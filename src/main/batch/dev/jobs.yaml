@@ -1,0 +1,70 @@
+jobs:
+  - key: py_smoke_test_fa_book_xfer
+    name: Python Smoke Test - FA Book Xfer
+    description: Runs hello_batch.py to validate Batch plumbing (input vars, download, outputs)
+
+    enabled: ENABLED
+    team: "<TEAM>"
+
+    computeGroup: "<COMPUTE_GROUP>"
+    dockerImage: "<DOCKER_IMAGE_KEY>"
+    runAsUser: "nobody"
+
+    inputVariables:
+      - name: requests_uri
+        description: "Path to requests JSON (gs://, http(s)://, or mounted file path)"
+      - name: out_uri_prefix
+        description: "Where to upload outputs (gs://... or mounted path)"
+        fixedValue:
+          string: "gs://<bucket>/batch-test/outputs"
+      - name: execute
+        description: "true executes (and fails run if any invalid rows), false is dry-run"
+        fixedValue:
+          string: "false"
+      - name: program
+        description: "Python program inside image"
+        fixedValue:
+          string: "/app/hello_batch.py"
+
+    command:
+      script:
+        shell: BASH
+        script: |
+          set -euo pipefail
+
+          REQUESTS_URI="{{ batch.input.requests_uri }}"
+          OUT_URI_PREFIX="{{ batch.input.out_uri_prefix }}"
+          EXECUTE="{{ batch.input.execute }}"
+          PROGRAM="{{ batch.input.program }}"
+
+          RUN_ID="${BATCH_RUN_ID:-manual}_$(date +%Y%m%d_%H%M%S)"
+          WORK="/work"
+          OUT_DIR="${WORK}/out/${RUN_ID}"
+          REQ_FILE="${WORK}/requests.json"
+          mkdir -p "${OUT_DIR}" "${WORK}"
+
+          echo "Downloading requests: ${REQUESTS_URI}"
+          if [[ "${REQUESTS_URI}" == gs://* ]]; then
+            gsutil cp "${REQUESTS_URI}" "${REQ_FILE}"
+          elif [[ "${REQUESTS_URI}" == http* ]]; then
+            curl -L "${REQUESTS_URI}" -o "${REQ_FILE}"
+          else
+            cp "${REQUESTS_URI}" "${REQ_FILE}"
+          fi
+
+          echo "Running program=${PROGRAM}"
+          if [[ "${EXECUTE}" == "true" ]]; then
+            python -u "${PROGRAM}" --config "${REQ_FILE}" --out-dir "${OUT_DIR}" --execute
+          else
+            python -u "${PROGRAM}" --config "${REQ_FILE}" --out-dir "${OUT_DIR}" --dry-run
+          fi
+
+          echo "Uploading outputs to ${OUT_URI_PREFIX}/${RUN_ID}/"
+          if [[ "${OUT_URI_PREFIX}" == gs://* ]]; then
+            gsutil -m cp -r "${OUT_DIR}" "${OUT_URI_PREFIX}/${RUN_ID}/"
+            echo "OUTPUT_URI=${OUT_URI_PREFIX}/${RUN_ID}/"
+          else
+            mkdir -p "${OUT_URI_PREFIX}/${RUN_ID}/"
+            cp -r "${OUT_DIR}/." "${OUT_URI_PREFIX}/${RUN_ID}/"
+            echo "OUTPUT_PATH=${OUT_URI_PREFIX}/${RUN_ID}/"
+          fi

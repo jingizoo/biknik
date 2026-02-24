@@ -1,0 +1,11 @@
+sync:
+  key: fa_book_xfer_sync_dev
+  name: FA Book Transfer Sync (DEV)
+  description: DEV sync for FA cross-book batch jobs
+  entitlements:
+    - type: ADMIN
+      username: ["<YOUR_USERNAME>"]
+      adGroup: ["<YOUR_ADMIN_AD_GROUP>"]
+    - type: SYNC
+      username: ["<DEPLOYER_SERVICE_ACCOUNT>"]
+      adGroup: ["<SYNC_AD_GROUP>"]
