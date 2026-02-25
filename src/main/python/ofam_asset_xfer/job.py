@@ -1,0 +1,296 @@
+from __future__ import annotations
+
+import json
+import logging
+import time
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
+
+from .exceptions import ConfigError, FusionApiError, ValidationError
+from .oracle_client import OracleConfig, OracleErpIntegrationsClient
+from .store import ArtifactStore
+from .fusion_ops import (
+    get_asset_information,
+    build_same_book_transfer_params,
+    build_add_asset_params,
+    build_retire_asset_params,
+)
+from .template import render
+
+
+log = logging.getLogger(__name__)
+
+
+def _load_config(config_uri: str) -> Dict[str, Any]:
+    store = ArtifactStore(base_uri=".")
+    try:
+        raw = store.read_text(config_uri)
+    except Exception as e:
+        raise ConfigError(f"Failed to read config: {config_uri}") from e
+    try:
+        return json.loads(raw)
+    except Exception as e:
+        raise ConfigError(f"Config is not valid JSON: {config_uri}") from e
+
+
+def _validate_request(req: Dict[str, Any]) -> None:
+    if not req.get("request_id"):
+        raise ConfigError("Each request must include request_id.")
+    if not isinstance(req.get("source"), dict):
+        raise ConfigError("Each request must include source {book_type_code, asset_number}.")
+    src = req["source"]
+    if not src.get("book_type_code") or not src.get("asset_number"):
+        raise ConfigError("source.book_type_code and source.asset_number are required.")
+    t = str(req.get("transfer_type", "")).upper()
+    if t not in ("SAME_BOOK", "XBOOK"):
+        raise ConfigError("transfer_type must be SAME_BOOK or XBOOK.")
+    if t == "XBOOK":
+        if not isinstance(req.get("target"), dict) and not isinstance(req.get("xbook"), dict):
+            raise ConfigError("XBOOK requires either target{book_type_code,...} or xbook{...} configuration.")
+
+
+def run_job(config_uri: str, out_dir_uri: str, cli_execute: Optional[bool] = None) -> None:
+    config = _load_config(config_uri)
+    store = ArtifactStore(base_uri=out_dir_uri)
+    store.ensure_dir()
+    store.ensure_dir("audit")
+    store.ensure_dir("exceptions")
+
+    oracle_cfg = OracleConfig.from_dict(config.get("oracle", {}))
+    execute_cfg = bool(config.get("execute", False))
+    execute = execute_cfg if cli_execute is None else bool(cli_execute)
+
+    client = OracleErpIntegrationsClient(oracle_cfg)
+
+    requests = config.get("requests")
+    if not isinstance(requests, list) or not requests:
+        raise ConfigError("Config must include non-empty 'requests' list.")
+
+    results: List[Dict[str, Any]] = []
+    summary = {"total": 0, "success": 0, "failed": 0, "noop": 0, "dry_run": (not execute), "started_ts": int(time.time())}
+
+    for req in requests:
+        summary["total"] += 1
+        try:
+            _validate_request(req)
+            r = _process_one(client, store, req, execute)
+            results.append(r)
+            if r["status"] == "SUCCESS":
+                summary["success"] += 1
+            elif r["status"] == "NOOP":
+                summary["noop"] += 1
+            else:
+                summary["failed"] += 1
+        except Exception as e:
+            log.exception("Unhandled exception processing request")
+            rid = req.get("request_id", "UNKNOWN") if isinstance(req, dict) else "UNKNOWN"
+            err = {"request_id": rid, "status": "FAILED", "error": str(e)}
+            results.append(err)
+            summary["failed"] += 1
+            store.write_json(f"exceptions/{rid}.json", {"request": req, "error": str(e)})
+
+    summary["finished_ts"] = int(time.time())
+    store.write_json("summary.json", summary)
+    store.write_json("results.json", results)
+    log.info("Run completed: %s", summary)
+
+
+def _process_one(
+    client: OracleErpIntegrationsClient,
+    store: ArtifactStore,
+    req: Dict[str, Any],
+    execute: bool,
+) -> Dict[str, Any]:
+    request_id = str(req["request_id"])
+    transfer_type = str(req.get("transfer_type", "SAME_BOOK")).upper()
+    effective_date = req.get("effective_date")
+    src = req["source"]
+    src_book = str(src["book_type_code"])
+    src_asset_number = str(src["asset_number"])
+
+    # Always pre-read source asset state.
+    raw_get, pl_get, state = get_asset_information(client, src_book, src_asset_number)
+    store.write_json(f"audit/{request_id}.getAssetInformation.request.json", {"P_BOOK_TYPE_CODE": src_book, "P_ASSET_NUMBER": src_asset_number})
+    store.write_json(f"audit/{request_id}.getAssetInformation.response.json", raw_get)
+
+    context = {
+        "request": req,
+        "source": {"book_type_code": src_book, "asset_number": src_asset_number, "asset_id": state.asset_id},
+        "asset": {
+            "asset_id": state.asset_id,
+            "asset_number": state.asset_number,
+            "book_type_code": state.book_type_code,
+            "category_id": state.category_id,
+            "date_placed_in_service": state.date_placed_in_service,
+            "cost": state.cost,
+            "description": state.description,
+            "tag_number": state.tag_number,
+        },
+    }
+
+    if transfer_type == "SAME_BOOK":
+        overrides = req.get("target_assignment") or {}
+        params, is_noop = build_same_book_transfer_params(
+            state=state,
+            effective_date=effective_date,
+            overrides=overrides,
+            request_id=request_id,
+        )
+        if is_noop:
+            return {
+                "request_id": request_id,
+                "transfer_type": transfer_type,
+                "status": "NOOP",
+                "message": "Target assignment matches current assignment; no transfer posted.",
+                "asset_id": state.asset_id,
+                "asset_number": state.asset_number,
+                "book_type_code": state.book_type_code,
+            }
+
+        store.write_json(f"audit/{request_id}.transferAsset.request.json", {"OperationName": "processTransaction-transferAsset", "ParameterList_params": params})
+        if not execute:
+            return {
+                "request_id": request_id,
+                "transfer_type": transfer_type,
+                "status": "SUCCESS",
+                "dry_run": True,
+                "message": "Dry-run: transferAsset payload built; no POST executed.",
+                "asset_id": state.asset_id,
+                "asset_number": state.asset_number,
+                "book_type_code": state.book_type_code,
+                "planned_handle": "transferAsset",
+            }
+
+        raw_txn, pl_txn = client.process_transaction("transferAsset", params)
+        store.write_json(f"audit/{request_id}.transferAsset.response.json", raw_txn)
+
+        return _result_from_fusion_response(request_id, transfer_type, state, "transferAsset", pl_txn)
+
+    # XBOOK
+    # Strategy 1: native xBook handle (configured via template; caller supplies handle + parameter template)
+    xbook = req.get("xbook") if isinstance(req.get("xbook"), dict) else None
+    if xbook and xbook.get("strategy", "").lower() == "native":
+        handle = str(xbook.get("handle") or "").strip()
+        tmpl = xbook.get("parameters_template")
+        if not handle or not isinstance(tmpl, dict):
+            raise ConfigError("xbook.strategy=native requires xbook.handle and xbook.parameters_template (dict).")
+
+        rendered_params = render(tmpl, context)
+        # Always enforce uppercase at build time (paramlist builder will validate).
+        store.write_json(f"audit/{request_id}.xbook.native.request.json", {"handle": handle, "params": rendered_params})
+        if not execute:
+            return {
+                "request_id": request_id,
+                "transfer_type": transfer_type,
+                "status": "SUCCESS",
+                "dry_run": True,
+                "message": "Dry-run: native xBook payload built; no POST executed.",
+                "asset_id": state.asset_id,
+                "asset_number": state.asset_number,
+                "book_type_code": state.book_type_code,
+                "planned_handle": handle,
+            }
+
+        raw_txn, pl_txn = client.process_transaction(handle, rendered_params)
+        store.write_json(f"audit/{request_id}.xbook.native.response.json", raw_txn)
+        return _result_from_fusion_response(request_id, transfer_type, state, handle, pl_txn)
+
+    # Strategy 2: orchestration fallback (addAsset in target book + retireAsset in source book)
+    target = req.get("target")
+    if not isinstance(target, dict) or not target.get("book_type_code"):
+        raise ConfigError("XBOOK orchestration requires target.book_type_code.")
+    tgt_book = str(target["book_type_code"])
+
+    tgt_asset_number = str(target.get("asset_number") or "").strip()
+    if not tgt_asset_number:
+        # Deterministic generator (can be replaced by upstream service).
+        tgt_asset_number = f"XFER_{state.asset_number}_{int(time.time())}"
+
+    overrides = req.get("target_assignment") or {}
+
+    add_params = build_add_asset_params(
+        state=state,
+        target_book_type_code=tgt_book,
+        target_asset_number=tgt_asset_number,
+        effective_date=effective_date,
+        overrides=overrides,
+        request_id=request_id,
+    )
+    store.write_json(f"audit/{request_id}.addAsset.request.json", {"OperationName": "processTransaction-addAsset", "ParameterList_params": add_params})
+
+    retire_params = build_retire_asset_params(state=state, effective_date=effective_date, request_id=request_id)
+    store.write_json(f"audit/{request_id}.retireAsset.request.json", {"OperationName": "processTransaction-retireAsset", "ParameterList_params": retire_params})
+
+    if not execute:
+        return {
+            "request_id": request_id,
+            "transfer_type": transfer_type,
+            "status": "SUCCESS",
+            "dry_run": True,
+            "message": "Dry-run: xBook orchestration payloads built (addAsset + retireAsset); no POST executed.",
+            "source_asset_id": state.asset_id,
+            "source_asset_number": state.asset_number,
+            "source_book_type_code": state.book_type_code,
+            "target_asset_number": tgt_asset_number,
+            "target_book_type_code": tgt_book,
+            "planned_handles": ["addAsset", "retireAsset"],
+        }
+
+    raw_add, pl_add = client.process_transaction("addAsset", add_params)
+    store.write_json(f"audit/{request_id}.addAsset.response.json", raw_add)
+
+    # If addAsset fails, do not retire source.
+    add_status = str(pl_add.get("X_RETURN_STATUS") or "").strip()
+    if add_status and add_status != "S":
+        raise FusionApiError(f"addAsset failed; not retiring source. Response: {pl_add}")
+
+    raw_ret, pl_ret = client.process_transaction("retireAsset", retire_params)
+    store.write_json(f"audit/{request_id}.retireAsset.response.json", raw_ret)
+
+    # Build consolidated result
+    return {
+        "request_id": request_id,
+        "transfer_type": transfer_type,
+        "status": "SUCCESS" if str(pl_ret.get("X_RETURN_STATUS") or "") == "S" else "FAILED",
+        "mode": "orchestrated_add_retire",
+        "source_asset_id": state.asset_id,
+        "source_asset_number": state.asset_number,
+        "source_book_type_code": state.book_type_code,
+        "target_asset_number": pl_add.get("PX_ASSET_NUMBER") or tgt_asset_number,
+        "target_book_type_code": tgt_book,
+        "addAsset": _compact_pl(pl_add),
+        "retireAsset": _compact_pl(pl_ret),
+    }
+
+
+def _compact_pl(pl: Dict[str, Any]) -> Dict[str, Any]:
+    keys = ["X_RETURN_STATUS", "X_EVENT_ID", "X_TRANSACTION_HEADER_ID", "X_D_TRANSACTION_HEADER_ID", "X_RETIREMENT_ID", "X_MSG_COUNT", "X_MSG_DATA", "PX_ASSET_NUMBER"]
+    return {k: pl.get(k) for k in keys if k in pl}
+
+
+def _result_from_fusion_response(
+    request_id: str,
+    transfer_type: str,
+    state: Any,
+    handle: str,
+    pl: Dict[str, Any],
+) -> Dict[str, Any]:
+    status = str(pl.get("X_RETURN_STATUS") or "").strip()
+    out = {
+        "request_id": request_id,
+        "transfer_type": transfer_type,
+        "handle": handle,
+        "asset_id": getattr(state, "asset_id", None),
+        "asset_number": getattr(state, "asset_number", None),
+        "book_type_code": getattr(state, "book_type_code", None),
+        "fusion": _compact_pl(pl),
+    }
+    if status == "S":
+        out["status"] = "SUCCESS"
+        return out
+
+    # Per Oracle guidance, X_RETURN_STATUS can be F even when X_EVENT_ID exists;
+    # treat as failure but preserve identifiers for investigation.
+    out["status"] = "FAILED"
+    out["message"] = "Fusion returned non-success X_RETURN_STATUS; see fusion payload for details."
+    return out

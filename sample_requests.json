@@ -1,0 +1,72 @@
+{
+  "oracle": {
+    "base_url": "https://YOUR_FUSION_HOST",
+    "api_version": "11.13.18.05",
+    "username_env": "FUSION_USER",
+    "password_env": "FUSION_PASS",
+    "verify_ssl": true,
+    "timeout_seconds": 60
+  },
+  "execute": false,
+  "requests": [
+    {
+      "request_id": "REQ-0001",
+      "transfer_type": "SAME_BOOK",
+      "source": {
+        "book_type_code": "OPS CORP",
+        "asset_number": "10026"
+      },
+      "effective_date": "2026-02-17",
+      "target_assignment": {
+        "location_ccid": "300100071633789",
+        "expense_ccid": "300100071633798",
+        "assigned_to": "100010024200338"
+      }
+    },
+    {
+      "request_id": "REQ-0002",
+      "transfer_type": "XBOOK",
+      "source": {
+        "book_type_code": "UK CORP BOOK",
+        "asset_number": "10026"
+      },
+      "effective_date": "2026-02-17",
+      "target": {
+        "book_type_code": "US CORP BOOK",
+        "asset_number": "XFER_10026_20260217"
+      },
+      "target_assignment": {
+        "location_ccid": "300100071633789",
+        "expense_ccid": "300100071633798",
+        "assigned_to": "100010024200338"
+      },
+      "xbook": {
+        "strategy": "orchestrate"
+      }
+    },
+    {
+      "request_id": "REQ-0003",
+      "transfer_type": "XBOOK",
+      "source": {
+        "book_type_code": "UK CORP BOOK",
+        "asset_number": "10026"
+      },
+      "effective_date": "2026-02-17",
+      "xbook": {
+        "strategy": "native",
+        "handle": "bookTransfer",
+        "parameters_template": {
+          "P_SOURCE_BOOK_TYPE_CODE": "{{source.book_type_code}}",
+          "P_DEST_BOOK_TYPE_CODE": "{{request.target.book_type_code}}",
+          "P_ASSET_ID": "{{source.asset_id}}",
+          "P_TRANSACTION_DATE_ENTERED": "{{request.effective_date}}",
+          "P_TRX_ATTRIBUTE1": "{{request.request_id}}",
+          "P_TRX_ATTRIBUTE2": "OFAM_XBOOK_NATIVE"
+        }
+      },
+      "target": {
+        "book_type_code": "US CORP BOOK"
+      }
+    }
+  ]
+}
