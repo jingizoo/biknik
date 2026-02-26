@@ -7,6 +7,7 @@ from typing import Any, Dict, Iterable, List, Tuple
 
 
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_NUMERIC_RE = re.compile(r"^-?\d+(\.\d+)?$")
 
 
 def _is_date_str(s: str) -> bool:
@@ -46,20 +47,26 @@ def build_parameter_list(params: Dict[str, Any]) -> str:
             raise ValueError(f"Parameter name must be UPPERCASE: {k!r}")
 
         if isinstance(v, (list, tuple)):
-            items.append(f"{k}: {to_rosetta_str(v)}")
+            items.append(f"{k}:{to_rosetta_str(v)}")
             continue
 
         if isinstance(v, str) and (k.endswith("_TBL") or k.endswith("_TABLE")):
             # Already encoded rosetta string, but enforce quoting.
-            items.append(f"{k}: {to_rosetta_str([p.strip() for p in v.split(',') if p.strip() != ''])}")
+            items.append(f"{k}:{to_rosetta_str([p.strip() for p in v.split(',') if p.strip() != ''])}")
             continue
 
         if isinstance(v, str) and _is_date_str(v):
             items.append(f"{k}: {_quote_single(v.strip())}")
             continue
 
-        # Keep strings unquoted to match Oracle examples (incl. book codes with spaces).
-        items.append(f"{k}: {v}")
+        # Numeric values stay unquoted (with space after colon);
+        # all other strings are single-quoted (no space before quote)
+        # per Oracle ERP Integrations ParameterList format.
+        sv = str(v)
+        if _NUMERIC_RE.match(sv.strip()):
+            items.append(f"{k}: {sv}")
+        else:
+            items.append(f"{k}:{_quote_single(sv)}")
     return "{" + ", ".join(items) + "}"
 
 
