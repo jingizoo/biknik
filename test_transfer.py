@@ -14,20 +14,23 @@ Environment variables:
   FUSION_API_VERSION e.g. 11.13.18.05
   FUSION_JWT         raw JWT token
 
+NOTE: getAssetInformation does NOT return X_ASSET_ID.
+  You must supply --asset-id manually (look it up in Oracle FA).
+
 Usage examples:
   # Dry-run: query asset info and show what transfer payload would look like
-  python test_transfer.py --asset-number 10026 --book-code "OPS CORP"
+  python test_transfer.py --asset-number 125183 --asset-id 12345 --book-code "OPS CORP"
 
   # Override specific fields for the destination
-  python test_transfer.py --asset-number 10026 --book-code "OPS CORP" \
+  python test_transfer.py --asset-number 125183 --asset-id 12345 --book-code "OPS CORP" \
       --location-ccid 300100071633789 --expense-ccid 300100071633798
 
   # Transfer to a different destination book
-  python test_transfer.py --asset-number 10026 --book-code "OPS CORP" \
+  python test_transfer.py --asset-number 125183 --asset-id 12345 --book-code "OPS CORP" \
       --dest-book-code "TAX CORP"
 
   # Actually execute the transfer
-  python test_transfer.py --asset-number 10026 --book-code "OPS CORP" --execute
+  python test_transfer.py --asset-number 125183 --asset-id 12345 --book-code "OPS CORP" --execute
 """
 
 import argparse
@@ -149,11 +152,13 @@ def call_fusion(
 # Step 1: Get asset information
 # ---------------------------------------------------------------------------
 
-def get_asset_info(base_url, api_version, jwt, book_code, asset_number):
+def get_asset_info(base_url, api_version, jwt, book_code, asset_number, cli_asset_id=None):
     print("=" * 70)
     print("STEP 1: getAssetInformation")
     print(f"  Book Type Code : {book_code}")
     print(f"  Asset Number   : {asset_number}")
+    if cli_asset_id:
+        print(f"  Asset ID (CLI) : {cli_asset_id}")
     print("=" * 70)
 
     params = {
@@ -170,9 +175,10 @@ def get_asset_info(base_url, api_version, jwt, book_code, asset_number):
         sys.exit(1)
 
     # Extract all relevant fields
-    # NOTE: X_ASSET_ID may not be returned by getAssetInformation.
-    # Use asset_number (which we sent) as the primary identifier instead.
-    asset_id = str(pl.get("X_ASSET_ID") or "").strip() or None
+    # NOTE: X_ASSET_ID is NOT returned by getAssetInformation.
+    # The asset_id MUST be supplied via --asset-id CLI argument.
+    api_asset_id = str(pl.get("X_ASSET_ID") or "").strip() or None
+    asset_id = cli_asset_id or api_asset_id
     asset_num = str(pl.get("X_ASSET_NUMBER") or asset_number).strip()
     book = str(pl.get("X_BOOK_TYPE_CODE") or pl.get("P_BOOK_TYPE_CODE") or book_code).strip()
 
@@ -193,11 +199,18 @@ def get_asset_info(base_url, api_version, jwt, book_code, asset_number):
         print(f"\nFull ParameterList:\n{json.dumps(pl, indent=2)[:3000]}")
         sys.exit(1)
 
-    if asset_id:
+    if not asset_id:
+        print("\nERROR: Asset ID is required for transferAsset but was NOT returned")
+        print("       by getAssetInformation (X_ASSET_ID is not in the response).")
+        print("       You must supply it via --asset-id <id>.")
+        print(f"\n       Example: python test_transfer.py --asset-number {asset_number} --asset-id <YOUR_ASSET_ID> --book-code \"{book_code}\"")
+        sys.exit(1)
+
+    if cli_asset_id:
+        print(f"\n  Using Asset ID from --asset-id: {asset_id}")
+    elif api_asset_id:
         print(f"\n  X_ASSET_ID found in response: {asset_id}")
-    else:
-        print(f"\n  NOTE: X_ASSET_ID not returned by getAssetInformation.")
-        print(f"        Will use P_ASSET_NUMBER ({asset_num}) for transferAsset call.")
+
 
     # Fill missing assigned_to with placeholders
     if not assigned_to:
@@ -349,11 +362,9 @@ def build_transfer_payload(state, args):
         "P_TRANSACTION_DATE_ENTERED": today,
     }
 
-    # Use P_ASSET_ID if available, otherwise fall back to P_ASSET_NUMBER
-    if state["asset_id"]:
-        params["P_ASSET_ID"] = state["asset_id"]
-    else:
-        params["P_ASSET_NUMBER"] = state["asset_number"]
+    # P_ASSET_ID is required by transferAsset (asset_id is guaranteed
+    # present at this point — either from --asset-id CLI or API response)
+    params["P_ASSET_ID"] = state["asset_id"]
 
     print("\n  Transfer Payload (dual-leg):")
     print(f"    {'Leg':<6} {'Dist ID':<20} {'Txn Units':<12} {'Units':<10} "
@@ -414,22 +425,24 @@ def main():
         epilog="""
 Examples:
   # Dry-run (default) - just query asset and show transfer payload:
-  python test_transfer.py --asset-number 10026 --book-code "OPS CORP"
+  python test_transfer.py --asset-number 125183 --asset-id 12345 --book-code "OPS CORP"
 
   # Override destination expense CCID:
-  python test_transfer.py --asset-number 10026 --book-code "OPS CORP" \\
+  python test_transfer.py --asset-number 125183 --asset-id 12345 --book-code "OPS CORP" \\
       --expense-ccid 300100071633798
 
   # Transfer to a different destination book:
-  python test_transfer.py --asset-number 10026 --book-code "OPS CORP" \\
+  python test_transfer.py --asset-number 125183 --asset-id 12345 --book-code "OPS CORP" \\
       --dest-book-code "TAX CORP"
 
   # Actually execute the transfer:
-  python test_transfer.py --asset-number 10026 --book-code "OPS CORP" \\
+  python test_transfer.py --asset-number 125183 --asset-id 12345 --book-code "OPS CORP" \\
       --expense-ccid 300100071633798 --execute
         """,
     )
-    parser.add_argument("--asset-number", required=True, help="Asset number (e.g. 10026)")
+    parser.add_argument("--asset-number", required=True, help="Asset number (e.g. 125183)")
+    parser.add_argument("--asset-id", required=True,
+                        help="Asset ID (required — getAssetInformation does NOT return this. Look it up in Oracle FA.)")
     parser.add_argument("--book-code", required=True, help="Source book type code (e.g. 'OPS CORP')")
     parser.add_argument("--dest-book-code", default=None,
                         help="Destination book type code. Defaults to source book code (same-book transfer).")
@@ -464,13 +477,14 @@ Examples:
     print(f"  Fusion Host  : {base_url}")
     print(f"  API Version  : {api_version}")
     print(f"  Asset Number : {args.asset_number}")
+    print(f"  Asset ID     : {args.asset_id}")
     print(f"  Source Book  : {args.book_code}")
     print(f"  Dest Book    : {dest_book_display}")
     print(f"  Mode         : {'EXECUTE' if args.execute else 'DRY-RUN'}")
     print(f"  SSL Verify   : {not args.no_verify_ssl}")
 
     # Step 1: Get asset information
-    state, raw_pl = get_asset_info(base_url, api_version, jwt_token, args.book_code, args.asset_number)
+    state, raw_pl = get_asset_info(base_url, api_version, jwt_token, args.book_code, args.asset_number, cli_asset_id=args.asset_id)
 
     # Step 2: Build transfer payload
     params, is_noop = build_transfer_payload(state, args)
