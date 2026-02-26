@@ -136,22 +136,35 @@ def lookup_ccid_by_segments(
     raises a hard error with a clear message about the missing combination.
     """
     # Build q= filter:  Segment1='US01';Segment2='100';...
+    # Sort segment keys numerically (Segment1, Segment2, ..., Segment10, ...)
+    def _seg_sort_key(k: str) -> tuple:
+        m = re.match(r"^(Segment)(\d+)$", k)
+        if m:
+            return (0, int(m.group(2)))
+        return (1, k)
+
+    sorted_keys = sorted(target_segments.keys(), key=_seg_sort_key)
+
     parts: List[str] = []
-    for key in sorted(target_segments.keys()):
+    for key in sorted_keys:
         parts.append(f"{key}={target_segments[key]}")
     if chart_of_accounts_id is not None:
         parts.append(f"ChartOfAccountsId={chart_of_accounts_id}")
 
     q_filter = ";".join(parts)
 
-    log.info("lookup_ccid_by_segments: q=%s", q_filter)
+    # Request the segment fields we need for exact-match verification
+    segment_fields = ",".join(sorted_keys)
+    fields = f"CodeCombinationId,ConcatenatedSegments,ChartOfAccountsId,{segment_fields}"
+
+    log.info("lookup_ccid_by_segments: q=%s fields=%s", q_filter, fields)
 
     resp = client.get_resource(
         "accountCombinationsLOV",
         {
             "q": q_filter,
             "onlyData": "true",
-            "fields": "CodeCombinationId,ConcatenatedSegments",
+            "fields": fields,
         },
     )
 

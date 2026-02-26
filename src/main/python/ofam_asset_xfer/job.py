@@ -204,7 +204,7 @@ def _process_one(
                 if xk not in ("strategy", "handle", "parameters_template"):
                     overrides.setdefault(xk, xv)
 
-        handle = str(xbook.get("handle") or "bookTransfer").strip() if xbook else "bookTransfer"
+        handle = str(xbook.get("handle") or "transferAsset").strip() if xbook else "transferAsset"
 
         # If a parameters_template is provided, use template rendering (legacy native path).
         tmpl = xbook.get("parameters_template") if xbook else None

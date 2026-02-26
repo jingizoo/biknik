@@ -82,6 +82,9 @@ def parse_rosetta(value) -> List[str]:
     s = str(value).strip()
     if s in ("", ","):
         return []
+    # Strip surrounding single quotes (Fusion sometimes returns quoted rosetta strings).
+    if s.startswith("'") and s.endswith("'"):
+        s = s[1:-1].replace("''", "'")
     parts = [p.strip() for p in s.split(",")]
     return [p for p in parts if p != ""]
 
@@ -245,8 +248,15 @@ def resolve_ccid_segments(base_url, api_version, jwt, ccid, verify_ssl=True):
 
 def lookup_ccid_by_segments(base_url, api_version, jwt, target_segments, coa_id=None, verify_ssl=True):
     """Find an existing CCID matching target segments."""
+    # Sort segment keys numerically (Segment1, Segment2, ..., Segment10, ...)
+    def _seg_sort_key(k):
+        m = re.match(r"^(Segment)(\d+)$", k)
+        return (0, int(m.group(2))) if m else (1, k)
+
+    sorted_keys = sorted(target_segments.keys(), key=_seg_sort_key)
+
     parts = []
-    for key in sorted(target_segments.keys()):
+    for key in sorted_keys:
         parts.append(f"{key}={target_segments[key]}")
     if coa_id is not None:
         parts.append(f"ChartOfAccountsId={coa_id}")
@@ -254,10 +264,14 @@ def lookup_ccid_by_segments(base_url, api_version, jwt, target_segments, coa_id=
     q_filter = ";".join(parts)
     print(f"\n  [CCID Resolver] Looking up target CCID with q={q_filter}")
 
+    # Request segment fields so we can verify exact match
+    segment_fields = ",".join(sorted_keys)
+    fields = f"CodeCombinationId,ConcatenatedSegments,ChartOfAccountsId,{segment_fields}"
+
     resp = call_fusion_get(base_url, api_version, jwt, "accountCombinationsLOV", {
         "q": q_filter,
         "onlyData": "true",
-        "fields": "CodeCombinationId,ConcatenatedSegments",
+        "fields": fields,
     }, verify_ssl=verify_ssl)
 
     items = resp.get("items") or []
@@ -389,9 +403,10 @@ def get_asset_info(base_url, api_version, jwt, book_code, asset_number, cli_asse
         print(f"\n  X_ASSET_ID found in response: {asset_id}")
 
 
-    # Fill missing assigned_to with placeholders
+    # Fill missing assigned_to with empty string placeholders.
+    # Oracle does not require assigned_to; '-1' is not a valid person ID.
     if not assigned_to:
-        assigned_to = ["-1"] * len(dist_ids)
+        assigned_to = [""] * len(dist_ids)
 
     # Display
     print("\n" + "-" * 70)
@@ -501,8 +516,39 @@ def build_transfer_payload(state, args):
     expense_tbl = []
     location_tbl = []
 
+    # Detect no-dist-change for cross-book (Option A: copy source lines)
+    no_dist_change = (
+        dest_location == state["location_ccids"]
+        and dest_expense == state["expense_ccids"]
+        and dest_assigned == state["assigned_to"]
+    )
+
+    if is_cross_book and no_dist_change:
+        # Option A: no distribution overrides → use P_COPY_SOURCE_LINES_FLAG=Y
+        # and omit distribution tables to avoid "identical distribution lines" error.
+        print("\n  Option A: No distribution change → P_COPY_SOURCE_LINES_FLAG=Y")
+        today = date.today().isoformat()
+        params = {
+            "P_ASSET_ID": state["asset_id"],
+            "P_TRANSACTION_DATE_ENTERED": today,
+            "P_BOOK_TYPE_CODE": state["book_type_code"],
+            "P_DEST_BOOK_TYPE_CODE": dest_book_code,
+            "P_BOOK_TRANSFER_TYPE_CODE": "NBV",
+            "P_COST_BASIS_CODE": "COST_RESERVE_SRC",
+            "P_USE_DEST_CAT_DEPRN_RULES_FLAG": "Y",
+            "P_USE_XFR_DATE_AS_DPIS_FLAG": "N",
+            "P_COPY_DFF_FLAG": "Y",
+            "P_COPY_ASSET_KEY_FLAG": "Y",
+            "P_CREATE_NEW_ASSET_FLAG": "Y",
+            "P_COPY_SOURCE_LINES_FLAG": "Y",
+            "P_CONVERSION_RATE_TYPE": "",
+        }
+        print(f"\n  ParameterList string:")
+        print(f"    {build_parameter_list(params)[:2000]}")
+        return params, is_noop
+
     if is_cross_book:
-        # Cross-book bookTransfer uses P_SRC_DISTRIBUTION_ID_TBL (null for source, 1 for dest)
+        # Cross-book with dist overrides: dual-leg P_SRC_DISTRIBUTION_ID_TBL (null/1)
         src_dist_tbl = []
         for i in range(n):
             units = state["units_assigned"][i]
@@ -529,14 +575,14 @@ def build_transfer_payload(state, args):
             dist_tbl.append(src_dist)
             txn_units_tbl.append(f"-{units}")
             units_tbl.append(units)
-            assigned_tbl.append(state["assigned_to"][i] or "-1")
+            assigned_tbl.append(state["assigned_to"][i] or "")
             expense_tbl.append(state["expense_ccids"][i])
             location_tbl.append(state["location_ccids"][i])
             # Destination leg
             dist_tbl.append("-1")
             txn_units_tbl.append(str(units))
             units_tbl.append(units)
-            assigned_tbl.append(dest_assigned[i] or "-1")
+            assigned_tbl.append(dest_assigned[i] or "")
             expense_tbl.append(dest_expense[i])
             location_tbl.append(dest_location[i])
 
@@ -599,8 +645,8 @@ def build_transfer_payload(state, args):
 # Step 3: Execute transfer
 # ---------------------------------------------------------------------------
 
-def execute_transfer(base_url, api_version, jwt, params, is_cross_book=False):
-    handle = "bookTransfer" if is_cross_book else "transferAsset"
+def execute_transfer(base_url, api_version, jwt, params):
+    handle = "transferAsset"
     print("\n" + "=" * 70)
     print(f"STEP 3: Execute {handle}")
     print("=" * 70)
@@ -787,8 +833,7 @@ Examples:
     if is_noop:
         print("\n  WARNING: Destination = source. Proceeding anyway since --execute was specified...")
 
-    is_cross_book = args.dest_book_code and args.dest_book_code != args.book_code
-    raw, pl = execute_transfer(base_url, api_version, jwt_token, params, is_cross_book=is_cross_book)
+    raw, pl = execute_transfer(base_url, api_version, jwt_token, params)
 
     # Save full results
     output_file = f"test_transfer_result_{args.asset_number}.json"

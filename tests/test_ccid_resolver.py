@@ -156,12 +156,14 @@ class TestLookupCcidBySegments:
 
         assert result == 789012
 
-        # Verify q filter was built correctly
-        call_args = client.get_resource.call_args
-        q_param = call_args[0][1]["q"] if len(call_args[0]) > 1 else call_args[1].get("query_params", {}).get("q")
-        # It's passed as positional or keyword — check the actual call
-        actual_params = call_args[0][1] if len(call_args[0]) > 1 else call_args[1]["query_params"]
+        # Verify q filter and fields were built correctly
+        actual_params = client.get_resource.call_args[0][1]
         assert "ChartOfAccountsId=50388" in actual_params["q"]
+        # Segments should be numerically sorted in q filter
+        assert actual_params["q"].startswith("Segment1=US01;Segment2=100;Segment3=7710")
+        # fields should include segment fields for exact-match verification
+        for seg in ["Segment1", "Segment2", "Segment3", "Segment4", "Segment5", "Segment6", "Segment7"]:
+            assert seg in actual_params["fields"]
 
     def test_no_match_raises(self):
         client = _mock_client(get_resource_return={"items": []})

@@ -59,9 +59,10 @@ class AssetState:
 
         ensure_same_len(dist_ids, units, expense, location)
 
-        # If assigned_to missing, fill with '-1' placeholders for builder convenience.
+        # If assigned_to missing, fill with empty string placeholders.
+        # Oracle does not require assigned_to; '-1' is not a valid person ID.
         if not assigned:
-            assigned = ["-1"] * len(dist_ids)
+            assigned = [""] * len(dist_ids)
 
         return AssetState(
             asset_id=asset_id,
@@ -141,11 +142,11 @@ def build_same_book_transfer_params(
     for i in range(n):
         src_dist = state.distribution_ids[i]
         units = state.units_assigned[i]
-        src_assigned = state.assigned_to[i] if state.assigned_to else "-1"
+        src_assigned = state.assigned_to[i] if state.assigned_to else ""
         src_exp = state.expense_ccids[i]
         src_loc = state.location_ccids[i]
 
-        dst_assigned = dest_assigned[i] if dest_assigned else "-1"
+        dst_assigned = dest_assigned[i] if dest_assigned else ""
         dst_exp = dest_expense[i]
         dst_loc = dest_location[i]
 
@@ -153,7 +154,7 @@ def build_same_book_transfer_params(
         dist_tbl.append(src_dist)
         txn_units_tbl.append(f"-{units}")
         units_tbl.append(units)
-        assigned_tbl.append(src_assigned or "-1")
+        assigned_tbl.append(src_assigned)
         expense_tbl.append(src_exp)
         location_tbl.append(src_loc)
 
@@ -161,7 +162,7 @@ def build_same_book_transfer_params(
         dist_tbl.append("-1")
         txn_units_tbl.append(str(units))
         units_tbl.append(units)
-        assigned_tbl.append(dst_assigned or "-1")
+        assigned_tbl.append(dst_assigned)
         expense_tbl.append(dst_exp)
         location_tbl.append(dst_loc)
 
@@ -242,11 +243,11 @@ def build_same_book_transfer_params_option_b(
     for i in range(n):
         src_dist = state.distribution_ids[i]
         units = state.units_assigned[i]
-        src_assigned = state.assigned_to[i] if state.assigned_to else "-1"
+        src_assigned = state.assigned_to[i] if state.assigned_to else ""
         src_exp = state.expense_ccids[i]
         src_loc = state.location_ccids[i]
 
-        dst_assigned = dest_assigned[i] if dest_assigned else "-1"
+        dst_assigned = dest_assigned[i] if dest_assigned else ""
         dst_exp = dest_expense[i]
         dst_loc = dest_location[i]
 
@@ -254,7 +255,7 @@ def build_same_book_transfer_params_option_b(
         dist_tbl.append(src_dist)
         txn_units_tbl.append(f"-{units}")
         units_tbl.append(units)
-        assigned_tbl.append(src_assigned or "-1")
+        assigned_tbl.append(src_assigned)
         expense_tbl.append(src_exp)
         location_tbl.append(src_loc)
 
@@ -262,7 +263,7 @@ def build_same_book_transfer_params_option_b(
         dist_tbl.append("-1")
         txn_units_tbl.append(str(units))
         units_tbl.append(units)
-        assigned_tbl.append(dst_assigned or "-1")
+        assigned_tbl.append(dst_assigned)
         expense_tbl.append(dst_exp)
         location_tbl.append(dst_loc)
 
@@ -292,12 +293,11 @@ def build_book_transfer_params(
     overrides: Dict[str, Any],
     request_id: str,
 ) -> Dict[str, Any]:
-    """Build bookTransfer ParameterList for native cross-book transfer.
+    """Build transferAsset ParameterList for cross-book transfer.
 
-    Matches the Oracle FA REST format:
-      {P_ASSET_ID: 2999, P_BOOK_TYPE_CODE:'UK CORP BOOK',
-       P_DEST_BOOK_TYPE_CODE:'US CORP BOOK', P_BOOK_TRANSFER_TYPE_CODE:'NBV',
-       P_SRC_DISTRIBUTION_ID_TBL:'null,1', ...}
+    Always uses processTransaction-transferAsset; cross-book behaviour is
+    driven by the params (P_DEST_BOOK_TYPE_CODE, P_BOOK_TRANSFER_TYPE_CODE,
+    P_SRC_DISTRIBUTION_ID_TBL, etc.).
     """
     n = len(state.distribution_ids)
 
@@ -315,7 +315,41 @@ def build_book_transfer_params(
     dest_expense = _expand_override("expense_ccid", state.expense_ccids)
     dest_assigned = _expand_override("assigned_to", state.assigned_to)
 
-    # Build dual-leg rosetta tables (source negative, dest positive)
+    # Read xbook-specific config overrides
+    book_transfer_type_code = overrides.get("book_transfer_type_code", "NBV")
+    cost_basis_code = overrides.get("cost_basis_code", "COST_RESERVE_SRC")
+
+    # Option A: If no distribution change is intended, use copy-source-lines mode
+    # to avoid the "identical distribution lines" validation error.
+    no_dist_change = (
+        dest_location == state.location_ccids
+        and dest_expense == state.expense_ccids
+        and dest_assigned == state.assigned_to
+    )
+
+    if no_dist_change:
+        log.info("build_book_transfer_params: no dist change → Option A (P_COPY_SOURCE_LINES_FLAG=Y)")
+        params: Dict[str, Any] = {
+            "P_ASSET_ID": state.asset_id,
+            "P_BOOK_TYPE_CODE": state.book_type_code,
+            "P_DEST_BOOK_TYPE_CODE": dest_book_type_code,
+            "P_BOOK_TRANSFER_TYPE_CODE": book_transfer_type_code,
+            "P_COST_BASIS_CODE": cost_basis_code,
+            "P_USE_DEST_CAT_DEPRN_RULES_FLAG": overrides.get("use_dest_cat_deprn_rules_flag", "Y"),
+            "P_USE_XFR_DATE_AS_DPIS_FLAG": overrides.get("use_xfr_date_as_dpis_flag", "N"),
+            "P_COPY_DFF_FLAG": overrides.get("copy_dff_flag", "Y"),
+            "P_COPY_ASSET_KEY_FLAG": overrides.get("copy_asset_key_flag", "Y"),
+            "P_CREATE_NEW_ASSET_FLAG": overrides.get("create_new_asset_flag", "Y"),
+            "P_COPY_SOURCE_LINES_FLAG": "Y",
+            "P_CONVERSION_RATE_TYPE": overrides.get("conversion_rate_type", ""),
+            "P_TRX_ATTRIBUTE1": request_id,
+            "P_TRX_ATTRIBUTE2": "OFAM_XBOOK_NATIVE",
+        }
+        if effective_date:
+            params["P_TRANSACTION_DATE_ENTERED"] = effective_date
+        return params
+
+    # Option B / explicit override: build dual-leg rosetta tables
     txn_units_tbl: List[str] = []
     expense_tbl: List[str] = []
     location_tbl: List[str] = []
@@ -339,14 +373,6 @@ def build_book_transfer_params(
         assigned_tbl.append(dest_assigned[i] if dest_assigned else "")
         src_dist_tbl.append("1")
 
-    # Read xbook-specific config overrides
-    book_transfer_type_code = overrides.get("book_transfer_type_code", "NBV")
-    cost_basis_code = overrides.get("cost_basis_code", "COST_RESERVE_SRC")
-
-    # If all assigned_to values are empty/placeholder, send empty list (Oracle expects '')
-    if all(a in ("", "-1") for a in assigned_tbl):
-        assigned_tbl = []
-
     params: Dict[str, Any] = {
         "P_ASSET_ID": state.asset_id,
         "P_BOOK_TYPE_CODE": state.book_type_code,
@@ -358,7 +384,7 @@ def build_book_transfer_params(
         "P_COPY_DFF_FLAG": overrides.get("copy_dff_flag", "Y"),
         "P_COPY_ASSET_KEY_FLAG": overrides.get("copy_asset_key_flag", "Y"),
         "P_CREATE_NEW_ASSET_FLAG": overrides.get("create_new_asset_flag", "Y"),
-        "P_COPY_SOURCE_LINES_FLAG": overrides.get("copy_source_lines_flag", "N"),
+        "P_COPY_SOURCE_LINES_FLAG": "N",
         "P_CONVERSION_RATE_TYPE": overrides.get("conversion_rate_type", ""),
         "P_TRANSACTION_UNITS_TBL": txn_units_tbl,
         "P_EXPENSE_CCID_TBL": expense_tbl,
@@ -423,7 +449,7 @@ def build_add_asset_params(
         "P_DISTRIBUTION_ID_TBL": dist_ids,
         "P_UNITS_ASSIGNED_TBL": units,
         "P_TRANSACTION_UNITS_TBL": txn_units,
-        "P_ASSIGNED_TO_TBL": dest_assigned if dest_assigned else ["-1"] * n,
+        "P_ASSIGNED_TO_TBL": dest_assigned if dest_assigned else [""] * n,
         "P_EXPENSE_CCID_TBL": dest_expense,
         "P_LOCATION_CCID_TBL": dest_location,
         "P_TRX_ATTRIBUTE1": request_id,

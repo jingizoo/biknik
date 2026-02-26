@@ -74,14 +74,17 @@ def parse_rosetta(value: Any) -> List[str]:
     """Parse a Rosetta table value coming back from Fusion.
 
     Fusion returns comma-separated strings, often with empty placeholders like ','.
+    Values may be wrapped in single quotes (e.g. ``'626955,626956'``); strip them.
     """
     if value is None:
         return []
     s = str(value).strip()
     if s == "" or s == ",":
         return []
+    # Strip surrounding single quotes (Fusion sometimes returns quoted rosetta strings).
+    if s.startswith("'") and s.endswith("'"):
+        s = s[1:-1].replace("''", "'")
     parts = [p.strip() for p in s.split(",")]
-    # Preserve empty cells? For OFAM transfer builder, we drop empties.
     return [p for p in parts if p != ""]
 
 
