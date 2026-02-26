@@ -184,6 +184,95 @@ def build_same_book_transfer_params(
     return params, False
 
 
+def build_book_transfer_params(
+    state: AssetState,
+    dest_book_type_code: str,
+    effective_date: Optional[str],
+    overrides: Dict[str, Any],
+    request_id: str,
+) -> Dict[str, Any]:
+    """Build bookTransfer ParameterList for native cross-book transfer.
+
+    Matches the Oracle FA REST format:
+      {P_ASSET_ID: 2999, P_BOOK_TYPE_CODE:'UK CORP BOOK',
+       P_DEST_BOOK_TYPE_CODE:'US CORP BOOK', P_BOOK_TRANSFER_TYPE_CODE:'NBV',
+       P_SRC_DISTRIBUTION_ID_TBL:'null,1', ...}
+    """
+    n = len(state.distribution_ids)
+
+    def _expand_override(key: str, source: List[str]) -> List[str]:
+        v = overrides.get(key)
+        if v is None:
+            return list(source)
+        if isinstance(v, list):
+            if len(v) != n:
+                raise ValidationError(f"Override list {key} length {len(v)} does not match distributions {n}")
+            return [str(x) for x in v]
+        return [str(v)] * n
+
+    dest_location = _expand_override("location_ccid", state.location_ccids)
+    dest_expense = _expand_override("expense_ccid", state.expense_ccids)
+    dest_assigned = _expand_override("assigned_to", state.assigned_to)
+
+    # Build dual-leg rosetta tables (source negative, dest positive)
+    txn_units_tbl: List[str] = []
+    expense_tbl: List[str] = []
+    location_tbl: List[str] = []
+    assigned_tbl: List[str] = []
+    src_dist_tbl: List[str] = []
+
+    for i in range(n):
+        units = state.units_assigned[i]
+
+        # Source leg
+        txn_units_tbl.append(f"-{units}")
+        expense_tbl.append(state.expense_ccids[i])
+        location_tbl.append(state.location_ccids[i])
+        assigned_tbl.append(state.assigned_to[i] if state.assigned_to else "")
+        src_dist_tbl.append("null")
+
+        # Destination leg
+        txn_units_tbl.append(str(units))
+        expense_tbl.append(dest_expense[i])
+        location_tbl.append(dest_location[i])
+        assigned_tbl.append(dest_assigned[i] if dest_assigned else "")
+        src_dist_tbl.append("1")
+
+    # Read xbook-specific config overrides
+    book_transfer_type_code = overrides.get("book_transfer_type_code", "NBV")
+    cost_basis_code = overrides.get("cost_basis_code", "COST_RESERVE_SRC")
+
+    # If all assigned_to values are empty/placeholder, send empty list (Oracle expects '')
+    if all(a in ("", "-1") for a in assigned_tbl):
+        assigned_tbl = []
+
+    params: Dict[str, Any] = {
+        "P_ASSET_ID": state.asset_id,
+        "P_BOOK_TYPE_CODE": state.book_type_code,
+        "P_DEST_BOOK_TYPE_CODE": dest_book_type_code,
+        "P_BOOK_TRANSFER_TYPE_CODE": book_transfer_type_code,
+        "P_COST_BASIS_CODE": cost_basis_code,
+        "P_USE_DEST_CAT_DEPRN_RULES_FLAG": overrides.get("use_dest_cat_deprn_rules_flag", "Y"),
+        "P_USE_XFR_DATE_AS_DPIS_FLAG": overrides.get("use_xfr_date_as_dpis_flag", "N"),
+        "P_COPY_DFF_FLAG": overrides.get("copy_dff_flag", "Y"),
+        "P_COPY_ASSET_KEY_FLAG": overrides.get("copy_asset_key_flag", "Y"),
+        "P_CREATE_NEW_ASSET_FLAG": overrides.get("create_new_asset_flag", "Y"),
+        "P_COPY_SOURCE_LINES_FLAG": overrides.get("copy_source_lines_flag", "N"),
+        "P_CONVERSION_RATE_TYPE": overrides.get("conversion_rate_type", ""),
+        "P_TRANSACTION_UNITS_TBL": txn_units_tbl,
+        "P_EXPENSE_CCID_TBL": expense_tbl,
+        "P_LOCATION_CCID_TBL": location_tbl,
+        "P_ASSIGNED_TO_TBL": assigned_tbl,
+        "P_SRC_DISTRIBUTION_ID_TBL": src_dist_tbl,
+        "P_TRX_ATTRIBUTE1": request_id,
+        "P_TRX_ATTRIBUTE2": "OFAM_XBOOK_NATIVE",
+    }
+    if effective_date:
+        params["P_TRANSACTION_DATE_ENTERED"] = effective_date
+
+    return params
+
+
 def build_add_asset_params(
     state: AssetState,
     target_book_type_code: str,

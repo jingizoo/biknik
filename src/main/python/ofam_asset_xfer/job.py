@@ -12,6 +12,7 @@ from .store import ArtifactStore
 from .fusion_ops import (
     get_asset_information,
     build_same_book_transfer_params,
+    build_book_transfer_params,
     build_add_asset_params,
     build_retire_asset_params,
 )
@@ -167,17 +168,39 @@ def _process_one(
         return _result_from_fusion_response(request_id, transfer_type, state, "transferAsset", pl_txn)
 
     # XBOOK
-    # Strategy 1: native xBook handle (configured via template; caller supplies handle + parameter template)
     xbook = req.get("xbook") if isinstance(req.get("xbook"), dict) else None
-    if xbook and xbook.get("strategy", "").lower() == "native":
-        handle = str(xbook.get("handle") or "").strip()
-        tmpl = xbook.get("parameters_template")
-        if not handle or not isinstance(tmpl, dict):
-            raise ConfigError("xbook.strategy=native requires xbook.handle and xbook.parameters_template (dict).")
+    strategy = xbook.get("strategy", "").lower() if xbook else ""
 
-        rendered_params = render(tmpl, context)
-        # Always enforce uppercase at build time (paramlist builder will validate).
-        store.write_json(f"audit/{request_id}.xbook.native.request.json", {"handle": handle, "params": rendered_params})
+    # Strategy 1: built-in bookTransfer builder (produces all Oracle-expected params)
+    if strategy in ("native", "builtin"):
+        target = req.get("target")
+        if not isinstance(target, dict) or not target.get("book_type_code"):
+            raise ConfigError("xbook native/builtin requires target.book_type_code.")
+        dest_book = str(target["book_type_code"])
+        overrides = req.get("target_assignment") or {}
+        # Merge xbook-level overrides (flags, book_transfer_type_code, etc.)
+        if xbook:
+            for xk, xv in xbook.items():
+                if xk not in ("strategy", "handle", "parameters_template"):
+                    overrides.setdefault(xk, xv)
+
+        handle = str(xbook.get("handle") or "bookTransfer").strip() if xbook else "bookTransfer"
+
+        # If a parameters_template is provided, use template rendering (legacy native path).
+        tmpl = xbook.get("parameters_template") if xbook else None
+        if isinstance(tmpl, dict) and tmpl:
+            rendered_params = render(tmpl, context)
+            params = rendered_params
+        else:
+            params = build_book_transfer_params(
+                state=state,
+                dest_book_type_code=dest_book,
+                effective_date=effective_date,
+                overrides=overrides,
+                request_id=request_id,
+            )
+
+        store.write_json(f"audit/{request_id}.xbook.native.request.json", {"handle": handle, "params": params})
         if not execute:
             return {
                 "request_id": request_id,
@@ -191,7 +214,7 @@ def _process_one(
                 "planned_handle": handle,
             }
 
-        raw_txn, pl_txn = client.process_transaction(handle, rendered_params)
+        raw_txn, pl_txn = client.process_transaction(handle, params)
         store.write_json(f"audit/{request_id}.xbook.native.response.json", raw_txn)
         return _result_from_fusion_response(request_id, transfer_type, state, handle, pl_txn)
 

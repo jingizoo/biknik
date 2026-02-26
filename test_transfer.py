@@ -317,68 +317,97 @@ def build_transfer_payload(state, args):
         print("           Use --location-ccid, --expense-ccid, --assigned-to, or --dest-book-code to specify new values.")
 
     # Build dual-leg rosetta tables (source leg negative, destination leg positive)
-    dist_tbl = []
     txn_units_tbl = []
-    units_tbl = []
     assigned_tbl = []
     expense_tbl = []
     location_tbl = []
 
-    for i in range(n):
-        src_dist = state["distribution_ids"][i]
-        units = state["units_assigned"][i]
-        src_assigned = state["assigned_to"][i]
-        src_exp = state["expense_ccids"][i]
-        src_loc = state["location_ccids"][i]
-
-        dst_assigned = dest_assigned[i]
-        dst_exp = dest_expense[i]
-        dst_loc = dest_location[i]
-
-        # Source leg (negative units = transfer FROM)
-        dist_tbl.append(src_dist)
-        txn_units_tbl.append(f"-{units}")
-        units_tbl.append(units)
-        assigned_tbl.append(src_assigned or "-1")
-        expense_tbl.append(src_exp)
-        location_tbl.append(src_loc)
-
-        # Destination leg (positive units = transfer TO, -1 = new distribution)
-        dist_tbl.append("-1")
-        txn_units_tbl.append(str(units))
-        units_tbl.append(units)
-        assigned_tbl.append(dst_assigned or "-1")
-        expense_tbl.append(dst_exp)
-        location_tbl.append(dst_loc)
+    if is_cross_book:
+        # Cross-book bookTransfer uses P_SRC_DISTRIBUTION_ID_TBL (null for source, 1 for dest)
+        src_dist_tbl = []
+        for i in range(n):
+            units = state["units_assigned"][i]
+            # Source leg
+            txn_units_tbl.append(f"-{units}")
+            expense_tbl.append(state["expense_ccids"][i])
+            location_tbl.append(state["location_ccids"][i])
+            assigned_tbl.append(state["assigned_to"][i] or "")
+            src_dist_tbl.append("null")
+            # Destination leg
+            txn_units_tbl.append(str(units))
+            expense_tbl.append(dest_expense[i])
+            location_tbl.append(dest_location[i])
+            assigned_tbl.append(dest_assigned[i] or "")
+            src_dist_tbl.append("1")
+    else:
+        # Same-book transferAsset uses P_DISTRIBUTION_ID_TBL
+        dist_tbl = []
+        units_tbl = []
+        for i in range(n):
+            src_dist = state["distribution_ids"][i]
+            units = state["units_assigned"][i]
+            # Source leg
+            dist_tbl.append(src_dist)
+            txn_units_tbl.append(f"-{units}")
+            units_tbl.append(units)
+            assigned_tbl.append(state["assigned_to"][i] or "-1")
+            expense_tbl.append(state["expense_ccids"][i])
+            location_tbl.append(state["location_ccids"][i])
+            # Destination leg
+            dist_tbl.append("-1")
+            txn_units_tbl.append(str(units))
+            units_tbl.append(units)
+            assigned_tbl.append(dest_assigned[i] or "-1")
+            expense_tbl.append(dest_expense[i])
+            location_tbl.append(dest_location[i])
 
     today = date.today().isoformat()
 
-    params = {
-        "P_BOOK_TYPE_CODE": state["book_type_code"],
-        "P_DEST_BOOK_TYPE_CODE": dest_book_code,
-        "P_DISTRIBUTION_ID_TBL": dist_tbl,
-        "P_TRANSACTION_UNITS_TBL": txn_units_tbl,
-        "P_UNITS_ASSIGNED_TBL": units_tbl,
-        "P_ASSIGNED_TO_TBL": assigned_tbl,
-        "P_EXPENSE_CCID_TBL": expense_tbl,
-        "P_LOCATION_CCID_TBL": location_tbl,
-        "P_TRX_ATTRIBUTE1": f"TEST-{today}",
-        "P_TRX_ATTRIBUTE2": "TEST_SAME_BOOK_XFER",
-        "P_TRANSACTION_DATE_ENTERED": today,
-    }
-
-    # P_ASSET_ID is required by transferAsset (asset_id is guaranteed
-    # present at this point — either from --asset-id CLI or API response)
-    params["P_ASSET_ID"] = state["asset_id"]
+    if is_cross_book:
+        params = {
+            "P_ASSET_ID": state["asset_id"],
+            "P_TRANSACTION_DATE_ENTERED": today,
+            "P_BOOK_TYPE_CODE": state["book_type_code"],
+            "P_DEST_BOOK_TYPE_CODE": dest_book_code,
+            "P_BOOK_TRANSFER_TYPE_CODE": "NBV",
+            "P_COST_BASIS_CODE": "COST_RESERVE_SRC",
+            "P_USE_DEST_CAT_DEPRN_RULES_FLAG": "Y",
+            "P_USE_XFR_DATE_AS_DPIS_FLAG": "N",
+            "P_COPY_DFF_FLAG": "Y",
+            "P_COPY_ASSET_KEY_FLAG": "Y",
+            "P_CREATE_NEW_ASSET_FLAG": "Y",
+            "P_COPY_SOURCE_LINES_FLAG": "N",
+            "P_CONVERSION_RATE_TYPE": "",
+            "P_TRANSACTION_UNITS_TBL": txn_units_tbl,
+            "P_EXPENSE_CCID_TBL": expense_tbl,
+            "P_LOCATION_CCID_TBL": location_tbl,
+            "P_ASSIGNED_TO_TBL": assigned_tbl,
+            "P_SRC_DISTRIBUTION_ID_TBL": src_dist_tbl,
+        }
+    else:
+        params = {
+            "P_BOOK_TYPE_CODE": state["book_type_code"],
+            "P_DEST_BOOK_TYPE_CODE": dest_book_code,
+            "P_DISTRIBUTION_ID_TBL": dist_tbl,
+            "P_TRANSACTION_UNITS_TBL": txn_units_tbl,
+            "P_UNITS_ASSIGNED_TBL": units_tbl,
+            "P_ASSIGNED_TO_TBL": assigned_tbl,
+            "P_EXPENSE_CCID_TBL": expense_tbl,
+            "P_LOCATION_CCID_TBL": location_tbl,
+            "P_TRX_ATTRIBUTE1": f"TEST-{today}",
+            "P_TRX_ATTRIBUTE2": "TEST_SAME_BOOK_XFER",
+            "P_TRANSACTION_DATE_ENTERED": today,
+        }
+        params["P_ASSET_ID"] = state["asset_id"]
 
     print("\n  Transfer Payload (dual-leg):")
-    print(f"    {'Leg':<6} {'Dist ID':<20} {'Txn Units':<12} {'Units':<10} "
+    print(f"    {'Leg':<6} {'Txn Units':<12} "
           f"{'Assigned To':<25} {'Expense CCID':<25} {'Location CCID':<25}")
-    print(f"    {'---':<6} {'-------':<20} {'---------':<12} {'-----':<10} "
+    print(f"    {'---':<6} {'---------':<12} "
           f"{'-----------':<25} {'------------':<25} {'-------------':<25}")
-    for i in range(len(dist_tbl)):
+    for i in range(len(txn_units_tbl)):
         leg = "SRC" if i % 2 == 0 else "DST"
-        print(f"    {leg:<6} {dist_tbl[i]:<20} {txn_units_tbl[i]:<12} {units_tbl[i]:<10} "
+        print(f"    {leg:<6} {txn_units_tbl[i]:<12} "
               f"{assigned_tbl[i]:<25} {expense_tbl[i]:<25} {location_tbl[i]:<25}")
 
     print(f"\n  ParameterList string:")
@@ -391,12 +420,13 @@ def build_transfer_payload(state, args):
 # Step 3: Execute transfer
 # ---------------------------------------------------------------------------
 
-def execute_transfer(base_url, api_version, jwt, params):
+def execute_transfer(base_url, api_version, jwt, params, is_cross_book=False):
+    handle = "bookTransfer" if is_cross_book else "transferAsset"
     print("\n" + "=" * 70)
-    print("STEP 3: Execute transferAsset")
+    print(f"STEP 3: Execute {handle}")
     print("=" * 70)
 
-    raw, pl = call_fusion(base_url, api_version, jwt, "transferAsset", params)
+    raw, pl = call_fusion(base_url, api_version, jwt, handle, params)
 
     status = str(pl.get("X_RETURN_STATUS") or "").strip()
 
@@ -520,7 +550,8 @@ Examples:
     if is_noop:
         print("\n  WARNING: Destination = source. Proceeding anyway since --execute was specified...")
 
-    raw, pl = execute_transfer(base_url, api_version, jwt_token, params)
+    is_cross_book = args.dest_book_code and args.dest_book_code != args.book_code
+    raw, pl = execute_transfer(base_url, api_version, jwt_token, params, is_cross_book=is_cross_book)
 
     # Save full results
     output_file = f"test_transfer_result_{args.asset_number}.json"

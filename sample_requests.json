@@ -52,20 +52,25 @@
         "asset_number": "10026"
       },
       "effective_date": "2026-02-17",
+      "target": {
+        "book_type_code": "US CORP BOOK"
+      },
+      "target_assignment": {
+        "location_ccid": "300100071633789",
+        "expense_ccid": "300100071633798"
+      },
       "xbook": {
         "strategy": "native",
         "handle": "bookTransfer",
-        "parameters_template": {
-          "P_SOURCE_BOOK_TYPE_CODE": "{{source.book_type_code}}",
-          "P_DEST_BOOK_TYPE_CODE": "{{request.target.book_type_code}}",
-          "P_ASSET_ID": "{{source.asset_id}}",
-          "P_TRANSACTION_DATE_ENTERED": "{{request.effective_date}}",
-          "P_TRX_ATTRIBUTE1": "{{request.request_id}}",
-          "P_TRX_ATTRIBUTE2": "OFAM_XBOOK_NATIVE"
-        }
-      },
-      "target": {
-        "book_type_code": "US CORP BOOK"
+        "book_transfer_type_code": "NBV",
+        "cost_basis_code": "COST_RESERVE_SRC",
+        "use_dest_cat_deprn_rules_flag": "Y",
+        "use_xfr_date_as_dpis_flag": "N",
+        "copy_dff_flag": "Y",
+        "copy_asset_key_flag": "Y",
+        "create_new_asset_flag": "Y",
+        "copy_source_lines_flag": "N",
+        "conversion_rate_type": ""
       }
     }
   ]
