@@ -49,6 +49,7 @@ import requests
 # ---------------------------------------------------------------------------
 
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_NUMERIC_RE = re.compile(r"^-?\d+(\.\d+)?$")
 
 
 def _is_date_str(s: str) -> bool:
@@ -91,7 +92,11 @@ def build_parameter_list(params: Dict[str, Any]) -> str:
         if isinstance(v, str) and _is_date_str(v):
             items.append(f"{k}: {_quote_single(v.strip())}")
             continue
-        items.append(f"{k}: {v}")
+        sv = str(v)
+        if _NUMERIC_RE.match(sv.strip()):
+            items.append(f"{k}: {sv}")
+        else:
+            items.append(f"{k}: {_quote_single(sv)}")
     return "{" + ", ".join(items) + "}"
 
 
