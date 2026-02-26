@@ -12,6 +12,7 @@ from .store import ArtifactStore
 from .fusion_ops import (
     get_asset_information,
     build_same_book_transfer_params,
+    build_same_book_transfer_params_option_b,
     build_book_transfer_params,
     build_add_asset_params,
     build_retire_asset_params,
@@ -131,12 +132,31 @@ def _process_one(
 
     if transfer_type == "SAME_BOOK":
         overrides = req.get("target_assignment") or {}
-        params, is_noop = build_same_book_transfer_params(
-            state=state,
-            effective_date=effective_date,
-            overrides=overrides,
-            request_id=request_id,
-        )
+        target_company = overrides.get("target_company")
+
+        if target_company:
+            # Option B: derive expense CCID by swapping the Company segment.
+            company_segment_key = str(overrides.get("company_segment_key", "Segment1"))
+            log.info(
+                "[%s] Option B: target_company=%s, company_segment_key=%s",
+                request_id, target_company, company_segment_key,
+            )
+            params, is_noop = build_same_book_transfer_params_option_b(
+                client=client,
+                state=state,
+                effective_date=effective_date,
+                target_company=str(target_company),
+                request_id=request_id,
+                company_segment_key=company_segment_key,
+            )
+        else:
+            params, is_noop = build_same_book_transfer_params(
+                state=state,
+                effective_date=effective_date,
+                overrides=overrides,
+                request_id=request_id,
+            )
+
         if is_noop:
             return {
                 "request_id": request_id,

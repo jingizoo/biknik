@@ -75,6 +75,10 @@ class OracleErpIntegrationsClient:
         rel = f"/fscmRestApi/resources/{self.cfg.api_version}/erpintegrations/processTransaction-{handle}"
         return self.cfg.base_url + rel
 
+    def _resource_url(self, resource_path: str) -> str:
+        rel = f"/fscmRestApi/resources/{self.cfg.api_version}/{resource_path}"
+        return self.cfg.base_url + rel
+
     def process_transaction(self, handle: str, params: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         """POST processTransaction-<handle>.
 
@@ -116,3 +120,27 @@ class OracleErpIntegrationsClient:
             pl = pl_raw
 
         return raw, pl
+
+    def get_resource(self, resource_path: str, query_params: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+        """GET a Fusion REST resource (e.g. accountCombinationsLOV).
+
+        Returns the parsed JSON response body.
+        """
+        url = self._resource_url(resource_path)
+        log.debug("GET %s params=%s", url, query_params)
+
+        r = self._session.get(
+            url,
+            params=query_params or {},
+            timeout=self.cfg.timeout_seconds,
+            verify=self.cfg.verify_ssl,
+        )
+        try:
+            raw = r.json()
+        except Exception as e:
+            raise FusionApiError(f"Non-JSON response from Fusion GET (status={r.status_code}): {r.text[:500]}") from e
+
+        if r.status_code >= 400:
+            raise FusionApiError(f"Fusion GET HTTP {r.status_code}: {raw}")
+
+        return raw

@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from .exceptions import FusionApiError, ValidationError
 from .oracle_client import OracleErpIntegrationsClient
 from .paramlist import parse_rosetta, ensure_same_len
+from .ccid_resolver import resolve_target_expense_ccid
 
 
 log = logging.getLogger(__name__)
@@ -179,6 +180,106 @@ def build_same_book_transfer_params(
     }
     if effective_date:
         # Used for prior period transfers as well; always pass in canonical format.
+        params["P_TRANSACTION_DATE_ENTERED"] = effective_date
+
+    return params, False
+
+
+def build_same_book_transfer_params_option_b(
+    client: OracleErpIntegrationsClient,
+    state: AssetState,
+    effective_date: Optional[str],
+    target_company: str,
+    request_id: str,
+    company_segment_key: str = "Segment1",
+) -> Tuple[Dict[str, Any], bool]:
+    """Build transferAsset payload for Option B: change only EXPENSE_CCID
+    by replacing the Company segment, keeping LOCATION_CCID and ASSIGNED_TO as-is.
+
+    For each source distribution line, resolves the destination expense CCID
+    by looking up the source CCID's GL segments, swapping the Company segment
+    to *target_company*, and finding the matching combination.
+
+    Returns (params, is_noop).
+    """
+    n = len(state.distribution_ids)
+
+    # Resolve per-distribution target expense CCIDs.  In most cases all dists
+    # share the same expense CCID, but handle the general case.
+    seen_resolutions: Dict[str, int] = {}  # cache: src_ccid_str -> target_ccid
+    dest_expense: List[str] = []
+
+    for i in range(n):
+        src_ccid_str = state.expense_ccids[i]
+        if src_ccid_str in seen_resolutions:
+            dest_expense.append(str(seen_resolutions[src_ccid_str]))
+        else:
+            target_ccid = resolve_target_expense_ccid(
+                client,
+                int(src_ccid_str),
+                target_company,
+                company_segment_key,
+            )
+            seen_resolutions[src_ccid_str] = target_ccid
+            dest_expense.append(str(target_ccid))
+
+    # LOCATION_CCID and ASSIGNED_TO stay unchanged.
+    dest_location = list(state.location_ccids)
+    dest_assigned = list(state.assigned_to)
+
+    # NOOP check (shouldn't happen since resolve_target_expense_ccid already
+    # raises on same-ccid, but be defensive).
+    if dest_expense == state.expense_ccids:
+        return {}, True
+
+    dist_tbl: List[str] = []
+    txn_units_tbl: List[str] = []
+    units_tbl: List[str] = []
+    assigned_tbl: List[str] = []
+    expense_tbl: List[str] = []
+    location_tbl: List[str] = []
+
+    for i in range(n):
+        src_dist = state.distribution_ids[i]
+        units = state.units_assigned[i]
+        src_assigned = state.assigned_to[i] if state.assigned_to else "-1"
+        src_exp = state.expense_ccids[i]
+        src_loc = state.location_ccids[i]
+
+        dst_assigned = dest_assigned[i] if dest_assigned else "-1"
+        dst_exp = dest_expense[i]
+        dst_loc = dest_location[i]
+
+        # Source leg (negative)
+        dist_tbl.append(src_dist)
+        txn_units_tbl.append(f"-{units}")
+        units_tbl.append(units)
+        assigned_tbl.append(src_assigned or "-1")
+        expense_tbl.append(src_exp)
+        location_tbl.append(src_loc)
+
+        # Destination leg (positive, new distribution id)
+        dist_tbl.append("-1")
+        txn_units_tbl.append(str(units))
+        units_tbl.append(units)
+        assigned_tbl.append(dst_assigned or "-1")
+        expense_tbl.append(dst_exp)
+        location_tbl.append(dst_loc)
+
+    params: Dict[str, Any] = {
+        "P_ASSET_ID": state.asset_id,
+        "P_BOOK_TYPE_CODE": state.book_type_code,
+        "P_DISTRIBUTION_ID_TBL": dist_tbl,
+        "P_TRANSACTION_UNITS_TBL": txn_units_tbl,
+        "P_UNITS_ASSIGNED_TBL": units_tbl,
+        "P_ASSIGNED_TO_TBL": assigned_tbl,
+        "P_EXPENSE_CCID_TBL": expense_tbl,
+        "P_LOCATION_CCID_TBL": location_tbl,
+        "P_COPY_SOURCE_LINES_FLAG": "N",
+        "P_TRX_ATTRIBUTE1": request_id,
+        "P_TRX_ATTRIBUTE2": "OFAM_SAME_BOOK_XFER_OPTB",
+    }
+    if effective_date:
         params["P_TRANSACTION_DATE_ENTERED"] = effective_date
 
     return params, False
