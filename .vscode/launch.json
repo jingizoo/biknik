@@ -1,0 +1,125 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Transfer: Dry Run (query only)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/test_transfer.py",
+      "args": [
+        "--asset-number", "${input:assetNumber}",
+        "--book-code", "${input:bookCode}"
+      ],
+      "env": {
+        "FUSION_BASE_URL": "${input:fusionBaseUrl}",
+        "FUSION_API_VERSION": "11.13.18.05",
+        "FUSION_JWT": "${input:fusionJwt}"
+      },
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "Transfer: Dry Run with Overrides",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/test_transfer.py",
+      "args": [
+        "--asset-number", "${input:assetNumber}",
+        "--book-code", "${input:bookCode}",
+        "--expense-ccid", "${input:expenseCcid}",
+        "--location-ccid", "${input:locationCcid}"
+      ],
+      "env": {
+        "FUSION_BASE_URL": "${input:fusionBaseUrl}",
+        "FUSION_API_VERSION": "11.13.18.05",
+        "FUSION_JWT": "${input:fusionJwt}"
+      },
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "Transfer: EXECUTE (posts to Fusion!)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/test_transfer.py",
+      "args": [
+        "--asset-number", "${input:assetNumber}",
+        "--book-code", "${input:bookCode}",
+        "--execute"
+      ],
+      "env": {
+        "FUSION_BASE_URL": "${input:fusionBaseUrl}",
+        "FUSION_API_VERSION": "11.13.18.05",
+        "FUSION_JWT": "${input:fusionJwt}"
+      },
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "Transfer: EXECUTE with Overrides (posts to Fusion!)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/test_transfer.py",
+      "args": [
+        "--asset-number", "${input:assetNumber}",
+        "--book-code", "${input:bookCode}",
+        "--expense-ccid", "${input:expenseCcid}",
+        "--location-ccid", "${input:locationCcid}",
+        "--execute"
+      ],
+      "env": {
+        "FUSION_BASE_URL": "${input:fusionBaseUrl}",
+        "FUSION_API_VERSION": "11.13.18.05",
+        "FUSION_JWT": "${input:fusionJwt}"
+      },
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "Test Fusion API (getAssetInformation only)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/test_fusion_api.py",
+      "env": {
+        "FUSION_BASE_URL": "${input:fusionBaseUrl}",
+        "FUSION_API_VERSION": "11.13.18.05",
+        "FUSION_JWT": "${input:fusionJwt}"
+      },
+      "console": "integratedTerminal"
+    }
+  ],
+  "inputs": [
+    {
+      "id": "assetNumber",
+      "type": "promptString",
+      "description": "Asset Number (e.g. 10026)",
+      "default": "10026"
+    },
+    {
+      "id": "bookCode",
+      "type": "promptString",
+      "description": "Book Type Code (e.g. OPS CORP)",
+      "default": "OPS CORP"
+    },
+    {
+      "id": "fusionBaseUrl",
+      "type": "promptString",
+      "description": "Fusion Base URL (e.g. https://your-fusion-host)",
+      "default": "https://YOUR_FUSION_HOST"
+    },
+    {
+      "id": "fusionJwt",
+      "type": "promptString",
+      "description": "Fusion JWT Token",
+      "password": true
+    },
+    {
+      "id": "expenseCcid",
+      "type": "promptString",
+      "description": "Destination Expense CCID (leave empty to keep source value)",
+      "default": ""
+    },
+    {
+      "id": "locationCcid",
+      "type": "promptString",
+      "description": "Destination Location CCID (leave empty to keep source value)",
+      "default": ""
+    }
+  ]
+}
