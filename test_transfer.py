@@ -21,9 +21,9 @@ Usage examples:
   # Dry-run: query asset info and show what transfer payload would look like
   python test_transfer.py --asset-number 125183 --asset-id 12345 --book-code "OPS CORP"
 
-  # Override specific fields for the destination
+  # Override destination expense account
   python test_transfer.py --asset-number 125183 --asset-id 12345 --book-code "OPS CORP" \
-      --location-ccid 300100071633789 --expense-ccid 300100071633798
+      --dest-expense-account 626999
 
   # Transfer to a different destination book
   python test_transfer.py --asset-number 125183 --asset-id 12345 --book-code "OPS CORP" \
@@ -31,10 +31,6 @@ Usage examples:
 
   # Actually execute the transfer
   python test_transfer.py --asset-number 125183 --asset-id 12345 --book-code "OPS CORP" --execute
-
-  # Option B: derive destination expense CCID by swapping Company segment
-  python test_transfer.py --asset-number 125183 --asset-id 12345 --book-code "OPS CORP" \
-      --target-company US01
 
 """
 
@@ -161,226 +157,6 @@ def call_fusion(
     return raw, pl
 
 
-def call_fusion_get(
-    base_url: str,
-    api_version: str,
-    jwt_token: str,
-    resource_path: str,
-    query_params: Dict[str, str] = None,
-    verify_ssl: bool = False,
-    timeout_seconds: int = 60,
-) -> Dict[str, Any]:
-    """GET a Fusion REST resource (e.g. accountCombinationsLOV)."""
-    url = f"{base_url.rstrip('/')}/fscmRestApi/resources/{api_version}/{resource_path}"
-
-    session = requests.Session()
-    session.headers.update({
-        "Content-Type": "application/json",
-        "ACCEPT": "application/json",
-        "Authorization": f"Bearer {jwt_token}",
-    })
-
-    print(f"\n>>> GET {url}")
-    if query_params:
-        print(f">>> Params: {json.dumps(query_params, indent=2)[:1000]}")
-
-    resp = session.get(url, params=query_params or {}, timeout=timeout_seconds, verify=verify_ssl)
-    try:
-        raw = resp.json()
-    except Exception:
-        raise RuntimeError(f"Non-JSON response (status={resp.status_code}): {resp.text[:500]}")
-
-    if resp.status_code >= 400:
-        raise RuntimeError(f"HTTP {resp.status_code}: {json.dumps(raw, indent=2)[:2000]}")
-
-    return raw
-
-
-# ---------------------------------------------------------------------------
-# Option B: CCID segment resolution
-# ---------------------------------------------------------------------------
-
-_SEGMENT_RE = re.compile(r"^Segment\d+$")
-
-# Known metadata (non-segment) fields returned by accountCombinationsLOV.
-# Everything NOT in this set is treated as a GL segment field.
-_LOV_METADATA_FIELDS = {
-    "CodeCombinationId", "codeCombinationId", "_CODE_COMBINATION_ID",
-    "ChartOfAccountsId", "chartOfAccountsId", "_CHART_OF_ACCOUNTS_ID",
-    "ConcatenatedSegments", "concatenatedSegments",
-    "AccountType", "accountType",
-    "EnabledFlag", "enabledFlag",
-    "StartDateActive", "startDateActive",
-    "EndDateActive", "endDateActive",
-    "SummaryFlag", "summaryFlag",
-    "DetailBudgetingAllowedFlag", "detailBudgetingAllowedFlag",
-    "DetailPostingAllowedFlag", "detailPostingAllowedFlag",
-    "BudgetingAllowedFlag", "budgetingAllowedFlag",
-    "PostingAllowedFlag", "postingAllowedFlag",
-    "JgzzReconFlag", "jgzzReconFlag",
-    "FinancialCategory", "financialCategory",
-    "Description", "description",
-    "ReferenceCount", "referenceCount",
-    "links",
-}
-
-
-def resolve_ccid_segments(base_url, api_version, jwt, ccid, verify_ssl=False):
-    """Look up a CCID's GL segments via accountCombinationsLOV."""
-    print(f"\n  [CCID Resolver] Looking up segments for CCID={ccid}")
-
-    resp = call_fusion_get(base_url, api_version, jwt, "accountCombinationsLOV", {
-        "finder": f"PrimaryKey;_CODE_COMBINATION_ID={ccid}",
-        "onlyData": "true",
-    }, verify_ssl=verify_ssl)
-
-    items = resp.get("items") or []
-    if not items:
-        print(f"  ERROR: accountCombinationsLOV returned no items for CCID={ccid}")
-        sys.exit(1)
-
-    row = items[0]
-
-    # Try Segment1/Segment2/... first (some Fusion instances use this naming).
-    segments = {}
-    for key, val in row.items():
-        if _SEGMENT_RE.match(key) and val is not None and str(val).strip():
-            segments[key] = str(val).strip()
-
-    # Fallback: use descriptive segment names (entity, account, costCenter, …)
-    # by excluding known metadata fields.
-    if not segments:
-        for key, val in row.items():
-            if key not in _LOV_METADATA_FIELDS and val is not None and str(val).strip():
-                segments[key] = str(val).strip()
-
-    if not segments:
-        print(f"  ERROR: No segment fields found in response for CCID={ccid}")
-        print(f"  Row keys: {list(row.keys())}")
-        sys.exit(1)
-
-    coa_id = row.get("ChartOfAccountsId") or row.get("chartOfAccountsId") \
-        or row.get("_CHART_OF_ACCOUNTS_ID")
-    concat_segs = row.get("ConcatenatedSegments") or row.get("concatenatedSegments") or ""
-
-    print(f"  [CCID Resolver] CCID={ccid} → COA={coa_id}")
-    print(f"  [CCID Resolver] Segments: {segments}")
-    print(f"  [CCID Resolver] Concatenated: {concat_segs}")
-
-    return {
-        "ccid": ccid,
-        "chart_of_accounts_id": int(coa_id) if coa_id else None,
-        "concatenated_segments": str(concat_segs),
-        "segments": segments,
-    }
-
-
-def lookup_ccid_by_segments(base_url, api_version, jwt, target_segments, coa_id=None, verify_ssl=False):
-    """Find an existing CCID matching target segments."""
-    # Sort segment keys: Segment\d+ numerically first, then alphabetical for named segments.
-    def _seg_sort_key(k):
-        m = re.match(r"^Segment(\d+)$", k)
-        return (0, int(m.group(1))) if m else (1, k)
-
-    sorted_keys = sorted(target_segments.keys(), key=_seg_sort_key)
-
-    parts = []
-    for key in sorted_keys:
-        parts.append(f"{key}={target_segments[key]}")
-    if coa_id is not None:
-        parts.append(f"ChartOfAccountsId={coa_id}")
-
-    q_filter = ";".join(parts)
-    print(f"\n  [CCID Resolver] Looking up target CCID with q={q_filter}")
-
-    # Don't pass 'fields' — descriptive segment names (entity, costCenter, …)
-    # are not valid field selectors in the REST API.  The LOV returns all
-    # segment values automatically.
-    resp = call_fusion_get(base_url, api_version, jwt, "accountCombinationsLOV", {
-        "q": q_filter,
-        "onlyData": "true",
-    }, verify_ssl=verify_ssl)
-
-    items = resp.get("items") or []
-    if not items:
-        segs_display = ", ".join(f"{k}={v}" for k, v in sorted(target_segments.items()))
-        print(f"  ERROR: No account combination found for: {segs_display}")
-        print(f"         ChartOfAccountsId={coa_id}")
-        print(f"         The combination may need to be created in Oracle GL first.")
-        sys.exit(1)
-
-    # Pick exact match — try both the original key and camelCase/PascalCase variants
-    for row in items:
-        match = True
-        for key, expected in target_segments.items():
-            actual = str(row.get(key, "")).strip()
-            if actual != expected:
-                match = False
-                break
-        if match:
-            ccid_val = row.get("_CODE_COMBINATION_ID") or row.get("CodeCombinationId") \
-                or row.get("codeCombinationId")
-            target_ccid = int(ccid_val)
-            concat = row.get("ConcatenatedSegments") or row.get("concatenatedSegments") or ""
-            print(f"  [CCID Resolver] Found exact match: target CCID={target_ccid} ({concat})")
-            return target_ccid
-
-    # Fallback: first item
-    first = items[0]
-    ccid_val = first.get("_CODE_COMBINATION_ID") or first.get("CodeCombinationId") \
-        or first.get("codeCombinationId")
-    target_ccid = int(ccid_val)
-    print(f"  [CCID Resolver] WARNING: Using first result CCID={target_ccid} (exact segment match not verified)")
-    return target_ccid
-
-
-def resolve_option_b_expense(base_url, api_version, jwt, src_ccid, target_company, company_segment_key="entity", verify_ssl=False):
-    """End-to-end Option B: resolve target expense CCID by swapping Company segment."""
-    print("\n" + "-" * 70)
-    print("OPTION B: Resolve Target Expense CCID")
-    print("-" * 70)
-    print(f"  Source Expense CCID    : {src_ccid}")
-    print(f"  Target Company         : {target_company}")
-    print(f"  Company Segment Key    : {company_segment_key}")
-
-    details = resolve_ccid_segments(base_url, api_version, jwt, src_ccid, verify_ssl=verify_ssl)
-    src_segments = details["segments"]
-    coa_id = details["chart_of_accounts_id"]
-
-    if company_segment_key not in src_segments:
-        # Auto-detect: if the user passed a segment VALUE instead of a KEY,
-        # find the key that holds that value.
-        reverse_match = [k for k, v in src_segments.items() if v == company_segment_key]
-        if reverse_match:
-            actual_key = reverse_match[0]
-            print(f"  NOTE: '{company_segment_key}' is a segment value, not a key.")
-            print(f"        Auto-detected segment key: '{actual_key}' (value='{company_segment_key}')")
-            company_segment_key = actual_key
-        else:
-            print(f"  ERROR: Company segment key '{company_segment_key}' not found in source segments.")
-            print(f"         Available keys:   {sorted(src_segments.keys())}")
-            print(f"         Available values: { {k: v for k, v in sorted(src_segments.items())} }")
-            sys.exit(1)
-
-    old_company = src_segments[company_segment_key]
-    target_segments = dict(src_segments)
-    target_segments[company_segment_key] = target_company
-
-    print(f"\n  Source segments:  {src_segments}")
-    print(f"  Target segments: {target_segments}")
-    print(f"  Changed: {company_segment_key} '{old_company}' → '{target_company}'")
-
-    target_ccid = lookup_ccid_by_segments(base_url, api_version, jwt, target_segments, coa_id, verify_ssl=verify_ssl)
-
-    if target_ccid == int(src_ccid):
-        print(f"\n  ERROR: Target CCID ({target_ccid}) equals source CCID ({src_ccid})!")
-        print(f"         Would create identical distribution lines.")
-        print(f"         Check target_company='{target_company}' vs source {company_segment_key}='{old_company}'.")
-        sys.exit(1)
-
-    print(f"\n  RESOLVED: src_expense_ccid={src_ccid} → target_expense_ccid={target_ccid}")
-    return target_ccid
-
 
 # ---------------------------------------------------------------------------
 # Step 1: Get asset information
@@ -427,6 +203,28 @@ def get_asset_info(base_url, api_version, jwt, book_code, asset_number, cli_asse
     cost = str(pl.get("X_COST") or "").strip() or None
     description = str(pl.get("X_DESCRIPTION") or "").strip() or None
     tag_number = str(pl.get("X_TAG_NUMBER") or "").strip() or None
+
+    # Check if asset is already retired
+    retirement_id = str(pl.get("X_RETIREMENT_ID") or "").strip()
+    date_retired = str(pl.get("X_DATE_RETIRED") or "").strip()
+    current_units = str(pl.get("X_CURRENT_UNITS") or "").strip()
+    period_retired = str(pl.get("X_PERIOD_COUNTER_FULLY_RETIRED") or "").strip()
+
+    is_retired = bool(retirement_id or date_retired or period_retired
+                      or current_units == "0")
+    if is_retired:
+        print("\n" + "!" * 70)
+        print("  ERROR: Asset is already RETIRED — cannot transfer.")
+        print("!" * 70)
+        if retirement_id:
+            print(f"  X_RETIREMENT_ID                  : {retirement_id}")
+        if date_retired:
+            print(f"  X_DATE_RETIRED                   : {date_retired}")
+        if period_retired:
+            print(f"  X_PERIOD_COUNTER_FULLY_RETIRED   : {period_retired}")
+        if current_units:
+            print(f"  X_CURRENT_UNITS                  : {current_units}")
+        sys.exit(1)
 
     if not asset_num:
         print("\nERROR: Missing asset number in response.")
@@ -521,14 +319,9 @@ def build_transfer_payload(state, args):
         dest_location = [args.location_ccid] * n
         overrides_applied.append(f"  location_ccid  : {args.location_ccid} (applied to all {n} distributions)")
 
-    # Option B: per-distribution resolved expense CCIDs take priority
-    option_b_expense = state.get("_option_b_dest_expense")
-    if option_b_expense:
-        dest_expense = option_b_expense[:]
-        overrides_applied.append(f"  expense_ccid   : [Option B per-dist] {option_b_expense}")
-    elif args.expense_ccid:
-        dest_expense = [args.expense_ccid] * n
-        overrides_applied.append(f"  expense_ccid   : {args.expense_ccid} (applied to all {n} distributions)")
+    if args.dest_expense_account:
+        dest_expense = [args.dest_expense_account] * n
+        overrides_applied.append(f"  expense_account: {args.dest_expense_account} (applied to all {n} distributions)")
 
     if args.assigned_to:
         dest_assigned = [args.assigned_to] * n
@@ -551,7 +344,7 @@ def build_transfer_payload(state, args):
     if is_noop:
         print("\n  WARNING: Destination values match source values exactly.")
         print("           This is a NO-OP transfer (nothing will change).")
-        print("           Use --location-ccid, --expense-ccid, --assigned-to, or --dest-book-code to specify new values.")
+        print("           Use --location-ccid, --dest-expense-account, --assigned-to, or --dest-book-code to specify new values.")
 
     # Build dual-leg rosetta tables (source leg negative, destination leg positive)
     txn_units_tbl = []
@@ -702,13 +495,9 @@ Examples:
   # Dry-run (default) - just query asset and show transfer payload:
   python test_transfer.py --asset-number 125183 --asset-id 12345 --book-code "OPS CORP"
 
-  # Override destination expense CCID:
+  # Override destination expense account:
   python test_transfer.py --asset-number 125183 --asset-id 12345 --book-code "OPS CORP" \\
-      --expense-ccid 300100071633798
-
-  # Option B: derive expense CCID by swapping Company segment:
-  python test_transfer.py --asset-number 125183 --asset-id 12345 --book-code "OPS CORP" \\
-      --target-company US01
+      --dest-expense-account 626999
 
   # Transfer to a different destination book:
   python test_transfer.py --asset-number 125183 --asset-id 12345 --book-code "OPS CORP" \\
@@ -716,7 +505,7 @@ Examples:
 
   # Actually execute the transfer:
   python test_transfer.py --asset-number 125183 --asset-id 12345 --book-code "OPS CORP" \\
-      --expense-ccid 300100071633798 --execute
+      --dest-expense-account 626999 --execute
         """,
     )
     parser.add_argument("--asset-number", required=True, help="Asset number (e.g. 125183)")
@@ -727,14 +516,10 @@ Examples:
                         help="Destination book type code. Defaults to source book code (same-book transfer).")
 
     parser.add_argument("--location-ccid", default=None, help="Override destination location CCID (applied to all distributions)")
-    parser.add_argument("--expense-ccid", default=None, help="Override destination expense CCID (applied to all distributions)")
+    parser.add_argument("--dest-expense-account", default=None,
+                        help="Destination expense account (applied to all distributions). "
+                             "If not provided, source expense account is kept.")
     parser.add_argument("--assigned-to", default=None, help="Override destination assigned-to ID (applied to all distributions)")
-
-    # Option B: derive expense CCID by swapping Company segment
-    parser.add_argument("--target-company", default=None,
-                        help="Option B: target Company segment value (e.g. 'US01'). "
-                             "Derives destination expense CCID by looking up source CCID segments "
-                             "and replacing the 'entity' segment. Mutually exclusive with --expense-ccid.")
 
     parser.add_argument("--execute", action="store_true", default=False,
                         help="Actually POST the transferAsset call. Without this flag, only dry-run.")
@@ -753,58 +538,21 @@ Examples:
         print("  FUSION_JWT         = <your JWT token>")
         sys.exit(1)
 
-    # Validate mutual exclusion
-    if args.target_company and args.expense_ccid:
-        print("ERROR: --target-company and --expense-ccid are mutually exclusive.")
-        print("       Use --target-company for Option B (segment-based derivation)")
-        print("       or --expense-ccid for direct override, not both.")
-        sys.exit(1)
-
     dest_book_display = args.dest_book_code or args.book_code
-    mode_label = "Option B" if args.target_company else ("EXECUTE" if args.execute else "DRY-RUN")
     print("=" * 70)
     print("  FUSION ASSET TRANSFER TEST TOOL")
     print("=" * 70)
-    print(f"  Fusion Host  : {base_url}")
-    print(f"  API Version  : {api_version}")
-    print(f"  Asset Number : {args.asset_number}")
-    print(f"  Asset ID     : {args.asset_id}")
-    print(f"  Source Book  : {args.book_code}")
-    print(f"  Dest Book    : {dest_book_display}")
-    print(f"  Mode         : {'EXECUTE' if args.execute else 'DRY-RUN'}")
-    if args.target_company:
-        print(f"  Option B     : target_company={args.target_company}, segment_key=entity")
+    print(f"  Fusion Host            : {base_url}")
+    print(f"  API Version            : {api_version}")
+    print(f"  Asset Number           : {args.asset_number}")
+    print(f"  Asset ID               : {args.asset_id}")
+    print(f"  Source Book            : {args.book_code}")
+    print(f"  Dest Book              : {dest_book_display}")
+    print(f"  Dest Expense Account   : {args.dest_expense_account or '(same as source)'}")
+    print(f"  Mode                   : {'EXECUTE' if args.execute else 'DRY-RUN'}")
 
     # Step 1: Get asset information
     state, raw_pl = get_asset_info(base_url, api_version, jwt_token, args.book_code, args.asset_number, cli_asset_id=args.asset_id)
-
-    # Step 1b (Option B): Resolve target expense CCID from Company segment
-    if args.target_company:
-        # Use first distribution's expense CCID as the source for segment lookup.
-        # If distributions have different expense CCIDs, resolve each uniquely.
-        unique_src_ccids = list(dict.fromkeys(state["expense_ccids"]))  # preserve order, dedupe
-        ccid_map = {}
-        for src_ccid_str in unique_src_ccids:
-            target_ccid = resolve_option_b_expense(
-                base_url, api_version, jwt_token,
-                int(src_ccid_str), args.target_company,
-            )
-            ccid_map[src_ccid_str] = str(target_ccid)
-
-        # Apply resolved expense CCIDs back into the override
-        resolved_expense = [ccid_map[c] for c in state["expense_ccids"]]
-        # Set args.expense_ccid to None (already checked mutual exclusion)
-        # and directly patch dest_expense in build_transfer_payload via args
-        args.expense_ccid = resolved_expense[0] if len(set(resolved_expense)) == 1 else None
-        if args.expense_ccid is None and len(set(resolved_expense)) > 1:
-            # Multiple different target CCIDs — override the state expense_ccids
-            # directly so build_transfer_payload picks them up as "source" values
-            # and we skip the override logic (no --expense-ccid set).
-            # Actually, we need to set them as destination values.
-            # Simplest: set expense_ccid as the resolved list and use it.
-            print(f"\n  NOTE: Multiple unique expense CCIDs resolved: {resolved_expense}")
-            # Override all expense_ccids directly for the destination
-            state["_option_b_dest_expense"] = resolved_expense
 
     # Step 2: Build transfer payload
     params, is_noop = build_transfer_payload(state, args)
@@ -817,7 +565,7 @@ Examples:
         print("  Add --execute flag to actually perform the transfer.")
         if is_noop:
             print("  NOTE: This is a NO-OP since destination = source values.")
-            print("        Specify --location-ccid, --expense-ccid, --assigned-to, or --dest-book-code to change destination.")
+            print("        Specify --location-ccid, --dest-expense-account, --assigned-to, or --dest-book-code to change destination.")
         print("=" * 70)
 
         # Save payload to file for inspection
