@@ -64,6 +64,12 @@
       "default": "all"
     },
     {
+      "id": "retReferenceNum",
+      "type": "promptString",
+      "description": "Retirement Reference Number (leave empty to skip update)",
+      "default": ""
+    },
+    {
       "id": "fusionBaseUrl",
       "type": "promptString",
       "description": "Fusion Base URL (e.g. https://your-fusion-host.oraclecloud.com)"
@@ -127,7 +133,7 @@
       "justMyCode": false
     },
     //
-    // ── POST-RETIREMENT PROCESSING ──────────────────────────
+    // ── POST-RETIREMENT PIPELINE ────────────────────────────
     //
     {
       "name": "Post-Retire — dry-run (all steps)",
@@ -136,7 +142,7 @@
       "program": "${workspaceFolder}/test_post_retire.py",
       "args": [
         "--book-code",     "${input:bookCode}",
-        "--period-name",   "${input:periodName}",
+        "--asset-id",      "${input:assetId}",
         "--step",          "all"
       ],
       "env": {
@@ -148,15 +154,36 @@
       "justMyCode": false
     },
     {
-      "name": "Post-Retire — EXECUTE (all steps)",
+      "name": "Post-Retire — EXECUTE (depreciation + accounting)",
       "type": "debugpy",
       "request": "launch",
       "program": "${workspaceFolder}/test_post_retire.py",
       "args": [
         "--book-code",     "${input:bookCode}",
-        "--period-name",   "${input:periodName}",
+        "--asset-id",      "${input:assetId}",
         "--step",          "all",
         "--execute"
+      ],
+      "env": {
+        "FUSION_BASE_URL":    "${input:fusionBaseUrl}",
+        "FUSION_API_VERSION": "${input:fusionApiVersion}",
+        "FUSION_JWT":         "${input:fusionJwt}"
+      },
+      "console": "integratedTerminal",
+      "justMyCode": false
+    },
+    {
+      "name": "Post-Retire — EXECUTE (all + close period)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/test_post_retire.py",
+      "args": [
+        "--book-code",     "${input:bookCode}",
+        "--asset-id",      "${input:assetId}",
+        "--period-name",   "${input:periodName}",
+        "--step",          "all",
+        "--execute",
+        "--close-period"
       ],
       "env": {
         "FUSION_BASE_URL":    "${input:fusionBaseUrl}",
@@ -173,8 +200,29 @@
       "program": "${workspaceFolder}/test_post_retire.py",
       "args": [
         "--book-code",     "${input:bookCode}",
+        "--asset-id",      "${input:assetId}",
         "--period-name",   "${input:periodName}",
         "--step",          "${input:postRetireStep}",
+        "--execute"
+      ],
+      "env": {
+        "FUSION_BASE_URL":    "${input:fusionBaseUrl}",
+        "FUSION_API_VERSION": "${input:fusionApiVersion}",
+        "FUSION_JWT":         "${input:fusionJwt}"
+      },
+      "console": "integratedTerminal",
+      "justMyCode": false
+    },
+    {
+      "name": "Post-Retire — update retirement ref + run all",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/test_post_retire.py",
+      "args": [
+        "--book-code",          "${input:bookCode}",
+        "--asset-id",           "${input:assetId}",
+        "--ret-reference-num",  "${input:retReferenceNum}",
+        "--step",               "all",
         "--execute"
       ],
       "env": {
