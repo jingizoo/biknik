@@ -296,14 +296,12 @@ def lookup_ccid_by_segments(base_url, api_version, jwt, target_segments, coa_id=
     q_filter = ";".join(parts)
     print(f"\n  [CCID Resolver] Looking up target CCID with q={q_filter}")
 
-    # Request segment fields so we can verify exact match
-    segment_fields = ",".join(sorted_keys)
-    fields = f"CodeCombinationId,ConcatenatedSegments,ChartOfAccountsId,{segment_fields}"
-
+    # Don't pass 'fields' — descriptive segment names (entity, costCenter, …)
+    # are not valid field selectors in the REST API.  The LOV returns all
+    # segment values automatically.
     resp = call_fusion_get(base_url, api_version, jwt, "accountCombinationsLOV", {
         "q": q_filter,
         "onlyData": "true",
-        "fields": fields,
     }, verify_ssl=verify_ssl)
 
     items = resp.get("items") or []
