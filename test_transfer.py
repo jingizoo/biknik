@@ -516,37 +516,9 @@ def build_transfer_payload(state, args):
     expense_tbl = []
     location_tbl = []
 
-    # Detect no-dist-change for cross-book (Option A: copy source lines)
-    no_dist_change = (
-        dest_location == state["location_ccids"]
-        and dest_expense == state["expense_ccids"]
-        and dest_assigned == state["assigned_to"]
-    )
-
-    if is_cross_book and no_dist_change:
-        # Option A: no distribution overrides → use P_COPY_SOURCE_LINES_FLAG=Y
-        # and omit distribution tables to avoid "identical distribution lines" error.
-        print("\n  Option A: No distribution change → P_COPY_SOURCE_LINES_FLAG=Y")
-        today = date.today().isoformat()
-        params = {
-            "P_ASSET_ID": state["asset_id"],
-            "P_TRANSACTION_DATE_ENTERED": today,
-            "P_BOOK_TYPE_CODE": state["book_type_code"],
-            "P_DEST_BOOK_TYPE_CODE": dest_book_code,
-            "P_BOOK_TRANSFER_TYPE_CODE": "NBV",
-            "P_COST_BASIS_CODE": "COST_RESERVE_SRC",
-            "P_USE_DEST_CAT_DEPRN_RULES_FLAG": "Y",
-            "P_USE_XFR_DATE_AS_DPIS_FLAG": "N",
-            "P_COPY_DFF_FLAG": "Y",
-            "P_COPY_ASSET_KEY_FLAG": "Y",
-            "P_CREATE_NEW_ASSET_FLAG": "Y",
-            "P_COPY_SOURCE_LINES_FLAG": "Y",
-            "P_CONVERSION_RATE_TYPE": "",
-        }
-        print(f"\n  ParameterList string:")
-        print(f"    {build_parameter_list(params)[:2000]}")
-        return params, is_noop
-
+    # Always build dual-leg tables for cross-book.
+    # P_COPY_SOURCE_LINES_FLAG=Y without tables causes ORA-06502 on some pods.
+    # Cross-book can have identical src/dst distributions (different book).
     if is_cross_book:
         # Cross-book with dist overrides: dual-leg P_SRC_DISTRIBUTION_ID_TBL (null/1)
         src_dist_tbl = []
