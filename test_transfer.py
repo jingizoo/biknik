@@ -353,9 +353,19 @@ def resolve_option_b_expense(base_url, api_version, jwt, src_ccid, target_compan
     coa_id = details["chart_of_accounts_id"]
 
     if company_segment_key not in src_segments:
-        print(f"  ERROR: Company segment key '{company_segment_key}' not found in source segments.")
-        print(f"         Available: {sorted(src_segments.keys())}")
-        sys.exit(1)
+        # Auto-detect: if the user passed a segment VALUE instead of a KEY,
+        # find the key that holds that value.
+        reverse_match = [k for k, v in src_segments.items() if v == company_segment_key]
+        if reverse_match:
+            actual_key = reverse_match[0]
+            print(f"  NOTE: '{company_segment_key}' is a segment value, not a key.")
+            print(f"        Auto-detected segment key: '{actual_key}' (value='{company_segment_key}')")
+            company_segment_key = actual_key
+        else:
+            print(f"  ERROR: Company segment key '{company_segment_key}' not found in source segments.")
+            print(f"         Available keys:   {sorted(src_segments.keys())}")
+            print(f"         Available values: { {k: v for k, v in sorted(src_segments.items())} }")
+            sys.exit(1)
 
     old_company = src_segments[company_segment_key]
     target_segments = dict(src_segments)
