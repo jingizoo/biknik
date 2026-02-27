@@ -36,9 +36,6 @@ Usage examples:
   python test_transfer.py --asset-number 125183 --asset-id 12345 --book-code "OPS CORP" \
       --target-company US01
 
-  # Option B with non-default segment key (e.g. if Company is in a different segment)
-  python test_transfer.py --asset-number 125183 --asset-id 12345 --book-code "OPS CORP" \
-      --target-company US01 --company-segment-key costCenter
 """
 
 import argparse
@@ -121,7 +118,7 @@ def call_fusion(
     jwt_token: str,
     handle: str,
     params: Dict[str, Any],
-    verify_ssl: bool = True,
+    verify_ssl: bool = False,
     timeout_seconds: int = 60,
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     op_name = f"processTransaction-{handle}"
@@ -129,7 +126,7 @@ def call_fusion(
         "OperationName": op_name,
         "ParameterList": build_parameter_list(params),
     }
-    url = f"{base_url.rstrip('/')}/fscmRestApi/resources/{api_version}/erpintegrations/{op_name}"
+    url = f"{base_url.rstrip('/')}/fscmRestApi/resources/{api_version}/erpintegrations"
 
     session = requests.Session()
     session.headers.update({
@@ -170,7 +167,7 @@ def call_fusion_get(
     jwt_token: str,
     resource_path: str,
     query_params: Dict[str, str] = None,
-    verify_ssl: bool = True,
+    verify_ssl: bool = False,
     timeout_seconds: int = 60,
 ) -> Dict[str, Any]:
     """GET a Fusion REST resource (e.g. accountCombinationsLOV)."""
@@ -228,7 +225,7 @@ _LOV_METADATA_FIELDS = {
 }
 
 
-def resolve_ccid_segments(base_url, api_version, jwt, ccid, verify_ssl=True):
+def resolve_ccid_segments(base_url, api_version, jwt, ccid, verify_ssl=False):
     """Look up a CCID's GL segments via accountCombinationsLOV."""
     print(f"\n  [CCID Resolver] Looking up segments for CCID={ccid}")
 
@@ -278,7 +275,7 @@ def resolve_ccid_segments(base_url, api_version, jwt, ccid, verify_ssl=True):
     }
 
 
-def lookup_ccid_by_segments(base_url, api_version, jwt, target_segments, coa_id=None, verify_ssl=True):
+def lookup_ccid_by_segments(base_url, api_version, jwt, target_segments, coa_id=None, verify_ssl=False):
     """Find an existing CCID matching target segments."""
     # Sort segment keys: Segment\d+ numerically first, then alphabetical for named segments.
     def _seg_sort_key(k):
@@ -321,8 +318,8 @@ def lookup_ccid_by_segments(base_url, api_version, jwt, target_segments, coa_id=
                 match = False
                 break
         if match:
-            ccid_val = row.get("CodeCombinationId") or row.get("codeCombinationId") \
-                or row.get("_CODE_COMBINATION_ID")
+            ccid_val = row.get("_CODE_COMBINATION_ID") or row.get("CodeCombinationId") \
+                or row.get("codeCombinationId")
             target_ccid = int(ccid_val)
             concat = row.get("ConcatenatedSegments") or row.get("concatenatedSegments") or ""
             print(f"  [CCID Resolver] Found exact match: target CCID={target_ccid} ({concat})")
@@ -330,14 +327,14 @@ def lookup_ccid_by_segments(base_url, api_version, jwt, target_segments, coa_id=
 
     # Fallback: first item
     first = items[0]
-    ccid_val = first.get("CodeCombinationId") or first.get("codeCombinationId") \
-        or first.get("_CODE_COMBINATION_ID")
+    ccid_val = first.get("_CODE_COMBINATION_ID") or first.get("CodeCombinationId") \
+        or first.get("codeCombinationId")
     target_ccid = int(ccid_val)
     print(f"  [CCID Resolver] WARNING: Using first result CCID={target_ccid} (exact segment match not verified)")
     return target_ccid
 
 
-def resolve_option_b_expense(base_url, api_version, jwt, src_ccid, target_company, company_segment_key="Segment1", verify_ssl=True):
+def resolve_option_b_expense(base_url, api_version, jwt, src_ccid, target_company, company_segment_key="entity", verify_ssl=False):
     """End-to-end Option B: resolve target expense CCID by swapping Company segment."""
     print("\n" + "-" * 70)
     print("OPTION B: Resolve Target Expense CCID")
@@ -713,10 +710,6 @@ Examples:
   python test_transfer.py --asset-number 125183 --asset-id 12345 --book-code "OPS CORP" \\
       --target-company US01
 
-  # Option B with non-default Company segment key:
-  python test_transfer.py --asset-number 125183 --asset-id 12345 --book-code "OPS CORP" \\
-      --target-company US01 --company-segment-key costCenter
-
   # Transfer to a different destination book:
   python test_transfer.py --asset-number 125183 --asset-id 12345 --book-code "OPS CORP" \\
       --dest-book-code "TAX CORP"
@@ -741,16 +734,10 @@ Examples:
     parser.add_argument("--target-company", default=None,
                         help="Option B: target Company segment value (e.g. 'US01'). "
                              "Derives destination expense CCID by looking up source CCID segments "
-                             "and replacing the Company segment. Mutually exclusive with --expense-ccid.")
-    parser.add_argument("--company-segment-key", default="entity",
-                        help="GL segment field name for Company (default: entity). "
-                             "Use the segment label returned by accountCombinationsLOV "
-                             "(e.g. 'entity', 'Segment1'). Used with --target-company.")
+                             "and replacing the 'entity' segment. Mutually exclusive with --expense-ccid.")
 
     parser.add_argument("--execute", action="store_true", default=False,
                         help="Actually POST the transferAsset call. Without this flag, only dry-run.")
-    parser.add_argument("--no-verify-ssl", action="store_true", default=False,
-                        help="Disable SSL verification (for dev/test environments)")
 
     args = parser.parse_args()
 
@@ -786,11 +773,9 @@ Examples:
     print(f"  Dest Book    : {dest_book_display}")
     print(f"  Mode         : {'EXECUTE' if args.execute else 'DRY-RUN'}")
     if args.target_company:
-        print(f"  Option B     : target_company={args.target_company}, segment_key={args.company_segment_key}")
-    print(f"  SSL Verify   : {not args.no_verify_ssl}")
+        print(f"  Option B     : target_company={args.target_company}, segment_key=entity")
 
     # Step 1: Get asset information
-    verify_ssl = not args.no_verify_ssl
     state, raw_pl = get_asset_info(base_url, api_version, jwt_token, args.book_code, args.asset_number, cli_asset_id=args.asset_id)
 
     # Step 1b (Option B): Resolve target expense CCID from Company segment
@@ -803,8 +788,6 @@ Examples:
             target_ccid = resolve_option_b_expense(
                 base_url, api_version, jwt_token,
                 int(src_ccid_str), args.target_company,
-                company_segment_key=args.company_segment_key,
-                verify_ssl=verify_ssl,
             )
             ccid_map[src_ccid_str] = str(target_ccid)
 
