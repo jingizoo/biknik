@@ -36,9 +36,9 @@ Usage examples:
   python test_transfer.py --asset-number 125183 --asset-id 12345 --book-code "OPS CORP" \
       --target-company US01
 
-  # Option B with non-default segment key
+  # Option B with non-default segment key (e.g. if Company is in a different segment)
   python test_transfer.py --asset-number 125183 --asset-id 12345 --book-code "OPS CORP" \
-      --target-company US01 --company-segment-key Segment3
+      --target-company US01 --company-segment-key costCenter
 """
 
 import argparse
@@ -205,6 +205,28 @@ def call_fusion_get(
 
 _SEGMENT_RE = re.compile(r"^Segment\d+$")
 
+# Known metadata (non-segment) fields returned by accountCombinationsLOV.
+# Everything NOT in this set is treated as a GL segment field.
+_LOV_METADATA_FIELDS = {
+    "CodeCombinationId", "codeCombinationId", "_CODE_COMBINATION_ID",
+    "ChartOfAccountsId", "chartOfAccountsId", "_CHART_OF_ACCOUNTS_ID",
+    "ConcatenatedSegments", "concatenatedSegments",
+    "AccountType", "accountType",
+    "EnabledFlag", "enabledFlag",
+    "StartDateActive", "startDateActive",
+    "EndDateActive", "endDateActive",
+    "SummaryFlag", "summaryFlag",
+    "DetailBudgetingAllowedFlag", "detailBudgetingAllowedFlag",
+    "DetailPostingAllowedFlag", "detailPostingAllowedFlag",
+    "BudgetingAllowedFlag", "budgetingAllowedFlag",
+    "PostingAllowedFlag", "postingAllowedFlag",
+    "JgzzReconFlag", "jgzzReconFlag",
+    "FinancialCategory", "financialCategory",
+    "Description", "description",
+    "ReferenceCount", "referenceCount",
+    "links",
+}
+
 
 def resolve_ccid_segments(base_url, api_version, jwt, ccid, verify_ssl=True):
     """Look up a CCID's GL segments via accountCombinationsLOV."""
@@ -221,17 +243,27 @@ def resolve_ccid_segments(base_url, api_version, jwt, ccid, verify_ssl=True):
         sys.exit(1)
 
     row = items[0]
+
+    # Try Segment1/Segment2/... first (some Fusion instances use this naming).
     segments = {}
     for key, val in row.items():
         if _SEGMENT_RE.match(key) and val is not None and str(val).strip():
             segments[key] = str(val).strip()
 
+    # Fallback: use descriptive segment names (entity, account, costCenter, …)
+    # by excluding known metadata fields.
     if not segments:
-        print(f"  ERROR: No Segment* fields in response for CCID={ccid}")
+        for key, val in row.items():
+            if key not in _LOV_METADATA_FIELDS and val is not None and str(val).strip():
+                segments[key] = str(val).strip()
+
+    if not segments:
+        print(f"  ERROR: No segment fields found in response for CCID={ccid}")
         print(f"  Row keys: {list(row.keys())}")
         sys.exit(1)
 
-    coa_id = row.get("ChartOfAccountsId") or row.get("chartOfAccountsId")
+    coa_id = row.get("ChartOfAccountsId") or row.get("chartOfAccountsId") \
+        or row.get("_CHART_OF_ACCOUNTS_ID")
     concat_segs = row.get("ConcatenatedSegments") or row.get("concatenatedSegments") or ""
 
     print(f"  [CCID Resolver] CCID={ccid} → COA={coa_id}")
@@ -248,10 +280,10 @@ def resolve_ccid_segments(base_url, api_version, jwt, ccid, verify_ssl=True):
 
 def lookup_ccid_by_segments(base_url, api_version, jwt, target_segments, coa_id=None, verify_ssl=True):
     """Find an existing CCID matching target segments."""
-    # Sort segment keys numerically (Segment1, Segment2, ..., Segment10, ...)
+    # Sort segment keys: Segment\d+ numerically first, then alphabetical for named segments.
     def _seg_sort_key(k):
-        m = re.match(r"^(Segment)(\d+)$", k)
-        return (0, int(m.group(2))) if m else (1, k)
+        m = re.match(r"^Segment(\d+)$", k)
+        return (0, int(m.group(1))) if m else (1, k)
 
     sorted_keys = sorted(target_segments.keys(), key=_seg_sort_key)
 
@@ -282,7 +314,7 @@ def lookup_ccid_by_segments(base_url, api_version, jwt, target_segments, coa_id=
         print(f"         The combination may need to be created in Oracle GL first.")
         sys.exit(1)
 
-    # Pick exact match
+    # Pick exact match — try both the original key and camelCase/PascalCase variants
     for row in items:
         match = True
         for key, expected in target_segments.items():
@@ -291,12 +323,18 @@ def lookup_ccid_by_segments(base_url, api_version, jwt, target_segments, coa_id=
                 match = False
                 break
         if match:
-            target_ccid = int(row["CodeCombinationId"])
-            print(f"  [CCID Resolver] Found exact match: target CCID={target_ccid} ({row.get('ConcatenatedSegments', '')})")
+            ccid_val = row.get("CodeCombinationId") or row.get("codeCombinationId") \
+                or row.get("_CODE_COMBINATION_ID")
+            target_ccid = int(ccid_val)
+            concat = row.get("ConcatenatedSegments") or row.get("concatenatedSegments") or ""
+            print(f"  [CCID Resolver] Found exact match: target CCID={target_ccid} ({concat})")
             return target_ccid
 
     # Fallback: first item
-    target_ccid = int(items[0]["CodeCombinationId"])
+    first = items[0]
+    ccid_val = first.get("CodeCombinationId") or first.get("codeCombinationId") \
+        or first.get("_CODE_COMBINATION_ID")
+    target_ccid = int(ccid_val)
     print(f"  [CCID Resolver] WARNING: Using first result CCID={target_ccid} (exact segment match not verified)")
     return target_ccid
 
@@ -669,7 +707,7 @@ Examples:
 
   # Option B with non-default Company segment key:
   python test_transfer.py --asset-number 125183 --asset-id 12345 --book-code "OPS CORP" \\
-      --target-company US01 --company-segment-key Segment3
+      --target-company US01 --company-segment-key costCenter
 
   # Transfer to a different destination book:
   python test_transfer.py --asset-number 125183 --asset-id 12345 --book-code "OPS CORP" \\
@@ -696,9 +734,10 @@ Examples:
                         help="Option B: target Company segment value (e.g. 'US01'). "
                              "Derives destination expense CCID by looking up source CCID segments "
                              "and replacing the Company segment. Mutually exclusive with --expense-ccid.")
-    parser.add_argument("--company-segment-key", default="Segment1",
-                        help="GL segment field name for Company (default: Segment1). "
-                             "Used with --target-company.")
+    parser.add_argument("--company-segment-key", default="entity",
+                        help="GL segment field name for Company (default: entity). "
+                             "Use the segment label returned by accountCombinationsLOV "
+                             "(e.g. 'entity', 'Segment1'). Used with --target-company.")
 
     parser.add_argument("--execute", action="store_true", default=False,
                         help="Actually POST the transferAsset call. Without this flag, only dry-run.")
