@@ -51,6 +51,19 @@
       "default": ""
     },
     {
+      "id": "periodName",
+      "type": "promptString",
+      "description": "FA Period Name (e.g. Jan-26, Feb-26)",
+      "default": ""
+    },
+    {
+      "id": "postRetireStep",
+      "type": "pickString",
+      "description": "Which post-retirement step(s) to run?",
+      "options": ["all", "1 (Depreciation)", "2 (Create Accounting)", "3 (Close Period)"],
+      "default": "all"
+    },
+    {
       "id": "fusionBaseUrl",
       "type": "promptString",
       "description": "Fusion Base URL (e.g. https://your-fusion-host.oraclecloud.com)"
@@ -114,19 +127,17 @@
       "justMyCode": false
     },
     //
-    // ── RETIRE ───────────────────────────────────────────────
+    // ── POST-RETIREMENT PROCESSING ──────────────────────────
     //
     {
-      "name": "Retire — dry-run",
+      "name": "Post-Retire — dry-run (all steps)",
       "type": "debugpy",
       "request": "launch",
-      "program": "${workspaceFolder}/test_retire.py",
+      "program": "${workspaceFolder}/test_post_retire.py",
       "args": [
-        "--asset-number",     "${input:assetNumber}",
-        "--asset-id",         "${input:assetId}",
-        "--book-code",        "${input:bookCode}",
-        "--retirement-type",  "${input:retirementType}",
-        "--proceeds",         "${input:proceeds}"
+        "--book-code",     "${input:bookCode}",
+        "--period-name",   "${input:periodName}",
+        "--step",          "all"
       ],
       "env": {
         "FUSION_BASE_URL":    "${input:fusionBaseUrl}",
@@ -137,16 +148,14 @@
       "justMyCode": false
     },
     {
-      "name": "Retire — EXECUTE",
+      "name": "Post-Retire — EXECUTE (all steps)",
       "type": "debugpy",
       "request": "launch",
-      "program": "${workspaceFolder}/test_retire.py",
+      "program": "${workspaceFolder}/test_post_retire.py",
       "args": [
-        "--asset-number",     "${input:assetNumber}",
-        "--asset-id",         "${input:assetId}",
-        "--book-code",        "${input:bookCode}",
-        "--retirement-type",  "${input:retirementType}",
-        "--proceeds",         "${input:proceeds}",
+        "--book-code",     "${input:bookCode}",
+        "--period-name",   "${input:periodName}",
+        "--step",          "all",
         "--execute"
       ],
       "env": {
@@ -158,38 +167,14 @@
       "justMyCode": false
     },
     {
-      "name": "Retire — partial (specify units)",
+      "name": "Post-Retire — single step (pick which)",
       "type": "debugpy",
       "request": "launch",
-      "program": "${workspaceFolder}/test_retire.py",
+      "program": "${workspaceFolder}/test_post_retire.py",
       "args": [
-        "--asset-number",     "${input:assetNumber}",
-        "--asset-id",         "${input:assetId}",
-        "--book-code",        "${input:bookCode}",
-        "--retirement-type",  "${input:retirementType}",
-        "--proceeds",         "${input:proceeds}",
-        "--units-to-retire",  "${input:unitsToRetire}"
-      ],
-      "env": {
-        "FUSION_BASE_URL":    "${input:fusionBaseUrl}",
-        "FUSION_API_VERSION": "${input:fusionApiVersion}",
-        "FUSION_JWT":         "${input:fusionJwt}"
-      },
-      "console": "integratedTerminal",
-      "justMyCode": false
-    },
-    {
-      "name": "Retire — with date override",
-      "type": "debugpy",
-      "request": "launch",
-      "program": "${workspaceFolder}/test_retire.py",
-      "args": [
-        "--asset-number",      "${input:assetNumber}",
-        "--asset-id",          "${input:assetId}",
-        "--book-code",         "${input:bookCode}",
-        "--retirement-type",   "${input:retirementType}",
-        "--retirement-date",   "${input:retirementDate}",
-        "--proceeds",          "${input:proceeds}",
+        "--book-code",     "${input:bookCode}",
+        "--period-name",   "${input:periodName}",
+        "--step",          "${input:postRetireStep}",
         "--execute"
       ],
       "env": {
