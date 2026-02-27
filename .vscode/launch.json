@@ -70,6 +70,11 @@
       "default": ""
     },
     {
+      "id": "ledgerName",
+      "type": "promptString",
+      "description": "Ledger Name for Create Accounting (e.g. US Primary Ledger)"
+    },
+    {
       "id": "fusionBaseUrl",
       "type": "promptString",
       "description": "Fusion Base URL (e.g. https://your-fusion-host.oraclecloud.com)"
@@ -133,7 +138,7 @@
       "justMyCode": false
     },
     //
-    // ── POST-RETIREMENT PIPELINE ────────────────────────────
+    // ── POST-RETIREMENT PIPELINE (ESS Jobs) ─────────────────
     //
     {
       "name": "Post-Retire — dry-run (all steps)",
@@ -141,9 +146,10 @@
       "request": "launch",
       "program": "${workspaceFolder}/test_post_retire.py",
       "args": [
-        "--book-code",     "${input:bookCode}",
-        "--asset-id",      "${input:assetId}",
-        "--step",          "all"
+        "--book-code",      "${input:bookCode}",
+        "--asset-id",       "${input:assetId}",
+        "--ledger-name",    "${input:ledgerName}",
+        "--step",           "all"
       ],
       "env": {
         "FUSION_BASE_URL":    "${input:fusionBaseUrl}",
@@ -159,9 +165,10 @@
       "request": "launch",
       "program": "${workspaceFolder}/test_post_retire.py",
       "args": [
-        "--book-code",     "${input:bookCode}",
-        "--asset-id",      "${input:assetId}",
-        "--step",          "all",
+        "--book-code",      "${input:bookCode}",
+        "--asset-id",       "${input:assetId}",
+        "--ledger-name",    "${input:ledgerName}",
+        "--step",           "all",
         "--execute"
       ],
       "env": {
@@ -178,10 +185,11 @@
       "request": "launch",
       "program": "${workspaceFolder}/test_post_retire.py",
       "args": [
-        "--book-code",     "${input:bookCode}",
-        "--asset-id",      "${input:assetId}",
-        "--period-name",   "${input:periodName}",
-        "--step",          "all",
+        "--book-code",      "${input:bookCode}",
+        "--asset-id",       "${input:assetId}",
+        "--ledger-name",    "${input:ledgerName}",
+        "--period-name",    "${input:periodName}",
+        "--step",           "all",
         "--execute",
         "--close-period"
       ],
@@ -199,10 +207,11 @@
       "request": "launch",
       "program": "${workspaceFolder}/test_post_retire.py",
       "args": [
-        "--book-code",     "${input:bookCode}",
-        "--asset-id",      "${input:assetId}",
-        "--period-name",   "${input:periodName}",
-        "--step",          "${input:postRetireStep}",
+        "--book-code",      "${input:bookCode}",
+        "--asset-id",       "${input:assetId}",
+        "--ledger-name",    "${input:ledgerName}",
+        "--period-name",    "${input:periodName}",
+        "--step",           "${input:postRetireStep}",
         "--execute"
       ],
       "env": {
@@ -221,6 +230,7 @@
       "args": [
         "--book-code",          "${input:bookCode}",
         "--asset-id",           "${input:assetId}",
+        "--ledger-name",        "${input:ledgerName}",
         "--ret-reference-num",  "${input:retReferenceNum}",
         "--step",               "all",
         "--execute"
