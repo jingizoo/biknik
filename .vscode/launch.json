@@ -1,0 +1,204 @@
+{
+  "version": "0.2.0",
+  "inputs": [
+    {
+      "id": "assetNumber",
+      "type": "promptString",
+      "description": "Asset Number (e.g. 125183)"
+    },
+    {
+      "id": "assetId",
+      "type": "promptString",
+      "description": "Asset ID (e.g. 706)"
+    },
+    {
+      "id": "bookCode",
+      "type": "promptString",
+      "description": "Book Type Code (e.g. UK CORP BOOK)"
+    },
+    {
+      "id": "destBookCode",
+      "type": "promptString",
+      "description": "Destination Book Type Code (e.g. US CORP BOOK)"
+    },
+    {
+      "id": "destExpenseAccount",
+      "type": "promptString",
+      "description": "Destination Expense Account (e.g. 626999)"
+    },
+    {
+      "id": "retirementType",
+      "type": "promptString",
+      "description": "Retirement Type (SALE or ABANDONMENT)",
+      "default": "SALE"
+    },
+    {
+      "id": "retirementDate",
+      "type": "promptString",
+      "description": "Retirement Date (YYYY-MM-DD, leave empty for today)",
+      "default": ""
+    },
+    {
+      "id": "proceeds",
+      "type": "promptString",
+      "description": "Proceeds of Sale (e.g. 50000, default 0)",
+      "default": "0"
+    },
+    {
+      "id": "unitsToRetire",
+      "type": "promptString",
+      "description": "Units to Retire (leave empty for full retirement)",
+      "default": ""
+    },
+    {
+      "id": "fusionBaseUrl",
+      "type": "promptString",
+      "description": "Fusion Base URL (e.g. https://your-fusion-host.oraclecloud.com)"
+    },
+    {
+      "id": "fusionApiVersion",
+      "type": "promptString",
+      "description": "Fusion API Version",
+      "default": "11.13.18.05"
+    },
+    {
+      "id": "fusionJwt",
+      "type": "promptString",
+      "description": "Fusion JWT token",
+      "password": true
+    }
+  ],
+  "configurations": [
+    //
+    // ── TRANSFER ─────────────────────────────────────────────
+    //
+    {
+      "name": "Transfer — dry-run",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/test_transfer.py",
+      "args": [
+        "--asset-number",          "${input:assetNumber}",
+        "--asset-id",              "${input:assetId}",
+        "--book-code",             "${input:bookCode}",
+        "--dest-book-code",        "${input:destBookCode}",
+        "--dest-expense-account",  "${input:destExpenseAccount}"
+      ],
+      "env": {
+        "FUSION_BASE_URL":    "${input:fusionBaseUrl}",
+        "FUSION_API_VERSION": "${input:fusionApiVersion}",
+        "FUSION_JWT":         "${input:fusionJwt}"
+      },
+      "console": "integratedTerminal",
+      "justMyCode": false
+    },
+    {
+      "name": "Transfer — EXECUTE",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/test_transfer.py",
+      "args": [
+        "--asset-number",          "${input:assetNumber}",
+        "--asset-id",              "${input:assetId}",
+        "--book-code",             "${input:bookCode}",
+        "--dest-book-code",        "${input:destBookCode}",
+        "--dest-expense-account",  "${input:destExpenseAccount}",
+        "--execute"
+      ],
+      "env": {
+        "FUSION_BASE_URL":    "${input:fusionBaseUrl}",
+        "FUSION_API_VERSION": "${input:fusionApiVersion}",
+        "FUSION_JWT":         "${input:fusionJwt}"
+      },
+      "console": "integratedTerminal",
+      "justMyCode": false
+    },
+    //
+    // ── RETIRE ───────────────────────────────────────────────
+    //
+    {
+      "name": "Retire — dry-run",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/test_retire.py",
+      "args": [
+        "--asset-number",     "${input:assetNumber}",
+        "--asset-id",         "${input:assetId}",
+        "--book-code",        "${input:bookCode}",
+        "--retirement-type",  "${input:retirementType}",
+        "--proceeds",         "${input:proceeds}"
+      ],
+      "env": {
+        "FUSION_BASE_URL":    "${input:fusionBaseUrl}",
+        "FUSION_API_VERSION": "${input:fusionApiVersion}",
+        "FUSION_JWT":         "${input:fusionJwt}"
+      },
+      "console": "integratedTerminal",
+      "justMyCode": false
+    },
+    {
+      "name": "Retire — EXECUTE",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/test_retire.py",
+      "args": [
+        "--asset-number",     "${input:assetNumber}",
+        "--asset-id",         "${input:assetId}",
+        "--book-code",        "${input:bookCode}",
+        "--retirement-type",  "${input:retirementType}",
+        "--proceeds",         "${input:proceeds}",
+        "--execute"
+      ],
+      "env": {
+        "FUSION_BASE_URL":    "${input:fusionBaseUrl}",
+        "FUSION_API_VERSION": "${input:fusionApiVersion}",
+        "FUSION_JWT":         "${input:fusionJwt}"
+      },
+      "console": "integratedTerminal",
+      "justMyCode": false
+    },
+    {
+      "name": "Retire — partial (specify units)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/test_retire.py",
+      "args": [
+        "--asset-number",     "${input:assetNumber}",
+        "--asset-id",         "${input:assetId}",
+        "--book-code",        "${input:bookCode}",
+        "--retirement-type",  "${input:retirementType}",
+        "--proceeds",         "${input:proceeds}",
+        "--units-to-retire",  "${input:unitsToRetire}"
+      ],
+      "env": {
+        "FUSION_BASE_URL":    "${input:fusionBaseUrl}",
+        "FUSION_API_VERSION": "${input:fusionApiVersion}",
+        "FUSION_JWT":         "${input:fusionJwt}"
+      },
+      "console": "integratedTerminal",
+      "justMyCode": false
+    },
+    {
+      "name": "Retire — with date override",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/test_retire.py",
+      "args": [
+        "--asset-number",      "${input:assetNumber}",
+        "--asset-id",          "${input:assetId}",
+        "--book-code",         "${input:bookCode}",
+        "--retirement-type",   "${input:retirementType}",
+        "--retirement-date",   "${input:retirementDate}",
+        "--proceeds",          "${input:proceeds}",
+        "--execute"
+      ],
+      "env": {
+        "FUSION_BASE_URL":    "${input:fusionBaseUrl}",
+        "FUSION_API_VERSION": "${input:fusionApiVersion}",
+        "FUSION_JWT":         "${input:fusionJwt}"
+      },
+      "console": "integratedTerminal",
+      "justMyCode": false
+    }
+  ]
+}
