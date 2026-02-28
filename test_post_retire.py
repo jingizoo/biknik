@@ -25,8 +25,8 @@ Full "next steps after retirement" flow:
 
   The defaults used here:
     1) Calculate Depreciation:
-       JobPackageName = /oracle/apps/ess/financials/assets/shared
-       JobDefName     = FAXDPRUN
+       JobPackageName = /oracle/apps/ess/financials/assets/depreciation/depreciation
+       JobDefName     = ProcessDepreciation
        ESSParameters  = <book_type_code>
 
     2) Create Accounting:
@@ -671,8 +671,8 @@ def run_close_period(
 
 # Default ESS job definitions — override via CLI if your environment differs.
 # Look these up via: Setup and Maintenance > Manage Enterprise Scheduler Job Definitions
-DEFAULT_DEPRN_JOB_PACKAGE = "/oracle/apps/ess/financials/assets/shared"
-DEFAULT_DEPRN_JOB_DEF = "FAXDPRUN"
+DEFAULT_DEPRN_JOB_PACKAGE = "/oracle/apps/ess/financials/assets/depreciation/depreciation"
+DEFAULT_DEPRN_JOB_DEF = "ProcessDepreciation"
 
 DEFAULT_ACCTG_JOB_PACKAGE = "/oracle/apps/ess/financials/subledgerAccounting/shared"
 DEFAULT_ACCTG_JOB_DEF = "XLATXNIMPORT"
