@@ -22,9 +22,9 @@
       "description": "Destination Book Type Code (e.g. US CORP BOOK)"
     },
     {
-      "id": "destExpenseAccount",
+      "id": "locationCcid",
       "type": "promptString",
-      "description": "Destination Expense Account (e.g. 626999)"
+      "description": "Destination Location CCID from CMDB (leave empty to keep source location)"
     },
     {
       "id": "retirementType",
@@ -102,11 +102,11 @@
       "request": "launch",
       "program": "${workspaceFolder}/test_transfer.py",
       "args": [
-        "--asset-number",          "${input:assetNumber}",
-        "--asset-id",              "${input:assetId}",
-        "--book-code",             "${input:bookCode}",
-        "--dest-book-code",        "${input:destBookCode}",
-        "--dest-expense-account",  "${input:destExpenseAccount}"
+        "--asset-number",    "${input:assetNumber}",
+        "--asset-id",        "${input:assetId}",
+        "--book-code",       "${input:bookCode}",
+        "--dest-book-code",  "${input:destBookCode}",
+        "--location-ccid",   "${input:locationCcid}"
       ],
       "env": {
         "FUSION_BASE_URL":    "${input:fusionBaseUrl}",
@@ -122,11 +122,11 @@
       "request": "launch",
       "program": "${workspaceFolder}/test_transfer.py",
       "args": [
-        "--asset-number",          "${input:assetNumber}",
-        "--asset-id",              "${input:assetId}",
-        "--book-code",             "${input:bookCode}",
-        "--dest-book-code",        "${input:destBookCode}",
-        "--dest-expense-account",  "${input:destExpenseAccount}",
+        "--asset-number",    "${input:assetNumber}",
+        "--asset-id",        "${input:assetId}",
+        "--book-code",       "${input:bookCode}",
+        "--dest-book-code",  "${input:destBookCode}",
+        "--location-ccid",   "${input:locationCcid}",
         "--execute"
       ],
       "env": {

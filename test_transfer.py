@@ -21,16 +21,17 @@ Usage examples:
   # Dry-run: query asset info and show what transfer payload would look like
   python test_transfer.py --asset-number 125183 --asset-id 12345 --book-code "OPS CORP"
 
-  # Override destination expense account
+  # Override destination location CCID (from CMDB)
   python test_transfer.py --asset-number 125183 --asset-id 12345 --book-code "OPS CORP" \
-      --dest-expense-account 626999
+      --location-ccid 54321
 
-  # Transfer to a different destination book
+  # Transfer to a different destination book (cross-ledger)
   python test_transfer.py --asset-number 125183 --asset-id 12345 --book-code "OPS CORP" \
-      --dest-book-code "TAX CORP"
+      --dest-book-code "US CORP BOOK" --location-ccid 54321
 
   # Actually execute the transfer
-  python test_transfer.py --asset-number 125183 --asset-id 12345 --book-code "OPS CORP" --execute
+  python test_transfer.py --asset-number 125183 --asset-id 12345 --book-code "OPS CORP" \
+      --location-ccid 54321 --execute
 
 """
 
@@ -308,9 +309,12 @@ def build_transfer_payload(state, args):
     if is_cross_book:
         print("  ** Cross-book transfer **")
 
-    # Determine destination values: use overrides if provided, else keep source
+    # Determine destination values: use overrides if provided, else keep source.
+    # NOTE: Expense account (CCID) stays the same — transfers change location,
+    # not the GL account. The legal entity changes via the code combination
+    # embedded in the location CCID.
     dest_location = state["location_ccids"][:]
-    dest_expense = state["expense_ccids"][:]
+    dest_expense = state["expense_ccids"][:]  # Always kept from source
     dest_assigned = state["assigned_to"][:]
 
     overrides_applied = []
@@ -318,10 +322,6 @@ def build_transfer_payload(state, args):
     if args.location_ccid:
         dest_location = [args.location_ccid] * n
         overrides_applied.append(f"  location_ccid  : {args.location_ccid} (applied to all {n} distributions)")
-
-    if args.dest_expense_account:
-        dest_expense = [args.dest_expense_account] * n
-        overrides_applied.append(f"  expense_account: {args.dest_expense_account} (applied to all {n} distributions)")
 
     if args.assigned_to:
         dest_assigned = [args.assigned_to] * n
@@ -344,7 +344,7 @@ def build_transfer_payload(state, args):
     if is_noop:
         print("\n  WARNING: Destination values match source values exactly.")
         print("           This is a NO-OP transfer (nothing will change).")
-        print("           Use --location-ccid, --dest-expense-account, --assigned-to, or --dest-book-code to specify new values.")
+        print("           Use --location-ccid, --assigned-to, or --dest-book-code to specify new values.")
 
     # Build dual-leg rosetta tables (source leg negative, destination leg positive)
     txn_units_tbl = []
@@ -495,17 +495,17 @@ Examples:
   # Dry-run (default) - just query asset and show transfer payload:
   python test_transfer.py --asset-number 125183 --asset-id 12345 --book-code "OPS CORP"
 
-  # Override destination expense account:
+  # Override destination location CCID (from CMDB):
   python test_transfer.py --asset-number 125183 --asset-id 12345 --book-code "OPS CORP" \\
-      --dest-expense-account 626999
+      --location-ccid 54321
 
-  # Transfer to a different destination book:
+  # Cross-ledger transfer with new location:
   python test_transfer.py --asset-number 125183 --asset-id 12345 --book-code "OPS CORP" \\
-      --dest-book-code "TAX CORP"
+      --dest-book-code "US CORP BOOK" --location-ccid 54321
 
   # Actually execute the transfer:
   python test_transfer.py --asset-number 125183 --asset-id 12345 --book-code "OPS CORP" \\
-      --dest-expense-account 626999 --execute
+      --location-ccid 54321 --execute
         """,
     )
     parser.add_argument("--asset-number", required=True, help="Asset number (e.g. 125183)")
@@ -515,10 +515,9 @@ Examples:
     parser.add_argument("--dest-book-code", default=None,
                         help="Destination book type code. Defaults to source book code (same-book transfer).")
 
-    parser.add_argument("--location-ccid", default=None, help="Override destination location CCID (applied to all distributions)")
-    parser.add_argument("--dest-expense-account", default=None,
-                        help="Destination expense account (applied to all distributions). "
-                             "If not provided, source expense account is kept.")
+    parser.add_argument("--location-ccid", default=None,
+                        help="Destination location CCID (from CMDB). Applied to all distributions. "
+                             "This is the primary transfer input — expense account stays the same.")
     parser.add_argument("--assigned-to", default=None, help="Override destination assigned-to ID (applied to all distributions)")
 
     parser.add_argument("--execute", action="store_true", default=False,
@@ -548,7 +547,7 @@ Examples:
     print(f"  Asset ID               : {args.asset_id}")
     print(f"  Source Book            : {args.book_code}")
     print(f"  Dest Book              : {dest_book_display}")
-    print(f"  Dest Expense Account   : {args.dest_expense_account or '(same as source)'}")
+    print(f"  Dest Location CCID     : {args.location_ccid or '(same as source)'}")
     print(f"  Mode                   : {'EXECUTE' if args.execute else 'DRY-RUN'}")
 
     # Step 1: Get asset information
@@ -565,7 +564,7 @@ Examples:
         print("  Add --execute flag to actually perform the transfer.")
         if is_noop:
             print("  NOTE: This is a NO-OP since destination = source values.")
-            print("        Specify --location-ccid, --dest-expense-account, --assigned-to, or --dest-book-code to change destination.")
+            print("        Specify --location-ccid, --assigned-to, or --dest-book-code to change destination.")
         print("=" * 70)
 
         # Save payload to file for inspection
