@@ -845,7 +845,7 @@ def main() -> None:
         print(f"      Handle: processTransaction-getAssetBookInformation")
         print(f"      Params: {build_parameter_list({'P_BOOK_TYPE_CODE': args.book_code})}")
 
-        if args.asset_id and not args.retirement_id:
+        if args.asset_id and not args.retirement_id and want_update_retirement:
             print("\n  [0b] getAssetRetirementHistory (synchronous)")
             print(f"      Handle: processTransaction-getAssetRetirementHistory")
             print(f"      Params: {build_parameter_list({'P_BOOK_TYPE_CODE': args.book_code, 'P_ASSET_ID': args.asset_id})}")
@@ -910,8 +910,11 @@ def main() -> None:
     resolved_period = args.period_name or str(pl.get("X_PERIOD_NAME") or "").strip() or None
 
     # Step 0b: Resolve retirement id (synchronous)
+    # Only runs when retirement-specific operations are requested:
+    #   --retirement-id, --ret-reference-num, or --ret-param
+    # Does NOT run for plain depreciation/accounting after a transfer.
     resolved_retirement_id: Optional[int] = args.retirement_id
-    if not resolved_retirement_id and args.asset_id:
+    if not resolved_retirement_id and args.asset_id and want_update_retirement:
         ok, raw, pl = run_get_asset_retirement_history(
             base_url, api_version, auth, args.book_code, args.asset_id,
             verify_ssl, timeout_seconds, audit_dir,
