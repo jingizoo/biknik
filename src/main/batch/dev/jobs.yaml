@@ -3,12 +3,13 @@ jobs:
     name: Python Smoke Test - FA Book Xfer
     description: Runs hello_batch.py to validate Batch plumbing (input vars, download, outputs)
 
-    enabled: ENABLED
-    team: "<TEAM>"
+    enabled: MANUAL_ONLY
+    team: "OracleFusion"
 
     computeGroup: "<COMPUTE_GROUP>"
     dockerImage: "<DOCKER_IMAGE_KEY>"
     runAsUser: "nobody"
+    timezone: "America/New_York"
 
     inputVariables:
       - name: requests_uri
@@ -34,8 +35,29 @@ jobs:
 
           REQUESTS_URI="{{ batch.input.requests_uri }}"
           OUT_URI_PREFIX="{{ batch.input.out_uri_prefix }}"
-          EXECUTE="{{ batch.input.execute }}"
+          EXECUTE_RAW="{{ batch.input.execute }}"
           PROGRAM="{{ batch.input.program }}"
+
+          if [[ -z "${REQUESTS_URI}" ]]; then
+            echo "ERROR: requests_uri is required"
+            exit 2
+          fi
+
+          if [[ -z "${OUT_URI_PREFIX}" ]]; then
+            echo "ERROR: out_uri_prefix is required"
+            exit 2
+          fi
+
+          if [[ ! -f "${PROGRAM}" ]]; then
+            echo "ERROR: program not found at ${PROGRAM}"
+            exit 2
+          fi
+
+          EXECUTE="$(echo "${EXECUTE_RAW}" | tr '[:upper:]' '[:lower:]')"
+          if [[ "${EXECUTE}" != "true" && "${EXECUTE}" != "false" ]]; then
+            echo "ERROR: execute must be true or false, got '${EXECUTE_RAW}'"
+            exit 2
+          fi
 
           RUN_ID="${BATCH_RUN_ID:-manual}_$(date +%Y%m%d_%H%M%S)"
           WORK="/work"
@@ -43,28 +65,37 @@ jobs:
           REQ_FILE="${WORK}/requests.json"
           mkdir -p "${OUT_DIR}" "${WORK}"
 
-          echo "Downloading requests: ${REQUESTS_URI}"
+          echo "Downloading requests from ${REQUESTS_URI}"
           if [[ "${REQUESTS_URI}" == gs://* ]]; then
             gsutil cp "${REQUESTS_URI}" "${REQ_FILE}"
-          elif [[ "${REQUESTS_URI}" == http* ]]; then
-            curl -L "${REQUESTS_URI}" -o "${REQ_FILE}"
+          elif [[ "${REQUESTS_URI}" =~ ^https?:// ]]; then
+            curl --fail --location --silent --show-error "${REQUESTS_URI}" -o "${REQ_FILE}"
           else
             cp "${REQUESTS_URI}" "${REQ_FILE}"
           fi
 
-          echo "Running program=${PROGRAM}"
-          if [[ "${EXECUTE}" == "true" ]]; then
-            python -u "${PROGRAM}" --config "${REQ_FILE}" --out-dir "${OUT_DIR}" --execute
-          else
-            python -u "${PROGRAM}" --config "${REQ_FILE}" --out-dir "${OUT_DIR}" --dry-run
+          if [[ ! -s "${REQ_FILE}" ]]; then
+            echo "ERROR: downloaded requests file is empty: ${REQ_FILE}"
+            exit 3
           fi
 
-          echo "Uploading outputs to ${OUT_URI_PREFIX}/${RUN_ID}/"
-          if [[ "${OUT_URI_PREFIX}" == gs://* ]]; then
-            gsutil -m cp -r "${OUT_DIR}" "${OUT_URI_PREFIX}/${RUN_ID}/"
-            echo "OUTPUT_URI=${OUT_URI_PREFIX}/${RUN_ID}/"
+          PY_ARGS=( -u "${PROGRAM}" --config "${REQ_FILE}" --out-dir "${OUT_DIR}" )
+          if [[ "${EXECUTE}" == "true" ]]; then
+            PY_ARGS+=( --execute )
           else
-            mkdir -p "${OUT_URI_PREFIX}/${RUN_ID}/"
-            cp -r "${OUT_DIR}/." "${OUT_URI_PREFIX}/${RUN_ID}/"
-            echo "OUTPUT_PATH=${OUT_URI_PREFIX}/${RUN_ID}/"
+            PY_ARGS+=( --dry-run )
+          fi
+
+          echo "Running python ${PY_ARGS[*]}"
+          python "${PY_ARGS[@]}"
+
+          DEST="${OUT_URI_PREFIX%/}/${RUN_ID}/"
+          echo "Uploading outputs to ${DEST}"
+          if [[ "${OUT_URI_PREFIX}" == gs://* ]]; then
+            gsutil -m cp -r "${OUT_DIR}" "${DEST}"
+            echo "OUTPUT_URI=${DEST}"
+          else
+            mkdir -p "${DEST}"
+            cp -r "${OUT_DIR}/." "${DEST}"
+            echo "OUTPUT_PATH=${DEST}"
           fi
