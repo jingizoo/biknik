@@ -1,4 +1,4 @@
-"""Unit tests for ofam_asset_xfer.fusion_sync (DFF-based IU transfer discovery).
+"""Unit tests for ofam_asset_xfer.fusion_sync (BIP + getAssetInformation discovery).
 
 All tests use mock clients — no network calls.
 """
@@ -37,33 +37,53 @@ def _mock_fusion():
     return MagicMock()
 
 
-def _fa_item(
-    asset_id="100",
+def _mock_bip():
+    return MagicMock()
+
+
+def _bip_row(
     asset_number="142847",
-    tag="142847",
-    description="ARISTA 7130",
     book="US CORP BOOK",
-    cost="36129.54",
     dff_entity="UK Entity",
     dff_date="2026-03-01",
     dff_location="",
 ):
-    """Build a fixedAssets REST response row with assetBooks + assetDFF."""
-    item = {
-        "AssetId": asset_id,
-        "AssetNumber": asset_number,
-        "TagNumber": tag,
-        "Description": description,
-        "assetBooks": [{"BookTypeCode": book, "Cost": cost}],
-        "assetDFF": [
-            {
-                "transferToEntity": dff_entity,
-                "transferDate": dff_date,
-                "transferToLocation": dff_location,
-            }
-        ],
+    """Build a BIP report row dict (as returned by BIPClient.run_report)."""
+    return {
+        "ASSET_NUMBER": asset_number,
+        "BOOK_TYPE_CODE": book,
+        "ATTRIBUTE9": dff_entity,
+        "ATTRIBUTE_DATE1": dff_date,
+        "ATTRIBUTE10": dff_location,
     }
-    return item
+
+
+def _get_asset_info_response(
+    asset_id="100",
+    asset_number="142847",
+    book="US CORP BOOK",
+    cost="36129.54",
+):
+    """Build a getAssetInformation processTransaction response."""
+    return (
+        {},  # raw
+        {
+            "X_RETURN_STATUS": "S",
+            "X_ASSET_ID": asset_id,
+            "X_ASSET_NUMBER": asset_number,
+            "X_BOOK_TYPE_CODE": book,
+            "X_DISTRIBUTION_ID_TBL": "1001",
+            "X_UNITS_ASSIGNED_TBL": "1",
+            "X_ASSIGNED_TO_TBL": "",
+            "X_EXPENSE_CCID_TBL": "626955",
+            "X_LOCATION_CCID_TBL": "789012",
+            "X_CATEGORY_ID": "501",
+            "X_DATE_PLACED_IN_SERVICE": "2023-01-15",
+            "X_COST": cost,
+            "X_DESCRIPTION": "ARISTA 7130",
+            "X_TAG_NUMBER": asset_number,
+        },
+    )
 
 
 def _sample_state(asset_id="100", asset_number="142847", book="US CORP BOOK"):
@@ -108,11 +128,11 @@ class TestFindPendingTransfers:
     def test_detects_pending_transfer(self):
         """Asset in US book with DFF entity=UK → pending cross-book."""
         fusion = _mock_fusion()
-        fusion.get_resource.return_value = {
-            "items": [_fa_item(book="US CORP BOOK", dff_entity="UK Entity")]
-        }
+        bip = _mock_bip()
+        bip.run_report.return_value = [_bip_row(book="US CORP BOOK", dff_entity="UK Entity")]
+        fusion.process_transaction.return_value = _get_asset_info_response()
 
-        sync = FusionIUSync(fusion, _resolver())
+        sync = FusionIUSync(fusion, _resolver(), bip)
         pending = sync.find_pending_transfers(
             books=["US CORP BOOK", "UK CORP BOOK"], limit=10,
         )
@@ -124,39 +144,43 @@ class TestFindPendingTransfers:
         assert pt.target_book_type_code == "UK CORP BOOK"
         assert pt.transfer_to_entity == "UK Entity"
         assert pt.transfer_date == "2026-03-01"
+        # Should have called getAssetInformation
+        fusion.process_transaction.assert_called_once()
+
+    def test_caches_asset_state_from_discovery(self):
+        """fa_state should be populated during discovery (avoid double fetch)."""
+        fusion = _mock_fusion()
+        bip = _mock_bip()
+        bip.run_report.return_value = [_bip_row()]
+        fusion.process_transaction.return_value = _get_asset_info_response()
+
+        sync = FusionIUSync(fusion, _resolver(), bip)
+        pending = sync.find_pending_transfers(books=["US CORP BOOK"], limit=10)
+
+        assert len(pending) == 1
+        assert pending[0].fa_state is not None
+        assert pending[0].fa_state.asset_id == "100"
 
     def test_skips_when_entity_matches_current_book(self):
         """Asset already in US book and entity resolves to US → skip."""
         fusion = _mock_fusion()
-        fusion.get_resource.return_value = {
-            "items": [_fa_item(book="US CORP BOOK", dff_entity="US Entity")]
-        }
+        bip = _mock_bip()
+        bip.run_report.return_value = [_bip_row(book="US CORP BOOK", dff_entity="US Entity")]
 
-        sync = FusionIUSync(fusion, _resolver())
+        sync = FusionIUSync(fusion, _resolver(), bip)
         pending = sync.find_pending_transfers(books=["US CORP BOOK"], limit=10)
 
         assert len(pending) == 0
-
-    def test_skips_when_no_dff(self):
-        """Asset with no DFF child → skip."""
-        fusion = _mock_fusion()
-        item = _fa_item()
-        item["assetDFF"] = []
-        fusion.get_resource.return_value = {"items": [item]}
-
-        sync = FusionIUSync(fusion, _resolver())
-        pending = sync.find_pending_transfers(books=["US CORP BOOK"], limit=10)
-
-        assert len(pending) == 0
+        # Should NOT have called getAssetInformation (filtered before that)
+        fusion.process_transaction.assert_not_called()
 
     def test_skips_when_entity_empty(self):
         """Asset with empty Transfer to Entity DFF → skip."""
         fusion = _mock_fusion()
-        fusion.get_resource.return_value = {
-            "items": [_fa_item(dff_entity="")]
-        }
+        bip = _mock_bip()
+        bip.run_report.return_value = [_bip_row(dff_entity="")]
 
-        sync = FusionIUSync(fusion, _resolver())
+        sync = FusionIUSync(fusion, _resolver(), bip)
         pending = sync.find_pending_transfers(books=["US CORP BOOK"], limit=10)
 
         assert len(pending) == 0
@@ -164,11 +188,10 @@ class TestFindPendingTransfers:
     def test_skips_when_entity_unknown(self):
         """Asset with entity not in map → skip (no crash)."""
         fusion = _mock_fusion()
-        fusion.get_resource.return_value = {
-            "items": [_fa_item(dff_entity="UNKNOWN ENTITY")]
-        }
+        bip = _mock_bip()
+        bip.run_report.return_value = [_bip_row(dff_entity="UNKNOWN ENTITY")]
 
-        sync = FusionIUSync(fusion, _resolver())
+        sync = FusionIUSync(fusion, _resolver(), bip)
         pending = sync.find_pending_transfers(books=["US CORP BOOK"], limit=10)
 
         assert len(pending) == 0
@@ -176,11 +199,10 @@ class TestFindPendingTransfers:
     def test_skips_when_book_not_in_search_list(self):
         """Asset in JP book but JP not in search books → skip."""
         fusion = _mock_fusion()
-        fusion.get_resource.return_value = {
-            "items": [_fa_item(book="JP CORP BOOK", dff_entity="US Entity")]
-        }
+        bip = _mock_bip()
+        bip.run_report.return_value = [_bip_row(book="JP CORP BOOK", dff_entity="US Entity")]
 
-        sync = FusionIUSync(fusion, _resolver())
+        sync = FusionIUSync(fusion, _resolver(), bip)
         pending = sync.find_pending_transfers(
             books=["US CORP BOOK", "UK CORP BOOK"], limit=10,
         )
@@ -189,103 +211,110 @@ class TestFindPendingTransfers:
 
     def test_respects_limit(self):
         """Should stop collecting after reaching limit."""
-        items = [
-            _fa_item(asset_id=str(i), asset_number=str(1000 + i), dff_entity="UK Entity")
+        rows = [
+            _bip_row(asset_number=str(1000 + i), dff_entity="UK Entity")
             for i in range(20)
         ]
         fusion = _mock_fusion()
-        fusion.get_resource.return_value = {"items": items}
+        bip = _mock_bip()
+        bip.run_report.return_value = rows
+        # Each getAssetInformation call returns matching asset
+        fusion.process_transaction.side_effect = [
+            _get_asset_info_response(asset_id=str(i), asset_number=str(1000 + i))
+            for i in range(20)
+        ]
 
-        sync = FusionIUSync(fusion, _resolver())
+        sync = FusionIUSync(fusion, _resolver(), bip)
         pending = sync.find_pending_transfers(books=["US CORP BOOK"], limit=5)
 
         assert len(pending) == 5
 
-    def test_paginates(self):
-        """Should fetch multiple pages when a page is full (200 items)."""
+    def test_custom_dff_column_names(self):
+        """Should use custom DFF column names from DFFConfig."""
         fusion = _mock_fusion()
-        # Page 1: full batch (200 items), none with Transfer to Entity → triggers page 2
-        page1 = [
-            _fa_item(asset_id=str(i), asset_number=str(i), dff_entity="")
-            for i in range(200)
-        ]
-        page2 = [_fa_item(asset_id="999", asset_number="1002", dff_entity="UK Entity")]
-
-        fusion.get_resource.side_effect = [
-            {"items": page1},
-            {"items": page2},
-        ]
-
-        sync = FusionIUSync(fusion, _resolver())
-        pending = sync.find_pending_transfers(books=["US CORP BOOK"], limit=10)
-
-        # Should have called get_resource twice (page1 was full → fetch page2)
-        assert fusion.get_resource.call_count == 2
-        assert len(pending) == 1
-        assert pending[0].asset_number == "1002"
-
-    def test_custom_dff_field_names(self):
-        """Should use custom DFF field names from DFFConfig."""
-        fusion = _mock_fusion()
-        item = {
-            "AssetId": "100",
-            "AssetNumber": "142847",
-            "TagNumber": "142847",
-            "Description": "Test",
-            "assetBooks": [{"BookTypeCode": "US CORP BOOK", "Cost": "1000"}],
-            "assetDFF": [
-                {
-                    "xferEntity": "UK Entity",
-                    "xferDate": "2026-06-01",
-                    "xferLoc": "",
-                }
-            ],
-        }
-        fusion.get_resource.return_value = {"items": [item]}
+        bip = _mock_bip()
+        bip.run_report.return_value = [{
+            "ASSET_NUM": "142847",
+            "BOOK": "US CORP BOOK",
+            "XFER_ENTITY": "UK Entity",
+            "XFER_DATE": "2026-06-01",
+            "XFER_LOC": "",
+        }]
+        fusion.process_transaction.return_value = _get_asset_info_response()
 
         dff = DFFConfig(
-            transfer_date="xferDate",
-            transfer_to_entity="xferEntity",
-            transfer_to_location="xferLoc",
+            asset_number_col="ASSET_NUM",
+            book_type_code_col="BOOK",
+            transfer_date_col="XFER_DATE",
+            transfer_to_entity_col="XFER_ENTITY",
+            transfer_to_location_col="XFER_LOC",
         )
-        sync = FusionIUSync(fusion, _resolver(), dff_config=dff)
+        sync = FusionIUSync(fusion, _resolver(), bip, dff_config=dff)
         pending = sync.find_pending_transfers(books=["US CORP BOOK"], limit=10)
 
         assert len(pending) == 1
         assert pending[0].transfer_date == "2026-06-01"
 
-    def test_extracts_cost_from_asset_books(self):
+    def test_handles_bip_failure(self):
+        """BIP report failure should not crash, just return empty."""
         fusion = _mock_fusion()
-        fusion.get_resource.return_value = {
-            "items": [_fa_item(cost="99999.99", dff_entity="UK Entity")]
-        }
+        bip = _mock_bip()
+        bip.run_report.side_effect = FusionApiError("Connection refused")
 
-        sync = FusionIUSync(fusion, _resolver())
-        pending = sync.find_pending_transfers(books=["US CORP BOOK"], limit=10)
-
-        assert pending[0].cost == "99999.99"
-
-    def test_handles_fusion_api_error(self):
-        """REST query failure should not crash, just return empty."""
-        fusion = _mock_fusion()
-        fusion.get_resource.side_effect = FusionApiError("Connection refused")
-
-        sync = FusionIUSync(fusion, _resolver())
+        sync = FusionIUSync(fusion, _resolver(), bip)
         pending = sync.find_pending_transfers(books=["US CORP BOOK"], limit=10)
 
         assert len(pending) == 0
 
+    def test_handles_get_asset_info_failure(self):
+        """getAssetInformation failure for one asset should skip it, not crash."""
+        fusion = _mock_fusion()
+        bip = _mock_bip()
+        bip.run_report.return_value = [
+            _bip_row(asset_number="AAA", dff_entity="UK Entity"),
+            _bip_row(asset_number="BBB", dff_entity="UK Entity"),
+        ]
+        # First call fails, second succeeds
+        fusion.process_transaction.side_effect = [
+            FusionApiError("Timeout"),
+            _get_asset_info_response(asset_id="200", asset_number="BBB"),
+        ]
+
+        sync = FusionIUSync(fusion, _resolver(), bip)
+        pending = sync.find_pending_transfers(books=["US CORP BOOK"], limit=10)
+
+        assert len(pending) == 1
+        assert pending[0].asset_number == "BBB"
+
     def test_transfer_to_location_captured(self):
         """Transfer to Location DFF should be captured if present."""
         fusion = _mock_fusion()
-        fusion.get_resource.return_value = {
-            "items": [_fa_item(dff_entity="UK Entity", dff_location="LON-DC1")]
-        }
+        bip = _mock_bip()
+        bip.run_report.return_value = [
+            _bip_row(dff_entity="UK Entity", dff_location="LON-DC1")
+        ]
+        fusion.process_transaction.return_value = _get_asset_info_response()
 
-        sync = FusionIUSync(fusion, _resolver())
+        sync = FusionIUSync(fusion, _resolver(), bip)
         pending = sync.find_pending_transfers(books=["US CORP BOOK"], limit=10)
 
         assert pending[0].transfer_to_location == "LON-DC1"
+
+    def test_passes_bip_params(self):
+        """bip_params should be forwarded to BIPClient.run_report."""
+        fusion = _mock_fusion()
+        bip = _mock_bip()
+        bip.run_report.return_value = []
+
+        sync = FusionIUSync(fusion, _resolver(), bip)
+        sync.find_pending_transfers(
+            books=["US CORP BOOK"], limit=10,
+            bip_params={"P_BOOK_TYPE_CODE": "US CORP BOOK"},
+        )
+
+        bip.run_report.assert_called_once_with(
+            params={"P_BOOK_TYPE_CODE": "US CORP BOOK"},
+        )
 
 
 # ===================================================================
@@ -295,6 +324,7 @@ class TestFindPendingTransfers:
 class TestExecuteTransfer:
     def test_dry_run(self):
         fusion = _mock_fusion()
+        bip = _mock_bip()
         # getAssetInformation call
         fusion.process_transaction.return_value = (
             {},
@@ -314,7 +344,7 @@ class TestExecuteTransfer:
             },
         )
 
-        sync = FusionIUSync(fusion, _resolver())
+        sync = FusionIUSync(fusion, _resolver(), bip)
         pt = _make_pending()
         result = sync.execute_transfer(pt, dry_run=True)
 
@@ -326,6 +356,7 @@ class TestExecuteTransfer:
 
     def test_execute_success(self):
         fusion = _mock_fusion()
+        bip = _mock_bip()
         state = _sample_state()
         pt = _make_pending(state=state)
 
@@ -335,7 +366,7 @@ class TestExecuteTransfer:
             {"X_RETURN_STATUS": "S", "X_EVENT_ID": "99999"},
         )
 
-        sync = FusionIUSync(fusion, _resolver())
+        sync = FusionIUSync(fusion, _resolver(), bip)
         result = sync.execute_transfer(pt, dry_run=False)
 
         assert result.status == "TRANSFERRED"
@@ -346,6 +377,7 @@ class TestExecuteTransfer:
 
     def test_execute_failure(self):
         fusion = _mock_fusion()
+        bip = _mock_bip()
         state = _sample_state()
         pt = _make_pending(state=state)
 
@@ -354,7 +386,7 @@ class TestExecuteTransfer:
             {"X_RETURN_STATUS": "F", "X_MSG_DATA": "Period closed"},
         )
 
-        sync = FusionIUSync(fusion, _resolver())
+        sync = FusionIUSync(fusion, _resolver(), bip)
         result = sync.execute_transfer(pt, dry_run=False)
 
         assert result.status == "FAILED"
@@ -363,6 +395,7 @@ class TestExecuteTransfer:
     def test_fetches_state_when_missing(self):
         """When fa_state is None, should call getAssetInformation first."""
         fusion = _mock_fusion()
+        bip = _mock_bip()
         pt = _make_pending(state=None)
 
         fusion.process_transaction.return_value = (
@@ -380,7 +413,7 @@ class TestExecuteTransfer:
             },
         )
 
-        sync = FusionIUSync(fusion, _resolver())
+        sync = FusionIUSync(fusion, _resolver(), bip)
         result = sync.execute_transfer(pt, dry_run=True)
 
         assert result.status == "DRY_RUN"
@@ -389,10 +422,11 @@ class TestExecuteTransfer:
 
     def test_state_fetch_failure(self):
         fusion = _mock_fusion()
+        bip = _mock_bip()
         fusion.process_transaction.side_effect = FusionApiError("Timeout")
         pt = _make_pending(state=None)
 
-        sync = FusionIUSync(fusion, _resolver())
+        sync = FusionIUSync(fusion, _resolver(), bip)
         result = sync.execute_transfer(pt, dry_run=False)
 
         assert result.status == "FAILED"
@@ -401,8 +435,8 @@ class TestExecuteTransfer:
     def test_uses_transfer_date_from_dff(self):
         """Effective date should come from the DFF Transfer Date."""
         fusion = _mock_fusion()
+        bip = _mock_bip()
         state = _sample_state()
-        pt = _make_pending(state=state)
         pt = PendingTransfer(
             asset_id="100", asset_number="142847",
             book_type_code="US CORP BOOK", description="Test",
@@ -419,7 +453,7 @@ class TestExecuteTransfer:
             {"X_RETURN_STATUS": "S"},
         )
 
-        sync = FusionIUSync(fusion, _resolver())
+        sync = FusionIUSync(fusion, _resolver(), bip)
         result = sync.execute_transfer(pt, dry_run=False)
 
         assert result.transfer_date == "2026-06-15"
@@ -430,6 +464,7 @@ class TestExecuteTransfer:
     def test_location_override_from_dff(self):
         """If Transfer to Location DFF is set, it should be used as location override."""
         fusion = _mock_fusion()
+        bip = _mock_bip()
         state = _sample_state()
         pt = PendingTransfer(
             asset_id="100", asset_number="142847",
@@ -447,7 +482,7 @@ class TestExecuteTransfer:
             {"X_RETURN_STATUS": "S"},
         )
 
-        sync = FusionIUSync(fusion, _resolver())
+        sync = FusionIUSync(fusion, _resolver(), bip)
         result = sync.execute_transfer(pt, dry_run=False)
 
         assert result.status == "TRANSFERRED"
@@ -463,26 +498,12 @@ class TestExecuteTransfer:
 class TestRunFullSync:
     def test_dry_run_summary(self):
         fusion = _mock_fusion()
-        fusion.get_resource.return_value = {
-            "items": [_fa_item(dff_entity="UK Entity")]
-        }
-        # getAssetInformation for execution
-        fusion.process_transaction.return_value = (
-            {},
-            {
-                "X_RETURN_STATUS": "S",
-                "X_ASSET_ID": "100",
-                "X_ASSET_NUMBER": "142847",
-                "X_BOOK_TYPE_CODE": "US CORP BOOK",
-                "X_DISTRIBUTION_ID_TBL": "1001",
-                "X_UNITS_ASSIGNED_TBL": "1",
-                "X_ASSIGNED_TO_TBL": "",
-                "X_EXPENSE_CCID_TBL": "626955",
-                "X_LOCATION_CCID_TBL": "789012",
-            },
-        )
+        bip = _mock_bip()
+        bip.run_report.return_value = [_bip_row(dff_entity="UK Entity")]
+        # getAssetInformation for discovery, then getAssetInformation already cached
+        fusion.process_transaction.return_value = _get_asset_info_response()
 
-        sync = FusionIUSync(fusion, _resolver())
+        sync = FusionIUSync(fusion, _resolver(), bip)
         summary = sync.run_full_sync(
             books=["US CORP BOOK", "UK CORP BOOK"],
             dry_run=True,
@@ -494,11 +515,12 @@ class TestRunFullSync:
         assert len(summary["results"]) == 1
         assert summary["results"][0]["status"] == "DRY_RUN"
 
-    def test_empty_portfolio_returns_empty(self):
+    def test_empty_report_returns_empty(self):
         fusion = _mock_fusion()
-        fusion.get_resource.return_value = {"items": []}
+        bip = _mock_bip()
+        bip.run_report.return_value = []
 
-        sync = FusionIUSync(fusion, _resolver())
+        sync = FusionIUSync(fusion, _resolver(), bip)
         summary = sync.run_full_sync(books=["US CORP BOOK"], dry_run=True)
 
         assert summary["counts"]["total"] == 0

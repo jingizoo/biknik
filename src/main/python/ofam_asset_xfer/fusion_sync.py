@@ -2,17 +2,15 @@
 
 Replaces the CMDB-based sync approach.  Instead of querying ServiceNow CMDB
 for asset locations, we read the asset-level Descriptive Flexfields (DFFs)
-directly from Oracle Fusion FA:
+from an Oracle BI Publisher report that queries FA_ADDITIONS:
 
-  * **Transfer Date**       – when the IU transfer should happen
-  * **Transfer to Entity**  – the destination legal entity
-
-If "Transfer to Entity" is populated and maps to a different book than the
-asset's current book, the asset is a pending IU transfer.
+  * **Transfer Date**         – ATTRIBUTE_DATE1 – when the IU transfer should happen
+  * **Transfer to Entity**    – ATTRIBUTE9      – the destination legal entity
+  * **Transfer to Location**  – ATTRIBUTE10     – optional location hint
 
 Architecture:
-  1. Query fixedAssets REST with assetBooks + assetDFF expansion
-  2. Filter for assets whose Transfer-to-Entity DFF is populated
+  1. Call BIP report via SOAP to get asset transfer candidates (DFF populated)
+  2. For each candidate, call getAssetInformation to get full asset state
   3. Resolve entity → target book via EntityBookResolver
   4. Compare current book vs target book
   5. If mismatch → pending transfer (cross-book)
@@ -26,6 +24,7 @@ from dataclasses import dataclass, field
 from datetime import date
 from typing import Any, Dict, List, Optional
 
+from .bip_client import BIPClient
 from .entity_resolver import EntityBookResolver
 from .exceptions import FusionApiError, OFAMAssetXferError, ValidationError
 from .fusion_ops import (
@@ -40,18 +39,23 @@ log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# DFF configuration
+# DFF column configuration (maps BIP report column names to logical fields)
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True)
 class DFFConfig:
-    """Maps logical DFF fields to the actual REST attribute names.
+    """Maps logical DFF fields to BIP report XML column names.
 
-    The REST field names depend on how the DFF segments were registered in
-    Oracle Fusion.  Override these if your environment uses different names.
+    The column names depend on the SQL aliases used in the BIP report
+    data model.  Override these if your report uses different names.
     """
-    transfer_date: str = "transferDate"
-    transfer_to_entity: str = "transferToEntity"
-    transfer_to_location: str = "transferToLocation"
+    # Asset identity columns in the BIP report
+    asset_number_col: str = "ASSET_NUMBER"
+    book_type_code_col: str = "BOOK_TYPE_CODE"
+
+    # FA_ADDITIONS DFF columns
+    transfer_date_col: str = "ATTRIBUTE_DATE1"
+    transfer_to_entity_col: str = "ATTRIBUTE9"
+    transfer_to_location_col: str = "ATTRIBUTE10"
 
 
 DEFAULT_DFF_CONFIG = DFFConfig()
@@ -108,10 +112,12 @@ class FusionIUSync:
         self,
         fusion_client: OracleErpIntegrationsClient,
         entity_resolver: EntityBookResolver,
+        bip_client: BIPClient,
         dff_config: Optional[DFFConfig] = None,
     ):
         self._client = fusion_client
         self._entity_resolver = entity_resolver
+        self._bip = bip_client
         self._dff = dff_config or DEFAULT_DFF_CONFIG
 
     # ------------------------------------------------------------------
@@ -121,139 +127,118 @@ class FusionIUSync:
         self,
         books: List[str],
         limit: int = 100,
+        bip_params: Optional[Dict[str, str]] = None,
     ) -> List[PendingTransfer]:
-        """Scan FA assets for those with Transfer-to-Entity DFF populated.
+        """Discover pending IU transfers from BIP report + getAssetInformation.
 
-        Queries the fixedAssets REST resource with assetBooks and assetDFF
-        expansion, then filters client-side for assets where:
-          - the asset is in one of the specified books
-          - the Transfer-to-Entity DFF is populated
-          - the resolved target book differs from the current book
+        1. Run the BIP report to get assets with Transfer-to-Entity DFF populated.
+        2. For each candidate, call getAssetInformation to get full asset state.
+        3. Resolve entity → target book and filter for actual pending transfers.
 
         Args:
             books: List of book_type_codes to scan.
             limit: Max pending transfers to collect.
+            bip_params: Optional extra parameters to pass to the BIP report.
 
         Returns:
             List of PendingTransfer objects (at most ``limit``).
         """
         log.info("Scanning for pending IU transfers (books=%s, limit=%d)", books, limit)
-
         books_upper = {b.upper().strip() for b in books}
+
+        # Step 1: Run BIP report to get transfer candidates
+        try:
+            rows = self._bip.run_report(params=bip_params)
+        except FusionApiError as e:
+            log.error("BIP report failed: %s", e)
+            return []
+
+        log.info("BIP report returned %d row(s)", len(rows))
+
+        # Step 2: Filter and enrich each candidate
         pending: List[PendingTransfer] = []
-        offset = 0
-        batch_size = 200
-
-        while len(pending) < limit:
-            try:
-                resp = self._client.get_resource("fixedAssets", {
-                    "expand": "assetBooks,assetDFF",
-                    "onlyData": "true",
-                    "limit": str(batch_size),
-                    "offset": str(offset),
-                })
-            except FusionApiError as e:
-                log.error("fixedAssets query failed at offset=%d: %s", offset, e)
+        for row in rows:
+            if len(pending) >= limit:
                 break
 
-            items = resp.get("items") or []
-            if not items:
-                break
-
-            for item in items:
-                if len(pending) >= limit:
-                    break
-
-                result = self._check_asset(item, books_upper)
-                if result:
-                    pending.append(result)
-                    log.info(
-                        "Pending #%d: asset=%s, %s → %s (entity=%s, date=%s)",
-                        len(pending),
-                        result.asset_number,
-                        result.book_type_code,
-                        result.target_book_type_code,
-                        result.transfer_to_entity,
-                        result.transfer_date,
-                    )
-
-            offset += batch_size
-            if len(items) < batch_size:
-                break  # No more pages
+            result = self._check_bip_row(row, books_upper)
+            if result:
+                pending.append(result)
+                log.info(
+                    "Pending #%d: asset=%s, %s → %s (entity=%s, date=%s)",
+                    len(pending),
+                    result.asset_number,
+                    result.book_type_code,
+                    result.target_book_type_code,
+                    result.transfer_to_entity,
+                    result.transfer_date,
+                )
 
         log.info("Scan complete: found %d pending transfer(s)", len(pending))
         return pending
 
-    def _check_asset(
+    def _check_bip_row(
         self,
-        item: Dict[str, Any],
+        row: Dict[str, str],
         books_upper: set,
     ) -> Optional[PendingTransfer]:
-        """Check a single fixedAssets REST row for a pending transfer."""
+        """Check a single BIP report row for a pending transfer.
 
-        # --- Extract DFF ---
-        dff_list = item.get("assetDFF") or []
-        if not dff_list:
-            return None
-        dff = dff_list[0] if isinstance(dff_list, list) else dff_list
+        Calls getAssetInformation to get full asset state for validated
+        candidates.
+        """
+        dff = self._dff
 
-        transfer_entity = str(dff.get(self._dff.transfer_to_entity) or "").strip()
+        # --- Extract DFF fields from report row ---
+        transfer_entity = row.get(dff.transfer_to_entity_col, "").strip()
         if not transfer_entity:
             return None
 
-        transfer_date_raw = str(dff.get(self._dff.transfer_date) or "").strip()
-        transfer_location = str(dff.get(self._dff.transfer_to_location) or "").strip() or None
-
-        # --- Current book from assetBooks ---
-        current_book = self._extract_current_book(item, books_upper)
-        if not current_book:
+        asset_number = row.get(dff.asset_number_col, "").strip()
+        book_type_code = row.get(dff.book_type_code_col, "").strip()
+        if not asset_number or not book_type_code:
             return None
+
+        # Check book is in the scan list
+        if book_type_code.upper().strip() not in books_upper:
+            return None
+
+        transfer_date_raw = row.get(dff.transfer_date_col, "").strip()
+        transfer_location = row.get(dff.transfer_to_location_col, "").strip() or None
 
         # --- Resolve target book from entity ---
         try:
             target_book = self._entity_resolver.resolve_target_book(transfer_entity)
         except ValidationError as e:
-            log.debug("Skipping asset %s: %s", item.get("AssetNumber"), e)
+            log.debug("Skipping asset %s: %s", asset_number, e)
             return None
 
-        if current_book.upper().strip() == target_book.upper().strip():
+        if book_type_code.upper().strip() == target_book.upper().strip():
             return None  # Already in the right book
 
-        # --- Build pending transfer ---
-        asset_id = str(item.get("AssetId") or "").strip()
-        asset_number = str(item.get("AssetNumber") or "").strip()
-
-        if not asset_id or not asset_number:
+        # --- Call getAssetInformation to get full state ---
+        try:
+            _raw, _pl, state = get_asset_information(
+                self._client, book_type_code, asset_number,
+            )
+        except FusionApiError as e:
+            log.warning("getAssetInformation failed for asset=%s book=%s: %s",
+                        asset_number, book_type_code, e)
             return None
 
-        # Extract cost from assetBooks if available
-        cost = None
-        for ab in (item.get("assetBooks") or []):
-            if str(ab.get("BookTypeCode") or "").upper().strip() == current_book.upper().strip():
-                cost = str(ab.get("Cost") or "").strip() or None
-                break
-
         return PendingTransfer(
-            asset_id=asset_id,
-            asset_number=asset_number,
-            book_type_code=current_book,
-            description=str(item.get("Description") or "").strip() or None,
-            tag_number=str(item.get("TagNumber") or "").strip() or None,
-            cost=cost,
+            asset_id=state.asset_id,
+            asset_number=state.asset_number,
+            book_type_code=book_type_code,
+            description=state.description,
+            tag_number=state.tag_number,
+            cost=state.cost,
             transfer_date=transfer_date_raw or date.today().isoformat(),
             transfer_to_entity=transfer_entity,
             transfer_to_location=transfer_location,
             target_book_type_code=target_book,
+            fa_state=state,
         )
-
-    @staticmethod
-    def _extract_current_book(item: Dict[str, Any], books_upper: set) -> Optional[str]:
-        """Get the current book_type_code from assetBooks child."""
-        for ab in (item.get("assetBooks") or []):
-            btc = str(ab.get("BookTypeCode") or "").strip()
-            if btc.upper().strip() in books_upper:
-                return btc
-        return None
 
     # ------------------------------------------------------------------
     # Execution
@@ -277,7 +262,7 @@ class FusionIUSync:
         effective_date = pending.transfer_date or date.today().isoformat()
         request_id = f"IU_XFER_{pending.asset_number}_{int(time.time())}"
 
-        # Fetch full asset state
+        # State should already be cached from discovery
         state = pending.fa_state
         if not state:
             try:
@@ -376,8 +361,9 @@ class FusionIUSync:
         books: List[str],
         dry_run: bool = True,
         max_transfers: int = 500,
+        bip_params: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
-        """Production entry point: scan FA assets, find pending IU transfers, execute.
+        """Production entry point: discover pending IU transfers via BIP, execute.
 
         Returns:
             Summary dict with counts and per-asset results.
@@ -389,7 +375,9 @@ class FusionIUSync:
             books, dry_run,
         )
 
-        pending_list = self.find_pending_transfers(books=books, limit=max_transfers)
+        pending_list = self.find_pending_transfers(
+            books=books, limit=max_transfers, bip_params=bip_params,
+        )
 
         results: List[Dict[str, Any]] = []
         counts = {
