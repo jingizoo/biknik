@@ -12,8 +12,7 @@ NO CMDB required — everything comes from Fusion itself.
 Environment variables:
   FUSION_BASE_URL     e.g. https://your-fusion-host
   FUSION_API_VERSION  e.g. 11.13.18.05
-  FUSION_USER         Oracle Fusion username
-  FUSION_PASS         Oracle Fusion password
+  FUSION_JWT          raw JWT bearer token
 
 Usage:
   python tester_iu_xfer.py --entity-book-map entity_map.json --books "US CORP BOOK,UK CORP BOOK"
@@ -122,8 +121,7 @@ def main():
     oracle_cfg = OracleConfig(
         base_url=get_env_or_die("FUSION_BASE_URL"),
         api_version=get_env_or_die("FUSION_API_VERSION"),
-        username=get_env_or_die("FUSION_USER"),
-        password=get_env_or_die("FUSION_PASS"),
+        bearer_token=get_env_or_die("FUSION_JWT"),
     )
     fusion_client = OracleErpIntegrationsClient(oracle_cfg)
     print(f"  Fusion : {oracle_cfg.base_url} (api={oracle_cfg.api_version})")

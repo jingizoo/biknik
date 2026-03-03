@@ -8,7 +8,6 @@ from typing import Any, Dict, Optional, Tuple
 from urllib.parse import urljoin
 
 import requests
-from requests.auth import HTTPBasicAuth
 
 from .exceptions import FusionApiError
 from .paramlist import build_parameter_list
@@ -21,8 +20,7 @@ log = logging.getLogger(__name__)
 class OracleConfig:
     base_url: str
     api_version: str
-    username: str
-    password: str
+    bearer_token: str
     verify_ssl: bool = True
     timeout_seconds: int = 60
 
@@ -33,25 +31,20 @@ class OracleConfig:
         if not base_url or not api_version:
             raise ValueError("oracle.base_url and oracle.api_version are required")
 
-        # Prefer env indirection for credentials (CDX secrets pattern)
-        username = d.get("username")
-        password = d.get("password")
-        username_env = d.get("username_env")
-        password_env = d.get("password_env")
+        # Prefer env indirection for token (CDX secrets pattern)
+        bearer_token = d.get("bearer_token")
+        bearer_token_env = d.get("bearer_token_env")
 
-        if username_env:
-            username = os.getenv(str(username_env), username)
-        if password_env:
-            password = os.getenv(str(password_env), password)
+        if bearer_token_env:
+            bearer_token = os.getenv(str(bearer_token_env), bearer_token)
 
-        if not username or not password:
-            raise ValueError("Oracle credentials are required (username/password or username_env/password_env).")
+        if not bearer_token:
+            raise ValueError("Oracle bearer_token is required (bearer_token or bearer_token_env).")
 
         return OracleConfig(
             base_url=base_url,
             api_version=api_version,
-            username=str(username),
-            password=str(password),
+            bearer_token=str(bearer_token),
             verify_ssl=bool(d.get("verify_ssl", True)),
             timeout_seconds=int(d.get("timeout_seconds", 60)),
         )
@@ -63,8 +56,8 @@ class OracleErpIntegrationsClient:
     def __init__(self, cfg: OracleConfig):
         self.cfg = cfg
         self._session = requests.Session()
-        self._session.auth = HTTPBasicAuth(cfg.username, cfg.password)
         self._session.headers.update({
+            "Authorization": f"Bearer {cfg.bearer_token}",
             "Content-Type": "application/vnd.oracle.adf.resourceitem+json",
             "REST-header-version": "4",
             "ACCEPT": "application/json",

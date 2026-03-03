@@ -2,8 +2,7 @@
   "oracle": {
     "base_url": "https://YOUR_FUSION_HOST",
     "api_version": "11.13.18.05",
-    "username_env": "FUSION_USER",
-    "password_env": "FUSION_PASS",
+    "bearer_token_env": "FUSION_JWT",
     "verify_ssl": true,
     "timeout_seconds": 60
   },
