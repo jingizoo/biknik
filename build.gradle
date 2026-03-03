@@ -34,7 +34,6 @@ cigpy {
 
 cigdocker {
   createDockerImage = true
-  imageName = “oraclefusion/fa-asset-xfer:latest”
 }
 
 sourceSets {
