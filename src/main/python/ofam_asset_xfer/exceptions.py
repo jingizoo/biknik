@@ -15,3 +15,11 @@ class FusionApiError(OFAMAssetXferError):
 
 class ValidationError(OFAMAssetXferError):
     """Business/data validation failed."""
+
+
+class CMDBApiError(OFAMAssetXferError):
+    """CMDB API returned an error or an unexpected response."""
+
+
+class LocationResolutionError(OFAMAssetXferError):
+    """Failed to resolve a CMDB location code to an FA location/book."""

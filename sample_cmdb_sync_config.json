@@ -1,0 +1,37 @@
+{
+  "oracle": {
+    "base_url": "https://YOUR_FUSION_HOST",
+    "api_version": "11.13.18.05",
+    "username_env": "FUSION_USER",
+    "password_env": "FUSION_PASS",
+    "verify_ssl": true,
+    "timeout_seconds": 60
+  },
+  "cmdb": {
+    "base_url": "https://YOUR_INSTANCE.service-now.com",
+    "username_env": "CMDB_USER",
+    "password_env": "CMDB_PASS",
+    "table": "alm_hardware"
+  },
+  "sync": {
+    "country_book_map": {
+      "US": "US CORP BOOK",
+      "UK": "UK CORP BOOK",
+      "GB": "UK CORP BOOK",
+      "AU": "AU CORP BOOK",
+      "JP": "JP CORP BOOK",
+      "HK": "HK CORP BOOK",
+      "SG": "SG CORP BOOK",
+      "IN": "IN CORP BOOK",
+      "DE": "DE CORP BOOK",
+      "FR": "FR CORP BOOK",
+      "CH": "CH CORP BOOK",
+      "CA": "CA CORP BOOK"
+    },
+    "location_resource": "fixedAssetLocations",
+    "max_transfers": 500,
+    "cmdb_query": null,
+    "effective_date": null
+  },
+  "execute": false
+}
