@@ -92,22 +92,6 @@
       "password": true
     },
     {
-      "id": "cmdbBaseUrl",
-      "type": "promptString",
-      "description": "CMDB (ServiceNow) Base URL (e.g. https://your-instance.service-now.com)"
-    },
-    {
-      "id": "cmdbUser",
-      "type": "promptString",
-      "description": "CMDB Username"
-    },
-    {
-      "id": "cmdbPass",
-      "type": "promptString",
-      "description": "CMDB Password",
-      "password": true
-    },
-    {
       "id": "fusionUser",
       "type": "promptString",
       "description": "Fusion Username (for Basic Auth)"
@@ -119,15 +103,21 @@
       "password": true
     },
     {
-      "id": "cmdbQuery",
+      "id": "entityBookMap",
       "type": "promptString",
-      "description": "Additional CMDB filter (e.g. company=Citadel) — leave empty for none",
+      "description": "Path to entity→book mapping JSON (e.g. entity_book_map.json)",
+      "default": "entity_book_map.json"
+    },
+    {
+      "id": "iuBooks",
+      "type": "promptString",
+      "description": "Comma-separated books to scan (leave empty = all from entity map)",
       "default": ""
     },
     {
-      "id": "mismatchLimit",
+      "id": "iuLimit",
       "type": "pickString",
-      "description": "Max mismatches to find",
+      "description": "Max pending IU transfers to find",
       "options": ["10", "20", "50", "100"],
       "default": "10"
     }
@@ -284,20 +274,18 @@
       "justMyCode": false
     },
     //
-    // ── CMDB → FA LOCATION SYNC TESTER ────────────────────────
+    // ── IU TRANSFER (DFF-based, no CMDB) ──────────────────────
     //
     {
-      "name": "CMDB Sync — find mismatches (dry-run)",
+      "name": "IU Transfer — find pending (dry-run)",
       "type": "debugpy",
       "request": "launch",
-      "program": "${workspaceFolder}/tester_cmdb_fa.py",
+      "program": "${workspaceFolder}/tester_iu_xfer.py",
       "args": [
-        "--limit",  "${input:mismatchLimit}"
+        "--entity-book-map",  "${input:entityBookMap}",
+        "--limit",            "${input:iuLimit}"
       ],
       "env": {
-        "CMDB_BASE_URL":      "${input:cmdbBaseUrl}",
-        "CMDB_USER":          "${input:cmdbUser}",
-        "CMDB_PASS":          "${input:cmdbPass}",
         "FUSION_BASE_URL":    "${input:fusionBaseUrl}",
         "FUSION_API_VERSION": "${input:fusionApiVersion}",
         "FUSION_USER":        "${input:fusionUser}",
@@ -307,18 +295,16 @@
       "justMyCode": false
     },
     {
-      "name": "CMDB Sync — find mismatches + EXECUTE transfer",
+      "name": "IU Transfer — find pending + EXECUTE",
       "type": "debugpy",
       "request": "launch",
-      "program": "${workspaceFolder}/tester_cmdb_fa.py",
+      "program": "${workspaceFolder}/tester_iu_xfer.py",
       "args": [
-        "--limit",   "${input:mismatchLimit}",
+        "--entity-book-map",  "${input:entityBookMap}",
+        "--limit",            "${input:iuLimit}",
         "--execute"
       ],
       "env": {
-        "CMDB_BASE_URL":      "${input:cmdbBaseUrl}",
-        "CMDB_USER":          "${input:cmdbUser}",
-        "CMDB_PASS":          "${input:cmdbPass}",
         "FUSION_BASE_URL":    "${input:fusionBaseUrl}",
         "FUSION_API_VERSION": "${input:fusionApiVersion}",
         "FUSION_USER":        "${input:fusionUser}",
@@ -328,18 +314,16 @@
       "justMyCode": false
     },
     {
-      "name": "CMDB Sync — with CMDB filter (dry-run)",
+      "name": "IU Transfer — specific books (dry-run)",
       "type": "debugpy",
       "request": "launch",
-      "program": "${workspaceFolder}/tester_cmdb_fa.py",
+      "program": "${workspaceFolder}/tester_iu_xfer.py",
       "args": [
-        "--limit",       "${input:mismatchLimit}",
-        "--cmdb-query",  "${input:cmdbQuery}"
+        "--entity-book-map",  "${input:entityBookMap}",
+        "--books",            "${input:iuBooks}",
+        "--limit",            "${input:iuLimit}"
       ],
       "env": {
-        "CMDB_BASE_URL":      "${input:cmdbBaseUrl}",
-        "CMDB_USER":          "${input:cmdbUser}",
-        "CMDB_PASS":          "${input:cmdbPass}",
         "FUSION_BASE_URL":    "${input:fusionBaseUrl}",
         "FUSION_API_VERSION": "${input:fusionApiVersion}",
         "FUSION_USER":        "${input:fusionUser}",
@@ -364,14 +348,13 @@
       "justMyCode": false
     },
     {
-      "name": "Run CMDB Tests Only",
+      "name": "Run IU Transfer Tests",
       "type": "debugpy",
       "request": "launch",
       "module": "pytest",
       "args": [
-        "tests/test_cmdb_client.py",
-        "tests/test_location_resolver.py",
-        "tests/test_cmdb_sync.py",
+        "tests/test_entity_resolver.py",
+        "tests/test_fusion_sync.py",
         "-v"
       ],
       "env": {
