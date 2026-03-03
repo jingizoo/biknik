@@ -90,6 +90,46 @@
       "type": "promptString",
       "description": "Fusion JWT token",
       "password": true
+    },
+    {
+      "id": "cmdbBaseUrl",
+      "type": "promptString",
+      "description": "CMDB (ServiceNow) Base URL (e.g. https://your-instance.service-now.com)"
+    },
+    {
+      "id": "cmdbUser",
+      "type": "promptString",
+      "description": "CMDB Username"
+    },
+    {
+      "id": "cmdbPass",
+      "type": "promptString",
+      "description": "CMDB Password",
+      "password": true
+    },
+    {
+      "id": "fusionUser",
+      "type": "promptString",
+      "description": "Fusion Username (for Basic Auth)"
+    },
+    {
+      "id": "fusionPass",
+      "type": "promptString",
+      "description": "Fusion Password (for Basic Auth)",
+      "password": true
+    },
+    {
+      "id": "cmdbQuery",
+      "type": "promptString",
+      "description": "Additional CMDB filter (e.g. company=Citadel) — leave empty for none",
+      "default": ""
+    },
+    {
+      "id": "mismatchLimit",
+      "type": "pickString",
+      "description": "Max mismatches to find",
+      "options": ["10", "20", "50", "100"],
+      "default": "10"
     }
   ],
   "configurations": [
@@ -239,6 +279,103 @@
         "FUSION_BASE_URL":    "${input:fusionBaseUrl}",
         "FUSION_API_VERSION": "${input:fusionApiVersion}",
         "FUSION_JWT":         "${input:fusionJwt}"
+      },
+      "console": "integratedTerminal",
+      "justMyCode": false
+    },
+    //
+    // ── CMDB → FA LOCATION SYNC TESTER ────────────────────────
+    //
+    {
+      "name": "CMDB Sync — find mismatches (dry-run)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/tester_cmdb_fa.py",
+      "args": [
+        "--limit",  "${input:mismatchLimit}"
+      ],
+      "env": {
+        "CMDB_BASE_URL":      "${input:cmdbBaseUrl}",
+        "CMDB_USER":          "${input:cmdbUser}",
+        "CMDB_PASS":          "${input:cmdbPass}",
+        "FUSION_BASE_URL":    "${input:fusionBaseUrl}",
+        "FUSION_API_VERSION": "${input:fusionApiVersion}",
+        "FUSION_USER":        "${input:fusionUser}",
+        "FUSION_PASS":        "${input:fusionPass}"
+      },
+      "console": "integratedTerminal",
+      "justMyCode": false
+    },
+    {
+      "name": "CMDB Sync — find mismatches + EXECUTE transfer",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/tester_cmdb_fa.py",
+      "args": [
+        "--limit",   "${input:mismatchLimit}",
+        "--execute"
+      ],
+      "env": {
+        "CMDB_BASE_URL":      "${input:cmdbBaseUrl}",
+        "CMDB_USER":          "${input:cmdbUser}",
+        "CMDB_PASS":          "${input:cmdbPass}",
+        "FUSION_BASE_URL":    "${input:fusionBaseUrl}",
+        "FUSION_API_VERSION": "${input:fusionApiVersion}",
+        "FUSION_USER":        "${input:fusionUser}",
+        "FUSION_PASS":        "${input:fusionPass}"
+      },
+      "console": "integratedTerminal",
+      "justMyCode": false
+    },
+    {
+      "name": "CMDB Sync — with CMDB filter (dry-run)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/tester_cmdb_fa.py",
+      "args": [
+        "--limit",       "${input:mismatchLimit}",
+        "--cmdb-query",  "${input:cmdbQuery}"
+      ],
+      "env": {
+        "CMDB_BASE_URL":      "${input:cmdbBaseUrl}",
+        "CMDB_USER":          "${input:cmdbUser}",
+        "CMDB_PASS":          "${input:cmdbPass}",
+        "FUSION_BASE_URL":    "${input:fusionBaseUrl}",
+        "FUSION_API_VERSION": "${input:fusionApiVersion}",
+        "FUSION_USER":        "${input:fusionUser}",
+        "FUSION_PASS":        "${input:fusionPass}"
+      },
+      "console": "integratedTerminal",
+      "justMyCode": false
+    },
+    //
+    // ── UNIT TESTS ────────────────────────────────────────────
+    //
+    {
+      "name": "Run All Tests",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "pytest",
+      "args": ["tests/", "-v"],
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}/src/main/python"
+      },
+      "console": "integratedTerminal",
+      "justMyCode": false
+    },
+    {
+      "name": "Run CMDB Tests Only",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "pytest",
+      "args": [
+        "tests/test_cmdb_client.py",
+        "tests/test_location_resolver.py",
+        "tests/test_cmdb_sync.py",
+        "-v"
+      ],
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}/src/main/python"
       },
       "console": "integratedTerminal",
       "justMyCode": false
