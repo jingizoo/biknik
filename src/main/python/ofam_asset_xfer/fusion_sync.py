@@ -443,6 +443,7 @@ class FusionIUSync:
                     "transfer_to_entity": result.transfer_to_entity,
                     "transfer_date": result.transfer_date,
                     "error": result.error,
+                    "fusion_response": result.fusion_response,
                 }
             )
             status_key = result.status.lower()

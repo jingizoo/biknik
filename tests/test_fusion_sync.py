@@ -686,6 +686,7 @@ class TestRunFullSync:
         assert summary["counts"]["dry_run"] == 1
         assert len(summary["results"]) == 1
         assert summary["results"][0]["status"] == "DRY_RUN"
+        assert summary["results"][0]["fusion_response"] is not None
 
     def test_empty_report_returns_empty(self):
         fusion = _mock_fusion()
