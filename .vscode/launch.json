@@ -35,6 +35,34 @@
   ],
   "configurations": [
     //
+    // ── LOCAL RUNNER (no Batch needed) ───────────────────────
+    //
+    {
+      "name": "Local Run — dry-run",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/run_local.py",
+      "args": [
+        "--config",  "${input:configFile}",
+        "--out-dir", "${input:outDir}"
+      ],
+      "console": "integratedTerminal",
+      "justMyCode": false
+    },
+    {
+      "name": "Local Run — EXECUTE",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/run_local.py",
+      "args": [
+        "--config",  "${input:configFile}",
+        "--out-dir", "${input:outDir}",
+        "--execute"
+      ],
+      "console": "integratedTerminal",
+      "justMyCode": false
+    },
+    //
     // ── BATCH JOB (production entrypoint) ────────────────────
     //
     {
