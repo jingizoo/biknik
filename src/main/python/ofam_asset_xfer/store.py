@@ -53,7 +53,11 @@ class ArtifactStore:
         return self.write_text(rel_path, json.dumps(obj, indent=indent, sort_keys=True))
 
     def read_text(self, uri_or_rel: str, encoding: str = "utf-8") -> str:
-        uri = uri_or_rel if "://" in uri_or_rel or os.path.isabs(uri_or_rel) else _join_uri(self.base_uri, uri_or_rel)
+        uri = (
+            uri_or_rel
+            if "://" in uri_or_rel or os.path.isabs(uri_or_rel)
+            else _join_uri(self.base_uri, uri_or_rel)
+        )
         fs, path = self._fs_and_path(uri)
         with fs.open(path, "r", encoding=encoding) as f:
             return f.read()

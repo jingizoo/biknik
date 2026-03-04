@@ -1,4 +1,5 @@
 """Unit tests for ofam_asset_xfer.paramlist — parse_rosetta quoted string handling."""
+
 from __future__ import annotations
 
 from ofam_asset_xfer.paramlist import parse_rosetta

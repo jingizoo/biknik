@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
-from datetime import date
-from typing import Any, Dict, Iterable, List, Tuple
+from typing import Any, Dict, Iterable, List
 
 
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -52,7 +50,9 @@ def build_parameter_list(params: Dict[str, Any]) -> str:
 
         if isinstance(v, str) and (k.endswith("_TBL") or k.endswith("_TABLE")):
             # Already encoded rosetta string, but enforce quoting.
-            items.append(f"{k}:{to_rosetta_str([p.strip() for p in v.split(',') if p.strip() != ''])}")
+            items.append(
+                f"{k}:{to_rosetta_str([p.strip() for p in v.split(',') if p.strip() != ''])}"
+            )
             continue
 
         if isinstance(v, str) and _is_date_str(v):

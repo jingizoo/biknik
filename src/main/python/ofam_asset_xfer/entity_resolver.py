@@ -9,11 +9,12 @@ Usage:
     resolver = EntityBookResolver({"US Entity": "US CORP BOOK", ...})
     book = resolver.resolve_target_book("US Entity")
 """
+
 from __future__ import annotations
 
 import json
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 from .exceptions import ValidationError
 
@@ -34,8 +35,7 @@ class EntityBookResolver:
             )
         # Normalise keys: upper + strip
         self._map: Dict[str, str] = {
-            k.upper().strip(): v.strip()
-            for k, v in entity_book_map.items()
+            k.upper().strip(): v.strip() for k, v in entity_book_map.items()
         }
 
     @property
@@ -70,7 +70,9 @@ class EntityBookResolver:
         with open(path) as f:
             data = json.load(f)
         if not isinstance(data, dict):
-            raise ValidationError(f"Entity book map JSON must be a dict, got {type(data).__name__}")
+            raise ValidationError(
+                f"Entity book map JSON must be a dict, got {type(data).__name__}"
+            )
         return EntityBookResolver(data)
 
     @staticmethod

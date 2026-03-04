@@ -39,9 +39,13 @@ class AssetState:
         # Required identity
         asset_id = str(pl.get("X_ASSET_ID") or "").strip()
         asset_number = str(pl.get("X_ASSET_NUMBER") or "").strip()
-        book_type_code = str(pl.get("X_BOOK_TYPE_CODE") or pl.get("P_BOOK_TYPE_CODE") or "").strip()
+        book_type_code = str(
+            pl.get("X_BOOK_TYPE_CODE") or pl.get("P_BOOK_TYPE_CODE") or ""
+        ).strip()
         if not asset_id or not asset_number or not book_type_code:
-            raise FusionApiError(f"Missing identity fields in getAssetInformation response: {pl}")
+            raise FusionApiError(
+                f"Missing identity fields in getAssetInformation response: {pl}"
+            )
 
         dist_ids = parse_rosetta(pl.get("X_DISTRIBUTION_ID_TBL"))
         units = parse_rosetta(pl.get("X_UNITS_ASSIGNED_TBL"))
@@ -74,7 +78,8 @@ class AssetState:
             expense_ccids=expense,
             location_ccids=location,
             category_id=str(pl.get("X_CATEGORY_ID") or "").strip() or None,
-            date_placed_in_service=str(pl.get("X_DATE_PLACED_IN_SERVICE") or "").strip() or None,
+            date_placed_in_service=str(pl.get("X_DATE_PLACED_IN_SERVICE") or "").strip()
+            or None,
             cost=str(pl.get("X_COST") or "").strip() or None,
             description=str(pl.get("X_DESCRIPTION") or "").strip() or None,
             tag_number=str(pl.get("X_TAG_NUMBER") or "").strip() or None,
@@ -88,10 +93,13 @@ def get_asset_information(
 ) -> Tuple[Dict[str, Any], Dict[str, Any], AssetState]:
     # The doc indicates you can query using asset_number, tag, serial, etc.
     # OFAM canonical identifier is (book_type_code, asset_number).
-    raw, pl = client.process_transaction("getAssetInformation", {
-        "P_BOOK_TYPE_CODE": book_type_code,
-        "P_ASSET_NUMBER": asset_number,
-    })
+    raw, pl = client.process_transaction(
+        "getAssetInformation",
+        {
+            "P_BOOK_TYPE_CODE": book_type_code,
+            "P_ASSET_NUMBER": asset_number,
+        },
+    )
     status = str(pl.get("X_RETURN_STATUS") or "").strip()
     if status and status != "S":
         raise FusionApiError(f"getAssetInformation failed (status={status}): {pl}")
@@ -120,7 +128,9 @@ def build_same_book_transfer_params(
             return list(source)
         if isinstance(v, list):
             if len(v) != n:
-                raise ValidationError(f"Override list {key} length {len(v)} does not match distributions {n}")
+                raise ValidationError(
+                    f"Override list {key} length {len(v)} does not match distributions {n}"
+                )
             return [str(x) for x in v]
         return [str(v)] * n
 
@@ -129,7 +139,11 @@ def build_same_book_transfer_params(
     dest_assigned = _expand_override("assigned_to", state.assigned_to)
 
     # NOOP detection: if no destination values changed, do not post transfer.
-    if dest_location == state.location_ccids and dest_expense == state.expense_ccids and dest_assigned == state.assigned_to:
+    if (
+        dest_location == state.location_ccids
+        and dest_expense == state.expense_ccids
+        and dest_assigned == state.assigned_to
+    ):
         return {}, True
 
     dist_tbl: List[str] = []
@@ -307,7 +321,9 @@ def build_book_transfer_params(
             return list(source)
         if isinstance(v, list):
             if len(v) != n:
-                raise ValidationError(f"Override list {key} length {len(v)} does not match distributions {n}")
+                raise ValidationError(
+                    f"Override list {key} length {len(v)} does not match distributions {n}"
+                )
             return [str(x) for x in v]
         return [str(v)] * n
 
@@ -351,7 +367,9 @@ def build_book_transfer_params(
         "P_DEST_BOOK_TYPE_CODE": dest_book_type_code,
         "P_BOOK_TRANSFER_TYPE_CODE": book_transfer_type_code,
         "P_COST_BASIS_CODE": cost_basis_code,
-        "P_USE_DEST_CAT_DEPRN_RULES_FLAG": overrides.get("use_dest_cat_deprn_rules_flag", "Y"),
+        "P_USE_DEST_CAT_DEPRN_RULES_FLAG": overrides.get(
+            "use_dest_cat_deprn_rules_flag", "Y"
+        ),
         "P_USE_XFR_DATE_AS_DPIS_FLAG": overrides.get("use_xfr_date_as_dpis_flag", "N"),
         "P_COPY_DFF_FLAG": overrides.get("copy_dff_flag", "Y"),
         "P_COPY_ASSET_KEY_FLAG": overrides.get("copy_asset_key_flag", "Y"),
@@ -398,7 +416,9 @@ def build_add_asset_params(
             return list(source)
         if isinstance(v, list):
             if len(v) != n:
-                raise ValidationError(f"Override list {key} length {len(v)} does not match distributions {n}")
+                raise ValidationError(
+                    f"Override list {key} length {len(v)} does not match distributions {n}"
+                )
             return [str(x) for x in v]
         return [str(v)] * n
 
@@ -406,7 +426,9 @@ def build_add_asset_params(
     dest_expense = _expand_override("expense_ccid", state.expense_ccids)
     dest_assigned = _expand_override("assigned_to", state.assigned_to)
 
-    dist_ids = [str(i + 1) for i in range(n)]  # For new assets, use sequence numbers (not source distribution ids).
+    dist_ids = [
+        str(i + 1) for i in range(n)
+    ]  # For new assets, use sequence numbers (not source distribution ids).
     units = list(state.units_assigned)
     txn_units = list(state.units_assigned)
 

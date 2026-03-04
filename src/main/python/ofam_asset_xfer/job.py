@@ -3,10 +3,9 @@ from __future__ import annotations
 import json
 import logging
 import time
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
-from .exceptions import ConfigError, FusionApiError, ValidationError
+from .exceptions import ConfigError, FusionApiError
 from .oracle_client import OracleConfig, OracleErpIntegrationsClient
 from .store import ArtifactStore
 from .fusion_ops import (
@@ -39,7 +38,9 @@ def _validate_request(req: Dict[str, Any]) -> None:
     if not req.get("request_id"):
         raise ConfigError("Each request must include request_id.")
     if not isinstance(req.get("source"), dict):
-        raise ConfigError("Each request must include source {book_type_code, asset_number}.")
+        raise ConfigError(
+            "Each request must include source {book_type_code, asset_number}."
+        )
     src = req["source"]
     if not src.get("book_type_code") or not src.get("asset_number"):
         raise ConfigError("source.book_type_code and source.asset_number are required.")
@@ -47,11 +48,17 @@ def _validate_request(req: Dict[str, Any]) -> None:
     if t not in ("SAME_BOOK", "XBOOK"):
         raise ConfigError("transfer_type must be SAME_BOOK or XBOOK.")
     if t == "XBOOK":
-        if not isinstance(req.get("target"), dict) and not isinstance(req.get("xbook"), dict):
-            raise ConfigError("XBOOK requires either target{book_type_code,...} or xbook{...} configuration.")
+        if not isinstance(req.get("target"), dict) and not isinstance(
+            req.get("xbook"), dict
+        ):
+            raise ConfigError(
+                "XBOOK requires either target{book_type_code,...} or xbook{...} configuration."
+            )
 
 
-def run_job(config_uri: str, out_dir_uri: str, cli_execute: Optional[bool] = None) -> None:
+def run_job(
+    config_uri: str, out_dir_uri: str, cli_execute: Optional[bool] = None
+) -> None:
     config = _load_config(config_uri)
     store = ArtifactStore(base_uri=out_dir_uri)
     store.ensure_dir()
@@ -69,7 +76,14 @@ def run_job(config_uri: str, out_dir_uri: str, cli_execute: Optional[bool] = Non
         raise ConfigError("Config must include non-empty 'requests' list.")
 
     results: List[Dict[str, Any]] = []
-    summary = {"total": 0, "success": 0, "failed": 0, "noop": 0, "dry_run": (not execute), "started_ts": int(time.time())}
+    summary = {
+        "total": 0,
+        "success": 0,
+        "failed": 0,
+        "noop": 0,
+        "dry_run": (not execute),
+        "started_ts": int(time.time()),
+    }
 
     for req in requests:
         summary["total"] += 1
@@ -85,11 +99,15 @@ def run_job(config_uri: str, out_dir_uri: str, cli_execute: Optional[bool] = Non
                 summary["failed"] += 1
         except Exception as e:
             log.exception("Unhandled exception processing request")
-            rid = req.get("request_id", "UNKNOWN") if isinstance(req, dict) else "UNKNOWN"
+            rid = (
+                req.get("request_id", "UNKNOWN") if isinstance(req, dict) else "UNKNOWN"
+            )
             err = {"request_id": rid, "status": "FAILED", "error": str(e)}
             results.append(err)
             summary["failed"] += 1
-            store.write_json(f"exceptions/{rid}.json", {"request": req, "error": str(e)})
+            store.write_json(
+                f"exceptions/{rid}.json", {"request": req, "error": str(e)}
+            )
 
     summary["finished_ts"] = int(time.time())
     store.write_json("summary.json", summary)
@@ -112,12 +130,19 @@ def _process_one(
 
     # Always pre-read source asset state.
     raw_get, pl_get, state = get_asset_information(client, src_book, src_asset_number)
-    store.write_json(f"audit/{request_id}.getAssetInformation.request.json", {"P_BOOK_TYPE_CODE": src_book, "P_ASSET_NUMBER": src_asset_number})
+    store.write_json(
+        f"audit/{request_id}.getAssetInformation.request.json",
+        {"P_BOOK_TYPE_CODE": src_book, "P_ASSET_NUMBER": src_asset_number},
+    )
     store.write_json(f"audit/{request_id}.getAssetInformation.response.json", raw_get)
 
     context = {
         "request": req,
-        "source": {"book_type_code": src_book, "asset_number": src_asset_number, "asset_id": state.asset_id},
+        "source": {
+            "book_type_code": src_book,
+            "asset_number": src_asset_number,
+            "asset_id": state.asset_id,
+        },
         "asset": {
             "asset_id": state.asset_id,
             "asset_number": state.asset_number,
@@ -139,7 +164,9 @@ def _process_one(
             company_segment_key = str(overrides.get("company_segment_key", "Segment1"))
             log.info(
                 "[%s] Option B: target_company=%s, company_segment_key=%s",
-                request_id, target_company, company_segment_key,
+                request_id,
+                target_company,
+                company_segment_key,
             )
             params, is_noop = build_same_book_transfer_params_option_b(
                 client=client,
@@ -168,7 +195,13 @@ def _process_one(
                 "book_type_code": state.book_type_code,
             }
 
-        store.write_json(f"audit/{request_id}.transferAsset.request.json", {"OperationName": "processTransaction-transferAsset", "ParameterList_params": params})
+        store.write_json(
+            f"audit/{request_id}.transferAsset.request.json",
+            {
+                "OperationName": "processTransaction-transferAsset",
+                "ParameterList_params": params,
+            },
+        )
         if not execute:
             return {
                 "request_id": request_id,
@@ -185,7 +218,9 @@ def _process_one(
         raw_txn, pl_txn = client.process_transaction("transferAsset", params)
         store.write_json(f"audit/{request_id}.transferAsset.response.json", raw_txn)
 
-        return _result_from_fusion_response(request_id, transfer_type, state, "transferAsset", pl_txn)
+        return _result_from_fusion_response(
+            request_id, transfer_type, state, "transferAsset", pl_txn
+        )
 
     # XBOOK
     xbook = req.get("xbook") if isinstance(req.get("xbook"), dict) else None
@@ -204,7 +239,11 @@ def _process_one(
                 if xk not in ("strategy", "handle", "parameters_template"):
                     overrides.setdefault(xk, xv)
 
-        handle = str(xbook.get("handle") or "transferAsset").strip() if xbook else "transferAsset"
+        handle = (
+            str(xbook.get("handle") or "transferAsset").strip()
+            if xbook
+            else "transferAsset"
+        )
 
         # If a parameters_template is provided, use template rendering (legacy native path).
         tmpl = xbook.get("parameters_template") if xbook else None
@@ -220,7 +259,10 @@ def _process_one(
                 request_id=request_id,
             )
 
-        store.write_json(f"audit/{request_id}.xbook.native.request.json", {"handle": handle, "params": params})
+        store.write_json(
+            f"audit/{request_id}.xbook.native.request.json",
+            {"handle": handle, "params": params},
+        )
         if not execute:
             return {
                 "request_id": request_id,
@@ -236,7 +278,9 @@ def _process_one(
 
         raw_txn, pl_txn = client.process_transaction(handle, params)
         store.write_json(f"audit/{request_id}.xbook.native.response.json", raw_txn)
-        return _result_from_fusion_response(request_id, transfer_type, state, handle, pl_txn)
+        return _result_from_fusion_response(
+            request_id, transfer_type, state, handle, pl_txn
+        )
 
     # Strategy 2: orchestration fallback (addAsset in target book + retireAsset in source book)
     target = req.get("target")
@@ -259,10 +303,24 @@ def _process_one(
         overrides=overrides,
         request_id=request_id,
     )
-    store.write_json(f"audit/{request_id}.addAsset.request.json", {"OperationName": "processTransaction-addAsset", "ParameterList_params": add_params})
+    store.write_json(
+        f"audit/{request_id}.addAsset.request.json",
+        {
+            "OperationName": "processTransaction-addAsset",
+            "ParameterList_params": add_params,
+        },
+    )
 
-    retire_params = build_retire_asset_params(state=state, effective_date=effective_date, request_id=request_id)
-    store.write_json(f"audit/{request_id}.retireAsset.request.json", {"OperationName": "processTransaction-retireAsset", "ParameterList_params": retire_params})
+    retire_params = build_retire_asset_params(
+        state=state, effective_date=effective_date, request_id=request_id
+    )
+    store.write_json(
+        f"audit/{request_id}.retireAsset.request.json",
+        {
+            "OperationName": "processTransaction-retireAsset",
+            "ParameterList_params": retire_params,
+        },
+    )
 
     if not execute:
         return {
@@ -285,7 +343,9 @@ def _process_one(
     # If addAsset fails, do not retire source.
     add_status = str(pl_add.get("X_RETURN_STATUS") or "").strip()
     if add_status and add_status != "S":
-        raise FusionApiError(f"addAsset failed; not retiring source. Response: {pl_add}")
+        raise FusionApiError(
+            f"addAsset failed; not retiring source. Response: {pl_add}"
+        )
 
     raw_ret, pl_ret = client.process_transaction("retireAsset", retire_params)
     store.write_json(f"audit/{request_id}.retireAsset.response.json", raw_ret)
@@ -294,7 +354,9 @@ def _process_one(
     return {
         "request_id": request_id,
         "transfer_type": transfer_type,
-        "status": "SUCCESS" if str(pl_ret.get("X_RETURN_STATUS") or "") == "S" else "FAILED",
+        "status": "SUCCESS"
+        if str(pl_ret.get("X_RETURN_STATUS") or "") == "S"
+        else "FAILED",
         "mode": "orchestrated_add_retire",
         "source_asset_id": state.asset_id,
         "source_asset_number": state.asset_number,
@@ -307,7 +369,16 @@ def _process_one(
 
 
 def _compact_pl(pl: Dict[str, Any]) -> Dict[str, Any]:
-    keys = ["X_RETURN_STATUS", "X_EVENT_ID", "X_TRANSACTION_HEADER_ID", "X_D_TRANSACTION_HEADER_ID", "X_RETIREMENT_ID", "X_MSG_COUNT", "X_MSG_DATA", "PX_ASSET_NUMBER"]
+    keys = [
+        "X_RETURN_STATUS",
+        "X_EVENT_ID",
+        "X_TRANSACTION_HEADER_ID",
+        "X_D_TRANSACTION_HEADER_ID",
+        "X_RETIREMENT_ID",
+        "X_MSG_COUNT",
+        "X_MSG_DATA",
+        "PX_ASSET_NUMBER",
+    ]
     return {k: pl.get(k) for k in keys if k in pl}
 
 
@@ -335,5 +406,7 @@ def _result_from_fusion_response(
     # Per Oracle guidance, X_RETURN_STATUS can be F even when X_EVENT_ID exists;
     # treat as failure but preserve identifiers for investigation.
     out["status"] = "FAILED"
-    out["message"] = "Fusion returned non-success X_RETURN_STATUS; see fusion payload for details."
+    out["message"] = (
+        "Fusion returned non-success X_RETURN_STATUS; see fusion payload for details."
+    )
     return out

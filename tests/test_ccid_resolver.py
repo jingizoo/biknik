@@ -2,6 +2,7 @@
 
 All tests use a mock REST client — no network calls.
 """
+
 from __future__ import annotations
 
 import pytest
@@ -19,6 +20,7 @@ from ofam_asset_xfer.exceptions import FusionApiError, ValidationError
 # ---------------------------------------------------------------------------
 # Fixtures / helpers
 # ---------------------------------------------------------------------------
+
 
 def _mock_client(get_resource_side_effect=None, get_resource_return=None):
     client = MagicMock()
@@ -58,6 +60,7 @@ SAMPLE_TARGET_ROW = {
 # ===================================================================
 # get_ccid_details
 # ===================================================================
+
 
 class TestGetCcidDetails:
     def test_success(self):
@@ -111,6 +114,7 @@ class TestGetCcidDetails:
 # build_target_segments
 # ===================================================================
 
+
 class TestBuildTargetSegments:
     def test_replaces_company_segment(self):
         src = {"Segment1": "101", "Segment2": "100", "Segment3": "7710"}
@@ -144,15 +148,23 @@ class TestBuildTargetSegments:
 # lookup_ccid_by_segments
 # ===================================================================
 
+
 class TestLookupCcidBySegments:
     def test_exact_match(self):
         client = _mock_client(get_resource_return={"items": [SAMPLE_TARGET_ROW]})
 
         target_segments = {
-            "Segment1": "US01", "Segment2": "100", "Segment3": "7710",
-            "Segment4": "0000", "Segment5": "000", "Segment6": "000", "Segment7": "000",
+            "Segment1": "US01",
+            "Segment2": "100",
+            "Segment3": "7710",
+            "Segment4": "0000",
+            "Segment5": "000",
+            "Segment6": "000",
+            "Segment7": "000",
         }
-        result = lookup_ccid_by_segments(client, target_segments, chart_of_accounts_id=50388)
+        result = lookup_ccid_by_segments(
+            client, target_segments, chart_of_accounts_id=50388
+        )
 
         assert result == 789012
 
@@ -162,7 +174,15 @@ class TestLookupCcidBySegments:
         # Segments should be numerically sorted in q filter
         assert actual_params["q"].startswith("Segment1=US01;Segment2=100;Segment3=7710")
         # fields should include segment fields for exact-match verification
-        for seg in ["Segment1", "Segment2", "Segment3", "Segment4", "Segment5", "Segment6", "Segment7"]:
+        for seg in [
+            "Segment1",
+            "Segment2",
+            "Segment3",
+            "Segment4",
+            "Segment5",
+            "Segment6",
+            "Segment7",
+        ]:
             assert seg in actual_params["fields"]
 
     def test_no_match_raises(self):
@@ -173,9 +193,13 @@ class TestLookupCcidBySegments:
 
     def test_no_coa_id(self):
         """When coa_id is None, it should not be in the q filter."""
-        client = _mock_client(get_resource_return={"items": [{"CodeCombinationId": 42}]})
+        client = _mock_client(
+            get_resource_return={"items": [{"CodeCombinationId": 42}]}
+        )
 
-        result = lookup_ccid_by_segments(client, {"Segment1": "US01"}, chart_of_accounts_id=None)
+        result = lookup_ccid_by_segments(
+            client, {"Segment1": "US01"}, chart_of_accounts_id=None
+        )
 
         assert result == 42
         actual_params = client.get_resource.call_args[0][1]
@@ -187,13 +211,16 @@ class TestLookupCcidBySegments:
         right_row = {"CodeCombinationId": 222, "Segment1": "US01", "Segment2": "100"}
         client = _mock_client(get_resource_return={"items": [wrong_row, right_row]})
 
-        result = lookup_ccid_by_segments(client, {"Segment1": "US01", "Segment2": "100"})
+        result = lookup_ccid_by_segments(
+            client, {"Segment1": "US01", "Segment2": "100"}
+        )
         assert result == 222
 
 
 # ===================================================================
 # resolve_target_expense_ccid (end-to-end)
 # ===================================================================
+
 
 class TestResolveTargetExpenseCcid:
     def test_success_end_to_end(self):
@@ -212,7 +239,10 @@ class TestResolveTargetExpenseCcid:
         client = _mock_client(get_resource_side_effect=mock_get_resource)
 
         target_ccid = resolve_target_expense_ccid(
-            client, src_expense_ccid=626955, target_company="US01", company_segment_key="Segment1",
+            client,
+            src_expense_ccid=626955,
+            target_company="US01",
+            company_segment_key="Segment1",
         )
 
         assert target_ccid == 789012
@@ -231,7 +261,10 @@ class TestResolveTargetExpenseCcid:
 
         with pytest.raises(ValidationError, match="equals source"):
             resolve_target_expense_ccid(
-                client, src_expense_ccid=626955, target_company="101", company_segment_key="Segment1",
+                client,
+                src_expense_ccid=626955,
+                target_company="101",
+                company_segment_key="Segment1",
             )
 
     def test_missing_segment_key_raises(self):
@@ -240,5 +273,8 @@ class TestResolveTargetExpenseCcid:
 
         with pytest.raises(ValidationError, match="not found"):
             resolve_target_expense_ccid(
-                client, src_expense_ccid=626955, target_company="US01", company_segment_key="Segment99",
+                client,
+                src_expense_ccid=626955,
+                target_company="US01",
+                company_segment_key="Segment99",
             )

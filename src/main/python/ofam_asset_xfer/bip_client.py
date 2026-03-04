@@ -12,6 +12,7 @@ Usage:
     rows = client.run_report(params={"P_BOOK_TYPE_CODE": "US CORP BOOK"})
     # rows = [{"ASSET_NUMBER": "142847", "BOOK_TYPE_CODE": "US CORP BOOK", ...}, ...]
 """
+
 from __future__ import annotations
 
 import base64
@@ -37,9 +38,9 @@ _PUB_NS = "http://xmlns.oracle.com/oxp/service/PublicReportService"
 class BIPConfig:
     """Configuration for BI Publisher SOAP client."""
 
-    base_url: str           # e.g. https://fa-host.oraclecloud.com
-    bearer_token: str       # same Fusion JWT / Bearer token
-    report_path: str        # e.g. /Custom/Integrations/Outbound/FA/AssetTransferDFF.xdo
+    base_url: str  # e.g. https://fa-host.oraclecloud.com
+    bearer_token: str  # same Fusion JWT / Bearer token
+    report_path: str  # e.g. /Custom/Integrations/Outbound/FA/AssetTransferDFF.xdo
     verify_ssl: bool = True
     timeout_seconds: int = 120
 
@@ -56,7 +57,9 @@ class BIPConfig:
         if not base_url:
             raise ValueError("bip.base_url is required")
         if not bearer_token:
-            raise ValueError("bip.bearer_token is required (bearer_token or bearer_token_env)")
+            raise ValueError(
+                "bip.bearer_token is required (bearer_token or bearer_token_env)"
+            )
         if not report_path:
             raise ValueError("bip.report_path is required")
 
@@ -75,10 +78,12 @@ class BIPClient:
     def __init__(self, cfg: BIPConfig):
         self.cfg = cfg
         self._session = requests.Session()
-        self._session.headers.update({
-            "Authorization": f"Bearer {cfg.bearer_token}",
-            "Content-Type": "application/soap+xml; charset=utf-8",
-        })
+        self._session.headers.update(
+            {
+                "Authorization": f"Bearer {cfg.bearer_token}",
+                "Content-Type": "application/soap+xml; charset=utf-8",
+            }
+        )
 
     def _endpoint(self) -> str:
         return f"{self.cfg.base_url}/xmlpserver/services/ExternalReportWSSService"
@@ -153,9 +158,7 @@ class BIPClient:
         )
 
         if resp.status_code >= 400:
-            raise FusionApiError(
-                f"BIP SOAP HTTP {resp.status_code}: {resp.text[:500]}"
-            )
+            raise FusionApiError(f"BIP SOAP HTTP {resp.status_code}: {resp.text[:500]}")
 
         return self._extract_report_bytes(resp.content)
 
@@ -170,9 +173,7 @@ class BIPClient:
             if local == "reportBytes" and elem.text:
                 return base64.b64decode(elem.text)
 
-        raise FusionApiError(
-            "No reportBytes found in BIP SOAP response"
-        )
+        raise FusionApiError("No reportBytes found in BIP SOAP response")
 
     @staticmethod
     def _parse_data_ds(data: bytes) -> List[Dict[str, str]]:

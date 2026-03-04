@@ -16,6 +16,7 @@ Architecture:
   5. If mismatch → pending transfer (cross-book)
   6. Execute via processTransaction-transferAsset
 """
+
 from __future__ import annotations
 
 import logging
@@ -26,11 +27,10 @@ from typing import Any, Dict, List, Optional
 
 from .bip_client import BIPClient
 from .entity_resolver import EntityBookResolver
-from .exceptions import FusionApiError, OFAMAssetXferError, ValidationError
+from .exceptions import FusionApiError, ValidationError
 from .fusion_ops import (
     AssetState,
     build_book_transfer_params,
-    build_same_book_transfer_params,
     get_asset_information,
 )
 from .oracle_client import OracleErpIntegrationsClient
@@ -48,6 +48,7 @@ class DFFConfig:
     The column names depend on the SQL aliases used in the BIP report
     data model.  Override these if your report uses different names.
     """
+
     # Asset identity columns in the BIP report
     asset_number_col: str = "ASSET_NUMBER"
     book_type_code_col: str = "BOOK_TYPE_CODE"
@@ -71,18 +72,18 @@ class PendingTransfer:
     # FA identity
     asset_id: str
     asset_number: str
-    book_type_code: str           # current book
+    book_type_code: str  # current book
     description: Optional[str]
     tag_number: Optional[str]
     cost: Optional[str]
 
     # From DFF
-    transfer_date: str            # effective date from DFF
-    transfer_to_entity: str       # destination entity from DFF
+    transfer_date: str  # effective date from DFF
+    transfer_to_entity: str  # destination entity from DFF
     transfer_to_location: Optional[str]  # optional location hint from DFF
 
     # Resolved
-    target_book_type_code: str    # resolved from entity
+    target_book_type_code: str  # resolved from entity
 
     # Cached state for transfer execution
     fa_state: Optional[AssetState] = field(default=None, repr=False)
@@ -93,7 +94,7 @@ class TransferResult:
     """Result of a single IU transfer operation."""
 
     asset_number: str
-    status: str                   # TRANSFERRED, NOOP, DRY_RUN, FAILED
+    status: str  # TRANSFERRED, NOOP, DRY_RUN, FAILED
     source_book: Optional[str] = None
     target_book: Optional[str] = None
     transfer_to_entity: Optional[str] = None
@@ -219,11 +220,17 @@ class FusionIUSync:
         # --- Call getAssetInformation to get full state ---
         try:
             _raw, _pl, state = get_asset_information(
-                self._client, book_type_code, asset_number,
+                self._client,
+                book_type_code,
+                asset_number,
             )
         except FusionApiError as e:
-            log.warning("getAssetInformation failed for asset=%s book=%s: %s",
-                        asset_number, book_type_code, e)
+            log.warning(
+                "getAssetInformation failed for asset=%s book=%s: %s",
+                asset_number,
+                book_type_code,
+                e,
+            )
             return None
 
         return PendingTransfer(
@@ -284,7 +291,11 @@ class FusionIUSync:
 
         try:
             return self._execute_cross_book(
-                pending, state, request_id, effective_date, dry_run,
+                pending,
+                state,
+                request_id,
+                effective_date,
+                dry_run,
             )
         except Exception as e:
             log.exception("Transfer failed for asset=%s", pending.asset_number)
@@ -328,7 +339,9 @@ class FusionIUSync:
         )
 
         if dry_run:
-            log.info("DRY-RUN: IU transfer payload built for asset=%s", pending.asset_number)
+            log.info(
+                "DRY-RUN: IU transfer payload built for asset=%s", pending.asset_number
+            )
             return TransferResult(
                 asset_number=pending.asset_number,
                 status="DRY_RUN",
@@ -350,7 +363,9 @@ class FusionIUSync:
             transfer_to_entity=pending.transfer_to_entity,
             transfer_date=effective_date,
             fusion_response=pl,
-            error=None if status_code == "S" else f"Fusion X_RETURN_STATUS={status_code}",
+            error=None
+            if status_code == "S"
+            else f"Fusion X_RETURN_STATUS={status_code}",
         )
 
     # ------------------------------------------------------------------
@@ -372,11 +387,14 @@ class FusionIUSync:
 
         log.info(
             "=== Fusion IU Sync started (books=%s, dry_run=%s) ===",
-            books, dry_run,
+            books,
+            dry_run,
         )
 
         pending_list = self.find_pending_transfers(
-            books=books, limit=max_transfers, bip_params=bip_params,
+            books=books,
+            limit=max_transfers,
+            bip_params=bip_params,
         )
 
         results: List[Dict[str, Any]] = []
@@ -389,15 +407,17 @@ class FusionIUSync:
 
         for pt in pending_list:
             result = self.execute_transfer(pt, dry_run=dry_run)
-            results.append({
-                "asset_number": result.asset_number,
-                "status": result.status,
-                "source_book": result.source_book,
-                "target_book": result.target_book,
-                "transfer_to_entity": result.transfer_to_entity,
-                "transfer_date": result.transfer_date,
-                "error": result.error,
-            })
+            results.append(
+                {
+                    "asset_number": result.asset_number,
+                    "status": result.status,
+                    "source_book": result.source_book,
+                    "target_book": result.target_book,
+                    "transfer_to_entity": result.transfer_to_entity,
+                    "transfer_date": result.transfer_date,
+                    "error": result.error,
+                }
+            )
             status_key = result.status.lower()
             if status_key in counts:
                 counts[status_key] += 1

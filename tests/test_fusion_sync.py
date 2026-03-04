@@ -2,20 +2,19 @@
 
 All tests use mock clients — no network calls.
 """
+
 from __future__ import annotations
 
-import pytest
 from unittest.mock import MagicMock
 
 from ofam_asset_xfer.fusion_sync import (
     FusionIUSync,
     DFFConfig,
     PendingTransfer,
-    TransferResult,
 )
 from ofam_asset_xfer.entity_resolver import EntityBookResolver
 from ofam_asset_xfer.fusion_ops import AssetState
-from ofam_asset_xfer.exceptions import FusionApiError, ValidationError
+from ofam_asset_xfer.exceptions import FusionApiError
 
 
 # ---------------------------------------------------------------------------
@@ -124,17 +123,21 @@ def _make_pending(state=None, book="US CORP BOOK", target="UK CORP BOOK"):
 # FusionIUSync.find_pending_transfers
 # ===================================================================
 
+
 class TestFindPendingTransfers:
     def test_detects_pending_transfer(self):
         """Asset in US book with DFF entity=UK → pending cross-book."""
         fusion = _mock_fusion()
         bip = _mock_bip()
-        bip.run_report.return_value = [_bip_row(book="US CORP BOOK", dff_entity="UK Entity")]
+        bip.run_report.return_value = [
+            _bip_row(book="US CORP BOOK", dff_entity="UK Entity")
+        ]
         fusion.process_transaction.return_value = _get_asset_info_response()
 
         sync = FusionIUSync(fusion, _resolver(), bip)
         pending = sync.find_pending_transfers(
-            books=["US CORP BOOK", "UK CORP BOOK"], limit=10,
+            books=["US CORP BOOK", "UK CORP BOOK"],
+            limit=10,
         )
 
         assert len(pending) == 1
@@ -165,7 +168,9 @@ class TestFindPendingTransfers:
         """Asset already in US book and entity resolves to US → skip."""
         fusion = _mock_fusion()
         bip = _mock_bip()
-        bip.run_report.return_value = [_bip_row(book="US CORP BOOK", dff_entity="US Entity")]
+        bip.run_report.return_value = [
+            _bip_row(book="US CORP BOOK", dff_entity="US Entity")
+        ]
 
         sync = FusionIUSync(fusion, _resolver(), bip)
         pending = sync.find_pending_transfers(books=["US CORP BOOK"], limit=10)
@@ -200,11 +205,14 @@ class TestFindPendingTransfers:
         """Asset in JP book but JP not in search books → skip."""
         fusion = _mock_fusion()
         bip = _mock_bip()
-        bip.run_report.return_value = [_bip_row(book="JP CORP BOOK", dff_entity="US Entity")]
+        bip.run_report.return_value = [
+            _bip_row(book="JP CORP BOOK", dff_entity="US Entity")
+        ]
 
         sync = FusionIUSync(fusion, _resolver(), bip)
         pending = sync.find_pending_transfers(
-            books=["US CORP BOOK", "UK CORP BOOK"], limit=10,
+            books=["US CORP BOOK", "UK CORP BOOK"],
+            limit=10,
         )
 
         assert len(pending) == 0
@@ -233,13 +241,15 @@ class TestFindPendingTransfers:
         """Should use custom DFF column names from DFFConfig."""
         fusion = _mock_fusion()
         bip = _mock_bip()
-        bip.run_report.return_value = [{
-            "ASSET_NUM": "142847",
-            "BOOK": "US CORP BOOK",
-            "XFER_ENTITY": "UK Entity",
-            "XFER_DATE": "2026-06-01",
-            "XFER_LOC": "",
-        }]
+        bip.run_report.return_value = [
+            {
+                "ASSET_NUM": "142847",
+                "BOOK": "US CORP BOOK",
+                "XFER_ENTITY": "UK Entity",
+                "XFER_DATE": "2026-06-01",
+                "XFER_LOC": "",
+            }
+        ]
         fusion.process_transaction.return_value = _get_asset_info_response()
 
         dff = DFFConfig(
@@ -308,7 +318,8 @@ class TestFindPendingTransfers:
 
         sync = FusionIUSync(fusion, _resolver(), bip)
         sync.find_pending_transfers(
-            books=["US CORP BOOK"], limit=10,
+            books=["US CORP BOOK"],
+            limit=10,
             bip_params={"P_BOOK_TYPE_CODE": "US CORP BOOK"},
         )
 
@@ -320,6 +331,7 @@ class TestFindPendingTransfers:
 # ===================================================================
 # FusionIUSync.execute_transfer
 # ===================================================================
+
 
 class TestExecuteTransfer:
     def test_dry_run(self):
@@ -438,9 +450,12 @@ class TestExecuteTransfer:
         bip = _mock_bip()
         state = _sample_state()
         pt = PendingTransfer(
-            asset_id="100", asset_number="142847",
-            book_type_code="US CORP BOOK", description="Test",
-            tag_number="142847", cost="36129.54",
+            asset_id="100",
+            asset_number="142847",
+            book_type_code="US CORP BOOK",
+            description="Test",
+            tag_number="142847",
+            cost="36129.54",
             transfer_date="2026-06-15",
             transfer_to_entity="UK Entity",
             transfer_to_location=None,
@@ -467,9 +482,12 @@ class TestExecuteTransfer:
         bip = _mock_bip()
         state = _sample_state()
         pt = PendingTransfer(
-            asset_id="100", asset_number="142847",
-            book_type_code="US CORP BOOK", description="Test",
-            tag_number="142847", cost="36129.54",
+            asset_id="100",
+            asset_number="142847",
+            book_type_code="US CORP BOOK",
+            description="Test",
+            tag_number="142847",
+            cost="36129.54",
             transfer_date="2026-03-01",
             transfer_to_entity="UK Entity",
             transfer_to_location="555555",
@@ -494,6 +512,7 @@ class TestExecuteTransfer:
 # ===================================================================
 # FusionIUSync.run_full_sync
 # ===================================================================
+
 
 class TestRunFullSync:
     def test_dry_run_summary(self):

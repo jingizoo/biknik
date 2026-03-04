@@ -1,9 +1,8 @@
 """Unit tests for ofam_asset_xfer.entity_resolver."""
+
 from __future__ import annotations
 
 import json
-import os
-import tempfile
 
 import pytest
 
@@ -14,6 +13,7 @@ from ofam_asset_xfer.exceptions import ValidationError
 # ---------------------------------------------------------------------------
 # Construction
 # ---------------------------------------------------------------------------
+
 
 class TestConstruction:
     def test_basic(self):
@@ -33,9 +33,12 @@ class TestConstruction:
 # resolve_target_book
 # ---------------------------------------------------------------------------
 
+
 class TestResolveTargetBook:
     def test_exact_match(self):
-        r = EntityBookResolver({"US Entity": "US CORP BOOK", "UK Entity": "UK CORP BOOK"})
+        r = EntityBookResolver(
+            {"US Entity": "US CORP BOOK", "UK Entity": "UK CORP BOOK"}
+        )
         assert r.resolve_target_book("US Entity") == "US CORP BOOK"
 
     def test_case_insensitive(self):
@@ -49,7 +52,9 @@ class TestResolveTargetBook:
 
     def test_unknown_entity_raises(self):
         r = EntityBookResolver({"US Entity": "US CORP BOOK"})
-        with pytest.raises(ValidationError, match="No book mapping for entity 'JP Entity'"):
+        with pytest.raises(
+            ValidationError, match="No book mapping for entity 'JP Entity'"
+        ):
             r.resolve_target_book("JP Entity")
 
     def test_empty_entity_raises(self):
@@ -67,6 +72,7 @@ class TestResolveTargetBook:
 # entity_book_map property
 # ---------------------------------------------------------------------------
 
+
 class TestEntityBookMap:
     def test_returns_copy(self):
         r = EntityBookResolver({"US Entity": "US CORP BOOK"})
@@ -79,10 +85,13 @@ class TestEntityBookMap:
 # from_json_file
 # ---------------------------------------------------------------------------
 
+
 class TestFromJsonFile:
     def test_loads_from_file(self, tmp_path):
         p = tmp_path / "map.json"
-        p.write_text(json.dumps({"US Entity": "US CORP BOOK", "UK Entity": "UK CORP BOOK"}))
+        p.write_text(
+            json.dumps({"US Entity": "US CORP BOOK", "UK Entity": "UK CORP BOOK"})
+        )
 
         r = EntityBookResolver.from_json_file(str(p))
         assert r.resolve_target_book("US Entity") == "US CORP BOOK"
@@ -99,6 +108,7 @@ class TestFromJsonFile:
 # ---------------------------------------------------------------------------
 # from_config
 # ---------------------------------------------------------------------------
+
 
 class TestFromConfig:
     def test_inline_map(self):

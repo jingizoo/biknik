@@ -5,8 +5,6 @@ import logging
 import os
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
-from urllib.parse import urljoin
-
 import requests
 
 from .exceptions import FusionApiError
@@ -39,7 +37,9 @@ class OracleConfig:
             bearer_token = os.getenv(str(bearer_token_env), bearer_token)
 
         if not bearer_token:
-            raise ValueError("Oracle bearer_token is required (bearer_token or bearer_token_env).")
+            raise ValueError(
+                "Oracle bearer_token is required (bearer_token or bearer_token_env)."
+            )
 
         return OracleConfig(
             base_url=base_url,
@@ -56,12 +56,14 @@ class OracleErpIntegrationsClient:
     def __init__(self, cfg: OracleConfig):
         self.cfg = cfg
         self._session = requests.Session()
-        self._session.headers.update({
-            "Authorization": f"Bearer {cfg.bearer_token}",
-            "Content-Type": "application/vnd.oracle.adf.resourceitem+json",
-            "REST-header-version": "4",
-            "ACCEPT": "application/json",
-        })
+        self._session.headers.update(
+            {
+                "Authorization": f"Bearer {cfg.bearer_token}",
+                "Content-Type": "application/vnd.oracle.adf.resourceitem+json",
+                "REST-header-version": "4",
+                "ACCEPT": "application/json",
+            }
+        )
 
     def _endpoint(self, handle: str) -> str:
         # Example from doc: /fscmRestApi/resources/11.13.18.05/erpintegrations/processTransaction-transferAsset
@@ -72,7 +74,9 @@ class OracleErpIntegrationsClient:
         rel = f"/fscmRestApi/resources/{self.cfg.api_version}/{resource_path}"
         return self.cfg.base_url + rel
 
-    def process_transaction(self, handle: str, params: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    def process_transaction(
+        self, handle: str, params: Dict[str, Any]
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         """POST processTransaction-<handle>.
 
         Returns:
@@ -96,7 +100,9 @@ class OracleErpIntegrationsClient:
         try:
             raw = r.json()
         except Exception as e:
-            raise FusionApiError(f"Non-JSON response from Fusion (status={r.status_code}): {r.text[:500]}") from e
+            raise FusionApiError(
+                f"Non-JSON response from Fusion (status={r.status_code}): {r.text[:500]}"
+            ) from e
 
         if r.status_code >= 400:
             raise FusionApiError(f"Fusion HTTP {r.status_code}: {raw}")
@@ -114,7 +120,9 @@ class OracleErpIntegrationsClient:
 
         return raw, pl
 
-    def get_resource(self, resource_path: str, query_params: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+    def get_resource(
+        self, resource_path: str, query_params: Optional[Dict[str, str]] = None
+    ) -> Dict[str, Any]:
         """GET a Fusion REST resource (e.g. accountCombinationsLOV).
 
         Returns the parsed JSON response body.
@@ -131,7 +139,9 @@ class OracleErpIntegrationsClient:
         try:
             raw = r.json()
         except Exception as e:
-            raise FusionApiError(f"Non-JSON response from Fusion GET (status={r.status_code}): {r.text[:500]}") from e
+            raise FusionApiError(
+                f"Non-JSON response from Fusion GET (status={r.status_code}): {r.text[:500]}"
+            ) from e
 
         if r.status_code >= 400:
             raise FusionApiError(f"Fusion GET HTTP {r.status_code}: {raw}")

@@ -7,6 +7,7 @@ destination CodeCombinationId.
 All HTTP I/O goes through the injected client so this module is unit-testable
 with a mock.
 """
+
 from __future__ import annotations
 
 import logging
@@ -27,7 +28,9 @@ _SEGMENT_RE = re.compile(r"^Segment\d+$")
 # Protocol for the HTTP client (allows mocking in tests)
 # ---------------------------------------------------------------------------
 class _RestClient(Protocol):
-    def get_resource(self, resource_path: str, query_params: Optional[Dict[str, str]] = None) -> Dict[str, Any]: ...
+    def get_resource(
+        self, resource_path: str, query_params: Optional[Dict[str, str]] = None
+    ) -> Dict[str, Any]: ...
 
 
 # ---------------------------------------------------------------------------
@@ -76,7 +79,9 @@ def get_ccid_details(client: _RestClient, ccid: int) -> Dict[str, Any]:
         )
 
     coa_id = row.get("ChartOfAccountsId") or row.get("chartOfAccountsId")
-    concat_segs = row.get("ConcatenatedSegments") or row.get("concatenatedSegments") or ""
+    concat_segs = (
+        row.get("ConcatenatedSegments") or row.get("concatenatedSegments") or ""
+    )
 
     result = {
         "ccid": ccid,
@@ -87,7 +92,10 @@ def get_ccid_details(client: _RestClient, ccid: int) -> Dict[str, Any]:
 
     log.info(
         "get_ccid_details: CCID=%s → coa=%s segments=%s concatenated=%s",
-        ccid, result["chart_of_accounts_id"], segments, concat_segs,
+        ccid,
+        result["chart_of_accounts_id"],
+        segments,
+        concat_segs,
     )
     return result
 
@@ -117,7 +125,9 @@ def build_target_segments(
 
     log.info(
         "build_target_segments: %s changed from '%s' to '%s'  (other segments unchanged)",
-        company_segment_key, old_val, target_company,
+        company_segment_key,
+        old_val,
+        target_company,
     )
     return target
 
@@ -135,6 +145,7 @@ def lookup_ccid_by_segments(
     Uses accountCombinationsLOV with a ``q`` filter.  If no match is found,
     raises a hard error with a clear message about the missing combination.
     """
+
     # Build q= filter:  Segment1='US01';Segment2='100';...
     # Sort segment keys numerically (Segment1, Segment2, ..., Segment10, ...)
     def _seg_sort_key(k: str) -> tuple:
@@ -155,7 +166,9 @@ def lookup_ccid_by_segments(
 
     # Request the segment fields we need for exact-match verification
     segment_fields = ",".join(sorted_keys)
-    fields = f"CodeCombinationId,ConcatenatedSegments,ChartOfAccountsId,{segment_fields}"
+    fields = (
+        f"CodeCombinationId,ConcatenatedSegments,ChartOfAccountsId,{segment_fields}"
+    )
 
     log.info("lookup_ccid_by_segments: q=%s fields=%s", q_filter, fields)
 
@@ -190,7 +203,8 @@ def lookup_ccid_by_segments(
             target_ccid = int(row["CodeCombinationId"])
             log.info(
                 "lookup_ccid_by_segments: found exact match CCID=%s (%s)",
-                target_ccid, row.get("ConcatenatedSegments", ""),
+                target_ccid,
+                row.get("ConcatenatedSegments", ""),
             )
             return target_ccid
 
@@ -199,7 +213,8 @@ def lookup_ccid_by_segments(
     log.warning(
         "lookup_ccid_by_segments: could not verify exact segment match; "
         "using first result CCID=%s. items_count=%d",
-        target_ccid, len(items),
+        target_ccid,
+        len(items),
     )
     return target_ccid
 
@@ -224,7 +239,9 @@ def resolve_target_expense_ccid(
     src_segments = details["segments"]
     coa_id = details["chart_of_accounts_id"]
 
-    target_segments = build_target_segments(src_segments, target_company, company_segment_key)
+    target_segments = build_target_segments(
+        src_segments, target_company, company_segment_key
+    )
 
     target_ccid = lookup_ccid_by_segments(client, target_segments, coa_id)
 
@@ -238,7 +255,9 @@ def resolve_target_expense_ccid(
 
     log.info(
         "resolve_target_expense_ccid: src=%s → target=%s (company %s→%s)",
-        src_expense_ccid, target_ccid,
-        src_segments.get(company_segment_key), target_company,
+        src_expense_ccid,
+        target_ccid,
+        src_segments.get(company_segment_key),
+        target_company,
     )
     return target_ccid

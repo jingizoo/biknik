@@ -2,11 +2,12 @@
 
 All tests use mock HTTP responses — no network calls.
 """
+
 from __future__ import annotations
 
 import base64
 import pytest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 from ofam_asset_xfer.bip_client import BIPClient, BIPConfig, _xml_escape
 from ofam_asset_xfer.exceptions import FusionApiError
@@ -15,6 +16,7 @@ from ofam_asset_xfer.exceptions import FusionApiError
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _cfg(**overrides):
     defaults = {
@@ -32,7 +34,9 @@ def _report_xml(*rows):
     for row in rows:
         children = "".join(f"<{k}>{v}</{k}>" for k, v in row.items())
         g1_blocks.append(f"<G_1>{children}</G_1>")
-    return f'<?xml version="1.0" encoding="UTF-8"?><DATA_DS>{"".join(g1_blocks)}</DATA_DS>'
+    return (
+        f'<?xml version="1.0" encoding="UTF-8"?><DATA_DS>{"".join(g1_blocks)}</DATA_DS>'
+    )
 
 
 def _soap_response(report_xml_str: str) -> bytes:
@@ -42,15 +46,15 @@ def _soap_response(report_xml_str: str) -> bytes:
         '<?xml version="1.0" encoding="UTF-8"?>'
         '<env:Envelope xmlns:env="http://www.w3.org/2003/05/soap-envelope"'
         ' xmlns:ns2="http://xmlns.oracle.com/oxp/service/PublicReportService">'
-        '<env:Body>'
-        '<ns2:runReportResponse>'
-        '<ns2:runReportReturn>'
-        f'<ns2:reportBytes>{b64}</ns2:reportBytes>'
-        '<ns2:reportContentType>application/xml</ns2:reportContentType>'
-        '</ns2:runReportReturn>'
-        '</ns2:runReportResponse>'
-        '</env:Body>'
-        '</env:Envelope>'
+        "<env:Body>"
+        "<ns2:runReportResponse>"
+        "<ns2:runReportReturn>"
+        f"<ns2:reportBytes>{b64}</ns2:reportBytes>"
+        "<ns2:reportContentType>application/xml</ns2:reportContentType>"
+        "</ns2:runReportReturn>"
+        "</ns2:runReportResponse>"
+        "</env:Body>"
+        "</env:Envelope>"
     ).encode("utf-8")
 
 
@@ -58,24 +62,29 @@ def _soap_response(report_xml_str: str) -> bytes:
 # BIPConfig
 # ---------------------------------------------------------------------------
 
+
 class TestBIPConfig:
     def test_from_dict(self):
-        cfg = BIPConfig.from_dict({
-            "base_url": "https://host.example.com/",
-            "bearer_token": "tok",
-            "report_path": "/Custom/Report.xdo",
-        })
+        cfg = BIPConfig.from_dict(
+            {
+                "base_url": "https://host.example.com/",
+                "bearer_token": "tok",
+                "report_path": "/Custom/Report.xdo",
+            }
+        )
         assert cfg.base_url == "https://host.example.com"
         assert cfg.bearer_token == "tok"
         assert cfg.report_path == "/Custom/Report.xdo"
 
     def test_from_dict_env_token(self, monkeypatch):
         monkeypatch.setenv("MY_BIP_TOKEN", "env-secret")
-        cfg = BIPConfig.from_dict({
-            "base_url": "https://host.example.com",
-            "bearer_token_env": "MY_BIP_TOKEN",
-            "report_path": "/Custom/Report.xdo",
-        })
+        cfg = BIPConfig.from_dict(
+            {
+                "base_url": "https://host.example.com",
+                "bearer_token_env": "MY_BIP_TOKEN",
+                "report_path": "/Custom/Report.xdo",
+            }
+        )
         assert cfg.bearer_token == "env-secret"
 
     def test_from_dict_missing_url(self):
@@ -95,6 +104,7 @@ class TestBIPConfig:
 # BIPClient._extract_report_bytes
 # ---------------------------------------------------------------------------
 
+
 class TestExtractReportBytes:
     def test_extracts_base64_content(self):
         xml_str = _report_xml({"COL1": "val1"})
@@ -106,8 +116,8 @@ class TestExtractReportBytes:
         empty_soap = (
             b'<env:Envelope xmlns:env="http://www.w3.org/2003/05/soap-envelope">'
             b'<env:Body><ns2:runReportResponse xmlns:ns2="http://xmlns.oracle.com/oxp/service/PublicReportService">'
-            b'<ns2:runReportReturn></ns2:runReportReturn>'
-            b'</ns2:runReportResponse></env:Body></env:Envelope>'
+            b"<ns2:runReportReturn></ns2:runReportReturn>"
+            b"</ns2:runReportResponse></env:Body></env:Envelope>"
         )
         with pytest.raises(FusionApiError, match="No reportBytes"):
             BIPClient._extract_report_bytes(empty_soap)
@@ -116,6 +126,7 @@ class TestExtractReportBytes:
 # ---------------------------------------------------------------------------
 # BIPClient._parse_data_ds
 # ---------------------------------------------------------------------------
+
 
 class TestParseDataDs:
     def test_parses_single_row(self):
@@ -146,11 +157,7 @@ class TestParseDataDs:
         assert rows[0]["EMPTY_COL"] == ""
 
     def test_strips_whitespace(self):
-        xml = (
-            '<DATA_DS><G_1>'
-            '<ASSET_NUMBER>  142847  </ASSET_NUMBER>'
-            '</G_1></DATA_DS>'
-        )
+        xml = "<DATA_DS><G_1><ASSET_NUMBER>  142847  </ASSET_NUMBER></G_1></DATA_DS>"
         rows = BIPClient._parse_data_ds(xml.encode("utf-8"))
         assert rows[0]["ASSET_NUMBER"] == "142847"
 
@@ -164,6 +171,7 @@ class TestParseDataDs:
 # ---------------------------------------------------------------------------
 # BIPClient.run_report (integration with mock HTTP)
 # ---------------------------------------------------------------------------
+
 
 class TestRunReport:
     def test_run_report_success(self):
@@ -216,7 +224,12 @@ class TestRunReport:
 
         client.run_report(report_path="/Custom/Other/Report.xdo")
 
-        call_data = client._session.post.call_args[1].get("data") or client._session.post.call_args[0][1] if len(client._session.post.call_args[0]) > 1 else None
+        call_data = (
+            client._session.post.call_args[1].get("data")
+            or client._session.post.call_args[0][1]
+            if len(client._session.post.call_args[0]) > 1
+            else None
+        )
         if call_data is None:
             call_data = client._session.post.call_args[1]["data"]
         assert b"/Custom/Other/Report.xdo" in call_data
@@ -260,6 +273,7 @@ class TestRunReport:
 # ---------------------------------------------------------------------------
 # _xml_escape
 # ---------------------------------------------------------------------------
+
 
 class TestXmlEscape:
     def test_escapes_ampersand(self):
