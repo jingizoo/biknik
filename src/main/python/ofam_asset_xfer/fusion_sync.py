@@ -2,11 +2,12 @@
 
 Replaces the CMDB-based sync approach.  Instead of querying ServiceNow CMDB
 for asset locations, we read the asset-level Descriptive Flexfields (DFFs)
-from an Oracle BI Publisher report that queries FA_ADDITIONS:
+from an Oracle BI Publisher report (All_IUT_Transfers_Rpt):
 
-  * **Transfer Date**         – ATTRIBUTE_DATE1 – when the IU transfer should happen
-  * **Transfer to Entity**    – ATTRIBUTE9      – the destination legal entity
-  * **Transfer to Location**  – ATTRIBUTE10     – optional location hint
+  * **Book Type Code**        – P_BOOK_TYPE_CODE    – echoed report parameter at root level
+  * **Transfer Date**         – TRANSFER_DATE       – when the IU transfer should happen
+  * **Transfer to Entity**    – TRANSFER_TO_ENTITY   – the destination legal entity
+  * **Transfer to Location**  – TRANSFER_TO_LOCATION – optional location hint
 
 Architecture:
   1. Call BIP report via SOAP to get asset transfer candidates (DFF populated)
@@ -51,12 +52,12 @@ class DFFConfig:
 
     # Asset identity columns in the BIP report
     asset_number_col: str = "ASSET_NUMBER"
-    book_type_code_col: str = "BOOK_TYPE_CODE"
+    book_type_code_col: str = "P_BOOK_TYPE_CODE"
 
-    # FA_ADDITIONS DFF columns
-    transfer_date_col: str = "ATTRIBUTE_DATE1"
-    transfer_to_entity_col: str = "ATTRIBUTE9"
-    transfer_to_location_col: str = "ATTRIBUTE10"
+    # All_IUT_Transfers_Rpt column aliases
+    transfer_date_col: str = "TRANSFER_DATE"
+    transfer_to_entity_col: str = "TRANSFER_TO_ENTITY"
+    transfer_to_location_col: str = "TRANSFER_TO_LOCATION"
 
 
 DEFAULT_DFF_CONFIG = DFFConfig()

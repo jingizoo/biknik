@@ -167,6 +167,34 @@ class TestParseDataDs:
         rows = BIPClient._parse_data_ds(data)
         assert len(rows) == 1
 
+    def test_root_level_elements_injected_into_rows(self):
+        """Root-level elements like P_BOOK_TYPE_CODE should appear in every row."""
+        xml = (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            "<DATA_DS>"
+            "<P_BOOK_TYPE_CODE>UK CORP BOOK</P_BOOK_TYPE_CODE>"
+            "<G_1><ASSET_NUMBER>100</ASSET_NUMBER></G_1>"
+            "<G_1><ASSET_NUMBER>200</ASSET_NUMBER></G_1>"
+            "</DATA_DS>"
+        )
+        rows = BIPClient._parse_data_ds(xml.encode("utf-8"))
+        assert len(rows) == 2
+        assert rows[0]["P_BOOK_TYPE_CODE"] == "UK CORP BOOK"
+        assert rows[1]["P_BOOK_TYPE_CODE"] == "UK CORP BOOK"
+        assert rows[0]["ASSET_NUMBER"] == "100"
+        assert rows[1]["ASSET_NUMBER"] == "200"
+
+    def test_g1_field_overrides_root_field(self):
+        """If a G_1 element has the same name as a root element, G_1 wins."""
+        xml = (
+            "<DATA_DS>"
+            "<BOOK>ROOT_VAL</BOOK>"
+            "<G_1><BOOK>ROW_VAL</BOOK></G_1>"
+            "</DATA_DS>"
+        )
+        rows = BIPClient._parse_data_ds(xml.encode("utf-8"))
+        assert rows[0]["BOOK"] == "ROW_VAL"
+
 
 # ---------------------------------------------------------------------------
 # BIPClient.run_report (integration with mock HTTP)

@@ -47,13 +47,17 @@ def _bip_row(
     dff_date="2026-03-01",
     dff_location="",
 ):
-    """Build a BIP report row dict (as returned by BIPClient.run_report)."""
+    """Build a BIP report row dict (as returned by BIPClient.run_report).
+
+    Column names match the All_IUT_Transfers_Rpt report.  P_BOOK_TYPE_CODE
+    comes from a root-level element injected into each row by _parse_data_ds.
+    """
     return {
         "ASSET_NUMBER": asset_number,
-        "BOOK_TYPE_CODE": book,
-        "ATTRIBUTE9": dff_entity,
-        "ATTRIBUTE_DATE1": dff_date,
-        "ATTRIBUTE10": dff_location,
+        "P_BOOK_TYPE_CODE": book,
+        "TRANSFER_TO_ENTITY": dff_entity,
+        "TRANSFER_DATE": dff_date,
+        "TRANSFER_TO_LOCATION": dff_location,
     }
 
 

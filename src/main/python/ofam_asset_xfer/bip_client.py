@@ -181,13 +181,18 @@ class BIPClient:
 
         Expected structure:
             <DATA_DS>
+              <P_BOOK_TYPE_CODE>UK CORP BOOK</P_BOOK_TYPE_CODE>
               <G_1>
                 <ASSET_NUMBER>142847</ASSET_NUMBER>
-                <BOOK_TYPE_CODE>US CORP BOOK</BOOK_TYPE_CODE>
+                <TRANSFER_TO_ENTITY>US Entity</TRANSFER_TO_ENTITY>
                 ...
               </G_1>
               ...
             </DATA_DS>
+
+        Root-level scalar elements (like echoed report parameters) are
+        injected into every row dict so downstream code can reference them
+        without special handling.
 
         Returns:
             List of dicts, one per G_1 element.
@@ -195,11 +200,19 @@ class BIPClient:
         text = data.decode("utf-8-sig")
         root = ET.fromstring(text)
 
+        # Collect root-level scalar elements (non-G_1 children of DATA_DS).
+        # These are typically echoed report parameters like P_BOOK_TYPE_CODE.
+        root_fields: Dict[str, str] = {}
+        for child in root:
+            local = child.tag.split("}")[-1] if "}" in child.tag else child.tag
+            if local != "G_1" and child.text is not None:
+                root_fields[local] = child.text.strip()
+
         rows: List[Dict[str, str]] = []
         # Find all G_1 elements (could be at root level or under DATA_DS)
         g1_elements = root.findall(".//G_1")
         for g1 in g1_elements:
-            row: Dict[str, str] = {}
+            row: Dict[str, str] = dict(root_fields)  # seed with root-level fields
             for child in g1:
                 local = child.tag.split("}")[-1] if "}" in child.tag else child.tag
                 row[local] = (child.text or "").strip()
