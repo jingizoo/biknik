@@ -47,6 +47,8 @@ def _bip_row(
     dff_entity="UK Entity",
     dff_date="2026-03-01",
     dff_location="",
+    final_target_book="",
+    target_location_id="",
 ):
     """Build a BIP report row dict (as returned by BIPClient.run_report).
 
@@ -61,6 +63,8 @@ def _bip_row(
         "TRANSFER_TO_ENTITY": dff_entity,
         "TRANSFER_DATE": dff_date,
         "TRANSFER_TO_LOCATION": dff_location,
+        "FINAL_TARGET_BOOK_TYPE_CODE": final_target_book,
+        "TARGET_LOCATION_ID": target_location_id,
     }
 
 
@@ -340,6 +344,86 @@ class TestFindPendingTransfers:
             params={"P_BOOK_TYPE_CODE": "US CORP BOOK"},
         )
 
+    def test_uses_final_target_book_from_report(self):
+        """When FINAL_TARGET_BOOK_TYPE_CODE is present, use it directly
+        instead of resolving via entity."""
+        fusion = _mock_fusion()
+        bip = _mock_bip()
+        bip.run_report.return_value = [
+            _bip_row(
+                book="US CORP BOOK",
+                dff_entity="UK Entity",
+                final_target_book="JP CORP BOOK",
+            )
+        ]
+        fusion.process_transaction.return_value = _get_asset_info_response()
+
+        sync = FusionIUSync(fusion, _resolver(), bip)
+        pending = sync.find_pending_transfers(
+            books=["US CORP BOOK", "JP CORP BOOK"],
+            limit=10,
+        )
+
+        assert len(pending) == 1
+        # Should use the report's FINAL_TARGET_BOOK_TYPE_CODE, not entity resolution
+        assert pending[0].target_book_type_code == "JP CORP BOOK"
+
+    def test_final_target_book_skips_when_matches_current(self):
+        """FINAL_TARGET_BOOK_TYPE_CODE == current book → skip (not pending)."""
+        fusion = _mock_fusion()
+        bip = _mock_bip()
+        bip.run_report.return_value = [
+            _bip_row(
+                book="US CORP BOOK",
+                dff_entity="UK Entity",
+                final_target_book="US CORP BOOK",
+            )
+        ]
+
+        sync = FusionIUSync(fusion, _resolver(), bip)
+        pending = sync.find_pending_transfers(books=["US CORP BOOK"], limit=10)
+
+        assert len(pending) == 0
+        fusion.process_transaction.assert_not_called()
+
+    def test_falls_back_to_entity_resolver_when_no_final_target(self):
+        """When FINAL_TARGET_BOOK_TYPE_CODE is empty, fall back to entity resolver."""
+        fusion = _mock_fusion()
+        bip = _mock_bip()
+        bip.run_report.return_value = [
+            _bip_row(
+                book="US CORP BOOK",
+                dff_entity="UK Entity",
+                final_target_book="",
+            )
+        ]
+        fusion.process_transaction.return_value = _get_asset_info_response()
+
+        sync = FusionIUSync(fusion, _resolver(), bip)
+        pending = sync.find_pending_transfers(books=["US CORP BOOK"], limit=10)
+
+        assert len(pending) == 1
+        assert pending[0].target_book_type_code == "UK CORP BOOK"
+
+    def test_target_location_id_captured(self):
+        """TARGET_LOCATION_ID from report should be captured."""
+        fusion = _mock_fusion()
+        bip = _mock_bip()
+        bip.run_report.return_value = [
+            _bip_row(
+                dff_entity="UK Entity",
+                final_target_book="UK CORP BOOK",
+                target_location_id="300100123456",
+            )
+        ]
+        fusion.process_transaction.return_value = _get_asset_info_response()
+
+        sync = FusionIUSync(fusion, _resolver(), bip)
+        pending = sync.find_pending_transfers(books=["US CORP BOOK"], limit=10)
+
+        assert len(pending) == 1
+        assert pending[0].target_location_id == "300100123456"
+
     def test_uses_bip_asset_id_when_oracle_omits_it(self):
         """When X_ASSET_ID is absent from getAssetInformation, the ASSET_ID
         from the BIP report row is used as fallback."""
@@ -542,6 +626,40 @@ class TestExecuteTransfer:
         call_params = fusion.process_transaction.call_args[0][1]
         # Location CCID tables should include the override
         assert "555555" in call_params["P_LOCATION_CCID_TBL"]
+
+    def test_target_location_id_overrides_dff_location(self):
+        """TARGET_LOCATION_ID should take priority over TRANSFER_TO_LOCATION."""
+        fusion = _mock_fusion()
+        bip = _mock_bip()
+        state = _sample_state()
+        pt = PendingTransfer(
+            asset_id="100",
+            asset_number="142847",
+            book_type_code="US CORP BOOK",
+            description="Test",
+            tag_number="142847",
+            cost="36129.54",
+            transfer_date="2026-03-01",
+            transfer_to_entity="UK Entity",
+            transfer_to_location="555555",
+            target_book_type_code="UK CORP BOOK",
+            target_location_id="300100999999",
+            fa_state=state,
+        )
+
+        fusion.process_transaction.return_value = (
+            {},
+            {"X_RETURN_STATUS": "S"},
+        )
+
+        sync = FusionIUSync(fusion, _resolver(), bip)
+        result = sync.execute_transfer(pt, dry_run=False)
+
+        assert result.status == "TRANSFERRED"
+        call_params = fusion.process_transaction.call_args[0][1]
+        # TARGET_LOCATION_ID should win over TRANSFER_TO_LOCATION
+        assert "300100999999" in call_params["P_LOCATION_CCID_TBL"]
+        assert "555555" not in call_params["P_LOCATION_CCID_TBL"]
 
 
 # ===================================================================

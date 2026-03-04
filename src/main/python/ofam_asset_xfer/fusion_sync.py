@@ -4,15 +4,17 @@ Replaces the CMDB-based sync approach.  Instead of querying ServiceNow CMDB
 for asset locations, we read the asset-level Descriptive Flexfields (DFFs)
 from an Oracle BI Publisher report (All_IUT_Transfers_Rpt):
 
-  * **Book Type Code**        – P_BOOK_TYPE_CODE    – echoed report parameter at root level
-  * **Transfer Date**         – TRANSFER_DATE       – when the IU transfer should happen
-  * **Transfer to Entity**    – TRANSFER_TO_ENTITY   – the destination legal entity
-  * **Transfer to Location**  – TRANSFER_TO_LOCATION – optional location hint
+  * **Book Type Code**              – P_BOOK_TYPE_CODE              – echoed report parameter at root level
+  * **Transfer Date**               – TRANSFER_DATE                 – when the IU transfer should happen
+  * **Transfer to Entity**          – TRANSFER_TO_ENTITY            – the destination legal entity
+  * **Transfer to Location**        – TRANSFER_TO_LOCATION          – optional location hint
+  * **Final Target Book Type Code** – FINAL_TARGET_BOOK_TYPE_CODE   – pre-resolved target book from report
+  * **Target Location ID**          – TARGET_LOCATION_ID            – target location ID from report
 
 Architecture:
   1. Call BIP report via SOAP to get asset transfer candidates (DFF populated)
   2. For each candidate, call getAssetInformation to get full asset state
-  3. Resolve entity → target book via EntityBookResolver
+  3. Use FINAL_TARGET_BOOK_TYPE_CODE from report as target book (fallback: resolve entity → target book via EntityBookResolver)
   4. Compare current book vs target book
   5. If mismatch → pending transfer (cross-book)
   6. Execute via processTransaction-transferAsset
@@ -60,6 +62,10 @@ class DFFConfig:
     transfer_to_entity_col: str = "TRANSFER_TO_ENTITY"
     transfer_to_location_col: str = "TRANSFER_TO_LOCATION"
 
+    # Pre-resolved target fields from report (preferred over entity resolution)
+    final_target_book_type_code_col: str = "FINAL_TARGET_BOOK_TYPE_CODE"
+    target_location_id_col: str = "TARGET_LOCATION_ID"
+
 
 DEFAULT_DFF_CONFIG = DFFConfig()
 
@@ -84,8 +90,9 @@ class PendingTransfer:
     transfer_to_entity: str  # destination entity from DFF
     transfer_to_location: Optional[str]  # optional location hint from DFF
 
-    # Resolved
-    target_book_type_code: str  # resolved from entity
+    # Resolved target
+    target_book_type_code: str  # from FINAL_TARGET_BOOK_TYPE_CODE or entity resolver
+    target_location_id: Optional[str] = None  # from TARGET_LOCATION_ID in report
 
     # Cached state for transfer execution
     fa_state: Optional[AssetState] = field(default=None, repr=False)
@@ -210,12 +217,25 @@ class FusionIUSync:
         transfer_date_raw = row.get(dff.transfer_date_col, "").strip()
         transfer_location = row.get(dff.transfer_to_location_col, "").strip() or None
 
-        # --- Resolve target book from entity ---
-        try:
-            target_book = self._entity_resolver.resolve_target_book(transfer_entity)
-        except ValidationError as e:
-            log.debug("Skipping asset %s: %s", asset_number, e)
-            return None
+        # --- Resolve target book ---
+        # Prefer FINAL_TARGET_BOOK_TYPE_CODE from the report (pre-resolved).
+        # Fall back to entity resolver if not present.
+        final_target_book = row.get(dff.final_target_book_type_code_col, "").strip()
+        target_location_id = row.get(dff.target_location_id_col, "").strip() or None
+
+        if final_target_book:
+            target_book = final_target_book
+            log.debug(
+                "Using FINAL_TARGET_BOOK_TYPE_CODE='%s' for asset %s",
+                target_book,
+                asset_number,
+            )
+        else:
+            try:
+                target_book = self._entity_resolver.resolve_target_book(transfer_entity)
+            except ValidationError as e:
+                log.debug("Skipping asset %s: %s", asset_number, e)
+                return None
 
         if book_type_code.upper().strip() == target_book.upper().strip():
             return None  # Already in the right book
@@ -248,6 +268,7 @@ class FusionIUSync:
             transfer_to_entity=transfer_entity,
             transfer_to_location=transfer_location,
             target_book_type_code=target_book,
+            target_location_id=target_location_id,
             fa_state=state,
         )
 
@@ -331,8 +352,10 @@ class FusionIUSync:
         )
 
         overrides: Dict[str, Any] = {}
-        if pending.transfer_to_location:
-            overrides["location_ccid"] = pending.transfer_to_location
+        # Prefer TARGET_LOCATION_ID from report; fall back to TRANSFER_TO_LOCATION DFF
+        location_override = pending.target_location_id or pending.transfer_to_location
+        if location_override:
+            overrides["location_ccid"] = location_override
 
         params = build_book_transfer_params(
             state=state,
