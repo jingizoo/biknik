@@ -49,6 +49,7 @@ def _bip_row(
     dff_location="",
     final_target_book="",
     target_location_id="",
+    current_location_id="",
 ):
     """Build a BIP report row dict (as returned by BIPClient.run_report).
 
@@ -65,6 +66,7 @@ def _bip_row(
         "TRANSFER_TO_LOCATION": dff_location,
         "FINAL_TARGET_BOOK_TYPE_CODE": final_target_book,
         "TARGET_LOCATION_ID": target_location_id,
+        "CURRENT_LOCATION_ID": current_location_id,
     }
 
 
@@ -423,6 +425,45 @@ class TestFindPendingTransfers:
 
         assert len(pending) == 1
         assert pending[0].target_location_id == "300100123456"
+
+    def test_skips_when_current_location_equals_target_location(self):
+        """CURRENT_LOCATION_ID == TARGET_LOCATION_ID → skip (already at target)."""
+        fusion = _mock_fusion()
+        bip = _mock_bip()
+        bip.run_report.return_value = [
+            _bip_row(
+                dff_entity="UK Entity",
+                final_target_book="UK CORP BOOK",
+                current_location_id="300100123456",
+                target_location_id="300100123456",
+            )
+        ]
+
+        sync = FusionIUSync(fusion, _resolver(), bip)
+        pending = sync.find_pending_transfers(books=["US CORP BOOK"], limit=10)
+
+        assert len(pending) == 0
+        fusion.process_transaction.assert_not_called()
+
+    def test_proceeds_when_current_location_differs_from_target(self):
+        """CURRENT_LOCATION_ID != TARGET_LOCATION_ID → proceed with transfer."""
+        fusion = _mock_fusion()
+        bip = _mock_bip()
+        bip.run_report.return_value = [
+            _bip_row(
+                dff_entity="UK Entity",
+                final_target_book="UK CORP BOOK",
+                current_location_id="300100111111",
+                target_location_id="300100222222",
+            )
+        ]
+        fusion.process_transaction.return_value = _get_asset_info_response()
+
+        sync = FusionIUSync(fusion, _resolver(), bip)
+        pending = sync.find_pending_transfers(books=["US CORP BOOK"], limit=10)
+
+        assert len(pending) == 1
+        assert pending[0].target_location_id == "300100222222"
 
     def test_uses_bip_asset_id_when_oracle_omits_it(self):
         """When X_ASSET_ID is absent from getAssetInformation, the ASSET_ID

@@ -65,6 +65,7 @@ class DFFConfig:
     # Pre-resolved target fields from report (preferred over entity resolution)
     final_target_book_type_code_col: str = "FINAL_TARGET_BOOK_TYPE_CODE"
     target_location_id_col: str = "TARGET_LOCATION_ID"
+    current_location_id_col: str = "CURRENT_LOCATION_ID"
 
 
 DEFAULT_DFF_CONFIG = DFFConfig()
@@ -222,6 +223,18 @@ class FusionIUSync:
         # Fall back to entity resolver if not present.
         final_target_book = row.get(dff.final_target_book_type_code_col, "").strip()
         target_location_id = row.get(dff.target_location_id_col, "").strip() or None
+        current_location_id = row.get(dff.current_location_id_col, "").strip() or None
+
+        # --- Location already matches → skip ---
+        if current_location_id and target_location_id and current_location_id == target_location_id:
+            log.info(
+                "Skipping asset %s: CURRENT_LOCATION_ID (%s) already equals "
+                "TARGET_LOCATION_ID (%s) — no transfer needed",
+                asset_number,
+                current_location_id,
+                target_location_id,
+            )
+            return None
 
         if final_target_book:
             target_book = final_target_book
