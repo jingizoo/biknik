@@ -1,21 +1,25 @@
 #!/usr/bin/env python3
-"""Local runner for OFAM Asset Transfer — use while Batch is not yet set up.
+"""Local runner for OFAM IU Asset Transfers — BIP-driven discovery.
+
+Discovers all pending Inter-Unit transfers from a BI Publisher report and
+executes them.  No individual asset IDs or numbers are needed — the BIP
+report (called with just the book code) returns all eligible IU assets.
 
 Usage:
   # Dry-run (default — safe, no writes to Fusion):
-  python run_local.py --config sample_requests.json
+  python run_local.py --config config.json
 
   # Execute for real:
-  python run_local.py --config sample_requests.json --execute
+  python run_local.py --config config.json --execute
 
   # Override output directory:
-  python run_local.py --config sample_requests.json --out-dir ./my_output
+  python run_local.py --config config.json --out-dir ./my_output
 
   # Verbose logging:
-  python run_local.py --config sample_requests.json --log-level DEBUG
+  python run_local.py --config config.json --log-level DEBUG
 
 Environment variables:
-  FUSION_JWT          Bearer token for Oracle Fusion
+  FUSION_JWT          Bearer token for Oracle Fusion / BIP
   FUSION_BASE_URL     (optional) override oracle.base_url from config
 """
 
@@ -32,17 +36,29 @@ from pathlib import Path
 # Ensure the package is importable when running from repo root.
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src" / "main" / "python"))
 
-from ofam_asset_xfer.job import run_job  # noqa: E402
+from ofam_asset_xfer.bip_client import BIPClient, BIPConfig  # noqa: E402
+from ofam_asset_xfer.entity_resolver import EntityBookResolver  # noqa: E402
+from ofam_asset_xfer.exceptions import ConfigError  # noqa: E402
+from ofam_asset_xfer.fusion_sync import FusionIUSync, DFFConfig  # noqa: E402
+from ofam_asset_xfer.oracle_client import OracleConfig, OracleErpIntegrationsClient  # noqa: E402
+
+
+def _load_config(path: str) -> dict:
+    raw = Path(path).read_text()
+    try:
+        return json.loads(raw)
+    except Exception as e:
+        raise ConfigError(f"Config is not valid JSON: {path}") from e
 
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(
-        description="Run OFAM asset transfers locally (no Batch infrastructure needed).",
+        description="Run OFAM IU asset transfers locally via BIP report discovery.",
     )
     p.add_argument(
         "--config",
         required=True,
-        help="Path to requests JSON config file (see sample_requests.json).",
+        help="Path to JSON config file (books, entity map, BIP + Oracle settings).",
     )
     p.add_argument(
         "--out-dir",
@@ -80,40 +96,79 @@ def main(argv: list[str] | None = None) -> int:
         out_dir = str(Path("output") / ts)
     Path(out_dir).mkdir(parents=True, exist_ok=True)
 
-    # Execution flag: --execute wins, else --dry-run wins, else defer to config.
-    cli_execute = True if args.execute else (False if args.dry_run else None)
+    # Execution flag: --execute wins, else dry-run (default).
+    execute = args.execute and not args.dry_run
+    dry_run = not execute
 
-    mode = "EXECUTE" if cli_execute else "DRY-RUN" if cli_execute is False else "config-default"
+    mode = "EXECUTE" if execute else "DRY-RUN"
     log.info("Config  : %s", args.config)
     log.info("Output  : %s", out_dir)
     log.info("Mode    : %s", mode)
 
     try:
-        run_job(
-            config_uri=args.config,
-            out_dir_uri=out_dir,
-            cli_execute=cli_execute,
+        config = _load_config(args.config)
+
+        # --- Build clients from config ---
+        oracle_cfg = OracleConfig.from_dict(config.get("oracle", {}))
+        fusion_client = OracleErpIntegrationsClient(oracle_cfg)
+
+        bip_cfg = BIPConfig.from_dict(config.get("bip", {}))
+        bip_client = BIPClient(bip_cfg)
+
+        entity_map = config.get("entity_book_map", {})
+        if not entity_map:
+            raise ConfigError("Config must include non-empty 'entity_book_map'.")
+        entity_resolver = EntityBookResolver(entity_map)
+
+        books = config.get("books", [])
+        if not books:
+            raise ConfigError("Config must include non-empty 'books' list.")
+
+        # Optional DFF column overrides
+        dff_config = None
+        if config.get("dff_columns"):
+            dff_config = DFFConfig(**config["dff_columns"])
+
+        # Optional BIP report parameters (e.g. P_BOOK_TYPE_CODE)
+        bip_params = config.get("bip_params")
+
+        max_transfers = int(config.get("max_transfers", 500))
+
+        # --- Run ---
+        sync = FusionIUSync(
+            fusion_client,
+            entity_resolver,
+            bip_client,
+            dff_config=dff_config,
         )
+        summary = sync.run_full_sync(
+            books=books,
+            dry_run=dry_run,
+            max_transfers=max_transfers,
+            bip_params=bip_params,
+        )
+
+        # Write results
+        summary_path = Path(out_dir) / "summary.json"
+        summary_path.write_text(json.dumps(summary, indent=2, default=str))
+
+        results_path = Path(out_dir) / "results.json"
+        results_path.write_text(
+            json.dumps(summary.get("results", []), indent=2, default=str)
+        )
+
     except Exception:
         log.exception("Job failed")
         return 1
 
-    # Print results summary.
-    summary_path = Path(out_dir) / "summary.json"
-    if summary_path.exists():
-        summary = json.loads(summary_path.read_text())
-        log.info("——— Summary ———")
-        log.info("  Total    : %s", summary.get("total"))
-        log.info("  Success  : %s", summary.get("success"))
-        log.info("  Failed   : %s", summary.get("failed"))
-        log.info("  NOOP     : %s", summary.get("noop"))
-        log.info("  Dry-run? : %s", summary.get("dry_run"))
-    else:
-        log.warning("No summary.json found in output — check logs above for errors.")
-
-    results_path = Path(out_dir) / "results.json"
-    if results_path.exists():
-        log.info("Full results: %s", results_path)
+    # Print summary.
+    counts = summary.get("counts", {})
+    log.info("——— Summary ———")
+    log.info("  Total       : %s", counts.get("total", 0))
+    log.info("  Transferred : %s", counts.get("transferred", 0))
+    log.info("  Failed      : %s", counts.get("failed", 0))
+    log.info("  Dry-run     : %s", counts.get("dry_run", 0))
+    log.info("Full results  : %s", Path(out_dir) / "results.json")
 
     return 0
 

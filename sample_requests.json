@@ -4,35 +4,20 @@
     "api_version": "11.13.18.05",
     "bearer_token_env": "FUSION_JWT"
   },
+  "bip": {
+    "base_url": "https://YOUR-FUSION-HOST.oraclecloud.com",
+    "bearer_token_env": "FUSION_JWT",
+    "report_path": "/Custom/FinancialsReports/All_IUT_Transfers_Rpt.xdo"
+  },
+  "books": [
+    "US CORP BOOK",
+    "UK CORP BOOK"
+  ],
+  "entity_book_map": {
+    "US Entity": "US CORP BOOK",
+    "UK Entity": "UK CORP BOOK",
+    "JP Entity": "JP CORP BOOK"
+  },
   "execute": false,
-
-  "requests": [
-    {
-      "request_id": "DEMO-001",
-      "transfer_type": "SAME_BOOK",
-      "source": {
-        "book_type_code": "OPS CORP",
-        "asset_number": "10026"
-      },
-      "effective_date": "2026-03-04",
-      "target_assignment": {
-        "location_ccid": "300100071633789"
-      }
-    },
-    {
-      "request_id": "DEMO-002",
-      "transfer_type": "XBOOK",
-      "source": {
-        "book_type_code": "US CORP BOOK",
-        "asset_number": "142847"
-      },
-      "target": {
-        "book_type_code": "UK CORP BOOK"
-      },
-      "xbook": {
-        "strategy": "native"
-      },
-      "effective_date": "2026-03-04"
-    }
-  ]
+  "max_transfers": 500
 }
