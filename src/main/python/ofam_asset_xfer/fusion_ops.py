@@ -86,6 +86,42 @@ class AssetState:
         )
 
 
+def _resolve_asset_id(
+    client: OracleErpIntegrationsClient,
+    asset_number: str,
+    book_type_code: str,
+) -> str:
+    """Look up AssetId via the fixedAssets REST resource.
+
+    Some Fusion versions do not return X_ASSET_ID from getAssetInformation;
+    this fallback resolves it from the fixedAssets resource by asset number.
+    """
+    log.info(
+        "Resolving asset_id via fixedAssets REST for asset_number=%s book=%s",
+        asset_number,
+        book_type_code,
+    )
+    resp = client.get_resource(
+        "fixedAssets",
+        {
+            "q": f"AssetNumber={asset_number}",
+            "fields": "AssetId,AssetNumber",
+            "onlyData": "true",
+        },
+    )
+    items = resp.get("items", [])
+    if not items:
+        raise FusionApiError(
+            f"fixedAssets REST lookup returned no results for AssetNumber={asset_number}"
+        )
+    asset_id = str(items[0].get("AssetId", "")).strip()
+    if not asset_id:
+        raise FusionApiError(
+            f"fixedAssets REST result missing AssetId for AssetNumber={asset_number}: {items[0]}"
+        )
+    return asset_id
+
+
 def get_asset_information(
     client: OracleErpIntegrationsClient,
     book_type_code: str,
@@ -103,6 +139,15 @@ def get_asset_information(
     status = str(pl.get("X_RETURN_STATUS") or "").strip()
     if status and status != "S":
         raise FusionApiError(f"getAssetInformation failed (status={status}): {pl}")
+
+    # Some Fusion versions omit X_BOOK_TYPE_CODE and/or X_ASSET_ID from the
+    # getAssetInformation response.  Inject known values as fallbacks so
+    # AssetState.from_get_asset_information() can succeed.
+    if not str(pl.get("X_BOOK_TYPE_CODE") or "").strip():
+        pl["P_BOOK_TYPE_CODE"] = book_type_code
+
+    if not str(pl.get("X_ASSET_ID") or "").strip():
+        pl["X_ASSET_ID"] = _resolve_asset_id(client, asset_number, book_type_code)
 
     state = AssetState.from_get_asset_information(pl)
     return raw, pl, state

@@ -66,27 +66,31 @@ def _get_asset_info_response(
     asset_number="142847",
     book="US CORP BOOK",
     cost="36129.54",
+    include_identity=True,
 ):
-    """Build a getAssetInformation processTransaction response."""
-    return (
-        {},  # raw
-        {
-            "X_RETURN_STATUS": "S",
-            "X_ASSET_ID": asset_id,
-            "X_ASSET_NUMBER": asset_number,
-            "X_BOOK_TYPE_CODE": book,
-            "X_DISTRIBUTION_ID_TBL": "1001",
-            "X_UNITS_ASSIGNED_TBL": "1",
-            "X_ASSIGNED_TO_TBL": "",
-            "X_EXPENSE_CCID_TBL": "626955",
-            "X_LOCATION_CCID_TBL": "789012",
-            "X_CATEGORY_ID": "501",
-            "X_DATE_PLACED_IN_SERVICE": "2023-01-15",
-            "X_COST": cost,
-            "X_DESCRIPTION": "ARISTA 7130",
-            "X_TAG_NUMBER": asset_number,
-        },
-    )
+    """Build a getAssetInformation processTransaction response.
+
+    When *include_identity* is False, omit X_ASSET_ID and X_BOOK_TYPE_CODE
+    to simulate Fusion versions that do not echo these fields back.
+    """
+    pl = {
+        "X_RETURN_STATUS": "S",
+        "X_ASSET_NUMBER": asset_number,
+        "X_DISTRIBUTION_ID_TBL": "1001",
+        "X_UNITS_ASSIGNED_TBL": "1",
+        "X_ASSIGNED_TO_TBL": "",
+        "X_EXPENSE_CCID_TBL": "626955",
+        "X_LOCATION_CCID_TBL": "789012",
+        "X_CATEGORY_ID": "501",
+        "X_DATE_PLACED_IN_SERVICE": "2023-01-15",
+        "X_COST": cost,
+        "X_DESCRIPTION": "ARISTA 7130",
+        "X_TAG_NUMBER": asset_number,
+    }
+    if include_identity:
+        pl["X_ASSET_ID"] = asset_id
+        pl["X_BOOK_TYPE_CODE"] = book
+    return ({}, pl)
 
 
 def _sample_state(asset_id="100", asset_number="142847", book="US CORP BOOK"):
@@ -330,6 +334,50 @@ class TestFindPendingTransfers:
         bip.run_report.assert_called_once_with(
             params={"P_BOOK_TYPE_CODE": "US CORP BOOK"},
         )
+
+    def test_resolves_missing_identity_fields_via_rest(self):
+        """When X_ASSET_ID and X_BOOK_TYPE_CODE are absent, fallback REST lookup is used."""
+        fusion = _mock_fusion()
+        bip = _mock_bip()
+        bip.run_report.return_value = [
+            _bip_row(book="US CORP BOOK", dff_entity="UK Entity")
+        ]
+        # getAssetInformation returns without identity fields
+        fusion.process_transaction.return_value = _get_asset_info_response(
+            include_identity=False,
+        )
+        # fixedAssets REST lookup returns the asset_id
+        fusion.get_resource.return_value = {
+            "items": [{"AssetId": 12345, "AssetNumber": "142847"}]
+        }
+
+        sync = FusionIUSync(fusion, _resolver(), bip)
+        pending = sync.find_pending_transfers(books=["US CORP BOOK"], limit=10)
+
+        assert len(pending) == 1
+        assert pending[0].fa_state.asset_id == "12345"
+        assert pending[0].fa_state.book_type_code == "US CORP BOOK"
+        # Verify the REST lookup was called
+        fusion.get_resource.assert_called_once()
+        call_args = fusion.get_resource.call_args
+        assert call_args[0][0] == "fixedAssets"
+
+    def test_skips_asset_when_rest_lookup_fails(self):
+        """When fixedAssets REST lookup fails, the asset is skipped gracefully."""
+        fusion = _mock_fusion()
+        bip = _mock_bip()
+        bip.run_report.return_value = [
+            _bip_row(asset_number="AAA", dff_entity="UK Entity"),
+        ]
+        fusion.process_transaction.return_value = _get_asset_info_response(
+            asset_number="AAA", include_identity=False,
+        )
+        fusion.get_resource.side_effect = FusionApiError("404 Not Found")
+
+        sync = FusionIUSync(fusion, _resolver(), bip)
+        pending = sync.find_pending_transfers(books=["US CORP BOOK"], limit=10)
+
+        assert len(pending) == 0
 
 
 # ===================================================================
