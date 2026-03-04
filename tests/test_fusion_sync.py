@@ -41,6 +41,7 @@ def _mock_bip():
 
 
 def _bip_row(
+    asset_id="100",
     asset_number="142847",
     book="US CORP BOOK",
     dff_entity="UK Entity",
@@ -51,8 +52,10 @@ def _bip_row(
 
     Column names match the All_IUT_Transfers_Rpt report.  P_BOOK_TYPE_CODE
     comes from a root-level element injected into each row by _parse_data_ds.
+    ASSET_ID is returned directly from the report G_1 rows.
     """
     return {
+        "ASSET_ID": asset_id,
         "ASSET_NUMBER": asset_number,
         "P_BOOK_TYPE_CODE": book,
         "TRANSFER_TO_ENTITY": dff_entity,
@@ -251,6 +254,7 @@ class TestFindPendingTransfers:
         bip = _mock_bip()
         bip.run_report.return_value = [
             {
+                "FA_ASSET_ID": "100",
                 "ASSET_NUM": "142847",
                 "BOOK": "US CORP BOOK",
                 "XFER_ENTITY": "UK Entity",
@@ -261,6 +265,7 @@ class TestFindPendingTransfers:
         fusion.process_transaction.return_value = _get_asset_info_response()
 
         dff = DFFConfig(
+            asset_id_col="FA_ASSET_ID",
             asset_number_col="ASSET_NUM",
             book_type_code_col="BOOK",
             transfer_date_col="XFER_DATE",
@@ -335,49 +340,27 @@ class TestFindPendingTransfers:
             params={"P_BOOK_TYPE_CODE": "US CORP BOOK"},
         )
 
-    def test_resolves_missing_identity_fields_via_rest(self):
-        """When X_ASSET_ID and X_BOOK_TYPE_CODE are absent, fallback REST lookup is used."""
+    def test_uses_bip_asset_id_when_oracle_omits_it(self):
+        """When X_ASSET_ID is absent from getAssetInformation, the ASSET_ID
+        from the BIP report row is used as fallback."""
         fusion = _mock_fusion()
         bip = _mock_bip()
         bip.run_report.return_value = [
-            _bip_row(book="US CORP BOOK", dff_entity="UK Entity")
+            _bip_row(asset_id="115", book="US CORP BOOK", dff_entity="UK Entity")
         ]
-        # getAssetInformation returns without identity fields
+        # getAssetInformation returns without X_ASSET_ID and X_BOOK_TYPE_CODE
         fusion.process_transaction.return_value = _get_asset_info_response(
             include_identity=False,
         )
-        # fixedAssets REST lookup returns the asset_id
-        fusion.get_resource.return_value = {
-            "items": [{"AssetId": 12345, "AssetNumber": "142847"}]
-        }
 
         sync = FusionIUSync(fusion, _resolver(), bip)
         pending = sync.find_pending_transfers(books=["US CORP BOOK"], limit=10)
 
         assert len(pending) == 1
-        assert pending[0].fa_state.asset_id == "12345"
+        assert pending[0].fa_state.asset_id == "115"
         assert pending[0].fa_state.book_type_code == "US CORP BOOK"
-        # Verify the REST lookup was called
-        fusion.get_resource.assert_called_once()
-        call_args = fusion.get_resource.call_args
-        assert call_args[0][0] == "fixedAssets"
-
-    def test_skips_asset_when_rest_lookup_fails(self):
-        """When fixedAssets REST lookup fails, the asset is skipped gracefully."""
-        fusion = _mock_fusion()
-        bip = _mock_bip()
-        bip.run_report.return_value = [
-            _bip_row(asset_number="AAA", dff_entity="UK Entity"),
-        ]
-        fusion.process_transaction.return_value = _get_asset_info_response(
-            asset_number="AAA", include_identity=False,
-        )
-        fusion.get_resource.side_effect = FusionApiError("404 Not Found")
-
-        sync = FusionIUSync(fusion, _resolver(), bip)
-        pending = sync.find_pending_transfers(books=["US CORP BOOK"], limit=10)
-
-        assert len(pending) == 0
+        # No REST resource call needed — asset_id came from BIP report
+        fusion.get_resource.assert_not_called()
 
 
 # ===================================================================

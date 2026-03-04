@@ -86,49 +86,22 @@ class AssetState:
         )
 
 
-def _resolve_asset_id(
-    client: OracleErpIntegrationsClient,
-    asset_number: str,
-    book_type_code: str,
-) -> str:
-    """Look up AssetId via the fixedAssets REST resource.
-
-    Some Fusion versions do not return X_ASSET_ID from getAssetInformation;
-    this fallback resolves it from the fixedAssets resource by asset number.
-    """
-    log.info(
-        "Resolving asset_id via fixedAssets REST for asset_number=%s book=%s",
-        asset_number,
-        book_type_code,
-    )
-    resp = client.get_resource(
-        "fixedAssets",
-        {
-            "q": f"AssetNumber={asset_number}",
-            "fields": "AssetId,AssetNumber",
-            "onlyData": "true",
-        },
-    )
-    items = resp.get("items", [])
-    if not items:
-        raise FusionApiError(
-            f"fixedAssets REST lookup returned no results for AssetNumber={asset_number}"
-        )
-    asset_id = str(items[0].get("AssetId", "")).strip()
-    if not asset_id:
-        raise FusionApiError(
-            f"fixedAssets REST result missing AssetId for AssetNumber={asset_number}: {items[0]}"
-        )
-    return asset_id
-
-
 def get_asset_information(
     client: OracleErpIntegrationsClient,
     book_type_code: str,
     asset_number: str,
+    *,
+    asset_id: Optional[str] = None,
 ) -> Tuple[Dict[str, Any], Dict[str, Any], AssetState]:
-    # The doc indicates you can query using asset_number, tag, serial, etc.
-    # OFAM canonical identifier is (book_type_code, asset_number).
+    """Fetch full asset state via getAssetInformation processTransaction.
+
+    Args:
+        client: Oracle ERP integrations client.
+        book_type_code: The FA book (e.g. "US CORP BOOK").
+        asset_number: The asset number.
+        asset_id: Optional asset_id from the BIP report.  Injected into the
+            response when Oracle does not echo X_ASSET_ID back.
+    """
     raw, pl = client.process_transaction(
         "getAssetInformation",
         {
@@ -146,8 +119,8 @@ def get_asset_information(
     if not str(pl.get("X_BOOK_TYPE_CODE") or "").strip():
         pl["P_BOOK_TYPE_CODE"] = book_type_code
 
-    if not str(pl.get("X_ASSET_ID") or "").strip():
-        pl["X_ASSET_ID"] = _resolve_asset_id(client, asset_number, book_type_code)
+    if not str(pl.get("X_ASSET_ID") or "").strip() and asset_id:
+        pl["X_ASSET_ID"] = asset_id
 
     state = AssetState.from_get_asset_information(pl)
     return raw, pl, state

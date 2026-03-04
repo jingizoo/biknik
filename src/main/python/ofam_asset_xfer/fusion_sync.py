@@ -51,6 +51,7 @@ class DFFConfig:
     """
 
     # Asset identity columns in the BIP report
+    asset_id_col: str = "ASSET_ID"
     asset_number_col: str = "ASSET_NUMBER"
     book_type_code_col: str = "P_BOOK_TYPE_CODE"
 
@@ -196,6 +197,7 @@ class FusionIUSync:
         if not transfer_entity:
             return None
 
+        asset_id = row.get(dff.asset_id_col, "").strip()
         asset_number = row.get(dff.asset_number_col, "").strip()
         book_type_code = row.get(dff.book_type_code_col, "").strip()
         if not asset_number or not book_type_code:
@@ -224,6 +226,7 @@ class FusionIUSync:
                 self._client,
                 book_type_code,
                 asset_number,
+                asset_id=asset_id or None,
             )
         except FusionApiError as e:
             log.warning(
