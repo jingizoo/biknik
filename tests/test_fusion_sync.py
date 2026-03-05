@@ -545,7 +545,7 @@ class TestExecuteTransfer:
         assert result.error is None
         fusion.process_transaction.assert_called_once()
         call_args = fusion.process_transaction.call_args
-        assert call_args[0][0] == "transferAsset"
+        assert call_args[0][0] == "bookTransfer"
 
     def test_execute_failure(self):
         fusion = _mock_fusion()
@@ -703,6 +703,89 @@ class TestExecuteTransfer:
         assert "555555" not in call_params["P_LOCATION_CCID_TBL"]
 
 
+
+    def test_same_book_transfer_uses_transfer_asset(self):
+        """Same-book transfer should call processTransaction-transferAsset."""
+        fusion = _mock_fusion()
+        bip = _mock_bip()
+        state = _sample_state()
+        pt = PendingTransfer(
+            asset_id="100",
+            asset_number="142847",
+            book_type_code="US CORP BOOK",
+            description="Test",
+            tag_number="142847",
+            cost="36129.54",
+            transfer_date="2026-03-01",
+            transfer_to_entity="US Entity",
+            transfer_to_location=None,
+            target_book_type_code="US CORP BOOK",
+            target_location_id="300100999999",
+            is_cross_book=False,
+            fa_state=state,
+        )
+
+        fusion.process_transaction.return_value = (
+            {},
+            {"X_RETURN_STATUS": "S"},
+        )
+
+        sync = FusionIUSync(fusion, _resolver(), bip)
+        result = sync.execute_transfer(pt, dry_run=False)
+
+        assert result.status == "TRANSFERRED"
+        call_args = fusion.process_transaction.call_args
+        assert call_args[0][0] == "transferAsset"
+
+    def test_same_book_noop_when_no_distribution_changes(self):
+        """Same-book transfer with no actual changes should return NOOP."""
+        fusion = _mock_fusion()
+        bip = _mock_bip()
+        state = _sample_state()
+        # target_location_id matches the state's existing location
+        pt = PendingTransfer(
+            asset_id="100",
+            asset_number="142847",
+            book_type_code="US CORP BOOK",
+            description="Test",
+            tag_number="142847",
+            cost="36129.54",
+            transfer_date="2026-03-01",
+            transfer_to_entity="US Entity",
+            transfer_to_location=None,
+            target_book_type_code="US CORP BOOK",
+            target_location_id="789012",  # same as state.location_ccids[0]
+            is_cross_book=False,
+            fa_state=state,
+        )
+
+        sync = FusionIUSync(fusion, _resolver(), bip)
+        result = sync.execute_transfer(pt, dry_run=False)
+
+        assert result.status == "NOOP"
+        fusion.process_transaction.assert_not_called()
+
+    def test_discovery_detects_same_book_location_transfer(self):
+        """Same book + different target location → pending same-book transfer."""
+        fusion = _mock_fusion()
+        bip = _mock_bip()
+        bip.run_report.return_value = [
+            _bip_row(
+                book="US CORP BOOK",
+                dff_entity="US Entity",
+                final_target_book="US CORP BOOK",
+                current_location_id="300100111111",
+                target_location_id="300100222222",
+            )
+        ]
+        fusion.process_transaction.return_value = _get_asset_info_response()
+
+        sync = FusionIUSync(fusion, _resolver(), bip)
+        pending = sync.find_pending_transfers(books=["US CORP BOOK"], limit=10)
+
+        assert len(pending) == 1
+        assert pending[0].is_cross_book is False
+        assert pending[0].target_location_id == "300100222222"
 # ===================================================================
 # FusionIUSync.run_full_sync
 # ===================================================================

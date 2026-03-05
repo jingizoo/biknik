@@ -16,8 +16,8 @@ Architecture:
   2. For each candidate, call getAssetInformation to get full asset state
   3. Use FINAL_TARGET_BOOK_TYPE_CODE from report as target book (fallback: resolve entity → target book via EntityBookResolver)
   4. Compare current book vs target book
-  5. If mismatch → pending transfer (cross-book)
-  6. Execute via processTransaction-transferAsset
+  5. If book mismatch → cross-book transfer via processTransaction-bookTransfer
+  6. If same book but location differs → same-book transfer via processTransaction-transferAsset
 """
 
 from __future__ import annotations
@@ -34,6 +34,7 @@ from .exceptions import FusionApiError, ValidationError
 from .fusion_ops import (
     AssetState,
     build_book_transfer_params,
+    build_same_book_transfer_params,
     get_asset_information,
 )
 from .oracle_client import OracleErpIntegrationsClient
@@ -94,6 +95,7 @@ class PendingTransfer:
     # Resolved target
     target_book_type_code: str  # from FINAL_TARGET_BOOK_TYPE_CODE or entity resolver
     target_location_id: Optional[str] = None  # from TARGET_LOCATION_ID in report
+    is_cross_book: bool = True  # False = same-book (location-only) transfer
 
     # Cached state for transfer execution
     fa_state: Optional[AssetState] = field(default=None, repr=False)
@@ -250,8 +252,11 @@ class FusionIUSync:
                 log.debug("Skipping asset %s: %s", asset_number, e)
                 return None
 
-        if book_type_code.upper().strip() == target_book.upper().strip():
-            return None  # Already in the right book
+        is_cross_book = book_type_code.upper().strip() != target_book.upper().strip()
+
+        # Same book AND no target location info → nothing to transfer
+        if not is_cross_book and not target_location_id:
+            return None
 
         # --- Call getAssetInformation to get full state ---
         try:
@@ -282,6 +287,7 @@ class FusionIUSync:
             transfer_to_location=transfer_location,
             target_book_type_code=target_book,
             target_location_id=target_location_id,
+            is_cross_book=is_cross_book,
             fa_state=state,
         )
 
@@ -328,13 +334,14 @@ class FusionIUSync:
                 )
 
         try:
-            return self._execute_cross_book(
-                pending,
-                state,
-                request_id,
-                effective_date,
-                dry_run,
-            )
+            if pending.is_cross_book:
+                return self._execute_cross_book(
+                    pending, state, request_id, effective_date, dry_run,
+                )
+            else:
+                return self._execute_same_book(
+                    pending, state, request_id, effective_date, dry_run,
+                )
         except Exception as e:
             log.exception("Transfer failed for asset=%s", pending.asset_number)
             return TransferResult(
@@ -357,7 +364,7 @@ class FusionIUSync:
     ) -> TransferResult:
         """Execute a cross-book IU transfer."""
         log.info(
-            "IU transfer: asset=%s, %s → %s (entity=%s)",
+            "Cross-book transfer: asset=%s, %s → %s (entity=%s)",
             pending.asset_number,
             pending.book_type_code,
             pending.target_book_type_code,
@@ -381,6 +388,79 @@ class FusionIUSync:
         if dry_run:
             log.info(
                 "DRY-RUN: IU transfer payload built for asset=%s", pending.asset_number
+            )
+            return TransferResult(
+                asset_number=pending.asset_number,
+                status="DRY_RUN",
+                source_book=pending.book_type_code,
+                target_book=pending.target_book_type_code,
+                transfer_to_entity=pending.transfer_to_entity,
+                transfer_date=effective_date,
+                fusion_response={"planned_params": params},
+            )
+
+        raw, pl = self._client.process_transaction("bookTransfer", params)
+        status_code = str(pl.get("X_RETURN_STATUS") or "").strip()
+
+        return TransferResult(
+            asset_number=pending.asset_number,
+            status="TRANSFERRED" if status_code == "S" else "FAILED",
+            source_book=pending.book_type_code,
+            target_book=pending.target_book_type_code,
+            transfer_to_entity=pending.transfer_to_entity,
+            transfer_date=effective_date,
+            fusion_response=pl,
+            error=None
+            if status_code == "S"
+            else f"Fusion X_RETURN_STATUS={status_code}",
+        )
+
+    def _execute_same_book(
+        self,
+        pending: PendingTransfer,
+        state: AssetState,
+        request_id: str,
+        effective_date: str,
+        dry_run: bool,
+    ) -> TransferResult:
+        """Execute a same-book transfer (location/distribution change)."""
+        log.info(
+            "Same-book transfer: asset=%s, book=%s, target_location=%s (entity=%s)",
+            pending.asset_number,
+            pending.book_type_code,
+            pending.target_location_id,
+            pending.transfer_to_entity,
+        )
+
+        overrides: Dict[str, Any] = {}
+        location_override = pending.target_location_id or pending.transfer_to_location
+        if location_override:
+            overrides["location_ccid"] = location_override
+
+        params, is_noop = build_same_book_transfer_params(
+            state=state,
+            effective_date=effective_date,
+            overrides=overrides,
+            request_id=request_id,
+        )
+
+        if is_noop:
+            log.info(
+                "NOOP: no distribution changes for asset=%s", pending.asset_number
+            )
+            return TransferResult(
+                asset_number=pending.asset_number,
+                status="NOOP",
+                source_book=pending.book_type_code,
+                target_book=pending.target_book_type_code,
+                transfer_to_entity=pending.transfer_to_entity,
+                transfer_date=effective_date,
+            )
+
+        if dry_run:
+            log.info(
+                "DRY-RUN: same-book transfer payload built for asset=%s",
+                pending.asset_number,
             )
             return TransferResult(
                 asset_number=pending.asset_number,
