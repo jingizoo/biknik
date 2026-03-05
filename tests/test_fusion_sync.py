@@ -50,6 +50,7 @@ def _bip_row(
     final_target_book="",
     target_location_id="",
     current_location_id="",
+    target_expense_ccid="",
 ):
     """Build a BIP report row dict (as returned by BIPClient.run_report).
 
@@ -67,6 +68,7 @@ def _bip_row(
         "FINAL_TARGET_BOOK_TYPE_CODE": final_target_book,
         "TARGET_LOCATION_ID": target_location_id,
         "CURRENT_LOCATION_ID": current_location_id,
+        "TARGET_EXPENSE_CCID": target_expense_ccid,
     }
 
 
@@ -146,9 +148,12 @@ class TestFindPendingTransfers:
         """Asset in US book with DFF entity=UK → pending cross-book."""
         fusion = _mock_fusion()
         bip = _mock_bip()
-        bip.run_report.return_value = [
-            _bip_row(book="US CORP BOOK", dff_entity="UK Entity")
-        ]
+        # BIP is called per book; only return rows for the US book call
+        bip.run_report.side_effect = lambda params: (
+            [_bip_row(book="US CORP BOOK", dff_entity="UK Entity")]
+            if params.get("P_BOOK_TYPE_CODE") == "US CORP BOOK"
+            else []
+        )
         fusion.process_transaction.return_value = _get_asset_info_response()
 
         sync = FusionIUSync(fusion, _resolver(), bip)
@@ -330,7 +335,7 @@ class TestFindPendingTransfers:
         assert pending[0].transfer_to_location == "LON-DC1"
 
     def test_passes_bip_params(self):
-        """bip_params should be forwarded to BIPClient.run_report."""
+        """bip_params should be forwarded to BIPClient.run_report with P_BOOK_TYPE_CODE."""
         fusion = _mock_fusion()
         bip = _mock_bip()
         bip.run_report.return_value = []
@@ -339,11 +344,11 @@ class TestFindPendingTransfers:
         sync.find_pending_transfers(
             books=["US CORP BOOK"],
             limit=10,
-            bip_params={"P_BOOK_TYPE_CODE": "US CORP BOOK"},
+            bip_params={"P_EXTRA": "value"},
         )
 
         bip.run_report.assert_called_once_with(
-            params={"P_BOOK_TYPE_CODE": "US CORP BOOK"},
+            params={"P_EXTRA": "value", "P_BOOK_TYPE_CODE": "US CORP BOOK"},
         )
 
     def test_uses_final_target_book_from_report(self):
@@ -351,13 +356,15 @@ class TestFindPendingTransfers:
         instead of resolving via entity."""
         fusion = _mock_fusion()
         bip = _mock_bip()
-        bip.run_report.return_value = [
-            _bip_row(
+        bip.run_report.side_effect = lambda params: (
+            [_bip_row(
                 book="US CORP BOOK",
                 dff_entity="UK Entity",
                 final_target_book="JP CORP BOOK",
-            )
-        ]
+            )]
+            if params.get("P_BOOK_TYPE_CODE") == "US CORP BOOK"
+            else []
+        )
         fusion.process_transaction.return_value = _get_asset_info_response()
 
         sync = FusionIUSync(fusion, _resolver(), bip)
@@ -786,6 +793,79 @@ class TestExecuteTransfer:
         assert len(pending) == 1
         assert pending[0].is_cross_book is False
         assert pending[0].target_location_id == "300100222222"
+
+    def test_target_expense_ccid_captured(self):
+        """TARGET_EXPENSE_CCID from report should be captured on PendingTransfer."""
+        fusion = _mock_fusion()
+        bip = _mock_bip()
+        bip.run_report.return_value = [
+            _bip_row(
+                dff_entity="UK Entity",
+                final_target_book="UK CORP BOOK",
+                target_expense_ccid="627564",
+            )
+        ]
+        fusion.process_transaction.return_value = _get_asset_info_response()
+
+        sync = FusionIUSync(fusion, _resolver(), bip)
+        pending = sync.find_pending_transfers(books=["US CORP BOOK"], limit=10)
+
+        assert len(pending) == 1
+        assert pending[0].target_expense_ccid == "627564"
+
+    def test_target_expense_ccid_used_in_cross_book_transfer(self):
+        """TARGET_EXPENSE_CCID should be passed as expense_ccid override."""
+        fusion = _mock_fusion()
+        bip = _mock_bip()
+        state = _sample_state()
+        pt = PendingTransfer(
+            asset_id="100",
+            asset_number="142847",
+            book_type_code="US CORP BOOK",
+            description="Test",
+            tag_number="142847",
+            cost="36129.54",
+            transfer_date="2026-03-01",
+            transfer_to_entity="UK Entity",
+            transfer_to_location=None,
+            target_book_type_code="UK CORP BOOK",
+            target_expense_ccid="627564",
+            fa_state=state,
+        )
+
+        fusion.process_transaction.return_value = (
+            {},
+            {"X_RETURN_STATUS": "S"},
+        )
+
+        sync = FusionIUSync(fusion, _resolver(), bip)
+        result = sync.execute_transfer(pt, dry_run=False)
+
+        assert result.status == "TRANSFERRED"
+        call_params = fusion.process_transaction.call_args[0][1]
+        assert "627564" in call_params["P_EXPENSE_CCID_TBL"]
+
+    def test_same_book_with_expense_ccid_only(self):
+        """Same book + target_expense_ccid but no target_location → should still trigger transfer."""
+        fusion = _mock_fusion()
+        bip = _mock_bip()
+        bip.run_report.return_value = [
+            _bip_row(
+                book="US CORP BOOK",
+                dff_entity="US Entity",
+                final_target_book="US CORP BOOK",
+                target_expense_ccid="627564",
+            )
+        ]
+        fusion.process_transaction.return_value = _get_asset_info_response()
+
+        sync = FusionIUSync(fusion, _resolver(), bip)
+        pending = sync.find_pending_transfers(books=["US CORP BOOK"], limit=10)
+
+        assert len(pending) == 1
+        assert pending[0].is_cross_book is False
+        assert pending[0].target_expense_ccid == "627564"
+
 # ===================================================================
 # FusionIUSync.run_full_sync
 # ===================================================================
@@ -795,7 +875,11 @@ class TestRunFullSync:
     def test_dry_run_summary(self):
         fusion = _mock_fusion()
         bip = _mock_bip()
-        bip.run_report.return_value = [_bip_row(dff_entity="UK Entity")]
+        bip.run_report.side_effect = lambda params: (
+            [_bip_row(dff_entity="UK Entity")]
+            if params.get("P_BOOK_TYPE_CODE") == "US CORP BOOK"
+            else []
+        )
         # getAssetInformation for discovery, then getAssetInformation already cached
         fusion.process_transaction.return_value = _get_asset_info_response()
 

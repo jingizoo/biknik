@@ -67,6 +67,7 @@ class DFFConfig:
     final_target_book_type_code_col: str = "FINAL_TARGET_BOOK_TYPE_CODE"
     target_location_id_col: str = "TARGET_LOCATION_ID"
     current_location_id_col: str = "CURRENT_LOCATION_ID"
+    target_expense_ccid_col: str = "TARGET_EXPENSE_CCID"
 
 
 DEFAULT_DFF_CONFIG = DFFConfig()
@@ -95,6 +96,7 @@ class PendingTransfer:
     # Resolved target
     target_book_type_code: str  # from FINAL_TARGET_BOOK_TYPE_CODE or entity resolver
     target_location_id: Optional[str] = None  # from TARGET_LOCATION_ID in report
+    target_expense_ccid: Optional[str] = None  # from TARGET_EXPENSE_CCID in report
     is_cross_book: bool = True  # False = same-book (location-only) transfer
 
     # Cached state for transfer execution
@@ -232,6 +234,7 @@ class FusionIUSync:
         final_target_book = row.get(dff.final_target_book_type_code_col, "").strip()
         target_location_id = row.get(dff.target_location_id_col, "").strip() or None
         current_location_id = row.get(dff.current_location_id_col, "").strip() or None
+        target_expense_ccid = row.get(dff.target_expense_ccid_col, "").strip() or None
 
         # --- Location already matches → skip ---
         if current_location_id and target_location_id and current_location_id == target_location_id:
@@ -260,8 +263,8 @@ class FusionIUSync:
 
         is_cross_book = book_type_code.upper().strip() != target_book.upper().strip()
 
-        # Same book AND no target location info → nothing to transfer
-        if not is_cross_book and not target_location_id:
+        # Same book AND no target location/expense info → nothing to transfer
+        if not is_cross_book and not target_location_id and not target_expense_ccid:
             return None
 
         # --- Call getAssetInformation to get full state ---
@@ -293,6 +296,7 @@ class FusionIUSync:
             transfer_to_location=transfer_location,
             target_book_type_code=target_book,
             target_location_id=target_location_id,
+            target_expense_ccid=target_expense_ccid,
             is_cross_book=is_cross_book,
             fa_state=state,
         )
@@ -382,6 +386,8 @@ class FusionIUSync:
         location_override = pending.target_location_id or pending.transfer_to_location
         if location_override:
             overrides["location_ccid"] = location_override
+        if pending.target_expense_ccid:
+            overrides["expense_ccid"] = pending.target_expense_ccid
 
         params = build_book_transfer_params(
             state=state,
@@ -442,6 +448,8 @@ class FusionIUSync:
         location_override = pending.target_location_id or pending.transfer_to_location
         if location_override:
             overrides["location_ccid"] = location_override
+        if pending.target_expense_ccid:
+            overrides["expense_ccid"] = pending.target_expense_ccid
 
         params, is_noop = build_same_book_transfer_params(
             state=state,
