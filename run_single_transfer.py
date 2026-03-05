@@ -96,6 +96,7 @@ def main(argv: list[str] | None = None) -> int:
     source_book = _prompt("Source Book Type Code")
     target_book = _prompt("Target Book Type Code")
     target_location_id = _prompt("Target Location ID", required=False) or None
+    asset_id = _prompt("Asset ID (if known, otherwise leave blank)", required=False) or None
     effective_date = _prompt("Effective Date (YYYY-MM-DD)", default=date.today().isoformat())
 
     is_cross_book = source_book.strip().upper() != target_book.strip().upper()
@@ -131,6 +132,7 @@ def main(argv: list[str] | None = None) -> int:
             client,
             source_book,
             asset_number,
+            asset_id=asset_id,
         )
         log.info("Asset state: id=%s, distributions=%d, cost=%s",
                  state.asset_id, len(state.distribution_ids), state.cost)

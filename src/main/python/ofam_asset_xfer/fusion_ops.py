@@ -42,9 +42,22 @@ class AssetState:
         book_type_code = str(
             pl.get("X_BOOK_TYPE_CODE") or pl.get("P_BOOK_TYPE_CODE") or ""
         ).strip()
-        if not asset_id or not asset_number or not book_type_code:
+        missing = []
+        if not asset_id:
+            missing.append("X_ASSET_ID")
+        if not asset_number:
+            missing.append("X_ASSET_NUMBER")
+        if not book_type_code:
+            missing.append("X_BOOK_TYPE_CODE/P_BOOK_TYPE_CODE")
+        if missing:
+            hint = ""
+            if "X_ASSET_ID" in missing:
+                hint = (
+                    " Hint: This Fusion instance may not return X_ASSET_ID in "
+                    "getAssetInformation. Supply it via the asset_id parameter."
+                )
             raise FusionApiError(
-                f"Missing identity fields in getAssetInformation response: {pl}"
+                f"Missing identity fields {missing} in getAssetInformation response.{hint}"
             )
 
         dist_ids = parse_rosetta(pl.get("X_DISTRIBUTION_ID_TBL"))
