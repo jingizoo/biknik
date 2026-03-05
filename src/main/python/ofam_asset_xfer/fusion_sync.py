@@ -159,14 +159,20 @@ class FusionIUSync:
         log.info("Scanning for pending IU transfers (books=%s, limit=%d)", books, limit)
         books_upper = {b.upper().strip() for b in books}
 
-        # Step 1: Run BIP report to get transfer candidates
-        try:
-            rows = self._bip.run_report(params=bip_params)
-        except FusionApiError as e:
-            log.error("BIP report failed: %s", e)
-            return []
+        # Step 1: Run BIP report per book to get transfer candidates.
+        # The BIP report requires P_BOOK_TYPE_CODE to filter assets.
+        rows: List[Dict[str, str]] = []
+        for book in books:
+            report_params = dict(bip_params or {})
+            report_params["P_BOOK_TYPE_CODE"] = book
+            try:
+                book_rows = self._bip.run_report(params=report_params)
+                log.info("BIP report for book '%s' returned %d row(s)", book, len(book_rows))
+                rows.extend(book_rows)
+            except FusionApiError as e:
+                log.error("BIP report failed for book '%s': %s", book, e)
 
-        log.info("BIP report returned %d row(s)", len(rows))
+        log.info("BIP report returned %d total row(s) across %d book(s)", len(rows), len(books))
 
         # Step 2: Filter and enrich each candidate
         pending: List[PendingTransfer] = []
