@@ -5,7 +5,10 @@ import logging
 import time
 from typing import Any, Dict, List, Optional
 
+from .bip_client import BIPClient, BIPConfig
+from .entity_resolver import EntityBookResolver
 from .exceptions import ConfigError, FusionApiError
+from .fusion_sync import FusionIUSync, DFFConfig
 from .oracle_client import OracleConfig, OracleErpIntegrationsClient
 from .store import ArtifactStore
 from .fusion_ops import (
@@ -56,22 +59,72 @@ def _validate_request(req: Dict[str, Any]) -> None:
             )
 
 
+def _run_bip_flow(
+    config: Dict[str, Any], store: ArtifactStore, execute: bool
+) -> None:
+    """BIP-driven flow: discover transfers from 'books' config via BIP report."""
+    oracle_cfg = OracleConfig.from_dict(config.get("oracle", {}))
+    fusion_client = OracleErpIntegrationsClient(oracle_cfg)
+
+    bip_cfg = BIPConfig.from_dict(config.get("bip", {}))
+    bip_client = BIPClient(bip_cfg)
+
+    entity_map = config.get("entity_book_map", {})
+    if not entity_map:
+        raise ConfigError("Config must include non-empty 'entity_book_map'.")
+    entity_resolver = EntityBookResolver(entity_map)
+
+    books = config.get("books", [])
+
+    dff_config = None
+    if config.get("dff_columns"):
+        dff_config = DFFConfig(**config["dff_columns"])
+
+    bip_params = config.get("bip_params")
+    max_transfers = int(config.get("max_transfers", 500))
+    dry_run = not execute
+
+    sync = FusionIUSync(
+        fusion_client,
+        entity_resolver,
+        bip_client,
+        dff_config=dff_config,
+    )
+    summary = sync.run_full_sync(
+        books=books,
+        dry_run=dry_run,
+        max_transfers=max_transfers,
+        bip_params=bip_params,
+    )
+
+    store.write_json("summary.json", summary)
+    store.write_json("results.json", summary.get("results", []))
+    log.info("Run completed: %s", summary.get("counts", {}))
+
+
 def run_job(
     config_uri: str, out_dir_uri: str, cli_execute: Optional[bool] = None
 ) -> None:
     config = _load_config(config_uri)
     store = ArtifactStore(base_uri=out_dir_uri)
     store.ensure_dir()
+
+    execute_cfg = bool(config.get("execute", False))
+    execute = execute_cfg if cli_execute is None else bool(cli_execute)
+
+    # Route to BIP-driven flow when config has 'books' instead of 'requests'.
+    if config.get("books") and not config.get("requests"):
+        store.ensure_dir("audit")
+        _run_bip_flow(config, store, execute)
+        return
+
     store.ensure_dir("audit")
     store.ensure_dir("exceptions")
 
     oracle_cfg = OracleConfig.from_dict(config.get("oracle", {}))
-    execute_cfg = bool(config.get("execute", False))
-    execute = execute_cfg if cli_execute is None else bool(cli_execute)
-
     client = OracleErpIntegrationsClient(oracle_cfg)
 
-    requests = config.get("requests") or config.get("books")
+    requests = config.get("requests")
     if not isinstance(requests, list) or not requests:
         raise ConfigError(
             "Config must include non-empty 'requests' or 'books' list."
