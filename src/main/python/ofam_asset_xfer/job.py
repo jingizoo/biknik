@@ -71,9 +71,11 @@ def run_job(
 
     client = OracleErpIntegrationsClient(oracle_cfg)
 
-    requests = config.get("requests")
+    requests = config.get("requests") or config.get("books")
     if not isinstance(requests, list) or not requests:
-        raise ConfigError("Config must include non-empty 'requests' list.")
+        raise ConfigError(
+            "Config must include non-empty 'requests' or 'books' list."
+        )
 
     results: List[Dict[str, Any]] = []
     summary = {
