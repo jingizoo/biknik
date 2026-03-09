@@ -84,11 +84,25 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = p.parse_args(argv)
 
+    log_level = getattr(logging, args.log_level.upper(), logging.INFO)
     logging.basicConfig(
-        level=getattr(logging, args.log_level.upper(), logging.INFO),
+        level=log_level,
         format="%(asctime)s %(levelname)-5s %(name)s — %(message)s",
     )
     log = logging.getLogger("run_local")
+
+    # Optionally attach Google Cloud Logging so all log.* calls are also
+    # shipped to GCP.  Requires ``google-cloud-logging`` and either
+    # GOOGLE_APPLICATION_CREDENTIALS or Application Default Credentials.
+    if os.getenv("ENABLE_CLOUD_LOGGING", "").strip().lower() in ("1", "true", "yes"):
+        try:
+            import google.cloud.logging as cloud_logging  # type: ignore[import-untyped]
+
+            cl_client = cloud_logging.Client()
+            cl_client.setup_logging(log_level=log_level)
+            log.info("Google Cloud Logging enabled")
+        except Exception:
+            log.warning("Could not initialise Google Cloud Logging — continuing with local logs only", exc_info=True)
 
     # Resolve output dir.
     if args.out_dir:
