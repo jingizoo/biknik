@@ -22,6 +22,7 @@ from ofam_asset_xfer.bip_client import BIPClient, BIPConfig
 from ofam_asset_xfer.entity_resolver import EntityBookResolver
 from ofam_asset_xfer.exceptions import ConfigError
 from ofam_asset_xfer.fusion_sync import FusionIUSync, DFFConfig
+from ofam_asset_xfer.gcs_publisher import GCSPublisherConfig, GCSResultPublisher
 from ofam_asset_xfer.oracle_client import OracleConfig, OracleErpIntegrationsClient
 from ofam_asset_xfer.store import ArtifactStore
 
@@ -91,11 +92,21 @@ def main(argv: list[str] | None = None) -> int:
             bip_params=bip_params,
         )
 
-        # Write results
+        # Write results locally
         out_store = ArtifactStore(base_uri=args.out_dir)
         out_store.ensure_dir()
         out_store.write_json("summary.json", summary)
         out_store.write_json("results.json", summary.get("results", []))
+
+        # Publish to GCS if configured
+        gcs_block = config.get("gcs")
+        if gcs_block:
+            try:
+                gcs_cfg = GCSPublisherConfig.from_dict(gcs_block)
+                publisher = GCSResultPublisher(gcs_cfg)
+                publisher.publish(summary, summary.get("results", []))
+            except Exception:
+                log.exception("Failed to publish results to GCS (non-fatal)")
 
         counts = summary.get("counts", {})
         log.info("Completed: total=%s transferred=%s failed=%s dry_run=%s",
