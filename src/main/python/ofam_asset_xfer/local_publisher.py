@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 from .gcs_publisher import flatten_results, to_ndjson
+from .merge_ndjson import merge
 
 log = logging.getLogger(__name__)
 
@@ -86,3 +87,8 @@ class LocalResultPublisher:
             self._prune_old_dirs()
         except Exception:
             log.exception("Prune failed (non-fatal)")
+
+        try:
+            merge(str(self._out_dir))
+        except Exception:
+            log.exception("Merge failed (non-fatal)")
