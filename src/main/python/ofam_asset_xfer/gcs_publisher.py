@@ -1,30 +1,29 @@
-"""Publish transfer results and error logs to a GCS bucket.
+"""Publish transfer results to GCS in a Tableau-friendly NDJSON format.
 
-Uses a service-account JSON key file for authentication.  The publisher writes
-three artefacts per run:
+Each run **appends** flat rows to daily files::
 
-    gs://<bucket>/<prefix>/summary.json      – high-level counts & timing
-    gs://<bucket>/<prefix>/results.json       – per-asset transfer outcomes
-    gs://<bucket>/<prefix>/errors.json        – only the FAILED rows (convenience)
+    gs://<bucket>/<prefix>/YYYY-MM-DD/results.ndjson
+    gs://<bucket>/<prefix>/YYYY-MM-DD/errors.ndjson   (FAILED rows only)
 
-``prefix`` defaults to ``transfers/<YYYY-MM-DD>/<epoch>`` so each run gets its
-own folder and nothing is overwritten.
+Every row is a self-contained JSON object with ``run_date``, ``run_ts``,
+and ``dry_run`` stamped in, so Tableau / BigQuery can query without joins.
+
+On each publish the publisher also **prunes** blobs whose date-folder is
+older than ``retention_days`` (default 365).
 
 Configuration
 -------------
-Add a ``gcs`` block to your config JSON::
+::
 
     {
       "gcs": {
         "bucket": "my-fa-transfer-logs",
         "prefix": "transfers",
         "service_account_file": "/path/to/sa-key.json",
-        "service_account_file_env": "GCS_SA_KEY_PATH"
+        "service_account_file_env": "GCS_SA_KEY_PATH",
+        "retention_days": 365
       }
     }
-
-Either ``service_account_file`` or ``service_account_file_env`` (env-var name
-whose value is the path) must be provided.
 """
 
 from __future__ import annotations
@@ -32,16 +31,64 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import time
 from dataclasses import dataclass
-from datetime import date, timezone, datetime
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from .exceptions import ConfigError
 
 log = logging.getLogger(__name__)
 
+# Matches date-named folders like  transfers/2025-03-09/
+_DATE_FOLDER_RE = re.compile(r"(\d{4}-\d{2}-\d{2})/")
 
+
+def _flatten_result(
+    row: Dict[str, Any],
+    run_date: str,
+    run_ts: int,
+    dry_run: bool,
+) -> Dict[str, Any]:
+    """Flatten a TransferResult dict into a Tableau-friendly row.
+
+    Removes nested ``fusion_response`` (too large / variable for dashboards)
+    and stamps run metadata onto every row.
+    """
+    flat: Dict[str, Any] = {
+        "run_date": run_date,
+        "run_ts": run_ts,
+        "dry_run": dry_run,
+        "asset_number": row.get("asset_number"),
+        "status": row.get("status"),
+        "source_book": row.get("source_book"),
+        "target_book": row.get("target_book"),
+        "transfer_to_entity": row.get("transfer_to_entity"),
+        "transfer_date": row.get("transfer_date"),
+        "error": row.get("error"),
+    }
+    return flat
+
+
+def flatten_results(
+    results: List[Dict[str, Any]],
+    run_date: str,
+    run_ts: int,
+    dry_run: bool,
+) -> List[Dict[str, Any]]:
+    """Convert raw results into flat Tableau-ready rows."""
+    return [_flatten_result(r, run_date, run_ts, dry_run) for r in results]
+
+
+def to_ndjson(rows: List[Dict[str, Any]]) -> str:
+    """Serialise rows as newline-delimited JSON (one JSON object per line)."""
+    return "".join(json.dumps(r, sort_keys=True, default=str) + "\n" for r in rows)
+
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
 @dataclass(frozen=True)
 class GCSPublisherConfig:
     """Immutable config for :class:`GCSResultPublisher`."""
@@ -49,6 +96,7 @@ class GCSPublisherConfig:
     bucket: str
     prefix: str
     service_account_file: str
+    retention_days: int = 365
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "GCSPublisherConfig":
@@ -68,11 +116,21 @@ class GCSPublisherConfig:
                     "gcs.service_account_file or gcs.service_account_file_env is required"
                 )
 
-        return cls(bucket=bucket, prefix=prefix, service_account_file=sa_file)
+        retention_days = int(d.get("retention_days", 365))
+
+        return cls(
+            bucket=bucket,
+            prefix=prefix,
+            service_account_file=sa_file,
+            retention_days=retention_days,
+        )
 
 
+# ---------------------------------------------------------------------------
+# Publisher
+# ---------------------------------------------------------------------------
 class GCSResultPublisher:
-    """Writes transfer results & error logs to a GCS bucket.
+    """Appends transfer results as NDJSON to daily files on GCS.
 
     Implements the :class:`~ofam_asset_xfer.result_publisher.ResultPublisher`
     protocol — no base-class coupling.
@@ -92,38 +150,73 @@ class GCSResultPublisher:
             )
         return self._client
 
-    def _run_prefix(self) -> str:
-        today = date.today().isoformat()
-        epoch = int(time.time())
-        return f"{self._cfg.prefix}/{today}/{epoch}"
+    # -- append -------------------------------------------------------------
 
-    def _upload_json(self, blob_path: str, obj: Any) -> str:
+    def _append_ndjson(self, blob_path: str, ndjson_text: str) -> str:
+        """Append *ndjson_text* to an existing blob, or create it."""
         client = self._get_client()
         bucket = client.bucket(self._cfg.bucket)
         blob = bucket.blob(blob_path)
-        payload = json.dumps(obj, indent=2, sort_keys=True, default=str)
-        blob.upload_from_string(payload, content_type="application/json")
+
+        existing = ""
+        if blob.exists():
+            existing = blob.download_as_text(encoding="utf-8")
+
+        merged = existing + ndjson_text
+        blob.upload_from_string(merged, content_type="application/x-ndjson")
+
         uri = f"gs://{self._cfg.bucket}/{blob_path}"
-        log.info("Uploaded %s (%d bytes)", uri, len(payload))
+        log.info("Appended %d row(s) to %s", ndjson_text.count("\n"), uri)
         return uri
 
-    # ---- ResultPublisher protocol ------------------------------------------
+    # -- prune --------------------------------------------------------------
+
+    def _prune_old_blobs(self) -> int:
+        """Delete blobs in date-folders older than retention_days."""
+        cutoff = date.today() - timedelta(days=self._cfg.retention_days)
+        client = self._get_client()
+        bucket = client.bucket(self._cfg.bucket)
+        prefix = self._cfg.prefix + "/"
+
+        deleted = 0
+        for blob in bucket.list_blobs(prefix=prefix):
+            match = _DATE_FOLDER_RE.search(blob.name[len(prefix):])
+            if not match:
+                continue
+            try:
+                folder_date = date.fromisoformat(match.group(1))
+            except ValueError:
+                continue
+            if folder_date < cutoff:
+                blob.delete()
+                deleted += 1
+
+        if deleted:
+            log.info("Pruned %d blob(s) older than %s", deleted, cutoff.isoformat())
+        return deleted
+
+    # -- ResultPublisher protocol -------------------------------------------
 
     def publish(self, summary: Dict[str, Any], results: List[Dict[str, Any]]) -> None:
-        """Upload summary, full results, and an errors-only extract to GCS."""
-        prefix = self._run_prefix()
+        """Flatten, append to daily NDJSON files, and prune old data."""
+        run_date = date.today().isoformat()
+        run_ts = int(time.time())
+        dry_run = summary.get("dry_run", True)
 
-        self._upload_json(f"{prefix}/summary.json", summary)
-        self._upload_json(f"{prefix}/results.json", results)
+        flat = flatten_results(results, run_date, run_ts, dry_run)
+        day_prefix = f"{self._cfg.prefix}/{run_date}"
 
-        errors = [r for r in results if r.get("status") == "FAILED"]
+        if flat:
+            self._append_ndjson(f"{day_prefix}/results.ndjson", to_ndjson(flat))
+
+        errors = [r for r in flat if r.get("status") == "FAILED"]
         if errors:
-            self._upload_json(f"{prefix}/errors.json", errors)
-            log.warning(
-                "Published %d error(s) to gs://%s/%s/errors.json",
-                len(errors),
-                self._cfg.bucket,
-                prefix,
-            )
+            self._append_ndjson(f"{day_prefix}/errors.ndjson", to_ndjson(errors))
+            log.warning("Published %d error(s)", len(errors))
         else:
             log.info("No errors to publish")
+
+        try:
+            self._prune_old_blobs()
+        except Exception:
+            log.exception("Prune failed (non-fatal)")

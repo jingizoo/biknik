@@ -30,7 +30,7 @@ import json
 import logging
 import os
 import sys
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 
 # Ensure the package is importable when running from repo root.
@@ -40,6 +40,8 @@ from ofam_asset_xfer.bip_client import BIPClient, BIPConfig  # noqa: E402
 from ofam_asset_xfer.entity_resolver import EntityBookResolver  # noqa: E402
 from ofam_asset_xfer.exceptions import ConfigError  # noqa: E402
 from ofam_asset_xfer.fusion_sync import FusionIUSync, DFFConfig  # noqa: E402
+from ofam_asset_xfer.gcs_publisher import GCSPublisherConfig, GCSResultPublisher  # noqa: E402
+from ofam_asset_xfer.local_publisher import LocalResultPublisher  # noqa: E402
 from ofam_asset_xfer.oracle_client import OracleConfig, OracleErpIntegrationsClient  # noqa: E402
 
 
@@ -148,7 +150,7 @@ def main(argv: list[str] | None = None) -> int:
             bip_params=bip_params,
         )
 
-        # Write results
+        # Write raw results (JSON)
         summary_path = Path(out_dir) / "summary.json"
         summary_path.write_text(json.dumps(summary, indent=2, default=str))
 
@@ -156,6 +158,21 @@ def main(argv: list[str] | None = None) -> int:
         results_path.write_text(
             json.dumps(summary.get("results", []), indent=2, default=str)
         )
+
+        # Publish Tableau-friendly NDJSON (always local, optionally GCS)
+        results_list = summary.get("results", [])
+
+        local_pub = LocalResultPublisher(out_dir)
+        local_pub.publish(summary, results_list)
+
+        gcs_block = config.get("gcs")
+        if gcs_block:
+            try:
+                gcs_cfg = GCSPublisherConfig.from_dict(gcs_block)
+                gcs_pub = GCSResultPublisher(gcs_cfg)
+                gcs_pub.publish(summary, results_list)
+            except Exception:
+                log.exception("Failed to publish to GCS (non-fatal)")
 
     except Exception:
         log.exception("Job failed")
@@ -169,6 +186,7 @@ def main(argv: list[str] | None = None) -> int:
     log.info("  Failed      : %s", counts.get("failed", 0))
     log.info("  Dry-run     : %s", counts.get("dry_run", 0))
     log.info("Full results  : %s", Path(out_dir) / "results.json")
+    log.info("NDJSON logs   : %s", Path(out_dir) / date.today().isoformat())
 
     return 0
 
