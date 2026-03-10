@@ -148,7 +148,7 @@ def lookup_ccid_by_segments(
 
     # Build q= filter:  Segment1='US01';Segment2='100';...
     # Sort segment keys numerically (Segment1, Segment2, ..., Segment10, ...)
-    def _seg_sort_key(k: str) -> tuple:
+    def _seg_sort_key(k: str) -> tuple[Any, ...]:
         m = re.match(r"^(Segment)(\d+)$", k)
         if m:
             return (0, int(m.group(2)))

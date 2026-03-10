@@ -159,7 +159,7 @@ class FusionIUSync:
             List of PendingTransfer objects (at most ``limit``).
         """
         log.info("Scanning for pending IU transfers (books=%s, limit=%d)", books, limit)
-        books_upper = {b.upper().strip() for b in books}
+        books_upper: set[str] = {b.upper().strip() for b in books}
 
         # Step 1: Run BIP report per book to get transfer candidates.
         # The BIP report requires P_BOOK_TYPE_CODE to filter assets.

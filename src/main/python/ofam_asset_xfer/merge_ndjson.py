@@ -32,7 +32,7 @@ import logging
 import sys
 from datetime import date, timedelta
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 log = logging.getLogger(__name__)
 
@@ -43,7 +43,7 @@ def collect_ndjson_files(
     after: Optional[date] = None,
 ) -> List[Path]:
     """Return sorted list of daily NDJSON files, optionally filtered by date."""
-    files = []
+    files: List[Path] = []
     if not base_dir.exists():
         return files
     for child in sorted(base_dir.iterdir()):
@@ -93,7 +93,7 @@ def merge(
     out_dir: Optional[str] = None,
     days: Optional[int] = None,
     write_csv: bool = False,
-) -> dict:
+) -> Dict[str, Any]:
     """Merge daily NDJSON into consolidated files.
 
     Returns a dict with row counts for results and errors.

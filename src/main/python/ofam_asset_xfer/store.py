@@ -6,7 +6,7 @@ import posixpath
 from dataclasses import dataclass
 from typing import Any, Tuple
 
-import fsspec
+import fsspec  # type: ignore[import-untyped]
 
 
 def _join_uri(base_uri: str, *parts: str) -> str:
@@ -60,7 +60,7 @@ class ArtifactStore:
         )
         fs, path = self._fs_and_path(uri)
         with fs.open(path, "r", encoding=encoding) as f:
-            return f.read()
+            return str(f.read())
 
     def read_json(self, uri_or_rel: str) -> Any:
         return json.loads(self.read_text(uri_or_rel))

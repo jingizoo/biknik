@@ -34,7 +34,8 @@ def _load_config(config_uri: str) -> Dict[str, Any]:
     except Exception as e:
         raise ConfigError(f"Failed to read config: {config_uri}") from e
     try:
-        return json.loads(raw)
+        result: Dict[str, Any] = json.loads(raw)
+        return result
     except Exception as e:
         raise ConfigError(f"Config is not valid JSON: {config_uri}") from e
 

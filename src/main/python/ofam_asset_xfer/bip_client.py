@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 from xml.etree import ElementTree as ET
 
-import requests
+import requests  # type: ignore[import-untyped]
 
 from .exceptions import FusionApiError
 

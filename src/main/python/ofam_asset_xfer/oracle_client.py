@@ -5,7 +5,7 @@ import logging
 import os
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
-import requests
+import requests  # type: ignore[import-untyped]
 
 from .exceptions import FusionApiError
 from .paramlist import build_parameter_list
@@ -146,4 +146,4 @@ class OracleErpIntegrationsClient:
         if r.status_code >= 400:
             raise FusionApiError(f"Fusion GET HTTP {r.status_code}: {raw}")
 
-        return raw
+        return dict(raw)

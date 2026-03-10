@@ -146,7 +146,7 @@ class GCSResultPublisher:
         self._cfg = config
         self._client = None  # lazy
 
-    def _get_client(self):
+    def _get_client(self) -> Any:
         """Lazy-init the GCS client so import-time doesn't require google libs."""
         if self._client is None:
             from google.cloud import storage  # type: ignore[import-untyped]
