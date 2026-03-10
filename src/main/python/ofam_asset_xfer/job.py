@@ -10,6 +10,8 @@ from .entity_resolver import EntityBookResolver
 from .exceptions import ConfigError, FusionApiError
 from .fusion_sync import FusionIUSync, DFFConfig
 from .oracle_client import OracleConfig, OracleErpIntegrationsClient
+from .gcs_publisher import GCSPublisherConfig, GCSResultPublisher
+from .local_publisher import LocalResultPublisher
 from .store import ArtifactStore
 from .fusion_ops import (
     get_asset_information,
@@ -99,6 +101,22 @@ def _run_bip_flow(
 
     store.write_json("summary.json", summary)
     store.write_json("results.json", summary.get("results", []))
+
+    # Publish Tableau-friendly NDJSON (always local, optionally GCS)
+    results_list = summary.get("results", [])
+
+    local_pub = LocalResultPublisher(store.base_uri)
+    local_pub.publish(summary, results_list)
+
+    gcs_block = config.get("gcs")
+    if gcs_block:
+        try:
+            gcs_cfg = GCSPublisherConfig.from_dict(gcs_block)
+            gcs_pub = GCSResultPublisher(gcs_cfg)
+            gcs_pub.publish(summary, results_list)
+        except Exception:
+            log.exception("Failed to publish to GCS (non-fatal)")
+
     log.info("Run completed: %s", summary.get("counts", {}))
 
 

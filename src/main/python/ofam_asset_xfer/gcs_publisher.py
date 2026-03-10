@@ -103,6 +103,10 @@ class GCSPublisherConfig:
         bucket = d.get("bucket", "").strip()
         if not bucket:
             raise ConfigError("gcs.bucket is required")
+        # Strip gs:// scheme if provided (users often copy the full URI).
+        if bucket.startswith("gs://"):
+            bucket = bucket[len("gs://"):]
+        bucket = bucket.strip("/")
 
         prefix = d.get("prefix", "transfers").strip().strip("/")
 
@@ -115,6 +119,8 @@ class GCSPublisherConfig:
                 raise ConfigError(
                     "gcs.service_account_file or gcs.service_account_file_env is required"
                 )
+        # Expand ~ to the user's home directory.
+        sa_file = os.path.expanduser(sa_file)
 
         retention_days = int(d.get("retention_days", 365))
 
