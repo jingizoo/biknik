@@ -13,7 +13,7 @@ from __future__ import annotations
 import logging
 import re
 from copy import deepcopy
-from typing import Any, Dict, List, Optional, Protocol
+from typing import Any, Dict, List, Optional, Protocol, Tuple
 
 from .exceptions import FusionApiError, ValidationError
 
@@ -148,7 +148,7 @@ def lookup_ccid_by_segments(
 
     # Build q= filter:  Segment1='US01';Segment2='100';...
     # Sort segment keys numerically (Segment1, Segment2, ..., Segment10, ...)
-    def _seg_sort_key(k: str) -> tuple[Any, ...]:
+    def _seg_sort_key(k: str) -> Tuple[Any, ...]:
         m = re.match(r"^(Segment)(\d+)$", k)
         if m:
             return (0, int(m.group(2)))
