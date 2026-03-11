@@ -169,18 +169,12 @@ class FusionIUSync:
             report_params["P_BOOK_TYPE_CODE"] = book
             try:
                 book_rows = self._bip.run_report(params=report_params)
-                log.info(
-                    "BIP report for book '%s' returned %d row(s)", book, len(book_rows)
-                )
+                log.info("BIP report for book '%s' returned %d row(s)", book, len(book_rows))
                 rows.extend(book_rows)
             except FusionApiError as e:
                 log.error("BIP report failed for book '%s': %s", book, e)
 
-        log.info(
-            "BIP report returned %d total row(s) across %d book(s)",
-            len(rows),
-            len(books),
-        )
+        log.info("BIP report returned %d total row(s) across %d book(s)", len(rows), len(books))
 
         # Step 2: Filter and enrich each candidate
         pending: List[PendingTransfer] = []
@@ -243,11 +237,7 @@ class FusionIUSync:
         target_expense_ccid = row.get(dff.target_expense_ccid_col, "").strip() or None
 
         # --- Location already matches → skip ---
-        if (
-            current_location_id
-            and target_location_id
-            and current_location_id == target_location_id
-        ):
+        if current_location_id and target_location_id and current_location_id == target_location_id:
             log.info(
                 "Skipping asset %s: CURRENT_LOCATION_ID (%s) already equals "
                 "TARGET_LOCATION_ID (%s) — no transfer needed",
@@ -356,19 +346,11 @@ class FusionIUSync:
         try:
             if pending.is_cross_book:
                 return self._execute_cross_book(
-                    pending,
-                    state,
-                    request_id,
-                    effective_date,
-                    dry_run,
+                    pending, state, request_id, effective_date, dry_run,
                 )
             else:
                 return self._execute_same_book(
-                    pending,
-                    state,
-                    request_id,
-                    effective_date,
-                    dry_run,
+                    pending, state, request_id, effective_date, dry_run,
                 )
         except Exception as e:
             log.exception("Transfer failed for asset=%s", pending.asset_number)
@@ -440,9 +422,9 @@ class FusionIUSync:
             transfer_to_entity=pending.transfer_to_entity,
             transfer_date=effective_date,
             fusion_response=pl,
-            error=(
-                None if status_code == "S" else f"Fusion X_RETURN_STATUS={status_code}"
-            ),
+            error=None
+            if status_code == "S"
+            else f"Fusion X_RETURN_STATUS={status_code}",
         )
 
     def _execute_same_book(
@@ -477,7 +459,9 @@ class FusionIUSync:
         )
 
         if is_noop:
-            log.info("NOOP: no distribution changes for asset=%s", pending.asset_number)
+            log.info(
+                "NOOP: no distribution changes for asset=%s", pending.asset_number
+            )
             return TransferResult(
                 asset_number=pending.asset_number,
                 status="NOOP",
@@ -513,9 +497,9 @@ class FusionIUSync:
             transfer_to_entity=pending.transfer_to_entity,
             transfer_date=effective_date,
             fusion_response=pl,
-            error=(
-                None if status_code == "S" else f"Fusion X_RETURN_STATUS={status_code}"
-            ),
+            error=None
+            if status_code == "S"
+            else f"Fusion X_RETURN_STATUS={status_code}",
         )
 
     # ------------------------------------------------------------------

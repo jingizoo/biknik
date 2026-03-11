@@ -40,7 +40,6 @@ class EntityBookResolver:
 
     @property
     def entity_book_map(self) -> Dict[str, str]:
-        """Return a copy of the normalised entity-to-book mapping."""
         return dict(self._map)
 
     def resolve_target_book(self, entity_name: str) -> str:

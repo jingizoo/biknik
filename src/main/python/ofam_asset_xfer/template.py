@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from typing import Any, Dict
 
+
 _VAR_RE = re.compile(r"\{\{\s*([a-zA-Z0-9_\.\-]+)\s*\}\}")
 
 

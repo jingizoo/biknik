@@ -23,6 +23,7 @@ from .fusion_ops import (
 )
 from .template import render
 
+
 log = logging.getLogger(__name__)
 
 
@@ -61,7 +62,9 @@ def _validate_request(req: Dict[str, Any]) -> None:
             )
 
 
-def _run_bip_flow(config: Dict[str, Any], store: ArtifactStore, execute: bool) -> None:
+def _run_bip_flow(
+    config: Dict[str, Any], store: ArtifactStore, execute: bool
+) -> None:
     """BIP-driven flow: discover transfers from 'books' config via BIP report."""
     oracle_cfg = OracleConfig.from_dict(config.get("oracle", {}))
     fusion_client = OracleErpIntegrationsClient(oracle_cfg)
@@ -142,7 +145,9 @@ def run_job(
 
     requests = config.get("requests")
     if not isinstance(requests, list) or not requests:
-        raise ConfigError("Config must include non-empty 'requests' or 'books' list.")
+        raise ConfigError(
+            "Config must include non-empty 'requests' or 'books' list."
+        )
 
     results: List[Dict[str, Any]] = []
     summary = {
@@ -423,9 +428,9 @@ def _process_one(
     return {
         "request_id": request_id,
         "transfer_type": transfer_type,
-        "status": (
-            "SUCCESS" if str(pl_ret.get("X_RETURN_STATUS") or "") == "S" else "FAILED"
-        ),
+        "status": "SUCCESS"
+        if str(pl_ret.get("X_RETURN_STATUS") or "") == "S"
+        else "FAILED",
         "mode": "orchestrated_add_retire",
         "source_asset_id": state.asset_id,
         "source_asset_number": state.asset_number,

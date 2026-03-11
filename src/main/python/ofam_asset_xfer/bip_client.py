@@ -26,6 +26,7 @@ import requests  # type: ignore[import-untyped]
 
 from .exceptions import FusionApiError
 
+
 log = logging.getLogger(__name__)
 
 # SOAP 1.2 / BIP namespaces
@@ -45,7 +46,6 @@ class BIPConfig:
 
     @staticmethod
     def from_dict(d: Dict[str, Any]) -> "BIPConfig":
-        """Build a BIPConfig from a raw config dictionary."""
         base_url = str(d.get("base_url", "")).rstrip("/")
         report_path = str(d.get("report_path", "")).strip()
 
@@ -112,6 +112,7 @@ class BIPClient:
         params: Optional[Dict[str, str]],
     ) -> bytes:
         """Build SOAP 1.2 envelope, POST to BIP, return decoded reportBytes."""
+
         # Build parameter XML fragment
         param_xml = ""
         if params:

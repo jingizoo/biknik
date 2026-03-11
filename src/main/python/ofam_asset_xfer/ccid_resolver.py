@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Optional, Protocol, Tuple
 
 from .exceptions import FusionApiError, ValidationError
 
+
 log = logging.getLogger(__name__)
 
 # Segment fields returned by accountCombinationsLOV (Segment1 .. Segment30).
@@ -144,6 +145,7 @@ def lookup_ccid_by_segments(
     Uses accountCombinationsLOV with a ``q`` filter.  If no match is found,
     raises a hard error with a clear message about the missing combination.
     """
+
     # Build q= filter:  Segment1='US01';Segment2='100';...
     # Sort segment keys numerically (Segment1, Segment2, ..., Segment10, ...)
     def _seg_sort_key(k: str) -> Tuple[Any, ...]:

@@ -34,7 +34,7 @@ import os
 import re
 import time
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from .exceptions import ConfigError
@@ -100,13 +100,12 @@ class GCSPublisherConfig:
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "GCSPublisherConfig":
-        """Build a GCSPublisherConfig from a raw config dictionary."""
         bucket = d.get("bucket", "").strip()
         if not bucket:
             raise ConfigError("gcs.bucket is required")
         # Strip gs:// scheme if provided (users often copy the full URI).
         if bucket.startswith("gs://"):
-            bucket = bucket[len("gs://") :]
+            bucket = bucket[len("gs://"):]
         bucket = bucket.strip("/")
 
         prefix = d.get("prefix", "transfers").strip().strip("/")
@@ -187,7 +186,7 @@ class GCSResultPublisher:
 
         deleted = 0
         for blob in bucket.list_blobs(prefix=prefix):
-            match = _DATE_FOLDER_RE.search(blob.name[len(prefix) :])
+            match = _DATE_FOLDER_RE.search(blob.name[len(prefix):])
             if not match:
                 continue
             try:

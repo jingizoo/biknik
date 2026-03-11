@@ -66,7 +66,6 @@ class LocalResultPublisher:
     # -- ResultPublisher protocol -------------------------------------------
 
     def publish(self, summary: Dict[str, Any], results: List[Dict[str, Any]]) -> None:
-        """Flatten, append to daily NDJSON files on disk, and prune old data."""
         run_date = date.today().isoformat()
         run_ts = int(time.time())
         dry_run = summary.get("dry_run", True)

@@ -15,6 +15,8 @@ import argparse
 import json
 import logging
 import os
+import sys
+from pathlib import Path
 
 from ofam_asset_xfer.bip_client import BIPClient, BIPConfig
 from ofam_asset_xfer.entity_resolver import EntityBookResolver
@@ -27,28 +29,12 @@ from ofam_asset_xfer.store import ArtifactStore
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
-        description="OFAM IU Asset Transfer Automation (BIP-driven)."
-    )
+    p = argparse.ArgumentParser(description="OFAM IU Asset Transfer Automation (BIP-driven).")
     p.add_argument("--config", required=True, help="Path/URI to config JSON.")
-    p.add_argument(
-        "--out-dir", required=True, help="Output directory/URI for artifacts."
-    )
-    p.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Reads/validation only (no writes to Fusion).",
-    )
-    p.add_argument(
-        "--execute",
-        action="store_true",
-        help="Post transactions to Fusion. Overrides --dry-run.",
-    )
-    p.add_argument(
-        "--log-level",
-        default=os.getenv("LOG_LEVEL", "INFO"),
-        help="Logging level (INFO, DEBUG, ...).",
-    )
+    p.add_argument("--out-dir", required=True, help="Output directory/URI for artifacts.")
+    p.add_argument("--dry-run", action="store_true", help="Reads/validation only (no writes to Fusion).")
+    p.add_argument("--execute", action="store_true", help="Post transactions to Fusion. Overrides --dry-run.")
+    p.add_argument("--log-level", default=os.getenv("LOG_LEVEL", "INFO"), help="Logging level (INFO, DEBUG, ...).")
     return p
 
 
@@ -129,13 +115,9 @@ def main(argv: list[str] | None = None) -> int:
                 log.exception("Failed to publish to GCS (non-fatal)")
 
         counts = summary.get("counts", {})
-        log.info(
-            "Completed: total=%s transferred=%s failed=%s dry_run=%s",
-            counts.get("total", 0),
-            counts.get("transferred", 0),
-            counts.get("failed", 0),
-            counts.get("dry_run", 0),
-        )
+        log.info("Completed: total=%s transferred=%s failed=%s dry_run=%s",
+                 counts.get("total", 0), counts.get("transferred", 0),
+                 counts.get("failed", 0), counts.get("dry_run", 0))
         return 0
 
     except Exception:
