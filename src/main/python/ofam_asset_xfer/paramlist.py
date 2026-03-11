@@ -3,7 +3,6 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, Iterable, List
 
-
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _NUMERIC_RE = re.compile(r"^-?\d+(\.\d+)?$")
 

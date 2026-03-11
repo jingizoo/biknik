@@ -9,7 +9,6 @@ from .oracle_client import OracleErpIntegrationsClient
 from .paramlist import parse_rosetta, ensure_same_len
 from .ccid_resolver import resolve_target_expense_ccid
 
-
 log = logging.getLogger(__name__)
 
 
@@ -35,6 +34,7 @@ class AssetState:
 
     @staticmethod
     def from_get_asset_information(pl: Dict[str, Any]) -> "AssetState":
+        """Parse a getAssetInformation parameter list into an AssetState."""
         # getAssetInformation returns X_* fields. We rely on those.
         # Required identity
         asset_id = str(pl.get("X_ASSET_ID") or "").strip()

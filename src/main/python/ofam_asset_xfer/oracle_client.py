@@ -10,7 +10,6 @@ import requests  # type: ignore[import-untyped]
 from .exceptions import FusionApiError
 from .paramlist import build_parameter_list
 
-
 log = logging.getLogger(__name__)
 
 
@@ -24,6 +23,7 @@ class OracleConfig:
 
     @staticmethod
     def from_dict(d: Dict[str, Any]) -> "OracleConfig":
+        """Build an OracleConfig from a raw config dictionary."""
         base_url = str(d.get("base_url", "")).rstrip("/")
         api_version = str(d.get("api_version", "")).strip()
         if not base_url or not api_version:

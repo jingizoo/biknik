@@ -29,7 +29,6 @@ import csv
 import io
 import json
 import logging
-import sys
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -76,7 +75,9 @@ def ndjson_to_csv(ndjson_text: str) -> str:
     """Convert NDJSON text to CSV text for Tableau Desktop."""
     if not ndjson_text.strip():
         return ""
-    rows = [json.loads(line) for line in ndjson_text.strip().split("\n") if line.strip()]
+    rows = [
+        json.loads(line) for line in ndjson_text.strip().split("\n") if line.strip()
+    ]
     if not rows:
         return ""
     # Use keys from first row as header (all rows should have same schema)
@@ -112,7 +113,9 @@ def merge(
 
         ndjson_path = dest / f"{kind}_all.ndjson"
         ndjson_path.write_text(merged, encoding="utf-8")
-        log.info("Wrote %d rows to %s (%d files merged)", row_count, ndjson_path, len(files))
+        log.info(
+            "Wrote %d rows to %s (%d files merged)", row_count, ndjson_path, len(files)
+        )
 
         if write_csv and merged.strip():
             csv_path = dest / f"{kind}_all.csv"
@@ -129,7 +132,9 @@ def main(argv: list[str] | None = None) -> int:
         description="Merge daily NDJSON into a single Tableau-ready file."
     )
     p.add_argument("base_dir", help="Directory containing YYYY-MM-DD/ subfolders.")
-    p.add_argument("-o", "--out-dir", default=None, help="Output dir (default: same as base_dir).")
+    p.add_argument(
+        "-o", "--out-dir", default=None, help="Output dir (default: same as base_dir)."
+    )
     p.add_argument("--days", type=int, default=None, help="Only include last N days.")
     p.add_argument("--csv", action="store_true", help="Also produce CSV output.")
     args = p.parse_args(argv)
@@ -141,8 +146,12 @@ def main(argv: list[str] | None = None) -> int:
 
     stats = merge(args.base_dir, args.out_dir, args.days, args.csv)
 
-    print(f"Results: {stats['results']['rows']} rows from {stats['results']['files']} files")
-    print(f"Errors:  {stats['errors']['rows']} rows from {stats['errors']['files']} files")
+    print(
+        f"Results: {stats['results']['rows']} rows from {stats['results']['files']} files"
+    )
+    print(
+        f"Errors:  {stats['errors']['rows']} rows from {stats['errors']['files']} files"
+    )
     return 0
 
 
