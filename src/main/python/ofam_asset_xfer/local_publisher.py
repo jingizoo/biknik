@@ -15,7 +15,6 @@ Old date-folders beyond ``retention_days`` are deleted on each publish.
 from __future__ import annotations
 
 import logging
-import os
 import shutil
 import time
 from datetime import date, timedelta
@@ -66,6 +65,7 @@ class LocalResultPublisher:
     # -- ResultPublisher protocol -------------------------------------------
 
     def publish(self, summary: Dict[str, Any], results: List[Dict[str, Any]]) -> None:
+        """Publish results as NDJSON to local disk."""
         run_date = date.today().isoformat()
         run_ts = int(time.time())
         dry_run = summary.get("dry_run", True)

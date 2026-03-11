@@ -35,6 +35,7 @@ class AssetState:
 
     @staticmethod
     def from_get_asset_information(pl: Dict[str, Any]) -> "AssetState":
+        """Parse a getAssetInformation response into an AssetState."""
         # getAssetInformation returns X_* fields. We rely on those.
         # Required identity
         asset_id = str(pl.get("X_ASSET_ID") or "").strip()

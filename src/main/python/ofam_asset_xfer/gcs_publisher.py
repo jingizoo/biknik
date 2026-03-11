@@ -34,8 +34,8 @@ import os
 import re
 import time
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from datetime import date, timedelta
+from typing import Any, Dict, List
 
 from .exceptions import ConfigError
 
@@ -100,6 +100,7 @@ class GCSPublisherConfig:
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "GCSPublisherConfig":
+        """Build a GCSPublisherConfig from a raw config dict."""
         bucket = d.get("bucket", "").strip()
         if not bucket:
             raise ConfigError("gcs.bucket is required")

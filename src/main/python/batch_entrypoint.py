@@ -15,8 +15,6 @@ import argparse
 import json
 import logging
 import os
-import sys
-from pathlib import Path
 
 from ofam_asset_xfer.bip_client import BIPClient, BIPConfig
 from ofam_asset_xfer.entity_resolver import EntityBookResolver
