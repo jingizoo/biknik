@@ -28,6 +28,7 @@ from dataclasses import dataclass, field
 from datetime import date
 from typing import Any, Dict, List, Optional, Set
 
+from .accounting_entries import build_transfer_accounting_entries
 from .bip_client import BIPClient
 from .entity_resolver import EntityBookResolver
 from .exceptions import FusionApiError, ValidationError
@@ -37,7 +38,13 @@ from .fusion_ops import (
     build_same_book_transfer_params,
     get_asset_information,
 )
+from .intercompany import ICConfig, build_ic_journal_entry
 from .oracle_client import OracleErpIntegrationsClient
+from .transfer_reporting import build_rollforward_entries, build_trace_record
+from .transfer_restrictions import (
+    TransferRestrictionConfig,
+    TransferRestrictionEngine,
+)
 
 log = logging.getLogger(__name__)
 
@@ -116,6 +123,14 @@ class TransferResult:
     error: Optional[str] = None
     fusion_response: Optional[Dict[str, Any]] = None
 
+    # BRD: IC journal, accounting entries, rollforward, traceability
+    ic_journal: Optional[Dict[str, Any]] = None
+    accounting_entries: Optional[Dict[str, Any]] = None
+    rollforward_entries: Optional[List[Dict[str, Any]]] = None
+    trace_record: Optional[Dict[str, Any]] = None
+    restriction_check: Optional[Dict[str, Any]] = None
+    transfer_classification: str = "TRANSFER"  # vs ADDITION / RETIREMENT
+
 
 # ---------------------------------------------------------------------------
 # FusionIUSync — core engine
@@ -129,11 +144,19 @@ class FusionIUSync:
         entity_resolver: EntityBookResolver,
         bip_client: BIPClient,
         dff_config: Optional[DFFConfig] = None,
+        ic_config: Optional[ICConfig] = None,
+        restriction_config: Optional[TransferRestrictionConfig] = None,
     ):
         self._client = fusion_client
         self._entity_resolver = entity_resolver
         self._bip = bip_client
         self._dff = dff_config or DEFAULT_DFF_CONFIG
+        self._ic_config = ic_config
+        self._restriction_engine = (
+            TransferRestrictionEngine(restriction_config)
+            if restriction_config
+            else None
+        )
 
     # ------------------------------------------------------------------
     # Discovery
@@ -381,6 +404,37 @@ class FusionIUSync:
             pending.transfer_to_entity,
         )
 
+        # --- BRD: Check transfer restrictions ---
+        restriction_check = None
+        if self._restriction_engine:
+            restriction = self._restriction_engine.check_transfer(
+                source_book=pending.book_type_code,
+                target_book=pending.target_book_type_code,
+            )
+            restriction_check = restriction.to_dict()
+            if not restriction.allowed:
+                log.warning(
+                    "Transfer blocked: asset=%s, reason=%s",
+                    pending.asset_number,
+                    restriction.reason,
+                )
+                return TransferResult(
+                    asset_number=pending.asset_number,
+                    status="FAILED",
+                    source_book=pending.book_type_code,
+                    target_book=pending.target_book_type_code,
+                    transfer_to_entity=pending.transfer_to_entity,
+                    transfer_date=effective_date,
+                    error=restriction.reason,
+                    restriction_check=restriction_check,
+                )
+            if restriction.requires_approval:
+                log.info(
+                    "Transfer requires approval: asset=%s, group=%s",
+                    pending.asset_number,
+                    restriction.approval_group,
+                )
+
         overrides: Dict[str, Any] = {}
         # Prefer TARGET_LOCATION_ID from report; fall back to TRANSFER_TO_LOCATION DFF
         location_override = pending.target_location_id or pending.transfer_to_location
@@ -397,6 +451,89 @@ class FusionIUSync:
             request_id=request_id,
         )
 
+        # --- BRD: Build IC journal entry (if asset has remaining NBV) ---
+        ic_journal_dict = None
+        if state.cost and pending.transfer_to_entity:
+            accum_depr = "0"  # Default; ideally from getAssetBookInformation
+            try:
+                ic_entry = build_ic_journal_entry(
+                    source_entity=pending.book_type_code,
+                    target_entity=pending.transfer_to_entity,
+                    asset_number=pending.asset_number,
+                    transfer_date=effective_date,
+                    cost=state.cost,
+                    accumulated_depreciation=accum_depr,
+                    config=self._ic_config,
+                    request_id=request_id,
+                )
+                if ic_entry:
+                    ic_journal_dict = ic_entry.to_dict()
+            except Exception as e:
+                log.warning("IC journal build failed (non-fatal): %s", e)
+
+        # --- BRD: Build accounting entries ---
+        acct_entries_dict = None
+        if state.cost and pending.transfer_to_entity:
+            accum_depr = "0"
+            try:
+                acct_entry = build_transfer_accounting_entries(
+                    asset_number=pending.asset_number,
+                    transfer_date=effective_date,
+                    source_entity=pending.book_type_code,
+                    target_entity=pending.transfer_to_entity,
+                    cost=state.cost,
+                    accumulated_depreciation=accum_depr,
+                    cost_account="ASSET_COST",
+                    accumulated_depreciation_account="ASSET_ACCUM_DEPR",
+                    request_id=request_id,
+                )
+                acct_entries_dict = acct_entry.to_dict()
+            except Exception as e:
+                log.warning("Accounting entries build failed (non-fatal): %s", e)
+
+        # --- BRD: Build rollforward entries ---
+        rollforward_dicts = None
+        if state.cost:
+            accum_depr = "0"
+            try:
+                rf_entries = build_rollforward_entries(
+                    source_asset_number=pending.asset_number,
+                    source_entity=pending.book_type_code,
+                    source_book=pending.book_type_code,
+                    target_asset_number=pending.asset_number,  # updated post-transfer
+                    target_entity=pending.transfer_to_entity,
+                    target_book=pending.target_book_type_code,
+                    transfer_date=effective_date,
+                    cost=state.cost,
+                    accumulated_depreciation=accum_depr,
+                    request_id=request_id,
+                )
+                rollforward_dicts = [e.to_dict() for e in rf_entries]
+            except Exception as e:
+                log.warning("Rollforward entries build failed (non-fatal): %s", e)
+
+        # --- BRD: Build trace record ---
+        trace_dict = None
+        if state.cost:
+            accum_depr = "0"
+            try:
+                trace = build_trace_record(
+                    source_asset_number=pending.asset_number,
+                    source_book=pending.book_type_code,
+                    source_entity=pending.book_type_code,
+                    target_asset_number=pending.asset_number,
+                    target_book=pending.target_book_type_code,
+                    target_entity=pending.transfer_to_entity,
+                    transfer_date=effective_date,
+                    cost=state.cost,
+                    accumulated_depreciation=accum_depr,
+                    tag_number=state.tag_number,
+                    request_id=request_id,
+                )
+                trace_dict = trace.to_dict()
+            except Exception as e:
+                log.warning("Trace record build failed (non-fatal): %s", e)
+
         if dry_run:
             log.info(
                 "DRY-RUN: IU transfer payload built for asset=%s", pending.asset_number
@@ -409,6 +546,12 @@ class FusionIUSync:
                 transfer_to_entity=pending.transfer_to_entity,
                 transfer_date=effective_date,
                 fusion_response={"planned_params": params},
+                ic_journal=ic_journal_dict,
+                accounting_entries=acct_entries_dict,
+                rollforward_entries=rollforward_dicts,
+                trace_record=trace_dict,
+                restriction_check=restriction_check,
+                transfer_classification="TRANSFER",
             )
 
         raw, pl = self._client.process_transaction("bookTransfer", params)
@@ -425,6 +568,12 @@ class FusionIUSync:
             error=None
             if status_code == "S"
             else f"Fusion X_RETURN_STATUS={status_code}",
+            ic_journal=ic_journal_dict,
+            accounting_entries=acct_entries_dict,
+            rollforward_entries=rollforward_dicts,
+            trace_record=trace_dict,
+            restriction_check=restriction_check,
+            transfer_classification="TRANSFER",
         )
 
     def _execute_same_book(
@@ -541,18 +690,28 @@ class FusionIUSync:
 
         for pt in pending_list:
             result = self.execute_transfer(pt, dry_run=dry_run)
-            results.append(
-                {
-                    "asset_number": result.asset_number,
-                    "status": result.status,
-                    "source_book": result.source_book,
-                    "target_book": result.target_book,
-                    "transfer_to_entity": result.transfer_to_entity,
-                    "transfer_date": result.transfer_date,
-                    "error": result.error,
-                    "fusion_response": result.fusion_response,
-                }
-            )
+            result_dict: Dict[str, Any] = {
+                "asset_number": result.asset_number,
+                "status": result.status,
+                "source_book": result.source_book,
+                "target_book": result.target_book,
+                "transfer_to_entity": result.transfer_to_entity,
+                "transfer_date": result.transfer_date,
+                "error": result.error,
+                "fusion_response": result.fusion_response,
+                "transfer_classification": result.transfer_classification,
+            }
+            if result.ic_journal:
+                result_dict["ic_journal"] = result.ic_journal
+            if result.accounting_entries:
+                result_dict["accounting_entries"] = result.accounting_entries
+            if result.rollforward_entries:
+                result_dict["rollforward_entries"] = result.rollforward_entries
+            if result.trace_record:
+                result_dict["trace_record"] = result.trace_record
+            if result.restriction_check:
+                result_dict["restriction_check"] = result.restriction_check
+            results.append(result_dict)
             status_key = result.status.lower()
             if status_key in counts:
                 counts[status_key] += 1
