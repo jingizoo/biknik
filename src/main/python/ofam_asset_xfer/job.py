@@ -9,7 +9,6 @@ from .bip_client import BIPClient, BIPConfig
 from .entity_resolver import EntityBookResolver
 from .exceptions import ConfigError, FusionApiError
 from .fusion_sync import FusionIUSync, DFFConfig
-from .intercompany import ICConfig
 from .oracle_client import OracleConfig, OracleErpIntegrationsClient
 from .gcs_publisher import GCSPublisherConfig, GCSResultPublisher
 from .local_publisher import LocalResultPublisher
@@ -23,7 +22,6 @@ from .fusion_ops import (
     build_retire_asset_params,
 )
 from .template import render
-from .transfer_restrictions import TransferRestrictionConfig
 
 
 log = logging.getLogger(__name__)
@@ -85,16 +83,6 @@ def _run_bip_flow(
     if config.get("dff_columns"):
         dff_config = DFFConfig(**config["dff_columns"])
 
-    ic_config = None
-    if config.get("intercompany"):
-        ic_config = ICConfig.from_dict(config["intercompany"])
-
-    restriction_config = None
-    if config.get("transfer_restrictions"):
-        restriction_config = TransferRestrictionConfig.from_dict(
-            config["transfer_restrictions"]
-        )
-
     bip_params = config.get("bip_params")
     max_transfers = int(config.get("max_transfers", 500))
     dry_run = not execute
@@ -104,8 +92,6 @@ def _run_bip_flow(
         entity_resolver,
         bip_client,
         dff_config=dff_config,
-        ic_config=ic_config,
-        restriction_config=restriction_config,
     )
     summary = sync.run_full_sync(
         books=books,
