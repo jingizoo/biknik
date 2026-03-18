@@ -76,6 +76,37 @@ DEFAULT_DFF_CONFIG = DFFConfig()
 # ---------------------------------------------------------------------------
 # Data structures
 # ---------------------------------------------------------------------------
+class TransferClassification:
+    """Transfer type classification constants.
+
+    Interunit:  Source entity != target entity  → cross-book transfer
+    Intraunit:  Same entity, same book          → location/expense/assignment change
+    """
+
+    INTERUNIT = "INTERUNIT"
+    INTRAUNIT = "INTRAUNIT"
+
+    @staticmethod
+    def classify(
+        source_book: str,
+        target_book: str,
+        source_entity: Optional[str] = None,
+        target_entity: Optional[str] = None,
+    ) -> str:
+        """Determine whether a transfer is interunit or intraunit.
+
+        Rules (from 2026-03-17 alignment):
+          - Different books → always INTERUNIT (entity must differ)
+          - Same book → INTRAUNIT (location/expense/cost-center change)
+          - Same entity but different book is still INTERUNIT (config-driven)
+        """
+        src = source_book.upper().strip()
+        tgt = target_book.upper().strip()
+        if src != tgt:
+            return TransferClassification.INTERUNIT
+        return TransferClassification.INTRAUNIT
+
+
 @dataclass
 class PendingTransfer:
     """An FA asset whose DFF indicates a pending IU transfer."""
@@ -99,8 +130,18 @@ class PendingTransfer:
     target_expense_ccid: Optional[str] = None  # from TARGET_EXPENSE_CCID in report
     is_cross_book: bool = True  # False = same-book (location-only) transfer
 
+    # Classification: INTERUNIT or INTRAUNIT
+    transfer_classification: str = ""
+
     # Cached state for transfer execution
     fa_state: Optional[AssetState] = field(default=None, repr=False)
+
+    def __post_init__(self) -> None:
+        if not self.transfer_classification:
+            self.transfer_classification = TransferClassification.classify(
+                self.book_type_code,
+                self.target_book_type_code,
+            )
 
 
 @dataclass
@@ -113,6 +154,7 @@ class TransferResult:
     target_book: Optional[str] = None
     transfer_to_entity: Optional[str] = None
     transfer_date: Optional[str] = None
+    transfer_classification: str = ""  # INTERUNIT or INTRAUNIT
     error: Optional[str] = None
     fusion_response: Optional[Dict[str, Any]] = None
 
@@ -343,15 +385,19 @@ class FusionIUSync:
                     error=f"Failed to get asset state: {e}",
                 )
 
+        classification = pending.transfer_classification
+
         try:
             if pending.is_cross_book:
-                return self._execute_cross_book(
+                result = self._execute_cross_book(
                     pending, state, request_id, effective_date, dry_run,
                 )
             else:
-                return self._execute_same_book(
+                result = self._execute_same_book(
                     pending, state, request_id, effective_date, dry_run,
                 )
+            result.transfer_classification = classification
+            return result
         except Exception as e:
             log.exception("Transfer failed for asset=%s", pending.asset_number)
             return TransferResult(
@@ -361,6 +407,7 @@ class FusionIUSync:
                 target_book=pending.target_book_type_code,
                 transfer_to_entity=pending.transfer_to_entity,
                 transfer_date=effective_date,
+                transfer_classification=classification,
                 error=str(e),
             )
 
@@ -549,6 +596,7 @@ class FusionIUSync:
                     "target_book": result.target_book,
                     "transfer_to_entity": result.transfer_to_entity,
                     "transfer_date": result.transfer_date,
+                    "transfer_classification": result.transfer_classification,
                     "error": result.error,
                     "fusion_response": result.fusion_response,
                 }

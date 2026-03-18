@@ -66,6 +66,7 @@ def _flatten_result(
         "target_book": row.get("target_book"),
         "transfer_to_entity": row.get("transfer_to_entity"),
         "transfer_date": row.get("transfer_date"),
+        "transfer_classification": row.get("transfer_classification", ""),
         "error": row.get("error"),
     }
     return flat
