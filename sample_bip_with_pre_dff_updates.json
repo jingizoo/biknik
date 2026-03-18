@@ -1,0 +1,61 @@
+{
+  "oracle": {
+    "base_url": "https://YOUR-FUSION-HOST.oraclecloud.com",
+    "api_version": "11.13.18.05",
+    "bearer_token_env": "FUSION_JWT"
+  },
+  "bip": {
+    "base_url": "https://YOUR-FUSION-HOST.oraclecloud.com",
+    "bearer_token_env": "FUSION_JWT",
+    "report_path": "/Custom/FinancialsReports/All_IUT_Transfers_Rpt.xdo"
+  },
+  "books": [
+    "US CORP BOOK",
+    "UK CORP BOOK"
+  ],
+  "entity_book_map": {
+    "US Entity": "US CORP BOOK",
+    "UK Entity": "UK CORP BOOK",
+    "JP Entity": "JP CORP BOOK"
+  },
+  "execute": false,
+  "max_transfers": 500,
+  "pre_bip_dff_updates": {
+    "enabled": true,
+    "operation_handle": "updateAssetDescriptiveDetails",
+    "lookup_asset_id_when_missing": true,
+    "continue_on_error": true,
+    "bip_visibility_delay_seconds": 5,
+    "field_parameter_map": {
+      "book_type_code": "P_BOOK_TYPE_CODE",
+      "transfer_to_entity": "P_ATTRIBUTE1",
+      "transfer_date": "P_ATTRIBUTE_DATE1",
+      "transfer_to_location": "P_ATTRIBUTE2",
+      "raw_target_cost_center": "P_ATTRIBUTE3"
+    },
+    "requests": [
+      {
+        "request_id": "CMDB_EVT_0001",
+        "book_type_code": "US CORP BOOK",
+        "asset_number": "142847",
+        "fields": {
+          "transfer_to_entity": "UK Entity",
+          "transfer_date": "2026-03-31",
+          "transfer_to_location": "LON-DC-01",
+          "raw_target_cost_center": "20501"
+        }
+      },
+      {
+        "request_id": "CMDB_EVT_0002",
+        "book_type_code": "US CORP BOOK",
+        "asset_number": "142848",
+        "fields": {
+          "transfer_to_entity": "JP Entity",
+          "transfer_date": "2026-03-31",
+          "transfer_to_location": "TOK-DC-02",
+          "raw_target_cost_center": "30501"
+        }
+      }
+    ]
+  }
+}
