@@ -24,7 +24,6 @@ The merged files are what you point Tableau at — one flat table, all days.
 
 from __future__ import annotations
 
-import argparse
 import csv
 import io
 import json
@@ -32,6 +31,8 @@ import logging
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+import typer
 
 log = logging.getLogger(__name__)
 
@@ -123,27 +124,26 @@ def merge(
     return stats
 
 
-def main(argv: list[str] | None = None) -> int:
-    p = argparse.ArgumentParser(
-        description="Merge daily NDJSON into a single Tableau-ready file."
-    )
-    p.add_argument("base_dir", help="Directory containing YYYY-MM-DD/ subfolders.")
-    p.add_argument("-o", "--out-dir", default=None, help="Output dir (default: same as base_dir).")
-    p.add_argument("--days", type=int, default=None, help="Only include last N days.")
-    p.add_argument("--csv", action="store_true", help="Also produce CSV output.")
-    args = p.parse_args(argv)
+app = typer.Typer(help="Merge daily NDJSON into a single Tableau-ready file.")
 
+
+@app.command()
+def main(
+    base_dir: str = typer.Argument(help="Directory containing YYYY-MM-DD/ subfolders."),
+    out_dir: Optional[str] = typer.Option(None, "--out-dir", "-o", help="Output dir (default: same as base_dir)."),
+    days: Optional[int] = typer.Option(None, help="Only include last N days."),
+    write_csv: bool = typer.Option(False, "--csv", help="Also produce CSV output."),
+) -> None:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)-5s %(name)s — %(message)s",
     )
 
-    stats = merge(args.base_dir, args.out_dir, args.days, args.csv)
+    stats = merge(base_dir, out_dir, days, write_csv)
 
-    print(f"Results: {stats['results']['rows']} rows from {stats['results']['files']} files")
-    print(f"Errors:  {stats['errors']['rows']} rows from {stats['errors']['files']} files")
-    return 0
+    typer.echo(f"Results: {stats['results']['rows']} rows from {stats['results']['files']} files")
+    typer.echo(f"Errors:  {stats['errors']['rows']} rows from {stats['errors']['files']} files")
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    app()

@@ -3,7 +3,10 @@ from __future__ import annotations
 import json
 import logging
 import time
+from enum import Enum
 from typing import Any, Dict, List, Optional
+
+from pydantic import BaseModel, model_validator
 
 from .bip_client import BIPClient, BIPConfig
 from .entity_resolver import EntityBookResolver
@@ -40,26 +43,43 @@ def _load_config(config_uri: str) -> Dict[str, Any]:
         raise ConfigError(f"Config is not valid JSON: {config_uri}") from e
 
 
-def _validate_request(req: Dict[str, Any]) -> None:
-    if not req.get("request_id"):
-        raise ConfigError("Each request must include request_id.")
-    if not isinstance(req.get("source"), dict):
-        raise ConfigError(
-            "Each request must include source {book_type_code, asset_number}."
-        )
-    src = req["source"]
-    if not src.get("book_type_code") or not src.get("asset_number"):
-        raise ConfigError("source.book_type_code and source.asset_number are required.")
-    t = str(req.get("transfer_type", "")).upper()
-    if t not in ("SAME_BOOK", "XBOOK"):
-        raise ConfigError("transfer_type must be SAME_BOOK or XBOOK.")
-    if t == "XBOOK":
-        if not isinstance(req.get("target"), dict) and not isinstance(
-            req.get("xbook"), dict
-        ):
-            raise ConfigError(
-                "XBOOK requires either target{book_type_code,...} or xbook{...} configuration."
-            )
+class TransferType(str, Enum):
+    SAME_BOOK = "SAME_BOOK"
+    XBOOK = "XBOOK"
+
+
+class SourceAsset(BaseModel):
+    book_type_code: str
+    asset_number: str
+
+
+class TransferRequest(BaseModel):
+    """Pydantic model for validating transfer request payloads."""
+
+    request_id: str
+    source: SourceAsset
+    transfer_type: TransferType
+    target: Optional[Dict[str, Any]] = None
+    xbook: Optional[Dict[str, Any]] = None
+    target_assignment: Optional[Dict[str, Any]] = None
+    effective_date: Optional[str] = None
+
+    @model_validator(mode="after")
+    def xbook_requires_target_or_xbook_config(self) -> "TransferRequest":
+        if self.transfer_type == TransferType.XBOOK:
+            if not self.target and not self.xbook:
+                raise ValueError(
+                    "XBOOK requires either target{book_type_code,...} or xbook{...} configuration."
+                )
+        return self
+
+
+def _validate_request(req: Dict[str, Any]) -> TransferRequest:
+    """Validate a transfer request dict and return a typed model."""
+    try:
+        return TransferRequest(**req)
+    except Exception as e:
+        raise ConfigError(str(e)) from e
 
 
 def _run_bip_flow(

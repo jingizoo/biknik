@@ -30,7 +30,11 @@ class OracleConfig:
         if not base_url or not api_version:
             raise ValueError("oracle.base_url and oracle.api_version are required")
 
-        # Prefer env indirection for token (CDX secrets pattern)
+        # Bearer token: sourced from config or, preferably, from an env var
+        # injected by CDX secrets at pod startup (bearer_token_env points to
+        # the env var name, e.g. "FUSION_JWT").  In production the token is
+        # rotated by the CDX secrets sidecar; for local dev it can be set
+        # directly in the config as "bearer_token".
         bearer_token = d.get("bearer_token")
         bearer_token_env = d.get("bearer_token_env")
 

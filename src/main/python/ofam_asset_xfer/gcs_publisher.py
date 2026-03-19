@@ -121,9 +121,6 @@ class GCSPublisherConfig:
                 raise ConfigError(
                     "gcs.service_account_file or gcs.service_account_file_env is required"
                 )
-        # Expand ~ to the user's home directory.
-        sa_file = os.path.expanduser(sa_file)
-
         retention_days = int(d.get("retention_days", 365))
 
         return cls(
