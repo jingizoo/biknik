@@ -5,7 +5,7 @@ metadata:
   namespace: accounting-gateway
   labels:
     app: fa-asset-xfer
-    project: pte-accounting-external-services-fa-asset-xfer
+    project: pte-accounting-external-services-assetxferpipeline
 spec:
   backoffLimit: 1
   activeDeadlineSeconds: 7200
@@ -16,7 +16,7 @@ spec:
     metadata:
       labels:
         app: fa-asset-xfer
-        project: pte-accounting-external-services-fa-asset-xfer
+        project: pte-accounting-external-services-assetxferpipeline
     spec:
       restartPolicy: Never
       serviceAccountName: fa-asset-xfer
@@ -35,10 +35,10 @@ spec:
           # note if you are using the Citsource deployment system, this "latest" doesn't actually
           # get used and instead the right image for the deployment build will get substituted
           # at deployment time
-          #image: artifactory.citadelgroup.com:5001/citsource/pte/accounting/external-services/fa-asset-xfer/jdk:latest
-          image: us-docker.pkg.dev/citadel-citadelx-prod-2/citsource/pte/accounting/external-services/fa-asset-xfer/jdk:latest
+          #image: artifactory.citadelgroup.com:5001/citsource/pte/accounting/external-services/acctgateway/assetxferpipeline/jdk:latest
+          image: us-docker.pkg.dev/citadel-citadelx-prod-2/citsource/pte/accounting/external-services/acctgateway/assetxferpipeline/jdk:latest
           # for deployments to GKE, it will actually use:
-          # image: us-docker.pkg.dev/citadel-citadelx-prod-2/citsource/pte/accounting/external-services/fa-asset-xfer/jdk:latest
+          # image: us-docker.pkg.dev/citadel-citadelx-prod-2/citsource/pte/accounting/external-services/acctgateway/assetxferpipeline/jdk:latest
 
           envFrom:
             - configMapRef:
@@ -75,7 +75,7 @@ spec:
                   name: fa-asset-xfer
                   key: INETPROXY_PASSWD
 
-          command: ["/usr/bin/bash", "-c", "cd /application/citsource/pte/accounting/external-services/fa-asset-xfer;export PYTHONPATH=/application/citsource/pte/accounting/external-services/fa-asset-xfer/build/pyshadow/fa-asset-xfer;python -u batch_entrypoint.py --config /work/requests.json --out-dir /work/out --dry-run"]
+          command: ["/usr/bin/bash", "-c", "cd /application/citsource/pte/accounting/external-services/acctgateway/assetxferpipeline;export PYTHONPATH=/application/citsource/pte/accounting/external-services/acctgateway/assetxferpipeline/build/pyshadow/assetxferpipeline;python -u batch_entrypoint.py --config /work/requests.json --out-dir /work/out --dry-run"]
           args:
 
           resources:
