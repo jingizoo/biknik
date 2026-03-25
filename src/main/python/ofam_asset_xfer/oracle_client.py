@@ -74,7 +74,7 @@ class OracleErpIntegrationsClient:
 
     def _endpoint(self, handle: str) -> str:
         # Example from doc: /fscmRestApi/resources/11.13.18.05/erpintegrations/processTransaction-transferAsset
-        rel = f"/fscmRestApi/resources/{self.cfg.api_version}/erpintegrations/processTransaction-{handle}"
+        rel = f"/fscmRestApi/resources/{self.cfg.api_version}/erpintegrations"
         return self.cfg.base_url + rel
 
     def _resource_url(self, resource_path: str) -> str:
@@ -141,7 +141,6 @@ class OracleErpIntegrationsClient:
             url,
             params=query_params or {},
             timeout=self.cfg.timeout_seconds,
-            verify=self.cfg.verify_ssl,
         )
         try:
             raw = r.json()
