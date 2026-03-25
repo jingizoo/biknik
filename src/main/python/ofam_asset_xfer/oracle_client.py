@@ -9,6 +9,7 @@ import requests  # type: ignore[import-untyped]
 
 from .exceptions import FusionApiError
 from .paramlist import build_parameter_list
+from .proxy_config import get_proxy_config
 
 
 log = logging.getLogger(__name__)
@@ -69,6 +70,7 @@ class OracleErpIntegrationsClient:
                 "ACCEPT": "application/json",
             }
         )
+        self._session.proxies.update(get_proxy_config())
 
     def _endpoint(self, handle: str) -> str:
         # Example from doc: /fscmRestApi/resources/11.13.18.05/erpintegrations/processTransaction-transferAsset

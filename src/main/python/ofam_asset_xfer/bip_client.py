@@ -25,6 +25,7 @@ from xml.etree import ElementTree as ET
 import requests  # type: ignore[import-untyped]
 
 from .exceptions import FusionApiError
+from .proxy_config import get_proxy_config
 
 
 log = logging.getLogger(__name__)
@@ -85,6 +86,7 @@ class BIPClient:
                 "Content-Type": "application/soap+xml; charset=utf-8",
             }
         )
+        self._session.proxies.update(get_proxy_config())
 
     def _endpoint(self) -> str:
         return f"{self.cfg.base_url}/xmlpserver/services/ExternalReportWSSService"
