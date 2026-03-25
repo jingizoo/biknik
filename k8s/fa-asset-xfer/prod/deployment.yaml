@@ -1,0 +1,90 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: fa-asset-xfer
+  namespace: accounting-gateway
+  labels:
+    app: fa-asset-xfer
+    project: pte-accounting-external-services-fa-asset-xfer
+spec:
+  backoffLimit: 1
+  activeDeadlineSeconds: 7200
+  selector:
+    matchLabels:
+      app: fa-asset-xfer
+  template:
+    metadata:
+      labels:
+        app: fa-asset-xfer
+        project: pte-accounting-external-services-fa-asset-xfer
+    spec:
+      restartPolicy: Never
+      serviceAccountName: fa-asset-xfer
+
+      volumes:
+        - name: keytab-file
+          secret:
+            secretName: fa-asset-xfer-securityproxy
+            items:
+              - key: sp_alteryx_keytab
+                path: keytabs/kerb_keytab_file
+
+      containers:
+        - name: fa-asset-xfer
+          imagePullPolicy: Always
+          # note if you are using the Citsource deployment system, this "latest" doesn't actually
+          # get used and instead the right image for the deployment build will get substituted
+          # at deployment time
+          #image: artifactory.citadelgroup.com:5001/citsource/pte/accounting/external-services/fa-asset-xfer/jdk:latest
+          image: us-docker.pkg.dev/citadel-citadelx-prod-2/citsource/pte/accounting/external-services/fa-asset-xfer/jdk:latest
+          # for deployments to GKE, it will actually use:
+          # image: us-docker.pkg.dev/citadel-citadelx-prod-2/citsource/pte/accounting/external-services/fa-asset-xfer/jdk:latest
+
+          envFrom:
+            - configMapRef:
+                name: fa-asset-xfer
+
+          env:
+            - name: STATSD
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+            - name: KRB5_CLIENT_KTNAME
+              value: "/secrets/keytab_file/keytabs/kerb_keytab_file"
+            - name: K5START_KEYTAB
+              value: "/secrets/keytab_file/keytabs/kerb_keytab_file"
+            - name: DD_ENTITY_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.uid
+            - name: FUSION_JWT
+              valueFrom:
+                secretKeyRef:
+                  name: fa-asset-xfer
+                  key: FUSION_JWT
+            - name: INETPROXY_USER
+              valueFrom:
+                secretKeyRef:
+                  name: fa-asset-xfer
+                  key: INETPROXY_USER
+            - name: INETPROXY_PASSWD
+              valueFrom:
+                secretKeyRef:
+                  name: fa-asset-xfer
+                  key: INETPROXY_PASSWD
+
+          command: ["/usr/bin/bash", "-c", "cd /application/citsource/pte/accounting/external-services/fa-asset-xfer;export PYTHONPATH=/application/citsource/pte/accounting/external-services/fa-asset-xfer/build/pyshadow/fa-asset-xfer;python -u batch_entrypoint.py --config /work/requests.json --out-dir /work/out --execute"]
+          args:
+
+          resources:
+            requests:
+              memory: "8Gi"
+              cpu: "1000m"
+            limits:
+              memory: "16Gi"
+              cpu: "4000m"
+
+          volumeMounts:
+            - name: keytab-file
+              mountPath: /secrets/keytab_file
+              readOnly: true
