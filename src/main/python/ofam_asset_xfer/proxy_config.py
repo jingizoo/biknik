@@ -37,16 +37,16 @@ def get_proxy_config() -> Dict[str, str]:
         log.debug("No proxy env vars found (HTTP_APP_PROXY / HTTPS_APP_PROXY); skipping proxy.")
         return {}
 
-    user = os.environ.get("INETPROXY_USER", "")
-    passwd = os.environ.get("INETPROXY_PASSWD", "")
+    INETPROXY_USER = os.environ["INETPROXY_USER"]
+    INETPROXY_PASSWD = os.environ["INETPROXY_PASSWD"]
 
     proxies: Dict[str, str] = {}
 
     if http_proxy_url:
-        proxies["http"] = _build_proxy_url(user, passwd, http_proxy_url)
+        proxies["http"] = _build_proxy_url(INETPROXY_USER, INETPROXY_PASSWD, http_proxy_url)
 
     if https_proxy_url:
-        proxies["https"] = _build_proxy_url(user, passwd, https_proxy_url)
+        proxies["https"] = _build_proxy_url(INETPROXY_USER, INETPROXY_PASSWD, https_proxy_url)
 
     log.info("Proxy configured for protocols: %s", list(proxies.keys()))
     return proxies
