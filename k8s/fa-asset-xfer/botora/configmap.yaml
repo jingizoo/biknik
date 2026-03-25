@@ -4,6 +4,10 @@ metadata:
   name: fa-asset-xfer
   namespace: accounting-gateway
 data:
+  RUN_ENV: "stabledev"
+  CITADEL_ENV: "stabledev"
+  CA_PEM: "/etc/pki/tls/certs/ca-bundle.crt"
+  CA_BUNDLE: "/etc/pki/tls/certs/ca-bundle.crt"
+  HTTP_APP_PROXY: "http://appproxy.gtm.citadelgroup.com:80"
+  HTTPS_APP_PROXY: "http://appproxy.gtm.citadelgroup.com:80"
   LOG_LEVEL: "INFO"
-  HTTP_APP_PROXY: "http://webproxy.internal:80"
-  HTTPS_APP_PROXY: "http://webproxy.internal:443"
