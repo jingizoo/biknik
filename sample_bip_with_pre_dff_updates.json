@@ -31,8 +31,7 @@
       "transfer_to_entity": "P_CAT_ATTRIBUTE9",
       "transfer_to_location": "P_CAT_ATTRIBUTE10",
       "transfer_date": "P_TRX_ATTRIBUTE2",
-      "account": "P_CAT_ATTRIBUTE11",
-      "raw_target_cost_center": "P_CAT_ATTRIBUTE12"
+      "account": "P_CAT_ATTRIBUTE11"
     },
     "request_id_param": "P_TRX_ATTRIBUTE1"
   }
