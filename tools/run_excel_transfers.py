@@ -104,6 +104,7 @@ class ExcelRow:
     target_expense_ccid: str
     target_book_type_code: str
     raw_target_cost_center: str
+    account: str
     notes: str
 
     def to_dff_update_request(self) -> DffUpdateRequest:
@@ -117,6 +118,8 @@ class ExcelRow:
             fields["transfer_to_location"] = self.transfer_to_location
         if self.raw_target_cost_center:
             fields["raw_target_cost_center"] = self.raw_target_cost_center
+        if self.account:
+            fields["account"] = self.account
 
         return DffUpdateRequest(
             request_id=self.request_id,
@@ -194,6 +197,7 @@ def read_excel(path: Path) -> List[ExcelRow]:
                 target_expense_ccid=_get(row_cells, "TARGET_EXPENSE_CCID"),
                 target_book_type_code=_get(row_cells, "TARGET_BOOK_TYPE_CODE"),
                 raw_target_cost_center=_get(row_cells, "RAW_TARGET_COST_CENTER"),
+                account=_get(row_cells, "ACCOUNT"),
                 notes=_get(row_cells, "NOTES"),
             )
         )
