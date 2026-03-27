@@ -105,10 +105,15 @@ class ExcelRow:
     target_book_type_code: str
     raw_target_cost_center: str
     account: str
+    cost_center: str
     notes: str
 
-    def to_dff_update_request(self) -> DffUpdateRequest:
-        """Convert to a DffUpdateRequest for the pre-BIP DFF flow."""
+    def to_dff_update_request(self, field_defaults: Optional[Dict[str, str]] = None) -> DffUpdateRequest:
+        """Convert to a DffUpdateRequest for the pre-BIP DFF flow.
+
+        field_defaults: fallback values from config for fields not in the Excel row.
+        """
+        defaults = field_defaults or {}
         fields: Dict[str, Any] = {}
         if self.transfer_to_entity:
             fields["transfer_to_entity"] = self.transfer_to_entity
@@ -118,8 +123,15 @@ class ExcelRow:
             fields["transfer_to_location"] = self.transfer_to_location
         if self.raw_target_cost_center:
             fields["raw_target_cost_center"] = self.raw_target_cost_center
-        if self.account:
-            fields["account"] = self.account
+
+        # account — use Excel value, fall back to config default
+        fields["account"] = self.account or defaults.get("account", "")
+
+        # cost_center — use Excel value, fall back to config default
+        fields["cost_center"] = self.cost_center or defaults.get("cost_center", "")
+
+        # Remove empty values
+        fields = {k: v for k, v in fields.items() if v}
 
         return DffUpdateRequest(
             request_id=self.request_id,
@@ -198,6 +210,7 @@ def read_excel(path: Path) -> List[ExcelRow]:
                 target_book_type_code=_get(row_cells, "TARGET_BOOK_TYPE_CODE"),
                 raw_target_cost_center=_get(row_cells, "RAW_TARGET_COST_CENTER"),
                 account=_get(row_cells, "ACCOUNT"),
+                cost_center=_get(row_cells, "COST_CENTER"),
                 notes=_get(row_cells, "NOTES"),
             )
         )
@@ -249,11 +262,12 @@ def run_dff_mode(
     # Build PreBipDffConfig from config file
     pre_bip_block = config.get("pre_bip_dff_updates", {})
     dff_cfg = PreBipDffConfig.from_dict({**pre_bip_block, "enabled": True})
+    field_defaults = pre_bip_block.get("field_defaults", {})
 
     if dry_run:
         # Dry-run: just build payloads without calling Oracle
         for row in rows:
-            req = row.to_dff_update_request()
+            req = row.to_dff_update_request(field_defaults=field_defaults)
             # Build params manually to show what would be sent
             params: Dict[str, Any] = dict(dff_cfg.static_params)
             params["P_ASSET_ID"] = row.asset_id or f"<lookup:{row.asset_number}>"
@@ -291,7 +305,7 @@ def run_dff_mode(
     updater = PreBipDffUpdater(client, dff_cfg)
 
     for row in rows:
-        req = row.to_dff_update_request()
+        req = row.to_dff_update_request(field_defaults=field_defaults)
         try:
             result = updater.apply_update(req, dry_run=False)
             results.append(
