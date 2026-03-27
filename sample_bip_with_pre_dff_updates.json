@@ -32,11 +32,15 @@
       "transfer_to_location": "P_CAT_ATTRIBUTE10",
       "transfer_date": "P_TRX_ATTRIBUTE2",
       "account": "P_CAT_ATTRIBUTE11",
-      "cost_center": "P_CAT_ATTRIBUTE12"
+      "cost_center": "P_CAT_ATTRIBUTE12",
+      "segment5": "P_CAT_ATTRIBUTE13",
+      "segment7": "P_CAT_ATTRIBUTE14"
     },
     "field_defaults": {
       "account": "LC000129",
-      "cost_center": "20501"
+      "cost_center": "20501",
+      "segment5": "00000",
+      "segment7": "000"
     },
     "request_id_param": "P_TRX_ATTRIBUTE1"
   }

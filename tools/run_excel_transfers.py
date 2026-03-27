@@ -106,6 +106,8 @@ class ExcelRow:
     raw_target_cost_center: str
     account: str
     cost_center: str
+    segment5: str
+    segment7: str
     notes: str
 
     def to_dff_update_request(self, field_defaults: Optional[Dict[str, str]] = None) -> DffUpdateRequest:
@@ -129,6 +131,12 @@ class ExcelRow:
 
         # cost_center — use Excel value, fall back to config default
         fields["cost_center"] = self.cost_center or defaults.get("cost_center", "")
+
+        # segment5 — use Excel value, fall back to config default
+        fields["segment5"] = self.segment5 or defaults.get("segment5", "")
+
+        # segment7 — use Excel value, fall back to config default
+        fields["segment7"] = self.segment7 or defaults.get("segment7", "")
 
         # Remove empty values
         fields = {k: v for k, v in fields.items() if v}
@@ -211,6 +219,8 @@ def read_excel(path: Path) -> List[ExcelRow]:
                 raw_target_cost_center=_get(row_cells, "RAW_TARGET_COST_CENTER"),
                 account=_get(row_cells, "ACCOUNT"),
                 cost_center=_get(row_cells, "COST_CENTER"),
+                segment5=_get(row_cells, "SEGMENT5"),
+                segment7=_get(row_cells, "SEGMENT7"),
                 notes=_get(row_cells, "NOTES"),
             )
         )
