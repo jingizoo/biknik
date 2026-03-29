@@ -51,6 +51,7 @@ class DffUpdateRequest:
 
     @staticmethod
     def from_dict(data: Dict[str, Any]) -> "DffUpdateRequest":
+        """Parse a dictionary into a DffUpdateRequest instance."""
         if not isinstance(data, dict):
             raise ConfigError("Each pre_bip_dff_updates.requests item must be an object.")
 
@@ -118,6 +119,7 @@ class PreBipDffConfig:
 
     @staticmethod
     def from_dict(data: Dict[str, Any]) -> "PreBipDffConfig":
+        """Parse a dictionary into a PreBipDffConfig instance."""
         if not isinstance(data, dict):
             raise ConfigError("pre_bip_dff_updates must be an object.")
 
