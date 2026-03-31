@@ -17,7 +17,7 @@ from urllib.parse import quote_plus
 log = logging.getLogger(__name__)
 
 
-def get_proxy_config() -> Dict[str, str]:
+def get_proxy_config(require: bool = False) -> Dict[str, str]:
     """Build a ``requests``-compatible proxies dict from environment variables.
 
     Expected env vars:
@@ -26,29 +26,51 @@ def get_proxy_config() -> Dict[str, str]:
         HTTP_APP_PROXY     – HTTP proxy URL  (e.g. http://proxy.example.com:80)
         HTTPS_APP_PROXY    – HTTPS proxy URL (e.g. http://proxy.example.com:443)
 
+    Args:
+        require: If True, raise ValueError when proxy env vars are missing
+                 instead of silently returning an empty dict.  Use this in
+                 pod/batch environments where direct routes don't exist.
+
     Returns:
         Dict suitable for ``requests.Session.proxies`` or ``requests.get(proxies=...)``.
-        Empty dict when proxy env vars are absent.
+        Empty dict when proxy env vars are absent and require=False.
     """
     http_proxy_url = os.environ.get("HTTP_APP_PROXY")
     https_proxy_url = os.environ.get("HTTPS_APP_PROXY")
 
     if not http_proxy_url and not https_proxy_url:
+        if require:
+            raise ValueError(
+                "Proxy is required but HTTP_APP_PROXY / HTTPS_APP_PROXY env vars "
+                "are not set. Set them or pass require=False for local dev."
+            )
         log.debug("No proxy env vars found (HTTP_APP_PROXY / HTTPS_APP_PROXY); skipping proxy.")
         return {}
 
-    INETPROXY_USER = os.environ["INETPROXY_USER"]
-    INETPROXY_PASSWD = os.environ["INETPROXY_PASSWD"]
+    user = os.environ.get("INETPROXY_USER", "")
+    passwd = os.environ.get("INETPROXY_PASSWD", "")
+
+    if not user or not passwd:
+        if require:
+            raise ValueError(
+                "Proxy env vars set but INETPROXY_USER / INETPROXY_PASSWD are "
+                "missing. Check the K8s secret (Holocron Vault)."
+            )
+        log.warning("Proxy URLs set but INETPROXY_USER/PASSWD missing — proxy will be unauthenticated.")
 
     proxies: Dict[str, str] = {}
 
     if http_proxy_url:
-        proxies["http"] = _build_proxy_url(INETPROXY_USER, INETPROXY_PASSWD, http_proxy_url)
+        proxies["http"] = _build_proxy_url(user, passwd, http_proxy_url)
 
     if https_proxy_url:
-        proxies["https"] = _build_proxy_url(INETPROXY_USER, INETPROXY_PASSWD, https_proxy_url)
+        proxies["https"] = _build_proxy_url(user, passwd, https_proxy_url)
 
-    log.info("Proxy configured for protocols: %s", list(proxies.keys()))
+    log.info(
+        "Proxy configured for protocols: %s (user=%s)",
+        list(proxies.keys()),
+        user or "<none>",
+    )
     return proxies
 
 

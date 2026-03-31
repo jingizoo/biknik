@@ -44,6 +44,7 @@ class BIPConfig:
     report_path: str  # e.g. /Custom/Integrations/Outbound/FA/AssetTransferDFF.xdo
     verify_ssl: bool = True
     timeout_seconds: int = 120
+    require_proxy: bool = False
 
     @staticmethod
     def from_dict(d: Dict[str, Any]) -> "BIPConfig":
@@ -71,6 +72,7 @@ class BIPConfig:
             report_path=report_path,
             verify_ssl=bool(d.get("verify_ssl", True)),
             timeout_seconds=int(d.get("timeout_seconds", 120)),
+            require_proxy=bool(d.get("require_proxy", False)),
         )
 
 
@@ -86,7 +88,7 @@ class BIPClient:
                 "Content-Type": "application/soap+xml; charset=utf-8",
             }
         )
-        self._session.proxies.update(get_proxy_config())
+        self._session.proxies.update(get_proxy_config(require=cfg.require_proxy))
 
     def _endpoint(self) -> str:
         return f"{self.cfg.base_url}/xmlpserver/services/ExternalReportWSSService"

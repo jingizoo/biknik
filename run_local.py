@@ -43,6 +43,11 @@ from ofam_asset_xfer.fusion_sync import FusionIUSync, DFFConfig  # noqa: E402
 from ofam_asset_xfer.gcs_publisher import GCSPublisherConfig, GCSResultPublisher  # noqa: E402
 from ofam_asset_xfer.local_publisher import LocalResultPublisher  # noqa: E402
 from ofam_asset_xfer.oracle_client import OracleConfig, OracleErpIntegrationsClient  # noqa: E402
+from ofam_asset_xfer.pre_bip_dff import (  # noqa: E402
+    PreBipDffConfig,
+    PreBipDffUpdater,
+    load_pre_bip_dff_requests,
+)
 
 
 def _load_config(path: str) -> dict:
@@ -149,6 +154,45 @@ def main(argv: list[str] | None = None) -> int:
         bip_params = config.get("bip_params")
 
         max_transfers = int(config.get("max_transfers", 500))
+
+        # --- Optional pre-BIP DFF updates ---
+        pre_bip_block = config.get("pre_bip_dff_updates") or {}
+        if pre_bip_block.get("enabled"):
+            pre_cfg = PreBipDffConfig.from_dict(pre_bip_block)
+            pre_requests = load_pre_bip_dff_requests(pre_bip_block)
+            if not pre_requests:
+                raise ConfigError(
+                    "pre_bip_dff_updates.enabled=true but no requests were supplied."
+                )
+            updater = PreBipDffUpdater(fusion_client, pre_cfg)
+            pre_summary = updater.apply_updates(pre_requests, dry_run=dry_run)
+
+            pre_summary_path = Path(out_dir) / "pre_bip_dff_summary.json"
+            pre_summary_path.write_text(json.dumps(pre_summary, indent=2, default=str))
+
+            pre_results_path = Path(out_dir) / "pre_bip_dff_results.json"
+            pre_results_path.write_text(
+                json.dumps(pre_summary.get("results", []), indent=2, default=str)
+            )
+
+            pre_counts = pre_summary.get("counts", {})
+            log.info(
+                "Pre-BIP DFF stage complete: total=%s updated=%s failed=%s dry_run=%s",
+                pre_counts.get("total", 0),
+                pre_counts.get("updated", 0),
+                pre_counts.get("failed", 0),
+                pre_counts.get("dry_run", 0),
+            )
+
+            delay = float(pre_cfg.bip_visibility_delay_seconds)
+            if execute and delay > 0 and pre_counts.get("updated", 0) > 0:
+                import time
+
+                log.info(
+                    "Sleeping %.1f second(s) before running BIP so updated DFF values are visible",
+                    delay,
+                )
+                time.sleep(delay)
 
         # --- Run ---
         sync = FusionIUSync(

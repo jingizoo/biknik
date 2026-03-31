@@ -22,6 +22,7 @@ class OracleConfig:
     bearer_token: str
     verify_ssl: bool = True
     timeout_seconds: int = 60
+    require_proxy: bool = False
 
     @staticmethod
     def from_dict(d: Dict[str, Any]) -> "OracleConfig":
@@ -53,6 +54,7 @@ class OracleConfig:
             bearer_token=str(bearer_token),
             verify_ssl=bool(d.get("verify_ssl", True)),
             timeout_seconds=int(d.get("timeout_seconds", 60)),
+            require_proxy=bool(d.get("require_proxy", False)),
         )
 
 
@@ -70,7 +72,7 @@ class OracleErpIntegrationsClient:
                 "ACCEPT": "application/json",
             }
         )
-        self._session.proxies.update(get_proxy_config())
+        self._session.proxies.update(get_proxy_config(require=cfg.require_proxy))
 
     def _endpoint(self, handle: str) -> str:
         # Example from doc: /fscmRestApi/resources/11.13.18.05/erpintegrations/processTransaction-transferAsset
@@ -141,6 +143,7 @@ class OracleErpIntegrationsClient:
             url,
             params=query_params or {},
             timeout=self.cfg.timeout_seconds,
+            verify=self.cfg.verify_ssl,
         )
         try:
             raw = r.json()
