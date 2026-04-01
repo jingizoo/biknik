@@ -460,6 +460,7 @@ class FusionIUSync:
 
         raw, pl = self._client.process_transaction("bookTransfer", params)
         status_code = str(pl.get("X_RETURN_STATUS") or "").strip()
+        return_msg = str(pl.get("X_RETURN_MESSAGE") or "").strip()
 
         return TransferResult(
             asset_number=pending.asset_number,
@@ -471,7 +472,7 @@ class FusionIUSync:
             fusion_response=pl,
             error=None
             if status_code == "S"
-            else f"Fusion X_RETURN_STATUS={status_code}",
+            else f"Fusion X_RETURN_STATUS={status_code}: {return_msg}",
         )
 
     def _execute_same_book(
@@ -535,6 +536,7 @@ class FusionIUSync:
 
         raw, pl = self._client.process_transaction("transferAsset", params)
         status_code = str(pl.get("X_RETURN_STATUS") or "").strip()
+        return_msg = str(pl.get("X_RETURN_MESSAGE") or "").strip()
 
         return TransferResult(
             asset_number=pending.asset_number,
@@ -546,7 +548,7 @@ class FusionIUSync:
             fusion_response=pl,
             error=None
             if status_code == "S"
-            else f"Fusion X_RETURN_STATUS={status_code}",
+            else f"Fusion X_RETURN_STATUS={status_code}: {return_msg}",
         )
 
     # ------------------------------------------------------------------

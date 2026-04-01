@@ -9,7 +9,7 @@
 #   grep -n "^# >>> FILE\|^# <<< END" bundle.py
 # =============================================================================
 
-# >>> FILE: proxy_config.py >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+# >>> FILE: proxy_config.py >>>
 """Proxy configuration for Oracle URL access.
 
 Reads INETPROXY_USER, INETPROXY_PASSWD, HTTP_APP_PROXY, and HTTPS_APP_PROXY
@@ -29,7 +29,7 @@ from urllib.parse import quote_plus
 log = logging.getLogger(__name__)
 
 
-def get_proxy_config() -> Dict[str, str]:
+def get_proxy_config(require: bool = False) -> Dict[str, str]:
     """Build a ``requests``-compatible proxies dict from environment variables.
 
     Expected env vars:
@@ -38,29 +38,51 @@ def get_proxy_config() -> Dict[str, str]:
         HTTP_APP_PROXY     – HTTP proxy URL  (e.g. http://proxy.example.com:80)
         HTTPS_APP_PROXY    – HTTPS proxy URL (e.g. http://proxy.example.com:443)
 
+    Args:
+        require: If True, raise ValueError when proxy env vars are missing
+                 instead of silently returning an empty dict.  Use this in
+                 pod/batch environments where direct routes don't exist.
+
     Returns:
         Dict suitable for ``requests.Session.proxies`` or ``requests.get(proxies=...)``.
-        Empty dict when proxy env vars are absent.
+        Empty dict when proxy env vars are absent and require=False.
     """
     http_proxy_url = os.environ.get("HTTP_APP_PROXY")
     https_proxy_url = os.environ.get("HTTPS_APP_PROXY")
 
     if not http_proxy_url and not https_proxy_url:
+        if require:
+            raise ValueError(
+                "Proxy is required but HTTP_APP_PROXY / HTTPS_APP_PROXY env vars "
+                "are not set. Set them or pass require=False for local dev."
+            )
         log.debug("No proxy env vars found (HTTP_APP_PROXY / HTTPS_APP_PROXY); skipping proxy.")
         return {}
 
-    INETPROXY_USER = os.environ["INETPROXY_USER"]
-    INETPROXY_PASSWD = os.environ["INETPROXY_PASSWD"]
+    user = os.environ.get("INETPROXY_USER", "")
+    passwd = os.environ.get("INETPROXY_PASSWD", "")
+
+    if not user or not passwd:
+        if require:
+            raise ValueError(
+                "Proxy env vars set but INETPROXY_USER / INETPROXY_PASSWD are "
+                "missing. Check the K8s secret (Holocron Vault)."
+            )
+        log.warning("Proxy URLs set but INETPROXY_USER/PASSWD missing — proxy will be unauthenticated.")
 
     proxies: Dict[str, str] = {}
 
     if http_proxy_url:
-        proxies["http"] = _build_proxy_url(INETPROXY_USER, INETPROXY_PASSWD, http_proxy_url)
+        proxies["http"] = _build_proxy_url(user, passwd, http_proxy_url)
 
     if https_proxy_url:
-        proxies["https"] = _build_proxy_url(INETPROXY_USER, INETPROXY_PASSWD, https_proxy_url)
+        proxies["https"] = _build_proxy_url(user, passwd, https_proxy_url)
 
-    log.info("Proxy configured for protocols: %s", list(proxies.keys()))
+    log.info(
+        "Proxy configured for protocols: %s (user=%s)",
+        list(proxies.keys()),
+        user or "<none>",
+    )
     return proxies
 
 
@@ -77,9 +99,9 @@ def _build_proxy_url(user: str, passwd: str, raw_url: str) -> str:
     # Strip the scheme so we can re-prefix with credentials.
     host_part = raw_url.replace("http://", "").replace("https://", "")
     return f"http://{quote_plus(user)}:{quote_plus(passwd)}@{host_part}"
-# <<< END: proxy_config.py <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+# <<< END: proxy_config.py <<<
 
-# >>> FILE: bip_client.py >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+# >>> FILE: bip_client.py >>>
 """BI Publisher SOAP client for running reports.
 
 Calls the ExternalReportWSSService SOAP 1.2 endpoint to run a BI Publisher
@@ -126,6 +148,7 @@ class BIPConfig:
     report_path: str  # e.g. /Custom/Integrations/Outbound/FA/AssetTransferDFF.xdo
     verify_ssl: bool = True
     timeout_seconds: int = 120
+    require_proxy: bool = False
 
     @staticmethod
     def from_dict(d: Dict[str, Any]) -> "BIPConfig":
@@ -153,6 +176,7 @@ class BIPConfig:
             report_path=report_path,
             verify_ssl=bool(d.get("verify_ssl", True)),
             timeout_seconds=int(d.get("timeout_seconds", 120)),
+            require_proxy=bool(d.get("require_proxy", False)),
         )
 
 
@@ -162,13 +186,14 @@ class BIPClient:
     def __init__(self, cfg: BIPConfig):
         self.cfg = cfg
         self._session = requests.Session()
+        self._session.trust_env = not cfg.require_proxy
         self._session.headers.update(
             {
                 "Authorization": f"Bearer {cfg.bearer_token}",
                 "Content-Type": "application/soap+xml; charset=utf-8",
             }
         )
-        self._session.proxies.update(get_proxy_config())
+        self._session.proxies.update(get_proxy_config(require=cfg.require_proxy))
 
     def _endpoint(self) -> str:
         return f"{self.cfg.base_url}/xmlpserver/services/ExternalReportWSSService"
@@ -314,9 +339,9 @@ def _xml_escape(s: str) -> str:
         .replace('"', "&quot;")
         .replace("'", "&apos;")
     )
-# <<< END: bip_client.py <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+# <<< END: bip_client.py <<<
 
-# >>> FILE: oracle_client.py >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+# >>> FILE: oracle_client.py >>>
 from __future__ import annotations
 
 import json
@@ -341,6 +366,7 @@ class OracleConfig:
     bearer_token: str
     verify_ssl: bool = True
     timeout_seconds: int = 60
+    require_proxy: bool = False
 
     @staticmethod
     def from_dict(d: Dict[str, Any]) -> "OracleConfig":
@@ -372,6 +398,7 @@ class OracleConfig:
             bearer_token=str(bearer_token),
             verify_ssl=bool(d.get("verify_ssl", True)),
             timeout_seconds=int(d.get("timeout_seconds", 60)),
+            require_proxy=bool(d.get("require_proxy", False)),
         )
 
 
@@ -381,6 +408,7 @@ class OracleErpIntegrationsClient:
     def __init__(self, cfg: OracleConfig):
         self.cfg = cfg
         self._session = requests.Session()
+        self._session.trust_env = not cfg.require_proxy
         self._session.headers.update(
             {
                 "Authorization": f"Bearer {cfg.bearer_token}",
@@ -389,7 +417,7 @@ class OracleErpIntegrationsClient:
                 "ACCEPT": "application/json",
             }
         )
-        self._session.proxies.update(get_proxy_config())
+        self._session.proxies.update(get_proxy_config(require=cfg.require_proxy))
 
     def _endpoint(self, handle: str) -> str:
         # Example from doc: /fscmRestApi/resources/11.13.18.05/erpintegrations/processTransaction-transferAsset
@@ -460,6 +488,7 @@ class OracleErpIntegrationsClient:
             url,
             params=query_params or {},
             timeout=self.cfg.timeout_seconds,
+            verify=self.cfg.verify_ssl,
         )
         try:
             raw = r.json()
@@ -472,4 +501,4 @@ class OracleErpIntegrationsClient:
             raise FusionApiError(f"Fusion GET HTTP {r.status_code}: {raw}")
 
         return dict(raw)
-# <<< END: oracle_client.py <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+# <<< END: oracle_client.py <<<

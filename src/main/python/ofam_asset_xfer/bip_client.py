@@ -82,6 +82,7 @@ class BIPClient:
     def __init__(self, cfg: BIPConfig):
         self.cfg = cfg
         self._session = requests.Session()
+        self._session.trust_env = not cfg.require_proxy
         self._session.headers.update(
             {
                 "Authorization": f"Bearer {cfg.bearer_token}",

@@ -64,6 +64,7 @@ class OracleErpIntegrationsClient:
     def __init__(self, cfg: OracleConfig):
         self.cfg = cfg
         self._session = requests.Session()
+        self._session.trust_env = not cfg.require_proxy
         self._session.headers.update(
             {
                 "Authorization": f"Bearer {cfg.bearer_token}",
