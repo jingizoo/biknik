@@ -200,6 +200,7 @@ def main(argv: list[str] | None = None) -> int:
             entity_resolver,
             bip_client,
             dff_config=dff_config,
+            default_transfer_date=config.get("default_transfer_date"),
         )
         summary = sync.run_full_sync(
             books=books,

@@ -171,11 +171,13 @@ class FusionIUSync:
         entity_resolver: EntityBookResolver,
         bip_client: BIPClient,
         dff_config: Optional[DFFConfig] = None,
+        default_transfer_date: Optional[str] = None,
     ):
         self._client = fusion_client
         self._entity_resolver = entity_resolver
         self._bip = bip_client
         self._dff = dff_config or DEFAULT_DFF_CONFIG
+        self._default_date = default_transfer_date
 
     # ------------------------------------------------------------------
     # Discovery
@@ -243,7 +245,7 @@ class FusionIUSync:
     def _check_bip_row(
         self,
         row: Dict[str, str],
-        books_upper: set,
+        books_upper: set[str],
     ) -> Optional[PendingTransfer]:
         """Check a single BIP report row for a pending transfer.
 
@@ -333,7 +335,7 @@ class FusionIUSync:
             description=state.description,
             tag_number=state.tag_number,
             cost=state.cost,
-            transfer_date=transfer_date_raw or date.today().isoformat(),
+            transfer_date=transfer_date_raw or self._default_date or date.today().isoformat(),
             transfer_to_entity=transfer_entity,
             transfer_to_location=transfer_location,
             target_book_type_code=target_book,
@@ -362,7 +364,7 @@ class FusionIUSync:
         Returns:
             TransferResult with transfer outcome.
         """
-        effective_date = pending.transfer_date or date.today().isoformat()
+        effective_date = pending.transfer_date or self._default_date or date.today().isoformat()
         request_id = f"IU_XFER_{pending.asset_number}_{int(time.time())}"
 
         # State should already be cached from discovery
@@ -460,7 +462,7 @@ class FusionIUSync:
 
         raw, pl = self._client.process_transaction("bookTransfer", params)
         status_code = str(pl.get("X_RETURN_STATUS") or "").strip()
-        return_msg = str(pl.get("X_RETURN_MESSAGE") or "").strip()
+        return_msg = str(pl.get("X_MSG_DATA") or pl.get("X_RETURN_MESSAGE") or "").strip()
 
         return TransferResult(
             asset_number=pending.asset_number,
@@ -536,7 +538,7 @@ class FusionIUSync:
 
         raw, pl = self._client.process_transaction("transferAsset", params)
         status_code = str(pl.get("X_RETURN_STATUS") or "").strip()
-        return_msg = str(pl.get("X_RETURN_MESSAGE") or "").strip()
+        return_msg = str(pl.get("X_MSG_DATA") or pl.get("X_RETURN_MESSAGE") or "").strip()
 
         return TransferResult(
             asset_number=pending.asset_number,
