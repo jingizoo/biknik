@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Read(//c/Users/Jalaj/OneDrive/Jalaj/Vertex/biknik/k8s/fa-asset-xfer/botora/**)",
+      "Read(//c/Users/Jalaj/OneDrive/Jalaj/Vertex/biknik/k8s/fa-asset-xfer/prod/**)"
+    ]
+  }
+}

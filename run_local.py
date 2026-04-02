@@ -41,6 +41,7 @@ from ofam_asset_xfer.entity_resolver import EntityBookResolver  # noqa: E402
 from ofam_asset_xfer.exceptions import ConfigError  # noqa: E402
 from ofam_asset_xfer.fusion_sync import FusionIUSync, DFFConfig  # noqa: E402
 from ofam_asset_xfer.gcs_publisher import GCSPublisherConfig, GCSResultPublisher  # noqa: E402
+from ofam_asset_xfer.slack_publisher import SlackPublisher  # noqa: E402
 from ofam_asset_xfer.local_publisher import LocalResultPublisher  # noqa: E402
 from ofam_asset_xfer.oracle_client import OracleConfig, OracleErpIntegrationsClient  # noqa: E402
 from ofam_asset_xfer.pre_bip_dff import (  # noqa: E402
@@ -232,6 +233,14 @@ def main(argv: list[str] | None = None) -> int:
                 gcs_pub.publish(summary, results_list)
             except Exception:
                 log.exception("Failed to publish to GCS (non-fatal)")
+
+        slack_block = config.get("slack")
+        if slack_block:
+            try:
+                slack_pub = SlackPublisher.from_dict(slack_block)
+                slack_pub.publish(summary, results_list)
+            except Exception:
+                log.exception("Failed to send Slack notification (non-fatal)")
 
     except Exception:
         log.exception("Job failed")

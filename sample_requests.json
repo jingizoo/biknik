@@ -25,6 +25,11 @@
     "prefix": "transfers",
     "service_account_file_env": "GCS_SA_KEY_PATH"
   },
+  "slack": {
+    "webhook_url_env": "SLACK_WEBHOOK_URL",
+    "dashboard_url": "",
+    "max_failures": 10
+  },
   "execute": false,
   "max_transfers": 500
 }
