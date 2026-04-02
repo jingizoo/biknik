@@ -24,6 +24,7 @@ from ofam_asset_xfer.exceptions import ConfigError
 from ofam_asset_xfer.fusion_sync import FusionIUSync, DFFConfig
 from ofam_asset_xfer.gcs_publisher import GCSPublisherConfig, GCSResultPublisher
 from ofam_asset_xfer.local_publisher import LocalResultPublisher
+from ofam_asset_xfer.slack_publisher import SlackPublisher
 from ofam_asset_xfer.oracle_client import OracleConfig, OracleErpIntegrationsClient
 from ofam_asset_xfer.store import ArtifactStore
 
@@ -83,7 +84,7 @@ def main(
             entity_resolver,
             bip_client,
             dff_config=dff_config,
-            default_transfer_date=config.get("default_transfer_date"),
+            default_transfer_date=cfg.get("default_transfer_date"),
         )
         summary = sync.run_full_sync(
             books=books,
@@ -112,6 +113,14 @@ def main(
                 gcs_pub.publish(summary, results_list)
             except Exception:
                 log.exception("Failed to publish to GCS (non-fatal)")
+
+        slack_block = cfg.get("slack")
+        if slack_block:
+            try:
+                slack_pub = SlackPublisher.from_dict(slack_block)
+                slack_pub.publish(summary, results_list)
+            except Exception:
+                log.exception("Failed to send Slack notification (non-fatal)")
 
         counts = summary.get("counts", {})
         log.info("Completed: total=%s transferred=%s failed=%s dry_run=%s",
