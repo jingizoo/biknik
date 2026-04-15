@@ -41,7 +41,7 @@ from ofam_asset_xfer.entity_resolver import EntityBookResolver  # noqa: E402
 from ofam_asset_xfer.exceptions import ConfigError  # noqa: E402
 from ofam_asset_xfer.fusion_sync import FusionIUSync, DFFConfig  # noqa: E402
 from ofam_asset_xfer.gcs_publisher import GCSPublisherConfig, GCSResultPublisher  # noqa: E402
-from ofam_asset_xfer.slack_publisher import SlackPublisher  # noqa: E402
+from ofam_asset_xfer.slack_publisher import SlackPublisher, PagerDutyPublisher  # noqa: E402
 from ofam_asset_xfer.local_publisher import LocalResultPublisher  # noqa: E402
 from ofam_asset_xfer.oracle_client import OracleConfig, OracleErpIntegrationsClient  # noqa: E402
 from ofam_asset_xfer.pre_bip_dff import (  # noqa: E402
@@ -242,8 +242,23 @@ def main(argv: list[str] | None = None) -> int:
             except Exception:
                 log.exception("Failed to send Slack notification (non-fatal)")
 
-    except Exception:
+        pd_block = config.get("pagerduty")
+        if pd_block:
+            try:
+                pd_pub = PagerDutyPublisher.from_dict(pd_block)
+                pd_pub.check_and_trigger(summary, results_list)
+            except Exception:
+                log.exception("Failed to check PagerDuty threshold (non-fatal)")
+
+    except Exception as exc:
         log.exception("Job failed")
+        pd_block = config.get("pagerduty") if "config" in dir() else None
+        if pd_block:
+            try:
+                pd_pub = PagerDutyPublisher.from_dict(pd_block)
+                pd_pub.trigger_if_hard_error(exc)
+            except Exception:
+                log.exception("Failed to trigger PagerDuty (non-fatal)")
         return 1
 
     # Print summary.
