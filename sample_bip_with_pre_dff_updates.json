@@ -1,0 +1,47 @@
+{
+  "oracle": {
+    "base_url": "https://lbpgjb-dev1.fa.ocs.oraclecloud.com",
+    "api_version": "11.13.18.05",
+    "bearer_token_env": "FUSION_JWT"
+  },
+  "bip": {
+    "base_url": "https://lbpgjb-dev1.fa.ocs.oraclecloud.com",
+    "bearer_token_env": "FUSION_JWT",
+    "report_path": "/Custom/FinancialsReports/All_IUT_Transfers_Rpt.xdo"
+  },
+  "books": [
+    "US CORP BOOK",
+    "UK CORP BOOK"
+  ],
+  "entity_book_map": {
+    "300000001234567": "US CORP BOOK",
+    "300000001234568": "UK CORP BOOK",
+    "300000001234569": "CN CORP BOOK"
+  },
+  "execute": false,
+  "max_transfers": 500,
+  "pre_bip_dff_updates": {
+    "enabled": true,
+    "operation_handle": "updateAssetDescriptiveDetails",
+    "lookup_asset_id_when_missing": true,
+    "continue_on_error": true,
+    "bip_visibility_delay_seconds": 5,
+    "field_parameter_map": {
+      "book_type_code": "P_BOOK_TYPE_CODE",
+      "transfer_to_entity": "P_CAT_ATTRIBUTE9",
+      "transfer_to_location": "P_CAT_ATTRIBUTE10",
+      "transfer_date": "P_TRX_ATTRIBUTE2",
+      "account": "P_CAT_ATTRIBUTE11",
+      "cost_center": "P_CAT_ATTRIBUTE12",
+      "segment5": "P_CAT_ATTRIBUTE13",
+      "segment7": "P_CAT_ATTRIBUTE14"
+    },
+    "field_defaults": {
+      "account": "LC000129",
+      "cost_center": "20501",
+      "segment5": "00000",
+      "segment7": "000"
+    },
+    "request_id_param": "P_TRX_ATTRIBUTE1"
+  }
+}

@@ -1,12 +1,11 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
-from datetime import date
-from typing import Any, Dict, Iterable, List, Tuple
+from typing import Any, Dict, Iterable, List
 
 
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_NUMERIC_RE = re.compile(r"^-?\d+(\.\d+)?$")
 
 
 def _is_date_str(s: str) -> bool:
@@ -46,20 +45,28 @@ def build_parameter_list(params: Dict[str, Any]) -> str:
             raise ValueError(f"Parameter name must be UPPERCASE: {k!r}")
 
         if isinstance(v, (list, tuple)):
-            items.append(f"{k}: {to_rosetta_str(v)}")
+            items.append(f"{k}:{to_rosetta_str(v)}")
             continue
 
         if isinstance(v, str) and (k.endswith("_TBL") or k.endswith("_TABLE")):
             # Already encoded rosetta string, but enforce quoting.
-            items.append(f"{k}: {to_rosetta_str([p.strip() for p in v.split(',') if p.strip() != ''])}")
+            items.append(
+                f"{k}:{to_rosetta_str([p.strip() for p in v.split(',') if p.strip() != ''])}"
+            )
             continue
 
         if isinstance(v, str) and _is_date_str(v):
             items.append(f"{k}: {_quote_single(v.strip())}")
             continue
 
-        # Keep strings unquoted to match Oracle examples (incl. book codes with spaces).
-        items.append(f"{k}: {v}")
+        # Numeric values stay unquoted (with space after colon);
+        # all other strings are single-quoted (no space before quote)
+        # per Oracle ERP Integrations ParameterList format.
+        sv = str(v)
+        if _NUMERIC_RE.match(sv.strip()):
+            items.append(f"{k}: {sv}")
+        else:
+            items.append(f"{k}:{_quote_single(sv)}")
     return "{" + ", ".join(items) + "}"
 
 
@@ -67,14 +74,17 @@ def parse_rosetta(value: Any) -> List[str]:
     """Parse a Rosetta table value coming back from Fusion.
 
     Fusion returns comma-separated strings, often with empty placeholders like ','.
+    Values may be wrapped in single quotes (e.g. ``'626955,626956'``); strip them.
     """
     if value is None:
         return []
     s = str(value).strip()
     if s == "" or s == ",":
         return []
+    # Strip surrounding single quotes (Fusion sometimes returns quoted rosetta strings).
+    if s.startswith("'") and s.endswith("'"):
+        s = s[1:-1].replace("''", "'")
     parts = [p.strip() for p in s.split(",")]
-    # Preserve empty cells? For OFAM transfer builder, we drop empties.
     return [p for p in parts if p != ""]
 
 

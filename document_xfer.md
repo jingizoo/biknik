@@ -55,8 +55,10 @@ Design intent:
 
 ### Out of scope (for now)
 
-* Automatic choice of **API vs FBDI** (design allows it later; implementation here is **API-only**).
+* Automatic choice of **API vs FBDI** (design allows it later; implementation here is **API-only**). Note: FBDI is confirmed fallback for same-period re-transfers if API limitation holds.
 * Full “web UI workbench” (we still design interfaces for exceptions + audit, but UI can come later).
+* Approval/staging workflow (PeopleSoft-style approve/decline before transfer execution) — decision deferred pending CMDB governance alignment.
+* Spreadsheet-based manual transfers — blocked by Oracle bug (patch expected 26B / June).
 
 ---
 
@@ -219,6 +221,7 @@ Transfer APIs require distribution-level inputs; safest approach is to derive di
 | Asset identity (`asset_id`, `asset_number`)  | Fusion           | `getAssetInformation` using `book_type_code + asset_number` |
 | Current distributions (IDs, units, CCIDs)    | Fusion           | `getAssetBookInformation` / inquiry                         |
 | Physical assignment (location/custodian/org) | CMDB             | CMDB “current state” API                                    |
+| Cost center                                  | CMDB             | CMDB DFF (field TBD — pending Simon/Dustin alignment)       |
 | Accounting mappings (segment mapping → CCID) | Mapping layer    | OFAM-owned mapping/validation                               |
 | Transfer effective date                      | Request/CMDB     | file value, CMDB effective date, or default job date        |
 
@@ -670,6 +673,91 @@ Prefer:
 
 ---
 
+## Key decisions from 2026-03-17 alignment call
+
+### 1) Intercompany transfer validated
+
+* US → UK cross-book transfer tested successfully by KPMG (Sujita).
+* Destination accounting populates correctly: intercompany payables segment (20501) and intercompany segment both accurate.
+* No code changes required from Jalaj's side for intercompany — it is configuration-based (KPMG effort).
+* **Action:** Sujita to run final-mode report of all entries generated from the transfer and share with Morgan/Robert/Leah for review.
+
+### 2) Entity flip logic confirmed
+
+* When CMDB sends a new entity for an inter-unit transfer, the automation keeps all other segments (account, cost center, etc.) the same and only replaces the entity.
+* The new book is derived from the new entity.
+* This is confirmed as the expected approach.
+
+### 3) Cost center must also be updated (NEW)
+
+* Cost center changes from CMDB must also be reflected in Oracle during transfers.
+* **Blocker:** Jalaj does not yet have the DFF field for cost center. Needs to check with Simon (on vacation) or Sam.
+* **Action:** Include Jalaj in the next call with Dustin (CMDB engineer) to align on what fields CMDB sends and how cost center is passed.
+* **Design impact:** The "overlay delta" in the transfer builder must support cost center changes in addition to entity changes.
+
+### 4) Scope of field changes during transfer — minimal
+
+* **Decision:** Only entity and cost center should change during a CMDB-driven transfer.
+* Category, description, and other metadata fields should NOT be updated.
+* Rationale: more fields = more maintenance burden on CMDB team and more risk of inaccuracy.
+
+### 5) Same-entity transfers are valid — do NOT skip
+
+* If source entity equals target entity, it can still be a valid transfer (e.g., location update within the same entity).
+* Location changes impact cost allocation by country.
+* **Design impact:** The automation must NOT short-circuit when source entity = target entity. It must still process location and other assignment changes.
+
+### 6) Multiple pending transfers — "final state wins"
+
+* **Key decision:** If multiple CMDB transfer events queue up for the same asset before the batch runs, only the **final state** is transferred.
+* Depreciation will be calculated on the final entity only.
+* No need to replay intermediate transfers.
+* **Action:** Document this as a formal policy decision for audit trail.
+
+### 7) Error handling — skip failed asset, continue batch
+
+* **Decision:** If 1 out of 100 assets fails, transfer the other 99 and flag the failure in the report.
+* Do NOT stop the entire batch for a single asset failure.
+* Failed assets appear in the exception report with reason and retry guidance.
+* **Status:** Already implemented this way in the current design.
+
+### 8) API same-period re-transfer limitation
+
+* **Issue:** The Oracle API may not allow two transfers of the same asset in the same accounting period.
+* Jalaj and another team member confirmed this limitation in testing.
+* Sujita believes it should work (works via UI); Mohit to verify API behavior.
+* **Fallback:** FBDI for same-period re-transfers if API limitation is confirmed.
+* **Design impact:** If a transfer needs to be reversed in the same month, it may require manual intervention or FBDI.
+
+### 9) Touchless vs approval workflow — still TBD
+
+* Robert's preference: a staging/review step (like PeopleSoft had) where transfers are approved or declined before execution.
+* Morgan's view: if upstream CMDB governance includes the right approvals (e.g., tax sign-off before transfers to India book), a touchless process may be acceptable.
+* **Decision deferred** pending alignment between all three accounting teams and resolution of upstream CMDB governance design.
+* Jalaj has read-only reporting capability already built. Prepaid application features could be explored for approval workflow if needed.
+
+### 10) Oracle spreadsheet transfer bug
+
+* Oracle's spreadsheet-based transfer method is currently broken.
+* Oracle plans to fix in 26B release (June production). Earlier patch available on request.
+* **Action:** Sujita to raise a separate patch request, since FBDI alone has controls issues and spreadsheet is needed as a manual fallback.
+* **Why it matters:** Non-CMDB cleanup scenarios (e.g., year-end) require manual transfers, and the spreadsheet is the controlled method for that.
+
+### 11) Oracle display bug — cost/depreciation values
+
+* Known Oracle bug: transferred asset cost and accumulated depreciation only display correctly after running depreciation (workaround).
+* Oracle acknowledges the bug; no fix date yet.
+* Custom reports may show incorrect values before depreciation runs.
+* **Action:** Sujita to compare before/after depreciation values and verify all custom FA reports display correctly.
+
+### 12) CMDB lifecycle (retire/unretire) — needs further discussion
+
+* Open question: what happens if an asset is retired in CMDB, then goes back into service, then is transferred — all in one activity window?
+* Current behavior: retired assets are disregarded entirely.
+* **Action:** Discuss with Jonathan (who is tracking CMDB governance conversations with core engineering team).
+
+---
+
 ## Open decisions to finalize (explicit)
 
 1. **Authoritative tag governance**
@@ -681,3 +769,18 @@ Prefer:
 3. **Controls placement**
 
    * Confirm where daily/weekly data quality checks will be surfaced and owned.
+4. **Touchless vs approval workflow**
+
+   * Requires alignment across all three accounting teams + upstream CMDB governance design resolution.
+5. **Cost center DFF integration**
+
+   * Jalaj to locate the DFF field with Simon/Sam and confirm how CMDB passes cost center to Oracle.
+6. **API same-period re-transfer**
+
+   * Mohit/Sujita to verify whether the API truly blocks same-period re-transfers or if it was a testing error.
+7. **CMDB lifecycle handling (retire/unretire + transfer)**
+
+   * Needs design decision — discuss with Jonathan and CMDB core engineering team.
+8. **Invalid CCID combinations**
+
+   * If target segment combination has no valid CCID in Oracle, transfer fails. Need more testing to determine if this is a real-world scenario or only a test artifact.

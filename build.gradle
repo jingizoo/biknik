@@ -1,177 +1,105 @@
 plugins {
-  // CitSource conventions (matches your screenshot style)
-  id 'citsource.common-conventions'
-  id 'citsource.python-conventions'
-
-  // CDX Batch publishing (batchCheck/batchDiff/batchSync)
-  id 'citadel-batch-plugin'
+  id ‘citsource.common-conventions’
+  id ‘citsource.python-conventions’
+  id ‘citadel-batch-plugin’
 }
 
-/**
- * ============================
- * Project metadata (optional)
- * ============================
- */
-description = "Oracle Fusion FA Cross-Book Transfer (CDX Batch runner)"
+description = “Oracle Fusion FA Cross-Book Transfer (CDX Batch runner)”
 
-/**
- * ============================
- * Python env (Conda) packages
- * ============================
- * Keep this minimal at first; add packages only as needed.
- */
 conda {
   realPackages = [
-    // core
-    "requests",
-    "pydantic",
-    "typer",
-    "rich",
-
-    // dates / retry
-    "python-dateutil",
-    "tenacity",
-
-    // storage (if using GCS for requests + outputs)
-    "google",
-    "google-auth",
-    "google-auth-oauthlib",
-    "google-api-core",
-    "google-cloud-core",
-    "google-cloud-storage",
-
-    // data helpers (optional)
-    "pandas"
+    “requests”,
+    “pydantic”,
+    “typer”,
+    “python-dateutil”,
+    “google”,
+    “google-auth”,
+    “google-auth-oauthlib”,
+    “google-api-core”,
+    “google-cloud-core”,
+    “google-cloud-storage”,
+    “pandas”
   ]
 
-  // Name your env uniquely for the module
-  condaEnvironment("faBookXferEnv") {
+  condaEnvironment(“faBookXferEnv”) {
     realmCondaBuild = CITSOURCE_REALM3_CONDA_BUILD
   }
 }
 
-/**
- * ============================
- * (Optional) Java/Kotlin deps
- * ============================
- * Remove this entire block if you're pure-Python.
- */
-dependencies {
-  // Example: internal shared libs (only if your repo has them)
-  // implementation project(':common:grpc')
-}
-
-/**
- * ============================
- * Bind conda env to this module
- * ============================
- * Replace the Gradle path with your module path in the monorepo.
- */
 cigpy {
-  useCondaEnvironment(":<YOUR_GRADLE_MODULE_PATH>", "faBookXferEnv")
+  useCondaEnvironment(“:oraclefusion:assetxferpipeline”, “faBookXferEnv”)
 }
 
-/**
- * ============================
- * Docker image build
- * ============================
- * This enables building an image from this module (per your environment’s conventions).
- */
 cigdocker {
   createDockerImage = true
-  // If your tooling supports naming here, set it; otherwise it will derive.
-  // imageName = "<REGISTRY>/<IMAGE_NAME>:<TAG>"
 }
 
-/**
- * ============================
- * Include non-.py files in python packaging
- * ============================
- */
 sourceSets {
   main {
     python {
       includes += [
-        "**/*.py",
-        "**/*.json",
-        "**/*.yaml",
-        "**/*.yml",
-        "**/*.txt"
+        “**/*.py”,
+        “**/*.json”,
+        “**/*.yaml”,
+        “**/*.yml”,
+        “**/*.txt”
       ]
     }
   }
 }
 
-/**
- * ============================
- * Start scripts (optional but useful)
- * ============================
- * Provides entrypoints you can run in container/jobs.
- */
 startScripts {
-  pythonBinary("fa_book_xfer") {
-    // Set to your real entrypoint (wrapper recommended)
-    main = "batch_entrypoint.py"
+  pythonBinary(“fa_book_xfer”) {
+    main = “batch_entrypoint.py”
   }
 
-  pythonBinary("smoke_test") {
-    main = "hello_batch.py"
+  pythonBinary(“smoke_test”) {
+    main = “hello_batch.py”
   }
 }
 
-/**
- * ============================
- * (Optional) Mypy
- * ============================
- */
-mypy {
-  myPyConfigAppendFile = "${projectDir}/mypy/mypy.ini"
-}
-
-/**
- * ============================
- * Deployer integration
- * ============================
- * This is how CDX Deployer “knows” it can deploy your Batch sync/job config.
- * Replace team/project/appCatalog names.
- */
 deployments {
-  // App deployment metadata (optional)
-  deployment("fa-book-xfer") {
-    team = "<DEPLOYER_TEAM>"               // e.g. "pte-accounting-engineering"
-    project = "<PROJECT_NAME>"             // e.g. "erp"
-    appCatalogApplication = "<APP_CATALOG_APP>"  // e.g. "ERP Finance"
+  deployment(“fa-asset-xfer”) {
+    team = “pte-accounting-engineering”
+    project = “assetxferpipeline”
+    appCatalogApplication = “FA Asset Transfer”
 
-    tag "fa-book-xfer"
-    tag "batch"
-    tag "prod"
+    tag “build-tag”
+
+    gke(“botora fa-asset-xfer”) {
+      configDir = “k8s/fa-asset-xfer/botora”
+      namespace = “accounting-gateway”
+      project = “cig-acctgateway-dev-1”
+      cluster = “ent-acctgateway-1--dev--us-east1”
+      credentialsSecret = “service-accounts/fa-asset-xfer/dev”
+      region = “us-east1”
+    }
+
+    gke(“prod fa-asset-xfer”) {
+      configDir = “k8s/fa-asset-xfer/prod”
+      namespace = “accounting-gateway”
+      project = “cig-acctgateway-prod-1”
+      cluster = “ent-acctgateway-1--prod--us-east1”
+      region = “us-east1”
+      soc1 = true
+    }
+
+    gke(“dr fa-asset-xfer”) {
+      configDir = “k8s/fa-asset-xfer/prod”
+      namespace = “accounting-gateway”
+      project = “cig-acctgateway-prod-1”
+      cluster = “ent-acctgateway-1--prod--us-central1”
+      region = “us-central1”
+      soc1 = true
+    }
   }
 
-  // Batch deployment hook
-  deployment("fa-book-xfer-batch") {
-    team = "<DEPLOYER_TEAM>"
-    project = "<PROJECT_NAME>"
+  deployment(“fa-asset-xfer-batch”) {
+    team = “OracleFusion”
+    project = “assetxferpipeline”
 
-    // This name is what shows up in Deployer as a Batch deployment item.
-    batch("<BATCH_DEPLOYMENT_NAME>") {
-      username = "<SERVICE_ACCOUNT_USERNAME>"     // e.g. "sp_erp_batch"
-      appCatalogApplications = ["<APP_CATALOG_APP>"]
-      // If your org supports env/subdir selection here, add it:
-      // subdir = "prod"
+    batch(“fa-asset-xfer-batch”) {
+      username = “sd_orc_fdi”
     }
   }
 }
-
-/**
- * ============================
- * Batch config layout (recommended)
- * ============================
- * Keep dev/prod YAML under:
- *   src/main/batch/dev/
- *   src/main/batch/prod/
- *
- * If your plugin supports this block, you can enable it. If not, delete it.
- */
-// batch {
-//   subdirs = ["dev", "prod"]
-// }

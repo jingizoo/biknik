@@ -1,0 +1,144 @@
+{
+  "version": "0.2.0",
+  "inputs": [
+    {
+      "id": "configFile",
+      "type": "promptString",
+      "description": "Path to requests JSON config file",
+      "default": "sample_requests.json"
+    },
+    {
+      "id": "outDir",
+      "type": "promptString",
+      "description": "Output directory for artifacts",
+      "default": "/tmp/ofam_out"
+    },
+    {
+      "id": "entityBookMap",
+      "type": "promptString",
+      "description": "Path to entity→book mapping JSON (e.g. entity_book_map.json)",
+      "default": "entity_book_map.json"
+    },
+    {
+      "id": "iuBooks",
+      "type": "promptString",
+      "description": "Comma-separated books to scan (leave empty = all from entity map)",
+      "default": ""
+    },
+    {
+      "id": "iuLimit",
+      "type": "pickString",
+      "description": "Max pending IU transfers to find",
+      "options": ["10", "20", "50", "100"],
+      "default": "10"
+    }
+  ],
+  "configurations": [
+    //
+    // ── LOCAL RUNNER (no Batch needed) ───────────────────────
+    //
+    {
+      "name": "Local Run — dry-run",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/run_local.py",
+      "args": [
+        "--config",  "${input:configFile}",
+        "--out-dir", "${input:outDir}"
+      ],
+      "console": "integratedTerminal",
+      "justMyCode": false
+    },
+    {
+      "name": "Local Run — EXECUTE",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/run_local.py",
+      "args": [
+        "--config",  "${input:configFile}",
+        "--out-dir", "${input:outDir}",
+        "--execute"
+      ],
+      "console": "integratedTerminal",
+      "justMyCode": false
+    },
+    //
+    // ── BATCH JOB (production entrypoint) ────────────────────
+    //
+    {
+      "name": "Batch Job — dry-run",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/src/main/python/batch_entrypoint.py",
+      "args": [
+        "--config",   "${input:configFile}",
+        "--out-dir",  "${input:outDir}",
+        "--dry-run"
+      ],
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}/src/main/python"
+      },
+      "console": "integratedTerminal",
+      "justMyCode": false
+    },
+    {
+      "name": "Batch Job — EXECUTE",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/src/main/python/batch_entrypoint.py",
+      "args": [
+        "--config",   "${input:configFile}",
+        "--out-dir",  "${input:outDir}",
+        "--execute"
+      ],
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}/src/main/python"
+      },
+      "console": "integratedTerminal",
+      "justMyCode": false
+    },
+    //
+    // ── UNIT TESTS ────────────────────────────────────────────
+    //
+    {
+      "name": "Run All Tests",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "pytest",
+      "args": ["tests/", "-v"],
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}/src/main/python"
+      },
+      "console": "integratedTerminal",
+      "justMyCode": false
+    },
+    {
+      "name": "Run BIP Client Tests",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "pytest",
+      "args": ["tests/test_bip_client.py", "-v"],
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}/src/main/python"
+      },
+      "console": "integratedTerminal",
+      "justMyCode": false
+    },
+    {
+      "name": "Run IU Transfer Tests",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "pytest",
+      "args": [
+        "tests/test_entity_resolver.py",
+        "tests/test_fusion_sync.py",
+        "-v"
+      ],
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}/src/main/python"
+      },
+      "console": "integratedTerminal",
+      "justMyCode": false
+    }
+  ]
+}

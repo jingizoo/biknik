@@ -1,0 +1,397 @@
+[
+  {
+    "case_id": "TC01_XBOOK_US_TO_UK_HAPPY",
+    "sequence": 1,
+    "description": "Cross-book happy path. Entity flip from US to UK with pre-resolved target book, location, and expense CCID.",
+    "source": {
+      "asset_id": "300100501",
+      "asset_number": "ASSET_US_UK_001",
+      "book_type_code": "US CORP BOOK",
+      "distribution_ids": ["5001"],
+      "units_assigned": ["1"],
+      "assigned_to": [""],
+      "expense_ccids": ["626955"],
+      "location_ccids": ["789012"],
+      "category_id": "501",
+      "date_placed_in_service": "2024-06-15",
+      "cost": "125000.00",
+      "description": "Dell PowerEdge R750 Server",
+      "tag_number": "SRV-US-2024-001"
+    },
+    "dff_update": {
+      "transfer_to_entity": "UK Entity",
+      "transfer_date": "2026-03-15",
+      "transfer_to_location": "",
+      "final_target_book_type_code": "UK CORP BOOK",
+      "target_location_id": "300100888001",
+      "target_expense_ccid": "627564"
+    },
+    "simulate": {
+      "transfer_status": "S",
+      "mock_target_asset_number": "UK-NEW-900001"
+    },
+    "expected": {
+      "business_status": "TRANSFERRED",
+      "notes": "Baseline inter-unit automation should succeed."
+    }
+  },
+  {
+    "case_id": "TC02_SAME_BOOK_LOCATION_HAPPY",
+    "sequence": 1,
+    "description": "Same-book valid transfer. Entity does not change, but location changes.",
+    "source": {
+      "asset_id": "300100504",
+      "asset_number": "ASSET_US_LOC_004",
+      "book_type_code": "US CORP BOOK",
+      "distribution_ids": ["5010"],
+      "units_assigned": ["1"],
+      "assigned_to": [""],
+      "expense_ccids": ["626955"],
+      "location_ccids": ["789012"],
+      "category_id": "501",
+      "date_placed_in_service": "2023-03-15",
+      "cost": "32000.00",
+      "description": "HP ProLiant DL380 Gen10",
+      "tag_number": "SRV-US-2023-088"
+    },
+    "dff_update": {
+      "transfer_to_entity": "US Entity",
+      "transfer_date": "2026-03-10",
+      "transfer_to_location": "",
+      "final_target_book_type_code": "US CORP BOOK",
+      "target_location_id": "300100999001",
+      "target_expense_ccid": ""
+    },
+    "simulate": {
+      "transfer_status": "S"
+    },
+    "expected": {
+      "business_status": "TRANSFERRED",
+      "notes": "Same-entity location changes are valid and should not be skipped."
+    }
+  },
+  {
+    "case_id": "TC03_SAME_BOOK_COST_CENTER_HAPPY",
+    "sequence": 1,
+    "description": "Same-book valid transfer. Expense / cost center changes, location stays the same.",
+    "source": {
+      "asset_id": "300100505",
+      "asset_number": "ASSET_US_EXP_005",
+      "book_type_code": "US CORP BOOK",
+      "distribution_ids": ["5011"],
+      "units_assigned": ["1"],
+      "assigned_to": [""],
+      "expense_ccids": ["626955"],
+      "location_ccids": ["789012"],
+      "category_id": "502",
+      "date_placed_in_service": "2024-02-28",
+      "cost": "18500.00",
+      "description": "Juniper EX4300 Switch",
+      "tag_number": "NET-US-2024-067"
+    },
+    "dff_update": {
+      "transfer_to_entity": "US Entity",
+      "transfer_date": "2026-03-12",
+      "transfer_to_location": "",
+      "final_target_book_type_code": "US CORP BOOK",
+      "target_location_id": "",
+      "target_expense_ccid": "627100"
+    },
+    "simulate": {
+      "transfer_status": "S"
+    },
+    "expected": {
+      "business_status": "TRANSFERRED",
+      "notes": "Cost center / expense changes should flow when CMDB sends them."
+    }
+  },
+  {
+    "case_id": "TC04_UNKNOWN_ENTITY_SKIP",
+    "sequence": 1,
+    "description": "Unknown entity sent by CMDB. Discovery should reject it before transfer.",
+    "source": {
+      "asset_id": "300100508",
+      "asset_number": "ASSET_FAIL_ENT_008",
+      "book_type_code": "US CORP BOOK",
+      "distribution_ids": ["5030"],
+      "units_assigned": ["1"],
+      "assigned_to": [""],
+      "expense_ccids": ["626955"],
+      "location_ccids": ["789012"],
+      "category_id": "505",
+      "date_placed_in_service": "2024-11-01",
+      "cost": "5000.00",
+      "description": "Raspberry Pi Cluster",
+      "tag_number": "IOT-US-2024-001"
+    },
+    "dff_update": {
+      "transfer_to_entity": "MARS Entity",
+      "transfer_date": "2026-03-25",
+      "transfer_to_location": "",
+      "final_target_book_type_code": "",
+      "target_location_id": "",
+      "target_expense_ccid": ""
+    },
+    "simulate": {
+      "transfer_status": "S"
+    },
+    "expected": {
+      "business_status": "SKIPPED_DISCOVERY",
+      "notes": "Should be flagged as bad input, not sent to Oracle."
+    }
+  },
+  {
+    "case_id": "TC05_INVALID_CCID_CONTINUE_BATCH",
+    "sequence": 1,
+    "description": "Cross-book transfer with invalid target expense CCID. Should fail but not stop the rest of the batch.",
+    "source": {
+      "asset_id": "300100510",
+      "asset_number": "ASSET_FAIL_API_010",
+      "book_type_code": "UK CORP BOOK",
+      "distribution_ids": ["6010"],
+      "units_assigned": ["1"],
+      "assigned_to": [""],
+      "expense_ccids": ["700110"],
+      "location_ccids": ["800210"],
+      "category_id": "507",
+      "date_placed_in_service": "2024-05-20",
+      "cost": "62000.00",
+      "description": "F5 BIG-IP i5800 Load Balancer",
+      "tag_number": "LB-UK-2024-005"
+    },
+    "dff_update": {
+      "transfer_to_entity": "JP Entity",
+      "transfer_date": "2026-03-28",
+      "transfer_to_location": "",
+      "final_target_book_type_code": "JP CORP BOOK",
+      "target_location_id": "300100888010",
+      "target_expense_ccid": "999999999"
+    },
+    "simulate": {
+      "transfer_status": "E",
+      "error_message": "Invalid target expense CCID"
+    },
+    "expected": {
+      "business_status": "FAILED",
+      "notes": "Batch should continue; failed asset should be clearly reported."
+    }
+  },
+  {
+    "case_id": "TC06_MULTI_DIST_US_TO_DE",
+    "sequence": 1,
+    "description": "Cross-book asset with two distributions. Ensures dual-leg rosetta tables are built correctly.",
+    "source": {
+      "asset_id": "300100507",
+      "asset_number": "ASSET_US_DE_007",
+      "book_type_code": "US CORP BOOK",
+      "distribution_ids": ["5020", "5021"],
+      "units_assigned": ["0.6", "0.4"],
+      "assigned_to": ["", ""],
+      "expense_ccids": ["626955", "626960"],
+      "location_ccids": ["789012", "789015"],
+      "category_id": "504",
+      "date_placed_in_service": "2024-08-01",
+      "cost": "250000.00",
+      "description": "NetApp AFF A400 Storage Array",
+      "tag_number": "STG-US-2024-003"
+    },
+    "dff_update": {
+      "transfer_to_entity": "DE Entity",
+      "transfer_date": "2026-03-22",
+      "transfer_to_location": "",
+      "final_target_book_type_code": "DE CORP BOOK",
+      "target_location_id": "300100888007",
+      "target_expense_ccid": "630200"
+    },
+    "simulate": {
+      "transfer_status": "S",
+      "mock_target_asset_number": "DE-NEW-900007"
+    },
+    "expected": {
+      "business_status": "TRANSFERRED",
+      "notes": "Multi-distribution asset should still transfer cleanly."
+    }
+  },
+  {
+    "case_id": "TC07_ALREADY_AT_TARGET_SHOULD_BE_VISIBLE_NOOP",
+    "sequence": 1,
+    "description": "CMDB says move to a location that already matches current location. Business expectation is a visible NOOP, not a silent skip.",
+    "source": {
+      "asset_id": "300100506",
+      "asset_number": "ASSET_US_NOOP_006",
+      "book_type_code": "US CORP BOOK",
+      "distribution_ids": ["5012"],
+      "units_assigned": ["1"],
+      "assigned_to": [""],
+      "expense_ccids": ["626955"],
+      "location_ccids": ["789012"],
+      "category_id": "503",
+      "date_placed_in_service": "2024-04-01",
+      "cost": "9800.00",
+      "description": "Ubiquiti EdgeSwitch 48",
+      "tag_number": "NET-US-2024-099"
+    },
+    "dff_update": {
+      "transfer_to_entity": "US Entity",
+      "transfer_date": "2026-03-05",
+      "transfer_to_location": "",
+      "final_target_book_type_code": "US CORP BOOK",
+      "target_location_id": "789012",
+      "target_expense_ccid": ""
+    },
+    "simulate": {
+      "transfer_status": "S"
+    },
+    "expected": {
+      "business_status": "NOOP",
+      "notes": "User should see that nothing changed and why."
+    }
+  },
+  {
+    "case_id": "TC08A_DUPLICATE_EVENT_STEP1_SHOULD_COLLAPSE",
+    "sequence": 1,
+    "event_group": "ASSET_DUP_011",
+    "description": "First of two queued CMDB events for the same asset. With final-state-wins policy this should collapse, not execute.",
+    "source": {
+      "asset_id": "300100511",
+      "asset_number": "ASSET_DUP_011",
+      "book_type_code": "US CORP BOOK",
+      "distribution_ids": ["5041"],
+      "units_assigned": ["1"],
+      "assigned_to": [""],
+      "expense_ccids": ["626975"],
+      "location_ccids": ["789031"],
+      "category_id": "506",
+      "date_placed_in_service": "2024-07-20",
+      "cost": "72000.00",
+      "description": "Queued transfer duplicate event asset",
+      "tag_number": "DUP-US-2024-011"
+    },
+    "dff_update": {
+      "transfer_to_entity": "UK Entity",
+      "transfer_date": "2026-03-21",
+      "transfer_to_location": "",
+      "final_target_book_type_code": "UK CORP BOOK",
+      "target_location_id": "300100881111",
+      "target_expense_ccid": "627000"
+    },
+    "simulate": {
+      "transfer_status": "S"
+    },
+    "expected": {
+      "business_status": "COLLAPSED_BY_POLICY",
+      "notes": "Earlier event should be suppressed when a later event exists for the same asset."
+    }
+  },
+  {
+    "case_id": "TC08B_DUPLICATE_EVENT_STEP2_FINAL_WINS",
+    "sequence": 2,
+    "event_group": "ASSET_DUP_011",
+    "description": "Final CMDB event for the same asset. This is the one that should execute under final-state-wins policy.",
+    "source": {
+      "asset_id": "300100511",
+      "asset_number": "ASSET_DUP_011",
+      "book_type_code": "US CORP BOOK",
+      "distribution_ids": ["5041"],
+      "units_assigned": ["1"],
+      "assigned_to": [""],
+      "expense_ccids": ["626975"],
+      "location_ccids": ["789031"],
+      "category_id": "506",
+      "date_placed_in_service": "2024-07-20",
+      "cost": "72000.00",
+      "description": "Queued transfer duplicate event asset",
+      "tag_number": "DUP-US-2024-011"
+    },
+    "dff_update": {
+      "transfer_to_entity": "JP Entity",
+      "transfer_date": "2026-03-22",
+      "transfer_to_location": "",
+      "final_target_book_type_code": "JP CORP BOOK",
+      "target_location_id": "300100882222",
+      "target_expense_ccid": "629300"
+    },
+    "simulate": {
+      "transfer_status": "S",
+      "same_period_retransfer_block": true,
+      "mock_target_asset_number": "JP-NEW-900011"
+    },
+    "expected": {
+      "business_status": "TRANSFERRED",
+      "notes": "Latest state should win. If policy is not enforced, same-period retry may fail."
+    }
+  },
+  {
+    "case_id": "TC09_LOCATION_TEXT_ONLY_GAP",
+    "sequence": 1,
+    "description": "Same-book move where CMDB only sends a location text / DFF fallback, not TARGET_LOCATION_ID. Business wants it processed, but current discovery logic skips it.",
+    "source": {
+      "asset_id": "300100512",
+      "asset_number": "ASSET_LOC_ONLY_012",
+      "book_type_code": "US CORP BOOK",
+      "distribution_ids": ["5042"],
+      "units_assigned": ["1"],
+      "assigned_to": [""],
+      "expense_ccids": ["626980"],
+      "location_ccids": ["789032"],
+      "category_id": "506",
+      "date_placed_in_service": "2024-08-05",
+      "cost": "28000.00",
+      "description": "Location-only text fallback asset",
+      "tag_number": "LOC-US-2024-012"
+    },
+    "dff_update": {
+      "transfer_to_entity": "US Entity",
+      "transfer_date": "2026-03-23",
+      "transfer_to_location": "300100777123",
+      "final_target_book_type_code": "US CORP BOOK",
+      "target_location_id": "",
+      "target_expense_ccid": ""
+    },
+    "simulate": {
+      "transfer_status": "S"
+    },
+    "expected": {
+      "business_status": "TRANSFERRED",
+      "notes": "Current code captures TRANSFER_TO_LOCATION but does not use it to qualify same-book discovery."
+    }
+  },
+  {
+    "case_id": "TC10_RAW_COST_CENTER_DFF_GAP",
+    "sequence": 1,
+    "description": "Same-book cost center change where CMDB only sends the raw cost center DFF. Current code expects TARGET_EXPENSE_CCID and ignores the raw DFF.",
+    "source": {
+      "asset_id": "300100513",
+      "asset_number": "ASSET_CC_RAW_013",
+      "book_type_code": "US CORP BOOK",
+      "distribution_ids": ["5043"],
+      "units_assigned": ["1"],
+      "assigned_to": [""],
+      "expense_ccids": ["626981"],
+      "location_ccids": ["789033"],
+      "category_id": "506",
+      "date_placed_in_service": "2024-09-10",
+      "cost": "31000.00",
+      "description": "Raw cost center DFF only asset",
+      "tag_number": "CC-US-2024-013"
+    },
+    "dff_update": {
+      "transfer_to_entity": "US Entity",
+      "transfer_date": "2026-03-24",
+      "transfer_to_location": "",
+      "final_target_book_type_code": "US CORP BOOK",
+      "target_location_id": "",
+      "target_expense_ccid": "",
+      "extra_columns": {
+        "TARGET_COST_CENTER": "4500"
+      }
+    },
+    "simulate": {
+      "transfer_status": "S"
+    },
+    "expected": {
+      "business_status": "TRANSFERRED",
+      "notes": "Current code has no raw-cost-center-to-CCID resolution wired into discovery/execution."
+    }
+  }
+]

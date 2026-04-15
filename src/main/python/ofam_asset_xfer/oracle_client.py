@@ -5,13 +5,11 @@ import logging
 import os
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
-from urllib.parse import urljoin
-
-import requests
-from requests.auth import HTTPBasicAuth
+import requests  # type: ignore[import-untyped]
 
 from .exceptions import FusionApiError
 from .paramlist import build_parameter_list
+from .proxy_config import get_proxy_config
 
 
 log = logging.getLogger(__name__)
@@ -21,39 +19,42 @@ log = logging.getLogger(__name__)
 class OracleConfig:
     base_url: str
     api_version: str
-    username: str
-    password: str
+    bearer_token: str
     verify_ssl: bool = True
     timeout_seconds: int = 60
+    require_proxy: bool = False
 
     @staticmethod
     def from_dict(d: Dict[str, Any]) -> "OracleConfig":
+        """Build an OracleConfig from a raw config dictionary."""
         base_url = str(d.get("base_url", "")).rstrip("/")
         api_version = str(d.get("api_version", "")).strip()
         if not base_url or not api_version:
             raise ValueError("oracle.base_url and oracle.api_version are required")
 
-        # Prefer env indirection for credentials (CDX secrets pattern)
-        username = d.get("username")
-        password = d.get("password")
-        username_env = d.get("username_env")
-        password_env = d.get("password_env")
+        # Bearer token: sourced from config or, preferably, from an env var
+        # injected by CDX secrets at pod startup (bearer_token_env points to
+        # the env var name, e.g. "FUSION_JWT").  In production the token is
+        # rotated by the CDX secrets sidecar; for local dev it can be set
+        # directly in the config as "bearer_token".
+        bearer_token = d.get("bearer_token")
+        bearer_token_env = d.get("bearer_token_env")
 
-        if username_env:
-            username = os.getenv(str(username_env), username)
-        if password_env:
-            password = os.getenv(str(password_env), password)
+        if bearer_token_env:
+            bearer_token = os.getenv(str(bearer_token_env), bearer_token)
 
-        if not username or not password:
-            raise ValueError("Oracle credentials are required (username/password or username_env/password_env).")
+        if not bearer_token:
+            raise ValueError(
+                "Oracle bearer_token is required (bearer_token or bearer_token_env)."
+            )
 
         return OracleConfig(
             base_url=base_url,
             api_version=api_version,
-            username=str(username),
-            password=str(password),
+            bearer_token=str(bearer_token),
             verify_ssl=bool(d.get("verify_ssl", True)),
             timeout_seconds=int(d.get("timeout_seconds", 60)),
+            require_proxy=bool(d.get("require_proxy", False)),
         )
 
 
@@ -63,19 +64,29 @@ class OracleErpIntegrationsClient:
     def __init__(self, cfg: OracleConfig):
         self.cfg = cfg
         self._session = requests.Session()
-        self._session.auth = HTTPBasicAuth(cfg.username, cfg.password)
-        self._session.headers.update({
-            "Content-Type": "application/vnd.oracle.adf.resourceitem+json",
-            "REST-header-version": "4",
-            "ACCEPT": "application/json",
-        })
+        self._session.trust_env = not cfg.require_proxy
+        self._session.headers.update(
+            {
+                "Authorization": f"Bearer {cfg.bearer_token}",
+                "Content-Type": "application/vnd.oracle.adf.resourceitem+json",
+                "REST-header-version": "4",
+                "ACCEPT": "application/json",
+            }
+        )
+        self._session.proxies.update(get_proxy_config(require=cfg.require_proxy))
 
     def _endpoint(self, handle: str) -> str:
         # Example from doc: /fscmRestApi/resources/11.13.18.05/erpintegrations/processTransaction-transferAsset
-        rel = f"/fscmRestApi/resources/{self.cfg.api_version}/erpintegrations/processTransaction-{handle}"
+        rel = f"/fscmRestApi/resources/{self.cfg.api_version}/erpintegrations"
         return self.cfg.base_url + rel
 
-    def process_transaction(self, handle: str, params: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    def _resource_url(self, resource_path: str) -> str:
+        rel = f"/fscmRestApi/resources/{self.cfg.api_version}/{resource_path}"
+        return self.cfg.base_url + rel
+
+    def process_transaction(
+        self, handle: str, params: Dict[str, Any]
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         """POST processTransaction-<handle>.
 
         Returns:
@@ -99,7 +110,9 @@ class OracleErpIntegrationsClient:
         try:
             raw = r.json()
         except Exception as e:
-            raise FusionApiError(f"Non-JSON response from Fusion (status={r.status_code}): {r.text[:500]}") from e
+            raise FusionApiError(
+                f"Non-JSON response from Fusion (status={r.status_code}): {r.text[:500]}"
+            ) from e
 
         if r.status_code >= 400:
             raise FusionApiError(f"Fusion HTTP {r.status_code}: {raw}")
@@ -116,3 +129,31 @@ class OracleErpIntegrationsClient:
             pl = pl_raw
 
         return raw, pl
+
+    def get_resource(
+        self, resource_path: str, query_params: Optional[Dict[str, str]] = None
+    ) -> Dict[str, Any]:
+        """GET a Fusion REST resource (e.g. accountCombinationsLOV).
+
+        Returns the parsed JSON response body.
+        """
+        url = self._resource_url(resource_path)
+        log.debug("GET %s params=%s", url, query_params)
+
+        r = self._session.get(
+            url,
+            params=query_params or {},
+            timeout=self.cfg.timeout_seconds,
+            verify=self.cfg.verify_ssl,
+        )
+        try:
+            raw = r.json()
+        except Exception as e:
+            raise FusionApiError(
+                f"Non-JSON response from Fusion GET (status={r.status_code}): {r.text[:500]}"
+            ) from e
+
+        if r.status_code >= 400:
+            raise FusionApiError(f"Fusion GET HTTP {r.status_code}: {raw}")
+
+        return dict(raw)

@@ -1,19 +1,265 @@
-from __future__ import annotations
+# =============================================================================
+# MERGED FILE — contains 2 original modules, each section is self-contained.
+#
+#   Section 1 → gcs_publisher.py
+#   Section 2 → job.py
+#
+# To find section boundaries:  grep -n "^# >>> FILE\|^# <<< END" gcs_job.py
+#
+# To split back, extract each section (excluding its header/footer marker
+# lines) and save to the filename shown in the marker.
+#
+# One cross-import was neutralised for the merged file:
+#   job.py line 13:
+#     FROM:  from .gcs_publisher import GCSPublisherConfig, GCSResultPublisher
+#     TO:    (classes are already defined above in Section 1)
+#   When splitting, restore that import line in job.py.
+# =============================================================================
+
+from __future__ import annotations  # shared — keep one copy at top of file
+
+# >>> FILE: gcs_publisher.py >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+"""Publish transfer results to GCS in a Tableau-friendly NDJSON format.
+
+Each run **appends** flat rows to daily files::
+
+    gs://<bucket>/<prefix>/YYYY-MM-DD/results.ndjson
+    gs://<bucket>/<prefix>/YYYY-MM-DD/errors.ndjson   (FAILED rows only)
+
+Every row is a self-contained JSON object with ``run_date``, ``run_ts``,
+and ``dry_run`` stamped in, so Tableau / BigQuery can query without joins.
+
+On each publish the publisher also **prunes** blobs whose date-folder is
+older than ``retention_days`` (default 365).
+
+Configuration
+-------------
+::
+
+    {
+      "gcs": {
+        "bucket": "my-fa-transfer-logs",
+        "prefix": "transfers",
+        "service_account_file": "/path/to/sa-key.json",
+        "service_account_file_env": "GCS_SA_KEY_PATH",
+        "retention_days": 365
+      }
+    }
+"""
 
 import json
 import logging
+import os
+import re
 import time
-from enum import Enum
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, model_validator
+from .exceptions import ConfigError
+
+log = logging.getLogger(__name__)
+
+# Matches date-named folders like  transfers/2025-03-09/
+_DATE_FOLDER_RE = re.compile(r"(\d{4}-\d{2}-\d{2})/")
+
+
+def _flatten_result(
+    row: Dict[str, Any],
+    run_date: str,
+    run_ts: int,
+    dry_run: bool,
+) -> Dict[str, Any]:
+    """Flatten a TransferResult dict into a Tableau-friendly row.
+
+    Removes nested ``fusion_response`` (too large / variable for dashboards)
+    and stamps run metadata onto every row.
+    """
+    flat: Dict[str, Any] = {
+        "run_date": run_date,
+        "run_ts": run_ts,
+        "dry_run": dry_run,
+        "asset_number": row.get("asset_number"),
+        "status": row.get("status"),
+        "source_book": row.get("source_book"),
+        "target_book": row.get("target_book"),
+        "transfer_to_entity": row.get("transfer_to_entity"),
+        "transfer_date": row.get("transfer_date"),
+        "error": row.get("error"),
+    }
+    return flat
+
+
+def flatten_results(
+    results: List[Dict[str, Any]],
+    run_date: str,
+    run_ts: int,
+    dry_run: bool,
+) -> List[Dict[str, Any]]:
+    """Convert raw results into flat Tableau-ready rows."""
+    return [_flatten_result(r, run_date, run_ts, dry_run) for r in results]
+
+
+def to_ndjson(rows: List[Dict[str, Any]]) -> str:
+    """Serialise rows as newline-delimited JSON (one JSON object per line)."""
+    return "".join(json.dumps(r, sort_keys=True, default=str) + "\n" for r in rows)
+
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class GCSPublisherConfig:
+    """Immutable config for :class:`GCSResultPublisher`."""
+
+    bucket: str
+    prefix: str
+    service_account_file: str
+    retention_days: int = 365
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "GCSPublisherConfig":
+        bucket = d.get("bucket", "").strip()
+        if not bucket:
+            raise ConfigError("gcs.bucket is required")
+        # Strip gs:// scheme if provided (users often copy the full URI).
+        if bucket.startswith("gs://"):
+            bucket = bucket[len("gs://"):]
+        bucket = bucket.strip("/")
+
+        prefix = d.get("prefix", "transfers").strip().strip("/")
+
+        sa_file = d.get("service_account_file", "").strip()
+        if not sa_file:
+            env_key = d.get("service_account_file_env", "").strip()
+            if env_key:
+                sa_file = os.environ.get(env_key, "").strip()
+            if not sa_file:
+                raise ConfigError(
+                    "gcs.service_account_file or gcs.service_account_file_env is required"
+                )
+        # Expand ~ to the user's home directory.
+        sa_file = os.path.expanduser(sa_file)
+
+        retention_days = int(d.get("retention_days", 365))
+
+        return cls(
+            bucket=bucket,
+            prefix=prefix,
+            service_account_file=sa_file,
+            retention_days=retention_days,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Publisher
+# ---------------------------------------------------------------------------
+class GCSResultPublisher:
+    """Appends transfer results as NDJSON to daily files on GCS.
+
+    Implements the :class:`~ofam_asset_xfer.result_publisher.ResultPublisher`
+    protocol — no base-class coupling.
+    """
+
+    def __init__(self, config: GCSPublisherConfig) -> None:
+        self._cfg = config
+        self._client = None  # lazy
+
+    def _get_client(self) -> Any:
+        """Lazy-init the GCS client so import-time doesn't require google libs."""
+        if self._client is None:
+            from google.cloud import storage  # type: ignore[import-untyped]
+
+            self._client = storage.Client.from_service_account_json(
+                self._cfg.service_account_file
+            )
+        return self._client
+
+    # -- append -------------------------------------------------------------
+
+    def _append_ndjson(self, blob_path: str, ndjson_text: str) -> str:
+        """Append *ndjson_text* to an existing blob, or create it."""
+        client = self._get_client()
+        bucket = client.bucket(self._cfg.bucket)
+        blob = bucket.blob(blob_path)
+
+        existing = ""
+        if blob.exists():
+            existing = blob.download_as_text(encoding="utf-8")
+
+        merged = existing + ndjson_text
+        blob.upload_from_string(merged, content_type="application/x-ndjson")
+
+        uri = f"gs://{self._cfg.bucket}/{blob_path}"
+        log.info("Appended %d row(s) to %s", ndjson_text.count("\n"), uri)
+        return uri
+
+    # -- prune --------------------------------------------------------------
+
+    def _prune_old_blobs(self) -> int:
+        """Delete blobs in date-folders older than retention_days."""
+        cutoff = date.today() - timedelta(days=self._cfg.retention_days)
+        client = self._get_client()
+        bucket = client.bucket(self._cfg.bucket)
+        prefix = self._cfg.prefix + "/"
+
+        deleted = 0
+        for blob in bucket.list_blobs(prefix=prefix):
+            match = _DATE_FOLDER_RE.search(blob.name[len(prefix):])
+            if not match:
+                continue
+            try:
+                folder_date = date.fromisoformat(match.group(1))
+            except ValueError:
+                continue
+            if folder_date < cutoff:
+                blob.delete()
+                deleted += 1
+
+        if deleted:
+            log.info("Pruned %d blob(s) older than %s", deleted, cutoff.isoformat())
+        return deleted
+
+    # -- ResultPublisher protocol -------------------------------------------
+
+    def publish(self, summary: Dict[str, Any], results: List[Dict[str, Any]]) -> None:
+        """Flatten, append to daily NDJSON files, and prune old data."""
+        run_date = date.today().isoformat()
+        run_ts = int(time.time())
+        dry_run = summary.get("dry_run", True)
+
+        flat = flatten_results(results, run_date, run_ts, dry_run)
+        day_prefix = f"{self._cfg.prefix}/{run_date}"
+
+        if flat:
+            self._append_ndjson(f"{day_prefix}/results.ndjson", to_ndjson(flat))
+
+        errors = [r for r in flat if r.get("status") == "FAILED"]
+        if errors:
+            self._append_ndjson(f"{day_prefix}/errors.ndjson", to_ndjson(errors))
+            log.warning("Published %d error(s)", len(errors))
+        else:
+            log.info("No errors to publish")
+
+        try:
+            self._prune_old_blobs()
+        except Exception:
+            log.exception("Prune failed (non-fatal)")
+# <<< END: gcs_publisher.py <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+
+# >>> FILE: job.py >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+
+# NOTE (merged): the original file imported GCSPublisherConfig and
+# GCSResultPublisher from .gcs_publisher — they are already defined above
+# in Section 1.  When splitting, restore this line at the top of job.py:
+#   from .gcs_publisher import GCSPublisherConfig, GCSResultPublisher
 
 from .bip_client import BIPClient, BIPConfig
 from .entity_resolver import EntityBookResolver
-from .exceptions import ConfigError, FusionApiError
+from .exceptions import FusionApiError
 from .fusion_sync import FusionIUSync, DFFConfig
 from .oracle_client import OracleConfig, OracleErpIntegrationsClient
-from .gcs_publisher import GCSPublisherConfig, GCSResultPublisher
 from .local_publisher import LocalResultPublisher
 from .store import ArtifactStore
 from .fusion_ops import (
@@ -25,9 +271,6 @@ from .fusion_ops import (
     build_retire_asset_params,
 )
 from .template import render
-
-
-log = logging.getLogger(__name__)
 
 
 def _load_config(config_uri: str) -> Dict[str, Any]:
@@ -43,43 +286,26 @@ def _load_config(config_uri: str) -> Dict[str, Any]:
         raise ConfigError(f"Config is not valid JSON: {config_uri}") from e
 
 
-class TransferType(str, Enum):
-    SAME_BOOK = "SAME_BOOK"
-    XBOOK = "XBOOK"
-
-
-class SourceAsset(BaseModel):
-    book_type_code: str
-    asset_number: str
-
-
-class TransferRequest(BaseModel):
-    """Pydantic model for validating transfer request payloads."""
-
-    request_id: str
-    source: SourceAsset
-    transfer_type: TransferType
-    target: Optional[Dict[str, Any]] = None
-    xbook: Optional[Dict[str, Any]] = None
-    target_assignment: Optional[Dict[str, Any]] = None
-    effective_date: Optional[str] = None
-
-    @model_validator(mode="after")
-    def xbook_requires_target_or_xbook_config(self) -> "TransferRequest":
-        if self.transfer_type == TransferType.XBOOK:
-            if not self.target and not self.xbook:
-                raise ValueError(
-                    "XBOOK requires either target{book_type_code,...} or xbook{...} configuration."
-                )
-        return self
-
-
-def _validate_request(req: Dict[str, Any]) -> TransferRequest:
-    """Validate a transfer request dict and return a typed model."""
-    try:
-        return TransferRequest(**req)
-    except Exception as e:
-        raise ConfigError(str(e)) from e
+def _validate_request(req: Dict[str, Any]) -> None:
+    if not req.get("request_id"):
+        raise ConfigError("Each request must include request_id.")
+    if not isinstance(req.get("source"), dict):
+        raise ConfigError(
+            "Each request must include source {book_type_code, asset_number}."
+        )
+    src = req["source"]
+    if not src.get("book_type_code") or not src.get("asset_number"):
+        raise ConfigError("source.book_type_code and source.asset_number are required.")
+    t = str(req.get("transfer_type", "")).upper()
+    if t not in ("SAME_BOOK", "XBOOK"):
+        raise ConfigError("transfer_type must be SAME_BOOK or XBOOK.")
+    if t == "XBOOK":
+        if not isinstance(req.get("target"), dict) and not isinstance(
+            req.get("xbook"), dict
+        ):
+            raise ConfigError(
+                "XBOOK requires either target{book_type_code,...} or xbook{...} configuration."
+            )
 
 
 def _run_bip_flow(
@@ -504,3 +730,4 @@ def _result_from_fusion_response(
         "Fusion returned non-success X_RETURN_STATUS; see fusion payload for details."
     )
     return out
+# <<< END: job.py <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<

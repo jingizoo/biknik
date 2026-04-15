@@ -30,7 +30,7 @@ def render(value: Any, context: Dict[str, Any]) -> Any:
     if not isinstance(value, str):
         return value
 
-    def repl(match: re.Match) -> str:
+    def repl(match: re.Match[str]) -> str:
         key = match.group(1)
         v = _get_from_context(context, key)
         return "" if v is None else str(v)
