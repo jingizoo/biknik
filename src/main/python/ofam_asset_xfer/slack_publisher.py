@@ -29,12 +29,11 @@ Configuration
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 import requests as http  # type: ignore[import-untyped]
 
@@ -56,6 +55,7 @@ class SlackConfig:
 
     @staticmethod
     def from_dict(d: Dict[str, Any]) -> "SlackConfig":
+        """Build a SlackConfig from a raw config dictionary."""
         webhook_url = d.get("webhook_url", "")
         webhook_url_env = d.get("webhook_url_env")
         if webhook_url_env:
@@ -82,11 +82,13 @@ class SlackPublisher:
 
     @staticmethod
     def from_dict(d: Dict[str, Any]) -> "SlackPublisher":
+        """Create a SlackPublisher from a raw config dict."""
         return SlackPublisher(SlackConfig.from_dict(d))
 
     def publish(
         self, summary: Dict[str, Any], results: List[Dict[str, Any]]
     ) -> None:
+        """Format and send Slack notification."""
         counts = summary.get("counts", {})
         total = counts.get("total", len(results))
         transferred = counts.get("transferred", 0)
@@ -193,6 +195,7 @@ class PagerDutyConfig:
 
     @staticmethod
     def from_dict(d: Dict[str, Any]) -> "PagerDutyConfig":
+        """Build a PagerDutyConfig from a raw config dictionary."""
         routing_key = d.get("routing_key", "")
         routing_key_env = d.get("routing_key_env")
         if routing_key_env:
@@ -230,6 +233,7 @@ class PagerDutyPublisher:
 
     @staticmethod
     def from_dict(d: Dict[str, Any]) -> "PagerDutyPublisher":
+        """Create a PagerDutyPublisher from a raw config dict."""
         return PagerDutyPublisher(PagerDutyConfig.from_dict(d))
 
     def trigger_if_hard_error(self, error: Exception) -> None:

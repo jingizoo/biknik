@@ -14,8 +14,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-from typing import Optional
-
 import typer
 
 from ofam_asset_xfer.bip_client import BIPClient, BIPConfig
