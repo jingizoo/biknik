@@ -23,7 +23,7 @@
   "gcs": {
     "bucket": "your-fa-transfer-logs",
     "prefix": "transfers",
-    "service_account_file_env": "GCS_SA_KEY_PATH"
+    "service_account_json_env": "GCS_SA_JSON"
   },
   "slack": {
     "webhook_url_env": "SLACK_WEBHOOK_URL",
