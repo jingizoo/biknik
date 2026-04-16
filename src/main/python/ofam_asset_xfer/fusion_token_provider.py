@@ -252,7 +252,7 @@ class FusionTokenProvider:
             body = resp.json()
         except ValueError:
             # Some endpoints return the raw token as plain text
-            return resp.text.strip()
+            return str(resp.text).strip()
 
         token = body.get("access_token") or body.get("token")
         if not token:
