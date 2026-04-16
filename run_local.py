@@ -40,6 +40,7 @@ from ofam_asset_xfer.bip_client import BIPClient, BIPConfig  # noqa: E402
 from ofam_asset_xfer.entity_resolver import EntityBookResolver  # noqa: E402
 from ofam_asset_xfer.exceptions import ConfigError  # noqa: E402
 from ofam_asset_xfer.fusion_sync import FusionIUSync, DFFConfig  # noqa: E402
+from ofam_asset_xfer.fusion_token_provider import build_token_provider  # noqa: E402
 from ofam_asset_xfer.gcs_publisher import GCSPublisherConfig, GCSResultPublisher  # noqa: E402
 from ofam_asset_xfer.slack_publisher import SlackPublisher, PagerDutyPublisher  # noqa: E402
 from ofam_asset_xfer.local_publisher import LocalResultPublisher  # noqa: E402
@@ -130,12 +131,20 @@ def main(argv: list[str] | None = None) -> int:
     try:
         config = _load_config(args.config)
 
+        # --- Build Fusion token provider (keytab/static) ---
+        # If ``fusion_auth`` is present, it drives authentication for both
+        # Oracle REST and BIP SOAP clients.  Otherwise the clients fall back
+        # to the legacy ``bearer_token_env`` inside oracle/bip blocks.
+        token_provider = build_token_provider(config.get("fusion_auth"))
+
         # --- Build clients from config ---
         oracle_cfg = OracleConfig.from_dict(config.get("oracle", {}))
-        fusion_client = OracleErpIntegrationsClient(oracle_cfg)
+        fusion_client = OracleErpIntegrationsClient(
+            oracle_cfg, token_provider=token_provider
+        )
 
         bip_cfg = BIPConfig.from_dict(config.get("bip", {}))
-        bip_client = BIPClient(bip_cfg)
+        bip_client = BIPClient(bip_cfg, token_provider=token_provider)
 
         entity_map = config.get("entity_book_map", {})
         if not entity_map:

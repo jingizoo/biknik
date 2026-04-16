@@ -20,6 +20,7 @@ from ofam_asset_xfer.bip_client import BIPClient, BIPConfig
 from ofam_asset_xfer.entity_resolver import EntityBookResolver
 from ofam_asset_xfer.exceptions import ConfigError
 from ofam_asset_xfer.fusion_sync import FusionIUSync, DFFConfig
+from ofam_asset_xfer.fusion_token_provider import build_token_provider
 from ofam_asset_xfer.gcs_publisher import GCSPublisherConfig, GCSResultPublisher
 from ofam_asset_xfer.local_publisher import LocalResultPublisher
 from ofam_asset_xfer.slack_publisher import SlackPublisher, PagerDutyPublisher
@@ -53,12 +54,17 @@ def main(
         raw = store.read_text(config)
         cfg = json.loads(raw)
 
+        # --- Build Fusion token provider (keytab/static) ---
+        token_provider = build_token_provider(cfg.get("fusion_auth"))
+
         # --- Build clients from config ---
         oracle_cfg = OracleConfig.from_dict(cfg.get("oracle", {}))
-        fusion_client = OracleErpIntegrationsClient(oracle_cfg)
+        fusion_client = OracleErpIntegrationsClient(
+            oracle_cfg, token_provider=token_provider
+        )
 
         bip_cfg = BIPConfig.from_dict(cfg.get("bip", {}))
-        bip_client = BIPClient(bip_cfg)
+        bip_client = BIPClient(bip_cfg, token_provider=token_provider)
 
         entity_map = cfg.get("entity_book_map", {})
         if not entity_map:
