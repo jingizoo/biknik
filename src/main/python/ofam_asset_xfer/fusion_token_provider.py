@@ -305,8 +305,8 @@ class FusionTokenProvider:
         """
         try:
             import gssapi  # type: ignore[import-untyped]
-            import httpx  # type: ignore[import-untyped]
-            from httpx_gssapi import HTTPSPNEGOAuth  # type: ignore[import-untyped]
+            import httpx  # type: ignore[import-not-found]
+            from httpx_gssapi import HTTPSPNEGOAuth  # type: ignore[import-not-found]
         except ImportError as exc:
             raise ConfigError(
                 "Keytab/password mode requires 'gssapi', 'httpx', and "
@@ -406,7 +406,7 @@ class FusionTokenProvider:
         log.debug("Exchanging PF token for Oracle JWT via %s", erp_auth_url)
 
         try:
-            import httpx  # type: ignore[import-untyped]
+            import httpx  # type: ignore[import-not-found]
 
             ssl_ctx = _get_erp_ssl_context()
             resp = httpx.post(
