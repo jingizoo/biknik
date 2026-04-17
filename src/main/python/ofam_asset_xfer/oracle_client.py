@@ -1,3 +1,5 @@
+"""Oracle Fusion ERP Integrations REST client for asset transactions."""
+
 from __future__ import annotations
 
 import json
@@ -17,6 +19,8 @@ log = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class OracleConfig:
+    """Immutable config for :class:`OracleErpIntegrationsClient`."""
+
     base_url: str
     api_version: str
     bearer_token: str = ""  # may be empty when using token_provider
@@ -75,6 +79,7 @@ class OracleErpIntegrationsClient:
         cfg: OracleConfig,
         token_provider: Optional[Callable[[], str]] = None,
     ):
+        """Initialise the client with config and optional token provider."""
         self.cfg = cfg
         self._token_provider = token_provider
 

@@ -96,7 +96,7 @@ def _resolve_citadel_env() -> str:
 
 
 def _get_erp_ssl_context() -> ssl.SSLContext:
-    """Custom SSL context matching erp_auth_helper.py for REALM3 compat."""
+    """Build a custom SSL context matching erp_auth_helper.py for REALM3."""
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     ctx.minimum_version = ssl.TLSVersion.TLSv1_2
     ctx.check_hostname = False
@@ -242,6 +242,7 @@ class FusionTokenProvider:
     """
 
     def __init__(self, cfg: TokenProviderConfig):
+        """Initialise the provider with the given config."""
         self._cfg = cfg
         self._lock = threading.Lock()
         self._cached_token: Optional[str] = None

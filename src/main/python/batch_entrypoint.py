@@ -31,7 +31,7 @@ app = typer.Typer(help="OFAM IU Asset Transfer Automation (BIP-driven).")
 
 
 @app.command()
-def main(
+def main(  # noqa: D103
     config: str = typer.Option(..., help="Path/URI to config JSON."),
     out_dir: str = typer.Option(..., help="Output directory/URI for artifacts."),
     dry_run: bool = typer.Option(False, help="Reads/validation only (no writes to Fusion)."),

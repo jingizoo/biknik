@@ -77,6 +77,7 @@ class SlackPublisher:
     """Publishes transfer summary to a Slack channel via webhook."""
 
     def __init__(self, cfg: SlackConfig):
+        """Initialise the Slack publisher with config."""
         self.cfg = cfg
         self._proxies = get_proxy_config()
 
@@ -228,6 +229,7 @@ class PagerDutyPublisher:
     """
 
     def __init__(self, cfg: PagerDutyConfig):
+        """Initialise the PagerDuty publisher with config."""
         self.cfg = cfg
         self._proxies = get_proxy_config()
 

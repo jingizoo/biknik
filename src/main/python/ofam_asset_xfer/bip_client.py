@@ -89,6 +89,7 @@ class BIPClient:
         cfg: BIPConfig,
         token_provider: Optional[Callable[[], str]] = None,
     ):
+        """Initialise the BIP client with config and optional token provider."""
         self.cfg = cfg
         self._token_provider = token_provider
 
