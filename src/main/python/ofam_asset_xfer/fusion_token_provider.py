@@ -334,7 +334,8 @@ class FusionTokenProvider:
                     mechs=[spnego],
                 )
                 auth = HTTPSPNEGOAuth(
-                    creds=cred_acquire_res.creds, mech=spnego
+                    creds=cred_acquire_res.creds,  # type: ignore[arg-type]
+                    mech=spnego,
                 )
 
             else:
