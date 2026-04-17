@@ -1,18 +1,20 @@
-"""Fusion JWT token provider — keytab -> PingFed -> JWT Service -> Oracle JWT.
+"""Fusion JWT token provider — keytab -> PingFed SPNEGO -> ERPSecurity/CreateJWT.
 
-This module replaces the static ``FUSION_JWT`` env-var pattern with a token
-provider that can refresh itself.  The flow on the Citadel batch pod is::
+Follows the Citadel ``erp_auth_helper.py`` pattern:
 
     keytab file (mounted from vault)
           |
-          v  [kinit via gssapi]
-    Kerberos credentials
+          v  [gssapi credentials from keytab]
+    Kerberos TGT
           |
-          v  [SPNEGO auth to PingFed]
+          v  [SPNEGO negotiate via httpx_gssapi]
     PingFed access_token
           |
-          v  [POST to internal JWT exchange service]
+          v  [POST to acctgateway ERPSecurity/CreateJWT]
     Oracle Fusion JWT  (cached until ~5 min before expiry)
+
+Environment is resolved from ``CITADEL_ENV`` env var (stabledev, test,
+dev1–4, prod) and drives which SSO host and ERPSecurity endpoint is used.
 
 Usage::
 
@@ -30,14 +32,12 @@ Two modes — pick one via ``fusion_auth.mode``::
         "token_env": "FUSION_JWT"
     }
 
-    # Keytab flow (production)
+    # Keytab flow (production / batch pod)
     "fusion_auth": {
         "mode": "keytab",
         "keytab_path_env": "FUSION_KEYTAB_PATH",
         "principal_env": "FUSION_PRINCIPAL",
-        "pingfed_url": "https://pingfed.citadelgroup.com/.../token",
-        "jwt_service_url": "https://internal-jwt-svc/exchange",
-        "jwt_service_scope": "oracle-fusion",
+        "ora_env": "STABLEDEV",
         "cache_buffer_seconds": 300
     }
 
@@ -52,17 +52,61 @@ import base64
 import json
 import logging
 import os
+import ssl
 import threading
 import time
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Optional
 
-import requests  # type: ignore[import-untyped]
-
 from .exceptions import ConfigError
-from .proxy_config import get_proxy_config
 
 log = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Citadel URL Maps (from erp_auth_helper.py)
+# ---------------------------------------------------------------------------
+SSO_HOST_MAP: Dict[str, str] = {
+    "PROD": "sso.citadelgroup.com",
+    "DEV": "sso-dev.citadelgroup.com",
+    "STABLEDEV": "sso-dev.citadelgroup.com",
+    "TEST": "sso-dev.citadelgroup.com",
+    "DEV1": "sso-dev.citadelgroup.com",
+    "DEV2": "sso-dev.citadelgroup.com",
+    "DEV3": "sso-dev.citadelgroup.com",
+    "DEV4": "sso-dev.citadelgroup.com",
+}
+
+ERP_AUTH_URL_MAP: Dict[str, str] = {
+    "TEST": "https://acctgateway-erpsecurity-dev.citadelgroup.com/ERPSecurity/CreateJWT",
+    "DEV1": "https://acctgateway-erpsecurity-dev1.citadelgroup.com/ERPSecurity/CreateJWT",
+    "DEV2": "https://acctgateway-erpsecurity-dev2.citadelgroup.com/ERPSecurity/CreateJWT",
+    "DEV3": "https://acctgateway-erpsecurity-dev3.citadelgroup.com/ERPSecurity/CreateJWT",
+    "DEV4": "https://acctgateway-erpsecurity-dev4.citadelgroup.com/ERPSecurity/CreateJWT",
+    "STABLEDEV": "https://acctgateway-erpsecurity-dev.citadelgroup.com/ERPSecurity/CreateJWT",
+    "PROD": "https://acctgateway-erpsecurity-prod.citadelgroup.com/ERPSecurity/CreateJWT",
+}
+
+
+def _resolve_citadel_env() -> str:
+    """Resolve Citadel environment from CITADEL_ENV (default stabledev)."""
+    env = os.environ.get("CITADEL_ENV", "stabledev").strip().lower()
+    # erp_auth_helper maps "dev" -> "stabledev"
+    if env == "dev":
+        env = "stabledev"
+    return env.upper()
+
+
+def _get_erp_ssl_context() -> ssl.SSLContext:
+    """Custom SSL context matching erp_auth_helper.py for REALM3 compat."""
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    ctx.set_ciphers(
+        "AES256-SHA:DHE-RSA-AES256-SHA:AES128-SHA:DHE-RSA-AES128-SHA"
+    )
+    return ctx
 
 
 # ---------------------------------------------------------------------------
@@ -80,15 +124,15 @@ class TokenProviderConfig:
     # --- keytab mode -----------------------------------------------------
     keytab_path: str = ""
     principal: str = ""
-    pingfed_url: str = ""
-    jwt_service_url: str = ""
-    jwt_service_scope: str = ""
+    ora_env: str = ""  # e.g. "STABLEDEV", "DEV1", "PROD"
+
+    # Optional overrides (if not provided, resolved from ora_env + maps)
+    negotiate_url: str = ""
+    erp_auth_url: str = ""
 
     # --- common ----------------------------------------------------------
     cache_buffer_seconds: int = 300  # refresh 5 min before expiry
     timeout_seconds: int = 30
-    verify_ssl: bool = True
-    require_proxy: bool = False
 
     @staticmethod
     def from_dict(d: Dict[str, Any]) -> "TokenProviderConfig":
@@ -106,7 +150,8 @@ class TokenProviderConfig:
                 token = os.environ.get(str(token_env), token)
             if not token:
                 raise ConfigError(
-                    "fusion_auth.token or fusion_auth.token_env is required for mode=static"
+                    "fusion_auth.token or fusion_auth.token_env is required "
+                    "for mode=static"
                 )
             return TokenProviderConfig(mode="static", static_token=str(token))
 
@@ -118,7 +163,8 @@ class TokenProviderConfig:
                 keytab = os.environ.get(env_key, "").strip()
         if not keytab:
             raise ConfigError(
-                "fusion_auth.keytab_path or keytab_path_env is required for mode=keytab"
+                "fusion_auth.keytab_path or keytab_path_env is required "
+                "for mode=keytab"
             )
 
         principal = d.get("principal", "").strip()
@@ -128,27 +174,52 @@ class TokenProviderConfig:
                 principal = os.environ.get(env_key, "").strip()
         if not principal:
             raise ConfigError(
-                "fusion_auth.principal or principal_env is required for mode=keytab"
+                "fusion_auth.principal or principal_env is required "
+                "for mode=keytab"
             )
 
-        pingfed_url = str(d.get("pingfed_url", "")).strip()
-        jwt_service_url = str(d.get("jwt_service_url", "")).strip()
-        if not pingfed_url or not jwt_service_url:
-            raise ConfigError(
-                "fusion_auth.pingfed_url and jwt_service_url are required for mode=keytab"
-            )
+        # Oracle environment (drives SSO + ERP URL resolution)
+        ora_env = str(
+            d.get("ora_env", "")
+            or os.environ.get("CITADEL_ENV", "stabledev")
+        ).strip().upper()
+        if ora_env == "DEV":
+            ora_env = "STABLEDEV"
+
+        # Allow explicit URL overrides; otherwise resolve from maps
+        negotiate_url = str(d.get("negotiate_url", "")).strip()
+        erp_auth_url = str(
+            d.get("erp_auth_url", "")
+            or os.environ.get("ERP_AUTH_URL", "")
+        ).strip()
+
+        if not negotiate_url:
+            sso_host = SSO_HOST_MAP.get(ora_env)
+            if not sso_host:
+                raise ConfigError(
+                    f"Unknown ora_env={ora_env!r}; set negotiate_url explicitly "
+                    f"or use one of: {list(SSO_HOST_MAP.keys())}"
+                )
+            negotiate_url = f"https://{sso_host}/negotiate"
+
+        if not erp_auth_url:
+            erp_auth_url_resolved = ERP_AUTH_URL_MAP.get(ora_env)
+            if not erp_auth_url_resolved:
+                raise ConfigError(
+                    f"Unknown ora_env={ora_env!r}; set erp_auth_url explicitly "
+                    f"or use one of: {list(ERP_AUTH_URL_MAP.keys())}"
+                )
+            erp_auth_url = erp_auth_url_resolved
 
         return TokenProviderConfig(
             mode="keytab",
             keytab_path=keytab,
             principal=principal,
-            pingfed_url=pingfed_url,
-            jwt_service_url=jwt_service_url,
-            jwt_service_scope=str(d.get("jwt_service_scope", "")).strip(),
+            ora_env=ora_env,
+            negotiate_url=negotiate_url,
+            erp_auth_url=erp_auth_url,
             cache_buffer_seconds=int(d.get("cache_buffer_seconds", 300)),
             timeout_seconds=int(d.get("timeout_seconds", 30)),
-            verify_ssl=bool(d.get("verify_ssl", True)),
-            require_proxy=bool(d.get("require_proxy", False)),
         )
 
 
@@ -156,10 +227,19 @@ class TokenProviderConfig:
 # Provider
 # ---------------------------------------------------------------------------
 class FusionTokenProvider:
-    """Caches + refreshes an Oracle Fusion JWT via keytab -> PingFed -> JWT service.
+    """Caches + refreshes Oracle Fusion JWT via keytab -> PingFed -> CreateJWT.
+
+    Follows the Citadel ``erp_auth_helper.py`` pattern:
+
+    1. Acquire Kerberos credentials from keytab (no external ``kinit``).
+    2. SPNEGO-negotiate against ``sso[-dev].citadelgroup.com/negotiate``
+       to obtain a PingFed access token.
+    3. POST the PF token to ``acctgateway-erpsecurity-*.citadelgroup.com
+       /ERPSecurity/CreateJWT`` with empty JSON body to get an Oracle JWT.
+    4. Cache the JWT and refresh ~5 min before its ``exp`` claim.
 
     Thread-safe: a single refresh is serialised with a lock so concurrent
-    callers can't stampede the PingFed / JWT service endpoints.
+    callers can't stampede the SSO / ERP endpoints.
     """
 
     def __init__(self, cfg: TokenProviderConfig):
@@ -190,9 +270,12 @@ class FusionTokenProvider:
             ):
                 return self._cached_token
 
-            log.info("Refreshing Fusion JWT via keytab -> PingFed -> JWT service")
-            ping_token = self._fetch_pingfed_token()
-            fusion_jwt, expires_at = self._exchange_for_fusion_jwt(ping_token)
+            log.info(
+                "Refreshing Fusion JWT (env=%s) via keytab -> SPNEGO -> CreateJWT",
+                self._cfg.ora_env,
+            )
+            pf_token = self._negotiate_pingfed_token()
+            fusion_jwt, expires_at = self._exchange_for_oracle_jwt(pf_token)
             self._cached_token = fusion_jwt
             self._expires_at = expires_at
             log.info(
@@ -203,112 +286,174 @@ class FusionTokenProvider:
             return self._cached_token
 
     # ------------------------------------------------------------------
-    # Step 1: keytab -> Kerberos creds -> PingFed access_token (SPNEGO)
+    # Step 1: keytab -> gssapi -> SPNEGO negotiate -> PF token
     # ------------------------------------------------------------------
-    def _fetch_pingfed_token(self) -> str:
-        """Call PingFed with kerberos (SPNEGO) auth using the keytab.
+    def _negotiate_pingfed_token(self) -> str:
+        """SPNEGO-negotiate against the SSO host using keytab credentials.
 
-        Requires ``gssapi`` and ``requests-kerberos`` libraries in the
-        image (``pip install gssapi requests-kerberos``).
+        Uses ``httpx`` + ``httpx_gssapi.HTTPSPNEGOAuth`` (same libraries as
+        ``erp_auth_helper.py``).  Falls back to ``requests`` +
+        ``requests_kerberos`` if ``httpx_gssapi`` is not available.
         """
+        keytab = self._cfg.keytab_path
+        principal = self._cfg.principal
+        url = self._cfg.negotiate_url
+        timeout = self._cfg.timeout_seconds
+
+        # --- Try httpx + httpx_gssapi first (matching erp_auth_helper.py) ---
+        try:
+            import httpx  # type: ignore[import-untyped]
+            from httpx_gssapi import HTTPSPNEGOAuth  # type: ignore[import-untyped]
+
+            # Set keytab so gssapi picks it up
+            os.environ["KRB5_CLIENT_KTNAME"] = keytab
+            auth = HTTPSPNEGOAuth()
+
+            ssl_ctx = _get_erp_ssl_context()
+            resp = httpx.get(
+                url,
+                auth=auth,
+                timeout=timeout,
+                verify=ssl_ctx,
+            )
+            if resp.status_code >= 400:
+                raise RuntimeError(
+                    f"SPNEGO negotiate failed (HTTP {resp.status_code}): "
+                    f"{str(resp.text)[:300]}"
+                )
+
+            return self._extract_pf_token(resp)
+
+        except ImportError:
+            log.debug("httpx_gssapi not available, trying requests_kerberos")
+
+        # --- Fallback: requests + requests_kerberos ---
         try:
             import gssapi  # type: ignore[import-untyped]
+            import requests  # type: ignore[import-untyped]
             from requests_kerberos import (  # type: ignore[import-untyped]
                 HTTPKerberosAuth,
                 DISABLED,
             )
         except ImportError as exc:
             raise ConfigError(
-                "Keytab mode requires 'gssapi' and 'requests-kerberos'; "
-                "install them or switch to mode=static"
+                "Keytab mode requires either 'httpx + httpx_gssapi' or "
+                "'requests + gssapi + requests_kerberos'. Install one set "
+                "or switch to mode=static."
             ) from exc
 
-        # Acquire creds from keytab (no external kinit call)
-        name = gssapi.Name(self._cfg.principal, gssapi.NameType.user)
+        name = gssapi.Name(principal, gssapi.NameType.user)
         creds = gssapi.Credentials.acquire(
             name=name,
             usage="initiate",
-            store={"client_keytab": self._cfg.keytab_path},
+            store={"client_keytab": keytab},
         ).creds
+        auth_rk = HTTPKerberosAuth(mutual_authentication=DISABLED, creds=creds)
 
-        auth = HTTPKerberosAuth(mutual_authentication=DISABLED, creds=creds)
-
-        proxies = get_proxy_config(require=self._cfg.require_proxy)
-        resp = requests.get(
-            self._cfg.pingfed_url,
-            auth=auth,
-            timeout=self._cfg.timeout_seconds,
-            verify=self._cfg.verify_ssl,
-            proxies=proxies,
+        resp_rk = requests.get(
+            url,
+            auth=auth_rk,
+            timeout=timeout,
+            verify=False,  # noqa: S501 — matches erp_auth_helper SSL context
         )
-        if resp.status_code >= 400:
+        if resp_rk.status_code >= 400:
             raise RuntimeError(
-                f"PingFed auth failed (HTTP {resp.status_code}): {resp.text[:300]}"
+                f"SPNEGO negotiate failed (HTTP {resp_rk.status_code}): "
+                f"{str(resp_rk.text)[:300]}"
             )
 
-        # Most PingFed token endpoints return JSON with access_token.
-        # If Citadel's endpoint returns a different shape, adjust here.
+        return self._extract_pf_token(resp_rk)
+
+    @staticmethod
+    def _extract_pf_token(resp: Any) -> str:
+        """Pull the PF access token from a negotiate response."""
         try:
             body = resp.json()
-        except ValueError:
-            # Some endpoints return the raw token as plain text
+        except (ValueError, AttributeError):
             return str(resp.text).strip()
 
-        token = body.get("access_token") or body.get("token")
+        token = (
+            body.get("access_token")
+            or body.get("token")
+            or body.get("id_token")
+        )
         if not token:
             raise RuntimeError(
-                f"PingFed response did not contain access_token: {body}"
+                f"SPNEGO negotiate response did not contain a token: {body}"
             )
         return str(token)
 
     # ------------------------------------------------------------------
-    # Step 2: PingFed token -> internal JWT service -> Oracle Fusion JWT
+    # Step 2: PF token -> ERPSecurity/CreateJWT -> Oracle Fusion JWT
     # ------------------------------------------------------------------
-    def _exchange_for_fusion_jwt(self, ping_token: str) -> tuple[str, float]:
-        """POST the Ping token to the internal JWT service, return Fusion JWT.
+    def _exchange_for_oracle_jwt(self, pf_token: str) -> tuple[str, float]:
+        """POST the PingFed token to ERPSecurity/CreateJWT.
+
+        Follows the erp_auth_helper pattern::
+
+            r = httpx.post(
+                erp_auth_url,
+                headers={"Content-Type": "application/json",
+                         "Authorization": "Bearer " + pftoken},
+                json={},            # <-- empty body
+                timeout=3000,
+            )
+            jwt_token = r.json()["token"]
 
         Returns:
             (fusion_jwt, expires_at_epoch_seconds)
         """
-        proxies = get_proxy_config(require=self._cfg.require_proxy)
+        erp_auth_url = self._cfg.erp_auth_url
+        timeout = self._cfg.timeout_seconds
 
-        payload: Dict[str, Any] = {"token": ping_token}
-        if self._cfg.jwt_service_scope:
-            payload["scope"] = self._cfg.jwt_service_scope
-
-        resp = requests.post(
-            self._cfg.jwt_service_url,
-            json=payload,
-            headers={"Authorization": f"Bearer {ping_token}"},
-            timeout=self._cfg.timeout_seconds,
-            verify=self._cfg.verify_ssl,
-            proxies=proxies,
+        log.debug(
+            "Exchanging PF token for Oracle JWT via %s", erp_auth_url
         )
-        if resp.status_code >= 400:
-            raise RuntimeError(
-                f"JWT service exchange failed (HTTP {resp.status_code}): "
-                f"{resp.text[:300]}"
+
+        # Use httpx if available (matching erp_auth_helper), else requests
+        try:
+            import httpx  # type: ignore[import-untyped]
+
+            ssl_ctx = _get_erp_ssl_context()
+            resp = httpx.post(
+                erp_auth_url,
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {pf_token}",
+                },
+                json={},
+                timeout=timeout,
+                verify=ssl_ctx,
             )
+            resp.raise_for_status()
+            body = resp.json()
 
-        body = resp.json()
-        fusion_jwt = (
-            body.get("access_token")
-            or body.get("jwt")
-            or body.get("token")
-        )
+        except ImportError:
+            import requests  # type: ignore[import-untyped]
+
+            resp_rq = requests.post(
+                erp_auth_url,
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {pf_token}",
+                },
+                json={},
+                timeout=timeout,
+                verify=False,  # noqa: S501
+            )
+            resp_rq.raise_for_status()
+            body = resp_rq.json()
+
+        fusion_jwt = body.get("token")
         if not fusion_jwt:
             raise RuntimeError(
-                f"JWT service response did not contain a token: {body}"
+                f"ERPSecurity/CreateJWT did not return a token: {body}"
             )
+        assert isinstance(fusion_jwt, str)
 
-        # Try to derive expiry — prefer server-provided, else decode JWT 'exp'.
-        expires_in = body.get("expires_in")
-        if expires_in:
-            expires_at = time.time() + int(expires_in)
-        else:
-            expires_at = _extract_jwt_expiry(str(fusion_jwt))
-
-        return str(fusion_jwt), expires_at
+        # Derive expiry from JWT 'exp' claim
+        expires_at = _extract_jwt_expiry(fusion_jwt)
+        return fusion_jwt, expires_at
 
 
 # ---------------------------------------------------------------------------
@@ -331,7 +476,9 @@ def _extract_jwt_expiry(jwt: str) -> float:
         if exp:
             return float(exp)
     except Exception:
-        log.debug("Could not decode JWT expiry; defaulting to +1h", exc_info=True)
+        log.debug(
+            "Could not decode JWT expiry; defaulting to +1h", exc_info=True
+        )
     return time.time() + 3600
 
 
