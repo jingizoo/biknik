@@ -89,6 +89,7 @@ def main(  # noqa: D103
             bip_client,
             dff_config=dff_config,
             default_transfer_date=cfg.get("default_transfer_date"),
+            blocked_books=cfg.get("blocked_books") or [],
         )
         summary = sync.run_full_sync(
             books=books,

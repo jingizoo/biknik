@@ -145,6 +145,7 @@ def main(argv: list[str] | None = None) -> int:
             bip_client,
             dff_config=dff_config,
             default_transfer_date=config.get("default_transfer_date"),
+            blocked_books=config.get("blocked_books") or [],
         )
         summary = sync.run_full_sync(
             books=books,
