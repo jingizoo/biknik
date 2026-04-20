@@ -40,7 +40,9 @@ from ofam_asset_xfer.bip_client import BIPClient, BIPConfig  # noqa: E402
 from ofam_asset_xfer.entity_resolver import EntityBookResolver  # noqa: E402
 from ofam_asset_xfer.exceptions import ConfigError  # noqa: E402
 from ofam_asset_xfer.fusion_sync import FusionIUSync, DFFConfig  # noqa: E402
+from ofam_asset_xfer.fusion_token_provider import build_token_provider  # noqa: E402
 from ofam_asset_xfer.gcs_publisher import GCSPublisherConfig, GCSResultPublisher  # noqa: E402
+from ofam_asset_xfer.slack_publisher import SlackPublisher, PagerDutyPublisher  # noqa: E402
 from ofam_asset_xfer.local_publisher import LocalResultPublisher  # noqa: E402
 from ofam_asset_xfer.oracle_client import OracleConfig, OracleErpIntegrationsClient  # noqa: E402
 from ofam_asset_xfer.pre_bip_dff import (  # noqa: E402
@@ -59,6 +61,7 @@ def _load_config(path: str) -> dict:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Entrypoint for the local runner."""
     p = argparse.ArgumentParser(
         description="Run OFAM IU asset transfers locally via BIP report discovery.",
     )
@@ -129,12 +132,20 @@ def main(argv: list[str] | None = None) -> int:
     try:
         config = _load_config(args.config)
 
+        # --- Build Fusion token provider (keytab/static) ---
+        # If ``fusion_auth`` is present, it drives authentication for both
+        # Oracle REST and BIP SOAP clients.  Otherwise the clients fall back
+        # to the legacy ``bearer_token_env`` inside oracle/bip blocks.
+        token_provider = build_token_provider(config.get("fusion_auth"))
+
         # --- Build clients from config ---
         oracle_cfg = OracleConfig.from_dict(config.get("oracle", {}))
-        fusion_client = OracleErpIntegrationsClient(oracle_cfg)
+        fusion_client = OracleErpIntegrationsClient(
+            oracle_cfg, token_provider=token_provider
+        )
 
         bip_cfg = BIPConfig.from_dict(config.get("bip", {}))
-        bip_client = BIPClient(bip_cfg)
+        bip_client = BIPClient(bip_cfg, token_provider=token_provider)
 
         entity_map = config.get("entity_book_map", {})
         if not entity_map:
@@ -156,7 +167,18 @@ def main(argv: list[str] | None = None) -> int:
         max_transfers = int(config.get("max_transfers", 500))
 
         # --- Optional pre-BIP DFF updates ---
-        pre_bip_block = config.get("pre_bip_dff_updates") or {}
+        # Block may be inline OR loaded from a separate file via
+        # ``pre_bip_dff_updates_file`` (path is resolved relative to the
+        # main config file when not absolute).
+        pre_bip_file = config.get("pre_bip_dff_updates_file")
+        if pre_bip_file:
+            pre_path = Path(pre_bip_file)
+            if not pre_path.is_absolute():
+                pre_path = Path(args.config).resolve().parent / pre_bip_file
+            log.info("Loading pre-BIP DFF updates from %s", pre_path)
+            pre_bip_block = json.loads(Path(pre_path).read_text()) or {}
+        else:
+            pre_bip_block = config.get("pre_bip_dff_updates") or {}
         if pre_bip_block.get("enabled"):
             pre_cfg = PreBipDffConfig.from_dict(pre_bip_block)
             pre_requests = load_pre_bip_dff_requests(pre_bip_block)
@@ -201,6 +223,7 @@ def main(argv: list[str] | None = None) -> int:
             bip_client,
             dff_config=dff_config,
             default_transfer_date=config.get("default_transfer_date"),
+            blocked_books=config.get("blocked_books") or [],
         )
         summary = sync.run_full_sync(
             books=books,
@@ -233,8 +256,31 @@ def main(argv: list[str] | None = None) -> int:
             except Exception:
                 log.exception("Failed to publish to GCS (non-fatal)")
 
-    except Exception:
+        slack_block = config.get("slack")
+        if slack_block:
+            try:
+                slack_pub = SlackPublisher.from_dict(slack_block)
+                slack_pub.publish(summary, results_list)
+            except Exception:
+                log.exception("Failed to send Slack notification (non-fatal)")
+
+        pd_block = config.get("pagerduty")
+        if pd_block:
+            try:
+                pd_pub = PagerDutyPublisher.from_dict(pd_block)
+                pd_pub.check_and_trigger(summary, results_list)
+            except Exception:
+                log.exception("Failed to check PagerDuty threshold (non-fatal)")
+
+    except Exception as exc:
         log.exception("Job failed")
+        pd_block = config.get("pagerduty") if "config" in dir() else None
+        if pd_block:
+            try:
+                pd_pub = PagerDutyPublisher.from_dict(pd_block)
+                pd_pub.trigger_if_hard_error(exc)
+            except Exception:
+                log.exception("Failed to trigger PagerDuty (non-fatal)")
         return 1
 
     # Print summary.

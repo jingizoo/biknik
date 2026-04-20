@@ -110,6 +110,7 @@ class PreBipDffConfig:
     operation_handle: str = "updateAssetDescriptiveDetails"
     field_parameter_map: Dict[str, str] = field(default_factory=dict)
     static_params: Dict[str, Any] = field(default_factory=dict)
+    field_defaults: Dict[str, Any] = field(default_factory=dict)
     request_id_param: str = "P_TRX_ATTRIBUTE1"
     trace_param: str = "P_TRX_ATTRIBUTE2"
     trace_value: str = "OFAM_PRE_BIP_DFF"
@@ -151,12 +152,17 @@ class PreBipDffConfig:
                     f"Static Fusion parameter names must be uppercase: {key!r}."
                 )
 
+        field_defaults = data.get("field_defaults") or {}
+        if not isinstance(field_defaults, dict):
+            raise ConfigError("pre_bip_dff_updates.field_defaults must be an object.")
+
         return PreBipDffConfig(
             enabled=bool(data.get("enabled", False)),
             operation_handle=str(
                 data.get("operation_handle") or "updateAssetDescriptiveDetails"
             ).strip(),
             field_parameter_map={str(k): str(v).strip() for k, v in field_parameter_map.items()},
+            field_defaults={str(k): v for k, v in field_defaults.items()},
             static_params=dict(static_params),
             request_id_param=str(data.get("request_id_param") or "P_TRX_ATTRIBUTE1").strip(),
             trace_param=str(data.get("trace_param") or "P_TRX_ATTRIBUTE2").strip(),
@@ -311,6 +317,9 @@ class PreBipDffUpdater:
             "asset_number": request.asset_number,
             "book_type_code": request.book_type_code,
         }
+        # Apply field_defaults first, then overlay with request fields
+        # so explicit values always win over defaults.
+        available_values.update(self._cfg.field_defaults)
         available_values.update(request.fields)
 
         mapped_count = 0

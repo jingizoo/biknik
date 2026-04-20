@@ -112,6 +112,7 @@ def _run_bip_flow(
         entity_resolver,
         bip_client,
         dff_config=dff_config,
+        blocked_books=config.get("blocked_books") or [],
     )
     summary = sync.run_full_sync(
         books=books,

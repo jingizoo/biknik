@@ -19,11 +19,18 @@ Configuration
       "gcs": {
         "bucket": "my-fa-transfer-logs",
         "prefix": "transfers",
+        "service_account_json_env": "GCS_SA_JSON",
         "service_account_file": "/path/to/sa-key.json",
         "service_account_file_env": "GCS_SA_KEY_PATH",
         "retention_days": 365
       }
     }
+
+Credential resolution precedence (first match wins):
+  1. ``service_account_json_env`` → env var containing the raw SA JSON
+     (typically injected by Holocron Vault / K8s secretRef).
+  2. ``service_account_file`` → direct path to a SA JSON file on disk.
+  3. ``service_account_file_env`` → env var holding the path to the file.
 """
 
 from __future__ import annotations
@@ -33,9 +40,9 @@ import logging
 import os
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, timedelta
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from .exceptions import ConfigError
 
@@ -92,11 +99,17 @@ def to_ndjson(rows: List[Dict[str, Any]]) -> str:
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True)
 class GCSPublisherConfig:
-    """Immutable config for :class:`GCSResultPublisher`."""
+    """Immutable config for :class:`GCSResultPublisher`.
+
+    Exactly one credential source must be provided:
+      * ``service_account_info`` — parsed SA JSON (from env var / vault).
+      * ``service_account_file`` — path to SA JSON file on disk.
+    """
 
     bucket: str
     prefix: str
-    service_account_file: str
+    service_account_file: str = ""
+    service_account_info: Optional[Dict[str, Any]] = field(default=None)
     retention_days: int = 365
 
     @classmethod
@@ -112,21 +125,43 @@ class GCSPublisherConfig:
 
         prefix = d.get("prefix", "transfers").strip().strip("/")
 
-        sa_file = d.get("service_account_file", "").strip()
-        if not sa_file:
-            env_key = d.get("service_account_file_env", "").strip()
-            if env_key:
-                sa_file = os.environ.get(env_key, "").strip()
+        # --- Credential resolution (precedence: json_env → file → file_env) ---
+        sa_info: Optional[Dict[str, Any]] = None
+        sa_file = ""
+
+        json_env_key = d.get("service_account_json_env", "").strip()
+        if json_env_key:
+            raw_json = os.environ.get(json_env_key, "").strip()
+            if raw_json:
+                try:
+                    sa_info = json.loads(raw_json)
+                except json.JSONDecodeError as exc:
+                    raise ConfigError(
+                        f"gcs.service_account_json_env={json_env_key!r} contains "
+                        f"invalid JSON: {exc}"
+                    ) from exc
+
+        if sa_info is None:
+            sa_file = d.get("service_account_file", "").strip()
             if not sa_file:
-                raise ConfigError(
-                    "gcs.service_account_file or gcs.service_account_file_env is required"
-                )
+                env_key = d.get("service_account_file_env", "").strip()
+                if env_key:
+                    sa_file = os.environ.get(env_key, "").strip()
+
+        if sa_info is None and not sa_file:
+            raise ConfigError(
+                "gcs credentials missing: set one of "
+                "service_account_json_env, service_account_file, or "
+                "service_account_file_env"
+            )
+
         retention_days = int(d.get("retention_days", 365))
 
         return cls(
             bucket=bucket,
             prefix=prefix,
             service_account_file=sa_file,
+            service_account_info=sa_info,
             retention_days=retention_days,
         )
 
@@ -150,9 +185,19 @@ class GCSResultPublisher:
         if self._client is None:
             from google.cloud import storage  # type: ignore[import-untyped]
 
-            self._client = storage.Client.from_service_account_json(
-                self._cfg.service_account_file
-            )
+            if self._cfg.service_account_info is not None:
+                log.info("Loading GCS service account from env (vault-injected JSON)")
+                self._client = storage.Client.from_service_account_info(
+                    self._cfg.service_account_info
+                )
+            else:
+                log.info(
+                    "Loading GCS service account from file %s",
+                    self._cfg.service_account_file,
+                )
+                self._client = storage.Client.from_service_account_json(
+                    self._cfg.service_account_file
+                )
         return self._client
 
     # -- append -------------------------------------------------------------

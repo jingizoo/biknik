@@ -1,10 +1,12 @@
+"""Oracle Fusion ERP Integrations REST client for asset transactions."""
+
 from __future__ import annotations
 
 import json
 import logging
 import os
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
 import requests  # type: ignore[import-untyped]
 
 from .exceptions import FusionApiError
@@ -17,16 +19,23 @@ log = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class OracleConfig:
+    """Immutable config for :class:`OracleErpIntegrationsClient`."""
+
     base_url: str
     api_version: str
-    bearer_token: str
+    bearer_token: str = ""  # may be empty when using token_provider
     verify_ssl: bool = True
     timeout_seconds: int = 60
     require_proxy: bool = False
 
     @staticmethod
     def from_dict(d: Dict[str, Any]) -> "OracleConfig":
-        """Build an OracleConfig from a raw config dictionary."""
+        """Build an OracleConfig from a raw config dictionary.
+
+        The ``bearer_token`` may be left empty when a ``token_provider`` is
+        passed to :class:`OracleErpIntegrationsClient`.  The provider then
+        supplies a fresh token per request.
+        """
         base_url = str(d.get("base_url", "")).rstrip("/")
         api_version = str(d.get("api_version", "")).strip()
         if not base_url or not api_version:
@@ -37,21 +46,19 @@ class OracleConfig:
         # the env var name, e.g. "FUSION_JWT").  In production the token is
         # rotated by the CDX secrets sidecar; for local dev it can be set
         # directly in the config as "bearer_token".
-        bearer_token = d.get("bearer_token")
+        #
+        # When a FusionTokenProvider is used (top-level fusion_auth block),
+        # no token is required here — the provider supplies one per request.
+        bearer_token = d.get("bearer_token", "")
         bearer_token_env = d.get("bearer_token_env")
 
         if bearer_token_env:
             bearer_token = os.getenv(str(bearer_token_env), bearer_token)
 
-        if not bearer_token:
-            raise ValueError(
-                "Oracle bearer_token is required (bearer_token or bearer_token_env)."
-            )
-
         return OracleConfig(
             base_url=base_url,
             api_version=api_version,
-            bearer_token=str(bearer_token),
+            bearer_token=str(bearer_token or ""),
             verify_ssl=bool(d.get("verify_ssl", True)),
             timeout_seconds=int(d.get("timeout_seconds", 60)),
             require_proxy=bool(d.get("require_proxy", False)),
@@ -59,21 +66,46 @@ class OracleConfig:
 
 
 class OracleErpIntegrationsClient:
-    """Client for Oracle Fusion ERP Integration REST Service for Assets transactions."""
+    """Client for Oracle Fusion ERP Integration REST Service for Assets transactions.
 
-    def __init__(self, cfg: OracleConfig):
+    Authorization header is set **per request** so that a refreshing
+    ``token_provider`` (keytab -> PingFed -> JWT service) always supplies a
+    currently-valid JWT.  If no provider is given, the static token from
+    ``OracleConfig.bearer_token`` is used.
+    """
+
+    def __init__(
+        self,
+        cfg: OracleConfig,
+        token_provider: Optional[Callable[[], str]] = None,
+    ):
+        """Initialise the client with config and optional token provider."""
         self.cfg = cfg
+        self._token_provider = token_provider
+
+        if not token_provider and not cfg.bearer_token:
+            raise ValueError(
+                "OracleErpIntegrationsClient requires either a token_provider "
+                "or OracleConfig.bearer_token"
+            )
+
         self._session = requests.Session()
         self._session.trust_env = not cfg.require_proxy
         self._session.headers.update(
             {
-                "Authorization": f"Bearer {cfg.bearer_token}",
                 "Content-Type": "application/vnd.oracle.adf.resourceitem+json",
                 "REST-header-version": "4",
                 "ACCEPT": "application/json",
             }
         )
         self._session.proxies.update(get_proxy_config(require=cfg.require_proxy))
+
+    def _auth_headers(self) -> Dict[str, str]:
+        """Build fresh Authorization header (uses provider if supplied)."""
+        token = (
+            self._token_provider() if self._token_provider else self.cfg.bearer_token
+        )
+        return {"Authorization": f"Bearer {token}"}
 
     def _endpoint(self, handle: str) -> str:
         # Example from doc: /fscmRestApi/resources/11.13.18.05/erpintegrations/processTransaction-transferAsset
@@ -104,6 +136,7 @@ class OracleErpIntegrationsClient:
         r = self._session.post(
             url,
             json=payload,
+            headers=self._auth_headers(),
             timeout=self.cfg.timeout_seconds,
             verify=self.cfg.verify_ssl,
         )
@@ -143,6 +176,7 @@ class OracleErpIntegrationsClient:
         r = self._session.get(
             url,
             params=query_params or {},
+            headers=self._auth_headers(),
             timeout=self.cfg.timeout_seconds,
             verify=self.cfg.verify_ssl,
         )

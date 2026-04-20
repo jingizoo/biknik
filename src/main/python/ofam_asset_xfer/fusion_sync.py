@@ -172,12 +172,16 @@ class FusionIUSync:
         bip_client: BIPClient,
         dff_config: Optional[DFFConfig] = None,
         default_transfer_date: Optional[str] = None,
+        blocked_books: Optional[List[str]] = None,
     ):
         self._client = fusion_client
         self._entity_resolver = entity_resolver
         self._bip = bip_client
         self._dff = dff_config or DEFAULT_DFF_CONFIG
         self._default_date = default_transfer_date
+        self._blocked_books: Set[str] = {
+            b.upper().strip() for b in (blocked_books or []) if b and b.strip()
+        }
 
     # ------------------------------------------------------------------
     # Discovery
@@ -305,7 +309,22 @@ class FusionIUSync:
                 log.debug("Skipping asset %s: %s", asset_number, e)
                 return None
 
-        is_cross_book = book_type_code.upper().strip() != target_book.upper().strip()
+        src_upper = book_type_code.upper().strip()
+        tgt_upper = target_book.upper().strip()
+
+        if self._blocked_books and (
+            src_upper in self._blocked_books or tgt_upper in self._blocked_books
+        ):
+            log.info(
+                "Skipping asset %s: blocked book (src=%s, tgt=%s, blocked=%s)",
+                asset_number,
+                book_type_code,
+                target_book,
+                sorted(self._blocked_books),
+            )
+            return None
+
+        is_cross_book = src_upper != tgt_upper
 
         # Same book AND no target location/expense info → nothing to transfer
         if not is_cross_book and not target_location_id and not target_expense_ccid:

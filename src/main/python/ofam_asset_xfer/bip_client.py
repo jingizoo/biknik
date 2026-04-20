@@ -19,7 +19,7 @@ import base64
 import logging
 import os
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 from xml.etree import ElementTree as ET
 
 import requests  # type: ignore[import-untyped]
@@ -40,35 +40,35 @@ class BIPConfig:
     """Configuration for BI Publisher SOAP client."""
 
     base_url: str  # e.g. https://fa-host.oraclecloud.com
-    bearer_token: str  # same Fusion JWT / Bearer token
     report_path: str  # e.g. /Custom/Integrations/Outbound/FA/AssetTransferDFF.xdo
+    bearer_token: str = ""  # may be empty when using token_provider
     verify_ssl: bool = True
     timeout_seconds: int = 120
     require_proxy: bool = False
 
     @staticmethod
     def from_dict(d: Dict[str, Any]) -> "BIPConfig":
-        """Build a BIPConfig from a raw config dictionary."""
+        """Build a BIPConfig from a raw config dictionary.
+
+        ``bearer_token`` may be empty when a ``token_provider`` is passed to
+        :class:`BIPClient` — the provider will supply a fresh JWT per request.
+        """
         base_url = str(d.get("base_url", "")).rstrip("/")
         report_path = str(d.get("report_path", "")).strip()
 
-        bearer_token = d.get("bearer_token")
+        bearer_token = d.get("bearer_token", "")
         bearer_token_env = d.get("bearer_token_env")
         if bearer_token_env:
             bearer_token = os.getenv(str(bearer_token_env), bearer_token)
 
         if not base_url:
             raise ValueError("bip.base_url is required")
-        if not bearer_token:
-            raise ValueError(
-                "bip.bearer_token is required (bearer_token or bearer_token_env)"
-            )
         if not report_path:
             raise ValueError("bip.report_path is required")
 
         return BIPConfig(
             base_url=base_url,
-            bearer_token=str(bearer_token),
+            bearer_token=str(bearer_token or ""),
             report_path=report_path,
             verify_ssl=bool(d.get("verify_ssl", True)),
             timeout_seconds=int(d.get("timeout_seconds", 120)),
@@ -77,19 +77,40 @@ class BIPConfig:
 
 
 class BIPClient:
-    """Client for Oracle BI Publisher SOAP reporting service."""
+    """Client for Oracle BI Publisher SOAP reporting service.
 
-    def __init__(self, cfg: BIPConfig):
+    Authorization header is set per-request so that a refreshing
+    ``token_provider`` supplies a currently-valid JWT.  Falls back to the
+    static ``BIPConfig.bearer_token`` when no provider is given.
+    """
+
+    def __init__(
+        self,
+        cfg: BIPConfig,
+        token_provider: Optional[Callable[[], str]] = None,
+    ):
+        """Initialise the BIP client with config and optional token provider."""
         self.cfg = cfg
+        self._token_provider = token_provider
+
+        if not token_provider and not cfg.bearer_token:
+            raise ValueError(
+                "BIPClient requires either a token_provider or BIPConfig.bearer_token"
+            )
+
         self._session = requests.Session()
         self._session.trust_env = not cfg.require_proxy
         self._session.headers.update(
-            {
-                "Authorization": f"Bearer {cfg.bearer_token}",
-                "Content-Type": "application/soap+xml; charset=utf-8",
-            }
+            {"Content-Type": "application/soap+xml; charset=utf-8"}
         )
         self._session.proxies.update(get_proxy_config(require=cfg.require_proxy))
+
+    def _auth_headers(self) -> Dict[str, str]:
+        """Build fresh Authorization header (uses provider if supplied)."""
+        token = (
+            self._token_provider() if self._token_provider else self.cfg.bearer_token
+        )
+        return {"Authorization": f"Bearer {token}"}
 
     def _endpoint(self) -> str:
         return f"{self.cfg.base_url}/xmlpserver/services/ExternalReportWSSService"
@@ -158,6 +179,7 @@ class BIPClient:
         resp = self._session.post(
             url,
             data=envelope.encode("utf-8"),
+            headers=self._auth_headers(),
             timeout=self.cfg.timeout_seconds,
             verify=self.cfg.verify_ssl,
         )

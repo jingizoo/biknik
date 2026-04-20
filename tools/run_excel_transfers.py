@@ -237,7 +237,7 @@ class TransferResult:
     asset_number: str
     book_type_code: str
     mode: str  # dff, transfer
-    status: str  # UPDATED, DRY_RUN, TRANSFERRED, FAILED, NOOP
+    status: str  # UPDATED, DRY_RUN, TRANSFERRED, FAILED, NOOP, SKIPPED
     asset_id: str = ""
     target_book: str = ""
     error: str = ""
@@ -261,6 +261,28 @@ class TransferResult:
 
 # ---------- DFF mode ----------
 
+def _blocked_books_set(config: Dict[str, Any]) -> set:
+    return {b.upper().strip() for b in (config.get("blocked_books") or []) if b and b.strip()}
+
+
+def _is_blocked(row: ExcelRow, blocked: set, resolver: Optional[EntityBookResolver] = None) -> Optional[str]:
+    """Return the offending book code if the row's source or target book is blocked, else None."""
+    if not blocked:
+        return None
+    src = row.book_type_code.upper().strip()
+    if src in blocked:
+        return row.book_type_code
+    tgt = (row.target_book_type_code or "").upper().strip()
+    if not tgt and resolver and row.transfer_to_entity:
+        try:
+            tgt = resolver.resolve_target_book(row.transfer_to_entity).upper().strip()
+        except Exception:
+            tgt = ""
+    if tgt and tgt in blocked:
+        return tgt
+    return None
+
+
 def run_dff_mode(
     rows: List[ExcelRow],
     config: Dict[str, Any],
@@ -274,9 +296,26 @@ def run_dff_mode(
     dff_cfg = PreBipDffConfig.from_dict({**pre_bip_block, "enabled": True})
     field_defaults = pre_bip_block.get("field_defaults", {})
 
+    blocked = _blocked_books_set(config)
+    resolver = EntityBookResolver(config.get("entity_book_map", {}) or {})
+
     if dry_run:
         # Dry-run: just build payloads without calling Oracle
         for row in rows:
+            offender = _is_blocked(row, blocked, resolver)
+            if offender:
+                results.append(
+                    TransferResult(
+                        request_id=row.request_id,
+                        asset_number=row.asset_number,
+                        book_type_code=row.book_type_code,
+                        mode="dff",
+                        status="SKIPPED",
+                        asset_id=row.asset_id,
+                        error=f"blocked book: {offender}",
+                    )
+                )
+                continue
             req = row.to_dff_update_request(field_defaults=field_defaults)
             # Build params manually to show what would be sent
             params: Dict[str, Any] = dict(dff_cfg.static_params)
@@ -315,6 +354,20 @@ def run_dff_mode(
     updater = PreBipDffUpdater(client, dff_cfg)
 
     for row in rows:
+        offender = _is_blocked(row, blocked, resolver)
+        if offender:
+            results.append(
+                TransferResult(
+                    request_id=row.request_id,
+                    asset_number=row.asset_number,
+                    book_type_code=row.book_type_code,
+                    mode="dff",
+                    status="SKIPPED",
+                    asset_id=row.asset_id,
+                    error=f"blocked book: {offender}",
+                )
+            )
+            continue
         req = row.to_dff_update_request(field_defaults=field_defaults)
         try:
             result = updater.apply_update(req, dry_run=False)
@@ -357,10 +410,25 @@ def run_transfer_mode(
 
     entity_map = config.get("entity_book_map", {})
     resolver = EntityBookResolver(entity_map)
+    blocked = _blocked_books_set(config)
 
     if dry_run:
         # Build planned payloads without calling Oracle
         for row in rows:
+            offender = _is_blocked(row, blocked, resolver)
+            if offender:
+                results.append(
+                    TransferResult(
+                        request_id=row.request_id,
+                        asset_number=row.asset_number,
+                        book_type_code=row.book_type_code,
+                        mode="transfer",
+                        status="SKIPPED",
+                        asset_id=row.asset_id,
+                        error=f"blocked book: {offender}",
+                    )
+                )
+                continue
             target_book = row.target_book_type_code or resolver.resolve_target_book(row.transfer_to_entity)
             is_cross_book = target_book.strip().upper() != row.book_type_code.strip().upper()
 
@@ -390,6 +458,20 @@ def run_transfer_mode(
     client = OracleErpIntegrationsClient(oracle_cfg)
 
     for row in rows:
+        offender = _is_blocked(row, blocked, resolver)
+        if offender:
+            results.append(
+                TransferResult(
+                    request_id=row.request_id,
+                    asset_number=row.asset_number,
+                    book_type_code=row.book_type_code,
+                    mode="transfer",
+                    status="SKIPPED",
+                    asset_id=row.asset_id,
+                    error=f"blocked book: {offender}",
+                )
+            )
+            continue
         try:
             # Step 1: Resolve target book
             target_book = row.target_book_type_code or resolver.resolve_target_book(row.transfer_to_entity)
