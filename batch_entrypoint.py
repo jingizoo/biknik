@@ -44,6 +44,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Entrypoint for the CDX batch job."""
     args = _build_arg_parser().parse_args(argv)
 
     logging.basicConfig(
@@ -90,7 +91,19 @@ def main(argv: list[str] | None = None) -> int:
         max_transfers = int(config.get("max_transfers", 500))
 
         # --- Optional pre-BIP DFF updates ---
-        pre_bip_block = config.get("pre_bip_dff_updates") or {}
+        # Block may be inline OR loaded from a separate file via
+        # ``pre_bip_dff_updates_file`` (path is resolved relative to the
+        # main config file when not absolute).
+        pre_bip_file = config.get("pre_bip_dff_updates_file")
+        if pre_bip_file:
+            from pathlib import Path as _Path
+            pre_path = _Path(pre_bip_file)
+            if not pre_path.is_absolute():
+                pre_path = _Path(args.config).resolve().parent / pre_bip_file
+            log.info("Loading pre-BIP DFF updates from %s", pre_path)
+            pre_bip_block = json.loads(_Path(pre_path).read_text()) or {}
+        else:
+            pre_bip_block = config.get("pre_bip_dff_updates") or {}
         if pre_bip_block.get("enabled"):
             pre_cfg = PreBipDffConfig.from_dict(pre_bip_block)
             pre_requests = load_pre_bip_dff_requests(pre_bip_block)
