@@ -129,6 +129,7 @@ def main(argv: list[str] | None = None) -> int:
     log.info("Output  : %s", out_dir)
     log.info("Mode    : %s", mode)
 
+    config: dict | None = None
     try:
         config = _load_config(args.config)
 
@@ -274,7 +275,7 @@ def main(argv: list[str] | None = None) -> int:
 
     except Exception as exc:
         log.exception("Job failed")
-        pd_block = config.get("pagerduty") if "config" in dir() else None
+        pd_block = config.get("pagerduty") if config is not None else None
         if pd_block:
             try:
                 pd_pub = PagerDutyPublisher.from_dict(pd_block)
