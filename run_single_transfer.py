@@ -36,6 +36,7 @@ from ofam_asset_xfer.fusion_ops import (  # noqa: E402
     build_same_book_transfer_params,
     get_asset_information,
 )
+from ofam_asset_xfer.fusion_token_provider import build_token_provider  # noqa: E402
 from ofam_asset_xfer.oracle_client import OracleConfig, OracleErpIntegrationsClient  # noqa: E402
 
 
@@ -121,9 +122,10 @@ def main(argv: list[str] | None = None) -> int:
     try:
         config = _load_config(args.config)
 
-        # Build Fusion client
+        # Build Fusion client (keytab/static token provider, matches batch path)
+        token_provider = build_token_provider(config.get("fusion_auth"))
         oracle_cfg = OracleConfig.from_dict(config.get("oracle", {}))
-        client = OracleErpIntegrationsClient(oracle_cfg)
+        client = OracleErpIntegrationsClient(oracle_cfg, token_provider=token_provider)
 
         # Step 1: Get current asset state
         log.info("Calling getAssetInformation for asset=%s book=%s ...",
