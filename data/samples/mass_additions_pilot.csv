@@ -1,0 +1,4 @@
+mass_addition_id,book_type_code,region,tag_number,serial_number,po_number,invoice_number,expected_action
+MA-100,CORP_BOOK,US,TAG-100,SN-100,PO-100,INV-100,auto_update
+MA-101,CORP_BOOK,US,TAG-404,SN-404,PO-404,INV-404,exception
+MA-102,OTHER_BOOK,US,TAG-102,SN-102,PO-102,INV-102,skip

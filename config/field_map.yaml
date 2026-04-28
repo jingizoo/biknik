@@ -1,0 +1,18 @@
+oracle:
+  mass_addition_id: P_MASS_ADDITION_ID
+  book: P_BOOK_TYPE_CODE
+  date_placed_in_service: P_DATE_PLACED_IN_SERVICE
+  feeder_system_name: P_FEEDER_SYSTEM_NAME
+  posting_status: P_POSTING_STATUS
+  queue_name: P_QUEUE_NAME
+  location_ids: P_LOCATION_ID_TBL
+  expense_ccids: P_DEPRN_EXPENSE_CCID_TBL
+  employee_ids: P_EMPLOYEE_ID_TBL
+  units: P_UNITS_TBL
+
+cmdb:
+  lookup_precedence:
+    - tag_number
+    - serial_number
+    - po_number
+    - invoice_number
