@@ -18,10 +18,24 @@
   },
 
   "oracle": {
-    "mode": "mock_csv",
+    "mode": "fusion",
+    "base_url": "https://YOUR-FA.fa.ocs.oraclecloud.com",
+    "api_version": "11.13.18.05",
+    "bearer_token_env": "FUSION_JWT",
+    "verify_ssl": true,
+    "require_proxy": false,
+    "timeout_seconds": 60,
+
+    "mass_additions_resource": "FAmassAdditions",
+    "tag_number_attribute": "Attribute1",
+    "serial_number_attribute": "Attribute5",
+    "page_size": 500,
+
+    "_alternate_offline_mode": "Set mode to 'mock_csv' and supply 'mock_csv' for an offline run that reads NEW rows from a CSV file instead of Fusion.",
     "mock_csv": "data/samples/mass_additions_pilot.csv"
   },
 
   "pilot_book": "CORP_BOOK",
-  "pilot_region": "US"
+  "pilot_region": "US",
+  "capitalize_threshold_amount": 1000.0
 }

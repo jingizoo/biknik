@@ -2,9 +2,8 @@
 
 Mirrors ``runner.dry_run.run_dry_run`` but swaps the mock CMDB lookup
 for a live ServiceNow client.  The Oracle FA client is still injected
-(callers can pass a real client implementing the same three methods as
-``MockOracleFaClient``: ``list_new_mass_addition_ids``,
-``get_mass_addition``, ``update_mass_addition``).
+(callers can pass either ``MockOracleFaClient`` for offline testing or
+``FusionFaClient`` for real Fusion).
 """
 
 from __future__ import annotations
@@ -16,6 +15,7 @@ from ofam_mass_additions.cmdb.servicenow_client import (
     make_servicenow_lookup,
 )
 from ofam_mass_additions.runner.cycle import MassAdditionCycleRunner
+from ofam_mass_additions.rules.enrichment import DEFAULT_CAPITALIZE_THRESHOLD
 
 
 def run_live(
@@ -26,6 +26,7 @@ def run_live(
     run_mode: str = "dry-run",
     pilot_book: str = "CORP_BOOK",
     pilot_region: str = "US",
+    capitalize_threshold: float = DEFAULT_CAPITALIZE_THRESHOLD,
 ) -> dict[str, int]:
     """Run a mass-additions cycle against real ServiceNow CMDB.
 
@@ -38,5 +39,6 @@ def run_live(
         pilot_book=pilot_book,
         pilot_region=pilot_region,
         cmdb_lookup=make_servicenow_lookup(servicenow_config),
+        capitalize_threshold=capitalize_threshold,
     )
     return runner.run(output_dir=output_dir)

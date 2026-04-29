@@ -63,10 +63,24 @@ def _load_config(path: str) -> dict:
 def _build_oracle_client(oracle_block: dict, config_path: str, log: logging.Logger) -> object:
     """Build the Oracle FA client per ``oracle.mode`` in the config.
 
-    Currently only ``mock_csv`` is supported.  Add more modes here when
-    a real Oracle FA mass-additions client is implemented.
+    Supported modes:
+
+    * ``fusion``    — call real Oracle Fusion (FA mass-additions REST resource
+                      for list/get + processTransaction-updateMassAddition for
+                      writes).  This is the production path.
+    * ``mock_csv``  — read NEW rows from a local CSV.  Offline rehearsal only.
     """
-    mode = (oracle_block or {}).get("mode", "mock_csv")
+    mode = (oracle_block or {}).get("mode", "fusion")
+
+    if mode == "fusion":
+        from ofam_mass_additions.oracle.fusion_client import (
+            FusionFaClient,
+            FusionFaConfig,
+        )
+
+        log.info("Building real Fusion FA client (base_url=%s)", oracle_block.get("base_url"))
+        return FusionFaClient(FusionFaConfig.from_dict(oracle_block))
+
     if mode == "mock_csv":
         from ofam_mass_additions.oracle.mock_client import MockOracleFaClient
 
@@ -82,8 +96,7 @@ def _build_oracle_client(oracle_block: dict, config_path: str, log: logging.Logg
         return MockOracleFaClient(rows=seed_oracle_rows_from_csv(csv_path))
 
     raise ConfigError(
-        f"Unknown oracle.mode={mode!r}. Supported: 'mock_csv'. "
-        "Real Oracle FA client is not yet implemented."
+        f"Unknown oracle.mode={mode!r}. Supported: 'fusion', 'mock_csv'."
     )
 
 
@@ -170,6 +183,9 @@ def main(argv: list[str] | None = None) -> int:
 
         pilot_book = config.get("pilot_book", "CORP_BOOK")
         pilot_region = config.get("pilot_region", "US")
+        capitalize_threshold = float(
+            config.get("capitalize_threshold_amount", 1000.0)
+        )
 
         result = run_live(
             oracle_client=oracle_client,
@@ -178,6 +194,7 @@ def main(argv: list[str] | None = None) -> int:
             run_mode=run_mode,
             pilot_book=pilot_book,
             pilot_region=pilot_region,
+            capitalize_threshold=capitalize_threshold,
         )
 
     except Exception:

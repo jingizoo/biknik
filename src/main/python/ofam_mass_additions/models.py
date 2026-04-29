@@ -20,6 +20,7 @@ class MassAddition:
     delivery_location: str | None = None
     invoice_quantity: int | None = None
     received_quantity: int | None = None
+    cost: float | None = None
     source_system: str = "OTBI"
 
 

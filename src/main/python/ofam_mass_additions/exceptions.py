@@ -13,3 +13,7 @@ class OFAMMassAdditionsError(Exception):
 
 class ConfigError(OFAMMassAdditionsError):
     """Raised when the user-supplied configuration is invalid or incomplete."""
+
+
+class FusionApiError(OFAMMassAdditionsError):
+    """Raised when an Oracle Fusion API call fails or returns malformed data."""

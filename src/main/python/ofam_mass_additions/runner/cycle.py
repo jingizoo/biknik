@@ -23,12 +23,14 @@ class MassAdditionCycleRunner:
         pilot_book: str = "CORP_BOOK",
         pilot_region: str = "US",
         cmdb_lookup: CmdbLookup | None = None,
+        capitalize_threshold: float = 1000.0,
     ) -> None:
         self.oracle_client = oracle_client
         self.run_mode = run_mode
         self.pilot_book = pilot_book
         self.pilot_region = pilot_region
         self.cmdb_lookup: CmdbLookup = cmdb_lookup or _default_cmdb_lookup
+        self.capitalize_threshold = capitalize_threshold
 
     def run(self, output_dir: Path) -> dict[str, int]:
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -39,7 +41,13 @@ class MassAdditionCycleRunner:
         for mass_addition_id in self.oracle_client.list_new_mass_addition_ids(book_type_code=self.pilot_book):
             mass_addition = self.oracle_client.get_mass_addition(mass_addition_id)
             cmdb_asset = self.cmdb_lookup(mass_addition)
-            decision = apply_enrichment_rules(mass_addition, cmdb_asset, self.pilot_book, self.pilot_region)
+            decision = apply_enrichment_rules(
+                mass_addition,
+                cmdb_asset,
+                self.pilot_book,
+                self.pilot_region,
+                capitalize_threshold=self.capitalize_threshold,
+            )
 
             if decision.action == "auto_update" and decision.proposed_update is not None:
                 operation_payload = build_operation_payload("updateMassAddition", decision.proposed_update.params)
