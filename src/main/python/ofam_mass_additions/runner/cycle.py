@@ -2,13 +2,17 @@ from __future__ import annotations
 
 import csv
 from pathlib import Path
+from typing import Callable
 
 from ofam_mass_additions.audit.writer import write_audit_log, write_exceptions, write_proposed_updates
-from ofam_mass_additions.cmdb.mock_lookup import lookup_cmdb_asset
-from ofam_mass_additions.models import AuditEvent, ExceptionRecord, ProposedOracleUpdate
+from ofam_mass_additions.cmdb.mock_lookup import lookup_cmdb_asset as _default_cmdb_lookup
+from ofam_mass_additions.models import AuditEvent, CmdbAsset, ExceptionRecord, ProposedOracleUpdate
 from ofam_mass_additions.oracle.payloads import build_operation_payload, parse_oracle_status
 from ofam_mass_additions.rules.enrichment import apply_enrichment_rules
 from ofam_mass_additions.models import MassAddition
+
+
+CmdbLookup = Callable[[MassAddition], CmdbAsset | None]
 
 
 class MassAdditionCycleRunner:
@@ -18,11 +22,13 @@ class MassAdditionCycleRunner:
         run_mode: str = "dry-run",
         pilot_book: str = "CORP_BOOK",
         pilot_region: str = "US",
+        cmdb_lookup: CmdbLookup | None = None,
     ) -> None:
         self.oracle_client = oracle_client
         self.run_mode = run_mode
         self.pilot_book = pilot_book
         self.pilot_region = pilot_region
+        self.cmdb_lookup: CmdbLookup = cmdb_lookup or _default_cmdb_lookup
 
     def run(self, output_dir: Path) -> dict[str, int]:
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -32,7 +38,7 @@ class MassAdditionCycleRunner:
 
         for mass_addition_id in self.oracle_client.list_new_mass_addition_ids(book_type_code=self.pilot_book):
             mass_addition = self.oracle_client.get_mass_addition(mass_addition_id)
-            cmdb_asset = lookup_cmdb_asset(mass_addition)
+            cmdb_asset = self.cmdb_lookup(mass_addition)
             decision = apply_enrichment_rules(mass_addition, cmdb_asset, self.pilot_book, self.pilot_region)
 
             if decision.action == "auto_update" and decision.proposed_update is not None:
