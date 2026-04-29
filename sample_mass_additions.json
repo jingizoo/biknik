@@ -1,11 +1,33 @@
 {
+  "fusion_auth": {
+    "mode": "keytab",
+    "ora_env": "DEV1"
+  },
+
+  "oracle": {
+    "mode": "fusion",
+    "base_url": "https://lbpgjb-dev1.fa.ocs.oraclecloud.com",
+    "api_version": "11.13.18.05",
+    "verify_ssl": false,
+    "require_proxy": true,
+    "timeout_seconds": 60,
+
+    "mass_additions_resource": "FAmassAdditions",
+    "tag_number_attribute": "Attribute1",
+    "serial_number_attribute": "Attribute5",
+    "page_size": 500,
+
+    "_alternate_offline_mode": "Set mode to 'mock_csv' and supply 'mock_csv' to read NEW rows from a CSV file (no Fusion access required).",
+    "mock_csv": "data/samples/mass_additions_pilot.csv"
+  },
+
   "servicenow": {
-    "base_url": "https://YOUR-INSTANCE.service-now.com",
+    "base_url": "https://citadelgroup.service-now.com",
     "bearer_token_env": "SNOW_BEARER_TOKEN",
     "api_key_env": "SNOW_API_KEY",
     "table": "alm_hardware",
-    "verify_ssl": true,
-    "require_proxy": false,
+    "verify_ssl": false,
+    "require_proxy": true,
 
     "asset_tag_field": "asset_tag",
     "serial_number_field": "serial_number",
@@ -17,25 +39,30 @@
     "extra_fields": []
   },
 
-  "oracle": {
-    "mode": "fusion",
-    "base_url": "https://YOUR-FA.fa.ocs.oraclecloud.com",
-    "api_version": "11.13.18.05",
-    "bearer_token_env": "FUSION_JWT",
-    "verify_ssl": true,
-    "require_proxy": false,
-    "timeout_seconds": 60,
+  "_publishers_note": "The blocks below mirror the asset-xfer config schema for parity. Mass-additions writes proposed_updates.csv / exceptions.csv / audit.jsonl to the local out-dir today; GCS / Slack / PagerDuty wiring for mass-additions is a planned follow-up.",
 
-    "mass_additions_resource": "FAmassAdditions",
-    "tag_number_attribute": "Attribute1",
-    "serial_number_attribute": "Attribute5",
-    "page_size": 500,
-
-    "_alternate_offline_mode": "Set mode to 'mock_csv' and supply 'mock_csv' for an offline run that reads NEW rows from a CSV file instead of Fusion.",
-    "mock_csv": "data/samples/mass_additions_pilot.csv"
+  "gcs": {
+    "bucket": "cig-orc-fusion-rpt-dev",
+    "prefix": "asset_management/mass_additions_audit",
+    "service_account_file": "/home/jmehta/dev/citadel/citadel-am/citsource/pte/accounting/external-services/acctgateway/assetxferpipeline/service_account_key/service-key-dev-rpt.json"
   },
 
-  "pilot_book": "CORP_BOOK",
+  "slack": {
+    "webhook_url": "",
+    "dashboard_url": "",
+    "max_failures": 10
+  },
+
+  "pagerduty": {
+    "routing_key_env": "PAGER_DUTY_ROUTING_KEY",
+    "severity": "critical",
+    "source": "fa-mass-additions"
+  },
+
+  "pilot_book": "US CORP BOOK",
   "pilot_region": "US",
-  "capitalize_threshold_amount": 1000.0
+  "capitalize_threshold_amount": 1000.0,
+
+  "execute": false,
+  "max_transfers": 500
 }

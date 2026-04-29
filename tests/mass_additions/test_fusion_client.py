@@ -65,7 +65,7 @@ def test_from_dict_strips_trailing_slash_and_takes_overrides() -> None:
 def test_missing_bearer_raises(monkeypatch) -> None:
     monkeypatch.delenv("FUSION_JWT", raising=False)
     client = FusionFaClient(_config())
-    with pytest.raises(FusionApiError, match="bearer token"):
+    with pytest.raises(FusionApiError, match="No Fusion JWT available"):
         client._auth_headers()
 
 

@@ -23,7 +23,7 @@ import json
 import logging
 import os
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import requests
 
@@ -95,10 +95,22 @@ class FusionFaConfig:
 
 
 class FusionFaClient:
-    """Drop-in replacement for ``MockOracleFaClient`` against real Fusion."""
+    """Drop-in replacement for ``MockOracleFaClient`` against real Fusion.
 
-    def __init__(self, cfg: FusionFaConfig) -> None:
+    Authentication: pass either a ``token_provider`` callable that returns
+    a fresh JWT on every call (the keytab/PingFed flow used by the
+    asset-xfer pipeline), or rely on ``cfg.bearer_token_env`` to point at
+    a pre-populated env var for static-bearer mode.  ``token_provider``
+    wins when both are present.
+    """
+
+    def __init__(
+        self,
+        cfg: FusionFaConfig,
+        token_provider: Optional[Callable[[], str]] = None,
+    ) -> None:
         self._cfg = cfg
+        self._token_provider = token_provider
         self._session = requests.Session()
         self._session.proxies = get_proxy_config(require=cfg.require_proxy)
         self._session.verify = cfg.verify_ssl
@@ -236,10 +248,15 @@ class FusionFaClient:
         return pl_raw if isinstance(pl_raw, str) else json.dumps(pl_raw)
 
     def _auth_headers(self) -> Dict[str, str]:
-        token = os.environ.get(self._cfg.bearer_token_env, "").strip()
+        if self._token_provider is not None:
+            token = self._token_provider()
+        else:
+            token = os.environ.get(self._cfg.bearer_token_env, "").strip()
         if not token:
             raise FusionApiError(
-                f"Fusion bearer token env var '{self._cfg.bearer_token_env}' is empty."
+                "No Fusion JWT available: configure 'fusion_auth' with a keytab/"
+                "password provider, or pre-populate the env var named in "
+                f"'oracle.bearer_token_env' (currently {self._cfg.bearer_token_env!r})."
             )
         return {"Authorization": f"Bearer {token}"}
 

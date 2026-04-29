@@ -60,7 +60,12 @@ def _load_config(path: str) -> dict:
         raise ConfigError(f"Config is not valid JSON: {path}") from e
 
 
-def _build_oracle_client(oracle_block: dict, config_path: str, log: logging.Logger) -> object:
+def _build_oracle_client(
+    oracle_block: dict,
+    fusion_auth_block: dict | None,
+    config_path: str,
+    log: logging.Logger,
+) -> object:
     """Build the Oracle FA client per ``oracle.mode`` in the config.
 
     Supported modes:
@@ -69,17 +74,26 @@ def _build_oracle_client(oracle_block: dict, config_path: str, log: logging.Logg
                       for list/get + processTransaction-updateMassAddition for
                       writes).  This is the production path.
     * ``mock_csv``  — read NEW rows from a local CSV.  Offline rehearsal only.
+
+    When ``fusion_auth_block`` is provided, the static/keytab/password JWT
+    flow is wired so the client gets a fresh token per call.  Otherwise
+    the client reads the env var named in ``oracle.bearer_token_env``.
     """
     mode = (oracle_block or {}).get("mode", "fusion")
 
     if mode == "fusion":
+        from ofam_mass_additions.fusion_token_provider import build_token_provider
         from ofam_mass_additions.oracle.fusion_client import (
             FusionFaClient,
             FusionFaConfig,
         )
 
         log.info("Building real Fusion FA client (base_url=%s)", oracle_block.get("base_url"))
-        return FusionFaClient(FusionFaConfig.from_dict(oracle_block))
+        token_provider = build_token_provider(fusion_auth_block) if fusion_auth_block else None
+        return FusionFaClient(
+            FusionFaConfig.from_dict(oracle_block),
+            token_provider=token_provider,
+        )
 
     if mode == "mock_csv":
         from ofam_mass_additions.oracle.mock_client import MockOracleFaClient
@@ -178,7 +192,10 @@ def main(argv: list[str] | None = None) -> int:
         sn_cfg = ServiceNowConfig.from_dict(sn_block)
 
         oracle_client = _build_oracle_client(
-            config.get("oracle") or {}, args.config, log
+            config.get("oracle") or {},
+            config.get("fusion_auth"),
+            args.config,
+            log,
         )
 
         pilot_book = config.get("pilot_book", "CORP_BOOK")
