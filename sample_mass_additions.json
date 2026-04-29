@@ -39,8 +39,6 @@
     "extra_fields": []
   },
 
-  "_publishers_note": "The blocks below mirror the asset-xfer config schema for parity. Mass-additions writes proposed_updates.csv / exceptions.csv / audit.jsonl to the local out-dir today; GCS / Slack / PagerDuty wiring for mass-additions is a planned follow-up.",
-
   "gcs": {
     "bucket": "cig-orc-fusion-rpt-dev",
     "prefix": "asset_management/mass_additions_audit",

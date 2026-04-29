@@ -32,6 +32,13 @@ class MassAdditionCycleRunner:
         self.cmdb_lookup: CmdbLookup = cmdb_lookup or _default_cmdb_lookup
         self.capitalize_threshold = capitalize_threshold
 
+        # Populated after .run() completes; publishers read these to build
+        # Slack messages, GCS uploads, PagerDuty events without re-parsing
+        # the on-disk artefacts.
+        self.last_proposed: list[ProposedOracleUpdate] = []
+        self.last_exceptions: list[ExceptionRecord] = []
+        self.last_audit_events: list[AuditEvent] = []
+
     def run(self, output_dir: Path) -> dict[str, int]:
         output_dir.mkdir(parents=True, exist_ok=True)
         proposed: list[ProposedOracleUpdate] = []
@@ -81,6 +88,10 @@ class MassAdditionCycleRunner:
         write_proposed_updates(output_dir / "proposed_updates.csv", proposed)
         write_exceptions(output_dir / "exceptions.csv", exceptions)
         write_audit_log(output_dir / "audit.jsonl", audit_events)
+
+        self.last_proposed = proposed
+        self.last_exceptions = exceptions
+        self.last_audit_events = audit_events
 
         return {
             "total": len(audit_events),

@@ -48,8 +48,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent / "src" / "main" / "pytho
 
 from ofam_mass_additions.cmdb.servicenow_client import ServiceNowConfig  # noqa: E402
 from ofam_mass_additions.exceptions import ConfigError  # noqa: E402
+from ofam_mass_additions.publishers.gcs_publisher import GCSAuditPublisher  # noqa: E402
+from ofam_mass_additions.publishers.slack_publisher import (  # noqa: E402
+    PagerDutyPublisher,
+    SlackPublisher,
+)
 from ofam_mass_additions.runner.cycle import seed_oracle_rows_from_csv  # noqa: E402
-from ofam_mass_additions.runner.live_run import run_live  # noqa: E402
+from ofam_mass_additions.runner.live_run import LiveRunResult, run_live  # noqa: E402
 
 
 def _load_config(path: str) -> dict:
@@ -183,6 +188,8 @@ def main(argv: list[str] | None = None) -> int:
     log.info("Output   : %s", out_dir)
     log.info("Run mode : %s", run_mode.upper())
 
+    config: dict | None = None
+    result: LiveRunResult | None = None
     try:
         config = _load_config(args.config)
 
@@ -214,18 +221,61 @@ def main(argv: list[str] | None = None) -> int:
             capitalize_threshold=capitalize_threshold,
         )
 
-    except Exception:
+        _publish_optional_sinks(config, result, log)
+
+    except Exception as exc:
         log.exception("Mass-additions run failed")
+        if config is not None:
+            _trigger_pagerduty_hard_error(config, exc, log)
         return 1
 
+    counts = result.counts
     log.info("——— Summary ———")
-    log.info("  Total       : %s", result.get("total", 0))
-    log.info("  Auto-update : %s", result.get("auto_update", 0))
-    log.info("  Exceptions  : %s", result.get("exception", 0))
+    log.info("  Total       : %s", counts.get("total", 0))
+    log.info("  Auto-update : %s", counts.get("auto_update", 0))
+    log.info("  Exceptions  : %s", counts.get("exception", 0))
     log.info("Proposed updates : %s", out_dir / "proposed_updates.csv")
     log.info("Exceptions       : %s", out_dir / "exceptions.csv")
     log.info("Audit log        : %s", out_dir / "audit.jsonl")
     return 0
+
+
+def _publish_optional_sinks(
+    config: dict, result: LiveRunResult, log: logging.Logger
+) -> None:
+    """Run Slack / GCS / PagerDuty publishers when their config blocks exist."""
+    gcs_block = config.get("gcs")
+    if gcs_block:
+        try:
+            GCSAuditPublisher.from_dict(gcs_block).publish(result)
+        except Exception:
+            log.exception("Failed to publish to GCS (non-fatal)")
+
+    slack_block = config.get("slack")
+    if slack_block and (slack_block.get("webhook_url") or slack_block.get("webhook_url_env")):
+        try:
+            SlackPublisher.from_dict(slack_block).publish(result)
+        except Exception:
+            log.exception("Failed to send Slack notification (non-fatal)")
+
+    pd_block = config.get("pagerduty")
+    if pd_block and (pd_block.get("routing_key") or pd_block.get("routing_key_env")):
+        try:
+            PagerDutyPublisher.from_dict(pd_block).check_and_trigger(result)
+        except Exception:
+            log.exception("Failed to check PagerDuty threshold (non-fatal)")
+
+
+def _trigger_pagerduty_hard_error(
+    config: dict, error: Exception, log: logging.Logger
+) -> None:
+    pd_block = config.get("pagerduty") or {}
+    if not (pd_block.get("routing_key") or pd_block.get("routing_key_env")):
+        return
+    try:
+        PagerDutyPublisher.from_dict(pd_block).trigger_if_hard_error(error)
+    except Exception:
+        log.exception("Failed to trigger PagerDuty (non-fatal)")
 
 
 if __name__ == "__main__":
