@@ -46,8 +46,8 @@ from pathlib import Path
 # Ensure the package is importable when running from repo root.
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src" / "main" / "python"))
 
-from ofam_asset_xfer.exceptions import ConfigError  # noqa: E402
 from ofam_mass_additions.cmdb.servicenow_client import ServiceNowConfig  # noqa: E402
+from ofam_mass_additions.exceptions import ConfigError  # noqa: E402
 from ofam_mass_additions.runner.cycle import seed_oracle_rows_from_csv  # noqa: E402
 from ofam_mass_additions.runner.live_run import run_live  # noqa: E402
 

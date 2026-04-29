@@ -25,8 +25,8 @@ from typing import Any, Callable
 
 import requests
 
-from ofam_asset_xfer.proxy_config import get_proxy_config
 from ofam_mass_additions.models import CmdbAsset, MassAddition
+from ofam_mass_additions.proxy_config import get_proxy_config
 
 log = logging.getLogger(__name__)
 
