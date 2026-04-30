@@ -244,6 +244,21 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
+def _pagerduty_routing_key_available(pd_block: dict) -> bool:
+    """True if PD config will yield a routing key (literal or via env var).
+
+    Treats a configured ``routing_key_env`` whose env var is empty as
+    "not available" so the runner doesn't try to instantiate
+    ``PagerDutyPublisher`` and crash on a ``ValueError``.
+    """
+    if pd_block.get("routing_key"):
+        return True
+    env_var = pd_block.get("routing_key_env")
+    if env_var and os.getenv(str(env_var), "").strip():
+        return True
+    return False
+
+
 def _publish_optional_sinks(
     config: dict, result: LiveRunResult, log: logging.Logger
 ) -> None:
@@ -263,7 +278,7 @@ def _publish_optional_sinks(
             log.exception("Failed to send Slack notification (non-fatal)")
 
     pd_block = config.get("pagerduty")
-    if pd_block and (pd_block.get("routing_key") or pd_block.get("routing_key_env")):
+    if pd_block and _pagerduty_routing_key_available(pd_block):
         try:
             PagerDutyPublisher.from_dict(pd_block).check_and_trigger(result)
         except Exception:
@@ -274,7 +289,7 @@ def _trigger_pagerduty_hard_error(
     config: dict, error: Exception, log: logging.Logger
 ) -> None:
     pd_block = config.get("pagerduty") or {}
-    if not (pd_block.get("routing_key") or pd_block.get("routing_key_env")):
+    if not _pagerduty_routing_key_available(pd_block):
         return
     try:
         PagerDutyPublisher.from_dict(pd_block).trigger_if_hard_error(error)

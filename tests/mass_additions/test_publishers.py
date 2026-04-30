@@ -231,6 +231,76 @@ def test_pagerduty_trigger_if_hard_error_includes_class() -> None:
     assert "network down" in payload["custom_details"]["error"]
 
 
+# ----- PagerDuty noise-suppression --------------------------------------
+#
+# When a config has ``pagerduty.routing_key_env`` configured but the env
+# var is empty (a common mid-bring-up state), the runner must not try to
+# instantiate ``PagerDutyPublisher`` — that would raise ValueError and
+# dump a traceback in the user's terminal.
+
+
+def test_runner_skips_pagerduty_when_env_var_missing(monkeypatch) -> None:
+    import sys
+
+    sys.path.insert(0, ".")
+    sys.path.insert(0, "src/main/python")
+    import run_mass_additions
+
+    monkeypatch.delenv("PAGER_DUTY_ROUTING_KEY", raising=False)
+
+    config = {
+        "pagerduty": {
+            "routing_key_env": "PAGER_DUTY_ROUTING_KEY",
+            "severity": "critical",
+        }
+    }
+    log = MagicMock()
+
+    # Hard-error path: previously crashed with ValueError on from_dict.
+    run_mass_additions._trigger_pagerduty_hard_error(
+        config, RuntimeError("boom"), log
+    )
+    log.exception.assert_not_called()
+
+    # Threshold path: same — must skip silently.
+    run_mass_additions._publish_optional_sinks(
+        config,
+        result=LiveRunResult(counts={"total": 0}),
+        log=log,
+    )
+    log.exception.assert_not_called()
+
+
+def test_runner_fires_pagerduty_when_env_var_set(monkeypatch) -> None:
+    import sys
+
+    sys.path.insert(0, ".")
+    sys.path.insert(0, "src/main/python")
+    import run_mass_additions
+
+    monkeypatch.setenv("PAGER_DUTY_ROUTING_KEY", "rk-from-env")
+
+    config = {
+        "pagerduty": {
+            "routing_key_env": "PAGER_DUTY_ROUTING_KEY",
+            "severity": "critical",
+        }
+    }
+    log = MagicMock()
+
+    posted = MagicMock(status_code=202, text="accepted")
+    with patch(
+        "ofam_mass_additions.publishers.slack_publisher.http.post",
+        return_value=posted,
+    ) as p:
+        run_mass_additions._trigger_pagerduty_hard_error(
+            config, RuntimeError("boom"), log
+        )
+
+    p.assert_called_once()
+    log.exception.assert_not_called()
+
+
 # ============================================================================
 # GCS
 # ============================================================================
