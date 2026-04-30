@@ -11,13 +11,18 @@
     "verify_ssl": false,
     "require_proxy": true,
     "timeout_seconds": 60,
+    "erp_integrations_resource": "erpintegrations",
 
-    "mass_additions_resource": "FAmassAdditions",
-    "tag_number_attribute": "Attribute1",
-    "serial_number_attribute": "Attribute5",
-    "page_size": 500,
+    "_discovery_note": "Oracle has no native list-mass-additions API. Provide IDs via 'explicit_ids' (pilot / smoke), or wait for 'bip_report' mode (see oracle/discovery.py).",
+    "discovery": {
+      "mode": "explicit_ids",
+      "ids": [
+        300100180277508,
+        300100180277509
+      ]
+    },
 
-    "_alternate_offline_mode": "Set mode to 'mock_csv' and supply 'mock_csv' to read NEW rows from a CSV file (no Fusion access required).",
+    "_alternate_offline_mode": "Set the top-level oracle.mode to 'mock_csv' and supply 'mock_csv' to read NEW rows from a CSV file (no Fusion access required).",
     "mock_csv": "data/samples/mass_additions_pilot.csv"
   },
 

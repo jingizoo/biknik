@@ -6,6 +6,9 @@ in the asset-xfer test suite (the file is a verbatim copy).  These tests
 just confirm the *wiring* — that ``FusionFaClient`` calls the provided
 callable per request and that the runner builds the provider from the
 ``fusion_auth`` config block.
+
+Both reads and writes go through ``processTransaction`` POSTs on
+``/erpintegrations``, so the mocks target ``Session.post``.
 """
 
 from __future__ import annotations
@@ -15,6 +18,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from ofam_mass_additions.exceptions import FusionApiError
+from ofam_mass_additions.oracle.discovery import ExplicitIdsDiscovery
 from ofam_mass_additions.oracle.fusion_client import (
     FusionFaClient,
     FusionFaConfig,
@@ -32,6 +36,21 @@ def _config() -> FusionFaConfig:
     return FusionFaConfig(base_url="https://fa.example.com")
 
 
+def _discovery() -> ExplicitIdsDiscovery:
+    return ExplicitIdsDiscovery(ids=("300100180277508",))
+
+
+# A getMassAddition response that won't make the runner sad.
+_GET_RESPONSE_BODY = {
+    "ParameterList": (
+        '{"X_RETURN_STATUS":"S",'
+        '"X_BOOK_TYPE_CODE":"US CORP BOOK",'
+        '"X_TAG_NUMBER":"TAG-1",'
+        '"X_COST":"100"}'
+    )
+}
+
+
 def test_token_provider_called_per_request_when_provided() -> None:
     calls = {"n": 0}
 
@@ -39,43 +58,39 @@ def test_token_provider_called_per_request_when_provided() -> None:
         calls["n"] += 1
         return f"jwt-{calls['n']}"
 
-    client = FusionFaClient(_config(), token_provider=fake_provider)
+    client = FusionFaClient(_config(), discovery=_discovery(), token_provider=fake_provider)
 
     with patch.object(
-        client._session,
-        "get",
-        return_value=_ok({"items": [], "hasMore": False}),
-    ) as get:
-        client.list_new_mass_addition_ids(book_type_code="US CORP BOOK")
+        client._session, "post", return_value=_ok(_GET_RESPONSE_BODY),
+    ) as post:
+        client.get_mass_addition("300100180277508")
 
     assert calls["n"] == 1
-    assert get.call_args.kwargs["headers"]["Authorization"] == "Bearer jwt-1"
+    assert post.call_args.kwargs["headers"]["Authorization"] == "Bearer jwt-1"
 
 
 def test_token_provider_takes_precedence_over_env(monkeypatch) -> None:
     monkeypatch.setenv("FUSION_JWT", "from-env")
-    client = FusionFaClient(_config(), token_provider=lambda: "from-provider")
+    client = FusionFaClient(
+        _config(), discovery=_discovery(), token_provider=lambda: "from-provider"
+    )
 
     with patch.object(
-        client._session,
-        "get",
-        return_value=_ok({"items": [], "hasMore": False}),
-    ) as get:
-        client.list_new_mass_addition_ids(book_type_code="X")
+        client._session, "post", return_value=_ok(_GET_RESPONSE_BODY),
+    ) as post:
+        client.get_mass_addition("300100180277508")
 
-    assert get.call_args.kwargs["headers"]["Authorization"] == "Bearer from-provider"
+    assert post.call_args.kwargs["headers"]["Authorization"] == "Bearer from-provider"
 
 
 def test_no_provider_and_empty_env_raises_clear_error(monkeypatch) -> None:
     monkeypatch.delenv("FUSION_JWT", raising=False)
-    client = FusionFaClient(_config())
+    client = FusionFaClient(_config(), discovery=_discovery())
     with pytest.raises(FusionApiError, match="fusion_auth"):
         client._auth_headers()
 
 
-def test_run_mass_additions_builds_provider_from_static_block(
-    monkeypatch, tmp_path
-) -> None:
+def test_run_mass_additions_builds_provider_from_static_block(monkeypatch) -> None:
     """run_mass_additions._build_oracle_client wires fusion_auth to the client."""
     import sys
 
@@ -90,6 +105,7 @@ def test_run_mass_additions_builds_provider_from_static_block(
         "base_url": "https://fa.example.com",
         "api_version": "11.13.18.05",
         "verify_ssl": False,
+        "discovery": {"mode": "explicit_ids", "ids": ["300100180277508"]},
     }
     fusion_auth = {"mode": "static", "token_env": "MY_TOKEN"}
 
@@ -100,12 +116,9 @@ def test_run_mass_additions_builds_provider_from_static_block(
         oracle_block, fusion_auth, "/tmp/x.json", log
     )
 
-    # Hit a path that actually triggers _auth_headers.
     with patch.object(
-        client._session,
-        "get",
-        return_value=_ok({"items": [], "hasMore": False}),
-    ) as get:
-        client.list_new_mass_addition_ids(book_type_code="X")
+        client._session, "post", return_value=_ok(_GET_RESPONSE_BODY),
+    ) as post:
+        client.get_mass_addition("300100180277508")
 
-    assert get.call_args.kwargs["headers"]["Authorization"] == "Bearer static-jwt-from-env"
+    assert post.call_args.kwargs["headers"]["Authorization"] == "Bearer static-jwt-from-env"

@@ -1,20 +1,20 @@
 """Real Oracle Fusion FA mass-additions client.
 
-Replaces ``MockOracleFaClient`` for production runs.  Two underlying
-endpoints are wrapped:
+Replaces ``MockOracleFaClient`` for production runs.  Per Oracle's
+documented FA Integration Service operations
+(https://docs.oracle.com/en/cloud/saas/financials/), every read and
+write goes through the **same** ``processTransaction`` REST endpoint:
 
-1. **FA mass-additions REST resource** — used to *discover* and *read*
-   rows in ``PostingStatus='NEW'`` for a given book.
-2. **ERP Integrations processTransaction service** — used to *write*
-   updates back via the documented FA operations:
+  * ``processTransaction-getMassAddition``    (FA_GET_ASSET_INFO_PUB.GET_ASSET_INFO)
+  * ``processTransaction-updateMassAddition`` (FA_MASS_ADD_UPD_PUB.UPDATE_MASS_ADDITION)
 
-       * ``processTransaction-updateMassAddition``  (FA_MASS_ADD_UPD_PUB)
-       * ``processTransaction-getMassAddition``     (optional re-read)
-       * ``processTransaction-changeMassAdditionsBook`` (future use)
+Discovery (which IDs are NEW for a given book) is *not* a Fusion
+operation — there's no ``listMassAdditions``.  IDs come from a
+:class:`~ofam_mass_additions.oracle.discovery.MassAdditionDiscovery`
+implementation injected at construction (config-driven via
+``run_mass_additions.py``).
 
-Self-contained: no imports from ofam_asset_xfer.  Authentication is
-bearer-token-from-env (the same ``FUSION_JWT`` env var the rest of the
-estate already uses).
+Self-contained: no imports from ofam_asset_xfer.
 """
 
 from __future__ import annotations
@@ -22,13 +22,15 @@ from __future__ import annotations
 import json
 import logging
 import os
-from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Tuple
+import re
+from dataclasses import dataclass
+from typing import Any, Callable, Dict, Optional
 
 import requests
 
 from ofam_mass_additions.exceptions import FusionApiError
 from ofam_mass_additions.models import MassAddition
+from ofam_mass_additions.oracle.discovery import MassAdditionDiscovery
 from ofam_mass_additions.oracle.paramlist import build_parameter_list
 from ofam_mass_additions.proxy_config import get_proxy_config
 
@@ -39,15 +41,12 @@ log = logging.getLogger(__name__)
 class FusionFaConfig:
     """Configuration for :class:`FusionFaClient`.
 
-    The ``*_attribute`` fields specify which DFF column on the
-    FA mass-additions REST resource carries each business value (the
-    runbook documents tag → ``Attribute1`` and serial → ``Attribute5``;
-    other tenants may differ).
+    All read/write traffic targets one URL:
 
-    The list/get path uses the REST resource at
-    ``/fscmRestApi/resources/<api_version>/<mass_additions_resource>``;
-    the update path uses ``/fscmRestApi/resources/<api_version>/erpintegrations``
-    with an ``OperationName`` of ``processTransaction-<handle>``.
+        ``<base_url>/fscmRestApi/resources/<api_version>/<erp_integrations_resource>``
+
+    with body
+    ``{"OperationName": "processTransaction-<handle>", "ParameterList": "..."}``.
     """
 
     base_url: str
@@ -56,19 +55,7 @@ class FusionFaConfig:
     verify_ssl: bool = True
     require_proxy: bool = False
     timeout_seconds: int = 60
-
-    mass_additions_resource: str = "FAmassAdditions"
     erp_integrations_resource: str = "erpintegrations"
-
-    tag_number_attribute: str = "Attribute1"
-    serial_number_attribute: str = "Attribute5"
-    po_number_field: str = "PoNumber"
-    invoice_number_field: str = "InvoiceNumber"
-    cost_field: str = "Cost"
-    quantity_field: str = "Quantity"
-    region_field: str = "Country"
-
-    page_size: int = 500
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "FusionFaConfig":
@@ -81,35 +68,34 @@ class FusionFaConfig:
             verify_ssl=bool(d.get("verify_ssl", True)),
             require_proxy=bool(d.get("require_proxy", False)),
             timeout_seconds=int(d.get("timeout_seconds", 60)),
-            mass_additions_resource=str(d.get("mass_additions_resource", "FAmassAdditions")),
-            erp_integrations_resource=str(d.get("erp_integrations_resource", "erpintegrations")),
-            tag_number_attribute=str(d.get("tag_number_attribute", "Attribute1")),
-            serial_number_attribute=str(d.get("serial_number_attribute", "Attribute5")),
-            po_number_field=str(d.get("po_number_field", "PoNumber")),
-            invoice_number_field=str(d.get("invoice_number_field", "InvoiceNumber")),
-            cost_field=str(d.get("cost_field", "Cost")),
-            quantity_field=str(d.get("quantity_field", "Quantity")),
-            region_field=str(d.get("region_field", "Country")),
-            page_size=int(d.get("page_size", 500)),
+            erp_integrations_resource=str(
+                d.get("erp_integrations_resource", "erpintegrations")
+            ),
         )
 
 
 class FusionFaClient:
     """Drop-in replacement for ``MockOracleFaClient`` against real Fusion.
 
-    Authentication: pass either a ``token_provider`` callable that returns
-    a fresh JWT on every call (the keytab/PingFed flow used by the
-    asset-xfer pipeline), or rely on ``cfg.bearer_token_env`` to point at
-    a pre-populated env var for static-bearer mode.  ``token_provider``
+    Authentication: pass either a ``token_provider`` callable returning a
+    fresh JWT per request (the keytab/PingFed flow), or rely on
+    ``cfg.bearer_token_env`` for static-bearer mode.  ``token_provider``
     wins when both are present.
+
+    Discovery: pass an instance of
+    :class:`~ofam_mass_additions.oracle.discovery.MassAdditionDiscovery`.
+    Without it the client cannot list NEW IDs (Oracle has no native list
+    operation).
     """
 
     def __init__(
         self,
         cfg: FusionFaConfig,
+        discovery: MassAdditionDiscovery,
         token_provider: Optional[Callable[[], str]] = None,
     ) -> None:
         self._cfg = cfg
+        self._discovery = discovery
         self._token_provider = token_provider
         self._session = requests.Session()
         self._session.proxies = get_proxy_config(require=cfg.require_proxy)
@@ -124,105 +110,59 @@ class FusionFaClient:
 
     # ---- Discovery -------------------------------------------------------
 
-    def list_new_mass_addition_ids(self, *, book_type_code: str) -> List[str]:
-        """Return MassAdditionId values for NEW rows in ``book_type_code``.
+    def list_new_mass_addition_ids(self, *, book_type_code: str) -> list[str]:
+        """Delegate to the configured discovery.
 
-        Uses the REST resource with cursor-style pagination.
+        See :mod:`ofam_mass_additions.oracle.discovery` for available
+        modes (``explicit_ids``, ``bip_report``).
         """
-        ids: List[str] = []
-        offset = 0
-        while True:
-            body = self._get_resource(
-                self._cfg.mass_additions_resource,
-                params={
-                    "q": (
-                        f"PostingStatus='NEW' and BookTypeCode='{book_type_code}'"
-                    ),
-                    "fields": "MassAdditionId",
-                    "limit": str(self._cfg.page_size),
-                    "offset": str(offset),
-                    "onlyData": "true",
-                },
-            )
-            items = body.get("items") or []
-            for item in items:
-                ma_id = item.get("MassAdditionId")
-                if ma_id is not None:
-                    ids.append(str(ma_id))
-            if not body.get("hasMore") or not items:
-                break
-            offset += len(items)
-        return ids
+        return list(self._discovery.list_new_mass_addition_ids(book_type_code=book_type_code))
+
+    # ---- Read (processTransaction-getMassAddition) -----------------------
 
     def get_mass_addition(self, mass_addition_id: str) -> MassAddition:
-        """Fetch one mass-addition row from the REST resource and map to model."""
-        body = self._get_resource(
-            f"{self._cfg.mass_additions_resource}/{mass_addition_id}"
-        )
-        return self._row_to_mass_addition(body)
+        """Read one mass-addition row by ID."""
+        params = {"P_MASS_ADDITION_ID": mass_addition_id}
+        response_pl = self._process_transaction("getMassAddition", params)
+        return self._parse_get_response(mass_addition_id, response_pl)
 
-    # ---- Write -----------------------------------------------------------
+    # ---- Write (processTransaction-updateMassAddition) -------------------
 
     def update_mass_addition(self, payload: Dict[str, Any]) -> str:
         """Call ``processTransaction-updateMassAddition`` with ``payload``.
 
-        Returns the raw ``ParameterList`` string from the response, matching
-        the ``MockOracleFaClient`` contract used by ``parse_oracle_status``.
+        Returns the raw ``ParameterList`` string from the response so the
+        caller (``parse_oracle_status``) can extract ``X_RETURN_STATUS`` /
+        ``X_MSG_DATA`` for audit logging.
         """
-        return self._process_transaction("updateMassAddition", payload)
+        return self._process_transaction_raw("updateMassAddition", payload)
 
     # ---- Internals -------------------------------------------------------
 
-    def _get_resource(
-        self, resource_path: str, params: Dict[str, str] | None = None
-    ) -> Dict[str, Any]:
-        url = (
-            f"{self._cfg.base_url}/fscmRestApi/resources/"
-            f"{self._cfg.api_version}/{resource_path}"
-        )
-        log.debug("GET %s params=%s", url, params)
-        try:
-            resp = self._session.get(
-                url,
-                params=params or {},
-                headers=self._auth_headers(),
-                timeout=self._cfg.timeout_seconds,
-            )
-        except requests.RequestException as exc:
-            raise FusionApiError(f"GET {url} failed: {exc}") from exc
-
-        if resp.status_code >= 400:
-            raise FusionApiError(
-                f"Fusion GET {resource_path} HTTP {resp.status_code}: "
-                f"{resp.text[:500]}"
-            )
-        try:
-            return dict(resp.json())
-        except Exception as exc:
-            raise FusionApiError(
-                f"Non-JSON response from Fusion GET {resource_path}: "
-                f"{resp.text[:500]}"
-            ) from exc
-
-    def _process_transaction(self, handle: str, params: Dict[str, Any]) -> str:
-        url = (
+    def _erpint_url(self) -> str:
+        return (
             f"{self._cfg.base_url}/fscmRestApi/resources/"
             f"{self._cfg.api_version}/{self._cfg.erp_integrations_resource}"
         )
+
+    def _process_transaction_raw(self, handle: str, params: Dict[str, Any]) -> str:
+        """POST processTransaction-<handle>; return raw ParameterList string."""
         body = {
             "OperationName": f"processTransaction-{handle}",
             "ParameterList": build_parameter_list(params),
         }
-        log.debug("POST %s payload=%s", url, body)
+        log.debug("POST %s payload=%s", self._erpint_url(), body)
         try:
             resp = self._session.post(
-                url,
+                self._erpint_url(),
                 json=body,
                 headers=self._auth_headers(),
                 timeout=self._cfg.timeout_seconds,
             )
         except requests.RequestException as exc:
-            raise FusionApiError(f"POST {url} failed: {exc}") from exc
+            raise FusionApiError(
+                f"POST processTransaction-{handle} failed: {exc}"
+            ) from exc
 
         if resp.status_code >= 400:
             raise FusionApiError(
@@ -239,13 +179,19 @@ class FusionFaClient:
             ) from exc
 
         pl_raw = raw.get("ParameterList")
-        # The cycle runner expects the ParameterList string back; downstream
-        # parse_oracle_status() handles JSON or `{X_RETURN_STATUS:'S', ...}`
-        # styles equally.  We return whatever Fusion gave us, falling back
-        # to the entire response body if the field was absent.
         if pl_raw is None:
             return json.dumps(raw)
         return pl_raw if isinstance(pl_raw, str) else json.dumps(pl_raw)
+
+    def _process_transaction(self, handle: str, params: Dict[str, Any]) -> Dict[str, Any]:
+        """POST processTransaction-<handle>; return ParameterList parsed to dict.
+
+        Use this for *read* operations where the caller needs the X_*
+        fields.  For writes, use :meth:`_process_transaction_raw` so the
+        caller can decide how to interpret the response.
+        """
+        pl_raw = self._process_transaction_raw(handle, params)
+        return _parse_parameter_list(pl_raw)
 
     def _auth_headers(self) -> Dict[str, str]:
         if self._token_provider is not None:
@@ -260,26 +206,99 @@ class FusionFaClient:
             )
         return {"Authorization": f"Bearer {token}"}
 
-    def _row_to_mass_addition(self, row: Dict[str, Any]) -> MassAddition:
-        cfg = self._cfg
+    # ---- Response mapping ------------------------------------------------
+
+    def _parse_get_response(
+        self, mass_addition_id: str, pl: Dict[str, Any]
+    ) -> MassAddition:
+        """Map an ``X_*`` response from ``getMassAddition`` to ``MassAddition``.
+
+        Field mapping is best-effort against the documented X_* names.
+        Tenants with custom DFFs may need a follow-up override (deferred
+        until field naming is confirmed with the Fusion team).
+        """
+        status = str(pl.get("X_RETURN_STATUS", "")).strip()
+        if status and status != "S":
+            msg = pl.get("X_MSG_DATA") or pl.get("X_MSG_COUNT") or "(no message)"
+            raise FusionApiError(
+                f"getMassAddition returned X_RETURN_STATUS={status!r} for "
+                f"P_MASS_ADDITION_ID={mass_addition_id}: {msg}"
+            )
+
         return MassAddition(
-            mass_addition_id=str(row.get("MassAdditionId", "")),
-            book_type_code=str(row.get("BookTypeCode", "")),
-            region=str(row.get(cfg.region_field, "") or ""),
-            queue_name=str(row.get("QueueName", "NEW") or "NEW"),
-            posting_status=str(row.get("PostingStatus", "NEW") or "NEW"),
-            tag_number=_str_or_none(row.get(cfg.tag_number_attribute)),
-            serial_number=_str_or_none(row.get(cfg.serial_number_attribute)),
-            po_number=_str_or_none(row.get(cfg.po_number_field)),
-            invoice_number=_str_or_none(row.get(cfg.invoice_number_field)),
-            ship_to_location=_str_or_none(row.get("ShipToLocation")),
-            delivery_location=_str_or_none(row.get("DeliveryLocation")),
-            invoice_quantity=_int_or_none(row.get("InvoiceQuantity")),
-            received_quantity=_int_or_none(row.get("ReceivedQuantity"))
-            or _int_or_none(row.get(cfg.quantity_field)),
-            cost=_float_or_none(row.get(cfg.cost_field)),
-            source_system=str(row.get("SourceSystemCode", "OTBI") or "OTBI"),
+            mass_addition_id=str(mass_addition_id),
+            book_type_code=str(pl.get("X_BOOK_TYPE_CODE", "") or ""),
+            region=str(pl.get("X_REGION", "") or ""),  # often blank; derive externally
+            queue_name=str(pl.get("X_QUEUE_NAME", "NEW") or "NEW"),
+            posting_status=str(pl.get("X_POSTING_STATUS", "NEW") or "NEW"),
+            tag_number=_str_or_none(pl.get("X_TAG_NUMBER")),
+            serial_number=_str_or_none(pl.get("X_SERIAL_NUMBER")),
+            po_number=_str_or_none(pl.get("X_PO_NUMBER")),
+            invoice_number=_str_or_none(pl.get("X_INVOICE_NUMBER")),
+            ship_to_location=_str_or_none(pl.get("X_SHIP_TO_LOCATION")),
+            delivery_location=_str_or_none(pl.get("X_DELIVERY_LOCATION")),
+            invoice_quantity=_int_or_none(pl.get("X_PAYABLES_UNITS")),
+            received_quantity=_int_or_none(pl.get("X_UNITS"))
+            or _int_or_none(pl.get("X_PAYABLES_UNITS")),
+            cost=_float_or_none(pl.get("X_COST")),
+            source_system=str(pl.get("X_FEEDER_SYSTEM_NAME", "OTBI") or "OTBI"),
         )
+
+
+# ============================================================================
+# ParameterList parsing helpers
+# ============================================================================
+#
+# Oracle's processTransaction response can return ``ParameterList`` in a few
+# shapes depending on the operation:
+#
+#   1. Strict JSON with double-quoted keys/values:
+#         "{\"X_RETURN_STATUS\":\"S\",\"X_MSG_COUNT\":\"0\"}"
+#   2. Loose Oracle PL-format with single quotes / no quotes around keys:
+#         "{X_RETURN_STATUS:'S',X_TAG_NUMBER:'TAG1',X_COST:1500.00}"
+#   3. Already-parsed dict (rare, when Fusion serialises ParameterList early).
+#
+# ``_parse_parameter_list`` handles all three.
+
+
+_PL_PAIR_RE = re.compile(
+    r"""
+    ([A-Z_][A-Z0-9_]*)         # KEY (uppercase identifier)
+    \s* : \s*                  # colon
+    (?:
+        '([^']*)'              # 'quoted value'
+      | ([^,'}{]+?)            # bare value: greedy run, terminated by lookahead
+        \s*(?=[,}])            # followed by comma or closing brace
+    )
+    """,
+    re.VERBOSE,
+)
+
+
+def _parse_parameter_list(raw: Any) -> Dict[str, Any]:
+    if raw is None:
+        return {}
+    if isinstance(raw, dict):
+        return dict(raw)
+    s = str(raw).strip()
+    if not s:
+        return {}
+
+    # First try strict JSON.
+    try:
+        parsed = json.loads(s)
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception:
+        pass
+
+    # Fall back to Oracle PL-format scanning.
+    out: Dict[str, Any] = {}
+    for m in _PL_PAIR_RE.finditer(s):
+        key = m.group(1)
+        val = m.group(2) if m.group(2) is not None else m.group(3)
+        out[key] = val.strip() if val is not None else None
+    return out
 
 
 def _str_or_none(v: Any) -> str | None:

@@ -88,6 +88,7 @@ def _build_oracle_client(
 
     if mode == "fusion":
         from ofam_mass_additions.fusion_token_provider import build_token_provider
+        from ofam_mass_additions.oracle.discovery import build_discovery
         from ofam_mass_additions.oracle.fusion_client import (
             FusionFaClient,
             FusionFaConfig,
@@ -95,8 +96,11 @@ def _build_oracle_client(
 
         log.info("Building real Fusion FA client (base_url=%s)", oracle_block.get("base_url"))
         token_provider = build_token_provider(fusion_auth_block) if fusion_auth_block else None
+        discovery = build_discovery(oracle_block.get("discovery"))
+        log.info("Mass-addition discovery: %s", type(discovery).__name__)
         return FusionFaClient(
             FusionFaConfig.from_dict(oracle_block),
+            discovery=discovery,
             token_provider=token_provider,
         )
 
