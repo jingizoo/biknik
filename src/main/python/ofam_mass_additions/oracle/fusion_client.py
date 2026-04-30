@@ -187,7 +187,10 @@ class FusionFaClient:
             "OperationName": f"processTransaction-{handle}",
             "ParameterList": build_parameter_list(params),
         }
-        log.debug("POST %s payload=%s", self._erpint_url(), body)
+        url = self._erpint_url()
+        # INFO so operators can paste the exact wire payload into Postman /
+        # the Oracle support ticket without re-running at DEBUG.
+        log.info("POST %s body=%s", url, json.dumps(body))
 
         max_attempts = max(1, self._cfg.max_retries + 1)
         last_exc: Optional[BaseException] = None
@@ -195,7 +198,7 @@ class FusionFaClient:
         for attempt in range(1, max_attempts + 1):
             try:
                 resp = self._session.post(
-                    self._erpint_url(),
+                    url,
                     json=body,
                     headers=self._auth_headers(),
                     timeout=self._cfg.timeout_seconds,
@@ -214,6 +217,14 @@ class FusionFaClient:
                 raise FusionApiError(
                     f"POST processTransaction-{handle} failed: {exc}"
                 ) from exc
+
+            log.info(
+                "processTransaction-%s attempt %d/%d -> HTTP %d",
+                handle,
+                attempt,
+                max_attempts,
+                resp.status_code,
+            )
 
             if resp.status_code in _RETRYABLE_STATUSES and attempt < max_attempts:
                 self._sleep_before_retry(
