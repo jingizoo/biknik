@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import csv
+import logging
+from dataclasses import asdict
 from pathlib import Path
 from typing import Callable
 
@@ -11,6 +13,8 @@ from ofam_mass_additions.oracle.payloads import build_operation_payload, parse_o
 from ofam_mass_additions.rules.enrichment import apply_enrichment_rules
 from ofam_mass_additions.models import MassAddition
 
+
+log = logging.getLogger(__name__)
 
 CmdbLookup = Callable[[MassAddition], CmdbAsset | None]
 
@@ -24,6 +28,7 @@ class MassAdditionCycleRunner:
         pilot_region: str = "US",
         cmdb_lookup: CmdbLookup | None = None,
         capitalize_threshold: float = 1000.0,
+        debug_dump: bool = False,
     ) -> None:
         self.oracle_client = oracle_client
         self.run_mode = run_mode
@@ -31,6 +36,7 @@ class MassAdditionCycleRunner:
         self.pilot_region = pilot_region
         self.cmdb_lookup: CmdbLookup = cmdb_lookup or _default_cmdb_lookup
         self.capitalize_threshold = capitalize_threshold
+        self.debug_dump = debug_dump
 
         # Populated after .run() completes; publishers read these to build
         # Slack messages, GCS uploads, PagerDuty events without re-parsing
@@ -55,6 +61,15 @@ class MassAdditionCycleRunner:
                 self.pilot_region,
                 capitalize_threshold=self.capitalize_threshold,
             )
+            if self.debug_dump:
+                log.info(
+                    "row=%s decision=%s reason=%s parsed=%s cmdb=%s",
+                    mass_addition_id,
+                    decision.action,
+                    decision.reason,
+                    asdict(mass_addition),
+                    asdict(cmdb_asset) if cmdb_asset is not None else None,
+                )
 
             if decision.action == "auto_update" and decision.proposed_update is not None:
                 operation_payload = build_operation_payload("updateMassAddition", decision.proposed_update.params)

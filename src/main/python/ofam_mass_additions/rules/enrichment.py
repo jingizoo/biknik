@@ -34,7 +34,14 @@ def apply_enrichment_rules(
     status=POST so a single ``updateMassAddition`` call moves the row to
     posted state.
     """
-    if mass_addition.book_type_code != pilot_book or mass_addition.region != pilot_region:
+    if mass_addition.book_type_code != pilot_book:
+        return EnrichmentDecision(action="skip", reason="outside_pilot_scope")
+    # Fusion's getMassAddition response often omits X_REGION (the parser
+    # then sets ``region=""``). Only enforce a region match when both the
+    # pilot scope and the row declare one — book_type_code already encodes
+    # the country segment for Citadel's books, so a blank row-region
+    # shouldn't drop an otherwise valid pilot row.
+    if pilot_region and mass_addition.region and mass_addition.region != pilot_region:
         return EnrichmentDecision(action="skip", reason="outside_pilot_scope")
 
     if cmdb_asset is None:

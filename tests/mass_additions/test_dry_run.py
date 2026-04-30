@@ -73,3 +73,61 @@ def test_oracle_style_failed_response_is_exception() -> None:
     status, msg = parse_oracle_status('{"X_RETURN_STATUS":"E","X_MSG_DATA":"validation failed"}')
     assert status == "E"
     assert "validation failed" in msg
+
+
+def test_debug_dump_logs_per_row(tmp_path: Path, caplog) -> None:
+    """``--debug-dump`` prints each row's parsed fields and rule outcome
+    so operators can see why rows were skipped without re-running."""
+    import logging
+
+    rows = {
+        "MA-100": MassAddition(
+            mass_addition_id="MA-100",
+            book_type_code="CORP_BOOK",
+            region="US",
+            posting_status="NEW",
+            tag_number="TAG-100",
+        )
+    }
+    runner = MassAdditionCycleRunner(
+        oracle_client=MockOracleFaClient(rows=rows),
+        run_mode="dry-run",
+        pilot_book="CORP_BOOK",
+        pilot_region="US",
+        debug_dump=True,
+    )
+
+    with caplog.at_level(logging.INFO, logger="ofam_mass_additions.runner.cycle"):
+        runner.run(output_dir=tmp_path)
+
+    dump_lines = [r for r in caplog.records if r.message.startswith("row=")]
+    assert len(dump_lines) == 1
+    rendered = dump_lines[0].getMessage()
+    assert "row=MA-100" in rendered
+    assert "decision=auto_update" in rendered
+    assert "TAG-100" in rendered
+
+
+def test_debug_dump_off_by_default(tmp_path: Path, caplog) -> None:
+    import logging
+
+    rows = {
+        "MA-100": MassAddition(
+            mass_addition_id="MA-100",
+            book_type_code="CORP_BOOK",
+            region="US",
+            posting_status="NEW",
+            tag_number="TAG-100",
+        )
+    }
+    runner = MassAdditionCycleRunner(
+        oracle_client=MockOracleFaClient(rows=rows),
+        run_mode="dry-run",
+        pilot_book="CORP_BOOK",
+        pilot_region="US",
+    )
+
+    with caplog.at_level(logging.INFO, logger="ofam_mass_additions.runner.cycle"):
+        runner.run(output_dir=tmp_path)
+
+    assert not [r for r in caplog.records if r.message.startswith("row=")]

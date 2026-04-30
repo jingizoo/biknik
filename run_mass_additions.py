@@ -168,6 +168,14 @@ def main(argv: list[str] | None = None) -> int:
         default=os.getenv("LOG_LEVEL", "INFO"),
         help="Logging level (default: INFO).",
     )
+    p.add_argument(
+        "--debug-dump",
+        action="store_true",
+        help=(
+            "Log each parsed mass-addition row + rule decision + CMDB hit. "
+            "Use when rows are getting skipped and you need to see why."
+        ),
+    )
     args = p.parse_args(argv)
 
     log_level = getattr(logging, args.log_level.upper(), logging.INFO)
@@ -223,6 +231,7 @@ def main(argv: list[str] | None = None) -> int:
             pilot_book=pilot_book,
             pilot_region=pilot_region,
             capitalize_threshold=capitalize_threshold,
+            debug_dump=args.debug_dump,
         )
 
         _publish_optional_sinks(config, result, log)
