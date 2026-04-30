@@ -6,7 +6,7 @@
 
   "oracle": {
     "mode": "fusion",
-    "base_url": "https://lbpgjb-dev1.fa.ocs.oraclecloud.com",
+    "base_url": "https://ibpgjb-dev1.fa.ocs.oraclecloud.com",
     "api_version": "11.13.18.05",
     "verify_ssl": false,
     "require_proxy": true,

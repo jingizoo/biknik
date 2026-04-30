@@ -4,12 +4,12 @@
     "token_env": "FUSION_JWT"
   },
   "oracle": {
-    "base_url": "https://lbpgjb-dev1.fa.ocs.oraclecloud.com",
+    "base_url": "https://ibpgjb-dev1.fa.ocs.oraclecloud.com",
     "api_version": "11.13.18.05",
     "verify_ssl": false
   },
   "bip": {
-    "base_url": "https://lbpgjb-dev1.fa.ocs.oraclecloud.com",
+    "base_url": "https://ibpgjb-dev1.fa.ocs.oraclecloud.com",
     "report_path": "/Custom/FinancialsReports/All_IUT_Transfers_Rpt.xdo",
     "verify_ssl": false
   },

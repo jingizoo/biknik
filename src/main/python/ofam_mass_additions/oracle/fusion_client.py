@@ -129,11 +129,15 @@ class FusionFaClient:
         self._session = requests.Session()
         self._session.proxies = get_proxy_config(require=cfg.require_proxy)
         self._session.verify = cfg.verify_ssl
+        # Match the headers Postman uses for the working call. The
+        # Oracle ADF vendor type (``application/vnd.oracle.adf.resourceitem+json``)
+        # and ``REST-header-version`` are documented for ADF resources but
+        # are not required by ``erpintegrations/processTransaction`` and
+        # were not part of the verified-working request.
         self._session.headers.update(
             {
                 "Accept": "application/json",
-                "Content-Type": "application/vnd.oracle.adf.resourceitem+json",
-                "REST-header-version": "4",
+                "Content-Type": "application/json",
             }
         )
 
