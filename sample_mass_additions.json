@@ -27,9 +27,11 @@
   },
 
   "servicenow": {
-    "base_url": "https://citadelgroup.service-now.com",
+    "base_url": "https://citadel.service-now.com",
     "bearer_token_env": "SNOW_BEARER_TOKEN",
     "api_key_env": "SNOW_API_KEY",
+    "username": "sp_orc_fdi",
+    "password_env": "SNOW_PASSWORD",
     "table": "alm_hardware",
     "verify_ssl": false,
     "require_proxy": true,

@@ -87,6 +87,83 @@ def test_no_auth_configured_raises(monkeypatch) -> None:
         ServiceNowCmdbClient(cfg)._auth_headers()
 
 
+def test_username_password_builds_basic_header(monkeypatch) -> None:
+    """Raw username + password env var -> base64 Basic header (Postman-style)."""
+    import base64
+
+    monkeypatch.delenv("SNOW_TOKEN", raising=False)
+    monkeypatch.setenv("SNOW_PW", "p@ss:w0rd")
+    cfg = ServiceNowConfig(
+        base_url="https://snow.example.com",
+        bearer_token_env="SNOW_TOKEN",
+        username="sp_orc_fdi",
+        password_env="SNOW_PW",
+    )
+    headers = ServiceNowCmdbClient(cfg)._auth_headers()
+    expected = base64.b64encode(b"sp_orc_fdi:p@ss:w0rd").decode("ascii")
+    assert headers["Authorization"] == f"Basic {expected}"
+
+
+def test_bearer_still_wins_over_username_password(monkeypatch) -> None:
+    monkeypatch.setenv("SNOW_TOKEN", "bearer-xyz")
+    monkeypatch.setenv("SNOW_PW", "secret")
+    cfg = ServiceNowConfig(
+        base_url="https://snow.example.com",
+        bearer_token_env="SNOW_TOKEN",
+        username="sp_orc_fdi",
+        password_env="SNOW_PW",
+    )
+    headers = ServiceNowCmdbClient(cfg)._auth_headers()
+    assert headers["Authorization"] == "Bearer bearer-xyz"
+
+
+def test_username_password_wins_over_pre_encoded_api_key(monkeypatch) -> None:
+    """Pre-encoded api_key was the legacy path; raw user/pass is friendlier."""
+    import base64
+
+    monkeypatch.delenv("SNOW_TOKEN", raising=False)
+    monkeypatch.setenv("SNOW_PW", "secret")
+    monkeypatch.setenv("SNOW_KEY", "legacy-pre-encoded")
+    cfg = ServiceNowConfig(
+        base_url="https://snow.example.com",
+        bearer_token_env="SNOW_TOKEN",
+        username="sp_orc_fdi",
+        password_env="SNOW_PW",
+        api_key_env="SNOW_KEY",
+    )
+    headers = ServiceNowCmdbClient(cfg)._auth_headers()
+    expected = base64.b64encode(b"sp_orc_fdi:secret").decode("ascii")
+    assert headers["Authorization"] == f"Basic {expected}"
+
+
+def test_username_without_password_env_falls_through(monkeypatch) -> None:
+    """If password env var is unset, fall through to api_key path."""
+    monkeypatch.delenv("SNOW_TOKEN", raising=False)
+    monkeypatch.delenv("SNOW_PW", raising=False)
+    monkeypatch.setenv("SNOW_KEY", "fallback-encoded")
+    cfg = ServiceNowConfig(
+        base_url="https://snow.example.com",
+        bearer_token_env="SNOW_TOKEN",
+        username="sp_orc_fdi",
+        password_env="SNOW_PW",
+        api_key_env="SNOW_KEY",
+    )
+    headers = ServiceNowCmdbClient(cfg)._auth_headers()
+    assert headers["Authorization"] == "Basic fallback-encoded"
+
+
+def test_from_dict_reads_username_password() -> None:
+    cfg = ServiceNowConfig.from_dict(
+        {
+            "base_url": "https://snow.example.com",
+            "username": "sp_orc_fdi",
+            "password_env": "SNOW_PW",
+        }
+    )
+    assert cfg.username == "sp_orc_fdi"
+    assert cfg.password_env == "SNOW_PW"
+
+
 # ----- lookup() happy path -------------------------------------------------
 
 

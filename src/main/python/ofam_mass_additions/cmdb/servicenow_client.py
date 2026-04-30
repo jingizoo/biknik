@@ -18,6 +18,7 @@ override individual fields without forking the client.
 
 from __future__ import annotations
 
+import base64
 import logging
 import os
 from dataclasses import dataclass, field
@@ -49,6 +50,11 @@ class ServiceNowConfig:
     base_url: str
     bearer_token_env: str | None = None
     api_key_env: str | None = None
+    # Raw username + env var holding its password. When both are set we
+    # base64-encode "user:pass" ourselves and send Basic auth — same shape
+    # Postman produces from its Username/Password fields.
+    username: str | None = None
+    password_env: str | None = None
     table: str = "alm_hardware"
     timeout_seconds: int = 30
     verify_ssl: bool = True
@@ -76,6 +82,8 @@ class ServiceNowConfig:
             base_url=d["base_url"],
             bearer_token_env=d.get("bearer_token_env"),
             api_key_env=d.get("api_key_env"),
+            username=d.get("username"),
+            password_env=d.get("password_env"),
             table=d.get("table", "alm_hardware"),
             timeout_seconds=int(d.get("timeout_seconds", 30)),
             verify_ssl=bool(d.get("verify_ssl", True)),
@@ -172,6 +180,15 @@ class ServiceNowCmdbClient:
             headers["Authorization"] = f"Bearer {bearer}"
             return headers
 
+        if self._cfg.username and self._cfg.password_env:
+            password = self._read_env(self._cfg.password_env)
+            if password:
+                token = base64.b64encode(
+                    f"{self._cfg.username}:{password}".encode("utf-8")
+                ).decode("ascii")
+                headers["Authorization"] = f"Basic {token}"
+                return headers
+
         api_key = self._read_env(self._cfg.api_key_env)
         if api_key:
             # ServiceNow API keys are sent as HTTP Basic, base64-encoded
@@ -181,7 +198,8 @@ class ServiceNowCmdbClient:
             return headers
 
         raise RuntimeError(
-            "ServiceNow auth not configured: set bearer_token_env or api_key_env."
+            "ServiceNow auth not configured: set bearer_token_env, "
+            "username + password_env, or api_key_env."
         )
 
     @staticmethod
