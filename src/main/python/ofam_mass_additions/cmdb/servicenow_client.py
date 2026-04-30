@@ -117,7 +117,11 @@ class ServiceNowCmdbClient:
         """
         cmdb_field = self._cmdb_field_for(field_name)
         if cmdb_field is None:
-            log.debug("CMDB field '%s' not configured; skipping lookup", field_name)
+            log.info(
+                "CMDB skip: %s -> not configured for this tenant (value=%s)",
+                field_name,
+                value,
+            )
             return None
 
         url = f"{self._cfg.base_url.rstrip('/')}/api/now/table/{self._cfg.table}"
@@ -127,6 +131,7 @@ class ServiceNowCmdbClient:
             "sysparm_fields": ",".join(self._sysparm_fields()),
             "sysparm_limit": "1",
         }
+        log.info("GET %s?sysparm_query=%s=%s", url, cmdb_field, value)
 
         try:
             resp = self._session.get(
@@ -139,13 +144,24 @@ class ServiceNowCmdbClient:
             log.warning("ServiceNow GET failed for %s=%s: %s", cmdb_field, value, exc)
             return None
 
+        log.info(
+            "ServiceNow CMDB %s=%s -> HTTP %d", cmdb_field, value, resp.status_code
+        )
+
         if resp.status_code == 404:
             return None
         resp.raise_for_status()
 
         results = (resp.json() or {}).get("result") or []
         if not results:
+            log.info("ServiceNow CMDB %s=%s -> 0 rows", cmdb_field, value)
             return None
+        log.info(
+            "ServiceNow CMDB %s=%s -> matched sys_id=%s",
+            cmdb_field,
+            value,
+            results[0].get("sys_id"),
+        )
         return self._row_to_cmdb_asset(field_name, value, results[0])
 
     def _auth_headers(self) -> dict[str, str]:
@@ -231,13 +247,32 @@ def make_servicenow_lookup(
     client = ServiceNowCmdbClient(cfg)
 
     def _lookup(mass_addition: MassAddition) -> CmdbAsset | None:
+        log.info(
+            "CMDB lookup for mass_addition_id=%s "
+            "(tag=%s serial=%s po=%s invoice=%s)",
+            mass_addition.mass_addition_id,
+            mass_addition.tag_number,
+            mass_addition.serial_number,
+            mass_addition.po_number,
+            mass_addition.invoice_number,
+        )
         for field_name in _LOOKUP_ORDER:
             value = getattr(mass_addition, field_name, None)
             if not value:
                 continue
             hit = client.lookup(field_name=field_name, value=value)
             if hit is not None:
+                log.info(
+                    "CMDB hit for mass_addition_id=%s via %s=%s",
+                    mass_addition.mass_addition_id,
+                    field_name,
+                    value,
+                )
                 return hit
+        log.info(
+            "CMDB miss for mass_addition_id=%s (no match across tag/serial/po/invoice)",
+            mass_addition.mass_addition_id,
+        )
         return None
 
     return _lookup
