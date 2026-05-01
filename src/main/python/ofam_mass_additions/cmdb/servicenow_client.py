@@ -320,14 +320,15 @@ def _strip_label_suffix(value: Any) -> Any:
     ServiceNow's ``cost_center.name`` ships as ``"30755 - Network Hardware"``
     on Citadel's CMDB — the leading token is the actual cost center number
     that maps to Oracle FA, the rest is the human-readable description.
-    Splitting on ``" - "`` and keeping the head gives us the identifier
-    while leaving plain values (sys_ids, codes without a separator) and
-    non-strings (None, ints) untouched.
+    ``str.split(maxsplit=1)`` keeps the leading whitespace-delimited token
+    regardless of separator (ASCII ``-``, en-dash ``–``, em-dash ``—``,
+    or no dash at all), and leaves plain values (sys_ids, codes without
+    whitespace) and non-strings (None, ints) untouched.
     """
     if not isinstance(value, str):
         return value
-    head, sep, _tail = value.partition(" - ")
-    return head if sep else value
+    parts = value.split(maxsplit=1)
+    return parts[0] if parts else value
 
 
 def _to_id(value: Any) -> int | str | None:

@@ -383,7 +383,15 @@ def test_lookup_strips_cost_center_name_description(monkeypatch) -> None:
 def test_strip_label_suffix_handles_common_shapes() -> None:
     from ofam_mass_additions.cmdb.servicenow_client import _strip_label_suffix
 
+    # ASCII hyphen with surrounding spaces (what we expect from CMDB)
     assert _strip_label_suffix("30755 - Network Hardware") == "30755"
+    # En-dash (U+2013) — some CMDB labels arrive with this instead of '-'
+    assert _strip_label_suffix("30755 – Network Hardware") == "30755"
+    # Em-dash (U+2014)
+    assert _strip_label_suffix("30755 — Network Hardware") == "30755"
+    # No dash at all, just space-separated description
+    assert _strip_label_suffix("30755 Network Hardware") == "30755"
+    # Single-token values pass through (sys_ids, codes, plain numbers)
     assert _strip_label_suffix("30755") == "30755"
     assert _strip_label_suffix("ENG-NA") == "ENG-NA"
     assert _strip_label_suffix("cbdd9bf56f897100142fbc775b3ee4c2") == (
