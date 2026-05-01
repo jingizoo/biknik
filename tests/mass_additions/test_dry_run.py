@@ -220,6 +220,41 @@ def test_oracle_translations_replace_string_ids_with_ints(tmp_path: Path) -> Non
     assert params["P_DEPRN_EXPENSE_CCID_TBL"] == [682610]
 
 
+def test_translation_runs_even_with_no_map_configured(tmp_path: Path) -> None:
+    """Without an oracle_translations block, string IDs from CMDB still
+    get reset to None — they must never reach Oracle as quoted strings."""
+    from ofam_mass_additions.models import CmdbAsset
+
+    rows = {
+        "MA-700": MassAddition(
+            mass_addition_id="MA-700",
+            book_type_code="CORP_BOOK",
+            region="US",
+            posting_status="NEW",
+            tag_number="TAG-700",
+            cost=100.0,
+            received_quantity=1,
+        )
+    }
+    runner = MassAdditionCycleRunner(
+        oracle_client=MockOracleFaClient(rows=rows),
+        run_mode="dry-run",
+        pilot_book="CORP_BOOK",
+        pilot_region="US",
+        cmdb_lookup=lambda _: CmdbAsset(
+            source_key="tag_number",
+            source_value="TAG-700",
+            location_id="a75acddd9771a190f8daf157f053afbf",  # sys_id
+            expense_ccid=42,
+            employee_id=None,
+        ),
+        # No oracle_translations passed at all.
+    )
+    result = runner.run(output_dir=tmp_path)
+    assert result["exception"] == 1
+    assert "Missing location" in (tmp_path / "exceptions.csv").read_text("utf-8")
+
+
 def test_oracle_translations_missing_entry_fails_enrichment(tmp_path: Path) -> None:
     """Untranslated string -> None -> rule emits 'Missing X' exception
     instead of letting a quoted string reach Oracle."""

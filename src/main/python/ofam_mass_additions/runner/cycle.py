@@ -170,7 +170,7 @@ def _apply_cmdb_override(
 
 def _translate_oracle_ids(
     cmdb_asset: CmdbAsset | None,
-    translations: dict[str, dict[str, int]],
+    translations: dict[str, dict[str, int]] | None,
 ) -> CmdbAsset | None:
     """Translate string CMDB values into Oracle FA numeric IDs.
 
@@ -178,13 +178,14 @@ def _translate_oracle_ids(
     ``expense_ccid``, ``employee_id``). Values are dicts mapping the
     CMDB-side strings (location codes, sys_ids) to Oracle FA's numeric
     IDs. Ints already on the asset (override-supplied or naturally
-    numeric) pass through unchanged. Strings missing from the map are
-    reset to ``None`` so the rule layer raises 'Missing X' instead of
-    letting a wrongly-quoted value leak into the Oracle ParameterList
-    (Oracle FA expects unquoted ints there).
+    numeric) pass through unchanged. Strings missing from the map (or
+    when no map is configured) are reset to ``None`` so the rule layer
+    raises 'Missing X' instead of letting a wrongly-quoted value leak
+    into the Oracle ParameterList — Oracle FA expects unquoted ints.
     """
-    if cmdb_asset is None or not translations:
+    if cmdb_asset is None:
         return cmdb_asset
+    translations = translations or {}
     for field_name in ("location_id", "expense_ccid", "employee_id"):
         current = getattr(cmdb_asset, field_name)
         if not isinstance(current, str):
