@@ -152,6 +152,53 @@ def test_username_without_password_env_falls_through(monkeypatch) -> None:
     assert headers["Authorization"] == "Basic fallback-encoded"
 
 
+def test_debug_dump_logs_raw_row(monkeypatch, caplog) -> None:
+    """When debug_dump is on, the matched CMDB row is logged so an operator
+    can see which columns came back populated and which didn't."""
+    import logging
+
+    monkeypatch.setenv("SNOW_TOKEN", "tok")
+    cfg = ServiceNowConfig(
+        base_url="https://snow.example.com",
+        bearer_token_env="SNOW_TOKEN",
+        debug_dump=True,
+    )
+    client = ServiceNowCmdbClient(cfg)
+    row = {
+        "sys_id": "abc",
+        "asset_tag": "TAG-1",
+        "location.u_fin_location_id": "",
+        "cost_center.value": "",
+    }
+    with patch.object(client._session, "get", return_value=_ok_response([row])):
+        with caplog.at_level(
+            logging.INFO, logger="ofam_mass_additions.cmdb.servicenow_client"
+        ):
+            client.lookup(field_name="tag_number", value="TAG-1")
+
+    dump_lines = [r for r in caplog.records if "raw row contents" in r.getMessage()]
+    assert len(dump_lines) == 1
+    assert "TAG-1" in dump_lines[0].getMessage()
+
+
+def test_debug_dump_off_by_default(monkeypatch, caplog) -> None:
+    import logging
+
+    monkeypatch.setenv("SNOW_TOKEN", "tok")
+    cfg = ServiceNowConfig(
+        base_url="https://snow.example.com",
+        bearer_token_env="SNOW_TOKEN",
+    )
+    client = ServiceNowCmdbClient(cfg)
+    row = {"sys_id": "abc", "asset_tag": "TAG-1"}
+    with patch.object(client._session, "get", return_value=_ok_response([row])):
+        with caplog.at_level(
+            logging.INFO, logger="ofam_mass_additions.cmdb.servicenow_client"
+        ):
+            client.lookup(field_name="tag_number", value="TAG-1")
+    assert not [r for r in caplog.records if "raw row contents" in r.getMessage()]
+
+
 def test_from_dict_reads_username_password() -> None:
     cfg = ServiceNowConfig.from_dict(
         {

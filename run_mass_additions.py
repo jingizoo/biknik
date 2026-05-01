@@ -209,6 +209,9 @@ def main(argv: list[str] | None = None) -> int:
         if not sn_block:
             raise ConfigError("Config must include a 'servicenow' block.")
         sn_cfg = ServiceNowConfig.from_dict(sn_block)
+        if args.debug_dump:
+            from dataclasses import replace as _dc_replace
+            sn_cfg = _dc_replace(sn_cfg, debug_dump=True)
 
         oracle_client = _build_oracle_client(
             config.get("oracle") or {},

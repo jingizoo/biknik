@@ -59,6 +59,10 @@ class ServiceNowConfig:
     timeout_seconds: int = 30
     verify_ssl: bool = True
     require_proxy: bool = False
+    # When True the client logs the raw matched ServiceNow row at INFO,
+    # so the operator can see exactly which columns came back populated.
+    # Plumbed from ``run_mass_additions.py --debug-dump``.
+    debug_dump: bool = False
 
     # CMDB column names (override when tenant uses custom fields).
     asset_tag_field: str = "asset_tag"
@@ -170,6 +174,8 @@ class ServiceNowCmdbClient:
             value,
             results[0].get("sys_id"),
         )
+        if self._cfg.debug_dump:
+            log.info("CMDB raw row contents: %r", results[0])
         return self._row_to_cmdb_asset(field_name, value, results[0])
 
     def _auth_headers(self) -> dict[str, str]:
