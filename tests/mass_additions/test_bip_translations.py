@@ -123,6 +123,25 @@ def test_load_builds_translations_dict(monkeypatch) -> None:
     assert result["employee_id"] == {"E12345": 99001}
 
 
+def test_load_logs_raw_xml_when_zero_rows(monkeypatch, caplog) -> None:
+    """When the BIP report returns 0 G_1 rows, dump the raw XML so the
+    operator can see what the report actually produced."""
+    import logging
+
+    monkeypatch.setenv("FUSION_TOKEN", "tok")
+    empty_xml = "<DATA_DS><P_BOOK_TYPE_CODE>US CORP BOOK</P_BOOK_TYPE_CODE></DATA_DS>"
+    loader = BipTranslationsLoader(_make_cfg())
+    with patch.object(loader._session, "post", return_value=_ok_response(empty_xml)):
+        with caplog.at_level(
+            logging.WARNING, logger="ofam_mass_additions.cmdb.bip_translations"
+        ):
+            result = loader.load()
+
+    assert result == {"location_id": {}, "expense_ccid": {}, "employee_id": {}}
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any("0 G_1 rows" in m and "P_BOOK_TYPE_CODE" in m for m in msgs)
+
+
 def test_load_skips_unknown_field(monkeypatch) -> None:
     monkeypatch.setenv("FUSION_TOKEN", "tok")
     xml = dedent("""\

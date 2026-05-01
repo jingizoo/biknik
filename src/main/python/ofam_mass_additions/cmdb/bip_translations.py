@@ -100,7 +100,16 @@ class BipTranslationsLoader:
             self._cfg.report_path,
             self._cfg.book_type_code,
         )
-        rows = self._run_report()
+        report_xml = self._run_report_raw()
+        rows = _parse_g1_rows(report_xml)
+        if not rows:
+            log.warning(
+                "BIP report returned 0 G_1 rows. First 800 bytes of "
+                "report XML follow — confirm the SQL inside %s actually "
+                "produces TRANSLATION_FIELD/CMDB_CODE/ORACLE_FA_ID columns.\n%s",
+                self._cfg.report_path,
+                report_xml[:800].decode("utf-8", errors="replace"),
+            )
         translations: dict[str, dict[str, int]] = {f: {} for f in _KNOWN_FIELDS}
         skipped = 0
         for row in rows:
@@ -132,7 +141,7 @@ class BipTranslationsLoader:
         )
         return translations
 
-    def _run_report(self) -> list[dict[str, str]]:
+    def _run_report_raw(self) -> bytes:
         payload = self._build_soap_envelope()
         url = f"{self._cfg.base_url}/xmlpserver/services/ExternalReportWSSService"
         log.info("BIP SOAP POST %s", url)
@@ -149,8 +158,7 @@ class BipTranslationsLoader:
             raise ConfigError(
                 f"BIP report HTTP {resp.status_code}: {resp.text[:400]}"
             )
-        report_bytes = _extract_report_bytes(resp.content)
-        return _parse_g1_rows(report_bytes)
+        return _extract_report_bytes(resp.content)
 
     def _auth_headers(self) -> dict[str, str]:
         if self._token_provider:
