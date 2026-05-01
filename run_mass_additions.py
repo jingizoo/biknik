@@ -63,7 +63,18 @@ from ofam_mass_additions.runner.live_run import LiveRunResult, run_live  # noqa:
 
 
 def _load_config(path: str) -> dict:
-    raw = Path(path).read_text()
+    """Read + parse the config JSON, tolerating Windows-saved cp1252 files."""
+    raw_bytes = Path(path).read_bytes()
+    for encoding in ("utf-8-sig", "utf-8", "cp1252"):
+        try:
+            raw = raw_bytes.decode(encoding)
+            break
+        except UnicodeDecodeError:
+            continue
+    else:
+        raise ConfigError(
+            f"Config could not be decoded as utf-8 or cp1252: {path}"
+        )
     try:
         return json.loads(raw)
     except Exception as e:
