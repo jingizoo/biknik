@@ -9,7 +9,7 @@ from typing import Callable
 from ofam_mass_additions.audit.writer import write_audit_log, write_exceptions, write_proposed_updates
 from ofam_mass_additions.cmdb.mock_lookup import lookup_cmdb_asset as _default_cmdb_lookup
 from ofam_mass_additions.models import AuditEvent, CmdbAsset, ExceptionRecord, ProposedOracleUpdate
-from ofam_mass_additions.oracle.payloads import build_operation_payload, parse_oracle_status
+from ofam_mass_additions.oracle.payloads import parse_oracle_status
 from ofam_mass_additions.rules.enrichment import apply_enrichment_rules
 from ofam_mass_additions.models import MassAddition
 
@@ -82,7 +82,6 @@ class MassAdditionCycleRunner:
                 )
 
             if decision.action == "auto_update" and decision.proposed_update is not None:
-                operation_payload = build_operation_payload("updateMassAddition", decision.proposed_update.params)
                 proposed.append(decision.proposed_update)
 
                 if self.run_mode != "live":
@@ -96,7 +95,13 @@ class MassAdditionCycleRunner:
                     )
                     continue
 
-                response_parameter_list = self.oracle_client.update_mass_addition(operation_payload)
+                # Pass the raw UPPERCASE params dict; FusionFaClient owns the
+                # OperationName + ParameterList wrapping.  Wrapping it here
+                # too caused build_parameter_list to choke on the lower-case
+                # "OperationName" / "ParameterList" keys.
+                response_parameter_list = self.oracle_client.update_mass_addition(
+                    decision.proposed_update.params
+                )
                 status, message = parse_oracle_status(response_parameter_list)
                 if status == "S":
                     audit_events.append(AuditEvent(mass_addition_id, "updateMassAddition", "success", message or "updated"))

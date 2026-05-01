@@ -67,6 +67,51 @@ def test_live_mode_records_oracle_errors_as_exceptions(tmp_path: Path) -> None:
     assert payload["status"] == "exception"
 
 
+class CapturingOracleClient(MockOracleFaClient):
+    """Records the exact dict update_mass_addition() was called with."""
+
+    captured_payload: dict | None = None
+
+    def update_mass_addition(self, payload: dict[str, str]) -> str:
+        type(self).captured_payload = payload
+        return '{"X_RETURN_STATUS":"S","X_MSG_DATA":"updated"}'
+
+
+def test_live_mode_passes_raw_uppercase_params_not_wrapped_payload(tmp_path: Path) -> None:
+    """update_mass_addition must receive the inner UPPERCASE params dict.
+
+    Wrapping it with {OperationName, ParameterList} before this point
+    double-wraps it inside FusionFaClient.process_transaction_raw and
+    fails the uppercase check on the second pass.
+    """
+    rows = {
+        "MA-100": MassAddition(
+            mass_addition_id="MA-100",
+            book_type_code="CORP_BOOK",
+            region="US",
+            posting_status="NEW",
+            tag_number="TAG-100",
+        )
+    }
+    CapturingOracleClient.captured_payload = None
+    runner = MassAdditionCycleRunner(
+        oracle_client=CapturingOracleClient(rows=rows),
+        run_mode="live",
+        pilot_book="CORP_BOOK",
+        pilot_region="US",
+    )
+    runner.run(output_dir=tmp_path)
+
+    payload = CapturingOracleClient.captured_payload
+    assert payload is not None
+    # No outer envelope keys — those belong inside the FA client.
+    assert "OperationName" not in payload
+    assert "ParameterList" not in payload
+    # Every key the runner sent is UPPERCASE so build_parameter_list passes.
+    assert payload, "expected non-empty params dict"
+    assert all(k == k.upper() for k in payload), payload
+
+
 def test_oracle_style_failed_response_is_exception() -> None:
     from ofam_mass_additions.oracle.payloads import parse_oracle_status
 
