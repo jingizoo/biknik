@@ -225,7 +225,9 @@ class ServiceNowCmdbClient:
 
     def _sysparm_fields(self) -> list[str]:
         # Always include sys_id + every field we map into CmdbAsset.
-        names = [
+        # Optional fields (employee_id_field, category_field, etc.) may be
+        # configured as null in JSON; skip those.
+        candidates = [
             "sys_id",
             self._cfg.asset_tag_field,
             self._cfg.serial_number_field,
@@ -234,6 +236,7 @@ class ServiceNowCmdbClient:
             self._cfg.employee_id_field,
             self._cfg.category_field,
         ]
+        names = [n for n in candidates if n]
         if self._cfg.ccid_active_field:
             names.append(self._cfg.ccid_active_field)
         names.extend(self._cfg.extra_fields)
@@ -249,12 +252,16 @@ class ServiceNowCmdbClient:
             raw = row.get(self._cfg.ccid_active_field)
             ccid_active = _to_bool(raw, default=True)
 
+        # Use _to_id (int when parseable, otherwise the trimmed string).
+        # The deeper SNOW paths return codes like "LC000238" or 32-char
+        # sys_ids — both are strings, both must flow through.
+        emp_field = self._cfg.employee_id_field
         return CmdbAsset(
             source_key=source_key,
             source_value=source_value,
-            location_id=_to_int(row.get(self._cfg.location_id_field)),
-            expense_ccid=_to_int(row.get(self._cfg.expense_ccid_field)),
-            employee_id=_to_int(row.get(self._cfg.employee_id_field)),
+            location_id=_to_id(row.get(self._cfg.location_id_field)),
+            expense_ccid=_to_id(row.get(self._cfg.expense_ccid_field)),
+            employee_id=_to_id(row.get(emp_field)) if emp_field else None,
             ccid_active=ccid_active,
         )
 
@@ -315,6 +322,28 @@ def _to_int(value: Any) -> int | None:
         return int(s)
     except ValueError:
         return None
+
+
+def _to_id(value: Any) -> int | str | None:
+    """Coerce to int when parseable, otherwise return the trimmed string.
+
+    CMDB returns:
+      * numeric strings ("682610")          -> int 682610
+      * code strings ("LC000238")            -> str "LC000238"
+      * 32-char sys_ids ("a75ac…")           -> str "a75ac…"
+      * empty / missing                      -> None
+    """
+    if value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    s = str(value).strip()
+    if not s:
+        return None
+    try:
+        return int(s)
+    except ValueError:
+        return s
 
 
 def _to_bool(value: Any, *, default: bool) -> bool:

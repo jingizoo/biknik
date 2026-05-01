@@ -96,3 +96,32 @@ def test_auto_update_carries_cmdb_fields_into_payload() -> None:
     assert params["P_DEPRN_EXPENSE_CCID_TBL"] == [42]
     assert params["P_EMPLOYEE_ID_TBL"] == [7]
     assert params["P_TAG_NUMBER"] == "TAG-100"
+
+
+def test_auto_update_omits_employee_when_cmdb_has_none() -> None:
+    """Servers / unowned assets have no assigned_to in CMDB. Don't send
+    P_EMPLOYEE_ID_TBL=[None] — Oracle would reject that."""
+    decision = apply_enrichment_rules(
+        _ma(),
+        _cmdb(employee_id=None),
+        "US CORP BOOK",
+        "US",
+    )
+    assert decision.action == "auto_update"
+    assert decision.proposed_update is not None
+    assert "P_EMPLOYEE_ID_TBL" not in decision.proposed_update.params
+
+
+def test_auto_update_passes_string_location_codes_through() -> None:
+    """CMDB returns location codes ('LC000238'); they flow into the
+    payload as-is until Oracle-ID translation is wired up."""
+    decision = apply_enrichment_rules(
+        _ma(),
+        _cmdb(location_id="LC000238", expense_ccid="cc-sysid-abc"),
+        "US CORP BOOK",
+        "US",
+    )
+    assert decision.action == "auto_update"
+    params = decision.proposed_update.params
+    assert params["P_LOCATION_ID_TBL"] == ["LC000238"]
+    assert params["P_DEPRN_EXPENSE_CCID_TBL"] == ["cc-sysid-abc"]

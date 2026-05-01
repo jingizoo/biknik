@@ -29,6 +29,7 @@ class MassAdditionCycleRunner:
         cmdb_lookup: CmdbLookup | None = None,
         capitalize_threshold: float = 1000.0,
         debug_dump: bool = False,
+        cmdb_overrides: dict[str, dict] | None = None,
     ) -> None:
         self.oracle_client = oracle_client
         self.run_mode = run_mode
@@ -37,6 +38,7 @@ class MassAdditionCycleRunner:
         self.cmdb_lookup: CmdbLookup = cmdb_lookup or _default_cmdb_lookup
         self.capitalize_threshold = capitalize_threshold
         self.debug_dump = debug_dump
+        self.cmdb_overrides = cmdb_overrides or {}
 
         # Populated after .run() completes; publishers read these to build
         # Slack messages, GCS uploads, PagerDuty events without re-parsing
@@ -54,6 +56,9 @@ class MassAdditionCycleRunner:
         for mass_addition_id in self.oracle_client.list_new_mass_addition_ids(book_type_code=self.pilot_book):
             mass_addition = self.oracle_client.get_mass_addition(mass_addition_id)
             cmdb_asset = self.cmdb_lookup(mass_addition)
+            cmdb_asset = _apply_cmdb_override(
+                cmdb_asset, mass_addition, self.cmdb_overrides
+            )
             decision = apply_enrichment_rules(
                 mass_addition,
                 cmdb_asset,
@@ -113,6 +118,45 @@ class MassAdditionCycleRunner:
             "auto_update": len(proposed),
             "exception": len(exceptions),
         }
+
+
+def _apply_cmdb_override(
+    cmdb_asset: CmdbAsset | None,
+    mass_addition: MassAddition,
+    overrides: dict[str, dict],
+) -> CmdbAsset | None:
+    """Replace CmdbAsset fields with values from the per-asset override map.
+
+    Override key is matched against ``tag_number`` first, then
+    ``mass_addition_id``. When CMDB returned no row at all but an
+    override exists, build a synthetic CmdbAsset so the row can still
+    proceed through the rules.
+    """
+    if not overrides:
+        return cmdb_asset
+    key = mass_addition.tag_number or mass_addition.mass_addition_id
+    override = overrides.get(key)
+    if override is None:
+        return cmdb_asset
+    log.info(
+        "Applying cmdb_overrides for %s: %s",
+        key,
+        {k: v for k, v in override.items() if not k.startswith("_")},
+    )
+    if cmdb_asset is None:
+        cmdb_asset = CmdbAsset(
+            source_key="override",
+            source_value=str(key),
+            location_id=None,
+            expense_ccid=None,
+            employee_id=None,
+        )
+    for field_name in ("location_id", "expense_ccid", "employee_id"):
+        if field_name in override:
+            setattr(cmdb_asset, field_name, override[field_name])
+    if "ccid_active" in override:
+        cmdb_asset.ccid_active = bool(override["ccid_active"])
+    return cmdb_asset
 
 
 def seed_oracle_rows_from_csv(input_csv: Path) -> dict[str, "MassAddition"]:

@@ -108,6 +108,74 @@ def test_debug_dump_logs_per_row(tmp_path: Path, caplog) -> None:
     assert "TAG-100" in rendered
 
 
+def test_cmdb_overrides_replace_lookup_values(tmp_path: Path) -> None:
+    """Per-asset overrides patch CmdbAsset fields so a row whose CMDB
+    return is missing/wrong-typed fields can still produce an
+    auto_update payload (used to ship demo cases)."""
+    rows = {
+        "MA-200": MassAddition(
+            mass_addition_id="MA-200",
+            book_type_code="CORP_BOOK",
+            region="US",
+            posting_status="NEW",
+            tag_number="C42105000676",
+            cost=14877.81,
+            received_quantity=1,
+        )
+    }
+
+    def empty_lookup(_):
+        return None
+
+    runner = MassAdditionCycleRunner(
+        oracle_client=MockOracleFaClient(rows=rows),
+        run_mode="dry-run",
+        pilot_book="CORP_BOOK",
+        pilot_region="US",
+        cmdb_lookup=empty_lookup,
+        cmdb_overrides={
+            "C42105000676": {
+                "location_id": 300000004974106,
+                "expense_ccid": 682610,
+                "employee_id": None,
+            }
+        },
+    )
+
+    result = runner.run(output_dir=tmp_path)
+    assert result["auto_update"] == 1
+    assert result["exception"] == 0
+
+
+def test_cmdb_overrides_keyed_by_mass_addition_id_when_no_tag(tmp_path: Path) -> None:
+    """Fall back to mass_addition_id when the row has no tag_number."""
+    rows = {
+        "300000023592395": MassAddition(
+            mass_addition_id="300000023592395",
+            book_type_code="CORP_BOOK",
+            region="US",
+            posting_status="NEW",
+            tag_number=None,
+            cost=27266.0,
+            received_quantity=1,
+        )
+    }
+    runner = MassAdditionCycleRunner(
+        oracle_client=MockOracleFaClient(rows=rows),
+        run_mode="dry-run",
+        pilot_book="CORP_BOOK",
+        pilot_region="US",
+        cmdb_lookup=lambda _: None,
+        cmdb_overrides={
+            "300000023592395": {
+                "location_id": 999, "expense_ccid": 1, "employee_id": None,
+            }
+        },
+    )
+    result = runner.run(output_dir=tmp_path)
+    assert result["auto_update"] == 1
+
+
 def test_debug_dump_off_by_default(tmp_path: Path, caplog) -> None:
     import logging
 

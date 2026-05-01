@@ -226,6 +226,14 @@ def main(argv: list[str] | None = None) -> int:
             config.get("capitalize_threshold_amount", 1000.0)
         )
 
+        # Per-asset stubs from JSON; entries whose key starts with "_"
+        # are ignored so the sample can ship example values inline
+        # without applying them.
+        raw_overrides = config.get("cmdb_overrides") or {}
+        cmdb_overrides = {
+            k: v for k, v in raw_overrides.items() if not k.startswith("_")
+        }
+
         result = run_live(
             oracle_client=oracle_client,
             servicenow_config=sn_cfg,
@@ -235,6 +243,7 @@ def main(argv: list[str] | None = None) -> int:
             pilot_region=pilot_region,
             capitalize_threshold=capitalize_threshold,
             debug_dump=args.debug_dump,
+            cmdb_overrides=cmdb_overrides,
         )
 
         _publish_optional_sinks(config, result, log)

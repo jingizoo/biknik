@@ -326,20 +326,58 @@ def test_lookup_parses_ccid_active_field_when_configured(monkeypatch) -> None:
     assert hit.ccid_active is False
 
 
-def test_lookup_returns_none_int_on_non_numeric_field(monkeypatch) -> None:
+def test_lookup_keeps_string_codes_for_non_numeric_ids(monkeypatch) -> None:
+    """Deeper field paths (e.g. location.u_fin_location_id.u_cit_location_code)
+    return strings like 'LC000238'; those must flow through, not be dropped."""
+    monkeypatch.setenv("SNOW_TOKEN", "tok")
+    cfg = _config()
+    client = ServiceNowCmdbClient(cfg)
+    row = {
+        "sys_id": "x",
+        "asset_tag": "TAG-X",
+        cfg.location_id_field: "LC000238",
+        cfg.expense_ccid_field: "cc-sysid-abc",
+        cfg.employee_id_field: "12345",
+    }
+    with patch.object(client._session, "get", return_value=_ok_response([row])):
+        hit = client.lookup(field_name="tag_number", value="TAG-X")
+    assert hit is not None
+    assert hit.location_id == "LC000238"
+    assert hit.expense_ccid == "cc-sysid-abc"
+    assert hit.employee_id == 12345
+
+
+def test_lookup_skips_employee_when_field_is_null(monkeypatch) -> None:
+    """When employee_id_field is configured as null in JSON, don't query it."""
+    from dataclasses import replace as _dc_replace
+
+    monkeypatch.setenv("SNOW_TOKEN", "tok")
+    cfg = _dc_replace(_config(), employee_id_field=None)
+    client = ServiceNowCmdbClient(cfg)
+    row = {"sys_id": "x", "asset_tag": "TAG-X", "location.u_fin_location_id": "1"}
+    with patch.object(client._session, "get", return_value=_ok_response([row])):
+        hit = client.lookup(field_name="tag_number", value="TAG-X")
+    assert hit is not None
+    assert hit.employee_id is None
+
+
+def test_lookup_handles_mixed_numeric_and_string_ids(monkeypatch) -> None:
+    """Empty/None still parses to None, but non-numeric labels survive
+    as strings (cost-center sys_ids, location codes) — Oracle FA
+    translation happens later via cmdb_overrides or a join layer."""
     monkeypatch.setenv("SNOW_TOKEN", "tok")
     client = ServiceNowCmdbClient(_config())
     row = {
         "asset_tag": "T",
         "location.u_fin_location_id": "",
-        "cost_center.value": "ENG-NA",  # non-numeric label
+        "cost_center.value": "ENG-NA",
         "assigned_to.u_employee_id": None,
     }
     with patch.object(client._session, "get", return_value=_ok_response([row])):
         hit = client.lookup(field_name="tag_number", value="T")
     assert hit is not None
     assert hit.location_id is None
-    assert hit.expense_ccid is None
+    assert hit.expense_ccid == "ENG-NA"
     assert hit.employee_id is None
 
 

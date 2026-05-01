@@ -66,8 +66,11 @@ def apply_enrichment_rules(
         "P_ASSET_TYPE": asset_type,
         "P_LOCATION_ID_TBL": [cmdb_asset.location_id],
         "P_DEPRN_EXPENSE_CCID_TBL": [cmdb_asset.expense_ccid],
-        "P_EMPLOYEE_ID_TBL": [cmdb_asset.employee_id],
     }
+    # Many CMDB rows (servers, infrastructure) have no assigned_to.
+    # Don't send P_EMPLOYEE_ID_TBL=[None] — Oracle would reject that.
+    if cmdb_asset.employee_id is not None:
+        params["P_EMPLOYEE_ID_TBL"] = [cmdb_asset.employee_id]
     if mass_addition.tag_number:
         params["P_TAG_NUMBER"] = mass_addition.tag_number
     if mass_addition.serial_number:
