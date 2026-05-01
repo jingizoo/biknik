@@ -28,10 +28,14 @@ class MassAddition:
 class CmdbAsset:
     source_key: str
     source_value: str
-    location_id: int | None
-    expense_ccid: int | None
-    employee_id: int | None
-    category_id: int | None = None
+    # Oracle FA expects numeric IDs (P_LOCATION_ID_TBL = 300000004974106).
+    # CMDB stores codes ("LC000238") or sys_ids — these flow through as
+    # strings; the cycle runner translates them to Oracle FA IDs via
+    # ``oracle_translations`` (or replaces them via ``cmdb_overrides``)
+    # before the payload is built.
+    location_id: int | str | None
+    expense_ccid: int | str | None
+    employee_id: int | str | None
     ccid_active: bool = True
 
 

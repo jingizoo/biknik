@@ -22,7 +22,9 @@ from __future__ import annotations
 import json
 import logging
 import os
+import random
 import re
+import time
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Optional
 
@@ -35,6 +37,22 @@ from ofam_mass_additions.oracle.paramlist import build_parameter_list
 from ofam_mass_additions.proxy_config import get_proxy_config
 
 log = logging.getLogger(__name__)
+
+
+# HTTP statuses Fusion / its CDN (Akamai) return for transient conditions:
+#   408 Request Timeout, 429 Too Many Requests,
+#   500 Internal Server Error, 502 Bad Gateway, 503 Service Unavailable
+#   (incl. "DNS failure" pages from Akamai), 504 Gateway Timeout.
+_RETRYABLE_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
+
+# Network-layer failures that warrant a retry. ``Timeout`` and
+# ``ConnectionError`` are subclasses of ``RequestException`` but the
+# converse is not true (e.g. ``InvalidURL`` should not retry), so the
+# explicit tuple matters.
+_RETRYABLE_EXCEPTIONS: tuple[type[BaseException], ...] = (
+    requests.ConnectionError,
+    requests.Timeout,
+)
 
 
 @dataclass(frozen=True)
@@ -56,6 +74,14 @@ class FusionFaConfig:
     require_proxy: bool = False
     timeout_seconds: int = 60
     erp_integrations_resource: str = "erpintegrations"
+    # Retry behaviour for transient HTTP / network failures. ``max_retries``
+    # is the count of *additional* attempts after the first, so the total
+    # number of POSTs is ``max_retries + 1``. A 503 from Akamai's edge with
+    # "DNS failure" or a momentary connection reset are exactly what these
+    # absorb; permanent 4xx responses still fail fast.
+    max_retries: int = 4
+    retry_backoff_seconds: float = 1.0
+    retry_max_backoff_seconds: float = 30.0
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "FusionFaConfig":
@@ -71,6 +97,9 @@ class FusionFaConfig:
             erp_integrations_resource=str(
                 d.get("erp_integrations_resource", "erpintegrations")
             ),
+            max_retries=int(d.get("max_retries", 4)),
+            retry_backoff_seconds=float(d.get("retry_backoff_seconds", 1.0)),
+            retry_max_backoff_seconds=float(d.get("retry_max_backoff_seconds", 30.0)),
         )
 
 
@@ -100,11 +129,15 @@ class FusionFaClient:
         self._session = requests.Session()
         self._session.proxies = get_proxy_config(require=cfg.require_proxy)
         self._session.verify = cfg.verify_ssl
+        # Match the headers Postman uses for the working call. The
+        # Oracle ADF vendor type (``application/vnd.oracle.adf.resourceitem+json``)
+        # and ``REST-header-version`` are documented for ADF resources but
+        # are not required by ``erpintegrations/processTransaction`` and
+        # were not part of the verified-working request.
         self._session.headers.update(
             {
                 "Accept": "application/json",
-                "Content-Type": "application/vnd.oracle.adf.resourceitem+json",
-                "REST-header-version": "4",
+                "Content-Type": "application/json",
             }
         )
 
@@ -146,42 +179,119 @@ class FusionFaClient:
         )
 
     def _process_transaction_raw(self, handle: str, params: Dict[str, Any]) -> str:
-        """POST processTransaction-<handle>; return raw ParameterList string."""
+        """POST processTransaction-<handle>; return raw ParameterList string.
+
+        Retries transient failures (network errors and HTTP 408/429/5xx)
+        with exponential backoff + jitter; honours ``Retry-After`` when the
+        server sets it. Both Fusion handles in use are keyed by
+        ``P_MASS_ADDITION_ID`` and idempotent in effect, so retrying after
+        a partial failure is safe.
+        """
         body = {
             "OperationName": f"processTransaction-{handle}",
             "ParameterList": build_parameter_list(params),
         }
-        log.debug("POST %s payload=%s", self._erpint_url(), body)
-        try:
-            resp = self._session.post(
-                self._erpint_url(),
-                json=body,
-                headers=self._auth_headers(),
-                timeout=self._cfg.timeout_seconds,
+        url = self._erpint_url()
+        # INFO so operators can paste the exact wire payload into Postman /
+        # the Oracle support ticket without re-running at DEBUG.
+        log.info("POST %s body=%s", url, json.dumps(body))
+
+        max_attempts = max(1, self._cfg.max_retries + 1)
+        last_exc: Optional[BaseException] = None
+
+        for attempt in range(1, max_attempts + 1):
+            try:
+                resp = self._session.post(
+                    url,
+                    json=body,
+                    headers=self._auth_headers(),
+                    timeout=self._cfg.timeout_seconds,
+                )
+            except _RETRYABLE_EXCEPTIONS as exc:
+                last_exc = exc
+                if attempt >= max_attempts:
+                    raise FusionApiError(
+                        f"POST processTransaction-{handle} failed after "
+                        f"{attempt} attempt(s): {exc}"
+                    ) from exc
+                self._sleep_before_retry(handle, attempt, reason=str(exc))
+                continue
+            except requests.RequestException as exc:
+                # Non-retryable network failure (e.g. InvalidURL).
+                raise FusionApiError(
+                    f"POST processTransaction-{handle} failed: {exc}"
+                ) from exc
+
+            log.info(
+                "processTransaction-%s attempt %d/%d -> HTTP %d",
+                handle,
+                attempt,
+                max_attempts,
+                resp.status_code,
             )
-        except requests.RequestException as exc:
-            raise FusionApiError(
-                f"POST processTransaction-{handle} failed: {exc}"
-            ) from exc
 
-        if resp.status_code >= 400:
-            raise FusionApiError(
-                f"Fusion processTransaction-{handle} HTTP {resp.status_code}: "
-                f"{resp.text[:500]}"
-            )
+            if resp.status_code in _RETRYABLE_STATUSES and attempt < max_attempts:
+                self._sleep_before_retry(
+                    handle,
+                    attempt,
+                    reason=f"HTTP {resp.status_code}",
+                    retry_after_header=resp.headers.get("Retry-After"),
+                )
+                continue
 
-        try:
-            raw = resp.json()
-        except Exception as exc:
-            raise FusionApiError(
-                f"Non-JSON response from processTransaction-{handle}: "
-                f"{resp.text[:500]}"
-            ) from exc
+            if resp.status_code >= 400:
+                raise FusionApiError(
+                    f"Fusion processTransaction-{handle} HTTP {resp.status_code}: "
+                    f"{resp.text[:500]}"
+                )
 
-        pl_raw = raw.get("ParameterList")
-        if pl_raw is None:
-            return json.dumps(raw)
-        return pl_raw if isinstance(pl_raw, str) else json.dumps(pl_raw)
+            try:
+                raw = resp.json()
+            except Exception as exc:
+                raise FusionApiError(
+                    f"Non-JSON response from processTransaction-{handle}: "
+                    f"{resp.text[:500]}"
+                ) from exc
+
+            pl_raw = raw.get("ParameterList")
+            if pl_raw is None:
+                return json.dumps(raw)
+            return pl_raw if isinstance(pl_raw, str) else json.dumps(pl_raw)
+
+        # Loop exited without returning — only reachable when the final
+        # attempt was a retryable status code (network errors above raise).
+        raise FusionApiError(
+            f"POST processTransaction-{handle} failed after {max_attempts} "
+            f"attempt(s): last error {last_exc}"
+        )
+
+    def _sleep_before_retry(
+        self,
+        handle: str,
+        attempt: int,
+        *,
+        reason: str,
+        retry_after_header: Optional[str] = None,
+    ) -> None:
+        """Wait before the next attempt, honouring ``Retry-After`` when set."""
+        delay = _parse_retry_after(retry_after_header)
+        if delay is None:
+            base = self._cfg.retry_backoff_seconds * (2 ** (attempt - 1))
+            delay = min(base, self._cfg.retry_max_backoff_seconds)
+            # Full-jitter to avoid thundering-herd when many cycles retry
+            # in lockstep against the same Fusion pod.
+            delay = random.uniform(0.0, delay)
+        else:
+            delay = min(delay, self._cfg.retry_max_backoff_seconds)
+        log.warning(
+            "processTransaction-%s attempt %d failed (%s); retrying in %.2fs",
+            handle,
+            attempt,
+            reason,
+            delay,
+        )
+        if delay > 0:
+            time.sleep(delay)
 
     def _process_transaction(self, handle: str, params: Dict[str, Any]) -> Dict[str, Any]:
         """POST processTransaction-<handle>; return ParameterList parsed to dict.
@@ -299,6 +409,36 @@ def _parse_parameter_list(raw: Any) -> Dict[str, Any]:
         val = m.group(2) if m.group(2) is not None else m.group(3)
         out[key] = val.strip() if val is not None else None
     return out
+
+
+def _parse_retry_after(value: Any) -> float | None:
+    """Parse ``Retry-After`` per RFC 9110: integer seconds or HTTP-date.
+
+    Returns ``None`` when the header is absent or unparseable so the caller
+    falls back to its own backoff schedule.
+    """
+    if value is None:
+        return None
+    s = str(value).strip()
+    if not s:
+        return None
+    try:
+        return max(0.0, float(s))
+    except ValueError:
+        pass
+    try:
+        from email.utils import parsedate_to_datetime
+        from datetime import datetime, timezone
+
+        when = parsedate_to_datetime(s)
+        if when is None:
+            return None
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=timezone.utc)
+        delta = (when - datetime.now(timezone.utc)).total_seconds()
+        return max(0.0, delta)
+    except (TypeError, ValueError):
+        return None
 
 
 def _str_or_none(v: Any) -> str | None:

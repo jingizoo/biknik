@@ -23,7 +23,17 @@ from ofam_mass_additions.oracle.fusion_client import (
     FusionFaClient,
     FusionFaConfig,
     _parse_parameter_list,
+    _parse_retry_after,
 )
+
+
+@pytest.fixture(autouse=True)
+def _no_sleep(monkeypatch) -> None:
+    """Skip backoff delays so retry tests stay fast."""
+    monkeypatch.setattr(
+        "ofam_mass_additions.oracle.fusion_client.time.sleep",
+        lambda _seconds: None,
+    )
 
 
 def _ok(body: dict) -> MagicMock:
@@ -33,8 +43,8 @@ def _ok(body: dict) -> MagicMock:
     return resp
 
 
-def _err(status: int, text: str = "boom") -> MagicMock:
-    return MagicMock(status_code=status, text=text)
+def _err(status: int, text: str = "boom", headers: dict | None = None) -> MagicMock:
+    return MagicMock(status_code=status, text=text, headers=headers or {})
 
 
 def _config(**overrides) -> FusionFaConfig:
@@ -49,12 +59,12 @@ def _config(**overrides) -> FusionFaConfig:
     return FusionFaConfig(**base)
 
 
-def _client(monkeypatch, **discovery_kw) -> FusionFaClient:
+def _client(monkeypatch, *, cfg: FusionFaConfig | None = None, **discovery_kw) -> FusionFaClient:
     monkeypatch.setenv("FUSION_JWT", "tok")
     discovery = ExplicitIdsDiscovery.from_dict(
         discovery_kw or {"ids": ["1"]}
     )
-    return FusionFaClient(_config(), discovery=discovery)
+    return FusionFaClient(cfg or _config(), discovery=discovery)
 
 
 # ============================================================================
@@ -216,11 +226,14 @@ def test_get_mass_addition_handles_loose_oracle_format(monkeypatch) -> None:
     assert ma.cost == 1234.5
 
 
-def test_get_mass_addition_raises_on_http_error(monkeypatch) -> None:
+def test_get_mass_addition_raises_immediately_on_non_retryable_status(monkeypatch) -> None:
+    """4xx responses (other than 408/429) must fail fast — no point retrying."""
     client = _client(monkeypatch)
-    with patch.object(client._session, "post", return_value=_err(500, "broke")):
-        with pytest.raises(FusionApiError, match="HTTP 500"):
+    fake_post = MagicMock(return_value=_err(404, "not found"))
+    with patch.object(client._session, "post", fake_post):
+        with pytest.raises(FusionApiError, match="HTTP 404"):
             client.get_mass_addition("1")
+    assert fake_post.call_count == 1
 
 
 # ============================================================================
@@ -262,19 +275,16 @@ def test_update_mass_addition_raises_on_http_error(monkeypatch) -> None:
             client.update_mass_addition({"P_MASS_ADDITION_ID": "1"})
 
 
-def test_update_mass_addition_treats_request_exception_as_error(monkeypatch) -> None:
+def test_update_mass_addition_fails_fast_on_non_retryable_request_exception(monkeypatch) -> None:
+    """Non-transient ``RequestException`` subclasses (bad URL, etc.) must not retry."""
+    from requests.exceptions import InvalidURL
+
     client = _client(monkeypatch)
-    with patch.object(
-        client._session, "post", side_effect=requests_exception()
-    ):
+    fake_post = MagicMock(side_effect=InvalidURL("bad url"))
+    with patch.object(client._session, "post", fake_post):
         with pytest.raises(FusionApiError, match="failed"):
             client.update_mass_addition({"P_MASS_ADDITION_ID": "1"})
-
-
-def requests_exception():
-    import requests
-
-    return requests.ConnectionError("network down")
+    assert fake_post.call_count == 1
 
 
 # ============================================================================
@@ -347,3 +357,164 @@ def test_parse_pl_handles_none_and_empty() -> None:
     assert _parse_parameter_list(None) == {}
     assert _parse_parameter_list("") == {}
     assert _parse_parameter_list("   ") == {}
+
+
+# ============================================================================
+# Retry behaviour
+# ============================================================================
+#
+# A 503 from Akamai's edge ("Service Unavailable - DNS failure") was the
+# original symptom — these tests pin the contract that triggered the fix:
+# transient HTTP / network failures are retried with backoff, permanent
+# 4xx responses still fail immediately, and ``Retry-After`` is respected.
+
+
+def test_retries_on_503_then_succeeds(monkeypatch) -> None:
+    client = _client(
+        monkeypatch,
+        cfg=_config(max_retries=3, retry_backoff_seconds=0.01),
+    )
+
+    success_body = {
+        "ParameterList": (
+            '{"X_RETURN_STATUS":"S","X_BOOK_TYPE_CODE":"CORP_BOOK"}'
+        )
+    }
+    fake_post = MagicMock(
+        side_effect=[_err(503, "edge down"), _err(503, "edge down"), _ok(success_body)]
+    )
+
+    with patch.object(client._session, "post", fake_post):
+        ma = client.get_mass_addition("1")
+
+    assert ma.book_type_code == "CORP_BOOK"
+    assert fake_post.call_count == 3
+
+
+def test_retries_on_connection_error_then_succeeds(monkeypatch) -> None:
+    import requests
+
+    client = _client(
+        monkeypatch,
+        cfg=_config(max_retries=2, retry_backoff_seconds=0.01),
+    )
+
+    success_body = {"ParameterList": '{"X_RETURN_STATUS":"S"}'}
+    fake_post = MagicMock(
+        side_effect=[requests.ConnectionError("reset"), _ok(success_body)]
+    )
+
+    with patch.object(client._session, "post", fake_post):
+        result = client.update_mass_addition({"P_MASS_ADDITION_ID": "1"})
+
+    assert "X_RETURN_STATUS" in result
+    assert fake_post.call_count == 2
+
+
+def test_retries_exhaust_and_raise_with_attempt_count(monkeypatch) -> None:
+    client = _client(
+        monkeypatch,
+        cfg=_config(max_retries=2, retry_backoff_seconds=0.01),
+    )
+    fake_post = MagicMock(return_value=_err(503, "edge down"))
+
+    with patch.object(client._session, "post", fake_post):
+        with pytest.raises(FusionApiError, match="HTTP 503"):
+            client.get_mass_addition("1")
+
+    # max_retries=2 means initial attempt + 2 retries = 3 POSTs total.
+    assert fake_post.call_count == 3
+
+
+def test_retries_exhaust_on_persistent_connection_error(monkeypatch) -> None:
+    import requests
+
+    client = _client(
+        monkeypatch,
+        cfg=_config(max_retries=2, retry_backoff_seconds=0.01),
+    )
+    fake_post = MagicMock(side_effect=requests.ConnectionError("network down"))
+
+    with patch.object(client._session, "post", fake_post):
+        with pytest.raises(FusionApiError, match="failed after 3 attempt"):
+            client.update_mass_addition({"P_MASS_ADDITION_ID": "1"})
+
+    assert fake_post.call_count == 3
+
+
+def test_max_retries_zero_disables_retries(monkeypatch) -> None:
+    client = _client(monkeypatch, cfg=_config(max_retries=0))
+    fake_post = MagicMock(return_value=_err(503))
+
+    with patch.object(client._session, "post", fake_post):
+        with pytest.raises(FusionApiError, match="HTTP 503"):
+            client.get_mass_addition("1")
+
+    assert fake_post.call_count == 1
+
+
+def test_retry_after_header_is_honoured(monkeypatch) -> None:
+    """When the server sets ``Retry-After``, sleep is invoked with that delay."""
+    client = _client(
+        monkeypatch,
+        cfg=_config(max_retries=1, retry_backoff_seconds=99.0),
+    )
+    success_body = {"ParameterList": '{"X_RETURN_STATUS":"S"}'}
+    fake_post = MagicMock(
+        side_effect=[_err(429, "slow down", headers={"Retry-After": "2"}), _ok(success_body)]
+    )
+
+    sleeps: list[float] = []
+    monkeypatch.setattr(
+        "ofam_mass_additions.oracle.fusion_client.time.sleep", sleeps.append
+    )
+
+    with patch.object(client._session, "post", fake_post):
+        client.get_mass_addition("1")
+
+    assert sleeps == [2.0]
+
+
+def test_retry_after_caps_at_max_backoff(monkeypatch) -> None:
+    client = _client(
+        monkeypatch,
+        cfg=_config(max_retries=1, retry_max_backoff_seconds=5.0),
+    )
+    success_body = {"ParameterList": '{"X_RETURN_STATUS":"S"}'}
+    fake_post = MagicMock(
+        side_effect=[_err(503, headers={"Retry-After": "9999"}), _ok(success_body)]
+    )
+
+    sleeps: list[float] = []
+    monkeypatch.setattr(
+        "ofam_mass_additions.oracle.fusion_client.time.sleep", sleeps.append
+    )
+
+    with patch.object(client._session, "post", fake_post):
+        client.get_mass_addition("1")
+
+    assert sleeps == [5.0]
+
+
+def test_from_dict_reads_retry_settings() -> None:
+    cfg = FusionFaConfig.from_dict(
+        {
+            "base_url": "https://fa.example.com",
+            "max_retries": 7,
+            "retry_backoff_seconds": 0.5,
+            "retry_max_backoff_seconds": 12.5,
+        }
+    )
+    assert cfg.max_retries == 7
+    assert cfg.retry_backoff_seconds == 0.5
+    assert cfg.retry_max_backoff_seconds == 12.5
+
+
+def test_parse_retry_after_seconds_and_invalid() -> None:
+    assert _parse_retry_after("3") == 3.0
+    assert _parse_retry_after("3.5") == 3.5
+    assert _parse_retry_after("not-a-number") is None
+    assert _parse_retry_after(None) is None
+    assert _parse_retry_after("") is None
+    # Negative / past values clamp to 0 rather than negative sleep.
+    assert _parse_retry_after("-5") == 0.0

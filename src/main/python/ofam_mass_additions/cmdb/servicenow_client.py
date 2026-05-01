@@ -18,6 +18,7 @@ override individual fields without forking the client.
 
 from __future__ import annotations
 
+import base64
 import logging
 import os
 from dataclasses import dataclass, field
@@ -49,10 +50,19 @@ class ServiceNowConfig:
     base_url: str
     bearer_token_env: str | None = None
     api_key_env: str | None = None
+    # Raw username + env var holding its password. When both are set we
+    # base64-encode "user:pass" ourselves and send Basic auth — same shape
+    # Postman produces from its Username/Password fields.
+    username: str | None = None
+    password_env: str | None = None
     table: str = "alm_hardware"
     timeout_seconds: int = 30
     verify_ssl: bool = True
     require_proxy: bool = False
+    # When True the client logs the raw matched ServiceNow row at INFO,
+    # so the operator can see exactly which columns came back populated.
+    # Plumbed from ``run_mass_additions.py --debug-dump``.
+    debug_dump: bool = False
 
     # CMDB column names (override when tenant uses custom fields).
     asset_tag_field: str = "asset_tag"
@@ -76,6 +86,8 @@ class ServiceNowConfig:
             base_url=d["base_url"],
             bearer_token_env=d.get("bearer_token_env"),
             api_key_env=d.get("api_key_env"),
+            username=d.get("username"),
+            password_env=d.get("password_env"),
             table=d.get("table", "alm_hardware"),
             timeout_seconds=int(d.get("timeout_seconds", 30)),
             verify_ssl=bool(d.get("verify_ssl", True)),
@@ -117,7 +129,11 @@ class ServiceNowCmdbClient:
         """
         cmdb_field = self._cmdb_field_for(field_name)
         if cmdb_field is None:
-            log.debug("CMDB field '%s' not configured; skipping lookup", field_name)
+            log.info(
+                "CMDB skip: %s -> not configured for this tenant (value=%s)",
+                field_name,
+                value,
+            )
             return None
 
         url = f"{self._cfg.base_url.rstrip('/')}/api/now/table/{self._cfg.table}"
@@ -127,6 +143,7 @@ class ServiceNowCmdbClient:
             "sysparm_fields": ",".join(self._sysparm_fields()),
             "sysparm_limit": "1",
         }
+        log.info("GET %s?sysparm_query=%s=%s", url, cmdb_field, value)
 
         try:
             resp = self._session.get(
@@ -139,13 +156,26 @@ class ServiceNowCmdbClient:
             log.warning("ServiceNow GET failed for %s=%s: %s", cmdb_field, value, exc)
             return None
 
+        log.info(
+            "ServiceNow CMDB %s=%s -> HTTP %d", cmdb_field, value, resp.status_code
+        )
+
         if resp.status_code == 404:
             return None
         resp.raise_for_status()
 
         results = (resp.json() or {}).get("result") or []
         if not results:
+            log.info("ServiceNow CMDB %s=%s -> 0 rows", cmdb_field, value)
             return None
+        log.info(
+            "ServiceNow CMDB %s=%s -> matched sys_id=%s",
+            cmdb_field,
+            value,
+            results[0].get("sys_id"),
+        )
+        if self._cfg.debug_dump:
+            log.info("CMDB raw row contents: %r", results[0])
         return self._row_to_cmdb_asset(field_name, value, results[0])
 
     def _auth_headers(self) -> dict[str, str]:
@@ -156,6 +186,15 @@ class ServiceNowCmdbClient:
             headers["Authorization"] = f"Bearer {bearer}"
             return headers
 
+        if self._cfg.username and self._cfg.password_env:
+            password = self._read_env(self._cfg.password_env)
+            if password:
+                token = base64.b64encode(
+                    f"{self._cfg.username}:{password}".encode("utf-8")
+                ).decode("ascii")
+                headers["Authorization"] = f"Basic {token}"
+                return headers
+
         api_key = self._read_env(self._cfg.api_key_env)
         if api_key:
             # ServiceNow API keys are sent as HTTP Basic, base64-encoded
@@ -165,7 +204,8 @@ class ServiceNowCmdbClient:
             return headers
 
         raise RuntimeError(
-            "ServiceNow auth not configured: set bearer_token_env or api_key_env."
+            "ServiceNow auth not configured: set bearer_token_env, "
+            "username + password_env, or api_key_env."
         )
 
     @staticmethod
@@ -185,7 +225,9 @@ class ServiceNowCmdbClient:
 
     def _sysparm_fields(self) -> list[str]:
         # Always include sys_id + every field we map into CmdbAsset.
-        names = [
+        # Optional fields (employee_id_field, category_field, etc.) may be
+        # configured as null in JSON; skip those.
+        candidates = [
             "sys_id",
             self._cfg.asset_tag_field,
             self._cfg.serial_number_field,
@@ -194,6 +236,7 @@ class ServiceNowCmdbClient:
             self._cfg.employee_id_field,
             self._cfg.category_field,
         ]
+        names = [n for n in candidates if n]
         if self._cfg.ccid_active_field:
             names.append(self._cfg.ccid_active_field)
         names.extend(self._cfg.extra_fields)
@@ -209,12 +252,16 @@ class ServiceNowCmdbClient:
             raw = row.get(self._cfg.ccid_active_field)
             ccid_active = _to_bool(raw, default=True)
 
+        # Use _to_id (int when parseable, otherwise the trimmed string).
+        # The deeper SNOW paths return codes like "LC000238" or 32-char
+        # sys_ids — both are strings, both must flow through.
+        emp_field = self._cfg.employee_id_field
         return CmdbAsset(
             source_key=source_key,
             source_value=source_value,
-            location_id=_to_int(row.get(self._cfg.location_id_field)),
-            expense_ccid=_to_int(row.get(self._cfg.expense_ccid_field)),
-            employee_id=_to_int(row.get(self._cfg.employee_id_field)),
+            location_id=_to_id(row.get(self._cfg.location_id_field)),
+            expense_ccid=_to_id(row.get(self._cfg.expense_ccid_field)),
+            employee_id=_to_id(row.get(emp_field)) if emp_field else None,
             ccid_active=ccid_active,
         )
 
@@ -231,13 +278,32 @@ def make_servicenow_lookup(
     client = ServiceNowCmdbClient(cfg)
 
     def _lookup(mass_addition: MassAddition) -> CmdbAsset | None:
+        log.info(
+            "CMDB lookup for mass_addition_id=%s "
+            "(tag=%s serial=%s po=%s invoice=%s)",
+            mass_addition.mass_addition_id,
+            mass_addition.tag_number,
+            mass_addition.serial_number,
+            mass_addition.po_number,
+            mass_addition.invoice_number,
+        )
         for field_name in _LOOKUP_ORDER:
             value = getattr(mass_addition, field_name, None)
             if not value:
                 continue
             hit = client.lookup(field_name=field_name, value=value)
             if hit is not None:
+                log.info(
+                    "CMDB hit for mass_addition_id=%s via %s=%s",
+                    mass_addition.mass_addition_id,
+                    field_name,
+                    value,
+                )
                 return hit
+        log.info(
+            "CMDB miss for mass_addition_id=%s (no match across tag/serial/po/invoice)",
+            mass_addition.mass_addition_id,
+        )
         return None
 
     return _lookup
@@ -256,6 +322,35 @@ def _to_int(value: Any) -> int | None:
         return int(s)
     except ValueError:
         return None
+
+
+def _to_id(value: Any) -> int | str | None:
+    """Coerce to int when parseable, otherwise return the trimmed string.
+
+    CMDB returns a mix of shapes:
+      * numeric strings ("682610")               -> int 682610
+      * zero-padded codes ("00000017")           -> str "00000017"  (preserve padding)
+      * code strings ("LC000238")                -> str "LC000238"
+      * 32-char sys_ids ("a75acddd...")          -> str "a75acddd..."
+      * empty / missing                          -> None
+
+    Leading zeros are preserved as strings — int() would silently drop
+    them and DFF segments (e.g. ``X_CAT_ATTRIBUTE1: '00000000017'``)
+    use that padding as part of the identifier.
+    """
+    if value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    s = str(value).strip()
+    if not s:
+        return None
+    if len(s) > 1 and s.startswith("0"):
+        return s
+    try:
+        return int(s)
+    except ValueError:
+        return s
 
 
 def _to_bool(value: Any, *, default: bool) -> bool:

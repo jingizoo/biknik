@@ -87,6 +87,130 @@ def test_no_auth_configured_raises(monkeypatch) -> None:
         ServiceNowCmdbClient(cfg)._auth_headers()
 
 
+def test_username_password_builds_basic_header(monkeypatch) -> None:
+    """Raw username + password env var -> base64 Basic header (Postman-style)."""
+    import base64
+
+    monkeypatch.delenv("SNOW_TOKEN", raising=False)
+    monkeypatch.setenv("SNOW_PW", "p@ss:w0rd")
+    cfg = ServiceNowConfig(
+        base_url="https://snow.example.com",
+        bearer_token_env="SNOW_TOKEN",
+        username="sp_orc_fdi",
+        password_env="SNOW_PW",
+    )
+    headers = ServiceNowCmdbClient(cfg)._auth_headers()
+    expected = base64.b64encode(b"sp_orc_fdi:p@ss:w0rd").decode("ascii")
+    assert headers["Authorization"] == f"Basic {expected}"
+
+
+def test_bearer_still_wins_over_username_password(monkeypatch) -> None:
+    monkeypatch.setenv("SNOW_TOKEN", "bearer-xyz")
+    monkeypatch.setenv("SNOW_PW", "secret")
+    cfg = ServiceNowConfig(
+        base_url="https://snow.example.com",
+        bearer_token_env="SNOW_TOKEN",
+        username="sp_orc_fdi",
+        password_env="SNOW_PW",
+    )
+    headers = ServiceNowCmdbClient(cfg)._auth_headers()
+    assert headers["Authorization"] == "Bearer bearer-xyz"
+
+
+def test_username_password_wins_over_pre_encoded_api_key(monkeypatch) -> None:
+    """Pre-encoded api_key was the legacy path; raw user/pass is friendlier."""
+    import base64
+
+    monkeypatch.delenv("SNOW_TOKEN", raising=False)
+    monkeypatch.setenv("SNOW_PW", "secret")
+    monkeypatch.setenv("SNOW_KEY", "legacy-pre-encoded")
+    cfg = ServiceNowConfig(
+        base_url="https://snow.example.com",
+        bearer_token_env="SNOW_TOKEN",
+        username="sp_orc_fdi",
+        password_env="SNOW_PW",
+        api_key_env="SNOW_KEY",
+    )
+    headers = ServiceNowCmdbClient(cfg)._auth_headers()
+    expected = base64.b64encode(b"sp_orc_fdi:secret").decode("ascii")
+    assert headers["Authorization"] == f"Basic {expected}"
+
+
+def test_username_without_password_env_falls_through(monkeypatch) -> None:
+    """If password env var is unset, fall through to api_key path."""
+    monkeypatch.delenv("SNOW_TOKEN", raising=False)
+    monkeypatch.delenv("SNOW_PW", raising=False)
+    monkeypatch.setenv("SNOW_KEY", "fallback-encoded")
+    cfg = ServiceNowConfig(
+        base_url="https://snow.example.com",
+        bearer_token_env="SNOW_TOKEN",
+        username="sp_orc_fdi",
+        password_env="SNOW_PW",
+        api_key_env="SNOW_KEY",
+    )
+    headers = ServiceNowCmdbClient(cfg)._auth_headers()
+    assert headers["Authorization"] == "Basic fallback-encoded"
+
+
+def test_debug_dump_logs_raw_row(monkeypatch, caplog) -> None:
+    """When debug_dump is on, the matched CMDB row is logged so an operator
+    can see which columns came back populated and which didn't."""
+    import logging
+
+    monkeypatch.setenv("SNOW_TOKEN", "tok")
+    cfg = ServiceNowConfig(
+        base_url="https://snow.example.com",
+        bearer_token_env="SNOW_TOKEN",
+        debug_dump=True,
+    )
+    client = ServiceNowCmdbClient(cfg)
+    row = {
+        "sys_id": "abc",
+        "asset_tag": "TAG-1",
+        "location.u_fin_location_id": "",
+        "cost_center.value": "",
+    }
+    with patch.object(client._session, "get", return_value=_ok_response([row])):
+        with caplog.at_level(
+            logging.INFO, logger="ofam_mass_additions.cmdb.servicenow_client"
+        ):
+            client.lookup(field_name="tag_number", value="TAG-1")
+
+    dump_lines = [r for r in caplog.records if "raw row contents" in r.getMessage()]
+    assert len(dump_lines) == 1
+    assert "TAG-1" in dump_lines[0].getMessage()
+
+
+def test_debug_dump_off_by_default(monkeypatch, caplog) -> None:
+    import logging
+
+    monkeypatch.setenv("SNOW_TOKEN", "tok")
+    cfg = ServiceNowConfig(
+        base_url="https://snow.example.com",
+        bearer_token_env="SNOW_TOKEN",
+    )
+    client = ServiceNowCmdbClient(cfg)
+    row = {"sys_id": "abc", "asset_tag": "TAG-1"}
+    with patch.object(client._session, "get", return_value=_ok_response([row])):
+        with caplog.at_level(
+            logging.INFO, logger="ofam_mass_additions.cmdb.servicenow_client"
+        ):
+            client.lookup(field_name="tag_number", value="TAG-1")
+    assert not [r for r in caplog.records if "raw row contents" in r.getMessage()]
+
+
+def test_from_dict_reads_username_password() -> None:
+    cfg = ServiceNowConfig.from_dict(
+        {
+            "base_url": "https://snow.example.com",
+            "username": "sp_orc_fdi",
+            "password_env": "SNOW_PW",
+        }
+    )
+    assert cfg.username == "sp_orc_fdi"
+    assert cfg.password_env == "SNOW_PW"
+
+
 # ----- lookup() happy path -------------------------------------------------
 
 
@@ -202,20 +326,73 @@ def test_lookup_parses_ccid_active_field_when_configured(monkeypatch) -> None:
     assert hit.ccid_active is False
 
 
-def test_lookup_returns_none_int_on_non_numeric_field(monkeypatch) -> None:
+def test_lookup_keeps_string_codes_for_non_numeric_ids(monkeypatch) -> None:
+    """Deeper field paths (e.g. location.u_fin_location_id.u_cit_location_code)
+    return strings like 'LC000238'; those must flow through, not be dropped."""
+    monkeypatch.setenv("SNOW_TOKEN", "tok")
+    cfg = _config()
+    client = ServiceNowCmdbClient(cfg)
+    row = {
+        "sys_id": "x",
+        "asset_tag": "TAG-X",
+        cfg.location_id_field: "LC000238",
+        cfg.expense_ccid_field: "cc-sysid-abc",
+        cfg.employee_id_field: "12345",
+    }
+    with patch.object(client._session, "get", return_value=_ok_response([row])):
+        hit = client.lookup(field_name="tag_number", value="TAG-X")
+    assert hit is not None
+    assert hit.location_id == "LC000238"
+    assert hit.expense_ccid == "cc-sysid-abc"
+    assert hit.employee_id == 12345
+
+
+def test_lookup_skips_employee_when_field_is_null(monkeypatch) -> None:
+    """When employee_id_field is configured as null in JSON, don't query it."""
+    from dataclasses import replace as _dc_replace
+
+    monkeypatch.setenv("SNOW_TOKEN", "tok")
+    cfg = _dc_replace(_config(), employee_id_field=None)
+    client = ServiceNowCmdbClient(cfg)
+    row = {"sys_id": "x", "asset_tag": "TAG-X", "location.u_fin_location_id": "1"}
+    with patch.object(client._session, "get", return_value=_ok_response([row])):
+        hit = client.lookup(field_name="tag_number", value="TAG-X")
+    assert hit is not None
+    assert hit.employee_id is None
+
+
+def test_to_id_helper_preserves_leading_zeros() -> None:
+    """DFF segments arrive zero-padded (X_CAT_ATTRIBUTE1: '00000017').
+    int() would silently drop the padding — make sure we don't."""
+    from ofam_mass_additions.cmdb.servicenow_client import _to_id
+
+    assert _to_id("0") == 0
+    assert _to_id("123") == 123
+    assert _to_id("0123") == "0123"
+    assert _to_id("00000017") == "00000017"
+    assert _to_id("LC000238") == "LC000238"
+    assert _to_id("") is None
+    assert _to_id(None) is None
+    assert _to_id(42) == 42
+
+
+def test_lookup_handles_mixed_numeric_and_string_ids(monkeypatch) -> None:
+    """Empty/None still parses to None, but non-numeric labels survive
+    as strings (cost-center sys_ids, location codes) — Oracle FA
+    translation happens later via cmdb_overrides or a join layer."""
     monkeypatch.setenv("SNOW_TOKEN", "tok")
     client = ServiceNowCmdbClient(_config())
     row = {
         "asset_tag": "T",
         "location.u_fin_location_id": "",
-        "cost_center.value": "ENG-NA",  # non-numeric label
+        "cost_center.value": "ENG-NA",
         "assigned_to.u_employee_id": None,
     }
     with patch.object(client._session, "get", return_value=_ok_response([row])):
         hit = client.lookup(field_name="tag_number", value="T")
     assert hit is not None
     assert hit.location_id is None
-    assert hit.expense_ccid is None
+    assert hit.expense_ccid == "ENG-NA"
     assert hit.employee_id is None
 
 

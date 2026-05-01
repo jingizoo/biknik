@@ -34,7 +34,14 @@ def apply_enrichment_rules(
     status=POST so a single ``updateMassAddition`` call moves the row to
     posted state.
     """
-    if mass_addition.book_type_code != pilot_book or mass_addition.region != pilot_region:
+    if mass_addition.book_type_code != pilot_book:
+        return EnrichmentDecision(action="skip", reason="outside_pilot_scope")
+    # Fusion's getMassAddition response often omits X_REGION (the parser
+    # then sets ``region=""``). Only enforce a region match when both the
+    # pilot scope and the row declare one — book_type_code already encodes
+    # the country segment for Citadel's books, so a blank row-region
+    # shouldn't drop an otherwise valid pilot row.
+    if pilot_region and mass_addition.region and mass_addition.region != pilot_region:
         return EnrichmentDecision(action="skip", reason="outside_pilot_scope")
 
     if cmdb_asset is None:
@@ -59,8 +66,11 @@ def apply_enrichment_rules(
         "P_ASSET_TYPE": asset_type,
         "P_LOCATION_ID_TBL": [cmdb_asset.location_id],
         "P_DEPRN_EXPENSE_CCID_TBL": [cmdb_asset.expense_ccid],
-        "P_EMPLOYEE_ID_TBL": [cmdb_asset.employee_id],
     }
+    # Many CMDB rows (servers, infrastructure) have no assigned_to.
+    # Don't send P_EMPLOYEE_ID_TBL=[None] — Oracle would reject that.
+    if cmdb_asset.employee_id is not None:
+        params["P_EMPLOYEE_ID_TBL"] = [cmdb_asset.employee_id]
     if mass_addition.tag_number:
         params["P_TAG_NUMBER"] = mass_addition.tag_number
     if mass_addition.serial_number:
