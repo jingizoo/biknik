@@ -167,8 +167,8 @@ def test_debug_dump_logs_raw_row(monkeypatch, caplog) -> None:
     row = {
         "sys_id": "abc",
         "asset_tag": "TAG-1",
-        "location.u_fin_location_id": "",
-        "cost_center.value": "",
+        "location.u_fin_location_id.u_cit_location_code": "",
+        "cost_center.name": "",
     }
     with patch.object(client._session, "get", return_value=_ok_response([row])):
         with caplog.at_level(
@@ -223,8 +223,8 @@ def test_lookup_by_tag_returns_cmdb_asset(monkeypatch) -> None:
         "sys_id": "snow-sysid-1",
         "asset_tag": "TAG-100",
         "serial_number": "SN-100",
-        "location.u_fin_location_id": "501",
-        "cost_center.value": "12001",
+        "location.u_fin_location_id.u_cit_location_code": "501",
+        "cost_center.name": "12001",
         "assigned_to.u_employee_id": "8801",
         "model_category.name": "Laptop",
     }
@@ -255,8 +255,8 @@ def test_lookup_by_serial_number(monkeypatch) -> None:
     row = {
         "sys_id": "x",
         "serial_number": "SN-9",
-        "location.u_fin_location_id": "10",
-        "cost_center.value": "20",
+        "location.u_fin_location_id.u_cit_location_code": "10",
+        "cost_center.name": "20",
         "assigned_to.u_employee_id": "30",
     }
     with patch.object(client._session, "get", return_value=_ok_response([row])) as get:
@@ -315,8 +315,8 @@ def test_lookup_parses_ccid_active_field_when_configured(monkeypatch) -> None:
     client = ServiceNowCmdbClient(cfg)
     row = {
         "asset_tag": "T",
-        "location.u_fin_location_id": "1",
-        "cost_center.value": "2",
+        "location.u_fin_location_id.u_cit_location_code": "1",
+        "cost_center.name": "2",
         "assigned_to.u_employee_id": "3",
         "u_ccid_active": "false",
     }
@@ -354,11 +354,44 @@ def test_lookup_skips_employee_when_field_is_null(monkeypatch) -> None:
     monkeypatch.setenv("SNOW_TOKEN", "tok")
     cfg = _dc_replace(_config(), employee_id_field=None)
     client = ServiceNowCmdbClient(cfg)
-    row = {"sys_id": "x", "asset_tag": "TAG-X", "location.u_fin_location_id": "1"}
+    row = {"sys_id": "x", "asset_tag": "TAG-X", "location.u_fin_location_id.u_cit_location_code": "1"}
     with patch.object(client._session, "get", return_value=_ok_response([row])):
         hit = client.lookup(field_name="tag_number", value="TAG-X")
     assert hit is not None
     assert hit.employee_id is None
+
+
+def test_lookup_strips_cost_center_name_description(monkeypatch) -> None:
+    """``cost_center.name`` arrives as ``"30755 - Network Hardware"`` —
+    the client strips the description so only the numeric prefix flows
+    through to Oracle FA's expense CCID."""
+    monkeypatch.setenv("SNOW_TOKEN", "tok")
+    client = ServiceNowCmdbClient(_config())
+    row = {
+        "asset_tag": "C42105000676",
+        "location.u_fin_location_id.u_cit_location_code": "LC000030",
+        "cost_center.name": "30755 - Network Hardware",
+        "assigned_to.u_employee_id": "",
+    }
+    with patch.object(client._session, "get", return_value=_ok_response([row])):
+        hit = client.lookup(field_name="tag_number", value="C42105000676")
+    assert hit is not None
+    assert hit.location_id == "LC000030"
+    assert hit.expense_ccid == 30755
+
+
+def test_strip_label_suffix_handles_common_shapes() -> None:
+    from ofam_mass_additions.cmdb.servicenow_client import _strip_label_suffix
+
+    assert _strip_label_suffix("30755 - Network Hardware") == "30755"
+    assert _strip_label_suffix("30755") == "30755"
+    assert _strip_label_suffix("ENG-NA") == "ENG-NA"
+    assert _strip_label_suffix("cbdd9bf56f897100142fbc775b3ee4c2") == (
+        "cbdd9bf56f897100142fbc775b3ee4c2"
+    )
+    assert _strip_label_suffix("") == ""
+    assert _strip_label_suffix(None) is None
+    assert _strip_label_suffix(42) == 42
 
 
 def test_to_id_helper_preserves_leading_zeros() -> None:
@@ -384,8 +417,8 @@ def test_lookup_handles_mixed_numeric_and_string_ids(monkeypatch) -> None:
     client = ServiceNowCmdbClient(_config())
     row = {
         "asset_tag": "T",
-        "location.u_fin_location_id": "",
-        "cost_center.value": "ENG-NA",
+        "location.u_fin_location_id.u_cit_location_code": "",
+        "cost_center.name": "ENG-NA",
         "assigned_to.u_employee_id": None,
     }
     with patch.object(client._session, "get", return_value=_ok_response([row])):
@@ -412,8 +445,8 @@ def test_make_servicenow_lookup_falls_through_to_serial_when_tag_missing(monkeyp
     )
     row = {
         "serial_number": "SN-9",
-        "location.u_fin_location_id": "1",
-        "cost_center.value": "2",
+        "location.u_fin_location_id.u_cit_location_code": "1",
+        "cost_center.name": "2",
         "assigned_to.u_employee_id": "3",
     }
     # Patch on the Session class so make_servicenow_lookup's internal

@@ -26,7 +26,7 @@
     "mock_csv": "data/samples/mass_additions_pilot.csv"
   },
 
-  "_servicenow_field_note": "Field paths align with SD_ORC_FUSION.cig_load_cmdb_alm_hardware_pages. The stored proc loads location codes ('LC000238') and cost_center sys_ids; it does NOT translate to Oracle FA numeric IDs (P_LOCATION_ID_TBL / P_DEPRN_EXPENSE_CCID_TBL). For a one-off demo, use 'cmdb_overrides' below to stub Oracle-friendly IDs per asset_tag.",
+  "_servicenow_field_note": "Field paths align with SD_ORC_FUSION.cig_load_cmdb_alm_hardware_pages. The stored proc loads location codes ('LC000238') and cost_center labels ('30755 - Network Hardware'); the client strips the ' - <description>' suffix so the leading number flows through. It does NOT translate to Oracle FA numeric IDs (P_LOCATION_ID_TBL / P_DEPRN_EXPENSE_CCID_TBL). For a one-off demo, use 'cmdb_overrides' below to stub Oracle-friendly IDs per asset_tag.",
   "servicenow": {
     "base_url": "https://citadel.service-now.com",
     "bearer_token_env": "SNOW_BEARER_TOKEN",
@@ -40,7 +40,7 @@
     "asset_tag_field": "asset_tag",
     "serial_number_field": "serial_number",
     "location_id_field": "location.u_fin_location_id.u_cit_location_code",
-    "expense_ccid_field": "cost_center.value",
+    "expense_ccid_field": "cost_center.name",
     "employee_id_field": "assigned_to.u_employee_id",
     "category_field": "model_category.value",
     "ccid_active_field": null,
