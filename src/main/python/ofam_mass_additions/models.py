@@ -30,12 +30,12 @@ class CmdbAsset:
     source_value: str
     # Oracle FA expects numeric IDs (P_LOCATION_ID_TBL = 300000004974106).
     # CMDB stores codes ("LC000238") or sys_ids — these flow through as
-    # strings until something downstream (cmdb_overrides config or an
-    # Oracle join) replaces them with the FA-friendly numeric IDs.
+    # strings; the cycle runner translates them to Oracle FA IDs via
+    # ``oracle_translations`` (or replaces them via ``cmdb_overrides``)
+    # before the payload is built.
     location_id: int | str | None
     expense_ccid: int | str | None
     employee_id: int | str | None
-    category_id: int | None = None
     ccid_active: bool = True
 
 

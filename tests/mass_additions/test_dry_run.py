@@ -147,6 +147,147 @@ def test_cmdb_overrides_replace_lookup_values(tmp_path: Path) -> None:
     assert result["exception"] == 0
 
 
+def test_cmdb_overrides_keyed_by_serial_when_tag_missing(tmp_path: Path) -> None:
+    """Override match falls through tag_number -> serial_number -> mass_addition_id."""
+    rows = {
+        "MA-300": MassAddition(
+            mass_addition_id="MA-300",
+            book_type_code="CORP_BOOK",
+            region="US",
+            posting_status="NEW",
+            tag_number=None,
+            serial_number="SN-DEMO-1",
+            cost=100.0,
+            received_quantity=1,
+        )
+    }
+    runner = MassAdditionCycleRunner(
+        oracle_client=MockOracleFaClient(rows=rows),
+        run_mode="dry-run",
+        pilot_book="CORP_BOOK",
+        pilot_region="US",
+        cmdb_lookup=lambda _: None,
+        cmdb_overrides={
+            "SN-DEMO-1": {"location_id": 1, "expense_ccid": 2, "employee_id": None}
+        },
+    )
+    assert runner.run(output_dir=tmp_path)["auto_update"] == 1
+
+
+def test_oracle_translations_replace_string_ids_with_ints(tmp_path: Path) -> None:
+    """A CMDB code like 'LC000238' is translated to its Oracle FA numeric ID
+    before the payload is built. This is the path that prevents quoted
+    strings from leaking into P_LOCATION_ID_TBL."""
+    from ofam_mass_additions.models import CmdbAsset
+
+    rows = {
+        "MA-400": MassAddition(
+            mass_addition_id="MA-400",
+            book_type_code="CORP_BOOK",
+            region="US",
+            posting_status="NEW",
+            tag_number="TAG-LC",
+            cost=500.0,
+            received_quantity=1,
+        )
+    }
+
+    def cmdb_with_code(_):
+        return CmdbAsset(
+            source_key="tag_number",
+            source_value="TAG-LC",
+            location_id="LC000238",
+            expense_ccid="cc-sysid-abc",
+            employee_id=None,
+        )
+
+    runner = MassAdditionCycleRunner(
+        oracle_client=MockOracleFaClient(rows=rows),
+        run_mode="dry-run",
+        pilot_book="CORP_BOOK",
+        pilot_region="US",
+        cmdb_lookup=cmdb_with_code,
+        oracle_translations={
+            "location_id": {"LC000238": 300000004974106},
+            "expense_ccid": {"cc-sysid-abc": 682610},
+        },
+    )
+    runner.run(output_dir=tmp_path)
+    proposed = runner.last_proposed
+    assert len(proposed) == 1
+    params = proposed[0].params
+    assert params["P_LOCATION_ID_TBL"] == [300000004974106]
+    assert params["P_DEPRN_EXPENSE_CCID_TBL"] == [682610]
+
+
+def test_oracle_translations_missing_entry_fails_enrichment(tmp_path: Path) -> None:
+    """Untranslated string -> None -> rule emits 'Missing X' exception
+    instead of letting a quoted string reach Oracle."""
+    from ofam_mass_additions.models import CmdbAsset
+
+    rows = {
+        "MA-500": MassAddition(
+            mass_addition_id="MA-500",
+            book_type_code="CORP_BOOK",
+            region="US",
+            posting_status="NEW",
+            tag_number="TAG-NEW",
+            cost=500.0,
+            received_quantity=1,
+        )
+    }
+    runner = MassAdditionCycleRunner(
+        oracle_client=MockOracleFaClient(rows=rows),
+        run_mode="dry-run",
+        pilot_book="CORP_BOOK",
+        pilot_region="US",
+        cmdb_lookup=lambda _: CmdbAsset(
+            source_key="tag_number",
+            source_value="TAG-NEW",
+            location_id="LC999_UNKNOWN",
+            expense_ccid=42,
+            employee_id=None,
+        ),
+        oracle_translations={"location_id": {"LC000238": 1}},  # no entry for LC999
+    )
+    result = runner.run(output_dir=tmp_path)
+    assert result["exception"] == 1
+    assert "Missing location" in (tmp_path / "exceptions.csv").read_text("utf-8")
+
+
+def test_oracle_translations_int_passes_through_unchanged(tmp_path: Path) -> None:
+    """Override-supplied or already-numeric IDs skip the translation map."""
+    from ofam_mass_additions.models import CmdbAsset
+
+    rows = {
+        "MA-600": MassAddition(
+            mass_addition_id="MA-600",
+            book_type_code="CORP_BOOK",
+            region="US",
+            posting_status="NEW",
+            tag_number="TAG-Z",
+            cost=500.0,
+            received_quantity=1,
+        )
+    }
+    runner = MassAdditionCycleRunner(
+        oracle_client=MockOracleFaClient(rows=rows),
+        run_mode="dry-run",
+        pilot_book="CORP_BOOK",
+        pilot_region="US",
+        cmdb_lookup=lambda _: CmdbAsset(
+            source_key="tag_number",
+            source_value="TAG-Z",
+            location_id=42,  # already int — translation must not touch it
+            expense_ccid=99,
+            employee_id=None,
+        ),
+        oracle_translations={"location_id": {"LC000238": 1}},
+    )
+    runner.run(output_dir=tmp_path)
+    assert runner.last_proposed[0].params["P_LOCATION_ID_TBL"] == [42]
+
+
 def test_cmdb_overrides_keyed_by_mass_addition_id_when_no_tag(tmp_path: Path) -> None:
     """Fall back to mass_addition_id when the row has no tag_number."""
     rows = {

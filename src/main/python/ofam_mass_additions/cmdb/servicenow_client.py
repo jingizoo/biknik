@@ -327,11 +327,16 @@ def _to_int(value: Any) -> int | None:
 def _to_id(value: Any) -> int | str | None:
     """Coerce to int when parseable, otherwise return the trimmed string.
 
-    CMDB returns:
-      * numeric strings ("682610")          -> int 682610
-      * code strings ("LC000238")            -> str "LC000238"
-      * 32-char sys_ids ("a75ac…")           -> str "a75ac…"
-      * empty / missing                      -> None
+    CMDB returns a mix of shapes:
+      * numeric strings ("682610")               -> int 682610
+      * zero-padded codes ("00000017")           -> str "00000017"  (preserve padding)
+      * code strings ("LC000238")                -> str "LC000238"
+      * 32-char sys_ids ("a75acddd...")          -> str "a75acddd..."
+      * empty / missing                          -> None
+
+    Leading zeros are preserved as strings — int() would silently drop
+    them and DFF segments (e.g. ``X_CAT_ATTRIBUTE1: '00000000017'``)
+    use that padding as part of the identifier.
     """
     if value is None:
         return None
@@ -340,6 +345,8 @@ def _to_id(value: Any) -> int | str | None:
     s = str(value).strip()
     if not s:
         return None
+    if len(s) > 1 and s.startswith("0"):
+        return s
     try:
         return int(s)
     except ValueError:

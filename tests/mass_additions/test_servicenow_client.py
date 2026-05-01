@@ -361,6 +361,21 @@ def test_lookup_skips_employee_when_field_is_null(monkeypatch) -> None:
     assert hit.employee_id is None
 
 
+def test_to_id_helper_preserves_leading_zeros() -> None:
+    """DFF segments arrive zero-padded (X_CAT_ATTRIBUTE1: '00000017').
+    int() would silently drop the padding — make sure we don't."""
+    from ofam_mass_additions.cmdb.servicenow_client import _to_id
+
+    assert _to_id("0") == 0
+    assert _to_id("123") == 123
+    assert _to_id("0123") == "0123"
+    assert _to_id("00000017") == "00000017"
+    assert _to_id("LC000238") == "LC000238"
+    assert _to_id("") is None
+    assert _to_id(None) is None
+    assert _to_id(42) == 42
+
+
 def test_lookup_handles_mixed_numeric_and_string_ids(monkeypatch) -> None:
     """Empty/None still parses to None, but non-numeric labels survive
     as strings (cost-center sys_ids, location codes) — Oracle FA

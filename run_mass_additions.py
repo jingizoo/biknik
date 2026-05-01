@@ -40,6 +40,7 @@ import json
 import logging
 import os
 import sys
+from dataclasses import replace as _dc_replace
 from datetime import datetime
 from pathlib import Path
 
@@ -210,7 +211,6 @@ def main(argv: list[str] | None = None) -> int:
             raise ConfigError("Config must include a 'servicenow' block.")
         sn_cfg = ServiceNowConfig.from_dict(sn_block)
         if args.debug_dump:
-            from dataclasses import replace as _dc_replace
             sn_cfg = _dc_replace(sn_cfg, debug_dump=True)
 
         oracle_client = _build_oracle_client(
@@ -226,13 +226,8 @@ def main(argv: list[str] | None = None) -> int:
             config.get("capitalize_threshold_amount", 1000.0)
         )
 
-        # Per-asset stubs from JSON; entries whose key starts with "_"
-        # are ignored so the sample can ship example values inline
-        # without applying them.
-        raw_overrides = config.get("cmdb_overrides") or {}
-        cmdb_overrides = {
-            k: v for k, v in raw_overrides.items() if not k.startswith("_")
-        }
+        cmdb_overrides = config.get("cmdb_overrides") or {}
+        oracle_translations = config.get("oracle_translations") or {}
 
         result = run_live(
             oracle_client=oracle_client,
@@ -244,6 +239,7 @@ def main(argv: list[str] | None = None) -> int:
             capitalize_threshold=capitalize_threshold,
             debug_dump=args.debug_dump,
             cmdb_overrides=cmdb_overrides,
+            oracle_translations=oracle_translations,
         )
 
         _publish_optional_sinks(config, result, log)

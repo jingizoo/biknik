@@ -52,6 +52,7 @@ def run_live(
     capitalize_threshold: float = DEFAULT_CAPITALIZE_THRESHOLD,
     debug_dump: bool = False,
     cmdb_overrides: dict[str, dict] | None = None,
+    oracle_translations: dict[str, dict[str, int]] | None = None,
 ) -> LiveRunResult:
     """Run a mass-additions cycle against real ServiceNow CMDB."""
     runner = MassAdditionCycleRunner(
@@ -63,6 +64,7 @@ def run_live(
         capitalize_threshold=capitalize_threshold,
         debug_dump=debug_dump,
         cmdb_overrides=cmdb_overrides,
+        oracle_translations=oracle_translations,
     )
     counts = runner.run(output_dir=output_dir)
 
