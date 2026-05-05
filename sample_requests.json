@@ -22,6 +22,29 @@
     "UK Entity": "UK CORP BOOK",
     "JP Entity": "JP CORP BOOK"
   },
+
+  "_routing_rules_note": "Optional EMEA routing engine.  When 'rules' or 'blocked_locations' is non-empty, FusionIUSync uses this resolver INSTEAD OF entity_book_map for picking the target book.  Each rule is a priority-ordered match on LC location code (exact or prefix), Oracle FA category_id (numeric), and/or cost-centre segment.  First-matching rule wins; unmatched assets surface as exceptions, blocked locations short-circuit as skips.",
+  "routing_rules_config": {
+    "blocked_locations": {
+      "LC000099": "KL — tax confirmation pending; review 2026-09-01"
+    },
+    "rules": [
+      { "name": "AMS_CSNL_office",        "location_in": ["LC000030"],                "category_in": [82001],         "target_book": "CSNL CORP BOOK" },
+      { "name": "AMS_CSNL_leasehold",     "cost_centre_in": ["30755"],                "category_in": [82030],         "target_book": "CSNL CORP BOOK" },
+      { "name": "AMS_MRIS_office",        "location_in": ["LC000031"],                "category_in": [82001],         "target_book": "MRIS-NL CORP BOOK" },
+      { "name": "EMEA_servers_to_CETS",   "location_starts_with": ["LC0001", "LC0002"], "category_in": [82010],       "target_book": "CETS CORP BOOK" },
+      { "name": "CH_office",              "location_starts_with": ["LC0050"],         "category_in": [82001],         "target_book": "CSZH CORP BOOK" },
+      { "name": "SA_furniture_leasehold", "location_starts_with": ["LC0080"],         "category_in": [82020, 82030],  "target_book": "CEDIFC CORP BOOK" }
+    ]
+  },
+
+  "_dff_columns_note": "BIP report column names for the routing dimensions.  Override these if your report uses different aliases for LC location code, Oracle FA category_id, and cost-centre segment.",
+  "dff_columns": {
+    "location_code_col": "LOCATION_CODE",
+    "category_id_col": "CATEGORY_ID",
+    "cost_centre_col": "COST_CENTRE"
+  },
+
   "gcs": {
     "bucket": "your-fa-transfer-logs",
     "prefix": "transfers",

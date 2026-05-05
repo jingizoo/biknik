@@ -333,12 +333,25 @@ def _run_bip_flow(
     max_transfers = int(config.get("max_transfers", 500))
     dry_run = not execute
 
+    routing_resolver = None
+    routing_block = config.get("routing_rules_config") or {}
+    if routing_block.get("rules") or routing_block.get("blocked_locations"):
+        from .routing_rules import RoutingRulesResolver
+
+        routing_resolver = RoutingRulesResolver.from_config(routing_block)
+        log.info(
+            "Routing rules loaded: %d rule(s), %d blocked location(s)",
+            len(routing_resolver.rules),
+            len(routing_resolver.blocked_locations),
+        )
+
     sync = FusionIUSync(
         fusion_client,
         entity_resolver,
         bip_client,
         dff_config=dff_config,
         blocked_books=config.get("blocked_books") or [],
+        routing_resolver=routing_resolver,
     )
     summary = sync.run_full_sync(
         books=books,
