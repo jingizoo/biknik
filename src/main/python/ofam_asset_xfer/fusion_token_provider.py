@@ -1,10 +1,10 @@
-"""Fusion JWT token provider — keytab/password -> SPNEGO -> ERPSecurity/CreateJWT.
+"""Fusion JWT token provider — keytab -> SPNEGO -> ERPSecurity/CreateJWT.
 
-Follows the Citadel ``erp_auth_helper.py`` pattern exactly:
+Follows the Citadel ``erp_auth_helper.py`` pattern:
 
-    ERP_KEYTAB (base64 env var) or ERP_CIG_USER + ERP_CIG_PASSWD
+    ERP_KEYTAB (base64 env var)
           |
-          v  [decode keytab to temp file / acquire creds with password]
+          v  [decode keytab to temp file]
     Kerberos credentials
           |
           v  [SPNEGO negotiate via httpx + httpx_gssapi]
@@ -20,7 +20,7 @@ SSO host and ERPSecurity endpoint is used.
 
 Configuration
 -------------
-Three modes::
+Two modes::
 
     # Static JWT (dev / workstation)
     "fusion_auth": { "mode": "static", "token_env": "FUSION_JWT" }
@@ -28,17 +28,10 @@ Three modes::
     # Keytab flow (batch pod — keytab is base64 in ERP_KEYTAB env var)
     "fusion_auth": { "mode": "keytab" }
 
-    # Username/password flow (CI / service accounts)
-    "fusion_auth": { "mode": "password" }
-
 Environment variables (keytab mode):
     ERP_KEYTAB          Base64-encoded keytab binary (from Holocron Vault)
     ERP_KEYTAB_PATH     Optional path to write decoded keytab (else tempfile)
     CITADEL_ENV         Environment name (stabledev, dev1-4, test, prod)
-
-Environment variables (password mode):
-    ERP_CIG_USER        Username (without @CITADELGROUP.COM)
-    ERP_CIG_PASSWD      Password
 
 If ``fusion_auth`` is absent the entrypoint falls back to the legacy
 ``oracle.bearer_token_env`` / ``bip.bearer_token_env`` fields.
@@ -124,12 +117,12 @@ def _safe_remove_file(filepath: Optional[str]) -> None:
 class TokenProviderConfig:
     """Configuration for :class:`FusionTokenProvider`."""
 
-    mode: str  # "static", "keytab", or "password"
+    mode: str  # "static" or "keytab"
 
     # --- static mode -----------------------------------------------------
     static_token: str = ""
 
-    # --- keytab / password mode ------------------------------------------
+    # --- keytab mode -----------------------------------------------------
     ora_env: str = ""  # e.g. "STABLEDEV", "DEV1", "PROD"
 
     # Optional overrides (if not provided, resolved from ora_env + maps)
@@ -144,10 +137,9 @@ class TokenProviderConfig:
     def from_dict(d: Dict[str, Any]) -> "TokenProviderConfig":
         """Build a TokenProviderConfig from a raw config dictionary."""
         mode = str(d.get("mode", "static")).strip().lower()
-        if mode not in ("static", "keytab", "password"):
+        if mode not in ("static", "keytab"):
             raise ConfigError(
-                f"fusion_auth.mode must be 'static', 'keytab', or 'password' "
-                f"(got {mode!r})"
+                f"fusion_auth.mode must be 'static' or 'keytab' (got {mode!r})"
             )
 
         if mode == "static":
@@ -162,22 +154,12 @@ class TokenProviderConfig:
                 )
             return TokenProviderConfig(mode="static", static_token=str(token))
 
-        # --- keytab or password mode ---
-        if mode == "keytab":
-            if not os.environ.get("ERP_KEYTAB"):
-                raise ConfigError(
-                    "fusion_auth.mode=keytab requires ERP_KEYTAB env var "
-                    "(base64-encoded keytab from Holocron Vault)"
-                )
-        elif mode == "password":
-            if not (
-                os.environ.get("ERP_CIG_USER")
-                and os.environ.get("ERP_CIG_PASSWD")
-            ):
-                raise ConfigError(
-                    "fusion_auth.mode=password requires ERP_CIG_USER and "
-                    "ERP_CIG_PASSWD env vars"
-                )
+        # --- keytab mode ---
+        if not os.environ.get("ERP_KEYTAB"):
+            raise ConfigError(
+                "fusion_auth.mode=keytab requires ERP_KEYTAB env var "
+                "(base64-encoded keytab from Holocron Vault)"
+            )
 
         # Oracle environment (drives SSO + ERP URL resolution)
         ora_env = str(
@@ -231,8 +213,7 @@ class FusionTokenProvider:
     Follows ``erp_auth_helper.py``:
 
     1. Acquire Kerberos creds from keytab (``ERP_KEYTAB`` base64 env var
-       → decode → temp file → ``KRB5_CLIENT_KTNAME``) **or** from
-       username/password (``ERP_CIG_USER`` / ``ERP_CIG_PASSWD``).
+       → decode → temp file → ``KRB5_CLIENT_KTNAME``).
     2. SPNEGO-negotiate against ``sso[-dev].citadelgroup.com/negotiate``
        → PingFed ``access_token``.
     3. POST PF token to ``acctgateway-erpsecurity-*.citadelgroup.com
@@ -290,14 +271,7 @@ class FusionTokenProvider:
     def _get_current_user_token(self) -> str:
         """SPNEGO-negotiate against SSO to obtain a PingFed access_token.
 
-        Two credential modes (matching ``erp_auth_helper.get_current_user_token``):
-
-        **Password mode** (``ERP_CIG_USER`` + ``ERP_CIG_PASSWD``):
-          - ``gssapi.raw.acquire_cred_with_password`` with principal
-            ``{user}@CITADELGROUP.COM``
-          - Pass creds to ``HTTPSPNEGOAuth``
-
-        **Keytab mode** (``ERP_KEYTAB`` base64):
+        Keytab credentials only (``ERP_KEYTAB`` base64):
           - Decode base64 → write to ``ERP_KEYTAB_PATH`` or tempfile
           - Set ``KRB5_CLIENT_KTNAME``
           - ``HTTPSPNEGOAuth`` with SPNEGO mech (picks up keytab via env)
@@ -309,8 +283,8 @@ class FusionTokenProvider:
             from httpx_gssapi import HTTPSPNEGOAuth  # type: ignore[import-not-found]
         except ImportError as exc:
             raise ConfigError(
-                "Keytab/password mode requires 'gssapi', 'httpx', and "
-                "'httpx_gssapi'. Install them or switch to mode=static."
+                "Keytab mode requires 'gssapi', 'httpx', and 'httpx_gssapi'. "
+                "Install them or switch to mode=static."
             ) from exc
 
         negotiate_url = self._cfg.negotiate_url
@@ -318,47 +292,25 @@ class FusionTokenProvider:
         keytab_temp_path: Optional[str] = None
 
         try:
-            if self._cfg.mode == "password":
-                # --- Username/password credentials ---
-                username = os.environ["ERP_CIG_USER"]
-                password = os.environ["ERP_CIG_PASSWD"]
-                log.debug("Using user/pass creds %s", username)
+            erp_keytab_b64 = os.environ["ERP_KEYTAB"]
 
-                c_name = gssapi.Name(
-                    f"{username}@CITADELGROUP.COM", gssapi.NameType.user
-                ).canonicalize(spnego)
-                cred_acquire_res = gssapi.raw.acquire_cred_with_password(
-                    c_name,
-                    bytes(password, "ascii"),
-                    usage="initiate",
-                    mechs=[spnego],
-                )
-                auth = HTTPSPNEGOAuth(
-                    creds=cred_acquire_res.creds,  # type: ignore[arg-type]
-                    mech=spnego,
-                )
-
+            erp_keytab_path = os.environ.get("ERP_KEYTAB_PATH", "")
+            if erp_keytab_path:
+                with open(erp_keytab_path, "wb") as kt_out:
+                    kt_out.write(base64.b64decode(erp_keytab_b64))
+                keytab_out_location = erp_keytab_path
             else:
-                # --- Keytab credentials ---
-                erp_keytab_b64 = os.environ["ERP_KEYTAB"]
+                keytab_fd, keytab_temp_name = tempfile.mkstemp()
+                keytab_fp = os.fdopen(keytab_fd, "wb")
+                keytab_fp.write(base64.b64decode(erp_keytab_b64))
+                keytab_fp.close()
+                keytab_out_location = keytab_temp_name
+                keytab_temp_path = keytab_temp_name
 
-                erp_keytab_path = os.environ.get("ERP_KEYTAB_PATH", "")
-                if erp_keytab_path:
-                    with open(erp_keytab_path, "wb") as kt_out:
-                        kt_out.write(base64.b64decode(erp_keytab_b64))
-                    keytab_out_location = erp_keytab_path
-                else:
-                    keytab_fd, keytab_temp_name = tempfile.mkstemp()
-                    keytab_fp = os.fdopen(keytab_fd, "wb")
-                    keytab_fp.write(base64.b64decode(erp_keytab_b64))
-                    keytab_fp.close()
-                    keytab_out_location = keytab_temp_name
-                    keytab_temp_path = keytab_temp_name
+            os.environ["KRB5_CLIENT_KTNAME"] = keytab_out_location
+            log.debug("Using spnego credentials (keytab at %s)", keytab_out_location)
 
-                os.environ["KRB5_CLIENT_KTNAME"] = keytab_out_location
-                log.debug("Using spnego credentials (keytab at %s)", keytab_out_location)
-
-                auth = HTTPSPNEGOAuth(mech=spnego)
+            auth = HTTPSPNEGOAuth(mech=spnego)
 
             # --- SPNEGO negotiate ---
             ssl_ctx = _get_erp_ssl_context()
@@ -406,34 +358,22 @@ class FusionTokenProvider:
 
         log.debug("Exchanging PF token for Oracle JWT via %s", erp_auth_url)
 
-        try:
-            import httpx  # type: ignore[import-not-found]
+        # httpx was already imported (and required) by _get_current_user_token
+        # before we ever get here, so the previous ImportError fallback to
+        # requests was unreachable.  Use httpx directly.
+        import httpx  # type: ignore[import-not-found]
 
-            ssl_ctx = _get_erp_ssl_context()
-            resp = httpx.post(
-                erp_auth_url,
-                headers={
-                    "Content-Type": "application/json",
-                    "Authorization": "Bearer " + pf_token,
-                },
-                json={},
-                timeout=3000,
-                verify=ssl_ctx,
-            )
-        except ImportError:
-            import requests  # type: ignore[import-untyped]
-
-            resp = requests.post(  # type: ignore[assignment]
-                erp_auth_url,
-                headers={
-                    "Content-Type": "application/json",
-                    "Authorization": "Bearer " + pf_token,
-                },
-                json={},
-                timeout=3000,
-                verify=False,  # noqa: S501
-            )
-
+        ssl_ctx = _get_erp_ssl_context()
+        resp = httpx.post(
+            erp_auth_url,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": "Bearer " + pf_token,
+            },
+            json={},
+            timeout=3000,
+            verify=ssl_ctx,
+        )
         resp.raise_for_status()
         jwt_token: str = resp.json()["token"]
         assert isinstance(jwt_token, str)
@@ -484,7 +424,7 @@ def build_token_provider(
     if fusion_auth_cfg:
         cfg = TokenProviderConfig.from_dict(fusion_auth_cfg)
         provider = FusionTokenProvider(cfg)
-        if cfg.mode in ("keytab", "password"):
+        if cfg.mode == "keytab":
             provider.get_token()  # eager fetch → surface errors early
         log.info("Built Fusion token provider (mode=%s)", cfg.mode)
         return provider.get_token
