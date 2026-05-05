@@ -14,7 +14,8 @@ from an Oracle BI Publisher report (All_IUT_Transfers_Rpt):
 Architecture:
   1. Call BIP report via SOAP to get asset transfer candidates (DFF populated)
   2. For each candidate, call getAssetInformation to get full asset state
-  3. Use FINAL_TARGET_BOOK_TYPE_CODE from report as target book (fallback: resolve entity → target book via EntityBookResolver)
+  3. Use FINAL_TARGET_BOOK_TYPE_CODE from report as target book
+     (fallback: resolve entity → target book via EntityBookResolver)
   4. Compare current book vs target book
   5. If book mismatch → cross-book transfer via processTransaction-bookTransfer
   6. If same book but location differs → same-book transfer via processTransaction-transferAsset

@@ -11,7 +11,6 @@ from __future__ import annotations
 import pytest
 
 from ofam_asset_xfer.routing_rules import (
-    RoutingDecision,
     RoutingRule,
     RoutingRulesResolver,
 )

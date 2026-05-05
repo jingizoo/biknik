@@ -104,10 +104,30 @@ class MassAdditionCycleRunner:
                 )
                 status, message = parse_oracle_status(response_parameter_list)
                 if status == "S":
-                    audit_events.append(AuditEvent(mass_addition_id, "updateMassAddition", "success", message or "updated"))
+                    audit_events.append(
+                        AuditEvent(
+                            mass_addition_id,
+                            "updateMassAddition",
+                            "success",
+                            message or "updated",
+                        )
+                    )
                 else:
-                    exceptions.append(ExceptionRecord(mass_addition_id, "Oracle validation failed", message or "unknown"))
-                    audit_events.append(AuditEvent(mass_addition_id, "updateMassAddition", "exception", message or "unknown"))
+                    exceptions.append(
+                        ExceptionRecord(
+                            mass_addition_id,
+                            "Oracle validation failed",
+                            message or "unknown",
+                        )
+                    )
+                    audit_events.append(
+                        AuditEvent(
+                            mass_addition_id,
+                            "updateMassAddition",
+                            "exception",
+                            message or "unknown",
+                        )
+                    )
 
             elif decision.action == "exception":
                 exceptions.append(ExceptionRecord(mass_addition_id, decision.reason, "validation failed"))
