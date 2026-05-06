@@ -30,7 +30,6 @@ from datetime import date
 from typing import Any, Dict, List, Optional, Set
 
 from .bip_client import BIPClient
-from .ccid_resolver import resolve_target_expense_ccid
 from .entity_resolver import EntityBookResolver
 from .exceptions import FusionApiError, ValidationError
 from .routing_rules import RoutingRulesResolver
@@ -71,12 +70,6 @@ class DFFConfig:
     target_location_id_col: str = "TARGET_LOCATION_ID"
     current_location_id_col: str = "CURRENT_LOCATION_ID"
     target_expense_ccid_col: str = "TARGET_EXPENSE_CCID"
-    # When TARGET_EXPENSE_CCID is empty, the destination expense CCID
-    # is computed by swapping the Company segment (Segment1) of the
-    # source CCID to TARGET_COMPANY and looking the result up via
-    # accountCombinationsLOV.  All other segments come from the source
-    # CCID — no defaults are applied.
-    target_company_col: str = "TARGET_COMPANY"
 
     # Routing-rules dimensions: LC location code, Oracle FA category ID,
     # cost-centre segment.  Override when the BIP report uses different
@@ -144,7 +137,6 @@ class PendingTransfer:
     target_book_type_code: str  # from FINAL_TARGET_BOOK_TYPE_CODE or entity resolver
     target_location_id: Optional[str] = None  # from TARGET_LOCATION_ID in report
     target_expense_ccid: Optional[str] = None  # from TARGET_EXPENSE_CCID in report
-    target_company: Optional[str] = None  # from TARGET_COMPANY in report (drives segment swap)
     is_cross_book: bool = True  # False = same-book (location-only) transfer
 
     # Classification: INTERUNIT or INTRAUNIT
@@ -302,7 +294,6 @@ class FusionIUSync:
         target_location_id = row.get(dff.target_location_id_col, "").strip() or None
         current_location_id = row.get(dff.current_location_id_col, "").strip() or None
         target_expense_ccid = row.get(dff.target_expense_ccid_col, "").strip() or None
-        target_company = row.get(dff.target_company_col, "").strip() or None
 
         # --- Location already matches → skip ---
         if current_location_id and target_location_id and current_location_id == target_location_id:
@@ -381,10 +372,8 @@ class FusionIUSync:
 
         is_cross_book = src_upper != tgt_upper
 
-        # Same book AND no target info at all → nothing to transfer.
-        # target_company alone is enough to trigger same-book Option B
-        # because it drives an expense-CCID swap.
-        if not is_cross_book and not target_location_id and not target_expense_ccid and not target_company:
+        # Same book AND no target location/expense info → nothing to transfer
+        if not is_cross_book and not target_location_id and not target_expense_ccid:
             return None
 
         # --- Call getAssetInformation to get full state ---
@@ -417,7 +406,6 @@ class FusionIUSync:
             target_book_type_code=target_book,
             target_location_id=target_location_id,
             target_expense_ccid=target_expense_ccid,
-            target_company=target_company,
             is_cross_book=is_cross_book,
             fa_state=state,
         )
@@ -490,59 +478,6 @@ class FusionIUSync:
                 error=str(e),
             )
 
-    def _resolve_expense_ccid_override(
-        self, pending: PendingTransfer, state: AssetState,
-    ) -> Optional[str]:
-        """Pick the destination expense CCID for a transfer.
-
-        Priority:
-          1. ``TARGET_EXPENSE_CCID`` from the BIP row, if populated —
-             explicit override always wins.
-          2. ``TARGET_COMPANY`` from the BIP row — when present, the
-             destination CCID is derived by swapping the source CCID's
-             Segment1 to TARGET_COMPANY and looking the result up via
-             ``accountCombinationsLOV``.  All other segments come from
-             the source CCID; no system defaults are applied.
-          3. Neither — return ``None`` and let Oracle's bookTransfer
-             handle pick a destination CCID itself.
-
-        When multiple distributions have different source CCIDs, each
-        is resolved independently; if they all collapse to the same
-        destination CCID we return that single value, otherwise we
-        raise ``ValidationError`` because the current single-string
-        override slot can't carry per-distribution targets.
-        """
-        if pending.target_expense_ccid:
-            return pending.target_expense_ccid
-        if not pending.target_company:
-            return None
-
-        log.info(
-            "Resolving destination expense CCID for asset=%s via segment "
-            "swap: target_company=%s",
-            pending.asset_number,
-            pending.target_company,
-        )
-        seen: Dict[str, int] = {}
-        for src_ccid_str in state.expense_ccids:
-            if src_ccid_str in seen:
-                continue
-            seen[src_ccid_str] = resolve_target_expense_ccid(
-                self._client,
-                int(src_ccid_str),
-                target_company=pending.target_company,
-            )
-
-        resolved = set(seen.values())
-        if len(resolved) == 1:
-            return str(resolved.pop())
-        raise ValidationError(
-            f"asset {pending.asset_number}: source distributions resolved "
-            f"to multiple destination CCIDs ({seen}); the BIP-driven flow "
-            f"only supports a single override. Populate TARGET_EXPENSE_CCID "
-            f"on the report to disambiguate."
-        )
-
     def _execute_cross_book(
         self,
         pending: PendingTransfer,
@@ -565,9 +500,8 @@ class FusionIUSync:
         location_override = pending.target_location_id or pending.transfer_to_location
         if location_override:
             overrides["location_ccid"] = location_override
-        expense_ccid_override = self._resolve_expense_ccid_override(pending, state)
-        if expense_ccid_override:
-            overrides["expense_ccid"] = expense_ccid_override
+        if pending.target_expense_ccid:
+            overrides["expense_ccid"] = pending.target_expense_ccid
 
         params = build_book_transfer_params(
             state=state,
@@ -629,9 +563,8 @@ class FusionIUSync:
         location_override = pending.target_location_id or pending.transfer_to_location
         if location_override:
             overrides["location_ccid"] = location_override
-        expense_ccid_override = self._resolve_expense_ccid_override(pending, state)
-        if expense_ccid_override:
-            overrides["expense_ccid"] = expense_ccid_override
+        if pending.target_expense_ccid:
+            overrides["expense_ccid"] = pending.target_expense_ccid
 
         params, is_noop = build_same_book_transfer_params(
             state=state,
