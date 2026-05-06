@@ -492,23 +492,30 @@ def _process_one(
     if transfer_type == "SAME_BOOK":
         overrides = req.get("target_assignment") or {}
         target_company = overrides.get("target_company")
+        segment_overrides_raw = overrides.get("segment_overrides") or {}
+        segment_overrides = {
+            str(k): str(v) for k, v in segment_overrides_raw.items()
+        }
 
-        if target_company:
-            # Option B: derive expense CCID by swapping the Company segment.
+        if target_company or segment_overrides:
+            # Option B: derive expense CCID by swapping one or more GL segments.
             company_segment_key = str(overrides.get("company_segment_key", "Segment1"))
             log.info(
-                "[%s] Option B: target_company=%s, company_segment_key=%s",
+                "[%s] Option B: target_company=%s, company_segment_key=%s, "
+                "segment_overrides=%s",
                 request_id,
                 target_company,
                 company_segment_key,
+                segment_overrides,
             )
             params, is_noop = build_same_book_transfer_params_option_b(
                 client=client,
                 state=state,
                 effective_date=effective_date,
-                target_company=str(target_company),
+                target_company=str(target_company) if target_company else None,
                 request_id=request_id,
                 company_segment_key=company_segment_key,
+                segment_overrides=segment_overrides or None,
             )
         else:
             params, is_noop = build_same_book_transfer_params(

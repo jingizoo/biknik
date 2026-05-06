@@ -143,6 +143,68 @@ class TestBuildTargetSegments:
         with pytest.raises(ValidationError, match="not found"):
             build_target_segments(src, "US01", "Segment99")
 
+    def test_segment_overrides_swaps_multiple_segments(self):
+        src = {
+            "Segment1": "101",
+            "Segment2": "100",
+            "Segment3": "7710",
+            "Segment4": "0000",
+            "Segment5": "000",
+        }
+        target = build_target_segments(
+            src,
+            segment_overrides={"Segment1": "US01", "Segment5": "ZZZ"},
+        )
+        assert target["Segment1"] == "US01"
+        assert target["Segment5"] == "ZZZ"
+        # untouched segments stay
+        assert target["Segment2"] == "100"
+        assert target["Segment3"] == "7710"
+        assert target["Segment4"] == "0000"
+
+    def test_segment_overrides_combines_with_target_company(self):
+        """Legacy target_company shortcut still works alongside the dict."""
+        src = {"Segment1": "101", "Segment2": "100", "Segment5": "000"}
+        target = build_target_segments(
+            src,
+            target_company="US01",
+            segment_overrides={"Segment5": "ZZZ"},
+        )
+        assert target["Segment1"] == "US01"
+        assert target["Segment5"] == "ZZZ"
+
+    def test_conflict_between_target_company_and_overrides_raises(self):
+        """When the same key shows up in both forms with different values."""
+        src = {"Segment1": "101", "Segment2": "100"}
+        with pytest.raises(ValidationError, match="pick one"):
+            build_target_segments(
+                src,
+                target_company="US01",
+                segment_overrides={"Segment1": "DIFFERENT"},
+            )
+
+    def test_same_value_in_both_forms_is_allowed(self):
+        """Redundant but consistent — no reason to fail."""
+        src = {"Segment1": "101", "Segment2": "100"}
+        target = build_target_segments(
+            src,
+            target_company="US01",
+            segment_overrides={"Segment1": "US01"},
+        )
+        assert target["Segment1"] == "US01"
+
+    def test_no_overrides_at_all_raises(self):
+        src = {"Segment1": "101"}
+        with pytest.raises(ValidationError, match="requires"):
+            build_target_segments(src)
+
+    def test_override_referencing_missing_source_segment_raises(self):
+        src = {"Segment1": "101", "Segment2": "100"}
+        with pytest.raises(ValidationError, match="not found"):
+            build_target_segments(
+                src, segment_overrides={"Segment9": "X"}
+            )
+
 
 # ===================================================================
 # lookup_ccid_by_segments
@@ -278,3 +340,37 @@ class TestResolveTargetExpenseCcid:
                 target_company="US01",
                 company_segment_key="Segment99",
             )
+
+    def test_swaps_segment5_alongside_company(self):
+        """Multi-segment swap: Segment1 -> US01 AND Segment5 -> ZZZ."""
+        target_row = {
+            "CodeCombinationId": 555000,
+            "ConcatenatedSegments": "US01-100-7710-0000-ZZZ-000-000",
+            "Segment1": "US01",
+            "Segment2": "100",
+            "Segment3": "7710",
+            "Segment4": "0000",
+            "Segment5": "ZZZ",
+            "Segment6": "000",
+            "Segment7": "000",
+        }
+        call_count = [0]
+
+        def mock_get_resource(_path, _params=None):
+            call_count[0] += 1
+            return {"items": [SAMPLE_LOV_ROW] if call_count[0] == 1 else [target_row]}
+
+        client = _mock_client(get_resource_side_effect=mock_get_resource)
+
+        target_ccid = resolve_target_expense_ccid(
+            client,
+            src_expense_ccid=626955,
+            target_company="US01",
+            segment_overrides={"Segment5": "ZZZ"},
+        )
+
+        assert target_ccid == 555000
+        # The lookup query must have asked for the swapped segments.
+        lookup_params = client.get_resource.call_args[0][1]
+        assert "Segment1=US01" in lookup_params["q"]
+        assert "Segment5=ZZZ" in lookup_params["q"]

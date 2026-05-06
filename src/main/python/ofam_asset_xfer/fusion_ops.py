@@ -236,16 +236,24 @@ def build_same_book_transfer_params_option_b(
     client: OracleErpIntegrationsClient,
     state: AssetState,
     effective_date: Optional[str],
-    target_company: str,
-    request_id: str,
+    target_company: Optional[str] = None,
+    request_id: str = "",
     company_segment_key: str = "Segment1",
+    segment_overrides: Optional[Dict[str, str]] = None,
 ) -> Tuple[Dict[str, Any], bool]:
     """Build transferAsset payload for Option B: change only EXPENSE_CCID
-    by replacing the Company segment, keeping LOCATION_CCID and ASSIGNED_TO as-is.
+    by swapping one or more GL segments, keeping LOCATION_CCID and
+    ASSIGNED_TO as-is.
 
-    For each source distribution line, resolves the destination expense CCID
-    by looking up the source CCID's GL segments, swapping the Company segment
-    to *target_company*, and finding the matching combination.
+    For each source distribution line, resolves the destination expense
+    CCID by looking up the source CCID's GL segments, applying the
+    configured swaps (``target_company``/``company_segment_key`` and/or
+    ``segment_overrides``), and finding the matching combination.
+
+    ``segment_overrides`` lets callers swap multiple segments in one go
+    (e.g. company + Segment5).  See
+    :func:`ofam_asset_xfer.ccid_resolver.build_target_segments` for the
+    merge rules between the two parameter forms.
 
     Returns (params, is_noop).
     """
@@ -264,8 +272,9 @@ def build_same_book_transfer_params_option_b(
             target_ccid = resolve_target_expense_ccid(
                 client,
                 int(src_ccid_str),
-                target_company,
-                company_segment_key,
+                target_company=target_company,
+                company_segment_key=company_segment_key,
+                segment_overrides=segment_overrides,
             )
             seen_resolutions[src_ccid_str] = target_ccid
             dest_expense.append(str(target_ccid))

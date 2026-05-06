@@ -29,7 +29,8 @@ _SEGMENT_RE = re.compile(r"^Segment\d+$")
 class _RestClient(Protocol):
     def get_resource(
         self, resource_path: str, query_params: Optional[Dict[str, str]] = None
-    ) -> Dict[str, Any]: ...
+    ) -> Dict[str, Any]:
+        ...
 
 
 # ---------------------------------------------------------------------------
@@ -104,30 +105,64 @@ def get_ccid_details(client: _RestClient, ccid: int) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 def build_target_segments(
     src_segments: Dict[str, str],
-    target_company: str,
+    target_company: Optional[str] = None,
     company_segment_key: str = "Segment1",
+    segment_overrides: Optional[Dict[str, str]] = None,
 ) -> Dict[str, str]:
-    """Copy source segments and replace the Company segment with *target_company*.
+    """Copy source segments and apply each configured swap.
 
-    Raises ValidationError if *company_segment_key* is not present in
-    *src_segments*.
+    Two ways to specify swaps (combinable):
+
+    * ``target_company`` + ``company_segment_key`` — single-segment
+      shortcut, kept for backwards compatibility with callers that
+      only ever swap the Company segment.
+    * ``segment_overrides`` — dict of ``{segment_key: new_value}``
+      mapping, e.g. ``{"Segment1": "US01", "Segment5": "ZZZ"}``.
+      Use this when more than one segment needs to change in the
+      same cross/in-book move.
+
+    When both forms reference the same segment key with different
+    values, that's almost always a config bug, so raise rather than
+    silently picking one.
+
+    Raises ValidationError if any override key is missing from
+    ``src_segments`` (no point swapping a segment that doesn't exist
+    on the source CCID), or when no overrides are supplied at all.
     """
-    if company_segment_key not in src_segments:
+    overrides: Dict[str, str] = dict(segment_overrides or {})
+    if target_company is not None:
+        existing = overrides.get(company_segment_key)
+        if existing is not None and existing != target_company:
+            raise ValidationError(
+                f"Segment '{company_segment_key}' set in both "
+                f"segment_overrides ({existing!r}) and target_company "
+                f"({target_company!r}) — pick one."
+            )
+        overrides[company_segment_key] = target_company
+
+    if not overrides:
         raise ValidationError(
-            f"Company segment key '{company_segment_key}' not found in source segments. "
+            "build_target_segments requires target_company and/or "
+            "segment_overrides; both were empty."
+        )
+
+    missing = [k for k in overrides if k not in src_segments]
+    if missing:
+        raise ValidationError(
+            f"Override segment(s) {missing} not found in source segments. "
             f"Available: {sorted(src_segments.keys())}"
         )
 
     target = deepcopy(src_segments)
-    old_val = target[company_segment_key]
-    target[company_segment_key] = target_company
-
-    log.info(
-        "build_target_segments: %s changed from '%s' to '%s'  (other segments unchanged)",
-        company_segment_key,
-        old_val,
-        target_company,
-    )
+    for key, new_val in overrides.items():
+        old_val = target[key]
+        target[key] = new_val
+        log.info(
+            "build_target_segments: %s changed from '%s' to '%s'",
+            key,
+            old_val,
+            new_val,
+        )
     return target
 
 
@@ -224,11 +259,16 @@ def lookup_ccid_by_segments(
 def resolve_target_expense_ccid(
     client: _RestClient,
     src_expense_ccid: int,
-    target_company: str,
+    target_company: Optional[str] = None,
     company_segment_key: str = "Segment1",
+    segment_overrides: Optional[Dict[str, str]] = None,
 ) -> int:
-    """End-to-end: given a source expense CCID and a target Company value,
+    """End-to-end: given a source expense CCID and a set of segment swaps,
     return the destination expense CCID.
+
+    Pass either the ``target_company``/``company_segment_key`` shortcut,
+    a multi-segment ``segment_overrides`` dict, or both — see
+    :func:`build_target_segments` for the merge rules.
 
     Raises:
         ValidationError  if target_ccid == src_expense_ccid (would create
@@ -239,24 +279,32 @@ def resolve_target_expense_ccid(
     coa_id = details["chart_of_accounts_id"]
 
     target_segments = build_target_segments(
-        src_segments, target_company, company_segment_key
+        src_segments,
+        target_company=target_company,
+        company_segment_key=company_segment_key,
+        segment_overrides=segment_overrides,
     )
 
     target_ccid = lookup_ccid_by_segments(client, target_segments, coa_id)
 
     if target_ccid == src_expense_ccid:
+        applied = [f"{k}={v!r}" for k, v in (segment_overrides or {}).items()]
+        if target_company is not None:
+            applied.append(f"{company_segment_key}={target_company!r}")
         raise ValidationError(
-            f"Target CCID ({target_ccid}) equals source CCID ({src_expense_ccid}); "
-            f"would create identical distribution lines. "
-            f"Check target_company='{target_company}' vs source "
-            f"{company_segment_key}='{src_segments.get(company_segment_key)}'."
+            f"Target CCID ({target_ccid}) equals source CCID "
+            f"({src_expense_ccid}); would create identical distribution "
+            f"lines. Overrides applied: {', '.join(applied)}; source "
+            f"segments={src_segments}."
         )
 
     log.info(
-        "resolve_target_expense_ccid: src=%s → target=%s (company %s→%s)",
+        "resolve_target_expense_ccid: src=%s → target=%s (overrides=%s)",
         src_expense_ccid,
         target_ccid,
-        src_segments.get(company_segment_key),
-        target_company,
+        {
+            **(segment_overrides or {}),
+            **({company_segment_key: target_company} if target_company else {}),
+        },
     )
     return target_ccid
