@@ -7,6 +7,8 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
+import pytest
+
 from ofam_asset_xfer.fusion_sync import (
     FusionIUSync,
     DFFConfig,
@@ -709,8 +711,6 @@ class TestExecuteTransfer:
         assert "300100999999" in call_params["P_LOCATION_CCID_TBL"]
         assert "555555" not in call_params["P_LOCATION_CCID_TBL"]
 
-
-
     def test_same_book_transfer_uses_transfer_asset(self):
         """Same-book transfer should call processTransaction-transferAsset."""
         fusion = _mock_fusion()
@@ -906,3 +906,170 @@ class TestRunFullSync:
 
         assert summary["counts"]["total"] == 0
         assert summary["results"] == []
+
+
+# ---------------------------------------------------------------------------
+# TARGET_COMPANY from BIP row drives segment-swap on dest CCID
+# ---------------------------------------------------------------------------
+
+
+class TestTargetCompanyFromBip:
+    """When the BIP row carries TARGET_COMPANY, the destination expense
+    CCID is computed by swapping Segment1 of the source CCID and looking
+    the result up via accountCombinationsLOV.  No defaults are applied —
+    every other segment comes from the source CCID.
+
+    These tests exercise the helper directly so they don't need a real
+    transferAsset round-trip; the helper is what _execute_*_book delegates
+    to.
+    """
+
+    def _state_with_ccid(self, src_ccid: str = "626955"):
+        from dataclasses import replace
+        return replace(_sample_state(), expense_ccids=[src_ccid])
+
+    def test_returns_target_expense_ccid_unchanged_when_explicit(self):
+        """TARGET_EXPENSE_CCID always wins over TARGET_COMPANY."""
+        fusion = _mock_fusion()
+        sync = FusionIUSync(fusion, _resolver(), _mock_bip())
+        pending = _make_pending()
+        pending.target_expense_ccid = "999"
+        pending.target_company = "US01"
+
+        result = sync._resolve_expense_ccid_override(pending, self._state_with_ccid())
+
+        assert result == "999"
+        # Should not call accountCombinationsLOV when explicit ccid is supplied.
+        fusion.get_resource.assert_not_called()
+
+    def test_returns_none_when_no_target_company_and_no_explicit_ccid(self):
+        sync = FusionIUSync(_mock_fusion(), _resolver(), _mock_bip())
+        pending = _make_pending()
+        pending.target_company = None
+        pending.target_expense_ccid = None
+
+        assert sync._resolve_expense_ccid_override(pending, self._state_with_ccid()) is None
+
+    def test_resolves_via_segment_swap_when_target_company_set(self):
+        """Two HTTP calls: one to read source segments, one to look up dest CCID."""
+        src_row = {
+            "CodeCombinationId": 626955,
+            "ChartOfAccountsId": 50388,
+            "Segment1": "101",
+            "Segment2": "100",
+            "Segment3": "7710",
+            "Segment4": "0000",
+            "Segment5": "000",
+        }
+        dest_row = {
+            "CodeCombinationId": 789012,
+            "Segment1": "US01",
+            "Segment2": "100",
+            "Segment3": "7710",
+            "Segment4": "0000",
+            "Segment5": "000",
+        }
+        fusion = _mock_fusion()
+        fusion.get_resource.side_effect = [
+            {"items": [src_row]},
+            {"items": [dest_row]},
+        ]
+        sync = FusionIUSync(fusion, _resolver(), _mock_bip())
+        pending = _make_pending()
+        pending.target_company = "US01"
+        pending.target_expense_ccid = None
+
+        result = sync._resolve_expense_ccid_override(pending, self._state_with_ccid("626955"))
+
+        assert result == "789012"
+        # First call: source CCID details. Second: target lookup.
+        assert fusion.get_resource.call_count == 2
+
+    def test_raises_when_distributions_resolve_to_different_ccids(self):
+        """Same target_company but two source CCIDs that map to different
+        destinations — single-string override slot can't carry both."""
+        src_a = {
+            "CodeCombinationId": 1,
+            "ChartOfAccountsId": 50388,
+            "Segment1": "101",
+            "Segment2": "100",
+        }
+        src_b = {
+            "CodeCombinationId": 2,
+            "ChartOfAccountsId": 50388,
+            "Segment1": "101",
+            "Segment2": "200",
+        }
+        dest_a = {"CodeCombinationId": 1001, "Segment1": "US01", "Segment2": "100"}
+        dest_b = {"CodeCombinationId": 1002, "Segment1": "US01", "Segment2": "200"}
+        fusion = _mock_fusion()
+        fusion.get_resource.side_effect = [
+            {"items": [src_a]}, {"items": [dest_a]},
+            {"items": [src_b]}, {"items": [dest_b]},
+        ]
+        from dataclasses import replace
+        sync = FusionIUSync(fusion, _resolver(), _mock_bip())
+        pending = _make_pending()
+        pending.target_company = "US01"
+        pending.target_expense_ccid = None
+        state = replace(_sample_state(), expense_ccids=["1", "2"])
+
+        from ofam_asset_xfer.exceptions import ValidationError
+        with pytest.raises(ValidationError, match="multiple destination"):
+            sync._resolve_expense_ccid_override(pending, state)
+
+
+# ---------------------------------------------------------------------------
+# _check_bip_row reads TARGET_COMPANY from the row
+# ---------------------------------------------------------------------------
+
+
+class TestCheckBipRowReadsTargetCompany:
+    def test_target_company_populated_on_pending(self):
+        fusion = _mock_fusion()
+        bip = _mock_bip()
+        row = _bip_row(target_expense_ccid="")
+        row["TARGET_COMPANY"] = "US01"
+        bip.run_report.return_value = [row]
+        fusion.process_transaction.return_value = _get_asset_info_response()
+
+        sync = FusionIUSync(fusion, _resolver(), bip)
+        pending_list = sync.find_pending_transfers(books=["US CORP BOOK"])
+
+        assert len(pending_list) == 1
+        assert pending_list[0].target_company == "US01"
+        assert pending_list[0].target_expense_ccid is None
+
+    def test_same_book_with_only_target_company_is_kept(self):
+        """Without TARGET_COMPANY the same-book row would be dropped as
+        'nothing to transfer'.  TARGET_COMPANY alone is enough now."""
+        fusion = _mock_fusion()
+        bip = _mock_bip()
+        # Same-book: target_book == source_book via FINAL_TARGET_BOOK_TYPE_CODE
+        row = _bip_row(target_expense_ccid="", final_target_book="US CORP BOOK")
+        row["TARGET_COMPANY"] = "US01"
+        bip.run_report.return_value = [row]
+        fusion.process_transaction.return_value = _get_asset_info_response()
+
+        sync = FusionIUSync(fusion, _resolver(), bip)
+        pending_list = sync.find_pending_transfers(books=["US CORP BOOK"])
+
+        assert len(pending_list) == 1
+        assert pending_list[0].is_cross_book is False
+
+    def test_custom_target_company_column_name(self):
+        from ofam_asset_xfer.fusion_sync import DFFConfig
+
+        fusion = _mock_fusion()
+        bip = _mock_bip()
+        row = _bip_row(target_expense_ccid="")
+        row["TGT_CO"] = "US01"
+        bip.run_report.return_value = [row]
+        fusion.process_transaction.return_value = _get_asset_info_response()
+
+        dff = DFFConfig(target_company_col="TGT_CO")
+        sync = FusionIUSync(fusion, _resolver(), bip, dff_config=dff)
+        pending_list = sync.find_pending_transfers(books=["US CORP BOOK"])
+
+        assert len(pending_list) == 1
+        assert pending_list[0].target_company == "US01"
