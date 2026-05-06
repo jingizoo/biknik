@@ -709,8 +709,6 @@ class TestExecuteTransfer:
         assert "300100999999" in call_params["P_LOCATION_CCID_TBL"]
         assert "555555" not in call_params["P_LOCATION_CCID_TBL"]
 
-
-
     def test_same_book_transfer_uses_transfer_asset(self):
         """Same-book transfer should call processTransaction-transferAsset."""
         fusion = _mock_fusion()
