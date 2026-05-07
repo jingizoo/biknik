@@ -40,6 +40,19 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--dry-run", action="store_true", help="Reads/validation only (no writes to Fusion).")
     p.add_argument("--execute", action="store_true", help="Post transactions to Fusion. Overrides --dry-run.")
     p.add_argument("--log-level", default=os.getenv("LOG_LEVEL", "INFO"), help="Logging level (INFO, DEBUG, ...).")
+    p.add_argument(
+        "--debug",
+        action="store_true",
+        help=(
+            "Enable DEBUG logging and dump every Fusion request/response "
+            "(auth-redacted) to <out-dir>/debug-dumps/ for offline inspection."
+        ),
+    )
+    p.add_argument(
+        "--debug-dir",
+        default=None,
+        help="Override directory for --debug dumps (default: <out-dir>/debug-dumps/).",
+    )
     return p
 
 
@@ -47,11 +60,17 @@ def main(argv: list[str] | None = None) -> int:
     """Entrypoint for the CDX batch job."""
     args = _build_arg_parser().parse_args(argv)
 
+    effective_log_level = "DEBUG" if args.debug else args.log_level
     logging.basicConfig(
-        level=getattr(logging, str(args.log_level).upper(), logging.INFO),
+        level=getattr(logging, str(effective_log_level).upper(), logging.INFO),
         format="%(asctime)s %(levelname)s %(name)s - %(message)s",
     )
     log = logging.getLogger("batch_entrypoint")
+
+    debug_dir: str | None = None
+    if args.debug:
+        from pathlib import Path as _P
+        debug_dir = args.debug_dir or str(_P(args.out_dir) / "debug-dumps")
 
     # Execution flag: --execute wins, else dry-run (default).
     execute = args.execute and not args.dry_run
@@ -68,7 +87,7 @@ def main(argv: list[str] | None = None) -> int:
         # --- Build clients from config ---
         oracle_cfg = OracleConfig.from_dict(config.get("oracle", {}))
         fusion_client = OracleErpIntegrationsClient(
-            oracle_cfg, token_provider=token_provider
+            oracle_cfg, token_provider=token_provider, debug_dir=debug_dir
         )
 
         bip_cfg = BIPConfig.from_dict(config.get("bip", {}))

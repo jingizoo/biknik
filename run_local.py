@@ -90,9 +90,23 @@ def main(argv: list[str] | None = None) -> int:
         default=os.getenv("LOG_LEVEL", "INFO"),
         help="Logging level (default: INFO).",
     )
+    p.add_argument(
+        "--debug",
+        action="store_true",
+        help=(
+            "Enable DEBUG logging and dump every Fusion request/response "
+            "(auth-redacted) to <out-dir>/debug-dumps/ for offline inspection."
+        ),
+    )
+    p.add_argument(
+        "--debug-dir",
+        default=None,
+        help="Override directory for --debug dumps (default: <out-dir>/debug-dumps/).",
+    )
     args = p.parse_args(argv)
 
-    log_level = getattr(logging, args.log_level.upper(), logging.INFO)
+    effective_log_level = "DEBUG" if args.debug else args.log_level
+    log_level = getattr(logging, effective_log_level.upper(), logging.INFO)
     logging.basicConfig(
         level=log_level,
         format="%(asctime)s %(levelname)-5s %(name)s — %(message)s",
@@ -120,6 +134,10 @@ def main(argv: list[str] | None = None) -> int:
         out_dir = str(Path("output") / ts)
     Path(out_dir).mkdir(parents=True, exist_ok=True)
 
+    debug_dir: str | None = None
+    if args.debug:
+        debug_dir = args.debug_dir or str(Path(out_dir) / "debug-dumps")
+
     # Execution flag: --execute wins, else dry-run (default).
     execute = args.execute and not args.dry_run
     dry_run = not execute
@@ -141,7 +159,7 @@ def main(argv: list[str] | None = None) -> int:
         # --- Build clients from config ---
         oracle_cfg = OracleConfig.from_dict(config.get("oracle", {}))
         fusion_client = OracleErpIntegrationsClient(
-            oracle_cfg, token_provider=token_provider
+            oracle_cfg, token_provider=token_provider, debug_dir=debug_dir
         )
 
         bip_cfg = BIPConfig.from_dict(config.get("bip", {}))

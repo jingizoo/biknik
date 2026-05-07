@@ -39,15 +39,34 @@ def main(  # noqa: D103
     log_level: str = typer.Option(
         os.getenv("LOG_LEVEL", "INFO"), help="Logging level (INFO, DEBUG, ...)."
     ),
+    debug: bool = typer.Option(
+        False,
+        "--debug",
+        help=(
+            "Enable DEBUG logging and dump every Fusion request/response "
+            "(auth-redacted) to <out-dir>/debug-dumps/ for offline inspection."
+        ),
+    ),
+    debug_dir: str = typer.Option(
+        None,
+        "--debug-dir",
+        help="Override directory for --debug dumps (default: <out-dir>/debug-dumps/).",
+    ),
 ) -> None:
+    effective_log_level = "DEBUG" if debug else log_level
     logging.basicConfig(
-        level=getattr(logging, str(log_level).upper(), logging.INFO),
+        level=getattr(logging, str(effective_log_level).upper(), logging.INFO),
         format="%(asctime)s %(levelname)s %(name)s - %(message)s",
     )
     log = logging.getLogger("batch_entrypoint")
 
     # Execution flag: --execute wins, else dry-run (default).
     should_execute = execute and not dry_run
+
+    resolved_debug_dir: str | None = None
+    if debug:
+        from pathlib import Path as _P
+        resolved_debug_dir = debug_dir or str(_P(out_dir) / "debug-dumps")
 
     try:
         store = ArtifactStore(base_uri=".")
@@ -60,7 +79,7 @@ def main(  # noqa: D103
         # --- Build clients from config ---
         oracle_cfg = OracleConfig.from_dict(cfg.get("oracle", {}))
         fusion_client = OracleErpIntegrationsClient(
-            oracle_cfg, token_provider=token_provider
+            oracle_cfg, token_provider=token_provider, debug_dir=resolved_debug_dir
         )
 
         bip_cfg = BIPConfig.from_dict(cfg.get("bip", {}))

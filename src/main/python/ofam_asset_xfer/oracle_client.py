@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import itertools
 import json
 import logging
 import os
+import re
+import threading
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Optional, Tuple
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Callable, Dict, Optional, Tuple, Union
 import requests  # type: ignore[import-untyped]
 
 from .exceptions import FusionApiError
@@ -15,6 +20,137 @@ from .proxy_config import get_proxy_config
 
 
 log = logging.getLogger(__name__)
+
+# Headers that may contain secrets; values are replaced with a marker
+# before being written to disk.
+_SECRET_HEADER_NAMES = frozenset(
+    {"authorization", "cookie", "set-cookie", "x-api-key", "proxy-authorization"}
+)
+_FILENAME_SAFE = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def _parse_fusion_response(r: "requests.Response", context: str) -> Dict[str, Any]:
+    """Parse a Fusion REST response, raising FusionApiError on any failure.
+
+    The Fusion gateway can return empty bodies or HTML error pages on
+    auth, proxy, or upstream failures.  Parsing JSON before checking the
+    HTTP status surfaces a generic ``JSONDecodeError`` and hides the real
+    cause (e.g. ``HTTP 401`` or ``HTTP 502``).  This helper inverts that
+    order: status first, body shape second, JSON parse last.
+    """
+    status = r.status_code
+    body = r.text or ""
+    snippet = body[:500].strip() or "(empty body)"
+
+    if status >= 400:
+        raise FusionApiError(f"Fusion {context} HTTP {status}: {snippet}")
+
+    if not body.strip():
+        raise FusionApiError(
+            f"Fusion {context} returned empty body (status={status}); "
+            "expected JSON. Possible upstream timeout or proxy failure."
+        )
+
+    try:
+        parsed = r.json()
+    except ValueError as e:
+        raise FusionApiError(
+            f"Fusion {context} returned non-JSON response "
+            f"(status={status}): {snippet}"
+        ) from e
+
+    if not isinstance(parsed, dict):
+        raise FusionApiError(
+            f"Fusion {context} returned unexpected JSON shape "
+            f"(status={status}, type={type(parsed).__name__}): {snippet}"
+        )
+    return parsed
+
+
+def _redact_headers(headers: Any) -> Dict[str, str]:
+    """Return a copy of ``headers`` with secret values masked."""
+    out: Dict[str, str] = {}
+    try:
+        items = headers.items()  # CaseInsensitiveDict / dict
+    except AttributeError:
+        return {}
+    for k, v in items:
+        if str(k).lower() in _SECRET_HEADER_NAMES:
+            out[str(k)] = "***REDACTED***"
+        else:
+            out[str(k)] = str(v)
+    return out
+
+
+class _ExchangeDumper:
+    """Writes Fusion request/response pairs to per-call JSON files.
+
+    Enabled when ``--debug`` is passed at the CLI: every POST/GET that
+    flows through the client is captured to ``<dir>/NNNN-<ts>-<tag>.json``
+    so an operator can inspect the exact wire payloads after the fact.
+    Authorization and other secret-bearing headers are redacted before
+    being written.  Failures to write a dump are logged but never raised
+    — debugging output must not break the live transfer.
+    """
+
+    def __init__(self, directory: Union[str, Path]) -> None:
+        self._dir = Path(directory)
+        self._dir.mkdir(parents=True, exist_ok=True)
+        self._counter = itertools.count(1)
+        self._lock = threading.Lock()
+        log.info("Fusion debug dumps will be written to %s", self._dir)
+
+    def dump(
+        self,
+        *,
+        method: str,
+        url: str,
+        request_headers: Any,
+        request_body: Any,
+        response: Optional["requests.Response"],
+        error: Optional[str],
+        elapsed_ms: float,
+        tag: str,
+    ) -> None:
+        try:
+            with self._lock:
+                seq = next(self._counter)
+            ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            slug = _FILENAME_SAFE.sub("_", tag)[:80] or "call"
+            path = self._dir / f"{seq:04d}-{ts}-{method}-{slug}.json"
+
+            payload: Dict[str, Any] = {
+                "sequence": seq,
+                "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                "elapsed_ms": round(elapsed_ms, 2),
+                "request": {
+                    "method": method,
+                    "url": url,
+                    "headers": _redact_headers(request_headers),
+                    "body": request_body,
+                },
+            }
+            if response is not None:
+                resp_text = response.text or ""
+                resp_body: Any = resp_text
+                # Best-effort JSON parse so the dump is easier to read,
+                # but always preserve the raw text on failure.
+                try:
+                    resp_body = response.json()
+                except ValueError:
+                    pass
+                payload["response"] = {
+                    "status_code": response.status_code,
+                    "headers": _redact_headers(response.headers),
+                    "body": resp_body,
+                    "raw_text": resp_text if resp_body is not resp_text else None,
+                }
+            if error is not None:
+                payload["error"] = error
+
+            path.write_text(json.dumps(payload, indent=2, default=str))
+        except Exception:  # never let dumping break the call
+            log.warning("Failed to write Fusion debug dump", exc_info=True)
 
 
 @dataclass(frozen=True)
@@ -78,8 +214,15 @@ class OracleErpIntegrationsClient:
         self,
         cfg: OracleConfig,
         token_provider: Optional[Callable[[], str]] = None,
+        debug_dir: Union[str, Path, None] = None,
     ):
-        """Initialise the client with config and optional token provider."""
+        """Initialise the client with config and optional token provider.
+
+        ``debug_dir``: when set, every Fusion request/response pair is
+        written to a JSON file under that directory.  Plumbed from the
+        ``--debug`` CLI flag.  Auth and other secret-bearing headers are
+        redacted before being written.
+        """
         self.cfg = cfg
         self._token_provider = token_provider
 
@@ -99,6 +242,8 @@ class OracleErpIntegrationsClient:
             }
         )
         self._session.proxies.update(get_proxy_config(require=cfg.require_proxy))
+
+        self._dumper = _ExchangeDumper(debug_dir) if debug_dir else None
 
     def _auth_headers(self) -> Dict[str, str]:
         """Build fresh Authorization header (uses provider if supplied)."""
@@ -133,22 +278,43 @@ class OracleErpIntegrationsClient:
         url = self._endpoint(handle)
         log.debug("POST %s payload=%s", url, payload)
 
-        r = self._session.post(
-            url,
-            json=payload,
-            headers=self._auth_headers(),
-            timeout=self.cfg.timeout_seconds,
-            verify=self.cfg.verify_ssl,
-        )
+        auth_headers = self._auth_headers()
+        request_headers = {**self._session.headers, **auth_headers}
+        r: Optional["requests.Response"] = None
+        transport_error: Optional[str] = None
+        started = datetime.now(timezone.utc)
         try:
-            raw = r.json()
+            r = self._session.post(
+                url,
+                json=payload,
+                headers=auth_headers,
+                timeout=self.cfg.timeout_seconds,
+                verify=self.cfg.verify_ssl,
+            )
         except Exception as e:
-            raise FusionApiError(
-                f"Non-JSON response from Fusion (status={r.status_code}): {r.text[:500]}"
-            ) from e
-
-        if r.status_code >= 400:
-            raise FusionApiError(f"Fusion HTTP {r.status_code}: {raw}")
+            transport_error = f"{type(e).__name__}: {e}"
+            self._maybe_dump(
+                method="POST",
+                url=url,
+                request_headers=request_headers,
+                request_body=payload,
+                response=None,
+                error=transport_error,
+                started=started,
+                tag=op_name,
+            )
+            raise
+        self._maybe_dump(
+            method="POST",
+            url=url,
+            request_headers=request_headers,
+            request_body=payload,
+            response=r,
+            error=None,
+            started=started,
+            tag=op_name,
+        )
+        raw = _parse_fusion_response(r, context=f"POST {op_name}")
 
         pl_raw = raw.get("ParameterList")
         pl: Dict[str, Any] = {}
@@ -173,21 +339,70 @@ class OracleErpIntegrationsClient:
         url = self._resource_url(resource_path)
         log.debug("GET %s params=%s", url, query_params)
 
-        r = self._session.get(
-            url,
-            params=query_params or {},
-            headers=self._auth_headers(),
-            timeout=self.cfg.timeout_seconds,
-            verify=self.cfg.verify_ssl,
-        )
+        auth_headers = self._auth_headers()
+        request_headers = {**self._session.headers, **auth_headers}
+        request_body = {"query_params": dict(query_params or {})}
+        r: Optional["requests.Response"] = None
+        transport_error: Optional[str] = None
+        started = datetime.now(timezone.utc)
         try:
-            raw = r.json()
+            r = self._session.get(
+                url,
+                params=query_params or {},
+                headers=auth_headers,
+                timeout=self.cfg.timeout_seconds,
+                verify=self.cfg.verify_ssl,
+            )
         except Exception as e:
-            raise FusionApiError(
-                f"Non-JSON response from Fusion GET (status={r.status_code}): {r.text[:500]}"
-            ) from e
-
-        if r.status_code >= 400:
-            raise FusionApiError(f"Fusion GET HTTP {r.status_code}: {raw}")
-
+            transport_error = f"{type(e).__name__}: {e}"
+            self._maybe_dump(
+                method="GET",
+                url=url,
+                request_headers=request_headers,
+                request_body=request_body,
+                response=None,
+                error=transport_error,
+                started=started,
+                tag=resource_path,
+            )
+            raise
+        self._maybe_dump(
+            method="GET",
+            url=url,
+            request_headers=request_headers,
+            request_body=request_body,
+            response=r,
+            error=None,
+            started=started,
+            tag=resource_path,
+        )
+        raw = _parse_fusion_response(r, context=f"GET {resource_path}")
         return dict(raw)
+
+    def _maybe_dump(
+        self,
+        *,
+        method: str,
+        url: str,
+        request_headers: Dict[str, Any],
+        request_body: Any,
+        response: Optional["requests.Response"],
+        error: Optional[str],
+        started: datetime,
+        tag: str,
+    ) -> None:
+        if self._dumper is None:
+            return
+        elapsed_ms = (
+            datetime.now(timezone.utc) - started
+        ).total_seconds() * 1000.0
+        self._dumper.dump(
+            method=method,
+            url=url,
+            request_headers=request_headers,
+            request_body=request_body,
+            response=response,
+            error=error,
+            elapsed_ms=elapsed_ms,
+            tag=tag,
+        )
