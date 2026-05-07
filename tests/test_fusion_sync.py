@@ -1181,3 +1181,118 @@ class TestTransferOverridesByBook:
         # Globals (copy_dff_flag etc.) keep their defaults; only the
         # explicitly-overridden key changes.
         assert params["P_COPY_DFF_FLAG"] == "Y"
+
+
+class TestAppliesToFlag:
+    """Per-book overrides scoped by applies_to: S (source), T (target,
+    default), B (both).  Source overrides apply first, target overrides
+    apply second so target wins when both supply the same key."""
+
+    def _run_with_source(self, source_book: str, target_book: str, *, overrides_by_book: dict):
+        fusion = _mock_fusion()
+        bip = _mock_bip()
+        bip.run_report.side_effect = lambda params: (
+            [_bip_row(book=source_book, dff_entity="Tgt Entity")]
+            if params.get("P_BOOK_TYPE_CODE") == source_book
+            else []
+        )
+        fusion.process_transaction.return_value = _get_asset_info_response(
+            book=source_book
+        )
+        entity_map = {"Src Entity": source_book, "Tgt Entity": target_book}
+        sync = FusionIUSync(
+            fusion,
+            EntityBookResolver(entity_map),
+            bip,
+            transfer_overrides_by_book=overrides_by_book,
+        )
+        summary = sync.run_full_sync(books=[source_book, target_book], dry_run=True)
+        return summary["results"][0]["fusion_response"]["planned_params"]
+
+    def test_default_is_target_only(self):
+        """No applies_to flag → entry applies only when book is target.
+        SG-as-source with no flag should NOT contribute its overrides."""
+        params = self._run_with_source(
+            source_book="SG CORP BOOK",
+            target_book="US CORP BOOK",
+            overrides_by_book={
+                "SG CORP BOOK": {"conversion_rate_type": "Spot"},
+            },
+        )
+        # SG is source; default applies_to=T means SG entry is skipped.
+        assert params["P_CONVERSION_RATE_TYPE"] is None
+
+    def test_source_flag_applies_only_when_book_is_source(self):
+        params = self._run_with_source(
+            source_book="SG CORP BOOK",
+            target_book="US CORP BOOK",
+            overrides_by_book={
+                "SG CORP BOOK": {"applies_to": "S", "conversion_rate_type": "User"},
+            },
+        )
+        assert params["P_CONVERSION_RATE_TYPE"] == "User"
+
+    def test_source_flag_does_not_apply_when_book_is_target(self):
+        params = self._run_with_source(
+            source_book="US CORP BOOK",
+            target_book="SG CORP BOOK",
+            overrides_by_book={
+                "SG CORP BOOK": {"applies_to": "S", "conversion_rate_type": "User"},
+            },
+        )
+        # SG is target now; applies_to=S means SG entry is skipped.
+        assert params["P_CONVERSION_RATE_TYPE"] is None
+
+    def test_target_wins_when_both_supply_same_key(self):
+        params = self._run_with_source(
+            source_book="SG CORP BOOK",
+            target_book="JP CORP BOOK",
+            overrides_by_book={
+                "SG CORP BOOK": {"applies_to": "S", "conversion_rate_type": "User"},
+                "JP CORP BOOK": {"applies_to": "T", "conversion_rate_type": "Corporate"},
+            },
+        )
+        # Target's value wins.
+        assert params["P_CONVERSION_RATE_TYPE"] == "Corporate"
+
+    def test_both_flag_applies_in_either_role(self):
+        # Once as source.
+        p_src = self._run_with_source(
+            source_book="SG CORP BOOK",
+            target_book="US CORP BOOK",
+            overrides_by_book={
+                "SG CORP BOOK": {"applies_to": "B", "conversion_rate_type": "Spot"},
+            },
+        )
+        assert p_src["P_CONVERSION_RATE_TYPE"] == "Spot"
+        # And once as target.
+        p_tgt = self._run_with_source(
+            source_book="US CORP BOOK",
+            target_book="SG CORP BOOK",
+            overrides_by_book={
+                "SG CORP BOOK": {"applies_to": "B", "conversion_rate_type": "Spot"},
+            },
+        )
+        assert p_tgt["P_CONVERSION_RATE_TYPE"] == "Spot"
+
+    def test_invalid_applies_to_value_falls_back_to_target(self):
+        params = self._run_with_source(
+            source_book="US CORP BOOK",
+            target_book="JP CORP BOOK",
+            overrides_by_book={
+                "JP CORP BOOK": {"applies_to": "garbage", "conversion_rate_type": "Corporate"},
+            },
+        )
+        assert params["P_CONVERSION_RATE_TYPE"] == "Corporate"
+
+    def test_applies_to_key_not_leaked_into_payload(self):
+        params = self._run_with_source(
+            source_book="US CORP BOOK",
+            target_book="JP CORP BOOK",
+            overrides_by_book={
+                "JP CORP BOOK": {"applies_to": "T", "conversion_rate_type": "Corporate"},
+            },
+        )
+        # ``applies_to`` is metadata, not a Fusion parameter.
+        assert "P_APPLIES_TO" not in params
+        assert "applies_to" not in params

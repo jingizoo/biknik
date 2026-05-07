@@ -27,13 +27,19 @@
   "transfer_overrides": {
   },
 
-  "_transfer_overrides_by_book_note": "Per-target-book overrides, keyed by destination book code (case-insensitive).  Required for cross-currency transfers because Oracle FA rejects an unknown conversion_rate_type and rejects an empty one when FX is needed.  Set conversion_rate_type to whatever the destination ledger publishes (commonly 'Corporate', 'Spot', 'User', or 'Daily').  Books not listed here transfer with the parameter omitted.",
+  "_transfer_overrides_by_book_note": "Per-book overrides, keyed by book code (case-insensitive).  Each entry may carry an 'applies_to' flag controlling when its values are layered onto the payload: 'T' (target, default) for inbound transfers into this book, 'S' (source) for outbound, 'B' for both.  Source overrides apply first; target overrides win when both supply the same key.  Books not listed transfer with no per-book values.",
   "transfer_overrides_by_book": {
     "JP CORP BOOK": {
+      "applies_to": "T",
       "conversion_rate_type": "Corporate"
     },
     "AU CORP BOOK": {
+      "applies_to": "T",
       "conversion_rate_type": "Spot"
+    },
+    "SG CORP BOOK": {
+      "applies_to": "S",
+      "conversion_rate_type": "User"
     }
   },
 

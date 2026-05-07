@@ -27,7 +27,7 @@ import logging
 import time
 from dataclasses import dataclass, field
 from datetime import date
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from .bip_client import BIPClient
 from .entity_resolver import EntityBookResolver
@@ -190,15 +190,55 @@ class FusionIUSync:
         # from the BIP report still take precedence — these are only used
         # when the row-level value is empty.
         self._transfer_overrides: Dict[str, Any] = dict(transfer_overrides or {})
-        # Per-target-book overrides, keyed by destination book code
-        # (case-insensitive). Layered on top of ``transfer_overrides`` so an
-        # AU ledger that does not publish a ``Corporate`` rate type can
-        # override just ``conversion_rate_type`` for transfers into AU
-        # without disturbing the JP / UK / US default.
+        # Per-book overrides, keyed by book code (case-insensitive).  Each
+        # entry may carry an ``applies_to`` flag:
+        #   * ``"T"`` (default) — applies when the book is the *target*
+        #     of the transfer.  Use for ledgers that publish their own
+        #     rate type (e.g. JP=Corporate, AU=Spot).
+        #   * ``"S"`` — applies when the book is the *source*.  Use for
+        #     ledgers whose outbound rules differ from the rest (e.g. SG
+        #     where Corporate as a rate type isn't valid for outbound
+        #     conversions).
+        #   * ``"B"`` — applies in either role.
+        # Source overrides are layered first, target overrides second,
+        # so when the same key is set on both, target wins.
         self._transfer_overrides_by_book: Dict[str, Dict[str, Any]] = {
             str(k).upper().strip(): dict(v or {})
             for k, v in (transfer_overrides_by_book or {}).items()
         }
+
+    @staticmethod
+    def _strip_applies_to(entry: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+        """Split an override entry into (applies_to, overrides)."""
+        applies_to = str(entry.get("applies_to") or "T").upper().strip() or "T"
+        if applies_to not in ("S", "T", "B"):
+            applies_to = "T"
+        return applies_to, {k: v for k, v in entry.items() if k != "applies_to"}
+
+    def _book_overrides_for(
+        self, source_book: Optional[str], target_book: Optional[str]
+    ) -> Dict[str, Any]:
+        """Resolve the per-book overrides that apply to this transfer.
+
+        Source overrides are layered first; target overrides win when
+        the same key is set on both sides.
+        """
+        out: Dict[str, Any] = {}
+        src = (source_book or "").upper().strip()
+        tgt = (target_book or "").upper().strip()
+
+        src_entry = self._transfer_overrides_by_book.get(src) if src else None
+        if src_entry:
+            applies_to, ovr = self._strip_applies_to(src_entry)
+            if applies_to in ("S", "B"):
+                out.update(ovr)
+
+        tgt_entry = self._transfer_overrides_by_book.get(tgt) if tgt else None
+        if tgt_entry:
+            applies_to, ovr = self._strip_applies_to(tgt_entry)
+            if applies_to in ("T", "B"):
+                out.update(ovr)
+        return out
 
     # ------------------------------------------------------------------
     # Discovery
@@ -470,12 +510,15 @@ class FusionIUSync:
         # (copy_dff_flag=Y, …) so they land in every Fusion call by
         # default.  Per-row values still win.
         overrides: Dict[str, Any] = dict(self._transfer_overrides)
-        # Layer per-target-book overrides (e.g. AU has no 'Corporate' rate
-        # type, so the AU ledger publishes its own conversion_rate_type).
-        per_book = self._transfer_overrides_by_book.get(
-            (pending.target_book_type_code or "").upper().strip(), {}
+        # Layer per-book overrides scoped by ``applies_to`` (S/T/B).
+        # Source first, target second — target wins when both supply the
+        # same key.
+        overrides.update(
+            self._book_overrides_for(
+                source_book=pending.book_type_code,
+                target_book=pending.target_book_type_code,
+            )
         )
-        overrides.update(per_book)
         # Prefer TARGET_LOCATION_ID from report; fall back to TRANSFER_TO_LOCATION DFF
         location_override = pending.target_location_id or pending.transfer_to_location
         if location_override:
