@@ -23,6 +23,11 @@
     "JP Entity": "JP CORP BOOK"
   },
 
+  "_transfer_overrides_note": "Defaults applied to every Fusion FA bookTransfer / transferAsset call.  Required for cross-currency transfers (e.g. US -> JP) where Oracle won't fall back to a ledger default.  Per-row TARGET_LOCATION_ID / TARGET_EXPENSE_CCID from BIP still win.",
+  "transfer_overrides": {
+    "conversion_rate_type": "Corporate"
+  },
+
   "_routing_rules_note": "Optional EMEA routing engine.  When 'rules' or 'blocked_locations' is non-empty, FusionIUSync uses this resolver INSTEAD OF entity_book_map for picking the target book.  Each rule is a priority-ordered match on LC location code (exact or prefix), Oracle FA category_id (numeric), and/or cost-centre segment.  First-matching rule wins; unmatched assets surface as exceptions, blocked locations short-circuit as skips.",
   "routing_rules_config": {
     "blocked_locations": {

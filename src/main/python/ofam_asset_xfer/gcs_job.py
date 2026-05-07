@@ -352,6 +352,7 @@ def _run_bip_flow(
         dff_config=dff_config,
         blocked_books=config.get("blocked_books") or [],
         routing_resolver=routing_resolver,
+        transfer_overrides=config.get("transfer_overrides") or {},
     )
     summary = sync.run_full_sync(
         books=books,

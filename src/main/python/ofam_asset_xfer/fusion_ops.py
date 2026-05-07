@@ -407,7 +407,11 @@ def build_book_transfer_params(
         "P_COPY_ASSET_KEY_FLAG": overrides.get("copy_asset_key_flag", "Y"),
         "P_CREATE_NEW_ASSET_FLAG": overrides.get("create_new_asset_flag", "Y"),
         "P_COPY_SOURCE_LINES_FLAG": "N",
-        "P_CONVERSION_RATE_TYPE": overrides.get("conversion_rate_type", ""),
+        # 'Corporate' is the most common GL daily-rate type at Citadel and
+        # is required by Oracle FA on cross-currency book transfers
+        # (e.g. US -> JP).  Override per-tenant via transfer_overrides
+        # in the runner config or per-request via target_assignment.
+        "P_CONVERSION_RATE_TYPE": overrides.get("conversion_rate_type", "Corporate"),
         "P_TRANSACTION_UNITS_TBL": txn_units_tbl,
         "P_EXPENSE_CCID_TBL": expense_tbl,
         "P_LOCATION_CCID_TBL": location_tbl,

@@ -904,3 +904,102 @@ class TestRunFullSync:
 
         assert summary["counts"]["total"] == 0
         assert summary["results"] == []
+
+
+# ---------------------------------------------------------------------------
+# transfer_overrides — run-wide defaults for the Fusion FA payload
+# (conversion_rate_type, copy_dff_flag, …).  Per-row BIP values still win.
+# ---------------------------------------------------------------------------
+
+
+class TestTransferOverridesDefaults:
+    def test_corporate_is_default_conversion_rate_type(self):
+        """fusion_ops.build_book_transfer_params now defaults P_CONVERSION_RATE_TYPE
+        to 'Corporate' — not the empty string that Oracle was rejecting on
+        cross-currency transfers (US -> JP)."""
+        from ofam_asset_xfer.fusion_ops import build_book_transfer_params
+
+        params = build_book_transfer_params(
+            state=_sample_state(),
+            dest_book_type_code="JP CORP BOOK",
+            effective_date="2026-05-01",
+            overrides={},
+            request_id="REQ-1",
+        )
+        assert params["P_CONVERSION_RATE_TYPE"] == "Corporate"
+
+    def test_explicit_conversion_rate_type_overrides_default(self):
+        from ofam_asset_xfer.fusion_ops import build_book_transfer_params
+
+        params = build_book_transfer_params(
+            state=_sample_state(),
+            dest_book_type_code="JP CORP BOOK",
+            effective_date="2026-05-01",
+            overrides={"conversion_rate_type": "User"},
+            request_id="REQ-1",
+        )
+        assert params["P_CONVERSION_RATE_TYPE"] == "User"
+
+    def test_transfer_overrides_seeds_every_cross_book_call(self):
+        """Run-wide transfer_overrides on FusionIUSync land in the
+        bookTransfer payload for every asset processed in the BIP flow."""
+        fusion = _mock_fusion()
+        bip = _mock_bip()
+        bip.run_report.side_effect = lambda params: (
+            [_bip_row(book="US CORP BOOK", dff_entity="JP Entity")]
+            if params.get("P_BOOK_TYPE_CODE") == "US CORP BOOK"
+            else []
+        )
+        fusion.process_transaction.return_value = _get_asset_info_response()
+
+        sync = FusionIUSync(
+            fusion,
+            _resolver(),
+            bip,
+            transfer_overrides={"conversion_rate_type": "Corporate"},
+        )
+        summary = sync.run_full_sync(
+            books=["US CORP BOOK", "JP CORP BOOK"], dry_run=True
+        )
+
+        assert summary["counts"]["dry_run"] == 1
+        sent = summary["results"][0]["fusion_response"]["planned_params"]
+        assert sent["P_CONVERSION_RATE_TYPE"] == "Corporate"
+
+    def test_per_row_target_overrides_still_win_over_run_wide_defaults(self):
+        """Run-wide defaults seed the dict; per-row TARGET_LOCATION_ID and
+        TARGET_EXPENSE_CCID from BIP overwrite their slots normally."""
+        fusion = _mock_fusion()
+        bip = _mock_bip()
+        bip.run_report.side_effect = lambda params: (
+            [
+                _bip_row(
+                    book="US CORP BOOK",
+                    dff_entity="JP Entity",
+                    target_location_id="300100999999",
+                )
+            ]
+            if params.get("P_BOOK_TYPE_CODE") == "US CORP BOOK"
+            else []
+        )
+        fusion.process_transaction.return_value = _get_asset_info_response()
+
+        sync = FusionIUSync(
+            fusion,
+            _resolver(),
+            bip,
+            transfer_overrides={
+                "conversion_rate_type": "Corporate",
+                "location_ccid": "111-default",  # would lose to TARGET_LOCATION_ID
+            },
+        )
+        summary = sync.run_full_sync(
+            books=["US CORP BOOK", "JP CORP BOOK"], dry_run=True
+        )
+
+        sent = summary["results"][0]["fusion_response"]["planned_params"]
+        # run-wide default lands
+        assert sent["P_CONVERSION_RATE_TYPE"] == "Corporate"
+        # per-row TARGET_LOCATION_ID still wins for the location slot
+        assert "300100999999" in sent["P_LOCATION_CCID_TBL"]
+        assert "111-default" not in sent["P_LOCATION_CCID_TBL"]
