@@ -79,13 +79,33 @@ def main(argv: list[str] | None = None) -> int:
         "--log-level", default=os.getenv("LOG_LEVEL", "INFO"),
         help="Logging level (default: INFO).",
     )
+    p.add_argument(
+        "--debug",
+        action="store_true",
+        help=(
+            "Enable DEBUG logging and dump every Fusion request/response "
+            "(auth-redacted) to ./debug-dumps/<timestamp>/ for offline inspection."
+        ),
+    )
+    p.add_argument(
+        "--debug-dir",
+        default=None,
+        help="Override directory for --debug dumps (default: ./debug-dumps/<timestamp>/).",
+    )
     args = p.parse_args(argv)
 
+    effective_log_level = "DEBUG" if args.debug else args.log_level
     logging.basicConfig(
-        level=getattr(logging, args.log_level.upper(), logging.INFO),
+        level=getattr(logging, effective_log_level.upper(), logging.INFO),
         format="%(asctime)s %(levelname)-5s %(name)s — %(message)s",
     )
     log = logging.getLogger("run_single_transfer")
+
+    debug_dir: str | None = None
+    if args.debug:
+        from datetime import datetime as _dt
+        ts = _dt.utcnow().strftime("%Y%m%dT%H%M%SZ")
+        debug_dir = args.debug_dir or str(Path("debug-dumps") / ts)
 
     execute = args.execute and not args.dry_run
     dry_run = not execute
@@ -123,7 +143,7 @@ def main(argv: list[str] | None = None) -> int:
 
         # Build Fusion client
         oracle_cfg = OracleConfig.from_dict(config.get("oracle", {}))
-        client = OracleErpIntegrationsClient(oracle_cfg)
+        client = OracleErpIntegrationsClient(oracle_cfg, debug_dir=debug_dir)
 
         # Step 1: Get current asset state
         log.info("Calling getAssetInformation for asset=%s book=%s ...",
