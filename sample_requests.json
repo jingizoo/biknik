@@ -22,6 +22,12 @@
     "UK Entity": "UK CORP BOOK",
     "JP Entity": "JP CORP BOOK"
   },
+
+  "_transfer_overrides_note": "Defaults applied to every Fusion FA bookTransfer / transferAsset call.  Required for cross-currency transfers (e.g. US -> JP) where Oracle won't fall back to a ledger default.  Per-row TARGET_LOCATION_ID / TARGET_EXPENSE_CCID from BIP still win.",
+  "transfer_overrides": {
+    "conversion_rate_type": "Corporate"
+  },
+
   "gcs": {
     "bucket": "your-fa-transfer-logs",
     "prefix": "transfers",

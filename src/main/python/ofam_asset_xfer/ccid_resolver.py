@@ -29,7 +29,8 @@ _SEGMENT_RE = re.compile(r"^Segment\d+$")
 class _RestClient(Protocol):
     def get_resource(
         self, resource_path: str, query_params: Optional[Dict[str, str]] = None
-    ) -> Dict[str, Any]: ...
+    ) -> Dict[str, Any]:
+        ...
 
 
 # ---------------------------------------------------------------------------

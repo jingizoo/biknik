@@ -7,13 +7,21 @@ from ofam_mass_additions.runner.cycle import MassAdditionCycleRunner
 from ofam_mass_additions.runner.dry_run import run_dry_run
 
 
-CSV_TEXT = """mass_addition_id,book_type_code,region,queue_name,posting_status,tag_number,serial_number,po_number,invoice_number,expected_action
-MA-100,CORP_BOOK,US,NEW,NEW,TAG-100,SN-100,PO-100,INV-100,auto_update
-MA-101,CORP_BOOK,US,NEW,NEW,TAG-404,SN-404,PO-404,INV-404,exception_cmdb_not_found
-MA-102,CORP_BOOK,US,NEW,NEW,TAG-102,SN-102,PO-102,INV-102,exception_missing_ccid
-MA-103,CORP_BOOK,US,NEW,NEW,TAG-103,SN-103,PO-103,INV-103,exception_inactive_ccid
-MA-104,OTHER_BOOK,US,NEW,NEW,TAG-104,SN-104,PO-104,INV-104,skip_outside_book
-"""
+_CSV_HEADER = (
+    "mass_addition_id,book_type_code,region,queue_name,posting_status,"
+    "tag_number,serial_number,po_number,invoice_number,expected_action"
+)
+CSV_TEXT = "\n".join(
+    [
+        _CSV_HEADER,
+        "MA-100,CORP_BOOK,US,NEW,NEW,TAG-100,SN-100,PO-100,INV-100,auto_update",
+        "MA-101,CORP_BOOK,US,NEW,NEW,TAG-404,SN-404,PO-404,INV-404,exception_cmdb_not_found",
+        "MA-102,CORP_BOOK,US,NEW,NEW,TAG-102,SN-102,PO-102,INV-102,exception_missing_ccid",
+        "MA-103,CORP_BOOK,US,NEW,NEW,TAG-103,SN-103,PO-103,INV-103,exception_inactive_ccid",
+        "MA-104,OTHER_BOOK,US,NEW,NEW,TAG-104,SN-104,PO-104,INV-104,skip_outside_book",
+        "",  # trailing newline preserved
+    ]
+)
 
 
 class ErrorOracleClient(MockOracleFaClient):
@@ -65,6 +73,51 @@ def test_live_mode_records_oracle_errors_as_exceptions(tmp_path: Path) -> None:
     line = (tmp_path / "audit.jsonl").read_text(encoding="utf-8").strip().splitlines()[0]
     payload = json.loads(line)
     assert payload["status"] == "exception"
+
+
+class CapturingOracleClient(MockOracleFaClient):
+    """Records the exact dict update_mass_addition() was called with."""
+
+    captured_payload: dict | None = None
+
+    def update_mass_addition(self, payload: dict[str, str]) -> str:
+        type(self).captured_payload = payload
+        return '{"X_RETURN_STATUS":"S","X_MSG_DATA":"updated"}'
+
+
+def test_live_mode_passes_raw_uppercase_params_not_wrapped_payload(tmp_path: Path) -> None:
+    """update_mass_addition must receive the inner UPPERCASE params dict.
+
+    Wrapping it with {OperationName, ParameterList} before this point
+    double-wraps it inside FusionFaClient.process_transaction_raw and
+    fails the uppercase check on the second pass.
+    """
+    rows = {
+        "MA-100": MassAddition(
+            mass_addition_id="MA-100",
+            book_type_code="CORP_BOOK",
+            region="US",
+            posting_status="NEW",
+            tag_number="TAG-100",
+        )
+    }
+    CapturingOracleClient.captured_payload = None
+    runner = MassAdditionCycleRunner(
+        oracle_client=CapturingOracleClient(rows=rows),
+        run_mode="live",
+        pilot_book="CORP_BOOK",
+        pilot_region="US",
+    )
+    runner.run(output_dir=tmp_path)
+
+    payload = CapturingOracleClient.captured_payload
+    assert payload is not None
+    # No outer envelope keys — those belong inside the FA client.
+    assert "OperationName" not in payload
+    assert "ParameterList" not in payload
+    # Every key the runner sent is UPPERCASE so build_parameter_list passes.
+    assert payload, "expected non-empty params dict"
+    assert all(k == k.upper() for k in payload), payload
 
 
 def test_oracle_style_failed_response_is_exception() -> None:

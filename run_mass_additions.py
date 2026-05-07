@@ -48,6 +48,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src" / "main" / "python"))
 
 from ofam_mass_additions.cmdb.servicenow_client import ServiceNowConfig  # noqa: E402
+from ofam_mass_additions.cmdb.bip_translations import (  # noqa: E402
+    BipTranslationsConfig,
+    BipTranslationsLoader,
+)
 from ofam_mass_additions.exceptions import ConfigError  # noqa: E402
 from ofam_mass_additions.publishers.gcs_publisher import GCSAuditPublisher  # noqa: E402
 from ofam_mass_additions.publishers.slack_publisher import (  # noqa: E402
@@ -59,7 +63,18 @@ from ofam_mass_additions.runner.live_run import LiveRunResult, run_live  # noqa:
 
 
 def _load_config(path: str) -> dict:
-    raw = Path(path).read_text()
+    """Read + parse the config JSON, tolerating Windows-saved cp1252 files."""
+    raw_bytes = Path(path).read_bytes()
+    for encoding in ("utf-8-sig", "utf-8", "cp1252"):
+        try:
+            raw = raw_bytes.decode(encoding)
+            break
+        except UnicodeDecodeError:
+            continue
+    else:
+        raise ConfigError(
+            f"Config could not be decoded as utf-8 or cp1252: {path}"
+        )
     try:
         return json.loads(raw)
     except Exception as e:
@@ -227,7 +242,9 @@ def main(argv: list[str] | None = None) -> int:
         )
 
         cmdb_overrides = config.get("cmdb_overrides") or {}
-        oracle_translations = config.get("oracle_translations") or {}
+        oracle_translations = _load_translations(
+            config, pilot_book, config.get("fusion_auth"), log
+        )
 
         result = run_live(
             oracle_client=oracle_client,
@@ -259,6 +276,32 @@ def main(argv: list[str] | None = None) -> int:
     log.info("Exceptions       : %s", out_dir / "exceptions.csv")
     log.info("Audit log        : %s", out_dir / "audit.jsonl")
     return 0
+
+
+def _load_translations(
+    config: dict,
+    pilot_book: str,
+    fusion_auth_block: dict | None,
+    log: logging.Logger,
+) -> dict:
+    """Return oracle_translations from a live BIP report or the static JSON block.
+
+    Priority:
+      1. ``translations_bip`` block in config → call the BIP report
+         (overrides any static ``oracle_translations`` block).
+      2. ``oracle_translations`` block → use as-is (existing behaviour).
+    """
+    bip_block = config.get("translations_bip")
+    if bip_block:
+        bip_cfg = BipTranslationsConfig.from_dict(
+            {"book_type_code": pilot_book, **bip_block}
+        )
+        token_provider = None
+        if fusion_auth_block:
+            from ofam_mass_additions.fusion_token_provider import build_token_provider
+            token_provider = build_token_provider(fusion_auth_block)
+        return BipTranslationsLoader(bip_cfg, token_provider=token_provider).load()
+    return config.get("oracle_translations") or {}
 
 
 def _pagerduty_routing_key_available(pd_block: dict) -> bool:

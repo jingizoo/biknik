@@ -14,7 +14,8 @@ from an Oracle BI Publisher report (All_IUT_Transfers_Rpt):
 Architecture:
   1. Call BIP report via SOAP to get asset transfer candidates (DFF populated)
   2. For each candidate, call getAssetInformation to get full asset state
-  3. Use FINAL_TARGET_BOOK_TYPE_CODE from report as target book (fallback: resolve entity → target book via EntityBookResolver)
+  3. Use FINAL_TARGET_BOOK_TYPE_CODE from report as target book
+     (fallback: resolve entity → target book via EntityBookResolver)
   4. Compare current book vs target book
   5. If book mismatch → cross-book transfer via processTransaction-bookTransfer
   6. If same book but location differs → same-book transfer via processTransaction-transferAsset
@@ -173,6 +174,7 @@ class FusionIUSync:
         dff_config: Optional[DFFConfig] = None,
         default_transfer_date: Optional[str] = None,
         blocked_books: Optional[List[str]] = None,
+        transfer_overrides: Optional[Dict[str, Any]] = None,
     ):
         self._client = fusion_client
         self._entity_resolver = entity_resolver
@@ -182,6 +184,11 @@ class FusionIUSync:
         self._blocked_books: Set[str] = {
             b.upper().strip() for b in (blocked_books or []) if b and b.strip()
         }
+        # Defaults for the Oracle FA bookTransfer / transferAsset payload
+        # (conversion_rate_type, copy_dff_flag, etc.).  Per-row overrides
+        # from the BIP report still take precedence — these are only used
+        # when the row-level value is empty.
+        self._transfer_overrides: Dict[str, Any] = dict(transfer_overrides or {})
 
     # ------------------------------------------------------------------
     # Discovery
@@ -449,7 +456,10 @@ class FusionIUSync:
             pending.transfer_to_entity,
         )
 
-        overrides: Dict[str, Any] = {}
+        # Seed per-asset overrides with the run-wide defaults
+        # (conversion_rate_type=Corporate, copy_dff_flag=Y, …) so they
+        # land in every Fusion call by default.  Per-row values still win.
+        overrides: Dict[str, Any] = dict(self._transfer_overrides)
         # Prefer TARGET_LOCATION_ID from report; fall back to TRANSFER_TO_LOCATION DFF
         location_override = pending.target_location_id or pending.transfer_to_location
         if location_override:

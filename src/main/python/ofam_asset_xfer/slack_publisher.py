@@ -89,7 +89,28 @@ class SlackPublisher:
     def publish(
         self, summary: Dict[str, Any], results: List[Dict[str, Any]]
     ) -> None:
-        """Format and send Slack notification."""
+        """Format and send Slack notification.
+
+        The message is composed of independent sections, each rendered
+        by a small helper that returns either the section text or ``""``
+        when there's nothing to show.  Empty sections are filtered out
+        before joining, so the on-the-wire message contains no stray
+        blank lines and the high-level structure stays readable.
+        """
+        sections = [
+            self._render_header(summary, results),
+            self._render_book_breakdown(results),
+            self._render_failures(results),
+            self._render_dashboard_link(),
+        ]
+        text = "\n\n".join(s for s in sections if s)
+        self._post(text)
+        log.info("Slack notification sent (%d chars)", len(text))
+
+    @staticmethod
+    def _render_header(
+        summary: Dict[str, Any], results: List[Dict[str, Any]]
+    ) -> str:
         counts = summary.get("counts", {})
         total = counts.get("total", len(results))
         transferred = counts.get("transferred", 0)
@@ -105,53 +126,53 @@ class SlackPublisher:
             if is_success
             else "FA Asset Transfer — Failures Detected"
         )
-
-        lines: List[str] = []
-        lines.append(f"{emoji} *{title}*")
-        lines.append(
-            f"Total: {total} | Transferred: {transferred} "
-            f"| Failed: {failed} | Dry-run: {dry_run_count}"
-        )
+        lines = [
+            f"{emoji} *{title}*",
+            (
+                f"Total: {total} | Transferred: {transferred} "
+                f"| Failed: {failed} | Dry-run: {dry_run_count}"
+            ),
+        ]
         if run_date or run_ts:
             lines.append(f"Date: {run_date} | Run: {run_ts}")
+        return "\n".join(lines)
 
-        # Per-book breakdown
+    @staticmethod
+    def _render_book_breakdown(results: List[Dict[str, Any]]) -> str:
         book_stats = _build_book_breakdown(results)
-        if book_stats:
-            lines.append("")
-            lines.append("*Per-Book Breakdown:*")
-            for key, stats in sorted(book_stats.items()):
-                src, tgt = key
-                ok = stats["ok"]
-                fail = stats["fail"]
-                status = f"{ok} ok, {fail} failed" if fail else f"{ok} ok"
-                lines.append(f"  \u2022 {src} \u2192 {tgt}: {status}")
+        if not book_stats:
+            return ""
+        lines = ["*Per-Book Breakdown:*"]
+        for (src, tgt), stats in sorted(book_stats.items()):
+            ok = stats["ok"]
+            fail = stats["fail"]
+            status = f"{ok} ok, {fail} failed" if fail else f"{ok} ok"
+            lines.append(f"  • {src} → {tgt}: {status}")
+        return "\n".join(lines)
 
-        # Failed assets
+    def _render_failures(self, results: List[Dict[str, Any]]) -> str:
         failures = [r for r in results if r.get("status") == "FAILED"]
-        if failures:
-            lines.append("")
-            show = failures[: self.cfg.max_failures]
-            lines.append(f"*Failed Assets ({len(failures)}):*")
-            for r in show:
-                asset = r.get("asset_number", "?")
-                error = r.get("error", "unknown error")
-                if len(str(error)) > 120:
-                    error = str(error)[:117] + "..."
-                lines.append(f"  \u2022 {asset}: {error}")
-            if len(failures) > self.cfg.max_failures:
-                lines.append(
-                    f"  _...and {len(failures) - self.cfg.max_failures} more \u2014 see dashboard_"
-                )
+        if not failures:
+            return ""
+        show = failures[: self.cfg.max_failures]
+        lines = [f"*Failed Assets ({len(failures)}):*"]
+        for r in show:
+            asset = r.get("asset_number", "?")
+            error = r.get("error", "unknown error")
+            if len(str(error)) > 120:
+                error = str(error)[:117] + "..."
+            lines.append(f"  • {asset}: {error}")
+        if len(failures) > self.cfg.max_failures:
+            lines.append(
+                f"  _...and {len(failures) - self.cfg.max_failures} "
+                f"more — see dashboard_"
+            )
+        return "\n".join(lines)
 
-        # Dashboard link
-        if self.cfg.dashboard_url:
-            lines.append("")
-            lines.append(f"<{self.cfg.dashboard_url}|:bar_chart: Open Dashboard>")
-
-        text = "\n".join(lines)
-        self._post(text)
-        log.info("Slack notification sent (%d chars)", len(text))
+    def _render_dashboard_link(self) -> str:
+        if not self.cfg.dashboard_url:
+            return ""
+        return f"<{self.cfg.dashboard_url}|:bar_chart: Open Dashboard>"
 
     def _post(self, text: str) -> None:
         payload = {"text": text}

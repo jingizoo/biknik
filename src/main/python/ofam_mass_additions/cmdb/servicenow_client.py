@@ -12,7 +12,7 @@ auth pattern mirror the existing PL/SQL stored procedure
   * Same proxy / SSL conventions as the rest of this repo (env-driven).
 
 Field-name mapping is configurable so a tenant with a different CMDB
-schema (e.g. ``u_fa_expense_ccid`` instead of ``cost_center.value``) can
+schema (e.g. ``u_fa_expense_ccid`` instead of ``cost_center.name``) can
 override individual fields without forking the client.
 """
 
@@ -69,8 +69,11 @@ class ServiceNowConfig:
     serial_number_field: str = "serial_number"
     po_number_field: str | None = None  # not on alm_hardware by default
     invoice_number_field: str | None = None  # not on alm_hardware by default
-    location_id_field: str = "location.u_fin_location_id"
-    expense_ccid_field: str = "cost_center.value"
+    location_id_field: str = "location.u_fin_location_id.u_cit_location_code"
+    # cost_center.name ships as "<cc-number> - <description>" on Citadel's
+    # CMDB; _strip_label_suffix keeps the leading number. (cost_center.value
+    # is empty under sysparm_exclude_reference_link=true.)
+    expense_ccid_field: str = "cost_center.name"
     employee_id_field: str = "assigned_to.u_employee_id"
     category_field: str = "model_category.name"
     ccid_active_field: str | None = None  # tenant-specific flag (e.g. "u_ccid_active")
@@ -96,8 +99,10 @@ class ServiceNowConfig:
             serial_number_field=d.get("serial_number_field", "serial_number"),
             po_number_field=d.get("po_number_field"),
             invoice_number_field=d.get("invoice_number_field"),
-            location_id_field=d.get("location_id_field", "location.u_fin_location_id"),
-            expense_ccid_field=d.get("expense_ccid_field", "cost_center.value"),
+            location_id_field=d.get(
+                "location_id_field", "location.u_fin_location_id.u_cit_location_code"
+            ),
+            expense_ccid_field=d.get("expense_ccid_field", "cost_center.name"),
             employee_id_field=d.get("employee_id_field", "assigned_to.u_employee_id"),
             category_field=d.get("category_field", "model_category.name"),
             ccid_active_field=d.get("ccid_active_field"),
@@ -260,7 +265,7 @@ class ServiceNowCmdbClient:
             source_key=source_key,
             source_value=source_value,
             location_id=_to_id(row.get(self._cfg.location_id_field)),
-            expense_ccid=_to_id(row.get(self._cfg.expense_ccid_field)),
+            expense_ccid=_to_id(_strip_label_suffix(row.get(self._cfg.expense_ccid_field))),
             employee_id=_to_id(row.get(emp_field)) if emp_field else None,
             ccid_active=ccid_active,
         )
@@ -309,19 +314,21 @@ def make_servicenow_lookup(
     return _lookup
 
 
-def _to_int(value: Any) -> int | None:
-    """Coerce a CMDB string value to int; return None on empty / non-numeric."""
-    if value is None:
-        return None
-    if isinstance(value, int):
+def _strip_label_suffix(value: Any) -> Any:
+    """Drop the ``" - <description>"`` tail from CMDB label-style values.
+
+    ServiceNow's ``cost_center.name`` ships as ``"30755 - Network Hardware"``
+    on Citadel's CMDB — the leading token is the actual cost center number
+    that maps to Oracle FA, the rest is the human-readable description.
+    ``str.split(maxsplit=1)`` keeps the leading whitespace-delimited token
+    regardless of separator (ASCII ``-``, en-dash ``–``, em-dash ``—``,
+    or no dash at all), and leaves plain values (sys_ids, codes without
+    whitespace) and non-strings (None, ints) untouched.
+    """
+    if not isinstance(value, str):
         return value
-    s = str(value).strip()
-    if not s:
-        return None
-    try:
-        return int(s)
-    except ValueError:
-        return None
+    parts = value.split(maxsplit=1)
+    return parts[0] if parts else value
 
 
 def _to_id(value: Any) -> int | str | None:
