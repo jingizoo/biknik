@@ -32,7 +32,6 @@ from typing import Any, Dict, List, Optional, Set
 from .bip_client import BIPClient
 from .entity_resolver import EntityBookResolver
 from .exceptions import FusionApiError, ValidationError
-from .routing_rules import RoutingRulesResolver
 from .fusion_ops import (
     AssetState,
     build_book_transfer_params,
@@ -70,13 +69,6 @@ class DFFConfig:
     target_location_id_col: str = "TARGET_LOCATION_ID"
     current_location_id_col: str = "CURRENT_LOCATION_ID"
     target_expense_ccid_col: str = "TARGET_EXPENSE_CCID"
-
-    # Routing-rules dimensions: LC location code, Oracle FA category ID,
-    # cost-centre segment.  Override when the BIP report uses different
-    # column names for these.
-    location_code_col: str = "LOCATION_CODE"
-    category_id_col: str = "CATEGORY_ID"
-    cost_centre_col: str = "COST_CENTRE"
 
 
 DEFAULT_DFF_CONFIG = DFFConfig()
@@ -182,7 +174,6 @@ class FusionIUSync:
         dff_config: Optional[DFFConfig] = None,
         default_transfer_date: Optional[str] = None,
         blocked_books: Optional[List[str]] = None,
-        routing_resolver: Optional[RoutingRulesResolver] = None,
         transfer_overrides: Optional[Dict[str, Any]] = None,
     ):
         self._client = fusion_client
@@ -193,7 +184,6 @@ class FusionIUSync:
         self._blocked_books: Set[str] = {
             b.upper().strip() for b in (blocked_books or []) if b and b.strip()
         }
-        self._routing_resolver = routing_resolver
         # Defaults for the Oracle FA bookTransfer / transferAsset payload
         # (conversion_rate_type, copy_dff_flag, etc.).  Per-row overrides
         # from the BIP report still take precedence — these are only used
@@ -316,41 +306,6 @@ class FusionIUSync:
             target_book = final_target_book
             log.debug(
                 "Using FINAL_TARGET_BOOK_TYPE_CODE='%s' for asset %s",
-                target_book,
-                asset_number,
-            )
-        elif self._routing_resolver is not None:
-            # EMEA routing rules win over the entity-name lookup when present.
-            # 'blocked' short-circuits with a clean skip; 'no_match' raises so
-            # finance gets an exception row instead of silent default routing.
-            location_code = (row.get(self._dff.location_code_col) or "").strip()
-            cost_centre = (row.get(self._dff.cost_centre_col) or "").strip()
-            category_raw = (row.get(self._dff.category_id_col) or "").strip()
-            try:
-                category_id = int(category_raw) if category_raw else None
-            except ValueError:
-                category_id = None
-            decision = self._routing_resolver.resolve(
-                location=location_code,
-                category_id=category_id,
-                cost_centre=cost_centre,
-            )
-            if decision.kind == "blocked":
-                log.info(
-                    "Skipping asset %s: location %s blocked (%s)",
-                    asset_number,
-                    location_code,
-                    decision.reason,
-                )
-                return None
-            if decision.kind == "no_match":
-                raise ValidationError(
-                    f"asset {asset_number}: {decision.reason}"
-                )
-            target_book = decision.target_book or ""
-            log.info(
-                "Routing rule '%s' picked target_book=%s for asset %s",
-                decision.rule_name,
                 target_book,
                 asset_number,
             )
