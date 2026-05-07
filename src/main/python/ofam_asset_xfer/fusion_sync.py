@@ -175,6 +175,7 @@ class FusionIUSync:
         default_transfer_date: Optional[str] = None,
         blocked_books: Optional[List[str]] = None,
         transfer_overrides: Optional[Dict[str, Any]] = None,
+        transfer_overrides_by_book: Optional[Dict[str, Dict[str, Any]]] = None,
     ):
         self._client = fusion_client
         self._entity_resolver = entity_resolver
@@ -189,6 +190,15 @@ class FusionIUSync:
         # from the BIP report still take precedence — these are only used
         # when the row-level value is empty.
         self._transfer_overrides: Dict[str, Any] = dict(transfer_overrides or {})
+        # Per-target-book overrides, keyed by destination book code
+        # (case-insensitive). Layered on top of ``transfer_overrides`` so an
+        # AU ledger that does not publish a ``Corporate`` rate type can
+        # override just ``conversion_rate_type`` for transfers into AU
+        # without disturbing the JP / UK / US default.
+        self._transfer_overrides_by_book: Dict[str, Dict[str, Any]] = {
+            str(k).upper().strip(): dict(v or {})
+            for k, v in (transfer_overrides_by_book or {}).items()
+        }
 
     # ------------------------------------------------------------------
     # Discovery
@@ -460,6 +470,12 @@ class FusionIUSync:
         # (conversion_rate_type=Corporate, copy_dff_flag=Y, …) so they
         # land in every Fusion call by default.  Per-row values still win.
         overrides: Dict[str, Any] = dict(self._transfer_overrides)
+        # Layer per-target-book overrides (e.g. AU has no 'Corporate' rate
+        # type, so the AU ledger publishes its own conversion_rate_type).
+        per_book = self._transfer_overrides_by_book.get(
+            (pending.target_book_type_code or "").upper().strip(), {}
+        )
+        overrides.update(per_book)
         # Prefer TARGET_LOCATION_ID from report; fall back to TRANSFER_TO_LOCATION DFF
         location_override = pending.target_location_id or pending.transfer_to_location
         if location_override:

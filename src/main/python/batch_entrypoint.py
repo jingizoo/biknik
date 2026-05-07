@@ -109,6 +109,8 @@ def main(  # noqa: D103
             dff_config=dff_config,
             default_transfer_date=cfg.get("default_transfer_date"),
             blocked_books=cfg.get("blocked_books") or [],
+            transfer_overrides=cfg.get("transfer_overrides") or {},
+            transfer_overrides_by_book=cfg.get("transfer_overrides_by_book") or {},
         )
         summary = sync.run_full_sync(
             books=books,

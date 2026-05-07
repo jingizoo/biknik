@@ -28,6 +28,13 @@
     "conversion_rate_type": "Corporate"
   },
 
+  "_transfer_overrides_by_book_note": "Per-target-book overrides, keyed by destination book code (case-insensitive).  Layered on top of transfer_overrides so a single ledger that does not publish 'Corporate' (e.g. AU CORP BOOK) can specify its own conversion_rate_type without disturbing US/UK/JP.  Example: AU publishes only 'Spot' and 'User'.",
+  "transfer_overrides_by_book": {
+    "AU CORP BOOK": {
+      "conversion_rate_type": "Spot"
+    }
+  },
+
   "gcs": {
     "bucket": "your-fa-transfer-logs",
     "prefix": "transfers",

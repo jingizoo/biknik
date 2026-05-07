@@ -1089,3 +1089,62 @@ class TestAssignedToParam:
         wire = build_parameter_list(params)
         # The serialized rosetta should not contain the empty-comma value.
         assert "P_ASSIGNED_TO_TBL" not in wire
+
+
+class TestTransferOverridesByBook:
+    """Per-target-book overrides should layer on top of run-wide
+    transfer_overrides, so an AU ledger that does not publish 'Corporate'
+    can use 'Spot' without changing the JP/UK default."""
+
+    def _run_one(self, target_book: str, *, overrides_by_book: dict):
+        fusion = _mock_fusion()
+        bip = _mock_bip()
+        bip.run_report.side_effect = lambda params: (
+            [_bip_row(book="US CORP BOOK", dff_entity="AU Entity")]
+            if params.get("P_BOOK_TYPE_CODE") == "US CORP BOOK"
+            else []
+        )
+        fusion.process_transaction.return_value = _get_asset_info_response()
+
+        entity_map = {"US Entity": "US CORP BOOK", "AU Entity": target_book}
+        sync = FusionIUSync(
+            fusion,
+            EntityBookResolver(entity_map),
+            bip,
+            transfer_overrides={"conversion_rate_type": "Corporate"},
+            transfer_overrides_by_book=overrides_by_book,
+        )
+        summary = sync.run_full_sync(
+            books=["US CORP BOOK", target_book], dry_run=True
+        )
+        return summary["results"][0]["fusion_response"]["planned_params"]
+
+    def test_au_overrides_conversion_rate_type(self):
+        params = self._run_one(
+            "AU CORP BOOK",
+            overrides_by_book={"AU CORP BOOK": {"conversion_rate_type": "Spot"}},
+        )
+        assert params["P_CONVERSION_RATE_TYPE"] == "Spot"
+
+    def test_jp_keeps_global_default_when_no_per_book_override(self):
+        params = self._run_one(
+            "JP CORP BOOK",
+            overrides_by_book={"AU CORP BOOK": {"conversion_rate_type": "Spot"}},
+        )
+        assert params["P_CONVERSION_RATE_TYPE"] == "Corporate"
+
+    def test_book_lookup_is_case_insensitive(self):
+        params = self._run_one(
+            "AU CORP BOOK",
+            overrides_by_book={"au corp book": {"conversion_rate_type": "User"}},
+        )
+        assert params["P_CONVERSION_RATE_TYPE"] == "User"
+
+    def test_per_book_override_does_not_disturb_other_keys(self):
+        params = self._run_one(
+            "AU CORP BOOK",
+            overrides_by_book={"AU CORP BOOK": {"conversion_rate_type": "Spot"}},
+        )
+        # Globals (copy_dff_flag etc.) keep their defaults; only the
+        # explicitly-overridden key changes.
+        assert params["P_COPY_DFF_FLAG"] == "Y"

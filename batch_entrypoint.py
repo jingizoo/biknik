@@ -165,6 +165,8 @@ def main(argv: list[str] | None = None) -> int:
             dff_config=dff_config,
             default_transfer_date=config.get("default_transfer_date"),
             blocked_books=config.get("blocked_books") or [],
+            transfer_overrides=config.get("transfer_overrides") or {},
+            transfer_overrides_by_book=config.get("transfer_overrides_by_book") or {},
         )
         summary = sync.run_full_sync(
             books=books,
