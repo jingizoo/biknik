@@ -17,6 +17,44 @@ from .proxy_config import get_proxy_config
 log = logging.getLogger(__name__)
 
 
+def _parse_fusion_response(r: "requests.Response", context: str) -> Dict[str, Any]:
+    """Parse a Fusion REST response, raising FusionApiError on any failure.
+
+    The Fusion gateway can return empty bodies or HTML error pages on
+    auth, proxy, or upstream failures.  Parsing JSON before checking the
+    HTTP status surfaces a generic ``JSONDecodeError`` and hides the real
+    cause (e.g. ``HTTP 401`` or ``HTTP 502``).  This helper inverts that
+    order: status first, body shape second, JSON parse last.
+    """
+    status = r.status_code
+    body = r.text or ""
+    snippet = body[:500].strip() or "(empty body)"
+
+    if status >= 400:
+        raise FusionApiError(f"Fusion {context} HTTP {status}: {snippet}")
+
+    if not body.strip():
+        raise FusionApiError(
+            f"Fusion {context} returned empty body (status={status}); "
+            "expected JSON. Possible upstream timeout or proxy failure."
+        )
+
+    try:
+        parsed = r.json()
+    except ValueError as e:
+        raise FusionApiError(
+            f"Fusion {context} returned non-JSON response "
+            f"(status={status}): {snippet}"
+        ) from e
+
+    if not isinstance(parsed, dict):
+        raise FusionApiError(
+            f"Fusion {context} returned unexpected JSON shape "
+            f"(status={status}, type={type(parsed).__name__}): {snippet}"
+        )
+    return parsed
+
+
 @dataclass(frozen=True)
 class OracleConfig:
     """Immutable config for :class:`OracleErpIntegrationsClient`."""
@@ -140,15 +178,7 @@ class OracleErpIntegrationsClient:
             timeout=self.cfg.timeout_seconds,
             verify=self.cfg.verify_ssl,
         )
-        try:
-            raw = r.json()
-        except Exception as e:
-            raise FusionApiError(
-                f"Non-JSON response from Fusion (status={r.status_code}): {r.text[:500]}"
-            ) from e
-
-        if r.status_code >= 400:
-            raise FusionApiError(f"Fusion HTTP {r.status_code}: {raw}")
+        raw = _parse_fusion_response(r, context=f"POST {op_name}")
 
         pl_raw = raw.get("ParameterList")
         pl: Dict[str, Any] = {}
@@ -180,14 +210,5 @@ class OracleErpIntegrationsClient:
             timeout=self.cfg.timeout_seconds,
             verify=self.cfg.verify_ssl,
         )
-        try:
-            raw = r.json()
-        except Exception as e:
-            raise FusionApiError(
-                f"Non-JSON response from Fusion GET (status={r.status_code}): {r.text[:500]}"
-            ) from e
-
-        if r.status_code >= 400:
-            raise FusionApiError(f"Fusion GET HTTP {r.status_code}: {raw}")
-
+        raw = _parse_fusion_response(r, context=f"GET {resource_path}")
         return dict(raw)
