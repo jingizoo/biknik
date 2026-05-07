@@ -23,13 +23,15 @@
     "JP Entity": "JP CORP BOOK"
   },
 
-  "_transfer_overrides_note": "Defaults applied to every Fusion FA bookTransfer / transferAsset call.  Required for cross-currency transfers (e.g. US -> JP) where Oracle won't fall back to a ledger default.  Per-row TARGET_LOCATION_ID / TARGET_EXPENSE_CCID from BIP still win.",
+  "_transfer_overrides_note": "Global defaults applied to every Fusion FA bookTransfer / transferAsset call.  Per-row TARGET_LOCATION_ID / TARGET_EXPENSE_CCID from BIP still win.  Note: do NOT set conversion_rate_type globally — it is ledger-specific.  When unset the parameter is omitted, which is required for same-currency transfers and for ledgers that don't publish that rate type.",
   "transfer_overrides": {
-    "conversion_rate_type": "Corporate"
   },
 
-  "_transfer_overrides_by_book_note": "Per-target-book overrides, keyed by destination book code (case-insensitive).  Layered on top of transfer_overrides so a single ledger that does not publish 'Corporate' (e.g. AU CORP BOOK) can specify its own conversion_rate_type without disturbing US/UK/JP.  Example: AU publishes only 'Spot' and 'User'.",
+  "_transfer_overrides_by_book_note": "Per-target-book overrides, keyed by destination book code (case-insensitive).  Required for cross-currency transfers because Oracle FA rejects an unknown conversion_rate_type and rejects an empty one when FX is needed.  Set conversion_rate_type to whatever the destination ledger publishes (commonly 'Corporate', 'Spot', 'User', or 'Daily').  Books not listed here transfer with the parameter omitted.",
   "transfer_overrides_by_book": {
+    "JP CORP BOOK": {
+      "conversion_rate_type": "Corporate"
+    },
     "AU CORP BOOK": {
       "conversion_rate_type": "Spot"
     }

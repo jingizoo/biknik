@@ -913,11 +913,14 @@ class TestRunFullSync:
 
 
 class TestTransferOverridesDefaults:
-    def test_corporate_is_default_conversion_rate_type(self):
-        """fusion_ops.build_book_transfer_params now defaults P_CONVERSION_RATE_TYPE
-        to 'Corporate' — not the empty string that Oracle was rejecting on
-        cross-currency transfers (US -> JP)."""
+    def test_no_default_conversion_rate_type(self):
+        """fusion_ops.build_book_transfer_params no longer hard-codes a
+        rate type.  Some Citadel ledgers don't publish 'Corporate', and
+        same-currency transfers need the parameter omitted entirely.
+        When no override is supplied, P_CONVERSION_RATE_TYPE is None so
+        ``build_parameter_list`` skips it on the wire."""
         from ofam_asset_xfer.fusion_ops import build_book_transfer_params
+        from ofam_asset_xfer.paramlist import build_parameter_list
 
         params = build_book_transfer_params(
             state=_sample_state(),
@@ -926,9 +929,10 @@ class TestTransferOverridesDefaults:
             overrides={},
             request_id="REQ-1",
         )
-        assert params["P_CONVERSION_RATE_TYPE"] == "Corporate"
+        assert params["P_CONVERSION_RATE_TYPE"] is None
+        assert "P_CONVERSION_RATE_TYPE" not in build_parameter_list(params)
 
-    def test_explicit_conversion_rate_type_overrides_default(self):
+    def test_explicit_conversion_rate_type_is_used(self):
         from ofam_asset_xfer.fusion_ops import build_book_transfer_params
 
         params = build_book_transfer_params(
@@ -939,6 +943,21 @@ class TestTransferOverridesDefaults:
             request_id="REQ-1",
         )
         assert params["P_CONVERSION_RATE_TYPE"] == "User"
+
+    def test_empty_string_override_is_treated_as_unset(self):
+        """An explicit ``conversion_rate_type: ""`` from config is the
+        same as not setting it — Oracle rejects empty strings for FX
+        transfers, so we drop the parameter rather than send ``''``."""
+        from ofam_asset_xfer.fusion_ops import build_book_transfer_params
+
+        params = build_book_transfer_params(
+            state=_sample_state(),
+            dest_book_type_code="JP CORP BOOK",
+            effective_date="2026-05-01",
+            overrides={"conversion_rate_type": ""},
+            request_id="REQ-1",
+        )
+        assert params["P_CONVERSION_RATE_TYPE"] is None
 
     def test_transfer_overrides_seeds_every_cross_book_call(self):
         """Run-wide transfer_overrides on FusionIUSync land in the
@@ -1096,7 +1115,7 @@ class TestTransferOverridesByBook:
     transfer_overrides, so an AU ledger that does not publish 'Corporate'
     can use 'Spot' without changing the JP/UK default."""
 
-    def _run_one(self, target_book: str, *, overrides_by_book: dict):
+    def _run_one(self, target_book: str, *, overrides_by_book: dict, transfer_overrides: dict | None = None):
         fusion = _mock_fusion()
         bip = _mock_bip()
         bip.run_report.side_effect = lambda params: (
@@ -1111,7 +1130,7 @@ class TestTransferOverridesByBook:
             fusion,
             EntityBookResolver(entity_map),
             bip,
-            transfer_overrides={"conversion_rate_type": "Corporate"},
+            transfer_overrides=transfer_overrides or {},
             transfer_overrides_by_book=overrides_by_book,
         )
         summary = sync.run_full_sync(
@@ -1126,12 +1145,26 @@ class TestTransferOverridesByBook:
         )
         assert params["P_CONVERSION_RATE_TYPE"] == "Spot"
 
-    def test_jp_keeps_global_default_when_no_per_book_override(self):
+    def test_jp_uses_its_own_per_book_override(self):
+        """Per-book overrides are independent: setting AU does not bleed
+        into JP, which gets its own rate type from its own per-book entry."""
+        params = self._run_one(
+            "JP CORP BOOK",
+            overrides_by_book={
+                "JP CORP BOOK": {"conversion_rate_type": "Corporate"},
+                "AU CORP BOOK": {"conversion_rate_type": "Spot"},
+            },
+        )
+        assert params["P_CONVERSION_RATE_TYPE"] == "Corporate"
+
+    def test_book_with_no_override_omits_rate_type(self):
+        """A book not listed in transfer_overrides_by_book and with no
+        global default sends no P_CONVERSION_RATE_TYPE on the wire."""
         params = self._run_one(
             "JP CORP BOOK",
             overrides_by_book={"AU CORP BOOK": {"conversion_rate_type": "Spot"}},
         )
-        assert params["P_CONVERSION_RATE_TYPE"] == "Corporate"
+        assert params["P_CONVERSION_RATE_TYPE"] is None
 
     def test_book_lookup_is_case_insensitive(self):
         params = self._run_one(

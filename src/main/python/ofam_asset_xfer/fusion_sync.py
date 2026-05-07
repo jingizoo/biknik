@@ -467,8 +467,8 @@ class FusionIUSync:
         )
 
         # Seed per-asset overrides with the run-wide defaults
-        # (conversion_rate_type=Corporate, copy_dff_flag=Y, …) so they
-        # land in every Fusion call by default.  Per-row values still win.
+        # (copy_dff_flag=Y, …) so they land in every Fusion call by
+        # default.  Per-row values still win.
         overrides: Dict[str, Any] = dict(self._transfer_overrides)
         # Layer per-target-book overrides (e.g. AU has no 'Corporate' rate
         # type, so the AU ledger publishes its own conversion_rate_type).
