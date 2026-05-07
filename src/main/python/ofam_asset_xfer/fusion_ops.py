@@ -13,6 +13,30 @@ from .ccid_resolver import resolve_target_expense_ccid
 log = logging.getLogger(__name__)
 
 
+# Sentinels Oracle uses for "no person assigned" in X_ASSIGNED_TO_TBL.
+# Sending these back in P_ASSIGNED_TO_TBL (e.g. ``','`` or ``'-1,-1'``)
+# can cause Fusion to reject the transaction because ``-1`` is not a
+# valid person ID and an all-empty rosetta string fails some validators.
+_ASSIGNED_TO_EMPTY_SENTINELS = frozenset({"", "-1"})
+
+
+def _assigned_to_param(assigned_tbl: List[str]) -> Optional[List[str]]:
+    """Return the rosetta list to send, or ``None`` to omit the parameter.
+
+    When every entry is empty or Oracle's ``-1`` placeholder, the
+    parameter is dropped so ``build_parameter_list`` skips it.  Oracle
+    does not require ``P_ASSIGNED_TO_TBL`` and a fully-empty rosetta
+    (e.g. sent as ``','``) is rejected by Fusion as malformed.  When at
+    least one distribution has a real assignee, the list is sent as-is
+    so the rosetta length still matches the other tables.
+    """
+    if not assigned_tbl:
+        return None
+    if all(str(v).strip() in _ASSIGNED_TO_EMPTY_SENTINELS for v in assigned_tbl):
+        return None
+    return assigned_tbl
+
+
 @dataclass(frozen=True)
 class AssetState:
     asset_id: str
@@ -218,7 +242,7 @@ def build_same_book_transfer_params(
         "P_DISTRIBUTION_ID_TBL": dist_tbl,
         "P_TRANSACTION_UNITS_TBL": txn_units_tbl,
         "P_UNITS_ASSIGNED_TBL": units_tbl,
-        "P_ASSIGNED_TO_TBL": assigned_tbl,
+        "P_ASSIGNED_TO_TBL": _assigned_to_param(assigned_tbl),
         "P_EXPENSE_CCID_TBL": expense_tbl,
         "P_LOCATION_CCID_TBL": location_tbl,
         # Traceability in transaction context:
@@ -319,7 +343,7 @@ def build_same_book_transfer_params_option_b(
         "P_DISTRIBUTION_ID_TBL": dist_tbl,
         "P_TRANSACTION_UNITS_TBL": txn_units_tbl,
         "P_UNITS_ASSIGNED_TBL": units_tbl,
-        "P_ASSIGNED_TO_TBL": assigned_tbl,
+        "P_ASSIGNED_TO_TBL": _assigned_to_param(assigned_tbl),
         "P_EXPENSE_CCID_TBL": expense_tbl,
         "P_LOCATION_CCID_TBL": location_tbl,
         "P_COPY_SOURCE_LINES_FLAG": "N",
@@ -415,7 +439,7 @@ def build_book_transfer_params(
         "P_TRANSACTION_UNITS_TBL": txn_units_tbl,
         "P_EXPENSE_CCID_TBL": expense_tbl,
         "P_LOCATION_CCID_TBL": location_tbl,
-        "P_ASSIGNED_TO_TBL": assigned_tbl,
+        "P_ASSIGNED_TO_TBL": _assigned_to_param(assigned_tbl),
         "P_SRC_DISTRIBUTION_ID_TBL": src_dist_tbl,
         "P_TRX_ATTRIBUTE1": request_id,
         "P_TRX_ATTRIBUTE2": "OFAM_XBOOK_NATIVE",
@@ -479,7 +503,9 @@ def build_add_asset_params(
         "P_DISTRIBUTION_ID_TBL": dist_ids,
         "P_UNITS_ASSIGNED_TBL": units,
         "P_TRANSACTION_UNITS_TBL": txn_units,
-        "P_ASSIGNED_TO_TBL": dest_assigned if dest_assigned else [""] * n,
+        "P_ASSIGNED_TO_TBL": _assigned_to_param(
+            list(dest_assigned) if dest_assigned else [""] * n
+        ),
         "P_EXPENSE_CCID_TBL": dest_expense,
         "P_LOCATION_CCID_TBL": dest_location,
         "P_TRX_ATTRIBUTE1": request_id,

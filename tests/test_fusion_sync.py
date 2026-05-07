@@ -1003,3 +1003,89 @@ class TestTransferOverridesDefaults:
         # per-row TARGET_LOCATION_ID still wins for the location slot
         assert "300100999999" in sent["P_LOCATION_CCID_TBL"]
         assert "111-default" not in sent["P_LOCATION_CCID_TBL"]
+
+
+class TestAssignedToParam:
+    """When every assigned_to slot is empty/-1, P_ASSIGNED_TO_TBL must be
+    omitted from the params dict (set to None so build_parameter_list
+    skips it).  Sending ``','`` or ``'-1,-1'`` causes Fusion to reject
+    the transaction with malformed-rosetta errors."""
+
+    def test_helper_returns_none_for_all_empty(self):
+        from ofam_asset_xfer.fusion_ops import _assigned_to_param
+        assert _assigned_to_param(["", "", ""]) is None
+
+    def test_helper_returns_none_for_all_minus_one(self):
+        from ofam_asset_xfer.fusion_ops import _assigned_to_param
+        assert _assigned_to_param(["-1", "-1"]) is None
+
+    def test_helper_returns_none_for_mixed_empty_sentinels(self):
+        from ofam_asset_xfer.fusion_ops import _assigned_to_param
+        assert _assigned_to_param(["", "-1", ""]) is None
+
+    def test_helper_returns_list_when_any_real_value(self):
+        from ofam_asset_xfer.fusion_ops import _assigned_to_param
+        assert _assigned_to_param(["", "8801", ""]) == ["", "8801", ""]
+
+    def test_same_book_omits_assigned_to_when_unassigned(self):
+        from ofam_asset_xfer.fusion_ops import build_same_book_transfer_params
+
+        # _sample_state has assigned_to=[""]
+        state = _sample_state()
+        params, is_noop = build_same_book_transfer_params(
+            state=state,
+            effective_date="2026-05-01",
+            overrides={"location_ccid": "999000"},
+            request_id="REQ-1",
+        )
+        assert not is_noop
+        # Helper returned None -> build_parameter_list will skip it.
+        assert params["P_ASSIGNED_TO_TBL"] is None
+
+    def test_same_book_keeps_assigned_to_when_set(self):
+        from ofam_asset_xfer.fusion_ops import build_same_book_transfer_params
+
+        state = AssetState(
+            asset_id="100",
+            asset_number="142847",
+            book_type_code="US CORP BOOK",
+            distribution_ids=["1001"],
+            units_assigned=["1"],
+            assigned_to=["8801"],
+            expense_ccids=["626955"],
+            location_ccids=["789012"],
+        )
+        params, _ = build_same_book_transfer_params(
+            state=state,
+            effective_date="2026-05-01",
+            overrides={"location_ccid": "999000"},
+            request_id="REQ-1",
+        )
+        # Source leg + dest leg, both with the real person id.
+        assert params["P_ASSIGNED_TO_TBL"] == ["8801", "8801"]
+
+    def test_cross_book_omits_assigned_to_when_unassigned(self):
+        from ofam_asset_xfer.fusion_ops import build_book_transfer_params
+
+        params = build_book_transfer_params(
+            state=_sample_state(),
+            dest_book_type_code="JP CORP BOOK",
+            effective_date="2026-05-01",
+            overrides={},
+            request_id="REQ-1",
+        )
+        assert params["P_ASSIGNED_TO_TBL"] is None
+
+    def test_built_parameter_list_drops_none_assigned_to(self):
+        from ofam_asset_xfer.fusion_ops import build_same_book_transfer_params
+        from ofam_asset_xfer.paramlist import build_parameter_list
+
+        params, _ = build_same_book_transfer_params(
+            state=_sample_state(),
+            effective_date="2026-05-01",
+            overrides={"location_ccid": "999000"},
+            request_id="REQ-1",
+        )
+        wire = build_parameter_list(params)
+        # The serialized rosetta should not contain the empty-comma value.
+        assert "P_ASSIGNED_TO_TBL" not in wire
