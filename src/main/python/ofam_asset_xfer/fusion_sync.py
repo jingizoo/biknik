@@ -341,17 +341,6 @@ class FusionIUSync:
         current_location_id = row.get(dff.current_location_id_col, "").strip() or None
         target_expense_ccid = row.get(dff.target_expense_ccid_col, "").strip() or None
 
-        # --- Location already matches → skip ---
-        if current_location_id and target_location_id and current_location_id == target_location_id:
-            log.info(
-                "Skipping asset %s: CURRENT_LOCATION_ID (%s) already equals "
-                "TARGET_LOCATION_ID (%s) — no transfer needed",
-                asset_number,
-                current_location_id,
-                target_location_id,
-            )
-            return None
-
         if final_target_book:
             target_book = final_target_book
             log.debug(
@@ -385,6 +374,27 @@ class FusionIUSync:
 
         # Same book AND no target location/expense info → nothing to transfer
         if not is_cross_book and not target_location_id and not target_expense_ccid:
+            return None
+
+        # Same-book + asked for a location move that's already in place + no
+        # CCID change → nothing left to do, skip.  Cross-book transfers are
+        # NOT skipped on location-match: the entity/book is what's changing,
+        # location may legitimately stay the same.  Same-book + matching
+        # location + a TARGET_EXPENSE_CCID is also kept (CCID is the delta).
+        if (
+            not is_cross_book
+            and current_location_id
+            and target_location_id
+            and current_location_id == target_location_id
+            and not target_expense_ccid
+        ):
+            log.info(
+                "Skipping asset %s: same-book, CURRENT_LOCATION_ID (%s) "
+                "already equals TARGET_LOCATION_ID and no CCID change — "
+                "nothing to do",
+                asset_number,
+                current_location_id,
+            )
             return None
 
         # --- Call getAssetInformation to get full state ---

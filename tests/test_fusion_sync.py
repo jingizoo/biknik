@@ -433,8 +433,10 @@ class TestFindPendingTransfers:
         assert len(pending) == 1
         assert pending[0].target_location_id == "300100123456"
 
-    def test_skips_when_current_location_equals_target_location(self):
-        """CURRENT_LOCATION_ID == TARGET_LOCATION_ID → skip (already at target)."""
+    def test_cross_book_proceeds_even_when_location_matches(self):
+        """Cross-book = entity move; location may legitimately stay the
+        same.  The previous skip rule treated location-match alone as a
+        no-op even for cross-book rows, blocking entity-only transfers."""
         fusion = _mock_fusion()
         bip = _mock_bip()
         bip.run_report.return_value = [
@@ -445,12 +447,57 @@ class TestFindPendingTransfers:
                 target_location_id="300100123456",
             )
         ]
+        fusion.process_transaction.return_value = _get_asset_info_response()
+
+        sync = FusionIUSync(fusion, _resolver(), bip)
+        pending = sync.find_pending_transfers(books=["US CORP BOOK"], limit=10)
+
+        assert len(pending) == 1
+        assert pending[0].is_cross_book is True
+
+    def test_same_book_skips_when_location_matches_and_no_ccid_change(self):
+        """Same-book + same location + no CCID change → genuinely a no-op."""
+        fusion = _mock_fusion()
+        bip = _mock_bip()
+        bip.run_report.return_value = [
+            _bip_row(
+                book="US CORP BOOK",
+                dff_entity="US Entity",
+                final_target_book="US CORP BOOK",
+                current_location_id="300100123456",
+                target_location_id="300100123456",
+            )
+        ]
 
         sync = FusionIUSync(fusion, _resolver(), bip)
         pending = sync.find_pending_transfers(books=["US CORP BOOK"], limit=10)
 
         assert len(pending) == 0
         fusion.process_transaction.assert_not_called()
+
+    def test_same_book_proceeds_when_location_matches_but_ccid_changes(self):
+        """Same-book + matching location + a TARGET_EXPENSE_CCID delta →
+        CCID is the actual change, must not be skipped."""
+        fusion = _mock_fusion()
+        bip = _mock_bip()
+        bip.run_report.return_value = [
+            _bip_row(
+                book="US CORP BOOK",
+                dff_entity="US Entity",
+                final_target_book="US CORP BOOK",
+                current_location_id="300100123456",
+                target_location_id="300100123456",
+                target_expense_ccid="12001",
+            )
+        ]
+        fusion.process_transaction.return_value = _get_asset_info_response()
+
+        sync = FusionIUSync(fusion, _resolver(), bip)
+        pending = sync.find_pending_transfers(books=["US CORP BOOK"], limit=10)
+
+        assert len(pending) == 1
+        assert pending[0].is_cross_book is False
+        assert pending[0].target_expense_ccid == "12001"
 
     def test_proceeds_when_current_location_differs_from_target(self):
         """CURRENT_LOCATION_ID != TARGET_LOCATION_ID → proceed with transfer."""
