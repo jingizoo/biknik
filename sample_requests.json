@@ -43,7 +43,7 @@
     }
   },
 
-  "_post_transfer_attribute_update_note": "Opt-in follow-up after a successful cross-book bookTransfer.  Resolves the destination asset_id in this order: (1) X_NEW_ASSET_ID / X_DEST_ASSET_ID etc. on the bookTransfer response, (2) X_NEW_ASSET_NUMBER + getAssetInformation against target book, (3) fallback to source asset_number against target book (only valid when CREATE_NEW_ASSET_FLAG=N).  Then calls processTransaction-updateAssetDescriptiveDetails with the bumped value.  Suffix rule: 'X' -> 'X_1', 'X_1' -> 'X_2', etc.  Default off.",
+  "_post_transfer_attribute_update_note": "Opt-in follow-up after a successful cross-book bookTransfer.  Resolves the destination asset_id in this order: (1) custom BIP report (dest_lookup_bip) - recommended; (2) X_NEW_ASSET_ID etc. on the bookTransfer response; (3) X_NEW_ASSET_NUMBER + getAssetInformation against target book; (4) fallback to source asset_number against target book.  Then calls processTransaction-updateAssetDescriptiveDetails with the bumped value.  Suffix rule: 'X' -> 'X_1', 'X_1' -> 'X_2', etc.  Default off.",
   "post_transfer_attribute_update": {
     "enabled": false,
     "source_field": "attribute10",
@@ -52,6 +52,18 @@
     "request_id_param": "P_TRX_ATTRIBUTE1",
     "trace_param": "P_TRX_ATTRIBUTE2",
     "trace_value": "OFAM_POST_XBOOK_ATTR_BUMP",
+
+    "_dest_lookup_bip_note": "Recommended: a small custom BIP report that joins on the source asset_id + target book and returns the freshly-created destination asset's id (and optionally number).  Placeholders ${source_asset_id}, ${source_asset_number}, ${source_book_type_code}, ${target_book_type_code}, ${transfer_to_entity} are interpolated into params at call time.  When this block is omitted the pipeline falls back to reading X_NEW_ASSET_ID from the bookTransfer response.",
+    "dest_lookup_bip": {
+      "report_path": "/Custom/FinancialsReports/Get_Transferred_Asset.xdo",
+      "params": {
+        "P_SOURCE_ASSET_ID": "${source_asset_id}",
+        "P_TARGET_BOOK_TYPE_CODE": "${target_book_type_code}"
+      },
+      "asset_id_column": "NEW_ASSET_ID",
+      "asset_number_column": "NEW_ASSET_NUMBER"
+    },
+
     "dest_asset_id_fields": [
       "X_NEW_ASSET_ID",
       "X_DEST_ASSET_ID",

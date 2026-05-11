@@ -24,10 +24,26 @@ Architecture:
 from __future__ import annotations
 
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from datetime import date
 from typing import Any, Dict, List, Optional, Set, Tuple
+
+
+_PLACEHOLDER_RE = re.compile(r"\$\{([a-zA-Z0-9_]+)\}")
+
+
+def _interpolate(template: str, substitutions: Dict[str, str]) -> str:
+    """Replace ``${key}`` placeholders in ``template`` from ``substitutions``.
+
+    Unknown placeholders are left in place so misconfigurations are
+    visible in the resulting BIP parameter values rather than silently
+    swallowed.
+    """
+    def _sub(m: "re.Match[str]") -> str:
+        return substitutions.get(m.group(1), m.group(0))
+    return _PLACEHOLDER_RE.sub(_sub, template)
 
 from .bip_client import BIPClient
 from .entity_resolver import EntityBookResolver
@@ -631,14 +647,16 @@ class FusionIUSync:
         transferred, only the DFF bump failed.
 
         Destination resolution order (most reliable → fallback):
-          1. ``X_NEW_ASSET_ID`` / ``X_DEST_ASSET_ID`` etc. on the
-             ``bookTransfer`` response (the canonical signal Oracle FA
-             gives back when a new asset is created).  Field names are
-             tenant-specific; the default list covers the common ones
-             and ``dest_asset_id_fields`` in config can extend it.
-          2. ``X_NEW_ASSET_NUMBER`` etc. + a getAssetInformation against
+          1. ``dest_lookup_bip`` — a tenant-owned BI Publisher report
+             that joins on source_asset_id + target_book and returns
+             the new asset_id.  Most reliable in production because
+             tenants control the report schema.
+          2. ``X_NEW_ASSET_ID`` etc. on the ``bookTransfer`` response
+             (field names are tenant-specific; ``dest_asset_id_fields``
+             can extend the lookup list).
+          3. ``X_NEW_ASSET_NUMBER`` etc. + getAssetInformation against
              the target book to look up the asset_id.
-          3. Source asset_number against target book — only valid when
+          4. Source asset_number against target book — only valid when
              ``P_CREATE_NEW_ASSET_FLAG=N`` (asset shared across books).
 
         Config shape (``post_transfer_attribute_update`` on FusionIUSync)::
@@ -651,6 +669,15 @@ class FusionIUSync:
               "request_id_param": "P_TRX_ATTRIBUTE1",
               "trace_param": "P_TRX_ATTRIBUTE2",
               "trace_value": "OFAM_POST_XBOOK_ATTR_BUMP",
+              "dest_lookup_bip": {
+                "report_path": "/Custom/.../Get_Transferred_Asset.xdo",
+                "params": {
+                  "P_SOURCE_ASSET_ID": "${source_asset_id}",
+                  "P_TARGET_BOOK_TYPE_CODE": "${target_book_type_code}"
+                },
+                "asset_id_column": "NEW_ASSET_ID",
+                "asset_number_column": "NEW_ASSET_NUMBER"
+              },
               "dest_asset_id_fields": ["X_NEW_ASSET_ID", ...],
               "dest_asset_number_fields": ["X_NEW_ASSET_NUMBER", ...],
               "allow_same_asset_number_fallback": true
@@ -684,14 +711,15 @@ class FusionIUSync:
             dest_id_fields=dest_id_fields,
             dest_num_fields=dest_num_fields,
             allow_same_asset_number_fallback=allow_fallback,
+            dest_lookup_bip=cfg.get("dest_lookup_bip") or {},
         )
         if not dest_asset_id:
             return (
                 "could not resolve destination asset_id from bookTransfer "
                 f"response (tried fields={list(dest_id_fields)}); "
-                "set 'dest_asset_id_fields' in post_transfer_attribute_update "
-                "to your tenant's field name, or enable "
-                "'allow_same_asset_number_fallback'"
+                "set 'dest_lookup_bip' (recommended) or "
+                "'dest_asset_id_fields' in post_transfer_attribute_update, "
+                "or enable 'allow_same_asset_number_fallback'"
             )
 
         log.info(
@@ -746,23 +774,41 @@ class FusionIUSync:
         dest_id_fields: Tuple[str, ...],
         dest_num_fields: Tuple[str, ...],
         allow_same_asset_number_fallback: bool,
+        dest_lookup_bip: Dict[str, Any],
     ) -> Tuple[Optional[str], Optional[str], str]:
         """Return (asset_id, asset_number, resolution_label).
 
-        See ``_run_post_transfer_attr_update`` for the lookup order.
+        Resolution order (most reliable → fallback):
+          1. Custom BIP report (``dest_lookup_bip`` block) — when
+             configured, this is the canonical way to find the new
+             asset.  Tenant builds a small report that joins on
+             source_asset_id + target_book and returns the new asset's
+             id (and optionally number).
+          2. ``X_NEW_ASSET_ID`` etc. directly on the bookTransfer
+             response (fragile — field names vary).
+          3. ``X_NEW_ASSET_NUMBER`` etc. + getAssetInformation against
+             the target book.
+          4. Source asset_number against target book — only valid when
+             ``P_CREATE_NEW_ASSET_FLAG=N`` (asset shared across books).
         """
-        # 1. Direct asset_id from the bookTransfer response.
+        # 1. Custom BIP report — recommended for production.
+        if dest_lookup_bip.get("report_path"):
+            asset_id, asset_number = self._lookup_dest_via_bip(
+                dest_lookup_bip,
+                pending=pending,
+                source_state=source_state,
+            )
+            if asset_id:
+                return asset_id, asset_number, "bip_report"
+
+        # 2. Direct asset_id from the bookTransfer response.
         for fname in dest_id_fields:
             v = str(book_transfer_response.get(fname) or "").strip()
             if v and v != source_state.asset_id:
-                # A field that returns the source asset_id (e.g. X_ASSET_ID
-                # in the CREATE_NEW_ASSET_FLAG=N case) is treated as a
-                # "same asset across books" signal — accept it only as a
-                # last resort below.
                 number = self._first_nonempty(book_transfer_response, dest_num_fields)
                 return v, number, f"response.{fname}"
 
-        # 2. asset_number from response → getAssetInformation on dest book.
+        # 3. asset_number from response → getAssetInformation on dest book.
         for fname in dest_num_fields:
             v = str(book_transfer_response.get(fname) or "").strip()
             if v and v != source_state.asset_number:
@@ -778,14 +824,13 @@ class FusionIUSync:
                     continue
                 return dest_state.asset_id, v, f"response.{fname}+getAssetInformation"
 
-        # 3. Same-id case: X_ASSET_ID echoed back means CREATE_NEW_ASSET_FLAG=N.
+        # 4. Same-id case: X_ASSET_ID echoed back means CREATE_NEW_ASSET_FLAG=N.
         for fname in dest_id_fields:
             v = str(book_transfer_response.get(fname) or "").strip()
             if v and v == source_state.asset_id:
                 return v, source_state.asset_number, f"response.{fname}(same_id)"
 
-        # 4. Last-resort fallback: source asset_number on target book.  Only
-        #    valid when the tenant preserves asset_number across books.
+        # 5. Last-resort fallback: source asset_number on target book.
         if allow_same_asset_number_fallback:
             try:
                 _r, _pl, dest_state = get_asset_information(
@@ -807,6 +852,77 @@ class FusionIUSync:
                 )
 
         return None, None, "unresolved"
+
+    def _lookup_dest_via_bip(
+        self,
+        cfg: Dict[str, Any],
+        *,
+        pending: PendingTransfer,
+        source_state: AssetState,
+    ) -> Tuple[Optional[str], Optional[str]]:
+        """Call the destination-lookup BIP report and parse the first row.
+
+        Config shape::
+
+            {
+              "report_path": "/Custom/.../Get_Transferred_Asset.xdo",
+              "params": {
+                "P_SOURCE_ASSET_ID": "${source_asset_id}",
+                "P_TARGET_BOOK_TYPE_CODE": "${target_book_type_code}"
+              },
+              "asset_id_column": "NEW_ASSET_ID",
+              "asset_number_column": "NEW_ASSET_NUMBER"
+            }
+
+        Param values support ``${...}`` placeholders that interpolate
+        fields from the source asset and the pending transfer:
+        ``source_asset_id``, ``source_asset_number``, ``source_book_type_code``,
+        ``target_book_type_code``, ``transfer_to_entity``.
+        """
+        report_path = str(cfg.get("report_path") or "").strip()
+        if not report_path:
+            return None, None
+
+        substitutions: Dict[str, str] = {
+            "source_asset_id": source_state.asset_id or "",
+            "source_asset_number": source_state.asset_number or "",
+            "source_book_type_code": pending.book_type_code or "",
+            "target_book_type_code": pending.target_book_type_code or "",
+            "transfer_to_entity": pending.transfer_to_entity or "",
+        }
+        raw_params = cfg.get("params") or {}
+        params: Dict[str, str] = {}
+        for k, v in raw_params.items():
+            params[str(k)] = _interpolate(str(v), substitutions)
+
+        id_col = str(cfg.get("asset_id_column") or "NEW_ASSET_ID")
+        num_col = str(cfg.get("asset_number_column") or "NEW_ASSET_NUMBER")
+
+        try:
+            rows = self._bip.run_report(params=params, report_path=report_path)
+        except Exception as e:
+            log.warning(
+                "Destination-lookup BIP report failed (path=%s, params=%s): %s",
+                report_path, params, e,
+            )
+            return None, None
+
+        if not rows:
+            log.warning(
+                "Destination-lookup BIP returned 0 rows (path=%s, params=%s)",
+                report_path, params,
+            )
+            return None, None
+
+        row = rows[0]
+        asset_id = str(row.get(id_col) or "").strip() or None
+        asset_number = str(row.get(num_col) or "").strip() or None
+        if not asset_id:
+            log.warning(
+                "Destination-lookup BIP row missing %s column (have: %s)",
+                id_col, sorted(row.keys()),
+            )
+        return asset_id, asset_number
 
     @staticmethod
     def _first_nonempty(

@@ -1393,6 +1393,129 @@ class TestPostTransferAttributeUpdate:
         op_handle, params = fusion.process_transaction.call_args_list[-1][0]
         assert params["P_ATTRIBUTE10"] == "ASSET-100_4"
 
+    DEST_LOOKUP_REPORT = "/Custom/Reports/Get_Transferred_Asset.xdo"
+
+    def _bip_router(self, dest_lookup_return):
+        """Build a side_effect that dispatches BIP calls by report_path.
+
+        Discovery calls (no report_path override) return the IU row only
+        when scanning US CORP BOOK.  The destination-lookup report
+        returns the supplied value (list, exception, or callable).
+        """
+        def _run(params=None, report_path=None):
+            if report_path == self.DEST_LOOKUP_REPORT:
+                if isinstance(dest_lookup_return, BaseException):
+                    raise dest_lookup_return
+                return dest_lookup_return
+            if (params or {}).get("P_BOOK_TYPE_CODE") == "US CORP BOOK":
+                return [_bip_row(book="US CORP BOOK", dff_entity="UK Entity")]
+            return []
+        return _run
+
+    def test_dest_lookup_bip_is_preferred_over_response_field(self):
+        """When dest_lookup_bip is configured, it wins over the
+        bookTransfer response field lookup."""
+        fusion = _mock_fusion()
+        # Response carries X_NEW_ASSET_ID=111 — but BIP should win.
+        fusion.process_transaction.side_effect = [
+            self._get_asset_info_with_attr10("ASSET-100"),
+            self._book_transfer_success_response(new_asset_id="111"),
+            ({}, {"X_RETURN_STATUS": "S"}),
+        ]
+        bip = _mock_bip()
+        bip.run_report.side_effect = self._bip_router(
+            [{"NEW_ASSET_ID": "999", "NEW_ASSET_NUMBER": "AUS-12345"}]
+        )
+        sync = FusionIUSync(
+            fusion,
+            _resolver(),
+            bip,
+            post_transfer_attribute_update={
+                "enabled": True,
+                "dest_lookup_bip": {
+                    "report_path": self.DEST_LOOKUP_REPORT,
+                    "params": {
+                        "P_SOURCE_ASSET_ID": "${source_asset_id}",
+                        "P_TARGET_BOOK": "${target_book_type_code}",
+                    },
+                    "asset_id_column": "NEW_ASSET_ID",
+                    "asset_number_column": "NEW_ASSET_NUMBER",
+                },
+            },
+        )
+        sync.run_full_sync(books=["US CORP BOOK", "UK CORP BOOK"], dry_run=False)
+
+        # Update was POSTed against the BIP-resolved id, not 111.
+        op_handle, params = fusion.process_transaction.call_args_list[-1][0]
+        assert op_handle == "updateAssetDescriptiveDetails"
+        assert params["P_ASSET_ID"] == "999"
+        assert params["P_ATTRIBUTE10"] == "ASSET-100_1"
+
+        # The BIP report was called with the interpolated params.
+        dest_calls = [
+            c for c in bip.run_report.call_args_list
+            if (c.kwargs or {}).get("report_path") == self.DEST_LOOKUP_REPORT
+        ]
+        assert len(dest_calls) == 1
+        sent = dest_calls[0].kwargs["params"]
+        assert sent["P_SOURCE_ASSET_ID"] == "100"
+        assert sent["P_TARGET_BOOK"] == "UK CORP BOOK"
+
+    def test_dest_lookup_bip_empty_rows_falls_back_to_response(self):
+        fusion = _mock_fusion()
+        fusion.process_transaction.side_effect = [
+            self._get_asset_info_with_attr10("ASSET-100"),
+            self._book_transfer_success_response(new_asset_id="111"),
+            ({}, {"X_RETURN_STATUS": "S"}),
+        ]
+        bip = _mock_bip()
+        bip.run_report.side_effect = self._bip_router([])  # empty rows
+        sync = FusionIUSync(
+            fusion,
+            _resolver(),
+            bip,
+            post_transfer_attribute_update={
+                "enabled": True,
+                "dest_lookup_bip": {
+                    "report_path": self.DEST_LOOKUP_REPORT,
+                    "params": {"P_SOURCE_ASSET_ID": "${source_asset_id}"},
+                    "asset_id_column": "NEW_ASSET_ID",
+                },
+            },
+        )
+        sync.run_full_sync(books=["US CORP BOOK", "UK CORP BOOK"], dry_run=False)
+
+        op_handle, params = fusion.process_transaction.call_args_list[-1][0]
+        assert params["P_ASSET_ID"] == "111"
+
+    def test_dest_lookup_bip_failure_falls_back_to_response(self):
+        fusion = _mock_fusion()
+        fusion.process_transaction.side_effect = [
+            self._get_asset_info_with_attr10("ASSET-100"),
+            self._book_transfer_success_response(new_asset_id="111"),
+            ({}, {"X_RETURN_STATUS": "S"}),
+        ]
+        bip = _mock_bip()
+        bip.run_report.side_effect = self._bip_router(
+            RuntimeError("BIP SOAP 500")
+        )
+        sync = FusionIUSync(
+            fusion,
+            _resolver(),
+            bip,
+            post_transfer_attribute_update={
+                "enabled": True,
+                "dest_lookup_bip": {
+                    "report_path": self.DEST_LOOKUP_REPORT,
+                    "params": {"P_SOURCE_ASSET_ID": "${source_asset_id}"},
+                    "asset_id_column": "NEW_ASSET_ID",
+                },
+            },
+        )
+        sync.run_full_sync(books=["US CORP BOOK", "UK CORP BOOK"], dry_run=False)
+        op_handle, params = fusion.process_transaction.call_args_list[-1][0]
+        assert params["P_ASSET_ID"] == "111"
+
     def test_custom_dest_asset_id_field_name(self):
         """Tenants whose bookTransfer returns the new id under a custom
         field name (e.g. X_DESTINATION_ASSET_ID) can extend the lookup
