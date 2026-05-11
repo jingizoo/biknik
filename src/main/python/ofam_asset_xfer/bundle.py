@@ -118,6 +118,7 @@ def main(
             blocked_books=cfg.get("blocked_books") or [],
             transfer_overrides=cfg.get("transfer_overrides") or {},
             transfer_overrides_by_book=cfg.get("transfer_overrides_by_book") or {},
+            post_transfer_attribute_update=cfg.get("post_transfer_attribute_update") or {},
         )
         summary = sync.run_full_sync(
             books=books,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -11,6 +12,31 @@ from .ccid_resolver import resolve_target_expense_ccid
 
 
 log = logging.getLogger(__name__)
+
+
+_UNDERSCORE_SUFFIX_RE = re.compile(r"_(\d+)$")
+
+
+def bump_underscore_suffix(value: Optional[str]) -> str:
+    """Return ``value`` with its ``_N`` suffix bumped by one.
+
+    Examples::
+
+        bump_underscore_suffix("ASSET-100")   == "ASSET-100_1"
+        bump_underscore_suffix("ASSET-100_1") == "ASSET-100_2"
+        bump_underscore_suffix("ASSET-100_9") == "ASSET-100_10"
+        bump_underscore_suffix("")            == "_1"
+        bump_underscore_suffix(None)          == "_1"
+
+    Used to differentiate the destination asset's ATTRIBUTE10 from the
+    source's so cross-book transfers don't leave duplicate tag values.
+    """
+    s = (value or "").strip()
+    m = _UNDERSCORE_SUFFIX_RE.search(s)
+    if m:
+        n = int(m.group(1)) + 1
+        return s[: m.start()] + f"_{n}"
+    return f"{s}_1"
 
 
 # Sentinels Oracle uses for "no person assigned" in X_ASSIGNED_TO_TBL.
@@ -56,6 +82,7 @@ class AssetState:
     cost: Optional[str] = None
     description: Optional[str] = None
     tag_number: Optional[str] = None
+    attribute10: Optional[str] = None
 
     @staticmethod
     def from_get_asset_information(pl: Dict[str, Any]) -> "AssetState":
@@ -121,6 +148,7 @@ class AssetState:
             cost=str(pl.get("X_COST") or "").strip() or None,
             description=str(pl.get("X_DESCRIPTION") or "").strip() or None,
             tag_number=str(pl.get("X_TAG_NUMBER") or "").strip() or None,
+            attribute10=str(pl.get("X_ATTRIBUTE10") or "").strip() or None,
         )
 
 

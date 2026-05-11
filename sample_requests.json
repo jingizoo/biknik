@@ -43,6 +43,17 @@
     }
   },
 
+  "_post_transfer_attribute_update_note": "Opt-in follow-up after a successful cross-book bookTransfer.  Looks up the destination asset by asset_number on the target book, then calls processTransaction-updateAssetDescriptiveDetails with the bumped value.  Suffix rule: 'X' -> 'X_1', 'X_1' -> 'X_2', etc.  Default off.",
+  "post_transfer_attribute_update": {
+    "enabled": false,
+    "source_field": "attribute10",
+    "fusion_parameter": "P_ATTRIBUTE10",
+    "operation_handle": "updateAssetDescriptiveDetails",
+    "request_id_param": "P_TRX_ATTRIBUTE1",
+    "trace_param": "P_TRX_ATTRIBUTE2",
+    "trace_value": "OFAM_POST_XBOOK_ATTR_BUMP"
+  },
+
   "gcs": {
     "bucket": "your-fa-transfer-logs",
     "prefix": "transfers",

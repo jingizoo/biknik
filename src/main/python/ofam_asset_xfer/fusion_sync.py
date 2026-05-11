@@ -36,6 +36,7 @@ from .fusion_ops import (
     AssetState,
     build_book_transfer_params,
     build_same_book_transfer_params,
+    bump_underscore_suffix,
     get_asset_information,
 )
 from .oracle_client import OracleErpIntegrationsClient
@@ -176,6 +177,7 @@ class FusionIUSync:
         blocked_books: Optional[List[str]] = None,
         transfer_overrides: Optional[Dict[str, Any]] = None,
         transfer_overrides_by_book: Optional[Dict[str, Dict[str, Any]]] = None,
+        post_transfer_attribute_update: Optional[Dict[str, Any]] = None,
     ):
         self._client = fusion_client
         self._entity_resolver = entity_resolver
@@ -185,6 +187,11 @@ class FusionIUSync:
         self._blocked_books: Set[str] = {
             b.upper().strip() for b in (blocked_books or []) if b and b.strip()
         }
+        # Optional post-bookTransfer update that bumps a DFF on the new
+        # asset.  Opt-in via config — see ``_run_post_transfer_attr_update``
+        # for the full shape.  Default off so existing tenants are
+        # unaffected.
+        self._post_attr_cfg: Dict[str, Any] = dict(post_transfer_attribute_update or {})
         # Defaults for the Oracle FA bookTransfer / transferAsset payload
         # (conversion_rate_type, copy_dff_flag, etc.).  Per-row overrides
         # from the BIP report still take precedence — these are only used
@@ -562,6 +569,22 @@ class FusionIUSync:
         status_code = str(pl.get("X_RETURN_STATUS") or "").strip()
         return_msg = str(pl.get("X_MSG_DATA") or pl.get("X_RETURN_MESSAGE") or "").strip()
 
+        post_update_error: Optional[str] = None
+        if status_code == "S":
+            post_update_error = self._run_post_transfer_attr_update(
+                pending=pending,
+                source_state=state,
+                request_id=request_id,
+            )
+
+        result_error: Optional[str] = None
+        if status_code != "S":
+            result_error = f"Fusion X_RETURN_STATUS={status_code}: {return_msg}"
+        elif post_update_error:
+            # Transfer itself succeeded; surface the post-update problem
+            # without flipping the row to FAILED.
+            result_error = f"post-transfer attribute update warning: {post_update_error}"
+
         return TransferResult(
             asset_number=pending.asset_number,
             status="TRANSFERRED" if status_code == "S" else "FAILED",
@@ -570,10 +593,109 @@ class FusionIUSync:
             transfer_to_entity=pending.transfer_to_entity,
             transfer_date=effective_date,
             fusion_response=pl,
-            error=None
-            if status_code == "S"
-            else f"Fusion X_RETURN_STATUS={status_code}: {return_msg}",
+            error=result_error,
         )
+
+    def _run_post_transfer_attr_update(
+        self,
+        *,
+        pending: PendingTransfer,
+        source_state: AssetState,
+        request_id: str,
+    ) -> Optional[str]:
+        """Post-bookTransfer DFF bump on the newly-created destination asset.
+
+        Returns ``None`` on success (or when the feature is disabled),
+        or an error string when the follow-up call fails.  The error is
+        attached to the transfer result as a warning — the asset *was*
+        transferred, only the DFF bump failed.
+
+        Config shape (``post_transfer_attribute_update`` on FusionIUSync)::
+
+            {
+              "enabled": true,
+              "source_field": "attribute10",            # AssetState attr to read
+              "fusion_parameter": "P_ATTRIBUTE10",      # where to send it
+              "operation_handle": "updateAssetDescriptiveDetails",
+              "request_id_param": "P_TRX_ATTRIBUTE1",
+              "trace_param": "P_TRX_ATTRIBUTE2",
+              "trace_value": "OFAM_POST_XBOOK_ATTR_BUMP"
+            }
+        """
+        cfg = self._post_attr_cfg
+        if not cfg or not cfg.get("enabled"):
+            return None
+
+        source_field = str(cfg.get("source_field") or "attribute10")
+        fusion_param = str(cfg.get("fusion_parameter") or "P_ATTRIBUTE10")
+        op_handle = str(cfg.get("operation_handle") or "updateAssetDescriptiveDetails")
+        rid_param = str(cfg.get("request_id_param") or "P_TRX_ATTRIBUTE1")
+        trace_param = str(cfg.get("trace_param") or "P_TRX_ATTRIBUTE2")
+        trace_value = str(cfg.get("trace_value") or "OFAM_POST_XBOOK_ATTR_BUMP")
+
+        current_value = getattr(source_state, source_field, None)
+        bumped = bump_underscore_suffix(current_value)
+
+        # Resolve the destination asset id.  For Oracle FA cross-book
+        # transfers the asset_number is preserved on the new (target-book)
+        # asset, so getAssetInformation against the target book returns
+        # the new asset_id.
+        try:
+            _raw, _pl, dest_state = get_asset_information(
+                self._client,
+                pending.target_book_type_code,
+                pending.asset_number,
+            )
+        except FusionApiError as e:
+            log.warning(
+                "Post-transfer attribute bump skipped for asset=%s: "
+                "could not look up destination asset (%s/%s): %s",
+                pending.asset_number,
+                pending.target_book_type_code,
+                pending.asset_number,
+                e,
+            )
+            return f"destination lookup failed: {e}"
+
+        log.info(
+            "Post-transfer bump asset=%s %s '%s' -> '%s' (dest_asset_id=%s)",
+            pending.asset_number,
+            fusion_param,
+            current_value,
+            bumped,
+            dest_state.asset_id,
+        )
+
+        params: Dict[str, Any] = {
+            "P_ASSET_ID": dest_state.asset_id,
+            "P_BOOK_TYPE_CODE": pending.target_book_type_code,
+            fusion_param: bumped,
+            rid_param: f"{request_id}_ATTR_BUMP",
+            trace_param: trace_value,
+        }
+
+        try:
+            _raw, pl = self._client.process_transaction(op_handle, params)
+        except FusionApiError as e:
+            log.warning(
+                "Post-transfer attribute bump failed for asset=%s: %s",
+                pending.asset_number,
+                e,
+            )
+            return f"updateAssetDescriptiveDetails call failed: {e}"
+
+        status_code = str(pl.get("X_RETURN_STATUS") or "").strip()
+        if status_code != "S":
+            msg = str(pl.get("X_MSG_DATA") or pl.get("X_RETURN_MESSAGE") or "").strip()
+            log.warning(
+                "Post-transfer attribute bump returned %s for asset=%s: %s",
+                status_code,
+                pending.asset_number,
+                msg,
+            )
+            return f"updateAssetDescriptiveDetails X_RETURN_STATUS={status_code}: {msg}"
+
+        return None
 
     def _execute_same_book(
         self,

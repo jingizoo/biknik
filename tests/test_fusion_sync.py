@@ -1230,6 +1230,157 @@ class TestTransferOverridesByBook:
         assert params["P_COPY_DFF_FLAG"] == "Y"
 
 
+class TestBumpUnderscoreSuffix:
+    """Suffix-bump rule for the post-transfer DFF update."""
+
+    def test_appends_underscore_one_when_no_suffix(self):
+        from ofam_asset_xfer.fusion_ops import bump_underscore_suffix
+        assert bump_underscore_suffix("ASSET-100") == "ASSET-100_1"
+
+    def test_increments_existing_suffix(self):
+        from ofam_asset_xfer.fusion_ops import bump_underscore_suffix
+        assert bump_underscore_suffix("ASSET-100_1") == "ASSET-100_2"
+        assert bump_underscore_suffix("ASSET-100_9") == "ASSET-100_10"
+        assert bump_underscore_suffix("ASSET-100_99") == "ASSET-100_100"
+
+    def test_none_and_empty(self):
+        from ofam_asset_xfer.fusion_ops import bump_underscore_suffix
+        assert bump_underscore_suffix(None) == "_1"
+        assert bump_underscore_suffix("") == "_1"
+
+    def test_only_trailing_digit_run_counts(self):
+        """_5_3 → _5_4 (trailing _N wins; leading _5 left alone)."""
+        from ofam_asset_xfer.fusion_ops import bump_underscore_suffix
+        assert bump_underscore_suffix("A_5_3") == "A_5_4"
+
+    def test_non_digit_suffix_not_treated_as_n(self):
+        """_abc is not _N; append _1."""
+        from ofam_asset_xfer.fusion_ops import bump_underscore_suffix
+        assert bump_underscore_suffix("ASSET_abc") == "ASSET_abc_1"
+
+
+class TestPostTransferAttributeUpdate:
+    """End-to-end behavior of the opt-in post-bookTransfer DFF bump."""
+
+    def _build_sync(self, fusion, *, enabled: bool, **cfg):
+        bip = _mock_bip()
+        bip.run_report.side_effect = lambda params: (
+            [_bip_row(book="US CORP BOOK", dff_entity="UK Entity")]
+            if params.get("P_BOOK_TYPE_CODE") == "US CORP BOOK"
+            else []
+        )
+        return FusionIUSync(
+            fusion,
+            _resolver(),
+            bip,
+            post_transfer_attribute_update={"enabled": enabled, **cfg},
+        )
+
+    @staticmethod
+    def _book_transfer_success_response():
+        return (
+            {"OperationName": "processTransaction-bookTransfer"},
+            {"X_RETURN_STATUS": "S"},
+        )
+
+    @staticmethod
+    def _get_asset_info_with_attr10(value: str):
+        pl = {
+            "X_RETURN_STATUS": "S",
+            "X_ASSET_ID": "100",
+            "X_ASSET_NUMBER": "142847",
+            "X_BOOK_TYPE_CODE": "US CORP BOOK",
+            "X_DISTRIBUTION_ID_TBL": "1001",
+            "X_UNITS_ASSIGNED_TBL": "1",
+            "X_ASSIGNED_TO_TBL": "",
+            "X_EXPENSE_CCID_TBL": "626955",
+            "X_LOCATION_CCID_TBL": "789012",
+            "X_ATTRIBUTE10": value,
+        }
+        return ({}, pl)
+
+    def test_disabled_by_default_no_extra_calls(self):
+        fusion = _mock_fusion()
+        fusion.process_transaction.side_effect = [
+            self._get_asset_info_with_attr10("ASSET-100"),  # discovery
+            self._book_transfer_success_response(),  # bookTransfer
+        ]
+        sync = self._build_sync(fusion, enabled=False)
+        summary = sync.run_full_sync(
+            books=["US CORP BOOK", "UK CORP BOOK"], dry_run=False
+        )
+        # exactly the two calls above, no post-update
+        assert fusion.process_transaction.call_count == 2
+        assert summary["results"][0]["status"] == "TRANSFERRED"
+
+    def test_enabled_bumps_and_posts_update(self):
+        fusion = _mock_fusion()
+        fusion.process_transaction.side_effect = [
+            self._get_asset_info_with_attr10("ASSET-100"),
+            self._book_transfer_success_response(),
+            self._get_asset_info_with_attr10("ASSET-100"),  # dest lookup
+            ({}, {"X_RETURN_STATUS": "S"}),  # updateAssetDescriptiveDetails
+        ]
+        sync = self._build_sync(fusion, enabled=True)
+        summary = sync.run_full_sync(
+            books=["US CORP BOOK", "UK CORP BOOK"], dry_run=False
+        )
+
+        # 4 calls: discovery + bookTransfer + dest lookup + update
+        assert fusion.process_transaction.call_count == 4
+        update_call = fusion.process_transaction.call_args_list[-1]
+        op_handle, params = update_call[0]
+        assert op_handle == "updateAssetDescriptiveDetails"
+        assert params["P_ATTRIBUTE10"] == "ASSET-100_1"
+        assert summary["results"][0]["status"] == "TRANSFERRED"
+        assert summary["results"][0]["error"] is None
+
+    def test_enabled_increments_existing_underscore_suffix(self):
+        fusion = _mock_fusion()
+        fusion.process_transaction.side_effect = [
+            self._get_asset_info_with_attr10("ASSET-100_3"),
+            self._book_transfer_success_response(),
+            self._get_asset_info_with_attr10("ASSET-100_3"),
+            ({}, {"X_RETURN_STATUS": "S"}),
+        ]
+        sync = self._build_sync(fusion, enabled=True)
+        sync.run_full_sync(books=["US CORP BOOK", "UK CORP BOOK"], dry_run=False)
+
+        op_handle, params = fusion.process_transaction.call_args_list[-1][0]
+        assert params["P_ATTRIBUTE10"] == "ASSET-100_4"
+
+    def test_failed_bookTransfer_skips_post_update(self):
+        fusion = _mock_fusion()
+        fusion.process_transaction.side_effect = [
+            self._get_asset_info_with_attr10("ASSET-100"),
+            ({}, {"X_RETURN_STATUS": "E", "X_MSG_DATA": "boom"}),
+        ]
+        sync = self._build_sync(fusion, enabled=True)
+        summary = sync.run_full_sync(
+            books=["US CORP BOOK", "UK CORP BOOK"], dry_run=False
+        )
+        # Only discovery + the failed bookTransfer.  Post-update must not fire.
+        assert fusion.process_transaction.call_count == 2
+        assert summary["results"][0]["status"] == "FAILED"
+
+    def test_post_update_failure_keeps_status_transferred_but_warns(self):
+        fusion = _mock_fusion()
+        fusion.process_transaction.side_effect = [
+            self._get_asset_info_with_attr10("ASSET-100"),
+            self._book_transfer_success_response(),
+            self._get_asset_info_with_attr10("ASSET-100"),
+            ({}, {"X_RETURN_STATUS": "E", "X_MSG_DATA": "permission denied"}),
+        ]
+        sync = self._build_sync(fusion, enabled=True)
+        summary = sync.run_full_sync(
+            books=["US CORP BOOK", "UK CORP BOOK"], dry_run=False
+        )
+        result = summary["results"][0]
+        assert result["status"] == "TRANSFERRED"
+        assert "post-transfer attribute update warning" in (result["error"] or "")
+        assert "permission denied" in (result["error"] or "")
+
+
 class TestAppliesToFlag:
     """Per-book overrides scoped by applies_to: S (source), T (target,
     default), B (both).  Source overrides apply first, target overrides
