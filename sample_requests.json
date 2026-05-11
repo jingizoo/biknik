@@ -53,7 +53,7 @@
     "trace_param": "P_TRX_ATTRIBUTE2",
     "trace_value": "OFAM_POST_XBOOK_ATTR_BUMP",
 
-    "_dest_lookup_bip_note": "Recommended: a small custom BIP report that joins on the source asset_id + target book and returns the freshly-created destination asset's id (and optionally number).  Placeholders ${source_asset_id}, ${source_asset_number}, ${source_book_type_code}, ${target_book_type_code}, ${transfer_to_entity} are interpolated into params at call time.  When this block is omitted the pipeline falls back to reading X_NEW_ASSET_ID from the bookTransfer response.",
+    "_dest_lookup_bip_note": "Recommended: a small custom BIP report that joins source asset_id + target book and returns the freshly-created destination asset.  Canonical SQL is in sql/get_transferred_asset.sql (uses FA_BOOK_TRANSFER_DISTS — the source-to-destination mapping table for cross-book transfers, NOT FA_ASSET_HISTORY).  Column names below must match the report's G_1 XML element names (BIP uppercases SELECT aliases by default, so the report ships NEW_ASSET_ID and NEW_ASSET_NUMBER).  Placeholders ${source_asset_id}, ${source_asset_number}, ${source_book_type_code}, ${target_book_type_code}, ${transfer_to_entity} are interpolated at call time.  When this block is omitted the pipeline falls back to reading X_NEW_ASSET_ID from the bookTransfer response.",
     "dest_lookup_bip": {
       "report_path": "/Custom/FinancialsReports/Get_Transferred_Asset.xdo",
       "params": {
