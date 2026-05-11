@@ -575,6 +575,7 @@ class FusionIUSync:
                 pending=pending,
                 source_state=state,
                 request_id=request_id,
+                book_transfer_response=pl,
             )
 
         result_error: Optional[str] = None
@@ -596,12 +597,31 @@ class FusionIUSync:
             error=result_error,
         )
 
+    # Field names Oracle FA *may* return on the bookTransfer response
+    # for the freshly-created destination asset.  Names vary by tenant /
+    # patch level, so we try several and let config extend the list.
+    _DEFAULT_DEST_ASSET_ID_FIELDS = (
+        "X_NEW_ASSET_ID",
+        "X_DEST_ASSET_ID",
+        "X_DESTINATION_ASSET_ID",
+        "X_TARGET_ASSET_ID",
+        "X_ASSET_ID",  # last resort: same-id case (CREATE_NEW_ASSET_FLAG=N)
+    )
+    _DEFAULT_DEST_ASSET_NUMBER_FIELDS = (
+        "X_NEW_ASSET_NUMBER",
+        "X_DEST_ASSET_NUMBER",
+        "X_DESTINATION_ASSET_NUMBER",
+        "X_TARGET_ASSET_NUMBER",
+        "X_ASSET_NUMBER",
+    )
+
     def _run_post_transfer_attr_update(
         self,
         *,
         pending: PendingTransfer,
         source_state: AssetState,
         request_id: str,
+        book_transfer_response: Dict[str, Any],
     ) -> Optional[str]:
         """Post-bookTransfer DFF bump on the newly-created destination asset.
 
@@ -610,16 +630,30 @@ class FusionIUSync:
         attached to the transfer result as a warning — the asset *was*
         transferred, only the DFF bump failed.
 
+        Destination resolution order (most reliable → fallback):
+          1. ``X_NEW_ASSET_ID`` / ``X_DEST_ASSET_ID`` etc. on the
+             ``bookTransfer`` response (the canonical signal Oracle FA
+             gives back when a new asset is created).  Field names are
+             tenant-specific; the default list covers the common ones
+             and ``dest_asset_id_fields`` in config can extend it.
+          2. ``X_NEW_ASSET_NUMBER`` etc. + a getAssetInformation against
+             the target book to look up the asset_id.
+          3. Source asset_number against target book — only valid when
+             ``P_CREATE_NEW_ASSET_FLAG=N`` (asset shared across books).
+
         Config shape (``post_transfer_attribute_update`` on FusionIUSync)::
 
             {
               "enabled": true,
-              "source_field": "attribute10",            # AssetState attr to read
-              "fusion_parameter": "P_ATTRIBUTE10",      # where to send it
+              "source_field": "attribute10",
+              "fusion_parameter": "P_ATTRIBUTE10",
               "operation_handle": "updateAssetDescriptiveDetails",
               "request_id_param": "P_TRX_ATTRIBUTE1",
               "trace_param": "P_TRX_ATTRIBUTE2",
-              "trace_value": "OFAM_POST_XBOOK_ATTR_BUMP"
+              "trace_value": "OFAM_POST_XBOOK_ATTR_BUMP",
+              "dest_asset_id_fields": ["X_NEW_ASSET_ID", ...],
+              "dest_asset_number_fields": ["X_NEW_ASSET_NUMBER", ...],
+              "allow_same_asset_number_fallback": true
             }
         """
         cfg = self._post_attr_cfg
@@ -632,42 +666,48 @@ class FusionIUSync:
         rid_param = str(cfg.get("request_id_param") or "P_TRX_ATTRIBUTE1")
         trace_param = str(cfg.get("trace_param") or "P_TRX_ATTRIBUTE2")
         trace_value = str(cfg.get("trace_value") or "OFAM_POST_XBOOK_ATTR_BUMP")
+        allow_fallback = bool(cfg.get("allow_same_asset_number_fallback", True))
+        dest_id_fields = tuple(
+            cfg.get("dest_asset_id_fields") or self._DEFAULT_DEST_ASSET_ID_FIELDS
+        )
+        dest_num_fields = tuple(
+            cfg.get("dest_asset_number_fields") or self._DEFAULT_DEST_ASSET_NUMBER_FIELDS
+        )
 
         current_value = getattr(source_state, source_field, None)
         bumped = bump_underscore_suffix(current_value)
 
-        # Resolve the destination asset id.  For Oracle FA cross-book
-        # transfers the asset_number is preserved on the new (target-book)
-        # asset, so getAssetInformation against the target book returns
-        # the new asset_id.
-        try:
-            _raw, _pl, dest_state = get_asset_information(
-                self._client,
-                pending.target_book_type_code,
-                pending.asset_number,
+        dest_asset_id, dest_asset_number, resolution = self._resolve_destination_asset(
+            book_transfer_response=book_transfer_response,
+            pending=pending,
+            source_state=source_state,
+            dest_id_fields=dest_id_fields,
+            dest_num_fields=dest_num_fields,
+            allow_same_asset_number_fallback=allow_fallback,
+        )
+        if not dest_asset_id:
+            return (
+                "could not resolve destination asset_id from bookTransfer "
+                f"response (tried fields={list(dest_id_fields)}); "
+                "set 'dest_asset_id_fields' in post_transfer_attribute_update "
+                "to your tenant's field name, or enable "
+                "'allow_same_asset_number_fallback'"
             )
-        except FusionApiError as e:
-            log.warning(
-                "Post-transfer attribute bump skipped for asset=%s: "
-                "could not look up destination asset (%s/%s): %s",
-                pending.asset_number,
-                pending.target_book_type_code,
-                pending.asset_number,
-                e,
-            )
-            return f"destination lookup failed: {e}"
 
         log.info(
-            "Post-transfer bump asset=%s %s '%s' -> '%s' (dest_asset_id=%s)",
+            "Post-transfer bump asset=%s %s '%s' -> '%s' "
+            "(dest_asset_id=%s, dest_asset_number=%s, resolved_via=%s)",
             pending.asset_number,
             fusion_param,
             current_value,
             bumped,
-            dest_state.asset_id,
+            dest_asset_id,
+            dest_asset_number,
+            resolution,
         )
 
         params: Dict[str, Any] = {
-            "P_ASSET_ID": dest_state.asset_id,
+            "P_ASSET_ID": dest_asset_id,
             "P_BOOK_TYPE_CODE": pending.target_book_type_code,
             fusion_param: bumped,
             rid_param: f"{request_id}_ATTR_BUMP",
@@ -695,6 +735,87 @@ class FusionIUSync:
             )
             return f"updateAssetDescriptiveDetails X_RETURN_STATUS={status_code}: {msg}"
 
+        return None
+
+    def _resolve_destination_asset(
+        self,
+        *,
+        book_transfer_response: Dict[str, Any],
+        pending: PendingTransfer,
+        source_state: AssetState,
+        dest_id_fields: Tuple[str, ...],
+        dest_num_fields: Tuple[str, ...],
+        allow_same_asset_number_fallback: bool,
+    ) -> Tuple[Optional[str], Optional[str], str]:
+        """Return (asset_id, asset_number, resolution_label).
+
+        See ``_run_post_transfer_attr_update`` for the lookup order.
+        """
+        # 1. Direct asset_id from the bookTransfer response.
+        for fname in dest_id_fields:
+            v = str(book_transfer_response.get(fname) or "").strip()
+            if v and v != source_state.asset_id:
+                # A field that returns the source asset_id (e.g. X_ASSET_ID
+                # in the CREATE_NEW_ASSET_FLAG=N case) is treated as a
+                # "same asset across books" signal — accept it only as a
+                # last resort below.
+                number = self._first_nonempty(book_transfer_response, dest_num_fields)
+                return v, number, f"response.{fname}"
+
+        # 2. asset_number from response → getAssetInformation on dest book.
+        for fname in dest_num_fields:
+            v = str(book_transfer_response.get(fname) or "").strip()
+            if v and v != source_state.asset_number:
+                try:
+                    _r, _pl, dest_state = get_asset_information(
+                        self._client, pending.target_book_type_code, v
+                    )
+                except FusionApiError as e:
+                    log.warning(
+                        "Post-transfer lookup via response.%s=%s failed: %s",
+                        fname, v, e,
+                    )
+                    continue
+                return dest_state.asset_id, v, f"response.{fname}+getAssetInformation"
+
+        # 3. Same-id case: X_ASSET_ID echoed back means CREATE_NEW_ASSET_FLAG=N.
+        for fname in dest_id_fields:
+            v = str(book_transfer_response.get(fname) or "").strip()
+            if v and v == source_state.asset_id:
+                return v, source_state.asset_number, f"response.{fname}(same_id)"
+
+        # 4. Last-resort fallback: source asset_number on target book.  Only
+        #    valid when the tenant preserves asset_number across books.
+        if allow_same_asset_number_fallback:
+            try:
+                _r, _pl, dest_state = get_asset_information(
+                    self._client,
+                    pending.target_book_type_code,
+                    pending.asset_number,
+                )
+                return (
+                    dest_state.asset_id,
+                    pending.asset_number,
+                    "fallback.source_asset_number_on_target_book",
+                )
+            except FusionApiError as e:
+                log.warning(
+                    "Post-transfer fallback lookup (%s/%s) failed: %s",
+                    pending.target_book_type_code,
+                    pending.asset_number,
+                    e,
+                )
+
+        return None, None, "unresolved"
+
+    @staticmethod
+    def _first_nonempty(
+        d: Dict[str, Any], keys: Tuple[str, ...]
+    ) -> Optional[str]:
+        for k in keys:
+            v = str(d.get(k) or "").strip()
+            if v:
+                return v
         return None
 
     def _execute_same_book(

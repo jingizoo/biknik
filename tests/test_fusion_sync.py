@@ -1277,11 +1277,15 @@ class TestPostTransferAttributeUpdate:
         )
 
     @staticmethod
-    def _book_transfer_success_response():
-        return (
-            {"OperationName": "processTransaction-bookTransfer"},
-            {"X_RETURN_STATUS": "S"},
-        )
+    def _book_transfer_success_response(
+        *, new_asset_id: str | None = None, new_asset_number: str | None = None
+    ):
+        pl: dict = {"X_RETURN_STATUS": "S"}
+        if new_asset_id is not None:
+            pl["X_NEW_ASSET_ID"] = new_asset_id
+        if new_asset_number is not None:
+            pl["X_NEW_ASSET_NUMBER"] = new_asset_number
+        return ({"OperationName": "processTransaction-bookTransfer"}, pl)
 
     @staticmethod
     def _get_asset_info_with_attr10(value: str):
@@ -1313,12 +1317,14 @@ class TestPostTransferAttributeUpdate:
         assert fusion.process_transaction.call_count == 2
         assert summary["results"][0]["status"] == "TRANSFERRED"
 
-    def test_enabled_bumps_and_posts_update(self):
+    def test_enabled_bumps_and_posts_update_with_new_asset_id_from_response(self):
+        """Happy path: Oracle returns X_NEW_ASSET_ID on the bookTransfer
+        response and the update is posted directly against it (no extra
+        getAssetInformation call needed)."""
         fusion = _mock_fusion()
         fusion.process_transaction.side_effect = [
-            self._get_asset_info_with_attr10("ASSET-100"),
-            self._book_transfer_success_response(),
-            self._get_asset_info_with_attr10("ASSET-100"),  # dest lookup
+            self._get_asset_info_with_attr10("ASSET-100"),  # discovery
+            self._book_transfer_success_response(new_asset_id="555"),
             ({}, {"X_RETURN_STATUS": "S"}),  # updateAssetDescriptiveDetails
         ]
         sync = self._build_sync(fusion, enabled=True)
@@ -1326,21 +1332,59 @@ class TestPostTransferAttributeUpdate:
             books=["US CORP BOOK", "UK CORP BOOK"], dry_run=False
         )
 
-        # 4 calls: discovery + bookTransfer + dest lookup + update
-        assert fusion.process_transaction.call_count == 4
-        update_call = fusion.process_transaction.call_args_list[-1]
-        op_handle, params = update_call[0]
+        # 3 calls: discovery + bookTransfer + update (no fallback lookup)
+        assert fusion.process_transaction.call_count == 3
+        op_handle, params = fusion.process_transaction.call_args_list[-1][0]
         assert op_handle == "updateAssetDescriptiveDetails"
+        assert params["P_ASSET_ID"] == "555"
         assert params["P_ATTRIBUTE10"] == "ASSET-100_1"
         assert summary["results"][0]["status"] == "TRANSFERRED"
         assert summary["results"][0]["error"] is None
+
+    def test_falls_back_to_dest_lookup_when_response_lacks_id_field(self):
+        """Tenant doesn't echo X_NEW_ASSET_ID; resolver falls back to
+        getAssetInformation against the target book using the source
+        asset_number (when allow_same_asset_number_fallback=True)."""
+        fusion = _mock_fusion()
+        fusion.process_transaction.side_effect = [
+            self._get_asset_info_with_attr10("ASSET-100"),  # discovery
+            self._book_transfer_success_response(),  # bookTransfer with NO new-id fields
+            self._get_asset_info_with_attr10("ASSET-100"),  # fallback lookup
+            ({}, {"X_RETURN_STATUS": "S"}),  # update
+        ]
+        sync = self._build_sync(fusion, enabled=True)
+        sync.run_full_sync(books=["US CORP BOOK", "UK CORP BOOK"], dry_run=False)
+        # discovery + bookTransfer + fallback lookup + update = 4
+        assert fusion.process_transaction.call_count == 4
+        op_handle, params = fusion.process_transaction.call_args_list[-1][0]
+        assert op_handle == "updateAssetDescriptiveDetails"
+        assert params["P_ATTRIBUTE10"] == "ASSET-100_1"
+
+    def test_no_id_in_response_and_fallback_disabled_warns(self):
+        """If neither the response carries an id/number nor the fallback
+        is allowed, the post-update is skipped and a warning is recorded."""
+        fusion = _mock_fusion()
+        fusion.process_transaction.side_effect = [
+            self._get_asset_info_with_attr10("ASSET-100"),
+            self._book_transfer_success_response(),  # no new-id fields
+        ]
+        sync = self._build_sync(
+            fusion, enabled=True, allow_same_asset_number_fallback=False
+        )
+        summary = sync.run_full_sync(
+            books=["US CORP BOOK", "UK CORP BOOK"], dry_run=False
+        )
+        # Only discovery + bookTransfer; no update was attempted.
+        assert fusion.process_transaction.call_count == 2
+        result = summary["results"][0]
+        assert result["status"] == "TRANSFERRED"
+        assert "could not resolve destination asset_id" in (result["error"] or "")
 
     def test_enabled_increments_existing_underscore_suffix(self):
         fusion = _mock_fusion()
         fusion.process_transaction.side_effect = [
             self._get_asset_info_with_attr10("ASSET-100_3"),
-            self._book_transfer_success_response(),
-            self._get_asset_info_with_attr10("ASSET-100_3"),
+            self._book_transfer_success_response(new_asset_id="555"),
             ({}, {"X_RETURN_STATUS": "S"}),
         ]
         sync = self._build_sync(fusion, enabled=True)
@@ -1348,6 +1392,31 @@ class TestPostTransferAttributeUpdate:
 
         op_handle, params = fusion.process_transaction.call_args_list[-1][0]
         assert params["P_ATTRIBUTE10"] == "ASSET-100_4"
+
+    def test_custom_dest_asset_id_field_name(self):
+        """Tenants whose bookTransfer returns the new id under a custom
+        field name (e.g. X_DESTINATION_ASSET_ID) can extend the lookup
+        list via config."""
+        fusion = _mock_fusion()
+        fusion.process_transaction.side_effect = [
+            self._get_asset_info_with_attr10("ASSET-100"),
+            (
+                {},
+                {
+                    "X_RETURN_STATUS": "S",
+                    "X_CITADEL_NEW_ASSET_PK": "777",
+                },
+            ),
+            ({}, {"X_RETURN_STATUS": "S"}),
+        ]
+        sync = self._build_sync(
+            fusion,
+            enabled=True,
+            dest_asset_id_fields=["X_CITADEL_NEW_ASSET_PK"],
+        )
+        sync.run_full_sync(books=["US CORP BOOK", "UK CORP BOOK"], dry_run=False)
+        op_handle, params = fusion.process_transaction.call_args_list[-1][0]
+        assert params["P_ASSET_ID"] == "777"
 
     def test_failed_bookTransfer_skips_post_update(self):
         fusion = _mock_fusion()
@@ -1367,8 +1436,7 @@ class TestPostTransferAttributeUpdate:
         fusion = _mock_fusion()
         fusion.process_transaction.side_effect = [
             self._get_asset_info_with_attr10("ASSET-100"),
-            self._book_transfer_success_response(),
-            self._get_asset_info_with_attr10("ASSET-100"),
+            self._book_transfer_success_response(new_asset_id="555"),
             ({}, {"X_RETURN_STATUS": "E", "X_MSG_DATA": "permission denied"}),
         ]
         sync = self._build_sync(fusion, enabled=True)

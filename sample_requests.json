@@ -43,7 +43,7 @@
     }
   },
 
-  "_post_transfer_attribute_update_note": "Opt-in follow-up after a successful cross-book bookTransfer.  Looks up the destination asset by asset_number on the target book, then calls processTransaction-updateAssetDescriptiveDetails with the bumped value.  Suffix rule: 'X' -> 'X_1', 'X_1' -> 'X_2', etc.  Default off.",
+  "_post_transfer_attribute_update_note": "Opt-in follow-up after a successful cross-book bookTransfer.  Resolves the destination asset_id in this order: (1) X_NEW_ASSET_ID / X_DEST_ASSET_ID etc. on the bookTransfer response, (2) X_NEW_ASSET_NUMBER + getAssetInformation against target book, (3) fallback to source asset_number against target book (only valid when CREATE_NEW_ASSET_FLAG=N).  Then calls processTransaction-updateAssetDescriptiveDetails with the bumped value.  Suffix rule: 'X' -> 'X_1', 'X_1' -> 'X_2', etc.  Default off.",
   "post_transfer_attribute_update": {
     "enabled": false,
     "source_field": "attribute10",
@@ -51,7 +51,22 @@
     "operation_handle": "updateAssetDescriptiveDetails",
     "request_id_param": "P_TRX_ATTRIBUTE1",
     "trace_param": "P_TRX_ATTRIBUTE2",
-    "trace_value": "OFAM_POST_XBOOK_ATTR_BUMP"
+    "trace_value": "OFAM_POST_XBOOK_ATTR_BUMP",
+    "dest_asset_id_fields": [
+      "X_NEW_ASSET_ID",
+      "X_DEST_ASSET_ID",
+      "X_DESTINATION_ASSET_ID",
+      "X_TARGET_ASSET_ID",
+      "X_ASSET_ID"
+    ],
+    "dest_asset_number_fields": [
+      "X_NEW_ASSET_NUMBER",
+      "X_DEST_ASSET_NUMBER",
+      "X_DESTINATION_ASSET_NUMBER",
+      "X_TARGET_ASSET_NUMBER",
+      "X_ASSET_NUMBER"
+    ],
+    "allow_same_asset_number_fallback": true
   },
 
   "gcs": {
