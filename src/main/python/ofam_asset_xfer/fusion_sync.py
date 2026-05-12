@@ -693,6 +693,11 @@ class FusionIUSync:
         """
         cfg = self._post_attr_cfg
         if not cfg or not cfg.get("enabled"):
+            log.debug(
+                "Post-transfer attr-bump skipped for asset=%s: feature disabled "
+                "(set post_transfer_attribute_update.enabled=true to enable)",
+                pending.asset_number,
+            )
             return None
 
         source_field = str(cfg.get("source_field") or "attribute10")
@@ -701,6 +706,7 @@ class FusionIUSync:
         rid_param = str(cfg.get("request_id_param") or "P_TRX_ATTRIBUTE1")
         trace_param = str(cfg.get("trace_param") or "P_TRX_ATTRIBUTE2")
         trace_value = str(cfg.get("trace_value") or "OFAM_POST_XBOOK_ATTR_BUMP")
+        skip_when_empty = bool(cfg.get("skip_when_source_empty", True))
         allow_fallback = bool(cfg.get("allow_same_asset_number_fallback", True))
         dest_id_fields = tuple(
             cfg.get("dest_asset_id_fields") or self._DEFAULT_DEST_ASSET_ID_FIELDS
@@ -709,8 +715,47 @@ class FusionIUSync:
             cfg.get("dest_asset_number_fields") or self._DEFAULT_DEST_ASSET_NUMBER_FIELDS
         )
 
+        log.info(
+            "Post-transfer attr-bump START asset=%s source_field=%s "
+            "fusion_parameter=%s op_handle=%s",
+            pending.asset_number,
+            source_field,
+            fusion_param,
+            op_handle,
+        )
+
+        # Read the source value.  Try direct attribute first (covers the
+        # back-compat ``attribute10`` shortcut), then fall back to the
+        # generic ``attributes`` dict so configs can target ATTRIBUTE7,
+        # ATTRIBUTE15, etc. without code changes.
         current_value = getattr(source_state, source_field, None)
+        if not current_value:
+            current_value = (source_state.attributes or {}).get(source_field)
+        if not current_value:
+            # Also accept upper-cased form, in case someone writes
+            # ``source_field: "ATTRIBUTE7"`` in their config.
+            current_value = (source_state.attributes or {}).get(source_field.lower())
+
+        if not current_value and skip_when_empty:
+            log.info(
+                "Post-transfer attr-bump SKIPPED asset=%s: source %s is empty "
+                "(available DFFs on source: %s).  Set "
+                "post_transfer_attribute_update.skip_when_source_empty=false "
+                "to force the call anyway (will send '_1').",
+                pending.asset_number,
+                source_field,
+                sorted((source_state.attributes or {}).keys()) or "(none)",
+            )
+            return None
+
         bumped = bump_underscore_suffix(current_value)
+        log.info(
+            "Post-transfer attr-bump VALUE asset=%s %s: '%s' -> '%s'",
+            pending.asset_number,
+            source_field,
+            current_value,
+            bumped,
+        )
 
         dest_asset_id, dest_asset_number, resolution = self._resolve_destination_asset(
             book_transfer_response=book_transfer_response,
@@ -722,6 +767,15 @@ class FusionIUSync:
             dest_lookup_bip=cfg.get("dest_lookup_bip") or {},
         )
         if not dest_asset_id:
+            log.warning(
+                "Post-transfer attr-bump UNRESOLVED asset=%s: no destination "
+                "asset_id found (tried response.fields=%s).  Configure "
+                "'dest_lookup_bip' (recommended), extend "
+                "'dest_asset_id_fields' to your tenant's field name, or "
+                "enable 'allow_same_asset_number_fallback'.",
+                pending.asset_number,
+                list(dest_id_fields),
+            )
             return (
                 "could not resolve destination asset_id from bookTransfer "
                 f"response (tried fields={list(dest_id_fields)}); "
@@ -731,12 +785,9 @@ class FusionIUSync:
             )
 
         log.info(
-            "Post-transfer bump asset=%s %s '%s' -> '%s' "
-            "(dest_asset_id=%s, dest_asset_number=%s, resolved_via=%s)",
+            "Post-transfer attr-bump DEST asset=%s dest_asset_id=%s "
+            "dest_asset_number=%s resolved_via=%s",
             pending.asset_number,
-            fusion_param,
-            current_value,
-            bumped,
             dest_asset_id,
             dest_asset_number,
             resolution,
@@ -750,11 +801,20 @@ class FusionIUSync:
             trace_param: trace_value,
         }
 
+        log.info(
+            "Post-transfer attr-bump POST asset=%s op=%s params=%s "
+            "(captured in --debug dumps as a NNNN-POST-%s.json file)",
+            pending.asset_number,
+            op_handle,
+            {k: v for k, v in params.items() if k != "P_TRX_ATTRIBUTE1"},
+            op_handle,
+        )
+
         try:
             _raw, pl = self._client.process_transaction(op_handle, params)
         except FusionApiError as e:
             log.warning(
-                "Post-transfer attribute bump failed for asset=%s: %s",
+                "Post-transfer attr-bump CALL FAILED asset=%s: %s",
                 pending.asset_number,
                 e,
             )
@@ -764,13 +824,19 @@ class FusionIUSync:
         if status_code != "S":
             msg = str(pl.get("X_MSG_DATA") or pl.get("X_RETURN_MESSAGE") or "").strip()
             log.warning(
-                "Post-transfer attribute bump returned %s for asset=%s: %s",
+                "Post-transfer attr-bump RETURN=%s asset=%s msg=%s",
                 status_code,
                 pending.asset_number,
                 msg,
             )
             return f"updateAssetDescriptiveDetails X_RETURN_STATUS={status_code}: {msg}"
 
+        log.info(
+            "Post-transfer attr-bump SUCCESS asset=%s %s='%s'",
+            pending.asset_number,
+            fusion_param,
+            bumped,
+        )
         return None
 
     def _resolve_destination_asset(

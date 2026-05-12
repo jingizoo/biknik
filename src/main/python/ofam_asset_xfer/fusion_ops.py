@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from typing import Any, Dict, List, Optional, Tuple
 
 from .ccid_resolver import resolve_target_expense_ccid
@@ -81,7 +82,14 @@ class AssetState:
     cost: Optional[str] = None
     description: Optional[str] = None
     tag_number: Optional[str] = None
-    attribute10: Optional[str] = None
+    attribute10: Optional[str] = None  # back-compat shortcut; same as attributes["attribute10"]
+
+    # Generic descriptive-flexfield bucket: every X_ATTRIBUTE* on the
+    # getAssetInformation response is captured here so post-transfer
+    # logic can target any DFF slot (ATTRIBUTE7, ATTRIBUTE15, etc.)
+    # without expanding the dataclass.  Keys are lowercase, e.g.
+    # ``attribute7``, ``attribute_date1``, ``attribute_number3``.
+    attributes: Dict[str, str] = dataclass_field(default_factory=dict)
 
     @staticmethod
     def from_get_asset_information(pl: Dict[str, Any]) -> "AssetState":
@@ -130,6 +138,20 @@ class AssetState:
         if not assigned:
             assigned = [""] * len(dist_ids)
 
+        # Collect every X_ATTRIBUTE* slot on the response into a dict
+        # keyed by lower-case name (e.g. ``attribute7``, ``attribute10``,
+        # ``attribute_date1``).  Post-transfer logic can then target any
+        # DFF slot via the config's ``source_field`` knob without
+        # extending this dataclass.
+        attributes: Dict[str, str] = {}
+        for k, v in pl.items():
+            if not isinstance(k, str) or not k.upper().startswith("X_ATTRIBUTE"):
+                continue
+            value = str(v or "").strip()
+            if not value:
+                continue
+            attributes[k[2:].lower()] = value  # strip leading "X_"
+
         return AssetState(
             asset_id=asset_id,
             asset_number=asset_number,
@@ -144,7 +166,8 @@ class AssetState:
             cost=str(pl.get("X_COST") or "").strip() or None,
             description=str(pl.get("X_DESCRIPTION") or "").strip() or None,
             tag_number=str(pl.get("X_TAG_NUMBER") or "").strip() or None,
-            attribute10=str(pl.get("X_ATTRIBUTE10") or "").strip() or None,
+            attribute10=attributes.get("attribute10"),
+            attributes=attributes,
         )
 
 

@@ -1301,6 +1301,15 @@ class TestPostTransferAttributeUpdate:
 
     @staticmethod
     def _get_asset_info_with_attr10(value: str):
+        return TestPostTransferAttributeUpdate._get_asset_info_with_attr("attribute10", value)
+
+    @staticmethod
+    def _get_asset_info_with_attr(slot: str, value: str):
+        """Build a getAssetInformation response with any X_ATTRIBUTE* slot set.
+
+        ``slot`` is a lower-case name like ``attribute7`` / ``attribute10``;
+        emitted on the response as ``X_ATTRIBUTE7`` / ``X_ATTRIBUTE10``.
+        """
         pl = {
             "X_RETURN_STATUS": "S",
             "X_ASSET_ID": "100",
@@ -1311,7 +1320,7 @@ class TestPostTransferAttributeUpdate:
             "X_ASSIGNED_TO_TBL": "",
             "X_EXPENSE_CCID_TBL": "626955",
             "X_LOCATION_CCID_TBL": "789012",
-            "X_ATTRIBUTE10": value,
+            f"X_{slot.upper()}": value,
         }
         return ({}, pl)
 
@@ -1557,6 +1566,117 @@ class TestPostTransferAttributeUpdate:
         # Only discovery + the failed bookTransfer.  Post-update must not fire.
         assert fusion.process_transaction.call_count == 2
         assert summary["results"][0]["status"] == "FAILED"
+
+    def test_bumps_attribute7_when_source_field_is_attribute7(self):
+        """source_field=attribute7 reads X_ATTRIBUTE7 from getAssetInformation
+        (via the AssetState.attributes dict) and POSTs P_ATTRIBUTE7."""
+        fusion = _mock_fusion()
+        fusion.process_transaction.side_effect = [
+            self._get_asset_info_with_attr("attribute7", "TAG-100"),  # discovery
+            self._book_transfer_success_response(new_asset_id="555"),
+            ({}, {"X_RETURN_STATUS": "S"}),  # update
+        ]
+        sync = self._build_sync(
+            fusion,
+            enabled=True,
+            source_field="attribute7",
+            fusion_parameter="P_ATTRIBUTE7",
+        )
+        sync.run_full_sync(books=["US CORP BOOK", "UK CORP BOOK"], dry_run=False)
+
+        op_handle, params = fusion.process_transaction.call_args_list[-1][0]
+        assert op_handle == "updateAssetDescriptiveDetails"
+        assert params["P_ASSET_ID"] == "555"
+        assert params["P_ATTRIBUTE7"] == "TAG-100_1"
+        assert "P_ATTRIBUTE10" not in params
+
+    def test_attribute_source_field_is_case_insensitive(self):
+        """Config that writes ``source_field: "ATTRIBUTE7"`` (upper-case)
+        still resolves to the X_ATTRIBUTE7 value."""
+        fusion = _mock_fusion()
+        fusion.process_transaction.side_effect = [
+            self._get_asset_info_with_attr("attribute7", "TAG-100"),
+            self._book_transfer_success_response(new_asset_id="555"),
+            ({}, {"X_RETURN_STATUS": "S"}),
+        ]
+        sync = self._build_sync(
+            fusion,
+            enabled=True,
+            source_field="ATTRIBUTE7",
+            fusion_parameter="P_ATTRIBUTE7",
+        )
+        sync.run_full_sync(books=["US CORP BOOK", "UK CORP BOOK"], dry_run=False)
+        op_handle, params = fusion.process_transaction.call_args_list[-1][0]
+        assert params["P_ATTRIBUTE7"] == "TAG-100_1"
+
+    def test_skip_when_source_empty_by_default(self):
+        """If the configured source DFF is empty on the source asset, the
+        bump is skipped (no updateAssetDescriptiveDetails call) instead of
+        sending '_1' as the seed value."""
+        fusion = _mock_fusion()
+        # X_ATTRIBUTE7 missing entirely
+        info_no_attr = (
+            {},
+            {
+                "X_RETURN_STATUS": "S",
+                "X_ASSET_ID": "100",
+                "X_ASSET_NUMBER": "142847",
+                "X_BOOK_TYPE_CODE": "US CORP BOOK",
+                "X_DISTRIBUTION_ID_TBL": "1001",
+                "X_UNITS_ASSIGNED_TBL": "1",
+                "X_ASSIGNED_TO_TBL": "",
+                "X_EXPENSE_CCID_TBL": "626955",
+                "X_LOCATION_CCID_TBL": "789012",
+            },
+        )
+        fusion.process_transaction.side_effect = [
+            info_no_attr,  # discovery
+            self._book_transfer_success_response(new_asset_id="555"),  # bookTransfer
+        ]
+        sync = self._build_sync(
+            fusion,
+            enabled=True,
+            source_field="attribute7",
+            fusion_parameter="P_ATTRIBUTE7",
+        )
+        sync.run_full_sync(books=["US CORP BOOK", "UK CORP BOOK"], dry_run=False)
+        # discovery + bookTransfer only.  Update call must NOT fire.
+        assert fusion.process_transaction.call_count == 2
+
+    def test_skip_when_source_empty_can_be_disabled(self):
+        """skip_when_source_empty=false forces the bump even when source
+        is empty (will send '_1' as seed)."""
+        fusion = _mock_fusion()
+        info_no_attr = (
+            {},
+            {
+                "X_RETURN_STATUS": "S",
+                "X_ASSET_ID": "100",
+                "X_ASSET_NUMBER": "142847",
+                "X_BOOK_TYPE_CODE": "US CORP BOOK",
+                "X_DISTRIBUTION_ID_TBL": "1001",
+                "X_UNITS_ASSIGNED_TBL": "1",
+                "X_ASSIGNED_TO_TBL": "",
+                "X_EXPENSE_CCID_TBL": "626955",
+                "X_LOCATION_CCID_TBL": "789012",
+            },
+        )
+        fusion.process_transaction.side_effect = [
+            info_no_attr,
+            self._book_transfer_success_response(new_asset_id="555"),
+            ({}, {"X_RETURN_STATUS": "S"}),
+        ]
+        sync = self._build_sync(
+            fusion,
+            enabled=True,
+            source_field="attribute7",
+            fusion_parameter="P_ATTRIBUTE7",
+            skip_when_source_empty=False,
+        )
+        sync.run_full_sync(books=["US CORP BOOK", "UK CORP BOOK"], dry_run=False)
+        # Update DID fire, seeded with "_1".
+        op_handle, params = fusion.process_transaction.call_args_list[-1][0]
+        assert params["P_ATTRIBUTE7"] == "_1"
 
     def test_post_update_failure_keeps_status_transferred_but_warns(self):
         fusion = _mock_fusion()
