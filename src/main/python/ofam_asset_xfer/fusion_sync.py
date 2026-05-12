@@ -593,6 +593,27 @@ class FusionIUSync:
         status_code = str(pl.get("X_RETURN_STATUS") or "").strip()
         return_msg = str(pl.get("X_MSG_DATA") or pl.get("X_RETURN_MESSAGE") or "").strip()
 
+        # Loud diagnostic so an operator can always tell from the log
+        # whether the follow-up update was even reachable.  Three cases:
+        #   1. feature disabled in config        -> CONFIG_DISABLED
+        #   2. enabled but bookTransfer != S     -> BOOKTRANSFER_FAILED
+        #   3. enabled and bookTransfer == S     -> ATTEMPTING (helper takes over)
+        post_attr_enabled = bool(self._post_attr_cfg.get("enabled"))
+        if not post_attr_enabled:
+            log.info(
+                "Post-transfer attr-bump CONFIG_DISABLED asset=%s "
+                "(set post_transfer_attribute_update.enabled=true to enable)",
+                pending.asset_number,
+            )
+        elif status_code != "S":
+            log.info(
+                "Post-transfer attr-bump SKIPPED asset=%s: bookTransfer "
+                "X_RETURN_STATUS=%s (must be 'S'); msg=%s",
+                pending.asset_number,
+                status_code or "(empty)",
+                return_msg or "(none)",
+            )
+
         post_update_error: Optional[str] = None
         if status_code == "S":
             post_update_error = self._run_post_transfer_attr_update(
@@ -693,11 +714,8 @@ class FusionIUSync:
         """
         cfg = self._post_attr_cfg
         if not cfg or not cfg.get("enabled"):
-            log.debug(
-                "Post-transfer attr-bump skipped for asset=%s: feature disabled "
-                "(set post_transfer_attribute_update.enabled=true to enable)",
-                pending.asset_number,
-            )
+            # The wrapper in _execute_cross_book already logs
+            # CONFIG_DISABLED at INFO; nothing to add here.
             return None
 
         source_field = str(cfg.get("source_field") or "attribute10")
