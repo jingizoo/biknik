@@ -1,16 +1,65 @@
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
+from .ccid_resolver import resolve_target_expense_ccid
 from .exceptions import FusionApiError, ValidationError
 from .oracle_client import OracleErpIntegrationsClient
-from .paramlist import parse_rosetta, ensure_same_len
-from .ccid_resolver import resolve_target_expense_ccid
-
+from .paramlist import ensure_same_len, parse_rosetta
 
 log = logging.getLogger(__name__)
+
+
+_UNDERSCORE_SUFFIX_RE = re.compile(r"_(\d+)$")
+
+
+def bump_underscore_suffix(value: Optional[str]) -> str:
+    """Return ``value`` with its ``_N`` suffix bumped by one.
+
+    Examples::
+
+        bump_underscore_suffix("ASSET-100")   == "ASSET-100_1"
+        bump_underscore_suffix("ASSET-100_1") == "ASSET-100_2"
+        bump_underscore_suffix("ASSET-100_9") == "ASSET-100_10"
+        bump_underscore_suffix("")            == "_1"
+        bump_underscore_suffix(None)          == "_1"
+
+    Used to differentiate the destination asset's ATTRIBUTE10 from the
+    source's so cross-book transfers don't leave duplicate tag values.
+    """
+    s = (value or "").strip()
+    m = _UNDERSCORE_SUFFIX_RE.search(s)
+    if m:
+        n = int(m.group(1)) + 1
+        return s[: m.start()] + f"_{n}"
+    return f"{s}_1"
+
+
+# Sentinels Oracle uses for "no person assigned" in X_ASSIGNED_TO_TBL.
+# Sending these back in P_ASSIGNED_TO_TBL (e.g. ``','`` or ``'-1,-1'``)
+# can cause Fusion to reject the transaction because ``-1`` is not a
+# valid person ID and an all-empty rosetta string fails some validators.
+_ASSIGNED_TO_EMPTY_SENTINELS = frozenset({"", "-1"})
+
+
+def _assigned_to_param(assigned_tbl: List[str]) -> Optional[List[str]]:
+    """Return the rosetta list to send, or ``None`` to omit the parameter.
+
+    When every entry is empty or Oracle's ``-1`` placeholder, the
+    parameter is dropped so ``build_parameter_list`` skips it.  Oracle
+    does not require ``P_ASSIGNED_TO_TBL`` and a fully-empty rosetta
+    (e.g. sent as ``','``) is rejected by Fusion as malformed.  When at
+    least one distribution has a real assignee, the list is sent as-is
+    so the rosetta length still matches the other tables.
+    """
+    if not assigned_tbl:
+        return None
+    if all(str(v).strip() in _ASSIGNED_TO_EMPTY_SENTINELS for v in assigned_tbl):
+        return None
+    return assigned_tbl
 
 
 @dataclass(frozen=True)
@@ -32,6 +81,7 @@ class AssetState:
     cost: Optional[str] = None
     description: Optional[str] = None
     tag_number: Optional[str] = None
+    attribute10: Optional[str] = None
 
     @staticmethod
     def from_get_asset_information(pl: Dict[str, Any]) -> "AssetState":
@@ -40,9 +90,7 @@ class AssetState:
         # Required identity
         asset_id = str(pl.get("X_ASSET_ID") or "").strip()
         asset_number = str(pl.get("X_ASSET_NUMBER") or "").strip()
-        book_type_code = str(
-            pl.get("X_BOOK_TYPE_CODE") or pl.get("P_BOOK_TYPE_CODE") or ""
-        ).strip()
+        book_type_code = str(pl.get("X_BOOK_TYPE_CODE") or pl.get("P_BOOK_TYPE_CODE") or "").strip()
         missing = []
         if not asset_id:
             missing.append("X_ASSET_ID")
@@ -92,11 +140,11 @@ class AssetState:
             expense_ccids=expense,
             location_ccids=location,
             category_id=str(pl.get("X_CATEGORY_ID") or "").strip() or None,
-            date_placed_in_service=str(pl.get("X_DATE_PLACED_IN_SERVICE") or "").strip()
-            or None,
+            date_placed_in_service=str(pl.get("X_DATE_PLACED_IN_SERVICE") or "").strip() or None,
             cost=str(pl.get("X_COST") or "").strip() or None,
             description=str(pl.get("X_DESCRIPTION") or "").strip() or None,
             tag_number=str(pl.get("X_TAG_NUMBER") or "").strip() or None,
+            attribute10=str(pl.get("X_ATTRIBUTE10") or "").strip() or None,
         )
 
 
@@ -218,7 +266,7 @@ def build_same_book_transfer_params(
         "P_DISTRIBUTION_ID_TBL": dist_tbl,
         "P_TRANSACTION_UNITS_TBL": txn_units_tbl,
         "P_UNITS_ASSIGNED_TBL": units_tbl,
-        "P_ASSIGNED_TO_TBL": assigned_tbl,
+        "P_ASSIGNED_TO_TBL": _assigned_to_param(assigned_tbl),
         "P_EXPENSE_CCID_TBL": expense_tbl,
         "P_LOCATION_CCID_TBL": location_tbl,
         # Traceability in transaction context:
@@ -319,7 +367,7 @@ def build_same_book_transfer_params_option_b(
         "P_DISTRIBUTION_ID_TBL": dist_tbl,
         "P_TRANSACTION_UNITS_TBL": txn_units_tbl,
         "P_UNITS_ASSIGNED_TBL": units_tbl,
-        "P_ASSIGNED_TO_TBL": assigned_tbl,
+        "P_ASSIGNED_TO_TBL": _assigned_to_param(assigned_tbl),
         "P_EXPENSE_CCID_TBL": expense_tbl,
         "P_LOCATION_CCID_TBL": location_tbl,
         "P_COPY_SOURCE_LINES_FLAG": "N",
@@ -399,23 +447,24 @@ def build_book_transfer_params(
         "P_DEST_BOOK_TYPE_CODE": dest_book_type_code,
         "P_BOOK_TRANSFER_TYPE_CODE": book_transfer_type_code,
         "P_COST_BASIS_CODE": cost_basis_code,
-        "P_USE_DEST_CAT_DEPRN_RULES_FLAG": overrides.get(
-            "use_dest_cat_deprn_rules_flag", "Y"
-        ),
+        "P_USE_DEST_CAT_DEPRN_RULES_FLAG": overrides.get("use_dest_cat_deprn_rules_flag", "Y"),
         "P_USE_XFR_DATE_AS_DPIS_FLAG": overrides.get("use_xfr_date_as_dpis_flag", "N"),
         "P_COPY_DFF_FLAG": overrides.get("copy_dff_flag", "Y"),
         "P_COPY_ASSET_KEY_FLAG": overrides.get("copy_asset_key_flag", "Y"),
         "P_CREATE_NEW_ASSET_FLAG": overrides.get("create_new_asset_flag", "Y"),
         "P_COPY_SOURCE_LINES_FLAG": "N",
-        # 'Corporate' is the most common GL daily-rate type at Citadel and
-        # is required by Oracle FA on cross-currency book transfers
-        # (e.g. US -> JP).  Override per-tenant via transfer_overrides
-        # in the runner config or per-request via target_assignment.
-        "P_CONVERSION_RATE_TYPE": overrides.get("conversion_rate_type", "Corporate"),
+        # P_CONVERSION_RATE_TYPE is ledger-specific: some Citadel ledgers
+        # publish 'Corporate', others 'Spot'/'User', and same-currency
+        # transfers need it omitted entirely (sending an unknown type
+        # makes Oracle FA reject the txn).  No default — set per ledger
+        # via ``transfer_overrides_by_book`` (or globally via
+        # ``transfer_overrides``).  When neither supplies a value the
+        # parameter is dropped.
+        "P_CONVERSION_RATE_TYPE": overrides.get("conversion_rate_type") or None,
         "P_TRANSACTION_UNITS_TBL": txn_units_tbl,
         "P_EXPENSE_CCID_TBL": expense_tbl,
         "P_LOCATION_CCID_TBL": location_tbl,
-        "P_ASSIGNED_TO_TBL": assigned_tbl,
+        "P_ASSIGNED_TO_TBL": _assigned_to_param(assigned_tbl),
         "P_SRC_DISTRIBUTION_ID_TBL": src_dist_tbl,
         "P_TRX_ATTRIBUTE1": request_id,
         "P_TRX_ATTRIBUTE2": "OFAM_XBOOK_NATIVE",
@@ -479,7 +528,7 @@ def build_add_asset_params(
         "P_DISTRIBUTION_ID_TBL": dist_ids,
         "P_UNITS_ASSIGNED_TBL": units,
         "P_TRANSACTION_UNITS_TBL": txn_units,
-        "P_ASSIGNED_TO_TBL": dest_assigned if dest_assigned else [""] * n,
+        "P_ASSIGNED_TO_TBL": _assigned_to_param(list(dest_assigned) if dest_assigned else [""] * n),
         "P_EXPENSE_CCID_TBL": dest_expense,
         "P_LOCATION_CCID_TBL": dest_location,
         "P_TRX_ATTRIBUTE1": request_id,

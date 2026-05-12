@@ -23,9 +23,62 @@
     "JP Entity": "JP CORP BOOK"
   },
 
-  "_transfer_overrides_note": "Defaults applied to every Fusion FA bookTransfer / transferAsset call.  Required for cross-currency transfers (e.g. US -> JP) where Oracle won't fall back to a ledger default.  Per-row TARGET_LOCATION_ID / TARGET_EXPENSE_CCID from BIP still win.",
+  "_transfer_overrides_note": "Global defaults applied to every Fusion FA bookTransfer / transferAsset call.  Per-row TARGET_LOCATION_ID / TARGET_EXPENSE_CCID from BIP still win.  Note: do NOT set conversion_rate_type globally — it is ledger-specific.  When unset the parameter is omitted, which is required for same-currency transfers and for ledgers that don't publish that rate type.",
   "transfer_overrides": {
-    "conversion_rate_type": "Corporate"
+  },
+
+  "_transfer_overrides_by_book_note": "Per-book overrides, keyed by book code (case-insensitive).  Each entry may carry an 'applies_to' flag controlling when its values are layered onto the payload: 'T' (target, default) for inbound transfers into this book, 'S' (source) for outbound, 'B' for both.  Source overrides apply first; target overrides win when both supply the same key.  Books not listed transfer with no per-book values.",
+  "transfer_overrides_by_book": {
+    "JP CORP BOOK": {
+      "applies_to": "T",
+      "conversion_rate_type": "Corporate"
+    },
+    "AU CORP BOOK": {
+      "applies_to": "T",
+      "conversion_rate_type": "Spot"
+    },
+    "SG CORP BOOK": {
+      "applies_to": "S",
+      "conversion_rate_type": "User"
+    }
+  },
+
+  "_post_transfer_attribute_update_note": "Opt-in follow-up after a successful cross-book bookTransfer.  Resolves the destination asset_id in this order: (1) custom BIP report (dest_lookup_bip) - recommended; (2) X_NEW_ASSET_ID etc. on the bookTransfer response; (3) X_NEW_ASSET_NUMBER + getAssetInformation against target book; (4) fallback to source asset_number against target book.  Then calls processTransaction-updateAssetDescriptiveDetails with the bumped value.  Suffix rule: 'X' -> 'X_1', 'X_1' -> 'X_2', etc.  Default off.",
+  "post_transfer_attribute_update": {
+    "enabled": false,
+    "source_field": "attribute10",
+    "fusion_parameter": "P_ATTRIBUTE10",
+    "operation_handle": "updateAssetDescriptiveDetails",
+    "request_id_param": "P_TRX_ATTRIBUTE1",
+    "trace_param": "P_TRX_ATTRIBUTE2",
+    "trace_value": "OFAM_POST_XBOOK_ATTR_BUMP",
+
+    "_dest_lookup_bip_note": "Recommended: a small custom BIP report that joins source asset_id + target book and returns the freshly-created destination asset.  Canonical SQL is in sql/get_transferred_asset.sql (uses FA_BOOK_TRANSFER_DISTS — the source-to-destination mapping table for cross-book transfers, NOT FA_ASSET_HISTORY).  Column names below must match the report's G_1 XML element names (BIP uppercases SELECT aliases by default, so the report ships NEW_ASSET_ID and NEW_ASSET_NUMBER).  Placeholders ${source_asset_id}, ${source_asset_number}, ${source_book_type_code}, ${target_book_type_code}, ${transfer_to_entity} are interpolated at call time.  When this block is omitted the pipeline falls back to reading X_NEW_ASSET_ID from the bookTransfer response.",
+    "dest_lookup_bip": {
+      "report_path": "/Custom/FinancialsReports/Get_Transferred_Asset.xdo",
+      "params": {
+        "P_SOURCE_ASSET_ID": "${source_asset_id}",
+        "P_TARGET_BOOK_TYPE_CODE": "${target_book_type_code}"
+      },
+      "asset_id_column": "NEW_ASSET_ID",
+      "asset_number_column": "NEW_ASSET_NUMBER"
+    },
+
+    "dest_asset_id_fields": [
+      "X_NEW_ASSET_ID",
+      "X_DEST_ASSET_ID",
+      "X_DESTINATION_ASSET_ID",
+      "X_TARGET_ASSET_ID",
+      "X_ASSET_ID"
+    ],
+    "dest_asset_number_fields": [
+      "X_NEW_ASSET_NUMBER",
+      "X_DEST_ASSET_NUMBER",
+      "X_DESTINATION_ASSET_NUMBER",
+      "X_TARGET_ASSET_NUMBER",
+      "X_ASSET_NUMBER"
+    ],
+    "allow_same_asset_number_fallback": true
   },
 
   "gcs": {

@@ -66,17 +66,20 @@ def main(argv: list[str] | None = None) -> int:
         description="Transfer a single asset to a specific book/location (interactive).",
     )
     p.add_argument(
-        "--config", required=True,
+        "--config",
+        required=True,
         help="Path to JSON config file (must contain 'oracle' connection settings).",
     )
     p.add_argument("--dry-run", action="store_true", help="Build payload only (default).")
     p.add_argument("--execute", action="store_true", help="Actually POST to Fusion.")
     p.add_argument(
-        "--out-file", default=None,
+        "--out-file",
+        default=None,
         help="Write result JSON to this file. Default: stdout.",
     )
     p.add_argument(
-        "--log-level", default=os.getenv("LOG_LEVEL", "INFO"),
+        "--log-level",
+        default=os.getenv("LOG_LEVEL", "INFO"),
         help="Logging level (default: INFO).",
     )
     p.add_argument(
@@ -104,6 +107,7 @@ def main(argv: list[str] | None = None) -> int:
     debug_dir: str | None = None
     if args.debug:
         from datetime import datetime as _dt
+
         ts = _dt.utcnow().strftime("%Y%m%dT%H%M%SZ")
         debug_dir = args.debug_dir or str(Path("debug-dumps") / ts)
 
@@ -146,16 +150,19 @@ def main(argv: list[str] | None = None) -> int:
         client = OracleErpIntegrationsClient(oracle_cfg, debug_dir=debug_dir)
 
         # Step 1: Get current asset state
-        log.info("Calling getAssetInformation for asset=%s book=%s ...",
-                 asset_number, source_book)
+        log.info("Calling getAssetInformation for asset=%s book=%s ...", asset_number, source_book)
         _raw, _pl, state = get_asset_information(
             client,
             source_book,
             asset_number,
             asset_id=asset_id,
         )
-        log.info("Asset state: id=%s, distributions=%d, cost=%s",
-                 state.asset_id, len(state.distribution_ids), state.cost)
+        log.info(
+            "Asset state: id=%s, distributions=%d, cost=%s",
+            state.asset_id,
+            len(state.distribution_ids),
+            state.cost,
+        )
 
         # Step 2: Build transfer params
         overrides = {}

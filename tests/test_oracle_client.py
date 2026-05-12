@@ -7,7 +7,6 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
-
 from ofam_asset_xfer.exceptions import FusionApiError
 from ofam_asset_xfer.oracle_client import (
     OracleConfig,
@@ -79,7 +78,9 @@ class TestParseFusionResponse:
 
 class TestRedactHeaders:
     def test_authorization_redacted(self) -> None:
-        out = _redact_headers({"Authorization": "Bearer secret-jwt", "Content-Type": "application/json"})
+        out = _redact_headers(
+            {"Authorization": "Bearer secret-jwt", "Content-Type": "application/json"}
+        )
         assert out["Authorization"] == "***REDACTED***"
         assert out["Content-Type"] == "application/json"
 
@@ -123,7 +124,12 @@ class TestDebugDump:
     def test_dump_written_for_post(self, tmp_path: Path) -> None:
         dump_dir = tmp_path / "dumps"
         client = _build_client(debug_dir=dump_dir)
-        _mock_post_response(client, status=200, text='{"ParameterList":"{}"}', json_value={"ParameterList": "{}"})
+        _mock_post_response(
+            client,
+            status=200,
+            text='{"ParameterList":"{}"}',
+            json_value={"ParameterList": "{}"},
+        )
 
         client.process_transaction("transferAsset", {"P_ASSET_NUMBER": "100"})
 
@@ -156,7 +162,7 @@ class TestDebugDump:
     def test_sequence_increments(self, tmp_path: Path) -> None:
         dump_dir = tmp_path / "dumps"
         client = _build_client(debug_dir=dump_dir)
-        _mock_post_response(client, status=200, text='{}', json_value={})
+        _mock_post_response(client, status=200, text="{}", json_value={})
 
         client.process_transaction("transferAsset", {})
         client.process_transaction("bookTransfer", {})
@@ -187,7 +193,7 @@ class TestDebugDump:
     def test_dump_failure_does_not_break_request(self, tmp_path: Path) -> None:
         dump_dir = tmp_path / "dumps"
         client = _build_client(debug_dir=dump_dir)
-        _mock_post_response(client, status=200, text='{}', json_value={})
+        _mock_post_response(client, status=200, text="{}", json_value={})
 
         # Force the dumper write to fail mid-call: dump() should swallow it.
         with patch.object(Path, "write_text", side_effect=OSError("disk full")):

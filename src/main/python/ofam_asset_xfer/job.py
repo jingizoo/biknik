@@ -11,21 +11,20 @@ from pydantic import BaseModel, model_validator
 from .bip_client import BIPClient, BIPConfig
 from .entity_resolver import EntityBookResolver
 from .exceptions import ConfigError, FusionApiError
-from .fusion_sync import FusionIUSync, DFFConfig
-from .oracle_client import OracleConfig, OracleErpIntegrationsClient
-from .gcs_publisher import GCSPublisherConfig, GCSResultPublisher
-from .local_publisher import LocalResultPublisher
-from .store import ArtifactStore
 from .fusion_ops import (
-    get_asset_information,
+    build_add_asset_params,
+    build_book_transfer_params,
+    build_retire_asset_params,
     build_same_book_transfer_params,
     build_same_book_transfer_params_option_b,
-    build_book_transfer_params,
-    build_add_asset_params,
-    build_retire_asset_params,
+    get_asset_information,
 )
+from .fusion_sync import DFFConfig, FusionIUSync
+from .gcs_publisher import GCSPublisherConfig, GCSResultPublisher
+from .local_publisher import LocalResultPublisher
+from .oracle_client import OracleConfig, OracleErpIntegrationsClient
+from .store import ArtifactStore
 from .template import render
-
 
 log = logging.getLogger(__name__)
 
@@ -82,9 +81,7 @@ def _validate_request(req: Dict[str, Any]) -> TransferRequest:
         raise ConfigError(str(e)) from e
 
 
-def _run_bip_flow(
-    config: Dict[str, Any], store: ArtifactStore, execute: bool
-) -> None:
+def _run_bip_flow(config: Dict[str, Any], store: ArtifactStore, execute: bool) -> None:
     """BIP-driven flow: discover transfers from 'books' config via BIP report."""
     oracle_cfg = OracleConfig.from_dict(config.get("oracle", {}))
     fusion_client = OracleErpIntegrationsClient(oracle_cfg)
@@ -114,6 +111,8 @@ def _run_bip_flow(
         dff_config=dff_config,
         blocked_books=config.get("blocked_books") or [],
         transfer_overrides=config.get("transfer_overrides") or {},
+        transfer_overrides_by_book=config.get("transfer_overrides_by_book") or {},
+        post_transfer_attribute_update=config.get("post_transfer_attribute_update") or {},
     )
     summary = sync.run_full_sync(
         books=books,
@@ -143,9 +142,7 @@ def _run_bip_flow(
     log.info("Run completed: %s", summary.get("counts", {}))
 
 
-def run_job(
-    config_uri: str, out_dir_uri: str, cli_execute: Optional[bool] = None
-) -> None:
+def run_job(config_uri: str, out_dir_uri: str, cli_execute: Optional[bool] = None) -> None:
     config = _load_config(config_uri)
     store = ArtifactStore(base_uri=out_dir_uri)
     store.ensure_dir()
@@ -167,9 +164,7 @@ def run_job(
 
     requests = config.get("requests")
     if not isinstance(requests, list) or not requests:
-        raise ConfigError(
-            "Config must include non-empty 'requests' or 'books' list."
-        )
+        raise ConfigError("Config must include non-empty 'requests' or 'books' list.")
 
     results: List[Dict[str, Any]] = []
     summary = {
@@ -195,15 +190,11 @@ def run_job(
                 summary["failed"] += 1
         except Exception as e:
             log.exception("Unhandled exception processing request")
-            rid = (
-                req.get("request_id", "UNKNOWN") if isinstance(req, dict) else "UNKNOWN"
-            )
+            rid = req.get("request_id", "UNKNOWN") if isinstance(req, dict) else "UNKNOWN"
             err = {"request_id": rid, "status": "FAILED", "error": str(e)}
             results.append(err)
             summary["failed"] += 1
-            store.write_json(
-                f"exceptions/{rid}.json", {"request": req, "error": str(e)}
-            )
+            store.write_json(f"exceptions/{rid}.json", {"request": req, "error": str(e)})
 
     summary["finished_ts"] = int(time.time())
     store.write_json("summary.json", summary)
@@ -335,11 +326,7 @@ def _process_one(
                 if xk not in ("strategy", "handle", "parameters_template"):
                     overrides.setdefault(xk, xv)
 
-        handle = (
-            str(xbook.get("handle") or "transferAsset").strip()
-            if xbook
-            else "transferAsset"
-        )
+        handle = str(xbook.get("handle") or "transferAsset").strip() if xbook else "transferAsset"
 
         # If a parameters_template is provided, use template rendering (legacy native path).
         tmpl = xbook.get("parameters_template") if xbook else None
@@ -374,9 +361,7 @@ def _process_one(
 
         raw_txn, pl_txn = client.process_transaction(handle, params)
         store.write_json(f"audit/{request_id}.xbook.native.response.json", raw_txn)
-        return _result_from_fusion_response(
-            request_id, transfer_type, state, handle, pl_txn
-        )
+        return _result_from_fusion_response(request_id, transfer_type, state, handle, pl_txn)
 
     # Strategy 2: orchestration fallback (addAsset in target book + retireAsset in source book)
     target = req.get("target")
@@ -439,9 +424,7 @@ def _process_one(
     # If addAsset fails, do not retire source.
     add_status = str(pl_add.get("X_RETURN_STATUS") or "").strip()
     if add_status and add_status != "S":
-        raise FusionApiError(
-            f"addAsset failed; not retiring source. Response: {pl_add}"
-        )
+        raise FusionApiError(f"addAsset failed; not retiring source. Response: {pl_add}")
 
     raw_ret, pl_ret = client.process_transaction("retireAsset", retire_params)
     store.write_json(f"audit/{request_id}.retireAsset.response.json", raw_ret)
@@ -450,9 +433,7 @@ def _process_one(
     return {
         "request_id": request_id,
         "transfer_type": transfer_type,
-        "status": "SUCCESS"
-        if str(pl_ret.get("X_RETURN_STATUS") or "") == "S"
-        else "FAILED",
+        "status": "SUCCESS" if str(pl_ret.get("X_RETURN_STATUS") or "") == "S" else "FAILED",
         "mode": "orchestrated_add_retire",
         "source_asset_id": state.asset_id,
         "source_asset_number": state.asset_number,
@@ -502,7 +483,5 @@ def _result_from_fusion_response(
     # Per Oracle guidance, X_RETURN_STATUS can be F even when X_EVENT_ID exists;
     # treat as failure but preserve identifiers for investigation.
     out["status"] = "FAILED"
-    out["message"] = (
-        "Fusion returned non-success X_RETURN_STATUS; see fusion payload for details."
-    )
+    out["message"] = "Fusion returned non-success X_RETURN_STATUS; see fusion payload for details."
     return out

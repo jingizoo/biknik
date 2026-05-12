@@ -14,17 +14,18 @@ from __future__ import annotations
 import json
 import logging
 import os
-import typer
+from typing import Optional
 
+import typer
 from ofam_asset_xfer.bip_client import BIPClient, BIPConfig
 from ofam_asset_xfer.entity_resolver import EntityBookResolver
 from ofam_asset_xfer.exceptions import ConfigError
-from ofam_asset_xfer.fusion_sync import FusionIUSync, DFFConfig
+from ofam_asset_xfer.fusion_sync import DFFConfig, FusionIUSync
 from ofam_asset_xfer.fusion_token_provider import build_token_provider
 from ofam_asset_xfer.gcs_publisher import GCSPublisherConfig, GCSResultPublisher
 from ofam_asset_xfer.local_publisher import LocalResultPublisher
-from ofam_asset_xfer.slack_publisher import SlackPublisher, PagerDutyPublisher
 from ofam_asset_xfer.oracle_client import OracleConfig, OracleErpIntegrationsClient
+from ofam_asset_xfer.slack_publisher import PagerDutyPublisher, SlackPublisher
 from ofam_asset_xfer.store import ArtifactStore
 
 app = typer.Typer(help="OFAM IU Asset Transfer Automation (BIP-driven).")
@@ -41,13 +42,13 @@ def main(  # noqa: D103
     ),
     debug: bool = typer.Option(
         False,
-        "--debug",
+        "--debug/--no-debug",
         help=(
             "Enable DEBUG logging and dump every Fusion request/response "
             "(auth-redacted) to <out-dir>/debug-dumps/ for offline inspection."
         ),
     ),
-    debug_dir: str = typer.Option(
+    debug_dir: Optional[str] = typer.Option(
         None,
         "--debug-dir",
         help="Override directory for --debug dumps (default: <out-dir>/debug-dumps/).",
@@ -66,6 +67,7 @@ def main(  # noqa: D103
     resolved_debug_dir: str | None = None
     if debug:
         from pathlib import Path as _P
+
         resolved_debug_dir = debug_dir or str(_P(out_dir) / "debug-dumps")
 
     try:
@@ -109,6 +111,9 @@ def main(  # noqa: D103
             dff_config=dff_config,
             default_transfer_date=cfg.get("default_transfer_date"),
             blocked_books=cfg.get("blocked_books") or [],
+            transfer_overrides=cfg.get("transfer_overrides") or {},
+            transfer_overrides_by_book=cfg.get("transfer_overrides_by_book") or {},
+            post_transfer_attribute_update=cfg.get("post_transfer_attribute_update") or {},
         )
         summary = sync.run_full_sync(
             books=books,
@@ -155,9 +160,13 @@ def main(  # noqa: D103
                 log.exception("Failed to check PagerDuty threshold (non-fatal)")
 
         counts = summary.get("counts", {})
-        log.info("Completed: total=%s transferred=%s failed=%s dry_run=%s",
-                 counts.get("total", 0), counts.get("transferred", 0),
-                 counts.get("failed", 0), counts.get("dry_run", 0))
+        log.info(
+            "Completed: total=%s transferred=%s failed=%s dry_run=%s",
+            counts.get("total", 0),
+            counts.get("transferred", 0),
+            counts.get("failed", 0),
+            counts.get("dry_run", 0),
+        )
 
     except Exception as exc:
         log.exception("Fatal error running job")

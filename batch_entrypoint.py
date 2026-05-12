@@ -19,10 +19,9 @@ import os
 from ofam_asset_xfer.bip_client import BIPClient, BIPConfig
 from ofam_asset_xfer.entity_resolver import EntityBookResolver
 from ofam_asset_xfer.exceptions import ConfigError
-from ofam_asset_xfer.fusion_sync import FusionIUSync, DFFConfig
+from ofam_asset_xfer.fusion_sync import DFFConfig, FusionIUSync
 from ofam_asset_xfer.fusion_token_provider import build_token_provider
 from ofam_asset_xfer.gcs_publisher import GCSPublisherConfig, GCSResultPublisher
-from ofam_asset_xfer.slack_publisher import SlackPublisher, PagerDutyPublisher
 from ofam_asset_xfer.local_publisher import LocalResultPublisher
 from ofam_asset_xfer.oracle_client import OracleConfig, OracleErpIntegrationsClient
 from ofam_asset_xfer.pre_bip_dff import (
@@ -30,6 +29,7 @@ from ofam_asset_xfer.pre_bip_dff import (
     PreBipDffUpdater,
     load_pre_bip_dff_requests,
 )
+from ofam_asset_xfer.slack_publisher import PagerDutyPublisher, SlackPublisher
 from ofam_asset_xfer.store import ArtifactStore
 
 
@@ -37,9 +37,17 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="OFAM IU Asset Transfer Automation (BIP-driven).")
     p.add_argument("--config", required=True, help="Path/URI to config JSON.")
     p.add_argument("--out-dir", required=True, help="Output directory/URI for artifacts.")
-    p.add_argument("--dry-run", action="store_true", help="Reads/validation only (no writes to Fusion).")
-    p.add_argument("--execute", action="store_true", help="Post transactions to Fusion. Overrides --dry-run.")
-    p.add_argument("--log-level", default=os.getenv("LOG_LEVEL", "INFO"), help="Logging level (INFO, DEBUG, ...).")
+    p.add_argument(
+        "--dry-run", action="store_true", help="Reads/validation only (no writes to Fusion)."
+    )
+    p.add_argument(
+        "--execute", action="store_true", help="Post transactions to Fusion. Overrides --dry-run."
+    )
+    p.add_argument(
+        "--log-level",
+        default=os.getenv("LOG_LEVEL", "INFO"),
+        help="Logging level (INFO, DEBUG, ...).",
+    )
     p.add_argument(
         "--debug",
         action="store_true",
@@ -70,6 +78,7 @@ def main(argv: list[str] | None = None) -> int:
     debug_dir: str | None = None
     if args.debug:
         from pathlib import Path as _P
+
         debug_dir = args.debug_dir or str(_P(args.out_dir) / "debug-dumps")
 
     # Execution flag: --execute wins, else dry-run (default).
@@ -116,6 +125,7 @@ def main(argv: list[str] | None = None) -> int:
         pre_bip_file = config.get("pre_bip_dff_updates_file")
         if pre_bip_file:
             from pathlib import Path as _Path
+
             pre_path = _Path(pre_bip_file)
             if not pre_path.is_absolute():
                 pre_path = _Path(args.config).resolve().parent / pre_bip_file
@@ -127,9 +137,7 @@ def main(argv: list[str] | None = None) -> int:
             pre_cfg = PreBipDffConfig.from_dict(pre_bip_block)
             pre_requests = load_pre_bip_dff_requests(pre_bip_block)
             if not pre_requests:
-                raise ConfigError(
-                    "pre_bip_dff_updates.enabled=true but no requests were supplied."
-                )
+                raise ConfigError("pre_bip_dff_updates.enabled=true but no requests were supplied.")
             updater = PreBipDffUpdater(fusion_client, pre_cfg)
             pre_summary = updater.apply_updates(pre_requests, dry_run=dry_run)
 
@@ -165,6 +173,9 @@ def main(argv: list[str] | None = None) -> int:
             dff_config=dff_config,
             default_transfer_date=config.get("default_transfer_date"),
             blocked_books=config.get("blocked_books") or [],
+            transfer_overrides=config.get("transfer_overrides") or {},
+            transfer_overrides_by_book=config.get("transfer_overrides_by_book") or {},
+            post_transfer_attribute_update=config.get("post_transfer_attribute_update") or {},
         )
         summary = sync.run_full_sync(
             books=books,
@@ -211,9 +222,13 @@ def main(argv: list[str] | None = None) -> int:
                 log.exception("Failed to check PagerDuty threshold (non-fatal)")
 
         counts = summary.get("counts", {})
-        log.info("Completed: total=%s transferred=%s failed=%s dry_run=%s",
-                 counts.get("total", 0), counts.get("transferred", 0),
-                 counts.get("failed", 0), counts.get("dry_run", 0))
+        log.info(
+            "Completed: total=%s transferred=%s failed=%s dry_run=%s",
+            counts.get("total", 0),
+            counts.get("transferred", 0),
+            counts.get("failed", 0),
+            counts.get("dry_run", 0),
+        )
         return 0
 
     except Exception as exc:

@@ -24,10 +24,11 @@ Architecture:
 from __future__ import annotations
 
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from datetime import date
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from .bip_client import BIPClient
 from .entity_resolver import EntityBookResolver
@@ -36,11 +37,29 @@ from .fusion_ops import (
     AssetState,
     build_book_transfer_params,
     build_same_book_transfer_params,
+    bump_underscore_suffix,
     get_asset_information,
 )
 from .oracle_client import OracleErpIntegrationsClient
 
 log = logging.getLogger(__name__)
+
+
+_PLACEHOLDER_RE = re.compile(r"\$\{([a-zA-Z0-9_]+)\}")
+
+
+def _interpolate(template: str, substitutions: Dict[str, str]) -> str:
+    """Replace ``${key}`` placeholders in ``template`` from ``substitutions``.
+
+    Unknown placeholders are left in place so misconfigurations are
+    visible in the resulting BIP parameter values rather than silently
+    swallowed.
+    """
+
+    def _sub(m: "re.Match[str]") -> str:
+        return substitutions.get(m.group(1), m.group(0))
+
+    return _PLACEHOLDER_RE.sub(_sub, template)
 
 
 # ---------------------------------------------------------------------------
@@ -175,6 +194,8 @@ class FusionIUSync:
         default_transfer_date: Optional[str] = None,
         blocked_books: Optional[List[str]] = None,
         transfer_overrides: Optional[Dict[str, Any]] = None,
+        transfer_overrides_by_book: Optional[Dict[str, Dict[str, Any]]] = None,
+        post_transfer_attribute_update: Optional[Dict[str, Any]] = None,
     ):
         self._client = fusion_client
         self._entity_resolver = entity_resolver
@@ -184,11 +205,65 @@ class FusionIUSync:
         self._blocked_books: Set[str] = {
             b.upper().strip() for b in (blocked_books or []) if b and b.strip()
         }
+        # Optional post-bookTransfer update that bumps a DFF on the new
+        # asset.  Opt-in via config — see ``_run_post_transfer_attr_update``
+        # for the full shape.  Default off so existing tenants are
+        # unaffected.
+        self._post_attr_cfg: Dict[str, Any] = dict(post_transfer_attribute_update or {})
         # Defaults for the Oracle FA bookTransfer / transferAsset payload
         # (conversion_rate_type, copy_dff_flag, etc.).  Per-row overrides
         # from the BIP report still take precedence — these are only used
         # when the row-level value is empty.
         self._transfer_overrides: Dict[str, Any] = dict(transfer_overrides or {})
+        # Per-book overrides, keyed by book code (case-insensitive).  Each
+        # entry may carry an ``applies_to`` flag:
+        #   * ``"T"`` (default) — applies when the book is the *target*
+        #     of the transfer.  Use for ledgers that publish their own
+        #     rate type (e.g. JP=Corporate, AU=Spot).
+        #   * ``"S"`` — applies when the book is the *source*.  Use for
+        #     ledgers whose outbound rules differ from the rest (e.g. SG
+        #     where Corporate as a rate type isn't valid for outbound
+        #     conversions).
+        #   * ``"B"`` — applies in either role.
+        # Source overrides are layered first, target overrides second,
+        # so when the same key is set on both, target wins.
+        self._transfer_overrides_by_book: Dict[str, Dict[str, Any]] = {
+            str(k).upper().strip(): dict(v or {})
+            for k, v in (transfer_overrides_by_book or {}).items()
+        }
+
+    @staticmethod
+    def _strip_applies_to(entry: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+        """Split an override entry into (applies_to, overrides)."""
+        applies_to = str(entry.get("applies_to") or "T").upper().strip() or "T"
+        if applies_to not in ("S", "T", "B"):
+            applies_to = "T"
+        return applies_to, {k: v for k, v in entry.items() if k != "applies_to"}
+
+    def _book_overrides_for(
+        self, source_book: Optional[str], target_book: Optional[str]
+    ) -> Dict[str, Any]:
+        """Resolve the per-book overrides that apply to this transfer.
+
+        Source overrides are layered first; target overrides win when
+        the same key is set on both sides.
+        """
+        out: Dict[str, Any] = {}
+        src = (source_book or "").upper().strip()
+        tgt = (target_book or "").upper().strip()
+
+        src_entry = self._transfer_overrides_by_book.get(src) if src else None
+        if src_entry:
+            applies_to, ovr = self._strip_applies_to(src_entry)
+            if applies_to in ("S", "B"):
+                out.update(ovr)
+
+        tgt_entry = self._transfer_overrides_by_book.get(tgt) if tgt else None
+        if tgt_entry:
+            applies_to, ovr = self._strip_applies_to(tgt_entry)
+            if applies_to in ("T", "B"):
+                out.update(ovr)
+        return out
 
     # ------------------------------------------------------------------
     # Discovery
@@ -291,17 +366,6 @@ class FusionIUSync:
         current_location_id = row.get(dff.current_location_id_col, "").strip() or None
         target_expense_ccid = row.get(dff.target_expense_ccid_col, "").strip() or None
 
-        # --- Location already matches → skip ---
-        if current_location_id and target_location_id and current_location_id == target_location_id:
-            log.info(
-                "Skipping asset %s: CURRENT_LOCATION_ID (%s) already equals "
-                "TARGET_LOCATION_ID (%s) — no transfer needed",
-                asset_number,
-                current_location_id,
-                target_location_id,
-            )
-            return None
-
         if final_target_book:
             target_book = final_target_book
             log.debug(
@@ -335,6 +399,27 @@ class FusionIUSync:
 
         # Same book AND no target location/expense info → nothing to transfer
         if not is_cross_book and not target_location_id and not target_expense_ccid:
+            return None
+
+        # Same-book + asked for a location move that's already in place + no
+        # CCID change → nothing left to do, skip.  Cross-book transfers are
+        # NOT skipped on location-match: the entity/book is what's changing,
+        # location may legitimately stay the same.  Same-book + matching
+        # location + a TARGET_EXPENSE_CCID is also kept (CCID is the delta).
+        if (
+            not is_cross_book
+            and current_location_id
+            and target_location_id
+            and current_location_id == target_location_id
+            and not target_expense_ccid
+        ):
+            log.info(
+                "Skipping asset %s: same-book, CURRENT_LOCATION_ID (%s) "
+                "already equals TARGET_LOCATION_ID and no CCID change — "
+                "nothing to do",
+                asset_number,
+                current_location_id,
+            )
             return None
 
         # --- Call getAssetInformation to get full state ---
@@ -418,11 +503,19 @@ class FusionIUSync:
         try:
             if pending.is_cross_book:
                 result = self._execute_cross_book(
-                    pending, state, request_id, effective_date, dry_run,
+                    pending,
+                    state,
+                    request_id,
+                    effective_date,
+                    dry_run,
                 )
             else:
                 result = self._execute_same_book(
-                    pending, state, request_id, effective_date, dry_run,
+                    pending,
+                    state,
+                    request_id,
+                    effective_date,
+                    dry_run,
                 )
             result.transfer_classification = classification
             return result
@@ -457,9 +550,18 @@ class FusionIUSync:
         )
 
         # Seed per-asset overrides with the run-wide defaults
-        # (conversion_rate_type=Corporate, copy_dff_flag=Y, …) so they
-        # land in every Fusion call by default.  Per-row values still win.
+        # (copy_dff_flag=Y, …) so they land in every Fusion call by
+        # default.  Per-row values still win.
         overrides: Dict[str, Any] = dict(self._transfer_overrides)
+        # Layer per-book overrides scoped by ``applies_to`` (S/T/B).
+        # Source first, target second — target wins when both supply the
+        # same key.
+        overrides.update(
+            self._book_overrides_for(
+                source_book=pending.book_type_code,
+                target_book=pending.target_book_type_code,
+            )
+        )
         # Prefer TARGET_LOCATION_ID from report; fall back to TRANSFER_TO_LOCATION DFF
         location_override = pending.target_location_id or pending.transfer_to_location
         if location_override:
@@ -476,9 +578,7 @@ class FusionIUSync:
         )
 
         if dry_run:
-            log.info(
-                "DRY-RUN: IU transfer payload built for asset=%s", pending.asset_number
-            )
+            log.info("DRY-RUN: IU transfer payload built for asset=%s", pending.asset_number)
             return TransferResult(
                 asset_number=pending.asset_number,
                 status="DRY_RUN",
@@ -493,6 +593,23 @@ class FusionIUSync:
         status_code = str(pl.get("X_RETURN_STATUS") or "").strip()
         return_msg = str(pl.get("X_MSG_DATA") or pl.get("X_RETURN_MESSAGE") or "").strip()
 
+        post_update_error: Optional[str] = None
+        if status_code == "S":
+            post_update_error = self._run_post_transfer_attr_update(
+                pending=pending,
+                source_state=state,
+                request_id=request_id,
+                book_transfer_response=pl,
+            )
+
+        result_error: Optional[str] = None
+        if status_code != "S":
+            result_error = f"Fusion X_RETURN_STATUS={status_code}: {return_msg}"
+        elif post_update_error:
+            # Transfer itself succeeded; surface the post-update problem
+            # without flipping the row to FAILED.
+            result_error = f"post-transfer attribute update warning: {post_update_error}"
+
         return TransferResult(
             asset_number=pending.asset_number,
             status="TRANSFERRED" if status_code == "S" else "FAILED",
@@ -501,10 +618,333 @@ class FusionIUSync:
             transfer_to_entity=pending.transfer_to_entity,
             transfer_date=effective_date,
             fusion_response=pl,
-            error=None
-            if status_code == "S"
-            else f"Fusion X_RETURN_STATUS={status_code}: {return_msg}",
+            error=result_error,
         )
+
+    # Field names Oracle FA *may* return on the bookTransfer response
+    # for the freshly-created destination asset.  Names vary by tenant /
+    # patch level, so we try several and let config extend the list.
+    _DEFAULT_DEST_ASSET_ID_FIELDS = (
+        "X_NEW_ASSET_ID",
+        "X_DEST_ASSET_ID",
+        "X_DESTINATION_ASSET_ID",
+        "X_TARGET_ASSET_ID",
+        "X_ASSET_ID",  # last resort: same-id case (CREATE_NEW_ASSET_FLAG=N)
+    )
+    _DEFAULT_DEST_ASSET_NUMBER_FIELDS = (
+        "X_NEW_ASSET_NUMBER",
+        "X_DEST_ASSET_NUMBER",
+        "X_DESTINATION_ASSET_NUMBER",
+        "X_TARGET_ASSET_NUMBER",
+        "X_ASSET_NUMBER",
+    )
+
+    def _run_post_transfer_attr_update(
+        self,
+        *,
+        pending: PendingTransfer,
+        source_state: AssetState,
+        request_id: str,
+        book_transfer_response: Dict[str, Any],
+    ) -> Optional[str]:
+        """Post-bookTransfer DFF bump on the newly-created destination asset.
+
+        Returns ``None`` on success (or when the feature is disabled),
+        or an error string when the follow-up call fails.  The error is
+        attached to the transfer result as a warning — the asset *was*
+        transferred, only the DFF bump failed.
+
+        Destination resolution order (most reliable → fallback):
+          1. ``dest_lookup_bip`` — a tenant-owned BI Publisher report
+             that joins on source_asset_id + target_book and returns
+             the new asset_id.  Most reliable in production because
+             tenants control the report schema.
+          2. ``X_NEW_ASSET_ID`` etc. on the ``bookTransfer`` response
+             (field names are tenant-specific; ``dest_asset_id_fields``
+             can extend the lookup list).
+          3. ``X_NEW_ASSET_NUMBER`` etc. + getAssetInformation against
+             the target book to look up the asset_id.
+          4. Source asset_number against target book — only valid when
+             ``P_CREATE_NEW_ASSET_FLAG=N`` (asset shared across books).
+
+        Config shape (``post_transfer_attribute_update`` on FusionIUSync)::
+
+            {
+              "enabled": true,
+              "source_field": "attribute10",
+              "fusion_parameter": "P_ATTRIBUTE10",
+              "operation_handle": "updateAssetDescriptiveDetails",
+              "request_id_param": "P_TRX_ATTRIBUTE1",
+              "trace_param": "P_TRX_ATTRIBUTE2",
+              "trace_value": "OFAM_POST_XBOOK_ATTR_BUMP",
+              "dest_lookup_bip": {
+                "report_path": "/Custom/.../Get_Transferred_Asset.xdo",
+                "params": {
+                  "P_SOURCE_ASSET_ID": "${source_asset_id}",
+                  "P_TARGET_BOOK_TYPE_CODE": "${target_book_type_code}"
+                },
+                "asset_id_column": "NEW_ASSET_ID",
+                "asset_number_column": "NEW_ASSET_NUMBER"
+              },
+              "dest_asset_id_fields": ["X_NEW_ASSET_ID", ...],
+              "dest_asset_number_fields": ["X_NEW_ASSET_NUMBER", ...],
+              "allow_same_asset_number_fallback": true
+            }
+        """
+        cfg = self._post_attr_cfg
+        if not cfg or not cfg.get("enabled"):
+            return None
+
+        source_field = str(cfg.get("source_field") or "attribute10")
+        fusion_param = str(cfg.get("fusion_parameter") or "P_ATTRIBUTE10")
+        op_handle = str(cfg.get("operation_handle") or "updateAssetDescriptiveDetails")
+        rid_param = str(cfg.get("request_id_param") or "P_TRX_ATTRIBUTE1")
+        trace_param = str(cfg.get("trace_param") or "P_TRX_ATTRIBUTE2")
+        trace_value = str(cfg.get("trace_value") or "OFAM_POST_XBOOK_ATTR_BUMP")
+        allow_fallback = bool(cfg.get("allow_same_asset_number_fallback", True))
+        dest_id_fields = tuple(
+            cfg.get("dest_asset_id_fields") or self._DEFAULT_DEST_ASSET_ID_FIELDS
+        )
+        dest_num_fields = tuple(
+            cfg.get("dest_asset_number_fields") or self._DEFAULT_DEST_ASSET_NUMBER_FIELDS
+        )
+
+        current_value = getattr(source_state, source_field, None)
+        bumped = bump_underscore_suffix(current_value)
+
+        dest_asset_id, dest_asset_number, resolution = self._resolve_destination_asset(
+            book_transfer_response=book_transfer_response,
+            pending=pending,
+            source_state=source_state,
+            dest_id_fields=dest_id_fields,
+            dest_num_fields=dest_num_fields,
+            allow_same_asset_number_fallback=allow_fallback,
+            dest_lookup_bip=cfg.get("dest_lookup_bip") or {},
+        )
+        if not dest_asset_id:
+            return (
+                "could not resolve destination asset_id from bookTransfer "
+                f"response (tried fields={list(dest_id_fields)}); "
+                "set 'dest_lookup_bip' (recommended) or "
+                "'dest_asset_id_fields' in post_transfer_attribute_update, "
+                "or enable 'allow_same_asset_number_fallback'"
+            )
+
+        log.info(
+            "Post-transfer bump asset=%s %s '%s' -> '%s' "
+            "(dest_asset_id=%s, dest_asset_number=%s, resolved_via=%s)",
+            pending.asset_number,
+            fusion_param,
+            current_value,
+            bumped,
+            dest_asset_id,
+            dest_asset_number,
+            resolution,
+        )
+
+        params: Dict[str, Any] = {
+            "P_ASSET_ID": dest_asset_id,
+            "P_BOOK_TYPE_CODE": pending.target_book_type_code,
+            fusion_param: bumped,
+            rid_param: f"{request_id}_ATTR_BUMP",
+            trace_param: trace_value,
+        }
+
+        try:
+            _raw, pl = self._client.process_transaction(op_handle, params)
+        except FusionApiError as e:
+            log.warning(
+                "Post-transfer attribute bump failed for asset=%s: %s",
+                pending.asset_number,
+                e,
+            )
+            return f"updateAssetDescriptiveDetails call failed: {e}"
+
+        status_code = str(pl.get("X_RETURN_STATUS") or "").strip()
+        if status_code != "S":
+            msg = str(pl.get("X_MSG_DATA") or pl.get("X_RETURN_MESSAGE") or "").strip()
+            log.warning(
+                "Post-transfer attribute bump returned %s for asset=%s: %s",
+                status_code,
+                pending.asset_number,
+                msg,
+            )
+            return f"updateAssetDescriptiveDetails X_RETURN_STATUS={status_code}: {msg}"
+
+        return None
+
+    def _resolve_destination_asset(
+        self,
+        *,
+        book_transfer_response: Dict[str, Any],
+        pending: PendingTransfer,
+        source_state: AssetState,
+        dest_id_fields: Tuple[str, ...],
+        dest_num_fields: Tuple[str, ...],
+        allow_same_asset_number_fallback: bool,
+        dest_lookup_bip: Dict[str, Any],
+    ) -> Tuple[Optional[str], Optional[str], str]:
+        """Return (asset_id, asset_number, resolution_label).
+
+        Resolution order (most reliable → fallback):
+          1. Custom BIP report (``dest_lookup_bip`` block) — when
+             configured, this is the canonical way to find the new
+             asset.  Tenant builds a small report that joins on
+             source_asset_id + target_book and returns the new asset's
+             id (and optionally number).
+          2. ``X_NEW_ASSET_ID`` etc. directly on the bookTransfer
+             response (fragile — field names vary).
+          3. ``X_NEW_ASSET_NUMBER`` etc. + getAssetInformation against
+             the target book.
+          4. Source asset_number against target book — only valid when
+             ``P_CREATE_NEW_ASSET_FLAG=N`` (asset shared across books).
+        """
+        # 1. Custom BIP report — recommended for production.
+        if dest_lookup_bip.get("report_path"):
+            asset_id, asset_number = self._lookup_dest_via_bip(
+                dest_lookup_bip,
+                pending=pending,
+                source_state=source_state,
+            )
+            if asset_id:
+                return asset_id, asset_number, "bip_report"
+
+        # 2. Direct asset_id from the bookTransfer response.
+        for fname in dest_id_fields:
+            v = str(book_transfer_response.get(fname) or "").strip()
+            if v and v != source_state.asset_id:
+                number = self._first_nonempty(book_transfer_response, dest_num_fields)
+                return v, number, f"response.{fname}"
+
+        # 3. asset_number from response → getAssetInformation on dest book.
+        for fname in dest_num_fields:
+            v = str(book_transfer_response.get(fname) or "").strip()
+            if v and v != source_state.asset_number:
+                try:
+                    _r, _pl, dest_state = get_asset_information(
+                        self._client, pending.target_book_type_code, v
+                    )
+                except FusionApiError as e:
+                    log.warning(
+                        "Post-transfer lookup via response.%s=%s failed: %s",
+                        fname,
+                        v,
+                        e,
+                    )
+                    continue
+                return dest_state.asset_id, v, f"response.{fname}+getAssetInformation"
+
+        # 4. Same-id case: X_ASSET_ID echoed back means CREATE_NEW_ASSET_FLAG=N.
+        for fname in dest_id_fields:
+            v = str(book_transfer_response.get(fname) or "").strip()
+            if v and v == source_state.asset_id:
+                return v, source_state.asset_number, f"response.{fname}(same_id)"
+
+        # 5. Last-resort fallback: source asset_number on target book.
+        if allow_same_asset_number_fallback:
+            try:
+                _r, _pl, dest_state = get_asset_information(
+                    self._client,
+                    pending.target_book_type_code,
+                    pending.asset_number,
+                )
+                return (
+                    dest_state.asset_id,
+                    pending.asset_number,
+                    "fallback.source_asset_number_on_target_book",
+                )
+            except FusionApiError as e:
+                log.warning(
+                    "Post-transfer fallback lookup (%s/%s) failed: %s",
+                    pending.target_book_type_code,
+                    pending.asset_number,
+                    e,
+                )
+
+        return None, None, "unresolved"
+
+    def _lookup_dest_via_bip(
+        self,
+        cfg: Dict[str, Any],
+        *,
+        pending: PendingTransfer,
+        source_state: AssetState,
+    ) -> Tuple[Optional[str], Optional[str]]:
+        """Call the destination-lookup BIP report and parse the first row.
+
+        Config shape::
+
+            {
+              "report_path": "/Custom/.../Get_Transferred_Asset.xdo",
+              "params": {
+                "P_SOURCE_ASSET_ID": "${source_asset_id}",
+                "P_TARGET_BOOK_TYPE_CODE": "${target_book_type_code}"
+              },
+              "asset_id_column": "NEW_ASSET_ID",
+              "asset_number_column": "NEW_ASSET_NUMBER"
+            }
+
+        Param values support ``${...}`` placeholders that interpolate
+        fields from the source asset and the pending transfer:
+        ``source_asset_id``, ``source_asset_number``, ``source_book_type_code``,
+        ``target_book_type_code``, ``transfer_to_entity``.
+        """
+        report_path = str(cfg.get("report_path") or "").strip()
+        if not report_path:
+            return None, None
+
+        substitutions: Dict[str, str] = {
+            "source_asset_id": source_state.asset_id or "",
+            "source_asset_number": source_state.asset_number or "",
+            "source_book_type_code": pending.book_type_code or "",
+            "target_book_type_code": pending.target_book_type_code or "",
+            "transfer_to_entity": pending.transfer_to_entity or "",
+        }
+        raw_params = cfg.get("params") or {}
+        params: Dict[str, str] = {}
+        for k, v in raw_params.items():
+            params[str(k)] = _interpolate(str(v), substitutions)
+
+        id_col = str(cfg.get("asset_id_column") or "NEW_ASSET_ID")
+        num_col = str(cfg.get("asset_number_column") or "NEW_ASSET_NUMBER")
+
+        try:
+            rows = self._bip.run_report(params=params, report_path=report_path)
+        except Exception as e:
+            log.warning(
+                "Destination-lookup BIP report failed (path=%s, params=%s): %s",
+                report_path,
+                params,
+                e,
+            )
+            return None, None
+
+        if not rows:
+            log.warning(
+                "Destination-lookup BIP returned 0 rows (path=%s, params=%s)",
+                report_path,
+                params,
+            )
+            return None, None
+
+        row = rows[0]
+        asset_id = str(row.get(id_col) or "").strip() or None
+        asset_number = str(row.get(num_col) or "").strip() or None
+        if not asset_id:
+            log.warning(
+                "Destination-lookup BIP row missing %s column (have: %s)",
+                id_col,
+                sorted(row.keys()),
+            )
+        return asset_id, asset_number
+
+    @staticmethod
+    def _first_nonempty(d: Dict[str, Any], keys: Tuple[str, ...]) -> Optional[str]:
+        for k in keys:
+            v = str(d.get(k) or "").strip()
+            if v:
+                return v
+        return None
 
     def _execute_same_book(
         self,
@@ -538,9 +978,7 @@ class FusionIUSync:
         )
 
         if is_noop:
-            log.info(
-                "NOOP: no distribution changes for asset=%s", pending.asset_number
-            )
+            log.info("NOOP: no distribution changes for asset=%s", pending.asset_number)
             return TransferResult(
                 asset_number=pending.asset_number,
                 status="NOOP",
@@ -577,9 +1015,11 @@ class FusionIUSync:
             transfer_to_entity=pending.transfer_to_entity,
             transfer_date=effective_date,
             fusion_response=pl,
-            error=None
-            if status_code == "S"
-            else f"Fusion X_RETURN_STATUS={status_code}: {return_msg}",
+            error=(
+                None
+                if status_code == "S"
+                else f"Fusion X_RETURN_STATUS={status_code}: {return_msg}"
+            ),
         )
 
     # ------------------------------------------------------------------

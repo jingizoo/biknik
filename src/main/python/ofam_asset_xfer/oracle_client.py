@@ -12,12 +12,12 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Tuple, Union
+
 import requests  # type: ignore[import-untyped]
 
 from .exceptions import FusionApiError
 from .paramlist import build_parameter_list
 from .proxy_config import get_proxy_config
-
 
 log = logging.getLogger(__name__)
 
@@ -55,8 +55,7 @@ def _parse_fusion_response(r: "requests.Response", context: str) -> Dict[str, An
         parsed = r.json()
     except ValueError as e:
         raise FusionApiError(
-            f"Fusion {context} returned non-JSON response "
-            f"(status={status}): {snippet}"
+            f"Fusion {context} returned non-JSON response " f"(status={status}): {snippet}"
         ) from e
 
     if not isinstance(parsed, dict):
@@ -247,9 +246,7 @@ class OracleErpIntegrationsClient:
 
     def _auth_headers(self) -> Dict[str, str]:
         """Build fresh Authorization header (uses provider if supplied)."""
-        token = (
-            self._token_provider() if self._token_provider else self.cfg.bearer_token
-        )
+        token = self._token_provider() if self._token_provider else self.cfg.bearer_token
         return {"Authorization": f"Bearer {token}"}
 
     def _endpoint(self, handle: str) -> str:
@@ -393,9 +390,7 @@ class OracleErpIntegrationsClient:
     ) -> None:
         if self._dumper is None:
             return
-        elapsed_ms = (
-            datetime.now(timezone.utc) - started
-        ).total_seconds() * 1000.0
+        elapsed_ms = (datetime.now(timezone.utc) - started).total_seconds() * 1000.0
         self._dumper.dump(
             method=method,
             url=url,
