@@ -138,14 +138,24 @@ class AssetState:
         if not assigned:
             assigned = [""] * len(dist_ids)
 
-        # Collect every X_ATTRIBUTE* slot on the response into a dict
-        # keyed by lower-case name (e.g. ``attribute7``, ``attribute10``,
-        # ``attribute_date1``).  Post-transfer logic can then target any
-        # DFF slot via the config's ``source_field`` knob without
-        # extending this dataclass.
+        # Collect every descriptive-flexfield slot on the response into
+        # a dict keyed by lower-case name.  Matches both the standard
+        # FA DFF (``X_ATTRIBUTE*``) and the category DFF
+        # (``X_CAT_ATTRIBUTE*``) so tenants that store tag identifiers
+        # in a category attribute (common at Citadel) can address them
+        # from config.  Examples:
+        #
+        #   X_ATTRIBUTE7         -> attributes["attribute7"]
+        #   X_CAT_ATTRIBUTE7     -> attributes["cat_attribute7"]
+        #   X_CAT_ATTRIBUTE_DATE1 -> attributes["cat_attribute_date1"]
         attributes: Dict[str, str] = {}
         for k, v in pl.items():
-            if not isinstance(k, str) or not k.upper().startswith("X_ATTRIBUTE"):
+            if not isinstance(k, str):
+                continue
+            upper_k = k.upper()
+            if not upper_k.startswith("X_"):
+                continue
+            if not (upper_k.startswith("X_ATTRIBUTE") or upper_k.startswith("X_CAT_ATTRIBUTE")):
                 continue
             value = str(v or "").strip()
             if not value:

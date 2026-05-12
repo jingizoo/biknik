@@ -1567,6 +1567,30 @@ class TestPostTransferAttributeUpdate:
         assert fusion.process_transaction.call_count == 2
         assert summary["results"][0]["status"] == "FAILED"
 
+    def test_bumps_cat_attribute7_when_tenant_uses_category_dff(self):
+        """Tenants that store the tag identifier in the category DFF
+        (X_CAT_ATTRIBUTE7) must be addressable via source_field=
+        cat_attribute7 + fusion_parameter=P_CAT_ATTRIBUTE7."""
+        fusion = _mock_fusion()
+        fusion.process_transaction.side_effect = [
+            self._get_asset_info_with_attr("cat_attribute7", "TAG-100"),  # discovery
+            self._book_transfer_success_response(new_asset_id="555"),
+            ({}, {"X_RETURN_STATUS": "S"}),  # update
+        ]
+        sync = self._build_sync(
+            fusion,
+            enabled=True,
+            source_field="cat_attribute7",
+            fusion_parameter="P_CAT_ATTRIBUTE7",
+        )
+        sync.run_full_sync(books=["US CORP BOOK", "UK CORP BOOK"], dry_run=False)
+
+        op_handle, params = fusion.process_transaction.call_args_list[-1][0]
+        assert op_handle == "updateAssetDescriptiveDetails"
+        assert params["P_ASSET_ID"] == "555"
+        assert params["P_CAT_ATTRIBUTE7"] == "TAG-100_1"
+        assert "P_ATTRIBUTE7" not in params
+
     def test_bumps_attribute7_when_source_field_is_attribute7(self):
         """source_field=attribute7 reads X_ATTRIBUTE7 from getAssetInformation
         (via the AssetState.attributes dict) and POSTs P_ATTRIBUTE7."""
