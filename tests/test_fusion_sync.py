@@ -7,15 +7,14 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
+from ofam_asset_xfer.entity_resolver import EntityBookResolver
+from ofam_asset_xfer.exceptions import FusionApiError
+from ofam_asset_xfer.fusion_ops import AssetState
 from ofam_asset_xfer.fusion_sync import (
-    FusionIUSync,
     DFFConfig,
+    FusionIUSync,
     PendingTransfer,
 )
-from ofam_asset_xfer.entity_resolver import EntityBookResolver
-from ofam_asset_xfer.fusion_ops import AssetState
-from ofam_asset_xfer.exceptions import FusionApiError
-
 
 # ---------------------------------------------------------------------------
 # Fixtures / helpers
@@ -190,9 +189,7 @@ class TestFindPendingTransfers:
         """Asset already in US book and entity resolves to US → skip."""
         fusion = _mock_fusion()
         bip = _mock_bip()
-        bip.run_report.return_value = [
-            _bip_row(book="US CORP BOOK", dff_entity="US Entity")
-        ]
+        bip.run_report.return_value = [_bip_row(book="US CORP BOOK", dff_entity="US Entity")]
 
         sync = FusionIUSync(fusion, _resolver(), bip)
         pending = sync.find_pending_transfers(books=["US CORP BOOK"], limit=10)
@@ -227,9 +224,7 @@ class TestFindPendingTransfers:
         """Asset in JP book but JP not in search books → skip."""
         fusion = _mock_fusion()
         bip = _mock_bip()
-        bip.run_report.return_value = [
-            _bip_row(book="JP CORP BOOK", dff_entity="US Entity")
-        ]
+        bip.run_report.return_value = [_bip_row(book="JP CORP BOOK", dff_entity="US Entity")]
 
         sync = FusionIUSync(fusion, _resolver(), bip)
         pending = sync.find_pending_transfers(
@@ -241,17 +236,13 @@ class TestFindPendingTransfers:
 
     def test_respects_limit(self):
         """Should stop collecting after reaching limit."""
-        rows = [
-            _bip_row(asset_number=str(1000 + i), dff_entity="UK Entity")
-            for i in range(20)
-        ]
+        rows = [_bip_row(asset_number=str(1000 + i), dff_entity="UK Entity") for i in range(20)]
         fusion = _mock_fusion()
         bip = _mock_bip()
         bip.run_report.return_value = rows
         # Each getAssetInformation call returns matching asset
         fusion.process_transaction.side_effect = [
-            _get_asset_info_response(asset_id=str(i), asset_number=str(1000 + i))
-            for i in range(20)
+            _get_asset_info_response(asset_id=str(i), asset_number=str(1000 + i)) for i in range(20)
         ]
 
         sync = FusionIUSync(fusion, _resolver(), bip)
@@ -324,9 +315,7 @@ class TestFindPendingTransfers:
         """Transfer to Location DFF should be captured if present."""
         fusion = _mock_fusion()
         bip = _mock_bip()
-        bip.run_report.return_value = [
-            _bip_row(dff_entity="UK Entity", dff_location="LON-DC1")
-        ]
+        bip.run_report.return_value = [_bip_row(dff_entity="UK Entity", dff_location="LON-DC1")]
         fusion.process_transaction.return_value = _get_asset_info_response()
 
         sync = FusionIUSync(fusion, _resolver(), bip)
@@ -357,11 +346,13 @@ class TestFindPendingTransfers:
         fusion = _mock_fusion()
         bip = _mock_bip()
         bip.run_report.side_effect = lambda params: (
-            [_bip_row(
-                book="US CORP BOOK",
-                dff_entity="UK Entity",
-                final_target_book="JP CORP BOOK",
-            )]
+            [
+                _bip_row(
+                    book="US CORP BOOK",
+                    dff_entity="UK Entity",
+                    final_target_book="JP CORP BOOK",
+                )
+            ]
             if params.get("P_BOOK_TYPE_CODE") == "US CORP BOOK"
             else []
         )
@@ -434,9 +425,13 @@ class TestFindPendingTransfers:
         assert pending[0].target_location_id == "300100123456"
 
     def test_cross_book_proceeds_even_when_location_matches(self):
-        """Cross-book = entity move; location may legitimately stay the
-        same.  The previous skip rule treated location-match alone as a
-        no-op even for cross-book rows, blocking entity-only transfers."""
+        """Cross-book rows must not be skipped on location-match.
+
+        Cross-book is an entity move; location may legitimately stay
+        the same.  The previous skip rule treated location-match alone
+        as a no-op even for cross-book rows, blocking entity-only
+        transfers.
+        """
         fusion = _mock_fusion()
         bip = _mock_bip()
         bip.run_report.return_value = [
@@ -476,8 +471,11 @@ class TestFindPendingTransfers:
         fusion.process_transaction.assert_not_called()
 
     def test_same_book_proceeds_when_location_matches_but_ccid_changes(self):
-        """Same-book + matching location + a TARGET_EXPENSE_CCID delta →
-        CCID is the actual change, must not be skipped."""
+        """CCID-only same-book transfers must not be skipped on location-match.
+
+        TARGET_EXPENSE_CCID is the actual delta when location stays
+        the same; the row must reach the executor.
+        """
         fusion = _mock_fusion()
         bip = _mock_bip()
         bip.run_report.return_value = [
@@ -911,6 +909,7 @@ class TestExecuteTransfer:
         assert pending[0].is_cross_book is False
         assert pending[0].target_expense_ccid == "627564"
 
+
 # ===================================================================
 # FusionIUSync.run_full_sync
 # ===================================================================
@@ -961,11 +960,13 @@ class TestRunFullSync:
 
 class TestTransferOverridesDefaults:
     def test_no_default_conversion_rate_type(self):
-        """fusion_ops.build_book_transfer_params no longer hard-codes a
-        rate type.  Some Citadel ledgers don't publish 'Corporate', and
-        same-currency transfers need the parameter omitted entirely.
-        When no override is supplied, P_CONVERSION_RATE_TYPE is None so
-        ``build_parameter_list`` skips it on the wire."""
+        """build_book_transfer_params no longer hard-codes a rate type.
+
+        Some Citadel ledgers don't publish 'Corporate', and same-currency
+        transfers need the parameter omitted entirely.  When no override
+        is supplied, P_CONVERSION_RATE_TYPE is None so
+        ``build_parameter_list`` skips it on the wire.
+        """
         from ofam_asset_xfer.fusion_ops import build_book_transfer_params
         from ofam_asset_xfer.paramlist import build_parameter_list
 
@@ -992,9 +993,11 @@ class TestTransferOverridesDefaults:
         assert params["P_CONVERSION_RATE_TYPE"] == "User"
 
     def test_empty_string_override_is_treated_as_unset(self):
-        """An explicit ``conversion_rate_type: ""`` from config is the
-        same as not setting it — Oracle rejects empty strings for FX
-        transfers, so we drop the parameter rather than send ``''``."""
+        """An explicit empty conversion_rate_type override is treated as unset.
+
+        Oracle rejects empty strings for FX transfers, so we drop the
+        parameter rather than send ``''``.
+        """
         from ofam_asset_xfer.fusion_ops import build_book_transfer_params
 
         params = build_book_transfer_params(
@@ -1024,9 +1027,7 @@ class TestTransferOverridesDefaults:
             bip,
             transfer_overrides={"conversion_rate_type": "Corporate"},
         )
-        summary = sync.run_full_sync(
-            books=["US CORP BOOK", "JP CORP BOOK"], dry_run=True
-        )
+        summary = sync.run_full_sync(books=["US CORP BOOK", "JP CORP BOOK"], dry_run=True)
 
         assert summary["counts"]["dry_run"] == 1
         sent = summary["results"][0]["fusion_response"]["planned_params"]
@@ -1059,9 +1060,7 @@ class TestTransferOverridesDefaults:
                 "location_ccid": "111-default",  # would lose to TARGET_LOCATION_ID
             },
         )
-        summary = sync.run_full_sync(
-            books=["US CORP BOOK", "JP CORP BOOK"], dry_run=True
-        )
+        summary = sync.run_full_sync(books=["US CORP BOOK", "JP CORP BOOK"], dry_run=True)
 
         sent = summary["results"][0]["fusion_response"]["planned_params"]
         # run-wide default lands
@@ -1079,18 +1078,22 @@ class TestAssignedToParam:
 
     def test_helper_returns_none_for_all_empty(self):
         from ofam_asset_xfer.fusion_ops import _assigned_to_param
+
         assert _assigned_to_param(["", "", ""]) is None
 
     def test_helper_returns_none_for_all_minus_one(self):
         from ofam_asset_xfer.fusion_ops import _assigned_to_param
+
         assert _assigned_to_param(["-1", "-1"]) is None
 
     def test_helper_returns_none_for_mixed_empty_sentinels(self):
         from ofam_asset_xfer.fusion_ops import _assigned_to_param
+
         assert _assigned_to_param(["", "-1", ""]) is None
 
     def test_helper_returns_list_when_any_real_value(self):
         from ofam_asset_xfer.fusion_ops import _assigned_to_param
+
         assert _assigned_to_param(["", "8801", ""]) == ["", "8801", ""]
 
     def test_same_book_omits_assigned_to_when_unassigned(self):
@@ -1162,7 +1165,13 @@ class TestTransferOverridesByBook:
     transfer_overrides, so an AU ledger that does not publish 'Corporate'
     can use 'Spot' without changing the JP/UK default."""
 
-    def _run_one(self, target_book: str, *, overrides_by_book: dict, transfer_overrides: dict | None = None):
+    def _run_one(
+        self,
+        target_book: str,
+        *,
+        overrides_by_book: dict,
+        transfer_overrides: dict | None = None,
+    ):
         fusion = _mock_fusion()
         bip = _mock_bip()
         bip.run_report.side_effect = lambda params: (
@@ -1180,9 +1189,7 @@ class TestTransferOverridesByBook:
             transfer_overrides=transfer_overrides or {},
             transfer_overrides_by_book=overrides_by_book,
         )
-        summary = sync.run_full_sync(
-            books=["US CORP BOOK", target_book], dry_run=True
-        )
+        summary = sync.run_full_sync(books=["US CORP BOOK", target_book], dry_run=True)
         return summary["results"][0]["fusion_response"]["planned_params"]
 
     def test_au_overrides_conversion_rate_type(self):
@@ -1235,27 +1242,32 @@ class TestBumpUnderscoreSuffix:
 
     def test_appends_underscore_one_when_no_suffix(self):
         from ofam_asset_xfer.fusion_ops import bump_underscore_suffix
+
         assert bump_underscore_suffix("ASSET-100") == "ASSET-100_1"
 
     def test_increments_existing_suffix(self):
         from ofam_asset_xfer.fusion_ops import bump_underscore_suffix
+
         assert bump_underscore_suffix("ASSET-100_1") == "ASSET-100_2"
         assert bump_underscore_suffix("ASSET-100_9") == "ASSET-100_10"
         assert bump_underscore_suffix("ASSET-100_99") == "ASSET-100_100"
 
     def test_none_and_empty(self):
         from ofam_asset_xfer.fusion_ops import bump_underscore_suffix
+
         assert bump_underscore_suffix(None) == "_1"
         assert bump_underscore_suffix("") == "_1"
 
     def test_only_trailing_digit_run_counts(self):
         """_5_3 → _5_4 (trailing _N wins; leading _5 left alone)."""
         from ofam_asset_xfer.fusion_ops import bump_underscore_suffix
+
         assert bump_underscore_suffix("A_5_3") == "A_5_4"
 
     def test_non_digit_suffix_not_treated_as_n(self):
         """_abc is not _N; append _1."""
         from ofam_asset_xfer.fusion_ops import bump_underscore_suffix
+
         assert bump_underscore_suffix("ASSET_abc") == "ASSET_abc_1"
 
 
@@ -1310,9 +1322,7 @@ class TestPostTransferAttributeUpdate:
             self._book_transfer_success_response(),  # bookTransfer
         ]
         sync = self._build_sync(fusion, enabled=False)
-        summary = sync.run_full_sync(
-            books=["US CORP BOOK", "UK CORP BOOK"], dry_run=False
-        )
+        summary = sync.run_full_sync(books=["US CORP BOOK", "UK CORP BOOK"], dry_run=False)
         # exactly the two calls above, no post-update
         assert fusion.process_transaction.call_count == 2
         assert summary["results"][0]["status"] == "TRANSFERRED"
@@ -1328,9 +1338,7 @@ class TestPostTransferAttributeUpdate:
             ({}, {"X_RETURN_STATUS": "S"}),  # updateAssetDescriptiveDetails
         ]
         sync = self._build_sync(fusion, enabled=True)
-        summary = sync.run_full_sync(
-            books=["US CORP BOOK", "UK CORP BOOK"], dry_run=False
-        )
+        summary = sync.run_full_sync(books=["US CORP BOOK", "UK CORP BOOK"], dry_run=False)
 
         # 3 calls: discovery + bookTransfer + update (no fallback lookup)
         assert fusion.process_transaction.call_count == 3
@@ -1368,12 +1376,8 @@ class TestPostTransferAttributeUpdate:
             self._get_asset_info_with_attr10("ASSET-100"),
             self._book_transfer_success_response(),  # no new-id fields
         ]
-        sync = self._build_sync(
-            fusion, enabled=True, allow_same_asset_number_fallback=False
-        )
-        summary = sync.run_full_sync(
-            books=["US CORP BOOK", "UK CORP BOOK"], dry_run=False
-        )
+        sync = self._build_sync(fusion, enabled=True, allow_same_asset_number_fallback=False)
+        summary = sync.run_full_sync(books=["US CORP BOOK", "UK CORP BOOK"], dry_run=False)
         # Only discovery + bookTransfer; no update was attempted.
         assert fusion.process_transaction.call_count == 2
         result = summary["results"][0]
@@ -1402,6 +1406,7 @@ class TestPostTransferAttributeUpdate:
         when scanning US CORP BOOK.  The destination-lookup report
         returns the supplied value (list, exception, or callable).
         """
+
         def _run(params=None, report_path=None):
             if report_path == self.DEST_LOOKUP_REPORT:
                 if isinstance(dest_lookup_return, BaseException):
@@ -1410,6 +1415,7 @@ class TestPostTransferAttributeUpdate:
             if (params or {}).get("P_BOOK_TYPE_CODE") == "US CORP BOOK":
                 return [_bip_row(book="US CORP BOOK", dff_entity="UK Entity")]
             return []
+
         return _run
 
     def test_dest_lookup_bip_is_preferred_over_response_field(self):
@@ -1453,7 +1459,8 @@ class TestPostTransferAttributeUpdate:
 
         # The BIP report was called with the interpolated params.
         dest_calls = [
-            c for c in bip.run_report.call_args_list
+            c
+            for c in bip.run_report.call_args_list
             if (c.kwargs or {}).get("report_path") == self.DEST_LOOKUP_REPORT
         ]
         assert len(dest_calls) == 1
@@ -1496,9 +1503,7 @@ class TestPostTransferAttributeUpdate:
             ({}, {"X_RETURN_STATUS": "S"}),
         ]
         bip = _mock_bip()
-        bip.run_report.side_effect = self._bip_router(
-            RuntimeError("BIP SOAP 500")
-        )
+        bip.run_report.side_effect = self._bip_router(RuntimeError("BIP SOAP 500"))
         sync = FusionIUSync(
             fusion,
             _resolver(),
@@ -1548,9 +1553,7 @@ class TestPostTransferAttributeUpdate:
             ({}, {"X_RETURN_STATUS": "E", "X_MSG_DATA": "boom"}),
         ]
         sync = self._build_sync(fusion, enabled=True)
-        summary = sync.run_full_sync(
-            books=["US CORP BOOK", "UK CORP BOOK"], dry_run=False
-        )
+        summary = sync.run_full_sync(books=["US CORP BOOK", "UK CORP BOOK"], dry_run=False)
         # Only discovery + the failed bookTransfer.  Post-update must not fire.
         assert fusion.process_transaction.call_count == 2
         assert summary["results"][0]["status"] == "FAILED"
@@ -1563,9 +1566,7 @@ class TestPostTransferAttributeUpdate:
             ({}, {"X_RETURN_STATUS": "E", "X_MSG_DATA": "permission denied"}),
         ]
         sync = self._build_sync(fusion, enabled=True)
-        summary = sync.run_full_sync(
-            books=["US CORP BOOK", "UK CORP BOOK"], dry_run=False
-        )
+        summary = sync.run_full_sync(books=["US CORP BOOK", "UK CORP BOOK"], dry_run=False)
         result = summary["results"][0]
         assert result["status"] == "TRANSFERRED"
         assert "post-transfer attribute update warning" in (result["error"] or "")
@@ -1585,9 +1586,7 @@ class TestAppliesToFlag:
             if params.get("P_BOOK_TYPE_CODE") == source_book
             else []
         )
-        fusion.process_transaction.return_value = _get_asset_info_response(
-            book=source_book
-        )
+        fusion.process_transaction.return_value = _get_asset_info_response(book=source_book)
         entity_map = {"Src Entity": source_book, "Tgt Entity": target_book}
         sync = FusionIUSync(
             fusion,

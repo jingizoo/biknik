@@ -39,10 +39,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent / "src" / "main" / "pytho
 from ofam_asset_xfer.bip_client import BIPClient, BIPConfig  # noqa: E402
 from ofam_asset_xfer.entity_resolver import EntityBookResolver  # noqa: E402
 from ofam_asset_xfer.exceptions import ConfigError  # noqa: E402
-from ofam_asset_xfer.fusion_sync import FusionIUSync, DFFConfig  # noqa: E402
+from ofam_asset_xfer.fusion_sync import DFFConfig, FusionIUSync  # noqa: E402
 from ofam_asset_xfer.fusion_token_provider import build_token_provider  # noqa: E402
 from ofam_asset_xfer.gcs_publisher import GCSPublisherConfig, GCSResultPublisher  # noqa: E402
-from ofam_asset_xfer.slack_publisher import SlackPublisher, PagerDutyPublisher  # noqa: E402
 from ofam_asset_xfer.local_publisher import LocalResultPublisher  # noqa: E402
 from ofam_asset_xfer.oracle_client import OracleConfig, OracleErpIntegrationsClient  # noqa: E402
 from ofam_asset_xfer.pre_bip_dff import (  # noqa: E402
@@ -50,6 +49,7 @@ from ofam_asset_xfer.pre_bip_dff import (  # noqa: E402
     PreBipDffUpdater,
     load_pre_bip_dff_requests,
 )
+from ofam_asset_xfer.slack_publisher import PagerDutyPublisher, SlackPublisher  # noqa: E402
 
 
 def _load_config(path: str) -> dict:
@@ -124,7 +124,10 @@ def main(argv: list[str] | None = None) -> int:
             cl_client.setup_logging(log_level=log_level)
             log.info("Google Cloud Logging enabled")
         except Exception:
-            log.warning("Could not initialise Google Cloud Logging — continuing with local logs only", exc_info=True)
+            log.warning(
+                "Could not initialise Google Cloud Logging — continuing with local logs only",
+                exc_info=True,
+            )
 
     # Resolve output dir.
     if args.out_dir:
@@ -201,9 +204,7 @@ def main(argv: list[str] | None = None) -> int:
             pre_cfg = PreBipDffConfig.from_dict(pre_bip_block)
             pre_requests = load_pre_bip_dff_requests(pre_bip_block)
             if not pre_requests:
-                raise ConfigError(
-                    "pre_bip_dff_updates.enabled=true but no requests were supplied."
-                )
+                raise ConfigError("pre_bip_dff_updates.enabled=true but no requests were supplied.")
             updater = PreBipDffUpdater(fusion_client, pre_cfg)
             pre_summary = updater.apply_updates(pre_requests, dry_run=dry_run)
 
@@ -258,9 +259,7 @@ def main(argv: list[str] | None = None) -> int:
         summary_path.write_text(json.dumps(summary, indent=2, default=str))
 
         results_path = Path(out_dir) / "results.json"
-        results_path.write_text(
-            json.dumps(summary.get("results", []), indent=2, default=str)
-        )
+        results_path.write_text(json.dumps(summary.get("results", []), indent=2, default=str))
 
         # Publish Tableau-friendly NDJSON (always local, optionally GCS)
         results_list = summary.get("results", [])

@@ -30,21 +30,6 @@ from dataclasses import dataclass, field
 from datetime import date
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-
-_PLACEHOLDER_RE = re.compile(r"\$\{([a-zA-Z0-9_]+)\}")
-
-
-def _interpolate(template: str, substitutions: Dict[str, str]) -> str:
-    """Replace ``${key}`` placeholders in ``template`` from ``substitutions``.
-
-    Unknown placeholders are left in place so misconfigurations are
-    visible in the resulting BIP parameter values rather than silently
-    swallowed.
-    """
-    def _sub(m: "re.Match[str]") -> str:
-        return substitutions.get(m.group(1), m.group(0))
-    return _PLACEHOLDER_RE.sub(_sub, template)
-
 from .bip_client import BIPClient
 from .entity_resolver import EntityBookResolver
 from .exceptions import FusionApiError, ValidationError
@@ -58,6 +43,23 @@ from .fusion_ops import (
 from .oracle_client import OracleErpIntegrationsClient
 
 log = logging.getLogger(__name__)
+
+
+_PLACEHOLDER_RE = re.compile(r"\$\{([a-zA-Z0-9_]+)\}")
+
+
+def _interpolate(template: str, substitutions: Dict[str, str]) -> str:
+    """Replace ``${key}`` placeholders in ``template`` from ``substitutions``.
+
+    Unknown placeholders are left in place so misconfigurations are
+    visible in the resulting BIP parameter values rather than silently
+    swallowed.
+    """
+
+    def _sub(m: "re.Match[str]") -> str:
+        return substitutions.get(m.group(1), m.group(0))
+
+    return _PLACEHOLDER_RE.sub(_sub, template)
 
 
 # ---------------------------------------------------------------------------
@@ -501,11 +503,19 @@ class FusionIUSync:
         try:
             if pending.is_cross_book:
                 result = self._execute_cross_book(
-                    pending, state, request_id, effective_date, dry_run,
+                    pending,
+                    state,
+                    request_id,
+                    effective_date,
+                    dry_run,
                 )
             else:
                 result = self._execute_same_book(
-                    pending, state, request_id, effective_date, dry_run,
+                    pending,
+                    state,
+                    request_id,
+                    effective_date,
+                    dry_run,
                 )
             result.transfer_classification = classification
             return result
@@ -568,9 +578,7 @@ class FusionIUSync:
         )
 
         if dry_run:
-            log.info(
-                "DRY-RUN: IU transfer payload built for asset=%s", pending.asset_number
-            )
+            log.info("DRY-RUN: IU transfer payload built for asset=%s", pending.asset_number)
             return TransferResult(
                 asset_number=pending.asset_number,
                 status="DRY_RUN",
@@ -819,7 +827,9 @@ class FusionIUSync:
                 except FusionApiError as e:
                     log.warning(
                         "Post-transfer lookup via response.%s=%s failed: %s",
-                        fname, v, e,
+                        fname,
+                        v,
+                        e,
                     )
                     continue
                 return dest_state.asset_id, v, f"response.{fname}+getAssetInformation"
@@ -903,14 +913,17 @@ class FusionIUSync:
         except Exception as e:
             log.warning(
                 "Destination-lookup BIP report failed (path=%s, params=%s): %s",
-                report_path, params, e,
+                report_path,
+                params,
+                e,
             )
             return None, None
 
         if not rows:
             log.warning(
                 "Destination-lookup BIP returned 0 rows (path=%s, params=%s)",
-                report_path, params,
+                report_path,
+                params,
             )
             return None, None
 
@@ -920,14 +933,13 @@ class FusionIUSync:
         if not asset_id:
             log.warning(
                 "Destination-lookup BIP row missing %s column (have: %s)",
-                id_col, sorted(row.keys()),
+                id_col,
+                sorted(row.keys()),
             )
         return asset_id, asset_number
 
     @staticmethod
-    def _first_nonempty(
-        d: Dict[str, Any], keys: Tuple[str, ...]
-    ) -> Optional[str]:
+    def _first_nonempty(d: Dict[str, Any], keys: Tuple[str, ...]) -> Optional[str]:
         for k in keys:
             v = str(d.get(k) or "").strip()
             if v:
@@ -966,9 +978,7 @@ class FusionIUSync:
         )
 
         if is_noop:
-            log.info(
-                "NOOP: no distribution changes for asset=%s", pending.asset_number
-            )
+            log.info("NOOP: no distribution changes for asset=%s", pending.asset_number)
             return TransferResult(
                 asset_number=pending.asset_number,
                 status="NOOP",
@@ -1005,9 +1015,11 @@ class FusionIUSync:
             transfer_to_entity=pending.transfer_to_entity,
             transfer_date=effective_date,
             fusion_response=pl,
-            error=None
-            if status_code == "S"
-            else f"Fusion X_RETURN_STATUS={status_code}: {return_msg}",
+            error=(
+                None
+                if status_code == "S"
+                else f"Fusion X_RETURN_STATUS={status_code}: {return_msg}"
+            ),
         )
 
     # ------------------------------------------------------------------

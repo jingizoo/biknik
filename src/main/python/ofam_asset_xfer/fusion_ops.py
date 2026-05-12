@@ -5,11 +5,10 @@ import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
+from .ccid_resolver import resolve_target_expense_ccid
 from .exceptions import FusionApiError, ValidationError
 from .oracle_client import OracleErpIntegrationsClient
-from .paramlist import parse_rosetta, ensure_same_len
-from .ccid_resolver import resolve_target_expense_ccid
-
+from .paramlist import ensure_same_len, parse_rosetta
 
 log = logging.getLogger(__name__)
 
@@ -91,9 +90,7 @@ class AssetState:
         # Required identity
         asset_id = str(pl.get("X_ASSET_ID") or "").strip()
         asset_number = str(pl.get("X_ASSET_NUMBER") or "").strip()
-        book_type_code = str(
-            pl.get("X_BOOK_TYPE_CODE") or pl.get("P_BOOK_TYPE_CODE") or ""
-        ).strip()
+        book_type_code = str(pl.get("X_BOOK_TYPE_CODE") or pl.get("P_BOOK_TYPE_CODE") or "").strip()
         missing = []
         if not asset_id:
             missing.append("X_ASSET_ID")
@@ -143,8 +140,7 @@ class AssetState:
             expense_ccids=expense,
             location_ccids=location,
             category_id=str(pl.get("X_CATEGORY_ID") or "").strip() or None,
-            date_placed_in_service=str(pl.get("X_DATE_PLACED_IN_SERVICE") or "").strip()
-            or None,
+            date_placed_in_service=str(pl.get("X_DATE_PLACED_IN_SERVICE") or "").strip() or None,
             cost=str(pl.get("X_COST") or "").strip() or None,
             description=str(pl.get("X_DESCRIPTION") or "").strip() or None,
             tag_number=str(pl.get("X_TAG_NUMBER") or "").strip() or None,
@@ -451,9 +447,7 @@ def build_book_transfer_params(
         "P_DEST_BOOK_TYPE_CODE": dest_book_type_code,
         "P_BOOK_TRANSFER_TYPE_CODE": book_transfer_type_code,
         "P_COST_BASIS_CODE": cost_basis_code,
-        "P_USE_DEST_CAT_DEPRN_RULES_FLAG": overrides.get(
-            "use_dest_cat_deprn_rules_flag", "Y"
-        ),
+        "P_USE_DEST_CAT_DEPRN_RULES_FLAG": overrides.get("use_dest_cat_deprn_rules_flag", "Y"),
         "P_USE_XFR_DATE_AS_DPIS_FLAG": overrides.get("use_xfr_date_as_dpis_flag", "N"),
         "P_COPY_DFF_FLAG": overrides.get("copy_dff_flag", "Y"),
         "P_COPY_ASSET_KEY_FLAG": overrides.get("copy_asset_key_flag", "Y"),
@@ -534,9 +528,7 @@ def build_add_asset_params(
         "P_DISTRIBUTION_ID_TBL": dist_ids,
         "P_UNITS_ASSIGNED_TBL": units,
         "P_TRANSACTION_UNITS_TBL": txn_units,
-        "P_ASSIGNED_TO_TBL": _assigned_to_param(
-            list(dest_assigned) if dest_assigned else [""] * n
-        ),
+        "P_ASSIGNED_TO_TBL": _assigned_to_param(list(dest_assigned) if dest_assigned else [""] * n),
         "P_EXPENSE_CCID_TBL": dest_expense,
         "P_LOCATION_CCID_TBL": dest_location,
         "P_TRX_ATTRIBUTE1": request_id,
