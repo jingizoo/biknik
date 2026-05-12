@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+from typing import Optional
 
 import typer
 from ofam_asset_xfer.bip_client import BIPClient, BIPConfig
@@ -41,13 +42,13 @@ def main(  # noqa: D103
     ),
     debug: bool = typer.Option(
         False,
-        "--debug",
+        "--debug/--no-debug",
         help=(
             "Enable DEBUG logging and dump every Fusion request/response "
             "(auth-redacted) to <out-dir>/debug-dumps/ for offline inspection."
         ),
     ),
-    debug_dir: str = typer.Option(
+    debug_dir: Optional[str] = typer.Option(
         None,
         "--debug-dir",
         help="Override directory for --debug dumps (default: <out-dir>/debug-dumps/).",
