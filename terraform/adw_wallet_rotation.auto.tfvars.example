@@ -1,0 +1,23 @@
+# Example values for the ADW wallet rotation module.
+# Copy to "adw_wallet_rotation.auto.tfvars" and fill in real OCIDs.
+# DO NOT commit the populated file — it is matched by .gitignore.
+
+# --- OCI auth (only fill the block matching your oci_auth choice) ---
+oci_auth   = "InstancePrincipal"          # or "ApiKey" / "ResourcePrincipal" / "SecurityToken"
+oci_region = "us-ashburn-1"
+
+# ApiKey auth only (leave empty otherwise):
+# oci_tenancy_ocid     = "ocid1.tenancy.oc1..xxxx"
+# oci_user_ocid        = "ocid1.user.oc1..xxxx"
+# oci_fingerprint      = "aa:bb:cc:dd:ee:ff:..."
+# oci_private_key_path = "~/.oci/oci_api_key.pem"
+
+# --- ADW + Vault targets ---
+adw_ocid           = "ocid1.autonomousdatabase.oc1..xxxx"
+compartment_ocid   = "ocid1.compartment.oc1..xxxx"
+vault_ocid         = "ocid1.vault.oc1..xxxx"
+key_ocid           = "ocid1.key.oc1..xxxx"
+wallet_secret_name = "adw-wallet-password"
+
+# Optional: existing ADB on Dedicated infra.
+is_dedicated = false
