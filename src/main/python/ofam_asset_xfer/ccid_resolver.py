@@ -261,6 +261,50 @@ def lookup_ccid_by_segments(
 # ---------------------------------------------------------------------------
 # 4) Top-level convenience: resolve_target_expense_ccid
 # ---------------------------------------------------------------------------
+def resolve_target_ccid_from_segments(
+    client: _RestClient,
+    target_segments: Dict[str, str],
+    *,
+    chart_of_accounts_id: Optional[int] = None,
+    creator: Optional[AccountCombinationCreator] = None,
+    ledger_name: Optional[str] = None,
+) -> int:
+    """Resolve a destination CCID directly from caller-supplied segments.
+
+    Skips the source-CCID-fetch + segment-swap dance entirely.  Useful
+    when the BIP report already ships the resolved ``TARGET_SEG1``..
+    ``TARGET_SEGN`` columns (the standard FA cross-book report shape).
+
+    Behaviour:
+      * Looks up an existing combination via
+        ``accountCombinationsLOV`` with a ``q`` segment-equality filter.
+      * On a miss, falls through to ``creator(ledger_name, segments)``
+        when both are supplied — typically the SOAP
+        ``AccountCombinationService.validateAndCreateAccounts`` wrapper.
+      * Without a creator, raises ``ValidationError`` with the
+        "needs to be created" message.
+
+    Args:
+        target_segments: ``{"Segment1": "...", "Segment2": "...", ...}``.
+            Keys must match Fusion's segment naming.
+        chart_of_accounts_id: Optional CoA filter to narrow the search
+            when the same segment combo could exist in multiple CoAs.
+        creator: Optional callable to create on miss.
+        ledger_name: Required when ``creator`` is supplied.
+    """
+    if not target_segments:
+        raise ValidationError(
+            "resolve_target_ccid_from_segments: target_segments must be non-empty"
+        )
+    return lookup_ccid_by_segments(
+        client,
+        target_segments,
+        chart_of_accounts_id,
+        creator=creator,
+        ledger_name=ledger_name,
+    )
+
+
 def resolve_target_expense_ccid(
     client: _RestClient,
     src_expense_ccid: int,

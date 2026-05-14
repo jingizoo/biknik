@@ -28,15 +28,14 @@ import os
 from typing import Optional
 
 import typer
-
 from ofam_asset_xfer.bip_client import BIPClient, BIPConfig
 from ofam_asset_xfer.entity_resolver import EntityBookResolver
 from ofam_asset_xfer.exceptions import ConfigError
-from ofam_asset_xfer.fusion_sync import FusionIUSync, DFFConfig
+from ofam_asset_xfer.fusion_sync import DFFConfig, FusionIUSync
 from ofam_asset_xfer.gcs_publisher import GCSPublisherConfig, GCSResultPublisher
 from ofam_asset_xfer.local_publisher import LocalResultPublisher
-from ofam_asset_xfer.slack_publisher import SlackPublisher, PagerDutyPublisher
 from ofam_asset_xfer.oracle_client import OracleConfig, OracleErpIntegrationsClient
+from ofam_asset_xfer.slack_publisher import PagerDutyPublisher, SlackPublisher
 from ofam_asset_xfer.store import ArtifactStore
 
 app = typer.Typer(help="OFAM IU Asset Transfer Automation (BIP-driven).")
@@ -78,6 +77,7 @@ def main(
     resolved_debug_dir: str | None = None
     if debug:
         from pathlib import Path as _P
+
         resolved_debug_dir = debug_dir or str(_P(out_dir) / "debug-dumps")
 
     try:
@@ -108,6 +108,14 @@ def main(
         bip_params = cfg.get("bip_params")
         max_transfers = int(cfg.get("max_transfers", 500))
 
+        from ofam_asset_xfer.fusion_sync import (  # local import — bundle.py has unusual top-level
+            build_account_combination_client_from_config,
+        )
+
+        ac_client, ledger_map = build_account_combination_client_from_config(
+            cfg.get("account_combination_service"),
+        )
+
         # --- Run ---
         sync = FusionIUSync(
             fusion_client,
@@ -119,6 +127,8 @@ def main(
             transfer_overrides=cfg.get("transfer_overrides") or {},
             transfer_overrides_by_book=cfg.get("transfer_overrides_by_book") or {},
             post_transfer_attribute_update=cfg.get("post_transfer_attribute_update") or {},
+            account_combination_client=ac_client,
+            ledger_name_by_book=ledger_map,
         )
         summary = sync.run_full_sync(
             books=books,
@@ -157,9 +167,13 @@ def main(
                 log.exception("Failed to send Slack notification (non-fatal)")
 
         counts = summary.get("counts", {})
-        log.info("Completed: total=%s transferred=%s failed=%s dry_run=%s",
-                 counts.get("total", 0), counts.get("transferred", 0),
-                 counts.get("failed", 0), counts.get("dry_run", 0))
+        log.info(
+            "Completed: total=%s transferred=%s failed=%s dry_run=%s",
+            counts.get("total", 0),
+            counts.get("transferred", 0),
+            counts.get("failed", 0),
+            counts.get("dry_run", 0),
+        )
 
     except Exception as exc:
         log.exception("Fatal error running job")
@@ -242,9 +256,7 @@ class SlackConfig:
             webhook_url = os.getenv(str(webhook_url_env), webhook_url)
 
         if not webhook_url:
-            raise ValueError(
-                "slack.webhook_url is required (webhook_url or webhook_url_env)"
-            )
+            raise ValueError("slack.webhook_url is required (webhook_url or webhook_url_env)")
 
         return SlackConfig(
             webhook_url=str(webhook_url),
@@ -264,9 +276,7 @@ class SlackPublisher:
     def from_dict(d: Dict[str, Any]) -> "SlackPublisher":
         return SlackPublisher(SlackConfig.from_dict(d))
 
-    def publish(
-        self, summary: Dict[str, Any], results: List[Dict[str, Any]]
-    ) -> None:
+    def publish(self, summary: Dict[str, Any], results: List[Dict[str, Any]]) -> None:
         counts = summary.get("counts", {})
         total = counts.get("total", len(results))
         transferred = counts.get("transferred", 0)
@@ -278,9 +288,7 @@ class SlackPublisher:
         is_success = failed == 0
         emoji = ":white_check_mark:" if is_success else ":warning:"
         title = (
-            "FA Asset Transfer Complete"
-            if is_success
-            else "FA Asset Transfer — Failures Detected"
+            "FA Asset Transfer Complete" if is_success else "FA Asset Transfer — Failures Detected"
         )
 
         lines: List[str] = []
@@ -378,9 +386,7 @@ class PagerDutyConfig:
             routing_key = os.getenv(str(routing_key_env), routing_key)
 
         if not routing_key:
-            raise ValueError(
-                "pagerduty.routing_key is required (routing_key or routing_key_env)"
-            )
+            raise ValueError("pagerduty.routing_key is required (routing_key or routing_key_env)")
 
         severity = str(d.get("severity", "critical")).strip().lower()
         if severity not in ("critical", "error", "warning", "info"):
@@ -459,9 +465,7 @@ class PagerDutyPublisher:
 def _build_book_breakdown(
     results: List[Dict[str, Any]],
 ) -> Dict[tuple[str, str], Dict[str, int]]:
-    stats: Dict[tuple[str, str], Dict[str, int]] = defaultdict(
-        lambda: {"ok": 0, "fail": 0}
-    )
+    stats: Dict[tuple[str, str], Dict[str, int]] = defaultdict(lambda: {"ok": 0, "fail": 0})
     for r in results:
         src = r.get("source_book", "?")
         tgt = r.get("target_book", "?")
@@ -471,4 +475,6 @@ def _build_book_breakdown(
         else:
             stats[key]["ok"] += 1
     return dict(stats)
+
+
 # <<< END: slack_publisher.py <<<

@@ -20,7 +20,11 @@ import typer
 from ofam_asset_xfer.bip_client import BIPClient, BIPConfig
 from ofam_asset_xfer.entity_resolver import EntityBookResolver
 from ofam_asset_xfer.exceptions import ConfigError
-from ofam_asset_xfer.fusion_sync import DFFConfig, FusionIUSync
+from ofam_asset_xfer.fusion_sync import (
+    DFFConfig,
+    FusionIUSync,
+    build_account_combination_client_from_config,
+)
 from ofam_asset_xfer.fusion_token_provider import build_token_provider
 from ofam_asset_xfer.gcs_publisher import GCSPublisherConfig, GCSResultPublisher
 from ofam_asset_xfer.local_publisher import LocalResultPublisher
@@ -103,6 +107,11 @@ def main(  # noqa: D103
         bip_params = cfg.get("bip_params")
         max_transfers = int(cfg.get("max_transfers", 500))
 
+        ac_client, ledger_map = build_account_combination_client_from_config(
+            cfg.get("account_combination_service"),
+            token_provider=token_provider,
+        )
+
         # --- Run ---
         sync = FusionIUSync(
             fusion_client,
@@ -114,6 +123,8 @@ def main(  # noqa: D103
             transfer_overrides=cfg.get("transfer_overrides") or {},
             transfer_overrides_by_book=cfg.get("transfer_overrides_by_book") or {},
             post_transfer_attribute_update=cfg.get("post_transfer_attribute_update") or {},
+            account_combination_client=ac_client,
+            ledger_name_by_book=ledger_map,
         )
         summary = sync.run_full_sync(
             books=books,

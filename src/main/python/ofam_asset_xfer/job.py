@@ -104,6 +104,12 @@ def _run_bip_flow(config: Dict[str, Any], store: ArtifactStore, execute: bool) -
     max_transfers = int(config.get("max_transfers", 500))
     dry_run = not execute
 
+    from .fusion_sync import build_account_combination_client_from_config
+
+    ac_client, ledger_map = build_account_combination_client_from_config(
+        config.get("account_combination_service")
+    )
+
     sync = FusionIUSync(
         fusion_client,
         entity_resolver,
@@ -113,6 +119,8 @@ def _run_bip_flow(config: Dict[str, Any], store: ArtifactStore, execute: bool) -
         transfer_overrides=config.get("transfer_overrides") or {},
         transfer_overrides_by_book=config.get("transfer_overrides_by_book") or {},
         post_transfer_attribute_update=config.get("post_transfer_attribute_update") or {},
+        account_combination_client=ac_client,
+        ledger_name_by_book=ledger_map,
     )
     summary = sync.run_full_sync(
         books=books,

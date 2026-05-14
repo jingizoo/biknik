@@ -5,17 +5,17 @@ All tests use a mock REST client — no network calls.
 
 from __future__ import annotations
 
-import pytest
 from unittest.mock import MagicMock
 
+import pytest
 from ofam_asset_xfer.ccid_resolver import (
-    get_ccid_details,
     build_target_segments,
+    get_ccid_details,
     lookup_ccid_by_segments,
+    resolve_target_ccid_from_segments,
     resolve_target_expense_ccid,
 )
 from ofam_asset_xfer.exceptions import FusionApiError, ValidationError
-
 
 # ---------------------------------------------------------------------------
 # Fixtures / helpers
@@ -162,9 +162,7 @@ class TestLookupCcidBySegments:
             "Segment6": "000",
             "Segment7": "000",
         }
-        result = lookup_ccid_by_segments(
-            client, target_segments, chart_of_accounts_id=50388
-        )
+        result = lookup_ccid_by_segments(client, target_segments, chart_of_accounts_id=50388)
 
         assert result == 789012
 
@@ -193,13 +191,9 @@ class TestLookupCcidBySegments:
 
     def test_no_coa_id(self):
         """When coa_id is None, it should not be in the q filter."""
-        client = _mock_client(
-            get_resource_return={"items": [{"CodeCombinationId": 42}]}
-        )
+        client = _mock_client(get_resource_return={"items": [{"CodeCombinationId": 42}]})
 
-        result = lookup_ccid_by_segments(
-            client, {"Segment1": "US01"}, chart_of_accounts_id=None
-        )
+        result = lookup_ccid_by_segments(client, {"Segment1": "US01"}, chart_of_accounts_id=None)
 
         assert result == 42
         actual_params = client.get_resource.call_args[0][1]
@@ -211,9 +205,7 @@ class TestLookupCcidBySegments:
         right_row = {"CodeCombinationId": 222, "Segment1": "US01", "Segment2": "100"}
         client = _mock_client(get_resource_return={"items": [wrong_row, right_row]})
 
-        result = lookup_ccid_by_segments(
-            client, {"Segment1": "US01", "Segment2": "100"}
-        )
+        result = lookup_ccid_by_segments(client, {"Segment1": "US01", "Segment2": "100"})
         assert result == 222
 
 
@@ -278,3 +270,61 @@ class TestResolveTargetExpenseCcid:
                 target_company="US01",
                 company_segment_key="Segment99",
             )
+
+
+class TestResolveTargetCcidFromSegments:
+    """The BIP-report-supplies-TARGET_SEG* path.  No source-CCID dance —
+    the report already worked out the destination segments and the
+    pipeline just needs to look them up (or mint via SOAP)."""
+
+    def test_lookup_returns_existing_ccid(self):
+        client = _mock_client(
+            get_resource_return={
+                "items": [
+                    {
+                        "CodeCombinationId": 999000,
+                        "Segment1": "SG01",
+                        "Segment2": "100",
+                        "Segment3": "7000",
+                        "ConcatenatedSegments": "SG01-100-7000",
+                    }
+                ]
+            }
+        )
+        ccid = resolve_target_ccid_from_segments(
+            client,
+            {"Segment1": "SG01", "Segment2": "100", "Segment3": "7000"},
+        )
+        assert ccid == 999000
+
+    def test_creates_when_lookup_misses(self):
+        client = _mock_client(get_resource_return={"items": []})
+
+        captured = []
+
+        def _creator(ledger, segments):
+            captured.append((ledger, dict(segments)))
+            return 1234567
+
+        ccid = resolve_target_ccid_from_segments(
+            client,
+            {"Segment1": "SG01", "Segment2": "100"},
+            creator=_creator,
+            ledger_name="Singapore Primary Ledger",
+        )
+        assert ccid == 1234567
+        assert captured == [("Singapore Primary Ledger", {"Segment1": "SG01", "Segment2": "100"})]
+
+    def test_raises_without_creator_when_lookup_misses(self):
+        client = _mock_client(get_resource_return={"items": []})
+
+        with pytest.raises(ValidationError, match="No account combination found"):
+            resolve_target_ccid_from_segments(
+                client,
+                {"Segment1": "SG01"},
+            )
+
+    def test_empty_segments_rejected(self):
+        client = _mock_client(get_resource_return={"items": []})
+        with pytest.raises(ValidationError, match="non-empty"):
+            resolve_target_ccid_from_segments(client, {})

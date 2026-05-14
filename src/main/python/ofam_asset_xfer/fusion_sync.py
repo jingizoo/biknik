@@ -28,7 +28,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from datetime import date
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from .bip_client import BIPClient
 from .entity_resolver import EntityBookResolver
@@ -62,6 +62,36 @@ def _interpolate(template: str, substitutions: Dict[str, str]) -> str:
     return _PLACEHOLDER_RE.sub(_sub, template)
 
 
+def build_account_combination_client_from_config(
+    cfg_block: Optional[Dict[str, Any]],
+    token_provider: Optional[Callable[[], str]] = None,
+) -> Tuple[Optional[Any], Dict[str, str]]:
+    """Build an ``AccountCombinationServiceClient`` + ledger map from config.
+
+    Returns ``(client, ledger_name_by_book)``.  Client is ``None`` when
+    the config block is missing or ``enabled`` is false.  Safe to call
+    even when the SOAP module is not used: the import is lazy so
+    deployments that don't enable Option B never pay for it.
+    """
+    if not cfg_block or not cfg_block.get("enabled"):
+        return None, {}
+
+    from .account_combination_client import (
+        AccountCombinationServiceClient,
+        AccountCombinationServiceConfig,
+    )
+
+    ac_cfg = AccountCombinationServiceConfig.from_dict(cfg_block)
+    ac_client = AccountCombinationServiceClient(ac_cfg, token_provider=token_provider)
+
+    ledger_map = {
+        str(k): str(v)
+        for k, v in (cfg_block.get("ledger_name_by_book") or {}).items()
+        if str(k).strip() and str(v).strip()
+    }
+    return ac_client, ledger_map
+
+
 # ---------------------------------------------------------------------------
 # DFF column configuration (maps BIP report column names to logical fields)
 # ---------------------------------------------------------------------------
@@ -88,6 +118,21 @@ class DFFConfig:
     target_location_id_col: str = "TARGET_LOCATION_ID"
     current_location_id_col: str = "CURRENT_LOCATION_ID"
     target_expense_ccid_col: str = "TARGET_EXPENSE_CCID"
+    # Target Company segment value (e.g. "SG01") for Option B same-book
+    # transfers.  When this column is non-empty and TARGET_EXPENSE_CCID
+    # is empty, the pipeline derives the destination CCID by swapping
+    # the company segment on the source CCID, looking up the matching
+    # combination in the target ledger, and optionally minting a new
+    # one via AccountCombinationService.validateAndCreateAccounts.
+    target_company_col: str = "TARGET_COMPANY"
+    # Prefix for per-segment target columns on the BIP report.  The
+    # pipeline scans for ``<prefix>1``, ``<prefix>2``, ... up to
+    # ``target_segment_col_max`` and builds a ``{Segment1: ..., ...}``
+    # dict.  When non-empty, this skips the company-segment-swap math
+    # entirely — the report has already worked out the destination
+    # segments, so we just look them up (and optionally auto-create).
+    target_segment_col_prefix: str = "TARGET_SEG"
+    target_segment_col_max: int = 30
 
 
 DEFAULT_DFF_CONFIG = DFFConfig()
@@ -148,6 +193,11 @@ class PendingTransfer:
     target_book_type_code: str  # from FINAL_TARGET_BOOK_TYPE_CODE or entity resolver
     target_location_id: Optional[str] = None  # from TARGET_LOCATION_ID in report
     target_expense_ccid: Optional[str] = None  # from TARGET_EXPENSE_CCID in report
+    target_company: Optional[str] = None  # from TARGET_COMPANY in report (Option B)
+    # From TARGET_SEG1..TARGET_SEGN columns on the report.  Pre-built
+    # target combination; pipeline looks it up directly (and creates
+    # via SOAP when ``account_combination_service.enabled``).
+    target_segments: Optional[Dict[str, str]] = None
     is_cross_book: bool = True  # False = same-book (location-only) transfer
 
     # Classification: INTERUNIT or INTRAUNIT
@@ -196,6 +246,9 @@ class FusionIUSync:
         transfer_overrides: Optional[Dict[str, Any]] = None,
         transfer_overrides_by_book: Optional[Dict[str, Dict[str, Any]]] = None,
         post_transfer_attribute_update: Optional[Dict[str, Any]] = None,
+        account_combination_client: Optional[Any] = None,
+        ledger_name_by_book: Optional[Dict[str, str]] = None,
+        company_segment_key: str = "Segment1",
     ):
         self._client = fusion_client
         self._entity_resolver = entity_resolver
@@ -205,6 +258,18 @@ class FusionIUSync:
         self._blocked_books: Set[str] = {
             b.upper().strip() for b in (blocked_books or []) if b and b.strip()
         }
+        # Optional Option B plumbing.  When the BIP report includes a
+        # TARGET_COMPANY column, same-book rows are routed through the
+        # company-segment-swap path.  When ``account_combination_client``
+        # is provided, missing combinations in the destination ledger
+        # are auto-created via SOAP validateAndCreateAccounts.
+        self._ac_client = account_combination_client
+        self._ledger_name_by_book: Dict[str, str] = {
+            str(k).upper().strip(): str(v)
+            for k, v in (ledger_name_by_book or {}).items()
+            if str(k).strip() and str(v).strip()
+        }
+        self._company_segment_key = company_segment_key or "Segment1"
         # Optional post-bookTransfer update that bumps a DFF on the new
         # asset.  Opt-in via config — see ``_run_post_transfer_attr_update``
         # for the full shape.  Default off so existing tenants are
@@ -239,6 +304,33 @@ class FusionIUSync:
         if applies_to not in ("S", "T", "B"):
             applies_to = "T"
         return applies_to, {k: v for k, v in entry.items() if k != "applies_to"}
+
+    def _make_account_combination_creator(self) -> Callable[[str, Dict[str, str]], int]:
+        """Adapt the SOAP client into the resolver's creator signature.
+
+        ``ccid_resolver`` expects ``(ledger_name, segments) -> int``.
+        The SOAP client returns a ``CreatedCombination`` with status +
+        error info; we translate ``Status=E`` into ``FusionApiError`` so
+        the transfer fails with a clear message instead of silently
+        returning ``None``.
+        """
+        ac_client = self._ac_client
+        if ac_client is None:
+            raise RuntimeError(  # pragma: no cover — guarded by callers
+                "AccountCombinationServiceClient not configured"
+            )
+
+        def _creator(ledger_name: str, segments: Dict[str, str]) -> int:
+            result = ac_client.validate_and_create(ledger_name=ledger_name, segments=segments)
+            if result.ccid is None or result.status != "S":
+                raise FusionApiError(
+                    f"AccountCombinationService rejected segments {segments} "
+                    f"(ledger={ledger_name}): status={result.status} "
+                    f"code={result.error_code} msg={result.error_message}"
+                )
+            return int(result.ccid)
+
+        return _creator
 
     def _book_overrides_for(
         self, source_book: Optional[str], target_book: Optional[str]
@@ -365,6 +457,18 @@ class FusionIUSync:
         target_location_id = row.get(dff.target_location_id_col, "").strip() or None
         current_location_id = row.get(dff.current_location_id_col, "").strip() or None
         target_expense_ccid = row.get(dff.target_expense_ccid_col, "").strip() or None
+        target_company = row.get(dff.target_company_col, "").strip() or None
+
+        # Scan TARGET_SEG1..TARGET_SEGn into a {SegmentN: value} dict.
+        # The BIP report ships these once it has resolved each row's
+        # destination segments (per the screenshot the user shared).
+        target_segments: Dict[str, str] = {}
+        for n in range(1, dff.target_segment_col_max + 1):
+            col = f"{dff.target_segment_col_prefix}{n}"
+            val = str(row.get(col, "") or "").strip()
+            if val:
+                target_segments[f"Segment{n}"] = val
+        target_segments_or_none = target_segments or None
 
         if final_target_book:
             target_book = final_target_book
@@ -397,21 +501,30 @@ class FusionIUSync:
 
         is_cross_book = src_upper != tgt_upper
 
-        # Same book AND no target location/expense info → nothing to transfer
-        if not is_cross_book and not target_location_id and not target_expense_ccid:
+        # Same book AND no target location/expense/company/segments info → nothing to transfer
+        if (
+            not is_cross_book
+            and not target_location_id
+            and not target_expense_ccid
+            and not target_company
+            and not target_segments_or_none
+        ):
             return None
 
         # Same-book + asked for a location move that's already in place + no
-        # CCID change → nothing left to do, skip.  Cross-book transfers are
-        # NOT skipped on location-match: the entity/book is what's changing,
-        # location may legitimately stay the same.  Same-book + matching
-        # location + a TARGET_EXPENSE_CCID is also kept (CCID is the delta).
+        # CCID change + no Company swap → nothing left to do, skip.  Cross-book
+        # transfers are NOT skipped on location-match: the entity/book is what's
+        # changing, location may legitimately stay the same.  Same-book +
+        # matching location + a TARGET_EXPENSE_CCID or TARGET_COMPANY is also
+        # kept (CCID is the delta).
         if (
             not is_cross_book
             and current_location_id
             and target_location_id
             and current_location_id == target_location_id
             and not target_expense_ccid
+            and not target_company
+            and not target_segments_or_none
         ):
             log.info(
                 "Skipping asset %s: same-book, CURRENT_LOCATION_ID (%s) "
@@ -452,6 +565,8 @@ class FusionIUSync:
             target_book_type_code=target_book,
             target_location_id=target_location_id,
             target_expense_ccid=target_expense_ccid,
+            target_company=target_company,
+            target_segments=target_segments_or_none,
             is_cross_book=is_cross_book,
             fa_state=state,
         )
@@ -1054,12 +1169,82 @@ class FusionIUSync:
         if pending.target_expense_ccid:
             overrides["expense_ccid"] = pending.target_expense_ccid
 
-        params, is_noop = build_same_book_transfer_params(
-            state=state,
-            effective_date=effective_date,
-            overrides=overrides,
-            request_id=request_id,
-        )
+        # Option B: when the report supplies a TARGET_COMPANY (and the
+        # destination CCID isn't already pinned down by TARGET_EXPENSE_CCID),
+        # route through build_same_book_transfer_params_option_b so the
+        # company-segment swap + optional auto-create flow runs.
+        # Pre-built TARGET_SEG* columns (preferred when the BIP report
+        # supplies them).  Skip the source-CCID-fetch + segment-swap
+        # entirely — the report has already resolved the destination
+        # segments; we just need to look them up and (optionally) mint
+        # the combination if it doesn't exist yet.
+        if pending.target_segments and not pending.target_expense_ccid:
+            from .ccid_resolver import resolve_target_ccid_from_segments
+
+            ledger_name = self._ledger_name_by_book.get(
+                (pending.book_type_code or "").upper().strip()
+            )
+            creator = None
+            if self._ac_client is not None and ledger_name:
+                creator = self._make_account_combination_creator()
+
+            log.info(
+                "Resolving target CCID from report TARGET_SEG* columns: "
+                "asset=%s segments=%s ledger=%s auto_create=%s",
+                pending.asset_number,
+                pending.target_segments,
+                ledger_name or "(none)",
+                "yes" if creator is not None else "no",
+            )
+            target_ccid = resolve_target_ccid_from_segments(
+                self._client,
+                pending.target_segments,
+                creator=creator,
+                ledger_name=ledger_name,
+            )
+            overrides["expense_ccid"] = str(target_ccid)
+            params, is_noop = build_same_book_transfer_params(
+                state=state,
+                effective_date=effective_date,
+                overrides=overrides,
+                request_id=request_id,
+            )
+        elif pending.target_company and not pending.target_expense_ccid:
+            from .fusion_ops import build_same_book_transfer_params_option_b
+
+            ledger_name = self._ledger_name_by_book.get(
+                (pending.book_type_code or "").upper().strip()
+            )
+            creator = None
+            if self._ac_client is not None and ledger_name:
+                creator = self._make_account_combination_creator()
+
+            log.info(
+                "Option B: asset=%s target_company=%s segment_key=%s ledger=%s " "auto_create=%s",
+                pending.asset_number,
+                pending.target_company,
+                self._company_segment_key,
+                ledger_name or "(none)",
+                "yes" if creator is not None else "no",
+            )
+
+            params, is_noop = build_same_book_transfer_params_option_b(
+                self._client,
+                state=state,
+                effective_date=effective_date,
+                target_company=pending.target_company,
+                request_id=request_id,
+                company_segment_key=self._company_segment_key,
+                account_combination_creator=creator,
+                target_ledger_name=ledger_name,
+            )
+        else:
+            params, is_noop = build_same_book_transfer_params(
+                state=state,
+                effective_date=effective_date,
+                overrides=overrides,
+                request_id=request_id,
+            )
 
         if is_noop:
             log.info("NOOP: no distribution changes for asset=%s", pending.asset_number)

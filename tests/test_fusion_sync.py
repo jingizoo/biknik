@@ -1717,6 +1717,69 @@ class TestPostTransferAttributeUpdate:
         assert "permission denied" in (result["error"] or "")
 
 
+class TestTargetSegmentResolution:
+    """BIP report supplies TARGET_SEG* columns; pipeline looks them up
+    (and optionally mints via SOAP)."""
+
+    def _row_with_target_segs(self, target_segs):
+        row = _bip_row(
+            book="US CORP BOOK",
+            dff_entity="US Entity",
+            final_target_book="US CORP BOOK",  # same-book
+            current_location_id="300100111111",
+            target_location_id="300100111111",
+        )
+        for k, v in target_segs.items():
+            row[k] = v
+        return row
+
+    def _setup_pipeline(self, *, target_segs, ac_client=None, ledger_map=None):
+        fusion = _mock_fusion()
+        bip = _mock_bip()
+        bip.run_report.side_effect = lambda params: (
+            [self._row_with_target_segs(target_segs)]
+            if params.get("P_BOOK_TYPE_CODE") == "US CORP BOOK"
+            else []
+        )
+        sync = FusionIUSync(
+            fusion,
+            _resolver(),
+            bip,
+            account_combination_client=ac_client,
+            ledger_name_by_book=ledger_map or {},
+        )
+        return fusion, sync
+
+    def test_pending_transfer_captures_target_segments(self):
+        target_segs = {"TARGET_SEG1": "SG01", "TARGET_SEG2": "100", "TARGET_SEG3": "7000"}
+        fusion, sync = self._setup_pipeline(target_segs=target_segs)
+        fusion.process_transaction.return_value = _get_asset_info_response()
+
+        pending = sync.find_pending_transfers(books=["US CORP BOOK"], limit=10)
+        assert len(pending) == 1
+        # Columns parsed into Segment1..3 dict
+        assert pending[0].target_segments == {
+            "Segment1": "SG01",
+            "Segment2": "100",
+            "Segment3": "7000",
+        }
+
+    def test_missing_target_segs_columns_yields_none(self):
+        # No TARGET_SEG* columns AND no target_location/expense → row skipped.
+        fusion, sync = self._setup_pipeline(target_segs={})
+        fusion.process_transaction.return_value = _get_asset_info_response()
+        pending = sync.find_pending_transfers(books=["US CORP BOOK"], limit=10)
+        assert pending == []
+
+    def test_partial_target_segs_columns_parsed(self):
+        # Only Segment1 and Segment5 set; gaps allowed.
+        target_segs = {"TARGET_SEG1": "SG01", "TARGET_SEG5": "1008"}
+        fusion, sync = self._setup_pipeline(target_segs=target_segs)
+        fusion.process_transaction.return_value = _get_asset_info_response()
+        pending = sync.find_pending_transfers(books=["US CORP BOOK"], limit=10)
+        assert pending[0].target_segments == {"Segment1": "SG01", "Segment5": "1008"}
+
+
 class TestAppliesToFlag:
     """Per-book overrides scoped by applies_to: S (source), T (target,
     default), B (both).  Source overrides apply first, target overrides
