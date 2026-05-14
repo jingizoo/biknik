@@ -13,7 +13,7 @@ from __future__ import annotations
 import logging
 import re
 from copy import deepcopy
-from typing import Any, Dict, List, Optional, Protocol, Tuple
+from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple
 
 from .exceptions import FusionApiError, ValidationError
 
@@ -26,11 +26,19 @@ _SEGMENT_RE = re.compile(r"^Segment\d+$")
 # ---------------------------------------------------------------------------
 # Protocol for the HTTP client (allows mocking in tests)
 # ---------------------------------------------------------------------------
+# fmt: off
 class _RestClient(Protocol):
-    def get_resource(
+    def get_resource(  # noqa: D102
         self, resource_path: str, query_params: Optional[Dict[str, str]] = None
     ) -> Dict[str, Any]:
         ...
+# fmt: on
+
+
+# Optional callable that creates a code combination when lookup misses.
+# Signature: (ledger_name, segments) -> CcId (int).
+# Raises FusionApiError / ValidationError on failure.
+AccountCombinationCreator = Callable[[str, Dict[str, str]], int]
 
 
 # ---------------------------------------------------------------------------
@@ -61,8 +69,7 @@ def get_ccid_details(client: _RestClient, ccid: int) -> Dict[str, Any]:
     items = resp.get("items") or []
     if not items:
         raise FusionApiError(
-            f"accountCombinationsLOV returned no items for CCID={ccid}. "
-            f"Response: {resp}"
+            f"accountCombinationsLOV returned no items for CCID={ccid}. " f"Response: {resp}"
         )
 
     row = items[0]
@@ -79,9 +86,7 @@ def get_ccid_details(client: _RestClient, ccid: int) -> Dict[str, Any]:
         )
 
     coa_id = row.get("ChartOfAccountsId") or row.get("chartOfAccountsId")
-    concat_segs = (
-        row.get("ConcatenatedSegments") or row.get("concatenatedSegments") or ""
-    )
+    concat_segs = row.get("ConcatenatedSegments") or row.get("concatenatedSegments") or ""
 
     result = {
         "ccid": ccid,
@@ -139,11 +144,18 @@ def lookup_ccid_by_segments(
     client: _RestClient,
     target_segments: Dict[str, str],
     chart_of_accounts_id: Optional[int] = None,
+    *,
+    creator: Optional[AccountCombinationCreator] = None,
+    ledger_name: Optional[str] = None,
 ) -> int:
     """Find an existing CodeCombinationId that matches all *target_segments*.
 
-    Uses accountCombinationsLOV with a ``q`` filter.  If no match is found,
-    raises a hard error with a clear message about the missing combination.
+    Uses accountCombinationsLOV with a ``q`` filter.  When no match is
+    found and ``creator`` is provided (typically the SOAP
+    ``AccountCombinationService.validateAndCreateAccounts`` wrapper)
+    the function calls the creator with ``ledger_name`` + segments and
+    returns the freshly-minted CCID.  Without a creator, raises
+    ValidationError with a clear "needs to be created" message.
     """
 
     # Build q= filter:  Segment1='US01';Segment2='100';...
@@ -166,9 +178,7 @@ def lookup_ccid_by_segments(
 
     # Request the segment fields we need for exact-match verification
     segment_fields = ",".join(sorted_keys)
-    fields = (
-        f"CodeCombinationId,ConcatenatedSegments,ChartOfAccountsId,{segment_fields}"
-    )
+    fields = f"CodeCombinationId,ConcatenatedSegments,ChartOfAccountsId,{segment_fields}"
 
     log.info("lookup_ccid_by_segments: q=%s fields=%s", q_filter, fields)
 
@@ -185,10 +195,39 @@ def lookup_ccid_by_segments(
 
     if not items:
         segs_display = ", ".join(f"{k}={v}" for k, v in sorted(target_segments.items()))
+
+        # When a creator is wired up, fall through to
+        # AccountCombinationService.validateAndCreateAccounts so Oracle
+        # mints the combination on demand (subject to cross-validation
+        # rules, segment-value security, dates, etc.).
+        if creator is not None and ledger_name:
+            log.info(
+                "lookup_ccid_by_segments: no match for %s — creating via "
+                "AccountCombinationService (ledger=%s)",
+                segs_display,
+                ledger_name,
+            )
+            try:
+                new_ccid = creator(ledger_name, dict(target_segments))
+            except (FusionApiError, ValidationError):
+                raise
+            except Exception as e:  # defensive: wrap unexpected errors
+                raise FusionApiError(
+                    f"AccountCombinationService creator raised " f"{type(e).__name__}: {e}"
+                ) from e
+            log.info(
+                "lookup_ccid_by_segments: created CCID=%s for %s",
+                new_ccid,
+                segs_display,
+            )
+            return int(new_ccid)
+
         raise ValidationError(
             f"No account combination found for target segments: {segs_display}. "
             f"ChartOfAccountsId={chart_of_accounts_id}. "
-            f"The combination may need to be created in Oracle GL first."
+            "Configure 'account_combination_service' in the runner config "
+            "to auto-create on miss, or create the combination in Oracle "
+            "GL manually."
         )
 
     # If multiple matches, pick exact match (all segments equal).
@@ -227,9 +266,17 @@ def resolve_target_expense_ccid(
     src_expense_ccid: int,
     target_company: str,
     company_segment_key: str = "Segment1",
+    *,
+    creator: Optional[AccountCombinationCreator] = None,
+    ledger_name: Optional[str] = None,
 ) -> int:
     """End-to-end: given a source expense CCID and a target Company value,
     return the destination expense CCID.
+
+    When the target combination doesn't exist in Oracle GL and a
+    ``creator`` is provided, the helper falls through to
+    ``AccountCombinationService.validateAndCreateAccounts`` (with the
+    target ``ledger_name``) to mint a new CCID on demand.
 
     Raises:
         ValidationError  if target_ccid == src_expense_ccid (would create
@@ -239,11 +286,15 @@ def resolve_target_expense_ccid(
     src_segments = details["segments"]
     coa_id = details["chart_of_accounts_id"]
 
-    target_segments = build_target_segments(
-        src_segments, target_company, company_segment_key
-    )
+    target_segments = build_target_segments(src_segments, target_company, company_segment_key)
 
-    target_ccid = lookup_ccid_by_segments(client, target_segments, coa_id)
+    target_ccid = lookup_ccid_by_segments(
+        client,
+        target_segments,
+        coa_id,
+        creator=creator,
+        ledger_name=ledger_name,
+    )
 
     if target_ccid == src_expense_ccid:
         raise ValidationError(

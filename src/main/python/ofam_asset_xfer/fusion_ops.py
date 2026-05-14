@@ -4,7 +4,7 @@ import logging
 import re
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .ccid_resolver import resolve_target_expense_ccid
 from .exceptions import FusionApiError, ValidationError
@@ -320,6 +320,9 @@ def build_same_book_transfer_params_option_b(
     target_company: str,
     request_id: str,
     company_segment_key: str = "Segment1",
+    *,
+    account_combination_creator: Optional[Callable[[str, Dict[str, str]], int]] = None,
+    target_ledger_name: Optional[str] = None,
 ) -> Tuple[Dict[str, Any], bool]:
     """Build transferAsset payload for Option B: change only EXPENSE_CCID
     by replacing the Company segment, keeping LOCATION_CCID and ASSIGNED_TO as-is.
@@ -347,6 +350,8 @@ def build_same_book_transfer_params_option_b(
                 int(src_ccid_str),
                 target_company,
                 company_segment_key,
+                creator=account_combination_creator,
+                ledger_name=target_ledger_name,
             )
             seen_resolutions[src_ccid_str] = target_ccid
             dest_expense.append(str(target_ccid))

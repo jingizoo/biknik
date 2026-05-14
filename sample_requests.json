@@ -44,6 +44,25 @@
   },
 
   "_post_transfer_attribute_update_note": "Opt-in follow-up after a successful cross-book bookTransfer.  Resolves the destination asset_id in this order: (1) custom BIP report (dest_lookup_bip) - recommended; (2) X_NEW_ASSET_ID etc. on the bookTransfer response; (3) X_NEW_ASSET_NUMBER + getAssetInformation against target book; (4) fallback to source asset_number against target book.  Then calls processTransaction-updateAssetDescriptiveDetails with the bumped value.  Suffix rule: 'X' -> 'X_1', 'X_1' -> 'X_2', etc.  Default off.",
+  "_account_combination_service_note": "Optional. When the cross-book CCID resolver (Option B same-book transfers that swap the Company segment) can't find a matching code combination in the destination ledger, fall through to the SOAP AccountCombinationService.validateAndCreateAccounts to mint one on demand.  Requires the GL_MANAGE_GENERAL_LEDGER_ACCOUNT_COMBINATIONS_PRIV privilege on the integration user.  Oracle still validates the combination against cross-validation rules, segment-value security, and date ranges — those failures come back as Status='E' with an Error message and the runner records the transfer as FAILED.  Omit this block to keep the previous behaviour (resolver raises ValidationError on miss).  ``ledger_name_by_book`` maps each target book to the GL ledger that owns its chart of accounts.",
+  "account_combination_service": {
+    "enabled": false,
+    "base_url": "https://ibpgjb-dev1.fa.ocs.oraclecloud.com",
+    "endpoint_path": "/fscmService/AccountCombinationService",
+    "verify_ssl": false,
+    "require_proxy": true,
+    "timeout_seconds": 60,
+    "dynamic_insertion": "Yes",
+    "enabled_flag": "true",
+    "ledger_name_by_book": {
+      "US CORP BOOK": "US Primary Ledger",
+      "UK CORP BOOK": "UK Primary Ledger",
+      "JP CORP BOOK": "Japan Primary Ledger",
+      "AU CORP BOOK": "Australia Primary Ledger",
+      "SG CORP BOOK": "Singapore Primary Ledger"
+    }
+  },
+
   "post_transfer_attribute_update": {
     "enabled": false,
     "_source_field_note": "Lower-case DFF name as it appears on the X_<NAME> field of getAssetInformation.  Captured into AssetState.attributes by scanning every X_ATTRIBUTE* AND X_CAT_ATTRIBUTE* on the response.  Common values: 'attribute7', 'attribute10' (standard FA DFF) or 'cat_attribute7', 'cat_attribute_date1' (category DFF — what Citadel uses).  Mirror this in fusion_parameter below (P_<UPPERCASE>).",
