@@ -64,7 +64,20 @@
     "from_date": null,
     "to_date": null,
 
-    "_pad_segments_note": "Some pods reject envelopes that don't include all 30 segments.  Set pad_segments_to=30 (and pad_segments_with='?') to emit <acc:Segment1>...<acc:Segment30> with '?' filling slots that weren't supplied.",
+    "_segment_defaults_note": "Per-segment filler for slots the BIP report does NOT populate.  List exactly the segments your chart of accounts has — this caps the SOAP envelope at your COA's segment count (no Segment14..30 noise) AND uses the correct width-specific filler per segment.  The report supplies the meaningful segments (1/2/3/5 etc.); these fill the rest.  Example below is a 13-segment Citadel COA: E00573973.6506300.30403.999999999999.1008.9999999999.999.999999999.9.9.9.9.9",
+    "segment_defaults": {
+      "Segment4": "999999999999",
+      "Segment6": "9999999999",
+      "Segment7": "999",
+      "Segment8": "999999999",
+      "Segment9": "9",
+      "Segment10": "9",
+      "Segment11": "9",
+      "Segment12": "9",
+      "Segment13": "9"
+    },
+
+    "_pad_segments_note": "Crude fallback: fill EVERY still-missing slot up to pad_segments_to with one value.  Prefer segment_defaults above (per-segment, COA-accurate).  Leave pad_segments_to=0 when segment_defaults covers your COA.",
     "pad_segments_to": 0,
     "pad_segments_with": "?",
 

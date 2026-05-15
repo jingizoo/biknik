@@ -29,6 +29,7 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from typing import Any, Callable, Dict, List, Mapping, Optional
 from xml.etree import ElementTree as ET
 
@@ -93,11 +94,33 @@ class AccountCombinationServiceConfig:
     to_date: Optional[str] = None
     # Pad missing segments with this placeholder up to
     # ``pad_segments_to``.  The Oracle doc sample shows ``"?"`` for
-    # unused slots in a 30-segment COA.  Off by default (``0``); set
-    # ``pad_segments_to: 30`` and ``pad_segments_with: "?"`` to emit
-    # all 30 slots.
+    # unused slots in a 30-segment COA.  Off by default (``0``).
+    #
+    # NOTE: most real charts of accounts use *specific* filler values
+    # per segment (e.g. ``999999999999`` for a 12-wide segment, ``9``
+    # for a 1-wide one) — a single ``pad_segments_with`` can't express
+    # that.  Use ``segment_defaults`` below for those; ``pad_segments_to``
+    # is only the crude "fill everything with one value" fallback.
     pad_segments_to: int = 0
     pad_segments_with: str = "?"
+    # Per-segment default values, keyed ``SegmentN``.  Applied for any
+    # segment the caller did NOT supply.  This is the right knob for a
+    # real COA: list exactly the segments your chart has, with the
+    # correct filler for each unused one — that also caps the envelope
+    # at your COA's segment count.  Example for a 13-segment COA::
+    #
+    #   "segment_defaults": {
+    #     "Segment4":  "999999999999",
+    #     "Segment6":  "9999999999",
+    #     "Segment7":  "999",
+    #     "Segment8":  "999999999",
+    #     "Segment9":  "9", "Segment10": "9", "Segment11": "9",
+    #     "Segment12": "9", "Segment13": "9"
+    #   }
+    #
+    # The report supplies Segment1/2/3/5; these fill the rest; the
+    # envelope ends up with exactly 13 segments.
+    segment_defaults: Dict[str, str] = dataclass_field(default_factory=dict)
 
     @staticmethod
     def from_dict(d: Mapping[str, Any]) -> "AccountCombinationServiceConfig":
@@ -129,6 +152,11 @@ class AccountCombinationServiceConfig:
             to_date=None if td is None or str(td).strip() == "" else str(td),
             pad_segments_to=int(d.get("pad_segments_to", 0) or 0),
             pad_segments_with=str(d.get("pad_segments_with", "?")),
+            segment_defaults={
+                str(k): str(v)
+                for k, v in (d.get("segment_defaults") or {}).items()
+                if str(k).strip()
+            },
         )
 
 
@@ -222,11 +250,17 @@ class AccountCombinationServiceClient:
         effective_to_date = to_date if to_date is not None else self.cfg.to_date
         effective_enabled_flag = enabled_flag if enabled_flag is not None else self.cfg.enabled_flag
 
-        # Optional: pad missing segments with the documented placeholder
-        # (Oracle's sample uses "?") so callers that ship a partial
-        # segment set still hit the full 30-segment shape some pods
-        # expect.  Driven by ``pad_segments_to`` on the config.
-        padded = dict(segments)
+        # Build the final segment set:
+        #   1. start from per-segment config defaults (segment_defaults)
+        #   2. overlay the caller's real values — caller always wins
+        #   3. optionally crude-pad any STILL-missing slot up to
+        #      pad_segments_to with the single pad_segments_with value
+        #
+        # When ``segment_defaults`` lists exactly the segments your COA
+        # has, the envelope ends up with exactly that many — no need to
+        # touch ``pad_segments_to`` at all.
+        padded: Dict[str, str] = dict(self.cfg.segment_defaults)
+        padded.update(segments)
         if self.cfg.pad_segments_to > 0:
             for n in range(1, self.cfg.pad_segments_to + 1):
                 padded.setdefault(f"Segment{n}", self.cfg.pad_segments_with)

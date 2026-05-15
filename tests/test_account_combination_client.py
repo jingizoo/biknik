@@ -365,6 +365,89 @@ class TestValidateAndCreate:
         assert "<acc:Segment4>?</acc:Segment4>" in body
         assert "<acc:Segment5>?</acc:Segment5>" in body
 
+    def test_segment_defaults_fill_unsupplied_slots(self):
+        """A 13-segment COA: report ships Segment1/2/3/5; segment_defaults
+        fills 4 and 6..13.  Envelope ends up with exactly 13 segments,
+        each unused one carrying its COA-specific filler (not '?')."""
+        cfg = AccountCombinationServiceConfig.from_dict(
+            {
+                "base_url": "https://x",
+                "bearer_token": "t",
+                "segment_defaults": {
+                    "Segment4": "999999999999",
+                    "Segment6": "9999999999",
+                    "Segment7": "999",
+                    "Segment8": "999999999",
+                    "Segment9": "9",
+                    "Segment10": "9",
+                    "Segment11": "9",
+                    "Segment12": "9",
+                    "Segment13": "9",
+                },
+            }
+        )
+        client = AccountCombinationServiceClient(cfg)
+        captured = {}
+
+        def _capture(url, data=None, headers=None, **kwargs):
+            captured["body"] = data.decode("utf-8")
+            resp = MagicMock()
+            resp.status_code = 200
+            resp.text = SUCCESS_RESPONSE
+            return resp
+
+        client._session.post = MagicMock(side_effect=_capture)
+        client.validate_and_create(
+            ledger_name="L",
+            segments={
+                "Segment1": "E00573973",
+                "Segment2": "6506300",
+                "Segment3": "30403",
+                "Segment5": "1008",
+            },
+        )
+        body = captured["body"]
+        # Report values preserved
+        assert "<acc:Segment1>E00573973</acc:Segment1>" in body
+        assert "<acc:Segment5>1008</acc:Segment5>" in body
+        # Defaults filled with COA-specific values, not "?"
+        assert "<acc:Segment4>999999999999</acc:Segment4>" in body
+        assert "<acc:Segment6>9999999999</acc:Segment6>" in body
+        assert "<acc:Segment13>9</acc:Segment13>" in body
+        # Capped at 13 — no Segment14+
+        assert "<acc:Segment14>" not in body
+        assert "<acc:Segment30>" not in body
+        # Exactly 13 <acc:SegmentN> elements
+        assert body.count("<acc:Segment") == 13
+
+    def test_caller_segment_wins_over_default(self):
+        cfg = AccountCombinationServiceConfig.from_dict(
+            {
+                "base_url": "https://x",
+                "bearer_token": "t",
+                "segment_defaults": {"Segment4": "999999999999"},
+            }
+        )
+        client = AccountCombinationServiceClient(cfg)
+        captured = {}
+
+        def _capture(url, data=None, headers=None, **kwargs):
+            captured["body"] = data.decode("utf-8")
+            resp = MagicMock()
+            resp.status_code = 200
+            resp.text = SUCCESS_RESPONSE
+            return resp
+
+        client._session.post = MagicMock(side_effect=_capture)
+        client.validate_and_create(
+            ledger_name="L",
+            segments={"Segment1": "X", "Segment4": "REAL_VALUE"},
+        )
+        body = captured["body"]
+        # Caller's explicit Segment4 wins over the config default.
+        assert "<acc:Segment4>REAL_VALUE</acc:Segment4>" in body
+        assert "999999999999" not in body
+
     def test_pad_segments_off_by_default(self):
         client = _client()
         captured = {}
