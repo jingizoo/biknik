@@ -102,7 +102,10 @@ class TestConfigFromDict:
         )
         assert cfg.endpoint_path == "/fscmService/AccountCombinationService"
         assert cfg.dynamic_insertion == "Yes"
-        assert cfg.enabled_flag == "true"
+        # EnabledFlag / FromDate are off by default to match Citadel's
+        # documented template; opt in via config or per-call kwargs.
+        assert cfg.enabled_flag is None
+        assert cfg.from_date is None
         assert cfg.timeout_seconds == 60
 
 
@@ -180,7 +183,11 @@ class TestValidateAndCreate:
         with pytest.raises(ValueError, match="segments"):
             client.validate_and_create(ledger_name="L", segments={})
 
-    def test_envelope_contains_segments_and_ledger(self):
+    def test_envelope_matches_documented_template(self):
+        """Citadel's documented SOAP template orders the row as:
+        DynamicInsertion → Segment1..N → LedgerName (with EnabledFlag /
+        FromDate as schema-optional, off by default).  Verify that's
+        what we ship on the wire."""
         client = _client()
         captured = {}
 
@@ -195,25 +202,33 @@ class TestValidateAndCreate:
 
         client._session.post = MagicMock(side_effect=_capture)
         client.validate_and_create(
-            ledger_name="Singapore Primary Ledger",
-            segments={"Segment2": "100", "Segment1": "SG01", "Segment10": "0"},
-            from_date="2026-05-14",
+            ledger_name="IN Primary Ledger",
+            segments={
+                "Segment2": "125",
+                "Segment1": "3004",
+                "Segment10": "00000",
+                "Segment3": "10510000",
+            },
         )
 
         body = captured["body"]
-        # Ledger + segments present
-        assert "<acc:LedgerName>Singapore Primary Ledger</acc:LedgerName>" in body
-        assert "<acc:Segment1>SG01</acc:Segment1>" in body
-        assert "<acc:Segment2>100</acc:Segment2>" in body
-        assert "<acc:Segment10>0</acc:Segment10>" in body
-        # Date + flags wired in
-        assert "<acc:FromDate>2026-05-14</acc:FromDate>" in body
+        # All elements present
+        assert "<acc:LedgerName>IN Primary Ledger</acc:LedgerName>" in body
+        assert "<acc:Segment1>3004</acc:Segment1>" in body
+        assert "<acc:Segment2>125</acc:Segment2>" in body
+        assert "<acc:Segment3>10510000</acc:Segment3>" in body
+        assert "<acc:Segment10>00000</acc:Segment10>" in body
         assert "<acc:DynamicInsertion>Yes</acc:DynamicInsertion>" in body
-        # Segments are sorted numerically: Segment1 before Segment2 before Segment10
+        # Documented order: DynamicInsertion → Segment1..N → LedgerName.
+        di_pos = body.index("<acc:DynamicInsertion>")
         seg1_pos = body.index("<acc:Segment1>")
         seg2_pos = body.index("<acc:Segment2>")
         seg10_pos = body.index("<acc:Segment10>")
-        assert seg1_pos < seg2_pos < seg10_pos
+        ledger_pos = body.index("<acc:LedgerName>")
+        assert di_pos < seg1_pos < seg2_pos < seg10_pos < ledger_pos
+        # Schema-optional tail elements are OFF by default — must not appear.
+        assert "<acc:FromDate>" not in body
+        assert "<acc:EnabledFlag>" not in body
         # URL hit
         assert captured["url"] == "https://fusion.example.com/fscmService/AccountCombinationService"
         # Auth + SOAPAction headers
@@ -257,6 +272,60 @@ class TestValidateAndCreate:
             dynamic_insertion="No",  # pure validation
         )
         assert "<acc:DynamicInsertion>No</acc:DynamicInsertion>" in captured["body"]
+
+    def test_optional_tail_elements_emitted_when_explicitly_set(self):
+        """``EnabledFlag`` and ``FromDate`` are schema-optional.  They
+        must NOT appear by default (matches Citadel's documented
+        template), but DO appear when the caller passes them."""
+        client = _client()
+        captured = {}
+
+        def _capture(url, data=None, headers=None, **kwargs):
+            captured["body"] = data.decode("utf-8")
+            resp = MagicMock()
+            resp.status_code = 200
+            resp.text = SUCCESS_RESPONSE
+            return resp
+
+        client._session.post = MagicMock(side_effect=_capture)
+        client.validate_and_create(
+            ledger_name="L",
+            segments={"Segment1": "X"},
+            from_date="2026-05-14",
+            enabled_flag="true",
+        )
+        body = captured["body"]
+        assert "<acc:FromDate>2026-05-14</acc:FromDate>" in body
+        assert "<acc:EnabledFlag>true</acc:EnabledFlag>" in body
+        # Tail elements come after LedgerName per the documented template.
+        assert body.index("<acc:LedgerName>") < body.index("<acc:FromDate>")
+
+    def test_optional_tail_elements_can_be_configured_globally(self):
+        """Setting ``enabled_flag`` / ``from_date`` on the config makes
+        every call include them — handy for pods that require either."""
+        cfg = AccountCombinationServiceConfig.from_dict(
+            {
+                "base_url": "https://x",
+                "bearer_token": "t",
+                "enabled_flag": "true",
+                "from_date": "2026-05-14",
+            }
+        )
+        client = AccountCombinationServiceClient(cfg)
+        captured = {}
+
+        def _capture(url, data=None, headers=None, **kwargs):
+            captured["body"] = data.decode("utf-8")
+            resp = MagicMock()
+            resp.status_code = 200
+            resp.text = SUCCESS_RESPONSE
+            return resp
+
+        client._session.post = MagicMock(side_effect=_capture)
+        client.validate_and_create(ledger_name="L", segments={"Segment1": "X"})
+        body = captured["body"]
+        assert "<acc:FromDate>2026-05-14</acc:FromDate>" in body
+        assert "<acc:EnabledFlag>true</acc:EnabledFlag>" in body
 
 
 class TestCreatorFunctionalIntegrationWithResolver:

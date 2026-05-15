@@ -29,7 +29,6 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass
-from datetime import date
 from typing import Any, Callable, Dict, List, Mapping, Optional
 from xml.etree import ElementTree as ET
 
@@ -79,8 +78,16 @@ class AccountCombinationServiceConfig:
     # Defaults applied to every validateAndCreateAccounts call when not
     # provided by the caller.  Override per-call by passing the matching
     # kwarg to ``validate_and_create``.
+    #
+    # The documented Citadel SOAP template includes only ``DynamicInsertion``
+    # + ``Segment*`` + ``LedgerName``; ``EnabledFlag`` and ``FromDate`` are
+    # schema-optional and not in the canonical envelope.  We leave them
+    # OFF by default and only include them when explicitly configured —
+    # set ``"enabled_flag": "true"`` / ``"from_date": "2026-05-14"`` to
+    # opt in.
     dynamic_insertion: str = "Yes"
-    enabled_flag: str = "true"
+    enabled_flag: Optional[str] = None
+    from_date: Optional[str] = None
 
     @staticmethod
     def from_dict(d: Mapping[str, Any]) -> "AccountCombinationServiceConfig":
@@ -94,6 +101,8 @@ class AccountCombinationServiceConfig:
         if bearer_token_env:
             bearer_token = os.getenv(str(bearer_token_env), bearer_token)
 
+        ef = d.get("enabled_flag")
+        fd = d.get("from_date")
         return AccountCombinationServiceConfig(
             base_url=base_url,
             endpoint_path=str(
@@ -104,7 +113,8 @@ class AccountCombinationServiceConfig:
             timeout_seconds=int(d.get("timeout_seconds", 60)),
             require_proxy=bool(d.get("require_proxy", False)),
             dynamic_insertion=str(d.get("dynamic_insertion", "Yes")),
-            enabled_flag=str(d.get("enabled_flag", "true")),
+            enabled_flag=None if ef is None or str(ef).strip() == "" else str(ef),
+            from_date=None if fd is None or str(fd).strip() == "" else str(fd),
         )
 
 
@@ -188,12 +198,19 @@ class AccountCombinationServiceClient:
         if not segments:
             raise ValueError("segments must be a non-empty mapping")
 
+        # Optional fields: only present in the envelope when explicitly
+        # supplied by the caller or set on the config.  Citadel's
+        # documented template omits both EnabledFlag and FromDate;
+        # auto-defaulting them caused Oracle to reject the envelope in
+        # some pods, so we keep them off unless explicitly opted in.
+        effective_from_date = from_date if from_date is not None else self.cfg.from_date
+        effective_enabled_flag = enabled_flag if enabled_flag is not None else self.cfg.enabled_flag
         body = self._build_envelope(
             ledger_name=ledger_name.strip(),
             segments=dict(segments),
-            from_date=from_date or date.today().isoformat(),
+            from_date=effective_from_date,
             dynamic_insertion=dynamic_insertion or self.cfg.dynamic_insertion,
-            enabled_flag=enabled_flag or self.cfg.enabled_flag,
+            enabled_flag=effective_enabled_flag,
         )
 
         url = self.cfg.base_url + self.cfg.endpoint_path
@@ -235,16 +252,42 @@ class AccountCombinationServiceClient:
         *,
         ledger_name: str,
         segments: Dict[str, str],
-        from_date: str,
+        from_date: Optional[str],
         dynamic_insertion: str,
-        enabled_flag: str,
+        enabled_flag: Optional[str],
     ) -> str:
+        """Render the SOAP envelope in the order Citadel's template uses.
+
+        The documented row order is::
+
+            <typ:validationInputRowList>
+              <acc:DynamicInsertion>...</acc:DynamicInsertion>
+              <acc:Segment1>...</acc:Segment1>
+              ...
+              <acc:SegmentN>...</acc:SegmentN>
+              <acc:LedgerName>...</acc:LedgerName>
+              <!-- EnabledFlag and FromDate are also optional;
+                   emitted only when the caller / config supplies them -->
+            </typ:validationInputRowList>
+
+        Most XML-schema validators accept any element order within the
+        row, but Oracle's tooling occasionally rejects unexpected layouts
+        so we mirror the documented template exactly.
+        """
         seg_xml_parts: List[str] = []
-        # Order Segment1..SegmentN numerically for readability; Oracle
-        # accepts any order.
+        # Order Segment1..SegmentN numerically.
         for key in sorted(segments.keys(), key=_segment_sort_key):
             seg_xml_parts.append(f"        <acc:{key}>{_xml_escape(segments[key])}</acc:{key}>")
         segments_xml = "\n".join(seg_xml_parts)
+
+        optional_tail_parts: List[str] = []
+        if enabled_flag is not None and str(enabled_flag).strip():
+            optional_tail_parts.append(
+                f"<acc:EnabledFlag>{_xml_escape(enabled_flag)}</acc:EnabledFlag>"
+            )
+        if from_date is not None and str(from_date).strip():
+            optional_tail_parts.append(f"<acc:FromDate>{_xml_escape(from_date)}</acc:FromDate>")
+        optional_tail = "".join(optional_tail_parts)
 
         return (
             '<?xml version="1.0" encoding="UTF-8"?>'
@@ -254,11 +297,10 @@ class AccountCombinationServiceClient:
             "<soapenv:Body>"
             "<typ:validateAndCreateAccounts>"
             "<typ:validationInputRowList>"
-            f"<acc:LedgerName>{_xml_escape(ledger_name)}</acc:LedgerName>"
             f"<acc:DynamicInsertion>{_xml_escape(dynamic_insertion)}</acc:DynamicInsertion>"
-            f"<acc:EnabledFlag>{_xml_escape(enabled_flag)}</acc:EnabledFlag>"
-            f"<acc:FromDate>{_xml_escape(from_date)}</acc:FromDate>"
             f"{segments_xml}"
+            f"<acc:LedgerName>{_xml_escape(ledger_name)}</acc:LedgerName>"
+            f"{optional_tail}"
             "</typ:validationInputRowList>"
             "</typ:validateAndCreateAccounts>"
             "</soapenv:Body>"
