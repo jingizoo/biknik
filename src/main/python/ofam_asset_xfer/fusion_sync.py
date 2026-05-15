@@ -344,12 +344,22 @@ class FusionIUSync:
 
         def _creator(ledger_name: str, segments: Dict[str, str]) -> int:
             result = ac_client.validate_and_create(ledger_name=ledger_name, segments=segments)
-            if result.ccid is None or result.status != "S":
+            # Oracle's Status is "Valid" / "New" / "Invalid" — both
+            # Valid and New return a CcId; Invalid does not.  Gate on
+            # the CcId (via is_success), NOT on a literal status code.
+            if not result.is_success:
                 raise FusionApiError(
                     f"AccountCombinationService rejected segments {segments} "
                     f"(ledger={ledger_name}): status={result.status} "
                     f"code={result.error_code} msg={result.error_message}"
                 )
+            log.info(
+                "AccountCombinationService %s CCID=%s for ledger=%s segments=%s",
+                result.status or "(no status)",
+                result.ccid,
+                ledger_name,
+                segments,
+            )
             return int(result.ccid)
 
         return _creator

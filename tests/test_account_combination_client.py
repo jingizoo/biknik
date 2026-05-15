@@ -13,6 +13,8 @@ from ofam_asset_xfer.account_combination_client import (
 )
 from ofam_asset_xfer.exceptions import FusionApiError
 
+# Oracle's real response shape (captured via Postman against dev1):
+# Status is "New" (just created) / "Valid" (already existed) / "Invalid".
 SUCCESS_RESPONSE = """<?xml version="1.0" encoding="UTF-8"?>
 <env:Envelope xmlns:env="http://schemas.xmlsoap.org/soap/envelope/">
   <env:Header/>
@@ -22,7 +24,7 @@ SUCCESS_RESPONSE = """<?xml version="1.0" encoding="UTF-8"?>
         xmlns:ns1="http://xmlns.oracle.com/apps/financials/generalLedger/accounts/codeCombinations/accountCombinationService/">
       <ns0:result>
         <ns1:CcId>12345678</ns1:CcId>
-        <ns1:Status>S</ns1:Status>
+        <ns1:Status>New</ns1:Status>
         <ns1:ConcatenatedSegments>SG01-100-7000-PRD-NONE</ns1:ConcatenatedSegments>
       </ns0:result>
     </ns0:validateAndCreateAccountsResponse>
@@ -31,6 +33,25 @@ SUCCESS_RESPONSE = """<?xml version="1.0" encoding="UTF-8"?>
 """
 
 
+# Combination already exists — Oracle returns it with Status "Valid".
+VALID_EXISTING_RESPONSE = """<?xml version="1.0" encoding="UTF-8"?>
+<env:Envelope xmlns:env="http://schemas.xmlsoap.org/soap/envelope/">
+  <env:Body>
+    <ns0:validateAndCreateAccountsResponse
+        xmlns:ns0="http://xmlns.oracle.com/apps/financials/generalLedger/accounts/codeCombinations/accountCombinationService/types/"
+        xmlns:ns1="http://xmlns.oracle.com/apps/financials/generalLedger/accounts/codeCombinations/accountCombinationService/">
+      <ns0:result>
+        <ns1:CcId>99887766</ns1:CcId>
+        <ns1:Status>Valid</ns1:Status>
+      </ns0:result>
+    </ns0:validateAndCreateAccountsResponse>
+  </env:Body>
+</env:Envelope>
+"""
+
+
+# Real failure shape from the Postman capture: Status "Invalid",
+# CcId nil, Error + ErrorCode populated.
 ERROR_RESPONSE = """<?xml version="1.0" encoding="UTF-8"?>
 <env:Envelope xmlns:env="http://schemas.xmlsoap.org/soap/envelope/">
   <env:Header/>
@@ -39,7 +60,9 @@ ERROR_RESPONSE = """<?xml version="1.0" encoding="UTF-8"?>
         xmlns:ns0="http://xmlns.oracle.com/apps/financials/generalLedger/accounts/codeCombinations/accountCombinationService/types/"
         xmlns:ns1="http://xmlns.oracle.com/apps/financials/generalLedger/accounts/codeCombinations/accountCombinationService/">
       <ns0:result>
-        <ns1:Status>E</ns1:Status>
+        <ns1:CcId xsi:nil="true"
+            xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"/>
+        <ns1:Status>Invalid</ns1:Status>
         <ns1:ErrorCode>GL_INVALID_SEGMENT_VALUE</ns1:ErrorCode>
         <ns1:Error>Segment value 'XXX' is disabled or out of date range.</ns1:Error>
       </ns0:result>
@@ -113,8 +136,28 @@ class TestConfigFromDict:
         assert cfg.pad_segments_with == "?"
 
 
+class TestIsSuccess:
+    """CreatedCombination.is_success — the authoritative success signal."""
+
+    def test_new_is_success(self):
+        assert CreatedCombination(ccid=1, status="New").is_success is True
+
+    def test_valid_is_success(self):
+        assert CreatedCombination(ccid=1, status="Valid").is_success is True
+
+    def test_invalid_is_not_success(self):
+        assert CreatedCombination(ccid=None, status="Invalid").is_success is False
+
+    def test_invalid_case_insensitive(self):
+        assert CreatedCombination(ccid=None, status="INVALID").is_success is False
+
+    def test_no_ccid_is_not_success_even_with_odd_status(self):
+        assert CreatedCombination(ccid=None, status="Weird").is_success is False
+
+
 class TestValidateAndCreate:
-    def test_success_returns_ccid(self):
+    def test_new_combination_returns_ccid(self):
+        """Status 'New' — Oracle just created the combination."""
         client = _client()
         _mock_session_post(client, text=SUCCESS_RESPONSE)
         result = client.validate_and_create(
@@ -123,13 +166,26 @@ class TestValidateAndCreate:
         )
         assert isinstance(result, CreatedCombination)
         assert result.ccid == 12345678
-        assert result.status == "S"
+        assert result.status == "New"
+        assert result.is_success is True
         assert result.error_code is None
         assert result.concatenated_segments == "SG01-100-7000-PRD-NONE"
 
-    def test_oracle_error_response_is_returned_not_raised(self):
-        """Validation/cross-validation errors come back in the result
-        body, not as exceptions.  Caller decides what to do."""
+    def test_valid_existing_combination_returns_ccid(self):
+        """Status 'Valid' — combination already existed; still a success."""
+        client = _client()
+        _mock_session_post(client, text=VALID_EXISTING_RESPONSE)
+        result = client.validate_and_create(
+            ledger_name="L",
+            segments={"Segment1": "SG01"},
+        )
+        assert result.ccid == 99887766
+        assert result.status == "Valid"
+        assert result.is_success is True
+
+    def test_invalid_response_is_returned_not_raised(self):
+        """Status 'Invalid' — validation/cross-validation/ledger error.
+        Comes back in the result body, not as an exception."""
         client = _client()
         _mock_session_post(client, text=ERROR_RESPONSE)
         result = client.validate_and_create(
@@ -137,7 +193,8 @@ class TestValidateAndCreate:
             segments={"Segment1": "XXX"},
         )
         assert result.ccid is None
-        assert result.status == "E"
+        assert result.status == "Invalid"
+        assert result.is_success is False
         assert result.error_code == "GL_INVALID_SEGMENT_VALUE"
         assert "disabled or out of date range" in (result.error_message or "")
 

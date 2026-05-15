@@ -1827,7 +1827,7 @@ class TestTargetSegmentResolution:
                     CreatedCombination,
                 )
 
-                return CreatedCombination(ccid=555000, status="S")
+                return CreatedCombination(ccid=555000, status="New")
 
         # discovery getAssetInformation, then transferAsset response
         fusion.process_transaction.side_effect = [

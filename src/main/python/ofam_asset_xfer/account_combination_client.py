@@ -162,13 +162,27 @@ class AccountCombinationServiceConfig:
 
 @dataclass(frozen=True)
 class CreatedCombination:
-    """Outcome of one ``validateAndCreateAccounts`` row."""
+    """Outcome of one ``validateAndCreateAccounts`` row.
+
+    Oracle's ``Status`` field carries one of:
+      * ``Valid``   — combination already existed and is usable
+      * ``New``     — combination did not exist and was just created
+      * ``Invalid`` — validation failed (see error_code / error_message)
+
+    Treat presence of a non-null ``ccid`` as the authoritative success
+    signal — ``Valid`` and ``New`` both return one, ``Invalid`` does not.
+    """
 
     ccid: Optional[int]
-    status: str  # e.g. "S" (success) or "E" (error)
+    status: str  # "Valid" | "New" | "Invalid" (Oracle's literal values)
     error_code: Optional[str] = None
     error_message: Optional[str] = None
     concatenated_segments: Optional[str] = None
+
+    @property
+    def is_success(self) -> bool:
+        """True when Oracle returned a usable CcId (Valid or New)."""
+        return self.ccid is not None and self.status.strip().lower() != "invalid"
 
 
 class AccountCombinationServiceClient:
@@ -200,7 +214,10 @@ class AccountCombinationServiceClient:
 
         self._session = requests.Session()
         self._session.trust_env = not cfg.require_proxy
-        self._session.headers.update({"Content-Type": "text/xml; charset=utf-8"})  # SOAP 1.1
+        # SOAP 1.1.  charset spelled "UTF-8" to match the working
+        # Postman / curl call exactly (HTTP charset is case-insensitive,
+        # but match removes any doubt).
+        self._session.headers.update({"Content-Type": "text/xml; charset=UTF-8"})
         self._session.proxies.update(get_proxy_config(require=cfg.require_proxy))
 
     # ------------------------------------------------------------------
