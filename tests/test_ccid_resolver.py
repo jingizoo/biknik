@@ -328,3 +328,56 @@ class TestResolveTargetCcidFromSegments:
         client = _mock_client(get_resource_return={"items": []})
         with pytest.raises(ValidationError, match="non-empty"):
             resolve_target_ccid_from_segments(client, {})
+
+    def test_skip_lov_lookup_calls_creator_directly(self):
+        """When skip_lov_lookup=True, the REST accountCombinationsLOV
+        call is bypassed entirely and the resolver goes straight to the
+        SOAP creator.  Oracle's validateAndCreateAccounts returns the
+        existing CcId when the combination already exists, so the LOV
+        round-trip is redundant."""
+        client = MagicMock()
+        # REST get_resource must NOT be called.
+        client.get_resource.side_effect = AssertionError(
+            "get_resource should not be called when skip_lov_lookup=True"
+        )
+
+        captured = []
+
+        def _creator(ledger, segments):
+            captured.append((ledger, dict(segments)))
+            return 7777777
+
+        ccid = resolve_target_ccid_from_segments(
+            client,
+            {"Segment1": "SG01", "Segment2": "100"},
+            creator=_creator,
+            ledger_name="Singapore Primary Ledger",
+            skip_lov_lookup=True,
+        )
+
+        assert ccid == 7777777
+        assert captured == [("Singapore Primary Ledger", {"Segment1": "SG01", "Segment2": "100"})]
+
+    def test_skip_lov_lookup_requires_creator(self):
+        client = MagicMock()
+        with pytest.raises(ValidationError, match="creator and a ledger_name"):
+            resolve_target_ccid_from_segments(
+                client,
+                {"Segment1": "X"},
+                skip_lov_lookup=True,
+            )
+
+    def test_skip_lov_lookup_propagates_fusion_error(self):
+        client = MagicMock()
+
+        def _bad_creator(ledger, segments):
+            raise FusionApiError("invalid segment value")
+
+        with pytest.raises(FusionApiError, match="invalid segment value"):
+            resolve_target_ccid_from_segments(
+                client,
+                {"Segment1": "X"},
+                creator=_bad_creator,
+                ledger_name="L",
+                skip_lov_lookup=True,
+            )

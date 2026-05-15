@@ -65,16 +65,24 @@ def _interpolate(template: str, substitutions: Dict[str, str]) -> str:
 def build_account_combination_client_from_config(
     cfg_block: Optional[Dict[str, Any]],
     token_provider: Optional[Callable[[], str]] = None,
-) -> Tuple[Optional[Any], Dict[str, str]]:
+) -> Tuple[Optional[Any], Dict[str, str], bool]:
     """Build an ``AccountCombinationServiceClient`` + ledger map from config.
 
-    Returns ``(client, ledger_name_by_book)``.  Client is ``None`` when
-    the config block is missing or ``enabled`` is false.  Safe to call
-    even when the SOAP module is not used: the import is lazy so
-    deployments that don't enable Option B never pay for it.
+    Returns ``(client, ledger_name_by_book, skip_lov_lookup)``.  Client
+    is ``None`` when the config block is missing or ``enabled`` is
+    false.  Safe to call even when the SOAP module is not used: the
+    import is lazy so deployments that don't enable Option B never pay
+    for it.
+
+    ``skip_lov_lookup`` (config key ``skip_lov_lookup``, default
+    ``false``) bypasses the REST ``accountCombinationsLOV`` round-trip
+    and goes straight to SOAP ``validateAndCreateAccounts``, which
+    returns the existing CcId when the combination already exists and
+    creates it otherwise.  Enable when the LOV endpoint is flaky on
+    your pod.
     """
     if not cfg_block or not cfg_block.get("enabled"):
-        return None, {}
+        return None, {}, False
 
     from .account_combination_client import (
         AccountCombinationServiceClient,
@@ -89,7 +97,8 @@ def build_account_combination_client_from_config(
         for k, v in (cfg_block.get("ledger_name_by_book") or {}).items()
         if str(k).strip() and str(v).strip()
     }
-    return ac_client, ledger_map
+    skip_lov = bool(cfg_block.get("skip_lov_lookup", False))
+    return ac_client, ledger_map, skip_lov
 
 
 # ---------------------------------------------------------------------------
@@ -249,6 +258,7 @@ class FusionIUSync:
         account_combination_client: Optional[Any] = None,
         ledger_name_by_book: Optional[Dict[str, str]] = None,
         company_segment_key: str = "Segment1",
+        ac_skip_lov_lookup: bool = False,
     ):
         self._client = fusion_client
         self._entity_resolver = entity_resolver
@@ -270,6 +280,11 @@ class FusionIUSync:
             if str(k).strip() and str(v).strip()
         }
         self._company_segment_key = company_segment_key or "Segment1"
+        # When True, the resolver skips the REST accountCombinationsLOV
+        # call and goes straight to SOAP validateAndCreateAccounts —
+        # which returns the existing CcId if the combination exists, or
+        # creates it.  Useful on pods where the LOV endpoint is flaky.
+        self._ac_skip_lov_lookup = bool(ac_skip_lov_lookup)
         # Optional post-bookTransfer update that bumps a DFF on the new
         # asset.  Opt-in via config — see ``_run_post_transfer_attr_update``
         # for the full shape.  Default off so existing tenants are
@@ -1201,6 +1216,7 @@ class FusionIUSync:
                 pending.target_segments,
                 creator=creator,
                 ledger_name=ledger_name,
+                skip_lov_lookup=self._ac_skip_lov_lookup,
             )
             overrides["expense_ccid"] = str(target_ccid)
             params, is_noop = build_same_book_transfer_params(

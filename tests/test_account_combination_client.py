@@ -102,11 +102,15 @@ class TestConfigFromDict:
         )
         assert cfg.endpoint_path == "/fscmService/AccountCombinationService"
         assert cfg.dynamic_insertion == "Yes"
-        # EnabledFlag / FromDate are off by default to match Citadel's
-        # documented template; opt in via config or per-call kwargs.
+        # EnabledFlag / FromDate / ToDate are off by default to match
+        # Citadel's documented template; opt in via config or per-call kwargs.
         assert cfg.enabled_flag is None
         assert cfg.from_date is None
+        assert cfg.to_date is None
         assert cfg.timeout_seconds == 60
+        # Segment padding is off by default.
+        assert cfg.pad_segments_to == 0
+        assert cfg.pad_segments_with == "?"
 
 
 class TestValidateAndCreate:
@@ -299,6 +303,88 @@ class TestValidateAndCreate:
         assert "<acc:EnabledFlag>true</acc:EnabledFlag>" in body
         # Tail elements come after LedgerName per the documented template.
         assert body.index("<acc:LedgerName>") < body.index("<acc:FromDate>")
+
+    def test_to_date_element_emitted_when_set(self):
+        """ToDate is a schema-optional tail element (Oracle support
+        docs show it alongside FromDate); emitted only when set."""
+        client = _client()
+        captured = {}
+
+        def _capture(url, data=None, headers=None, **kwargs):
+            captured["body"] = data.decode("utf-8")
+            resp = MagicMock()
+            resp.status_code = 200
+            resp.text = SUCCESS_RESPONSE
+            return resp
+
+        client._session.post = MagicMock(side_effect=_capture)
+        client.validate_and_create(
+            ledger_name="L",
+            segments={"Segment1": "X"},
+            from_date="2017-10-17",
+            to_date="2023-10-22",
+        )
+        body = captured["body"]
+        assert "<acc:FromDate>2017-10-17</acc:FromDate>" in body
+        assert "<acc:ToDate>2023-10-22</acc:ToDate>" in body
+        # ToDate comes after FromDate in the documented order.
+        assert body.index("<acc:FromDate>") < body.index("<acc:ToDate>")
+
+    def test_pad_segments_emits_placeholder_for_missing_slots(self):
+        """When pad_segments_to=N is set, slots not in the caller's
+        segments map are emitted as <acc:SegmentK>?</acc:SegmentK>."""
+        cfg = AccountCombinationServiceConfig.from_dict(
+            {
+                "base_url": "https://x",
+                "bearer_token": "t",
+                "pad_segments_to": 5,
+                "pad_segments_with": "?",
+            }
+        )
+        client = AccountCombinationServiceClient(cfg)
+        captured = {}
+
+        def _capture(url, data=None, headers=None, **kwargs):
+            captured["body"] = data.decode("utf-8")
+            resp = MagicMock()
+            resp.status_code = 200
+            resp.text = SUCCESS_RESPONSE
+            return resp
+
+        client._session.post = MagicMock(side_effect=_capture)
+        client.validate_and_create(
+            ledger_name="L",
+            segments={"Segment1": "01", "Segment3": "2580"},  # 2, 4, 5 missing
+        )
+        body = captured["body"]
+        # Explicit values preserved
+        assert "<acc:Segment1>01</acc:Segment1>" in body
+        assert "<acc:Segment3>2580</acc:Segment3>" in body
+        # Missing slots padded with "?"
+        assert "<acc:Segment2>?</acc:Segment2>" in body
+        assert "<acc:Segment4>?</acc:Segment4>" in body
+        assert "<acc:Segment5>?</acc:Segment5>" in body
+
+    def test_pad_segments_off_by_default(self):
+        client = _client()
+        captured = {}
+
+        def _capture(url, data=None, headers=None, **kwargs):
+            captured["body"] = data.decode("utf-8")
+            resp = MagicMock()
+            resp.status_code = 200
+            resp.text = SUCCESS_RESPONSE
+            return resp
+
+        client._session.post = MagicMock(side_effect=_capture)
+        client.validate_and_create(
+            ledger_name="L",
+            segments={"Segment1": "01", "Segment3": "2580"},
+        )
+        body = captured["body"]
+        # Missing slots are NOT emitted by default.
+        assert "<acc:Segment2>" not in body
+        assert "<acc:Segment4>" not in body
 
     def test_optional_tail_elements_can_be_configured_globally(self):
         """Setting ``enabled_flag`` / ``from_date`` on the config makes

@@ -147,16 +147,41 @@ def lookup_ccid_by_segments(
     *,
     creator: Optional[AccountCombinationCreator] = None,
     ledger_name: Optional[str] = None,
+    skip_lov_lookup: bool = False,
 ) -> int:
-    """Find an existing CodeCombinationId that matches all *target_segments*.
+    """Find or create a CodeCombinationId for ``target_segments``.
 
-    Uses accountCombinationsLOV with a ``q`` filter.  When no match is
-    found and ``creator`` is provided (typically the SOAP
-    ``AccountCombinationService.validateAndCreateAccounts`` wrapper)
-    the function calls the creator with ``ledger_name`` + segments and
-    returns the freshly-minted CCID.  Without a creator, raises
-    ValidationError with a clear "needs to be created" message.
+    Default behaviour: hit ``accountCombinationsLOV`` (REST) with a
+    ``q`` filter; on a miss, call the SOAP creator if one is supplied.
+
+    When ``skip_lov_lookup=True``, the REST lookup is bypassed entirely
+    and the function goes straight to the SOAP creator —
+    ``validateAndCreateAccounts`` returns the existing CcId when the
+    combination already exists, so the LOV round-trip is redundant on
+    many pods (and ``accountCombinationsLOV`` is itself flaky on some
+    Oracle releases).  ``creator`` and ``ledger_name`` are required
+    when this mode is on.
     """
+    if skip_lov_lookup:
+        if creator is None or not ledger_name:
+            raise ValidationError(
+                "skip_lov_lookup=True requires both a creator and a ledger_name "
+                "(validateAndCreateAccounts is the only resolution path)."
+            )
+        log.info(
+            "lookup_ccid_by_segments: skip_lov_lookup=True; calling "
+            "validateAndCreateAccounts directly (ledger=%s, segments=%s)",
+            ledger_name,
+            target_segments,
+        )
+        try:
+            return int(creator(ledger_name, dict(target_segments)))
+        except (FusionApiError, ValidationError):
+            raise
+        except Exception as e:
+            raise FusionApiError(
+                f"AccountCombinationService creator raised {type(e).__name__}: {e}"
+            ) from e
 
     # Build q= filter:  Segment1='US01';Segment2='100';...
     # Sort segment keys numerically (Segment1, Segment2, ..., Segment10, ...)
@@ -268,6 +293,7 @@ def resolve_target_ccid_from_segments(
     chart_of_accounts_id: Optional[int] = None,
     creator: Optional[AccountCombinationCreator] = None,
     ledger_name: Optional[str] = None,
+    skip_lov_lookup: bool = False,
 ) -> int:
     """Resolve a destination CCID directly from caller-supplied segments.
 
@@ -302,6 +328,7 @@ def resolve_target_ccid_from_segments(
         chart_of_accounts_id,
         creator=creator,
         ledger_name=ledger_name,
+        skip_lov_lookup=skip_lov_lookup,
     )
 
 

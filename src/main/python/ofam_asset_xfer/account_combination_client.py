@@ -79,15 +79,25 @@ class AccountCombinationServiceConfig:
     # provided by the caller.  Override per-call by passing the matching
     # kwarg to ``validate_and_create``.
     #
-    # The documented Citadel SOAP template includes only ``DynamicInsertion``
-    # + ``Segment*`` + ``LedgerName``; ``EnabledFlag`` and ``FromDate`` are
-    # schema-optional and not in the canonical envelope.  We leave them
-    # OFF by default and only include them when explicitly configured —
-    # set ``"enabled_flag": "true"`` / ``"from_date": "2026-05-14"`` to
-    # opt in.
+    # The documented Oracle SOAP template includes ``DynamicInsertion``
+    # + ``Segment1..30`` + ``LedgerName`` + optional ``EnabledFlag`` /
+    # ``FromDate`` / ``ToDate``.  Pods differ on the literal value
+    # ``DynamicInsertion`` expects — some accept ``Yes``, some ``y``,
+    # some ``true``.  Make it config-driven and default to ``"Yes"``
+    # (the value the Citadel template uses).  ``EnabledFlag`` /
+    # ``FromDate`` / ``ToDate`` are schema-optional and emitted only
+    # when explicitly configured.
     dynamic_insertion: str = "Yes"
     enabled_flag: Optional[str] = None
     from_date: Optional[str] = None
+    to_date: Optional[str] = None
+    # Pad missing segments with this placeholder up to
+    # ``pad_segments_to``.  The Oracle doc sample shows ``"?"`` for
+    # unused slots in a 30-segment COA.  Off by default (``0``); set
+    # ``pad_segments_to: 30`` and ``pad_segments_with: "?"`` to emit
+    # all 30 slots.
+    pad_segments_to: int = 0
+    pad_segments_with: str = "?"
 
     @staticmethod
     def from_dict(d: Mapping[str, Any]) -> "AccountCombinationServiceConfig":
@@ -103,6 +113,7 @@ class AccountCombinationServiceConfig:
 
         ef = d.get("enabled_flag")
         fd = d.get("from_date")
+        td = d.get("to_date")
         return AccountCombinationServiceConfig(
             base_url=base_url,
             endpoint_path=str(
@@ -115,6 +126,9 @@ class AccountCombinationServiceConfig:
             dynamic_insertion=str(d.get("dynamic_insertion", "Yes")),
             enabled_flag=None if ef is None or str(ef).strip() == "" else str(ef),
             from_date=None if fd is None or str(fd).strip() == "" else str(fd),
+            to_date=None if td is None or str(td).strip() == "" else str(td),
+            pad_segments_to=int(d.get("pad_segments_to", 0) or 0),
+            pad_segments_with=str(d.get("pad_segments_with", "?")),
         )
 
 
@@ -170,6 +184,7 @@ class AccountCombinationServiceClient:
         ledger_name: str,
         segments: Mapping[str, str],
         from_date: Optional[str] = None,
+        to_date: Optional[str] = None,
         dynamic_insertion: Optional[str] = None,
         enabled_flag: Optional[str] = None,
     ) -> CreatedCombination:
@@ -204,11 +219,23 @@ class AccountCombinationServiceClient:
         # auto-defaulting them caused Oracle to reject the envelope in
         # some pods, so we keep them off unless explicitly opted in.
         effective_from_date = from_date if from_date is not None else self.cfg.from_date
+        effective_to_date = to_date if to_date is not None else self.cfg.to_date
         effective_enabled_flag = enabled_flag if enabled_flag is not None else self.cfg.enabled_flag
+
+        # Optional: pad missing segments with the documented placeholder
+        # (Oracle's sample uses "?") so callers that ship a partial
+        # segment set still hit the full 30-segment shape some pods
+        # expect.  Driven by ``pad_segments_to`` on the config.
+        padded = dict(segments)
+        if self.cfg.pad_segments_to > 0:
+            for n in range(1, self.cfg.pad_segments_to + 1):
+                padded.setdefault(f"Segment{n}", self.cfg.pad_segments_with)
+
         body = self._build_envelope(
             ledger_name=ledger_name.strip(),
-            segments=dict(segments),
+            segments=padded,
             from_date=effective_from_date,
+            to_date=effective_to_date,
             dynamic_insertion=dynamic_insertion or self.cfg.dynamic_insertion,
             enabled_flag=effective_enabled_flag,
         )
@@ -253,6 +280,7 @@ class AccountCombinationServiceClient:
         ledger_name: str,
         segments: Dict[str, str],
         from_date: Optional[str],
+        to_date: Optional[str],
         dynamic_insertion: str,
         enabled_flag: Optional[str],
     ) -> str:
@@ -287,6 +315,8 @@ class AccountCombinationServiceClient:
             )
         if from_date is not None and str(from_date).strip():
             optional_tail_parts.append(f"<acc:FromDate>{_xml_escape(from_date)}</acc:FromDate>")
+        if to_date is not None and str(to_date).strip():
+            optional_tail_parts.append(f"<acc:ToDate>{_xml_escape(to_date)}</acc:ToDate>")
         optional_tail = "".join(optional_tail_parts)
 
         return (

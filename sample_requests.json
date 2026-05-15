@@ -52,8 +52,22 @@
     "verify_ssl": false,
     "require_proxy": true,
     "timeout_seconds": 60,
+
+    "_dynamic_insertion_note": "Literal value Oracle wants in the <acc:DynamicInsertion> element.  Most pods accept 'Yes'; some require 'y' or 'true'.  Check your tenant's WSDL sample if in doubt.",
     "dynamic_insertion": "Yes",
-    "enabled_flag": "true",
+
+    "_skip_lov_lookup_note": "When true, skip the REST accountCombinationsLOV lookup and call SOAP validateAndCreateAccounts directly.  Oracle returns the existing CcId when the combination already exists (Status=S) or mints it when it doesn't.  Useful when accountCombinationsLOV is flaky on your pod (Citadel dev1).  Default false (preserves the lookup-first behaviour).",
+    "skip_lov_lookup": false,
+
+    "_optional_tail_fields_note": "Schema-optional elements in the documented Oracle template (EnabledFlag, FromDate, ToDate).  Omit / leave null to keep them out of the envelope.  Set as strings when your pod requires them.",
+    "enabled_flag": null,
+    "from_date": null,
+    "to_date": null,
+
+    "_pad_segments_note": "Some pods reject envelopes that don't include all 30 segments.  Set pad_segments_to=30 (and pad_segments_with='?') to emit <acc:Segment1>...<acc:Segment30> with '?' filling slots that weren't supplied.",
+    "pad_segments_to": 0,
+    "pad_segments_with": "?",
+
     "ledger_name_by_book": {
       "US CORP BOOK": "US Primary Ledger",
       "UK CORP BOOK": "UK Primary Ledger",

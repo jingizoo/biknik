@@ -170,7 +170,7 @@ def main(argv: list[str] | None = None) -> int:
                 time.sleep(delay)
 
         # Optional Option B account-combination-service client.
-        ac_client, ledger_map = build_account_combination_client_from_config(
+        ac_client, ledger_map, ac_skip_lov = build_account_combination_client_from_config(
             config.get("account_combination_service"),
             token_provider=token_provider,
         )
@@ -188,6 +188,7 @@ def main(argv: list[str] | None = None) -> int:
             post_transfer_attribute_update=config.get("post_transfer_attribute_update") or {},
             account_combination_client=ac_client,
             ledger_name_by_book=ledger_map,
+            ac_skip_lov_lookup=ac_skip_lov,
         )
         summary = sync.run_full_sync(
             books=books,

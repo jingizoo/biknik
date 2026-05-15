@@ -112,7 +112,7 @@ def main(
             build_account_combination_client_from_config,
         )
 
-        ac_client, ledger_map = build_account_combination_client_from_config(
+        ac_client, ledger_map, ac_skip_lov = build_account_combination_client_from_config(
             cfg.get("account_combination_service"),
         )
 
@@ -129,6 +129,7 @@ def main(
             post_transfer_attribute_update=cfg.get("post_transfer_attribute_update") or {},
             account_combination_client=ac_client,
             ledger_name_by_book=ledger_map,
+            ac_skip_lov_lookup=ac_skip_lov,
         )
         summary = sync.run_full_sync(
             books=books,
