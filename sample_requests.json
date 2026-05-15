@@ -81,6 +81,7 @@
     "pad_segments_to": 0,
     "pad_segments_with": "?",
 
+    "_ledger_name_by_book_note": "FALLBACK ONLY.  The GL ledger is sourced per-row from the BIP report's TARGET_LEDGER_NAME column.  This static book->ledger map is consulted only when that column is blank for a row.  Safe to leave empty when the report always supplies TARGET_LEDGER_NAME.",
     "ledger_name_by_book": {
       "US CORP BOOK": "US Primary Ledger",
       "UK CORP BOOK": "UK Primary Ledger",

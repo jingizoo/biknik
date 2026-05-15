@@ -50,6 +50,7 @@ def _bip_row(
     target_location_id="",
     current_location_id="",
     target_expense_ccid="",
+    target_ledger_name="",
 ):
     """Build a BIP report row dict (as returned by BIPClient.run_report).
 
@@ -68,6 +69,7 @@ def _bip_row(
         "TARGET_LOCATION_ID": target_location_id,
         "CURRENT_LOCATION_ID": current_location_id,
         "TARGET_EXPENSE_CCID": target_expense_ccid,
+        "TARGET_LEDGER_NAME": target_ledger_name,
     }
 
 
@@ -1721,13 +1723,14 @@ class TestTargetSegmentResolution:
     """BIP report supplies TARGET_SEG* columns; pipeline looks them up
     (and optionally mints via SOAP)."""
 
-    def _row_with_target_segs(self, target_segs):
+    def _row_with_target_segs(self, target_segs, target_ledger_name=""):
         row = _bip_row(
             book="US CORP BOOK",
             dff_entity="US Entity",
             final_target_book="US CORP BOOK",  # same-book
             current_location_id="300100111111",
             target_location_id="300100111111",
+            target_ledger_name=target_ledger_name,
         )
         for k, v in target_segs.items():
             row[k] = v
@@ -1778,6 +1781,74 @@ class TestTargetSegmentResolution:
         fusion.process_transaction.return_value = _get_asset_info_response()
         pending = sync.find_pending_transfers(books=["US CORP BOOK"], limit=10)
         assert pending[0].target_segments == {"Segment1": "SG01", "Segment5": "1008"}
+
+    def test_target_ledger_name_column_captured(self):
+        """TARGET_LEDGER_NAME from the report lands on PendingTransfer."""
+        fusion = _mock_fusion()
+        bip = _mock_bip()
+        bip.run_report.side_effect = lambda params: (
+            [
+                self._row_with_target_segs(
+                    {"TARGET_SEG1": "SG01"},
+                    target_ledger_name="Singapore Primary Ledger",
+                )
+            ]
+            if params.get("P_BOOK_TYPE_CODE") == "US CORP BOOK"
+            else []
+        )
+        fusion.process_transaction.return_value = _get_asset_info_response()
+        sync = FusionIUSync(fusion, _resolver(), bip)
+        pending = sync.find_pending_transfers(books=["US CORP BOOK"], limit=10)
+        assert len(pending) == 1
+        assert pending[0].target_ledger_name == "Singapore Primary Ledger"
+
+    def test_report_ledger_name_overrides_config_map(self):
+        """The per-row TARGET_LEDGER_NAME column wins over the static
+        ledger_name_by_book config map."""
+        fusion = _mock_fusion()
+        bip = _mock_bip()
+        bip.run_report.side_effect = lambda params: (
+            [
+                self._row_with_target_segs(
+                    {"TARGET_SEG1": "SG01", "TARGET_SEG2": "100"},
+                    target_ledger_name="Report-Supplied Ledger",
+                )
+            ]
+            if params.get("P_BOOK_TYPE_CODE") == "US CORP BOOK"
+            else []
+        )
+
+        captured_ledgers = []
+
+        class _FakeAC:
+            def validate_and_create(self, *, ledger_name, segments, **kw):
+                captured_ledgers.append(ledger_name)
+                from ofam_asset_xfer.account_combination_client import (
+                    CreatedCombination,
+                )
+
+                return CreatedCombination(ccid=555000, status="S")
+
+        # discovery getAssetInformation, then transferAsset response
+        fusion.process_transaction.side_effect = [
+            _get_asset_info_response(),  # discovery
+            (
+                {},
+                {"X_RETURN_STATUS": "S"},
+            ),  # transferAsset
+        ]
+        sync = FusionIUSync(
+            fusion,
+            _resolver(),
+            bip,
+            account_combination_client=_FakeAC(),
+            # Config map says something else — must be overridden.
+            ledger_name_by_book={"US CORP BOOK": "Config-Map Ledger"},
+            ac_skip_lov_lookup=True,  # straight to SOAP creator
+        )
+        sync.run_full_sync(books=["US CORP BOOK"], dry_run=False)
+        # The SOAP creator was called with the REPORT's ledger, not the map's.
+        assert captured_ledgers == ["Report-Supplied Ledger"]
 
 
 class TestAppliesToFlag:

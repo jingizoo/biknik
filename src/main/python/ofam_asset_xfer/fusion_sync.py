@@ -142,6 +142,11 @@ class DFFConfig:
     # segments, so we just look them up (and optionally auto-create).
     target_segment_col_prefix: str = "TARGET_SEG"
     target_segment_col_max: int = 30
+    # GL ledger that owns the destination chart of accounts.  Used by
+    # AccountCombinationService.validateAndCreateAccounts.  Sourced
+    # per-row from the BIP report; the static ``ledger_name_by_book``
+    # config map is only a fallback for rows where this column is blank.
+    target_ledger_name_col: str = "TARGET_LEDGER_NAME"
 
 
 DEFAULT_DFF_CONFIG = DFFConfig()
@@ -207,6 +212,8 @@ class PendingTransfer:
     # target combination; pipeline looks it up directly (and creates
     # via SOAP when ``account_combination_service.enabled``).
     target_segments: Optional[Dict[str, str]] = None
+    # GL ledger for the destination CoA, from TARGET_LEDGER_NAME column.
+    target_ledger_name: Optional[str] = None
     is_cross_book: bool = True  # False = same-book (location-only) transfer
 
     # Classification: INTERUNIT or INTRAUNIT
@@ -473,6 +480,7 @@ class FusionIUSync:
         current_location_id = row.get(dff.current_location_id_col, "").strip() or None
         target_expense_ccid = row.get(dff.target_expense_ccid_col, "").strip() or None
         target_company = row.get(dff.target_company_col, "").strip() or None
+        target_ledger_name = row.get(dff.target_ledger_name_col, "").strip() or None
 
         # Scan TARGET_SEG1..TARGET_SEGn into a {SegmentN: value} dict.
         # The BIP report ships these once it has resolved each row's
@@ -582,6 +590,7 @@ class FusionIUSync:
             target_expense_ccid=target_expense_ccid,
             target_company=target_company,
             target_segments=target_segments_or_none,
+            target_ledger_name=target_ledger_name,
             is_cross_book=is_cross_book,
             fa_state=state,
         )
@@ -1196,7 +1205,9 @@ class FusionIUSync:
         if pending.target_segments and not pending.target_expense_ccid:
             from .ccid_resolver import resolve_target_ccid_from_segments
 
-            ledger_name = self._ledger_name_by_book.get(
+            # Ledger: prefer the per-row TARGET_LEDGER_NAME column;
+            # fall back to the static ledger_name_by_book config map.
+            ledger_name = pending.target_ledger_name or self._ledger_name_by_book.get(
                 (pending.book_type_code or "").upper().strip()
             )
             creator = None
@@ -1228,7 +1239,9 @@ class FusionIUSync:
         elif pending.target_company and not pending.target_expense_ccid:
             from .fusion_ops import build_same_book_transfer_params_option_b
 
-            ledger_name = self._ledger_name_by_book.get(
+            # Ledger: prefer the per-row TARGET_LEDGER_NAME column;
+            # fall back to the static ledger_name_by_book config map.
+            ledger_name = pending.target_ledger_name or self._ledger_name_by_book.get(
                 (pending.book_type_code or "").upper().strip()
             )
             creator = None
