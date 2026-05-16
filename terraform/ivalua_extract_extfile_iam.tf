@@ -16,3 +16,17 @@ resource "google_storage_bucket_iam_member" "ivalua_extract_prod_extfile" {
   role   = "roles/storage.objectUser"
   member = "serviceAccount:sp-extfile@citadel-extfile-prod-1.iam.gserviceaccount.com"
 }
+
+# invoice_attachments/ path for ExtFile to monitor (PMTSUPPORT-42065).
+
+resource "google_storage_bucket_object" "ivalua_extract_dev_invoice_attachments" {
+  name    = "invoice_attachments/"
+  content = "invoice_attachments"
+  bucket  = "cig-ivalua-extract"
+}
+
+resource "google_storage_bucket_object" "ivalua_extract_prod_invoice_attachments" {
+  name    = "invoice_attachments/"
+  content = "invoice_attachments"
+  bucket  = "cig-ivalua-extract-prod"
+}
