@@ -452,6 +452,12 @@ def build_book_transfer_params(
     # Read xbook-specific config overrides
     book_transfer_type_code = overrides.get("book_transfer_type_code", "NBV")
     cost_basis_code = overrides.get("cost_basis_code", "COST_RESERVE_SRC")
+    # Retirement type code for the source-book leg of a cross-book
+    # transfer.  Oracle FA retires the asset on the source book and
+    # re-adds it on the destination; this names the retirement reason.
+    # Citadel's working bookTransfer payload uses 'TRF TO NEW BOOK'.
+    # Default to that; override via transfer_overrides[.by_book].
+    retirement_type_code = overrides.get("retirement_type_code", "TRF TO NEW BOOK")
 
     # Always build dual-leg rosetta tables for cross-book.
     # P_COPY_SOURCE_LINES_FLAG=Y without tables causes ORA-06502 on some pods.
@@ -485,6 +491,7 @@ def build_book_transfer_params(
         "P_DEST_BOOK_TYPE_CODE": dest_book_type_code,
         "P_BOOK_TRANSFER_TYPE_CODE": book_transfer_type_code,
         "P_COST_BASIS_CODE": cost_basis_code,
+        "P_RETIREMENT_TYPE_CODE": retirement_type_code or None,
         "P_USE_DEST_CAT_DEPRN_RULES_FLAG": overrides.get("use_dest_cat_deprn_rules_flag", "Y"),
         "P_USE_XFR_DATE_AS_DPIS_FLAG": overrides.get("use_xfr_date_as_dpis_flag", "N"),
         "P_COPY_DFF_FLAG": overrides.get("copy_dff_flag", "Y"),

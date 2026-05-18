@@ -23,7 +23,7 @@
     "JP Entity": "JP CORP BOOK"
   },
 
-  "_transfer_overrides_note": "Global defaults applied to every Fusion FA bookTransfer / transferAsset call.  Per-row TARGET_LOCATION_ID / TARGET_EXPENSE_CCID from BIP still win.  Note: do NOT set conversion_rate_type globally — it is ledger-specific.  When unset the parameter is omitted, which is required for same-currency transfers and for ledgers that don't publish that rate type.",
+  "_transfer_overrides_note": "Global defaults applied to every Fusion FA bookTransfer / transferAsset call.  Per-row TARGET_LOCATION_ID / TARGET_EXPENSE_CCID from BIP still win.  Note: do NOT set conversion_rate_type globally — it is ledger-specific.  When unset the parameter is omitted, which is required for same-currency transfers and for ledgers that don't publish that rate type.  Other recognised keys: book_transfer_type_code (default 'NBV'), cost_basis_code (default 'COST_RESERVE_SRC'), retirement_type_code (default 'TRF TO NEW BOOK' — the source-book retirement reason for cross-book transfers; set to '' to omit), copy_dff_flag, copy_asset_key_flag, create_new_asset_flag, use_dest_cat_deprn_rules_flag, use_xfr_date_as_dpis_flag.",
   "transfer_overrides": {
   },
 

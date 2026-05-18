@@ -994,6 +994,49 @@ class TestTransferOverridesDefaults:
         )
         assert params["P_CONVERSION_RATE_TYPE"] == "User"
 
+    def test_retirement_type_code_default(self):
+        """Cross-book bookTransfer retires the asset on the source book;
+        P_RETIREMENT_TYPE_CODE defaults to 'TRF TO NEW BOOK' (the value
+        in Citadel's verified-working payload)."""
+        from ofam_asset_xfer.fusion_ops import build_book_transfer_params
+
+        params = build_book_transfer_params(
+            state=_sample_state(),
+            dest_book_type_code="JP CORP BOOK",
+            effective_date="2026-05-01",
+            overrides={},
+            request_id="REQ-1",
+        )
+        assert params["P_RETIREMENT_TYPE_CODE"] == "TRF TO NEW BOOK"
+
+    def test_retirement_type_code_override(self):
+        from ofam_asset_xfer.fusion_ops import build_book_transfer_params
+
+        params = build_book_transfer_params(
+            state=_sample_state(),
+            dest_book_type_code="JP CORP BOOK",
+            effective_date="2026-05-01",
+            overrides={"retirement_type_code": "INTERCOMPANY XFER"},
+            request_id="REQ-1",
+        )
+        assert params["P_RETIREMENT_TYPE_CODE"] == "INTERCOMPANY XFER"
+
+    def test_retirement_type_code_empty_override_drops_param(self):
+        """An explicit empty retirement_type_code drops the parameter
+        (build_parameter_list skips None)."""
+        from ofam_asset_xfer.fusion_ops import build_book_transfer_params
+        from ofam_asset_xfer.paramlist import build_parameter_list
+
+        params = build_book_transfer_params(
+            state=_sample_state(),
+            dest_book_type_code="JP CORP BOOK",
+            effective_date="2026-05-01",
+            overrides={"retirement_type_code": ""},
+            request_id="REQ-1",
+        )
+        assert params["P_RETIREMENT_TYPE_CODE"] is None
+        assert "P_RETIREMENT_TYPE_CODE" not in build_parameter_list(params)
+
     def test_empty_string_override_is_treated_as_unset(self):
         """An explicit empty conversion_rate_type override is treated as unset.
 
