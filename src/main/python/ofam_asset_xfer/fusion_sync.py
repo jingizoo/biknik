@@ -364,6 +364,49 @@ class FusionIUSync:
 
         return _creator
 
+    def _resolve_expense_ccid_from_segments(self, pending: "PendingTransfer") -> Optional[str]:
+        """Resolve the destination expense CCID from TARGET_SEG* columns.
+
+        Used by BOTH the cross-book and same-book paths.  Returns the
+        CCID as a string when the report supplied ``TARGET_SEG*``
+        columns and no explicit ``TARGET_EXPENSE_CCID`` override, or
+        ``None`` when there's nothing to resolve (caller then keeps the
+        source / report-supplied CCID).
+
+        When ``account_combination_service`` is wired, a missing
+        combination is minted via SOAP ``validateAndCreateAccounts``.
+        """
+        if not pending.target_segments or pending.target_expense_ccid:
+            return None
+
+        from .ccid_resolver import resolve_target_ccid_from_segments
+
+        # Ledger: prefer the per-row TARGET_LEDGER_NAME column; fall back
+        # to the static ledger_name_by_book config map.
+        ledger_name = pending.target_ledger_name or self._ledger_name_by_book.get(
+            (pending.target_book_type_code or "").upper().strip()
+        )
+        creator = None
+        if self._ac_client is not None and ledger_name:
+            creator = self._make_account_combination_creator()
+
+        log.info(
+            "Resolving target CCID from report TARGET_SEG* columns: "
+            "asset=%s segments=%s ledger=%s auto_create=%s",
+            pending.asset_number,
+            pending.target_segments,
+            ledger_name or "(none)",
+            "yes" if creator is not None else "no",
+        )
+        target_ccid = resolve_target_ccid_from_segments(
+            self._client,
+            pending.target_segments,
+            creator=creator,
+            ledger_name=ledger_name,
+            skip_lov_lookup=self._ac_skip_lov_lookup,
+        )
+        return str(target_ccid)
+
     def _book_overrides_for(
         self, source_book: Optional[str], target_book: Optional[str]
     ) -> Dict[str, Any]:
@@ -717,6 +760,16 @@ class FusionIUSync:
             overrides["location_ccid"] = location_override
         if pending.target_expense_ccid:
             overrides["expense_ccid"] = pending.target_expense_ccid
+        else:
+            # No explicit TARGET_EXPENSE_CCID — when the report supplies
+            # TARGET_SEG* columns, resolve the destination CCID (minting
+            # it via AccountCombinationService when missing).  Without
+            # this the cross-book payload would carry the SOURCE ledger's
+            # CCID, which Oracle rejects ("balancing segment value not
+            # valid for ledger ...").
+            resolved_ccid = self._resolve_expense_ccid_from_segments(pending)
+            if resolved_ccid:
+                overrides["expense_ccid"] = resolved_ccid
 
         params = build_book_transfer_params(
             state=state,
@@ -1203,43 +1256,12 @@ class FusionIUSync:
         if pending.target_expense_ccid:
             overrides["expense_ccid"] = pending.target_expense_ccid
 
-        # Option B: when the report supplies a TARGET_COMPANY (and the
-        # destination CCID isn't already pinned down by TARGET_EXPENSE_CCID),
-        # route through build_same_book_transfer_params_option_b so the
-        # company-segment swap + optional auto-create flow runs.
         # Pre-built TARGET_SEG* columns (preferred when the BIP report
-        # supplies them).  Skip the source-CCID-fetch + segment-swap
-        # entirely — the report has already resolved the destination
-        # segments; we just need to look them up and (optionally) mint
-        # the combination if it doesn't exist yet.
-        if pending.target_segments and not pending.target_expense_ccid:
-            from .ccid_resolver import resolve_target_ccid_from_segments
-
-            # Ledger: prefer the per-row TARGET_LEDGER_NAME column;
-            # fall back to the static ledger_name_by_book config map.
-            ledger_name = pending.target_ledger_name or self._ledger_name_by_book.get(
-                (pending.book_type_code or "").upper().strip()
-            )
-            creator = None
-            if self._ac_client is not None and ledger_name:
-                creator = self._make_account_combination_creator()
-
-            log.info(
-                "Resolving target CCID from report TARGET_SEG* columns: "
-                "asset=%s segments=%s ledger=%s auto_create=%s",
-                pending.asset_number,
-                pending.target_segments,
-                ledger_name or "(none)",
-                "yes" if creator is not None else "no",
-            )
-            target_ccid = resolve_target_ccid_from_segments(
-                self._client,
-                pending.target_segments,
-                creator=creator,
-                ledger_name=ledger_name,
-                skip_lov_lookup=self._ac_skip_lov_lookup,
-            )
-            overrides["expense_ccid"] = str(target_ccid)
+        # supplies them): resolve — and optionally mint — the destination
+        # CCID, then send a plain transferAsset with that expense_ccid.
+        resolved_ccid = self._resolve_expense_ccid_from_segments(pending)
+        if resolved_ccid:
+            overrides["expense_ccid"] = resolved_ccid
             params, is_noop = build_same_book_transfer_params(
                 state=state,
                 effective_date=effective_date,
