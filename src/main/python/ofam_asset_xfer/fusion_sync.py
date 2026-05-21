@@ -1088,6 +1088,35 @@ class FusionIUSync:
         clear_source_dffs: Dict[str, str] = {
             str(k): str(v) for k, v in (cfg.get("clear_source_dffs") or {}).items()
         }
+        # ``populate_dest_dffs`` / ``populate_source_dffs`` are dicts of
+        # additional DFF params to set on the update calls.  Values
+        # support ``${...}`` templating from the same substitution set
+        # used by ``dest_lookup_bip.params`` — most useful to set
+        # "Source Asset Book" / "Source Asset Number" DFFs on the
+        # destination so the new asset record points back at where it
+        # came from.  Keys in the dest dict only fire on the destination
+        # link; keys in the source dict fire on every non-destination
+        # link (and on the source asset in non-chain mode).
+        substitutions: Dict[str, str] = {
+            "source_asset_id": source_state.asset_id or "",
+            "source_asset_number": source_state.asset_number or "",
+            "source_book_type_code": pending.book_type_code or "",
+            "target_book_type_code": pending.target_book_type_code or "",
+            "target_asset_id": str(dest_asset_id) or "",
+            "target_asset_number": str(dest_asset_number or "") or "",
+            "transfer_to_entity": pending.transfer_to_entity or "",
+            "transfer_date": pending.transfer_date or "",
+            "bumped_value": bumped,
+            "tag_value": current_value or "",
+        }
+        populate_dest_dffs: Dict[str, str] = {
+            str(k): _interpolate(str(v), substitutions)
+            for k, v in (cfg.get("populate_dest_dffs") or {}).items()
+        }
+        populate_source_dffs: Dict[str, str] = {
+            str(k): _interpolate(str(v), substitutions)
+            for k, v in (cfg.get("populate_source_dffs") or {}).items()
+        }
         # Secondary fusion parameters that receive the *same* bumped
         # value.  Typical use: primary updates P_TAG_NUMBER (canonical
         # FA header tag), also_bump_params=["P_CAT_ATTRIBUTE7"] mirrors
@@ -1133,6 +1162,9 @@ class FusionIUSync:
                         "book_type_code": book,
                         "side": "destination" if is_dest else "chain",
                         "clears": clear_dest_dffs if is_dest else clear_source_dffs,
+                        "populates": (
+                            populate_dest_dffs if is_dest else populate_source_dffs
+                        ),
                         "label": (
                             "destination" if is_dest else f"chain[{link.chain_order}]"
                         ),
@@ -1153,6 +1185,7 @@ class FusionIUSync:
                         "book_type_code": pending.book_type_code,
                         "side": "source",
                         "clears": clear_source_dffs,
+                        "populates": populate_source_dffs,
                         "label": "source",
                     }
                 )
@@ -1162,6 +1195,7 @@ class FusionIUSync:
                     "book_type_code": pending.target_book_type_code,
                     "side": "destination",
                     "clears": clear_dest_dffs,
+                    "populates": populate_dest_dffs,
                     "label": "destination",
                 }
             )
@@ -1176,6 +1210,9 @@ class FusionIUSync:
                 trace_param: trace_value,
             }
             params.update(also_bump_dict)
+            # Populate-then-clear ordering matters: if the same param
+            # appears in both, clear wins (you asked for it to be empty).
+            params.update(target["populates"])
             params.update(target["clears"])
             err = self._post_attr_update_call(
                 pending=pending,

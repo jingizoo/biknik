@@ -109,13 +109,24 @@
     "_bump_source_too_note": "When true, ALSO POST updateAssetDescriptiveDetails against the SOURCE (retired) asset with the same bumped value, so the source-book record carries the same _N suffix as the destination.  Both sides end up with the same tag value, signalling 'this is the Nth transfer of this asset'.  Default false (destination only).",
     "bump_source_too": true,
 
-    "_clear_dest_dffs_note": "Extra params to POST on the DESTINATION update.  Use empty-string values to CLEAR directive DFFs that were only meaningful pre-transfer (e.g. the legal-entity-to-transfer-to DFF inherited via P_COPY_DFF_FLAG=Y).  Otherwise the new asset looks like it has another transfer queued to itself.",
+    "_clear_dest_dffs_note": "Extra params to POST on the DESTINATION update with empty-string values, CLEARING directive DFFs that were only meaningful pre-transfer.  After a transfer completes the destination shouldn't carry Transfer Date / Transfer to Entity / Transfer to Location — otherwise it looks like another transfer is queued.  The exact P_<name> params are tenant-specific; map them to the DFF slots Citadel uses (P_CAT_ATTRIBUTE5/6/9 are common).",
     "clear_dest_dffs": {
+      "P_CAT_ATTRIBUTE5": "",
+      "P_CAT_ATTRIBUTE6": "",
       "P_CAT_ATTRIBUTE9": ""
     },
 
     "_clear_source_dffs_note": "Symmetric to clear_dest_dffs but for the source asset (rare — most directive DFFs only matter on the destination side).",
     "clear_source_dffs": {},
+
+    "_populate_dest_dffs_note": "Extra params to POST on the DESTINATION update with templated values.  Typical use: fill 'Source Asset Book' / 'Source Asset Number' DFFs on the new asset so it points back at where it came from.  Values support placeholders: ${source_asset_id}, ${source_asset_number}, ${source_book_type_code}, ${target_book_type_code}, ${target_asset_id}, ${target_asset_number}, ${transfer_to_entity}, ${transfer_date}, ${bumped_value}, ${tag_value}.  Unknown placeholders are left in place so misconfig is visible.  The exact P_<name> params are tenant-specific — map to whichever ATTRIBUTE_N slots Citadel uses for Source Asset Book / Source Asset Number.",
+    "populate_dest_dffs": {
+      "P_ATTRIBUTE13": "${source_book_type_code}",
+      "P_ATTRIBUTE14": "${source_asset_number}"
+    },
+
+    "_populate_source_dffs_note": "Symmetric to populate_dest_dffs but applied to source-side updates.  Rare; mostly for tagging retired ancestor records with destination info.",
+    "populate_source_dffs": {},
 
     "_bump_chain_note": "When true, after a successful cross-book transfer the pipeline calls dest_lookup_bip to get the FULL lineage chain (every historical asset_id this physical asset has ever lived under, plus the new destination), then POSTs the same bumped Tag Number against ALL of them — keeping the chain in lockstep on the underscore-suffix scheme.  Without this, only the immediate source + destination get the new value, and older retired ancestors keep their old _N values (CMDB and FA audit then disagree on retired rows).  Default false; requires dest_lookup_bip and the chain-aware SQL in sql/get_transferred_asset.sql.",
     "bump_chain": true,

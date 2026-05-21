@@ -1995,6 +1995,156 @@ class TestPostTransferAttributeUpdate:
         assert "src failed" in (result["error"] or "")
 
 
+class TestPopulateDestDffs:
+    """populate_dest_dffs sets templated DFF values on the destination
+    asset — typically to fill in 'Source Asset Book' / 'Source Asset
+    Number' DFFs so the new asset record points back at where it came
+    from.  Values support ${source_*} / ${target_*} placeholders."""
+
+    def _build_sync(self, fusion, **cfg):
+        bip = _mock_bip()
+        bip.run_report.side_effect = lambda params: (
+            [_bip_row(book="US CORP BOOK", dff_entity="UK Entity")]
+            if params.get("P_BOOK_TYPE_CODE") == "US CORP BOOK"
+            else []
+        )
+        return FusionIUSync(
+            fusion,
+            _resolver(),
+            bip,
+            post_transfer_attribute_update={"enabled": True, **cfg},
+        )
+
+    @staticmethod
+    def _get_asset_info_with_tag(value: str):
+        return TestPostTransferAttributeUpdate._get_asset_info_with_tag(value)
+
+    @staticmethod
+    def _book_transfer_success_response(new_asset_id="555"):
+        return TestPostTransferAttributeUpdate._book_transfer_success_response(
+            new_asset_id=new_asset_id
+        )
+
+    def test_populates_source_book_and_source_number_on_destination(self):
+        """The destination asset's Source Asset Book / Source Asset
+        Number DFFs (tenant-specific P_ATTRIBUTE_* names) get the
+        source asset's book + number."""
+        fusion = _mock_fusion()
+        fusion.process_transaction.side_effect = [
+            self._get_asset_info_with_tag("TAG-100"),
+            self._book_transfer_success_response(new_asset_id="555"),
+            ({}, {"X_RETURN_STATUS": "S"}),
+        ]
+        sync = self._build_sync(
+            fusion,
+            populate_dest_dffs={
+                "P_ATTRIBUTE13": "${source_book_type_code}",
+                "P_ATTRIBUTE14": "${source_asset_number}",
+            },
+        )
+        sync.run_full_sync(books=["US CORP BOOK", "UK CORP BOOK"], dry_run=False)
+
+        _, params = fusion.process_transaction.call_args_list[-1][0]
+        # Source book + asset number from the in-flight transfer.
+        assert params["P_ATTRIBUTE13"] == "US CORP BOOK"
+        assert params["P_ATTRIBUTE14"] == "142847"
+
+    def test_populate_and_clear_can_target_different_params_together(self):
+        """populate_dest_dffs and clear_dest_dffs are independent —
+        populate sets new values, clear blanks the directive DFFs that
+        drove the transfer (Transfer Date / Transfer to Entity /
+        Transfer to Location)."""
+        fusion = _mock_fusion()
+        fusion.process_transaction.side_effect = [
+            self._get_asset_info_with_tag("TAG-100"),
+            self._book_transfer_success_response(new_asset_id="555"),
+            ({}, {"X_RETURN_STATUS": "S"}),
+        ]
+        sync = self._build_sync(
+            fusion,
+            populate_dest_dffs={
+                "P_ATTRIBUTE13": "${source_book_type_code}",
+                "P_ATTRIBUTE14": "${source_asset_number}",
+            },
+            clear_dest_dffs={
+                "P_CAT_ATTRIBUTE5": "",  # Transfer Date
+                "P_CAT_ATTRIBUTE9": "",  # Transfer to Entity
+                "P_CAT_ATTRIBUTE6": "",  # Transfer to Location
+            },
+        )
+        sync.run_full_sync(books=["US CORP BOOK", "UK CORP BOOK"], dry_run=False)
+
+        _, params = fusion.process_transaction.call_args_list[-1][0]
+        assert params["P_ATTRIBUTE13"] == "US CORP BOOK"
+        assert params["P_ATTRIBUTE14"] == "142847"
+        assert params["P_CAT_ATTRIBUTE5"] == ""
+        assert params["P_CAT_ATTRIBUTE9"] == ""
+        assert params["P_CAT_ATTRIBUTE6"] == ""
+
+    def test_clear_wins_when_same_param_in_both_populate_and_clear(self):
+        """If misconfigured to both populate and clear the same param,
+        clear wins — explicit-clear is the safer outcome."""
+        fusion = _mock_fusion()
+        fusion.process_transaction.side_effect = [
+            self._get_asset_info_with_tag("TAG-100"),
+            self._book_transfer_success_response(new_asset_id="555"),
+            ({}, {"X_RETURN_STATUS": "S"}),
+        ]
+        sync = self._build_sync(
+            fusion,
+            populate_dest_dffs={"P_ATTRIBUTE13": "${source_book_type_code}"},
+            clear_dest_dffs={"P_ATTRIBUTE13": ""},
+        )
+        sync.run_full_sync(books=["US CORP BOOK", "UK CORP BOOK"], dry_run=False)
+        _, params = fusion.process_transaction.call_args_list[-1][0]
+        assert params["P_ATTRIBUTE13"] == ""
+
+    def test_unknown_placeholders_left_in_place(self):
+        """Misconfigured ${...} placeholders aren't silently dropped —
+        they appear literally in the POST, so the bad config is
+        visible in --debug dumps."""
+        fusion = _mock_fusion()
+        fusion.process_transaction.side_effect = [
+            self._get_asset_info_with_tag("TAG-100"),
+            self._book_transfer_success_response(new_asset_id="555"),
+            ({}, {"X_RETURN_STATUS": "S"}),
+        ]
+        sync = self._build_sync(
+            fusion,
+            populate_dest_dffs={"P_ATTRIBUTE13": "${not_a_real_key}"},
+        )
+        sync.run_full_sync(books=["US CORP BOOK", "UK CORP BOOK"], dry_run=False)
+        _, params = fusion.process_transaction.call_args_list[-1][0]
+        assert params["P_ATTRIBUTE13"] == "${not_a_real_key}"
+
+    def test_populate_source_dffs_applies_to_source_asset_only(self):
+        """populate_source_dffs lands on the source-side update only
+        (not the destination).  Mirror of populate_dest_dffs."""
+        fusion = _mock_fusion()
+        fusion.process_transaction.side_effect = [
+            self._get_asset_info_with_tag("TAG-100"),
+            self._book_transfer_success_response(new_asset_id="555"),
+            ({}, {"X_RETURN_STATUS": "S"}),  # source
+            ({}, {"X_RETURN_STATUS": "S"}),  # destination
+        ]
+        sync = self._build_sync(
+            fusion,
+            bump_source_too=True,
+            populate_source_dffs={"P_ATTRIBUTE15": "${target_book_type_code}"},
+            populate_dest_dffs={"P_ATTRIBUTE13": "${source_book_type_code}"},
+        )
+        sync.run_full_sync(books=["US CORP BOOK", "UK CORP BOOK"], dry_run=False)
+
+        _, src_params = fusion.process_transaction.call_args_list[-2][0]
+        _, dest_params = fusion.process_transaction.call_args_list[-1][0]
+        # Source got source-DFF, NOT dest-DFF.
+        assert src_params["P_ATTRIBUTE15"] == "UK CORP BOOK"
+        assert "P_ATTRIBUTE13" not in src_params
+        # Destination got dest-DFF, NOT source-DFF.
+        assert dest_params["P_ATTRIBUTE13"] == "US CORP BOOK"
+        assert "P_ATTRIBUTE15" not in dest_params
+
+
 class TestBumpChain:
     """bump_chain=true walks the full lineage chain returned by the
     lineage-lookup BIP report and POSTs the same bumped Tag Number
