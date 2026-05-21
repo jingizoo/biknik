@@ -1013,18 +1013,87 @@ class FusionIUSync:
             resolution,
         )
 
-        params: Dict[str, Any] = {
+        # Read the optional extras: source-side bump + DFFs to clear.
+        bump_source_too = bool(cfg.get("bump_source_too", False))
+        clear_dest_dffs: Dict[str, str] = {
+            str(k): str(v) for k, v in (cfg.get("clear_dest_dffs") or {}).items()
+        }
+        clear_source_dffs: Dict[str, str] = {
+            str(k): str(v) for k, v in (cfg.get("clear_source_dffs") or {}).items()
+        }
+
+        errors: List[str] = []
+
+        # 1. Optional: bump the SOURCE (retired) asset's DFF with the
+        #    same value, so the source-book record reflects which
+        #    transfer cycle retired it.  Also clear any directive DFFs
+        #    that were only meaningful pre-transfer (e.g. the
+        #    legal-entity-to-transfer-to DFF).
+        if bump_source_too:
+            src_params: Dict[str, Any] = {
+                "P_ASSET_ID": source_state.asset_id,
+                "P_BOOK_TYPE_CODE": pending.book_type_code,
+                fusion_param: bumped,
+                rid_param: f"{request_id}_ATTR_BUMP_SRC",
+                trace_param: trace_value,
+            }
+            src_params.update(clear_source_dffs)
+            src_err = self._post_attr_update_call(
+                pending=pending,
+                params=src_params,
+                op_handle=op_handle,
+                side="source",
+                asset_id=source_state.asset_id,
+            )
+            if src_err:
+                errors.append(f"source: {src_err}")
+
+        # 2. Bump the DESTINATION (newly-created) asset's DFF + clear
+        #    any directive DFFs inherited via P_COPY_DFF_FLAG=Y.
+        dest_params: Dict[str, Any] = {
             "P_ASSET_ID": dest_asset_id,
             "P_BOOK_TYPE_CODE": pending.target_book_type_code,
             fusion_param: bumped,
             rid_param: f"{request_id}_ATTR_BUMP",
             trace_param: trace_value,
         }
+        dest_params.update(clear_dest_dffs)
+        dest_err = self._post_attr_update_call(
+            pending=pending,
+            params=dest_params,
+            op_handle=op_handle,
+            side="destination",
+            asset_id=dest_asset_id,
+        )
+        if dest_err:
+            errors.append(f"destination: {dest_err}")
 
+        if errors:
+            return "; ".join(errors)
+        return None
+
+    def _post_attr_update_call(
+        self,
+        *,
+        pending: PendingTransfer,
+        params: Dict[str, Any],
+        op_handle: str,
+        side: str,
+        asset_id: str,
+    ) -> Optional[str]:
+        """POST one updateAssetDescriptiveDetails call.
+
+        ``side`` is "source" or "destination" — used only for log lines.
+        Returns ``None`` on success, an error string on failure.  Never
+        raises — failures are bubbled up as warning strings so the
+        outer transfer status stays TRANSFERRED.
+        """
         log.info(
-            "Post-transfer attr-bump POST asset=%s op=%s params=%s "
-            "(captured in --debug dumps as a NNNN-POST-%s.json file)",
+            "Post-transfer attr-bump POST asset=%s side=%s asset_id=%s op=%s "
+            "params=%s (captured in --debug dumps as a NNNN-POST-%s.json file)",
             pending.asset_number,
+            side,
+            asset_id,
             op_handle,
             {k: v for k, v in params.items() if k != "P_TRX_ATTRIBUTE1"},
             op_handle,
@@ -1034,8 +1103,9 @@ class FusionIUSync:
             _raw, pl = self._client.process_transaction(op_handle, params)
         except FusionApiError as e:
             log.warning(
-                "Post-transfer attr-bump CALL FAILED asset=%s: %s",
+                "Post-transfer attr-bump CALL FAILED asset=%s side=%s: %s",
                 pending.asset_number,
+                side,
                 e,
             )
             return f"updateAssetDescriptiveDetails call failed: {e}"
@@ -1044,18 +1114,19 @@ class FusionIUSync:
         if status_code != "S":
             msg = str(pl.get("X_MSG_DATA") or pl.get("X_RETURN_MESSAGE") or "").strip()
             log.warning(
-                "Post-transfer attr-bump RETURN=%s asset=%s msg=%s",
+                "Post-transfer attr-bump RETURN=%s asset=%s side=%s msg=%s",
                 status_code,
                 pending.asset_number,
+                side,
                 msg,
             )
             return f"updateAssetDescriptiveDetails X_RETURN_STATUS={status_code}: {msg}"
 
         log.info(
-            "Post-transfer attr-bump SUCCESS asset=%s %s='%s'",
+            "Post-transfer attr-bump SUCCESS asset=%s side=%s asset_id=%s",
             pending.asset_number,
-            fusion_param,
-            bumped,
+            side,
+            asset_id,
         )
         return None
 

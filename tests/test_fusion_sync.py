@@ -1761,6 +1761,75 @@ class TestPostTransferAttributeUpdate:
         assert "post-transfer attribute update warning" in (result["error"] or "")
         assert "permission denied" in (result["error"] or "")
 
+    def test_bump_source_too_posts_both_sides(self):
+        """bump_source_too=true posts updateAssetDescriptiveDetails twice:
+        once against the source (retired) asset and once against the
+        destination — both with the same bumped value."""
+        fusion = _mock_fusion()
+        fusion.process_transaction.side_effect = [
+            self._get_asset_info_with_attr10("ASSET-100"),  # discovery
+            self._book_transfer_success_response(new_asset_id="555"),  # bookTransfer
+            ({}, {"X_RETURN_STATUS": "S"}),  # source-side update
+            ({}, {"X_RETURN_STATUS": "S"}),  # destination-side update
+        ]
+        sync = self._build_sync(fusion, enabled=True, bump_source_too=True)
+        summary = sync.run_full_sync(books=["US CORP BOOK", "UK CORP BOOK"], dry_run=False)
+
+        assert summary["results"][0]["status"] == "TRANSFERRED"
+        assert summary["results"][0]["error"] is None
+        # 4 calls total: discovery + bookTransfer + 2 updates
+        assert fusion.process_transaction.call_count == 4
+
+        # Source update — asset_id=100 (the discovery state)
+        src_op, src_params = fusion.process_transaction.call_args_list[-2][0]
+        assert src_op == "updateAssetDescriptiveDetails"
+        assert src_params["P_ASSET_ID"] == "100"
+        assert src_params["P_ATTRIBUTE10"] == "ASSET-100_1"
+
+        # Destination update — asset_id=555 (from bookTransfer response)
+        dest_op, dest_params = fusion.process_transaction.call_args_list[-1][0]
+        assert dest_op == "updateAssetDescriptiveDetails"
+        assert dest_params["P_ASSET_ID"] == "555"
+        assert dest_params["P_ATTRIBUTE10"] == "ASSET-100_1"
+
+    def test_clear_dest_dffs_includes_clear_params(self):
+        """clear_dest_dffs adds extra param entries to the destination
+        update — typically to blank out the legal-entity directive DFF
+        inherited via P_COPY_DFF_FLAG=Y."""
+        fusion = _mock_fusion()
+        fusion.process_transaction.side_effect = [
+            self._get_asset_info_with_attr10("ASSET-100"),
+            self._book_transfer_success_response(new_asset_id="555"),
+            ({}, {"X_RETURN_STATUS": "S"}),
+        ]
+        sync = self._build_sync(
+            fusion,
+            enabled=True,
+            clear_dest_dffs={"P_CAT_ATTRIBUTE9": ""},
+        )
+        sync.run_full_sync(books=["US CORP BOOK", "UK CORP BOOK"], dry_run=False)
+        _, dest_params = fusion.process_transaction.call_args_list[-1][0]
+        # Bumped tag + clear directive
+        assert dest_params["P_ATTRIBUTE10"] == "ASSET-100_1"
+        assert dest_params["P_CAT_ATTRIBUTE9"] == ""
+
+    def test_source_update_failure_kept_as_warning_alongside_dest_success(self):
+        """If source update fails but dest succeeds, both outcomes are
+        reported in the warning, transfer stays TRANSFERRED."""
+        fusion = _mock_fusion()
+        fusion.process_transaction.side_effect = [
+            self._get_asset_info_with_attr10("ASSET-100"),
+            self._book_transfer_success_response(new_asset_id="555"),
+            ({}, {"X_RETURN_STATUS": "E", "X_MSG_DATA": "src failed"}),
+            ({}, {"X_RETURN_STATUS": "S"}),
+        ]
+        sync = self._build_sync(fusion, enabled=True, bump_source_too=True)
+        summary = sync.run_full_sync(books=["US CORP BOOK", "UK CORP BOOK"], dry_run=False)
+        result = summary["results"][0]
+        assert result["status"] == "TRANSFERRED"
+        assert "source:" in (result["error"] or "")
+        assert "src failed" in (result["error"] or "")
+
 
 class TestTargetSegmentResolution:
     """BIP report supplies TARGET_SEG* columns; pipeline looks them up

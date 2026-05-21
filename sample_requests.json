@@ -104,6 +104,17 @@
     "_skip_when_source_empty_note": "When the source asset's source_field is empty / null, skip the bump entirely instead of sending '_1'.  Default true.  Set false only if you genuinely want '_1' as the seed value on assets that arrived with no tag.",
     "skip_when_source_empty": true,
 
+    "_bump_source_too_note": "When true, ALSO POST updateAssetDescriptiveDetails against the SOURCE (retired) asset with the same bumped value, so the source-book record carries the same _N suffix as the destination.  Both sides end up with the same DFF value, signalling 'this is the Nth transfer of this asset'.  Default false (destination only).",
+    "bump_source_too": true,
+
+    "_clear_dest_dffs_note": "Extra params to POST on the DESTINATION update.  Use empty-string values to CLEAR directive DFFs that were only meaningful pre-transfer (e.g. the legal-entity-to-transfer-to DFF inherited via P_COPY_DFF_FLAG=Y).  Otherwise the new asset looks like it has another transfer queued to itself.",
+    "clear_dest_dffs": {
+      "P_CAT_ATTRIBUTE9": ""
+    },
+
+    "_clear_source_dffs_note": "Symmetric to clear_dest_dffs but for the source asset (rare — most directive DFFs only matter on the destination side).",
+    "clear_source_dffs": {},
+
     "_dest_lookup_bip_note": "Recommended: a small custom BIP report that joins source asset_id + target book and returns the freshly-created destination asset.  Canonical SQL is in sql/get_transferred_asset.sql (uses FA_BOOK_TRANSFER_DISTS — the source-to-destination mapping table for cross-book transfers, NOT FA_ASSET_HISTORY).  Column names below must match the report's G_1 XML element names (BIP uppercases SELECT aliases by default, so the report ships NEW_ASSET_ID and NEW_ASSET_NUMBER).  Placeholders ${source_asset_id}, ${source_asset_number}, ${source_book_type_code}, ${target_book_type_code}, ${transfer_to_entity} are interpolated at call time.  When this block is omitted the pipeline falls back to reading X_NEW_ASSET_ID from the bookTransfer response.",
     "dest_lookup_bip": {
       "report_path": "/Custom/FinancialsReports/Get_Transferred_Asset.xdo",
