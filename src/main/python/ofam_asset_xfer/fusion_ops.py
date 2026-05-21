@@ -17,6 +17,47 @@ log = logging.getLogger(__name__)
 _UNDERSCORE_SUFFIX_RE = re.compile(r"_(\d+)$")
 
 
+def strip_underscore_suffix(value: Optional[str]) -> str:
+    """Return ``value`` with any trailing ``_N`` suffix removed.
+
+    Examples::
+
+        strip_underscore_suffix("ASSET-100")    == "ASSET-100"
+        strip_underscore_suffix("ASSET-100_1")  == "ASSET-100"
+        strip_underscore_suffix("ASSET-100_99") == "ASSET-100"
+        strip_underscore_suffix("")             == ""
+        strip_underscore_suffix(None)           == ""
+
+    Used to derive the canonical ("original") tag from a source asset
+    that may already carry an underscore suffix from a prior transfer.
+    The destination of a cross-book transfer is set to this stripped
+    value so the active record always holds the clean canonical tag.
+    """
+    s = (value or "").strip()
+    m = _UNDERSCORE_SUFFIX_RE.search(s)
+    if m:
+        return s[: m.start()]
+    return s
+
+
+def apply_underscore_suffix(value: Optional[str], n: int) -> str:
+    """Return ``<stripped value>_<n>`` — re-apply a specific suffix.
+
+    Examples::
+
+        apply_underscore_suffix("TAG", 1)    == "TAG_1"
+        apply_underscore_suffix("TAG_2", 5)  == "TAG_5"   (any existing _N is replaced)
+        apply_underscore_suffix(None, 3)     == "_3"
+
+    Used to assign a deterministic suffix to the retired source asset
+    based on its position in the lineage chain (1 = first transfer,
+    2 = second, ...).  The retired source gets the suffix so the new
+    active destination can hold the clean canonical tag.
+    """
+    base = strip_underscore_suffix(value)
+    return f"{base}_{n}"
+
+
 def bump_underscore_suffix(value: Optional[str]) -> str:
     """Return ``value`` with its ``_N`` suffix bumped by one.
 
@@ -28,9 +69,12 @@ def bump_underscore_suffix(value: Optional[str]) -> str:
         bump_underscore_suffix("")            == "_1"
         bump_underscore_suffix(None)          == "_1"
 
-    Used to differentiate the destination asset's canonical Tag Number
-    (and any mirrored tag DFFs) from the source's so cross-book
-    transfers don't collide on Oracle FA's tag uniqueness check.
+    Fallback used when the lineage chain (which gives the canonical
+    suffix number based on chain position) is unavailable — bumps the
+    existing _N by 1, or appends _1 to a clean tag.  Less accurate
+    than ``apply_underscore_suffix`` with a chain-order number because
+    it can't detect the case where a previous transfer left the tag
+    clean (e.g. when the asset was just promoted to active).
     """
     s = (value or "").strip()
     m = _UNDERSCORE_SUFFIX_RE.search(s)
@@ -83,7 +127,9 @@ class AssetState:
     cost: Optional[str] = None
     description: Optional[str] = None
     tag_number: Optional[str] = None
-    attribute10: Optional[str] = None  # back-compat shortcut; same as attributes["attribute10"]
+    attribute10: Optional[str] = (
+        None  # back-compat shortcut; same as attributes["attribute10"]
+    )
 
     # Generic descriptive-flexfield bucket: every X_ATTRIBUTE* on the
     # getAssetInformation response is captured here so post-transfer
@@ -99,7 +145,9 @@ class AssetState:
         # Required identity
         asset_id = str(pl.get("X_ASSET_ID") or "").strip()
         asset_number = str(pl.get("X_ASSET_NUMBER") or "").strip()
-        book_type_code = str(pl.get("X_BOOK_TYPE_CODE") or pl.get("P_BOOK_TYPE_CODE") or "").strip()
+        book_type_code = str(
+            pl.get("X_BOOK_TYPE_CODE") or pl.get("P_BOOK_TYPE_CODE") or ""
+        ).strip()
         missing = []
         if not asset_id:
             missing.append("X_ASSET_ID")
@@ -156,7 +204,10 @@ class AssetState:
             upper_k = k.upper()
             if not upper_k.startswith("X_"):
                 continue
-            if not (upper_k.startswith("X_ATTRIBUTE") or upper_k.startswith("X_CAT_ATTRIBUTE")):
+            if not (
+                upper_k.startswith("X_ATTRIBUTE")
+                or upper_k.startswith("X_CAT_ATTRIBUTE")
+            ):
                 continue
             value = str(v or "").strip()
             if not value:
@@ -173,7 +224,8 @@ class AssetState:
             expense_ccids=expense,
             location_ccids=location,
             category_id=str(pl.get("X_CATEGORY_ID") or "").strip() or None,
-            date_placed_in_service=str(pl.get("X_DATE_PLACED_IN_SERVICE") or "").strip() or None,
+            date_placed_in_service=str(pl.get("X_DATE_PLACED_IN_SERVICE") or "").strip()
+            or None,
             cost=str(pl.get("X_COST") or "").strip() or None,
             description=str(pl.get("X_DESCRIPTION") or "").strip() or None,
             tag_number=str(pl.get("X_TAG_NUMBER") or "").strip() or None,
@@ -493,7 +545,9 @@ def build_book_transfer_params(
         "P_BOOK_TRANSFER_TYPE_CODE": book_transfer_type_code,
         "P_COST_BASIS_CODE": cost_basis_code,
         "P_RETIREMENT_TYPE_CODE": retirement_type_code or None,
-        "P_USE_DEST_CAT_DEPRN_RULES_FLAG": overrides.get("use_dest_cat_deprn_rules_flag", "Y"),
+        "P_USE_DEST_CAT_DEPRN_RULES_FLAG": overrides.get(
+            "use_dest_cat_deprn_rules_flag", "Y"
+        ),
         "P_USE_XFR_DATE_AS_DPIS_FLAG": overrides.get("use_xfr_date_as_dpis_flag", "N"),
         "P_COPY_DFF_FLAG": overrides.get("copy_dff_flag", "Y"),
         "P_COPY_ASSET_KEY_FLAG": overrides.get("copy_asset_key_flag", "Y"),
@@ -574,7 +628,9 @@ def build_add_asset_params(
         "P_DISTRIBUTION_ID_TBL": dist_ids,
         "P_UNITS_ASSIGNED_TBL": units,
         "P_TRANSACTION_UNITS_TBL": txn_units,
-        "P_ASSIGNED_TO_TBL": _assigned_to_param(list(dest_assigned) if dest_assigned else [""] * n),
+        "P_ASSIGNED_TO_TBL": _assigned_to_param(
+            list(dest_assigned) if dest_assigned else [""] * n
+        ),
         "P_EXPENSE_CCID_TBL": dest_expense,
         "P_LOCATION_CCID_TBL": dest_location,
         "P_TRX_ATTRIBUTE1": request_id,

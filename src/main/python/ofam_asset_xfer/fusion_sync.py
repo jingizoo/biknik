@@ -35,10 +35,12 @@ from .entity_resolver import EntityBookResolver
 from .exceptions import FusionApiError, ValidationError
 from .fusion_ops import (
     AssetState,
+    apply_underscore_suffix,
     build_book_transfer_params,
     build_same_book_transfer_params,
     bump_underscore_suffix,
     get_asset_information,
+    strip_underscore_suffix,
 )
 from .oracle_client import OracleErpIntegrationsClient
 
@@ -915,20 +917,36 @@ class FusionIUSync:
         attached to the transfer result as a warning — the asset *was*
         transferred, only the tag bump failed.
 
-        **Why this exists.**  Oracle FA's bookTransfer creates a fresh
-        destination asset but does *not* carry over the canonical
-        ``TAG_NUMBER`` (the UI "Tag Number" column header that has FA's
-        uniqueness behaviour and drives the standard FA asset reports).
-        Without a follow-up update the destination ends up with a blank
-        Tag Number — losing the audit trail tenants rely on.  Defaults
-        here therefore target the canonical header tag
-        (``source_field="tag_number"`` + ``fusion_parameter="P_TAG_NUMBER"``)
-        and increment its underscore suffix (``TAG`` → ``TAG_1`` → ``TAG_2``)
-        so re-transfers don't collide with the source's still-on-file value.
+        **Bump direction.**  Oracle FA enforces tag uniqueness across
+        active assets.  After a cross-book transfer, both the retired
+        source and the newly-created destination would otherwise carry
+        the same canonical tag — a collision.  We resolve it by
+        suffixing the **retired source** with ``_<N>`` (where N is its
+        position in the lineage chain) and giving the **destination**
+        the clean canonical tag.
+
+        Per the expected-behaviour contract::
+
+            Transfer 1:  A (retired) -> A_1   ;  B (new active) -> A
+            Transfer 2:  B (retired) -> A_2   ;  C (new active) -> A
+            Transfer 3:  C (retired) -> A_3   ;  D (new active) -> A
+
+        Each transfer issues exactly two ``updateAssetDescriptiveDetails``
+        calls — one against the retired source and one against the new
+        destination.  Earlier retired ancestors (A, B in transfer 3
+        above) are NOT touched; they already carry their own historical
+        suffix from when they were the source of an earlier transfer.
+
+        The suffix number ``N`` comes from the source's ``chain_order``
+        in the lineage BIP report.  When the chain BIP is unavailable
+        the code falls back to ``bump_underscore_suffix(source_tag)`` —
+        less accurate, but adequate for first-time transfers.
 
         Tenants that *also* maintain a CMDB tag identifier in a DFF
         (e.g. ``X_CAT_ATTRIBUTE7`` at Citadel) can mirror the same
-        bumped value into that DFF via ``also_bump_params``.
+        per-side values into that DFF via ``also_bump_params`` (the
+        source-side update gets the suffixed value, the destination-side
+        update gets the clean value).
 
         Destination resolution order (most reliable → fallback):
           1. ``dest_lookup_bip`` — a tenant-owned BI Publisher report
@@ -1022,22 +1040,17 @@ class FusionIUSync:
                 "Post-transfer attr-bump SKIPPED asset=%s: source %s is empty "
                 "(available DFFs on source: %s).  Set "
                 "post_transfer_attribute_update.skip_when_source_empty=false "
-                "to force the call anyway (will send '_1').",
+                "to force the call anyway.",
                 pending.asset_number,
                 source_field,
                 sorted((source_state.attributes or {}).keys()) or "(none)",
             )
             return None
 
-        bumped = bump_underscore_suffix(current_value)
-        log.info(
-            "Post-transfer attr-bump VALUE asset=%s %s: '%s' -> '%s'",
-            pending.asset_number,
-            source_field,
-            current_value,
-            bumped,
-        )
-
+        # Resolve destination + lineage chain via the BIP report.  The
+        # chain (when present) gives us each link's chain_order so we
+        # can assign deterministic suffixes by position rather than
+        # naive string-bumping.
         dest_asset_id, dest_asset_number, resolution, chain = (
             self._resolve_destination_asset(
                 book_transfer_response=book_transfer_response,
@@ -1076,27 +1089,67 @@ class FusionIUSync:
             resolution,
         )
 
-        # Read the optional extras: source-side bump + DFFs to clear +
-        # secondary fields to mirror the bumped value into + chain-wide
-        # bump flag.
-        bump_source_too = bool(cfg.get("bump_source_too", False))
-        bump_chain = bool(cfg.get("bump_chain", False))
-        max_chain_length = int(cfg.get("max_chain_length", 20))
+        # ---- Read config knobs ----
         clear_dest_dffs: Dict[str, str] = {
             str(k): str(v) for k, v in (cfg.get("clear_dest_dffs") or {}).items()
         }
         clear_source_dffs: Dict[str, str] = {
             str(k): str(v) for k, v in (cfg.get("clear_source_dffs") or {}).items()
         }
+        # ``also_bump_params`` are secondary fusion parameters that
+        # receive the *same* tag value as the primary (P_TAG_NUMBER).
+        # Typical use: mirror into the CMDB tag DFF ("P_CAT_ATTRIBUTE7")
+        # so the asset header and CMDB record stay in lockstep.
+        also_bump_params: List[str] = [
+            str(p) for p in (cfg.get("also_bump_params") or []) if str(p).strip()
+        ]
+        # ---- Compute the canonical original tag + per-side values ----
+        #
+        # Contract (per agreed expected-behaviour table):
+        #
+        #   Transfer N: source asset gets <original>_<chain_order>;
+        #               destination asset gets <original> (clean).
+        #
+        # The retired source vacates the canonical tag (FA tag-uniqueness)
+        # so the new active destination can hold it unsuffixed.  Each
+        # retired ancestor keeps its own historical suffix from when it
+        # was the source of an earlier transfer; we don't touch them.
+        original_tag = strip_underscore_suffix(current_value)
+
+        # Find the source link in the chain to read its chain_order.
+        # When chain BIP is unavailable, fall back to bumping the
+        # source's existing suffix by 1 (less accurate — can't detect
+        # a "clean tag after previous transfer" case).
+        source_chain_order: Optional[int] = None
+        for link in chain:
+            if str(link.asset_id) == str(source_state.asset_id):
+                source_chain_order = link.chain_order
+                break
+
+        if source_chain_order is not None:
+            source_new_tag = apply_underscore_suffix(original_tag, source_chain_order)
+            suffix_resolution = f"chain_order={source_chain_order}"
+        else:
+            source_new_tag = bump_underscore_suffix(current_value)
+            suffix_resolution = "string-bumped (chain unavailable)"
+
+        destination_new_tag = original_tag
+
+        log.info(
+            "Post-transfer attr-bump VALUES asset=%s original='%s' "
+            "source_new='%s' dest_new='%s' (%s)",
+            pending.asset_number,
+            original_tag,
+            source_new_tag,
+            destination_new_tag,
+            suffix_resolution,
+        )
+
         # ``populate_dest_dffs`` / ``populate_source_dffs`` are dicts of
-        # additional DFF params to set on the update calls.  Values
-        # support ``${...}`` templating from the same substitution set
-        # used by ``dest_lookup_bip.params`` — most useful to set
-        # "Source Asset Book" / "Source Asset Number" DFFs on the
-        # destination so the new asset record points back at where it
-        # came from.  Keys in the dest dict only fire on the destination
-        # link; keys in the source dict fire on every non-destination
-        # link (and on the source asset in non-chain mode).
+        # extra DFF params to set on the update calls.  Values support
+        # ``${...}`` templating — typically used to fill "Source Asset
+        # Book" / "Source Asset Number" DFFs on the destination so the
+        # new asset record points back at where it came from.
         substitutions: Dict[str, str] = {
             "source_asset_id": source_state.asset_id or "",
             "source_asset_number": source_state.asset_number or "",
@@ -1106,8 +1159,9 @@ class FusionIUSync:
             "target_asset_number": str(dest_asset_number or "") or "",
             "transfer_to_entity": pending.transfer_to_entity or "",
             "transfer_date": pending.transfer_date or "",
-            "bumped_value": bumped,
-            "tag_value": current_value or "",
+            "original_tag": original_tag,
+            "source_new_tag": source_new_tag,
+            "destination_new_tag": destination_new_tag,
         }
         populate_dest_dffs: Dict[str, str] = {
             str(k): _interpolate(str(v), substitutions)
@@ -1117,112 +1171,62 @@ class FusionIUSync:
             str(k): _interpolate(str(v), substitutions)
             for k, v in (cfg.get("populate_source_dffs") or {}).items()
         }
-        # Secondary fusion parameters that receive the *same* bumped
-        # value.  Typical use: primary updates P_TAG_NUMBER (canonical
-        # FA header tag), also_bump_params=["P_CAT_ATTRIBUTE7"] mirrors
-        # the value into the CMDB tag DFF so both stay in lockstep.
-        also_bump_params: List[str] = [
-            str(p) for p in (cfg.get("also_bump_params") or []) if str(p).strip()
-        ]
-        also_bump_dict: Dict[str, str] = {p: bumped for p in also_bump_params}
 
-        # Build the list of (asset_id, book_type_code, side, clears,
-        # label) tuples describing every asset we'll POST against.
-        # Three strategies:
-        #   * bump_chain=true and chain non-empty -> walk the chain,
-        #     marking the resolved destination separately so it picks
-        #     up clear_dest_dffs (everything else gets clear_source_dffs).
-        #   * bump_source_too=true (legacy two-asset behaviour) ->
-        #     source + destination.
-        #   * neither -> destination only.
-        update_targets: List[Dict[str, Any]] = []
-
-        if bump_chain and chain:
-            limited_chain = chain[:max_chain_length]
-            if len(chain) > max_chain_length:
-                log.warning(
-                    "Post-transfer attr-bump CHAIN TRUNCATED asset=%s "
-                    "len=%d max_chain_length=%d (set higher to bump all)",
-                    pending.asset_number,
-                    len(chain),
-                    max_chain_length,
-                )
-            for link in limited_chain:
-                is_dest = str(link.asset_id) == str(dest_asset_id)
-                # Each link may live in a different book; updateAsset
-                # Descriptive Details binds P_BOOK_TYPE_CODE per call.
-                # Fall back to the in-flight transfer's books when the
-                # report didn't supply a book per row.
-                book = link.book_type_code or (
-                    pending.target_book_type_code if is_dest else pending.book_type_code
-                )
-                update_targets.append(
-                    {
-                        "asset_id": link.asset_id,
-                        "book_type_code": book,
-                        "side": "destination" if is_dest else "chain",
-                        "clears": clear_dest_dffs if is_dest else clear_source_dffs,
-                        "populates": (
-                            populate_dest_dffs if is_dest else populate_source_dffs
-                        ),
-                        "label": (
-                            "destination" if is_dest else f"chain[{link.chain_order}]"
-                        ),
-                    }
-                )
-        else:
-            if bump_chain and not chain:
-                log.warning(
-                    "Post-transfer attr-bump bump_chain=true but lineage "
-                    "BIP returned no chain for asset=%s — falling back to "
-                    "source+destination bump (dest_lookup_bip configured?)",
-                    pending.asset_number,
-                )
-            if bump_source_too or (bump_chain and not chain):
-                update_targets.append(
-                    {
-                        "asset_id": source_state.asset_id,
-                        "book_type_code": pending.book_type_code,
-                        "side": "source",
-                        "clears": clear_source_dffs,
-                        "populates": populate_source_dffs,
-                        "label": "source",
-                    }
-                )
-            update_targets.append(
-                {
-                    "asset_id": dest_asset_id,
-                    "book_type_code": pending.target_book_type_code,
-                    "side": "destination",
-                    "clears": clear_dest_dffs,
-                    "populates": populate_dest_dffs,
-                    "label": "destination",
-                }
-            )
-
+        # ---- Build the two POSTs: source (suffixed) + destination (clean) ----
+        #
+        # Retired ancestors in the chain are NOT touched.  They already
+        # carry their own historical suffixes from when they were the
+        # source of an earlier transfer; rewriting them would lose audit
+        # state and risks creating new uniqueness collisions.
         errors: List[str] = []
-        for target in update_targets:
-            params: Dict[str, Any] = {
-                "P_ASSET_ID": target["asset_id"],
-                "P_BOOK_TYPE_CODE": target["book_type_code"],
-                fusion_param: bumped,
-                rid_param: f"{request_id}_ATTR_BUMP_{target['label']}",
-                trace_param: trace_value,
-            }
-            params.update(also_bump_dict)
-            # Populate-then-clear ordering matters: if the same param
-            # appears in both, clear wins (you asked for it to be empty).
-            params.update(target["populates"])
-            params.update(target["clears"])
-            err = self._post_attr_update_call(
-                pending=pending,
-                params=params,
-                op_handle=op_handle,
-                side=target["side"],
-                asset_id=target["asset_id"],
-            )
-            if err:
-                errors.append(f"{target['label']}: {err}")
+
+        # Source POST — retired asset gets the suffix so the destination
+        # can hold the clean canonical tag.
+        source_params: Dict[str, Any] = {
+            "P_ASSET_ID": source_state.asset_id,
+            "P_BOOK_TYPE_CODE": pending.book_type_code,
+            fusion_param: source_new_tag,
+            rid_param: f"{request_id}_ATTR_BUMP_SRC",
+            trace_param: trace_value,
+        }
+        for p in also_bump_params:
+            source_params[p] = source_new_tag
+        source_params.update(populate_source_dffs)
+        source_params.update(clear_source_dffs)
+        src_err = self._post_attr_update_call(
+            pending=pending,
+            params=source_params,
+            op_handle=op_handle,
+            side="source",
+            asset_id=source_state.asset_id,
+        )
+        if src_err:
+            errors.append(f"source: {src_err}")
+
+        # Destination POST — new asset gets the clean canonical tag +
+        # populated source-info DFFs + cleared directive DFFs.
+        dest_params: Dict[str, Any] = {
+            "P_ASSET_ID": dest_asset_id,
+            "P_BOOK_TYPE_CODE": pending.target_book_type_code,
+            fusion_param: destination_new_tag,
+            rid_param: f"{request_id}_ATTR_BUMP_DST",
+            trace_param: trace_value,
+        }
+        for p in also_bump_params:
+            dest_params[p] = destination_new_tag
+        # Populate-then-clear ordering: if a misconfig lists the same
+        # param in both blocks, clear wins (safer outcome).
+        dest_params.update(populate_dest_dffs)
+        dest_params.update(clear_dest_dffs)
+        dest_err = self._post_attr_update_call(
+            pending=pending,
+            params=dest_params,
+            op_handle=op_handle,
+            side="destination",
+            asset_id=dest_asset_id,
+        )
+        if dest_err:
+            errors.append(f"destination: {dest_err}")
 
         if errors:
             return "; ".join(errors)
