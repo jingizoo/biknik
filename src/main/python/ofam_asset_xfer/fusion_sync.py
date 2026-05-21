@@ -245,6 +245,24 @@ class TransferResult:
     fusion_response: Optional[Dict[str, Any]] = None
 
 
+@dataclass(frozen=True)
+class ChainLink:
+    """One asset_id in a transferred asset's lineage chain.
+
+    Populated from the lineage-lookup BIP report (FA_BOOK_TRANSFER_DISTS
+    recursive walk).  Used both for resolving the just-created
+    destination asset and — when ``bump_chain`` is enabled — for
+    iterating the post-transfer Tag Number bump across every link in
+    the chain so historical retired records stay in lockstep.
+    """
+
+    asset_id: str
+    asset_number: Optional[str]
+    book_type_code: Optional[str]
+    chain_order: int  # 1 = earliest by creation_date, N = latest
+    is_destination: bool  # True for the asset just created by this transfer
+
+
 # ---------------------------------------------------------------------------
 # FusionIUSync — core engine
 # ---------------------------------------------------------------------------
@@ -1020,14 +1038,16 @@ class FusionIUSync:
             bumped,
         )
 
-        dest_asset_id, dest_asset_number, resolution = self._resolve_destination_asset(
-            book_transfer_response=book_transfer_response,
-            pending=pending,
-            source_state=source_state,
-            dest_id_fields=dest_id_fields,
-            dest_num_fields=dest_num_fields,
-            allow_same_asset_number_fallback=allow_fallback,
-            dest_lookup_bip=cfg.get("dest_lookup_bip") or {},
+        dest_asset_id, dest_asset_number, resolution, chain = (
+            self._resolve_destination_asset(
+                book_transfer_response=book_transfer_response,
+                pending=pending,
+                source_state=source_state,
+                dest_id_fields=dest_id_fields,
+                dest_num_fields=dest_num_fields,
+                allow_same_asset_number_fallback=allow_fallback,
+                dest_lookup_bip=cfg.get("dest_lookup_bip") or {},
+            )
         )
         if not dest_asset_id:
             log.warning(
@@ -1057,8 +1077,11 @@ class FusionIUSync:
         )
 
         # Read the optional extras: source-side bump + DFFs to clear +
-        # secondary fields to mirror the bumped value into.
+        # secondary fields to mirror the bumped value into + chain-wide
+        # bump flag.
         bump_source_too = bool(cfg.get("bump_source_too", False))
+        bump_chain = bool(cfg.get("bump_chain", False))
+        max_chain_length = int(cfg.get("max_chain_length", 20))
         clear_dest_dffs: Dict[str, str] = {
             str(k): str(v) for k, v in (cfg.get("clear_dest_dffs") or {}).items()
         }
@@ -1074,54 +1097,95 @@ class FusionIUSync:
         ]
         also_bump_dict: Dict[str, str] = {p: bumped for p in also_bump_params}
 
-        errors: List[str] = []
+        # Build the list of (asset_id, book_type_code, side, clears,
+        # label) tuples describing every asset we'll POST against.
+        # Three strategies:
+        #   * bump_chain=true and chain non-empty -> walk the chain,
+        #     marking the resolved destination separately so it picks
+        #     up clear_dest_dffs (everything else gets clear_source_dffs).
+        #   * bump_source_too=true (legacy two-asset behaviour) ->
+        #     source + destination.
+        #   * neither -> destination only.
+        update_targets: List[Dict[str, Any]] = []
 
-        # 1. Optional: bump the SOURCE (retired) asset's tag with the
-        #    same value, so the source-book record reflects which
-        #    transfer cycle retired it.  Also clear any directive DFFs
-        #    that were only meaningful pre-transfer (e.g. the
-        #    legal-entity-to-transfer-to DFF).
-        if bump_source_too:
-            src_params: Dict[str, Any] = {
-                "P_ASSET_ID": source_state.asset_id,
-                "P_BOOK_TYPE_CODE": pending.book_type_code,
+        if bump_chain and chain:
+            limited_chain = chain[:max_chain_length]
+            if len(chain) > max_chain_length:
+                log.warning(
+                    "Post-transfer attr-bump CHAIN TRUNCATED asset=%s "
+                    "len=%d max_chain_length=%d (set higher to bump all)",
+                    pending.asset_number,
+                    len(chain),
+                    max_chain_length,
+                )
+            for link in limited_chain:
+                is_dest = str(link.asset_id) == str(dest_asset_id)
+                # Each link may live in a different book; updateAsset
+                # Descriptive Details binds P_BOOK_TYPE_CODE per call.
+                # Fall back to the in-flight transfer's books when the
+                # report didn't supply a book per row.
+                book = link.book_type_code or (
+                    pending.target_book_type_code if is_dest else pending.book_type_code
+                )
+                update_targets.append(
+                    {
+                        "asset_id": link.asset_id,
+                        "book_type_code": book,
+                        "side": "destination" if is_dest else "chain",
+                        "clears": clear_dest_dffs if is_dest else clear_source_dffs,
+                        "label": (
+                            "destination" if is_dest else f"chain[{link.chain_order}]"
+                        ),
+                    }
+                )
+        else:
+            if bump_chain and not chain:
+                log.warning(
+                    "Post-transfer attr-bump bump_chain=true but lineage "
+                    "BIP returned no chain for asset=%s — falling back to "
+                    "source+destination bump (dest_lookup_bip configured?)",
+                    pending.asset_number,
+                )
+            if bump_source_too or (bump_chain and not chain):
+                update_targets.append(
+                    {
+                        "asset_id": source_state.asset_id,
+                        "book_type_code": pending.book_type_code,
+                        "side": "source",
+                        "clears": clear_source_dffs,
+                        "label": "source",
+                    }
+                )
+            update_targets.append(
+                {
+                    "asset_id": dest_asset_id,
+                    "book_type_code": pending.target_book_type_code,
+                    "side": "destination",
+                    "clears": clear_dest_dffs,
+                    "label": "destination",
+                }
+            )
+
+        errors: List[str] = []
+        for target in update_targets:
+            params: Dict[str, Any] = {
+                "P_ASSET_ID": target["asset_id"],
+                "P_BOOK_TYPE_CODE": target["book_type_code"],
                 fusion_param: bumped,
-                rid_param: f"{request_id}_ATTR_BUMP_SRC",
+                rid_param: f"{request_id}_ATTR_BUMP_{target['label']}",
                 trace_param: trace_value,
             }
-            src_params.update(also_bump_dict)
-            src_params.update(clear_source_dffs)
-            src_err = self._post_attr_update_call(
+            params.update(also_bump_dict)
+            params.update(target["clears"])
+            err = self._post_attr_update_call(
                 pending=pending,
-                params=src_params,
+                params=params,
                 op_handle=op_handle,
-                side="source",
-                asset_id=source_state.asset_id,
+                side=target["side"],
+                asset_id=target["asset_id"],
             )
-            if src_err:
-                errors.append(f"source: {src_err}")
-
-        # 2. Bump the DESTINATION (newly-created) asset's tag + mirror
-        #    into any secondary DFFs + clear directive DFFs inherited
-        #    via P_COPY_DFF_FLAG=Y.
-        dest_params: Dict[str, Any] = {
-            "P_ASSET_ID": dest_asset_id,
-            "P_BOOK_TYPE_CODE": pending.target_book_type_code,
-            fusion_param: bumped,
-            rid_param: f"{request_id}_ATTR_BUMP",
-            trace_param: trace_value,
-        }
-        dest_params.update(also_bump_dict)
-        dest_params.update(clear_dest_dffs)
-        dest_err = self._post_attr_update_call(
-            pending=pending,
-            params=dest_params,
-            op_handle=op_handle,
-            side="destination",
-            asset_id=dest_asset_id,
-        )
-        if dest_err:
-            errors.append(f"destination: {dest_err}")
+            if err:
+                errors.append(f"{target['label']}: {err}")
 
         if errors:
             return "; ".join(errors)
@@ -1195,15 +1259,20 @@ class FusionIUSync:
         dest_num_fields: Tuple[str, ...],
         allow_same_asset_number_fallback: bool,
         dest_lookup_bip: Dict[str, Any],
-    ) -> Tuple[Optional[str], Optional[str], str]:
-        """Return (asset_id, asset_number, resolution_label).
+    ) -> Tuple[Optional[str], Optional[str], str, List[ChainLink]]:
+        """Return (asset_id, asset_number, resolution_label, chain).
+
+        ``chain`` is the full lineage chain returned by the BIP report
+        (empty list when BIP isn't used or returned 0 rows).  Consumers
+        that want chain-wide tag bumps read it directly; destination-only
+        consumers can ignore it.
 
         Resolution order (most reliable → fallback):
           1. Custom BIP report (``dest_lookup_bip`` block) — when
              configured, this is the canonical way to find the new
-             asset.  Tenant builds a small report that joins on
-             source_asset_id + target_book and returns the new asset's
-             id (and optionally number).
+             asset.  The report returns the full lineage chain
+             (FA_BOOK_TRANSFER_DISTS recursive walk); we pick the row
+             whose BOOK_TYPE_CODE matches the in-flight target book.
           2. ``X_NEW_ASSET_ID`` etc. directly on the bookTransfer
              response (fragile — field names vary).
           3. ``X_NEW_ASSET_NUMBER`` etc. + getAssetInformation against
@@ -1211,22 +1280,33 @@ class FusionIUSync:
           4. Source asset_number against target book — only valid when
              ``P_CREATE_NEW_ASSET_FLAG=N`` (asset shared across books).
         """
-        # 1. Custom BIP report — recommended for production.
+        # 1. Custom BIP report — recommended for production.  Returns
+        #    the full chain in one call; destination is the link whose
+        #    book matches the in-flight transfer's target book.
+        chain: List[ChainLink] = []
         if dest_lookup_bip.get("report_path"):
-            asset_id, asset_number = self._lookup_dest_via_bip(
+            chain = self._fetch_lineage_chain(
                 dest_lookup_bip,
                 pending=pending,
                 source_state=source_state,
             )
-            if asset_id:
-                return asset_id, asset_number, "bip_report"
+            dest_link = self._pick_destination_from_chain(
+                chain, target_book=pending.target_book_type_code
+            )
+            if dest_link is not None:
+                return (
+                    dest_link.asset_id,
+                    dest_link.asset_number,
+                    "bip_report",
+                    chain,
+                )
 
         # 2. Direct asset_id from the bookTransfer response.
         for fname in dest_id_fields:
             v = str(book_transfer_response.get(fname) or "").strip()
             if v and v != source_state.asset_id:
                 number = self._first_nonempty(book_transfer_response, dest_num_fields)
-                return v, number, f"response.{fname}"
+                return v, number, f"response.{fname}", chain
 
         # 3. asset_number from response → getAssetInformation on dest book.
         for fname in dest_num_fields:
@@ -1244,13 +1324,18 @@ class FusionIUSync:
                         e,
                     )
                     continue
-                return dest_state.asset_id, v, f"response.{fname}+getAssetInformation"
+                return (
+                    dest_state.asset_id,
+                    v,
+                    f"response.{fname}+getAssetInformation",
+                    chain,
+                )
 
         # 4. Same-id case: X_ASSET_ID echoed back means CREATE_NEW_ASSET_FLAG=N.
         for fname in dest_id_fields:
             v = str(book_transfer_response.get(fname) or "").strip()
             if v and v == source_state.asset_id:
-                return v, source_state.asset_number, f"response.{fname}(same_id)"
+                return v, source_state.asset_number, f"response.{fname}(same_id)", chain
 
         # 5. Last-resort fallback: source asset_number on target book.
         if allow_same_asset_number_fallback:
@@ -1264,6 +1349,7 @@ class FusionIUSync:
                     dest_state.asset_id,
                     pending.asset_number,
                     "fallback.source_asset_number_on_target_book",
+                    chain,
                 )
             except FusionApiError as e:
                 log.warning(
@@ -1273,37 +1359,97 @@ class FusionIUSync:
                     e,
                 )
 
-        return None, None, "unresolved"
+        return None, None, "unresolved", chain
 
-    def _lookup_dest_via_bip(
+    @staticmethod
+    def _pick_destination_from_chain(
+        chain: List[ChainLink],
+        *,
+        target_book: Optional[str],
+    ) -> Optional[ChainLink]:
+        """Pick the destination link from a lineage chain.
+
+        Preference order:
+          1. ``is_destination=True`` AND ``book_type_code == target_book``
+          2. Any link with ``book_type_code == target_book``, picking
+             the latest by ``chain_order``.
+          3. The link with the highest ``chain_order`` whose
+             ``is_destination=True`` (book column missing).
+          4. Back-compat: when no row carries ``book_type_code`` or
+             ``is_destination``, treat the highest-``chain_order`` row
+             as the destination.  This matches the old single-row
+             destination-only report shape.
+        """
+        if not chain:
+            return None
+        tgt = (target_book or "").upper().strip()
+        if tgt:
+            matches = [
+                link
+                for link in chain
+                if (link.book_type_code or "").upper().strip() == tgt
+            ]
+            destination_matches = [m for m in matches if m.is_destination]
+            if destination_matches:
+                return max(destination_matches, key=lambda m: m.chain_order)
+            if matches:
+                return max(matches, key=lambda m: m.chain_order)
+        dest_flagged = [link for link in chain if link.is_destination]
+        if dest_flagged:
+            return max(dest_flagged, key=lambda m: m.chain_order)
+        # Old report shape: no book / is_destination columns at all.
+        any_book = any(link.book_type_code for link in chain)
+        any_flag = any(link.is_destination for link in chain)
+        if not any_book and not any_flag:
+            return max(chain, key=lambda m: m.chain_order)
+        return None
+
+    def _fetch_lineage_chain(
         self,
         cfg: Dict[str, Any],
         *,
         pending: PendingTransfer,
         source_state: AssetState,
-    ) -> Tuple[Optional[str], Optional[str]]:
-        """Call the destination-lookup BIP report and parse the first row.
+    ) -> List[ChainLink]:
+        """Call the lineage-lookup BIP report and parse all rows into a chain.
+
+        One report serves two purposes: pick the destination asset of
+        the just-completed transfer, and (when ``bump_chain`` is
+        enabled) enumerate every link in the lineage so the post-
+        transfer Tag Number bump can hit them all.
 
         Config shape::
 
             {
               "report_path": "/Custom/.../Get_Transferred_Asset.xdo",
               "params": {
-                "P_SOURCE_ASSET_ID": "${source_asset_id}",
-                "P_TARGET_BOOK_TYPE_CODE": "${target_book_type_code}"
+                "P_SOURCE_ASSET_ID": "${source_asset_id}"
               },
               "asset_id_column": "NEW_ASSET_ID",
-              "asset_number_column": "NEW_ASSET_NUMBER"
+              "asset_number_column": "NEW_ASSET_NUMBER",
+              "book_type_code_column": "BOOK_TYPE_CODE",
+              "is_destination_column": "IS_DESTINATION",
+              "chain_order_column": "CHAIN_ORDER"
             }
+
+        ``book_type_code_column`` is required for ``bump_chain`` —
+        each link in the chain may live in a different book, and the
+        ``updateAssetDescriptiveDetails`` call needs the right
+        ``P_BOOK_TYPE_CODE`` per row.
 
         Param values support ``${...}`` placeholders that interpolate
         fields from the source asset and the pending transfer:
-        ``source_asset_id``, ``source_asset_number``, ``source_book_type_code``,
-        ``target_book_type_code``, ``transfer_to_entity``.
+        ``source_asset_id``, ``source_asset_number``,
+        ``source_book_type_code``, ``target_book_type_code``,
+        ``transfer_to_entity``.
+
+        Returns an empty list when the report is unconfigured, fails,
+        or returns 0 rows.  Callers treat empty chain as "fall back to
+        legacy destination-resolution path".
         """
         report_path = str(cfg.get("report_path") or "").strip()
         if not report_path:
-            return None, None
+            return []
 
         substitutions: Dict[str, str] = {
             "source_asset_id": source_state.asset_id or "",
@@ -1319,36 +1465,69 @@ class FusionIUSync:
 
         id_col = str(cfg.get("asset_id_column") or "NEW_ASSET_ID")
         num_col = str(cfg.get("asset_number_column") or "NEW_ASSET_NUMBER")
+        book_col = str(cfg.get("book_type_code_column") or "BOOK_TYPE_CODE")
+        is_dest_col = str(cfg.get("is_destination_column") or "IS_DESTINATION")
+        chain_order_col = str(cfg.get("chain_order_column") or "CHAIN_ORDER")
 
         try:
             rows = self._bip.run_report(params=params, report_path=report_path)
         except Exception as e:
             log.warning(
-                "Destination-lookup BIP report failed (path=%s, params=%s): %s",
+                "Lineage-lookup BIP report failed (path=%s, params=%s): %s",
                 report_path,
                 params,
                 e,
             )
-            return None, None
+            return []
 
         if not rows:
             log.warning(
-                "Destination-lookup BIP returned 0 rows (path=%s, params=%s)",
+                "Lineage-lookup BIP returned 0 rows (path=%s, params=%s)",
                 report_path,
                 params,
             )
-            return None, None
+            return []
 
-        row = rows[0]
-        asset_id = str(row.get(id_col) or "").strip() or None
-        asset_number = str(row.get(num_col) or "").strip() or None
-        if not asset_id:
-            log.warning(
-                "Destination-lookup BIP row missing %s column (have: %s)",
-                id_col,
-                sorted(row.keys()),
+        chain: List[ChainLink] = []
+        for idx, row in enumerate(rows, start=1):
+            asset_id = str(row.get(id_col) or "").strip()
+            if not asset_id:
+                log.warning(
+                    "Lineage-lookup BIP row missing %s column (have: %s); skipping",
+                    id_col,
+                    sorted(row.keys()),
+                )
+                continue
+            asset_number = str(row.get(num_col) or "").strip() or None
+            book_type_code = str(row.get(book_col) or "").strip() or None
+            is_destination = str(row.get(is_dest_col) or "").strip().upper() in (
+                "Y",
+                "YES",
+                "TRUE",
+                "1",
             )
-        return asset_id, asset_number
+            chain_order_raw = str(row.get(chain_order_col) or "").strip()
+            try:
+                chain_order = int(chain_order_raw) if chain_order_raw else idx
+            except ValueError:
+                chain_order = idx
+            chain.append(
+                ChainLink(
+                    asset_id=asset_id,
+                    asset_number=asset_number,
+                    book_type_code=book_type_code,
+                    chain_order=chain_order,
+                    is_destination=is_destination,
+                )
+            )
+
+        log.info(
+            "Lineage-lookup BIP returned %d link(s) for source_asset_id=%s: %s",
+            len(chain),
+            source_state.asset_id,
+            [(link.chain_order, link.asset_id, link.book_type_code) for link in chain],
+        )
+        return chain
 
     @staticmethod
     def _first_nonempty(d: Dict[str, Any], keys: Tuple[str, ...]) -> Optional[str]:

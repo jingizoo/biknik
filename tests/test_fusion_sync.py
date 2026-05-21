@@ -1995,6 +1995,330 @@ class TestPostTransferAttributeUpdate:
         assert "src failed" in (result["error"] or "")
 
 
+class TestBumpChain:
+    """bump_chain=true walks the full lineage chain returned by the
+    lineage-lookup BIP report and POSTs the same bumped Tag Number
+    against every link, so historical retired records stay in
+    lockstep on the underscore-suffix scheme."""
+
+    DEST_LOOKUP_REPORT = "/Custom/Reports/Get_Transferred_Asset.xdo"
+
+    @staticmethod
+    def _get_asset_info_with_tag(value: str):
+        return TestPostTransferAttributeUpdate._get_asset_info_with_tag(value)
+
+    @staticmethod
+    def _book_transfer_success_response(new_asset_id="555"):
+        return TestPostTransferAttributeUpdate._book_transfer_success_response(
+            new_asset_id=new_asset_id
+        )
+
+    def _build_sync(self, fusion, chain_rows, **extra_cfg):
+        """Build a FusionIUSync wired with a BIP that routes by report_path.
+
+        Discovery calls (default report) return the IU row only when
+        scanning US CORP BOOK.  The lineage-lookup report returns
+        ``chain_rows``.
+        """
+        bip = _mock_bip()
+
+        def _run(params=None, report_path=None):
+            if report_path == self.DEST_LOOKUP_REPORT:
+                return chain_rows
+            if (params or {}).get("P_BOOK_TYPE_CODE") == "US CORP BOOK":
+                return [_bip_row(book="US CORP BOOK", dff_entity="UK Entity")]
+            return []
+
+        bip.run_report.side_effect = _run
+
+        cfg = {
+            "enabled": True,
+            "bump_chain": True,
+            "dest_lookup_bip": {
+                "report_path": self.DEST_LOOKUP_REPORT,
+                "params": {"P_SOURCE_ASSET_ID": "${source_asset_id}"},
+                "asset_id_column": "ASSET_ID",
+                "asset_number_column": "ASSET_NUMBER",
+                "book_type_code_column": "BOOK_TYPE_CODE",
+                "is_destination_column": "IS_DESTINATION",
+                "chain_order_column": "CHAIN_ORDER",
+            },
+        }
+        cfg.update(extra_cfg)
+        return FusionIUSync(
+            fusion, _resolver(), bip, post_transfer_attribute_update=cfg
+        )
+
+    @staticmethod
+    def _link(asset_id, *, book, chain_order, asset_number=None, is_dest="N"):
+        return {
+            "ASSET_ID": asset_id,
+            "ASSET_NUMBER": asset_number or f"ASSET-{asset_id}",
+            "BOOK_TYPE_CODE": book,
+            "CHAIN_ORDER": chain_order,
+            "IS_DESTINATION": is_dest,
+        }
+
+    def test_three_link_chain_posts_against_every_asset(self):
+        """Asset transferred US -> UK -> SG -> JP returns 4 chain
+        links; bump_chain posts updateAssetDescriptiveDetails against
+        all four, each with its own P_BOOK_TYPE_CODE."""
+        fusion = _mock_fusion()
+        # Asset 100 is the source of the current transfer (UK CORP -> SG).
+        # Chain links 1..4: original US, UK (retired by earlier xfer),
+        # current source (100 / UK), new destination (555 / SG).
+        chain = [
+            self._link("11", book="US CORP BOOK", chain_order=1),
+            self._link("22", book="UK CORP BOOK", chain_order=2),
+            self._link("100", book="UK CORP BOOK", chain_order=3),  # source
+            self._link("555", book="SG CORP BOOK", chain_order=4, is_dest="Y"),
+        ]
+        fusion.process_transaction.side_effect = [
+            self._get_asset_info_with_tag("ASSET-100_2"),  # discovery
+            self._book_transfer_success_response(new_asset_id="555"),
+            ({}, {"X_RETURN_STATUS": "S"}),  # update link 1
+            ({}, {"X_RETURN_STATUS": "S"}),  # update link 2
+            ({}, {"X_RETURN_STATUS": "S"}),  # update link 3
+            ({}, {"X_RETURN_STATUS": "S"}),  # update link 4 (destination)
+        ]
+        sync = self._build_sync(fusion, chain)
+        # Run with target SG CORP BOOK so destination link gets matched.
+        sync._entity_resolver._map["UK ENTITY"] = "SG CORP BOOK"  # type: ignore[attr-defined]
+        summary = sync.run_full_sync(
+            books=["US CORP BOOK", "UK CORP BOOK", "SG CORP BOOK"], dry_run=False
+        )
+
+        # discovery + bookTransfer + 4 chain updates = 6 calls
+        assert fusion.process_transaction.call_count == 6
+        result = summary["results"][0]
+        assert result["status"] == "TRANSFERRED"
+        assert result["error"] is None
+
+        update_calls = [
+            c
+            for c in fusion.process_transaction.call_args_list
+            if c[0][0] == "updateAssetDescriptiveDetails"
+        ]
+        assert len(update_calls) == 4
+        seen = {
+            (c[0][1]["P_ASSET_ID"], c[0][1]["P_BOOK_TYPE_CODE"]) for c in update_calls
+        }
+        assert seen == {
+            ("11", "US CORP BOOK"),
+            ("22", "UK CORP BOOK"),
+            ("100", "UK CORP BOOK"),
+            ("555", "SG CORP BOOK"),
+        }
+        # Same bumped value on every link.
+        for c in update_calls:
+            assert c[0][1]["P_TAG_NUMBER"] == "ASSET-100_3"
+
+    def test_chain_destination_gets_clear_dest_dffs_other_links_get_clear_source(self):
+        """Only the link flagged as destination receives clear_dest_dffs;
+        every other link (ancestors + the retired source) gets
+        clear_source_dffs.  Ensures the directive-DFF wipe still happens
+        on the correct row when bumping the whole chain."""
+        fusion = _mock_fusion()
+        chain = [
+            self._link("100", book="UK CORP BOOK", chain_order=1),
+            self._link("555", book="SG CORP BOOK", chain_order=2, is_dest="Y"),
+        ]
+        fusion.process_transaction.side_effect = [
+            self._get_asset_info_with_tag("ASSET-100"),
+            self._book_transfer_success_response(new_asset_id="555"),
+            ({}, {"X_RETURN_STATUS": "S"}),
+            ({}, {"X_RETURN_STATUS": "S"}),
+        ]
+        sync = self._build_sync(
+            fusion,
+            chain,
+            clear_dest_dffs={"P_CAT_ATTRIBUTE9": ""},
+            clear_source_dffs={"P_CAT_ATTRIBUTE8": ""},
+        )
+        sync._entity_resolver._map["UK ENTITY"] = "SG CORP BOOK"  # type: ignore[attr-defined]
+        sync.run_full_sync(
+            books=["US CORP BOOK", "UK CORP BOOK", "SG CORP BOOK"], dry_run=False
+        )
+
+        update_calls = [
+            c
+            for c in fusion.process_transaction.call_args_list
+            if c[0][0] == "updateAssetDescriptiveDetails"
+        ]
+        by_id = {c[0][1]["P_ASSET_ID"]: c[0][1] for c in update_calls}
+        # Source link gets clear_source_dffs
+        assert by_id["100"].get("P_CAT_ATTRIBUTE8") == ""
+        assert "P_CAT_ATTRIBUTE9" not in by_id["100"]
+        # Destination gets clear_dest_dffs
+        assert by_id["555"].get("P_CAT_ATTRIBUTE9") == ""
+        assert "P_CAT_ATTRIBUTE8" not in by_id["555"]
+
+    def test_bump_chain_with_also_bump_params_mirrors_into_every_link(self):
+        """also_bump_params applies to every chain link too — the
+        secondary DFF stays in lockstep across the whole lineage."""
+        fusion = _mock_fusion()
+        chain = [
+            self._link("11", book="US CORP BOOK", chain_order=1),
+            self._link("100", book="UK CORP BOOK", chain_order=2),
+            self._link("555", book="SG CORP BOOK", chain_order=3, is_dest="Y"),
+        ]
+        fusion.process_transaction.side_effect = [
+            self._get_asset_info_with_tag("HW-42"),
+            self._book_transfer_success_response(new_asset_id="555"),
+            ({}, {"X_RETURN_STATUS": "S"}),
+            ({}, {"X_RETURN_STATUS": "S"}),
+            ({}, {"X_RETURN_STATUS": "S"}),
+        ]
+        sync = self._build_sync(fusion, chain, also_bump_params=["P_CAT_ATTRIBUTE7"])
+        sync._entity_resolver._map["UK ENTITY"] = "SG CORP BOOK"  # type: ignore[attr-defined]
+        sync.run_full_sync(
+            books=["US CORP BOOK", "UK CORP BOOK", "SG CORP BOOK"], dry_run=False
+        )
+
+        update_calls = [
+            c
+            for c in fusion.process_transaction.call_args_list
+            if c[0][0] == "updateAssetDescriptiveDetails"
+        ]
+        for c in update_calls:
+            params = c[0][1]
+            assert params["P_TAG_NUMBER"] == "HW-42_1"
+            assert params["P_CAT_ATTRIBUTE7"] == "HW-42_1"
+
+    def test_bump_chain_empty_chain_falls_back_to_source_plus_dest(self):
+        """When bump_chain=true but the lineage BIP returns 0 rows
+        (report misconfigured, asset not found), pipeline falls back
+        to the legacy source+destination two-asset behaviour rather
+        than no-op'ing.  Destination is resolved from the bookTransfer
+        response field."""
+        fusion = _mock_fusion()
+        fusion.process_transaction.side_effect = [
+            self._get_asset_info_with_tag("ASSET-100"),
+            self._book_transfer_success_response(new_asset_id="555"),
+            ({}, {"X_RETURN_STATUS": "S"}),  # source
+            ({}, {"X_RETURN_STATUS": "S"}),  # destination
+        ]
+        sync = self._build_sync(fusion, chain_rows=[])  # empty chain
+        summary = sync.run_full_sync(
+            books=["US CORP BOOK", "UK CORP BOOK"], dry_run=False
+        )
+
+        update_calls = [
+            c
+            for c in fusion.process_transaction.call_args_list
+            if c[0][0] == "updateAssetDescriptiveDetails"
+        ]
+        assert len(update_calls) == 2
+        assert {c[0][1]["P_ASSET_ID"] for c in update_calls} == {"100", "555"}
+        assert summary["results"][0]["status"] == "TRANSFERRED"
+
+    def test_bump_chain_truncates_at_max_chain_length(self):
+        """Defensive cap: max_chain_length stops processing if the
+        chain query returns runaway rows (loops in FA data, etc.).
+        Default 20; tests use 2 to keep the test concise."""
+        fusion = _mock_fusion()
+        chain = [
+            self._link("11", book="US CORP BOOK", chain_order=1),
+            self._link("22", book="UK CORP BOOK", chain_order=2),
+            self._link("100", book="UK CORP BOOK", chain_order=3),
+            self._link("555", book="SG CORP BOOK", chain_order=4, is_dest="Y"),
+        ]
+        fusion.process_transaction.side_effect = [
+            self._get_asset_info_with_tag("ASSET-100"),
+            self._book_transfer_success_response(new_asset_id="555"),
+            ({}, {"X_RETURN_STATUS": "S"}),
+            ({}, {"X_RETURN_STATUS": "S"}),
+        ]
+        sync = self._build_sync(fusion, chain, max_chain_length=2)
+        sync._entity_resolver._map["UK ENTITY"] = "SG CORP BOOK"  # type: ignore[attr-defined]
+        sync.run_full_sync(
+            books=["US CORP BOOK", "UK CORP BOOK", "SG CORP BOOK"], dry_run=False
+        )
+        update_calls = [
+            c
+            for c in fusion.process_transaction.call_args_list
+            if c[0][0] == "updateAssetDescriptiveDetails"
+        ]
+        # Only the first 2 chain links got updated (the rest were
+        # truncated; the destination did NOT get a call here because
+        # the cap kicked in before it).
+        assert len(update_calls) == 2
+
+    def test_bump_chain_per_link_failure_continues_chain_and_warns(self):
+        """Per-link failure doesn't abort the rest of the chain; all
+        failures are aggregated into the warning string."""
+        fusion = _mock_fusion()
+        chain = [
+            self._link("100", book="UK CORP BOOK", chain_order=1),
+            self._link("555", book="SG CORP BOOK", chain_order=2, is_dest="Y"),
+        ]
+        fusion.process_transaction.side_effect = [
+            self._get_asset_info_with_tag("ASSET-100"),
+            self._book_transfer_success_response(new_asset_id="555"),
+            ({}, {"X_RETURN_STATUS": "E", "X_MSG_DATA": "boom"}),  # link 1 fails
+            ({}, {"X_RETURN_STATUS": "S"}),  # link 2 succeeds
+        ]
+        sync = self._build_sync(fusion, chain)
+        sync._entity_resolver._map["UK ENTITY"] = "SG CORP BOOK"  # type: ignore[attr-defined]
+        summary = sync.run_full_sync(
+            books=["US CORP BOOK", "UK CORP BOOK", "SG CORP BOOK"], dry_run=False
+        )
+        result = summary["results"][0]
+        assert result["status"] == "TRANSFERRED"
+        assert "boom" in (result["error"] or "")
+        assert "chain[1]" in (result["error"] or "")
+        # Both links were attempted.
+        update_calls = [
+            c
+            for c in fusion.process_transaction.call_args_list
+            if c[0][0] == "updateAssetDescriptiveDetails"
+        ]
+        assert len(update_calls) == 2
+
+    def test_destination_picked_by_book_match_when_is_destination_missing(self):
+        """When the report doesn't supply is_destination, the
+        destination is the link whose BOOK_TYPE_CODE matches the
+        in-flight target book (with the highest chain_order)."""
+        fusion = _mock_fusion()
+        chain = [
+            {
+                "ASSET_ID": "100",
+                "ASSET_NUMBER": "ASSET-100",
+                "BOOK_TYPE_CODE": "UK CORP BOOK",
+                "CHAIN_ORDER": 1,
+                # IS_DESTINATION column absent
+            },
+            {
+                "ASSET_ID": "555",
+                "ASSET_NUMBER": "ASSET-555",
+                "BOOK_TYPE_CODE": "SG CORP BOOK",
+                "CHAIN_ORDER": 2,
+            },
+        ]
+        fusion.process_transaction.side_effect = [
+            self._get_asset_info_with_tag("ASSET-100"),
+            self._book_transfer_success_response(new_asset_id="555"),
+            ({}, {"X_RETURN_STATUS": "S"}),
+            ({}, {"X_RETURN_STATUS": "S"}),
+        ]
+        sync = self._build_sync(fusion, chain)
+        sync._entity_resolver._map["UK ENTITY"] = "SG CORP BOOK"  # type: ignore[attr-defined]
+        sync.run_full_sync(
+            books=["US CORP BOOK", "UK CORP BOOK", "SG CORP BOOK"], dry_run=False
+        )
+        update_calls = [
+            c
+            for c in fusion.process_transaction.call_args_list
+            if c[0][0] == "updateAssetDescriptiveDetails"
+        ]
+        # The "destination" link (book=SG) should be the one picked
+        # by _pick_destination_from_chain, gating which clear_dffs apply.
+        # Both rows still get POSTed since bump_chain=true.
+        by_id = {c[0][1]["P_ASSET_ID"]: c[0][1] for c in update_calls}
+        assert by_id["555"]["P_BOOK_TYPE_CODE"] == "SG CORP BOOK"
+        assert by_id["100"]["P_BOOK_TYPE_CODE"] == "UK CORP BOOK"
+
+
 class TestTargetSegmentResolution:
     """BIP report supplies TARGET_SEG* columns; pipeline looks them up
     (and optionally mints via SOAP)."""
