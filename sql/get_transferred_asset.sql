@@ -59,24 +59,51 @@ WITH chain_links AS (
 
     -- The source asset itself (the link that was retired by THIS
     -- transfer) — included with direction=0 so it always appears
-    -- exactly once in the deduplicated chain.  Pull its active book
-    -- from fa_books so BOOK_TYPE_CODE is populated even when the
-    -- asset has never been cross-book transferred (and thus has no
-    -- rows in fa_book_transfer_dists).
+    -- exactly once in the deduplicated chain.  Resolve the source's
+    -- book in priority order so this works for never-transferred,
+    -- just-retired, and previously-transferred assets alike:
+    --   1. btd.src_book_type_code from most recent transfer-OUT
+    --      (asset was the source of some transfer — including the
+    --      just-completed one)
+    --   2. btd.dest_book_type_code from most recent transfer-IN
+    --      (asset was a destination in some prior transfer)
+    --   3. fa_books (any row for this asset_id — handles the
+    --      never-transferred case, and survives the date_ineffective
+    --      flip on retirement)
+    --
+    -- The earlier ``WHERE fb.date_ineffective IS NULL`` filter broke
+    -- this for retired sources: bookTransfer flips date_ineffective
+    -- on the source's fa_books row, so the filter excluded the row
+    -- and BOOK_TYPE_CODE came back NULL.
     SELECT :P_SOURCE_ASSET_ID,
-           fb.book_type_code,
-           SYSDATE,
+           COALESCE(
+             (SELECT MAX(btd.src_book_type_code)
+                       KEEP (DENSE_RANK LAST ORDER BY btd.creation_date)
+                FROM   fa_book_transfer_dists btd
+                WHERE  btd.src_asset_id = :P_SOURCE_ASSET_ID),
+             (SELECT MAX(btd.dest_book_type_code)
+                       KEEP (DENSE_RANK LAST ORDER BY btd.creation_date)
+                FROM   fa_book_transfer_dists btd
+                WHERE  btd.dest_asset_id = :P_SOURCE_ASSET_ID),
+             (SELECT MAX(fb.book_type_code)
+                FROM   fa_books fb
+                WHERE  fb.asset_id = :P_SOURCE_ASSET_ID)
+           ),
+           -- Use a sentinel "older than any real btd.creation_date"
+           -- so the source ends up at chain_order=1 and descendants
+           -- (the just-created destination) at chain_order=2+.
+           TO_DATE('1900-01-01', 'YYYY-MM-DD'),
            0
-    FROM   fa_books fb
-    WHERE  fb.asset_id            = :P_SOURCE_ASSET_ID
-      AND  fb.date_ineffective IS NULL
+    FROM   dual
 ),
 dedup AS (
+    -- Plain MAX(book_type_code) ignores NULLs, so an asset that lands
+    -- in chain_links via more than one walk (each potentially carrying
+    -- a different book) settles to a deterministic non-NULL value.
     SELECT asset_id,
-           MAX(book_type_code) KEEP (DENSE_RANK LAST ORDER BY creation_date)
-               AS book_type_code,
-           MAX(creation_date) AS creation_date,
-           MAX(direction)     AS direction
+           MAX(book_type_code) AS book_type_code,
+           MAX(creation_date)  AS creation_date,
+           MAX(direction)      AS direction
     FROM   chain_links
     WHERE  asset_id IS NOT NULL
     GROUP  BY asset_id
