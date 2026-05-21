@@ -93,10 +93,12 @@
 
   "post_transfer_attribute_update": {
     "enabled": false,
-    "_source_field_note": "Lower-case DFF name as it appears on the X_<NAME> field of getAssetInformation.  Captured into AssetState.attributes by scanning every X_ATTRIBUTE* AND X_CAT_ATTRIBUTE* on the response.  Common values: 'attribute7', 'attribute10' (standard FA DFF) or 'cat_attribute7', 'cat_attribute_date1' (category DFF — what Citadel uses).  Mirror this in fusion_parameter below (P_<UPPERCASE>).",
-    "source_field": "cat_attribute7",
-    "_fusion_parameter_note": "Matching P_<NAME> bind parameter for processTransaction-updateAssetDescriptiveDetails.  Must mirror source_field.  P_CAT_ATTRIBUTE7 for category DFF, P_ATTRIBUTE7 for standard FA DFF.",
-    "fusion_parameter": "P_CAT_ATTRIBUTE7",
+    "_source_field_note": "Lower-case AssetState field name OR DFF slot read from getAssetInformation.  DEFAULT 'tag_number' targets Oracle FA's canonical header Tag Number (X_TAG_NUMBER) — the field with FA uniqueness behaviour that feeds the FA asset reports.  bookTransfer does NOT copy this to the destination, so without the bump the new asset's header Tag Number is left blank.  Set to 'attribute10' / 'cat_attribute7' / etc. instead only if your tenant tracks the canonical tag in a DFF.  Mirror this in fusion_parameter below.",
+    "source_field": "tag_number",
+    "_fusion_parameter_note": "Matching P_<NAME> bind parameter for processTransaction-updateAssetDescriptiveDetails.  Must mirror source_field.  DEFAULT 'P_TAG_NUMBER' for the canonical header tag; use 'P_CAT_ATTRIBUTE7' for the CMDB tag DFF, 'P_ATTRIBUTE10' for standard FA DFF slot 10.",
+    "fusion_parameter": "P_TAG_NUMBER",
+    "_also_bump_params_note": "Secondary fusion params that receive the SAME bumped value on both source-side and destination-side updates.  Typical use at Citadel: primary updates P_TAG_NUMBER (canonical FA header tag), also_bump_params=['P_CAT_ATTRIBUTE7'] mirrors the same _N value into the CMDB tag DFF so the two stay in lockstep (the asset header and the CMDB record never disagree on the active tag).",
+    "also_bump_params": ["P_CAT_ATTRIBUTE7"],
     "operation_handle": "updateAssetDescriptiveDetails",
     "request_id_param": "P_TRX_ATTRIBUTE1",
     "trace_param": "P_TRX_ATTRIBUTE2",
@@ -104,7 +106,7 @@
     "_skip_when_source_empty_note": "When the source asset's source_field is empty / null, skip the bump entirely instead of sending '_1'.  Default true.  Set false only if you genuinely want '_1' as the seed value on assets that arrived with no tag.",
     "skip_when_source_empty": true,
 
-    "_bump_source_too_note": "When true, ALSO POST updateAssetDescriptiveDetails against the SOURCE (retired) asset with the same bumped value, so the source-book record carries the same _N suffix as the destination.  Both sides end up with the same DFF value, signalling 'this is the Nth transfer of this asset'.  Default false (destination only).",
+    "_bump_source_too_note": "When true, ALSO POST updateAssetDescriptiveDetails against the SOURCE (retired) asset with the same bumped value, so the source-book record carries the same _N suffix as the destination.  Both sides end up with the same tag value, signalling 'this is the Nth transfer of this asset'.  Default false (destination only).",
     "bump_source_too": true,
 
     "_clear_dest_dffs_note": "Extra params to POST on the DESTINATION update.  Use empty-string values to CLEAR directive DFFs that were only meaningful pre-transfer (e.g. the legal-entity-to-transfer-to DFF inherited via P_COPY_DFF_FLAG=Y).  Otherwise the new asset looks like it has another transfer queued to itself.",

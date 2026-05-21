@@ -343,7 +343,9 @@ class FusionIUSync:
             )
 
         def _creator(ledger_name: str, segments: Dict[str, str]) -> int:
-            result = ac_client.validate_and_create(ledger_name=ledger_name, segments=segments)
+            result = ac_client.validate_and_create(
+                ledger_name=ledger_name, segments=segments
+            )
             # Oracle's Status is "Valid" / "New" / "Invalid" — both
             # Valid and New return a CcId; Invalid does not.  Gate on
             # the CcId (via is_success), NOT on a literal status code.
@@ -364,7 +366,9 @@ class FusionIUSync:
 
         return _creator
 
-    def _resolve_expense_ccid_from_segments(self, pending: "PendingTransfer") -> Optional[str]:
+    def _resolve_expense_ccid_from_segments(
+        self, pending: "PendingTransfer"
+    ) -> Optional[str]:
         """Resolve the destination expense CCID from TARGET_SEG* columns.
 
         Used by BOTH the cross-book and same-book paths.  Returns the
@@ -466,12 +470,18 @@ class FusionIUSync:
             report_params["P_BOOK_TYPE_CODE"] = book
             try:
                 book_rows = self._bip.run_report(params=report_params)
-                log.info("BIP report for book '%s' returned %d row(s)", book, len(book_rows))
+                log.info(
+                    "BIP report for book '%s' returned %d row(s)", book, len(book_rows)
+                )
                 rows.extend(book_rows)
             except FusionApiError as e:
                 log.error("BIP report failed for book '%s': %s", book, e)
 
-        log.info("BIP report returned %d total row(s) across %d book(s)", len(rows), len(books))
+        log.info(
+            "BIP report returned %d total row(s) across %d book(s)",
+            len(rows),
+            len(books),
+        )
 
         # Step 2: Filter and enrich each candidate
         pending: List[PendingTransfer] = []
@@ -635,7 +645,9 @@ class FusionIUSync:
             description=state.description,
             tag_number=state.tag_number,
             cost=state.cost,
-            transfer_date=transfer_date_raw or self._default_date or date.today().isoformat(),
+            transfer_date=transfer_date_raw
+            or self._default_date
+            or date.today().isoformat(),
             transfer_to_entity=transfer_entity,
             transfer_to_location=transfer_location,
             target_book_type_code=target_book,
@@ -667,7 +679,9 @@ class FusionIUSync:
         Returns:
             TransferResult with transfer outcome.
         """
-        effective_date = pending.transfer_date or self._default_date or date.today().isoformat()
+        effective_date = (
+            pending.transfer_date or self._default_date or date.today().isoformat()
+        )
         request_id = f"IU_XFER_{pending.asset_number}_{int(time.time())}"
 
         # State should already be cached from discovery
@@ -780,7 +794,9 @@ class FusionIUSync:
         )
 
         if dry_run:
-            log.info("DRY-RUN: IU transfer payload built for asset=%s", pending.asset_number)
+            log.info(
+                "DRY-RUN: IU transfer payload built for asset=%s", pending.asset_number
+            )
             return TransferResult(
                 asset_number=pending.asset_number,
                 status="DRY_RUN",
@@ -793,7 +809,9 @@ class FusionIUSync:
 
         raw, pl = self._client.process_transaction("bookTransfer", params)
         status_code = str(pl.get("X_RETURN_STATUS") or "").strip()
-        return_msg = str(pl.get("X_MSG_DATA") or pl.get("X_RETURN_MESSAGE") or "").strip()
+        return_msg = str(
+            pl.get("X_MSG_DATA") or pl.get("X_RETURN_MESSAGE") or ""
+        ).strip()
 
         # Loud diagnostic so an operator can always tell from the log
         # whether the follow-up update was even reachable.  Three cases:
@@ -831,7 +849,9 @@ class FusionIUSync:
         elif post_update_error:
             # Transfer itself succeeded; surface the post-update problem
             # without flipping the row to FAILED.
-            result_error = f"post-transfer attribute update warning: {post_update_error}"
+            result_error = (
+                f"post-transfer attribute update warning: {post_update_error}"
+            )
 
         return TransferResult(
             asset_number=pending.asset_number,
@@ -870,12 +890,27 @@ class FusionIUSync:
         request_id: str,
         book_transfer_response: Dict[str, Any],
     ) -> Optional[str]:
-        """Post-bookTransfer DFF bump on the newly-created destination asset.
+        """Post-bookTransfer tag bump on the newly-created destination asset.
 
         Returns ``None`` on success (or when the feature is disabled),
         or an error string when the follow-up call fails.  The error is
         attached to the transfer result as a warning — the asset *was*
-        transferred, only the DFF bump failed.
+        transferred, only the tag bump failed.
+
+        **Why this exists.**  Oracle FA's bookTransfer creates a fresh
+        destination asset but does *not* carry over the canonical
+        ``TAG_NUMBER`` (the UI "Tag Number" column header that has FA's
+        uniqueness behaviour and drives the standard FA asset reports).
+        Without a follow-up update the destination ends up with a blank
+        Tag Number — losing the audit trail tenants rely on.  Defaults
+        here therefore target the canonical header tag
+        (``source_field="tag_number"`` + ``fusion_parameter="P_TAG_NUMBER"``)
+        and increment its underscore suffix (``TAG`` → ``TAG_1`` → ``TAG_2``)
+        so re-transfers don't collide with the source's still-on-file value.
+
+        Tenants that *also* maintain a CMDB tag identifier in a DFF
+        (e.g. ``X_CAT_ATTRIBUTE7`` at Citadel) can mirror the same
+        bumped value into that DFF via ``also_bump_params``.
 
         Destination resolution order (most reliable → fallback):
           1. ``dest_lookup_bip`` — a tenant-owned BI Publisher report
@@ -894,8 +929,9 @@ class FusionIUSync:
 
             {
               "enabled": true,
-              "source_field": "attribute10",
-              "fusion_parameter": "P_ATTRIBUTE10",
+              "source_field": "tag_number",
+              "fusion_parameter": "P_TAG_NUMBER",
+              "also_bump_params": ["P_CAT_ATTRIBUTE7"],
               "operation_handle": "updateAssetDescriptiveDetails",
               "request_id_param": "P_TRX_ATTRIBUTE1",
               "trace_param": "P_TRX_ATTRIBUTE2",
@@ -920,8 +956,13 @@ class FusionIUSync:
             # CONFIG_DISABLED at INFO; nothing to add here.
             return None
 
-        source_field = str(cfg.get("source_field") or "attribute10")
-        fusion_param = str(cfg.get("fusion_parameter") or "P_ATTRIBUTE10")
+        # Defaults target the canonical Oracle FA header Tag Number —
+        # the field with uniqueness behaviour that feeds the FA asset
+        # reports.  Bumping a DFF instead leaves the header Tag Number
+        # blank on the destination (Fusion's bookTransfer doesn't copy
+        # it), which is why tenants saw the tag "lost" pre-fix.
+        source_field = str(cfg.get("source_field") or "tag_number")
+        fusion_param = str(cfg.get("fusion_parameter") or "P_TAG_NUMBER")
         op_handle = str(cfg.get("operation_handle") or "updateAssetDescriptiveDetails")
         rid_param = str(cfg.get("request_id_param") or "P_TRX_ATTRIBUTE1")
         trace_param = str(cfg.get("trace_param") or "P_TRX_ATTRIBUTE2")
@@ -932,7 +973,8 @@ class FusionIUSync:
             cfg.get("dest_asset_id_fields") or self._DEFAULT_DEST_ASSET_ID_FIELDS
         )
         dest_num_fields = tuple(
-            cfg.get("dest_asset_number_fields") or self._DEFAULT_DEST_ASSET_NUMBER_FIELDS
+            cfg.get("dest_asset_number_fields")
+            or self._DEFAULT_DEST_ASSET_NUMBER_FIELDS
         )
 
         log.info(
@@ -944,10 +986,11 @@ class FusionIUSync:
             op_handle,
         )
 
-        # Read the source value.  Try direct attribute first (covers the
-        # back-compat ``attribute10`` shortcut), then fall back to the
-        # generic ``attributes`` dict so configs can target ATTRIBUTE7,
-        # ATTRIBUTE15, etc. without code changes.
+        # Read the source value.  Try direct attribute first — this
+        # covers the canonical ``tag_number`` (X_TAG_NUMBER) field as
+        # well as the back-compat ``attribute10`` shortcut.  Then fall
+        # back to the generic ``attributes`` dict so configs can target
+        # ATTRIBUTE7, CAT_ATTRIBUTE7, etc. without code changes.
         current_value = getattr(source_state, source_field, None)
         if not current_value:
             current_value = (source_state.attributes or {}).get(source_field)
@@ -1013,7 +1056,8 @@ class FusionIUSync:
             resolution,
         )
 
-        # Read the optional extras: source-side bump + DFFs to clear.
+        # Read the optional extras: source-side bump + DFFs to clear +
+        # secondary fields to mirror the bumped value into.
         bump_source_too = bool(cfg.get("bump_source_too", False))
         clear_dest_dffs: Dict[str, str] = {
             str(k): str(v) for k, v in (cfg.get("clear_dest_dffs") or {}).items()
@@ -1021,10 +1065,18 @@ class FusionIUSync:
         clear_source_dffs: Dict[str, str] = {
             str(k): str(v) for k, v in (cfg.get("clear_source_dffs") or {}).items()
         }
+        # Secondary fusion parameters that receive the *same* bumped
+        # value.  Typical use: primary updates P_TAG_NUMBER (canonical
+        # FA header tag), also_bump_params=["P_CAT_ATTRIBUTE7"] mirrors
+        # the value into the CMDB tag DFF so both stay in lockstep.
+        also_bump_params: List[str] = [
+            str(p) for p in (cfg.get("also_bump_params") or []) if str(p).strip()
+        ]
+        also_bump_dict: Dict[str, str] = {p: bumped for p in also_bump_params}
 
         errors: List[str] = []
 
-        # 1. Optional: bump the SOURCE (retired) asset's DFF with the
+        # 1. Optional: bump the SOURCE (retired) asset's tag with the
         #    same value, so the source-book record reflects which
         #    transfer cycle retired it.  Also clear any directive DFFs
         #    that were only meaningful pre-transfer (e.g. the
@@ -1037,6 +1089,7 @@ class FusionIUSync:
                 rid_param: f"{request_id}_ATTR_BUMP_SRC",
                 trace_param: trace_value,
             }
+            src_params.update(also_bump_dict)
             src_params.update(clear_source_dffs)
             src_err = self._post_attr_update_call(
                 pending=pending,
@@ -1048,8 +1101,9 @@ class FusionIUSync:
             if src_err:
                 errors.append(f"source: {src_err}")
 
-        # 2. Bump the DESTINATION (newly-created) asset's DFF + clear
-        #    any directive DFFs inherited via P_COPY_DFF_FLAG=Y.
+        # 2. Bump the DESTINATION (newly-created) asset's tag + mirror
+        #    into any secondary DFFs + clear directive DFFs inherited
+        #    via P_COPY_DFF_FLAG=Y.
         dest_params: Dict[str, Any] = {
             "P_ASSET_ID": dest_asset_id,
             "P_BOOK_TYPE_CODE": pending.target_book_type_code,
@@ -1057,6 +1111,7 @@ class FusionIUSync:
             rid_param: f"{request_id}_ATTR_BUMP",
             trace_param: trace_value,
         }
+        dest_params.update(also_bump_dict)
         dest_params.update(clear_dest_dffs)
         dest_err = self._post_attr_update_call(
             pending=pending,
@@ -1352,7 +1407,8 @@ class FusionIUSync:
                 creator = self._make_account_combination_creator()
 
             log.info(
-                "Option B: asset=%s target_company=%s segment_key=%s ledger=%s " "auto_create=%s",
+                "Option B: asset=%s target_company=%s segment_key=%s ledger=%s "
+                "auto_create=%s",
                 pending.asset_number,
                 pending.target_company,
                 self._company_segment_key,
@@ -1406,7 +1462,9 @@ class FusionIUSync:
 
         raw, pl = self._client.process_transaction("transferAsset", params)
         status_code = str(pl.get("X_RETURN_STATUS") or "").strip()
-        return_msg = str(pl.get("X_MSG_DATA") or pl.get("X_RETURN_MESSAGE") or "").strip()
+        return_msg = str(
+            pl.get("X_MSG_DATA") or pl.get("X_RETURN_MESSAGE") or ""
+        ).strip()
 
         return TransferResult(
             asset_number=pending.asset_number,

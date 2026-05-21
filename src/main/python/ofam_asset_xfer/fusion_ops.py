@@ -28,8 +28,9 @@ def bump_underscore_suffix(value: Optional[str]) -> str:
         bump_underscore_suffix("")            == "_1"
         bump_underscore_suffix(None)          == "_1"
 
-    Used to differentiate the destination asset's ATTRIBUTE10 from the
-    source's so cross-book transfers don't leave duplicate tag values.
+    Used to differentiate the destination asset's canonical Tag Number
+    (and any mirrored tag DFFs) from the source's so cross-book
+    transfers don't collide on Oracle FA's tag uniqueness check.
     """
     s = (value or "").strip()
     m = _UNDERSCORE_SUFFIX_RE.search(s)
