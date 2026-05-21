@@ -30,7 +30,7 @@ import logging
 import os
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
-from typing import Any, Callable, Dict, List, Mapping, Optional
+from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 from xml.etree import ElementTree as ET
 
 import requests  # type: ignore[import-untyped]
@@ -452,7 +452,7 @@ class AccountCombinationServiceClient:
 # ---------------------------------------------------------------------------
 # XML helpers (local to this module)
 # ---------------------------------------------------------------------------
-def _segment_sort_key(key: str) -> tuple:
+def _segment_sort_key(key: str) -> Tuple[Any, ...]:
     """Sort Segment1, Segment2, ..., Segment10 numerically."""
     if key.startswith("Segment"):
         rest = key[len("Segment") :]
@@ -467,7 +467,7 @@ def _innertext(el: Optional[ET.Element]) -> Optional[str]:
     return "".join(el.itertext())
 
 
-def _find_first(root: ET.Element, path: tuple) -> Optional[ET.Element]:
+def _find_first(root: ET.Element, path: Tuple[Optional[str], ...]) -> Optional[ET.Element]:
     """Walk ``path`` from ``root``; each step can be a tag (str) or None
     to match any child at that level.  Returns the first leaf reached
     or ``None``."""
