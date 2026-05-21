@@ -1942,7 +1942,10 @@ class TestPostTransferAttributeUpdate:
         assert src_params["P_TAG_NUMBER"] == "ASSET-100_1"
         assert "P_CAT_ATTRIBUTE9" not in src_params  # source untouched
         assert dst_params["P_TAG_NUMBER"] == "ASSET-100"
-        assert dst_params["P_CAT_ATTRIBUTE9"] == ""
+        # Empty-string in config substituted with the null sentinel —
+        # Fusion's processTransaction treats '' as "don't change", so we
+        # have to send an explicit null sentinel to actually clear.
+        assert dst_params["P_CAT_ATTRIBUTE9"] == "!*FND_API.G_MISS_CHAR*!"
 
     def test_default_targets_canonical_tag_number_field(self):
         """With no source_field/fusion_parameter overrides, the post-update
@@ -2124,7 +2127,8 @@ class TestPopulateDestDffs:
         fusion.process_transaction.side_effect = [
             self._get_asset_info_with_tag("TAG-100"),
             self._book_transfer_success_response(new_asset_id="555"),
-            ({}, {"X_RETURN_STATUS": "S"}),
+            ({}, {"X_RETURN_STATUS": "S"}),  # source update
+            ({}, {"X_RETURN_STATUS": "S"}),  # destination update
         ]
         sync = self._build_sync(
             fusion,
@@ -2136,20 +2140,19 @@ class TestPopulateDestDffs:
         sync.run_full_sync(books=["US CORP BOOK", "UK CORP BOOK"], dry_run=False)
 
         _, params = fusion.process_transaction.call_args_list[-1][0]
-        # Source book + asset number from the in-flight transfer.
         assert params["P_ATTRIBUTE13"] == "US CORP BOOK"
         assert params["P_ATTRIBUTE14"] == "142847"
 
     def test_populate_and_clear_can_target_different_params_together(self):
         """populate_dest_dffs and clear_dest_dffs are independent —
-        populate sets new values, clear blanks the directive DFFs that
-        drove the transfer (Transfer Date / Transfer to Entity /
-        Transfer to Location)."""
+        populate sets new values, clear blanks (via null sentinel) the
+        directive DFFs that drove the transfer."""
         fusion = _mock_fusion()
         fusion.process_transaction.side_effect = [
             self._get_asset_info_with_tag("TAG-100"),
             self._book_transfer_success_response(new_asset_id="555"),
-            ({}, {"X_RETURN_STATUS": "S"}),
+            ({}, {"X_RETURN_STATUS": "S"}),  # source update
+            ({}, {"X_RETURN_STATUS": "S"}),  # destination update
         ]
         sync = self._build_sync(
             fusion,
@@ -2168,9 +2171,12 @@ class TestPopulateDestDffs:
         _, params = fusion.process_transaction.call_args_list[-1][0]
         assert params["P_ATTRIBUTE13"] == "US CORP BOOK"
         assert params["P_ATTRIBUTE14"] == "142847"
-        assert params["P_CAT_ATTRIBUTE5"] == ""
-        assert params["P_CAT_ATTRIBUTE9"] == ""
-        assert params["P_CAT_ATTRIBUTE6"] == ""
+        # Empty-string clears substituted with the null sentinel —
+        # required so Fusion actually NULLs the columns instead of
+        # treating '' as "no change".
+        assert params["P_CAT_ATTRIBUTE5"] == "!*FND_API.G_MISS_CHAR*!"
+        assert params["P_CAT_ATTRIBUTE9"] == "!*FND_API.G_MISS_CHAR*!"
+        assert params["P_CAT_ATTRIBUTE6"] == "!*FND_API.G_MISS_CHAR*!"
 
     def test_clear_wins_when_same_param_in_both_populate_and_clear(self):
         """If misconfigured to both populate and clear the same param,
@@ -2179,7 +2185,8 @@ class TestPopulateDestDffs:
         fusion.process_transaction.side_effect = [
             self._get_asset_info_with_tag("TAG-100"),
             self._book_transfer_success_response(new_asset_id="555"),
-            ({}, {"X_RETURN_STATUS": "S"}),
+            ({}, {"X_RETURN_STATUS": "S"}),  # source update
+            ({}, {"X_RETURN_STATUS": "S"}),  # destination update
         ]
         sync = self._build_sync(
             fusion,
@@ -2188,7 +2195,53 @@ class TestPopulateDestDffs:
         )
         sync.run_full_sync(books=["US CORP BOOK", "UK CORP BOOK"], dry_run=False)
         _, params = fusion.process_transaction.call_args_list[-1][0]
-        assert params["P_ATTRIBUTE13"] == ""
+        # Clear wins → sentinel value, not the populated source book.
+        assert params["P_ATTRIBUTE13"] == "!*FND_API.G_MISS_CHAR*!"
+
+    def test_custom_clear_sentinel_overrides_default(self):
+        """When clear_sentinel is set in config, empty-string clears
+        get substituted with that value instead of the default
+        !*FND_API.G_MISS_CHAR*! — for tenants whose Fusion patch level
+        wants a different convention."""
+        fusion = _mock_fusion()
+        fusion.process_transaction.side_effect = [
+            self._get_asset_info_with_tag("TAG-100"),
+            self._book_transfer_success_response(new_asset_id="555"),
+            ({}, {"X_RETURN_STATUS": "S"}),
+            ({}, {"X_RETURN_STATUS": "S"}),
+        ]
+        sync = self._build_sync(
+            fusion,
+            clear_sentinel="#FND_NULL#",
+            clear_dest_dffs={"P_CAT_ATTRIBUTE9": ""},
+        )
+        sync.run_full_sync(books=["US CORP BOOK", "UK CORP BOOK"], dry_run=False)
+        _, params = fusion.process_transaction.call_args_list[-1][0]
+        assert params["P_CAT_ATTRIBUTE9"] == "#FND_NULL#"
+
+    def test_clear_dffs_non_empty_value_passes_through_unchanged(self):
+        """Non-empty values in clear_dest_dffs aren't substituted —
+        lets users send a literal date like '1900-01-01' to clear a
+        DATE-typed DFF where the generic null sentinel wouldn't parse."""
+        fusion = _mock_fusion()
+        fusion.process_transaction.side_effect = [
+            self._get_asset_info_with_tag("TAG-100"),
+            self._book_transfer_success_response(new_asset_id="555"),
+            ({}, {"X_RETURN_STATUS": "S"}),
+            ({}, {"X_RETURN_STATUS": "S"}),
+        ]
+        sync = self._build_sync(
+            fusion,
+            clear_dest_dffs={
+                "P_CAT_ATTRIBUTE_DATE1": "1900-01-01",
+                "P_CAT_ATTRIBUTE9": "",
+            },
+        )
+        sync.run_full_sync(books=["US CORP BOOK", "UK CORP BOOK"], dry_run=False)
+        _, params = fusion.process_transaction.call_args_list[-1][0]
+        # Literal date passes through as-is; empty string substituted.
+        assert params["P_CAT_ATTRIBUTE_DATE1"] == "1900-01-01"
+        assert params["P_CAT_ATTRIBUTE9"] == "!*FND_API.G_MISS_CHAR*!"
 
     def test_unknown_placeholders_left_in_place(self):
         """Misconfigured ${...} placeholders aren't silently dropped —
@@ -2378,11 +2431,13 @@ class TestBumpChain:
             if c[0][0] == "updateAssetDescriptiveDetails"
         ]
         by_id = {c[0][1]["P_ASSET_ID"]: c[0][1] for c in update_calls}
-        # Source gets clear_source_dffs, NOT clear_dest_dffs.
-        assert by_id["100"]["P_CAT_ATTRIBUTE8"] == ""
+        # Source gets clear_source_dffs (with null sentinel
+        # substitution), NOT clear_dest_dffs.
+        assert by_id["100"]["P_CAT_ATTRIBUTE8"] == "!*FND_API.G_MISS_CHAR*!"
         assert "P_CAT_ATTRIBUTE9" not in by_id["100"]
-        # Destination gets clear_dest_dffs, NOT clear_source_dffs.
-        assert by_id["555"]["P_CAT_ATTRIBUTE9"] == ""
+        # Destination gets clear_dest_dffs (with null sentinel), NOT
+        # clear_source_dffs.
+        assert by_id["555"]["P_CAT_ATTRIBUTE9"] == "!*FND_API.G_MISS_CHAR*!"
         assert "P_CAT_ATTRIBUTE8" not in by_id["555"]
 
     def test_also_bump_params_per_side_mirrors_correct_value(self):

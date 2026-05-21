@@ -1090,12 +1090,38 @@ class FusionIUSync:
         )
 
         # ---- Read config knobs ----
-        clear_dest_dffs: Dict[str, str] = {
-            str(k): str(v) for k, v in (cfg.get("clear_dest_dffs") or {}).items()
-        }
-        clear_source_dffs: Dict[str, str] = {
-            str(k): str(v) for k, v in (cfg.get("clear_source_dffs") or {}).items()
-        }
+        #
+        # ``clear_sentinel`` is the literal value sent for clear_*_dffs
+        # entries whose configured value is an empty string.  Fusion's
+        # processTransaction API treats ``''`` (empty quoted string) as
+        # "don't change this column" — so to actually NULL a DFF we
+        # have to send a Fusion-recognised null sentinel.  Default is
+        # the standard ``!*FND_API.G_MISS_CHAR*!`` used by Oracle's
+        # internal APIs; override in config if your tenant uses a
+        # different convention.  For DATE-typed DFFs (e.g.
+        # P_CAT_ATTRIBUTE_DATE1) you can supply a literal date string
+        # in clear_*_dffs to avoid the substitution.
+        clear_sentinel = str(cfg.get("clear_sentinel") or "!*FND_API.G_MISS_CHAR*!")
+
+        def _resolve_clears(raw: Dict[str, Any]) -> Dict[str, str]:
+            """Map empty-string clear values to the sentinel.
+
+            Non-empty values pass through unchanged — letting users
+            send a literal date (e.g. '1900-01-01') to clear DATE-typed
+            DFFs, or override the sentinel per-field.
+            """
+            out: Dict[str, str] = {}
+            for k, v in (raw or {}).items():
+                sv = str(v)
+                out[str(k)] = clear_sentinel if sv == "" else sv
+            return out
+
+        clear_dest_dffs: Dict[str, str] = _resolve_clears(
+            cfg.get("clear_dest_dffs") or {}
+        )
+        clear_source_dffs: Dict[str, str] = _resolve_clears(
+            cfg.get("clear_source_dffs") or {}
+        )
         # ``also_bump_params`` are secondary fusion parameters that
         # receive the *same* tag value as the primary (P_TAG_NUMBER).
         # Typical use: mirror into the CMDB tag DFF ("P_CAT_ATTRIBUTE7")

@@ -108,7 +108,10 @@
 
     "_contract_note": "Per-transfer behaviour: TWO updateAssetDescriptiveDetails POSTs land per cross-book transfer.  (1) The RETIRED SOURCE asset gets its tag suffixed with _<N> where N is its chain_order from dest_lookup_bip (1 for first transfer, 2 for second, etc.).  (2) The NEW DESTINATION asset gets the clean canonical tag (suffix stripped).  This frees the canonical tag for the new active asset while keeping each historical retired record uniquely identifiable.  Same-book transfers do NOT run this path — they keep their asset_id and tag unchanged.",
 
-    "_clear_dest_dffs_note": "Params to send with empty-string values on the DESTINATION update only, CLEARING directive DFFs that were only meaningful pre-transfer (Transfer Date / Transfer to Entity / Transfer to Location).  Param names match Citadel's pre_bip_dff_updates.field_parameter_map.",
+    "_clear_sentinel_note": "Literal value substituted for empty-string entries in clear_*_dffs at POST time.  Fusion's processTransaction treats '' (empty quoted string) as 'don't change this column' — to actually NULL a DFF we have to send an Oracle-recognised null sentinel.  Default '!*FND_API.G_MISS_CHAR*!' (Oracle's standard public-API null sentinel for char columns).  Override if your tenant uses a different convention (e.g. '#FND_NULL#' or ' ').  For DATE-typed DFFs that the generic char sentinel can't clear, put a literal date like '1900-01-01' directly in clear_dest_dffs instead of '' (literal values bypass the substitution).",
+    "clear_sentinel": "!*FND_API.G_MISS_CHAR*!",
+
+    "_clear_dest_dffs_note": "Params to send on the DESTINATION update with empty-string ('') values, which get substituted at POST time with clear_sentinel (above) so Fusion treats them as explicit NULL rather than 'no change'.  Use this to clear directive DFFs that were only meaningful pre-transfer (Transfer Date / Transfer to Entity / Transfer to Location).  Param names match Citadel's pre_bip_dff_updates.field_parameter_map.",
     "clear_dest_dffs": {
       "P_CAT_ATTRIBUTE_DATE1": "",
       "P_CAT_ATTRIBUTE9": "",
