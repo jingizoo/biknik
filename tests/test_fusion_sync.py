@@ -5,6 +5,7 @@ All tests use mock clients — no network calls.
 
 from __future__ import annotations
 
+from datetime import date
 from unittest.mock import MagicMock
 
 from ofam_asset_xfer.entity_resolver import EntityBookResolver
@@ -1797,10 +1798,10 @@ class TestPostTransferAttributeUpdate:
         assert src_params["P_ATTRIBUTE7"] == "TAG-100_1"
         assert dst_params["P_ATTRIBUTE7"] == "TAG-100"
 
-    def test_skip_when_source_empty_by_default(self):
-        """If the configured source DFF is empty on the source asset, the
-        bump is skipped (no updateAssetDescriptiveDetails call) instead of
-        sending '_1' as the seed value."""
+    def test_skip_when_source_empty_and_no_dff_work(self):
+        """If the configured source DFF is empty AND no populate/clear
+        DFFs are configured, the whole follow-up is skipped (no
+        updateAssetDescriptiveDetails call) — '_1' is never seeded."""
         fusion = _mock_fusion()
         # X_ATTRIBUTE7 missing entirely
         info_no_attr = (
@@ -1831,10 +1832,11 @@ class TestPostTransferAttributeUpdate:
         # discovery + bookTransfer only.  Update call must NOT fire.
         assert fusion.process_transaction.call_count == 2
 
-    def test_skip_when_source_empty_can_be_disabled(self):
-        """skip_when_source_empty=false forces the bump even when source
-        is empty.  Source POST sends '_1' as seed; destination POST
-        sends '' (stripped empty)."""
+    def test_empty_source_still_applies_dff_updates(self):
+        """An untagged source no longer aborts the follow-up: the tag
+        bump is skipped (no '_1' seeded, no tag param on the POST) but
+        the destination POST still runs its populate/clear DFFs.  The
+        source POST is omitted — no tag and no source-side DFFs."""
         fusion = _mock_fusion()
         info_no_attr = (
             {},
@@ -1851,9 +1853,8 @@ class TestPostTransferAttributeUpdate:
             },
         )
         fusion.process_transaction.side_effect = [
-            info_no_attr,
+            info_no_attr,  # discovery
             self._book_transfer_success_response(new_asset_id="555"),
-            ({}, {"X_RETURN_STATUS": "S"}),  # source update
             ({}, {"X_RETURN_STATUS": "S"}),  # destination update
         ]
         sync = self._build_sync(
@@ -1861,13 +1862,21 @@ class TestPostTransferAttributeUpdate:
             enabled=True,
             source_field="attribute7",
             fusion_parameter="P_ATTRIBUTE7",
-            skip_when_source_empty=False,
+            populate_dest_dffs={"P_ATTRIBUTE13": "${source_book_type_code}"},
+            clear_dest_dffs={"P_CAT_ATTRIBUTE9": ""},
         )
         sync.run_full_sync(books=["US CORP BOOK", "UK CORP BOOK"], dry_run=False)
-        _, src_params = fusion.process_transaction.call_args_list[-2][0]
-        _, dst_params = fusion.process_transaction.call_args_list[-1][0]
-        assert src_params["P_ATTRIBUTE7"] == "_1"
-        assert dst_params["P_ATTRIBUTE7"] == ""  # strip("") -> ""
+        # discovery + bookTransfer + ONE destination POST (source POST
+        # skipped: no tag, no source-side DFFs).
+        assert fusion.process_transaction.call_count == 3
+        op, params = fusion.process_transaction.call_args_list[-1][0]
+        assert op == "updateAssetDescriptiveDetails"
+        assert params["P_ASSET_ID"] == "555"
+        # DFF updates applied...
+        assert params["P_ATTRIBUTE13"] == "US CORP BOOK"
+        assert params["P_CAT_ATTRIBUTE9"] == ""
+        # ...but the tag param is left off entirely.
+        assert "P_ATTRIBUTE7" not in params
 
     def test_post_update_failure_keeps_status_transferred_but_warns(self):
         """Source POST fails with E; destination POST still runs (per-side
@@ -2037,10 +2046,10 @@ class TestPostTransferAttributeUpdate:
         assert src_params["P_TAG_NUMBER"] == "HW-SERVER-42_1"
         assert dst_params["P_TAG_NUMBER"] == "HW-SERVER-42"
 
-    def test_skip_when_tag_empty_by_default(self):
-        """Source asset has no X_TAG_NUMBER (untagged) — the default
-        skip_when_source_empty=True means no update is posted; we don't
-        seed '_1' as the tag on previously-untagged assets."""
+    def test_skip_when_tag_empty_and_no_dff_work(self):
+        """Source asset has no X_TAG_NUMBER (untagged) and no
+        populate/clear DFFs configured — nothing to do, so no update is
+        posted; we never seed '_1' on a previously-untagged asset."""
         fusion = _mock_fusion()
         # X_TAG_NUMBER absent
         info_no_tag = (
@@ -2234,6 +2243,26 @@ class TestPopulateDestDffs:
         # Destination got dest-DFF, NOT source-DFF.
         assert dest_params["P_ATTRIBUTE13"] == "US CORP BOOK"
         assert "P_ATTRIBUTE15" not in dest_params
+
+    def test_current_date_placeholder_resolves_to_today(self):
+        """${current_date} interpolates to today's date (YYYY-MM-DD) —
+        used to default a DATE DFF on the destination, since Oracle FA
+        treats an empty string as 'no change' for DATE columns and so
+        such a field cannot be blanked."""
+        fusion = _mock_fusion()
+        fusion.process_transaction.side_effect = [
+            self._get_asset_info_with_tag("TAG-100"),
+            self._book_transfer_success_response(new_asset_id="555"),
+            ({}, {"X_RETURN_STATUS": "S"}),  # source POST
+            ({}, {"X_RETURN_STATUS": "S"}),  # destination POST
+        ]
+        sync = self._build_sync(
+            fusion,
+            populate_dest_dffs={"P_CAT_ATTRIBUTE_DATE1": "${current_date}"},
+        )
+        sync.run_full_sync(books=["US CORP BOOK", "UK CORP BOOK"], dry_run=False)
+        _, params = fusion.process_transaction.call_args_list[-1][0]
+        assert params["P_CAT_ATTRIBUTE_DATE1"] == date.today().isoformat()
 
 
 class TestBumpChain:

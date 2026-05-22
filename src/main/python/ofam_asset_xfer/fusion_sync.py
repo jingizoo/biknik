@@ -943,6 +943,13 @@ class FusionIUSync:
         the code falls back to ``bump_underscore_suffix(source_tag)`` —
         less accurate, but adequate for first-time transfers.
 
+        **Empty source tag.**  When the source asset has no tag at all,
+        the Tag Number bump is skipped — no ``_N`` on the source, no tag
+        POSTed to the destination — so a previously-untagged asset is
+        never seeded with ``_1``.  The configured ``populate_*_dffs`` /
+        ``clear_*_dffs`` updates still run; the whole follow-up is
+        skipped only when there is also no DFF work configured.
+
         Tenants that *also* maintain a CMDB tag identifier in a DFF
         (e.g. ``X_CAT_ATTRIBUTE7`` at Citadel) can mirror the same
         per-side values into that DFF via ``also_bump_params`` (the
@@ -1004,7 +1011,6 @@ class FusionIUSync:
         rid_param = str(cfg.get("request_id_param") or "P_TRX_ATTRIBUTE1")
         trace_param = str(cfg.get("trace_param") or "P_TRX_ATTRIBUTE2")
         trace_value = str(cfg.get("trace_value") or "OFAM_POST_XBOOK_ATTR_BUMP")
-        skip_when_empty = bool(cfg.get("skip_when_source_empty", True))
         allow_fallback = bool(cfg.get("allow_same_asset_number_fallback", True))
         dest_id_fields = tuple(
             cfg.get("dest_asset_id_fields") or self._DEFAULT_DEST_ASSET_ID_FIELDS
@@ -1036,17 +1042,40 @@ class FusionIUSync:
             # ``source_field: "ATTRIBUTE7"`` in their config.
             current_value = (source_state.attributes or {}).get(source_field.lower())
 
-        if not current_value and skip_when_empty:
+        # An empty source tag no longer aborts the whole follow-up.  The
+        # destination still needs its Source Asset Book/Number DFFs
+        # populated and its directive DFFs cleared — only the Tag Number
+        # bump is skipped (the source keeps no _N suffix, the
+        # destination is POSTed no tag at all, so a previously-untagged
+        # asset is never seeded with "_1").
+        has_tag = bool(current_value)
+
+        # The one true "nothing to do" case: no tag to bump AND no
+        # populate/clear DFFs configured on either side.
+        has_dff_work = bool(
+            cfg.get("populate_dest_dffs")
+            or cfg.get("clear_dest_dffs")
+            or cfg.get("populate_source_dffs")
+            or cfg.get("clear_source_dffs")
+        )
+        if not has_tag and not has_dff_work:
             log.info(
                 "Post-transfer attr-bump SKIPPED asset=%s: source %s is empty "
-                "(available DFFs on source: %s).  Set "
-                "post_transfer_attribute_update.skip_when_source_empty=false "
-                "to force the call anyway.",
+                "and no populate/clear DFFs are configured — nothing to do "
+                "(available DFFs on source: %s).",
                 pending.asset_number,
                 source_field,
                 sorted((source_state.attributes or {}).keys()) or "(none)",
             )
             return None
+        if not has_tag:
+            log.info(
+                "Post-transfer attr-bump asset=%s: source %s is empty — "
+                "leaving Tag Number untouched, still applying the configured "
+                "populate/clear DFF updates.",
+                pending.asset_number,
+                source_field,
+            )
 
         # Resolve destination + lineage chain via the BIP report.  The
         # chain (when present) gives us each link's chain_order so we
@@ -1115,42 +1144,57 @@ class FusionIUSync:
         # so the new active destination can hold it unsuffixed.  Each
         # retired ancestor keeps its own historical suffix from when it
         # was the source of an earlier transfer; we don't touch them.
-        original_tag = strip_underscore_suffix(current_value)
+        #
+        # All three stay empty when the source has no tag (see has_tag):
+        # the tag params are then left off both POSTs entirely.
+        original_tag = ""
+        source_new_tag = ""
+        destination_new_tag = ""
+        if has_tag:
+            original_tag = strip_underscore_suffix(current_value)
 
-        # Find the source link in the chain to read its chain_order.
-        # When chain BIP is unavailable, fall back to bumping the
-        # source's existing suffix by 1 (less accurate — can't detect
-        # a "clean tag after previous transfer" case).
-        source_chain_order: Optional[int] = None
-        for link in chain:
-            if str(link.asset_id) == str(source_state.asset_id):
-                source_chain_order = link.chain_order
-                break
+            # Find the source link in the chain to read its chain_order.
+            # When chain BIP is unavailable, fall back to bumping the
+            # source's existing suffix by 1 (less accurate — can't
+            # detect a "clean tag after previous transfer" case).
+            source_chain_order: Optional[int] = None
+            for link in chain:
+                if str(link.asset_id) == str(source_state.asset_id):
+                    source_chain_order = link.chain_order
+                    break
 
-        if source_chain_order is not None:
-            source_new_tag = apply_underscore_suffix(original_tag, source_chain_order)
-            suffix_resolution = f"chain_order={source_chain_order}"
-        else:
-            source_new_tag = bump_underscore_suffix(current_value)
-            suffix_resolution = "string-bumped (chain unavailable)"
+            if source_chain_order is not None:
+                source_new_tag = apply_underscore_suffix(
+                    original_tag, source_chain_order
+                )
+                suffix_resolution = f"chain_order={source_chain_order}"
+            else:
+                source_new_tag = bump_underscore_suffix(current_value)
+                suffix_resolution = "string-bumped (chain unavailable)"
 
-        destination_new_tag = original_tag
+            destination_new_tag = original_tag
 
-        log.info(
-            "Post-transfer attr-bump VALUES asset=%s original='%s' "
-            "source_new='%s' dest_new='%s' (%s)",
-            pending.asset_number,
-            original_tag,
-            source_new_tag,
-            destination_new_tag,
-            suffix_resolution,
-        )
+            log.info(
+                "Post-transfer attr-bump VALUES asset=%s original='%s' "
+                "source_new='%s' dest_new='%s' (%s)",
+                pending.asset_number,
+                original_tag,
+                source_new_tag,
+                destination_new_tag,
+                suffix_resolution,
+            )
 
         # ``populate_dest_dffs`` / ``populate_source_dffs`` are dicts of
         # extra DFF params to set on the update calls.  Values support
         # ``${...}`` templating — typically used to fill "Source Asset
         # Book" / "Source Asset Number" DFFs on the destination so the
         # new asset record points back at where it came from.
+        #
+        # ``${current_date}`` resolves to today as YYYY-MM-DD.  Use it to
+        # stamp a DATE-typed DFF on the destination: Oracle FA treats an
+        # empty string as "no change" for DATE columns, so such a field
+        # can't be blanked — defaulting it to the current date is the
+        # workable alternative.
         substitutions: Dict[str, str] = {
             "source_asset_id": source_state.asset_id or "",
             "source_asset_number": source_state.asset_number or "",
@@ -1160,6 +1204,7 @@ class FusionIUSync:
             "target_asset_number": str(dest_asset_number or "") or "",
             "transfer_to_entity": pending.transfer_to_entity or "",
             "transfer_date": pending.transfer_date or "",
+            "current_date": date.today().isoformat(),
             "original_tag": original_tag,
             "source_new_tag": source_new_tag,
             "destination_new_tag": destination_new_tag,
@@ -1181,53 +1226,62 @@ class FusionIUSync:
         # state and risks creating new uniqueness collisions.
         errors: List[str] = []
 
-        # Source POST — retired asset gets the suffix so the destination
-        # can hold the clean canonical tag.
+        # Source POST — retired asset gets the suffixed tag.  The tag
+        # params (primary + also_bump_params) are included only when the
+        # source actually had a tag; the POST is skipped entirely when
+        # there's neither a tag nor any source-side DFF, since what's
+        # left would be only request-id/trace bookkeeping.
         source_params: Dict[str, Any] = {
             "P_ASSET_ID": source_state.asset_id,
             "P_BOOK_TYPE_CODE": pending.book_type_code,
-            fusion_param: source_new_tag,
             rid_param: f"{request_id}_ATTR_BUMP_SRC",
             trace_param: trace_value,
         }
-        for p in also_bump_params:
-            source_params[p] = source_new_tag
+        if has_tag:
+            source_params[fusion_param] = source_new_tag
+            for p in also_bump_params:
+                source_params[p] = source_new_tag
         source_params.update(populate_source_dffs)
         source_params.update(clear_source_dffs)
-        src_err = self._post_attr_update_call(
-            pending=pending,
-            params=source_params,
-            op_handle=op_handle,
-            side="source",
-            asset_id=source_state.asset_id,
-        )
-        if src_err:
-            errors.append(f"source: {src_err}")
+        if has_tag or populate_source_dffs or clear_source_dffs:
+            src_err = self._post_attr_update_call(
+                pending=pending,
+                params=source_params,
+                op_handle=op_handle,
+                side="source",
+                asset_id=source_state.asset_id,
+            )
+            if src_err:
+                errors.append(f"source: {src_err}")
 
         # Destination POST — new asset gets the clean canonical tag +
-        # populated source-info DFFs + cleared directive DFFs.
+        # populated source-info DFFs + cleared directive DFFs.  The tag
+        # params are likewise included only when the source had a tag;
+        # populate/clear DFF updates run regardless.
         dest_params: Dict[str, Any] = {
             "P_ASSET_ID": dest_asset_id,
             "P_BOOK_TYPE_CODE": pending.target_book_type_code,
-            fusion_param: destination_new_tag,
             rid_param: f"{request_id}_ATTR_BUMP_DST",
             trace_param: trace_value,
         }
-        for p in also_bump_params:
-            dest_params[p] = destination_new_tag
+        if has_tag:
+            dest_params[fusion_param] = destination_new_tag
+            for p in also_bump_params:
+                dest_params[p] = destination_new_tag
         # Populate-then-clear ordering: if a misconfig lists the same
         # param in both blocks, clear wins (safer outcome).
         dest_params.update(populate_dest_dffs)
         dest_params.update(clear_dest_dffs)
-        dest_err = self._post_attr_update_call(
-            pending=pending,
-            params=dest_params,
-            op_handle=op_handle,
-            side="destination",
-            asset_id=dest_asset_id,
-        )
-        if dest_err:
-            errors.append(f"destination: {dest_err}")
+        if has_tag or populate_dest_dffs or clear_dest_dffs:
+            dest_err = self._post_attr_update_call(
+                pending=pending,
+                params=dest_params,
+                op_handle=op_handle,
+                side="destination",
+                asset_id=dest_asset_id,
+            )
+            if dest_err:
+                errors.append(f"destination: {dest_err}")
 
         if errors:
             return "; ".join(errors)

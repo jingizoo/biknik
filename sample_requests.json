@@ -103,14 +103,10 @@
     "request_id_param": "P_TRX_ATTRIBUTE1",
     "trace_param": "P_TRX_ATTRIBUTE2",
     "trace_value": "OFAM_POST_XBOOK_ATTR_BUMP",
-    "_skip_when_source_empty_note": "When the source asset's source_field is empty / null, skip the bump entirely instead of sending '_1'.  Default true.  Set false only if you genuinely want '_1' as the seed value on assets that arrived with no tag.",
-    "skip_when_source_empty": true,
+    "_contract_note": "Per-transfer behaviour: normally TWO updateAssetDescriptiveDetails POSTs land per cross-book transfer.  (1) The RETIRED SOURCE asset gets its tag suffixed with _<N> where N is its chain_order from dest_lookup_bip (1 for first transfer, 2 for second, etc.).  (2) The NEW DESTINATION asset gets the clean canonical tag (suffix stripped).  This frees the canonical tag for the new active asset while keeping each historical retired record uniquely identifiable.  Same-book transfers do NOT run this path — they keep their asset_id and tag unchanged.  When the SOURCE asset has no tag at all, the Tag Number bump is skipped (a previously-untagged asset is never seeded with _1) — the destination POST still applies its populate/clear DFF updates, and the source POST is sent only if source-side DFFs are configured.",
 
-    "_contract_note": "Per-transfer behaviour: TWO updateAssetDescriptiveDetails POSTs land per cross-book transfer.  (1) The RETIRED SOURCE asset gets its tag suffixed with _<N> where N is its chain_order from dest_lookup_bip (1 for first transfer, 2 for second, etc.).  (2) The NEW DESTINATION asset gets the clean canonical tag (suffix stripped).  This frees the canonical tag for the new active asset while keeping each historical retired record uniquely identifiable.  Same-book transfers do NOT run this path — they keep their asset_id and tag unchanged.",
-
-    "_clear_dest_dffs_note": "Params to send with empty-string values on the DESTINATION update only, CLEARING directive DFFs that were only meaningful pre-transfer (Transfer Date / Transfer to Entity / Transfer to Location).  Param names match Citadel's pre_bip_dff_updates.field_parameter_map.",
+    "_clear_dest_dffs_note": "Params to send with empty-string values on the DESTINATION update only, CLEARING directive DFFs that were only meaningful pre-transfer (Transfer to Entity / Transfer to Location).  NOTE: empty-string clears work for CHAR DFFs only — Oracle FA treats '' as 'no change' for DATE-typed DFFs, so a Transfer DATE field cannot be blanked this way.  Default it to the current date via populate_dest_dffs (${current_date}) instead — see P_CAT_ATTRIBUTE_DATE1 below.  Param names match Citadel's pre_bip_dff_updates.field_parameter_map.",
     "clear_dest_dffs": {
-      "P_CAT_ATTRIBUTE_DATE1": "",
       "P_CAT_ATTRIBUTE9": "",
       "P_CAT_ATTRIBUTE10": ""
     },
@@ -118,10 +114,11 @@
     "_clear_source_dffs_note": "Symmetric to clear_dest_dffs but for the source asset (rare — most directive DFFs only matter on the destination side).",
     "clear_source_dffs": {},
 
-    "_populate_dest_dffs_note": "Params to set on the DESTINATION update with templated values — typically Source Asset Book / Source Asset Number DFFs so the new asset points back at its origin.  Values support placeholders: ${source_asset_id}, ${source_asset_number}, ${source_book_type_code}, ${target_book_type_code}, ${target_asset_id}, ${target_asset_number}, ${transfer_to_entity}, ${transfer_date}, ${original_tag}, ${source_new_tag}, ${destination_new_tag}.  Unknown placeholders are left in place so misconfig is visible in --debug dumps.  P_CAT_ATTRIBUTE2 = Source Asset Book; P_CAT_ATTRIBUTE3 = Source Asset Number (per the Asset Category DFF setup at Citadel).",
+    "_populate_dest_dffs_note": "Params to set on the DESTINATION update with templated values — typically Source Asset Book / Source Asset Number DFFs so the new asset points back at its origin.  Values support placeholders: ${source_asset_id}, ${source_asset_number}, ${source_book_type_code}, ${target_book_type_code}, ${target_asset_id}, ${target_asset_number}, ${transfer_to_entity}, ${transfer_date}, ${current_date}, ${original_tag}, ${source_new_tag}, ${destination_new_tag}.  ${current_date} is today as YYYY-MM-DD.  Unknown placeholders are left in place so misconfig is visible in --debug dumps.  P_CAT_ATTRIBUTE2 = Source Asset Book; P_CAT_ATTRIBUTE3 = Source Asset Number; P_CAT_ATTRIBUTE_DATE1 = Transfer Date, defaulted to ${current_date} because Oracle FA won't blank a DATE DFF with an empty string (per the Asset Category DFF setup at Citadel).",
     "populate_dest_dffs": {
       "P_CAT_ATTRIBUTE2": "${source_book_type_code}",
-      "P_CAT_ATTRIBUTE3": "${source_asset_number}"
+      "P_CAT_ATTRIBUTE3": "${source_asset_number}",
+      "P_CAT_ATTRIBUTE_DATE1": "${current_date}"
     },
 
     "_populate_source_dffs_note": "Symmetric to populate_dest_dffs but applied to the source-side update.  Rare.",
