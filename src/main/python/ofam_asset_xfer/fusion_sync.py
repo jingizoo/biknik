@@ -251,11 +251,12 @@ class TransferResult:
 class ChainLink:
     """One asset_id in a transferred asset's lineage chain.
 
-    Populated from the lineage-lookup BIP report (FA_BOOK_TRANSFER_DISTS
-    recursive walk).  Used both for resolving the just-created
-    destination asset and — when ``bump_chain`` is enabled — for
-    iterating the post-transfer Tag Number bump across every link in
-    the chain so historical retired records stay in lockstep.
+    Populated from the lineage-lookup BIP report, which walks a merged
+    edge set — TRUE bookTransfer rows (FA_BOOK_TRANSFER_DISTS) plus
+    historical addition+retirement hops recovered from the "Source
+    Asset Number" DFF.  Used to resolve the just-created destination
+    asset and to read the source link's ``chain_order`` so the retired
+    source's Tag Number gets the right ``_N`` suffix.
     """
 
     asset_id: str

@@ -127,7 +127,7 @@
     "_populate_source_dffs_note": "Symmetric to populate_dest_dffs but applied to the source-side update.  Rare.",
     "populate_source_dffs": {},
 
-    "_dest_lookup_bip_note": "Recommended: a custom BIP report that returns the lineage chain for a transferred asset.  Canonical SQL is in sql/get_transferred_asset.sql (recursive walk on FA_BOOK_TRANSFER_DISTS).  Serves two purposes: (a) pick the freshly-created destination (the row whose BOOK_TYPE_CODE matches the in-flight target book), and (b) provide the chain_order of the source link so we know what suffix number to apply (1 for first transfer, 2 for second, etc.).  When omitted, source suffix falls back to bump_underscore_suffix (less accurate — can't distinguish 'clean tag from prior cycle' from 'never been transferred').",
+    "_dest_lookup_bip_note": "Recommended: a custom BIP report that returns the lineage chain for a transferred asset.  Canonical SQL is in sql/get_transferred_asset.sql (recursive walk over a merged edge set: TRUE bookTransfer rows in FA_BOOK_TRANSFER_DISTS PLUS historical addition+retirement hops recovered from the 'Source Asset Number' DFF, so hand-migrated assets still chain correctly).  Serves two purposes: (a) pick the freshly-created destination (the row whose BOOK_TYPE_CODE matches the in-flight target book), and (b) provide the chain_order of the source link so we know what suffix number to apply (1 for first transfer, 2 for second, etc.).  When omitted, source suffix falls back to bump_underscore_suffix (less accurate — can't distinguish 'clean tag from prior cycle' from 'never been transferred').",
     "dest_lookup_bip": {
       "report_path": "/Custom/Integrations/Outbound/FDI/Cit_Get_Transferred_Asset.xdo",
       "params": {
