@@ -552,7 +552,7 @@ def build_book_transfer_params(
         "P_COPY_DFF_FLAG": overrides.get("copy_dff_flag", "Y"),
         "P_COPY_ASSET_KEY_FLAG": overrides.get("copy_asset_key_flag", "Y"),
         "P_CREATE_NEW_ASSET_FLAG": overrides.get("create_new_asset_flag", "Y"),
-        "P_COPY_SOURCE_LINES_FLAG": "N",
+        "P_COPY_SOURCE_LINES_FLAG": overrides.get("copy_source_lines_flag", "N"),
         # P_CONVERSION_RATE_TYPE is ledger-specific: some Citadel ledgers
         # publish 'Corporate', others 'Spot'/'User', and same-currency
         # transfers need it omitted entirely (sending an unknown type
