@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Tuple, Union
 
-import requests  # type: ignore[import-untyped]
+import httpx
 
 from .exceptions import FusionApiError
 from .paramlist import build_parameter_list
@@ -29,7 +29,7 @@ _SECRET_HEADER_NAMES = frozenset(
 _FILENAME_SAFE = re.compile(r"[^A-Za-z0-9._-]+")
 
 
-def _parse_fusion_response(r: "requests.Response", context: str) -> Dict[str, Any]:
+def _parse_fusion_response(r: "httpx.Response", context: str) -> Dict[str, Any]:
     """Parse a Fusion REST response, raising FusionApiError on any failure.
 
     The Fusion gateway can return empty bodies or HTML error pages on
@@ -106,7 +106,7 @@ class _ExchangeDumper:
         url: str,
         request_headers: Any,
         request_body: Any,
-        response: Optional["requests.Response"],
+        response: Optional["httpx.Response"],
         error: Optional[str],
         elapsed_ms: float,
         tag: str,
@@ -231,16 +231,15 @@ class OracleErpIntegrationsClient:
                 "or OracleConfig.bearer_token"
             )
 
-        self._session = requests.Session()
-        self._session.trust_env = not cfg.require_proxy
-        self._session.headers.update(
-            {
+        self._session = httpx.Client(
+            trust_env=not cfg.require_proxy,
+            headers={
                 "Content-Type": "application/vnd.oracle.adf.resourceitem+json",
                 "REST-header-version": "4",
                 "ACCEPT": "application/json",
-            }
+            },
+            proxies=get_proxy_config(require=cfg.require_proxy),
         )
-        self._session.proxies.update(get_proxy_config(require=cfg.require_proxy))
 
         self._dumper = _ExchangeDumper(debug_dir) if debug_dir else None
 
@@ -277,7 +276,7 @@ class OracleErpIntegrationsClient:
 
         auth_headers = self._auth_headers()
         request_headers = {**self._session.headers, **auth_headers}
-        r: Optional["requests.Response"] = None
+        r: Optional["httpx.Response"] = None
         transport_error: Optional[str] = None
         started = datetime.now(timezone.utc)
         try:
@@ -339,7 +338,7 @@ class OracleErpIntegrationsClient:
         auth_headers = self._auth_headers()
         request_headers = {**self._session.headers, **auth_headers}
         request_body = {"query_params": dict(query_params or {})}
-        r: Optional["requests.Response"] = None
+        r: Optional["httpx.Response"] = None
         transport_error: Optional[str] = None
         started = datetime.now(timezone.utc)
         try:
@@ -383,7 +382,7 @@ class OracleErpIntegrationsClient:
         url: str,
         request_headers: Dict[str, Any],
         request_body: Any,
-        response: Optional["requests.Response"],
+        response: Optional["httpx.Response"],
         error: Optional[str],
         started: datetime,
         tag: str,

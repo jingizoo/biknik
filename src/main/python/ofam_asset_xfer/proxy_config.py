@@ -2,7 +2,7 @@
 
 Reads INETPROXY_USER, INETPROXY_PASSWD, HTTP_APP_PROXY, and HTTPS_APP_PROXY
 from environment variables and builds authenticated proxy URLs for use with
-the ``requests`` library.
+the ``httpx`` library.
 
 When the environment variables are not set, returns an empty dict (no proxy).
 """
@@ -18,7 +18,7 @@ log = logging.getLogger(__name__)
 
 
 def get_proxy_config(require: bool = False) -> Dict[str, str]:
-    """Build a ``requests``-compatible proxies dict from environment variables.
+    """Build an ``httpx``-compatible proxies dict from environment variables.
 
     Expected env vars:
         INETPROXY_USER     – proxy username
@@ -32,7 +32,7 @@ def get_proxy_config(require: bool = False) -> Dict[str, str]:
                  pod/batch environments where direct routes don't exist.
 
     Returns:
-        Dict suitable for ``requests.Session.proxies`` or ``requests.get(proxies=...)``.
+        Dict suitable for ``httpx.Client(proxies=...)`` or ``httpx.get(proxies=...)``.
         Empty dict when proxy env vars are absent and require=False.
     """
     http_proxy_url = os.environ.get("HTTP_APP_PROXY")
@@ -61,10 +61,10 @@ def get_proxy_config(require: bool = False) -> Dict[str, str]:
     proxies: Dict[str, str] = {}
 
     if http_proxy_url:
-        proxies["http"] = _build_proxy_url(user, passwd, http_proxy_url)
+        proxies["http://"] = _build_proxy_url(user, passwd, http_proxy_url)
 
     if https_proxy_url:
-        proxies["https"] = _build_proxy_url(user, passwd, https_proxy_url)
+        proxies["https://"] = _build_proxy_url(user, passwd, https_proxy_url)
 
     log.info(
         "Proxy configured for protocols: %s (user=%s)",
