@@ -50,6 +50,8 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Optional
 
+import httpx
+
 from .exceptions import ConfigError
 
 log = logging.getLogger(__name__)
@@ -279,7 +281,6 @@ class FusionTokenProvider:
         """
         try:
             import gssapi  # type: ignore[import-untyped]
-            import httpx  # type: ignore[import-not-found]
             from httpx_gssapi import HTTPSPNEGOAuth  # type: ignore[import-not-found]
         except ImportError as exc:
             raise ConfigError(
@@ -357,11 +358,6 @@ class FusionTokenProvider:
         erp_auth_url = self._cfg.erp_auth_url
 
         log.debug("Exchanging PF token for Oracle JWT via %s", erp_auth_url)
-
-        # httpx was already imported (and required) by _get_current_user_token
-        # before we ever get here, so the previous ImportError fallback to
-        # requests was unreachable.  Use httpx directly.
-        import httpx  # type: ignore[import-not-found]
 
         ssl_ctx = _get_erp_ssl_context()
         resp = httpx.post(

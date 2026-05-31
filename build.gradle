@@ -52,10 +52,6 @@ startScripts {
   pythonBinary(“fa_book_xfer”) {
     main = “batch_entrypoint.py”
   }
-
-  pythonBinary(“smoke_test”) {
-    main = “hello_batch.py”
-  }
 }
 
 deployments {
