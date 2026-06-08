@@ -157,15 +157,70 @@ DEFAULT_DFF_CONFIG = DFFConfig()
 # ---------------------------------------------------------------------------
 # Data structures
 # ---------------------------------------------------------------------------
+@dataclass
+class TransferControl:
+    """Per-classification operational toggle.
+
+    Lets the runner kill-switch any of the four transfer classifications,
+    or selected behaviors within them, without a code change.  All flags
+    default to ``True`` so an empty / missing ``transfer_controls``
+    config preserves the original pre-control behavior.
+
+    Resolution order: global default for the classification → per-book
+    source-side block (``applies_to`` in ``S``/``B``) → per-book
+    target-side block (``applies_to`` in ``T``/``B``).  Target wins
+    on conflict.
+    """
+
+    enabled: bool = True
+    post_transfer_bump: bool = True
+    pre_bip_dff_updates: bool = True
+
+    @staticmethod
+    def from_dict(d: Dict[str, Any]) -> "TransferControl":
+        return TransferControl(
+            enabled=bool(d.get("enabled", True)),
+            post_transfer_bump=bool(d.get("post_transfer_bump", True)),
+            pre_bip_dff_updates=bool(d.get("pre_bip_dff_updates", True)),
+        )
+
+    def overlay(self, other: "TransferControl") -> "TransferControl":
+        """Return a new TransferControl with ``other``'s values winning."""
+        return TransferControl(
+            enabled=other.enabled,
+            post_transfer_bump=other.post_transfer_bump,
+            pre_bip_dff_updates=other.pre_bip_dff_updates,
+        )
+
+
 class TransferClassification:
     """Transfer type classification constants.
 
-    Interunit:  Source entity != target entity  → cross-book transfer
-    Intraunit:  Same entity, same book          → location/expense/assignment change
+    Four classifications across two axes:
+      * Entity: same (``INTRAUNIT``) vs different (``INTERUNIT``)
+      * Book:   same (``INTRABOOK``) vs different (``INTERBOOK``)
+
+    Backward-compat aliases (``INTERUNIT`` / ``INTRAUNIT``) point at the
+    cross-book and same-book quadrants respectively, so existing callers
+    keep working.
+
+    Note: until upstream populates ``source_entity`` (TODO — likely a
+    ``SOURCE_ENTITY`` column on the BIP report or a reverse lookup of
+    ``entity_book_map``), classify() degrades to a 2-way book-only
+    split.  Only ``INTRAUNIT_INTERBOOK`` and ``INTRAUNIT_INTRABOOK`` are
+    reachable in that mode; the ``INTERUNIT_*`` quadrants light up once
+    source_entity is wired through.
     """
 
-    INTERUNIT = "INTERUNIT"
-    INTRAUNIT = "INTRAUNIT"
+    INTERUNIT_INTERBOOK = "INTERUNIT_INTERBOOK"
+    INTERUNIT_INTRABOOK = "INTERUNIT_INTRABOOK"
+    INTRAUNIT_INTERBOOK = "INTRAUNIT_INTERBOOK"
+    INTRAUNIT_INTRABOOK = "INTRAUNIT_INTRABOOK"
+
+    # Backward-compat aliases — existing callers reading
+    # ``TransferClassification.INTERUNIT`` / ``.INTRAUNIT`` still work.
+    INTERUNIT = INTERUNIT_INTERBOOK
+    INTRAUNIT = INTRAUNIT_INTRABOOK
 
     @staticmethod
     def classify(
@@ -174,18 +229,21 @@ class TransferClassification:
         source_entity: Optional[str] = None,
         target_entity: Optional[str] = None,
     ) -> str:
-        """Determine whether a transfer is interunit or intraunit.
-
-        Rules (from 2026-03-17 alignment):
-          - Different books → always INTERUNIT (entity must differ)
-          - Same book → INTRAUNIT (location/expense/cost-center change)
-          - Same entity but different book is still INTERUNIT (config-driven)
-        """
-        src = source_book.upper().strip()
-        tgt = target_book.upper().strip()
-        if src != tgt:
-            return TransferClassification.INTERUNIT
-        return TransferClassification.INTRAUNIT
+        """Classify a transfer across the entity x book axes."""
+        is_cross_book = (
+            source_book.upper().strip() != target_book.upper().strip()
+        )
+        is_cross_entity = (
+            bool(source_entity and target_entity)
+            and source_entity.upper().strip() != target_entity.upper().strip()
+        )
+        if is_cross_entity and is_cross_book:
+            return TransferClassification.INTERUNIT_INTERBOOK
+        if is_cross_entity and not is_cross_book:
+            return TransferClassification.INTERUNIT_INTRABOOK
+        if not is_cross_entity and is_cross_book:
+            return TransferClassification.INTRAUNIT_INTERBOOK
+        return TransferClassification.INTRAUNIT_INTRABOOK
 
 
 @dataclass
@@ -226,9 +284,14 @@ class PendingTransfer:
 
     def __post_init__(self) -> None:
         if not self.transfer_classification:
+            # TODO: derive ``source_entity`` (BIP ``SOURCE_ENTITY`` column,
+            # or reverse-lookup of ``entity_book_map``).  Until then
+            # ``classify()`` degrades to a 2-way book-only split.
             self.transfer_classification = TransferClassification.classify(
                 self.book_type_code,
                 self.target_book_type_code,
+                source_entity=None,
+                target_entity=self.transfer_to_entity,
             )
 
 
@@ -237,12 +300,12 @@ class TransferResult:
     """Result of a single IU transfer operation."""
 
     asset_number: str
-    status: str  # TRANSFERRED, NOOP, DRY_RUN, FAILED
+    status: str  # TRANSFERRED, NOOP, DRY_RUN, FAILED, SKIPPED
     source_book: Optional[str] = None
     target_book: Optional[str] = None
     transfer_to_entity: Optional[str] = None
     transfer_date: Optional[str] = None
-    transfer_classification: str = ""  # INTERUNIT or INTRAUNIT
+    transfer_classification: str = ""  # one of TransferClassification.* values
     error: Optional[str] = None
     fusion_response: Optional[Dict[str, Any]] = None
 
@@ -287,6 +350,8 @@ class FusionIUSync:
         ledger_name_by_book: Optional[Dict[str, str]] = None,
         company_segment_key: str = "Segment1",
         ac_skip_lov_lookup: bool = False,
+        transfer_controls: Optional[Dict[str, Any]] = None,
+        transfer_controls_by_book: Optional[Dict[str, Dict[str, Any]]] = None,
     ):
         self._client = fusion_client
         self._entity_resolver = entity_resolver
@@ -338,6 +403,26 @@ class FusionIUSync:
         self._transfer_overrides_by_book: Dict[str, Dict[str, Any]] = {
             str(k).upper().strip(): dict(v or {})
             for k, v in (transfer_overrides_by_book or {}).items()
+        }
+        # Global default controls per classification.  Each value is a
+        # dict shaped like ``{"enabled": bool, "post_transfer_bump":
+        # bool, "pre_bip_dff_updates": bool}``; missing keys default to
+        # True via ``TransferControl.from_dict``.  An empty / missing
+        # config preserves the original pre-control behavior.
+        self._transfer_controls: Dict[str, TransferControl] = {
+            str(k): TransferControl.from_dict(v)
+            for k, v in (transfer_controls or {}).items()
+            if isinstance(v, dict) and k != "applies_to"
+        }
+        # Per-book overrides for transfer controls, keyed by book code
+        # (case-insensitive).  Each book entry may carry an
+        # ``applies_to`` flag (``S`` / ``T`` / ``B``) plus per-
+        # classification blocks.  Resolution mirrors
+        # ``transfer_overrides_by_book``: source first, target second
+        # (target wins on conflict).
+        self._transfer_controls_by_book: Dict[str, Dict[str, Any]] = {
+            str(k).upper().strip(): dict(v or {})
+            for k, v in (transfer_controls_by_book or {}).items()
         }
 
     @staticmethod
@@ -456,6 +541,70 @@ class FusionIUSync:
             if applies_to in ("T", "B"):
                 out.update(ovr)
         return out
+
+    def _resolve_transfer_control(
+        self,
+        classification: str,
+        source_book: Optional[str],
+        target_book: Optional[str],
+    ) -> TransferControl:
+        """Resolve the effective :class:`TransferControl` for a transfer.
+
+        Resolution order: global default for the classification →
+        per-book source-side block (``applies_to`` in ``S`` / ``B``) →
+        per-book target-side block (``applies_to`` in ``T`` / ``B``).
+        Target wins on conflict.
+        """
+        base = self._transfer_controls.get(classification, TransferControl())
+
+        src = (source_book or "").upper().strip()
+        tgt = (target_book or "").upper().strip()
+
+        src_entry = self._transfer_controls_by_book.get(src) if src else None
+        if src_entry:
+            applies_to = (
+                str(src_entry.get("applies_to", "T")).upper().strip() or "T"
+            )
+            if applies_to in ("S", "B"):
+                cls_block = src_entry.get(classification)
+                if isinstance(cls_block, dict):
+                    base = TransferControl(
+                        enabled=bool(cls_block.get("enabled", base.enabled)),
+                        post_transfer_bump=bool(
+                            cls_block.get(
+                                "post_transfer_bump", base.post_transfer_bump
+                            )
+                        ),
+                        pre_bip_dff_updates=bool(
+                            cls_block.get(
+                                "pre_bip_dff_updates", base.pre_bip_dff_updates
+                            )
+                        ),
+                    )
+
+        tgt_entry = self._transfer_controls_by_book.get(tgt) if tgt else None
+        if tgt_entry:
+            applies_to = (
+                str(tgt_entry.get("applies_to", "T")).upper().strip() or "T"
+            )
+            if applies_to in ("T", "B"):
+                cls_block = tgt_entry.get(classification)
+                if isinstance(cls_block, dict):
+                    base = TransferControl(
+                        enabled=bool(cls_block.get("enabled", base.enabled)),
+                        post_transfer_bump=bool(
+                            cls_block.get(
+                                "post_transfer_bump", base.post_transfer_bump
+                            )
+                        ),
+                        pre_bip_dff_updates=bool(
+                            cls_block.get(
+                                "pre_bip_dff_updates", base.pre_bip_dff_updates
+                            )
+                        ),
+                    )
+
+        return base
 
     # ------------------------------------------------------------------
     # Discovery
@@ -727,6 +876,30 @@ class FusionIUSync:
 
         classification = pending.transfer_classification
 
+        control = self._resolve_transfer_control(
+            classification,
+            pending.book_type_code,
+            pending.target_book_type_code,
+        )
+        if not control.enabled:
+            log.info(
+                "SKIPPED asset=%s: transfer_controls disabled for %s "
+                "(src=%s, tgt=%s)",
+                pending.asset_number,
+                classification,
+                pending.book_type_code,
+                pending.target_book_type_code,
+            )
+            return TransferResult(
+                asset_number=pending.asset_number,
+                status="SKIPPED",
+                source_book=pending.book_type_code,
+                target_book=pending.target_book_type_code,
+                transfer_to_entity=pending.transfer_to_entity,
+                transfer_date=effective_date,
+                transfer_classification=classification,
+            )
+
         try:
             if pending.is_cross_book:
                 result = self._execute_cross_book(
@@ -839,12 +1012,22 @@ class FusionIUSync:
         #   1. feature disabled in config        -> CONFIG_DISABLED
         #   2. enabled but bookTransfer != S     -> BOOKTRANSFER_FAILED
         #   3. enabled and bookTransfer == S     -> ATTEMPTING (helper takes over)
-        post_attr_enabled = bool(self._post_attr_cfg.get("enabled"))
+        control = self._resolve_transfer_control(
+            pending.transfer_classification,
+            pending.book_type_code,
+            pending.target_book_type_code,
+        )
+        post_attr_enabled = (
+            bool(self._post_attr_cfg.get("enabled"))
+            and control.post_transfer_bump
+        )
         if not post_attr_enabled:
             log.info(
                 "Post-transfer attr-bump CONFIG_DISABLED asset=%s "
-                "(set post_transfer_attribute_update.enabled=true to enable)",
+                "(set post_transfer_attribute_update.enabled=true and "
+                "transfer_controls[%s].post_transfer_bump=true to enable)",
                 pending.asset_number,
+                pending.transfer_classification,
             )
         elif status_code != "S":
             log.info(

@@ -126,6 +126,8 @@ def main(  # noqa: D103
             account_combination_client=ac_client,
             ledger_name_by_book=ledger_map,
             ac_skip_lov_lookup=ac_skip_lov,
+            transfer_controls=cfg.get("transfer_controls") or {},
+            transfer_controls_by_book=cfg.get("transfer_controls_by_book") or {},
         )
         summary = sync.run_full_sync(
             books=books,
