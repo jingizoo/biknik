@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Hockey Scheduler — iPhone Demo</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <div class="stage">
+    <!-- iPhone frame -->
+    <div class="phone">
+      <div class="notch"></div>
+      <div class="screen">
+        <div class="statusbar">
+          <span>9:41</span>
+          <span class="statusbar-icons">▮▮▮ &nbsp; 5G &nbsp; 🔋</span>
+        </div>
+
+        <div class="navbar">
+          <span class="nav-title">Game Detail</span>
+          <button id="reset-btn" class="nav-action" title="Reset demo">Reset</button>
+        </div>
+
+        <!-- role switcher -->
+        <div class="segmented">
+          <button data-view="coach" class="seg active">Coach</button>
+          <button data-view="player" class="seg">Player</button>
+        </div>
+
+        <div id="content" class="content"><!-- rendered by app.js --></div>
+      </div>
+    </div>
+
+    <div class="hint">
+      <h1>Hockey Scheduler — Game Detail</h1>
+      <p>This is a browser preview of the iPhone screen. It drives the
+        <strong>real</strong> roster &amp; substitute engine from the backend.</p>
+      <ol>
+        <li>In <strong>Coach</strong> view, mark a selected skater
+          <em>Can't play</em> → watch the status flip to <em>Open Slot</em>.</li>
+        <li>Switch to <strong>Player</strong> view, pick an un-selected player,
+          tap <em>Enroll as Substitute</em>.</li>
+        <li>Back in <strong>Coach</strong> view, <em>Add</em> that substitute →
+          the slot closes and the roster is confirmed again.</li>
+      </ol>
+      <p class="muted">Reset returns to a fully confirmed roster.</p>
+    </div>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

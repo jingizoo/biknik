@@ -9,7 +9,7 @@ web framework) never see Python tracebacks across the boundary.
 from dataclasses import asdict
 from typing import Callable, List, Optional
 
-from ..domain import AvailabilityStatus, RosterEntryStatus
+from ..domain import AvailabilityStatus, RosterEntryStatus, SubstituteStatus
 from ..domain.errors import DomainError
 from ..services import RosterService
 from ..store import InMemoryStore
@@ -121,6 +121,63 @@ class ApiService:
     @catch
     def get_roster_status(self, game_id: str) -> dict:
         return self.roster.compute_roster_status(game_id).to_dict()
+
+    # -- screen view-model -------------------------------------------------
+    @catch
+    def get_board(self, game_id: str) -> dict:
+        """Everything the Game Detail screen needs in one call.
+
+        Groups every team player into selected / substitute / available so
+        the iPhone UI can render Coach and Player views without extra round
+        trips. This is a UI convenience over the contract endpoints; it does
+        not introduce new domain rules.
+        """
+        game = self.roster._require_game(game_id)
+        status = self.roster.compute_roster_status(game_id).to_dict()
+
+        roster = {e.player_id: e for e in self.store.roster_for_game(game_id)}
+        avail = {a.player_id: a for a in self.store.availability_for_game(game_id)}
+        subs = {s.player_id: s for s in self.store.substitutes_for_game(game_id)}
+
+        rows = []
+        for p in self.store.players_for_team(game.home_team_id):
+            entry = roster.get(p.id)
+            a = avail.get(p.id)
+            s = subs.get(p.id)
+            backed_out = entry is not None and not entry.status.occupies_slot
+            active_sub = s is not None and s.status in (
+                SubstituteStatus.ENROLLED, SubstituteStatus.OFFERED
+            )
+            if entry is not None:
+                group = "selected"
+            elif active_sub:
+                group = "substitute"
+            else:
+                group = "available"
+            rows.append({
+                "id": p.id,
+                "name": p.name,
+                "position": p.position.value,
+                "slot_type": p.slot_type.value,
+                "jersey_number": p.jersey_number,
+                "group": group,
+                "roster_status": entry.status.value if entry else None,
+                "backed_out": backed_out,
+                "availability": a.availability_status.value if a else "pending",
+                "sub_status": s.status.value if s else None,
+            })
+
+        notifications = [
+            {"type": n.type.value, "audience": n.audience, "message": n.message}
+            for n in self.store.notifications_for_game(game_id)
+        ]
+        return {
+            "game": _serialize(game),
+            "status": status,
+            "players": rows,
+            "notifications": notifications,
+            "audit_count": len(self.store.audit_for_game(game_id)),
+        }
 
     # -- coach controls ----------------------------------------------------
     @catch

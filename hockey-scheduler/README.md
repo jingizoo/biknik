@@ -21,7 +21,8 @@ single most important product behavior:
 | Audit trail for every state change | ✅ implemented |
 | Notification events (defined + emitted from the service) | ✅ implemented |
 | Service facade mapping to the REST API contract | ✅ implemented |
-| iOS app (SwiftUI) | ⛔ out of scope for this slice — screens are specified in `docs/` |
+| Browser-based iPhone-framed demo UI (Coach + Player views) | ✅ implemented |
+| Native iOS app (SwiftUI) | ⛔ follow-up — needs a Mac/Xcode; screens are specified in `docs/` |
 | Season scheduler engine | ⛔ explicitly out of scope |
 
 The backend is written in pure-stdlib Python so it runs and tests with no
@@ -44,9 +45,35 @@ hockey-scheduler/
       services/   roster_service (status engine + workflow)
       store/      in-memory repository
       api/        service facade mapping to the API contract
+      web/        iPhone-framed demo: stdlib HTTP server + static UI
       seed.py     mock data builder
     tests/        unittest suite (no external deps)
 ```
+
+## iPhone-framed web demo (no Mac needed)
+
+A native iOS simulator only runs inside Xcode on a Mac. Until that follow-up,
+this slice ships a **browser preview** that renders an iPhone frame and drives
+the *real* roster/substitute engine through the documented API. It runs on any
+OS (Windows included) with just Python — no third-party packages.
+
+```bash
+cd hockey-scheduler/backend
+python3 -m hockey_scheduler.web        # then open http://localhost:8000
+```
+
+It has two views via a segmented control:
+
+- **Coach** — Game Detail with the roster-status banner, selected players (mark
+  *Can't play*), the substitute pool (*Add* a sub), and *Lock Roster*.
+- **Player** — pick any player to see their personalized screen: confirm / back
+  out if selected, *Enroll as Substitute* if not, or *Accept/Withdraw* an offer.
+
+Suggested walkthrough: in **Coach** view mark a selected skater *Can't play* →
+the banner flips to **Open Slot**; switch to **Player**, pick an un-selected
+player and *Enroll as Substitute* → the coach banner becomes **Needs Substitute
+Decision**; back in **Coach**, *Add* that substitute → the slot closes and the
+roster is **Confirmed** again. *Reset* (top-right) restores the starting state.
 
 ## Run the tests
 
