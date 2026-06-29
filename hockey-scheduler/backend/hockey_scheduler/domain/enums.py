@@ -1,0 +1,122 @@
+"""Enumerations for the roster + substitute domain.
+
+Values are lowercase strings so they serialize directly into the JSON API
+contract (see docs/architecture/api-contract.md).
+"""
+
+from enum import Enum
+
+
+class Position(str, Enum):
+    GOALIE = "goalie"
+    DEFENSE = "defense"
+    FORWARD = "forward"
+    SKATER = "skater"  # generic non-goalie
+
+    @property
+    def slot_type(self) -> "SlotType":
+        """Map a player's position to the slot it fills.
+
+        Goalies fill goalie slots; everyone else fills skater slots.
+        """
+        return SlotType.GOALIE if self is Position.GOALIE else SlotType.SKATER
+
+
+class SlotType(str, Enum):
+    GOALIE = "goalie"
+    SKATER = "skater"
+
+
+class SlotStatus(str, Enum):
+    FULL = "full"
+    OPEN = "open"
+    NEEDS_COACH_DECISION = "needs_coach_decision"
+
+
+class RosterRole(str, Enum):
+    SELECTED = "selected"
+    SUBSTITUTE_ADDED = "substitute_added"
+
+
+class SelectionSource(str, Enum):
+    COACH_SELECTED = "coach_selected"
+    SUBSTITUTE_POOL = "substitute_pool"
+    MANUAL_OVERRIDE = "manual_override"
+    AUTO_FILL = "auto_fill"
+
+
+class RosterEntryStatus(str, Enum):
+    SELECTED = "selected"
+    CONFIRMED = "confirmed"
+    UNAVAILABLE = "unavailable"
+    REMOVED = "removed"
+    OFFERED = "offered"
+    ACCEPTED = "accepted"
+
+    @property
+    def occupies_slot(self) -> bool:
+        """True when this entry is holding a roster slot."""
+        return self in {
+            RosterEntryStatus.SELECTED,
+            RosterEntryStatus.CONFIRMED,
+            RosterEntryStatus.OFFERED,
+            RosterEntryStatus.ACCEPTED,
+        }
+
+    @property
+    def is_confirmed_body(self) -> bool:
+        """True when this entry counts as a confirmed, attending player."""
+        return self in {RosterEntryStatus.CONFIRMED, RosterEntryStatus.ACCEPTED}
+
+
+class AvailabilityStatus(str, Enum):
+    PENDING = "pending"
+    AVAILABLE = "available"
+    UNAVAILABLE = "unavailable"
+    MAYBE = "maybe"
+
+
+class SubstituteStatus(str, Enum):
+    ENROLLED = "enrolled"
+    OFFERED = "offered"
+    ACCEPTED = "accepted"
+    DECLINED = "declined"
+    EXPIRED = "expired"
+    WITHDRAWN = "withdrawn"
+    CANCELLED = "cancelled"
+
+
+class GameStatus(str, Enum):
+    DRAFT = "draft"
+    SELECTED = "selected"
+    AWAITING_RESPONSES = "awaiting_responses"
+    ROSTER_CONFIRMED = "roster_confirmed"
+    NEEDS_SUBSTITUTE = "needs_substitute"
+    OPEN_SLOT = "open_slot"
+    LOCKED = "locked"
+    FINAL = "final"
+
+
+class AuditAction(str, Enum):
+    ROSTER_SELECTED = "roster_selected"
+    AVAILABILITY_SET = "availability_set"
+    PLAYER_BACKED_OUT = "player_backed_out"
+    SUBSTITUTE_ENROLLED = "substitute_enrolled"
+    SUBSTITUTE_WITHDRAWN = "substitute_withdrawn"
+    SUBSTITUTE_OFFERED = "substitute_offered"
+    SUBSTITUTE_ACCEPTED = "substitute_accepted"
+    SUBSTITUTE_DECLINED = "substitute_declined"
+    SUBSTITUTE_ADDED_TO_ROSTER = "substitute_added_to_roster"
+    PLAYER_REMOVED = "player_removed"
+    ROSTER_LOCKED = "roster_locked"
+    ROSTER_UNLOCKED = "roster_unlocked"
+    GAME_CANCELLED = "game_cancelled"
+
+
+class NotificationType(str, Enum):
+    PLAYER_BACKED_OUT = "player_backed_out"
+    SLOT_OPEN = "slot_open"
+    SUBSTITUTE_ENROLLED = "substitute_enrolled"
+    SUBSTITUTE_OFFERED = "substitute_offered"
+    SUBSTITUTE_ACCEPTED = "substitute_accepted"
+    ROSTER_LOCKED = "roster_locked"

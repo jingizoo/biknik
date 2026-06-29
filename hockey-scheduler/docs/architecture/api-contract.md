@@ -1,0 +1,107 @@
+# API Contract — First Slice
+
+These endpoints map 1:1 to methods on `hockey_scheduler.api.service.ApiService`.
+A web framework can be mounted on top of the facade later without changing
+domain logic. All responses are JSON. Errors use the structured error shape
+below.
+
+## Conventions
+
+- IDs are opaque strings.
+- Timestamps are ISO-8601 UTC.
+- A successful response returns `200`/`201` with the resource.
+- Errors return `4xx`/`5xx` with:
+
+```json
+{ "error": { "code": "slot_already_filled", "message": "Human readable." } }
+```
+
+Error codes used in this slice: `not_found`, `validation_error`,
+`roster_locked`, `already_selected`, `not_enrolled`, `invalid_transition`,
+`slot_already_filled`, `not_eligible`, `game_cancelled`.
+
+## Game & roster
+
+```http
+GET   /games/{gameId}
+GET   /games/{gameId}/roster
+POST  /games/{gameId}/roster/select
+PATCH /games/{gameId}/roster/{playerId}/status
+```
+
+- `POST /roster/select` body: `{ "player_ids": ["player_1", ...], "actor_id": "..." }`
+- `PATCH /roster/{playerId}/status` body: `{ "status": "unavailable", "actor_id": "..." }`
+  (used by a selected player to confirm or back out)
+
+## Availability
+
+```http
+GET  /games/{gameId}/availability
+POST /games/{gameId}/availability
+```
+
+- `POST /availability` body:
+  `{ "player_id": "...", "availability_status": "unavailable", "response_source": "player|guardian|coach", "actor_id": "..." }`
+
+## Substitutes
+
+```http
+GET  /games/{gameId}/substitutes
+POST /games/{gameId}/substitutes/enroll
+POST /games/{gameId}/substitutes/withdraw
+POST /games/{gameId}/substitutes/{playerId}/offer
+POST /games/{gameId}/substitutes/{playerId}/accept
+POST /games/{gameId}/substitutes/{playerId}/decline
+POST /games/{gameId}/substitutes/{playerId}/add-to-roster
+```
+
+- `enroll` body: `{ "player_id": "...", "actor_id": "..." }`
+- `withdraw` body: `{ "player_id": "...", "actor_id": "..." }`
+- `offer` body: `{ "actor_id": "...", "expires_at": "<iso>?" }`
+- `accept` / `decline` body: `{ "actor_id": "..." }`
+- `add-to-roster` body: `{ "actor_id": "..." }` (coach override; offers + accepts in one step)
+
+## Roster status
+
+```http
+GET /games/{gameId}/roster-status
+```
+
+Example response:
+
+```json
+{
+  "game_id": "game_123",
+  "team_id": "team_456",
+  "target_goalies": 1,
+  "confirmed_goalies": 1,
+  "open_goalie_slots": 0,
+  "target_skaters": 15,
+  "confirmed_skaters": 14,
+  "open_skater_slots": 1,
+  "substitutes_enrolled": 0,
+  "status": "open_slot",
+  "action_required": true,
+  "message": "1 skater slot open. No substitutes enrolled."
+}
+```
+
+## Coach roster controls
+
+```http
+POST /games/{gameId}/roster/lock
+POST /games/{gameId}/roster/unlock
+POST /games/{gameId}/cancel
+```
+
+Body: `{ "actor_id": "..." }`.
+
+## UI states (Game Detail screen)
+
+The facade supports the three required screen states:
+
+- **Loading** — client concern; the facade is synchronous.
+- **Empty** — `GET /roster` returns `[]` and `roster-status` reports
+  `status = "draft"` with `message = "No players selected yet."`.
+- **Error** — any structured error shape above; the screen shows the
+  `error.message`.
