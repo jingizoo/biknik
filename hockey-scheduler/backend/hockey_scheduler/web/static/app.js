@@ -357,10 +357,12 @@ function coachBody(board) {
     <div class="banner ${bannerClass(s.status)}"><h2>${prettyStatus(s.status)}</h2><p>${esc(s.message)}</p></div>
     <div class="card">${slotBar("Goalies", s.confirmed_goalies, s.target_goalies, s.open_goalie_slots)}
       ${slotBar("Skaters", s.confirmed_skaters, s.target_skaters, s.open_skater_slots)}</div>
-    <div class="section-title">Selected Players</div>
-    <div class="card">${selRows || '<div class="empty">No players selected.</div>'}</div>
-    <div class="section-title">Substitute Pool</div>
-    <div class="card">${subRows}</div>
+    <div class="roster-cols">
+      <div><div class="section-title">Selected Players</div>
+        <div class="card">${selRows || '<div class="empty">No players selected.</div>'}</div></div>
+      <div><div class="section-title">Substitute Pool</div>
+        <div class="card">${subRows}</div></div>
+    </div>
     ${locked ? `<div class="locked-note">🔒 Roster locked. Player actions disabled.
         <button class="act ghost" data-act="unlock" style="margin-left:auto">Unlock</button></div>`
       : `<div class="actions"><button class="act ghost" data-act="lock">Lock Roster</button></div>`}
@@ -414,20 +416,28 @@ const SETUP_LABEL = {
   rink_created: "Rink created", ice_slot_created: "Ice slot created",
   game_created: "Game scheduled", player_added: "Player added",
 };
+function tlRow(time, msg, dotColor) {
+  return `<div class="tl-item"><div class="tl-dot" style="background:${dotColor || "var(--blue)"}"></div>
+    <div class="tl-body"><div class="tl-msg">${msg}</div></div>
+    <div class="tl-time">${esc(time || "")}</div></div>`;
+}
 function renderActivity(board, ov) {
-  const setup = [...((ov && ov.setup_audit) || [])].reverse().slice(0, 30);
+  const setup = [...((ov && ov.setup_audit) || [])].reverse().slice(0, 40);
   const setupHtml = setup.length
-    ? setup.map((a) => `<div class="audit-line"><span class="a-action">${esc(SETUP_LABEL[a.action] || a.action)}</span> — ${esc(a.entity_id)}</div>`).join("")
+    ? setup.map((a) => tlRow(fmt(a.at), `<strong>${esc(SETUP_LABEL[a.action] || a.action)}</strong> · ${esc(a.entity_id)}`, "#06b6d4")).join("")
     : `<div class="empty">No setup activity.</div>`;
   const operatorSection = `<div class="section-title">Operator setup (${(ov && ov.setup_audit_count) || 0})</div><div class="card">${setupHtml}</div>`;
   if (!board) return operatorSection + `<div class="section-title">Game</div><div class="card"><div class="empty">Open a game roster to see its game activity.</div></div>`;
   const names = {}; board.players.forEach((p) => (names[p.id] = p.name));
   const feed = [...(board.notifications || [])].reverse();
   const audit = [...(board.audit || [])].reverse();
-  const fHtml = feed.length ? feed.map((n) => `<div class="feed-item"><div class="feed-dot ${esc(n.audience)}"></div>
-    <div class="feed-body"><div class="msg">${esc(n.message)}</div>
-      <div class="who">to ${esc(n.audience)}${n.subject_player_id && names[n.subject_player_id] ? " · " + esc(names[n.subject_player_id]) : ""}</div></div></div>`).join("") : `<div class="empty">No notifications yet.</div>`;
-  const aHtml = audit.length ? audit.map((a) => `<div class="audit-line"><span class="a-action">${esc(AUDIT_LABEL[a.action] || a.action)}</span>${a.subject_player_id && names[a.subject_player_id] ? " — " + esc(names[a.subject_player_id]) : ""}</div>`).join("") : `<div class="empty">No audit entries.</div>`;
+  const dotFor = { coach: "var(--blue)", player: "var(--green)", team: "var(--purple)", guardian: "#b07bd6" };
+  const fHtml = feed.length ? feed.map((n) => tlRow(fmt(n.at),
+    `${esc(n.message)} <span style="color:var(--muted)">· to ${esc(n.audience)}${n.subject_player_id && names[n.subject_player_id] ? " · " + esc(names[n.subject_player_id]) : ""}</span>`,
+    dotFor[n.audience])).join("") : `<div class="empty">No notifications yet.</div>`;
+  const aHtml = audit.length ? audit.map((a) => tlRow(fmt(a.at),
+    `<strong>${esc(AUDIT_LABEL[a.action] || a.action)}</strong>${a.subject_player_id && names[a.subject_player_id] ? " · " + esc(names[a.subject_player_id]) : ""}`,
+    "#94a3b8")).join("") : `<div class="empty">No audit entries.</div>`;
   return `${operatorSection}
     <div class="section-title">Game notifications</div><div class="card">${fHtml}</div>
     <div class="section-title">Game audit (${board.audit_count})</div><div class="card">${aHtml}</div>
@@ -491,14 +501,37 @@ async function rosterAction(act, id) {
 }
 
 /* ---------- render & wiring ---------- */
-async function render() {
-  const ov = await getJSON("/api/demo/overview");
-  if (!currentGame && ov.schedule[0]) currentGame = ov.schedule[0].game_id;
-  const needsBoard = ["roster", "activity"].includes(view) || view === "dashboard";
-  const board = (needsBoard && currentGame) ? await getJSON(`/api/games/${currentGame}/board`) : null;
-
+function setChrome(ov) {
   document.getElementById("nav-title").textContent = NAV[view];
+  document.body.dataset.view = view;  // drives per-view max-width in web.css
+  const bc = document.getElementById("breadcrumb");
+  if (bc) {
+    const league = (ov && ov.league && ov.league.name) || "No league yet";
+    const season = (ov && ov.seasons && ov.seasons[0] && ov.seasons[0].name) || "No season yet";
+    bc.textContent = `${league} · ${season}`;
+  }
+}
+
+async function render() {
   const c = document.getElementById("content");
+  document.body.dataset.view = view;
+  let ov, board;
+  try {
+    c.innerHTML = `<div class="skeleton"></div><div class="skeleton"></div><div class="skeleton"></div>`;
+    ov = await getJSON("/api/demo/overview");
+    if (ov && ov.error) throw new Error(ov.error.message);
+    if (!currentGame && ov.schedule[0]) currentGame = ov.schedule[0].game_id;
+    const needsBoard = ["roster", "activity"].includes(view) || view === "dashboard";
+    board = (needsBoard && currentGame) ? await getJSON(`/api/games/${currentGame}/board`) : null;
+  } catch (e) {
+    setChrome(ov);
+    c.innerHTML = `<div class="banner alert"><h2>Could not load data</h2>
+      <p>The backend may not be running. ${esc(e.message || e)}</p></div>
+      <div class="actions"><button class="act primary" onclick="render()">Retry</button></div>`;
+    return;
+  }
+
+  setChrome(ov);
   c.innerHTML =
     view === "dashboard" ? renderDashboard(ov, board)
     : view === "setup" ? renderSetup(ov)
@@ -547,5 +580,7 @@ function switchTab(next) {
   render();
 }
 document.querySelectorAll(".tab").forEach((b) => b.onclick = () => switchTab(b.dataset.tab));
+// Topbar command actions (web shell) — outside #content, wired once.
+document.querySelectorAll(".topbar [data-goto]").forEach((b) => b.onclick = () => switchTab(b.dataset.goto));
 document.getElementById("reset-btn").onclick = async () => { await post("/api/reset", {}); toast = ""; currentGame = null; pickedPlayer = null; wizard = null; render(); };
 render();

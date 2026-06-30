@@ -9,35 +9,46 @@
 </head>
 <body class="web-body">
   <div class="web">
-    <!-- sidebar -->
     <aside class="sidebar">
-      <div class="brand"><span class="brand-ico">🏒</span>
+      <div class="brand">
+        <span class="brand-ico" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 18l7-7 4 4 7-9"/><circle cx="10" cy="11" r="1.6" fill="currentColor" stroke="none"/></svg>
+        </span>
         <div><div class="brand-name">Hockey Scheduler</div>
-          <div class="brand-sub">Operator Console</div></div></div>
+          <div class="brand-sub">Operator Console</div></div>
+      </div>
 
       <nav class="side-nav">
-        <button class="tab active" data-tab="dashboard"><span class="ti">📊</span>Dashboard</button>
-        <button class="tab" data-tab="setup"><span class="ti">🧩</span>Setup</button>
-        <button class="tab" data-tab="calendar"><span class="ti">📅</span>Arena Calendar</button>
-        <button class="tab" data-tab="games"><span class="ti">📋</span>Games</button>
-        <button class="tab" data-tab="roster"><span class="ti">🏒</span>Roster</button>
-        <button class="tab" data-tab="activity"><span class="ti">🔔</span>Activity</button>
-        <button class="tab" data-tab="public"><span class="ti">🌐</span>Public</button>
+        <button class="tab active" data-tab="dashboard">
+          <svg class="ti" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="9" rx="1"/><rect x="14" y="3" width="7" height="5" rx="1"/><rect x="14" y="12" width="7" height="9" rx="1"/><rect x="3" y="16" width="7" height="5" rx="1"/></svg>Dashboard</button>
+        <button class="tab" data-tab="setup">
+          <svg class="ti" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>Setup</button>
+        <button class="tab" data-tab="calendar">
+          <svg class="ti" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/></svg>Arena Calendar</button>
+        <button class="tab" data-tab="games">
+          <svg class="ti" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 4h6a2 2 0 0 1 2 2v0H7v0a2 2 0 0 1 2-2z"/><rect x="5" y="4" width="14" height="18" rx="2"/><path d="M9 10h6M9 14h6M9 18h3"/></svg>Games</button>
+        <button class="tab" data-tab="roster">
+          <svg class="ti" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></svg>Roster</button>
+        <button class="tab" data-tab="activity">
+          <svg class="ti" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg>Activity</button>
+        <button class="tab" data-tab="public">
+          <svg class="ti" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M2 12h20M12 2a15.3 15.3 0 0 1 0 20 15.3 15.3 0 0 1 0-20z"/></svg>Public</button>
       </nav>
 
       <div class="side-foot">
-        <button id="reset-btn" class="act ghost" title="Reset demo data">Reset demo</button>
         <a class="mobile-link" href="/mobile">📱 Mobile preview</a>
         <div class="side-note">Demo data · in-memory store</div>
       </div>
     </aside>
 
-    <!-- main -->
     <main class="main">
       <header class="topbar">
-        <div><h1 id="nav-title">Dashboard</h1>
-          <div class="crumbs">Alpine Ice Hockey League · 2026–27 Winter Season</div></div>
+        <div class="topbar-title"><h1 id="nav-title">Dashboard</h1>
+          <div id="breadcrumb" class="crumbs"></div></div>
         <div class="topbar-actions">
+          <button class="act primary" data-goto="calendar">＋ Schedule Game</button>
+          <button class="act ghost" data-goto="setup">＋ Add Ice</button>
+          <button id="reset-btn" class="act ghost" title="Reset demo data">Reset</button>
           <span class="env-pill">Demo</span>
         </div>
       </header>
