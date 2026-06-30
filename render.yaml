@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: hockey-scheduler-demo
+    runtime: python
+    plan: free
+    rootDir: hockey-scheduler/backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m hockey_scheduler.web --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.7"
