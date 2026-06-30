@@ -1,84 +1,106 @@
-/* Desktop web shell for the operator console.
-   Loaded AFTER styles.css; reuses all component styles (cards, banners, forms,
-   calendar board, rows) and only replaces the app shell + a few overrides. */
+/* Desktop web shell — modern operator console.
+   Loaded AFTER styles.css; reuses all component styles and replaces the shell. */
 
-.web-body {
-  margin: 0;
-  background: #eceef2;
-  color: var(--ink);
-}
-
+.web-body { margin: 0; background: #f3f5f9; color: var(--ink); }
 .web { display: flex; min-height: 100vh; align-items: stretch; }
 
-/* ---------- sidebar ---------- */
+/* ---------- sidebar (dark, premium) ---------- */
 .sidebar {
-  width: 248px;
-  flex: 0 0 248px;
-  background: #fff;
-  border-right: 1px solid #e3e5ea;
-  display: flex;
-  flex-direction: column;
-  position: sticky;
-  top: 0;
-  height: 100vh;
+  width: 248px; flex: 0 0 248px;
+  background: linear-gradient(180deg, #0b1424 0%, #0f172a 100%);
+  color: #e6edf8; border-right: none;
+  display: flex; flex-direction: column;
+  position: sticky; top: 0; height: 100vh;
 }
-.brand { display: flex; gap: 10px; align-items: center; padding: 18px 18px 14px; border-bottom: 1px solid #eef0f3; }
-.brand-ico { font-size: 24px; }
-.brand-name { font-weight: 700; font-size: 15px; }
-.brand-sub { font-size: 11px; color: var(--muted); }
+.brand { display: flex; gap: 11px; align-items: center; padding: 20px 18px 16px; border-bottom: 1px solid rgba(255,255,255,.08); }
+.brand-ico { width: 30px; height: 30px; color: #38bdf8; display: flex; }
+.brand-ico svg { width: 30px; height: 30px; }
+.brand-name { font-weight: 700; font-size: 15px; color: #fff; }
+.brand-sub { font-size: 11px; color: #8da2c0; }
 
-.side-nav { display: flex; flex-direction: column; padding: 10px 10px; gap: 2px; flex: 1; }
-/* override the bottom-tab styling from styles.css */
+.side-nav { display: flex; flex-direction: column; padding: 12px 10px; gap: 3px; flex: 1; }
 .side-nav .tab {
-  display: flex; flex-direction: row; align-items: center; gap: 10px;
-  width: 100%; min-width: 0;
-  padding: 10px 12px; border-radius: 9px; border: none; background: none;
-  font-size: 14px; font-weight: 500; color: #3a3a40; cursor: pointer; text-align: left;
+  display: flex; flex-direction: row; align-items: center; gap: 11px;
+  width: 100%; min-width: 0; padding: 10px 12px; border-radius: 10px;
+  border: none; background: none; font-size: 14px; font-weight: 500;
+  color: #b9c6dc; cursor: pointer; text-align: left;
 }
-.side-nav .tab .ti { font-size: 16px; width: 20px; text-align: center; }
-.side-nav .tab:hover { background: #f3f4f7; }
-.side-nav .tab.active { background: #eaf1ff; color: var(--blue); font-weight: 600; }
+.side-nav .tab .ti { width: 18px; height: 18px; flex: 0 0 18px; opacity: .85; }
+.side-nav .tab:hover { background: rgba(255,255,255,.07); color: #fff; }
+.side-nav .tab.active { background: linear-gradient(90deg, #2563eb, #06b6d4); color: #fff; box-shadow: 0 6px 18px rgba(37,99,235,.35); }
+.side-nav .tab.active .ti { opacity: 1; }
 
-.side-foot { padding: 12px; border-top: 1px solid #eef0f3; display: flex; flex-direction: column; gap: 8px; }
-.side-foot .act { width: 100%; padding: 9px; }
-.mobile-link { font-size: 13px; color: var(--blue); text-decoration: none; text-align: center; }
-.side-note { font-size: 11px; color: var(--muted); text-align: center; }
+.side-foot { padding: 14px; border-top: 1px solid rgba(255,255,255,.08); display: flex; flex-direction: column; gap: 8px; }
+.mobile-link { font-size: 13px; color: #7dd3fc; text-decoration: none; text-align: center; }
+.side-note { font-size: 11px; color: #6b7d99; text-align: center; }
 
-/* ---------- main ---------- */
+/* ---------- main + topbar ---------- */
 .main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
 .topbar {
-  display: flex; justify-content: space-between; align-items: center;
-  padding: 16px 28px; background: #fff; border-bottom: 1px solid #e3e5ea;
+  display: flex; justify-content: space-between; align-items: center; gap: 16px;
+  padding: 14px 28px; background: #fff; border-bottom: 1px solid #e6e8ee;
   position: sticky; top: 0; z-index: 10;
 }
 .topbar h1 { margin: 0; font-size: 20px; font-weight: 700; }
 .topbar .crumbs { font-size: 12px; color: var(--muted); margin-top: 2px; }
-.env-pill { font-size: 11px; font-weight: 700; padding: 4px 10px; border-radius: 20px; background: #fff0db; color: #b86a00; }
+.topbar-actions { display: flex; align-items: center; gap: 8px; }
+.topbar-actions .act { padding: 8px 14px; font-size: 13px; }
+.env-pill { font-size: 11px; font-weight: 700; padding: 5px 11px; border-radius: 20px; background: #fff0db; color: #b86a00; }
 
-/* override the phone .content (flex/scroll) for a web column */
+/* override phone .content for a web column; width varies per view */
 .main > .content {
-  flex: none; width: 100%; max-width: 1060px; margin: 0 auto;
-  padding: 24px 28px 48px; overflow: visible;
+  flex: none; width: 100%; max-width: 1080px; margin: 0 auto;
+  padding: 26px 28px 56px; overflow: visible;
 }
+body[data-view="calendar"] .main > .content,
+body[data-view="games"] .main > .content { max-width: 1440px; }
 
-/* widen some component layouts on desktop */
-.main .stats { grid-template-columns: repeat(4, 1fr); }
-.main .actions { max-width: 520px; }
-.main .form { max-width: 560px; }
-.main .wizard { max-width: 560px; }
-.main .cal-slots { flex-wrap: wrap; }
-.main .slot-card { min-width: 150px; }
+/* ---------- desktop component upgrades ---------- */
+.main .stats { grid-template-columns: repeat(4, 1fr); gap: 14px; }
+.main .stat { padding: 16px 18px; box-shadow: 0 1px 2px rgba(16,24,40,.06); }
+.main .stat .n { font-size: 28px; }
+.main .actions { max-width: 560px; }
+.main .form { max-width: 580px; }
+.main .wizard { max-width: 600px; }
+.main .card { box-shadow: 0 1px 2px rgba(16,24,40,.05); }
 
-/* the side hint panel from the phone demo is not used here */
+/* hero — control-room gradient */
+.main .hero {
+  background:
+    radial-gradient(circle at 18% 18%, rgba(56,189,248,.35), transparent 38%),
+    linear-gradient(135deg, #0f172a, #1d4ed8);
+  border-radius: 20px; padding: 26px 28px;
+}
+.main .hero h2 { font-size: 26px; }
+
+/* calendar — roomier board */
+.main .cal-slots { flex-wrap: wrap; gap: 8px; }
+.main .slot-card { min-width: 168px; padding: 12px 14px; }
+.main .slot-card .t { font-size: 13px; }
+.main .cal-rink { flex-basis: 110px; font-size: 14px; }
+
+/* roster — two columns on desktop */
+.main .roster-cols { display: grid; grid-template-columns: 1fr 1fr; gap: 0 24px; align-items: start; }
+
+/* activity timeline */
+.tl-item { display: flex; gap: 12px; padding: 9px 14px; border-bottom: 1px solid var(--sep); }
+.tl-item:last-child { border-bottom: none; }
+.tl-dot { width: 9px; height: 9px; border-radius: 50%; margin-top: 6px; background: var(--blue); flex: 0 0 auto; }
+.tl-body { flex: 1; }
+.tl-body .tl-msg { font-size: 14px; }
+.tl-time { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; flex: 0 0 auto; }
+
 .hint { display: none; }
 
-/* ---------- responsive: collapse sidebar to a top bar ---------- */
+/* ---------- responsive: collapse sidebar ---------- */
 @media (max-width: 880px) {
   .web { flex-direction: column; }
-  .sidebar { width: 100%; flex: none; height: auto; position: static; flex-direction: column; }
+  .sidebar { width: 100%; flex: none; height: auto; position: static; }
   .side-nav { flex-direction: row; overflow-x: auto; padding: 8px; }
   .side-nav .tab { white-space: nowrap; }
-  .side-foot { flex-direction: row; align-items: center; }
+  .side-foot { flex-direction: row; justify-content: space-between; align-items: center; }
+  .topbar { flex-wrap: wrap; padding: 12px 16px; }
   .main > .content { padding: 16px; }
   .main .stats { grid-template-columns: repeat(2, 1fr); }
+  .main .roster-cols { grid-template-columns: 1fr; }
 }
