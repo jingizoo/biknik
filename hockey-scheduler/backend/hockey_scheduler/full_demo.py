@@ -19,10 +19,15 @@ from .store import InMemoryStore
 # A fixed demo "Saturday".
 _DAY = datetime(2026, 9, 5, tzinfo=timezone.utc)
 
-_SKATERS = [
+_LIONS_SKATERS = [
     "Aarav M.", "Kabir S.", "Rohan P.", "Dev K.", "Neil R.", "Sam T.",
     "Leo V.", "Max W.", "Ivan O.", "Theo L.", "Finn B.", "Zane H.",
     "Owen C.", "Cole D.", "Jude E.", "Reid F.",
+]
+_FALCONS_SKATERS = [
+    "Lukas B.", "Nico H.", "Emil R.", "Jonas K.", "Tim S.", "Ravi P.",
+    "Omar D.", "Felix W.", "Noah V.", "Liam O.", "Adam T.", "Eli C.",
+    "Yusuf A.", "Karl N.", "Ben F.", "Milo G.",
 ]
 
 
@@ -69,20 +74,20 @@ def build_full_demo_store() -> Tuple[InMemoryStore, str, dict]:
     game = setup.create_game(season.id, d_u16.id, u16_lions.id, u16_falcons.id,
                              slot_game.id, actor_id=admin)
 
-    # Seed BOTH U16 teams with a full squad so any U16 game (either team as
-    # home) has a rosterable roster. The Falcons squad uses distinct names.
-    def seed_squad(team_id, prefix):
-        goalie = setup.add_player(team_id, f"{prefix} Goalie", Position.GOALIE,
+    # Seed BOTH U16 teams with a full squad (distinct names) so any U16 game
+    # (either team as home) has a rosterable roster.
+    def seed_squad(team_id, goalie_name, names):
+        goalie = setup.add_player(team_id, goalie_name, Position.GOALIE,
                                   jersey_number=30, actor_id=admin)
         out = []
-        for i, name in enumerate(_SKATERS, start=1):
+        for i, name in enumerate(names, start=1):
             pos = Position.DEFENSE if i % 3 == 0 else Position.FORWARD
-            out.append(setup.add_player(team_id, f"{name}", pos,
+            out.append(setup.add_player(team_id, name, pos,
                                         jersey_number=i, actor_id=admin))
         return goalie, out
 
-    goalie, skaters = seed_squad(u16_lions.id, "Lions")
-    seed_squad(u16_falcons.id, "Falcons")
+    goalie, skaters = seed_squad(u16_lions.id, "Gabe (G)", _LIONS_SKATERS)
+    seed_squad(u16_falcons.id, "Marek (G)", _FALCONS_SKATERS)
 
     selected = [goalie.id] + [s.id for s in skaters[:15]]
     roster.select_roster(game.id, selected, actor_id="coach_lions")

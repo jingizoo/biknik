@@ -80,6 +80,27 @@ class FullDemoTest(unittest.TestCase):
         status = self.api.auto_build_roster(game["id"])
         self.assertEqual(status["status"], "roster_confirmed")
 
+    def test_auto_build_short_roster_is_not_confirmed(self):
+        # A team with fewer players than target builds a draft (open) roster,
+        # never silently "confirmed".
+        api = ApiService()
+        lg = api.create_league("L")
+        se = api.create_season(lg["id"], "S")
+        dv = api.create_division(se["id"], "D")
+        ta = api.create_team(api.create_club("CA")["id"], dv["id"], "TA")
+        tb = api.create_team(api.create_club("CB")["id"], dv["id"], "TB")
+        # Only 2 skaters, no goalie — well below the 1 goalie / 15 skater target.
+        for n in ("Skater A", "Skater B"):
+            api.create_player(ta["id"], n, "forward")
+        rink = api.create_rink(api.create_venue("V")["id"], "R")
+        slot = api.create_ice_slot(rink["id"], "2026-09-01T18:30:00+00:00",
+                                   "2026-09-01T20:00:00+00:00")
+        game = api.create_game(se["id"], dv["id"], ta["id"], tb["id"], slot["id"])
+        status = api.auto_build_roster(game["id"])
+        self.assertNotEqual(status["status"], "roster_confirmed")
+        self.assertGreater(status["open_skater_slots"], 0)
+        self.assertEqual(status["open_goalie_slots"], 1)
+
     def test_build_roster_without_players_errors(self):
         # A team with no players cannot be auto-rostered.
         api = ApiService()

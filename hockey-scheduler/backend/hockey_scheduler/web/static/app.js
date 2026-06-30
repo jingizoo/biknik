@@ -152,12 +152,22 @@ function renderSetup(ov) {
       </select>
       <button class="act primary" data-create="ice-slot">Add ice slot</button>
     </div>
-    <div class="section-title">Already set up (${ov.setup_audit_count} audited)</div>
-    <div class="card">
-      <div class="kv"><span class="k">Divisions</span><span class="v">${ov.divisions.length}</span></div>
-      <div class="kv"><span class="k">Clubs / Teams</span><span class="v">${ov.clubs.length} / ${ov.teams.length}</span></div>
-      <div class="kv"><span class="k">Venues / Rinks</span><span class="v">${ov.venues.length} / ${ov.rinks.length}</span></div>
-    </div>${toastHtml()}`;
+    ${setupList("Leagues", ov.leagues.map((l) => l.name))}
+    ${setupList("Seasons", ov.seasons.map((s) => s.name))}
+    ${setupList("Divisions", ov.divisions.map((d) => d.name + (d.is_junior ? " · Junior" : "")))}
+    ${setupList("Clubs", ov.clubs.map((c) => c.name))}
+    ${setupList("Teams", ov.teams.map((t) => `${t.name} — ${t.division_name || ""}`))}
+    ${setupList("Venues", ov.venues.map((v) => v.name))}
+    ${setupList("Rinks", ov.rinks.map((r) => `${r.name} — ${r.venue_name || ""}`))}
+    ${toastHtml()}`;
+}
+
+function setupList(title, items) {
+  const rows = items.length
+    ? items.map((x) => `<div class="li"><div class="li-main"><div class="li-title">${esc(x)}</div></div>
+        <button class="act ghost" disabled title="Edit/delete is a follow-up">⋯</button></div>`).join("")
+    : `<div class="empty">None yet.</div>`;
+  return `<div class="section-title">${title} (${items.length})</div><div class="card">${rows}</div>`;
 }
 
 /* ---------- Arena Calendar ---------- */
@@ -166,19 +176,40 @@ function renderCalendar(ov) {
   const slotsByRink = {};
   ov.rinks.forEach((r) => (slotsByRink[r.id] = []));
   ov.ice_slots.forEach((s) => { (slotsByRink[s.rink_id] ||= []).push(s); });
+  const label = (s) => {
+    if (s.game_label) return esc(s.game_label);
+    if (s.status === "available") return "Available · Schedule";
+    if (s.slot_type === "maintenance") return "Blocked · Maintenance";
+    if (s.slot_type === "public_skate") return "Blocked · Public skate";
+    if (s.slot_type === "practice") return "Blocked · Practice";
+    if (s.slot_type === "tournament") return "Blocked · Tournament";
+    return s.status;
+  };
   const rows = ov.rinks.map((r) => {
     const cards = (slotsByRink[r.id] || []).map((s) => {
       const cls = s.status === "available" ? "available" : s.slot_type === "maintenance" ? "maintenance" : s.status;
-      const sub = s.game_label ? esc(s.game_label) : s.status === "available" ? "Tap to schedule" : s.slot_type;
       const attr = s.status === "available" ? `data-slot="${s.id}"` : "";
-      return `<div class="slot-card ${cls}" ${attr}><div class="t">${fmt(s.start_time)}–${fmt(s.end_time)}</div><div class="s">${sub}</div></div>`;
+      const cta = s.game_label ? " · Open" : "";
+      return `<div class="slot-card ${cls}" ${attr}><div class="t">${fmt(s.start_time)}–${fmt(s.end_time)}</div><div class="s">${label(s)}${cta}</div></div>`;
     }).join("") || `<div class="slot-card"><div class="s">No ice</div></div>`;
     return `<div class="cal-row"><div class="cal-rink">${esc(r.name)}</div>
       <div class="cal-slots">${cards}
         <div class="slot-card available" data-addslot="${r.id}"><div class="t">＋</div><div class="s">Add ice</div></div></div></div>`;
   }).join("");
   return `
-    <div class="section-title">${esc((ov.venues[0] || {}).name || "Arena")} · Saturday</div>
+    <div class="cal-head">
+      <div><div class="cal-date">Sat 5 Sep 2026</div>
+        <div class="cal-venue">${esc((ov.venues[0] || {}).name || "Arena")}</div></div>
+      <div class="cal-nav"><button class="act ghost" disabled>‹</button>
+        <button class="act ghost" disabled>Day</button>
+        <button class="act ghost" disabled>›</button></div>
+    </div>
+    <div class="legend">
+      <span><i class="dot lg-game"></i>Available</span>
+      <span><i class="dot lg-alloc"></i>Allocated</span>
+      <span><i class="dot lg-maint"></i>Maintenance</span>
+      <span><i class="dot lg-skate"></i>Public skate</span>
+    </div>
     ${rows}
     <div class="privacy-note">📅 Tap an <strong>Available</strong> slot to open the Schedule Game wizard.
       Apple/Google calendars are export targets only (#33) — this board is the source of truth.</div>
@@ -213,13 +244,21 @@ function renderWizard(ov) {
         <div class="li-main"><div class="li-title">${esc(slot.rink_name)}</div>
           <div class="li-sub">${esc((ov.venues[0] || {}).name || "")}</div></div></div>
       <div class="step">4 · Validation</div>
-      ${v(!!teams.length, "Teams exist in the division")}
+      ${v(!!teams.length, "Same division")}
       ${v(distinct, "Home and away are different teams")}
       ${v(slot.status === "available", "Ice slot is available")}
       ${v(true, "Public-safe junior fixture (no PII)")}
+      <div class="step">5 · Review</div>
+      <div class="review">
+        <div class="kv"><span class="k">Division</span><span class="v">${esc((divs.find((d) => d.id === wizard.division_id) || {}).name || "")}</span></div>
+        <div class="kv"><span class="k">Home</span><span class="v">${esc((teams.find((t) => t.id === wizard.home_id) || {}).name || "—")}</span></div>
+        <div class="kv"><span class="k">Away</span><span class="v">${esc((awayTeams.find((t) => t.id === wizard.away_id) || {}).name || "—")}</span></div>
+        <div class="kv"><span class="k">Venue · Rink</span><span class="v">${esc((ov.venues[0] || {}).name || "")} · ${esc(slot.rink_name)}</span></div>
+        <div class="kv"><span class="k">Time</span><span class="v">Sat ${fmt(slot.start_time)}–${fmt(slot.end_time)}</span></div>
+      </div>
       <div class="actions">
         <button class="act ghost" data-wizcancel="1">Cancel</button>
-        <button class="act primary" data-wizcreate="1" ${ok ? "" : "disabled"}>Create Game</button>
+        <button class="act primary" data-wizcreate="1" ${ok ? "" : "disabled"}>Create Draft Game</button>
       </div>
     </div>`;
 }
@@ -270,13 +309,14 @@ function coachBody(board) {
   if (!selected.length && !subs.length) {
     if (!board.players.length) {
       return `<div class="banner neutral"><h2>No roster yet</h2>
-        <p>${esc(board.game.home_team_id)} has no players. Add or import players
-        first (player management is a follow-up: #25).</p></div>${toastHtml()}`;
+        <p>The home team has no players. Add or import players first (player
+        management is a follow-up: #25).</p></div>${toastHtml()}`;
     }
     return `<div class="banner neutral"><h2>No roster selected yet</h2>
-      <p>This game has ${board.players.length} eligible players on the home team.
-      Build the roster to start the availability / substitute flow.</p></div>
-      <div class="actions"><button class="act primary" data-act="build">Build roster from team</button></div>
+      <p>${board.players.length} eligible players on the home team. For the demo
+      you can auto-fill a draft roster; production will offer Select / Import /
+      Copy-from-previous (#25).</p></div>
+      <div class="actions"><button class="act primary" data-act="build">Auto-fill demo roster</button></div>
       ${toastHtml()}`;
   }
   const openFor = (st) => st === "goalie" ? s.open_goalie_slots > 0 : s.open_skater_slots > 0;
@@ -350,8 +390,20 @@ const AUDIT_LABEL = {
   substitute_added_to_roster: "Substitute added to roster", player_removed: "Player removed",
   roster_locked: "Roster locked", roster_unlocked: "Roster unlocked", game_cancelled: "Game cancelled",
 };
-function renderActivity(board) {
-  if (!board) return `<div class="empty">Open a game roster to see its activity.</div>`;
+const SETUP_LABEL = {
+  league_created: "League created", season_created: "Season created",
+  division_created: "Division created", club_created: "Club created",
+  team_created: "Team created", venue_created: "Venue created",
+  rink_created: "Rink created", ice_slot_created: "Ice slot created",
+  game_created: "Game scheduled", player_added: "Player added",
+};
+function renderActivity(board, ov) {
+  const setup = [...((ov && ov.setup_audit) || [])].reverse().slice(0, 30);
+  const setupHtml = setup.length
+    ? setup.map((a) => `<div class="audit-line"><span class="a-action">${esc(SETUP_LABEL[a.action] || a.action)}</span> — ${esc(a.entity_id)}</div>`).join("")
+    : `<div class="empty">No setup activity.</div>`;
+  const operatorSection = `<div class="section-title">Operator setup (${(ov && ov.setup_audit_count) || 0})</div><div class="card">${setupHtml}</div>`;
+  if (!board) return operatorSection + `<div class="section-title">Game</div><div class="card"><div class="empty">Open a game roster to see its game activity.</div></div>`;
   const names = {}; board.players.forEach((p) => (names[p.id] = p.name));
   const feed = [...(board.notifications || [])].reverse();
   const audit = [...(board.audit || [])].reverse();
@@ -359,8 +411,9 @@ function renderActivity(board) {
     <div class="feed-body"><div class="msg">${esc(n.message)}</div>
       <div class="who">to ${esc(n.audience)}${n.subject_player_id && names[n.subject_player_id] ? " · " + esc(names[n.subject_player_id]) : ""}</div></div></div>`).join("") : `<div class="empty">No notifications yet.</div>`;
   const aHtml = audit.length ? audit.map((a) => `<div class="audit-line"><span class="a-action">${esc(AUDIT_LABEL[a.action] || a.action)}</span>${a.subject_player_id && names[a.subject_player_id] ? " — " + esc(names[a.subject_player_id]) : ""}</div>`).join("") : `<div class="empty">No audit entries.</div>`;
-  return `<div class="section-title">Notifications</div><div class="card">${fHtml}</div>
-    <div class="section-title">Audit trail (${board.audit_count})</div><div class="card">${aHtml}</div>
+  return `${operatorSection}
+    <div class="section-title">Game notifications</div><div class="card">${fHtml}</div>
+    <div class="section-title">Game audit (${board.audit_count})</div><div class="card">${aHtml}</div>
     <div class="section-title">Delivery</div><div class="card">${stub("📨", "Push / email delivery", "Worker + device tokens", 32)}</div>`;
 }
 
@@ -435,7 +488,7 @@ async function render() {
     : view === "calendar" ? renderCalendar(ov)
     : view === "games" ? renderGames(ov)
     : view === "roster" ? renderRoster(board)
-    : view === "activity" ? renderActivity(board)
+    : view === "activity" ? renderActivity(board, ov)
     : renderPublic(ov);
 
   c.querySelectorAll("button[data-goto]").forEach((b) => b.onclick = () => switchTab(b.dataset.goto));

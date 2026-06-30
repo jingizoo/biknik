@@ -383,6 +383,11 @@ class ApiService:
 
         leagues = [_serialize(x) for x in self.store.leagues.values()]
         seasons = [_serialize(x) for x in self.store.seasons.values()]
+        setup_audit = [
+            {"action": a.action, "entity_type": a.entity_type,
+             "entity_id": a.entity_id, "at": a.at.isoformat()}
+            for a in self.store.setup_audit
+        ]
         return {
             "league": leagues[0] if leagues else None,
             "leagues": leagues,
@@ -395,7 +400,8 @@ class ApiService:
             "ice_slots": slot_rows,
             "schedule": schedule,
             "public_fixtures": public_fixtures,
-            "setup_audit_count": len(self.store.setup_audit),
+            "setup_audit": setup_audit,
+            "setup_audit_count": len(setup_audit),
         }
 
     # ====================================================================
