@@ -16,6 +16,7 @@ from ..domain import (
     IceSlotType,
     Position,
     RosterEntryStatus,
+    SlotType,
     SubstituteStatus,
 )
 from ..domain.errors import DomainError, ValidationError
@@ -187,6 +188,39 @@ class ApiService:
     def get_roster_status(self, game_id: str) -> dict:
         return self.roster.compute_roster_status(game_id).to_dict()
 
+    @catch
+    def auto_build_roster(self, game_id: str, actor_id: Optional[str] = None) -> dict:
+        """Demo helper: select + confirm a full roster from the home team.
+
+        Picks the home team's goalies and skaters up to the game's targets so a
+        newly-scheduled game becomes immediately playable by the roster flow.
+        Raises if the home team has no players (the UI shows an empty state).
+        """
+        game = self.roster._require_game(game_id)
+        players = self.store.players_for_team(game.home_team_id)
+        if not players:
+            raise ValidationError(
+                "Home team has no players yet. Add or import players first."
+            )
+        goalies = [p for p in players if p.slot_type == SlotType.GOALIE]
+        skaters = [p for p in players if p.slot_type == SlotType.SKATER]
+        selected = ([g.id for g in goalies[:game.target_goalies]]
+                    + [s.id for s in skaters[:game.target_skaters]])
+        self.roster.select_roster(game_id, selected, actor_id)
+        for pid in selected:
+            self.roster.set_availability(game_id, pid, AvailabilityStatus.AVAILABLE)
+        status = self.roster.compute_roster_status(game_id).to_dict()
+        # Coach-friendly classification of a short roster.
+        status["missing_goalies"] = status["open_goalie_slots"]
+        status["missing_skaters"] = status["open_skater_slots"]
+        status["short_roster"] = (status["open_goalie_slots"] > 0
+                                  or status["open_skater_slots"] > 0)
+        return status
+
+    @catch
+    def publish_game(self, game_id: str, actor_id: Optional[str] = None) -> dict:
+        return _serialize(self.setup.publish_game(game_id, True, actor_id))
+
     # -- screen view-model -------------------------------------------------
     @catch
     def get_board(self, game_id: str) -> dict:
@@ -264,6 +298,122 @@ class ApiService:
     @catch
     def cancel_game(self, game_id: str, actor_id: Optional[str] = None) -> dict:
         return _serialize(self.roster.cancel_game(game_id, actor_id))
+
+    # ====================================================================
+    # Full E2E demo overview (League / Arena / Schedule / Public)
+    # ====================================================================
+    @catch
+    def get_demo_overview(self) -> dict:
+        """Assemble the League/Arena/Schedule/Public view for the E2E demo.
+
+        The ``public`` section deliberately contains NO player names or any
+        personal data — only fixture information that is safe to show fans.
+        """
+        divisions = {d.id: d for d in self.store.divisions.values()}
+        clubs = {c.id: c for c in self.store.clubs.values()}
+        teams = {t.id: t for t in self.store.teams.values()}
+        venues = {v.id: v for v in self.store.venues.values()}
+        rinks = {r.id: r for r in self.store.rinks.values()}
+
+        def is_junior(div):
+            if div is None:
+                return False
+            tag = (div.age_group or div.name or "").upper()
+            return tag.startswith("U")
+
+        def team_name(tid):
+            t = teams.get(tid)
+            return t.name if t else tid
+
+        division_rows = [
+            {"id": d.id, "season_id": d.season_id, "name": d.name,
+             "age_group": d.age_group, "is_junior": is_junior(d)}
+            for d in divisions.values()
+        ]
+        team_rows = [
+            {"id": t.id, "name": t.name, "club_id": t.club_id,
+             "division_id": t.division_id,
+             "club_name": clubs[t.club_id].name if t.club_id in clubs else None,
+             "division_name": divisions[t.division_id].name
+             if t.division_id in divisions else t.division}
+            for t in teams.values()
+        ]
+        rink_rows = [
+            {"id": r.id, "venue_id": r.venue_id, "name": r.name,
+             "venue_name": venues[r.venue_id].name if r.venue_id in venues else None}
+            for r in rinks.values()
+        ]
+
+        game_by_slot = {g.ice_slot_id: g for g in self.store.games.values()
+                        if g.ice_slot_id}
+        slot_rows = []
+        for s in sorted(self.store.ice_slots.values(),
+                        key=lambda x: (x.rink_id, x.start_time)):
+            g = game_by_slot.get(s.id)
+            slot_rows.append({
+                "id": s.id, "rink_id": s.rink_id,
+                "rink_name": rinks[s.rink_id].name if s.rink_id in rinks else None,
+                "start_time": s.start_time.isoformat(),
+                "end_time": s.end_time.isoformat(),
+                "slot_type": s.slot_type.value, "status": s.status.value,
+                "game_id": g.id if g else None,
+                "game_label": f"{team_name(g.home_team_id)} vs "
+                              f"{team_name(g.away_team_id)}" if g else None,
+            })
+
+        schedule, public_fixtures = [], []
+        for g in self.store.games.values():
+            div = divisions.get(g.division_id)
+            rstatus = self.roster.compute_roster_status(g.id)
+            venue_name = None
+            slot = self.store.get_ice_slot(g.ice_slot_id) if g.ice_slot_id else None
+            if slot and slot.rink_id in rinks:
+                rk = rinks[slot.rink_id]
+                venue_name = venues[rk.venue_id].name if rk.venue_id in venues else None
+            schedule.append({
+                "game_id": g.id,
+                "home_team_name": team_name(g.home_team_id),
+                "away_team_name": team_name(g.away_team_id) if g.away_team_id else None,
+                "division_name": div.name if div else None,
+                "rink_name": g.rink, "venue_name": venue_name,
+                "start_time": g.start_time.isoformat(),
+                "roster_status": rstatus.status.value,
+                "published": g.published,
+            })
+            # PUBLIC: only PUBLISHED games, fixture info only — no players/PII.
+            if g.published and not g.cancelled:
+                public_fixtures.append({
+                    "division_name": div.name if div else None,
+                    "home_team_name": team_name(g.home_team_id),
+                    "away_team_name": team_name(g.away_team_id) if g.away_team_id else None,
+                    "venue_name": venue_name, "rink_name": g.rink,
+                    "start_time": g.start_time.isoformat(),
+                    "status": "Scheduled",
+                    "is_junior": is_junior(div),
+                })
+
+        leagues = [_serialize(x) for x in self.store.leagues.values()]
+        seasons = [_serialize(x) for x in self.store.seasons.values()]
+        setup_audit = [
+            {"action": a.action, "entity_type": a.entity_type,
+             "entity_id": a.entity_id, "at": a.at.isoformat()}
+            for a in self.store.setup_audit
+        ]
+        return {
+            "league": leagues[0] if leagues else None,
+            "leagues": leagues,
+            "seasons": seasons,
+            "divisions": division_rows,
+            "clubs": [_serialize(c) for c in clubs.values()],
+            "teams": team_rows,
+            "venues": [_serialize(v) for v in venues.values()],
+            "rinks": rink_rows,
+            "ice_slots": slot_rows,
+            "schedule": schedule,
+            "public_fixtures": public_fixtures,
+            "setup_audit": setup_audit,
+            "setup_audit_count": len(setup_audit),
+        }
 
     # ====================================================================
     # League + Arena setup

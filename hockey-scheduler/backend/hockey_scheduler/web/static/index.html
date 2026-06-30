@@ -3,12 +3,11 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Hockey Scheduler — iPhone Demo</title>
+  <title>Hockey Scheduler — Operator Demo</title>
   <link rel="stylesheet" href="/styles.css" />
 </head>
 <body>
   <div class="stage">
-    <!-- iPhone frame -->
     <div class="phone">
       <div class="notch"></div>
       <div class="screen">
@@ -16,46 +15,42 @@
           <span>9:41</span>
           <span class="statusbar-icons">▮▮▮ &nbsp; 5G &nbsp; 🔋</span>
         </div>
-
         <div class="navbar">
-          <span id="nav-title" class="nav-title">Today</span>
+          <span id="nav-title" class="nav-title">Dashboard</span>
           <button id="reset-btn" class="nav-action" title="Reset demo">Reset</button>
         </div>
-
-        <div id="content" class="content"><!-- rendered by app.js --></div>
-
-        <!-- bottom tab bar -->
+        <div id="content" class="content"></div>
         <nav class="tabbar">
-          <button class="tab active" data-tab="today">
-            <span class="tab-ico">🏒</span><span>Today</span>
-          </button>
-          <button class="tab" data-tab="game">
-            <span class="tab-ico">📋</span><span>Game</span>
-          </button>
-          <button class="tab" data-tab="activity">
-            <span class="tab-ico">🔔</span><span>Activity</span>
-          </button>
+          <button class="tab active" data-tab="dashboard"><span class="tab-ico">📊</span><span>Dash</span></button>
+          <button class="tab" data-tab="setup"><span class="tab-ico">🧩</span><span>Setup</span></button>
+          <button class="tab" data-tab="calendar"><span class="tab-ico">📅</span><span>Calendar</span></button>
+          <button class="tab" data-tab="games"><span class="tab-ico">📋</span><span>Games</span></button>
+          <button class="tab" data-tab="roster"><span class="tab-ico">🏒</span><span>Roster</span></button>
+          <button class="tab" data-tab="activity"><span class="tab-ico">🔔</span><span>Activity</span></button>
+          <button class="tab" data-tab="public"><span class="tab-ico">🌐</span><span>Public</span></button>
         </nav>
       </div>
     </div>
 
     <div class="hint">
-      <h1>Hockey Scheduler</h1>
-      <p>A browser preview of the iPhone app. It drives the <strong>real</strong>
-        roster &amp; substitute engine on the backend — every tap hits the API.</p>
-      <ul>
-        <li><strong>Today</strong> — the next game at a glance: roster fill,
-          open slots, and an action banner.</li>
-        <li><strong>Game</strong> — full Game Detail. Toggle <em>Coach</em> /
-          <em>Player</em>. Mark a skater <em>Can't play</em>, enroll a sub,
-          and fill the slot.</li>
-        <li><strong>Activity</strong> — the live notification feed and the
-          audit trail the backend records for every change.</li>
-      </ul>
-      <p class="muted">Reset (top-right) restores a fully confirmed roster.</p>
+      <h1>Calendar-first Operator Demo</h1>
+      <p>Run a league &amp; arena from one app, driving the <strong>real</strong>
+        backend — every create and schedule action hits the API.</p>
+      <ol>
+        <li><strong>Setup</strong> — create a league, season, division, club,
+          team, venue, rink (real records).</li>
+        <li><strong>Calendar</strong> — see ice by rink &amp; time; tap an
+          <em>Available</em> slot → <em>Schedule Game</em> wizard.</li>
+        <li><strong>Games</strong> — the operations checklist per game; open the
+          roster.</li>
+        <li><strong>Roster</strong> — Coach/Player substitute flow: back out →
+          open slot → enroll → add → confirm → lock.</li>
+        <li><strong>Public</strong> — fan fixtures, no junior player names.</li>
+      </ol>
+      <p class="muted">Officials, results, notifications &amp; calendar export
+        are shown as disabled follow-ups linked to their issues.</p>
     </div>
   </div>
-
   <script src="/app.js"></script>
 </body>
 </html>
