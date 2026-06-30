@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Hockey Scheduler — iPhone Demo</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <div class="stage">
+    <!-- iPhone frame -->
+    <div class="phone">
+      <div class="notch"></div>
+      <div class="screen">
+        <div class="statusbar">
+          <span>9:41</span>
+          <span class="statusbar-icons">▮▮▮ &nbsp; 5G &nbsp; 🔋</span>
+        </div>
+
+        <div class="navbar">
+          <span id="nav-title" class="nav-title">Today</span>
+          <button id="reset-btn" class="nav-action" title="Reset demo">Reset</button>
+        </div>
+
+        <div id="content" class="content"><!-- rendered by app.js --></div>
+
+        <!-- bottom tab bar -->
+        <nav class="tabbar">
+          <button class="tab active" data-tab="today">
+            <span class="tab-ico">🏒</span><span>Today</span>
+          </button>
+          <button class="tab" data-tab="game">
+            <span class="tab-ico">📋</span><span>Game</span>
+          </button>
+          <button class="tab" data-tab="activity">
+            <span class="tab-ico">🔔</span><span>Activity</span>
+          </button>
+        </nav>
+      </div>
+    </div>
+
+    <div class="hint">
+      <h1>Hockey Scheduler</h1>
+      <p>A browser preview of the iPhone app. It drives the <strong>real</strong>
+        roster &amp; substitute engine on the backend — every tap hits the API.</p>
+      <ul>
+        <li><strong>Today</strong> — the next game at a glance: roster fill,
+          open slots, and an action banner.</li>
+        <li><strong>Game</strong> — full Game Detail. Toggle <em>Coach</em> /
+          <em>Player</em>. Mark a skater <em>Can't play</em>, enroll a sub,
+          and fill the slot.</li>
+        <li><strong>Activity</strong> — the live notification feed and the
+          audit trail the backend records for every change.</li>
+      </ul>
+      <p class="muted">Reset (top-right) restores a fully confirmed roster.</p>
+    </div>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

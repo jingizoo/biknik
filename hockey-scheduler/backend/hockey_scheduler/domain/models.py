@@ -1,0 +1,170 @@
+"""Dataclass models for the roster + substitute domain.
+
+These are plain data holders. All business logic lives in the service layer
+so the models stay easy to serialize and test.
+"""
+
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Optional
+
+from .enums import (
+    AuditAction,
+    AvailabilityStatus,
+    GameStatus,
+    NotificationType,
+    Position,
+    RosterEntryStatus,
+    RosterRole,
+    SelectionSource,
+    SlotStatus,
+    SlotType,
+    SubstituteStatus,
+)
+
+
+@dataclass
+class Team:
+    id: str
+    name: str
+    division: str = ""
+
+
+@dataclass
+class Player:
+    id: str
+    team_id: str
+    name: str
+    position: Position
+    shoots: Optional[str] = None
+    jersey_number: Optional[int] = None
+    is_active: bool = True
+    guardian_person_id: Optional[str] = None
+
+    @property
+    def slot_type(self) -> SlotType:
+        return self.position.slot_type
+
+
+@dataclass
+class Game:
+    id: str
+    home_team_id: str
+    start_time: datetime
+    target_goalies: int = 1
+    target_skaters: int = 15
+    max_skaters: int = 18
+    away_team_id: Optional[str] = None
+    rink: Optional[str] = None
+    end_time: Optional[datetime] = None
+    roster_lock_time: Optional[datetime] = None
+    locked: bool = False
+    cancelled: bool = False
+
+
+@dataclass
+class GameRosterEntry:
+    id: str
+    game_id: str
+    player_id: str
+    roster_role: RosterRole
+    selection_source: SelectionSource
+    status: RosterEntryStatus
+    selected_at: datetime
+    updated_at: datetime
+    selected_by: Optional[str] = None
+
+
+@dataclass
+class GameAvailability:
+    id: str
+    game_id: str
+    player_id: str
+    availability_status: AvailabilityStatus
+    response_source: str = "player"
+    responded_at: Optional[datetime] = None
+    notes: Optional[str] = None
+
+
+@dataclass
+class SubstituteEnrollment:
+    id: str
+    game_id: str
+    player_id: str
+    position: Position
+    status: SubstituteStatus
+    enrolled_at: datetime
+    priority_rank: Optional[int] = None
+    offered_at: Optional[datetime] = None
+    offer_expires_at: Optional[datetime] = None
+    accepted_at: Optional[datetime] = None
+    declined_at: Optional[datetime] = None
+
+    @property
+    def slot_type(self) -> SlotType:
+        return self.position.slot_type
+
+
+@dataclass
+class AuditLog:
+    id: str
+    game_id: str
+    action: AuditAction
+    at: datetime
+    actor_id: Optional[str] = None
+    subject_player_id: Optional[str] = None
+    detail: dict = field(default_factory=dict)
+
+
+@dataclass
+class NotificationEvent:
+    id: str
+    game_id: str
+    type: NotificationType
+    audience: str  # "coach" | "player" | "guardian" | "team"
+    message: str
+    at: datetime
+    subject_player_id: Optional[str] = None
+
+
+@dataclass
+class SlotSummary:
+    slot_type: SlotType
+    target_count: int
+    confirmed_count: int
+    occupied_count: int
+    open_count: int
+    substitutes_available: int
+    status: SlotStatus
+
+
+@dataclass
+class RosterStatus:
+    game_id: str
+    team_id: str
+    target_goalies: int
+    confirmed_goalies: int
+    open_goalie_slots: int
+    target_skaters: int
+    confirmed_skaters: int
+    open_skater_slots: int
+    substitutes_enrolled: int
+    status: GameStatus
+    action_required: bool
+    message: str
+
+    def to_dict(self) -> dict:
+        return {
+            "game_id": self.game_id,
+            "team_id": self.team_id,
+            "target_goalies": self.target_goalies,
+            "confirmed_goalies": self.confirmed_goalies,
+            "open_goalie_slots": self.open_goalie_slots,
+            "target_skaters": self.target_skaters,
+            "confirmed_skaters": self.confirmed_skaters,
+            "open_skater_slots": self.open_skater_slots,
+            "substitutes_enrolled": self.substitutes_enrolled,
+            "status": self.status.value,
+            "action_required": self.action_required,
+            "message": self.message,
+        }
