@@ -5,6 +5,7 @@ division, club → team, venue → rink → ice slot, and manual game creation.
 Pure logic over the store with an injected clock; every create is audited.
 """
 
+import functools
 from datetime import datetime, timezone
 from typing import Callable, List, Optional
 
@@ -35,6 +36,15 @@ from ..store import InMemoryStore
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _transactional(fn):
+    """Wrap a mutating service method in a single store transaction."""
+    @functools.wraps(fn)
+    def wrapper(self, *args, **kwargs):
+        with self.store.transaction():
+            return fn(self, *args, **kwargs)
+    return wrapper
 
 
 class SetupService:
@@ -71,6 +81,7 @@ class SetupService:
         ))
 
     # -- league / season / division ---------------------------------------
+    @_transactional
     def create_league(self, name: str, country: str = "", timezone_name: str = "UTC",
                       actor_id: Optional[str] = None) -> League:
         league = League(id=self.store.next_id("league"),
@@ -80,6 +91,7 @@ class SetupService:
         self._audit("league_created", "league", league.id, actor_id)
         return league
 
+    @_transactional
     def create_season(self, league_id: str, name: str,
                       start_date: Optional[datetime] = None,
                       end_date: Optional[datetime] = None,
@@ -97,6 +109,7 @@ class SetupService:
                     {"league_id": league_id})
         return season
 
+    @_transactional
     def create_division(self, season_id: str, name: str, age_group: str = "",
                         actor_id: Optional[str] = None) -> Division:
         if self.store.get_season(season_id) is None:
@@ -109,6 +122,7 @@ class SetupService:
         return division
 
     # -- club / team -------------------------------------------------------
+    @_transactional
     def create_club(self, name: str, country: str = "",
                     actor_id: Optional[str] = None) -> Club:
         club = Club(id=self.store.next_id("club"), name=self._require_name(name),
@@ -117,6 +131,7 @@ class SetupService:
         self._audit("club_created", "club", club.id, actor_id)
         return club
 
+    @_transactional
     def create_team(self, club_id: str, division_id: str, name: str,
                     actor_id: Optional[str] = None) -> Team:
         if self.store.get_club(club_id) is None:
@@ -132,6 +147,7 @@ class SetupService:
         return team
 
     # -- venue / rink / ice slot ------------------------------------------
+    @_transactional
     def create_venue(self, name: str, address: str = "", timezone_name: str = "UTC",
                      actor_id: Optional[str] = None) -> Venue:
         venue = Venue(id=self.store.next_id("venue"), name=self._require_name(name),
@@ -140,6 +156,7 @@ class SetupService:
         self._audit("venue_created", "venue", venue.id, actor_id)
         return venue
 
+    @_transactional
     def create_rink(self, venue_id: str, name: str,
                     actor_id: Optional[str] = None) -> Rink:
         if self.store.get_venue(venue_id) is None:
@@ -150,6 +167,7 @@ class SetupService:
         self._audit("rink_created", "rink", rink.id, actor_id, {"venue_id": venue_id})
         return rink
 
+    @_transactional
     def create_ice_slot(self, rink_id: str, start_time: datetime, end_time: datetime,
                         slot_type: IceSlotType = IceSlotType.GAME,
                         actor_id: Optional[str] = None) -> IceSlot:
@@ -180,6 +198,7 @@ class SetupService:
         return slot
 
     # -- manual game creation ---------------------------------------------
+    @_transactional
     def create_game(self, season_id: str, division_id: str, home_team_id: str,
                     away_team_id: str, ice_slot_id: str,
                     target_goalies: int = 1, target_skaters: int = 15,
@@ -272,6 +291,7 @@ class SetupService:
         })
         return game
 
+    @_transactional
     def publish_game(self, game_id: str, published: bool = True,
                      actor_id: Optional[str] = None) -> Game:
         game = self.store.get_game(game_id)
@@ -284,6 +304,7 @@ class SetupService:
         return game
 
     # -- convenience: add a player to a team ------------------------------
+    @_transactional
     def add_player(self, team_id: str, name: str, position: Position,
                    jersey_number: Optional[int] = None,
                    actor_id: Optional[str] = None) -> Player:

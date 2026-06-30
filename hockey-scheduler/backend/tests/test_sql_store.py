@@ -9,12 +9,17 @@ DATABASE_URL.
 import os
 import tempfile
 import unittest
+from datetime import datetime, timezone
 
 from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
 
 from hockey_scheduler.api import ApiService
+from hockey_scheduler.domain.errors import NotFoundError
 from hockey_scheduler.full_demo import build_full_demo_store
+from hockey_scheduler.services import SetupService
 from hockey_scheduler.store import SqlStore, create_store
+
+UTC = timezone.utc
 
 
 class SqlStoreParityTest(unittest.TestCase):
@@ -60,21 +65,62 @@ class SqlStoreParityTest(unittest.TestCase):
         self.assertEqual(dup["error"]["code"], "schedule_conflict")
 
 
+class SqlStoreTransactionTest(unittest.TestCase):
+    """A failure mid multi-write operation must roll the whole thing back."""
+
+    def test_failed_create_game_rolls_back(self):
+        store = SqlStore(":memory:")
+        svc = SetupService(store)
+        league = svc.create_league("L")
+        season = svc.create_season(league.id, "S")
+        div = svc.create_division(season.id, "D")
+        home = svc.create_team(svc.create_club("CA").id, div.id, "TA")
+        away = svc.create_team(svc.create_club("CB").id, div.id, "TB")
+        rink = svc.create_rink(svc.create_venue("V").id, "R")
+        slot = svc.create_ice_slot(rink.id, datetime(2026, 9, 1, 18, 30, tzinfo=UTC),
+                                   datetime(2026, 9, 1, 20, 0, tzinfo=UTC))
+        self.assertEqual(len(store.all_games()), 0)
+
+        # Force the final step of create_game (the audit write) to fail, after
+        # the game insert and the slot-allocation update.
+        def boom(*_a, **_k):
+            raise RuntimeError("audit write failed")
+        store.add_setup_audit = boom
+        with self.assertRaises(RuntimeError):
+            svc.create_game(season.id, div.id, home.id, away.id, slot.id)
+
+        # The transaction rolled back: no game, and the slot is still available.
+        self.assertEqual(len(store.all_games()), 0)
+        self.assertEqual(store.get_ice_slot(slot.id).status.value, "available")
+
+
 class SqlStoreReloadTest(unittest.TestCase):
-    """State must survive re-opening the database (the whole point of #23)."""
+    """State must survive re-opening the database (the whole point of #23).
+
+    Runs against PostgreSQL when TEST_DATABASE_URL is set (CI), else a SQLite
+    temp file locally.
+    """
 
     def setUp(self):
-        fd, self.path = tempfile.mkstemp(suffix=".db")
-        os.close(fd)
+        self._tmp = None
+        url = os.environ.get("TEST_DATABASE_URL")
+        if url:
+            SqlStore(url).reset_schema()  # isolate from other tests
+            self.url = url
+        else:
+            fd, self._tmp = tempfile.mkstemp(suffix=".db")
+            os.close(fd)
+            self.url = self._tmp
 
     def tearDown(self):
-        os.remove(self.path)
+        if self._tmp:
+            os.remove(self._tmp)
 
     def _api(self):
-        return ApiService(SqlStore(self.path))
+        return ApiService(SqlStore(self.url))
 
     def test_state_persists_across_reload(self):
-        store = SqlStore(self.path)
+        store = SqlStore(self.url)
         _, gid, ids = build_full_demo_store(store)
         api = ApiService(store)
         # Mutate: back out, add substitute, lock — and schedule + publish a 2nd game.
@@ -107,7 +153,7 @@ class SqlStoreReloadTest(unittest.TestCase):
         self.assertEqual(len(ov2["teams"]), 4)
 
     def test_create_store_factory_selects_sql_for_url(self):
-        store = create_store(self.path)
+        store = create_store(self.url)
         self.assertIsInstance(store, SqlStore)
 
 

@@ -5,6 +5,7 @@ the public methods here, so a SQL-backed implementation can be substituted
 later without touching domain logic.
 """
 
+from contextlib import contextmanager
 from itertools import count
 from typing import Dict, List, Optional
 
@@ -48,6 +49,14 @@ class InMemoryStore:
         self.ice_slots: Dict[str, IceSlot] = {}
         self.setup_audit: List[SetupAuditLog] = []
         self._counters: Dict[str, count] = {}
+
+    @contextmanager
+    def transaction(self):
+        """No-op for the in-memory store (single-process, by reference)."""
+        yield
+
+    def close(self) -> None:
+        pass
 
     # -- id generation -----------------------------------------------------
     def next_id(self, prefix: str) -> str:

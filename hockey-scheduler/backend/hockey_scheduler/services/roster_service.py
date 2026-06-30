@@ -8,6 +8,7 @@ Every state-changing method appends an :class:`AuditLog` entry and, where the
 use case calls for it, emits a :class:`NotificationEvent`.
 """
 
+import functools
 from datetime import datetime, timezone
 from typing import Callable, List, Optional
 
@@ -48,6 +49,15 @@ from ..store import InMemoryStore
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _transactional(fn):
+    """Wrap a mutating service method in a single store transaction."""
+    @functools.wraps(fn)
+    def wrapper(self, *args, **kwargs):
+        with self.store.transaction():
+            return fn(self, *args, **kwargs)
+    return wrapper
 
 
 class RosterService:
@@ -118,6 +128,7 @@ class RosterService:
     # ====================================================================
     # roster selection
     # ====================================================================
+    @_transactional
     def select_roster(
         self, game_id: str, player_ids: List[str], actor_id: Optional[str] = None
     ) -> List[GameRosterEntry]:
@@ -166,6 +177,7 @@ class RosterService:
     # ====================================================================
     # availability / confirm / back out
     # ====================================================================
+    @_transactional
     def set_availability(
         self,
         game_id: str,
@@ -231,6 +243,7 @@ class RosterService:
                 self._back_out_entry(game, entry, actor_id)
         return av
 
+    @_transactional
     def set_roster_entry_status(
         self,
         game_id: str,
@@ -317,6 +330,7 @@ class RosterService:
     # ====================================================================
     # substitute workflow
     # ====================================================================
+    @_transactional
     def enroll_substitute(
         self, game_id: str, player_id: str, actor_id: Optional[str] = None
     ) -> SubstituteEnrollment:
@@ -371,6 +385,7 @@ class RosterService:
         )
         return sub
 
+    @_transactional
     def withdraw_substitute(
         self, game_id: str, player_id: str, actor_id: Optional[str] = None
     ) -> SubstituteEnrollment:
@@ -397,6 +412,7 @@ class RosterService:
             )
         return sub
 
+    @_transactional
     def offer_substitute(
         self,
         game_id: str,
@@ -431,6 +447,7 @@ class RosterService:
         )
         return sub
 
+    @_transactional
     def accept_substitute(
         self, game_id: str, player_id: str, actor_id: Optional[str] = None
     ) -> GameRosterEntry:
@@ -465,6 +482,7 @@ class RosterService:
         )
         return entry
 
+    @_transactional
     def decline_substitute(
         self, game_id: str, player_id: str, actor_id: Optional[str] = None
     ) -> SubstituteEnrollment:
@@ -484,6 +502,7 @@ class RosterService:
         )
         return sub
 
+    @_transactional
     def add_substitute_to_roster(
         self, game_id: str, player_id: str, actor_id: Optional[str] = None
     ) -> GameRosterEntry:
@@ -562,6 +581,7 @@ class RosterService:
     # ====================================================================
     # coach controls
     # ====================================================================
+    @_transactional
     def remove_player(
         self, game_id: str, player_id: str, actor_id: Optional[str] = None
     ) -> GameRosterEntry:
@@ -573,6 +593,7 @@ class RosterService:
         self._back_out_entry(game, entry, actor_id, removed=True)
         return entry
 
+    @_transactional
     def lock_roster(self, game_id: str, actor_id: Optional[str] = None) -> Game:
         game = self._require_game(game_id)
         if game.cancelled:
@@ -588,6 +609,7 @@ class RosterService:
         )
         return game
 
+    @_transactional
     def unlock_roster(self, game_id: str, actor_id: Optional[str] = None) -> Game:
         game = self._require_game(game_id)
         game.locked = False
@@ -595,6 +617,7 @@ class RosterService:
         self._audit(game_id, AuditAction.ROSTER_UNLOCKED, actor_id=actor_id)
         return game
 
+    @_transactional
     def cancel_game(self, game_id: str, actor_id: Optional[str] = None) -> Game:
         game = self._require_game(game_id)
         game.cancelled = True

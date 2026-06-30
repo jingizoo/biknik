@@ -73,6 +73,23 @@ python3 -m hockey_scheduler.web        # then open http://localhost:8000
 Both surfaces share the same `app.js` and the same API; the desktop console is
 just a different shell over the same views.
 
+## Persistence / run modes
+
+The store is selected from `DATABASE_URL` (else in-memory). Multi-write
+operations run inside a transaction, so a partial failure rolls back. See
+`docs/architecture/persistence.md`.
+
+```bash
+# In-memory (default; resets on restart) — good for the demo
+python3 -m hockey_scheduler.web
+
+# SQLite file (durable, zero dependencies)
+DATABASE_URL=sqlite:///hockey.db python3 -m hockey_scheduler.web
+
+# PostgreSQL (product target; needs `pip install "psycopg[binary]"`)
+DATABASE_URL=postgresql://user:pass@localhost:5432/hockey python3 -m hockey_scheduler.web
+```
+
 It is a **calendar-first operator demo** seeded (via the real setup service)
 with the Alpine Ice Hockey League scenario. Every create and schedule action
 hits the API and writes real store records. The bottom tab bar is organized as

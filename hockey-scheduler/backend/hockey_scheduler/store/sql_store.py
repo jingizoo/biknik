@@ -8,6 +8,7 @@ ISO-8601 text, booleans as 0/1, and dict payloads as JSON text.
 
 import json
 import threading
+from contextlib import contextmanager
 from dataclasses import fields
 from datetime import datetime
 from typing import List, Optional
@@ -151,6 +152,18 @@ def _ddl(spec) -> str:
     return f"CREATE TABLE IF NOT EXISTS {spec.table} ({', '.join(defs)})"
 
 
+# Helpful indexes for the common lookups (created IF NOT EXISTS).
+_INDEXES = [
+    "CREATE INDEX IF NOT EXISTS ix_ice_slots_rink ON ice_slots(rink_id, start_time)",
+    "CREATE INDEX IF NOT EXISTS ix_games_slot ON games(ice_slot_id)",
+    "CREATE INDEX IF NOT EXISTS ix_games_teams ON games(home_team_id, away_team_id)",
+    "CREATE INDEX IF NOT EXISTS ix_players_team ON players(team_id)",
+    "CREATE INDEX IF NOT EXISTS ix_roster_game ON game_roster_entries(game_id, player_id)",
+    "CREATE INDEX IF NOT EXISTS ix_subs_game ON substitute_enrollments(game_id, player_id)",
+    "CREATE INDEX IF NOT EXISTS ix_avail_game ON game_availability(game_id, player_id)",
+]
+
+
 def migrate(conn, dialect) -> None:
     cur = conn.cursor()
     cur.execute("CREATE TABLE IF NOT EXISTS schema_migrations "
@@ -159,6 +172,8 @@ def migrate(conn, dialect) -> None:
                 "(prefix TEXT PRIMARY KEY, value INTEGER)")
     for spec in SPECS.values():
         cur.execute(_ddl(spec))
+    for ddl in _INDEXES:
+        cur.execute(ddl)
     cur.execute(dialect.sql(
         "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?) "
         "ON CONFLICT(version) DO NOTHING"),
@@ -168,8 +183,28 @@ def migrate(conn, dialect) -> None:
 class SqlStore:
     def __init__(self, url: str = ":memory:"):
         self.conn, self.dialect = connect(url)
-        self._lock = threading.Lock()
+        # Reentrant: transaction() holds the lock while inner _exec re-acquires.
+        self._lock = threading.RLock()
         migrate(self.conn, self.dialect)
+
+    @contextmanager
+    def transaction(self):
+        """Atomic multi-write block: commit on success, roll back on error."""
+        with self._lock:
+            if self.dialect.paramstyle == "pyformat":  # psycopg manages it
+                with self.conn.transaction():
+                    yield
+            else:  # sqlite (autocommit) — explicit txn
+                try:
+                    self.conn.execute("BEGIN")
+                    yield
+                    self.conn.commit()
+                except Exception:
+                    self.conn.rollback()
+                    raise
+
+    def close(self) -> None:
+        self.conn.close()
 
     def reset_schema(self) -> None:
         """Drop all tables and re-migrate — for a clean test database."""
