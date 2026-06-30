@@ -11,9 +11,15 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Callable, List, Optional
 
-from ..domain import AvailabilityStatus, RosterEntryStatus, SubstituteStatus
+from ..domain import (
+    AvailabilityStatus,
+    IceSlotType,
+    Position,
+    RosterEntryStatus,
+    SubstituteStatus,
+)
 from ..domain.errors import DomainError, ValidationError
-from ..services import RosterService
+from ..services import RosterService, SetupService
 from ..store import InMemoryStore
 
 
@@ -88,6 +94,7 @@ class ApiService:
     def __init__(self, store: Optional[InMemoryStore] = None):
         self.store = store or InMemoryStore()
         self.roster = RosterService(self.store)
+        self.setup = SetupService(self.store)
 
     # -- games -------------------------------------------------------------
     @catch
@@ -257,3 +264,75 @@ class ApiService:
     @catch
     def cancel_game(self, game_id: str, actor_id: Optional[str] = None) -> dict:
         return _serialize(self.roster.cancel_game(game_id, actor_id))
+
+    # ====================================================================
+    # League + Arena setup
+    # ====================================================================
+    @catch
+    def create_league(self, name: str, country: str = "", timezone: str = "UTC",
+                      actor_id: Optional[str] = None) -> dict:
+        return _serialize(self.setup.create_league(name, country, timezone, actor_id))
+
+    @catch
+    def list_leagues(self) -> List[dict]:
+        return [_serialize(x) for x in self.setup.list_leagues()]
+
+    @catch
+    def create_season(self, league_id: str, name: str,
+                      start_date: Optional[str] = None, end_date: Optional[str] = None,
+                      actor_id: Optional[str] = None) -> dict:
+        return _serialize(self.setup.create_season(
+            league_id, name, _parse_dt(start_date, "start_date"),
+            _parse_dt(end_date, "end_date"), actor_id))
+
+    @catch
+    def create_division(self, season_id: str, name: str, age_group: str = "",
+                        actor_id: Optional[str] = None) -> dict:
+        return _serialize(self.setup.create_division(season_id, name, age_group, actor_id))
+
+    @catch
+    def create_club(self, name: str, country: str = "",
+                    actor_id: Optional[str] = None) -> dict:
+        return _serialize(self.setup.create_club(name, country, actor_id))
+
+    @catch
+    def create_team(self, club_id: str, division_id: str, name: str,
+                    actor_id: Optional[str] = None) -> dict:
+        return _serialize(self.setup.create_team(club_id, division_id, name, actor_id))
+
+    @catch
+    def create_venue(self, name: str, address: str = "", timezone: str = "UTC",
+                     actor_id: Optional[str] = None) -> dict:
+        return _serialize(self.setup.create_venue(name, address, timezone, actor_id))
+
+    @catch
+    def create_rink(self, venue_id: str, name: str,
+                    actor_id: Optional[str] = None) -> dict:
+        return _serialize(self.setup.create_rink(venue_id, name, actor_id))
+
+    @catch
+    def create_ice_slot(self, rink_id: str, start_time: str, end_time: str,
+                        slot_type: str = "game", actor_id: Optional[str] = None) -> dict:
+        return _serialize(self.setup.create_ice_slot(
+            rink_id, _parse_dt(start_time, "start_time"),
+            _parse_dt(end_time, "end_time"),
+            _parse_enum(IceSlotType, slot_type, "slot_type"), actor_id))
+
+    @catch
+    def create_player(self, team_id: str, name: str, position: str,
+                      jersey_number: Optional[int] = None,
+                      actor_id: Optional[str] = None) -> dict:
+        return _serialize(self.setup.add_player(
+            team_id, name, _parse_enum(Position, position, "position"),
+            jersey_number, actor_id))
+
+    @catch
+    def create_game(self, season_id: str, division_id: str, home_team_id: str,
+                    away_team_id: str, ice_slot_id: str, target_goalies: int = 1,
+                    target_skaters: int = 15, max_skaters: int = 18,
+                    allow_division_override: bool = False,
+                    actor_id: Optional[str] = None) -> dict:
+        return _serialize(self.setup.create_game(
+            season_id, division_id, home_team_id, away_team_id, ice_slot_id,
+            target_goalies, target_skaters, max_skaters,
+            allow_division_override, actor_id))

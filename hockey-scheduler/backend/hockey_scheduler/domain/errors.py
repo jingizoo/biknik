@@ -51,3 +51,11 @@ class SlotAlreadyFilledError(DomainError):
 
 class NotEligibleError(DomainError):
     code = "not_eligible"
+
+
+class ScheduleConflictError(DomainError):
+    code = "schedule_conflict"
+
+
+class DivisionMismatchError(DomainError):
+    code = "division_mismatch"

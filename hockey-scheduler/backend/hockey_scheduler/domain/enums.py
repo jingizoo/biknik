@@ -113,6 +113,20 @@ class AuditAction(str, Enum):
     GAME_CANCELLED = "game_cancelled"
 
 
+class IceSlotType(str, Enum):
+    GAME = "game"
+    PRACTICE = "practice"
+    TOURNAMENT = "tournament"
+    MAINTENANCE = "maintenance"
+    PUBLIC_SKATE = "public_skate"
+
+
+class IceSlotStatus(str, Enum):
+    AVAILABLE = "available"
+    ALLOCATED = "allocated"
+    BLOCKED = "blocked"
+
+
 class NotificationType(str, Enum):
     PLAYER_BACKED_OUT = "player_backed_out"
     SLOT_OPEN = "slot_open"

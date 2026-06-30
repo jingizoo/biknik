@@ -21,6 +21,7 @@ single most important product behavior:
 | Audit trail for every state change | ✅ implemented |
 | Notification events (defined + emitted from the service) | ✅ implemented |
 | Service facade mapping to the REST API contract | ✅ implemented |
+| League + Arena setup (league/season/division, club/team, venue/rink/ice-slot, manual game) | ✅ implemented |
 | Browser-based iPhone-framed demo UI (Coach + Player views) | ✅ implemented |
 | Native iOS app (SwiftUI) | ⛔ follow-up — needs a Mac/Xcode; screens are specified in `docs/` |
 | Season scheduler engine | ⛔ explicitly out of scope |
@@ -99,3 +100,15 @@ python3 -m hockey_scheduler.demo
 The demo seeds a game, has a confirmed skater back out, and prints the
 recalculated roster status — first with no substitutes enrolled (Open Slot),
 then with a substitute enrolled and added to the roster (slot closed).
+
+## League + Arena setup demo
+
+```bash
+cd hockey-scheduler/backend
+python3 -m hockey_scheduler.setup_demo
+```
+
+Builds a league → season → division, two clubs/teams, and a venue → rink →
+ice slot, then creates a manual game on that slot (rejecting a double-booking)
+and shows the new game driving the existing roster engine. See
+`docs/architecture/league-arena-setup.md`.

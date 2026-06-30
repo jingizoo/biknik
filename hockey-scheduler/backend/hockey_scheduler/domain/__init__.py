@@ -2,6 +2,8 @@ from .enums import (
     AuditAction,
     AvailabilityStatus,
     GameStatus,
+    IceSlotStatus,
+    IceSlotType,
     Position,
     RosterEntryStatus,
     RosterRole,
@@ -12,6 +14,7 @@ from .enums import (
 )
 from .errors import (
     AlreadySelectedError,
+    DivisionMismatchError,
     DomainError,
     GameCancelledError,
     InvalidTransitionError,
@@ -19,6 +22,7 @@ from .errors import (
     NotEnrolledError,
     NotFoundError,
     RosterLockedError,
+    ScheduleConflictError,
     SlotAlreadyFilledError,
     ValidationError,
 )
@@ -34,12 +38,24 @@ from .models import (
     SubstituteEnrollment,
     Team,
 )
+from .setup_models import (
+    Club,
+    Division,
+    IceSlot,
+    League,
+    Rink,
+    Season,
+    SetupAuditLog,
+    Venue,
+)
 
 __all__ = [
     # enums
     "AuditAction",
     "AvailabilityStatus",
     "GameStatus",
+    "IceSlotStatus",
+    "IceSlotType",
     "Position",
     "RosterEntryStatus",
     "RosterRole",
@@ -49,6 +65,7 @@ __all__ = [
     "SubstituteStatus",
     # errors
     "AlreadySelectedError",
+    "DivisionMismatchError",
     "DomainError",
     "GameCancelledError",
     "InvalidTransitionError",
@@ -56,6 +73,7 @@ __all__ = [
     "NotEnrolledError",
     "NotFoundError",
     "RosterLockedError",
+    "ScheduleConflictError",
     "SlotAlreadyFilledError",
     "ValidationError",
     # models
@@ -69,4 +87,13 @@ __all__ = [
     "SlotSummary",
     "SubstituteEnrollment",
     "Team",
+    # setup models
+    "Club",
+    "Division",
+    "IceSlot",
+    "League",
+    "Rink",
+    "Season",
+    "SetupAuditLog",
+    "Venue",
 ]
