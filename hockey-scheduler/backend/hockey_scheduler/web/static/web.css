@@ -90,12 +90,6 @@ body[data-view="games"] .main > .content { max-width: 1440px; }
 .tl-body .tl-msg { font-size: 14px; }
 .tl-time { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; flex: 0 0 auto; }
 
-/* loading + error */
-.skeleton { height: 64px; border-radius: 12px; margin-bottom: 12px;
-  background: linear-gradient(90deg, #eef1f6 25%, #e3e7ef 37%, #eef1f6 63%);
-  background-size: 400% 100%; animation: sk 1.3s ease-in-out infinite; }
-@keyframes sk { 0% { background-position: 100% 0; } 100% { background-position: 0 0; } }
-
 .hint { display: none; }
 
 /* ---------- responsive: collapse sidebar ---------- */
