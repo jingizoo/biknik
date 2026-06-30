@@ -8,6 +8,7 @@ Every state-changing method appends an :class:`AuditLog` entry and, where the
 use case calls for it, emits a :class:`NotificationEvent`.
 """
 
+import functools
 from datetime import datetime, timezone
 from typing import Callable, List, Optional
 
@@ -48,6 +49,15 @@ from ..store import InMemoryStore
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _transactional(fn):
+    """Wrap a mutating service method in a single store transaction."""
+    @functools.wraps(fn)
+    def wrapper(self, *args, **kwargs):
+        with self.store.transaction():
+            return fn(self, *args, **kwargs)
+    return wrapper
 
 
 class RosterService:
@@ -118,6 +128,7 @@ class RosterService:
     # ====================================================================
     # roster selection
     # ====================================================================
+    @_transactional
     def select_roster(
         self, game_id: str, player_ids: List[str], actor_id: Optional[str] = None
     ) -> List[GameRosterEntry]:
@@ -166,6 +177,7 @@ class RosterService:
     # ====================================================================
     # availability / confirm / back out
     # ====================================================================
+    @_transactional
     def set_availability(
         self,
         game_id: str,
@@ -231,6 +243,7 @@ class RosterService:
                 self._back_out_entry(game, entry, actor_id)
         return av
 
+    @_transactional
     def set_roster_entry_status(
         self,
         game_id: str,
@@ -276,6 +289,7 @@ class RosterService:
     ) -> None:
         entry.status = status
         entry.updated_at = self.clock()
+        self.store.save_roster_entry(entry)
 
     def _back_out_entry(
         self,
@@ -316,6 +330,7 @@ class RosterService:
     # ====================================================================
     # substitute workflow
     # ====================================================================
+    @_transactional
     def enroll_substitute(
         self, game_id: str, player_id: str, actor_id: Optional[str] = None
     ) -> SubstituteEnrollment:
@@ -370,6 +385,7 @@ class RosterService:
         )
         return sub
 
+    @_transactional
     def withdraw_substitute(
         self, game_id: str, player_id: str, actor_id: Optional[str] = None
     ) -> SubstituteEnrollment:
@@ -378,6 +394,7 @@ class RosterService:
         sub = self._require_active_enrollment(game_id, player_id)
         was_offered = sub.status == SubstituteStatus.OFFERED
         sub.status = SubstituteStatus.WITHDRAWN
+        self.store.save_substitute(sub)
         self._audit(
             game_id,
             AuditAction.SUBSTITUTE_WITHDRAWN,
@@ -395,6 +412,7 @@ class RosterService:
             )
         return sub
 
+    @_transactional
     def offer_substitute(
         self,
         game_id: str,
@@ -413,6 +431,7 @@ class RosterService:
         sub.status = SubstituteStatus.OFFERED
         sub.offered_at = self.clock()
         sub.offer_expires_at = offer_expires_at
+        self.store.save_substitute(sub)
         self._audit(
             game_id,
             AuditAction.SUBSTITUTE_OFFERED,
@@ -428,6 +447,7 @@ class RosterService:
         )
         return sub
 
+    @_transactional
     def accept_substitute(
         self, game_id: str, player_id: str, actor_id: Optional[str] = None
     ) -> GameRosterEntry:
@@ -439,11 +459,13 @@ class RosterService:
         # Offers can expire: a lapsed offer returns the player to the pool.
         if sub.offer_expires_at and self.clock() > sub.offer_expires_at:
             sub.status = SubstituteStatus.EXPIRED
+            self.store.save_substitute(sub)
             raise InvalidTransitionError("This substitute offer has expired.")
         # First-accepted-wins: the slot must still be open.
         self._require_open_slot(game_id, sub.slot_type)
         sub.status = SubstituteStatus.ACCEPTED
         sub.accepted_at = self.clock()
+        self.store.save_substitute(sub)
         entry = self._add_to_roster_entry(game, player_id)
         self._audit(
             game_id,
@@ -460,6 +482,7 @@ class RosterService:
         )
         return entry
 
+    @_transactional
     def decline_substitute(
         self, game_id: str, player_id: str, actor_id: Optional[str] = None
     ) -> SubstituteEnrollment:
@@ -470,6 +493,7 @@ class RosterService:
             raise InvalidTransitionError("No active offer to decline.")
         sub.status = SubstituteStatus.DECLINED
         sub.declined_at = self.clock()
+        self.store.save_substitute(sub)
         self._audit(
             game_id,
             AuditAction.SUBSTITUTE_DECLINED,
@@ -478,6 +502,7 @@ class RosterService:
         )
         return sub
 
+    @_transactional
     def add_substitute_to_roster(
         self, game_id: str, player_id: str, actor_id: Optional[str] = None
     ) -> GameRosterEntry:
@@ -495,6 +520,7 @@ class RosterService:
         self._require_open_slot(game_id, sub.slot_type)
         sub.status = SubstituteStatus.ACCEPTED
         sub.accepted_at = self.clock()
+        self.store.save_substitute(sub)
         entry = self._add_to_roster_entry(game, player_id)
         self._audit(
             game_id,
@@ -520,7 +546,7 @@ class RosterService:
             existing.selection_source = SelectionSource.SUBSTITUTE_POOL
             existing.status = RosterEntryStatus.ACCEPTED
             existing.updated_at = now
-            return existing
+            return self.store.save_roster_entry(existing)
         entry = GameRosterEntry(
             id=self.store.next_id("entry"),
             game_id=game.id,
@@ -555,6 +581,7 @@ class RosterService:
     # ====================================================================
     # coach controls
     # ====================================================================
+    @_transactional
     def remove_player(
         self, game_id: str, player_id: str, actor_id: Optional[str] = None
     ) -> GameRosterEntry:
@@ -566,11 +593,13 @@ class RosterService:
         self._back_out_entry(game, entry, actor_id, removed=True)
         return entry
 
+    @_transactional
     def lock_roster(self, game_id: str, actor_id: Optional[str] = None) -> Game:
         game = self._require_game(game_id)
         if game.cancelled:
             raise GameCancelledError("Game is cancelled.")
         game.locked = True
+        self.store.save_game(game)
         self._audit(game_id, AuditAction.ROSTER_LOCKED, actor_id=actor_id)
         self._notify(
             game_id,
@@ -580,19 +609,24 @@ class RosterService:
         )
         return game
 
+    @_transactional
     def unlock_roster(self, game_id: str, actor_id: Optional[str] = None) -> Game:
         game = self._require_game(game_id)
         game.locked = False
+        self.store.save_game(game)
         self._audit(game_id, AuditAction.ROSTER_UNLOCKED, actor_id=actor_id)
         return game
 
+    @_transactional
     def cancel_game(self, game_id: str, actor_id: Optional[str] = None) -> Game:
         game = self._require_game(game_id)
         game.cancelled = True
+        self.store.save_game(game)
         # Cancel any active substitute enrollments.
         for sub in self.store.substitutes_for_game(game_id):
             if sub.status in (SubstituteStatus.ENROLLED, SubstituteStatus.OFFERED):
                 sub.status = SubstituteStatus.CANCELLED
+                self.store.save_substitute(sub)
         self._audit(game_id, AuditAction.GAME_CANCELLED, actor_id=actor_id)
         return game
 

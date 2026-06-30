@@ -5,6 +5,7 @@ the public methods here, so a SQL-backed implementation can be substituted
 later without touching domain logic.
 """
 
+from contextlib import contextmanager
 from itertools import count
 from typing import Dict, List, Optional
 
@@ -48,6 +49,14 @@ class InMemoryStore:
         self.ice_slots: Dict[str, IceSlot] = {}
         self.setup_audit: List[SetupAuditLog] = []
         self._counters: Dict[str, count] = {}
+
+    @contextmanager
+    def transaction(self):
+        """No-op for the in-memory store (single-process, by reference)."""
+        yield
+
+    def close(self) -> None:
+        pass
 
     # -- id generation -----------------------------------------------------
     def next_id(self, prefix: str) -> str:
@@ -209,3 +218,58 @@ class InMemoryStore:
     def add_setup_audit(self, entry: SetupAuditLog) -> SetupAuditLog:
         self.setup_audit.append(entry)
         return entry
+
+    # -- listings (interface shared with the SQL store) -------------------
+    def all_leagues(self) -> List[League]:
+        return list(self.leagues.values())
+
+    def all_seasons(self) -> List[Season]:
+        return list(self.seasons.values())
+
+    def all_divisions(self) -> List[Division]:
+        return list(self.divisions.values())
+
+    def all_clubs(self) -> List[Club]:
+        return list(self.clubs.values())
+
+    def all_teams(self) -> List[Team]:
+        return list(self.teams.values())
+
+    def all_venues(self) -> List[Venue]:
+        return list(self.venues.values())
+
+    def all_rinks(self) -> List[Rink]:
+        return list(self.rinks.values())
+
+    def all_ice_slots(self) -> List[IceSlot]:
+        return list(self.ice_slots.values())
+
+    def all_games(self) -> List[Game]:
+        return list(self.games.values())
+
+    def all_setup_audit(self) -> List[SetupAuditLog]:
+        return list(self.setup_audit)
+
+    # -- saves (persist in-place mutations) -------------------------------
+    # For the in-memory store these are effectively no-ops (the object is
+    # already held by reference); they exist so the service layer can be
+    # written backend-agnostically and the SQL store can persist updates.
+    def save_game(self, game: Game) -> Game:
+        self.games[game.id] = game
+        return game
+
+    def save_ice_slot(self, slot: IceSlot) -> IceSlot:
+        self.ice_slots[slot.id] = slot
+        return slot
+
+    def save_substitute(self, sub: SubstituteEnrollment) -> SubstituteEnrollment:
+        self.substitutes[sub.id] = sub
+        return sub
+
+    def save_roster_entry(self, entry: GameRosterEntry) -> GameRosterEntry:
+        self.roster_entries[entry.id] = entry
+        return entry
+
+    def save_availability(self, av: GameAvailability) -> GameAvailability:
+        self.availability[av.id] = av
+        return av

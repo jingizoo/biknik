@@ -18,6 +18,7 @@ from datetime import datetime, timedelta
 
 from ..api import ApiService
 from ..full_demo import build_full_demo_store
+from ..store import SqlStore, create_store
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 CONTENT_TYPES = {
@@ -55,8 +56,12 @@ class DemoState:
     def reset(self) -> None:
         # Build the full Alpine league/arena scenario via the real setup
         # service, with one game rostered and confirmed, ready to demo a
-        # back-out → substitute flow.
-        store, game_id, ids = build_full_demo_store()
+        # back-out → substitute flow. Honors DATABASE_URL (SQLite/Postgres);
+        # the demo reseeds a clean dataset on each reset.
+        store = create_store()
+        if isinstance(store, SqlStore):
+            store.reset_schema()
+        store, game_id, ids = build_full_demo_store(store)
         self.api = ApiService(store)
         self.game_id = game_id
         self.ids = ids

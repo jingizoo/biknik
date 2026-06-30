@@ -1,0 +1,47 @@
+"""PostgreSQL smoke test — exercises the SQL store against real Postgres.
+
+Skipped unless TEST_DATABASE_URL is set (CI sets it to a Postgres service).
+The same SqlStore code path is covered against SQLite in test_sql_store.py.
+"""
+
+import os
+import unittest
+
+from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
+
+from hockey_scheduler.api import ApiService
+from hockey_scheduler.full_demo import build_full_demo_store
+from hockey_scheduler.store import SqlStore
+
+URL = os.environ.get("TEST_DATABASE_URL")
+
+
+@unittest.skipUnless(URL, "TEST_DATABASE_URL not set (no Postgres available)")
+class PostgresSmokeTest(unittest.TestCase):
+    def setUp(self):
+        # Start from a clean schema so the run is isolated.
+        SqlStore(URL).reset_schema()
+
+    def test_seed_flow_and_reload_on_postgres(self):
+        store = SqlStore(URL)
+        _, gid, ids = build_full_demo_store(store)
+        api = ApiService(store)
+        self.assertEqual(api.get_roster_status(gid)["status"], "roster_confirmed")
+
+        # Run the substitute flow + lock.
+        api.set_availability(gid, ids["selected_player_id"], "unavailable")
+        api.enroll_substitute(gid, ids["substitute_player_id"])
+        api.add_substitute_to_roster(gid, ids["substitute_player_id"], actor_id="c")
+        api.lock_roster(gid, actor_id="c")
+
+        # Re-open Postgres in a fresh connection — state must persist.
+        api2 = ApiService(SqlStore(URL))
+        self.assertEqual(api2.get_roster_status(gid)["status"], "locked")
+        ov = api2.get_demo_overview()
+        self.assertEqual(ov["league"]["name"], "Alpine Ice Hockey League")
+        self.assertEqual(len(ov["teams"]), 4)
+        self.assertEqual(len(ov["public_fixtures"]), 1)
+
+
+if __name__ == "__main__":
+    unittest.main()
