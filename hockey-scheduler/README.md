@@ -52,17 +52,25 @@ hockey-scheduler/
     tests/        unittest suite (no external deps)
 ```
 
-## iPhone-framed web demo (no Mac needed)
+## Web operator console (no Mac needed)
 
-A native iOS simulator only runs inside Xcode on a Mac. Until that follow-up,
-this slice ships a **browser preview** that renders an iPhone frame and drives
-the *real* roster/substitute engine through the documented API. It runs on any
-OS (Windows included) with just Python — no third-party packages.
+A native iOS app needs a Mac + Xcode, so until then the app ships as a
+**responsive web console** that drives the *real* backend through the
+documented API. It runs on any OS with just Python — no third-party packages.
 
 ```bash
 cd hockey-scheduler/backend
 python3 -m hockey_scheduler.web        # then open http://localhost:8000
 ```
+
+- **`/`** — the desktop **Operator Console**: a sidebar app (Dashboard, Setup,
+  Arena Calendar, Games, Roster, Activity, Public) with a wide layout, designed
+  for a league/arena operator. Collapses to a top nav on narrow screens.
+- **`/mobile`** — the original **iPhone-framed preview** of the same flows
+  (the design reference for the future native app).
+
+Both surfaces share the same `app.js` and the same API; the desktop console is
+just a different shell over the same views.
 
 It is a **calendar-first operator demo** seeded (via the real setup service)
 with the Alpine Ice Hockey League scenario. Every create and schedule action

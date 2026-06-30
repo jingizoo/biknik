@@ -97,7 +97,12 @@ class Handler(BaseHTTPRequestHandler):
             return {}
 
     def _serve_static(self, path: str) -> None:
-        rel = "index.html" if path in ("/", "") else path.lstrip("/")
+        if path in ("/", ""):
+            rel = "index.html"            # desktop web console
+        elif path in ("/mobile", "/mobile/"):
+            rel = "mobile.html"           # iPhone-framed preview
+        else:
+            rel = path.lstrip("/")
         target = (STATIC_DIR / rel).resolve()
         if STATIC_DIR not in target.parents or not target.is_file():
             self.send_error(404, "Not found")

@@ -128,6 +128,19 @@ class WebServerTest(unittest.TestCase):
         self.assertEqual(status, 400)
         self.assertEqual(body["error"]["code"], "validation_error")
 
+    def test_root_serves_web_console(self):
+        with urllib.request.urlopen(f"http://{HOST}:{PORT}/") as resp:
+            html = resp.read().decode()
+        self.assertEqual(resp.status, 200)
+        self.assertIn("Operator Console", html)
+        self.assertIn('class="sidebar"', html)
+
+    def test_mobile_route_serves_phone_shell(self):
+        with urllib.request.urlopen(f"http://{HOST}:{PORT}/mobile") as resp:
+            html = resp.read().decode()
+        self.assertEqual(resp.status, 200)
+        self.assertIn('class="phone"', html)
+
 
 if __name__ == "__main__":
     unittest.main()
