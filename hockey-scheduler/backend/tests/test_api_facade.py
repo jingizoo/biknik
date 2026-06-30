@@ -68,6 +68,20 @@ class ApiFacadeTest(unittest.TestCase):
         self.assertIsInstance(game["start_time"], str)
         self.assertTrue(game["start_time"].endswith("+00:00"))
 
+    def test_offer_with_naive_expires_at_returns_validation_error(self):
+        # Set up an open slot with an enrolled substitute.
+        selected = ["player_goalie_1"] + [f"player_skater_{i}" for i in range(1, 16)]
+        self.api.select_roster(self.game_id, selected, actor_id="coach_1")
+        for pid in selected:
+            self.api.set_availability(self.game_id, pid, "available")
+        self.api.enroll_substitute(self.game_id, "player_skater_16")
+        self.api.set_availability(self.game_id, "player_skater_5", "unavailable")
+        # A naive (no timezone) timestamp must be rejected.
+        result = self.api.offer_substitute(
+            self.game_id, "player_skater_16", expires_at="2026-07-04T18:30:00"
+        )
+        self.assertEqual(result["error"]["code"], "validation_error")
+
     def test_board_is_fully_json_serializable(self):
         import json
         self.api.select_roster(self.game_id, ["player_skater_1"], actor_id="coach_1")

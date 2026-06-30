@@ -180,7 +180,25 @@ class RosterService:
             raise GameCancelledError("Game is cancelled.")
         if game.locked:
             raise RosterLockedError("Roster is locked. Unlock to make changes.")
-        self._require_player(player_id)
+        player = self._require_player(player_id)
+
+        # Validate the roster-entry transition BEFORE persisting anything so a
+        # rejected re-confirm leaves no partial availability/audit state.
+        entry = self.store.roster_entry_for_player(game_id, player_id)
+        reconfirming = (
+            entry is not None
+            and availability_status == AvailabilityStatus.AVAILABLE
+            and entry.status == RosterEntryStatus.UNAVAILABLE
+        )
+        if entry is not None and availability_status == AvailabilityStatus.AVAILABLE:
+            if entry.status == RosterEntryStatus.REMOVED:
+                raise InvalidTransitionError(
+                    "Player was removed by the coach and cannot self re-confirm."
+                )
+            if reconfirming:
+                # Re-confirming after a back-out only works while the slot is
+                # still open (a substitute may have already filled it).
+                self._require_open_slot(game_id, player.slot_type)
 
         existing = self.store.availability_for_player(game_id, player_id)
         av = GameAvailability(
@@ -203,11 +221,13 @@ class RosterService:
         )
 
         # Keep the roster entry in sync so the status engine reacts.
-        entry = self.store.roster_entry_for_player(game_id, player_id)
-        if entry and entry.status.occupies_slot:
-            if availability_status == AvailabilityStatus.AVAILABLE:
+        if entry is not None:
+            if availability_status == AvailabilityStatus.AVAILABLE and (
+                entry.status.occupies_slot or reconfirming
+            ):
                 self._set_entry_status(entry, RosterEntryStatus.CONFIRMED)
-            elif availability_status == AvailabilityStatus.UNAVAILABLE:
+            elif (availability_status == AvailabilityStatus.UNAVAILABLE
+                  and entry.status.occupies_slot):
                 self._back_out_entry(game, entry, actor_id)
         return av
 
@@ -300,8 +320,7 @@ class RosterService:
         self, game_id: str, player_id: str, actor_id: Optional[str] = None
     ) -> SubstituteEnrollment:
         game = self._require_game(game_id)
-        if game.cancelled:
-            raise GameCancelledError("Game is cancelled.")
+        self._guard_mutable(game)
         player = self._require_player(player_id)
 
         if player.team_id != game.home_team_id:
@@ -354,7 +373,8 @@ class RosterService:
     def withdraw_substitute(
         self, game_id: str, player_id: str, actor_id: Optional[str] = None
     ) -> SubstituteEnrollment:
-        self._require_game(game_id)
+        game = self._require_game(game_id)
+        self._guard_mutable(game)
         sub = self._require_active_enrollment(game_id, player_id)
         was_offered = sub.status == SubstituteStatus.OFFERED
         sub.status = SubstituteStatus.WITHDRAWN
@@ -443,7 +463,8 @@ class RosterService:
     def decline_substitute(
         self, game_id: str, player_id: str, actor_id: Optional[str] = None
     ) -> SubstituteEnrollment:
-        self._require_game(game_id)
+        game = self._require_game(game_id)
+        self._guard_mutable(game)
         sub = self.store.substitute_for_player(game_id, player_id)
         if sub is None or sub.status != SubstituteStatus.OFFERED:
             raise InvalidTransitionError("No active offer to decline.")

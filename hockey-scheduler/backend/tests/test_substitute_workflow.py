@@ -194,6 +194,68 @@ class SubstituteWorkflowTest(unittest.TestCase):
         with self.assertRaises(AlreadySelectedError):
             service.enroll_substitute(game_id, "player_skater_1")
 
+    def test_locked_roster_blocks_substitute_enrollment(self):
+        service, _, game_id = make_service(target_skaters=4)
+        service.lock_roster(game_id, actor_id="coach_1")
+        with self.assertRaises(RosterLockedError):
+            service.enroll_substitute(game_id, "player_skater_5")
+
+    def test_locked_roster_blocks_substitute_withdrawal(self):
+        service, _, game_id = make_service(target_skaters=4)
+        service.enroll_substitute(game_id, "player_skater_5")
+        service.lock_roster(game_id, actor_id="coach_1")
+        with self.assertRaises(RosterLockedError):
+            service.withdraw_substitute(game_id, "player_skater_5")
+
+    def test_locked_roster_blocks_substitute_decline(self):
+        service, _, game_id = make_service(target_skaters=4)
+        self._full_roster(service, game_id)
+        service.enroll_substitute(game_id, "player_skater_5")
+        service.set_availability(
+            game_id, "player_skater_1", AvailabilityStatus.UNAVAILABLE
+        )
+        service.offer_substitute(game_id, "player_skater_5")
+        service.lock_roster(game_id, actor_id="coach_1")
+        with self.assertRaises(RosterLockedError):
+            service.decline_substitute(game_id, "player_skater_5")
+
+    def test_backed_out_player_can_reconfirm_when_slot_still_open(self):
+        service, store, game_id = make_service(target_skaters=4)
+        self._full_roster(service, game_id)
+        service.set_availability(
+            game_id, "player_skater_1", AvailabilityStatus.UNAVAILABLE
+        )
+        service.set_availability(
+            game_id, "player_skater_1", AvailabilityStatus.AVAILABLE
+        )
+        entry = store.roster_entry_for_player(game_id, "player_skater_1")
+        self.assertEqual(entry.status, RosterEntryStatus.CONFIRMED)
+        self.assertEqual(
+            service.compute_roster_status(game_id).open_skater_slots, 0
+        )
+
+    def test_backed_out_player_cannot_reconfirm_after_slot_filled(self):
+        service, _, game_id = make_service(target_skaters=4)
+        self._full_roster(service, game_id)
+        service.enroll_substitute(game_id, "player_skater_5")
+        service.set_availability(
+            game_id, "player_skater_1", AvailabilityStatus.UNAVAILABLE
+        )
+        service.add_substitute_to_roster(game_id, "player_skater_5", actor_id="coach_1")
+        with self.assertRaises(SlotAlreadyFilledError):
+            service.set_availability(
+                game_id, "player_skater_1", AvailabilityStatus.AVAILABLE
+            )
+
+    def test_coach_removed_player_cannot_self_reconfirm(self):
+        service, _, game_id = make_service(target_skaters=4)
+        self._full_roster(service, game_id)
+        service.remove_player(game_id, "player_skater_1", actor_id="coach_1")
+        with self.assertRaises(InvalidTransitionError):
+            service.set_availability(
+                game_id, "player_skater_1", AvailabilityStatus.AVAILABLE
+            )
+
     def test_expired_offer_cannot_be_accepted(self):
         service, store, game_id = make_service(target_skaters=4)
         self._full_roster(service, game_id)

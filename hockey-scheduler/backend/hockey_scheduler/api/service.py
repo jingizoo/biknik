@@ -7,7 +7,7 @@ web framework) never see Python tracebacks across the boundary.
 """
 
 from dataclasses import asdict, is_dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Callable, List, Optional
 
@@ -53,17 +53,23 @@ def _parse_enum(enum_cls, value, field_name: str):
 
 
 def _parse_dt(value, field_name: str):
-    """Parse an optional ISO-8601 timestamp string into a datetime."""
+    """Parse an optional ISO-8601 *UTC* timestamp into a timezone-aware datetime."""
     if value is None or value == "":
         return None
     if isinstance(value, datetime):
-        return value
-    try:
-        return datetime.fromisoformat(value)
-    except (ValueError, TypeError):
+        parsed = value
+    else:
+        try:
+            parsed = datetime.fromisoformat(value)
+        except (ValueError, TypeError):
+            raise ValidationError(
+                f"Invalid {field_name}: {value!r}. Expected an ISO-8601 timestamp."
+            )
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
         raise ValidationError(
-            f"Invalid {field_name}: {value!r}. Expected an ISO-8601 timestamp."
+            f"Invalid {field_name}: expected a timezone-aware ISO-8601 UTC timestamp."
         )
+    return parsed.astimezone(timezone.utc)
 
 
 def catch(fn: Callable):
@@ -220,15 +226,23 @@ class ApiService:
             })
 
         notifications = [
-            {"type": n.type.value, "audience": n.audience, "message": n.message}
+            {"type": n.type.value, "audience": n.audience, "message": n.message,
+             "at": n.at.isoformat(), "subject_player_id": n.subject_player_id}
             for n in self.store.notifications_for_game(game_id)
+        ]
+        audit = [
+            {"action": a.action.value, "actor_id": a.actor_id,
+             "subject_player_id": a.subject_player_id, "at": a.at.isoformat(),
+             "detail": a.detail}
+            for a in self.store.audit_for_game(game_id)
         ]
         return {
             "game": _serialize(game),
             "status": status,
             "players": rows,
             "notifications": notifications,
-            "audit_count": len(self.store.audit_for_game(game_id)),
+            "audit": audit,
+            "audit_count": len(audit),
         }
 
     # -- coach controls ----------------------------------------------------

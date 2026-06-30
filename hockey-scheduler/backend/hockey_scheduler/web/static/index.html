@@ -18,33 +18,41 @@
         </div>
 
         <div class="navbar">
-          <span class="nav-title">Game Detail</span>
+          <span id="nav-title" class="nav-title">Today</span>
           <button id="reset-btn" class="nav-action" title="Reset demo">Reset</button>
         </div>
 
-        <!-- role switcher -->
-        <div class="segmented">
-          <button data-view="coach" class="seg active">Coach</button>
-          <button data-view="player" class="seg">Player</button>
-        </div>
-
         <div id="content" class="content"><!-- rendered by app.js --></div>
+
+        <!-- bottom tab bar -->
+        <nav class="tabbar">
+          <button class="tab active" data-tab="today">
+            <span class="tab-ico">🏒</span><span>Today</span>
+          </button>
+          <button class="tab" data-tab="game">
+            <span class="tab-ico">📋</span><span>Game</span>
+          </button>
+          <button class="tab" data-tab="activity">
+            <span class="tab-ico">🔔</span><span>Activity</span>
+          </button>
+        </nav>
       </div>
     </div>
 
     <div class="hint">
-      <h1>Hockey Scheduler — Game Detail</h1>
-      <p>This is a browser preview of the iPhone screen. It drives the
-        <strong>real</strong> roster &amp; substitute engine from the backend.</p>
-      <ol>
-        <li>In <strong>Coach</strong> view, mark a selected skater
-          <em>Can't play</em> → watch the status flip to <em>Open Slot</em>.</li>
-        <li>Switch to <strong>Player</strong> view, pick an un-selected player,
-          tap <em>Enroll as Substitute</em>.</li>
-        <li>Back in <strong>Coach</strong> view, <em>Add</em> that substitute →
-          the slot closes and the roster is confirmed again.</li>
-      </ol>
-      <p class="muted">Reset returns to a fully confirmed roster.</p>
+      <h1>Hockey Scheduler</h1>
+      <p>A browser preview of the iPhone app. It drives the <strong>real</strong>
+        roster &amp; substitute engine on the backend — every tap hits the API.</p>
+      <ul>
+        <li><strong>Today</strong> — the next game at a glance: roster fill,
+          open slots, and an action banner.</li>
+        <li><strong>Game</strong> — full Game Detail. Toggle <em>Coach</em> /
+          <em>Player</em>. Mark a skater <em>Can't play</em>, enroll a sub,
+          and fill the slot.</li>
+        <li><strong>Activity</strong> — the live notification feed and the
+          audit trail the backend records for every change.</li>
+      </ul>
+      <p class="muted">Reset (top-right) restores a fully confirmed roster.</p>
     </div>
   </div>
 
