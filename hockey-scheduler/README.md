@@ -22,6 +22,7 @@ single most important product behavior:
 | Notification events (defined + emitted from the service) | ✅ implemented |
 | Service facade mapping to the REST API contract | ✅ implemented |
 | League + Arena setup (league/season/division, club/team, venue/rink/ice-slot, manual game) | ✅ implemented |
+| Persistence: in-memory + SQL store (PostgreSQL target, SQLite dev adapter) | ✅ implemented |
 | Browser-based iPhone-framed demo UI (Coach + Player views) | ✅ implemented |
 | Native iOS app (SwiftUI) | ⛔ follow-up — needs a Mac/Xcode; screens are specified in `docs/` |
 | Season scheduler engine | ⛔ explicitly out of scope |

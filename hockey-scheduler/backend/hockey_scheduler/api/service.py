@@ -309,11 +309,11 @@ class ApiService:
         The ``public`` section deliberately contains NO player names or any
         personal data — only fixture information that is safe to show fans.
         """
-        divisions = {d.id: d for d in self.store.divisions.values()}
-        clubs = {c.id: c for c in self.store.clubs.values()}
-        teams = {t.id: t for t in self.store.teams.values()}
-        venues = {v.id: v for v in self.store.venues.values()}
-        rinks = {r.id: r for r in self.store.rinks.values()}
+        divisions = {d.id: d for d in self.store.all_divisions()}
+        clubs = {c.id: c for c in self.store.all_clubs()}
+        teams = {t.id: t for t in self.store.all_teams()}
+        venues = {v.id: v for v in self.store.all_venues()}
+        rinks = {r.id: r for r in self.store.all_rinks()}
 
         def is_junior(div):
             if div is None:
@@ -344,10 +344,10 @@ class ApiService:
             for r in rinks.values()
         ]
 
-        game_by_slot = {g.ice_slot_id: g for g in self.store.games.values()
+        game_by_slot = {g.ice_slot_id: g for g in self.store.all_games()
                         if g.ice_slot_id}
         slot_rows = []
-        for s in sorted(self.store.ice_slots.values(),
+        for s in sorted(self.store.all_ice_slots(),
                         key=lambda x: (x.rink_id, x.start_time)):
             g = game_by_slot.get(s.id)
             slot_rows.append({
@@ -362,7 +362,7 @@ class ApiService:
             })
 
         schedule, public_fixtures = [], []
-        for g in self.store.games.values():
+        for g in self.store.all_games():
             div = divisions.get(g.division_id)
             rstatus = self.roster.compute_roster_status(g.id)
             venue_name = None
@@ -392,12 +392,12 @@ class ApiService:
                     "is_junior": is_junior(div),
                 })
 
-        leagues = [_serialize(x) for x in self.store.leagues.values()]
-        seasons = [_serialize(x) for x in self.store.seasons.values()]
+        leagues = [_serialize(x) for x in self.store.all_leagues()]
+        seasons = [_serialize(x) for x in self.store.all_seasons()]
         setup_audit = [
             {"action": a.action, "entity_type": a.entity_type,
              "entity_id": a.entity_id, "at": a.at.isoformat()}
-            for a in self.store.setup_audit
+            for a in self.store.all_setup_audit()
         ]
         return {
             "league": leagues[0] if leagues else None,

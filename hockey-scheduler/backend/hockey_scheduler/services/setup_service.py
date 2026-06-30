@@ -160,7 +160,7 @@ class SetupService:
         if end <= start:
             raise ValidationError("end_time must be after start_time.")
         # No two slots may overlap on the same rink (adjacent is fine).
-        for ex in self.store.ice_slots.values():
+        for ex in self.store.all_ice_slots():
             if ex.rink_id != rink_id:
                 continue
             if start < ex.end_time and end > ex.start_time:
@@ -231,7 +231,7 @@ class SetupService:
                 f"Ice slot {ice_slot_id} is already used by game {clash.id}."
             )
         # Neither team may already have an overlapping (non-cancelled) game.
-        for ex in self.store.games.values():
+        for ex in self.store.all_games():
             if ex.cancelled or ex.ice_slot_id is None:
                 continue
             ex_slot = self.store.get_ice_slot(ex.ice_slot_id)
@@ -264,6 +264,7 @@ class SetupService:
         self.store.add_game(game)
         # Mark the slot allocated so it reads as taken across the arena.
         slot.status = IceSlotStatus.ALLOCATED
+        self.store.save_ice_slot(slot)
         self._audit("game_created", "game", game.id, actor_id, {
             "season_id": season_id, "division_id": division_id,
             "home_team_id": home_team_id, "away_team_id": away_team_id,
@@ -277,6 +278,7 @@ class SetupService:
         if game is None:
             raise NotFoundError(f"Game {game_id} not found.")
         game.published = published
+        self.store.save_game(game)
         self._audit("game_published" if published else "game_unpublished",
                     "game", game_id, actor_id)
         return game
@@ -297,7 +299,7 @@ class SetupService:
 
     # -- listings ----------------------------------------------------------
     def list_leagues(self) -> List[League]:
-        return list(self.store.leagues.values())
+        return list(self.store.all_leagues())
 
     def list_seasons(self, league_id: str) -> List[Season]:
         return self.store.seasons_for_league(league_id)

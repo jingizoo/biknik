@@ -31,9 +31,13 @@ _FALCONS_SKATERS = [
 ]
 
 
-def build_full_demo_store() -> Tuple[InMemoryStore, str, dict]:
-    """Return (store, game_id, ids) for the full E2E demo scenario."""
-    store = InMemoryStore()
+def build_full_demo_store(store=None) -> Tuple[InMemoryStore, str, dict]:
+    """Return (store, game_id, ids) for the full E2E demo scenario.
+
+    A store may be injected (e.g. a SqlStore) to seed any backend; defaults to
+    a fresh in-memory store.
+    """
+    store = store if store is not None else InMemoryStore()
     setup = SetupService(store)
     roster = RosterService(store)
     admin = "league_admin"
