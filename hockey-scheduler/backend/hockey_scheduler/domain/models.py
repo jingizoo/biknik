@@ -28,6 +28,8 @@ class Team:
     id: str
     name: str
     division: str = ""
+    club_id: Optional[str] = None
+    division_id: Optional[str] = None
 
 
 @dataclass
@@ -60,6 +62,9 @@ class Game:
     roster_lock_time: Optional[datetime] = None
     locked: bool = False
     cancelled: bool = False
+    season_id: Optional[str] = None
+    division_id: Optional[str] = None
+    ice_slot_id: Optional[str] = None
 
 
 @dataclass
