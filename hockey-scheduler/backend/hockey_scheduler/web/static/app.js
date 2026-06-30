@@ -202,14 +202,20 @@ function renderCalendar(ov) {
   const rows = ov.rinks.map((r) => {
     const cards = (slotsByRink[r.id] || []).map((s) => {
       const cls = s.status === "available" ? "available" : s.slot_type === "maintenance" ? "maintenance" : s.status;
-      const attr = s.status === "available" ? `data-slot="${s.id}"` : "";
-      const cta = s.game_label ? " · Open" : "";
-      return `<div class="slot-card ${cls}" ${attr}><div class="t">${fmt(s.start_time)}–${fmt(s.end_time)}</div><div class="s">${label(s)}${cta}</div></div>`;
+      // Available game ice is a click-target (schedule) and a drop-target (move).
+      const attr = s.status === "available" ? `data-slot="${s.id}" data-drop="${s.id}"` : "";
+      // Allocated game cards are draggable to move the game to another slot.
+      const drag = s.game_id ? `draggable="true" data-game="${s.game_id}"` : "";
+      const cta = s.game_label ? " · drag to move" : "";
+      return `<div class="slot-card ${cls}" ${attr} ${drag}><div class="t">${fmt(s.start_time)}–${fmt(s.end_time)}</div><div class="s">${label(s)}${cta}</div></div>`;
     }).join("") || `<div class="slot-card"><div class="s">No ice</div></div>`;
     return `<div class="cal-row"><div class="cal-rink">${esc(r.name)}</div>
       <div class="cal-slots">${cards}
         <div class="slot-card available" data-addslot="${r.id}"><div class="t">＋</div><div class="s">Add ice</div></div></div></div>`;
   }).join("");
+  const drafts = ov.schedule.filter((g) => !g.published);
+  const tray = drafts.length ? `<div class="tray"><span class="tray-label">Draft games</span>
+    ${drafts.map((g) => `<span class="chip-drag" draggable="true" data-game="${g.game_id}">⠿ ${esc(g.home_team_name)} vs ${esc(g.away_team_name)} · ${fmt(g.start_time)}</span>`).join("")}</div>` : "";
   return `
     <div class="cal-head">
       <div><div class="cal-date">${esc(fmtDate(calendarDate))}</div>
@@ -224,9 +230,11 @@ function renderCalendar(ov) {
       <span><i class="dot lg-maint"></i>Maintenance</span>
       <span><i class="dot lg-skate"></i>Public skate</span>
     </div>
+    ${tray}
     ${rows}
-    <div class="privacy-note">📅 Tap an <strong>Available</strong> slot to open the Schedule Game wizard.
-      Apple/Google calendars are export targets only (#33) — this board is the source of truth.</div>
+    <div class="privacy-note">📅 Tap an <strong>Available</strong> slot to schedule, or
+      <strong>drag</strong> a game onto available ice to move it (validated server-side;
+      a published game is unpublished on move). This board is the source of truth (#33).</div>
     ${toastHtml()}`;
 }
 
@@ -548,6 +556,29 @@ async function render() {
   c.querySelectorAll("[data-slot]").forEach((b) => b.onclick = () => { wizard = { slot_id: b.dataset.slot }; toast = ""; render(); });
   c.querySelectorAll("[data-addslot]").forEach((b) => b.onclick = async () => { await post("/api/demo/add-ice-slot", { rink_id: b.dataset.addslot, date: calendarDate }); await render(); });
   c.querySelectorAll("[data-cal]").forEach((b) => b.onclick = () => { const v = +b.dataset.cal; if (v === 0) calendarDate = "2026-09-05"; else shiftDate(v); toast = ""; render(); });
+  // Drag a game (allocated card or draft chip) onto an available slot to move it.
+  c.querySelectorAll("[data-game]").forEach((el) => {
+    el.addEventListener("dragstart", (e) => {
+      e.dataTransfer.setData("text/plain", el.dataset.game);
+      e.dataTransfer.effectAllowed = "move";
+      el.classList.add("dragging");
+    });
+    el.addEventListener("dragend", () => el.classList.remove("dragging"));
+  });
+  c.querySelectorAll("[data-drop]").forEach((el) => {
+    el.addEventListener("dragover", (e) => { e.preventDefault(); el.classList.add("drop-hover"); });
+    el.addEventListener("dragleave", () => el.classList.remove("drop-hover"));
+    el.addEventListener("drop", async (e) => {
+      e.preventDefault();
+      el.classList.remove("drop-hover");
+      const gid = e.dataTransfer.getData("text/plain");
+      if (!gid) return;
+      toast = "";
+      const res = await post(`/api/games/${gid}/move`, { ice_slot_id: el.dataset.drop, reason: "Moved on arena calendar" });
+      if (res && !res.error) toast = "Game moved.";
+      await render();
+    });
+  });
   c.querySelectorAll("[data-publish]").forEach((b) => b.onclick = async () => { await post(`/api/games/${b.dataset.publish}/publish`, {}); toast = "Game published."; await render(); });
   c.querySelectorAll("[data-openroster]").forEach((b) => b.onclick = () => { currentGame = b.dataset.openroster; switchTab("roster"); });
   const picker = document.getElementById("player-picker");

@@ -221,6 +221,11 @@ class ApiService:
     def publish_game(self, game_id: str, actor_id: Optional[str] = None) -> dict:
         return _serialize(self.setup.publish_game(game_id, True, actor_id))
 
+    @catch
+    def move_game(self, game_id: str, ice_slot_id: str, reason: str = "",
+                  actor_id: Optional[str] = None) -> dict:
+        return _serialize(self.setup.move_game(game_id, ice_slot_id, reason, actor_id))
+
     # -- screen view-model -------------------------------------------------
     @catch
     def get_board(self, game_id: str) -> dict:
