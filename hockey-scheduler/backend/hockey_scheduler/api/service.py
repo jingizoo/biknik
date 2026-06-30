@@ -224,7 +224,24 @@ class ApiService:
     @catch
     def move_game(self, game_id: str, ice_slot_id: str, reason: str = "",
                   actor_id: Optional[str] = None) -> dict:
-        return _serialize(self.setup.move_game(game_id, ice_slot_id, reason, actor_id))
+        game = self.setup.move_game(game_id, ice_slot_id, reason, actor_id)
+        # Surface the move's side effects so the calendar's conflict side panel
+        # can explain *consequences* (a published fixture reverted to draft, a
+        # locked roster reopened) — the audit log is the authoritative record.
+        moved = next(
+            (a.detail for a in reversed(self.store.all_setup_audit())
+             if a.action == "game_moved" and a.entity_id == game.id),
+            {},
+        )
+        return {
+            **_serialize(game),
+            "moved": {
+                "old_slot_id": moved.get("old_slot_id"),
+                "new_slot_id": moved.get("new_slot_id"),
+                "unpublished": bool(moved.get("unpublished")),
+                "roster_unlocked": bool(moved.get("roster_unlocked")),
+            },
+        }
 
     # -- screen view-model -------------------------------------------------
     @catch

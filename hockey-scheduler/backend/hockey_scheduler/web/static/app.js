@@ -10,6 +10,7 @@ let calendarDate = "2026-09-05";  // YYYY-MM-DD shown on the arena calendar
 let calendarMode = "day";   // day | week
 let calFilters = { venueId: "all", rinkId: "all", divisionId: "all", teamId: "all" };
 let toast = "";
+let conflict = null;        // {ok, title, lines[], game, slot} — calendar side panel (#43)
 
 const DAY_MS = 86400000;
 function addDays(dateStr, n) {
@@ -291,13 +292,72 @@ function calToolbar(ov) {
     </div>`;
 }
 
+// Turn a /move API result into a conflict-panel model (#43). Explains *why* a
+// drop was rejected, or — on success — what side effects the move triggered.
+// The backend is authoritative: failures carry error.details.reason, successes
+// carry a `moved` summary. We only translate those into operator-facing copy.
+function buildConflict(res, ov, gameId, slotId) {
+  const slotName = (id) => {
+    const s = ov.ice_slots.find((x) => x.id === id);
+    if (!s) return "that slot";
+    const r = ov.rinks.find((rr) => rr.id === s.rink_id);
+    return `${r ? r.name : "Rink"} ${fmt(s.start_time)}–${fmt(s.end_time)}`;
+  };
+  const gameName = (id) => {
+    const g = ov.schedule.find((x) => x.game_id === id);
+    return g ? `${g.home_team_name} vs ${g.away_team_name}` : "this game";
+  };
+  if (res && res.error) {
+    const d = res.error.details || {};
+    const reason = d.reason || res.error.code;
+    const target = slotName(slotId);
+    const MAP = {
+      team_overlap: ["Team already booked",
+        [`${gameName(gameId)} can't move to ${target}.`,
+         "One of its teams already has a game overlapping that time. A team can't be in two places at once."]],
+      slot_unavailable: ["Slot already taken",
+        [`${target} is ${d.slot_status || "not available"}.`,
+         "Drop the game onto an open (Available) slot, or free this one first."]],
+      not_game_slot: ["Not a game slot",
+        [`${target} is a ${(d.slot_type || "non-game").replace("_", " ")} slot.`,
+         "Only slots reserved for games can host a fixture — maintenance and public-skate ice is off limits."]],
+      same_slot: ["Already here", [`${gameName(gameId)} is already in ${target}.`]],
+      game_cancelled: ["Game cancelled", ["A cancelled game can't be moved."]],
+      game_missing: ["Game not found", ["That game no longer exists — refresh the calendar."]],
+      slot_missing: ["Slot not found", ["That ice slot no longer exists — refresh the calendar."]],
+    };
+    const [title, lines] = MAP[reason] || ["Move blocked", [res.error.message]];
+    return { ok: false, title, lines };
+  }
+  // Success — surface consequences worth a heads-up.
+  const m = (res && res.moved) || {};
+  const lines = [`${gameName(gameId)} now plays ${slotName(m.new_slot_id || slotId)}.`];
+  if (m.unpublished) lines.push("It was published, so the fixture reverted to Draft — re-publish when you're ready.");
+  if (m.roster_unlocked) lines.push("The roster was locked, so it reopened — players must reconfirm the new time.");
+  return { ok: true, title: "Game moved", lines };
+}
+
+function conflictPanelHtml() {
+  if (!conflict) return "";
+  const cls = conflict.ok ? "ok" : "bad";
+  const icon = conflict.ok ? "✅" : "⛔";
+  return `<aside class="cal-aside ${cls}">
+    <div class="ca-head"><span class="ca-ico">${icon}</span><span class="ca-title">${esc(conflict.title)}</span>
+      <button class="ca-x" data-conflict-dismiss aria-label="Dismiss">×</button></div>
+    <div class="ca-body">${conflict.lines.map((l) => `<p>${esc(l)}</p>`).join("")}</div>
+  </aside>`;
+}
+
 function renderCalendar(ov) {
   if (wizard) return renderWizard(ov) + toastHtml();
   const ctx = calContext(ov);
   const rinks = visibleRinks(ov);
-  return calendarMode === "week"
-    ? calToolbar(ov) + renderWeek(ov, ctx, rinks) + toastHtml()
-    : calToolbar(ov) + renderDay(ov, ctx, rinks) + toastHtml();
+  const board = calendarMode === "week"
+    ? renderWeek(ov, ctx, rinks)
+    : renderDay(ov, ctx, rinks);
+  return calToolbar(ov) +
+    `<div class="cal-layout"><div class="cal-main">${board}</div>${conflictPanelHtml()}</div>` +
+    toastHtml();
 }
 
 function renderDay(ov, ctx, rinks) {
@@ -670,14 +730,14 @@ async function render() {
     const v = +b.dataset.cal;
     if (v === 0) calendarDate = "2026-09-05";
     else shiftDate(v * (calendarMode === "week" ? 7 : 1));
-    toast = ""; render();
+    toast = ""; conflict = null; render();
   });
-  c.querySelectorAll("[data-mode]").forEach((b) => b.onclick = () => { calendarMode = b.dataset.mode; toast = ""; render(); });
+  c.querySelectorAll("[data-mode]").forEach((b) => b.onclick = () => { calendarMode = b.dataset.mode; toast = ""; conflict = null; render(); });
   c.querySelectorAll("[data-filter]").forEach((sel) => sel.onchange = (e) => {
     const key = sel.dataset.filter;
     calFilters[key] = e.target.value;
     if (key === "venueId") calFilters.rinkId = "all";  // rink list depends on venue
-    toast = ""; render();
+    toast = ""; conflict = null; render();
   });
   // Drag a game (allocated card or draft chip) onto an available slot to move it.
   c.querySelectorAll("[data-game]").forEach((el) => {
@@ -698,10 +758,15 @@ async function render() {
       if (!gid) return;
       toast = "";
       const res = await post(`/api/games/${gid}/move`, { ice_slot_id: el.dataset.drop, reason: "Moved on arena calendar" });
-      if (res && !res.error) toast = "Game moved.";
+      // Explain the outcome in the side panel instead of a terse toast (#43):
+      // why a drop was rejected, or what a successful move changed.
+      conflict = buildConflict(res, ov, gid, el.dataset.drop);
+      if (res && res.error) toast = "";   // panel carries the message now
       await render();
     });
   });
+  const dismiss = c.querySelector("[data-conflict-dismiss]");
+  if (dismiss) dismiss.onclick = () => { conflict = null; render(); };
   c.querySelectorAll("[data-publish]").forEach((b) => b.onclick = async () => { await post(`/api/games/${b.dataset.publish}/publish`, {}); toast = "Game published."; await render(); });
   c.querySelectorAll("[data-openroster]").forEach((b) => b.onclick = () => { currentGame = b.dataset.openroster; switchTab("roster"); });
   const picker = document.getElementById("player-picker");
@@ -729,7 +794,7 @@ async function render() {
 }
 
 function switchTab(next) {
-  view = next; toast = ""; if (next !== "calendar") wizard = null;
+  view = next; toast = ""; if (next !== "calendar") { wizard = null; conflict = null; }
   document.querySelectorAll(".tab").forEach((x) => x.classList.toggle("active", x.dataset.tab === next));
   render();
 }

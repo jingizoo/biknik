@@ -309,23 +309,31 @@ class SetupService:
         """Move a game to another available game ice slot (drag/drop)."""
         game = self.store.get_game(game_id)
         if game is None:
-            raise NotFoundError(f"Game {game_id} not found.")
+            raise NotFoundError(f"Game {game_id} not found.",
+                                details={"reason": "game_missing"})
         if game.cancelled:
-            raise ValidationError("Cannot move a cancelled game.")
+            raise ValidationError("Cannot move a cancelled game.",
+                                  details={"reason": "game_cancelled"})
 
         new_slot = self.store.get_ice_slot(new_ice_slot_id)
         if new_slot is None:
-            raise NotFoundError(f"Ice slot {new_ice_slot_id} not found.")
+            raise NotFoundError(f"Ice slot {new_ice_slot_id} not found.",
+                                details={"reason": "slot_missing"})
         if new_slot.id == game.ice_slot_id:
-            raise ValidationError("Game is already in that ice slot.")
+            raise ValidationError("Game is already in that ice slot.",
+                                  details={"reason": "same_slot"})
         if new_slot.slot_type != IceSlotType.GAME:
             raise ValidationError(
                 "Only game ice slots can host a game (not maintenance / "
-                "public skate / practice / tournament)."
+                "public skate / practice / tournament).",
+                details={"reason": "not_game_slot",
+                         "slot_type": new_slot.slot_type.value},
             )
         if new_slot.status != IceSlotStatus.AVAILABLE:
             raise ScheduleConflictError(
-                f"Ice slot {new_ice_slot_id} is not available."
+                f"Ice slot {new_ice_slot_id} is not available.",
+                details={"reason": "slot_unavailable",
+                         "slot_status": new_slot.status.value},
             )
         # Neither team may already have an overlapping game (excluding this one).
         for ex in self.store.all_games():
@@ -340,7 +348,8 @@ class SetupService:
                          or ex.away_team_id in (game.home_team_id, game.away_team_id))
             if overlaps and same_team:
                 raise ScheduleConflictError(
-                    f"A team already has an overlapping game {ex.id}."
+                    f"A team already has an overlapping game {ex.id}.",
+                    details={"reason": "team_overlap", "conflict_game_id": ex.id},
                 )
 
         old_slot_id = game.ice_slot_id
