@@ -88,6 +88,19 @@ class GameMoveTest(unittest.TestCase):
         moved = c["svc"].move_game(c["game"].id, c["slot_b"].id)
         self.assertFalse(moved.published)
 
+    def test_move_locked_game_unlocks_roster_for_reconfirmation(self):
+        c = universe()
+        c["svc"].publish_game(c["game"].id)
+        c["game"].locked = True
+        c["store"].save_game(c["game"])
+        moved = c["svc"].move_game(c["game"].id, c["slot_b"].id)
+        self.assertFalse(moved.locked)       # unlocked for reconfirmation
+        self.assertFalse(moved.published)    # and unpublished
+        audit = [a for a in c["store"].all_setup_audit()
+                 if a.action == "game_moved"][-1]
+        self.assertTrue(audit.detail["roster_unlocked"])
+        self.assertTrue(audit.detail["unpublished"])
+
     def test_move_audits_old_and_new_slot(self):
         c = universe()
         c["svc"].move_game(c["game"].id, c["slot_b"].id, reason="drag")

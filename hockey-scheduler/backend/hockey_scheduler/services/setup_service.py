@@ -354,6 +354,7 @@ class SetupService:
 
         rink = self.store.get_rink(new_slot.rink_id)
         was_published = game.published
+        was_locked = game.locked
         game.ice_slot_id = new_slot.id
         game.start_time = new_slot.start_time
         game.end_time = new_slot.end_time
@@ -361,10 +362,14 @@ class SetupService:
         if was_published:
             # The fixture changed — it must be re-published before going public.
             game.published = False
+        if was_locked:
+            # Time/rink changed — players must reconfirm, so unlock the roster.
+            game.locked = False
         self.store.save_game(game)
         self._audit("game_moved", "game", game_id, actor_id, {
             "old_slot_id": old_slot_id, "new_slot_id": new_slot.id,
             "reason": reason, "unpublished": was_published,
+            "roster_unlocked": was_locked,
         })
         return game
 

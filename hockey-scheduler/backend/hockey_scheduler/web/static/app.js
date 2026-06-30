@@ -233,8 +233,9 @@ function renderCalendar(ov) {
     ${tray}
     ${rows}
     <div class="privacy-note">📅 Tap an <strong>Available</strong> slot to schedule, or
-      <strong>drag</strong> a game onto available ice to move it (validated server-side;
-      a published game is unpublished on move). This board is the source of truth (#33).</div>
+      <strong>drag</strong> a game onto available ice to move it (validated server-side).
+      Moving changes the time/rink, so a published fixture is unpublished and a locked
+      roster is unlocked for reconfirmation. This board is the source of truth (#33).</div>
     ${toastHtml()}`;
 }
 
