@@ -303,6 +303,76 @@ class SetupService:
                     "game", game_id, actor_id)
         return game
 
+    @_transactional
+    def move_game(self, game_id: str, new_ice_slot_id: str, reason: str = "",
+                  actor_id: Optional[str] = None) -> Game:
+        """Move a game to another available game ice slot (drag/drop)."""
+        game = self.store.get_game(game_id)
+        if game is None:
+            raise NotFoundError(f"Game {game_id} not found.")
+        if game.cancelled:
+            raise ValidationError("Cannot move a cancelled game.")
+
+        new_slot = self.store.get_ice_slot(new_ice_slot_id)
+        if new_slot is None:
+            raise NotFoundError(f"Ice slot {new_ice_slot_id} not found.")
+        if new_slot.id == game.ice_slot_id:
+            raise ValidationError("Game is already in that ice slot.")
+        if new_slot.slot_type != IceSlotType.GAME:
+            raise ValidationError(
+                "Only game ice slots can host a game (not maintenance / "
+                "public skate / practice / tournament)."
+            )
+        if new_slot.status != IceSlotStatus.AVAILABLE:
+            raise ScheduleConflictError(
+                f"Ice slot {new_ice_slot_id} is not available."
+            )
+        # Neither team may already have an overlapping game (excluding this one).
+        for ex in self.store.all_games():
+            if ex.id == game_id or ex.cancelled or ex.ice_slot_id is None:
+                continue
+            ex_slot = self.store.get_ice_slot(ex.ice_slot_id)
+            if ex_slot is None:
+                continue
+            overlaps = (new_slot.start_time < ex_slot.end_time
+                        and new_slot.end_time > ex_slot.start_time)
+            same_team = (ex.home_team_id in (game.home_team_id, game.away_team_id)
+                         or ex.away_team_id in (game.home_team_id, game.away_team_id))
+            if overlaps and same_team:
+                raise ScheduleConflictError(
+                    f"A team already has an overlapping game {ex.id}."
+                )
+
+        old_slot_id = game.ice_slot_id
+        if old_slot_id:
+            old_slot = self.store.get_ice_slot(old_slot_id)
+            if old_slot is not None:
+                old_slot.status = IceSlotStatus.AVAILABLE
+                self.store.save_ice_slot(old_slot)
+        new_slot.status = IceSlotStatus.ALLOCATED
+        self.store.save_ice_slot(new_slot)
+
+        rink = self.store.get_rink(new_slot.rink_id)
+        was_published = game.published
+        was_locked = game.locked
+        game.ice_slot_id = new_slot.id
+        game.start_time = new_slot.start_time
+        game.end_time = new_slot.end_time
+        game.rink = rink.name if rink else None
+        if was_published:
+            # The fixture changed — it must be re-published before going public.
+            game.published = False
+        if was_locked:
+            # Time/rink changed — players must reconfirm, so unlock the roster.
+            game.locked = False
+        self.store.save_game(game)
+        self._audit("game_moved", "game", game_id, actor_id, {
+            "old_slot_id": old_slot_id, "new_slot_id": new_slot.id,
+            "reason": reason, "unpublished": was_published,
+            "roster_unlocked": was_locked,
+        })
+        return game
+
     # -- convenience: add a player to a team ------------------------------
     @_transactional
     def add_player(self, team_id: str, name: str, position: Position,

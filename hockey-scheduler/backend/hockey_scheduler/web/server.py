@@ -196,6 +196,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_api(api.auto_build_roster(gid, actor))
             if action == "publish":
                 return self._send_api(api.publish_game(gid, actor))
+            if action == "move":
+                return self._send_api(api.move_game(
+                    gid, body.get("ice_slot_id"), body.get("reason", ""), actor))
             if action == "substitutes/enroll":
                 return self._send_api(api.enroll_substitute(gid, pid, actor))
             if action == "substitutes/withdraw":

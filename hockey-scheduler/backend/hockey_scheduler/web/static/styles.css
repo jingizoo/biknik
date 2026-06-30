@@ -357,6 +357,20 @@ select.player-picker {
 .slot-card.allocated .s { color: #0a64c4; }
 .slot-card.maintenance { background: #f4f2f0; }
 .slot-card.maintenance .s { color: #8a6d3b; }
+.slot-card[draggable="true"] { cursor: grab; }
+.slot-card.allocated[draggable="true"]:active { cursor: grabbing; }
+.slot-card.dragging { opacity: 0.5; }
+.slot-card.drop-hover { outline: 2px dashed var(--green); outline-offset: 1px; background: #e9fbef; }
+
+/* draft-games drag tray */
+.tray { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 0 2px 12px; }
+.tray-label { font-size: 11px; text-transform: uppercase; letter-spacing: .5px; color: var(--muted); }
+.chip-drag {
+  display: inline-flex; align-items: center; gap: 4px;
+  background: #eef0f3; border: 1px solid var(--sep); border-radius: 18px;
+  padding: 5px 11px; font-size: 12px; font-weight: 600; cursor: grab;
+}
+.chip-drag.dragging { opacity: 0.5; }
 
 /* ----- calendar header + legend ----- */
 .cal-head { display: flex; justify-content: space-between; align-items: center; margin: 4px 2px 10px; }
