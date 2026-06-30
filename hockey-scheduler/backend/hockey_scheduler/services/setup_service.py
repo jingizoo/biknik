@@ -159,12 +159,24 @@ class SetupService:
         end = self._require_utc(end_time, "end_time")
         if end <= start:
             raise ValidationError("end_time must be after start_time.")
+        # No two slots may overlap on the same rink (adjacent is fine).
+        for ex in self.store.ice_slots.values():
+            if ex.rink_id != rink_id:
+                continue
+            if start < ex.end_time and end > ex.start_time:
+                raise ScheduleConflictError(
+                    f"Ice slot overlaps existing slot {ex.id} on this rink."
+                )
+        # Only GAME ice is bookable for league games; other types are blocked
+        # so they cannot be scheduled into.
+        status = (IceSlotStatus.AVAILABLE if slot_type == IceSlotType.GAME
+                  else IceSlotStatus.BLOCKED)
         slot = IceSlot(id=self.store.next_id("slot"), rink_id=rink_id,
                        start_time=start, end_time=end, slot_type=slot_type,
-                       status=IceSlotStatus.AVAILABLE)
+                       status=status)
         self.store.add_ice_slot(slot)
         self._audit("ice_slot_created", "ice_slot", slot.id, actor_id,
-                    {"rink_id": rink_id})
+                    {"rink_id": rink_id, "slot_type": slot_type.value})
         return slot
 
     # -- manual game creation ---------------------------------------------
@@ -204,11 +216,35 @@ class SetupService:
         slot = self.store.get_ice_slot(ice_slot_id)
         if slot is None:
             raise NotFoundError(f"Ice slot {ice_slot_id} not found.")
+        if slot.slot_type != IceSlotType.GAME:
+            raise ValidationError(
+                "Only game ice slots can host a game (not maintenance / "
+                "public skate / practice / tournament)."
+            )
+        if slot.status != IceSlotStatus.AVAILABLE:
+            raise ScheduleConflictError(
+                f"Ice slot {ice_slot_id} is not available."
+            )
         clash = self.store.game_using_ice_slot(ice_slot_id)
         if clash is not None:
             raise ScheduleConflictError(
                 f"Ice slot {ice_slot_id} is already used by game {clash.id}."
             )
+        # Neither team may already have an overlapping (non-cancelled) game.
+        for ex in self.store.games.values():
+            if ex.cancelled or ex.ice_slot_id is None:
+                continue
+            ex_slot = self.store.get_ice_slot(ex.ice_slot_id)
+            if ex_slot is None:
+                continue
+            overlaps = (slot.start_time < ex_slot.end_time
+                        and slot.end_time > ex_slot.start_time)
+            same_team = (ex.home_team_id in (home_team_id, away_team_id)
+                         or ex.away_team_id in (home_team_id, away_team_id))
+            if overlaps and same_team:
+                raise ScheduleConflictError(
+                    f"A team already has an overlapping game {ex.id}."
+                )
 
         rink = self.store.get_rink(slot.rink_id)
         game = Game(

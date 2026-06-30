@@ -92,6 +92,7 @@ function renderSetup(ov) {
   const clubOpts = ov.clubs.map((c) => opt(c.id, c.name)).join("");
   const divOpts = ov.divisions.map((d) => opt(d.id, d.name)).join("");
   const venueOpts = ov.venues.map((v) => opt(v.id, v.name)).join("");
+  const rinkOpts = ov.rinks.map((r) => opt(r.id, `${r.venue_name || ""} · ${r.name}`)).join("");
   return `
     <div class="section-title">League &amp; season</div>
     <div class="form">
@@ -133,6 +134,23 @@ function renderSetup(ov) {
       <label>Rink — venue</label><select id="f-rink-venue">${venueOpts}</select>
       <label>Rink name</label><input id="f-rink" placeholder="e.g. Rink 3" />
       <button class="act primary" data-create="rink">Create rink</button>
+    </div>
+    <div class="form">
+      <label>Ice slot — rink</label><select id="f-slot-rink">${rinkOpts}</select>
+      <label>Date</label><input id="f-slot-date" type="date" value="2026-09-05" />
+      <div class="row2">
+        <div><label>Start</label><input id="f-slot-start" type="time" value="21:00" /></div>
+        <div><label>End</label><input id="f-slot-end" type="time" value="22:30" /></div>
+      </div>
+      <label>Type</label>
+      <select id="f-slot-type">
+        <option value="game">Game</option>
+        <option value="practice">Practice</option>
+        <option value="public_skate">Public skate</option>
+        <option value="maintenance">Maintenance</option>
+        <option value="tournament">Tournament</option>
+      </select>
+      <button class="act primary" data-create="ice-slot">Add ice slot</button>
     </div>
     <div class="section-title">Already set up (${ov.setup_audit_count} audited)</div>
     <div class="card">
@@ -247,6 +265,20 @@ function coachBody(board) {
   const selected = board.players.filter((p) => p.group === "selected");
   const subs = board.players.filter((p) => p.group === "substitute");
   const locked = s.status === "locked";
+
+  // Newly-scheduled game: no roster selected yet.
+  if (!selected.length && !subs.length) {
+    if (!board.players.length) {
+      return `<div class="banner neutral"><h2>No roster yet</h2>
+        <p>${esc(board.game.home_team_id)} has no players. Add or import players
+        first (player management is a follow-up: #25).</p></div>${toastHtml()}`;
+    }
+    return `<div class="banner neutral"><h2>No roster selected yet</h2>
+      <p>This game has ${board.players.length} eligible players on the home team.
+      Build the roster to start the availability / substitute flow.</p></div>
+      <div class="actions"><button class="act primary" data-act="build">Build roster from team</button></div>
+      ${toastHtml()}`;
+  }
   const openFor = (st) => st === "goalie" ? s.open_goalie_slots > 0 : s.open_skater_slots > 0;
   const selRows = selected.map((p) => {
     let btn = "";
@@ -360,16 +392,23 @@ async function createEntity(kind) {
     team: () => post("/api/setup/team", { club_id: val("f-team-club"), division_id: val("f-team-div"), name: val("f-team") }),
     venue: () => post("/api/setup/venue", { name: val("f-venue") }),
     rink: () => post("/api/setup/rink", { venue_id: val("f-rink-venue"), name: val("f-rink") }),
+    "ice-slot": () => post("/api/setup/ice-slot", {
+      rink_id: val("f-slot-rink"),
+      start_time: `${val("f-slot-date")}T${val("f-slot-start")}:00+00:00`,
+      end_time: `${val("f-slot-date")}T${val("f-slot-end")}:00+00:00`,
+      slot_type: val("f-slot-type"),
+    }),
   };
   const res = await map[kind]();
-  if (res && !res.error) toast = `${kind[0].toUpperCase() + kind.slice(1)} created.`;
+  if (res && !res.error) toast = `${kind === "ice-slot" ? "Ice slot" : kind[0].toUpperCase() + kind.slice(1)} created.`;
   await render();
 }
 
 async function rosterAction(act, id) {
   toast = "";
   const B = `/api/games/${currentGame}`;
-  if (act === "confirm") await post(`${B}/availability`, { player_id: id, availability_status: "available" });
+  if (act === "build") await post(`${B}/build-roster`, {});
+  else if (act === "confirm") await post(`${B}/availability`, { player_id: id, availability_status: "available" });
   else if (act === "backout") await post(`${B}/availability`, { player_id: id, availability_status: "unavailable" });
   else if (act === "enroll") await post(`${B}/substitutes/enroll`, { player_id: id });
   else if (act === "withdraw") await post(`${B}/substitutes/withdraw`, { player_id: id });
@@ -418,10 +457,11 @@ async function render() {
   const wc = c.querySelector("[data-wizcancel]"); if (wc) wc.onclick = () => { wizard = null; render(); };
   const wcr = c.querySelector("[data-wizcreate]");
   if (wcr) wcr.onclick = async () => {
-    const ov2 = ov;
-    const slot = ov2.ice_slots.find((s) => s.id === wizard.slot_id);
+    // Use the SELECTED division's season, not the first seeded season.
+    const div = ov.divisions.find((d) => d.id === wizard.division_id);
     const res = await post("/api/setup/game", {
-      season_id: ov2.seasons[0].id, division_id: wizard.division_id,
+      season_id: div ? div.season_id : (ov.seasons[0] || {}).id,
+      division_id: wizard.division_id,
       home_team_id: wizard.home_id, away_team_id: wizard.away_id, ice_slot_id: wizard.slot_id,
     });
     if (res && !res.error) { toast = "Game scheduled."; currentGame = res.id; wizard = null; view = "games"; }

@@ -178,6 +178,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_api(api.set_availability(
                     gid, pid, body.get("availability_status", "pending"),
                     body.get("response_source", "player"), actor))
+            if action == "build-roster":
+                return self._send_api(api.auto_build_roster(gid, actor))
             if action == "substitutes/enroll":
                 return self._send_api(api.enroll_substitute(gid, pid, actor))
             if action == "substitutes/withdraw":

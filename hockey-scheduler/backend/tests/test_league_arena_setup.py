@@ -18,6 +18,10 @@ START = datetime(2026, 9, 1, 18, 30, tzinfo=UTC)
 END = datetime(2026, 9, 1, 20, 0, tzinfo=UTC)
 
 
+def dt(h, m=0):
+    return datetime(2026, 9, 1, h, m, tzinfo=UTC)
+
+
 def build():
     store = InMemoryStore()
     return SetupService(store, clock=FakeClock()), store
@@ -153,6 +157,90 @@ class LeagueArenaSetupTest(unittest.TestCase):
         svc, _ = build()
         with self.assertRaises(ValidationError):
             svc.create_league("   ")
+
+    # -- scheduling-rule fixes (review round 3) ---------------------------
+    def test_game_in_second_season_division_succeeds(self):
+        # The wizard/back end must accept a non-seeded season's division.
+        svc, _ = build()
+        lg = svc.create_league("L2")
+        se = svc.create_season(lg.id, "S2")
+        dv = svc.create_division(se.id, "U16 B")
+        ta = svc.create_team(svc.create_club("CA").id, dv.id, "TA")
+        tb = svc.create_team(svc.create_club("CB").id, dv.id, "TB")
+        rink = svc.create_rink(svc.create_venue("VE").id, "RI")
+        slot = svc.create_ice_slot(rink.id, dt(18, 30), dt(20))
+        game = svc.create_game(se.id, dv.id, ta.id, tb.id, slot.id)
+        self.assertEqual(game.season_id, se.id)
+
+    def test_overlapping_ice_slots_rejected(self):
+        svc, _ = build()
+        rink = svc.create_rink(svc.create_venue("V").id, "R")
+        svc.create_ice_slot(rink.id, dt(18, 30), dt(20))
+        with self.assertRaises(ScheduleConflictError):
+            svc.create_ice_slot(rink.id, dt(19), dt(20, 30))
+
+    def test_adjacent_ice_slots_allowed(self):
+        svc, _ = build()
+        rink = svc.create_rink(svc.create_venue("V").id, "R")
+        svc.create_ice_slot(rink.id, dt(18, 30), dt(20))
+        s = svc.create_ice_slot(rink.id, dt(20), dt(21, 30))  # starts at prev end
+        self.assertIsNotNone(s.id)
+
+    def test_same_time_different_rink_allowed(self):
+        svc, _ = build()
+        venue = svc.create_venue("V")
+        r1 = svc.create_rink(venue.id, "R1")
+        r2 = svc.create_rink(venue.id, "R2")
+        svc.create_ice_slot(r1.id, dt(18, 30), dt(20))
+        s = svc.create_ice_slot(r2.id, dt(18, 30), dt(20))
+        self.assertIsNotNone(s.id)
+
+    def test_non_game_slot_cannot_host_game(self):
+        svc, _ = build()
+        u = full_universe(svc)
+        maint = svc.create_ice_slot(u["rink"].id, dt(20, 30), dt(22),
+                                    slot_type=IceSlotType.MAINTENANCE)
+        self.assertEqual(maint.status, IceSlotStatus.BLOCKED)
+        with self.assertRaises(ValidationError):
+            svc.create_game(u["season"].id, u["division"].id,
+                            u["home"].id, u["away"].id, maint.id)
+
+    def test_team_overlap_rejected(self):
+        svc, _ = build()
+        u = full_universe(svc)
+        r2 = svc.create_rink(u["venue"].id, "R2")
+        slot2 = svc.create_ice_slot(r2.id, dt(18, 30), dt(20))  # same time
+        svc.create_game(u["season"].id, u["division"].id,
+                        u["home"].id, u["away"].id, u["slot"].id)
+        bears = svc.create_team(svc.create_club("Bears").id, u["division"].id, "Bears")
+        with self.assertRaises(ScheduleConflictError):
+            svc.create_game(u["season"].id, u["division"].id,
+                            u["home"].id, bears.id, slot2.id)
+
+    def test_team_overlap_adjacent_allowed(self):
+        svc, _ = build()
+        u = full_universe(svc)
+        r2 = svc.create_rink(u["venue"].id, "R2")
+        slot2 = svc.create_ice_slot(r2.id, dt(20), dt(21, 30))  # adjacent
+        svc.create_game(u["season"].id, u["division"].id,
+                        u["home"].id, u["away"].id, u["slot"].id)
+        bears = svc.create_team(svc.create_club("Bears").id, u["division"].id, "Bears")
+        game = svc.create_game(u["season"].id, u["division"].id,
+                               u["home"].id, bears.id, slot2.id)
+        self.assertIsNotNone(game.id)
+
+    def test_different_teams_same_time_allowed(self):
+        svc, _ = build()
+        u = full_universe(svc)
+        r2 = svc.create_rink(u["venue"].id, "R2")
+        slot2 = svc.create_ice_slot(r2.id, dt(18, 30), dt(20))
+        svc.create_game(u["season"].id, u["division"].id,
+                        u["home"].id, u["away"].id, u["slot"].id)
+        bears = svc.create_team(svc.create_club("Bears").id, u["division"].id, "Bears")
+        eagles = svc.create_team(svc.create_club("Eagles").id, u["division"].id, "Eagles")
+        game = svc.create_game(u["season"].id, u["division"].id,
+                               bears.id, eagles.id, slot2.id)
+        self.assertIsNotNone(game.id)
 
 
 if __name__ == "__main__":

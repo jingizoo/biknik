@@ -16,6 +16,7 @@ from ..domain import (
     IceSlotType,
     Position,
     RosterEntryStatus,
+    SlotType,
     SubstituteStatus,
 )
 from ..domain.errors import DomainError, ValidationError
@@ -185,6 +186,29 @@ class ApiService:
     # -- roster status -----------------------------------------------------
     @catch
     def get_roster_status(self, game_id: str) -> dict:
+        return self.roster.compute_roster_status(game_id).to_dict()
+
+    @catch
+    def auto_build_roster(self, game_id: str, actor_id: Optional[str] = None) -> dict:
+        """Demo helper: select + confirm a full roster from the home team.
+
+        Picks the home team's goalies and skaters up to the game's targets so a
+        newly-scheduled game becomes immediately playable by the roster flow.
+        Raises if the home team has no players (the UI shows an empty state).
+        """
+        game = self.roster._require_game(game_id)
+        players = self.store.players_for_team(game.home_team_id)
+        if not players:
+            raise ValidationError(
+                "Home team has no players yet. Add or import players first."
+            )
+        goalies = [p for p in players if p.slot_type == SlotType.GOALIE]
+        skaters = [p for p in players if p.slot_type == SlotType.SKATER]
+        selected = ([g.id for g in goalies[:game.target_goalies]]
+                    + [s.id for s in skaters[:game.target_skaters]])
+        self.roster.select_roster(game_id, selected, actor_id)
+        for pid in selected:
+            self.roster.set_availability(game_id, pid, AvailabilityStatus.AVAILABLE)
         return self.roster.compute_roster_status(game_id).to_dict()
 
     # -- screen view-model -------------------------------------------------

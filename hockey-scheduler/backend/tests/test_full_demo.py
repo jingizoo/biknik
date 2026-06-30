@@ -66,6 +66,35 @@ class FullDemoTest(unittest.TestCase):
     def test_overview_is_json_serializable(self):
         json.dumps(self.api.get_demo_overview())
 
+    def test_newly_scheduled_game_can_build_roster(self):
+        # Schedule a second U16 game (Falcons home) on an available slot, then
+        # build a roster for it — both U16 teams are seeded with players.
+        ov = self.api.get_demo_overview()
+        slot = next(s for s in ov["ice_slots"] if s["status"] == "available")
+        u16 = [t for t in ov["teams"] if t["division_name"] == "U16 Elite"]
+        falcons = next(t for t in u16 if t["name"] == "U16 Falcons")
+        lions = next(t for t in u16 if t["name"] == "U16 Lions")
+        game = self.api.create_game(ov["seasons"][0]["id"], falcons["division_id"],
+                                    falcons["id"], lions["id"], slot["id"])
+        self.assertNotIn("error", game)
+        status = self.api.auto_build_roster(game["id"])
+        self.assertEqual(status["status"], "roster_confirmed")
+
+    def test_build_roster_without_players_errors(self):
+        # A team with no players cannot be auto-rostered.
+        api = ApiService()
+        lg = api.create_league("L")
+        se = api.create_season(lg["id"], "S")
+        dv = api.create_division(se["id"], "D")
+        ta = api.create_team(api.create_club("CA")["id"], dv["id"], "TA")
+        tb = api.create_team(api.create_club("CB")["id"], dv["id"], "TB")
+        rink = api.create_rink(api.create_venue("V")["id"], "R")
+        slot = api.create_ice_slot(rink["id"], "2026-09-01T18:30:00+00:00",
+                                   "2026-09-01T20:00:00+00:00")
+        game = api.create_game(se["id"], dv["id"], ta["id"], tb["id"], slot["id"])
+        result = api.auto_build_roster(game["id"])
+        self.assertEqual(result["error"]["code"], "validation_error")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -69,15 +69,20 @@ def build_full_demo_store() -> Tuple[InMemoryStore, str, dict]:
     game = setup.create_game(season.id, d_u16.id, u16_lions.id, u16_falcons.id,
                              slot_game.id, actor_id=admin)
 
-    # Seed the home team's players and confirm a full roster (1 goalie + 15
-    # skaters), leaving the 16th skater unselected to act as a substitute.
-    goalie = setup.add_player(u16_lions.id, "Goalie Gabe", Position.GOALIE,
-                              jersey_number=30, actor_id=admin)
-    skaters = []
-    for i, name in enumerate(_SKATERS, start=1):
-        pos = Position.DEFENSE if i % 3 == 0 else Position.FORWARD
-        skaters.append(setup.add_player(u16_lions.id, name, pos,
+    # Seed BOTH U16 teams with a full squad so any U16 game (either team as
+    # home) has a rosterable roster. The Falcons squad uses distinct names.
+    def seed_squad(team_id, prefix):
+        goalie = setup.add_player(team_id, f"{prefix} Goalie", Position.GOALIE,
+                                  jersey_number=30, actor_id=admin)
+        out = []
+        for i, name in enumerate(_SKATERS, start=1):
+            pos = Position.DEFENSE if i % 3 == 0 else Position.FORWARD
+            out.append(setup.add_player(team_id, f"{name}", pos,
                                         jersey_number=i, actor_id=admin))
+        return goalie, out
+
+    goalie, skaters = seed_squad(u16_lions.id, "Lions")
+    seed_squad(u16_falcons.id, "Falcons")
 
     selected = [goalie.id] + [s.id for s in skaters[:15]]
     roster.select_roster(game.id, selected, actor_id="coach_lions")
