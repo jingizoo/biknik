@@ -47,14 +47,23 @@ def tearDownModule():
 
 class WebServerTest(unittest.TestCase):
     def setUp(self):
-        # Fresh, fully-confirmed roster before each test.
+        # Fresh, fully-confirmed roster before each test, and derive a
+        # selected player id from the board (ids depend on the seed).
         _request("POST", "/api/reset", {})
+        _, board = _request("GET", "/api/games/game_1/board")
+        self.selected_id = next(p["id"] for p in board["players"]
+                                if p["group"] == "selected")
 
     def test_board_ok_and_json_safe(self):
         status, body = _request("GET", "/api/games/game_1/board")
         self.assertEqual(status, 200)
         # start_time serialized as an ISO string over the wire.
         self.assertIsInstance(body["game"]["start_time"], str)
+
+    def test_overview_endpoint_ok(self):
+        status, body = _request("GET", "/api/demo/overview")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["league"]["name"], "Alpine Ice Hockey League")
 
     def test_unknown_endpoint_404(self):
         status, body = _request("GET", "/api/games/game_1/nope")
@@ -64,7 +73,7 @@ class WebServerTest(unittest.TestCase):
     def test_already_selected_returns_409(self):
         status, body = _request(
             "POST", "/api/games/game_1/substitutes/enroll",
-            {"player_id": "player_skater_1"},
+            {"player_id": self.selected_id},
         )
         self.assertEqual(status, 409)
         self.assertEqual(body["error"]["code"], "already_selected")
@@ -72,7 +81,7 @@ class WebServerTest(unittest.TestCase):
     def test_invalid_availability_returns_400(self):
         status, body = _request(
             "POST", "/api/games/game_1/availability",
-            {"player_id": "player_skater_1", "availability_status": "bad"},
+            {"player_id": self.selected_id, "availability_status": "bad"},
         )
         self.assertEqual(status, 400)
         self.assertEqual(body["error"]["code"], "validation_error")
@@ -81,7 +90,7 @@ class WebServerTest(unittest.TestCase):
         _request("POST", "/api/games/game_1/roster/lock", {})
         status, body = _request(
             "POST", "/api/games/game_1/availability",
-            {"player_id": "player_skater_1", "availability_status": "unavailable"},
+            {"player_id": self.selected_id, "availability_status": "unavailable"},
         )
         self.assertEqual(status, 409)
         self.assertEqual(body["error"]["code"], "roster_locked")

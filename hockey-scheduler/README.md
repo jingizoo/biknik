@@ -46,8 +46,9 @@ hockey-scheduler/
       services/   roster_service (status engine + workflow)
       store/      in-memory repository
       api/        service facade mapping to the API contract
-      web/        iPhone-framed demo: stdlib HTTP server + static UI
-      seed.py     mock data builder
+      web/        iPhone-framed E2E demo: stdlib HTTP server + 7-tab UI
+      seed.py     single-game mock data builder
+      full_demo.py  full Alpine league/arena E2E seed (real setup service)
     tests/        unittest suite (no external deps)
 ```
 
@@ -63,25 +64,33 @@ cd hockey-scheduler/backend
 python3 -m hockey_scheduler.web        # then open http://localhost:8000
 ```
 
-It has a bottom tab bar with three screens:
+It is a **full end-to-end demo** seeded (via the real setup service) with the
+Alpine Ice Hockey League scenario — league → season → divisions, clubs/teams,
+venue → rinks → ice slots, and a manual U16 Lions vs U16 Falcons game. The
+bottom tab bar has seven screens:
 
-- **Today** — the next game at a glance: hero card, goalie/skater fill bars,
-  open-slot count, and an action banner.
-- **Game** — the full Game Detail, with a **Coach / Player** segmented control:
-  - *Coach* — roster-status banner, slot bars, selected players (mark *Can't
-    play* / *Re-confirm*), the substitute pool (*Add* a sub), and *Lock Roster*.
-  - *Player* — pick any player for their personalized screen: confirm / back
-    out, *Enroll as Substitute*, *Withdraw*, or *Accept/Decline* an offer. When
-    the roster is locked, player actions are disabled.
-- **Activity** — the live notification feed and the audit trail the backend
-  records for every state change.
+- **Today** — next game at a glance: hero card, goalie/skater fill bars, action
+  items, and the follow-up modules (officials/results/notifications/calendar)
+  shown as disabled cards linking to their issues.
+- **League** — the seeded league, season, divisions (with Junior tags), clubs,
+  and teams.
+- **Arena** — venue, rinks, and ice slots (the 18:30 slot allocated to the
+  game); a live *+ Add ice slot* action exercises the setup API.
+- **Schedule** — the manual game created from the setup layer; *Open* jumps to
+  the Game tab.
+- **Game** — full Game Detail with a **Coach / Player** toggle (mark *Can't
+  play* / *Re-confirm*, substitute pool with position-aware *Add*, *Lock
+  Roster*; locked state disables player actions).
+- **Activity** — the live notification feed and the audit trail.
+- **Public** — the fan fixture page. Shows fixtures only — **no junior player
+  names or any personal/guardian/medical data**.
 
-Suggested walkthrough: on **Game → Coach** mark a selected skater *Can't play* →
-the banner flips to **Open Slot**; switch to **Player**, pick that player and
-tap *I'm Available again* → the slot closes and the roster is **Confirmed**
-again (or pick an un-selected player and *Enroll as Substitute*, then *Add* them
-from the Coach view). Open **Activity** to see the notifications and audit
-entries each action produced. *Reset* (top-right) restores the starting state.
+Suggested walkthrough: **League/Arena** show the seeded setup; on **Game →
+Coach** mark a selected skater *Can't play* → **Open Slot**; switch to
+**Player**, pick an un-selected player and *Enroll as Substitute* → **Needs
+Substitute Decision**; back on **Coach**, *Add* them → **Roster Confirmed**,
+then *Lock Roster*. **Activity** shows the trail; **Public** shows the safe
+fixture. *Reset* (top-right) restores the starting state.
 
 ## Run the tests
 

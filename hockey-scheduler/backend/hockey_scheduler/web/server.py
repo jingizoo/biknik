@@ -14,9 +14,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Optional
 
+from datetime import timedelta
+
 from ..api import ApiService
-from ..domain import AvailabilityStatus
-from ..seed import build_seeded_store
+from ..full_demo import build_full_demo_store
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 CONTENT_TYPES = {
@@ -52,15 +53,13 @@ class DemoState:
         self.reset()
 
     def reset(self) -> None:
-        store, game_id = build_seeded_store()
+        # Build the full Alpine league/arena scenario via the real setup
+        # service, with one game rostered and confirmed, ready to demo a
+        # back-out → substitute flow.
+        store, game_id, ids = build_full_demo_store()
         self.api = ApiService(store)
         self.game_id = game_id
-        # Pre-select 1 goalie + 15 skaters and confirm them, so the demo opens
-        # on a confirmed roster ready for someone to back out.
-        selected = ["player_goalie_1"] + [f"player_skater_{i}" for i in range(1, 16)]
-        self.api.select_roster(game_id, selected, actor_id="coach_1")
-        for pid in selected:
-            self.api.set_availability(game_id, pid, "available")
+        self.ids = ids
 
 
 STATE = DemoState()
@@ -120,6 +119,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(204)
             self.end_headers()
             return
+        if path == "/api/demo/overview":
+            return self._send_api(api.get_demo_overview())
         if path == f"/api/games/{gid}/board":
             return self._send_api(api.get_board(gid))
         if path == f"/api/games/{gid}/roster-status":
@@ -146,6 +147,20 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/reset":
             STATE.reset()
             return self._send_json({"ok": True})
+
+        # Live setup action: add an available ice slot on the Main Rink,
+        # starting 30 min after the latest existing slot on that rink.
+        if path == "/api/demo/add-ice-slot":
+            rink_id = STATE.ids["main_rink_id"]
+            ends = [s.end_time for s in api.store.ice_slots.values()
+                    if s.rink_id == rink_id]
+            if not ends:
+                return self._send_api({"error": {"code": "validation_error",
+                                                 "message": "No reference slot."}})
+            start = max(ends) + timedelta(minutes=30)
+            end = start + timedelta(minutes=90)
+            return self._send_api(api.create_ice_slot(
+                rink_id, start.isoformat(), end.isoformat(), actor_id="arena_mgr"))
 
         # availability (confirm / back out)
         if path == f"/api/games/{gid}/availability":

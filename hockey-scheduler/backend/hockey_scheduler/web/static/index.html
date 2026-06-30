@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Hockey Scheduler — iPhone Demo</title>
+  <title>Hockey Scheduler — Full E2E Demo</title>
   <link rel="stylesheet" href="/styles.css" />
 </head>
 <body>
@@ -24,35 +24,38 @@
 
         <div id="content" class="content"><!-- rendered by app.js --></div>
 
-        <!-- bottom tab bar -->
+        <!-- bottom tab bar (scrolls horizontally) -->
         <nav class="tabbar">
-          <button class="tab active" data-tab="today">
-            <span class="tab-ico">🏒</span><span>Today</span>
-          </button>
-          <button class="tab" data-tab="game">
-            <span class="tab-ico">📋</span><span>Game</span>
-          </button>
-          <button class="tab" data-tab="activity">
-            <span class="tab-ico">🔔</span><span>Activity</span>
-          </button>
+          <button class="tab active" data-tab="today"><span class="tab-ico">🏒</span><span>Today</span></button>
+          <button class="tab" data-tab="league"><span class="tab-ico">🏆</span><span>League</span></button>
+          <button class="tab" data-tab="arena"><span class="tab-ico">🏟️</span><span>Arena</span></button>
+          <button class="tab" data-tab="schedule"><span class="tab-ico">📅</span><span>Schedule</span></button>
+          <button class="tab" data-tab="game"><span class="tab-ico">📋</span><span>Game</span></button>
+          <button class="tab" data-tab="activity"><span class="tab-ico">🔔</span><span>Activity</span></button>
+          <button class="tab" data-tab="public"><span class="tab-ico">🌐</span><span>Public</span></button>
         </nav>
       </div>
     </div>
 
     <div class="hint">
-      <h1>Hockey Scheduler</h1>
-      <p>A browser preview of the iPhone app. It drives the <strong>real</strong>
-        roster &amp; substitute engine on the backend — every tap hits the API.</p>
-      <ul>
-        <li><strong>Today</strong> — the next game at a glance: roster fill,
-          open slots, and an action banner.</li>
-        <li><strong>Game</strong> — full Game Detail. Toggle <em>Coach</em> /
-          <em>Player</em>. Mark a skater <em>Can't play</em>, enroll a sub,
-          and fill the slot.</li>
-        <li><strong>Activity</strong> — the live notification feed and the
-          audit trail the backend records for every change.</li>
-      </ul>
-      <p class="muted">Reset (top-right) restores a fully confirmed roster.</p>
+      <h1>Full E2E Demo</h1>
+      <p>One browser walkthrough of the whole hockey operating flow, driving the
+        <strong>real</strong> backend: League → Arena → Schedule → Game →
+        Substitute → Public.</p>
+      <ol>
+        <li><strong>League</strong> &amp; <strong>Arena</strong> — the seeded
+          Alpine league, divisions, clubs, teams, venue, rinks and ice slots.</li>
+        <li><strong>Schedule</strong> — the manual game created from the setup
+          layer; tap <em>Open</em>.</li>
+        <li><strong>Game</strong> — Coach marks a skater <em>Can't play</em> →
+          Open Slot; a player enrolls → Needs Substitute; Coach adds → Confirmed;
+          then <em>Lock Roster</em>.</li>
+        <li><strong>Activity</strong> — the notification + audit trail.</li>
+        <li><strong>Public</strong> — the fan fixture page (no junior player
+          names).</li>
+      </ol>
+      <p class="muted">Reset restores the confirmed roster. Officials, results,
+        notifications and calendar feeds are shown as disabled follow-ups.</p>
     </div>
   </div>
 
