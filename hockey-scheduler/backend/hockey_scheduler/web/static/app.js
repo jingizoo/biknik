@@ -238,13 +238,15 @@ function slotPasses(s, ctx) {
   return true;
 }
 
-function slotCard(s, draggable) {
+function slotCard(s, draggable, ctx) {
   const cls = s.status === "available" ? "available" : s.slot_type === "maintenance" ? "maintenance" : s.status;
   const dropClick = (draggable && s.status === "available") ? `data-slot="${s.id}" data-drop="${s.id}"` : "";
   const drag = (draggable && s.game_id) ? `draggable="true" data-game="${s.game_id}"` : "";
-  const pub = s.game_id ? ` · ${ (s.published === false) ? "Draft" : "" }` : "";
+  // Draft/Published state comes from the schedule game, not the slot row.
+  const g = (s.game_id && ctx) ? ctx.gameById[s.game_id] : null;
+  const state = g ? (g.published ? " · Published" : " · Draft") : "";
   const cta = (draggable && s.game_id) ? " · drag to move" : "";
-  return `<div class="slot-card ${cls}" ${dropClick} ${drag}><div class="t">${fmt(s.start_time)}–${fmt(s.end_time)}</div><div class="s">${slotLabel(s)}${cta}</div></div>`;
+  return `<div class="slot-card ${cls}" ${dropClick} ${drag}><div class="t">${fmt(s.start_time)}–${fmt(s.end_time)}</div><div class="s">${slotLabel(s)}${state}${cta}</div></div>`;
 }
 
 function calToolbar(ov) {
@@ -265,7 +267,7 @@ function calToolbar(ov) {
     <div class="cal-toolbar">
       <div class="cal-toprow">
         <div><div class="cal-date">${head}</div>
-          <div class="cal-venue">${esc((ov.venues[0] || {}).name || "Arena")}</div></div>
+          <div class="cal-venue">${esc(calFilters.venueId === "all" ? "All venues" : (ov.venues.find((v) => v.id === calFilters.venueId) || {}).name || "Arena")}</div></div>
         <div class="cal-controls">
           <div class="seg-mini"><button class="segm ${calendarMode === "day" ? "active" : ""}" data-mode="day">Day</button>
             <button class="segm ${calendarMode === "week" ? "active" : ""}" data-mode="week">Week</button></div>
@@ -302,16 +304,21 @@ function renderDay(ov, ctx, rinks) {
   const onDay = (s) => (s.start_time || "").startsWith(calendarDate) && slotPasses(s, ctx);
   const rows = rinks.map((r) => {
     const slots = ov.ice_slots.filter((s) => s.rink_id === r.id && onDay(s));
-    const cards = slots.map((s) => slotCard(s, true)).join("")
+    const cards = slots.map((s) => slotCard(s, true, ctx)).join("")
       || `<div class="slot-card"><div class="s">No ice</div></div>`;
     return `<div class="cal-row"><div class="cal-rink">${esc(r.name)}</div>
       <div class="cal-slots">${cards}
         <div class="slot-card available" data-addslot="${r.id}"><div class="t">＋</div><div class="s">Add ice</div></div></div></div>`;
   }).join("");
-  // Draft tray (respects venue/rink/division/team filters via slotPasses on its slot).
-  const drafts = ov.schedule.filter((g) => !g.published && (g.start_time || "").startsWith(calendarDate)
-    && (calFilters.divisionId === "all" || g.division_id === calFilters.divisionId)
-    && (calFilters.teamId === "all" || g.home_team_id === calFilters.teamId || g.away_team_id === calFilters.teamId));
+  // Draft tray (respects venue/rink/division/team filters by routing the draft
+  // game's own ice slot through slotPasses, just like the allocated cards above).
+  const slotById = {};
+  ov.ice_slots.forEach((s) => (slotById[s.id] = s));
+  const drafts = ov.schedule.filter((g) => {
+    if (g.published || !(g.start_time || "").startsWith(calendarDate)) return false;
+    const slot = slotById[g.ice_slot_id];
+    return slot ? slotPasses(slot, ctx) : true;
+  });
   const tray = drafts.length ? `<div class="tray"><span class="tray-label">Draft games</span>
     ${drafts.map((g) => `<span class="chip-drag" draggable="true" data-game="${g.game_id}">⠿ ${esc(g.home_team_name)} vs ${esc(g.away_team_name)} · ${fmt(g.start_time)}</span>`).join("")}</div>` : "";
   const body = rinks.length
@@ -332,7 +339,7 @@ function renderWeek(ov, ctx, rinks) {
         && (s.start_time || "").startsWith(day) && slotPasses(s, ctx));
       const today = day === calendarDate ? " today" : "";
       const items = slots.length
-        ? slots.map((s) => slotCard(s, false)).join("")
+        ? slots.map((s) => slotCard(s, false, ctx)).join("")
         : `<div class="wk-none">—</div>`;
       return `<div class="wk-cell${today}"><div class="wk-day">${esc(fmtDayShort(day))}</div>${items}</div>`;
     }).join("");
