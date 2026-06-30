@@ -7,16 +7,33 @@ let currentGame = null;     // game id whose roster we're viewing
 let pickedPlayer = null;
 let wizard = null;          // {slot_id, division_id, home_id, away_id} when scheduling
 let calendarDate = "2026-09-05";  // YYYY-MM-DD shown on the arena calendar
+let calendarMode = "day";   // day | week
+let calFilters = { venueId: "all", rinkId: "all", divisionId: "all", teamId: "all" };
 let toast = "";
 
-function shiftDate(days) {
-  const d = new Date(calendarDate + "T00:00:00Z");
-  d.setUTCDate(d.getUTCDate() + days);
-  calendarDate = d.toISOString().slice(0, 10);
+const DAY_MS = 86400000;
+function addDays(dateStr, n) {
+  const d = new Date(dateStr + "T00:00:00Z");
+  d.setUTCDate(d.getUTCDate() + n);
+  return d.toISOString().slice(0, 10);
+}
+function shiftDate(days) { calendarDate = addDays(calendarDate, days); }
+function startOfWeek(dateStr) {
+  const d = new Date(dateStr + "T00:00:00Z");
+  const dow = (d.getUTCDay() + 6) % 7;  // Monday = 0
+  return addDays(dateStr, -dow);
+}
+function weekDays(dateStr) {
+  const mon = startOfWeek(dateStr);
+  return Array.from({ length: 7 }, (_, i) => addDays(mon, i));
 }
 function fmtDate(d) {
   return new Date(d + "T00:00:00Z").toLocaleDateString("en-GB",
     { weekday: "short", day: "numeric", month: "short", year: "numeric", timeZone: "UTC" }).replace(",", "");
+}
+function fmtDayShort(d) {
+  return new Date(d + "T00:00:00Z").toLocaleDateString("en-GB",
+    { weekday: "short", day: "numeric", timeZone: "UTC" }).replace(",", "");
 }
 
 const NAV = {
@@ -181,62 +198,148 @@ function setupList(title, items) {
   return `<div class="section-title">${title} (${items.length})</div><div class="card">${rows}</div>`;
 }
 
-/* ---------- Arena Calendar ---------- */
-function renderCalendar(ov) {
-  if (wizard) return renderWizard(ov) + toastHtml();
-  const slotsByRink = {};
-  ov.rinks.forEach((r) => (slotsByRink[r.id] = []));
-  // Only show ice for the selected calendar date.
-  ov.ice_slots
-    .filter((s) => (s.start_time || "").startsWith(calendarDate))
-    .forEach((s) => { (slotsByRink[s.rink_id] ||= []).push(s); });
-  const label = (s) => {
-    if (s.game_label) return esc(s.game_label);
-    if (s.status === "available") return "Available · Schedule";
-    if (s.slot_type === "maintenance") return "Blocked · Maintenance";
-    if (s.slot_type === "public_skate") return "Blocked · Public skate";
-    if (s.slot_type === "practice") return "Blocked · Practice";
-    if (s.slot_type === "tournament") return "Blocked · Tournament";
-    return s.status;
-  };
-  const rows = ov.rinks.map((r) => {
-    const cards = (slotsByRink[r.id] || []).map((s) => {
-      const cls = s.status === "available" ? "available" : s.slot_type === "maintenance" ? "maintenance" : s.status;
-      // Available game ice is a click-target (schedule) and a drop-target (move).
-      const attr = s.status === "available" ? `data-slot="${s.id}" data-drop="${s.id}"` : "";
-      // Allocated game cards are draggable to move the game to another slot.
-      const drag = s.game_id ? `draggable="true" data-game="${s.game_id}"` : "";
-      const cta = s.game_label ? " · drag to move" : "";
-      return `<div class="slot-card ${cls}" ${attr} ${drag}><div class="t">${fmt(s.start_time)}–${fmt(s.end_time)}</div><div class="s">${label(s)}${cta}</div></div>`;
-    }).join("") || `<div class="slot-card"><div class="s">No ice</div></div>`;
-    return `<div class="cal-row"><div class="cal-rink">${esc(r.name)}</div>
-      <div class="cal-slots">${cards}
-        <div class="slot-card available" data-addslot="${r.id}"><div class="t">＋</div><div class="s">Add ice</div></div></div></div>`;
-  }).join("");
-  const drafts = ov.schedule.filter((g) => !g.published);
-  const tray = drafts.length ? `<div class="tray"><span class="tray-label">Draft games</span>
-    ${drafts.map((g) => `<span class="chip-drag" draggable="true" data-game="${g.game_id}">⠿ ${esc(g.home_team_name)} vs ${esc(g.away_team_name)} · ${fmt(g.start_time)}</span>`).join("")}</div>` : "";
+/* ---------- Arena Calendar (day + week, filtered) ---------- */
+function slotLabel(s) {
+  if (s.game_label) return esc(s.game_label);
+  if (s.status === "available") return "Available · Schedule";
+  if (s.slot_type === "maintenance") return "Blocked · Maintenance";
+  if (s.slot_type === "public_skate") return "Blocked · Public skate";
+  if (s.slot_type === "practice") return "Blocked · Practice";
+  if (s.slot_type === "tournament") return "Blocked · Tournament";
+  return s.status;
+}
+
+function calContext(ov) {
+  // rink_id → venue_id, and game lookups for division/team filtering.
+  const rinkVenue = {};
+  ov.rinks.forEach((r) => (rinkVenue[r.id] = r.venue_id));
+  const gameById = {};
+  ov.schedule.forEach((g) => (gameById[g.game_id] = g));
+  return { rinkVenue, gameById };
+}
+
+function visibleRinks(ov) {
+  return ov.rinks.filter((r) =>
+    (calFilters.venueId === "all" || r.venue_id === calFilters.venueId) &&
+    (calFilters.rinkId === "all" || r.id === calFilters.rinkId));
+}
+
+function slotPasses(s, ctx) {
+  // Venue/rink restrict the ice inventory; division/team restrict allocated
+  // games only — available ice stays visible.
+  if (calFilters.venueId !== "all" && ctx.rinkVenue[s.rink_id] !== calFilters.venueId) return false;
+  if (calFilters.rinkId !== "all" && s.rink_id !== calFilters.rinkId) return false;
+  if (s.game_id) {
+    const g = ctx.gameById[s.game_id];
+    if (calFilters.divisionId !== "all" && (!g || g.division_id !== calFilters.divisionId)) return false;
+    if (calFilters.teamId !== "all" &&
+        (!g || (g.home_team_id !== calFilters.teamId && g.away_team_id !== calFilters.teamId))) return false;
+  }
+  return true;
+}
+
+function slotCard(s, draggable) {
+  const cls = s.status === "available" ? "available" : s.slot_type === "maintenance" ? "maintenance" : s.status;
+  const dropClick = (draggable && s.status === "available") ? `data-slot="${s.id}" data-drop="${s.id}"` : "";
+  const drag = (draggable && s.game_id) ? `draggable="true" data-game="${s.game_id}"` : "";
+  const pub = s.game_id ? ` · ${ (s.published === false) ? "Draft" : "" }` : "";
+  const cta = (draggable && s.game_id) ? " · drag to move" : "";
+  return `<div class="slot-card ${cls}" ${dropClick} ${drag}><div class="t">${fmt(s.start_time)}–${fmt(s.end_time)}</div><div class="s">${slotLabel(s)}${cta}</div></div>`;
+}
+
+function calToolbar(ov) {
+  const opt2 = (v, label, sel) => `<option value="${esc(v)}" ${sel ? "selected" : ""}>${esc(label)}</option>`;
+  const venueOpts = `<option value="all">All venues</option>` +
+    ov.venues.map((v) => opt2(v.id, v.name, v.id === calFilters.venueId)).join("");
+  const rinkSrc = ov.rinks.filter((r) => calFilters.venueId === "all" || r.venue_id === calFilters.venueId);
+  const rinkOpts = `<option value="all">All rinks</option>` +
+    rinkSrc.map((r) => opt2(r.id, r.name, r.id === calFilters.rinkId)).join("");
+  const divOpts = `<option value="all">All divisions</option>` +
+    ov.divisions.map((d) => opt2(d.id, d.name, d.id === calFilters.divisionId)).join("");
+  const teamOpts = `<option value="all">All teams</option>` +
+    ov.teams.map((t) => opt2(t.id, t.name, t.id === calFilters.teamId)).join("");
+  const head = calendarMode === "week"
+    ? `Week of ${esc(fmtDate(startOfWeek(calendarDate)))}`
+    : esc(fmtDate(calendarDate));
   return `
-    <div class="cal-head">
-      <div><div class="cal-date">${esc(fmtDate(calendarDate))}</div>
-        <div class="cal-venue">${esc((ov.venues[0] || {}).name || "Arena")}</div></div>
-      <div class="cal-nav"><button class="act ghost" data-cal="-1">‹</button>
-        <button class="act ghost" data-cal="0">Today</button>
-        <button class="act ghost" data-cal="1">›</button></div>
+    <div class="cal-toolbar">
+      <div class="cal-toprow">
+        <div><div class="cal-date">${head}</div>
+          <div class="cal-venue">${esc((ov.venues[0] || {}).name || "Arena")}</div></div>
+        <div class="cal-controls">
+          <div class="seg-mini"><button class="segm ${calendarMode === "day" ? "active" : ""}" data-mode="day">Day</button>
+            <button class="segm ${calendarMode === "week" ? "active" : ""}" data-mode="week">Week</button></div>
+          <div class="cal-nav"><button class="act ghost" data-cal="-1">‹</button>
+            <button class="act ghost" data-cal="0">Today</button>
+            <button class="act ghost" data-cal="1">›</button></div>
+        </div>
+      </div>
+      <div class="cal-filters">
+        <select data-filter="venueId">${venueOpts}</select>
+        <select data-filter="rinkId">${rinkOpts}</select>
+        <select data-filter="divisionId">${divOpts}</select>
+        <select data-filter="teamId">${teamOpts}</select>
+      </div>
     </div>
     <div class="legend">
       <span><i class="dot lg-game"></i>Available</span>
       <span><i class="dot lg-alloc"></i>Allocated</span>
       <span><i class="dot lg-maint"></i>Maintenance</span>
       <span><i class="dot lg-skate"></i>Public skate</span>
-    </div>
-    ${tray}
-    ${rows}
-    <div class="privacy-note">📅 Tap an <strong>Available</strong> slot to schedule, or
-      <strong>drag</strong> a game onto available ice to move it (validated server-side).
-      Moving changes the time/rink, so a published fixture is unpublished and a locked
-      roster is unlocked for reconfirmation. This board is the source of truth (#33).</div>
-    ${toastHtml()}`;
+    </div>`;
+}
+
+function renderCalendar(ov) {
+  if (wizard) return renderWizard(ov) + toastHtml();
+  const ctx = calContext(ov);
+  const rinks = visibleRinks(ov);
+  return calendarMode === "week"
+    ? calToolbar(ov) + renderWeek(ov, ctx, rinks) + toastHtml()
+    : calToolbar(ov) + renderDay(ov, ctx, rinks) + toastHtml();
+}
+
+function renderDay(ov, ctx, rinks) {
+  const onDay = (s) => (s.start_time || "").startsWith(calendarDate) && slotPasses(s, ctx);
+  const rows = rinks.map((r) => {
+    const slots = ov.ice_slots.filter((s) => s.rink_id === r.id && onDay(s));
+    const cards = slots.map((s) => slotCard(s, true)).join("")
+      || `<div class="slot-card"><div class="s">No ice</div></div>`;
+    return `<div class="cal-row"><div class="cal-rink">${esc(r.name)}</div>
+      <div class="cal-slots">${cards}
+        <div class="slot-card available" data-addslot="${r.id}"><div class="t">＋</div><div class="s">Add ice</div></div></div></div>`;
+  }).join("");
+  // Draft tray (respects venue/rink/division/team filters via slotPasses on its slot).
+  const drafts = ov.schedule.filter((g) => !g.published && (g.start_time || "").startsWith(calendarDate)
+    && (calFilters.divisionId === "all" || g.division_id === calFilters.divisionId)
+    && (calFilters.teamId === "all" || g.home_team_id === calFilters.teamId || g.away_team_id === calFilters.teamId));
+  const tray = drafts.length ? `<div class="tray"><span class="tray-label">Draft games</span>
+    ${drafts.map((g) => `<span class="chip-drag" draggable="true" data-game="${g.game_id}">⠿ ${esc(g.home_team_name)} vs ${esc(g.away_team_name)} · ${fmt(g.start_time)}</span>`).join("")}</div>` : "";
+  const body = rinks.length
+    ? tray + rows
+    : `<div class="empty">No rinks match the selected filters.</div>`;
+  return body + `<div class="privacy-note">📅 Tap an <strong>Available</strong> slot to schedule, or
+    <strong>drag</strong> a game onto available ice to move it (validated server-side).
+    Moving changes the time/rink, so a published fixture is unpublished and a locked roster
+    is unlocked. This board is the source of truth (#33).</div>`;
+}
+
+function renderWeek(ov, ctx, rinks) {
+  const days = weekDays(calendarDate);
+  if (!rinks.length) return `<div class="empty">No rinks for the selected filters.</div>`;
+  const grid = rinks.map((r) => {
+    const cells = days.map((day) => {
+      const slots = ov.ice_slots.filter((s) => s.rink_id === r.id
+        && (s.start_time || "").startsWith(day) && slotPasses(s, ctx));
+      const today = day === calendarDate ? " today" : "";
+      const items = slots.length
+        ? slots.map((s) => slotCard(s, false)).join("")
+        : `<div class="wk-none">—</div>`;
+      return `<div class="wk-cell${today}"><div class="wk-day">${esc(fmtDayShort(day))}</div>${items}</div>`;
+    }).join("");
+    return `<div class="wk-row"><div class="cal-rink">${esc(r.name)}</div><div class="wk-days">${cells}</div></div>`;
+  }).join("");
+  return grid + `<div class="privacy-note">📅 Week view is read-only.
+    <strong>Drag/drop to move games is available in Day view</strong> — switch to Day.</div>`;
 }
 
 function renderWizard(ov) {
@@ -556,7 +659,19 @@ async function render() {
   c.querySelectorAll(".seg").forEach((b) => b.onclick = () => { gameView = b.dataset.view; toast = ""; render(); });
   c.querySelectorAll("[data-slot]").forEach((b) => b.onclick = () => { wizard = { slot_id: b.dataset.slot }; toast = ""; render(); });
   c.querySelectorAll("[data-addslot]").forEach((b) => b.onclick = async () => { await post("/api/demo/add-ice-slot", { rink_id: b.dataset.addslot, date: calendarDate }); await render(); });
-  c.querySelectorAll("[data-cal]").forEach((b) => b.onclick = () => { const v = +b.dataset.cal; if (v === 0) calendarDate = "2026-09-05"; else shiftDate(v); toast = ""; render(); });
+  c.querySelectorAll("[data-cal]").forEach((b) => b.onclick = () => {
+    const v = +b.dataset.cal;
+    if (v === 0) calendarDate = "2026-09-05";
+    else shiftDate(v * (calendarMode === "week" ? 7 : 1));
+    toast = ""; render();
+  });
+  c.querySelectorAll("[data-mode]").forEach((b) => b.onclick = () => { calendarMode = b.dataset.mode; toast = ""; render(); });
+  c.querySelectorAll("[data-filter]").forEach((sel) => sel.onchange = (e) => {
+    const key = sel.dataset.filter;
+    calFilters[key] = e.target.value;
+    if (key === "venueId") calFilters.rinkId = "all";  // rink list depends on venue
+    toast = ""; render();
+  });
   // Drag a game (allocated card or draft chip) onto an available slot to move it.
   c.querySelectorAll("[data-game]").forEach((el) => {
     el.addEventListener("dragstart", (e) => {

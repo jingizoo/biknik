@@ -377,9 +377,13 @@ class ApiService:
                 venue_name = venues[rk.venue_id].name if rk.venue_id in venues else None
             schedule.append({
                 "game_id": g.id,
+                "home_team_id": g.home_team_id,
+                "away_team_id": g.away_team_id,
                 "home_team_name": team_name(g.home_team_id),
                 "away_team_name": team_name(g.away_team_id) if g.away_team_id else None,
+                "division_id": g.division_id,
                 "division_name": div.name if div else None,
+                "ice_slot_id": g.ice_slot_id,
                 "rink_name": g.rink, "venue_name": venue_name,
                 "start_time": g.start_time.isoformat(),
                 "roster_status": rstatus.status.value,
