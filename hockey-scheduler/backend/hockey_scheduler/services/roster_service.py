@@ -178,6 +178,8 @@ class RosterService:
         game = self._require_game(game_id)
         if game.cancelled:
             raise GameCancelledError("Game is cancelled.")
+        if game.locked:
+            raise RosterLockedError("Roster is locked. Unlock to make changes.")
         self._require_player(player_id)
 
         existing = self.store.availability_for_player(game_id, player_id)
@@ -309,10 +311,13 @@ class RosterService:
         if not player.is_active:
             raise NotEligibleError(f"{player.name} is not an active player.")
 
+        # A player who already has any roster entry for this game — selected,
+        # confirmed, or even backed out/removed — is not part of the
+        # "not selected" substitute pool and may not enroll.
         entry = self.store.roster_entry_for_player(game_id, player_id)
-        if entry and entry.status.occupies_slot:
+        if entry is not None:
             raise AlreadySelectedError(
-                f"{player.name} is already selected for this game."
+                f"{player.name} was already selected for this game."
             )
 
         existing = self.store.substitute_for_player(game_id, player_id)
@@ -411,6 +416,10 @@ class RosterService:
         sub = self.store.substitute_for_player(game_id, player_id)
         if sub is None or sub.status != SubstituteStatus.OFFERED:
             raise InvalidTransitionError("No active offer to accept.")
+        # Offers can expire: a lapsed offer returns the player to the pool.
+        if sub.offer_expires_at and self.clock() > sub.offer_expires_at:
+            sub.status = SubstituteStatus.EXPIRED
+            raise InvalidTransitionError("This substitute offer has expired.")
         # First-accepted-wins: the slot must still be open.
         self._require_open_slot(game_id, sub.slot_type)
         sub.status = SubstituteStatus.ACCEPTED

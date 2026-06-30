@@ -11,6 +11,14 @@ let toast = "";
 const POS_LABEL = { goalie: "G", defense: "D", forward: "F", skater: "S" };
 const POS_CLASS = { goalie: "pos-G", defense: "pos-D", forward: "pos-F", skater: "pos-D" };
 
+// Escape any backend-provided text before interpolating into innerHTML.
+// Today seed names are fictional, but player names will become user-entered.
+function esc(s) {
+  return String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+  }[c]));
+}
+
 async function getBoard() {
   const r = await fetch(`${BASE}/board`);
   return r.json();
@@ -64,7 +72,7 @@ function renderCoach(board) {
       } else {
         btn = `<button class="act ghost" data-act="confirm" data-id="${p.id}">Confirm</button>`;
       }
-      return `<div class="row">${posDot(p)}<span class="name">${p.name}</span>
+      return `<div class="row">${posDot(p)}<span class="name">${esc(p.name)}</span>
         ${statusBadge(p)}${locked ? "" : btn}</div>`;
     })
     .join("");
@@ -73,7 +81,7 @@ function renderCoach(board) {
     ? subs
         .map((p) => {
           const offered = p.sub_status === "offered";
-          return `<div class="row">${posDot(p)}<span class="name">${p.name}</span>
+          return `<div class="row">${posDot(p)}<span class="name">${esc(p.name)}</span>
             ${offered ? '<span class="badge orange">Offered</span>' : '<span class="badge blue">Enrolled</span>'}
             ${locked ? "" : `<button class="act primary" data-act="add" data-id="${p.id}">Add</button>`}</div>`;
         })
@@ -83,11 +91,11 @@ function renderCoach(board) {
   return `
     <div class="banner ${bannerClass(s.status)}">
       <h2>${prettyStatus(s.status)}</h2>
-      <p>${s.message}</p>
+      <p>${esc(s.message)}</p>
     </div>
     <div class="game-head">
       <h2>${board.game.id === GAME ? "U16 Lions vs Falcons" : board.game.id}</h2>
-      <div class="sub">Sat 18:30 · ${board.game.rink || "Rink 2"}</div>
+      <div class="sub">Sat 18:30 · ${esc(board.game.rink || "Rink 2")}</div>
     </div>
     <div class="card">
       <div class="row"><span class="name">Goalies</span>
@@ -107,7 +115,7 @@ function renderCoach(board) {
         ? `<button class="act ghost" data-act="unlock">Unlock Roster</button>`
         : `<button class="act ghost" data-act="lock">Lock Roster</button>`}
     </div>
-    ${toast ? `<div class="toast">${toast}</div>` : ""}
+    ${toast ? `<div class="toast">${esc(toast)}</div>` : ""}
   `;
 }
 
@@ -119,7 +127,7 @@ function renderPlayer(board) {
   }
   const options = players
     .map((p) => `<option value="${p.id}" ${p.id === pickedPlayer ? "selected" : ""}>
-        ${p.name} · ${p.position}</option>`)
+        ${esc(p.name)} · ${esc(p.position)}</option>`)
     .join("");
 
   const p = players.find((x) => x.id === pickedPlayer);
@@ -171,7 +179,7 @@ function renderPlayer(board) {
     <div class="section-title">View as player</div>
     <select class="player-picker" id="player-picker">${options}</select>
     ${card}
-    ${toast ? `<div class="toast">${toast}</div>` : ""}
+    ${toast ? `<div class="toast">${esc(toast)}</div>` : ""}
   `;
 }
 

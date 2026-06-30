@@ -173,6 +173,45 @@ class SubstituteWorkflowTest(unittest.TestCase):
         with self.assertRaises(InvalidTransitionError):
             service.accept_substitute(game_id, "player_skater_5")
 
+    def test_locked_roster_blocks_availability_backout(self):
+        # A locked roster must not be changed via the availability path either.
+        service, _, game_id = make_service(target_skaters=4)
+        self._full_roster(service, game_id)
+        service.lock_roster(game_id, actor_id="coach_1")
+        with self.assertRaises(RosterLockedError):
+            service.set_availability(
+                game_id, "player_skater_1", AvailabilityStatus.UNAVAILABLE
+            )
+
+    def test_backed_out_selected_player_cannot_enroll_as_substitute(self):
+        # A previously-selected player who backed out is still "selected" for
+        # this game and may not join the not-selected substitute pool.
+        service, _, game_id = make_service(target_skaters=4)
+        self._full_roster(service, game_id)
+        service.set_availability(
+            game_id, "player_skater_1", AvailabilityStatus.UNAVAILABLE
+        )
+        with self.assertRaises(AlreadySelectedError):
+            service.enroll_substitute(game_id, "player_skater_1")
+
+    def test_expired_offer_cannot_be_accepted(self):
+        service, store, game_id = make_service(target_skaters=4)
+        self._full_roster(service, game_id)
+        service.enroll_substitute(game_id, "player_skater_5")
+        service.set_availability(
+            game_id, "player_skater_1", AvailabilityStatus.UNAVAILABLE
+        )
+        # Capture a timestamp now; the monotonic clock advances past it before
+        # accept, so the offer is expired by acceptance time.
+        expired_at = service.clock()
+        service.offer_substitute(
+            game_id, "player_skater_5", offer_expires_at=expired_at
+        )
+        with self.assertRaises(InvalidTransitionError):
+            service.accept_substitute(game_id, "player_skater_5")
+        sub = store.substitute_for_player(game_id, "player_skater_5")
+        self.assertEqual(sub.status, SubstituteStatus.EXPIRED)
+
 
 if __name__ == "__main__":
     unittest.main()

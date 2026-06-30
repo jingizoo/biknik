@@ -25,6 +25,19 @@ CONTENT_TYPES = {
     ".js": "application/javascript; charset=utf-8",
 }
 
+# Maps structured domain-error codes to HTTP status codes (per api-contract.md).
+ERROR_HTTP_STATUS = {
+    "not_found": 404,
+    "validation_error": 400,
+    "roster_locked": 409,
+    "already_selected": 409,
+    "not_enrolled": 409,
+    "invalid_transition": 409,
+    "slot_already_filled": 409,
+    "not_eligible": 403,
+    "game_cancelled": 409,
+}
+
 
 def _json_default(obj):
     if isinstance(obj, datetime):
@@ -67,6 +80,13 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_api(self, payload) -> None:
+        """Send an API payload, mapping structured domain errors to HTTP codes."""
+        if isinstance(payload, dict) and "error" in payload:
+            code = payload["error"].get("code", "domain_error")
+            return self._send_json(payload, ERROR_HTTP_STATUS.get(code, 400))
+        return self._send_json(payload)
+
     def _read_body(self) -> dict:
         length = int(self.headers.get("Content-Length", 0) or 0)
         if not length:
@@ -101,15 +121,15 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             return
         if path == f"/api/games/{gid}/board":
-            return self._send_json(api.get_board(gid))
+            return self._send_api(api.get_board(gid))
         if path == f"/api/games/{gid}/roster-status":
-            return self._send_json(api.get_roster_status(gid))
+            return self._send_api(api.get_roster_status(gid))
         if path == f"/api/games/{gid}/roster":
-            return self._send_json(api.get_roster(gid))
+            return self._send_api(api.get_roster(gid))
         if path == f"/api/games/{gid}/substitutes":
-            return self._send_json(api.get_substitutes(gid))
+            return self._send_api(api.get_substitutes(gid))
         if path == f"/api/games/{gid}":
-            return self._send_json(api.get_game(gid))
+            return self._send_api(api.get_game(gid))
         if path.startswith("/api/"):
             return self._send_json({"error": {"code": "not_found",
                                               "message": "Unknown endpoint."}}, 404)
@@ -129,7 +149,7 @@ class Handler(BaseHTTPRequestHandler):
 
         # availability (confirm / back out)
         if path == f"/api/games/{gid}/availability":
-            return self._send_json(api.set_availability(
+            return self._send_api(api.set_availability(
                 gid, pid, body.get("availability_status", "pending"),
                 body.get("response_source", "player"), actor))
 
@@ -139,18 +159,20 @@ class Handler(BaseHTTPRequestHandler):
             f"/api/games/{gid}/substitutes/withdraw": api.withdraw_substitute,
         }
         if path in sub_routes:
-            return self._send_json(sub_routes[path](gid, pid, actor))
+            return self._send_api(sub_routes[path](gid, pid, actor))
 
         m = re.match(rf"^/api/games/{re.escape(gid)}/substitutes/([^/]+)/(offer|accept|decline|add-to-roster)$", path)
         if m:
             player_id, action = m.group(1), m.group(2)
+            if action == "offer":
+                return self._send_api(api.offer_substitute(
+                    gid, player_id, actor, expires_at=body.get("expires_at")))
             fn = {
-                "offer": api.offer_substitute,
                 "accept": api.accept_substitute,
                 "decline": api.decline_substitute,
                 "add-to-roster": api.add_substitute_to_roster,
             }[action]
-            return self._send_json(fn(gid, player_id, actor))
+            return self._send_api(fn(gid, player_id, actor))
 
         # coach controls
         coach_routes = {
@@ -159,7 +181,7 @@ class Handler(BaseHTTPRequestHandler):
             f"/api/games/{gid}/cancel": api.cancel_game,
         }
         if path in coach_routes:
-            return self._send_json(coach_routes[path](gid, actor))
+            return self._send_api(coach_routes[path](gid, actor))
 
         return self._send_json({"error": {"code": "not_found",
                                           "message": "Unknown endpoint."}}, 404)

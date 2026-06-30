@@ -54,6 +54,28 @@ class ApiFacadeTest(unittest.TestCase):
         result = self.api.enroll_substitute(self.game_id, "player_skater_1")
         self.assertEqual(result["error"]["code"], "already_selected")
 
+    def test_invalid_roster_status_returns_structured_error(self):
+        self.api.select_roster(self.game_id, ["player_skater_1"], actor_id="coach_1")
+        result = self.api.set_roster_status(self.game_id, "player_skater_1", "bad")
+        self.assertEqual(result["error"]["code"], "validation_error")
+
+    def test_invalid_availability_status_returns_structured_error(self):
+        result = self.api.set_availability(self.game_id, "player_skater_1", "bad")
+        self.assertEqual(result["error"]["code"], "validation_error")
+
+    def test_get_game_returns_json_serializable_timestamps(self):
+        game = self.api.get_game(self.game_id)
+        self.assertIsInstance(game["start_time"], str)
+        self.assertTrue(game["start_time"].endswith("+00:00"))
+
+    def test_board_is_fully_json_serializable(self):
+        import json
+        self.api.select_roster(self.game_id, ["player_skater_1"], actor_id="coach_1")
+        self.api.set_availability(self.game_id, "player_skater_1", "available")
+        board = self.api.get_board(self.game_id)
+        # Must round-trip through json with no custom encoder.
+        json.dumps(board)
+
 
 if __name__ == "__main__":
     unittest.main()

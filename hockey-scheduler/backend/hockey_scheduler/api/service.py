@@ -6,19 +6,64 @@ returned as the structured ``{"error": {...}}`` shape so callers (and a future
 web framework) never see Python tracebacks across the boundary.
 """
 
-from dataclasses import asdict
+from dataclasses import asdict, is_dataclass
+from datetime import datetime
+from enum import Enum
 from typing import Callable, List, Optional
 
 from ..domain import AvailabilityStatus, RosterEntryStatus, SubstituteStatus
-from ..domain.errors import DomainError
+from ..domain.errors import DomainError, ValidationError
 from ..services import RosterService
 from ..store import InMemoryStore
 
 
+def _jsonify(value):
+    """Recursively convert a value into JSON-safe primitives.
+
+    Enums → their ``.value``; datetimes → ISO-8601 strings; dataclasses,
+    dicts, and lists are walked so nested timestamps/enums are converted too.
+    """
+    if isinstance(value, Enum):
+        return value.value
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if is_dataclass(value):
+        return _jsonify(asdict(value))
+    if isinstance(value, dict):
+        return {k: _jsonify(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonify(v) for v in value]
+    return value
+
+
 def _serialize(obj) -> dict:
-    """Convert a domain dataclass to a JSON-friendly dict (enums → values)."""
-    raw = asdict(obj)
-    return {k: (v.value if hasattr(v, "value") else v) for k, v in raw.items()}
+    """Convert a domain dataclass to a fully JSON-safe dict."""
+    return _jsonify(obj)
+
+
+def _parse_enum(enum_cls, value, field_name: str):
+    """Parse a client-supplied enum string, raising a structured error."""
+    try:
+        return enum_cls(value)
+    except ValueError:
+        allowed = ", ".join(e.value for e in enum_cls)
+        raise ValidationError(
+            f"Invalid {field_name}: {value!r}. Allowed values: {allowed}."
+        )
+
+
+def _parse_dt(value, field_name: str):
+    """Parse an optional ISO-8601 timestamp string into a datetime."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime):
+        return value
+    try:
+        return datetime.fromisoformat(value)
+    except (ValueError, TypeError):
+        raise ValidationError(
+            f"Invalid {field_name}: {value!r}. Expected an ISO-8601 timestamp."
+        )
 
 
 def catch(fn: Callable):
@@ -59,7 +104,8 @@ class ApiService:
     def set_roster_status(self, game_id: str, player_id: str, status: str,
                           actor_id: Optional[str] = None) -> dict:
         entry = self.roster.set_roster_entry_status(
-            game_id, player_id, RosterEntryStatus(status), actor_id
+            game_id, player_id, _parse_enum(RosterEntryStatus, status, "status"),
+            actor_id,
         )
         return _serialize(entry)
 
@@ -74,7 +120,9 @@ class ApiService:
                          availability_status: str, response_source: str = "player",
                          actor_id: Optional[str] = None) -> dict:
         av = self.roster.set_availability(
-            game_id, player_id, AvailabilityStatus(availability_status),
+            game_id, player_id,
+            _parse_enum(AvailabilityStatus, availability_status,
+                        "availability_status"),
             response_source, actor_id,
         )
         return _serialize(av)
@@ -97,8 +145,12 @@ class ApiService:
 
     @catch
     def offer_substitute(self, game_id: str, player_id: str,
-                         actor_id: Optional[str] = None) -> dict:
-        return _serialize(self.roster.offer_substitute(game_id, player_id, actor_id))
+                         actor_id: Optional[str] = None,
+                         expires_at: Optional[str] = None) -> dict:
+        return _serialize(self.roster.offer_substitute(
+            game_id, player_id, actor_id,
+            offer_expires_at=_parse_dt(expires_at, "expires_at"),
+        ))
 
     @catch
     def accept_substitute(self, game_id: str, player_id: str,
