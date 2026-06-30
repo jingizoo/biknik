@@ -100,6 +100,25 @@ class FullDemoTest(unittest.TestCase):
         self.assertNotEqual(status["status"], "roster_confirmed")
         self.assertGreater(status["open_skater_slots"], 0)
         self.assertEqual(status["open_goalie_slots"], 1)
+        self.assertTrue(status["short_roster"])
+        self.assertEqual(status["missing_goalies"], 1)
+
+    def test_scheduled_game_is_draft_until_published(self):
+        ov = self.api.get_demo_overview()
+        slot = next(s for s in ov["ice_slots"] if s["status"] == "available")
+        u16 = [t for t in ov["teams"] if t["division_name"] == "U16 Elite"]
+        before = len(ov["public_fixtures"])  # only the seeded (published) game
+        game = self.api.create_game(ov["seasons"][0]["id"], u16[0]["division_id"],
+                                    u16[0]["id"], u16[1]["id"], slot["id"])
+        # A freshly scheduled game is a draft and is NOT public yet.
+        ov2 = self.api.get_demo_overview()
+        sched = next(g for g in ov2["schedule"] if g["game_id"] == game["id"])
+        self.assertFalse(sched["published"])
+        self.assertEqual(len(ov2["public_fixtures"]), before)
+        # Publishing it makes it appear in the public fixtures.
+        self.api.publish_game(game["id"], actor_id="league_admin")
+        ov3 = self.api.get_demo_overview()
+        self.assertEqual(len(ov3["public_fixtures"]), before + 1)
 
     def test_build_roster_without_players_errors(self):
         # A team with no players cannot be auto-rostered.

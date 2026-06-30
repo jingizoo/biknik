@@ -271,6 +271,16 @@ class SetupService:
         })
         return game
 
+    def publish_game(self, game_id: str, published: bool = True,
+                     actor_id: Optional[str] = None) -> Game:
+        game = self.store.get_game(game_id)
+        if game is None:
+            raise NotFoundError(f"Game {game_id} not found.")
+        game.published = published
+        self._audit("game_published" if published else "game_unpublished",
+                    "game", game_id, actor_id)
+        return game
+
     # -- convenience: add a player to a team ------------------------------
     def add_player(self, team_id: str, name: str, position: Position,
                    jersey_number: Optional[int] = None,

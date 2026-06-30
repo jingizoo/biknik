@@ -73,6 +73,7 @@ def build_full_demo_store() -> Tuple[InMemoryStore, str, dict]:
 
     game = setup.create_game(season.id, d_u16.id, u16_lions.id, u16_falcons.id,
                              slot_game.id, actor_id=admin)
+    setup.publish_game(game.id, actor_id=admin)  # seeded game is public
 
     # Seed BOTH U16 teams with a full squad (distinct names) so any U16 game
     # (either team as home) has a rosterable roster.

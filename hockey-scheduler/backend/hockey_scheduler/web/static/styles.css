@@ -283,6 +283,7 @@ select.player-picker {
 .pill.blocked { background: #ffe5e3; color: #c0271b; }
 .pill.junior { background: #efe9ff; color: #5a40c0; }
 .pill.scheduled { background: #e3f0ff; color: #0a64c4; }
+.pill.gray { background: #ececf1; color: #6b6b70; }
 
 .kv { display: flex; justify-content: space-between; padding: 11px 14px; border-bottom: 1px solid var(--sep); font-size: 14px; }
 .kv:last-child { border-bottom: none; }

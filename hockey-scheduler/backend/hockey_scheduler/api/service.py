@@ -209,7 +209,17 @@ class ApiService:
         self.roster.select_roster(game_id, selected, actor_id)
         for pid in selected:
             self.roster.set_availability(game_id, pid, AvailabilityStatus.AVAILABLE)
-        return self.roster.compute_roster_status(game_id).to_dict()
+        status = self.roster.compute_roster_status(game_id).to_dict()
+        # Coach-friendly classification of a short roster.
+        status["missing_goalies"] = status["open_goalie_slots"]
+        status["missing_skaters"] = status["open_skater_slots"]
+        status["short_roster"] = (status["open_goalie_slots"] > 0
+                                  or status["open_skater_slots"] > 0)
+        return status
+
+    @catch
+    def publish_game(self, game_id: str, actor_id: Optional[str] = None) -> dict:
+        return _serialize(self.setup.publish_game(game_id, True, actor_id))
 
     # -- screen view-model -------------------------------------------------
     @catch
@@ -368,18 +378,19 @@ class ApiService:
                 "rink_name": g.rink, "venue_name": venue_name,
                 "start_time": g.start_time.isoformat(),
                 "roster_status": rstatus.status.value,
-                "published": True,
+                "published": g.published,
             })
-            # PUBLIC: fixture info only — no players, no PII.
-            public_fixtures.append({
-                "division_name": div.name if div else None,
-                "home_team_name": team_name(g.home_team_id),
-                "away_team_name": team_name(g.away_team_id) if g.away_team_id else None,
-                "venue_name": venue_name, "rink_name": g.rink,
-                "start_time": g.start_time.isoformat(),
-                "status": "Postponed" if g.cancelled else "Scheduled",
-                "is_junior": is_junior(div),
-            })
+            # PUBLIC: only PUBLISHED games, fixture info only — no players/PII.
+            if g.published and not g.cancelled:
+                public_fixtures.append({
+                    "division_name": div.name if div else None,
+                    "home_team_name": team_name(g.home_team_id),
+                    "away_team_name": team_name(g.away_team_id) if g.away_team_id else None,
+                    "venue_name": venue_name, "rink_name": g.rink,
+                    "start_time": g.start_time.isoformat(),
+                    "status": "Scheduled",
+                    "is_junior": is_junior(div),
+                })
 
         leagues = [_serialize(x) for x in self.store.leagues.values()]
         seasons = [_serialize(x) for x in self.store.seasons.values()]

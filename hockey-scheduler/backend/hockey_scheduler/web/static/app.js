@@ -6,7 +6,18 @@ let gameView = "coach";     // coach | player (roster)
 let currentGame = null;     // game id whose roster we're viewing
 let pickedPlayer = null;
 let wizard = null;          // {slot_id, division_id, home_id, away_id} when scheduling
+let calendarDate = "2026-09-05";  // YYYY-MM-DD shown on the arena calendar
 let toast = "";
+
+function shiftDate(days) {
+  const d = new Date(calendarDate + "T00:00:00Z");
+  d.setUTCDate(d.getUTCDate() + days);
+  calendarDate = d.toISOString().slice(0, 10);
+}
+function fmtDate(d) {
+  return new Date(d + "T00:00:00Z").toLocaleDateString("en-GB",
+    { weekday: "short", day: "numeric", month: "short", year: "numeric", timeZone: "UTC" }).replace(",", "");
+}
 
 const NAV = {
   dashboard: "Dashboard", setup: "Setup", calendar: "Arena Calendar",
@@ -175,7 +186,10 @@ function renderCalendar(ov) {
   if (wizard) return renderWizard(ov) + toastHtml();
   const slotsByRink = {};
   ov.rinks.forEach((r) => (slotsByRink[r.id] = []));
-  ov.ice_slots.forEach((s) => { (slotsByRink[s.rink_id] ||= []).push(s); });
+  // Only show ice for the selected calendar date.
+  ov.ice_slots
+    .filter((s) => (s.start_time || "").startsWith(calendarDate))
+    .forEach((s) => { (slotsByRink[s.rink_id] ||= []).push(s); });
   const label = (s) => {
     if (s.game_label) return esc(s.game_label);
     if (s.status === "available") return "Available · Schedule";
@@ -198,11 +212,11 @@ function renderCalendar(ov) {
   }).join("");
   return `
     <div class="cal-head">
-      <div><div class="cal-date">Sat 5 Sep 2026</div>
+      <div><div class="cal-date">${esc(fmtDate(calendarDate))}</div>
         <div class="cal-venue">${esc((ov.venues[0] || {}).name || "Arena")}</div></div>
-      <div class="cal-nav"><button class="act ghost" disabled>‹</button>
-        <button class="act ghost" disabled>Day</button>
-        <button class="act ghost" disabled>›</button></div>
+      <div class="cal-nav"><button class="act ghost" data-cal="-1">‹</button>
+        <button class="act ghost" data-cal="0">Today</button>
+        <button class="act ghost" data-cal="1">›</button></div>
     </div>
     <div class="legend">
       <span><i class="dot lg-game"></i>Available</span>
@@ -276,7 +290,7 @@ function renderGames(ov) {
         <div class="li"><span class="li-time">${fmt(g.start_time)}</span>
           <div class="li-main"><div class="li-title">${esc(g.division_name || "")}</div>
             <div class="li-sub">${esc(g.venue_name || "")} · ${esc(g.rink_name || "")}</div></div>
-          <span class="pill scheduled">${prettyStatus(g.roster_status)}</span></div>
+          <span class="pill ${g.published ? "scheduled" : "gray"}">${g.published ? "Published" : "Draft"}</span></div>
       </div>
       <div class="section-title">Game operations</div>
       <div class="card">
@@ -285,9 +299,12 @@ function renderGames(ov) {
         ${ck(false, "Officials", "Coming #30")}
         ${ck(false, "Locker rooms", "Follow-up")}
         ${ck(false, "Scorekeeper", "Coming #31")}
-        ${ck(true, "Public fixture", "Published")}
+        ${ck(g.published, "Public fixture", g.published ? "Published" : "Draft — not public")}
       </div>
-      <div class="actions"><button class="act primary" data-openroster="${g.game_id}">Open Roster</button></div>`;
+      <div class="actions">
+        <button class="act primary" data-openroster="${g.game_id}">Open Roster</button>
+        ${g.published ? "" : `<button class="act success" data-publish="${g.game_id}">Publish</button>`}
+      </div>`;
   }).join("") + toastHtml();
 }
 
@@ -496,7 +513,9 @@ async function render() {
   c.querySelectorAll("button[data-act]").forEach((b) => b.onclick = () => rosterAction(b.dataset.act, b.dataset.id));
   c.querySelectorAll(".seg").forEach((b) => b.onclick = () => { gameView = b.dataset.view; toast = ""; render(); });
   c.querySelectorAll("[data-slot]").forEach((b) => b.onclick = () => { wizard = { slot_id: b.dataset.slot }; toast = ""; render(); });
-  c.querySelectorAll("[data-addslot]").forEach((b) => b.onclick = async () => { await post("/api/demo/add-ice-slot", { rink_id: b.dataset.addslot }); await render(); });
+  c.querySelectorAll("[data-addslot]").forEach((b) => b.onclick = async () => { await post("/api/demo/add-ice-slot", { rink_id: b.dataset.addslot, date: calendarDate }); await render(); });
+  c.querySelectorAll("[data-cal]").forEach((b) => b.onclick = () => { const v = +b.dataset.cal; if (v === 0) calendarDate = "2026-09-05"; else shiftDate(v); toast = ""; render(); });
+  c.querySelectorAll("[data-publish]").forEach((b) => b.onclick = async () => { await post(`/api/games/${b.dataset.publish}/publish`, {}); toast = "Game published."; await render(); });
   c.querySelectorAll("[data-openroster]").forEach((b) => b.onclick = () => { currentGame = b.dataset.openroster; switchTab("roster"); });
   const picker = document.getElementById("player-picker");
   if (picker) picker.onchange = (e) => { pickedPlayer = e.target.value; toast = ""; render(); };

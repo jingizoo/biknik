@@ -14,7 +14,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Optional
 
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from ..api import ApiService
 from ..full_demo import build_full_demo_store
@@ -150,17 +150,21 @@ class Handler(BaseHTTPRequestHandler):
             STATE.reset()
             return self._send_json({"ok": True})
 
-        # Quick action: add an available 90-min slot on the Main Rink after
-        # the latest existing slot on that rink.
+        # Quick action: add an available 90-min game slot on a rink for the
+        # given date, after the latest existing slot on that rink that day.
         if path == "/api/demo/add-ice-slot":
             rink_id = body.get("rink_id") or STATE.ids["main_rink_id"]
+            date = body.get("date")  # "YYYY-MM-DD"
             ends = [s.end_time for s in api.store.ice_slots.values()
-                    if s.rink_id == rink_id]
-            start = (max(ends) if ends else None)
-            if start is None:
+                    if s.rink_id == rink_id
+                    and (not date or s.start_time.isoformat().startswith(date))]
+            if ends:
+                start = max(ends) + timedelta(minutes=30)
+            elif date:
+                start = datetime.fromisoformat(f"{date}T18:00:00+00:00")
+            else:
                 return self._send_api({"error": {"code": "validation_error",
                                                  "message": "No reference slot."}})
-            start = start + timedelta(minutes=30)
             end = start + timedelta(minutes=90)
             return self._send_api(api.create_ice_slot(
                 rink_id, start.isoformat(), end.isoformat(),
@@ -180,6 +184,8 @@ class Handler(BaseHTTPRequestHandler):
                     body.get("response_source", "player"), actor))
             if action == "build-roster":
                 return self._send_api(api.auto_build_roster(gid, actor))
+            if action == "publish":
+                return self._send_api(api.publish_game(gid, actor))
             if action == "substitutes/enroll":
                 return self._send_api(api.enroll_substitute(gid, pid, actor))
             if action == "substitutes/withdraw":
