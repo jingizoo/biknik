@@ -113,7 +113,6 @@ class Handler(BaseHTTPRequestHandler):
     # -- routing -----------------------------------------------------------
     def do_GET(self):
         path = self.path.split("?", 1)[0]
-        gid = STATE.game_id
         api = STATE.api
         if path == "/favicon.ico":
             self.send_response(204)
@@ -121,16 +120,20 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/demo/overview":
             return self._send_api(api.get_demo_overview())
-        if path == f"/api/games/{gid}/board":
-            return self._send_api(api.get_board(gid))
-        if path == f"/api/games/{gid}/roster-status":
-            return self._send_api(api.get_roster_status(gid))
-        if path == f"/api/games/{gid}/roster":
-            return self._send_api(api.get_roster(gid))
-        if path == f"/api/games/{gid}/substitutes":
-            return self._send_api(api.get_substitutes(gid))
-        if path == f"/api/games/{gid}":
-            return self._send_api(api.get_game(gid))
+        # /api/games/{gid}/<sub>  — works for any game id, not just the seed.
+        m = re.match(r"^/api/games/([^/]+)(?:/(board|roster-status|roster|substitutes))?$", path)
+        if m:
+            gid, sub = m.group(1), m.group(2)
+            if sub == "board":
+                return self._send_api(api.get_board(gid))
+            if sub == "roster-status":
+                return self._send_api(api.get_roster_status(gid))
+            if sub == "roster":
+                return self._send_api(api.get_roster(gid))
+            if sub == "substitutes":
+                return self._send_api(api.get_substitutes(gid))
+            if sub is None:
+                return self._send_api(api.get_game(gid))
         if path.startswith("/api/"):
             return self._send_json({"error": {"code": "not_found",
                                               "message": "Unknown endpoint."}}, 404)
@@ -138,7 +141,6 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = self.path.split("?", 1)[0]
-        gid = STATE.game_id
         api = STATE.api
         body = self._read_body()
         pid: Optional[str] = body.get("player_id")
@@ -148,58 +150,95 @@ class Handler(BaseHTTPRequestHandler):
             STATE.reset()
             return self._send_json({"ok": True})
 
-        # Live setup action: add an available ice slot on the Main Rink,
-        # starting 30 min after the latest existing slot on that rink.
+        # Quick action: add an available 90-min slot on the Main Rink after
+        # the latest existing slot on that rink.
         if path == "/api/demo/add-ice-slot":
-            rink_id = STATE.ids["main_rink_id"]
+            rink_id = body.get("rink_id") or STATE.ids["main_rink_id"]
             ends = [s.end_time for s in api.store.ice_slots.values()
                     if s.rink_id == rink_id]
-            if not ends:
+            start = (max(ends) if ends else None)
+            if start is None:
                 return self._send_api({"error": {"code": "validation_error",
                                                  "message": "No reference slot."}})
-            start = max(ends) + timedelta(minutes=30)
+            start = start + timedelta(minutes=30)
             end = start + timedelta(minutes=90)
             return self._send_api(api.create_ice_slot(
-                rink_id, start.isoformat(), end.isoformat(), actor_id="arena_mgr"))
+                rink_id, start.isoformat(), end.isoformat(),
+                body.get("slot_type", "game"), actor_id="arena_mgr"))
 
-        # availability (confirm / back out)
-        if path == f"/api/games/{gid}/availability":
-            return self._send_api(api.set_availability(
-                gid, pid, body.get("availability_status", "pending"),
-                body.get("response_source", "player"), actor))
+        # Setup create endpoints — operator creates real records via the API.
+        if path.startswith("/api/setup/"):
+            return self._handle_setup(path[len("/api/setup/"):], body, actor)
 
-        # substitute actions
-        sub_routes = {
-            f"/api/games/{gid}/substitutes/enroll": api.enroll_substitute,
-            f"/api/games/{gid}/substitutes/withdraw": api.withdraw_substitute,
-        }
-        if path in sub_routes:
-            return self._send_api(sub_routes[path](gid, pid, actor))
-
-        m = re.match(rf"^/api/games/{re.escape(gid)}/substitutes/([^/]+)/(offer|accept|decline|add-to-roster)$", path)
+        # /api/games/{gid}/<action>
+        m = re.match(r"^/api/games/([^/]+)/(.+)$", path)
         if m:
-            player_id, action = m.group(1), m.group(2)
-            if action == "offer":
-                return self._send_api(api.offer_substitute(
-                    gid, player_id, actor, expires_at=body.get("expires_at")))
-            fn = {
-                "accept": api.accept_substitute,
-                "decline": api.decline_substitute,
-                "add-to-roster": api.add_substitute_to_roster,
-            }[action]
-            return self._send_api(fn(gid, player_id, actor))
-
-        # coach controls
-        coach_routes = {
-            f"/api/games/{gid}/roster/lock": api.lock_roster,
-            f"/api/games/{gid}/roster/unlock": api.unlock_roster,
-            f"/api/games/{gid}/cancel": api.cancel_game,
-        }
-        if path in coach_routes:
-            return self._send_api(coach_routes[path](gid, actor))
+            gid, action = m.group(1), m.group(2)
+            if action == "availability":
+                return self._send_api(api.set_availability(
+                    gid, pid, body.get("availability_status", "pending"),
+                    body.get("response_source", "player"), actor))
+            if action == "substitutes/enroll":
+                return self._send_api(api.enroll_substitute(gid, pid, actor))
+            if action == "substitutes/withdraw":
+                return self._send_api(api.withdraw_substitute(gid, pid, actor))
+            sub = re.match(r"^substitutes/([^/]+)/(offer|accept|decline|add-to-roster)$", action)
+            if sub:
+                player_id, op = sub.group(1), sub.group(2)
+                if op == "offer":
+                    return self._send_api(api.offer_substitute(
+                        gid, player_id, actor, expires_at=body.get("expires_at")))
+                fn = {"accept": api.accept_substitute,
+                      "decline": api.decline_substitute,
+                      "add-to-roster": api.add_substitute_to_roster}[op]
+                return self._send_api(fn(gid, player_id, actor))
+            coach = {"roster/lock": api.lock_roster,
+                     "roster/unlock": api.unlock_roster,
+                     "cancel": api.cancel_game}.get(action)
+            if coach:
+                return self._send_api(coach(gid, actor))
 
         return self._send_json({"error": {"code": "not_found",
                                           "message": "Unknown endpoint."}}, 404)
+
+    def _handle_setup(self, entity: str, body: dict, actor: str):
+        """Dispatch /api/setup/<entity> to the matching facade create method."""
+        api = STATE.api
+        b = body
+        if entity == "league":
+            return self._send_api(api.create_league(
+                b.get("name"), b.get("country", ""), b.get("timezone", "UTC"), actor))
+        if entity == "season":
+            return self._send_api(api.create_season(
+                b.get("league_id"), b.get("name"),
+                b.get("start_date"), b.get("end_date"), actor))
+        if entity == "division":
+            return self._send_api(api.create_division(
+                b.get("season_id"), b.get("name"), b.get("age_group", ""), actor))
+        if entity == "club":
+            return self._send_api(api.create_club(
+                b.get("name"), b.get("country", ""), actor))
+        if entity == "team":
+            return self._send_api(api.create_team(
+                b.get("club_id"), b.get("division_id"), b.get("name"), actor))
+        if entity == "venue":
+            return self._send_api(api.create_venue(
+                b.get("name"), b.get("address", ""), b.get("timezone", "UTC"), actor))
+        if entity == "rink":
+            return self._send_api(api.create_rink(
+                b.get("venue_id"), b.get("name"), actor))
+        if entity == "ice-slot":
+            return self._send_api(api.create_ice_slot(
+                b.get("rink_id"), b.get("start_time"), b.get("end_time"),
+                b.get("slot_type", "game"), actor))
+        if entity == "game":
+            return self._send_api(api.create_game(
+                b.get("season_id"), b.get("division_id"), b.get("home_team_id"),
+                b.get("away_team_id"), b.get("ice_slot_id"),
+                allow_division_override=bool(b.get("allow_division_override")),
+                actor_id=actor))
+        return self._send_json({"error": {"code": "not_found",
+                                          "message": "Unknown setup entity."}}, 404)
 
 
 def serve(host: str = "127.0.0.1", port: int = 8000) -> None:
