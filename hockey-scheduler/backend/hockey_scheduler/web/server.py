@@ -131,11 +131,13 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/demo/overview":
             return self._send_api(api.get_demo_overview())
         # /api/games/{gid}/<sub>  — works for any game id, not just the seed.
-        m = re.match(r"^/api/games/([^/]+)(?:/(board|roster-status|roster|substitutes))?$", path)
+        m = re.match(r"^/api/games/([^/]+)(?:/(board|lineups|roster-status|roster|substitutes))?$", path)
         if m:
             gid, sub = m.group(1), m.group(2)
             if sub == "board":
                 return self._send_api(api.get_board(gid))
+            if sub == "lineups":
+                return self._send_api(api.get_lineups(gid))
             if sub == "roster-status":
                 return self._send_api(api.get_roster_status(gid))
             if sub == "roster":
@@ -200,7 +202,8 @@ class Handler(BaseHTTPRequestHandler):
             if action == "roster/remove":
                 return self._send_api(api.remove_player(gid, pid, actor))
             if action == "roster/copy-previous":
-                return self._send_api(api.copy_previous_roster(gid, actor))
+                return self._send_api(api.copy_previous_roster(
+                    gid, body.get("team_id"), actor))
             if action == "publish":
                 return self._send_api(api.publish_game(gid, actor))
             if action == "move":

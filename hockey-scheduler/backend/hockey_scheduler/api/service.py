@@ -120,9 +120,9 @@ class ApiService:
         return _serialize(self.roster.remove_player(game_id, player_id, actor_id))
 
     @catch
-    def copy_previous_roster(self, game_id: str,
+    def copy_previous_roster(self, game_id: str, team_id: Optional[str] = None,
                              actor_id: Optional[str] = None) -> dict:
-        return self.roster.copy_previous_roster(game_id, actor_id)
+        return self.roster.copy_previous_roster(game_id, team_id, actor_id)
 
     @catch
     def set_roster_status(self, game_id: str, player_id: str, status: str,
@@ -266,12 +266,35 @@ class ApiService:
         game = self.roster._require_game(game_id)
         status = self.roster.compute_roster_status(game_id).to_dict()
 
+        rows = self._lineup_rows(game_id, game.home_team_id)
+
+        notifications = [
+            {"type": n.type.value, "audience": n.audience, "message": n.message,
+             "at": n.at.isoformat(), "subject_player_id": n.subject_player_id}
+            for n in self.store.notifications_for_game(game_id)
+        ]
+        audit = [
+            {"action": a.action.value, "actor_id": a.actor_id,
+             "subject_player_id": a.subject_player_id, "at": a.at.isoformat(),
+             "detail": a.detail}
+            for a in self.store.audit_for_game(game_id)
+        ]
+        return {
+            "game": _serialize(game),
+            "status": status,
+            "players": rows,
+            "notifications": notifications,
+            "audit": audit,
+            "audit_count": len(audit),
+        }
+
+    def _lineup_rows(self, game_id: str, team_id: str) -> list:
+        """Group a team's players into selected / substitute / available."""
         roster = {e.player_id: e for e in self.store.roster_for_game(game_id)}
         avail = {a.player_id: a for a in self.store.availability_for_game(game_id)}
         subs = {s.player_id: s for s in self.store.substitutes_for_game(game_id)}
-
         rows = []
-        for p in self.store.players_for_team(game.home_team_id):
+        for p in self.store.players_for_team(team_id):
             entry = roster.get(p.id)
             a = avail.get(p.id)
             s = subs.get(p.id)
@@ -297,25 +320,30 @@ class ApiService:
                 "availability": a.availability_status.value if a else "pending",
                 "sub_status": s.status.value if s else None,
             })
+        return rows
 
-        notifications = [
-            {"type": n.type.value, "audience": n.audience, "message": n.message,
-             "at": n.at.isoformat(), "subject_player_id": n.subject_player_id}
-            for n in self.store.notifications_for_game(game_id)
-        ]
-        audit = [
-            {"action": a.action.value, "actor_id": a.actor_id,
-             "subject_player_id": a.subject_player_id, "at": a.at.isoformat(),
-             "detail": a.detail}
-            for a in self.store.audit_for_game(game_id)
-        ]
+    @catch
+    def get_lineups(self, game_id: str) -> dict:
+        """Both sides' lineups + independent status for a game (#25).
+
+        Home and away rosters are managed separately; this returns each side's
+        team, roster status, and player groups in one call for the roster UI.
+        """
+        game = self.roster._require_game(game_id)
+
+        def side(team_id):
+            team = self.store.get_team(team_id)
+            return {
+                "team_id": team_id,
+                "team_name": team.name if team else team_id,
+                "status": self.roster.compute_roster_status(game_id, team_id).to_dict(),
+                "players": self._lineup_rows(game_id, team_id),
+            }
+
         return {
             "game": _serialize(game),
-            "status": status,
-            "players": rows,
-            "notifications": notifications,
-            "audit": audit,
-            "audit_count": len(audit),
+            "home": side(game.home_team_id),
+            "away": side(game.away_team_id),
         }
 
     # -- coach controls ----------------------------------------------------

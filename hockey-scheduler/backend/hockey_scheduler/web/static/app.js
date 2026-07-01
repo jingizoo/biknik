@@ -3,6 +3,8 @@
 
 let view = "dashboard";     // dashboard|setup|calendar|games|roster|activity|public
 let gameView = "coach";     // coach | player (roster)
+let rosterSide = "home";    // home | away — which lineup the roster tab shows (#25)
+let rosterTeamId = null;    // team_id of the currently shown lineup (for copy)
 let currentGame = null;     // game id whose roster we're viewing
 let pickedPlayer = null;
 let wizard = null;          // {slot_id, division_id, home_id, away_id} when scheduling
@@ -570,12 +572,22 @@ function renderGames(ov) {
 }
 
 /* ---------- Roster (Coach/Player) ---------- */
-function renderRoster(board) {
-  if (!board) return `<div class="empty">Select a game from the Games tab.</div>`;
-  return `<div class="segmented">
+function renderRoster(lineups) {
+  if (!lineups) return `<div class="empty">Select a game from the Games tab.</div>`;
+  if (!(rosterSide in lineups)) rosterSide = "home";
+  const side = lineups[rosterSide];
+  rosterTeamId = side.team_id;
+  const tab = (key, icon, label) => {
+    const l = lineups[key];
+    return `<button class="ls ${rosterSide === key ? "active" : ""}" data-side="${key}">
+      <span class="ls-team">${icon} ${esc(l.team_name)}</span>
+      <span class="ls-sub">${label} · ${prettyStatus(l.status.status)}</span></button>`;
+  };
+  return `<div class="lineup-switch">${tab("home", "🏠", "Home")}${tab("away", "✈️", "Away")}</div>
+    <div class="segmented">
       <button class="seg ${gameView === "coach" ? "active" : ""}" data-view="coach">Coach</button>
       <button class="seg ${gameView === "player" ? "active" : ""}" data-view="player">Player</button>
-    </div><div style="padding-top:8px">${gameView === "coach" ? coachBody(board) : playerBody(board)}</div>`;
+    </div><div style="padding-top:8px">${gameView === "coach" ? coachBody(side) : playerBody(side)}</div>`;
 }
 // Small building blocks shared by the roster-selection surface (#46).
 function playerRow(p, right) {
@@ -811,7 +823,7 @@ async function rosterAction(act, id) {
   if (act === "build") await post(`${B}/build-roster`, {});
   else if (act === "select") await post(`${B}/roster/select`, { player_ids: [id] });
   else if (act === "remove") await post(`${B}/roster/remove`, { player_id: id });
-  else if (act === "copy") { const r = await post(`${B}/roster/copy-previous`, {}); if (r && !r.error) toast = `Copied ${r.copied} players from the previous game.`; }
+  else if (act === "copy") { const r = await post(`${B}/roster/copy-previous`, { team_id: rosterTeamId }); if (r && !r.error) toast = `Copied ${r.copied} players from the previous game.`; }
   else if (act === "confirm") await post(`${B}/availability`, { player_id: id, availability_status: "available" });
   else if (act === "backout") await post(`${B}/availability`, { player_id: id, availability_status: "unavailable" });
   else if (act === "enroll") await post(`${B}/substitutes/enroll`, { player_id: id });
@@ -839,14 +851,16 @@ function setChrome(ov) {
 async function render() {
   const c = document.getElementById("content");
   document.body.dataset.view = view;
-  let ov, board;
+  let ov, board, lineups;
   try {
     c.innerHTML = `<div class="skeleton"></div><div class="skeleton"></div><div class="skeleton"></div>`;
     ov = await getJSON("/api/demo/overview");
     if (ov && ov.error) throw new Error(ov.error.message);
     if (!currentGame && ov.schedule[0]) currentGame = ov.schedule[0].game_id;
-    const needsBoard = ["roster", "activity"].includes(view) || view === "dashboard";
+    const needsBoard = ["activity", "dashboard"].includes(view);
     board = (needsBoard && currentGame) ? await getJSON(`/api/games/${currentGame}/board`) : null;
+    // The roster tab shows both sides' lineups (home + away, #25).
+    lineups = (view === "roster" && currentGame) ? await getJSON(`/api/games/${currentGame}/lineups`) : null;
   } catch (e) {
     setChrome(ov);
     c.innerHTML = `<div class="banner alert"><h2>Could not load data</h2>
@@ -861,7 +875,7 @@ async function render() {
     : view === "setup" ? renderSetup(ov)
     : view === "calendar" ? renderCalendar(ov)
     : view === "games" ? renderGames(ov)
-    : view === "roster" ? renderRoster(board)
+    : view === "roster" ? renderRoster(lineups)
     : view === "activity" ? renderActivity(board, ov)
     : renderPublic(ov);
 
@@ -880,6 +894,7 @@ async function render() {
   }
   c.querySelectorAll("button[data-act]").forEach((b) => b.onclick = () => rosterAction(b.dataset.act, b.dataset.id));
   c.querySelectorAll(".seg").forEach((b) => b.onclick = () => { gameView = b.dataset.view; toast = ""; render(); });
+  c.querySelectorAll("[data-side]").forEach((b) => b.onclick = () => { rosterSide = b.dataset.side; toast = ""; render(); });
   // Shared move: used by both drag/drop and the click-based Move fallback.
   const applyMove = async (gid, slotId) => {
     toast = "";

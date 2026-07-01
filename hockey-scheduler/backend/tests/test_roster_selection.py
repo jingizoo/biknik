@@ -56,10 +56,19 @@ class RosterSelectionTest(unittest.TestCase):
         self.assertTrue(row["backed_out"])
         self.assertEqual(row["roster_status"], "removed")
 
-    def test_select_non_team_player_rejected(self):
-        # A Falcons (away-team) player cannot be selected onto the Lions roster.
-        falcons = self.store.players_for_team(self.ids["away_team_id"])
-        res = self.api.select_roster(self.next_id, [falcons[0].id], actor_id="coach")
+    def test_away_team_player_is_eligible(self):
+        # #25: the away team's players CAN be selected (their own lineup).
+        away = self.store.players_for_team(self.ids["away_team_id"])
+        res = self.api.select_roster(self.next_id, [away[0].id], actor_id="coach")
+        self.assertNotIn("error", res if isinstance(res, dict) else {})
+        self.assertEqual(len(res), 1)
+
+    def test_select_player_from_third_team_rejected(self):
+        # A player on neither team in this game is not eligible.
+        club = self.api.create_club("Outsiders HC")
+        team = self.api.create_team(club["id"], self.ids["division_id"], "Outsiders")
+        player = self.api.create_player(team["id"], "Outsider O.", "forward")
+        res = self.api.select_roster(self.next_id, [player["id"]], actor_id="coach")
         self.assertEqual(res["error"]["code"], "not_eligible")
 
     def test_select_on_locked_roster_rejected(self):
