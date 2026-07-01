@@ -64,6 +64,23 @@ class SqlStoreParityTest(unittest.TestCase):
                                    u16[0]["id"], u16[1]["id"], slot["id"])
         self.assertEqual(dup["error"]["code"], "schedule_conflict")
 
+    def test_per_recipient_read_state_on_sql(self):
+        # The feed + per-recipient read state (#32/#57) must roundtrip through
+        # the notifications_feed and notification_recipients tables.
+        admin = self.api.get_notifications("league_admin", {})
+        self.assertGreater(admin["unread"], 0)
+        public = next(n for n in admin["notifications"]
+                      if n["kind"] == "result_approved")
+        self.api.mark_notification_read(public["id"], "league_admin", {})
+
+        # Admin's copy persists as read; the viewer's copy stays unread.
+        admin2 = self.api.get_notifications("league_admin", {})
+        self.assertTrue(next(n for n in admin2["notifications"]
+                             if n["id"] == public["id"])["read"])
+        viewer = self.api.get_notifications("viewer", {})
+        self.assertFalse(next(n for n in viewer["notifications"]
+                              if n["id"] == public["id"])["read"])
+
 
 class SqlStoreTransactionTest(unittest.TestCase):
     """A failure mid multi-write operation must roll the whole thing back."""

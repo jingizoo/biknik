@@ -31,6 +31,7 @@ from ..domain import (
     NotificationAudience,
     NotificationEvent,
     NotificationKind,
+    NotificationRecipient,
     Official,
     OfficialAssignment,
     OfficialAssignmentStatus,
@@ -154,14 +155,16 @@ SPECS = {
     Notification: Spec(Notification, "notifications_feed",
                        {"kind": _enum(NotificationKind),
                         "audience": _enum(NotificationAudience),
-                        "at": _dt(), "read": _bool()}),
+                        "at": _dt()}),
+    NotificationRecipient: Spec(NotificationRecipient, "notification_recipients",
+                                {"read_at": _dt()}),
 }
 
 # Column type for DDL: INTEGER for int/bool fields, else TEXT.
 _INT_FIELDS = {
     "target_goalies", "target_skaters", "max_skaters", "jersey_number",
     "priority_rank", "is_active", "locked", "cancelled", "published",
-    "home_score", "away_score", "read",
+    "home_score", "away_score",
 }
 
 
@@ -187,6 +190,7 @@ _INDEXES = [
     "CREATE INDEX IF NOT EXISTS ix_off_assign_official ON official_assignments(official_id)",
     "CREATE INDEX IF NOT EXISTS ix_game_results_game ON game_results(game_id)",
     "CREATE INDEX IF NOT EXISTS ix_notifs_feed_aud ON notifications_feed(audience, audience_ref)",
+    "CREATE INDEX IF NOT EXISTS ix_notif_recips_actor ON notification_recipients(actor_key)",
 ]
 
 
@@ -447,3 +451,11 @@ class SqlStore:
     def get_notification_feed(self, notification_id):
         return self._get(Notification, notification_id)
     def all_notifications_feed(self): return self._query(Notification, order="id")
+
+    # -- per-recipient read state (#57) ------------------------------------
+    def get_notification_recipient(self, recipient_id):
+        return self._get(NotificationRecipient, recipient_id)
+    def save_notification_recipient(self, r): return self._upsert(r)
+    def recipients_for_actor(self, actor_key):
+        return self._query(NotificationRecipient, "actor_key = ?", (actor_key,),
+                           order="id")

@@ -21,6 +21,7 @@ from ..domain import (
     League,
     Notification,
     NotificationEvent,
+    NotificationRecipient,
     Official,
     OfficialAssignment,
     Player,
@@ -55,6 +56,7 @@ class InMemoryStore:
         self.official_assignments: Dict[str, OfficialAssignment] = {}
         self.game_results: Dict[str, GameResult] = {}
         self.feed_notifications: Dict[str, Notification] = {}
+        self.notif_recipients: Dict[str, NotificationRecipient] = {}
         self.setup_audit: List[SetupAuditLog] = []
         self._counters: Dict[str, count] = {}
 
@@ -290,6 +292,21 @@ class InMemoryStore:
 
     def all_notifications_feed(self) -> List[Notification]:
         return list(self.feed_notifications.values())
+
+    # -- per-recipient read state (#57) ------------------------------------
+    def get_notification_recipient(
+            self, recipient_id: str) -> Optional[NotificationRecipient]:
+        return self.notif_recipients.get(recipient_id)
+
+    def save_notification_recipient(
+            self, r: NotificationRecipient) -> NotificationRecipient:
+        self.notif_recipients[r.id] = r
+        return r
+
+    def recipients_for_actor(
+            self, actor_key: str) -> List[NotificationRecipient]:
+        return [r for r in self.notif_recipients.values()
+                if r.actor_key == actor_key]
 
     def add_setup_audit(self, entry: SetupAuditLog) -> SetupAuditLog:
         self.setup_audit.append(entry)

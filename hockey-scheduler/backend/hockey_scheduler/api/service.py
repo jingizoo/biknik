@@ -14,6 +14,7 @@ from typing import Callable, List, Optional
 from ..domain import (
     AvailabilityStatus,
     IceSlotType,
+    NotificationRecipient,
     OfficialRole,
     Position,
     ResultStatus,
@@ -409,20 +410,57 @@ class ApiService:
         return False
 
     @staticmethod
-    def _notif_row(n) -> dict:
+    def _actor_key(role: str, scope: dict) -> str:
+        """A stable per-actor identity for read state, derived from role/scope.
+
+        Matches the granularity of feed visibility while keeping distinct
+        actors apart. The key is role-qualified because a player session
+        carries both ``team_id`` and ``player_id``: without the role guard a
+        player and their coach would share the team bucket and one could mark
+        the other's copy read. Officials key by official id, coaches by team,
+        players by player id, everyone else by role.
+        """
+        scope = scope or {}
+        if role == "official" and scope.get("official_id"):
+            return "official:" + scope["official_id"]
+        if role == "coach" and scope.get("team_id"):
+            return "coach-team:" + scope["team_id"]
+        if role == "player" and scope.get("player_id"):
+            return "player:" + scope["player_id"]
+        return "role:" + role
+
+    def _recipient_id(self, notification_id: str, actor_key: str) -> str:
+        return notification_id + "::" + actor_key
+
+    @staticmethod
+    def _notif_row(n, read: bool) -> dict:
         return {"id": n.id, "kind": n.kind.value, "audience": n.audience.value,
                 "title": n.title, "message": n.message, "at": n.at.isoformat(),
-                "read": n.read, "game_id": n.game_id,
+                "read": read, "game_id": n.game_id,
                 "assignment_id": n.assignment_id}
 
     @catch
     def get_notifications(self, role: str, scope: dict) -> dict:
         scope = scope or {}
+        actor_key = self._actor_key(role, scope)
+        read_ids = {r.notification_id
+                    for r in self.store.recipients_for_actor(actor_key)}
         items = [n for n in self.store.all_notifications_feed()
                  if self._notif_visible(n, role, scope)]
         items.sort(key=lambda n: n.at, reverse=True)
-        return {"notifications": [self._notif_row(n) for n in items],
-                "unread": sum(1 for n in items if not n.read)}
+        rows = [self._notif_row(n, n.id in read_ids) for n in items]
+        return {"notifications": rows,
+                "unread": sum(1 for r in rows if not r["read"])}
+
+    def _mark_read(self, n, actor_key: str) -> bool:
+        """Record that ``actor_key`` has read ``n``; True if newly marked."""
+        rid = self._recipient_id(n.id, actor_key)
+        if self.store.get_notification_recipient(rid) is not None:
+            return False
+        self.store.save_notification_recipient(NotificationRecipient(
+            id=rid, notification_id=n.id, actor_key=actor_key,
+            read_at=self.roster.clock()))
+        return True
 
     @catch
     def mark_notification_read(self, notification_id: str, role: str,
@@ -433,18 +471,16 @@ class ApiService:
             raise NotFoundError("Notification not found.")
         if not self._notif_visible(n, role, scope):
             raise NotAuthorizedError("You cannot mark this notification read.")
-        n.read = True
-        self.store.save_notification_feed(n)
-        return self._notif_row(n)
+        self._mark_read(n, self._actor_key(role, scope))
+        return self._notif_row(n, True)
 
     @catch
     def mark_all_notifications_read(self, role: str, scope: dict) -> dict:
         scope = scope or {}
+        actor_key = self._actor_key(role, scope)
         count = 0
         for n in self.store.all_notifications_feed():
-            if not n.read and self._notif_visible(n, role, scope):
-                n.read = True
-                self.store.save_notification_feed(n)
+            if self._notif_visible(n, role, scope) and self._mark_read(n, actor_key):
                 count += 1
         return {"marked": count}
 
