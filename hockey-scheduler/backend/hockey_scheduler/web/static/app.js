@@ -923,7 +923,12 @@ document.querySelectorAll(".topbar [data-open-drawer]").forEach((b) => b.onclick
   drawer = { kind: b.dataset.openDrawer }; drawerError = ""; drawerValues = {};
   switchTab("setup");
 });
-document.getElementById("reset-btn").onclick = async () => { await post("/api/reset", {}); toast = ""; currentGame = null; pickedPlayer = null; wizard = null; render(); };
+document.getElementById("reset-btn").onclick = async () => {
+  await post("/api/reset", {});
+  toast = ""; currentGame = null; pickedPlayer = null; wizard = null;
+  movingGameId = null; conflict = null; drawer = null; drawerError = ""; drawerValues = {};
+  render();
+};
 // Escape closes an open Setup drawer (#44).
 document.addEventListener("keydown", (e) => {
   if (e.key !== "Escape") return;
