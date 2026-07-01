@@ -63,9 +63,34 @@ class NotificationsTest(unittest.TestCase):
         feed = self.api.get_notifications("league_admin", {})
         self.assertEqual(feed["unread"], len(feed["notifications"]))
         nid = feed["notifications"][0]["id"]
-        self.api.mark_notification_read(nid)
+        self.api.mark_notification_read(nid, "league_admin", {})
         feed2 = self.api.get_notifications("league_admin", {})
         self.assertEqual(feed2["unread"], feed["unread"] - 1)
+
+    def test_viewer_cannot_mark_scheduler_notification_read(self):
+        # A scheduler-audience notification is not visible to a viewer, so a
+        # viewer must not be able to mark it read even if they know the id.
+        self.api.respond_assignment(self.ids["ref_assignment_id"], accept=True)
+        admin_feed = self.api.get_notifications("league_admin", {})
+        scheduler_notif = next(
+            n for n in admin_feed["notifications"]
+            if n["kind"] == "assignment_accepted")
+        res = self.api.mark_notification_read(
+            scheduler_notif["id"], "viewer", {})
+        self.assertEqual(res["error"]["code"], "forbidden")
+        # It stays unread for the intended recipient.
+        arena = self.api.get_notifications("arena_manager", {})
+        target = next(n for n in arena["notifications"]
+                      if n["id"] == scheduler_notif["id"])
+        self.assertFalse(target["read"])
+
+    def test_other_official_cannot_mark_offer_read(self):
+        feed = self.api.get_notifications("league_admin", {})
+        offer = next(n for n in feed["notifications"]
+                     if n["kind"] == "assignment_offered")
+        res = self.api.mark_notification_read(
+            offer["id"], "official", {"official_id": "official_other"})
+        self.assertEqual(res["error"]["code"], "forbidden")
 
     def test_mark_all_read(self):
         res = self.api.mark_all_notifications_read("league_admin", {})
@@ -81,7 +106,8 @@ class NotificationsTest(unittest.TestCase):
         self.assertEqual(after_admin, before_admin - 1)
 
     def test_mark_unknown_notification_errors(self):
-        res = self.api.mark_notification_read("notif_missing")
+        res = self.api.mark_notification_read(
+            "notif_missing", "league_admin", {})
         self.assertEqual(res["error"]["code"], "not_found")
 
 

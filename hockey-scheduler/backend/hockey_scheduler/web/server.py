@@ -367,7 +367,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_api(api.mark_all_notifications_read(role.value, scope))
         nr = re.match(r"^/api/notifications/([^/]+)/read$", path)
         if nr:
-            return self._send_api(api.mark_notification_read(nr.group(1)))
+            return self._send_api(
+                api.mark_notification_read(nr.group(1), role.value, scope))
 
         # Official accepts/declines a proposed assignment, or it's unassigned (#30).
         oa = re.match(r"^/api/officials/assignments/([^/]+)/(accept|decline|unassign)$", path)

@@ -21,7 +21,12 @@ from ..domain import (
     SlotType,
     SubstituteStatus,
 )
-from ..domain.errors import DomainError, NotFoundError, ValidationError
+from ..domain.errors import (
+    DomainError,
+    NotAuthorizedError,
+    NotFoundError,
+    ValidationError,
+)
 from ..services import RosterService, SetupService
 from ..store import InMemoryStore
 
@@ -420,10 +425,14 @@ class ApiService:
                 "unread": sum(1 for n in items if not n.read)}
 
     @catch
-    def mark_notification_read(self, notification_id: str) -> dict:
+    def mark_notification_read(self, notification_id: str, role: str,
+                               scope: dict) -> dict:
+        scope = scope or {}
         n = self.store.get_notification_feed(notification_id)
         if n is None:
             raise NotFoundError("Notification not found.")
+        if not self._notif_visible(n, role, scope):
+            raise NotAuthorizedError("You cannot mark this notification read.")
         n.read = True
         self.store.save_notification_feed(n)
         return self._notif_row(n)
