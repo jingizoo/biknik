@@ -98,12 +98,47 @@ class NotificationsTest(unittest.TestCase):
         self.assertEqual(self.api.get_notifications("league_admin", {})["unread"], 0)
 
     def test_mark_all_read_is_scoped(self):
-        # A viewer marking all read only clears the public ones they can see.
+        # A viewer marking all read clears only their own copies; the admin's
+        # unread count is untouched (per-recipient read state, #57).
         before_admin = self.api.get_notifications("league_admin", {})["unread"]
-        self.api.mark_all_notifications_read("viewer", {})
+        res = self.api.mark_all_notifications_read("viewer", {})
+        self.assertEqual(res["marked"], 1)  # the single public notification
         after_admin = self.api.get_notifications("league_admin", {})["unread"]
-        # Only the single public notification got marked.
-        self.assertEqual(after_admin, before_admin - 1)
+        self.assertEqual(after_admin, before_admin)
+        # And the viewer's own copy is now read.
+        self.assertEqual(self.api.get_notifications("viewer", {})["unread"], 0)
+
+    def test_read_state_is_per_recipient(self):
+        # The public result is visible to both admin and viewer. Admin reading
+        # it must not change the viewer's unread count for that notification.
+        admin_feed = self.api.get_notifications("league_admin", {})
+        public = next(n for n in admin_feed["notifications"]
+                      if n["kind"] == "result_approved")
+        viewer_before = self.api.get_notifications("viewer", {})
+        self.assertTrue(all(not n["read"] for n in viewer_before["notifications"]))
+
+        self.api.mark_notification_read(public["id"], "league_admin", {})
+
+        # Admin's copy is read; the viewer's copy of the same id is still unread.
+        admin_after = self.api.get_notifications("league_admin", {})
+        admin_row = next(n for n in admin_after["notifications"]
+                         if n["id"] == public["id"])
+        self.assertTrue(admin_row["read"])
+        viewer_after = self.api.get_notifications("viewer", {})
+        viewer_row = next(n for n in viewer_after["notifications"]
+                          if n["id"] == public["id"])
+        self.assertFalse(viewer_row["read"])
+        self.assertEqual(viewer_after["unread"], viewer_before["unread"])
+
+    def test_mark_read_is_idempotent(self):
+        feed = self.api.get_notifications("league_admin", {})
+        nid = feed["notifications"][0]["id"]
+        self.api.mark_notification_read(nid, "league_admin", {})
+        # Marking the same notification again does not double-count or error.
+        again = self.api.mark_all_notifications_read("league_admin", {})
+        self.assertEqual(again["marked"], len(feed["notifications"]) - 1)
+        self.assertEqual(
+            self.api.get_notifications("league_admin", {})["unread"], 0)
 
     def test_mark_unknown_notification_errors(self):
         res = self.api.mark_notification_read(

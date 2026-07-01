@@ -115,7 +115,12 @@ class GameResult:
 
 @dataclass
 class Notification:
-    """A feed notification delivered to a recipient with read state (#32)."""
+    """A feed notification addressed to an audience (#32).
+
+    Read state is tracked per actor via :class:`NotificationRecipient` (#57),
+    so a shared/public notification can be read by one recipient without
+    changing anyone else's unread count.
+    """
     id: str
     kind: NotificationKind
     audience: NotificationAudience
@@ -125,7 +130,21 @@ class Notification:
     audience_ref: Optional[str] = None   # official_id / team_id (None = whole audience)
     game_id: Optional[str] = None
     assignment_id: Optional[str] = None
-    read: bool = False
+
+
+@dataclass
+class NotificationRecipient:
+    """Per-actor read state for a feed notification (#57).
+
+    A row exists only once an actor has read the notification; its presence
+    (and ``read_at``) is what marks that actor's copy read. ``actor_key`` is a
+    stable identity derived from the signed-in role/scope (e.g.
+    ``official:<id>``, ``team:<id>``, ``role:<role>``).
+    """
+    id: str
+    notification_id: str
+    actor_key: str
+    read_at: datetime
 
 
 @dataclass

@@ -20,6 +20,5 @@ def push(store, clock, kind, audience, title, message,
         audience_ref=audience_ref,
         game_id=game_id,
         assignment_id=assignment_id,
-        read=False,
     )
     return store.add_notification_feed(n)
