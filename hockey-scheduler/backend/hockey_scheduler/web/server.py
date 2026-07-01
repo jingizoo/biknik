@@ -17,8 +17,15 @@ from typing import Optional
 from datetime import datetime, timedelta
 
 from ..api import ApiService
+from ..domain import ROLE_LABELS, Role, permissions_for
 from ..full_demo import build_full_demo_store
 from ..store import SqlStore, create_store
+from .authz import authorize, required_permission
+
+# The demo has no login; the client sends the acting role in this header. When
+# it is absent we assume the full operator (League Admin) so scripts/curl keep
+# working — the UI's role switcher downgrades it to demonstrate enforcement.
+ROLE_HEADER = "X-Demo-Role"
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 CONTENT_TYPES = {
@@ -37,6 +44,7 @@ ERROR_HTTP_STATUS = {
     "invalid_transition": 409,
     "slot_already_filled": 409,
     "not_eligible": 403,
+    "forbidden": 403,
     "game_cancelled": 409,
 }
 
@@ -130,6 +138,17 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/demo/overview":
             return self._send_api(api.get_demo_overview())
+        if path == "/api/auth/roles":
+            # Roles + their permissions so the UI can build the switcher and
+            # gate actions from the same policy the server enforces (#24).
+            return self._send_json({
+                "default": Role.LEAGUE_ADMIN.value,
+                "roles": [
+                    {"id": r.value, "label": ROLE_LABELS[r],
+                     "permissions": permissions_for(r)}
+                    for r in Role
+                ],
+            })
         # /api/games/{gid}/<sub>  — works for any game id, not just the seed.
         m = re.match(r"^/api/games/([^/]+)(?:/(board|lineups|roster-status|roster|substitutes))?$", path)
         if m:
@@ -157,6 +176,33 @@ class Handler(BaseHTTPRequestHandler):
         body = self._read_body()
         pid: Optional[str] = body.get("player_id")
         actor = body.get("actor_id", "demo")
+
+        # Authorize the acting role at the HTTP boundary (#24). The policy is the
+        # domain permission model; GET requests are read-only and never reach here.
+        # A missing header defaults to admin (back-compat for scripts/curl), but a
+        # supplied-yet-invalid role must NOT escalate — reject it rather than fall
+        # back to admin.
+        raw_role = self.headers.get(ROLE_HEADER)
+        if raw_role is None or raw_role == "":
+            role = Role.LEAGUE_ADMIN
+        else:
+            try:
+                role = Role(raw_role)
+            except ValueError:
+                return self._send_json({"error": {
+                    "code": "forbidden",
+                    "message": f"Unknown role '{raw_role}'.",
+                    "details": {"role": raw_role},
+                }}, 403)
+        if not authorize(role, path):
+            perm = required_permission(path)
+            return self._send_json({"error": {
+                "code": "forbidden",
+                "message": (f"Your role ({ROLE_LABELS[role]}) can't do this "
+                            f"(requires {perm.value})."),
+                "details": {"role": role.value,
+                            "required": perm.value if perm else None},
+            }}, 403)
 
         if path == "/api/reset":
             STATE.reset()

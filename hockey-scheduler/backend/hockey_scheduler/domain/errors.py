@@ -66,3 +66,7 @@ class ScheduleConflictError(DomainError):
 
 class DivisionMismatchError(DomainError):
     code = "division_mismatch"
+
+
+class NotAuthorizedError(DomainError):
+    code = "forbidden"

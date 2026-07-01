@@ -116,6 +116,13 @@ body {
 }
 .seg.active { background: #fff; box-shadow: 0 1px 3px rgba(0, 0, 0, 0.15); }
 
+/* ----- demo role picker (#24) ----- */
+.role-picker { display: inline-flex; align-items: center; gap: 5px; background: #fff;
+  border: 1px solid var(--sep); border-radius: 8px; padding: 3px 8px; }
+.role-picker .role-ico { font-size: 13px; }
+.role-picker select { border: none; background: transparent; font-size: 13px; font-weight: 600;
+  color: var(--ink); cursor: pointer; padding: 2px; }
+
 /* ----- home / away lineup switch (#25) ----- */
 .lineup-switch { display: flex; gap: 8px; margin: 12px 16px 4px; }
 .lineup-switch .ls { flex: 1; display: flex; flex-direction: column; align-items: flex-start;

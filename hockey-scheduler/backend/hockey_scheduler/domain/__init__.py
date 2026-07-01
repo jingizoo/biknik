@@ -18,6 +18,7 @@ from .errors import (
     DomainError,
     GameCancelledError,
     InvalidTransitionError,
+    NotAuthorizedError,
     NotEligibleError,
     NotEnrolledError,
     NotFoundError,
@@ -25,6 +26,15 @@ from .errors import (
     ScheduleConflictError,
     SlotAlreadyFilledError,
     ValidationError,
+)
+from .roles import (
+    ROLE_LABELS,
+    ROLE_PERMISSIONS,
+    Permission,
+    Role,
+    can,
+    permissions_for,
+    role_from_str,
 )
 from .models import (
     AuditLog,
@@ -69,6 +79,7 @@ __all__ = [
     "DomainError",
     "GameCancelledError",
     "InvalidTransitionError",
+    "NotAuthorizedError",
     "NotEligibleError",
     "NotEnrolledError",
     "NotFoundError",
@@ -76,6 +87,14 @@ __all__ = [
     "ScheduleConflictError",
     "SlotAlreadyFilledError",
     "ValidationError",
+    # roles / permissions
+    "Role",
+    "Permission",
+    "ROLE_LABELS",
+    "ROLE_PERMISSIONS",
+    "can",
+    "permissions_for",
+    "role_from_str",
     # models
     "AuditLog",
     "Game",
