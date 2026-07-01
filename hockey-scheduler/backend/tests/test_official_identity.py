@@ -96,7 +96,6 @@ class OfficialHttpTest(unittest.TestCase):
         inbox = self._get(c, "/api/me/assignments")
         self.assertEqual(inbox["official_id"], self.ref_id)
         self.assertTrue(inbox["assignments"])
-        self.assertTrue(all(True for _ in inbox["assignments"]))
         # The other official's assignment must not appear here.
         ids = {a["assignment_id"] for a in inbox["assignments"]}
         self.assertIn(self.assignment_id, ids)
@@ -107,6 +106,21 @@ class OfficialHttpTest(unittest.TestCase):
 
     def test_inbox_empty_without_session(self):
         c = urllib.request.build_opener()  # no cookie
+        inbox = self._get(c, "/api/me/assignments")
+        self.assertIsNone(inbox["official_id"])
+        self.assertEqual(inbox["assignments"], [])
+
+    def test_inbox_invalid_session_cookie_returns_401(self):
+        c = urllib.request.build_opener()
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{self.port}/api/me/assignments", method="GET",
+            headers={"Cookie": f"{srv.SESSION_COOKIE}=bogustoken"})
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            c.open(req)
+        self.assertEqual(ctx.exception.code, 401)
+
+    def test_inbox_empty_for_non_official_session(self):
+        c = self._login("coach")
         inbox = self._get(c, "/api/me/assignments")
         self.assertIsNone(inbox["official_id"])
         self.assertEqual(inbox["assignments"], [])
