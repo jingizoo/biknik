@@ -208,6 +208,14 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_json({"accounts": demo_accounts()})
         if path == "/api/officials":
             return self._send_api({"officials": api.get_officials()})
+        if path == "/api/me/assignments":
+            # The signed-in official's own inbox (#55). Identity comes from the
+            # session cookie; without a bound official it's simply empty.
+            sess = SESSIONS.resolve(self._cookie(SESSION_COOKIE))
+            oid = (sess or {}).get("scope", {}).get("official_id")
+            if not oid:
+                return self._send_json({"official_id": None, "assignments": []})
+            return self._send_api(api.get_official_inbox(oid))
         sd = re.match(r"^/api/standings/([^/]+)$", path)
         if sd:
             return self._send_api(api.get_standings(sd.group(1)))

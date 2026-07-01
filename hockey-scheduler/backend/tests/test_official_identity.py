@@ -86,6 +86,39 @@ class OfficialHttpTest(unittest.TestCase):
         with opener.open(f"http://127.0.0.1:{self.port}/api/auth/me") as r:
             return json.loads(r.read() or b"{}")
 
+    def _get(self, opener, path):
+        with opener.open(f"http://127.0.0.1:{self.port}{path}") as r:
+            return json.loads(r.read() or b"{}")
+
+    # -- inbox (#55) -------------------------------------------------------
+    def test_inbox_lists_only_own_assignments(self):
+        c = self._login("official")
+        inbox = self._get(c, "/api/me/assignments")
+        self.assertEqual(inbox["official_id"], self.ref_id)
+        self.assertTrue(inbox["assignments"])
+        self.assertTrue(all(True for _ in inbox["assignments"]))
+        # The other official's assignment must not appear here.
+        ids = {a["assignment_id"] for a in inbox["assignments"]}
+        self.assertIn(self.assignment_id, ids)
+        self.assertNotIn(self.other_assignment_id, ids)
+        row = inbox["assignments"][0]
+        for key in ("role", "status", "home_team_name", "start_time", "rink"):
+            self.assertIn(key, row)
+
+    def test_inbox_empty_without_session(self):
+        c = urllib.request.build_opener()  # no cookie
+        inbox = self._get(c, "/api/me/assignments")
+        self.assertIsNone(inbox["official_id"])
+        self.assertEqual(inbox["assignments"], [])
+
+    def test_accept_from_inbox_updates_status(self):
+        c = self._login("official")
+        aid = self._get(c, "/api/me/assignments")["assignments"][0]["assignment_id"]
+        self._post(c, f"/api/officials/assignments/{aid}/accept", {})
+        after = self._get(c, "/api/me/assignments")
+        row = next(a for a in after["assignments"] if a["assignment_id"] == aid)
+        self.assertEqual(row["status"], "accepted")
+
     def test_official_session_bound_to_official(self):
         c = self._login("official")
         user = self._me(c)["user"]
