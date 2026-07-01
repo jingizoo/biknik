@@ -27,7 +27,10 @@ from ..domain import (
     IceSlotType,
     GameResult,
     League,
+    Notification,
+    NotificationAudience,
     NotificationEvent,
+    NotificationKind,
     Official,
     OfficialAssignment,
     OfficialAssignmentStatus,
@@ -148,13 +151,17 @@ SPECS = {
     GameResult: Spec(GameResult, "game_results",
                      {"status": _enum(ResultStatus),
                       "recorded_at": _dt(), "approved_at": _dt()}),
+    Notification: Spec(Notification, "notifications_feed",
+                       {"kind": _enum(NotificationKind),
+                        "audience": _enum(NotificationAudience),
+                        "at": _dt(), "read": _bool()}),
 }
 
 # Column type for DDL: INTEGER for int/bool fields, else TEXT.
 _INT_FIELDS = {
     "target_goalies", "target_skaters", "max_skaters", "jersey_number",
     "priority_rank", "is_active", "locked", "cancelled", "published",
-    "home_score", "away_score",
+    "home_score", "away_score", "read",
 }
 
 
@@ -179,6 +186,7 @@ _INDEXES = [
     "CREATE INDEX IF NOT EXISTS ix_off_assign_game ON official_assignments(game_id)",
     "CREATE INDEX IF NOT EXISTS ix_off_assign_official ON official_assignments(official_id)",
     "CREATE INDEX IF NOT EXISTS ix_game_results_game ON game_results(game_id)",
+    "CREATE INDEX IF NOT EXISTS ix_notifs_feed_aud ON notifications_feed(audience, audience_ref)",
 ]
 
 
@@ -432,3 +440,10 @@ class SqlStore:
         rows = self._query(GameResult, "game_id = ?", (game_id,), order="id")
         return rows[0] if rows else None
     def all_game_results(self): return self._query(GameResult, order="id")
+
+    # -- feed notifications (#32) ------------------------------------------
+    def add_notification_feed(self, n): return self._insert(n)
+    def save_notification_feed(self, n): return self._update(n)
+    def get_notification_feed(self, notification_id):
+        return self._get(Notification, notification_id)
+    def all_notifications_feed(self): return self._query(Notification, order="id")

@@ -208,6 +208,14 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_json({"accounts": demo_accounts()})
         if path == "/api/officials":
             return self._send_api({"officials": api.get_officials()})
+        if path == "/api/notifications":
+            # The signed-in user's feed (#32). Same resolution as POSTs: valid
+            # session → its role/scope; invalid cookie → 401; else admin default.
+            role, scope, err = self._resolve_role()
+            if err is not None:
+                code, payload = err
+                return self._send_json(payload, code)
+            return self._send_api(api.get_notifications(role.value, scope))
         if path == "/api/me/assignments":
             # The signed-in official's own inbox (#55). Identity comes from the
             # session cookie, with the same rules as /api/auth/me: no cookie →
@@ -353,6 +361,14 @@ class Handler(BaseHTTPRequestHandler):
         # Setup create endpoints — operator creates real records via the API.
         if path.startswith("/api/setup/"):
             return self._handle_setup(path[len("/api/setup/"):], body, actor)
+
+        # Notifications feed: mark read / read-all (#32).
+        if path == "/api/notifications/read-all":
+            return self._send_api(api.mark_all_notifications_read(role.value, scope))
+        nr = re.match(r"^/api/notifications/([^/]+)/read$", path)
+        if nr:
+            return self._send_api(
+                api.mark_notification_read(nr.group(1), role.value, scope))
 
         # Official accepts/declines a proposed assignment, or it's unassigned (#30).
         oa = re.match(r"^/api/officials/assignments/([^/]+)/(accept|decline|unassign)$", path)

@@ -21,7 +21,12 @@ from ..domain import (
     SlotType,
     SubstituteStatus,
 )
-from ..domain.errors import DomainError, ValidationError
+from ..domain.errors import (
+    DomainError,
+    NotAuthorizedError,
+    NotFoundError,
+    ValidationError,
+)
 from ..services import RosterService, SetupService
 from ..store import InMemoryStore
 
@@ -384,6 +389,64 @@ class ApiService:
     def get_officials_for_game(self, game_id: str) -> List[dict]:
         self.roster._require_game(game_id)
         return self._official_rows(game_id)
+
+    # -- notifications feed (#32) ------------------------------------------
+    def _notif_visible(self, n, role, scope) -> bool:
+        """Is a feed notification visible to this signed-in role/scope?"""
+        if role == "league_admin":
+            return True  # demo god view — sees the whole feed
+        aud = n.audience.value
+        if aud == "public":
+            return True
+        if aud == "scheduler":
+            return role in ("league_admin", "arena_manager")
+        if aud == "official":
+            oid = scope.get("official_id")
+            return oid is not None and n.audience_ref == oid
+        if aud == "coach":
+            return role == "coach" and (
+                n.audience_ref is None or n.audience_ref == scope.get("team_id"))
+        return False
+
+    @staticmethod
+    def _notif_row(n) -> dict:
+        return {"id": n.id, "kind": n.kind.value, "audience": n.audience.value,
+                "title": n.title, "message": n.message, "at": n.at.isoformat(),
+                "read": n.read, "game_id": n.game_id,
+                "assignment_id": n.assignment_id}
+
+    @catch
+    def get_notifications(self, role: str, scope: dict) -> dict:
+        scope = scope or {}
+        items = [n for n in self.store.all_notifications_feed()
+                 if self._notif_visible(n, role, scope)]
+        items.sort(key=lambda n: n.at, reverse=True)
+        return {"notifications": [self._notif_row(n) for n in items],
+                "unread": sum(1 for n in items if not n.read)}
+
+    @catch
+    def mark_notification_read(self, notification_id: str, role: str,
+                               scope: dict) -> dict:
+        scope = scope or {}
+        n = self.store.get_notification_feed(notification_id)
+        if n is None:
+            raise NotFoundError("Notification not found.")
+        if not self._notif_visible(n, role, scope):
+            raise NotAuthorizedError("You cannot mark this notification read.")
+        n.read = True
+        self.store.save_notification_feed(n)
+        return self._notif_row(n)
+
+    @catch
+    def mark_all_notifications_read(self, role: str, scope: dict) -> dict:
+        scope = scope or {}
+        count = 0
+        for n in self.store.all_notifications_feed():
+            if not n.read and self._notif_visible(n, role, scope):
+                n.read = True
+                self.store.save_notification_feed(n)
+                count += 1
+        return {"marked": count}
 
     @catch
     def get_official_inbox(self, official_id: str) -> dict:

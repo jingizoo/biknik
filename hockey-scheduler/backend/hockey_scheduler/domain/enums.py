@@ -157,3 +157,20 @@ class NotificationType(str, Enum):
     SUBSTITUTE_OFFERED = "substitute_offered"
     SUBSTITUTE_ACCEPTED = "substitute_accepted"
     ROSTER_LOCKED = "roster_locked"
+
+
+class NotificationKind(str, Enum):
+    """Feed notification categories delivered to a recipient (#32)."""
+    ASSIGNMENT_OFFERED = "assignment_offered"      # → the official
+    ASSIGNMENT_ACCEPTED = "assignment_accepted"    # → schedulers
+    ASSIGNMENT_DECLINED = "assignment_declined"    # → schedulers
+    ROSTER_OPEN_SLOT = "roster_open_slot"          # → the coach
+    RESULT_APPROVED = "result_approved"            # → public feed
+
+
+class NotificationAudience(str, Enum):
+    """Who a feed notification is for (matched against the signed-in session)."""
+    PUBLIC = "public"        # everyone
+    SCHEDULER = "scheduler"  # league admin / arena manager
+    COACH = "coach"          # a team's coach (audience_ref = team_id)
+    OFFICIAL = "official"    # a specific official (audience_ref = official_id)

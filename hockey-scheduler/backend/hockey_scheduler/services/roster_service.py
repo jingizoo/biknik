@@ -16,6 +16,8 @@ from ..domain import (
     AuditAction,
     AuditLog,
     AvailabilityStatus,
+    NotificationAudience,
+    NotificationKind,
     Game,
     GameAvailability,
     GameRosterEntry,
@@ -45,6 +47,7 @@ from ..domain.errors import (
     ValidationError,
 )
 from ..store import InMemoryStore
+from .notifier import push as _push_notification
 
 
 def _utcnow() -> datetime:
@@ -329,7 +332,9 @@ class RosterService:
                 subject_player_id=entry.player_id,
             )
         # Recalculate and, if a slot is now open with no substitutes, alert.
-        status = self.compute_roster_status(game.id)
+        player = self.store.get_player(entry.player_id)
+        team_id = player.team_id if player else None
+        status = self.compute_roster_status(game.id, team_id)
         if status.status == GameStatus.OPEN_SLOT:
             self._notify(
                 game.id,
@@ -337,6 +342,12 @@ class RosterService:
                 audience="coach",
                 message=status.message,
             )
+            # Feed notification to that team's coach (#32).
+            _push_notification(
+                self.store, self.clock,
+                NotificationKind.ROSTER_OPEN_SLOT, NotificationAudience.COACH,
+                "Open roster slot", status.message,
+                audience_ref=team_id, game_id=game.id)
 
     # ====================================================================
     # substitute workflow
