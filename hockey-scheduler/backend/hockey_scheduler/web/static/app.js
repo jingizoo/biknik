@@ -584,7 +584,7 @@ function renderGames(ov) {
       <div class="card">
         ${ck(true, "Ice slot allocated")}
         ${ck(confirmed, "Roster", prettyStatus(g.roster_status))}
-        ${ck((g.officials_assigned || 0) > 0, "Officials",
+        ${ck((g.officials_assigned || 0) > 0 && (g.officials_accepted || 0) === g.officials_assigned, "Officials",
              g.officials_assigned ? `${g.officials_accepted}/${g.officials_assigned} accepted` : "None assigned")}
         ${ck(false, "Locker rooms", "Follow-up")}
         ${ck(false, "Scorekeeper", "Coming #31")}

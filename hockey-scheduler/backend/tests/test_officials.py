@@ -157,6 +157,29 @@ class OfficialsFacadeTest(unittest.TestCase):
         res = self.api.assign_official(self.game_id, "official_missing", "referee")
         self.assertEqual(res["error"]["code"], "not_found")
 
+    def _seeded_summary(self):
+        ov = self.api.get_demo_overview()
+        return next(g for g in ov["schedule"] if g["game_id"] == self.game_id)
+
+    def test_declined_assignment_not_counted_in_games_checklist(self):
+        # A declined assignment frees the official → not counted as assigned.
+        self.api.respond_assignment(self.ids["ref_assignment_id"], accept=False)
+        seeded = self._seeded_summary()
+        self.assertEqual(seeded["officials_assigned"], 0)
+        self.assertEqual(seeded["officials_accepted"], 0)
+
+    def test_accepted_assignment_counts_ready(self):
+        self.api.respond_assignment(self.ids["ref_assignment_id"], accept=True)
+        seeded = self._seeded_summary()
+        self.assertEqual(seeded["officials_assigned"], 1)
+        self.assertEqual(seeded["officials_accepted"], 1)
+
+    def test_proposed_counts_assigned_not_accepted(self):
+        # The seeded referee starts proposed: assigned but not yet accepted.
+        seeded = self._seeded_summary()
+        self.assertEqual(seeded["officials_assigned"], 1)
+        self.assertEqual(seeded["officials_accepted"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -483,7 +483,10 @@ class ApiService:
             if slot and slot.rink_id in rinks:
                 rk = rinks[slot.rink_id]
                 venue_name = venues[rk.venue_id].name if rk.venue_id in venues else None
-            g_assignments = self.store.assignments_for_game(g.id)
+            # Only active (proposed/accepted) assignments count as "assigned";
+            # a declined assignment frees the official (#30 review).
+            g_active = [a for a in self.store.assignments_for_game(g.id)
+                        if a.status.is_active]
             schedule.append({
                 "game_id": g.id,
                 "home_team_id": g.home_team_id,
@@ -498,9 +501,9 @@ class ApiService:
                 "roster_status": rstatus.status.value,
                 "published": g.published,
                 # Officials summary for the Games operations checklist (#30).
-                "officials_assigned": len(g_assignments),
+                "officials_assigned": len(g_active),
                 "officials_accepted": sum(
-                    1 for a in g_assignments if a.status.value == "accepted"),
+                    1 for a in g_active if a.status.value == "accepted"),
             })
             # PUBLIC: only PUBLISHED games, fixture info only — no players/PII.
             if g.published and not g.cancelled:
