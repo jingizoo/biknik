@@ -18,6 +18,7 @@ let roleCatalog = [];              // [{id,label,permissions}] from /api/auth/ro
 let accounts = [];                 // [{username,role,label}] demo sign-in options (#50)
 let rolePerms = new Set();         // permissions of the current role
 let officialsPool = [];            // [{id,name}] officials for the assign UI (#30)
+let standingsDivision = null;      // selected division for the Standings tab (#31)
 let movingGameId = null;    // click-to-move fallback: game awaiting a destination slot
 let conflict = null;        // {ok, title, lines[], game, slot} — calendar side panel (#43)
 let drawer = null;          // {kind} when a Setup create drawer is open (#44)
@@ -52,7 +53,7 @@ function fmtDayShort(d) {
 const NAV = {
   dashboard: "Dashboard", setup: "Setup", calendar: "Arena Calendar",
   games: "Games", roster: "Roster", sheet: "Game Sheet",
-  activity: "Activity", public: "Public",
+  standings: "Standings", activity: "Activity", public: "Public",
 };
 const POS_CLASS = { goalie: "pos-G", defense: "pos-D", forward: "pos-F", skater: "pos-D" };
 const REPO = "https://github.com/jingizoo/biknik/issues";
@@ -676,14 +677,66 @@ function renderGameSheet(lineups) {
       <div class="gs-meta">${esc(fmtDateTime(g.start_time))}${g.rink ? " · " + esc(g.rink) : ""}</div>
       <div class="gs-badges">${pub} ${lock} ${cancelled}</div>
     </header>
+    ${resultSection(lineups)}
     <div class="gs-grid">
       ${sheetSide(lineups.home, "Home")}
       ${sheetSide(lineups.away, "Away")}
     </div>
     ${officialsPanel(lineups)}
-    <div class="privacy-note">📋 Roster names are visible to authorized operators only. Score,
-      penalties, and signatures are follow-ups (results/standings in <a href="${REPO}/31" target="_blank">#31</a>).</div>
+    <div class="privacy-note">📋 Roster names are visible to authorized operators only. Penalties
+      and signatures are follow-ups. Standings update from Final results (<a href="${REPO}/31" target="_blank">#31</a>).</div>
   </div>`;
+}
+function resultSection(lineups) {
+  const canEdit = hasPerm("manage_schedule");
+  const r = lineups.result;
+  const final = r && r.status === "final";
+  const score = r ? `${r.home_score} – ${r.away_score}` : "– : –";
+  const badge = !r ? `<span class="badge gray">No result</span>`
+    : final ? `<span class="badge green">Final</span>`
+    : `<span class="badge orange">Draft</span>`;
+  const form = (canEdit && !final) ? `<div class="gs-result-form no-print">
+      <input id="res-home" type="number" min="0" value="${r ? r.home_score : ""}" placeholder="H" />
+      <span class="gs-dash">–</span>
+      <input id="res-away" type="number" min="0" value="${r ? r.away_score : ""}" placeholder="A" />
+      <button class="act primary" data-record-result>Save score</button>
+      ${r ? `<button class="act success" data-approve-result>Approve → Final</button>` : ""}
+    </div>` : "";
+  return `<section class="gs-result">
+    <div class="gs-result-head">🏒 Result ${badge}</div>
+    <div class="gs-score"><span>${esc(lineups.home.team_name)}</span>
+      <strong>${score}</strong><span>${esc(lineups.away.team_name)}</span></div>
+    ${form}
+    ${!final ? `<div class="gs-note no-print">Only an approved <strong>Final</strong> result affects standings.</div>` : ""}
+  </section>`;
+}
+/* ---------- Standings (#31) ---------- */
+function renderStandings(ov, standings) {
+  if (!ov.divisions.length) return `<div class="empty">No divisions yet. Create one in Setup.</div>`;
+  const opts = ov.divisions.map((d) =>
+    `<option value="${esc(d.id)}" ${d.id === standingsDivision ? "selected" : ""}>${esc(d.name)}</option>`).join("");
+  const rows = (standings && standings.standings) || [];
+  const body = rows.length
+    ? rows.map((r, i) => `<tr>
+        <td class="st-rank">${i + 1}</td>
+        <td class="st-team">${esc(r.team_name)}</td>
+        <td>${r.gp}</td><td>${r.w}</td><td>${r.l}</td><td>${r.t}</td>
+        <td>${r.gf}</td><td>${r.ga}</td>
+        <td>${r.gd > 0 ? "+" + r.gd : r.gd}</td>
+        <td class="st-pts">${r.pts}</td></tr>`).join("")
+    : `<tr><td colspan="10" class="st-empty">No teams in this division yet.</td></tr>`;
+  const anyPlayed = rows.some((r) => r.gp > 0);
+  return `
+    <div class="st-toolbar">
+      <select id="standings-div" class="st-div">${opts}</select>
+      <span class="gs-hint">Points: win 2 · tie 1 · loss 0 — from <strong>Final</strong> results only.</span>
+    </div>
+    <div class="card st-card"><table class="st-table">
+      <thead><tr><th>#</th><th class="st-team">Team</th><th>GP</th><th>W</th><th>L</th><th>T</th>
+        <th>GF</th><th>GA</th><th>GD</th><th>Pts</th></tr></thead>
+      <tbody>${body}</tbody></table></div>
+    ${anyPlayed ? "" : `<div class="privacy-note">No games have a Final result yet. Enter and approve a score on a game's Game Sheet.</div>`}
+    ${toastHtml()}`;
 }
 function officialsPanel(lineups) {
   const canAssign = hasPerm("manage_schedule");   // arena manager / league admin
@@ -1010,7 +1063,7 @@ function setChrome(ov) {
 async function render() {
   const c = document.getElementById("content");
   document.body.dataset.view = view;
-  let ov, board, lineups;
+  let ov, board, lineups, standings;
   try {
     c.innerHTML = `<div class="skeleton"></div><div class="skeleton"></div><div class="skeleton"></div>`;
     ov = await getJSON("/api/demo/overview");
@@ -1025,6 +1078,14 @@ async function render() {
     if (view === "sheet") {
       const op = await getJSON("/api/officials");
       officialsPool = (op && op.officials) || [];
+    }
+    // Standings for the selected division (#31).
+    if (view === "standings") {
+      if (!standingsDivision || !ov.divisions.some((d) => d.id === standingsDivision)) {
+        standingsDivision = ov.divisions[0] ? ov.divisions[0].id : null;
+      }
+      standings = standingsDivision
+        ? await getJSON(`/api/standings/${standingsDivision}`) : null;
     }
   } catch (e) {
     setChrome(ov);
@@ -1042,6 +1103,7 @@ async function render() {
     : view === "games" ? renderGames(ov)
     : view === "roster" ? renderRoster(lineups)
     : view === "sheet" ? renderGameSheet(lineups)
+    : view === "standings" ? renderStandings(ov, standings)
     : view === "activity" ? renderActivity(board, ov)
     : renderPublic(ov);
 
@@ -1083,6 +1145,22 @@ async function render() {
     await post(`/api/officials/assignments/${b.dataset.unassign}/unassign`, {});
     toast = "Official unassigned."; await render();
   });
+  // Result entry + approval (#31).
+  const recBtn = c.querySelector("[data-record-result]");
+  if (recBtn) recBtn.onclick = async () => {
+    const r = await post(`/api/games/${currentGame}/result`,
+      { home_score: val("res-home"), away_score: val("res-away") });
+    if (r && !r.error) toast = "Score saved (draft).";
+    await render();
+  };
+  const apprBtn = c.querySelector("[data-approve-result]");
+  if (apprBtn) apprBtn.onclick = async () => {
+    const r = await post(`/api/games/${currentGame}/result/approve`, {});
+    if (r && !r.error) toast = "Result approved — standings updated.";
+    await render();
+  };
+  const stDiv = c.querySelector("#standings-div");
+  if (stDiv) stDiv.onchange = (e) => { standingsDivision = e.target.value; render(); };
   // Shared move: used by both drag/drop and the click-based Move fallback.
   const applyMove = async (gid, slotId) => {
     toast = "";

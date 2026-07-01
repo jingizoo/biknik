@@ -314,6 +314,34 @@ select.player-picker {
   .gs-grid { break-inside: avoid; }
 }
 
+/* ----- game result + standings (#31) ----- */
+.gs-result { border: 1px solid var(--sep); border-radius: 12px; background: var(--card);
+  padding: 14px; margin-bottom: 12px; text-align: center; }
+.gs-result-head { font-weight: 800; font-size: 15px; margin-bottom: 8px; }
+.gs-score { display: flex; align-items: center; justify-content: center; gap: 12px;
+  font-size: 15px; color: var(--muted); }
+.gs-score strong { font-size: 26px; color: var(--ink); font-variant-numeric: tabular-nums; }
+.gs-result-form { display: flex; align-items: center; justify-content: center; gap: 8px;
+  margin-top: 12px; flex-wrap: wrap; }
+.gs-result-form input { width: 56px; padding: 8px; border: 1px solid var(--sep);
+  border-radius: 8px; font-size: 16px; text-align: center; }
+.gs-result-form .gs-dash { font-weight: 700; color: var(--muted); }
+.gs-note { font-size: 12px; color: var(--muted); margin-top: 8px; }
+
+.st-toolbar { display: flex; align-items: center; gap: 12px; margin: 4px 2px 12px; flex-wrap: wrap; }
+.st-div { padding: 8px 10px; border: 1px solid var(--sep); border-radius: 8px; font-size: 14px;
+  font-weight: 600; background: #fff; }
+.st-card { overflow-x: auto; }
+.st-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.st-table th, .st-table td { padding: 9px 8px; text-align: center; border-bottom: 1px solid var(--sep); }
+.st-table th { font-size: 11px; text-transform: uppercase; letter-spacing: .4px; color: var(--muted); }
+.st-table th.st-team, .st-table td.st-team { text-align: left; }
+.st-table .st-team { font-weight: 600; }
+.st-table .st-rank { color: var(--muted); }
+.st-table .st-pts { font-weight: 800; }
+.st-table tbody tr:last-child td { border-bottom: none; }
+.st-empty { color: var(--muted); font-style: italic; padding: 18px; }
+
 /* ----- roster selection surface (#46) ----- */
 .ros-summary { padding: 12px 14px; display: grid; gap: 12px; }
 .pos-stat .ps-top { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }

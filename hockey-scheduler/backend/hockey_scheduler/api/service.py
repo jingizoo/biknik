@@ -16,6 +16,7 @@ from ..domain import (
     IceSlotType,
     OfficialRole,
     Position,
+    ResultStatus,
     RosterEntryStatus,
     SlotType,
     SubstituteStatus,
@@ -346,11 +347,13 @@ class ApiService:
                 "players": self._lineup_rows(game_id, team_id),
             }
 
+        result = self.store.result_for_game(game_id)
         return {
             "game": _serialize(game),
             "home": side(game.home_team_id),
             "away": side(game.away_team_id),
             "officials": self._official_rows(game_id),
+            "result": _serialize(result) if result is not None else None,
         }
 
     def _official_rows(self, game_id: str) -> list:
@@ -398,6 +401,64 @@ class ApiService:
     def unassign_official(self, assignment_id: str,
                           actor_id: Optional[str] = None) -> dict:
         return _serialize(self.setup.unassign_official(assignment_id, actor_id))
+
+    # -- results & standings (#31) -----------------------------------------
+    @catch
+    def record_result(self, game_id: str, home_score, away_score,
+                      actor_id: Optional[str] = None) -> dict:
+        return _serialize(self.setup.record_result(
+            game_id, home_score, away_score, actor_id))
+
+    @catch
+    def approve_result(self, game_id: str, actor_id: Optional[str] = None) -> dict:
+        return _serialize(self.setup.approve_result(game_id, actor_id))
+
+    @catch
+    def get_result(self, game_id: str) -> dict:
+        self.roster._require_game(game_id)
+        r = self.store.result_for_game(game_id)
+        return _serialize(r) if r is not None else {"game_id": game_id, "status": None}
+
+    @catch
+    def get_standings(self, division_id: str) -> dict:
+        """Standings for a division from FINAL results only (#31).
+
+        Points: win = 2, tie = 1, loss = 0. Ranked by points, then goal
+        difference, then goals for, then name.
+        """
+        teams = [t for t in self.store.all_teams() if t.division_id == division_id]
+        rows = {t.id: {"team_id": t.id, "team_name": t.name, "gp": 0,
+                       "w": 0, "l": 0, "t": 0, "gf": 0, "ga": 0, "gd": 0, "pts": 0}
+                for t in teams}
+        for g in self.store.all_games():
+            if g.division_id != division_id or g.cancelled:
+                continue
+            r = self.store.result_for_game(g.id)
+            if r is None or r.status != ResultStatus.FINAL:
+                continue
+            home, away = rows.get(g.home_team_id), rows.get(g.away_team_id)
+            if home is None or away is None:
+                continue
+            self._apply_result(home, r.home_score, r.away_score)
+            self._apply_result(away, r.away_score, r.home_score)
+        ranked = sorted(rows.values(),
+                        key=lambda x: (-x["pts"], -x["gd"], -x["gf"], x["team_name"]))
+        return {"division_id": division_id, "standings": ranked}
+
+    @staticmethod
+    def _apply_result(row: dict, gf: int, ga: int) -> None:
+        row["gp"] += 1
+        row["gf"] += gf
+        row["ga"] += ga
+        row["gd"] = row["gf"] - row["ga"]
+        if gf > ga:
+            row["w"] += 1
+            row["pts"] += 2
+        elif gf == ga:
+            row["t"] += 1
+            row["pts"] += 1
+        else:
+            row["l"] += 1
 
     # -- coach controls ----------------------------------------------------
     @catch

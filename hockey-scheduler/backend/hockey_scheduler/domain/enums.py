@@ -113,6 +113,11 @@ class AuditAction(str, Enum):
     GAME_CANCELLED = "game_cancelled"
 
 
+class ResultStatus(str, Enum):
+    DRAFT = "draft"      # score entered, not yet approved
+    FINAL = "final"      # approved — affects standings
+
+
 class OfficialRole(str, Enum):
     REFEREE = "referee"
     LINESPERSON = "linesperson"

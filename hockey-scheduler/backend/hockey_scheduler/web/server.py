@@ -208,6 +208,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_json({"accounts": demo_accounts()})
         if path == "/api/officials":
             return self._send_api({"officials": api.get_officials()})
+        sd = re.match(r"^/api/standings/([^/]+)$", path)
+        if sd:
+            return self._send_api(api.get_standings(sd.group(1)))
         if path == "/api/auth/me":
             # Consistent with POST role resolution (#50): no cookie → signed out,
             # a valid cookie → the user, a present-but-invalid/expired cookie →
@@ -362,6 +365,11 @@ class Handler(BaseHTTPRequestHandler):
             if action == "officials/assign":
                 return self._send_api(api.assign_official(
                     gid, body.get("official_id"), body.get("role", "referee"), actor))
+            if action == "result":
+                return self._send_api(api.record_result(
+                    gid, body.get("home_score"), body.get("away_score"), actor))
+            if action == "result/approve":
+                return self._send_api(api.approve_result(gid, actor))
             if action == "publish":
                 return self._send_api(api.publish_game(gid, actor))
             if action == "move":

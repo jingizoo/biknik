@@ -25,6 +25,7 @@ from ..domain import (
     IceSlot,
     IceSlotStatus,
     IceSlotType,
+    GameResult,
     League,
     NotificationEvent,
     Official,
@@ -32,6 +33,7 @@ from ..domain import (
     OfficialAssignmentStatus,
     OfficialRole,
     Player,
+    ResultStatus,
     Position,
     Rink,
     RosterEntryStatus,
@@ -143,12 +145,16 @@ SPECS = {
                              {"role": _enum(OfficialRole),
                               "status": _enum(OfficialAssignmentStatus),
                               "assigned_at": _dt(), "responded_at": _dt()}),
+    GameResult: Spec(GameResult, "game_results",
+                     {"status": _enum(ResultStatus),
+                      "recorded_at": _dt(), "approved_at": _dt()}),
 }
 
 # Column type for DDL: INTEGER for int/bool fields, else TEXT.
 _INT_FIELDS = {
     "target_goalies", "target_skaters", "max_skaters", "jersey_number",
     "priority_rank", "is_active", "locked", "cancelled", "published",
+    "home_score", "away_score",
 }
 
 
@@ -172,6 +178,7 @@ _INDEXES = [
     "CREATE INDEX IF NOT EXISTS ix_avail_game ON game_availability(game_id, player_id)",
     "CREATE INDEX IF NOT EXISTS ix_off_assign_game ON official_assignments(game_id)",
     "CREATE INDEX IF NOT EXISTS ix_off_assign_official ON official_assignments(official_id)",
+    "CREATE INDEX IF NOT EXISTS ix_game_results_game ON game_results(game_id)",
 ]
 
 
@@ -417,3 +424,11 @@ class SqlStore:
         with self._lock:
             self._exec(f"DELETE FROM {SPECS[OfficialAssignment].table} WHERE id = ?",
                        (assignment_id,))
+
+    # -- game results (#31) ------------------------------------------------
+    def add_game_result(self, result): return self._insert(result)
+    def save_game_result(self, result): return self._update(result)
+    def result_for_game(self, game_id):
+        rows = self._query(GameResult, "game_id = ?", (game_id,), order="id")
+        return rows[0] if rows else None
+    def all_game_results(self): return self._query(GameResult, order="id")

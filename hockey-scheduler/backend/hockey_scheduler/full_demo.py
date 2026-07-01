@@ -116,6 +116,11 @@ def build_full_demo_store(store=None) -> Tuple[InMemoryStore, str, dict]:
     ref_assignment = setup.assign_official(game.id, ref.id, OfficialRole.REFEREE,
                                            actor_id=admin)
 
+    # A finalized result on the seeded game so the demo standings are non-empty
+    # (#31). Lions 4, Falcons 2.
+    setup.record_result(game.id, 4, 2, actor_id=admin)
+    setup.approve_result(game.id, actor_id=admin)
+
     ids = {
         "next_game_id": game_next.id,
         "referee_id": ref.id,
