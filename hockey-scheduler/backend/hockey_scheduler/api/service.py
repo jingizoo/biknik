@@ -413,16 +413,20 @@ class ApiService:
     def _actor_key(role: str, scope: dict) -> str:
         """A stable per-actor identity for read state, derived from role/scope.
 
-        Matches the granularity of feed visibility: an official is keyed by
-        their official id, a coach by their team id, everyone else by role.
-        Two actors that would see a notification via different scopes get
-        distinct keys, so marking read never leaks across recipients.
+        Matches the granularity of feed visibility while keeping distinct
+        actors apart. The key is role-qualified because a player session
+        carries both ``team_id`` and ``player_id``: without the role guard a
+        player and their coach would share the team bucket and one could mark
+        the other's copy read. Officials key by official id, coaches by team,
+        players by player id, everyone else by role.
         """
         scope = scope or {}
-        if scope.get("official_id"):
+        if role == "official" and scope.get("official_id"):
             return "official:" + scope["official_id"]
-        if scope.get("team_id"):
-            return "team:" + scope["team_id"]
+        if role == "coach" and scope.get("team_id"):
+            return "coach-team:" + scope["team_id"]
+        if role == "player" and scope.get("player_id"):
+            return "player:" + scope["player_id"]
         return "role:" + role
 
     def _recipient_id(self, notification_id: str, actor_key: str) -> str:

@@ -130,6 +130,34 @@ class NotificationsTest(unittest.TestCase):
         self.assertFalse(viewer_row["read"])
         self.assertEqual(viewer_after["unread"], viewer_before["unread"])
 
+    def test_player_read_public_does_not_mark_coach_copy_read(self):
+        # A player session carries team_id, but its read state must not spill
+        # into the coach's bucket for the same team (role-qualified actor key).
+        home = self.ids["home_team_id"]
+        player = self.ids["selected_player_id"]
+        public = next(
+            n for n in self.api.get_notifications("viewer", {})["notifications"]
+            if n["kind"] == "result_approved")
+        self.api.mark_notification_read(
+            public["id"], "player", {"team_id": home, "player_id": player})
+        coach_feed = self.api.get_notifications("coach", {"team_id": home})
+        coach_row = next(n for n in coach_feed["notifications"]
+                         if n["id"] == public["id"])
+        self.assertFalse(coach_row["read"])
+
+    def test_coach_read_public_does_not_mark_player_copy_read(self):
+        home = self.ids["home_team_id"]
+        player = self.ids["selected_player_id"]
+        public = next(
+            n for n in self.api.get_notifications("viewer", {})["notifications"]
+            if n["kind"] == "result_approved")
+        self.api.mark_notification_read(public["id"], "coach", {"team_id": home})
+        player_feed = self.api.get_notifications(
+            "player", {"team_id": home, "player_id": player})
+        player_row = next(n for n in player_feed["notifications"]
+                          if n["id"] == public["id"])
+        self.assertFalse(player_row["read"])
+
     def test_mark_read_is_idempotent(self):
         feed = self.api.get_notifications("league_admin", {})
         nid = feed["notifications"][0]["id"]
