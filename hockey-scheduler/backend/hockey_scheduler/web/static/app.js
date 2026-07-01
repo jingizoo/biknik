@@ -12,6 +12,9 @@ let calendarDate = "2026-09-05";  // YYYY-MM-DD shown on the arena calendar
 let calendarMode = "day";   // day | week
 let calFilters = { venueId: "all", rinkId: "all", divisionId: "all", teamId: "all" };
 let toast = "";
+let currentRole = "league_admin";  // demo role sent with each request (#24)
+let roleCatalog = [];              // [{id,label,permissions}] from /api/auth/roles
+let rolePerms = new Set();         // permissions of the current role
 let movingGameId = null;    // click-to-move fallback: game awaiting a destination slot
 let conflict = null;        // {ok, title, lines[], game, slot} — calendar side panel (#43)
 let drawer = null;          // {kind} when a Setup create drawer is open (#44)
@@ -55,10 +58,15 @@ const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) =>
   ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const fmt = (iso) => { const m = /T(\d{2}:\d{2})/.exec(iso || ""); return m ? m[1] : ""; };
 const val = (id) => { const e = document.getElementById(id); return e ? e.value.trim() : ""; };
+const hasPerm = (p) => rolePerms.has(p);
 
-async function getJSON(p) { return (await fetch(p)).json(); }
+// Every request carries the demo-selected role; the server authorizes it (#24).
+const roleHeaders = () => ({ "X-Demo-Role": currentRole });
+async function getJSON(p) { return (await fetch(p, { headers: roleHeaders() })).json(); }
 async function post(p, b) {
-  const r = await fetch(p, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(b || {}) });
+  const r = await fetch(p, { method: "POST",
+    headers: { "Content-Type": "application/json", ...roleHeaders() },
+    body: JSON.stringify(b || {}) });
   const d = await r.json();
   if (d && d.error) toast = d.error.message;
   return d;
@@ -126,26 +134,26 @@ function renderDashboard(ov, board) {
 // its create-form fields once, so the record cards and the create drawer stay
 // in sync. The API endpoints are unchanged — the drawer just POSTs to them.
 const SETUP_ENTITIES = [
-  { key: "league", title: "Leagues", icon: "🏆", noun: "league",
+  { key: "league", title: "Leagues", icon: "🏆", noun: "league", perm: "manage_setup",
     list: (ov) => ov.leagues.map((l) => ({ title: l.name })),
     fields: [{ id: "f-league", label: "League name", required: true, placeholder: "e.g. Coastal League" }] },
-  { key: "season", title: "Seasons", icon: "🗓️", noun: "season",
+  { key: "season", title: "Seasons", icon: "🗓️", noun: "season", perm: "manage_setup",
     list: (ov) => ov.seasons.map((s) => ({ title: s.name, sub: nameById(ov.leagues, s.league_id) })),
     fields: [
       { id: "f-season-league", label: "League", type: "select", required: true, ofNoun: "league",
         options: (ov) => ov.leagues.map((l) => [l.id, l.name]) },
       { id: "f-season", label: "Season name", required: true, placeholder: "e.g. 2027–28" }] },
-  { key: "division", title: "Divisions", icon: "🏅", noun: "division",
+  { key: "division", title: "Divisions", icon: "🏅", noun: "division", perm: "manage_setup",
     list: (ov) => ov.divisions.map((d) => ({ title: d.name, sub: d.is_junior ? "Junior" : "" })),
     fields: [
       { id: "f-div-season", label: "Season", type: "select", required: true, ofNoun: "season",
         options: (ov) => ov.seasons.map((s) => [s.id, s.name]) },
       { id: "f-div", label: "Division name", required: true, placeholder: "e.g. U14" },
       { id: "f-div-age", label: "Age group", placeholder: "e.g. U14 (optional)" }] },
-  { key: "club", title: "Clubs", icon: "🏒", noun: "club",
+  { key: "club", title: "Clubs", icon: "🏒", noun: "club", perm: "manage_setup",
     list: (ov) => ov.clubs.map((c) => ({ title: c.name })),
     fields: [{ id: "f-club", label: "Club name", required: true, placeholder: "e.g. Eagles HC" }] },
-  { key: "team", title: "Teams", icon: "👥", noun: "team",
+  { key: "team", title: "Teams", icon: "👥", noun: "team", perm: "manage_setup",
     list: (ov) => ov.teams.map((t) => ({ title: t.name, sub: t.division_name || t.club_name || "" })),
     fields: [
       { id: "f-team-club", label: "Club", type: "select", required: true, ofNoun: "club",
@@ -153,16 +161,16 @@ const SETUP_ENTITIES = [
       { id: "f-team-div", label: "Division", type: "select", required: true, ofNoun: "division",
         options: (ov) => ov.divisions.map((d) => [d.id, d.name]) },
       { id: "f-team", label: "Team name", required: true, placeholder: "e.g. U14 Eagles" }] },
-  { key: "venue", title: "Venues", icon: "🏟️", noun: "venue",
+  { key: "venue", title: "Venues", icon: "🏟️", noun: "venue", perm: "manage_arena",
     list: (ov) => ov.venues.map((v) => ({ title: v.name })),
     fields: [{ id: "f-venue", label: "Venue name", required: true, placeholder: "e.g. South Arena" }] },
-  { key: "rink", title: "Rinks", icon: "⛸️", noun: "rink",
+  { key: "rink", title: "Rinks", icon: "⛸️", noun: "rink", perm: "manage_arena",
     list: (ov) => ov.rinks.map((r) => ({ title: r.name, sub: r.venue_name || "" })),
     fields: [
       { id: "f-rink-venue", label: "Venue", type: "select", required: true, ofNoun: "venue",
         options: (ov) => ov.venues.map((v) => [v.id, v.name]) },
       { id: "f-rink", label: "Rink name", required: true, placeholder: "e.g. Rink 3" }] },
-  { key: "ice-slot", title: "Ice slots", icon: "🧊", noun: "ice slot",
+  { key: "ice-slot", title: "Ice slots", icon: "🧊", noun: "ice slot", perm: "manage_arena",
     list: null,  // ice inventory is managed visually on the Arena Calendar
     fields: [
       { id: "f-slot-rink", label: "Rink", type: "select", required: true, ofNoun: "rink",
@@ -215,10 +223,11 @@ function setupCard(ent, ov) {
       ${it.sub ? `<div class="li-sub">${esc(it.sub)}</div>` : ""}</div></div>`).join("");
   }
   const count = items ? `<span class="setup-count">${items.length}</span>` : "";
+  const newBtn = hasPerm(ent.perm)
+    ? `<button class="act primary sc-new" data-drawer="${ent.key}">＋ New</button>` : "";
   return `<section class="setup-card">
     <header class="setup-card-head"><span class="sc-ico">${ent.icon}</span>
-      <span class="sc-title">${esc(ent.title)}</span>${count}
-      <button class="act primary sc-new" data-drawer="${ent.key}">＋ New</button></header>
+      <span class="sc-title">${esc(ent.title)}</span>${count}${newBtn}</header>
     <div class="setup-card-body">${body}</div>
   </section>`;
 }
@@ -310,18 +319,19 @@ function slotCard(s, draggable, ctx) {
   const moving = movingGameId != null;
   // While a move is in progress, available game slots become click targets and
   // dragging is suspended so the two interaction modes don't fight.
+  const canMove = hasPerm("manage_schedule");   // #24: arena manager / admin
   const isTarget = moving && draggable && s.status === "available";
-  const dropClick = (draggable && s.status === "available") ? `data-slot="${s.id}" data-drop="${s.id}"` : "";
-  const drag = (draggable && s.game_id && !moving) ? `draggable="true" data-game="${s.game_id}"` : "";
+  const dropClick = (draggable && s.status === "available" && canMove) ? `data-slot="${s.id}" data-drop="${s.id}"` : "";
+  const drag = (draggable && s.game_id && !moving && canMove) ? `draggable="true" data-game="${s.game_id}"` : "";
   // Draft/Published state comes from the schedule game, not the slot row.
   const g = (s.game_id && ctx) ? ctx.gameById[s.game_id] : null;
   const state = g ? (g.published ? " · Published" : " · Draft") : "";
   const isMovingThis = s.game_id && s.game_id === movingGameId;
   // A Move button gives touch/mobile/keyboard users a drag-free path (#move-mode).
-  const moveBtn = (draggable && s.game_id && !moving)
+  const moveBtn = (draggable && s.game_id && !moving && canMove)
     ? `<button class="slot-move" data-move-game="${s.game_id}">Move</button>` : "";
   const extra = `${isTarget ? " move-target" : ""}${isMovingThis ? " moving" : ""}`;
-  const cta = isTarget ? " · tap to move here" : (draggable && s.game_id && !moving ? " · drag or Move" : "");
+  const cta = isTarget ? " · tap to move here" : (draggable && s.game_id && !moving && canMove ? " · drag or Move" : "");
   return `<div class="slot-card ${cls}${extra}" ${dropClick} ${drag}><div class="t">${fmt(s.start_time)}–${fmt(s.end_time)}</div><div class="s">${slotLabel(s)}${state}${cta}</div>${moveBtn}</div>`;
 }
 
@@ -446,14 +456,16 @@ function moveBanner(ov) {
 
 function renderDay(ov, ctx, rinks) {
   const moving = movingGameId != null;
+  const canArena = hasPerm("manage_arena");   // #24: arena manager / admin adds ice
   const onDay = (s) => (s.start_time || "").startsWith(calendarDate) && slotPasses(s, ctx);
   const rows = rinks.map((r) => {
     const slots = ov.ice_slots.filter((s) => s.rink_id === r.id && onDay(s));
     const cards = slots.map((s) => slotCard(s, true, ctx)).join("")
       || `<div class="slot-card"><div class="s">No ice</div></div>`;
+    const addIce = canArena
+      ? `<div class="slot-card available" data-addslot="${r.id}"><div class="t">＋</div><div class="s">Add ice</div></div>` : "";
     return `<div class="cal-row"><div class="cal-rink">${esc(r.name)}</div>
-      <div class="cal-slots">${cards}
-        <div class="slot-card available" data-addslot="${r.id}"><div class="t">＋</div><div class="s">Add ice</div></div></div></div>`;
+      <div class="cal-slots">${cards}${addIce}</div></div>`;
   }).join("");
   // Draft tray (respects venue/rink/division/team filters by routing the draft
   // game's own ice slot through slotPasses, just like the allocated cards above).
@@ -702,6 +714,8 @@ function availableGroups(available, s, locked) {
 function coachBody(board) {
   const s = board.status;
   const locked = s.status === "locked";
+  const canRoster = hasPerm("manage_roster");   // #24: coach/admin only
+  const canEdit = !locked && canRoster;         // editable right now?
   const onRoster = board.players.filter((p) => p.group === "selected" && !p.backed_out);
   const backedOut = board.players.filter((p) => p.group === "selected" && p.backed_out);
   const available = board.players.filter((p) => p.group === "available");
@@ -727,14 +741,14 @@ function coachBody(board) {
   if (backedOut.length) warn.push(`${backedOut.length} player${plural(backedOut.length)} backed out or removed — re-confirm or refill.`);
   const warnHtml = warn.length ? `<div class="ros-warn">⚠ ${warn.map(esc).join(" ")}</div>` : "";
 
-  const toolbar = locked ? "" : `<div class="ros-toolbar">
+  const toolbar = canEdit ? `<div class="ros-toolbar">
     <button class="act ghost" data-act="copy">⧉ Copy previous roster</button>
-    <button class="act ghost" data-act="build">Auto-fill remaining</button></div>`;
+    <button class="act ghost" data-act="build">Auto-fill remaining</button></div>` : "";
 
   // Roster section: occupying players first, then anyone backed out / removed.
   const rosterRows = [...onRoster, ...backedOut].map((p) => {
     let btns = "";
-    if (!locked) {
+    if (canEdit) {
       if (p.backed_out) {
         btns = p.roster_status === "removed"
           ? `<button class="act success" data-act="select" data-id="${p.id}">Add back</button>`
@@ -750,12 +764,23 @@ function coachBody(board) {
   }).join("") || `<div class="empty">No players on the roster yet — add from Available below.</div>`;
 
   const subRows = subs.length ? subs.map((p) => {
-    const canAdd = !locked && (p.slot_type === "goalie" ? s.open_goalie_slots > 0 : s.open_skater_slots > 0);
+    const canAdd = canEdit && (p.slot_type === "goalie" ? s.open_goalie_slots > 0 : s.open_skater_slots > 0);
     const ctrl = p.sub_status === "offered" ? '<span class="badge orange">Offered</span>' : '<span class="badge blue">Enrolled</span>';
-    const btn = locked ? "" : canAdd ? `<button class="act primary" data-act="add" data-id="${p.id}">Add</button>`
+    const btn = !canEdit ? "" : canAdd ? `<button class="act primary" data-act="add" data-id="${p.id}">Add</button>`
       : `<button class="act ghost" disabled>No slot</button>`;
     return playerRow(p, `${posTag(p)}${ctrl}${btn}`);
   }).join("") : `<div class="empty">No substitutes enrolled.</div>`;
+
+  // Footer: lock control for roster managers, else a read-only note by role.
+  let footer;
+  if (!canRoster) {
+    footer = `<div class="locked-note">🔒 Read-only — your role can't manage rosters.</div>`;
+  } else if (locked) {
+    footer = `<div class="locked-note">🔒 Roster locked. Selection disabled.
+        <button class="act ghost" data-act="unlock" style="margin-left:auto">Unlock</button></div>`;
+  } else {
+    footer = `<div class="actions"><button class="act ghost" data-act="lock">Lock Roster</button></div>`;
+  }
 
   const total = s.target_goalies + s.target_skaters;
   return `
@@ -763,12 +788,10 @@ function coachBody(board) {
     ${summary}${warnHtml}${toolbar}
     <div class="section-title">Roster (${onRoster.length}/${total})</div>
     <div class="card">${rosterRows}</div>
-    ${availableGroups(available, s, locked)}
+    ${availableGroups(available, s, !canEdit)}
     <div class="section-title">Substitute pool</div>
     <div class="card">${subRows}</div>
-    ${locked ? `<div class="locked-note">🔒 Roster locked. Selection disabled.
-        <button class="act ghost" data-act="unlock" style="margin-left:auto">Unlock</button></div>`
-      : `<div class="actions"><button class="act ghost" data-act="lock">Lock Roster</button></div>`}
+    ${footer}
     ${toastHtml()}`;
 }
 function playerBody(board) {
@@ -777,7 +800,11 @@ function playerBody(board) {
   if (!pickedPlayer || !players.find((p) => p.id === pickedPlayer)) pickedPlayer = players[0] ? players[0].id : null;
   const options = players.map((p) => opt(p.id, `${p.name} · ${p.position}`, p.id === pickedPlayer)).join("");
   const p = players.find((x) => x.id === pickedPlayer);
-  const acts = (html) => locked ? `<div class="locked-note">🔒 Roster locked — actions disabled.</div>` : `<div class="actions">${html}</div>`;
+  const canRespond = hasPerm("respond_availability");   // #24: player/coach/admin
+  const acts = (html) => !canRespond
+    ? `<div class="locked-note">🔒 Read-only — your role can't respond for players.</div>`
+    : locked ? `<div class="locked-note">🔒 Roster locked — actions disabled.</div>`
+    : `<div class="actions">${html}</div>`;
   let card = `<div class="empty">No players.</div>`;
   if (p) {
     if (p.group === "selected" && !p.backed_out)
@@ -1087,4 +1114,39 @@ document.addEventListener("keydown", (e) => {
   if (drawer) { drawer = null; drawerError = ""; drawerValues = {}; render(); }
   else if (movingGameId != null) { movingGameId = null; render(); }
 });
-render();
+
+// -- role switcher (demo auth, #24) --------------------------------------
+function applyRolePerms() {
+  const r = roleCatalog.find((x) => x.id === currentRole);
+  rolePerms = new Set(r ? r.permissions : []);
+  gateChrome();
+}
+function gateChrome() {
+  const toggle = (sel, ok) => document.querySelectorAll(sel).forEach((el) => {
+    el.style.display = ok ? "" : "none";
+  });
+  toggle('.topbar [data-goto="calendar"]', hasPerm("manage_schedule"));
+  toggle('.topbar [data-open-drawer="ice-slot"]', hasPerm("manage_arena"));
+}
+function renderRoleSwitch() {
+  const sel = document.getElementById("role-switch");
+  if (!sel || !roleCatalog.length) return;
+  sel.innerHTML = roleCatalog.map((r) =>
+    `<option value="${esc(r.id)}" ${r.id === currentRole ? "selected" : ""}>${esc(r.label)}</option>`).join("");
+  sel.onchange = (e) => {
+    currentRole = e.target.value; applyRolePerms();
+    toast = ""; drawer = null; movingGameId = null;
+    renderRoleSwitch(); render();
+  };
+}
+async function bootstrap() {
+  try {
+    const data = await (await fetch("/api/auth/roles")).json();
+    roleCatalog = data.roles || [];
+    if (data.default && roleCatalog.some((r) => r.id === data.default)) currentRole = data.default;
+  } catch (_) { roleCatalog = []; }
+  applyRolePerms();
+  renderRoleSwitch();
+  render();
+}
+bootstrap();
