@@ -12,6 +12,8 @@ from typing import Optional
 from .enums import (
     IceSlotStatus,
     IceSlotType,
+    NotificationAudience,
+    NotificationKind,
     OfficialAssignmentStatus,
     OfficialRole,
     ResultStatus,
@@ -109,6 +111,21 @@ class GameResult:
     recorded_at: Optional[datetime] = None
     approved_by: Optional[str] = None
     approved_at: Optional[datetime] = None
+
+
+@dataclass
+class Notification:
+    """A feed notification delivered to a recipient with read state (#32)."""
+    id: str
+    kind: NotificationKind
+    audience: NotificationAudience
+    title: str
+    message: str
+    at: datetime
+    audience_ref: Optional[str] = None   # official_id / team_id (None = whole audience)
+    game_id: Optional[str] = None
+    assignment_id: Optional[str] = None
+    read: bool = False
 
 
 @dataclass

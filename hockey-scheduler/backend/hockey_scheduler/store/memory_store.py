@@ -19,6 +19,7 @@ from ..domain import (
     IceSlot,
     GameResult,
     League,
+    Notification,
     NotificationEvent,
     Official,
     OfficialAssignment,
@@ -53,6 +54,7 @@ class InMemoryStore:
         self.officials: Dict[str, Official] = {}
         self.official_assignments: Dict[str, OfficialAssignment] = {}
         self.game_results: Dict[str, GameResult] = {}
+        self.feed_notifications: Dict[str, Notification] = {}
         self.setup_audit: List[SetupAuditLog] = []
         self._counters: Dict[str, count] = {}
 
@@ -273,6 +275,21 @@ class InMemoryStore:
 
     def all_game_results(self) -> List[GameResult]:
         return list(self.game_results.values())
+
+    # -- feed notifications (#32) ------------------------------------------
+    def add_notification_feed(self, n: Notification) -> Notification:
+        self.feed_notifications[n.id] = n
+        return n
+
+    def save_notification_feed(self, n: Notification) -> Notification:
+        self.feed_notifications[n.id] = n
+        return n
+
+    def get_notification_feed(self, notification_id: str) -> Optional[Notification]:
+        return self.feed_notifications.get(notification_id)
+
+    def all_notifications_feed(self) -> List[Notification]:
+        return list(self.feed_notifications.values())
 
     def add_setup_audit(self, entry: SetupAuditLog) -> SetupAuditLog:
         self.setup_audit.append(entry)

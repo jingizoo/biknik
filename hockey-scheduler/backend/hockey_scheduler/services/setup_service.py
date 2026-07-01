@@ -18,6 +18,8 @@ from ..domain import (
     IceSlotType,
     League,
     GameResult,
+    NotificationAudience,
+    NotificationKind,
     Official,
     OfficialAssignment,
     OfficialAssignmentStatus,
@@ -39,6 +41,7 @@ from ..domain.errors import (
     ValidationError,
 )
 from ..store import InMemoryStore
+from .notifier import push as _push_notification
 
 
 def _utcnow() -> datetime:
@@ -86,6 +89,16 @@ class SetupService:
             actor_id=actor_id,
             detail=detail or {},
         ))
+
+    def _matchup(self, game) -> str:
+        def team_name(tid):
+            t = self.store.get_team(tid) if tid else None
+            return t.name if t else "TBD"
+        return f"{team_name(game.home_team_id)} vs {team_name(game.away_team_id)}"
+
+    def _notify(self, kind, audience, title, message, **links):
+        return _push_notification(self.store, self.clock, kind, audience,
+                                  title, message, **links)
 
     # -- league / season / division ---------------------------------------
     @_transactional
@@ -478,6 +491,11 @@ class SetupService:
         self._audit("official_assigned", "official_assignment", assignment.id,
                     actor_id, {"game_id": game_id, "official_id": official_id,
                                "role": role.value})
+        self._notify(
+            NotificationKind.ASSIGNMENT_OFFERED, NotificationAudience.OFFICIAL,
+            "New game assignment",
+            f"You've been assigned as {role.value} for {self._matchup(game)}.",
+            audience_ref=official_id, game_id=game_id, assignment_id=assignment.id)
         return assignment
 
     @_transactional
@@ -495,6 +513,18 @@ class SetupService:
         self.store.save_official_assignment(a)
         self._audit("assignment_accepted" if accept else "assignment_declined",
                     "official_assignment", a.id, actor_id)
+        official = self.store.get_official(a.official_id)
+        name = official.name if official else "An official"
+        game = self.store.get_game(a.game_id)
+        matchup = self._matchup(game) if game else "a game"
+        self._notify(
+            NotificationKind.ASSIGNMENT_ACCEPTED if accept
+            else NotificationKind.ASSIGNMENT_DECLINED,
+            NotificationAudience.SCHEDULER,
+            f"Assignment {'accepted' if accept else 'declined'}",
+            f"{name} {'accepted' if accept else 'declined'} the {a.role.value} "
+            f"assignment for {matchup}.",
+            game_id=a.game_id, assignment_id=a.id)
         return a
 
     @_transactional
@@ -559,6 +589,11 @@ class SetupService:
         self.store.save_game_result(result)
         self._audit("result_approved", "game_result", result.id, actor_id,
                     {"game_id": game_id})
+        self._notify(
+            NotificationKind.RESULT_APPROVED, NotificationAudience.PUBLIC,
+            "Final result",
+            f"Final: {self._matchup(game)} — {result.home_score}–{result.away_score}.",
+            game_id=game_id)
         return result
 
     def _require_score(self, value) -> int:

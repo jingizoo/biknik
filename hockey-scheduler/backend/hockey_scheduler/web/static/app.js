@@ -19,6 +19,7 @@ let accounts = [];                 // [{username,role,label}] demo sign-in optio
 let rolePerms = new Set();         // permissions of the current role
 let officialsPool = [];            // [{id,name}] officials for the assign UI (#30)
 let standingsDivision = null;      // selected division for the Standings tab (#31)
+let notifState = { notifications: [], unread: 0 };  // feed for the bell (#32)
 let movingGameId = null;    // click-to-move fallback: game awaiting a destination slot
 let conflict = null;        // {ok, title, lines[], game, slot} — calendar side panel (#43)
 let drawer = null;          // {kind} when a Setup create drawer is open (#44)
@@ -54,7 +55,7 @@ const NAV = {
   dashboard: "Dashboard", setup: "Setup", calendar: "Arena Calendar",
   games: "Games", roster: "Roster", sheet: "Game Sheet",
   inbox: "My Assignments", standings: "Standings",
-  activity: "Activity", public: "Public",
+  notifications: "Notifications", activity: "Activity", public: "Public",
 };
 const POS_CLASS = { goalie: "pos-G", defense: "pos-D", forward: "pos-F", skater: "pos-D" };
 const REPO = "https://github.com/jingizoo/biknik/issues";
@@ -745,6 +746,40 @@ function renderInbox(inbox) {
     <div class="inbox-list">${cards}</div>${toastHtml()}`;
 }
 
+/* ---------- Notifications feed (#32) ---------- */
+const NOTIF_ICON = {
+  assignment_offered: "👨‍⚖️", assignment_accepted: "✅", assignment_declined: "❌",
+  roster_open_slot: "⚠️", result_approved: "🏒",
+};
+function updateNotifBadge() {
+  const badge = document.getElementById("notif-badge");
+  if (!badge) return;
+  const n = notifState.unread || 0;
+  badge.textContent = n > 0 ? (n > 9 ? "9+" : String(n)) : "";
+  badge.style.display = n > 0 ? "" : "none";
+}
+function renderNotifications() {
+  const rows = notifState.notifications || [];
+  const unread = notifState.unread || 0;
+  const head = `<div class="notif-head"><div class="section-title" style="margin:0">Notifications${unread ? ` · ${unread} unread` : ""}</div>
+    ${unread ? `<button class="act ghost" data-notif-readall>Mark all read</button>` : ""}</div>`;
+  if (!rows.length) {
+    return `${head}<div class="banner neutral"><h2>You're all caught up</h2>
+      <p>Assignment offers, roster alerts, and final results will show up here.</p></div>`;
+  }
+  const cards = rows.map((n) => {
+    const link = n.game_id
+      ? `<button class="act ghost" data-notif-open="${n.game_id}">Open game</button>` : "";
+    return `<div class="notif-card ${n.read ? "read" : "unread"}" data-notif-read="${n.id}">
+      <span class="notif-ico">${NOTIF_ICON[n.kind] || "🔔"}</span>
+      <div class="notif-body"><div class="notif-title">${esc(n.title)}${n.read ? "" : ` <span class="notif-dot"></span>`}</div>
+        <div class="notif-msg">${esc(n.message)}</div>
+        <div class="notif-meta">${esc(fmtDateTime(n.at))}</div></div>
+      ${link}</div>`;
+  }).join("");
+  return `${head}<div class="notif-list">${cards}</div>${toastHtml()}`;
+}
+
 /* ---------- Standings (#31) ---------- */
 function renderStandings(ov, standings) {
   if (!ov.divisions.length) return `<div class="empty">No divisions yet. Create one in Setup.</div>`;
@@ -1127,6 +1162,9 @@ async function render() {
     }
     // The signed-in official's inbox (#55).
     if (view === "inbox") inbox = await getJSON("/api/me/assignments");
+    // Notifications feed drives the bell badge on every view (#32).
+    const nf = await getJSON("/api/notifications");
+    if (nf && !nf.error) notifState = nf;
     // Standings for the selected division (#31).
     if (view === "standings") {
       if (!standingsDivision || !ov.divisions.some((d) => d.id === standingsDivision)) {
@@ -1144,6 +1182,7 @@ async function render() {
   }
 
   setChrome(ov);
+  updateNotifBadge();
   c.innerHTML =
     view === "dashboard" ? renderDashboard(ov, board)
     : view === "setup" ? renderSetup(ov)
@@ -1152,6 +1191,7 @@ async function render() {
     : view === "roster" ? renderRoster(lineups)
     : view === "sheet" ? renderGameSheet(lineups)
     : view === "inbox" ? renderInbox(inbox)
+    : view === "notifications" ? renderNotifications()
     : view === "standings" ? renderStandings(ov, standings)
     : view === "activity" ? renderActivity(board, ov)
     : renderPublic(ov);
@@ -1214,6 +1254,19 @@ async function render() {
   c.querySelectorAll("[data-open-sheet]").forEach((b) => b.onclick = () => {
     currentGame = b.dataset.openSheet; switchTab("sheet");
   });
+  // Notifications (#32): mark read on tap, open the related game, mark all.
+  c.querySelectorAll("[data-notif-open]").forEach((b) => b.onclick = async (e) => {
+    e.stopPropagation();
+    const card = b.closest("[data-notif-read]");
+    if (card) await post(`/api/notifications/${card.dataset.notifRead}/read`, {});
+    currentGame = b.dataset.notifOpen; switchTab("sheet");
+  });
+  c.querySelectorAll("[data-notif-read]").forEach((el) => el.onclick = async () => {
+    if (el.classList.contains("read")) return;
+    await post(`/api/notifications/${el.dataset.notifRead}/read`, {}); await render();
+  });
+  const readAll = c.querySelector("[data-notif-readall]");
+  if (readAll) readAll.onclick = async () => { await post("/api/notifications/read-all", {}); await render(); };
   // Shared move: used by both drag/drop and the click-based Move fallback.
   const applyMove = async (gid, slotId) => {
     toast = "";

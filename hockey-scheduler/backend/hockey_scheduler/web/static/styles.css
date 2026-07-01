@@ -317,6 +317,23 @@ select.player-picker {
   .gs-grid { break-inside: avoid; }
 }
 
+/* ----- notifications feed (#32) ----- */
+.notif-badge { display: inline-flex; align-items: center; justify-content: center;
+  min-width: 17px; height: 17px; padding: 0 4px; margin-left: 5px; border-radius: 9px;
+  background: var(--red); color: #fff; font-size: 10px; font-weight: 800; }
+.notif-head { display: flex; align-items: center; justify-content: space-between;
+  gap: 10px; margin: 4px 2px 12px; }
+.notif-list { display: grid; gap: 8px; }
+.notif-card { display: flex; align-items: flex-start; gap: 10px; background: var(--card);
+  border: 1px solid var(--sep); border-radius: 12px; padding: 12px 14px; cursor: pointer; }
+.notif-card.unread { border-color: #bcd9ff; background: #f4f9ff; }
+.notif-ico { font-size: 18px; }
+.notif-body { flex: 1; }
+.notif-title { font-weight: 700; font-size: 14px; display: flex; align-items: center; gap: 6px; }
+.notif-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--blue); display: inline-block; }
+.notif-msg { font-size: 13px; color: var(--ink); margin-top: 2px; }
+.notif-meta { font-size: 11px; color: var(--muted); margin-top: 4px; }
+
 /* ----- official inbox (#55) ----- */
 .inbox-list { display: grid; gap: 10px; }
 .inbox-card { background: var(--card); border: 1px solid var(--sep); border-radius: 12px; padding: 14px; }
