@@ -491,7 +491,8 @@ class ApiService:
         return {"id": d.id, "notification_id": d.notification_id,
                 "channel": d.channel.value, "status": d.status.value,
                 "attempts": d.attempts, "last_error": d.last_error,
-                "sent_at": d.sent_at.isoformat() if d.sent_at else None}
+                "sent_at": d.sent_at.isoformat() if d.sent_at else None,
+                "recipient_ref": d.recipient_ref, "destination": d.destination}
 
     @catch
     def process_notification_deliveries(self) -> dict:

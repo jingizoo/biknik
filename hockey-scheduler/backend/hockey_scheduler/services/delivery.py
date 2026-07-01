@@ -11,6 +11,7 @@ sender is pluggable, so success / failure / retry are all unit-testable.
 
 from ..domain import (
     DeliveryStatus,
+    NotificationAudience,
     NotificationChannel,
     NotificationDelivery,
 )
@@ -22,14 +23,49 @@ DEFAULT_CHANNELS = (NotificationChannel.EMAIL, NotificationChannel.PUSH)
 MAX_ATTEMPTS = 3
 
 
+def recipient_ref(notification) -> str:
+    """Who a notification's deliveries target, derived from its audience (#59).
+
+    Officials and coaches resolve to the specific official / team the
+    notification was addressed to; scheduler and public map to shared
+    operator / broadcast targets. This is the routing key a real transport
+    would later look up a mailbox or device token by.
+    """
+    aud = notification.audience
+    ref = notification.audience_ref
+    if aud == NotificationAudience.OFFICIAL and ref:
+        return "official:" + ref
+    if aud == NotificationAudience.COACH and ref:
+        return "team:" + ref
+    if aud == NotificationAudience.SCHEDULER:
+        return "scheduler"
+    return "public"
+
+
+def destination_for(recipient: str, channel) -> str:
+    """A placeholder per-channel address for a recipient (#59).
+
+    No real mailbox or device token exists in this slice, so we synthesize an
+    obviously-fictional address. The ``.invalid`` TLD is reserved and never
+    routes, which keeps the mock worker from ever contacting anything real.
+    """
+    slug = recipient.replace(":", "-")
+    if channel == NotificationChannel.EMAIL:
+        return slug + "@notify.invalid"
+    return "push-token:" + slug
+
+
 def enqueue(store, notification, channels=DEFAULT_CHANNELS):
     """Create the pending delivery rows for a freshly emitted notification."""
+    recipient = recipient_ref(notification)
     created = []
     for channel in channels:
         d = NotificationDelivery(
             id=store.next_id("notif_delivery"),
             notification_id=notification.id,
             channel=channel,
+            recipient_ref=recipient,
+            destination=destination_for(recipient, channel),
         )
         created.append(store.add_notification_delivery(d))
     return created

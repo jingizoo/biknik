@@ -153,7 +153,11 @@ class NotificationRecipient:
 class NotificationDelivery:
     """A single queued out-of-app delivery of a notification (#58).
 
-    One row per (notification, channel). The delivery worker moves it from
+    One row per (notification, channel). ``recipient_ref`` is who the delivery
+    targets (derived from the notification's audience, e.g. ``official:<id>``,
+    ``team:<id>``, ``scheduler``, ``public``) and ``destination`` is the
+    per-channel address to reach them — a placeholder in this slice (#59), no
+    real mailbox or device token. The delivery worker moves the row from
     ``pending`` → ``sent`` (or ``failed``) via a mock sender, tracking
     ``attempts`` and the ``last_error`` so failures can be retried until the
     attempt budget is exhausted.
@@ -165,6 +169,8 @@ class NotificationDelivery:
     attempts: int = 0
     last_error: Optional[str] = None
     sent_at: Optional[datetime] = None
+    recipient_ref: Optional[str] = None
+    destination: Optional[str] = None
 
 
 @dataclass
