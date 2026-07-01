@@ -13,6 +13,7 @@ let toast = "";
 let conflict = null;        // {ok, title, lines[], game, slot} — calendar side panel (#43)
 let drawer = null;          // {kind} when a Setup create drawer is open (#44)
 let drawerError = "";       // validation/API error shown inside the open drawer
+let drawerValues = {};      // {fieldId: value} preserved across re-render on error
 
 const DAY_MS = 86400000;
 function addDays(dateStr, n) {
@@ -220,17 +221,22 @@ function setupCard(ent, ov) {
 
 function drawerField(f, ov) {
   const req = f.required ? ` <span class="req">*</span>` : "";
+  // Preserve what the user already typed/selected across an error re-render;
+  // fall back to the field's default only on first open.
+  const current = f.id in drawerValues ? drawerValues[f.id] : (f.value || "");
   if (f.type === "select") {
     const rows = f.options(ov);
     if (!rows.length) {
       return `<label>${esc(f.label)}${req}</label>
         <div class="drawer-note">Create a ${esc(f.ofNoun || "record")} first.</div>`;
     }
-    const opts = rows.map(([v, label]) => `<option value="${esc(v)}">${esc(label)}</option>`).join("");
+    const sel = current || rows[0][0];
+    const opts = rows.map(([v, label]) =>
+      `<option value="${esc(v)}"${v === sel ? " selected" : ""}>${esc(label)}</option>`).join("");
     return `<label>${esc(f.label)}${req}</label><select id="${f.id}">${opts}</select>`;
   }
   const type = f.type || "text";
-  const attrs = `${f.value ? ` value="${esc(f.value)}"` : ""}${f.placeholder ? ` placeholder="${esc(f.placeholder)}"` : ""}`;
+  const attrs = `${current ? ` value="${esc(current)}"` : ""}${f.placeholder ? ` placeholder="${esc(f.placeholder)}"` : ""}`;
   return `<label>${esc(f.label)}${req}</label><input id="${f.id}" type="${type}"${attrs} />`;
 }
 
@@ -240,6 +246,8 @@ function renderDrawer(ov) {
   if (!ent) return "";
   const fields = ent.fields.map((f) => drawerField(f, ov)).join("");
   const err = drawerError ? `<div class="drawer-err">⚠ ${esc(drawerError)}</div>` : "";
+  // A required select with no options can never be satisfied — block submit.
+  const blocked = ent.fields.some((f) => f.type === "select" && f.required && !f.options(ov).length);
   return `<div class="drawer-scrim" data-drawer-close></div>
     <aside class="drawer" role="dialog" aria-modal="true" aria-label="New ${esc(ent.noun)}">
       <header class="drawer-head"><span class="drawer-ico">${ent.icon}</span>
@@ -248,7 +256,7 @@ function renderDrawer(ov) {
       <div class="drawer-body">${fields}${err}</div>
       <footer class="drawer-foot">
         <button class="act ghost" data-drawer-close>Cancel</button>
-        <button class="act primary" data-drawer-submit="${ent.key}">Create ${esc(ent.noun)}</button>
+        <button class="act primary" data-drawer-submit="${ent.key}"${blocked ? " disabled" : ""}>Create ${esc(ent.noun)}</button>
       </footer>
     </aside>`;
 }
@@ -695,9 +703,18 @@ function renderPublic(ov) {
 }
 
 /* ---------- actions ---------- */
+function captureDrawerValues(ent) {
+  // Snapshot the live inputs so an error re-render keeps the user's work.
+  ent.fields.forEach((f) => {
+    const el = document.getElementById(f.id);
+    if (el) drawerValues[f.id] = el.value;
+  });
+}
+
 async function submitSetup(kind) {
   const ent = SETUP_ENTITIES.find((e) => e.key === kind);
   toast = "";
+  captureDrawerValues(ent);
   // Validate required fields client-side; the backend stays authoritative.
   const missing = ent.fields.filter((f) => f.required && !val(f.id));
   if (missing.length) {
@@ -707,12 +724,12 @@ async function submitSetup(kind) {
   drawerError = "";
   const res = await SETUP_POST[kind]();
   if (res && res.error) {
-    // Keep the drawer open and surface the server's message inside it.
+    // Keep the drawer open, preserve input, surface the server's message.
     drawerError = res.error.message;
     toast = "";
     return render();
   }
-  drawer = null; drawerError = "";
+  drawer = null; drawerError = ""; drawerValues = {};
   toast = `${ent.noun[0].toUpperCase() + ent.noun.slice(1)} created.`;
   await render();
 }
@@ -777,10 +794,10 @@ async function render() {
   c.querySelectorAll("button[data-goto]").forEach((b) => b.onclick = () => switchTab(b.dataset.goto));
   // Setup drawers (#44): open, close, submit.
   c.querySelectorAll("[data-drawer]").forEach((b) => b.onclick = () => {
-    drawer = { kind: b.dataset.drawer }; drawerError = ""; toast = ""; render();
+    drawer = { kind: b.dataset.drawer }; drawerError = ""; drawerValues = {}; toast = ""; render();
   });
   c.querySelectorAll("[data-drawer-close]").forEach((b) => b.onclick = () => {
-    drawer = null; drawerError = ""; render();
+    drawer = null; drawerError = ""; drawerValues = {}; render();
   });
   c.querySelectorAll("[data-drawer-submit]").forEach((b) => b.onclick = () => submitSetup(b.dataset.drawerSubmit));
   if (drawer) {
@@ -860,16 +877,21 @@ async function render() {
 
 function switchTab(next) {
   view = next; toast = ""; if (next !== "calendar") { wizard = null; conflict = null; }
-  if (next !== "setup") { drawer = null; drawerError = ""; }
+  if (next !== "setup") { drawer = null; drawerError = ""; drawerValues = {}; }
   document.querySelectorAll(".tab").forEach((x) => x.classList.toggle("active", x.dataset.tab === next));
   render();
 }
 document.querySelectorAll(".tab").forEach((b) => b.onclick = () => switchTab(b.dataset.tab));
 // Topbar command actions (web shell) — outside #content, wired once.
 document.querySelectorAll(".topbar [data-goto]").forEach((b) => b.onclick = () => switchTab(b.dataset.goto));
+// Topbar shortcut: jump to Setup and open a create drawer directly (#44).
+document.querySelectorAll(".topbar [data-open-drawer]").forEach((b) => b.onclick = () => {
+  drawer = { kind: b.dataset.openDrawer }; drawerError = ""; drawerValues = {};
+  switchTab("setup");
+});
 document.getElementById("reset-btn").onclick = async () => { await post("/api/reset", {}); toast = ""; currentGame = null; pickedPlayer = null; wizard = null; render(); };
 // Escape closes an open Setup drawer (#44).
 document.addEventListener("keydown", (e) => {
-  if (e.key === "Escape" && drawer) { drawer = null; drawerError = ""; render(); }
+  if (e.key === "Escape" && drawer) { drawer = null; drawerError = ""; drawerValues = {}; render(); }
 });
 render();
