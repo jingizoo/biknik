@@ -267,6 +267,8 @@ class Handler(BaseHTTPRequestHandler):
             elif prole == Role.PLAYER:
                 scope["team_id"] = STATE.ids.get("home_team_id")
                 scope["player_id"] = STATE.ids.get("selected_player_id")
+            elif prole == Role.OFFICIAL:
+                scope["official_id"] = STATE.ids.get("referee_id")
             token = SESSIONS.login(body.get("username", ""),
                                    body.get("password", ""), scope=scope)
             if token is None:

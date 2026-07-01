@@ -24,6 +24,7 @@ DEMO_USERS = {
     "arena": Role.ARENA_MANAGER,
     "coach": Role.COACH,
     "player": Role.PLAYER,
+    "official": Role.OFFICIAL,
     "viewer": Role.VIEWER,
 }
 
@@ -90,6 +91,10 @@ def user_view(session, store=None) -> dict:
         if pid:
             player = store.get_player(pid)
             scope["player_name"] = player.name if player else pid
+        oid = scope.get("official_id")
+        if oid:
+            official = store.get_official(oid)
+            scope["official_name"] = official.name if official else oid
     return {
         "username": session["username"],
         "role": role.value,

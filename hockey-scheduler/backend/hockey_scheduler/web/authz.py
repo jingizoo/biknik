@@ -35,7 +35,12 @@ def required_permission(path: str):
         return None
     if path == "/api/demo/add-ice-slot":
         return Permission.MANAGE_ARENA
-    # Officials: assignment + accept/decline is an operator/scheduling action (#30).
+    # Officials: an official accepts/declines their own assignment (#54);
+    # unassigning is an operator/scheduling action (#30).
+    m = re.match(r"^/api/officials/assignments/[^/]+/(accept|decline|unassign)$", path)
+    if m:
+        return (Permission.MANAGE_SCHEDULE if m.group(1) == "unassign"
+                else Permission.RESPOND_ASSIGNMENT)
     if path.startswith("/api/officials/assignments/"):
         return Permission.MANAGE_SCHEDULE
 
