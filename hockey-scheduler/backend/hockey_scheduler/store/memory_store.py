@@ -19,6 +19,8 @@ from ..domain import (
     IceSlot,
     League,
     NotificationEvent,
+    Official,
+    OfficialAssignment,
     Player,
     Rink,
     Season,
@@ -47,6 +49,8 @@ class InMemoryStore:
         self.venues: Dict[str, Venue] = {}
         self.rinks: Dict[str, Rink] = {}
         self.ice_slots: Dict[str, IceSlot] = {}
+        self.officials: Dict[str, Official] = {}
+        self.official_assignments: Dict[str, OfficialAssignment] = {}
         self.setup_audit: List[SetupAuditLog] = []
         self._counters: Dict[str, count] = {}
 
@@ -214,6 +218,38 @@ class InMemoryStore:
             if g.ice_slot_id == slot_id and not g.cancelled:
                 return g
         return None
+
+    # -- officials (#30) ---------------------------------------------------
+    def add_official(self, official: Official) -> Official:
+        self.officials[official.id] = official
+        return official
+
+    def get_official(self, official_id: str) -> Optional[Official]:
+        return self.officials.get(official_id)
+
+    def all_officials(self) -> List[Official]:
+        return list(self.officials.values())
+
+    def add_official_assignment(self, a: OfficialAssignment) -> OfficialAssignment:
+        self.official_assignments[a.id] = a
+        return a
+
+    def save_official_assignment(self, a: OfficialAssignment) -> OfficialAssignment:
+        self.official_assignments[a.id] = a
+        return a
+
+    def get_official_assignment(self, assignment_id: str) -> Optional[OfficialAssignment]:
+        return self.official_assignments.get(assignment_id)
+
+    def all_official_assignments(self) -> List[OfficialAssignment]:
+        return list(self.official_assignments.values())
+
+    def assignments_for_game(self, game_id: str) -> List[OfficialAssignment]:
+        return [a for a in self.official_assignments.values() if a.game_id == game_id]
+
+    def assignments_for_official(self, official_id: str) -> List[OfficialAssignment]:
+        return [a for a in self.official_assignments.values()
+                if a.official_id == official_id]
 
     def add_setup_audit(self, entry: SetupAuditLog) -> SetupAuditLog:
         self.setup_audit.append(entry)

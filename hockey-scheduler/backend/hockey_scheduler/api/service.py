@@ -14,6 +14,7 @@ from typing import Callable, List, Optional
 from ..domain import (
     AvailabilityStatus,
     IceSlotType,
+    OfficialRole,
     Position,
     RosterEntryStatus,
     SlotType,
@@ -349,7 +350,49 @@ class ApiService:
             "game": _serialize(game),
             "home": side(game.home_team_id),
             "away": side(game.away_team_id),
+            "officials": self._official_rows(game_id),
         }
+
+    def _official_rows(self, game_id: str) -> list:
+        """Assigned officials for a game, with names, for the game sheet (#30)."""
+        rows = []
+        for a in self.store.assignments_for_game(game_id):
+            off = self.store.get_official(a.official_id)
+            rows.append({
+                "assignment_id": a.id,
+                "official_id": a.official_id,
+                "official_name": off.name if off else a.official_id,
+                "role": a.role.value,
+                "status": a.status.value,
+            })
+        return rows
+
+    # -- officials (#30) ---------------------------------------------------
+    @catch
+    def create_official(self, name: str, home_club_id: Optional[str] = None,
+                        actor_id: Optional[str] = None) -> dict:
+        return _serialize(self.setup.create_official(name, home_club_id, actor_id))
+
+    @catch
+    def get_officials(self) -> List[dict]:
+        return [_serialize(o) for o in self.store.all_officials()]
+
+    @catch
+    def get_officials_for_game(self, game_id: str) -> List[dict]:
+        self.roster._require_game(game_id)
+        return self._official_rows(game_id)
+
+    @catch
+    def assign_official(self, game_id: str, official_id: str, role: str,
+                        actor_id: Optional[str] = None) -> dict:
+        a = self.setup.assign_official(
+            game_id, official_id, _parse_enum(OfficialRole, role, "role"), actor_id)
+        return _serialize(a)
+
+    @catch
+    def respond_assignment(self, assignment_id: str, accept: bool,
+                           actor_id: Optional[str] = None) -> dict:
+        return _serialize(self.setup.respond_assignment(assignment_id, accept, actor_id))
 
     # -- coach controls ----------------------------------------------------
     @catch
@@ -478,6 +521,12 @@ class ApiService:
             "venues": [_serialize(v) for v in venues.values()],
             "rinks": rink_rows,
             "ice_slots": slot_rows,
+            "officials": [
+                {"id": o.id, "name": o.name,
+                 "home_club_name": (clubs[o.home_club_id].name
+                                    if o.home_club_id in clubs else None)}
+                for o in self.store.all_officials()
+            ],
             "schedule": schedule,
             "public_fixtures": public_fixtures,
             "setup_audit": setup_audit,

@@ -27,6 +27,10 @@ from ..domain import (
     IceSlotType,
     League,
     NotificationEvent,
+    Official,
+    OfficialAssignment,
+    OfficialAssignmentStatus,
+    OfficialRole,
     Player,
     Position,
     Rink,
@@ -134,6 +138,11 @@ SPECS = {
                             {"type": _enum(NotificationType), "at": _dt()}),
     SetupAuditLog: Spec(SetupAuditLog, "setup_audit_logs",
                         {"at": _dt(), "detail": _jsonc()}),
+    Official: Spec(Official, "officials", {"is_active": _bool()}),
+    OfficialAssignment: Spec(OfficialAssignment, "official_assignments",
+                             {"role": _enum(OfficialRole),
+                              "status": _enum(OfficialAssignmentStatus),
+                              "assigned_at": _dt(), "responded_at": _dt()}),
 }
 
 # Column type for DDL: INTEGER for int/bool fields, else TEXT.
@@ -161,6 +170,8 @@ _INDEXES = [
     "CREATE INDEX IF NOT EXISTS ix_roster_game ON game_roster_entries(game_id, player_id)",
     "CREATE INDEX IF NOT EXISTS ix_subs_game ON substitute_enrollments(game_id, player_id)",
     "CREATE INDEX IF NOT EXISTS ix_avail_game ON game_availability(game_id, player_id)",
+    "CREATE INDEX IF NOT EXISTS ix_off_assign_game ON official_assignments(game_id)",
+    "CREATE INDEX IF NOT EXISTS ix_off_assign_official ON official_assignments(official_id)",
 ]
 
 
@@ -385,3 +396,20 @@ class SqlStore:
 
     def add_setup_audit(self, entry): return self._insert(entry)
     def all_setup_audit(self): return self._query(SetupAuditLog, order="id")
+
+    # -- officials (#30) ---------------------------------------------------
+    def add_official(self, official): return self._insert(official)
+    def get_official(self, official_id): return self._get(Official, official_id)
+    def all_officials(self): return self._query(Official, order="id")
+
+    def add_official_assignment(self, a): return self._insert(a)
+    def save_official_assignment(self, a): return self._update(a)
+    def get_official_assignment(self, assignment_id):
+        return self._get(OfficialAssignment, assignment_id)
+    def all_official_assignments(self):
+        return self._query(OfficialAssignment, order="id")
+    def assignments_for_game(self, game_id):
+        return self._query(OfficialAssignment, "game_id = ?", (game_id,), order="id")
+    def assignments_for_official(self, official_id):
+        return self._query(OfficialAssignment, "official_id = ?", (official_id,),
+                           order="id")

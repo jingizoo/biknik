@@ -291,10 +291,19 @@ select.player-picker {
 .gs-row:last-child { border-bottom: none; }
 .gs-num { width: 22px; text-align: center; font-weight: 800; font-size: 13px; color: var(--muted); }
 .gs-name { flex: 1; font-size: 14px; font-weight: 500; }
-.gs-officials { border: 1px dashed var(--sep); border-radius: 12px; background: #fafbfc; padding: 14px; }
-.gs-off-title { font-weight: 700; font-size: 14px; margin-bottom: 8px; }
-.gs-off-slots { display: flex; align-items: center; gap: 10px; }
+.gs-officials { border: 1px solid var(--sep); border-radius: 12px; background: var(--card);
+  padding: 14px; margin-bottom: 12px; }
+.gs-off-head { font-weight: 800; font-size: 15px; margin-bottom: 10px; display: flex;
+  align-items: center; gap: 8px; }
+.gs-off-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+.gs-off-role { border: 1px solid var(--sep); border-radius: 10px; padding: 10px; background: #fafbfc; }
+.gs-off-title { font-weight: 700; font-size: 13px; margin-bottom: 8px; }
+.gs-off-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 6px; }
+.gs-off-name { font-size: 13px; font-weight: 600; flex: 1; }
 .gs-off-slot { font-size: 13px; color: var(--muted); font-style: italic; }
+.gs-assign { display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap; }
+.gs-assign select { padding: 8px 10px; border: 1px solid var(--sep); border-radius: 8px; font-size: 13px; background: #fff; }
+@media (max-width: 680px) { .gs-off-grid { grid-template-columns: 1fr; } }
 @media (max-width: 680px) { .gs-grid { grid-template-columns: 1fr; } }
 @media print {
   body { background: #fff !important; }

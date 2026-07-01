@@ -17,6 +17,7 @@ let currentUser = null;            // {username, role, label} or null when signe
 let roleCatalog = [];              // [{id,label,permissions}] from /api/auth/roles
 let accounts = [];                 // [{username,role,label}] demo sign-in options (#50)
 let rolePerms = new Set();         // permissions of the current role
+let officialsPool = [];            // [{id,name}] officials for the assign UI (#30)
 let movingGameId = null;    // click-to-move fallback: game awaiting a destination slot
 let conflict = null;        // {ok, title, lines[], game, slot} — calendar side panel (#43)
 let drawer = null;          // {kind} when a Setup create drawer is open (#44)
@@ -183,6 +184,12 @@ const SETUP_ENTITIES = [
       { id: "f-slot-type", label: "Type", type: "select", required: true,
         options: () => [["game", "Game"], ["practice", "Practice"], ["public_skate", "Public skate"],
                         ["maintenance", "Maintenance"], ["tournament", "Tournament"]] }] },
+  { key: "official", title: "Officials", icon: "🧑‍⚖️", noun: "official", perm: "manage_schedule",
+    list: (ov) => (ov.officials || []).map((o) => ({ title: o.name, sub: o.home_club_name || "" })),
+    fields: [
+      { id: "f-official", label: "Official name", required: true, placeholder: "e.g. Riley Whistle" },
+      { id: "f-official-club", label: "Home club (optional — for conflict checks)", type: "select",
+        options: (ov) => [["", "— none —"]].concat(ov.clubs.map((c) => [c.id, c.name])) }] },
 ];
 
 // Each entity's POST body, built from the drawer inputs (ids match the fields).
@@ -199,6 +206,9 @@ const SETUP_POST = {
     start_time: `${val("f-slot-date")}T${val("f-slot-start")}:00+00:00`,
     end_time: `${val("f-slot-date")}T${val("f-slot-end")}:00+00:00`,
     slot_type: val("f-slot-type"),
+  }),
+  official: () => post("/api/setup/official", {
+    name: val("f-official"), home_club_id: val("f-official-club") || null,
   }),
 };
 
@@ -656,10 +666,6 @@ function renderGameSheet(lineups) {
     ? `<span class="badge orange">🔒 Locked</span>`
     : `<span class="badge blue">🔓 Open</span>`;
   const cancelled = g.cancelled ? `<span class="badge red">Cancelled</span>` : "";
-  const placeholder = (icon, title, issue) => `<div class="gs-officials">
-    <div class="gs-off-title">${icon} ${title}</div>
-    <div class="gs-off-slots"><span class="gs-off-slot">To be assigned</span>
-      <a class="badge" href="${REPO}/${issue}" target="_blank">#${issue}</a></div></div>`;
   return `<div class="game-sheet">
     <div class="gs-toolbar no-print">
       <span class="gs-hint">Read-only official game sheet — combines both lineups.</span>
@@ -673,13 +679,36 @@ function renderGameSheet(lineups) {
       ${sheetSide(lineups.home, "Home")}
       ${sheetSide(lineups.away, "Away")}
     </div>
-    <div class="gs-grid">
-      ${placeholder("👨‍⚖️", "Officials", 30)}
-      ${placeholder("📝", "Scorekeeper / Results", 31)}
-    </div>
+    ${officialsPanel(lineups)}
     <div class="privacy-note">📋 Roster names are visible to authorized operators only. Score,
-      penalties, official assignment, and signatures are follow-ups (auth in #24).</div>
+      penalties, and signatures are follow-ups (results/standings in <a href="${REPO}/31" target="_blank">#31</a>).</div>
   </div>`;
+}
+function officialsPanel(lineups) {
+  const canAssign = hasPerm("manage_schedule");   // arena manager / league admin
+  const assigned = lineups.officials || [];
+  const ROLES = [["referee", "👨‍⚖️ Referee"], ["linesperson", "🚩 Linesperson"],
+                 ["scorekeeper", "📝 Scorekeeper"]];
+  const badge = (st) => st === "accepted" ? `<span class="badge green">Accepted</span>`
+    : st === "declined" ? `<span class="badge red">Declined</span>`
+    : `<span class="badge orange">Proposed</span>`;
+  const roleBlocks = ROLES.map(([role, label]) => {
+    const list = assigned.filter((a) => a.role === role);
+    const body = list.length
+      ? list.map((a) => `<div class="gs-off-row"><span class="gs-off-name">${esc(a.official_name)}</span>${badge(a.status)}
+          ${canAssign && a.status === "proposed"
+            ? `<button class="act success" data-accept="${a.assignment_id}">Accept</button>
+               <button class="act danger" data-decline="${a.assignment_id}">Decline</button>` : ""}</div>`).join("")
+      : `<div class="gs-off-slot">Unassigned</div>`;
+    return `<div class="gs-off-role"><div class="gs-off-title">${label}</div>${body}</div>`;
+  }).join("");
+  const assignForm = (canAssign && officialsPool.length) ? `<div class="gs-assign no-print">
+      <select id="off-pick">${officialsPool.map((o) => `<option value="${esc(o.id)}">${esc(o.name)}</option>`).join("")}</select>
+      <select id="off-role"><option value="referee">Referee</option><option value="linesperson">Linesperson</option><option value="scorekeeper">Scorekeeper</option></select>
+      <button class="act primary" data-assign-official>Assign</button></div>` : "";
+  return `<section class="gs-officials">
+    <div class="gs-off-head">👥 Officials <a class="badge" href="${REPO}/30" target="_blank">#30</a></div>
+    <div class="gs-off-grid">${roleBlocks}</div>${assignForm}</section>`;
 }
 
 // Small building blocks shared by the roster-selection surface (#46).
@@ -990,6 +1019,11 @@ async function render() {
     // The roster tab and the game sheet both use both sides' lineups (#25/#48).
     lineups = (["roster", "sheet"].includes(view) && currentGame)
       ? await getJSON(`/api/games/${currentGame}/lineups`) : null;
+    // The game sheet also needs the officials pool for its assign control (#30).
+    if (view === "sheet") {
+      const op = await getJSON("/api/officials");
+      officialsPool = (op && op.officials) || [];
+    }
   } catch (e) {
     setChrome(ov);
     c.innerHTML = `<div class="banner alert"><h2>Could not load data</h2>
@@ -1027,6 +1061,22 @@ async function render() {
   c.querySelectorAll("[data-side]").forEach((b) => b.onclick = () => { rosterSide = b.dataset.side; toast = ""; render(); });
   const printBtn = c.querySelector("[data-print]");
   if (printBtn) printBtn.onclick = () => window.print();
+  // Officials assignment (#30): assign from the pool, official accepts/declines.
+  const assignBtn = c.querySelector("[data-assign-official]");
+  if (assignBtn) assignBtn.onclick = async () => {
+    const official_id = val("off-pick");
+    const role = val("off-role");
+    if (!official_id) return;
+    const r = await post(`/api/games/${currentGame}/officials/assign`, { official_id, role });
+    if (r && !r.error) toast = "Official assigned.";
+    await render();
+  };
+  c.querySelectorAll("[data-accept]").forEach((b) => b.onclick = async () => {
+    await post(`/api/officials/assignments/${b.dataset.accept}/accept`, {}); await render();
+  });
+  c.querySelectorAll("[data-decline]").forEach((b) => b.onclick = async () => {
+    await post(`/api/officials/assignments/${b.dataset.decline}/decline`, {}); await render();
+  });
   // Shared move: used by both drag/drop and the click-based Move fallback.
   const applyMove = async (gid, slotId) => {
     toast = "";
