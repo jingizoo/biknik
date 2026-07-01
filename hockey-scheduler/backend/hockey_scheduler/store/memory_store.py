@@ -18,8 +18,10 @@ from ..domain import (
     GameRosterEntry,
     IceSlot,
     GameResult,
+    DeliveryStatus,
     League,
     Notification,
+    NotificationDelivery,
     NotificationEvent,
     NotificationRecipient,
     Official,
@@ -57,6 +59,7 @@ class InMemoryStore:
         self.game_results: Dict[str, GameResult] = {}
         self.feed_notifications: Dict[str, Notification] = {}
         self.notif_recipients: Dict[str, NotificationRecipient] = {}
+        self.notif_deliveries: Dict[str, NotificationDelivery] = {}
         self.setup_audit: List[SetupAuditLog] = []
         self._counters: Dict[str, count] = {}
 
@@ -307,6 +310,37 @@ class InMemoryStore:
             self, actor_key: str) -> List[NotificationRecipient]:
         return [r for r in self.notif_recipients.values()
                 if r.actor_key == actor_key]
+
+    # -- notification delivery queue (#58) ---------------------------------
+    def add_notification_delivery(
+            self, d: NotificationDelivery) -> NotificationDelivery:
+        self.notif_deliveries[d.id] = d
+        return d
+
+    def save_notification_delivery(
+            self, d: NotificationDelivery) -> NotificationDelivery:
+        self.notif_deliveries[d.id] = d
+        return d
+
+    def get_notification_delivery(
+            self, delivery_id: str) -> Optional[NotificationDelivery]:
+        return self.notif_deliveries.get(delivery_id)
+
+    def deliveries_for_notification(
+            self, notification_id: str) -> List[NotificationDelivery]:
+        return [d for d in self.notif_deliveries.values()
+                if d.notification_id == notification_id]
+
+    def all_notification_deliveries(self) -> List[NotificationDelivery]:
+        return list(self.notif_deliveries.values())
+
+    def pending_deliveries(
+            self, max_attempts: int) -> List[NotificationDelivery]:
+        """Deliverable rows: still pending, or failed with attempts to spare."""
+        return [d for d in self.notif_deliveries.values()
+                if d.status == DeliveryStatus.PENDING
+                or (d.status == DeliveryStatus.FAILED
+                    and d.attempts < max_attempts)]
 
     def add_setup_audit(self, entry: SetupAuditLog) -> SetupAuditLog:
         self.setup_audit.append(entry)

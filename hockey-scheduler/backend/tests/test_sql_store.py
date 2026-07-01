@@ -81,6 +81,18 @@ class SqlStoreParityTest(unittest.TestCase):
         self.assertFalse(next(n for n in viewer["notifications"]
                               if n["id"] == public["id"])["read"])
 
+    def test_delivery_queue_roundtrips_on_sql(self):
+        # Emission fans out to notification_deliveries; the worker drains them
+        # and the sent state persists through the SQL store (#58).
+        ov = self.api.get_delivery_overview()
+        self.assertGreater(ov["total"], 0)
+        self.assertEqual(ov["by_status"].get("pending"), ov["total"])
+        res = self.api.process_notification_deliveries()
+        self.assertEqual(res["sent"], ov["total"])
+        ov2 = self.api.get_delivery_overview()
+        self.assertEqual(ov2["by_status"].get("sent"), ov2["total"])
+        self.assertTrue(all(d["sent_at"] for d in ov2["deliveries"]))
+
 
 class SqlStoreTransactionTest(unittest.TestCase):
     """A failure mid multi-write operation must roll the whole thing back."""
