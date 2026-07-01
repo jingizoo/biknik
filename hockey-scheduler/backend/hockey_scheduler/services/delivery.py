@@ -55,6 +55,19 @@ def destination_for(recipient: str, channel) -> str:
     return "push-token:" + slug
 
 
+def resolve_destination(store, recipient: str, channel) -> str:
+    """The real stored contact for (recipient, channel), else a placeholder (#60).
+
+    Operators can register a real destination via the contact registry; when
+    none exists we fall back to the synthesized ``.invalid`` placeholder so a
+    delivery always has somewhere (fictional) to go.
+    """
+    stored = store.get_contact_destination(recipient, channel)
+    if stored is not None and stored.destination:
+        return stored.destination
+    return destination_for(recipient, channel)
+
+
 def enqueue(store, notification, channels=DEFAULT_CHANNELS):
     """Create the pending delivery rows for a freshly emitted notification."""
     recipient = recipient_ref(notification)
@@ -65,7 +78,7 @@ def enqueue(store, notification, channels=DEFAULT_CHANNELS):
             notification_id=notification.id,
             channel=channel,
             recipient_ref=recipient,
-            destination=destination_for(recipient, channel),
+            destination=resolve_destination(store, recipient, channel),
         )
         created.append(store.add_notification_delivery(d))
     return created

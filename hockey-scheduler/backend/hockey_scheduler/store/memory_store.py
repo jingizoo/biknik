@@ -18,6 +18,7 @@ from ..domain import (
     GameRosterEntry,
     IceSlot,
     GameResult,
+    ContactDestination,
     DeliveryStatus,
     League,
     Notification,
@@ -60,6 +61,7 @@ class InMemoryStore:
         self.feed_notifications: Dict[str, Notification] = {}
         self.notif_recipients: Dict[str, NotificationRecipient] = {}
         self.notif_deliveries: Dict[str, NotificationDelivery] = {}
+        self.contact_destinations: Dict[str, ContactDestination] = {}
         self.setup_audit: List[SetupAuditLog] = []
         self._counters: Dict[str, count] = {}
 
@@ -341,6 +343,27 @@ class InMemoryStore:
                 if d.status == DeliveryStatus.PENDING
                 or (d.status == DeliveryStatus.FAILED
                     and d.attempts < max_attempts)]
+
+    # -- contact registry (#60) --------------------------------------------
+    def add_contact_destination(
+            self, c: ContactDestination) -> ContactDestination:
+        self.contact_destinations[c.id] = c
+        return c
+
+    def save_contact_destination(
+            self, c: ContactDestination) -> ContactDestination:
+        self.contact_destinations[c.id] = c
+        return c
+
+    def get_contact_destination(
+            self, recipient_ref: str, channel) -> Optional[ContactDestination]:
+        for c in self.contact_destinations.values():
+            if c.recipient_ref == recipient_ref and c.channel == channel:
+                return c
+        return None
+
+    def all_contact_destinations(self) -> List[ContactDestination]:
+        return list(self.contact_destinations.values())
 
     def add_setup_audit(self, entry: SetupAuditLog) -> SetupAuditLog:
         self.setup_audit.append(entry)

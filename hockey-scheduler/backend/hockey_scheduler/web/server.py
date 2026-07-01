@@ -153,6 +153,29 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_json(payload, ERROR_HTTP_STATUS.get(code, 400))
         return self._send_json(payload)
 
+    def _operator_only(self, guard: str) -> bool:
+        """For read-only operator routes: send 401/403 and return True if the
+        caller may not operate, else False. Same resolution as the feed —
+        invalid cookie → 401, and the ``guard`` path's permission → 403 for
+        non-operators.
+        """
+        role, scope, err = self._resolve_role()
+        if err is not None:
+            code, payload = err
+            self._send_json(payload, code)
+            return True
+        if not authorize(role, guard):
+            perm = required_permission(guard)
+            self._send_json({"error": {
+                "code": "forbidden",
+                "message": (f"Your role ({ROLE_LABELS[role]}) can't do this "
+                            f"(requires {perm.value})."),
+                "details": {"role": role.value,
+                            "required": perm.value if perm else None},
+            }}, 403)
+            return True
+        return False
+
     def _read_body(self) -> dict:
         length = int(self.headers.get("Content-Length", 0) or 0)
         if not length:
@@ -218,24 +241,16 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_api(api.get_notifications(role.value, scope))
         if path == "/api/notifications/deliveries":
             # Delivery-queue overview for operators (#58). Exposes internal
-            # queue state, so it is operator-only: same resolution as the feed
-            # (invalid cookie → 401) plus the MANAGE_SCHEDULE check that guards
-            # the drain endpoint (non-operators → 403).
-            role, scope, err = self._resolve_role()
-            if err is not None:
-                code, payload = err
-                return self._send_json(payload, code)
-            guard = "/api/notifications/deliveries/process"
-            if not authorize(role, guard):
-                perm = required_permission(guard)
-                return self._send_json({"error": {
-                    "code": "forbidden",
-                    "message": (f"Your role ({ROLE_LABELS[role]}) can't do this "
-                                f"(requires {perm.value})."),
-                    "details": {"role": role.value,
-                                "required": perm.value if perm else None},
-                }}, 403)
+            # queue state, so it is operator-only (invalid cookie → 401,
+            # non-operator → 403 via the drain endpoint's permission).
+            if self._operator_only("/api/notifications/deliveries/process"):
+                return
             return self._send_api(api.get_delivery_overview())
+        if path == "/api/notifications/contacts":
+            # Contact registry listing for operators (#60); same guard.
+            if self._operator_only("/api/notifications/contacts"):
+                return
+            return self._send_api(api.list_contact_destinations())
         if path == "/api/me/assignments":
             # The signed-in official's own inbox (#55). Identity comes from the
             # session cookie, with the same rules as /api/auth/me: no cookie →
@@ -385,6 +400,12 @@ class Handler(BaseHTTPRequestHandler):
         # Notification delivery worker: drain the pending queue (#58).
         if path == "/api/notifications/deliveries/process":
             return self._send_api(api.process_notification_deliveries())
+
+        # Contact registry: register/update a real destination (#60).
+        if path == "/api/notifications/contacts":
+            return self._send_api(api.set_contact_destination(
+                body.get("recipient_ref"), body.get("channel"),
+                body.get("destination"), body.get("label")))
 
         # Notifications feed: mark read / read-all (#32).
         if path == "/api/notifications/read-all":

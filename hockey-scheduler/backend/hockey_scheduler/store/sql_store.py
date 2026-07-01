@@ -27,6 +27,7 @@ from ..domain import (
     IceSlotType,
     GameResult,
     League,
+    ContactDestination,
     DeliveryStatus,
     Notification,
     NotificationAudience,
@@ -165,6 +166,8 @@ SPECS = {
                                {"channel": _enum(NotificationChannel),
                                 "status": _enum(DeliveryStatus),
                                 "sent_at": _dt()}),
+    ContactDestination: Spec(ContactDestination, "contact_destinations",
+                             {"channel": _enum(NotificationChannel)}),
 }
 
 # Column type for DDL: INTEGER for int/bool fields, else TEXT.
@@ -200,6 +203,7 @@ _INDEXES = [
     "CREATE INDEX IF NOT EXISTS ix_notif_recips_actor ON notification_recipients(actor_key)",
     "CREATE INDEX IF NOT EXISTS ix_notif_deliv_status ON notification_deliveries(status)",
     "CREATE INDEX IF NOT EXISTS ix_notif_deliv_notif ON notification_deliveries(notification_id)",
+    "CREATE INDEX IF NOT EXISTS ix_contacts_ref ON contact_destinations(recipient_ref, channel)",
 ]
 
 
@@ -486,3 +490,14 @@ class SqlStore:
             (DeliveryStatus.PENDING.value, DeliveryStatus.FAILED.value,
              max_attempts),
             order="id")
+
+    # -- contact registry (#60) --------------------------------------------
+    def add_contact_destination(self, c): return self._insert(c)
+    def save_contact_destination(self, c): return self._update(c)
+    def get_contact_destination(self, recipient_ref, channel):
+        rows = self._query(
+            ContactDestination, "recipient_ref = ? AND channel = ?",
+            (recipient_ref, channel.value), order="id")
+        return rows[0] if rows else None
+    def all_contact_destinations(self):
+        return self._query(ContactDestination, order="id")

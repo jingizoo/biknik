@@ -96,6 +96,20 @@ class SqlStoreParityTest(unittest.TestCase):
         self.assertTrue(all(d["recipient_ref"] and d["destination"]
                             for d in ov2["deliveries"]))
 
+    def test_contact_registry_roundtrips_on_sql(self):
+        # A stored contact (#60) persists and overrides the placeholder on the
+        # next emission, all through the SQL store.
+        self.api.set_contact_destination(
+            "scheduler", "email", "ops@contacts.invalid")
+        listed = self.api.list_contact_destinations()["contacts"]
+        self.assertEqual(listed[0]["destination"], "ops@contacts.invalid")
+        self.api.respond_assignment(self.ids["ref_assignment_id"], accept=True)
+        ov = self.api.get_delivery_overview()
+        accepted_email = next(
+            d for d in ov["deliveries"]
+            if d["recipient_ref"] == "scheduler" and d["channel"] == "email")
+        self.assertEqual(accepted_email["destination"], "ops@contacts.invalid")
+
 
 class SqlStoreTransactionTest(unittest.TestCase):
     """A failure mid multi-write operation must roll the whole thing back."""
