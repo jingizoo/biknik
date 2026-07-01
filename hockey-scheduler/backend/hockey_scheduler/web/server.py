@@ -217,7 +217,24 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_json(payload, code)
             return self._send_api(api.get_notifications(role.value, scope))
         if path == "/api/notifications/deliveries":
-            # Delivery-queue overview for operators (#58); read-only.
+            # Delivery-queue overview for operators (#58). Exposes internal
+            # queue state, so it is operator-only: same resolution as the feed
+            # (invalid cookie → 401) plus the MANAGE_SCHEDULE check that guards
+            # the drain endpoint (non-operators → 403).
+            role, scope, err = self._resolve_role()
+            if err is not None:
+                code, payload = err
+                return self._send_json(payload, code)
+            guard = "/api/notifications/deliveries/process"
+            if not authorize(role, guard):
+                perm = required_permission(guard)
+                return self._send_json({"error": {
+                    "code": "forbidden",
+                    "message": (f"Your role ({ROLE_LABELS[role]}) can't do this "
+                                f"(requires {perm.value})."),
+                    "details": {"role": role.value,
+                                "required": perm.value if perm else None},
+                }}, 403)
             return self._send_api(api.get_delivery_overview())
         if path == "/api/me/assignments":
             # The signed-in official's own inbox (#55). Identity comes from the

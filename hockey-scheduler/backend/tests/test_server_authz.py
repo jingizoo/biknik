@@ -44,6 +44,19 @@ class ServerAuthzTest(unittest.TestCase):
         with urllib.request.urlopen(f"http://127.0.0.1:{self.port}{path}") as r:
             return r.status, json.loads(r.read() or b"{}")
 
+    def _get_h(self, path, role=None, cookie=None):
+        url = f"http://127.0.0.1:{self.port}{path}"
+        req = urllib.request.Request(url, method="GET")
+        if role is not None:
+            req.add_header("X-Demo-Role", role)
+        if cookie is not None:
+            req.add_header("Cookie", cookie)
+        try:
+            with urllib.request.urlopen(req) as r:
+                return r.status, json.loads(r.read() or b"{}")
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read() or b"{}")
+
     def test_roles_endpoint_lists_roles(self):
         status, body = self._get("/api/auth/roles")
         self.assertEqual(status, 200)
@@ -83,6 +96,24 @@ class ServerAuthzTest(unittest.TestCase):
         # And it must not have created the league.
         _, ov = self._get("/api/demo/overview")
         self.assertNotIn("Sneaky", [l["name"] for l in ov["leagues"]])
+
+    # -- delivery-queue overview is operator-only (#58) --------------------
+    def test_viewer_cannot_read_delivery_overview(self):
+        status, body = self._get_h("/api/notifications/deliveries", role="viewer")
+        self.assertEqual(status, 403)
+        self.assertEqual(body["error"]["code"], "forbidden")
+
+    def test_operator_can_read_delivery_overview(self):
+        for role in ("league_admin", "arena_manager"):
+            status, body = self._get_h("/api/notifications/deliveries", role=role)
+            self.assertEqual(status, 200, role)
+            self.assertIn("by_status", body)
+
+    def test_invalid_cookie_on_delivery_overview_is_401(self):
+        status, body = self._get_h("/api/notifications/deliveries",
+                                   cookie="hs_sid=bogus-session")
+        self.assertEqual(status, 401)
+        self.assertEqual(body["error"]["code"], "unauthorized")
 
 
 if __name__ == "__main__":
