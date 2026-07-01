@@ -10,6 +10,7 @@ let calendarDate = "2026-09-05";  // YYYY-MM-DD shown on the arena calendar
 let calendarMode = "day";   // day | week
 let calFilters = { venueId: "all", rinkId: "all", divisionId: "all", teamId: "all" };
 let toast = "";
+let movingGameId = null;    // click-to-move fallback: game awaiting a destination slot
 let conflict = null;        // {ok, title, lines[], game, slot} — calendar side panel (#43)
 let drawer = null;          // {kind} when a Setup create drawer is open (#44)
 let drawerError = "";       // validation/API error shown inside the open drawer
@@ -303,13 +304,22 @@ function slotPasses(s, ctx) {
 
 function slotCard(s, draggable, ctx) {
   const cls = s.status === "available" ? "available" : s.slot_type === "maintenance" ? "maintenance" : s.status;
+  const moving = movingGameId != null;
+  // While a move is in progress, available game slots become click targets and
+  // dragging is suspended so the two interaction modes don't fight.
+  const isTarget = moving && draggable && s.status === "available";
   const dropClick = (draggable && s.status === "available") ? `data-slot="${s.id}" data-drop="${s.id}"` : "";
-  const drag = (draggable && s.game_id) ? `draggable="true" data-game="${s.game_id}"` : "";
+  const drag = (draggable && s.game_id && !moving) ? `draggable="true" data-game="${s.game_id}"` : "";
   // Draft/Published state comes from the schedule game, not the slot row.
   const g = (s.game_id && ctx) ? ctx.gameById[s.game_id] : null;
   const state = g ? (g.published ? " · Published" : " · Draft") : "";
-  const cta = (draggable && s.game_id) ? " · drag to move" : "";
-  return `<div class="slot-card ${cls}" ${dropClick} ${drag}><div class="t">${fmt(s.start_time)}–${fmt(s.end_time)}</div><div class="s">${slotLabel(s)}${state}${cta}</div></div>`;
+  const isMovingThis = s.game_id && s.game_id === movingGameId;
+  // A Move button gives touch/mobile/keyboard users a drag-free path (#move-mode).
+  const moveBtn = (draggable && s.game_id && !moving)
+    ? `<button class="slot-move" data-move-game="${s.game_id}">Move</button>` : "";
+  const extra = `${isTarget ? " move-target" : ""}${isMovingThis ? " moving" : ""}`;
+  const cta = isTarget ? " · tap to move here" : (draggable && s.game_id && !moving ? " · drag or Move" : "");
+  return `<div class="slot-card ${cls}${extra}" ${dropClick} ${drag}><div class="t">${fmt(s.start_time)}–${fmt(s.end_time)}</div><div class="s">${slotLabel(s)}${state}${cta}</div>${moveBtn}</div>`;
 }
 
 function calToolbar(ov) {
@@ -422,7 +432,17 @@ function renderCalendar(ov) {
     toastHtml();
 }
 
+function moveBanner(ov) {
+  if (movingGameId == null) return "";
+  const g = ov.schedule.find((x) => x.game_id === movingGameId);
+  const name = g ? `${g.home_team_name} vs ${g.away_team_name}` : "this game";
+  return `<div class="move-banner"><span>🔀 Select an <strong>Available</strong> slot to move
+    <strong>${esc(name)}</strong>.</span>
+    <button class="act ghost" data-move-cancel>Cancel</button></div>`;
+}
+
 function renderDay(ov, ctx, rinks) {
+  const moving = movingGameId != null;
   const onDay = (s) => (s.start_time || "").startsWith(calendarDate) && slotPasses(s, ctx);
   const rows = rinks.map((r) => {
     const slots = ov.ice_slots.filter((s) => s.rink_id === r.id && onDay(s));
@@ -442,14 +462,14 @@ function renderDay(ov, ctx, rinks) {
     return slot ? slotPasses(slot, ctx) : true;
   });
   const tray = drafts.length ? `<div class="tray"><span class="tray-label">Draft games</span>
-    ${drafts.map((g) => `<span class="chip-drag" draggable="true" data-game="${g.game_id}">⠿ ${esc(g.home_team_name)} vs ${esc(g.away_team_name)} · ${fmt(g.start_time)}</span>`).join("")}</div>` : "";
+    ${drafts.map((g) => `<span class="chip-drag${g.game_id === movingGameId ? " moving" : ""}" ${moving ? "" : `draggable="true" data-game="${g.game_id}"`}>⠿ ${esc(g.home_team_name)} vs ${esc(g.away_team_name)} · ${fmt(g.start_time)}${moving ? "" : ` <button class="chip-move" data-move-game="${g.game_id}">Move</button>`}</span>`).join("")}</div>` : "";
   const body = rinks.length
-    ? tray + rows
+    ? moveBanner(ov) + tray + rows
     : `<div class="empty">No rinks match the selected filters.</div>`;
-  return body + `<div class="privacy-note">📅 Tap an <strong>Available</strong> slot to schedule, or
-    <strong>drag</strong> a game onto available ice to move it (validated server-side).
-    Moving changes the time/rink, so a published fixture is unpublished and a locked roster
-    is unlocked. This board is the source of truth (#33).</div>`;
+  return body + `<div class="privacy-note">📅 Tap an <strong>Available</strong> slot to schedule, or move a
+    game onto available ice — <strong>drag</strong> it, or tap <strong>Move</strong> then tap a slot
+    (works on touch). Moving changes the time/rink, so a published fixture is unpublished and a locked
+    roster is unlocked. Validated server-side; this board is the source of truth (#33).</div>`;
 }
 
 function renderWeek(ov, ctx, rinks) {
@@ -468,7 +488,7 @@ function renderWeek(ov, ctx, rinks) {
     return `<div class="wk-row"><div class="cal-rink">${esc(r.name)}</div><div class="wk-days">${cells}</div></div>`;
   }).join("");
   return grid + `<div class="privacy-note">📅 Week view is read-only.
-    <strong>Drag/drop to move games is available in Day view</strong> — switch to Day.</div>`;
+    <strong>Switch to Day view to move games</strong> (drag, or tap Move then a slot).</div>`;
 }
 
 function renderWizard(ov) {
@@ -806,20 +826,39 @@ async function render() {
   }
   c.querySelectorAll("button[data-act]").forEach((b) => b.onclick = () => rosterAction(b.dataset.act, b.dataset.id));
   c.querySelectorAll(".seg").forEach((b) => b.onclick = () => { gameView = b.dataset.view; toast = ""; render(); });
-  c.querySelectorAll("[data-slot]").forEach((b) => b.onclick = () => { wizard = { slot_id: b.dataset.slot }; toast = ""; render(); });
+  // Shared move: used by both drag/drop and the click-based Move fallback.
+  const applyMove = async (gid, slotId) => {
+    toast = "";
+    const res = await post(`/api/games/${gid}/move`, { ice_slot_id: slotId, reason: "Moved on arena calendar" });
+    conflict = buildConflict(res, ov, gid, slotId);   // #43 side panel explains outcome
+    if (res && res.error) toast = "";
+    movingGameId = null;
+    await render();
+  };
+  // Tapping an Available slot: complete a pending move, else open the wizard.
+  c.querySelectorAll("[data-slot]").forEach((b) => b.onclick = () => {
+    if (movingGameId != null) return applyMove(movingGameId, b.dataset.slot);
+    wizard = { slot_id: b.dataset.slot }; toast = ""; render();
+  });
+  // Enter move mode (drag-free path for touch/mobile/keyboard).
+  c.querySelectorAll("[data-move-game]").forEach((b) => b.onclick = (e) => {
+    e.stopPropagation();
+    movingGameId = b.dataset.moveGame; conflict = null; toast = ""; render();
+  });
+  c.querySelectorAll("[data-move-cancel]").forEach((b) => b.onclick = () => { movingGameId = null; render(); });
   c.querySelectorAll("[data-addslot]").forEach((b) => b.onclick = async () => { await post("/api/demo/add-ice-slot", { rink_id: b.dataset.addslot, date: calendarDate }); await render(); });
   c.querySelectorAll("[data-cal]").forEach((b) => b.onclick = () => {
     const v = +b.dataset.cal;
     if (v === 0) calendarDate = "2026-09-05";
     else shiftDate(v * (calendarMode === "week" ? 7 : 1));
-    toast = ""; conflict = null; render();
+    toast = ""; conflict = null; movingGameId = null; render();
   });
-  c.querySelectorAll("[data-mode]").forEach((b) => b.onclick = () => { calendarMode = b.dataset.mode; toast = ""; conflict = null; render(); });
+  c.querySelectorAll("[data-mode]").forEach((b) => b.onclick = () => { calendarMode = b.dataset.mode; toast = ""; conflict = null; movingGameId = null; render(); });
   c.querySelectorAll("[data-filter]").forEach((sel) => sel.onchange = (e) => {
     const key = sel.dataset.filter;
     calFilters[key] = e.target.value;
     if (key === "venueId") calFilters.rinkId = "all";  // rink list depends on venue
-    toast = ""; conflict = null; render();
+    toast = ""; conflict = null; movingGameId = null; render();
   });
   // Drag a game (allocated card or draft chip) onto an available slot to move it.
   c.querySelectorAll("[data-game]").forEach((el) => {
@@ -838,13 +877,8 @@ async function render() {
       el.classList.remove("drop-hover");
       const gid = e.dataTransfer.getData("text/plain");
       if (!gid) return;
-      toast = "";
-      const res = await post(`/api/games/${gid}/move`, { ice_slot_id: el.dataset.drop, reason: "Moved on arena calendar" });
-      // Explain the outcome in the side panel instead of a terse toast (#43):
-      // why a drop was rejected, or what a successful move changed.
-      conflict = buildConflict(res, ov, gid, el.dataset.drop);
-      if (res && res.error) toast = "";   // panel carries the message now
-      await render();
+      // Same server-validated move + #43 conflict panel as the click fallback.
+      await applyMove(gid, el.dataset.drop);
     });
   });
   const dismiss = c.querySelector("[data-conflict-dismiss]");
@@ -876,7 +910,7 @@ async function render() {
 }
 
 function switchTab(next) {
-  view = next; toast = ""; if (next !== "calendar") { wizard = null; conflict = null; }
+  view = next; toast = ""; if (next !== "calendar") { wizard = null; conflict = null; movingGameId = null; }
   if (next !== "setup") { drawer = null; drawerError = ""; drawerValues = {}; }
   document.querySelectorAll(".tab").forEach((x) => x.classList.toggle("active", x.dataset.tab === next));
   render();
@@ -892,6 +926,8 @@ document.querySelectorAll(".topbar [data-open-drawer]").forEach((b) => b.onclick
 document.getElementById("reset-btn").onclick = async () => { await post("/api/reset", {}); toast = ""; currentGame = null; pickedPlayer = null; wizard = null; render(); };
 // Escape closes an open Setup drawer (#44).
 document.addEventListener("keydown", (e) => {
-  if (e.key === "Escape" && drawer) { drawer = null; drawerError = ""; drawerValues = {}; render(); }
+  if (e.key !== "Escape") return;
+  if (drawer) { drawer = null; drawerError = ""; drawerValues = {}; render(); }
+  else if (movingGameId != null) { movingGameId = null; render(); }
 });
 render();
