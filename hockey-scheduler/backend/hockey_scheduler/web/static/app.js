@@ -638,7 +638,7 @@ function coachBody(board) {
 
   const toolbar = locked ? "" : `<div class="ros-toolbar">
     <button class="act ghost" data-act="copy">⧉ Copy previous roster</button>
-    <button class="act ghost" data-act="build">Auto-fill</button></div>`;
+    <button class="act ghost" data-act="build">Auto-fill remaining</button></div>`;
 
   // Roster section: occupying players first, then anyone backed out / removed.
   const rosterRows = [...onRoster, ...backedOut].map((p) => {

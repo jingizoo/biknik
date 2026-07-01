@@ -68,6 +68,30 @@ class RosterSelectionTest(unittest.TestCase):
         res = self.api.select_roster(self.next_id, [avail[0]["id"]], actor_id="coach")
         self.assertEqual(res["error"]["code"], "roster_locked")
 
+    def test_add_back_removed_player_reuses_existing_entry(self):
+        # Remove → Add back must revive the row, not create a duplicate.
+        pick = self._available(self.next_id)[0]["id"]
+        self.api.select_roster(self.next_id, [pick], actor_id="coach")
+        before = self.store.roster_for_game(self.next_id)
+        self.api.remove_player(self.next_id, pick, actor_id="coach")
+        self.api.select_roster(self.next_id, [pick], actor_id="coach")
+        after = self.store.roster_for_game(self.next_id)
+        player_entries = [e for e in after if e.player_id == pick]
+        self.assertEqual(len(player_entries), 1)
+        self.assertTrue(player_entries[0].status.occupies_slot)
+        self.assertEqual(len(after), len(before))
+
+    def test_reselect_unavailable_player_reuses_entry(self):
+        # A backed-out (unavailable) player re-selected does not duplicate rows.
+        pick = self._available(self.next_id)[0]["id"]
+        self.api.select_roster(self.next_id, [pick], actor_id="coach")
+        self.api.set_availability(self.next_id, pick, "unavailable")
+        self.api.select_roster(self.next_id, [pick], actor_id="coach")
+        entries = [e for e in self.store.roster_for_game(self.next_id)
+                   if e.player_id == pick]
+        self.assertEqual(len(entries), 1)
+        self.assertTrue(entries[0].status.occupies_slot)
+
     # -- copy previous roster ---------------------------------------------
     def test_copy_previous_roster(self):
         # The future draft game copies the seeded game's confirmed roster.

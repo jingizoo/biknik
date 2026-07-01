@@ -145,13 +145,24 @@ class RosterService:
             if not player.is_active:
                 raise NotEligibleError(f"{player.name} is not an active player.")
 
+            now = self.clock()
             existing = self.store.roster_entry_for_player(game_id, player_id)
-            if existing and existing.status.occupies_slot:
-                # idempotent: already selected
+            if existing is not None:
+                if existing.status.occupies_slot:
+                    # idempotent: already selected
+                    entries.append(existing)
+                    continue
+                # Revive a removed/unavailable row instead of inserting a
+                # duplicate (there is no unique (game_id, player_id) constraint).
+                existing.roster_role = RosterRole.SELECTED
+                existing.selection_source = SelectionSource.COACH_SELECTED
+                existing.status = RosterEntryStatus.SELECTED
+                existing.selected_by = actor_id
+                existing.updated_at = now
+                self.store.save_roster_entry(existing)
                 entries.append(existing)
                 continue
 
-            now = self.clock()
             entry = GameRosterEntry(
                 id=self.store.next_id("entry"),
                 game_id=game_id,
