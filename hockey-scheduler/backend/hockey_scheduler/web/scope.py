@@ -68,10 +68,12 @@ def scope_violation(role, scope, path, body, store):
                 return "Players can only respond for themselves."
     elif role == Role.OFFICIAL:
         own = scope.get("official_id")
-        if not own:
-            return None
         m = _ASSIGN_RESPOND.match(path)
         if m:
+            # This slice is about self-service identity: responding requires a
+            # bound official, and only to their own assignment (#54 review).
+            if not own:
+                return "Official assignment response requires a signed-in official."
             assignment = store.get_official_assignment(m.group(1))
             if assignment is not None and assignment.official_id != own:
                 return "Officials can only respond to their own assignments."

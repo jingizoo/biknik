@@ -34,9 +34,10 @@ class OfficialScopeUnitTest(unittest.TestCase):
         self.assertIsNotNone(
             scope_violation(Role.OFFICIAL, scope, path, {}, self.store))
 
-    def test_unbound_official_not_scoped(self):
+    def test_unbound_official_cannot_respond(self):
+        # Self-service identity: an unbound official (dev header) may not respond.
         path = f"/api/officials/assignments/{self.assignment_id}/decline"
-        self.assertIsNone(scope_violation(Role.OFFICIAL, {}, path, {}, self.store))
+        self.assertIsNotNone(scope_violation(Role.OFFICIAL, {}, path, {}, self.store))
 
 
 class OfficialHttpTest(unittest.TestCase):
@@ -116,6 +117,21 @@ class OfficialHttpTest(unittest.TestCase):
         c = self._login("official")
         status, _ = self._post(
             c, f"/api/officials/assignments/{self.assignment_id}/unassign", {})
+        self.assertEqual(status, 403)
+
+    def test_unbound_official_header_cannot_respond(self):
+        # No session — just the dev X-Demo-Role header, so no official_id binding.
+        c = urllib.request.build_opener()
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{self.port}"
+            f"/api/officials/assignments/{self.assignment_id}/accept",
+            data=b"{}", method="POST",
+            headers={"Content-Type": "application/json", "X-Demo-Role": "official"})
+        try:
+            with c.open(req) as r:
+                status = r.status
+        except urllib.error.HTTPError as e:
+            status = e.code
         self.assertEqual(status, 403)
 
 
