@@ -409,6 +409,44 @@ select.player-picker {
 .wk-cell .slot-card .s { font-size: 10px; }
 .wk-none { color: #c4c8d0; font-size: 13px; text-align: center; padding: 6px 0; }
 
+/* ----- Setup cards + create drawer (#44) ----- */
+.setup-intro { color: var(--muted); font-size: 13px; margin: 4px 4px 12px; }
+.setup-grid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); }
+.setup-card { background: var(--card); border: 1px solid var(--sep); border-radius: 12px; overflow: hidden; display: flex; flex-direction: column; }
+.setup-card-head { display: flex; align-items: center; gap: 8px; padding: 11px 12px; border-bottom: 1px solid var(--sep); }
+.setup-card-head .sc-ico { font-size: 16px; }
+.setup-card-head .sc-title { font-weight: 700; font-size: 14px; }
+.setup-card-head .setup-count { font-size: 12px; font-weight: 700; color: var(--muted);
+  background: var(--bg); border-radius: 10px; padding: 1px 8px; }
+.setup-card-head .sc-new { margin-left: auto; padding: 6px 10px; font-size: 13px; }
+.setup-card-body { padding: 2px 0; max-height: 220px; overflow-y: auto; }
+.setup-card-body .empty { padding: 16px 12px; font-size: 13px; }
+.setup-hint { padding: 14px 12px; font-size: 13px; color: var(--muted); }
+.linklike { border: none; background: none; padding: 0; color: var(--blue); font: inherit; cursor: pointer; text-decoration: underline; }
+
+.drawer-scrim { position: fixed; inset: 0; background: rgba(0,0,0,.35); z-index: 40; animation: fade .15s ease; }
+.drawer { position: fixed; top: 0; right: 0; height: 100%; width: 360px; max-width: 92vw;
+  background: var(--card); z-index: 41; display: flex; flex-direction: column;
+  box-shadow: -6px 0 24px rgba(0,0,0,.22); animation: slidein .18s ease; }
+@keyframes fade { from { opacity: 0; } to { opacity: 1; } }
+@keyframes slidein { from { transform: translateX(100%); } to { transform: translateX(0); } }
+.drawer-head { display: flex; align-items: center; gap: 8px; padding: 14px 16px; border-bottom: 1px solid var(--sep); }
+.drawer-head .drawer-ico { font-size: 18px; }
+.drawer-head .drawer-title { font-weight: 700; font-size: 16px; flex: 1; }
+.drawer-x { border: none; background: transparent; font-size: 22px; line-height: 1; cursor: pointer; color: var(--muted); }
+.drawer-x:hover { color: var(--ink); }
+.drawer-body { flex: 1; overflow-y: auto; padding: 16px; }
+.drawer-body label { display: block; font-size: 12px; font-weight: 600; color: var(--muted); margin: 12px 0 4px; }
+.drawer-body label:first-child { margin-top: 0; }
+.drawer-body input, .drawer-body select { width: 100%; padding: 10px 11px; border: 1px solid var(--sep);
+  border-radius: 9px; font-size: 14px; background: #fff; }
+.drawer-body .req { color: var(--red); }
+.drawer-note { font-size: 13px; color: var(--muted); background: var(--bg); border-radius: 8px; padding: 8px 10px; }
+.drawer-err { margin-top: 14px; background: #fdecec; color: #a3231f; border: 1px solid #f3b7b4;
+  border-radius: 9px; padding: 10px 12px; font-size: 13px; }
+.drawer-foot { display: flex; justify-content: flex-end; gap: 8px; padding: 12px 16px; border-top: 1px solid var(--sep); }
+@media (max-width: 480px) { .drawer { width: 100%; } }
+
 /* ----- conflict side panel (#43) ----- */
 .cal-layout { display: flex; align-items: flex-start; gap: 14px; }
 .cal-main { flex: 1; min-width: 0; }
