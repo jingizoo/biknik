@@ -65,6 +65,17 @@ class ScopeUnitTest(unittest.TestCase):
                                   "/api/games/g/roster/select",
                                   {"player_ids": [self.away_player]}))
 
+    def test_scoped_coach_cannot_lock_unlock_or_cancel(self):
+        scope = {"team_id": self.home}
+        for path in ("/api/games/g/roster/lock",
+                     "/api/games/g/roster/unlock",
+                     "/api/games/g/cancel"):
+            self.assertIsNotNone(self._v(Role.COACH, scope, path, {}), path)
+
+    def test_admin_can_lock_unlock_cancel(self):
+        for path in ("/api/games/g/roster/lock", "/api/games/g/cancel"):
+            self.assertIsNone(self._v(Role.LEAGUE_ADMIN, {}, path, {}), path)
+
     def test_player_self_only(self):
         scope = {"player_id": self.home_player}
         self.assertIsNone(self._v(Role.PLAYER, scope,
@@ -148,6 +159,21 @@ class ScopeHttpTest(unittest.TestCase):
                                {"player_id": self.away_player,
                                 "availability_status": "available"})
         self.assertEqual(status, 403)
+
+    def test_coach_cannot_lock_whole_game(self):
+        c = self._login("coach")
+        status, _ = self._post(c, f"/api/games/{self.gid}/roster/lock", {})
+        self.assertEqual(status, 403)
+
+    def test_coach_cannot_cancel_whole_game(self):
+        c = self._login("coach")
+        status, _ = self._post(c, f"/api/games/{self.gid}/cancel", {})
+        self.assertEqual(status, 403)
+
+    def test_admin_can_lock_whole_game(self):
+        c = self._login("admin")
+        status, _ = self._post(c, f"/api/games/{self.gid}/roster/lock", {})
+        self.assertNotEqual(status, 403)
 
 
 if __name__ == "__main__":

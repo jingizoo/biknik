@@ -783,6 +783,12 @@ function coachBody(board) {
     footer = `<div class="locked-note">🔒 Read-only — you manage <strong>${esc(team)}</strong>, not this team.</div>`;
   } else if (!canRoster) {
     footer = `<div class="locked-note">🔒 Read-only — your role can't manage rosters.</div>`;
+  } else if (boundTeam) {
+    // A scoped coach can select their team but not lock/unlock the whole game
+    // (that flips shared game state) — #51. Show a note instead of the control.
+    footer = locked
+      ? `<div class="locked-note">🔒 Roster locked by a league admin.</div>`
+      : `<div class="locked-note">Per-team roster locking is coming; a league admin locks the full game.</div>`;
   } else if (locked) {
     footer = `<div class="locked-note">🔒 Roster locked. Selection disabled.
         <button class="act ghost" data-act="unlock" style="margin-left:auto">Unlock</button></div>`;

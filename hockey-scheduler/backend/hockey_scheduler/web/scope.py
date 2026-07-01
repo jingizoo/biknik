@@ -14,6 +14,13 @@ from ..domain import Role
 
 _SUB_ACTION = re.compile(
     r"^/api/games/[^/]+/substitutes/([^/]+)/(?:offer|accept|decline|add-to-roster)$")
+_GAME_ACTION = re.compile(r"^/api/games/[^/]+/(.+)$")
+
+# Game-wide actions a scoped coach may NOT perform — they flip whole-game state
+# (game.locked / game.cancelled) affecting the other team, and carry no target
+# for scope_violation to constrain. Until per-side locks exist, block them for a
+# bound coach; league admins are unscoped and keep these controls.
+_GAME_WIDE_COACH_ACTIONS = {"roster/lock", "roster/unlock", "cancel"}
 
 
 def _player_ids(path: str, body: dict):
@@ -39,6 +46,10 @@ def scope_violation(role, scope, path, body, store):
         team = scope.get("team_id")
         if not team:
             return None  # unbound coach (dev fallback) — not resource-scoped
+        m = _GAME_ACTION.match(path)
+        if m and m.group(1) in _GAME_WIDE_COACH_ACTIONS:
+            return ("A coach can't lock, unlock, or cancel the whole game "
+                    "(that affects the other team) — ask a league admin.")
         for pid in _player_ids(path, body):
             player = store.get_player(pid)
             if player is not None and player.team_id != team:
