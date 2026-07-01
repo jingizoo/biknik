@@ -194,6 +194,13 @@ class Handler(BaseHTTPRequestHandler):
                     body.get("response_source", "player"), actor))
             if action == "build-roster":
                 return self._send_api(api.auto_build_roster(gid, actor))
+            if action == "roster/select":
+                return self._send_api(api.select_roster(
+                    gid, body.get("player_ids", []), actor))
+            if action == "roster/remove":
+                return self._send_api(api.remove_player(gid, pid, actor))
+            if action == "roster/copy-previous":
+                return self._send_api(api.copy_previous_roster(gid, actor))
             if action == "publish":
                 return self._send_api(api.publish_game(gid, actor))
             if action == "move":

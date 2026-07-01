@@ -577,54 +577,105 @@ function renderRoster(board) {
       <button class="seg ${gameView === "player" ? "active" : ""}" data-view="player">Player</button>
     </div><div style="padding-top:8px">${gameView === "coach" ? coachBody(board) : playerBody(board)}</div>`;
 }
+// Small building blocks shared by the roster-selection surface (#46).
+function playerRow(p, right) {
+  const jersey = p.jersey_number != null ? ` <span class="jersey">#${p.jersey_number}</span>` : "";
+  return `<div class="row">${avatar(p)}<span class="name">${esc(p.name)}${jersey}</span>${right}</div>`;
+}
+function posTag(p) {
+  const g = p.slot_type === "goalie";
+  return `<span class="pos-tag ${g ? "g" : "s"}" title="${esc(p.position)}">${g ? "G" : "SK"}</span>`;
+}
+function posStat(label, filled, target, confirmed, open) {
+  const pct = target ? Math.min(100, Math.round((filled / target) * 100)) : 0;
+  return `<div class="pos-stat"><div class="ps-top"><span class="ps-label">${label}</span>
+    <span class="ps-num">${filled}/${target} filled · ${confirmed} confirmed${open ? ` · ${open} open` : ""}</span></div>
+    <div class="ps-bar ${open ? "open" : "full"}"><span style="width:${pct}%"></span></div></div>`;
+}
+function availableGroups(available, s, locked) {
+  const mk = (label, st, open) => {
+    const list = available.filter((p) => p.slot_type === st);
+    if (!list.length) return "";
+    const need = open > 0 ? `<span class="need">need ${open}</span>` : `<span class="need ok">full</span>`;
+    const rows = list.map((p) => playerRow(p,
+      `${posTag(p)}${locked ? "" : `<button class="act primary" data-act="select" data-id="${p.id}">Add</button>`}`)).join("");
+    return `<div class="avail-group"><div class="avail-head">${label} ${need}</div>${rows}</div>`;
+  };
+  const body = available.length
+    ? mk("Goalies", "goalie", s.open_goalie_slots) + mk("Skaters", "skater", s.open_skater_slots)
+    : `<div class="empty">All eligible players are on the roster or in the sub pool.</div>`;
+  return `<div class="section-title">Available players (${available.length})</div>
+    <div class="card">${body}</div>`;
+}
+
 function coachBody(board) {
   const s = board.status;
-  const selected = board.players.filter((p) => p.group === "selected");
-  const subs = board.players.filter((p) => p.group === "substitute");
   const locked = s.status === "locked";
+  const onRoster = board.players.filter((p) => p.group === "selected" && !p.backed_out);
+  const backedOut = board.players.filter((p) => p.group === "selected" && p.backed_out);
+  const available = board.players.filter((p) => p.group === "available");
+  const subs = board.players.filter((p) => p.group === "substitute");
 
-  // Newly-scheduled game: no roster selected yet.
-  if (!selected.length && !subs.length) {
-    if (!board.players.length) {
-      return `<div class="banner neutral"><h2>No roster yet</h2>
-        <p>The home team has no players. Add or import players first (player
-        management is a follow-up: #25).</p></div>${toastHtml()}`;
-    }
-    return `<div class="banner neutral"><h2>No roster selected yet</h2>
-      <p>${board.players.length} eligible players on the home team. For the demo
-      you can auto-fill a draft roster; production will offer Select / Import /
-      Copy-from-previous (#25).</p></div>
-      <div class="actions"><button class="act primary" data-act="build">Auto-fill demo roster</button></div>
-      ${toastHtml()}`;
+  if (!board.players.length) {
+    return `<div class="banner neutral"><h2>No roster yet</h2>
+      <p>The home team has no players. Add players in Setup first (team player
+      management is a follow-up: #25).</p></div>${toastHtml()}`;
   }
-  const openFor = (st) => st === "goalie" ? s.open_goalie_slots > 0 : s.open_skater_slots > 0;
-  const selRows = selected.map((p) => {
-    let btn = "";
+
+  const gFilled = s.target_goalies - s.open_goalie_slots;
+  const sFilled = s.target_skaters - s.open_skater_slots;
+  const summary = `<div class="card ros-summary">
+    ${posStat("Goalies", gFilled, s.target_goalies, s.confirmed_goalies, s.open_goalie_slots)}
+    ${posStat("Skaters", sFilled, s.target_skaters, s.confirmed_skaters, s.open_skater_slots)}</div>`;
+
+  // Eligibility / position warnings.
+  const warn = [];
+  const plural = (n) => (n > 1 ? "s" : "");
+  if (s.open_goalie_slots > 0) warn.push(`Need ${s.open_goalie_slots} more goalie${plural(s.open_goalie_slots)}.`);
+  if (s.open_skater_slots > 0) warn.push(`Need ${s.open_skater_slots} more skater${plural(s.open_skater_slots)}.`);
+  if (backedOut.length) warn.push(`${backedOut.length} player${plural(backedOut.length)} backed out or removed — re-confirm or refill.`);
+  const warnHtml = warn.length ? `<div class="ros-warn">⚠ ${warn.map(esc).join(" ")}</div>` : "";
+
+  const toolbar = locked ? "" : `<div class="ros-toolbar">
+    <button class="act ghost" data-act="copy">⧉ Copy previous roster</button>
+    <button class="act ghost" data-act="build">Auto-fill</button></div>`;
+
+  // Roster section: occupying players first, then anyone backed out / removed.
+  const rosterRows = [...onRoster, ...backedOut].map((p) => {
+    let btns = "";
     if (!locked) {
-      if (p.backed_out) btn = `<button class="act success" data-act="confirm" data-id="${p.id}">Re-confirm</button>`;
-      else if (p.availability === "available") btn = `<button class="act danger" data-act="backout" data-id="${p.id}">Can't play</button>`;
-      else btn = `<button class="act ghost" data-act="confirm" data-id="${p.id}">Confirm</button>`;
+      if (p.backed_out) {
+        btns = p.roster_status === "removed"
+          ? `<button class="act success" data-act="select" data-id="${p.id}">Add back</button>`
+          : `<button class="act success" data-act="confirm" data-id="${p.id}">Re-confirm</button>`;
+      } else if (p.availability === "available") {
+        btns = `<button class="act danger" data-act="backout" data-id="${p.id}">Can't play</button>`;
+      } else {
+        btns = `<button class="act ghost" data-act="confirm" data-id="${p.id}">Confirm</button>`;
+      }
+      btns += `<button class="act danger ghost xbtn" data-act="remove" data-id="${p.id}" title="Remove from roster">✕</button>`;
     }
-    return `<div class="row">${avatar(p)}<span class="name">${esc(p.name)}</span>${statusBadge(p)}${btn}</div>`;
-  }).join("");
+    return playerRow(p, `${posTag(p)}${statusBadge(p)}${btns}`);
+  }).join("") || `<div class="empty">No players on the roster yet — add from Available below.</div>`;
+
   const subRows = subs.length ? subs.map((p) => {
-    const canAdd = !locked && openFor(p.slot_type);
+    const canAdd = !locked && (p.slot_type === "goalie" ? s.open_goalie_slots > 0 : s.open_skater_slots > 0);
     const ctrl = p.sub_status === "offered" ? '<span class="badge orange">Offered</span>' : '<span class="badge blue">Enrolled</span>';
     const btn = locked ? "" : canAdd ? `<button class="act primary" data-act="add" data-id="${p.id}">Add</button>`
       : `<button class="act ghost" disabled>No slot</button>`;
-    return `<div class="row">${avatar(p)}<span class="name">${esc(p.name)}</span>${ctrl}${btn}</div>`;
+    return playerRow(p, `${posTag(p)}${ctrl}${btn}`);
   }).join("") : `<div class="empty">No substitutes enrolled.</div>`;
+
+  const total = s.target_goalies + s.target_skaters;
   return `
     <div class="banner ${bannerClass(s.status)}"><h2>${prettyStatus(s.status)}</h2><p>${esc(s.message)}</p></div>
-    <div class="card">${slotBar("Goalies", s.confirmed_goalies, s.target_goalies, s.open_goalie_slots)}
-      ${slotBar("Skaters", s.confirmed_skaters, s.target_skaters, s.open_skater_slots)}</div>
-    <div class="roster-cols">
-      <div><div class="section-title">Selected Players</div>
-        <div class="card">${selRows || '<div class="empty">No players selected.</div>'}</div></div>
-      <div><div class="section-title">Substitute Pool</div>
-        <div class="card">${subRows}</div></div>
-    </div>
-    ${locked ? `<div class="locked-note">🔒 Roster locked. Player actions disabled.
+    ${summary}${warnHtml}${toolbar}
+    <div class="section-title">Roster (${onRoster.length}/${total})</div>
+    <div class="card">${rosterRows}</div>
+    ${availableGroups(available, s, locked)}
+    <div class="section-title">Substitute pool</div>
+    <div class="card">${subRows}</div>
+    ${locked ? `<div class="locked-note">🔒 Roster locked. Selection disabled.
         <button class="act ghost" data-act="unlock" style="margin-left:auto">Unlock</button></div>`
       : `<div class="actions"><button class="act ghost" data-act="lock">Lock Roster</button></div>`}
     ${toastHtml()}`;
@@ -758,6 +809,9 @@ async function rosterAction(act, id) {
   toast = "";
   const B = `/api/games/${currentGame}`;
   if (act === "build") await post(`${B}/build-roster`, {});
+  else if (act === "select") await post(`${B}/roster/select`, { player_ids: [id] });
+  else if (act === "remove") await post(`${B}/roster/remove`, { player_id: id });
+  else if (act === "copy") { const r = await post(`${B}/roster/copy-previous`, {}); if (r && !r.error) toast = `Copied ${r.copied} players from the previous game.`; }
   else if (act === "confirm") await post(`${B}/availability`, { player_id: id, availability_status: "available" });
   else if (act === "backout") await post(`${B}/availability`, { player_id: id, availability_status: "unavailable" });
   else if (act === "enroll") await post(`${B}/substitutes/enroll`, { player_id: id });

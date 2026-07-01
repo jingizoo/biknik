@@ -21,10 +21,15 @@ class FullDemoTest(unittest.TestCase):
                          {"U16 Lions", "U16 Falcons", "U18 Lions", "Senior Lions"})
         self.assertEqual({r["name"] for r in ov["rinks"]},
                          {"Main Rink", "Training Rink"})
-        # Exactly one slot is allocated to the game.
+        # Two slots are allocated: the seeded published game and a future draft
+        # game (left unrostered for the roster-selection demo). Both are Lions
+        # vs Falcons; exactly one of them is published.
         allocated = [s for s in ov["ice_slots"] if s["status"] == "allocated"]
-        self.assertEqual(len(allocated), 1)
-        self.assertEqual(allocated[0]["game_label"], "U16 Lions vs U16 Falcons")
+        self.assertEqual(len(allocated), 2)
+        self.assertEqual({s["game_label"] for s in allocated},
+                         {"U16 Lions vs U16 Falcons"})
+        published = [g for g in ov["schedule"] if g["published"]]
+        self.assertEqual(len(published), 1)
 
     def test_opens_on_confirmed_roster(self):
         status = self.api.get_roster_status(self.game_id)

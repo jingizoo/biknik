@@ -99,7 +99,17 @@ def build_full_demo_store(store=None) -> Tuple[InMemoryStore, str, dict]:
     for pid in selected:
         roster.set_availability(game.id, pid, AvailabilityStatus.AVAILABLE)
 
+    # A future draft game for the same team, left UNROSTERED, so the operator
+    # can demonstrate real roster selection (manual picks + copy previous
+    # roster) against an empty roster instead of the already-full seeded game.
+    _NEXT = datetime(2026, 9, 12, tzinfo=timezone.utc)
+    slot_next = setup.create_ice_slot(main_rink.id, _NEXT.replace(hour=18, minute=30),
+                                      _NEXT.replace(hour=20), actor_id=admin)
+    game_next = setup.create_game(season.id, d_u16.id, u16_lions.id,
+                                  u16_falcons.id, slot_next.id, actor_id=admin)
+
     ids = {
+        "next_game_id": game_next.id,
         "league_id": league.id,
         "season_id": season.id,
         "division_id": d_u16.id,
