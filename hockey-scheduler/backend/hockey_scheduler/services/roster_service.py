@@ -138,9 +138,9 @@ class RosterService:
         entries: List[GameRosterEntry] = []
         for player_id in player_ids:
             player = self._require_player(player_id)
-            if player.team_id != game.home_team_id:
+            if player.team_id not in (game.home_team_id, game.away_team_id):
                 raise NotEligibleError(
-                    f"{player.name} is not on this team's roster."
+                    f"{player.name} is not on either team in this game."
                 )
             if not player.is_active:
                 raise NotEligibleError(f"{player.name} is not an active player.")
@@ -221,7 +221,7 @@ class RosterService:
             if reconfirming:
                 # Re-confirming after a back-out only works while the slot is
                 # still open (a substitute may have already filled it).
-                self._require_open_slot(game_id, player.slot_type)
+                self._require_open_slot(game_id, player.slot_type, player.team_id)
 
         existing = self.store.availability_for_player(game_id, player_id)
         av = GameAvailability(
@@ -349,7 +349,7 @@ class RosterService:
         self._guard_mutable(game)
         player = self._require_player(player_id)
 
-        if player.team_id != game.home_team_id:
+        if player.team_id not in (game.home_team_id, game.away_team_id):
             raise NotEligibleError(
                 f"{player.name} is not eligible (cross-team borrowing is off)."
             )
@@ -438,7 +438,7 @@ class RosterService:
             raise InvalidTransitionError(
                 "Only an enrolled substitute can be offered a slot."
             )
-        self._require_open_slot(game_id, sub.slot_type)
+        self._require_open_slot(game_id, sub.slot_type, self._player_team(sub.player_id))
         sub.status = SubstituteStatus.OFFERED
         sub.offered_at = self.clock()
         sub.offer_expires_at = offer_expires_at
@@ -473,7 +473,7 @@ class RosterService:
             self.store.save_substitute(sub)
             raise InvalidTransitionError("This substitute offer has expired.")
         # First-accepted-wins: the slot must still be open.
-        self._require_open_slot(game_id, sub.slot_type)
+        self._require_open_slot(game_id, sub.slot_type, self._player_team(sub.player_id))
         sub.status = SubstituteStatus.ACCEPTED
         sub.accepted_at = self.clock()
         self.store.save_substitute(sub)
@@ -528,7 +528,7 @@ class RosterService:
             raise NotEnrolledError(
                 "Player must be an enrolled/offered substitute to be added."
             )
-        self._require_open_slot(game_id, sub.slot_type)
+        self._require_open_slot(game_id, sub.slot_type, self._player_team(sub.player_id))
         sub.status = SubstituteStatus.ACCEPTED
         sub.accepted_at = self.clock()
         self.store.save_substitute(sub)
@@ -581,13 +581,19 @@ class RosterService:
             raise NotEnrolledError("Player is not currently enrolled as a substitute.")
         return sub
 
-    def _require_open_slot(self, game_id: str, slot_type: SlotType) -> None:
-        summaries = self._slot_summaries(game_id)
+    def _require_open_slot(
+        self, game_id: str, slot_type: SlotType, team_id: str
+    ) -> None:
+        summaries = self._slot_summaries(game_id, team_id)
         summary = summaries[slot_type]
         if summary.open_count <= 0:
             raise SlotAlreadyFilledError(
                 f"The {slot_type.value} slot is already filled."
             )
+
+    def _player_team(self, player_id: str) -> Optional[str]:
+        p = self.store.get_player(player_id)
+        return p.team_id if p else None
 
     # ====================================================================
     # coach controls
@@ -605,21 +611,25 @@ class RosterService:
         return entry
 
     def copy_previous_roster(
-        self, game_id: str, actor_id: Optional[str] = None
+        self, game_id: str, team_id: Optional[str] = None,
+        actor_id: Optional[str] = None,
     ) -> dict:
-        """Seed this game's roster from the team's most recent earlier game.
+        """Seed one side's roster from that team's most recent earlier game.
 
-        A time-saver for coaches: find the newest non-cancelled game where the
-        same team was home and had players occupying slots, then re-select those
-        players (skipping any who are no longer active on the team). The actual
+        A time-saver for coaches: find the newest non-cancelled game the team
+        played (as home *or* away) that had players occupying slots, then
+        re-select those players (skipping any no longer active on the team). The
         selection goes through :meth:`select_roster`, so all eligibility, lock,
-        and audit rules still apply.
+        and audit rules still apply. ``team_id`` defaults to the home side.
         """
         game = self._require_game(game_id)
         self._guard_mutable(game)
+        team_id = team_id or game.home_team_id
+        if team_id not in (game.home_team_id, game.away_team_id):
+            raise ValidationError("That team is not playing in this game.")
         earlier = [
             g for g in self.store.all_games()
-            if g.id != game_id and g.home_team_id == game.home_team_id
+            if g.id != game_id and team_id in (g.home_team_id, g.away_team_id)
             and not g.cancelled and g.start_time is not None
             and (game.start_time is None or g.start_time < game.start_time)
         ]
@@ -629,11 +639,12 @@ class RosterService:
                 e.player_id for e in self.store.roster_for_game(src.id)
                 if e.status.occupies_slot
                 and (p := self.store.get_player(e.player_id)) is not None
-                and p.is_active and p.team_id == game.home_team_id
+                and p.is_active and p.team_id == team_id
             ]
             if eligible:
                 self.select_roster(game_id, eligible, actor_id)
-                return {"copied": len(eligible), "from_game_id": src.id}
+                return {"copied": len(eligible), "from_game_id": src.id,
+                        "team_id": team_id}
         raise ValidationError("No previous roster to copy for this team.")
 
     @_transactional
@@ -676,7 +687,7 @@ class RosterService:
     # ====================================================================
     # roster status engine
     # ====================================================================
-    def _slot_summaries(self, game_id: str):
+    def _slot_summaries(self, game_id: str, team_id: str):
         game = self._require_game(game_id)
         entries = self.store.roster_for_game(game_id)
         subs = self.store.substitutes_for_game(game_id)
@@ -689,8 +700,8 @@ class RosterService:
         confirmed = {SlotType.GOALIE: 0, SlotType.SKATER: 0}
         for entry in entries:
             player = self.store.get_player(entry.player_id)
-            if player is None:
-                continue
+            if player is None or player.team_id != team_id:
+                continue  # each side is counted independently (home vs away)
             st = player.slot_type
             if entry.status.occupies_slot:
                 occupied[st] += 1
@@ -699,6 +710,9 @@ class RosterService:
 
         subs_available = {SlotType.GOALIE: 0, SlotType.SKATER: 0}
         for sub in subs:
+            player = self.store.get_player(sub.player_id)
+            if player is None or player.team_id != team_id:
+                continue
             if sub.status == SubstituteStatus.ENROLLED:
                 subs_available[sub.slot_type] += 1
 
@@ -722,10 +736,19 @@ class RosterService:
             )
         return result
 
-    def compute_roster_status(self, game_id: str) -> RosterStatus:
+    def compute_roster_status(
+        self, game_id: str, team_id: Optional[str] = None
+    ) -> RosterStatus:
         game = self._require_game(game_id)
-        entries = self.store.roster_for_game(game_id)
-        summaries = self._slot_summaries(game_id)
+        # Home and away lineups are computed independently (#25). Default to the
+        # home side so existing callers/behaviour are unchanged.
+        team_id = team_id or game.home_team_id
+        entries = [
+            e for e in self.store.roster_for_game(game_id)
+            if (p := self.store.get_player(e.player_id)) is not None
+            and p.team_id == team_id
+        ]
+        summaries = self._slot_summaries(game_id, team_id)
         goalie = summaries[SlotType.GOALIE]
         skater = summaries[SlotType.SKATER]
 
@@ -733,6 +756,8 @@ class RosterService:
             1
             for s in self.store.substitutes_for_game(game_id)
             if s.status == SubstituteStatus.ENROLLED
+            and (p := self.store.get_player(s.player_id)) is not None
+            and p.team_id == team_id
         )
 
         open_total = goalie.open_count + skater.open_count
@@ -747,7 +772,7 @@ class RosterService:
 
         return RosterStatus(
             game_id=game_id,
-            team_id=game.home_team_id,
+            team_id=team_id,
             target_goalies=goalie.target_count,
             confirmed_goalies=goalie.confirmed_count,
             open_goalie_slots=goalie.open_count,
