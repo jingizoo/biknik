@@ -17,7 +17,7 @@ from typing import Optional
 from datetime import datetime, timedelta
 
 from ..api import ApiService
-from ..domain import ROLE_LABELS, Role, permissions_for, role_from_str
+from ..domain import ROLE_LABELS, Role, permissions_for
 from ..full_demo import build_full_demo_store
 from ..store import SqlStore, create_store
 from .authz import authorize, required_permission
@@ -179,7 +179,21 @@ class Handler(BaseHTTPRequestHandler):
 
         # Authorize the acting role at the HTTP boundary (#24). The policy is the
         # domain permission model; GET requests are read-only and never reach here.
-        role = role_from_str(self.headers.get(ROLE_HEADER), default=Role.LEAGUE_ADMIN)
+        # A missing header defaults to admin (back-compat for scripts/curl), but a
+        # supplied-yet-invalid role must NOT escalate — reject it rather than fall
+        # back to admin.
+        raw_role = self.headers.get(ROLE_HEADER)
+        if raw_role is None or raw_role == "":
+            role = Role.LEAGUE_ADMIN
+        else:
+            try:
+                role = Role(raw_role)
+            except ValueError:
+                return self._send_json({"error": {
+                    "code": "forbidden",
+                    "message": f"Unknown role '{raw_role}'.",
+                    "details": {"role": raw_role},
+                }}, 403)
         if not authorize(role, path):
             perm = required_permission(path)
             return self._send_json({"error": {

@@ -74,6 +74,16 @@ class ServerAuthzTest(unittest.TestCase):
         status, body = self._post(f"/api/games/{self.game_id}/roster/lock", {})
         self.assertNotEqual(status, 403)
 
+    def test_invalid_role_does_not_escalate_to_admin(self):
+        # A supplied-but-unknown role must be rejected, never treated as admin.
+        status, body = self._post("/api/setup/league", {"name": "Sneaky"},
+                                  role="nonsense")
+        self.assertEqual(status, 403)
+        self.assertEqual(body["error"]["code"], "forbidden")
+        # And it must not have created the league.
+        _, ov = self._get("/api/demo/overview")
+        self.assertNotIn("Sneaky", [l["name"] for l in ov["leagues"]])
+
 
 if __name__ == "__main__":
     unittest.main()
