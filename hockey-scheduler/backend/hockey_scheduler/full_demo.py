@@ -12,7 +12,7 @@ No real PII — all names are obviously fictional.
 from datetime import datetime, timezone
 from typing import Tuple
 
-from .domain import AvailabilityStatus, Position
+from .domain import AvailabilityStatus, OfficialRole, Position
 from .services import RosterService, SetupService
 from .store import InMemoryStore
 
@@ -108,8 +108,18 @@ def build_full_demo_store(store=None) -> Tuple[InMemoryStore, str, dict]:
     game_next = setup.create_game(season.id, d_u16.id, u16_lions.id,
                                   u16_falcons.id, slot_next.id, actor_id=admin)
 
+    # Officials pool + one assignment on the seeded game so the game sheet has
+    # something to show (#30). Names are obviously fictional.
+    ref = setup.create_official("Riley Whistle", actor_id=admin)
+    setup.create_official("Lee Blueline", actor_id=admin)
+    setup.create_official("Sky Tally", actor_id=admin)
+    ref_assignment = setup.assign_official(game.id, ref.id, OfficialRole.REFEREE,
+                                           actor_id=admin)
+
     ids = {
         "next_game_id": game_next.id,
+        "referee_id": ref.id,
+        "ref_assignment_id": ref_assignment.id,
         "league_id": league.id,
         "season_id": season.id,
         "division_id": d_u16.id,

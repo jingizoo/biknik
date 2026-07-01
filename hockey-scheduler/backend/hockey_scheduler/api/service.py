@@ -14,6 +14,7 @@ from typing import Callable, List, Optional
 from ..domain import (
     AvailabilityStatus,
     IceSlotType,
+    OfficialRole,
     Position,
     RosterEntryStatus,
     SlotType,
@@ -349,7 +350,54 @@ class ApiService:
             "game": _serialize(game),
             "home": side(game.home_team_id),
             "away": side(game.away_team_id),
+            "officials": self._official_rows(game_id),
         }
+
+    def _official_rows(self, game_id: str) -> list:
+        """Assigned officials for a game, with names, for the game sheet (#30)."""
+        rows = []
+        for a in self.store.assignments_for_game(game_id):
+            off = self.store.get_official(a.official_id)
+            rows.append({
+                "assignment_id": a.id,
+                "official_id": a.official_id,
+                "official_name": off.name if off else a.official_id,
+                "role": a.role.value,
+                "status": a.status.value,
+            })
+        return rows
+
+    # -- officials (#30) ---------------------------------------------------
+    @catch
+    def create_official(self, name: str, home_club_id: Optional[str] = None,
+                        actor_id: Optional[str] = None) -> dict:
+        return _serialize(self.setup.create_official(name, home_club_id, actor_id))
+
+    @catch
+    def get_officials(self) -> List[dict]:
+        return [_serialize(o) for o in self.store.all_officials()]
+
+    @catch
+    def get_officials_for_game(self, game_id: str) -> List[dict]:
+        self.roster._require_game(game_id)
+        return self._official_rows(game_id)
+
+    @catch
+    def assign_official(self, game_id: str, official_id: str, role: str,
+                        actor_id: Optional[str] = None) -> dict:
+        a = self.setup.assign_official(
+            game_id, official_id, _parse_enum(OfficialRole, role, "role"), actor_id)
+        return _serialize(a)
+
+    @catch
+    def respond_assignment(self, assignment_id: str, accept: bool,
+                           actor_id: Optional[str] = None) -> dict:
+        return _serialize(self.setup.respond_assignment(assignment_id, accept, actor_id))
+
+    @catch
+    def unassign_official(self, assignment_id: str,
+                          actor_id: Optional[str] = None) -> dict:
+        return _serialize(self.setup.unassign_official(assignment_id, actor_id))
 
     # -- coach controls ----------------------------------------------------
     @catch
@@ -435,6 +483,10 @@ class ApiService:
             if slot and slot.rink_id in rinks:
                 rk = rinks[slot.rink_id]
                 venue_name = venues[rk.venue_id].name if rk.venue_id in venues else None
+            # Only active (proposed/accepted) assignments count as "assigned";
+            # a declined assignment frees the official (#30 review).
+            g_active = [a for a in self.store.assignments_for_game(g.id)
+                        if a.status.is_active]
             schedule.append({
                 "game_id": g.id,
                 "home_team_id": g.home_team_id,
@@ -448,6 +500,10 @@ class ApiService:
                 "start_time": g.start_time.isoformat(),
                 "roster_status": rstatus.status.value,
                 "published": g.published,
+                # Officials summary for the Games operations checklist (#30).
+                "officials_assigned": len(g_active),
+                "officials_accepted": sum(
+                    1 for a in g_active if a.status.value == "accepted"),
             })
             # PUBLIC: only PUBLISHED games, fixture info only — no players/PII.
             if g.published and not g.cancelled:
@@ -478,6 +534,12 @@ class ApiService:
             "venues": [_serialize(v) for v in venues.values()],
             "rinks": rink_rows,
             "ice_slots": slot_rows,
+            "officials": [
+                {"id": o.id, "name": o.name,
+                 "home_club_name": (clubs[o.home_club_id].name
+                                    if o.home_club_id in clubs else None)}
+                for o in self.store.all_officials()
+            ],
             "schedule": schedule,
             "public_fixtures": public_fixtures,
             "setup_audit": setup_audit,

@@ -9,7 +9,12 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional
 
-from .enums import IceSlotStatus, IceSlotType
+from .enums import (
+    IceSlotStatus,
+    IceSlotType,
+    OfficialAssignmentStatus,
+    OfficialRole,
+)
 
 
 @dataclass
@@ -67,6 +72,28 @@ class IceSlot:
     end_time: datetime
     slot_type: IceSlotType = IceSlotType.GAME
     status: IceSlotStatus = IceSlotStatus.AVAILABLE
+
+
+@dataclass
+class Official:
+    """A match official who can be assigned to games (#30)."""
+    id: str
+    name: str
+    home_club_id: Optional[str] = None   # for conflict-of-interest checks
+    is_active: bool = True
+
+
+@dataclass
+class OfficialAssignment:
+    id: str
+    game_id: str
+    official_id: str
+    role: OfficialRole
+    status: OfficialAssignmentStatus = OfficialAssignmentStatus.PROPOSED
+    assigned_at: Optional[datetime] = None
+    responded_at: Optional[datetime] = None
+    assigned_by: Optional[str] = None
+    note: str = ""
 
 
 @dataclass

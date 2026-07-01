@@ -35,10 +35,13 @@ def required_permission(path: str):
         return None
     if path == "/api/demo/add-ice-slot":
         return Permission.MANAGE_ARENA
+    # Officials: assignment + accept/decline is an operator/scheduling action (#30).
+    if path.startswith("/api/officials/assignments/"):
+        return Permission.MANAGE_SCHEDULE
 
     if path.startswith("/api/setup/"):
         entity = path[len("/api/setup/"):]
-        if entity == "game":
+        if entity in ("game", "official"):
             return Permission.MANAGE_SCHEDULE
         if entity in _ARENA_SETUP:
             return Permission.MANAGE_ARENA
@@ -49,7 +52,7 @@ def required_permission(path: str):
     m = re.match(r"^/api/games/[^/]+/(.+)$", path)
     if m:
         action = m.group(1)
-        if action in _SCHEDULE_ACTIONS:
+        if action in _SCHEDULE_ACTIONS or action.startswith("officials/"):
             return Permission.MANAGE_SCHEDULE
         if action in _ROSTER_ACTIONS:
             return Permission.MANAGE_ROSTER

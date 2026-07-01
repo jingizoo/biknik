@@ -17,6 +17,10 @@ from ..domain import (
     IceSlotStatus,
     IceSlotType,
     League,
+    Official,
+    OfficialAssignment,
+    OfficialAssignmentStatus,
+    OfficialRole,
     Player,
     Position,
     Rink,
@@ -27,6 +31,7 @@ from ..domain import (
 )
 from ..domain.errors import (
     DivisionMismatchError,
+    NotEligibleError,
     NotFoundError,
     ScheduleConflictError,
     ValidationError,
@@ -396,6 +401,111 @@ class SetupService:
         self._audit("player_added", "player", player.id, actor_id,
                     {"team_id": team_id})
         return player
+
+    # -- officials (#30) ---------------------------------------------------
+    @_transactional
+    def create_official(self, name: str, home_club_id: Optional[str] = None,
+                        actor_id: Optional[str] = None) -> Official:
+        if home_club_id and self.store.get_club(home_club_id) is None:
+            raise NotFoundError(f"Club {home_club_id} not found.")
+        official = Official(id=self.store.next_id("official"),
+                            name=self._require_name(name),
+                            home_club_id=home_club_id or None)
+        self.store.add_official(official)
+        self._audit("official_created", "official", official.id, actor_id)
+        return official
+
+    def _game_time(self, game: Game):
+        slot = self.store.get_ice_slot(game.ice_slot_id) if game.ice_slot_id else None
+        start = game.start_time or (slot.start_time if slot else None)
+        end = game.end_time or (slot.end_time if slot else None)
+        return start, end
+
+    @_transactional
+    def assign_official(self, game_id: str, official_id: str, role: OfficialRole,
+                        actor_id: Optional[str] = None) -> OfficialAssignment:
+        """Propose an official for a role on a game, with conflict checks."""
+        game = self.store.get_game(game_id)
+        if game is None:
+            raise NotFoundError(f"Game {game_id} not found.")
+        if game.cancelled:
+            raise ValidationError("Cannot assign officials to a cancelled game.")
+        official = self.store.get_official(official_id)
+        if official is None:
+            raise NotFoundError(f"Official {official_id} not found.")
+        if not official.is_active:
+            raise NotEligibleError(f"{official.name} is not an active official.")
+
+        # Conflict of interest: an official from a club playing in this game.
+        if official.home_club_id:
+            for tid in (game.home_team_id, game.away_team_id):
+                team = self.store.get_team(tid) if tid else None
+                if team is not None and team.club_id == official.home_club_id:
+                    raise NotEligibleError(
+                        f"{official.name} has a club conflict with this game.")
+
+        # Already actively assigned to this game (any role)?
+        for a in self.store.assignments_for_game(game_id):
+            if a.official_id == official_id and a.status.is_active:
+                raise ScheduleConflictError(
+                    f"{official.name} is already assigned to this game.")
+
+        # Time overlap with another active assignment on a different game.
+        start, end = self._game_time(game)
+        if start is not None and end is not None:
+            for a in self.store.assignments_for_official(official_id):
+                if a.game_id == game_id or not a.status.is_active:
+                    continue
+                other = self.store.get_game(a.game_id)
+                if other is None or other.cancelled:
+                    continue
+                o_start, o_end = self._game_time(other)
+                if o_start is not None and o_end is not None \
+                        and start < o_end and end > o_start:
+                    raise ScheduleConflictError(
+                        f"{official.name} is already officiating an overlapping game.")
+
+        now = self.clock()
+        assignment = OfficialAssignment(
+            id=self.store.next_id("assign"),
+            game_id=game_id, official_id=official_id, role=role,
+            status=OfficialAssignmentStatus.PROPOSED,
+            assigned_at=now, assigned_by=actor_id,
+        )
+        self.store.add_official_assignment(assignment)
+        self._audit("official_assigned", "official_assignment", assignment.id,
+                    actor_id, {"game_id": game_id, "official_id": official_id,
+                               "role": role.value})
+        return assignment
+
+    @_transactional
+    def respond_assignment(self, assignment_id: str, accept: bool,
+                           actor_id: Optional[str] = None) -> OfficialAssignment:
+        """An official accepts or declines a proposed assignment."""
+        a = self.store.get_official_assignment(assignment_id)
+        if a is None:
+            raise NotFoundError(f"Assignment {assignment_id} not found.")
+        if a.status != OfficialAssignmentStatus.PROPOSED:
+            raise ValidationError("Only a proposed assignment can be responded to.")
+        a.status = (OfficialAssignmentStatus.ACCEPTED if accept
+                    else OfficialAssignmentStatus.DECLINED)
+        a.responded_at = self.clock()
+        self.store.save_official_assignment(a)
+        self._audit("assignment_accepted" if accept else "assignment_declined",
+                    "official_assignment", a.id, actor_id)
+        return a
+
+    @_transactional
+    def unassign_official(self, assignment_id: str,
+                          actor_id: Optional[str] = None) -> OfficialAssignment:
+        """Remove an official assignment from a game entirely."""
+        a = self.store.get_official_assignment(assignment_id)
+        if a is None:
+            raise NotFoundError(f"Assignment {assignment_id} not found.")
+        self.store.remove_official_assignment(assignment_id)
+        self._audit("official_unassigned", "official_assignment", assignment_id,
+                    actor_id, {"game_id": a.game_id, "official_id": a.official_id})
+        return a
 
     # -- listings ----------------------------------------------------------
     def list_leagues(self) -> List[League]:

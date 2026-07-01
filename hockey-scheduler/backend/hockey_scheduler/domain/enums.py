@@ -113,6 +113,24 @@ class AuditAction(str, Enum):
     GAME_CANCELLED = "game_cancelled"
 
 
+class OfficialRole(str, Enum):
+    REFEREE = "referee"
+    LINESPERSON = "linesperson"
+    SCOREKEEPER = "scorekeeper"
+
+
+class OfficialAssignmentStatus(str, Enum):
+    PROPOSED = "proposed"      # offered to the official, awaiting response
+    ACCEPTED = "accepted"
+    DECLINED = "declined"
+
+    @property
+    def is_active(self) -> bool:
+        # Proposed or accepted assignments hold the official's time.
+        return self in {OfficialAssignmentStatus.PROPOSED,
+                        OfficialAssignmentStatus.ACCEPTED}
+
+
 class IceSlotType(str, Enum):
     GAME = "game"
     PRACTICE = "practice"
