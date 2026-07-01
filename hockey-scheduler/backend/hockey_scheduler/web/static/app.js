@@ -53,7 +53,8 @@ function fmtDayShort(d) {
 const NAV = {
   dashboard: "Dashboard", setup: "Setup", calendar: "Arena Calendar",
   games: "Games", roster: "Roster", sheet: "Game Sheet",
-  standings: "Standings", activity: "Activity", public: "Public",
+  inbox: "My Assignments", standings: "Standings",
+  activity: "Activity", public: "Public",
 };
 const POS_CLASS = { goalie: "pos-G", defense: "pos-D", forward: "pos-F", skater: "pos-D" };
 const REPO = "https://github.com/jingizoo/biknik/issues";
@@ -711,6 +712,39 @@ function resultSection(lineups) {
     ${!final ? `<div class="gs-note no-print">Only an approved <strong>Final</strong> result affects standings.</div>` : ""}
   </section>`;
 }
+/* ---------- Official "My Assignments" inbox (#55) ---------- */
+function renderInbox(inbox) {
+  if (!inbox || !inbox.official_id) {
+    return `<div class="empty">Sign in as an <strong>Official</strong> to see your assignments.</div>`;
+  }
+  const rows = inbox.assignments || [];
+  if (!rows.length) {
+    return `<div class="banner neutral"><h2>No assignments yet</h2>
+      <p>When a scheduler assigns you to a game, it will appear here to accept or decline.</p></div>`;
+  }
+  const roleLabel = { referee: "👨‍⚖️ Referee", linesperson: "🚩 Linesperson", scorekeeper: "📝 Scorekeeper" };
+  const badge = (st) => st === "accepted" ? `<span class="badge green">Accepted</span>`
+    : st === "declined" ? `<span class="badge red">Declined</span>`
+    : `<span class="badge orange">Proposed</span>`;
+  const cards = rows.map((a) => {
+    const matchup = `${esc(a.home_team_name)} vs ${esc(a.away_team_name || "TBD")}`;
+    const where = `${esc(fmtDateTime(a.start_time))}${a.rink ? " · " + esc(a.rink) : ""}${a.venue_name ? " · " + esc(a.venue_name) : ""}`;
+    const actions = a.status === "proposed" && !a.cancelled
+      ? `<button class="act success" data-accept="${a.assignment_id}">Accept</button>
+         <button class="act danger" data-decline="${a.assignment_id}">Decline</button>` : "";
+    const cancelled = a.cancelled ? `<span class="badge red">Game cancelled</span>` : "";
+    return `<div class="inbox-card">
+      <div class="inbox-top"><span class="inbox-role">${roleLabel[a.role] || a.role}</span>${badge(a.status)}${cancelled}</div>
+      <div class="inbox-match">${matchup}</div>
+      <div class="inbox-where">${where}</div>
+      <div class="inbox-actions">${actions}
+        <button class="act ghost" data-open-sheet="${a.game_id}">Open game sheet</button></div>
+    </div>`;
+  }).join("");
+  return `<div class="section-title">Your upcoming assignments (${rows.length})</div>
+    <div class="inbox-list">${cards}</div>${toastHtml()}`;
+}
+
 /* ---------- Standings (#31) ---------- */
 function renderStandings(ov, standings) {
   if (!ov.divisions.length) return `<div class="empty">No divisions yet. Create one in Setup.</div>`;
@@ -1075,7 +1109,7 @@ function setChrome(ov) {
 async function render() {
   const c = document.getElementById("content");
   document.body.dataset.view = view;
-  let ov, board, lineups, standings;
+  let ov, board, lineups, standings, inbox;
   try {
     c.innerHTML = `<div class="skeleton"></div><div class="skeleton"></div><div class="skeleton"></div>`;
     ov = await getJSON("/api/demo/overview");
@@ -1091,6 +1125,8 @@ async function render() {
       const op = await getJSON("/api/officials");
       officialsPool = (op && op.officials) || [];
     }
+    // The signed-in official's inbox (#55).
+    if (view === "inbox") inbox = await getJSON("/api/me/assignments");
     // Standings for the selected division (#31).
     if (view === "standings") {
       if (!standingsDivision || !ov.divisions.some((d) => d.id === standingsDivision)) {
@@ -1115,6 +1151,7 @@ async function render() {
     : view === "games" ? renderGames(ov)
     : view === "roster" ? renderRoster(lineups)
     : view === "sheet" ? renderGameSheet(lineups)
+    : view === "inbox" ? renderInbox(inbox)
     : view === "standings" ? renderStandings(ov, standings)
     : view === "activity" ? renderActivity(board, ov)
     : renderPublic(ov);
@@ -1173,6 +1210,10 @@ async function render() {
   };
   const stDiv = c.querySelector("#standings-div");
   if (stDiv) stDiv.onchange = (e) => { standingsDivision = e.target.value; render(); };
+  // Inbox: jump to a game's sheet (#55).
+  c.querySelectorAll("[data-open-sheet]").forEach((b) => b.onclick = () => {
+    currentGame = b.dataset.openSheet; switchTab("sheet");
+  });
   // Shared move: used by both drag/drop and the click-based Move fallback.
   const applyMove = async (gid, slotId) => {
     toast = "";
@@ -1295,6 +1336,9 @@ function gateChrome() {
   });
   toggle('.topbar [data-goto="calendar"]', hasPerm("manage_schedule"));
   toggle('.topbar [data-open-drawer="ice-slot"]', hasPerm("manage_arena"));
+  // The "My Assignments" tab is only for a signed-in official (#55).
+  const isOfficial = !!(currentUser && currentUser.scope && currentUser.scope.official_id);
+  toggle('.tab[data-tab="inbox"]', isOfficial);
 }
 function setUser(user) {
   currentUser = user;

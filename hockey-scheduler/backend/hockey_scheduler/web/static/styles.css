@@ -317,6 +317,16 @@ select.player-picker {
   .gs-grid { break-inside: avoid; }
 }
 
+/* ----- official inbox (#55) ----- */
+.inbox-list { display: grid; gap: 10px; }
+.inbox-card { background: var(--card); border: 1px solid var(--sep); border-radius: 12px; padding: 14px; }
+.inbox-top { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+.inbox-role { font-weight: 800; font-size: 14px; flex: 1; }
+.inbox-match { font-size: 16px; font-weight: 700; }
+.inbox-where { font-size: 13px; color: var(--muted); margin-top: 2px; }
+.inbox-actions { display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap; }
+.inbox-actions .act { flex: 1; min-width: 120px; }
+
 /* ----- game result + standings (#31) ----- */
 .gs-result { border: 1px solid var(--sep); border-radius: 12px; background: var(--card);
   padding: 14px; margin-bottom: 12px; text-align: center; }

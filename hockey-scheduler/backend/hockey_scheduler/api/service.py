@@ -386,6 +386,33 @@ class ApiService:
         return self._official_rows(game_id)
 
     @catch
+    def get_official_inbox(self, official_id: str) -> dict:
+        """An official's own assignments with game context, for the inbox (#55)."""
+        rows = []
+        for a in self.store.assignments_for_official(official_id):
+            g = self.store.get_game(a.game_id)
+            if g is None:
+                continue
+            home = self.store.get_team(g.home_team_id)
+            away = self.store.get_team(g.away_team_id) if g.away_team_id else None
+            rink = self.store.get_ice_slot(g.ice_slot_id) if g.ice_slot_id else None
+            venue = None
+            if rink is not None:
+                rk = self.store.get_rink(rink.rink_id)
+                venue = self.store.get_venue(rk.venue_id).name if (
+                    rk and self.store.get_venue(rk.venue_id)) else None
+            rows.append({
+                "assignment_id": a.id, "game_id": a.game_id,
+                "role": a.role.value, "status": a.status.value,
+                "home_team_name": home.name if home else g.home_team_id,
+                "away_team_name": away.name if away else None,
+                "start_time": g.start_time.isoformat() if g.start_time else None,
+                "rink": g.rink, "venue_name": venue, "cancelled": g.cancelled,
+            })
+        rows.sort(key=lambda r: r["start_time"] or "")
+        return {"official_id": official_id, "assignments": rows}
+
+    @catch
     def assign_official(self, game_id: str, official_id: str, role: str,
                         actor_id: Optional[str] = None) -> dict:
         a = self.setup.assign_official(

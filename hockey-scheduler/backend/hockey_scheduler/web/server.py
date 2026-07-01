@@ -208,6 +208,23 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_json({"accounts": demo_accounts()})
         if path == "/api/officials":
             return self._send_api({"officials": api.get_officials()})
+        if path == "/api/me/assignments":
+            # The signed-in official's own inbox (#55). Identity comes from the
+            # session cookie, with the same rules as /api/auth/me: no cookie →
+            # empty; a present-but-invalid/expired cookie → 401; a valid session
+            # without an official binding → empty; a bound official → their inbox.
+            sid = self._cookie(SESSION_COOKIE)
+            if sid is None:
+                return self._send_json({"official_id": None, "assignments": []})
+            sess = SESSIONS.resolve(sid)
+            if sess is None:
+                return self._send_json({"error": {
+                    "code": "unauthorized",
+                    "message": "Session expired — please sign in again."}}, 401)
+            oid = sess.get("scope", {}).get("official_id")
+            if not oid:
+                return self._send_json({"official_id": None, "assignments": []})
+            return self._send_api(api.get_official_inbox(oid))
         sd = re.match(r"^/api/standings/([^/]+)$", path)
         if sd:
             return self._send_api(api.get_standings(sd.group(1)))
