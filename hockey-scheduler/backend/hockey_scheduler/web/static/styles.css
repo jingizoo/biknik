@@ -372,6 +372,23 @@ select.player-picker {
 }
 .chip-drag.dragging { opacity: 0.5; }
 
+/* ----- click-to-move fallback (touch/mobile-friendly) ----- */
+.slot-move, .chip-move {
+  margin-left: 8px; border: 1px solid var(--blue); background: #fff; color: var(--blue);
+  border-radius: 7px; padding: 2px 8px; font-size: 11px; font-weight: 700; cursor: pointer;
+}
+.slot-move:hover, .chip-move:hover { background: var(--blue); color: #fff; }
+.slot-card.allocated .slot-move { margin-top: 5px; margin-left: 0; display: inline-block; }
+.slot-card.move-target { outline: 2px dashed var(--blue); outline-offset: 1px; background: #eaf3ff;
+  animation: pulse-target 1.4s ease-in-out infinite; }
+@keyframes pulse-target { 0%,100% { outline-color: var(--blue); } 50% { outline-color: #7fbaff; } }
+.slot-card.moving, .chip-drag.moving { outline: 2px solid var(--orange); outline-offset: 1px; }
+.move-banner {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  background: #fff5e8; border: 1px solid #ffd9a8; border-radius: 10px;
+  padding: 10px 14px; margin: 0 2px 12px; font-size: 13px;
+}
+
 /* ----- calendar header + legend ----- */
 .cal-head { display: flex; justify-content: space-between; align-items: center; margin: 4px 2px 10px; }
 .cal-date { font-size: 17px; font-weight: 700; }
