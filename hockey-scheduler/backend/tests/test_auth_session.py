@@ -133,7 +133,7 @@ class AuthSessionTest(unittest.TestCase):
         _, body = self._req(c, "GET", "/api/auth/accounts")
         roles = {a["role"] for a in body["accounts"]}
         self.assertEqual(roles, {"league_admin", "arena_manager", "coach",
-                                 "player", "viewer"})
+                                 "player", "official", "viewer"})
 
 
 if __name__ == "__main__":

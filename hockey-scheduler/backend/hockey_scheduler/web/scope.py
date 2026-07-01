@@ -14,6 +14,8 @@ from ..domain import Role
 
 _SUB_ACTION = re.compile(
     r"^/api/games/[^/]+/substitutes/([^/]+)/(?:offer|accept|decline|add-to-roster)$")
+_ASSIGN_RESPOND = re.compile(
+    r"^/api/officials/assignments/([^/]+)/(?:accept|decline)$")
 _GAME_ACTION = re.compile(r"^/api/games/[^/]+/(.+)$")
 
 # Game-wide actions a scoped coach may NOT perform — they flip whole-game state
@@ -64,4 +66,13 @@ def scope_violation(role, scope, path, body, store):
         for pid in _player_ids(path, body):
             if pid != own:
                 return "Players can only respond for themselves."
+    elif role == Role.OFFICIAL:
+        own = scope.get("official_id")
+        if not own:
+            return None
+        m = _ASSIGN_RESPOND.match(path)
+        if m:
+            assignment = store.get_official_assignment(m.group(1))
+            if assignment is not None and assignment.official_id != own:
+                return "Officials can only respond to their own assignments."
     return None

@@ -49,7 +49,7 @@ class ServerAuthzTest(unittest.TestCase):
         self.assertEqual(status, 200)
         ids = {r["id"] for r in body["roles"]}
         self.assertEqual(ids, {"league_admin", "arena_manager", "coach",
-                               "player", "viewer"})
+                               "player", "official", "viewer"})
         self.assertEqual(body["default"], "league_admin")
 
     def test_viewer_cannot_create_league(self):

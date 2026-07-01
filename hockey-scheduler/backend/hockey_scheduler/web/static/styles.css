@@ -301,6 +301,9 @@ select.player-picker {
 .gs-off-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 6px; }
 .gs-off-name { font-size: 13px; font-weight: 600; flex: 1; }
 .gs-off-slot { font-size: 13px; color: var(--muted); font-style: italic; }
+.gs-off-row.mine { background: #f2f8ff; border-radius: 8px; padding: 4px 6px; margin: -2px -6px 4px; }
+.you-tag { font-size: 10px; font-weight: 800; text-transform: uppercase; letter-spacing: .3px;
+  color: var(--blue); background: #e3f0ff; border-radius: 6px; padding: 1px 5px; }
 .gs-assign { display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap; }
 .gs-assign select { padding: 8px 10px; border: 1px solid var(--sep); border-radius: 8px; font-size: 13px; background: #fff; }
 @media (max-width: 680px) { .gs-off-grid { grid-template-columns: 1fr; } }

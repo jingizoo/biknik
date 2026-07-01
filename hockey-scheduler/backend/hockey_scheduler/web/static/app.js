@@ -740,7 +740,13 @@ function renderStandings(ov, standings) {
     ${toastHtml()}`;
 }
 function officialsPanel(lineups) {
-  const canAssign = hasPerm("manage_schedule");   // arena manager / league admin
+  const canManage = hasPerm("manage_schedule");        // assign / unassign (operator)
+  const canRespondAny = hasPerm("respond_assignment"); // admin, or a signed-in official
+  const myOfficialId = (currentUser && currentUser.scope) ? currentUser.scope.official_id : null;
+  // An official may respond only to their own proposed assignment (#54); an
+  // admin (respond permission, no official scope) may respond to any.
+  const canRespondTo = (a) => canRespondAny && a.status === "proposed"
+    && (!myOfficialId || a.official_id === myOfficialId);
   const assigned = lineups.officials || [];
   const ROLES = [["referee", "👨‍⚖️ Referee"], ["linesperson", "🚩 Linesperson"],
                  ["scorekeeper", "📝 Scorekeeper"]];
@@ -750,21 +756,26 @@ function officialsPanel(lineups) {
   const roleBlocks = ROLES.map(([role, label]) => {
     const list = assigned.filter((a) => a.role === role);
     const body = list.length
-      ? list.map((a) => `<div class="gs-off-row"><span class="gs-off-name">${esc(a.official_name)}</span>${badge(a.status)}
-          ${canAssign && a.status === "proposed"
+      ? list.map((a) => {
+        const mine = myOfficialId && a.official_id === myOfficialId;
+        return `<div class="gs-off-row${mine ? " mine" : ""}"><span class="gs-off-name">${esc(a.official_name)}${mine ? ` <span class="you-tag">you</span>` : ""}</span>${badge(a.status)}
+          ${canRespondTo(a)
             ? `<button class="act success" data-accept="${a.assignment_id}">Accept</button>
                <button class="act danger" data-decline="${a.assignment_id}">Decline</button>` : ""}
-          ${canAssign ? `<button class="act danger ghost xbtn" data-unassign="${a.assignment_id}" title="Unassign">✕</button>` : ""}</div>`).join("")
+          ${canManage ? `<button class="act danger ghost xbtn" data-unassign="${a.assignment_id}" title="Unassign">✕</button>` : ""}</div>`;
+      }).join("")
       : `<div class="gs-off-slot">Unassigned</div>`;
     return `<div class="gs-off-role"><div class="gs-off-title">${label}</div>${body}</div>`;
   }).join("");
-  const assignForm = (canAssign && officialsPool.length) ? `<div class="gs-assign no-print">
+  const assignForm = (canManage && officialsPool.length) ? `<div class="gs-assign no-print">
       <select id="off-pick">${officialsPool.map((o) => `<option value="${esc(o.id)}">${esc(o.name)}</option>`).join("")}</select>
       <select id="off-role"><option value="referee">Referee</option><option value="linesperson">Linesperson</option><option value="scorekeeper">Scorekeeper</option></select>
       <button class="act primary" data-assign-official>Assign</button></div>` : "";
+  const officialHint = (myOfficialId && !canManage)
+    ? `<div class="gs-note">You're signed in as an official — accept or decline your own assignments below.</div>` : "";
   return `<section class="gs-officials">
     <div class="gs-off-head">👥 Officials <a class="badge" href="${REPO}/30" target="_blank">#30</a></div>
-    <div class="gs-off-grid">${roleBlocks}</div>${assignForm}</section>`;
+    ${officialHint}<div class="gs-off-grid">${roleBlocks}</div>${assignForm}</section>`;
 }
 
 // Small building blocks shared by the roster-selection surface (#46).
@@ -1307,7 +1318,7 @@ function renderRoleSwitch() {
   const chip = document.getElementById("scope-chip");
   if (chip) {
     const sc = (currentUser && currentUser.scope) || {};
-    const name = sc.player_name || sc.team_name;
+    const name = sc.player_name || sc.official_name || sc.team_name;
     chip.textContent = name ? `· ${name}` : "";
   }
 }
