@@ -16,16 +16,27 @@ from typing import Optional
 
 from datetime import datetime, timedelta
 
+from http.cookies import SimpleCookie
+
 from ..api import ApiService
 from ..domain import ROLE_LABELS, Role, permissions_for
 from ..full_demo import build_full_demo_store
 from ..store import SqlStore, create_store
+from .auth import (
+    SESSION_COOKIE,
+    SessionManager,
+    demo_accounts,
+    user_view,
+)
 from .authz import authorize, required_permission
 
-# The demo has no login; the client sends the acting role in this header. When
-# it is absent we assume the full operator (League Admin) so scripts/curl keep
-# working — the UI's role switcher downgrades it to demonstrate enforcement.
+# Acting role resolution (#50): a server-issued session cookie is authoritative.
+# The X-Demo-Role header remains only as a dev fallback for scripts/curl; when
+# neither is present we assume the full operator (League Admin) for convenience.
 ROLE_HEADER = "X-Demo-Role"
+
+# Sessions live outside DemoState so signing in survives a demo-data reset.
+SESSIONS = SessionManager()
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 CONTENT_TYPES = {
@@ -45,6 +56,7 @@ ERROR_HTTP_STATUS = {
     "slot_already_filled": 409,
     "not_eligible": 403,
     "forbidden": 403,
+    "unauthorized": 401,
     "game_cancelled": 409,
 }
 
@@ -84,13 +96,53 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     # -- helpers -----------------------------------------------------------
-    def _send_json(self, payload, code: int = 200) -> None:
+    def _send_json(self, payload, code: int = 200, extra_headers=None) -> None:
         body = json.dumps(payload, default=_json_default).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        for name, value in (extra_headers or []):
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(body)
+
+    def _cookie(self, name: str):
+        raw = self.headers.get("Cookie")
+        if not raw:
+            return None
+        try:
+            jar = SimpleCookie(raw)
+        except Exception:
+            return None
+        morsel = jar.get(name)
+        return morsel.value if morsel else None
+
+    def _resolve_role(self):
+        """Resolve the acting role. Returns (role, error_response_or_None).
+
+        Priority: a valid session cookie (authoritative), else the X-Demo-Role
+        dev fallback (invalid → 403), else League Admin (no auth). A *present*
+        session cookie that is invalid/expired is rejected (401) rather than
+        silently downgraded.
+        """
+        sid = self._cookie(SESSION_COOKIE)
+        if sid is not None:
+            sess = SESSIONS.resolve(sid)
+            if sess is None:
+                return None, (401, {"error": {
+                    "code": "unauthorized",
+                    "message": "Session expired — please sign in again."}})
+            return sess["role"], None
+        raw_role = self.headers.get(ROLE_HEADER)
+        if raw_role is None or raw_role == "":
+            return Role.LEAGUE_ADMIN, None
+        try:
+            return Role(raw_role), None
+        except ValueError:
+            return None, (403, {"error": {
+                "code": "forbidden",
+                "message": f"Unknown role '{raw_role}'.",
+                "details": {"role": raw_role}}})
 
     def _send_api(self, payload) -> None:
         """Send an API payload, mapping structured domain errors to HTTP codes."""
@@ -149,6 +201,13 @@ class Handler(BaseHTTPRequestHandler):
                     for r in Role
                 ],
             })
+        if path == "/api/auth/accounts":
+            # The pickable demo accounts for the sign-in UI (#50).
+            return self._send_json({"accounts": demo_accounts()})
+        if path == "/api/auth/me":
+            # Current signed-in user from the session cookie, or null.
+            sess = SESSIONS.resolve(self._cookie(SESSION_COOKIE))
+            return self._send_json({"user": user_view(sess) if sess else None})
         # /api/games/{gid}/<sub>  — works for any game id, not just the seed.
         m = re.match(r"^/api/games/([^/]+)(?:/(board|lineups|roster-status|roster|substitutes))?$", path)
         if m:
@@ -177,23 +236,30 @@ class Handler(BaseHTTPRequestHandler):
         pid: Optional[str] = body.get("player_id")
         actor = body.get("actor_id", "demo")
 
-        # Authorize the acting role at the HTTP boundary (#24). The policy is the
-        # domain permission model; GET requests are read-only and never reach here.
-        # A missing header defaults to admin (back-compat for scripts/curl), but a
-        # supplied-yet-invalid role must NOT escalate — reject it rather than fall
-        # back to admin.
-        raw_role = self.headers.get(ROLE_HEADER)
-        if raw_role is None or raw_role == "":
-            role = Role.LEAGUE_ADMIN
-        else:
-            try:
-                role = Role(raw_role)
-            except ValueError:
+        # -- authentication (#50): login / logout are open (no role required) ---
+        if path == "/api/auth/login":
+            token = SESSIONS.login(body.get("username", ""), body.get("password", ""))
+            if token is None:
                 return self._send_json({"error": {
-                    "code": "forbidden",
-                    "message": f"Unknown role '{raw_role}'.",
-                    "details": {"role": raw_role},
-                }}, 403)
+                    "code": "unauthorized",
+                    "message": "Invalid username or password."}}, 401)
+            sess = SESSIONS.resolve(token)
+            cookie = (f"{SESSION_COOKIE}={token}; HttpOnly; Path=/; SameSite=Lax; "
+                      f"Max-Age={8 * 60 * 60}")
+            return self._send_json({"user": user_view(sess)},
+                                   extra_headers=[("Set-Cookie", cookie)])
+        if path == "/api/auth/logout":
+            SESSIONS.logout(self._cookie(SESSION_COOKIE))
+            expire = f"{SESSION_COOKIE}=; HttpOnly; Path=/; SameSite=Lax; Max-Age=0"
+            return self._send_json({"ok": True},
+                                   extra_headers=[("Set-Cookie", expire)])
+
+        # Authorize the acting role at the HTTP boundary (#24/#50). A session
+        # cookie is authoritative; the X-Demo-Role header is a dev fallback.
+        role, err = self._resolve_role()
+        if err is not None:
+            code, payload = err
+            return self._send_json(payload, code)
         if not authorize(role, path):
             perm = required_permission(path)
             return self._send_json({"error": {

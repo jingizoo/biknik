@@ -12,8 +12,10 @@ let calendarDate = "2026-09-05";  // YYYY-MM-DD shown on the arena calendar
 let calendarMode = "day";   // day | week
 let calFilters = { venueId: "all", rinkId: "all", divisionId: "all", teamId: "all" };
 let toast = "";
-let currentRole = "league_admin";  // demo role sent with each request (#24)
+let currentRole = "viewer";        // role of the signed-in user (from /api/auth/me)
+let currentUser = null;            // {username, role, label} or null when signed out
 let roleCatalog = [];              // [{id,label,permissions}] from /api/auth/roles
+let accounts = [];                 // [{username,role,label}] demo sign-in options (#50)
 let rolePerms = new Set();         // permissions of the current role
 let movingGameId = null;    // click-to-move fallback: game awaiting a destination slot
 let conflict = null;        // {ok, title, lines[], game, slot} — calendar side panel (#43)
@@ -60,12 +62,12 @@ const fmt = (iso) => { const m = /T(\d{2}:\d{2})/.exec(iso || ""); return m ? m[
 const val = (id) => { const e = document.getElementById(id); return e ? e.value.trim() : ""; };
 const hasPerm = (p) => rolePerms.has(p);
 
-// Every request carries the demo-selected role; the server authorizes it (#24).
-const roleHeaders = () => ({ "X-Demo-Role": currentRole });
-async function getJSON(p) { return (await fetch(p, { headers: roleHeaders() })).json(); }
+// The session cookie carries identity; the server resolves the role from it
+// and authorizes each request (#50). No client-asserted role header.
+async function getJSON(p) { return (await fetch(p, { credentials: "same-origin" })).json(); }
 async function post(p, b) {
-  const r = await fetch(p, { method: "POST",
-    headers: { "Content-Type": "application/json", ...roleHeaders() },
+  const r = await fetch(p, { method: "POST", credentials: "same-origin",
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify(b || {}) });
   const d = await r.json();
   if (d && d.error) toast = d.error.message;
@@ -1115,7 +1117,7 @@ document.addEventListener("keydown", (e) => {
   else if (movingGameId != null) { movingGameId = null; render(); }
 });
 
-// -- role switcher (demo auth, #24) --------------------------------------
+// -- sign-in / session (demo auth, #50) ----------------------------------
 function applyRolePerms() {
   const r = roleCatalog.find((x) => x.id === currentRole);
   rolePerms = new Set(r ? r.permissions : []);
@@ -1128,23 +1130,42 @@ function gateChrome() {
   toggle('.topbar [data-goto="calendar"]', hasPerm("manage_schedule"));
   toggle('.topbar [data-open-drawer="ice-slot"]', hasPerm("manage_arena"));
 }
+function setUser(user) {
+  currentUser = user;
+  currentRole = user ? user.role : "viewer";
+  applyRolePerms();
+}
+async function signIn(username) {
+  const r = await post("/api/auth/login", { username, password: "demo" });
+  if (r && !r.error) { setUser(r.user); toast = ""; }
+  drawer = null; movingGameId = null; conflict = null;
+  renderRoleSwitch(); render();
+}
 function renderRoleSwitch() {
   const sel = document.getElementById("role-switch");
-  if (!sel || !roleCatalog.length) return;
-  sel.innerHTML = roleCatalog.map((r) =>
-    `<option value="${esc(r.id)}" ${r.id === currentRole ? "selected" : ""}>${esc(r.label)}</option>`).join("");
-  sel.onchange = (e) => {
-    currentRole = e.target.value; applyRolePerms();
-    toast = ""; drawer = null; movingGameId = null;
-    renderRoleSwitch(); render();
-  };
+  if (!sel || !accounts.length) return;
+  sel.innerHTML = accounts.map((a) =>
+    `<option value="${esc(a.username)}" ${a.role === currentRole ? "selected" : ""}>${esc(a.label)}</option>`).join("");
+  // Switching the demo account performs a real server-side sign-in (#50).
+  sel.onchange = (e) => signIn(e.target.value);
 }
 async function bootstrap() {
   try {
-    const data = await (await fetch("/api/auth/roles")).json();
-    roleCatalog = data.roles || [];
-    if (data.default && roleCatalog.some((r) => r.id === data.default)) currentRole = data.default;
-  } catch (_) { roleCatalog = []; }
+    const [rolesRes, acctRes, meRes] = await Promise.all([
+      fetch("/api/auth/roles").then((r) => r.json()),
+      fetch("/api/auth/accounts").then((r) => r.json()),
+      fetch("/api/auth/me", { credentials: "same-origin" }).then((r) => r.json()),
+    ]);
+    roleCatalog = rolesRes.roles || [];
+    accounts = acctRes.accounts || [];
+    if (meRes.user) {
+      setUser(meRes.user);
+    } else {
+      // Start the demo signed in as League Admin (server-issued session).
+      await post("/api/auth/login", { username: "admin", password: "demo" })
+        .then((r) => { if (r && !r.error) setUser(r.user); });
+    }
+  } catch (_) { roleCatalog = []; accounts = []; }
   applyRolePerms();
   renderRoleSwitch();
   render();
