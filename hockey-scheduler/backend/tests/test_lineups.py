@@ -66,5 +66,24 @@ class LineupsTest(unittest.TestCase):
         self.assertEqual({p["id"] for p in away_next}, set(picks))
 
 
+    def test_auto_build_away_does_not_touch_home(self):
+        home_before = self.api.get_roster_status(self.game_id)
+        res = self.api.auto_build_roster(
+            self.game_id, team_id=self.away, actor_id="coach_away")
+        self.assertNotIn("error", res)
+        self.assertEqual(res["team_id"], self.away)
+        lineups = self.api.get_lineups(self.game_id)
+        self.assertEqual(lineups["home"]["status"], home_before)
+        self.assertNotEqual(lineups["away"]["status"]["status"], "draft")
+
+    def test_auto_build_third_team_rejected(self):
+        club = self.api.create_club("Outsiders HC")
+        team = self.api.create_team(
+            club["id"], self.ids["division_id"], "Outsiders")
+        res = self.api.auto_build_roster(
+            self.game_id, team_id=team["id"], actor_id="coach")
+        self.assertEqual(res["error"]["code"], "validation_error")
+
+
 if __name__ == "__main__":
     unittest.main()

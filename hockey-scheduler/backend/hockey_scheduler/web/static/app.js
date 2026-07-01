@@ -820,7 +820,7 @@ async function submitSetup(kind) {
 async function rosterAction(act, id) {
   toast = "";
   const B = `/api/games/${currentGame}`;
-  if (act === "build") await post(`${B}/build-roster`, {});
+  if (act === "build") await post(`${B}/build-roster`, { team_id: rosterTeamId });
   else if (act === "select") await post(`${B}/roster/select`, { player_ids: [id] });
   else if (act === "remove") await post(`${B}/roster/remove`, { player_id: id });
   else if (act === "copy") { const r = await post(`${B}/roster/copy-previous`, { team_id: rosterTeamId }); if (r && !r.error) toast = `Copied ${r.copied} players from the previous game.`; }

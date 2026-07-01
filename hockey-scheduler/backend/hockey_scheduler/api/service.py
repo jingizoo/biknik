@@ -199,18 +199,23 @@ class ApiService:
         return self.roster.compute_roster_status(game_id).to_dict()
 
     @catch
-    def auto_build_roster(self, game_id: str, actor_id: Optional[str] = None) -> dict:
-        """Demo helper: select + confirm a full roster from the home team.
+    def auto_build_roster(self, game_id: str, team_id: Optional[str] = None,
+                          actor_id: Optional[str] = None) -> dict:
+        """Demo helper: select + confirm a full roster for one side.
 
-        Picks the home team's goalies and skaters up to the game's targets so a
+        Picks the team's goalies and skaters up to the game's targets so a
         newly-scheduled game becomes immediately playable by the roster flow.
-        Raises if the home team has no players (the UI shows an empty state).
+        ``team_id`` defaults to the home side (#25); a team not playing in the
+        game is rejected. Raises if the team has no players (empty state).
         """
         game = self.roster._require_game(game_id)
-        players = self.store.players_for_team(game.home_team_id)
+        team_id = team_id or game.home_team_id
+        if team_id not in (game.home_team_id, game.away_team_id):
+            raise ValidationError("That team is not playing in this game.")
+        players = self.store.players_for_team(team_id)
         if not players:
             raise ValidationError(
-                "Home team has no players yet. Add or import players first."
+                "Team has no players yet. Add or import players first."
             )
         goalies = [p for p in players if p.slot_type == SlotType.GOALIE]
         skaters = [p for p in players if p.slot_type == SlotType.SKATER]
@@ -219,7 +224,7 @@ class ApiService:
         self.roster.select_roster(game_id, selected, actor_id)
         for pid in selected:
             self.roster.set_availability(game_id, pid, AvailabilityStatus.AVAILABLE)
-        status = self.roster.compute_roster_status(game_id).to_dict()
+        status = self.roster.compute_roster_status(game_id, team_id).to_dict()
         # Coach-friendly classification of a short roster.
         status["missing_goalies"] = status["open_goalie_slots"]
         status["missing_skaters"] = status["open_skater_slots"]

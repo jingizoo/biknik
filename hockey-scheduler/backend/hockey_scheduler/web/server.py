@@ -195,7 +195,8 @@ class Handler(BaseHTTPRequestHandler):
                     gid, pid, body.get("availability_status", "pending"),
                     body.get("response_source", "player"), actor))
             if action == "build-roster":
-                return self._send_api(api.auto_build_roster(gid, actor))
+                return self._send_api(api.auto_build_roster(
+                    gid, body.get("team_id"), actor))
             if action == "roster/select":
                 return self._send_api(api.select_roster(
                     gid, body.get("player_ids", []), actor))
