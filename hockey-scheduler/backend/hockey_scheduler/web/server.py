@@ -23,12 +23,14 @@ from ..domain import ROLE_LABELS, Role, permissions_for
 from ..full_demo import build_full_demo_store
 from ..store import SqlStore, create_store
 from .auth import (
+    DEMO_USERS,
     SESSION_COOKIE,
     SessionManager,
     demo_accounts,
     user_view,
 )
 from .authz import authorize, required_permission
+from .scope import scope_violation
 
 # Acting role resolution (#50): a server-issued session cookie is authoritative.
 # The X-Demo-Role header remains only as a dev fallback for scripts/curl; when
@@ -118,28 +120,28 @@ class Handler(BaseHTTPRequestHandler):
         return morsel.value if morsel else None
 
     def _resolve_role(self):
-        """Resolve the acting role. Returns (role, error_response_or_None).
+        """Resolve the acting role + scope. Returns (role, scope, err_or_None).
 
-        Priority: a valid session cookie (authoritative), else the X-Demo-Role
-        dev fallback (invalid → 403), else League Admin (no auth). A *present*
-        session cookie that is invalid/expired is rejected (401) rather than
-        silently downgraded.
+        Priority: a valid session cookie (authoritative, carries scope), else the
+        X-Demo-Role dev fallback (invalid → 403, no scope), else League Admin (no
+        auth). A *present* session cookie that is invalid/expired is rejected
+        (401) rather than silently downgraded.
         """
         sid = self._cookie(SESSION_COOKIE)
         if sid is not None:
             sess = SESSIONS.resolve(sid)
             if sess is None:
-                return None, (401, {"error": {
+                return None, None, (401, {"error": {
                     "code": "unauthorized",
                     "message": "Session expired — please sign in again."}})
-            return sess["role"], None
+            return sess["role"], sess.get("scope", {}), None
         raw_role = self.headers.get(ROLE_HEADER)
         if raw_role is None or raw_role == "":
-            return Role.LEAGUE_ADMIN, None
+            return Role.LEAGUE_ADMIN, {}, None
         try:
-            return Role(raw_role), None
+            return Role(raw_role), {}, None
         except ValueError:
-            return None, (403, {"error": {
+            return None, None, (403, {"error": {
                 "code": "forbidden",
                 "message": f"Unknown role '{raw_role}'.",
                 "details": {"role": raw_role}}})
@@ -216,7 +218,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_json({"error": {
                     "code": "unauthorized",
                     "message": "Session expired — please sign in again."}}, 401)
-            return self._send_json({"user": user_view(sess)})
+            return self._send_json({"user": user_view(sess, api.store)})
         # /api/games/{gid}/<sub>  — works for any game id, not just the seed.
         m = re.match(r"^/api/games/([^/]+)(?:/(board|lineups|roster-status|roster|substitutes))?$", path)
         if m:
@@ -247,7 +249,19 @@ class Handler(BaseHTTPRequestHandler):
 
         # -- authentication (#50): login / logout are open (no role required) ---
         if path == "/api/auth/login":
-            token = SESSIONS.login(body.get("username", ""), body.get("password", ""))
+            # Bind coach/player sessions to a resource so scoping can enforce
+            # "own team / own self" (#51). Demo ids are deterministic across
+            # resets, so binding at login stays valid.
+            uname = (body.get("username") or "").strip().lower()
+            prole = DEMO_USERS.get(uname)
+            scope = {}
+            if prole == Role.COACH:
+                scope["team_id"] = STATE.ids.get("home_team_id")
+            elif prole == Role.PLAYER:
+                scope["team_id"] = STATE.ids.get("home_team_id")
+                scope["player_id"] = STATE.ids.get("selected_player_id")
+            token = SESSIONS.login(body.get("username", ""),
+                                   body.get("password", ""), scope=scope)
             if token is None:
                 return self._send_json({"error": {
                     "code": "unauthorized",
@@ -255,7 +269,7 @@ class Handler(BaseHTTPRequestHandler):
             sess = SESSIONS.resolve(token)
             cookie = (f"{SESSION_COOKIE}={token}; HttpOnly; Path=/; SameSite=Lax; "
                       f"Max-Age={8 * 60 * 60}")
-            return self._send_json({"user": user_view(sess)},
+            return self._send_json({"user": user_view(sess, api.store)},
                                    extra_headers=[("Set-Cookie", cookie)])
         if path == "/api/auth/logout":
             SESSIONS.logout(self._cookie(SESSION_COOKIE))
@@ -265,7 +279,7 @@ class Handler(BaseHTTPRequestHandler):
 
         # Authorize the acting role at the HTTP boundary (#24/#50). A session
         # cookie is authoritative; the X-Demo-Role header is a dev fallback.
-        role, err = self._resolve_role()
+        role, scope, err = self._resolve_role()
         if err is not None:
             code, payload = err
             return self._send_json(payload, code)
@@ -277,6 +291,13 @@ class Handler(BaseHTTPRequestHandler):
                             f"(requires {perm.value})."),
                 "details": {"role": role.value,
                             "required": perm.value if perm else None},
+            }}, 403)
+        # Resource scoping (#51): a coach only their team, a player only self.
+        violation = scope_violation(role, scope, path, body, api.store)
+        if violation is not None:
+            return self._send_json({"error": {
+                "code": "forbidden", "message": violation,
+                "details": {"role": role.value, "scope": scope},
             }}, 403)
 
         if path == "/api/reset":

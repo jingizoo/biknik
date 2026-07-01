@@ -83,11 +83,16 @@ class AuthSessionTest(unittest.TestCase):
         c = self._client()
         self._req(c, "POST", "/api/auth/login",
                   {"username": "coach", "password": "demo"})
-        # A coach session may lock a roster but not move a game.
+        # A coach session may manage its own team's roster but not move a game
+        # (scheduling) — and not lock/cancel the whole game (that is scoped out
+        # for a bound coach in #51).
         status, _ = self._req(c, "POST", f"/api/games/{self.game_id}/move",
                               {"ice_slot_id": "x"})
         self.assertEqual(status, 403)
-        status, _ = self._req(c, "POST", f"/api/games/{self.game_id}/roster/lock", {})
+        home = srv.STATE.ids["home_team_id"]
+        status, _ = self._req(c, "POST",
+                              f"/api/games/{self.game_id}/build-roster",
+                              {"team_id": home})
         self.assertNotEqual(status, 403)
 
     def test_session_beats_header(self):
