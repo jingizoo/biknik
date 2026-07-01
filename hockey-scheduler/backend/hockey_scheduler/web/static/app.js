@@ -660,8 +660,8 @@ function renderGameSheet(lineups) {
       ${sheetSide(lineups.away, "Away")}
     </div>
     <div class="gs-grid">
-      ${placeholder("👨‍⚖️", "Officials", 49)}
-      ${placeholder("📝", "Scorekeeper", 49)}
+      ${placeholder("👨‍⚖️", "Officials", 30)}
+      ${placeholder("📝", "Scorekeeper / Results", 31)}
     </div>
     <div class="privacy-note">📋 Roster names are visible to authorized operators only. Score,
       penalties, official assignment, and signatures are follow-ups (auth in #24).</div>
