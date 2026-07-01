@@ -107,6 +107,22 @@ class AuthSessionTest(unittest.TestCase):
         self.assertEqual(status, 401)
         self.assertEqual(body["error"]["code"], "unauthorized")
 
+    def test_me_invalid_session_cookie_returns_401(self):
+        # A present-but-invalid cookie must not read as signed out (which would
+        # let the client silently auto-login as admin); it must be a 401.
+        c = self._client()
+        status, body = self._req(
+            c, "GET", "/api/auth/me",
+            headers={"Cookie": f"{srv.SESSION_COOKIE}=bogustoken"})
+        self.assertEqual(status, 401)
+        self.assertEqual(body["error"]["code"], "unauthorized")
+
+    def test_me_no_cookie_is_signed_out(self):
+        c = self._client()
+        status, body = self._req(c, "GET", "/api/auth/me")
+        self.assertEqual(status, 200)
+        self.assertIsNone(body["user"])
+
     def test_accounts_endpoint_lists_demo_users(self):
         c = self._client()
         _, body = self._req(c, "GET", "/api/auth/accounts")

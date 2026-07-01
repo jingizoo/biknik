@@ -205,9 +205,18 @@ class Handler(BaseHTTPRequestHandler):
             # The pickable demo accounts for the sign-in UI (#50).
             return self._send_json({"accounts": demo_accounts()})
         if path == "/api/auth/me":
-            # Current signed-in user from the session cookie, or null.
-            sess = SESSIONS.resolve(self._cookie(SESSION_COOKIE))
-            return self._send_json({"user": user_view(sess) if sess else None})
+            # Consistent with POST role resolution (#50): no cookie → signed out,
+            # a valid cookie → the user, a present-but-invalid/expired cookie →
+            # 401 (must re-auth) rather than silently reading as signed out.
+            sid = self._cookie(SESSION_COOKIE)
+            if sid is None:
+                return self._send_json({"user": None})
+            sess = SESSIONS.resolve(sid)
+            if sess is None:
+                return self._send_json({"error": {
+                    "code": "unauthorized",
+                    "message": "Session expired — please sign in again."}}, 401)
+            return self._send_json({"user": user_view(sess)})
         # /api/games/{gid}/<sub>  — works for any game id, not just the seed.
         m = re.match(r"^/api/games/([^/]+)(?:/(board|lineups|roster-status|roster|substitutes))?$", path)
         if m:

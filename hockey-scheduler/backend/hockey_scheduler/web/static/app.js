@@ -1151,17 +1151,22 @@ function renderRoleSwitch() {
 }
 async function bootstrap() {
   try {
-    const [rolesRes, acctRes, meRes] = await Promise.all([
+    const [rolesRes, acctRes, meResp] = await Promise.all([
       fetch("/api/auth/roles").then((r) => r.json()),
       fetch("/api/auth/accounts").then((r) => r.json()),
-      fetch("/api/auth/me", { credentials: "same-origin" }).then((r) => r.json()),
+      fetch("/api/auth/me", { credentials: "same-origin" }),
     ]);
     roleCatalog = rolesRes.roles || [];
     accounts = acctRes.accounts || [];
-    if (meRes.user) {
+    const meRes = await meResp.json();
+    if (meResp.status === 401) {
+      // A stale/invalid session must NOT silently become a new admin session.
+      setUser(null);
+      toast = "Session expired — pick an account to sign in.";
+    } else if (meRes.user) {
       setUser(meRes.user);
     } else {
-      // Start the demo signed in as League Admin (server-issued session).
+      // No session at all: start the demo signed in as League Admin.
       await post("/api/auth/login", { username: "admin", password: "demo" })
         .then((r) => { if (r && !r.error) setUser(r.user); });
     }
