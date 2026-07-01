@@ -92,6 +92,9 @@ class SqlStoreParityTest(unittest.TestCase):
         ov2 = self.api.get_delivery_overview()
         self.assertEqual(ov2["by_status"].get("sent"), ov2["total"])
         self.assertTrue(all(d["sent_at"] for d in ov2["deliveries"]))
+        # Recipient targeting (#59) persists through the SQL store too.
+        self.assertTrue(all(d["recipient_ref"] and d["destination"]
+                            for d in ov2["deliveries"]))
 
 
 class SqlStoreTransactionTest(unittest.TestCase):
