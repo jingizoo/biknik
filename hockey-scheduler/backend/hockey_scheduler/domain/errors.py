@@ -9,12 +9,19 @@ leaking Python exceptions across the boundary.
 class DomainError(Exception):
     code = "domain_error"
 
-    def __init__(self, message: str):
+    def __init__(self, message: str, details: dict = None):
         super().__init__(message)
         self.message = message
+        # Optional machine-readable context (e.g. a conflict ``reason`` and the
+        # ids involved) so a client can explain *why* an action failed without
+        # parsing the English message. See the conflict side panel (#43).
+        self.details = details or {}
 
     def to_dict(self) -> dict:
-        return {"error": {"code": self.code, "message": self.message}}
+        err = {"code": self.code, "message": self.message}
+        if self.details:
+            err["details"] = self.details
+        return {"error": err}
 
 
 class NotFoundError(DomainError):

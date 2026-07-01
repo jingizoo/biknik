@@ -122,5 +122,90 @@ class GameMoveTest(unittest.TestCase):
             c["svc"].move_game(c["game"].id, "slot_missing")
 
 
+class MoveConflictReasonTest(unittest.TestCase):
+    """The conflict side panel (#43) relies on structured error.details.reason."""
+
+    def _reason(self, fn):
+        try:
+            fn()
+        except Exception as exc:  # noqa: BLE001 - we assert on the captured one
+            return getattr(exc, "details", {}).get("reason")
+        return None
+
+    def test_same_slot_reason(self):
+        c = universe()
+        self.assertEqual(
+            self._reason(lambda: c["svc"].move_game(c["game"].id, c["slot_a"].id)),
+            "same_slot")
+
+    def test_not_game_slot_reason_carries_slot_type(self):
+        c = universe()
+        maint = c["svc"].create_ice_slot(c["r2"].id, dt(6), dt(7),
+                                         slot_type=IceSlotType.MAINTENANCE)
+        try:
+            c["svc"].move_game(c["game"].id, maint.id)
+            self.fail("expected ValidationError")
+        except ValidationError as exc:
+            self.assertEqual(exc.details["reason"], "not_game_slot")
+            self.assertEqual(exc.details["slot_type"], "maintenance")
+
+    def test_slot_unavailable_reason(self):
+        c = universe()
+        c["svc"].create_game(c["season"].id, c["div"].id,
+                             c["bears"].id, c["eagles"].id, c["slot_b"].id)
+        try:
+            c["svc"].move_game(c["game"].id, c["slot_b"].id)
+            self.fail("expected ScheduleConflictError")
+        except ScheduleConflictError as exc:
+            self.assertEqual(exc.details["reason"], "slot_unavailable")
+            self.assertEqual(exc.details["slot_status"], "allocated")
+
+    def test_team_overlap_reason_carries_conflict_game(self):
+        c = universe()
+        rink3 = c["svc"].create_rink(c["store"].all_venues()[0].id, "Rink 3")
+        slot_c = c["svc"].create_ice_slot(c["r1"].id, dt(21), dt(22, 30))
+        other = c["svc"].create_game(c["season"].id, c["div"].id,
+                                     c["away"].id, c["bears"].id, slot_c.id)
+        slot_d = c["svc"].create_ice_slot(rink3.id, dt(21), dt(22, 30))
+        try:
+            c["svc"].move_game(c["game"].id, slot_d.id)
+            self.fail("expected ScheduleConflictError")
+        except ScheduleConflictError as exc:
+            self.assertEqual(exc.details["reason"], "team_overlap")
+            self.assertEqual(exc.details["conflict_game_id"], other.id)
+
+
+class MoveFacadeSideEffectTest(unittest.TestCase):
+    """ApiService.move_game returns a `moved` summary for the side panel."""
+
+    def _api(self):
+        from hockey_scheduler.api import ApiService
+        c = universe()
+        return ApiService(c["store"]), c
+
+    def test_success_returns_moved_summary(self):
+        api, c = self._api()
+        res = api.move_game(c["game"].id, c["slot_b"].id)
+        self.assertNotIn("error", res)
+        self.assertEqual(res["moved"]["old_slot_id"], c["slot_a"].id)
+        self.assertEqual(res["moved"]["new_slot_id"], c["slot_b"].id)
+        self.assertFalse(res["moved"]["unpublished"])
+        self.assertFalse(res["moved"]["roster_unlocked"])
+
+    def test_published_locked_move_flags_side_effects(self):
+        api, c = self._api()
+        c["svc"].publish_game(c["game"].id)
+        c["game"].locked = True
+        c["store"].save_game(c["game"])
+        res = api.move_game(c["game"].id, c["slot_b"].id)
+        self.assertTrue(res["moved"]["unpublished"])
+        self.assertTrue(res["moved"]["roster_unlocked"])
+
+    def test_failed_move_returns_error_with_reason(self):
+        api, c = self._api()
+        res = api.move_game(c["game"].id, c["slot_a"].id)  # same slot
+        self.assertEqual(res["error"]["details"]["reason"], "same_slot")
+
+
 if __name__ == "__main__":
     unittest.main()

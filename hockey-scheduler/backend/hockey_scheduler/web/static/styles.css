@@ -409,6 +409,31 @@ select.player-picker {
 .wk-cell .slot-card .s { font-size: 10px; }
 .wk-none { color: #c4c8d0; font-size: 13px; text-align: center; padding: 6px 0; }
 
+/* ----- conflict side panel (#43) ----- */
+.cal-layout { display: flex; align-items: flex-start; gap: 14px; }
+.cal-main { flex: 1; min-width: 0; }
+.cal-aside { flex: 0 0 280px; align-self: flex-start; position: sticky; top: 10px;
+  background: var(--card); border: 1px solid var(--sep); border-radius: 12px;
+  overflow: hidden; box-shadow: 0 2px 8px rgba(0,0,0,.06); }
+.cal-aside.bad { border-color: var(--red); }
+.cal-aside.ok { border-color: var(--green); }
+.cal-aside .ca-head { display: flex; align-items: center; gap: 8px; padding: 11px 12px;
+  font-weight: 700; font-size: 14px; }
+.cal-aside.bad .ca-head { background: #fdecec; color: #a3231f; }
+.cal-aside.ok .ca-head { background: #e9fbef; color: #1c7a36; }
+.cal-aside .ca-ico { font-size: 15px; }
+.cal-aside .ca-title { flex: 1; }
+.cal-aside .ca-x { border: none; background: transparent; font-size: 19px; line-height: 1;
+  cursor: pointer; color: inherit; opacity: .65; padding: 0 2px; }
+.cal-aside .ca-x:hover { opacity: 1; }
+.cal-aside .ca-body { padding: 10px 12px 12px; }
+.cal-aside .ca-body p { margin: 0 0 8px; font-size: 13px; line-height: 1.45; color: var(--ink); }
+.cal-aside .ca-body p:last-child { margin-bottom: 0; }
+@media (max-width: 720px) {
+  .cal-layout { flex-direction: column; }
+  .cal-aside { flex-basis: auto; width: 100%; position: static; }
+}
+
 /* ----- wizard ----- */
 .wizard { background: var(--card); border-radius: 14px; padding: 14px; margin-bottom: 12px; border: 2px solid var(--blue); }
 .wizard h3 { margin: 0 0 4px; font-size: 17px; }
