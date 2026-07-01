@@ -45,7 +45,8 @@ function fmtDayShort(d) {
 
 const NAV = {
   dashboard: "Dashboard", setup: "Setup", calendar: "Arena Calendar",
-  games: "Games", roster: "Roster", activity: "Activity", public: "Public",
+  games: "Games", roster: "Roster", sheet: "Game Sheet",
+  activity: "Activity", public: "Public",
 };
 const POS_CLASS = { goalie: "pos-G", defense: "pos-D", forward: "pos-F", skater: "pos-D" };
 const REPO = "https://github.com/jingizoo/biknik/issues";
@@ -589,6 +590,84 @@ function renderRoster(lineups) {
       <button class="seg ${gameView === "player" ? "active" : ""}" data-view="player">Player</button>
     </div><div style="padding-top:8px">${gameView === "coach" ? coachBody(side) : playerBody(side)}</div>`;
 }
+
+/* ---------- Game Sheet (read-only, both lineups) (#48) ---------- */
+function fmtDateTime(iso) {
+  if (!iso) return "Date TBD";
+  const d = new Date(iso);
+  const date = d.toLocaleDateString("en-GB",
+    { weekday: "short", day: "numeric", month: "short", year: "numeric", timeZone: "UTC" }).replace(",", "");
+  return `${date} · ${fmt(iso)}`;
+}
+function sheetSide(side, label) {
+  const s = side.status;
+  const occupying = side.players
+    .filter((p) => p.group === "selected" && !p.backed_out)
+    .sort((a, b) => (a.slot_type === b.slot_type
+      ? (a.jersey_number || 99) - (b.jersey_number || 99)
+      : (a.slot_type === "goalie" ? -1 : 1)));
+  const warn = [];
+  const plural = (n) => (n > 1 ? "s" : "");
+  if (!occupying.length) warn.push("No players selected yet.");
+  if (s.open_goalie_slots > 0) warn.push(`Need ${s.open_goalie_slots} more goalie${plural(s.open_goalie_slots)}.`);
+  if (s.open_skater_slots > 0) warn.push(`Need ${s.open_skater_slots} more skater${plural(s.open_skater_slots)}.`);
+  const warnHtml = warn.length ? `<div class="ros-warn">⚠ ${warn.map(esc).join(" ")}</div>` : "";
+  const rows = occupying.length
+    ? occupying.map((p) => `<div class="gs-row">
+        <span class="gs-num">${p.jersey_number != null ? esc(p.jersey_number) : "—"}</span>
+        ${posTag(p)}<span class="gs-name">${esc(p.name)}</span>${statusBadge(p)}</div>`).join("")
+    : `<div class="empty">No lineup submitted.</div>`;
+  const gF = s.target_goalies - s.open_goalie_slots;
+  const sF = s.target_skaters - s.open_skater_slots;
+  return `<section class="gs-side">
+    <header class="gs-side-head">
+      <div><div class="gs-side-team">${esc(side.team_name)}</div>
+        <div class="gs-side-label">${label}</div></div>
+      <span class="badge ${bannerClass(s.status) === "ok" ? "green" : bannerClass(s.status) === "alert" ? "red" : "gray"}">${prettyStatus(s.status)}</span>
+    </header>
+    <div class="gs-counts"><span>Goalies <strong>${gF}/${s.target_goalies}</strong></span>
+      <span>Skaters <strong>${sF}/${s.target_skaters}</strong></span>
+      <span>Confirmed <strong>${s.confirmed_goalies + s.confirmed_skaters}</strong></span></div>
+    ${warnHtml}
+    <div class="gs-roster">${rows}</div>
+  </section>`;
+}
+function renderGameSheet(lineups) {
+  if (!lineups) return `<div class="empty">Select a game from the Games tab.</div>`;
+  const g = lineups.game;
+  const pub = g.published
+    ? `<span class="badge green">● Published</span>`
+    : `<span class="badge gray">○ Draft</span>`;
+  const lock = g.locked
+    ? `<span class="badge orange">🔒 Locked</span>`
+    : `<span class="badge blue">🔓 Open</span>`;
+  const cancelled = g.cancelled ? `<span class="badge red">Cancelled</span>` : "";
+  const placeholder = (icon, title, issue) => `<div class="gs-officials">
+    <div class="gs-off-title">${icon} ${title}</div>
+    <div class="gs-off-slots"><span class="gs-off-slot">To be assigned</span>
+      <a class="badge" href="${REPO}/${issue}" target="_blank">#${issue}</a></div></div>`;
+  return `<div class="game-sheet">
+    <div class="gs-toolbar no-print">
+      <span class="gs-hint">Read-only official game sheet — combines both lineups.</span>
+      <button class="act ghost" data-print>🖨 Print / Export</button></div>
+    <header class="gs-header">
+      <div class="gs-match">${esc(lineups.home.team_name)} <span class="gs-vs">vs</span> ${esc(lineups.away.team_name)}</div>
+      <div class="gs-meta">${esc(fmtDateTime(g.start_time))}${g.rink ? " · " + esc(g.rink) : ""}</div>
+      <div class="gs-badges">${pub} ${lock} ${cancelled}</div>
+    </header>
+    <div class="gs-grid">
+      ${sheetSide(lineups.home, "Home")}
+      ${sheetSide(lineups.away, "Away")}
+    </div>
+    <div class="gs-grid">
+      ${placeholder("👨‍⚖️", "Officials", 49)}
+      ${placeholder("📝", "Scorekeeper", 49)}
+    </div>
+    <div class="privacy-note">📋 Roster names are visible to authorized operators only. Score,
+      penalties, official assignment, and signatures are follow-ups (auth in #24).</div>
+  </div>`;
+}
+
 // Small building blocks shared by the roster-selection surface (#46).
 function playerRow(p, right) {
   const jersey = p.jersey_number != null ? ` <span class="jersey">#${p.jersey_number}</span>` : "";
@@ -859,8 +938,9 @@ async function render() {
     if (!currentGame && ov.schedule[0]) currentGame = ov.schedule[0].game_id;
     const needsBoard = ["activity", "dashboard"].includes(view);
     board = (needsBoard && currentGame) ? await getJSON(`/api/games/${currentGame}/board`) : null;
-    // The roster tab shows both sides' lineups (home + away, #25).
-    lineups = (view === "roster" && currentGame) ? await getJSON(`/api/games/${currentGame}/lineups`) : null;
+    // The roster tab and the game sheet both use both sides' lineups (#25/#48).
+    lineups = (["roster", "sheet"].includes(view) && currentGame)
+      ? await getJSON(`/api/games/${currentGame}/lineups`) : null;
   } catch (e) {
     setChrome(ov);
     c.innerHTML = `<div class="banner alert"><h2>Could not load data</h2>
@@ -876,6 +956,7 @@ async function render() {
     : view === "calendar" ? renderCalendar(ov)
     : view === "games" ? renderGames(ov)
     : view === "roster" ? renderRoster(lineups)
+    : view === "sheet" ? renderGameSheet(lineups)
     : view === "activity" ? renderActivity(board, ov)
     : renderPublic(ov);
 
@@ -895,6 +976,8 @@ async function render() {
   c.querySelectorAll("button[data-act]").forEach((b) => b.onclick = () => rosterAction(b.dataset.act, b.dataset.id));
   c.querySelectorAll(".seg").forEach((b) => b.onclick = () => { gameView = b.dataset.view; toast = ""; render(); });
   c.querySelectorAll("[data-side]").forEach((b) => b.onclick = () => { rosterSide = b.dataset.side; toast = ""; render(); });
+  const printBtn = c.querySelector("[data-print]");
+  if (printBtn) printBtn.onclick = () => window.print();
   // Shared move: used by both drag/drop and the click-based Move fallback.
   const applyMove = async (gid, slotId) => {
     toast = "";
