@@ -15,7 +15,7 @@ _ARENA_SETUP = {"venue", "rink", "ice-slot"}
 _LEAGUE_SETUP = {"league", "season", "division", "club", "team"}
 
 # Game sub-actions grouped by the permission they require.
-_SCHEDULE_ACTIONS = {"move", "publish"}
+_SCHEDULE_ACTIONS = {"move", "publish", "result", "result/approve"}
 _ROSTER_ACTIONS = {
     "build-roster", "roster/select", "roster/remove", "roster/copy-previous",
     "roster/lock", "roster/unlock", "cancel",

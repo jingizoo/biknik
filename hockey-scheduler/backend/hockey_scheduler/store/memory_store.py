@@ -17,6 +17,7 @@ from ..domain import (
     GameAvailability,
     GameRosterEntry,
     IceSlot,
+    GameResult,
     League,
     NotificationEvent,
     Official,
@@ -51,6 +52,7 @@ class InMemoryStore:
         self.ice_slots: Dict[str, IceSlot] = {}
         self.officials: Dict[str, Official] = {}
         self.official_assignments: Dict[str, OfficialAssignment] = {}
+        self.game_results: Dict[str, GameResult] = {}
         self.setup_audit: List[SetupAuditLog] = []
         self._counters: Dict[str, count] = {}
 
@@ -253,6 +255,24 @@ class InMemoryStore:
 
     def remove_official_assignment(self, assignment_id: str) -> None:
         self.official_assignments.pop(assignment_id, None)
+
+    # -- game results (#31) ------------------------------------------------
+    def add_game_result(self, result: GameResult) -> GameResult:
+        self.game_results[result.id] = result
+        return result
+
+    def save_game_result(self, result: GameResult) -> GameResult:
+        self.game_results[result.id] = result
+        return result
+
+    def result_for_game(self, game_id: str) -> Optional[GameResult]:
+        for r in self.game_results.values():
+            if r.game_id == game_id:
+                return r
+        return None
+
+    def all_game_results(self) -> List[GameResult]:
+        return list(self.game_results.values())
 
     def add_setup_audit(self, entry: SetupAuditLog) -> SetupAuditLog:
         self.setup_audit.append(entry)

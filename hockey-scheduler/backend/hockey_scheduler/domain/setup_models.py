@@ -14,6 +14,7 @@ from .enums import (
     IceSlotType,
     OfficialAssignmentStatus,
     OfficialRole,
+    ResultStatus,
 )
 
 
@@ -94,6 +95,20 @@ class OfficialAssignment:
     responded_at: Optional[datetime] = None
     assigned_by: Optional[str] = None
     note: str = ""
+
+
+@dataclass
+class GameResult:
+    """Final (or draft) score for a game (#31). Only FINAL affects standings."""
+    id: str
+    game_id: str
+    home_score: int
+    away_score: int
+    status: ResultStatus = ResultStatus.DRAFT
+    recorded_by: Optional[str] = None
+    recorded_at: Optional[datetime] = None
+    approved_by: Optional[str] = None
+    approved_at: Optional[datetime] = None
 
 
 @dataclass

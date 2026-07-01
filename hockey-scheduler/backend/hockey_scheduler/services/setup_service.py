@@ -17,11 +17,13 @@ from ..domain import (
     IceSlotStatus,
     IceSlotType,
     League,
+    GameResult,
     Official,
     OfficialAssignment,
     OfficialAssignmentStatus,
     OfficialRole,
     Player,
+    ResultStatus,
     Position,
     Rink,
     Season,
@@ -506,6 +508,67 @@ class SetupService:
         self._audit("official_unassigned", "official_assignment", assignment_id,
                     actor_id, {"game_id": a.game_id, "official_id": a.official_id})
         return a
+
+    # -- results (#31) -----------------------------------------------------
+    @_transactional
+    def record_result(self, game_id: str, home_score: int, away_score: int,
+                      actor_id: Optional[str] = None) -> GameResult:
+        """Enter (or re-enter) a score as a DRAFT result. Approval finalizes it."""
+        game = self.store.get_game(game_id)
+        if game is None:
+            raise NotFoundError(f"Game {game_id} not found.")
+        if game.cancelled:
+            raise ValidationError("Cannot record a result for a cancelled game.")
+        hs, as_ = self._require_score(home_score), self._require_score(away_score)
+        result = self.store.result_for_game(game_id)
+        if result is not None and result.status == ResultStatus.FINAL:
+            raise ValidationError(
+                "Result is already final. It can't be edited without reopening.")
+        now = self.clock()
+        if result is None:
+            result = GameResult(id=self.store.next_id("result"), game_id=game_id,
+                                home_score=hs, away_score=as_,
+                                status=ResultStatus.DRAFT,
+                                recorded_by=actor_id, recorded_at=now)
+            self.store.add_game_result(result)
+        else:
+            result.home_score, result.away_score = hs, as_
+            result.recorded_by, result.recorded_at = actor_id, now
+            self.store.save_game_result(result)
+        self._audit("result_recorded", "game_result", result.id, actor_id,
+                    {"game_id": game_id, "home_score": hs, "away_score": as_})
+        return result
+
+    @_transactional
+    def approve_result(self, game_id: str,
+                       actor_id: Optional[str] = None) -> GameResult:
+        """Approve a draft result → FINAL. Only a FINAL result affects standings."""
+        game = self.store.get_game(game_id)
+        if game is None:
+            raise NotFoundError(f"Game {game_id} not found.")
+        if game.cancelled:
+            raise ValidationError("Cannot approve a result for a cancelled game.")
+        result = self.store.result_for_game(game_id)
+        if result is None:
+            raise NotFoundError("No result recorded for this game yet.")
+        if result.status == ResultStatus.FINAL:
+            raise ValidationError("Result is already final.")
+        result.status = ResultStatus.FINAL
+        result.approved_by = actor_id
+        result.approved_at = self.clock()
+        self.store.save_game_result(result)
+        self._audit("result_approved", "game_result", result.id, actor_id,
+                    {"game_id": game_id})
+        return result
+
+    def _require_score(self, value) -> int:
+        try:
+            score = int(value)
+        except (TypeError, ValueError):
+            raise ValidationError("Score must be a whole number.")
+        if score < 0:
+            raise ValidationError("Score can't be negative.")
+        return score
 
     # -- listings ----------------------------------------------------------
     def list_leagues(self) -> List[League]:
