@@ -548,6 +548,7 @@ class ApiService:
             # a declined assignment frees the official (#30 review).
             g_active = [a for a in self.store.assignments_for_game(g.id)
                         if a.status.is_active]
+            g_result = self.store.result_for_game(g.id)
             schedule.append({
                 "game_id": g.id,
                 "home_team_id": g.home_team_id,
@@ -565,6 +566,8 @@ class ApiService:
                 "officials_assigned": len(g_active),
                 "officials_accepted": sum(
                     1 for a in g_active if a.status.value == "accepted"),
+                # Result lifecycle for the operations checklist (#31): None/draft/final.
+                "result_status": g_result.status.value if g_result else None,
             })
             # PUBLIC: only PUBLISHED games, fixture info only — no players/PII.
             if g.published and not g.cancelled:

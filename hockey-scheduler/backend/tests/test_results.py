@@ -77,6 +77,15 @@ class ResultsTest(unittest.TestCase):
         with self.assertRaises(ValidationError):
             self.svc.record_result(g.id, 1, 0)
 
+    def test_approve_cancelled_game_result_rejected(self):
+        # A draft recorded before cancellation cannot be finalized afterwards.
+        g = self._game(self.lions, self.falcons)
+        self.svc.record_result(g.id, 2, 1)
+        g.cancelled = True
+        self.store.save_game(g)
+        with self.assertRaises(ValidationError):
+            self.svc.approve_result(g.id)
+
     # -- standings ---------------------------------------------------------
     def _standings(self):
         return {r["team_name"]: r

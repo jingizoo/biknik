@@ -588,7 +588,8 @@ function renderGames(ov) {
         ${ck((g.officials_assigned || 0) > 0 && (g.officials_accepted || 0) === g.officials_assigned, "Officials",
              g.officials_assigned ? `${g.officials_accepted}/${g.officials_assigned} accepted` : "None assigned")}
         ${ck(false, "Locker rooms", "Follow-up")}
-        ${ck(false, "Scorekeeper", "Coming #31")}
+        ${ck(g.result_status === "final", "Result",
+             g.result_status === "final" ? "Final" : g.result_status === "draft" ? "Draft — approve to finalize" : "Not entered")}
         ${ck(g.published, "Public fixture", g.published ? "Published" : "Draft — not public")}
       </div>
       <div class="actions">

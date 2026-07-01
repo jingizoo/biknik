@@ -543,6 +543,11 @@ class SetupService:
     def approve_result(self, game_id: str,
                        actor_id: Optional[str] = None) -> GameResult:
         """Approve a draft result → FINAL. Only a FINAL result affects standings."""
+        game = self.store.get_game(game_id)
+        if game is None:
+            raise NotFoundError(f"Game {game_id} not found.")
+        if game.cancelled:
+            raise ValidationError("Cannot approve a result for a cancelled game.")
         result = self.store.result_for_game(game_id)
         if result is None:
             raise NotFoundError("No result recorded for this game yet.")
