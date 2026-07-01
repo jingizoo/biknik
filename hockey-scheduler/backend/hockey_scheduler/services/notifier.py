@@ -1,11 +1,14 @@
 """Feed-notification emission helper (#32).
 
 A tiny helper both the setup and roster services use to append a
-:class:`Notification` to the store. Delivery (push/email) is a later concern;
-this slice records notifications for an in-app feed with read/unread state.
+:class:`Notification` to the store. Emitting a notification also fans it out
+to the mock delivery queue (#58); the delivery worker drains that queue
+separately.
 """
 
 from ..domain import Notification
+
+from .delivery import enqueue as _enqueue_deliveries
 
 
 def push(store, clock, kind, audience, title, message,
@@ -21,4 +24,6 @@ def push(store, clock, kind, audience, title, message,
         game_id=game_id,
         assignment_id=assignment_id,
     )
-    return store.add_notification_feed(n)
+    store.add_notification_feed(n)
+    _enqueue_deliveries(store, n)
+    return n

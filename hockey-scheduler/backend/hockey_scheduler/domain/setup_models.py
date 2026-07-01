@@ -10,9 +10,11 @@ from datetime import datetime
 from typing import Optional
 
 from .enums import (
+    DeliveryStatus,
     IceSlotStatus,
     IceSlotType,
     NotificationAudience,
+    NotificationChannel,
     NotificationKind,
     OfficialAssignmentStatus,
     OfficialRole,
@@ -145,6 +147,24 @@ class NotificationRecipient:
     notification_id: str
     actor_key: str
     read_at: datetime
+
+
+@dataclass
+class NotificationDelivery:
+    """A single queued out-of-app delivery of a notification (#58).
+
+    One row per (notification, channel). The delivery worker moves it from
+    ``pending`` → ``sent`` (or ``failed``) via a mock sender, tracking
+    ``attempts`` and the ``last_error`` so failures can be retried until the
+    attempt budget is exhausted.
+    """
+    id: str
+    notification_id: str
+    channel: NotificationChannel
+    status: DeliveryStatus = DeliveryStatus.PENDING
+    attempts: int = 0
+    last_error: Optional[str] = None
+    sent_at: Optional[datetime] = None
 
 
 @dataclass

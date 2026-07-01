@@ -174,3 +174,20 @@ class NotificationAudience(str, Enum):
     SCHEDULER = "scheduler"  # league admin / arena manager
     COACH = "coach"          # a team's coach (audience_ref = team_id)
     OFFICIAL = "official"    # a specific official (audience_ref = official_id)
+
+
+class NotificationChannel(str, Enum):
+    """Out-of-app delivery channels for the mock delivery worker (#58).
+
+    Delivery is mocked in this slice — no real SMTP / APNs / FCM. These name
+    the queues a notification fans out to when it is emitted.
+    """
+    EMAIL = "email"
+    PUSH = "push"
+
+
+class DeliveryStatus(str, Enum):
+    """Lifecycle of a single :class:`NotificationDelivery` (#58)."""
+    PENDING = "pending"  # queued, not yet attempted (or awaiting retry)
+    SENT = "sent"        # delivered by the (mock) sender
+    FAILED = "failed"    # last attempt failed; retried until attempts exhausted

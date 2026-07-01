@@ -216,6 +216,9 @@ class Handler(BaseHTTPRequestHandler):
                 code, payload = err
                 return self._send_json(payload, code)
             return self._send_api(api.get_notifications(role.value, scope))
+        if path == "/api/notifications/deliveries":
+            # Delivery-queue overview for operators (#58); read-only.
+            return self._send_api(api.get_delivery_overview())
         if path == "/api/me/assignments":
             # The signed-in official's own inbox (#55). Identity comes from the
             # session cookie, with the same rules as /api/auth/me: no cookie →
@@ -361,6 +364,10 @@ class Handler(BaseHTTPRequestHandler):
         # Setup create endpoints — operator creates real records via the API.
         if path.startswith("/api/setup/"):
             return self._handle_setup(path[len("/api/setup/"):], body, actor)
+
+        # Notification delivery worker: drain the pending queue (#58).
+        if path == "/api/notifications/deliveries/process":
+            return self._send_api(api.process_notification_deliveries())
 
         # Notifications feed: mark read / read-all (#32).
         if path == "/api/notifications/read-all":

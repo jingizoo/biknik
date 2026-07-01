@@ -28,7 +28,7 @@ from ..domain.errors import (
     NotFoundError,
     ValidationError,
 )
-from ..services import RosterService, SetupService
+from ..services import DeliveryWorker, RosterService, SetupService
 from ..store import InMemoryStore
 
 
@@ -104,6 +104,7 @@ class ApiService:
         self.store = store or InMemoryStore()
         self.roster = RosterService(self.store)
         self.setup = SetupService(self.store)
+        self.delivery = DeliveryWorker(self.store, self.roster.clock)
 
     # -- games -------------------------------------------------------------
     @catch
@@ -483,6 +484,32 @@ class ApiService:
             if self._notif_visible(n, role, scope) and self._mark_read(n, actor_key):
                 count += 1
         return {"marked": count}
+
+    # -- notification delivery queue (#58) ---------------------------------
+    @staticmethod
+    def _delivery_row(d) -> dict:
+        return {"id": d.id, "notification_id": d.notification_id,
+                "channel": d.channel.value, "status": d.status.value,
+                "attempts": d.attempts, "last_error": d.last_error,
+                "sent_at": d.sent_at.isoformat() if d.sent_at else None}
+
+    @catch
+    def process_notification_deliveries(self) -> dict:
+        """Drain the pending delivery queue through the mock sender."""
+        return self.delivery.process_pending()
+
+    @catch
+    def get_delivery_overview(self) -> dict:
+        """Delivery-queue counts by status and channel, for observability."""
+        rows = self.store.all_notification_deliveries()
+        by_status: dict = {}
+        by_channel: dict = {}
+        for d in rows:
+            by_status[d.status.value] = by_status.get(d.status.value, 0) + 1
+            by_channel[d.channel.value] = by_channel.get(d.channel.value, 0) + 1
+        return {"total": len(rows), "by_status": by_status,
+                "by_channel": by_channel,
+                "deliveries": [self._delivery_row(d) for d in rows]}
 
     @catch
     def get_official_inbox(self, official_id: str) -> dict:

@@ -27,8 +27,11 @@ from ..domain import (
     IceSlotType,
     GameResult,
     League,
+    DeliveryStatus,
     Notification,
     NotificationAudience,
+    NotificationChannel,
+    NotificationDelivery,
     NotificationEvent,
     NotificationKind,
     NotificationRecipient,
@@ -158,13 +161,17 @@ SPECS = {
                         "at": _dt()}),
     NotificationRecipient: Spec(NotificationRecipient, "notification_recipients",
                                 {"read_at": _dt()}),
+    NotificationDelivery: Spec(NotificationDelivery, "notification_deliveries",
+                               {"channel": _enum(NotificationChannel),
+                                "status": _enum(DeliveryStatus),
+                                "sent_at": _dt()}),
 }
 
 # Column type for DDL: INTEGER for int/bool fields, else TEXT.
 _INT_FIELDS = {
     "target_goalies", "target_skaters", "max_skaters", "jersey_number",
     "priority_rank", "is_active", "locked", "cancelled", "published",
-    "home_score", "away_score",
+    "home_score", "away_score", "attempts",
 }
 
 
@@ -191,6 +198,8 @@ _INDEXES = [
     "CREATE INDEX IF NOT EXISTS ix_game_results_game ON game_results(game_id)",
     "CREATE INDEX IF NOT EXISTS ix_notifs_feed_aud ON notifications_feed(audience, audience_ref)",
     "CREATE INDEX IF NOT EXISTS ix_notif_recips_actor ON notification_recipients(actor_key)",
+    "CREATE INDEX IF NOT EXISTS ix_notif_deliv_status ON notification_deliveries(status)",
+    "CREATE INDEX IF NOT EXISTS ix_notif_deliv_notif ON notification_deliveries(notification_id)",
 ]
 
 
@@ -459,3 +468,21 @@ class SqlStore:
     def recipients_for_actor(self, actor_key):
         return self._query(NotificationRecipient, "actor_key = ?", (actor_key,),
                            order="id")
+
+    # -- notification delivery queue (#58) ---------------------------------
+    def add_notification_delivery(self, d): return self._insert(d)
+    def save_notification_delivery(self, d): return self._update(d)
+    def get_notification_delivery(self, delivery_id):
+        return self._get(NotificationDelivery, delivery_id)
+    def deliveries_for_notification(self, notification_id):
+        return self._query(NotificationDelivery, "notification_id = ?",
+                           (notification_id,), order="id")
+    def all_notification_deliveries(self):
+        return self._query(NotificationDelivery, order="id")
+    def pending_deliveries(self, max_attempts):
+        return self._query(
+            NotificationDelivery,
+            "status = ? OR (status = ? AND attempts < ?)",
+            (DeliveryStatus.PENDING.value, DeliveryStatus.FAILED.value,
+             max_attempts),
+            order="id")
