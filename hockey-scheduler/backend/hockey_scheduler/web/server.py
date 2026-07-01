@@ -332,11 +332,13 @@ class Handler(BaseHTTPRequestHandler):
         if path.startswith("/api/setup/"):
             return self._handle_setup(path[len("/api/setup/"):], body, actor)
 
-        # Official accepts/declines a proposed assignment (#30).
-        oa = re.match(r"^/api/officials/assignments/([^/]+)/(accept|decline)$", path)
+        # Official accepts/declines a proposed assignment, or it's unassigned (#30).
+        oa = re.match(r"^/api/officials/assignments/([^/]+)/(accept|decline|unassign)$", path)
         if oa:
-            return self._send_api(api.respond_assignment(
-                oa.group(1), oa.group(2) == "accept", actor))
+            aid, op = oa.group(1), oa.group(2)
+            if op == "unassign":
+                return self._send_api(api.unassign_official(aid, actor))
+            return self._send_api(api.respond_assignment(aid, op == "accept", actor))
 
         # /api/games/{gid}/<action>
         m = re.match(r"^/api/games/([^/]+)/(.+)$", path)

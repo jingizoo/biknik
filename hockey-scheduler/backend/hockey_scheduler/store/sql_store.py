@@ -413,3 +413,7 @@ class SqlStore:
     def assignments_for_official(self, official_id):
         return self._query(OfficialAssignment, "official_id = ?", (official_id,),
                            order="id")
+    def remove_official_assignment(self, assignment_id):
+        with self._lock:
+            self._exec(f"DELETE FROM {SPECS[OfficialAssignment].table} WHERE id = ?",
+                       (assignment_id,))

@@ -495,6 +495,18 @@ class SetupService:
                     "official_assignment", a.id, actor_id)
         return a
 
+    @_transactional
+    def unassign_official(self, assignment_id: str,
+                          actor_id: Optional[str] = None) -> OfficialAssignment:
+        """Remove an official assignment from a game entirely."""
+        a = self.store.get_official_assignment(assignment_id)
+        if a is None:
+            raise NotFoundError(f"Assignment {assignment_id} not found.")
+        self.store.remove_official_assignment(assignment_id)
+        self._audit("official_unassigned", "official_assignment", assignment_id,
+                    actor_id, {"game_id": a.game_id, "official_id": a.official_id})
+        return a
+
     # -- listings ----------------------------------------------------------
     def list_leagues(self) -> List[League]:
         return list(self.store.all_leagues())

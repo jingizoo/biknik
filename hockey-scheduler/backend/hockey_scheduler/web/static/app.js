@@ -584,7 +584,8 @@ function renderGames(ov) {
       <div class="card">
         ${ck(true, "Ice slot allocated")}
         ${ck(confirmed, "Roster", prettyStatus(g.roster_status))}
-        ${ck(false, "Officials", "Coming #30")}
+        ${ck((g.officials_assigned || 0) > 0, "Officials",
+             g.officials_assigned ? `${g.officials_accepted}/${g.officials_assigned} accepted` : "None assigned")}
         ${ck(false, "Locker rooms", "Follow-up")}
         ${ck(false, "Scorekeeper", "Coming #31")}
         ${ck(g.published, "Public fixture", g.published ? "Published" : "Draft — not public")}
@@ -698,7 +699,8 @@ function officialsPanel(lineups) {
       ? list.map((a) => `<div class="gs-off-row"><span class="gs-off-name">${esc(a.official_name)}</span>${badge(a.status)}
           ${canAssign && a.status === "proposed"
             ? `<button class="act success" data-accept="${a.assignment_id}">Accept</button>
-               <button class="act danger" data-decline="${a.assignment_id}">Decline</button>` : ""}</div>`).join("")
+               <button class="act danger" data-decline="${a.assignment_id}">Decline</button>` : ""}
+          ${canAssign ? `<button class="act danger ghost xbtn" data-unassign="${a.assignment_id}" title="Unassign">✕</button>` : ""}</div>`).join("")
       : `<div class="gs-off-slot">Unassigned</div>`;
     return `<div class="gs-off-role"><div class="gs-off-title">${label}</div>${body}</div>`;
   }).join("");
@@ -1076,6 +1078,10 @@ async function render() {
   });
   c.querySelectorAll("[data-decline]").forEach((b) => b.onclick = async () => {
     await post(`/api/officials/assignments/${b.dataset.decline}/decline`, {}); await render();
+  });
+  c.querySelectorAll("[data-unassign]").forEach((b) => b.onclick = async () => {
+    await post(`/api/officials/assignments/${b.dataset.unassign}/unassign`, {});
+    toast = "Official unassigned."; await render();
   });
   // Shared move: used by both drag/drop and the click-based Move fallback.
   const applyMove = async (gid, slotId) => {

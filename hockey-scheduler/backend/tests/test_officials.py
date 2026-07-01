@@ -94,6 +94,29 @@ class OfficialsServiceTest(unittest.TestCase):
         a2 = self.svc.assign_official(game2.id, off.id, OfficialRole.REFEREE)
         self.assertEqual(a2.status.value, "proposed")
 
+    def test_unassign_removes_and_frees_official(self):
+        off = self.svc.create_official("Temp Ref")
+        a = self.svc.assign_official(self.game.id, off.id, OfficialRole.REFEREE)
+        self.assertEqual(len(self.store.assignments_for_game(self.game.id)), 1)
+        self.svc.unassign_official(a.id)
+        self.assertEqual(len(self.store.assignments_for_game(self.game.id)), 0)
+        # The official can be reassigned after being unassigned.
+        a2 = self.svc.assign_official(self.game.id, off.id, OfficialRole.LINESPERSON)
+        self.assertEqual(a2.status.value, "proposed")
+
+    def test_cancelled_game_does_not_block_assignment(self):
+        # An official on a now-cancelled overlapping game is still assignable.
+        slot2 = self.svc.create_ice_slot(self.rink2.id, dt(19), dt(21))
+        game2 = self.svc.create_game(self.season.id, self.div.id,
+                                     self.home2.id, self.away2.id, slot2.id)
+        off = self.svc.create_official("Ref X")
+        self.svc.assign_official(self.game.id, off.id, OfficialRole.REFEREE)
+        # Cancel the first game; the official is now free for the overlap.
+        self.game.cancelled = True
+        self.store.save_game(self.game)
+        a2 = self.svc.assign_official(game2.id, off.id, OfficialRole.REFEREE)
+        self.assertEqual(a2.status.value, "proposed")
+
     def test_club_conflict_rejected(self):
         # An official from club_a can't officiate a game where Aces (club_a) play.
         off = self.svc.create_official("Biased Ref", home_club_id=self.club_a.id)

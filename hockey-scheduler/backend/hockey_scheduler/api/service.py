@@ -394,6 +394,11 @@ class ApiService:
                            actor_id: Optional[str] = None) -> dict:
         return _serialize(self.setup.respond_assignment(assignment_id, accept, actor_id))
 
+    @catch
+    def unassign_official(self, assignment_id: str,
+                          actor_id: Optional[str] = None) -> dict:
+        return _serialize(self.setup.unassign_official(assignment_id, actor_id))
+
     # -- coach controls ----------------------------------------------------
     @catch
     def lock_roster(self, game_id: str, actor_id: Optional[str] = None) -> dict:
@@ -478,6 +483,7 @@ class ApiService:
             if slot and slot.rink_id in rinks:
                 rk = rinks[slot.rink_id]
                 venue_name = venues[rk.venue_id].name if rk.venue_id in venues else None
+            g_assignments = self.store.assignments_for_game(g.id)
             schedule.append({
                 "game_id": g.id,
                 "home_team_id": g.home_team_id,
@@ -491,6 +497,10 @@ class ApiService:
                 "start_time": g.start_time.isoformat(),
                 "roster_status": rstatus.status.value,
                 "published": g.published,
+                # Officials summary for the Games operations checklist (#30).
+                "officials_assigned": len(g_assignments),
+                "officials_accepted": sum(
+                    1 for a in g_assignments if a.status.value == "accepted"),
             })
             # PUBLIC: only PUBLISHED games, fixture info only — no players/PII.
             if g.published and not g.cancelled:

@@ -251,6 +251,9 @@ class InMemoryStore:
         return [a for a in self.official_assignments.values()
                 if a.official_id == official_id]
 
+    def remove_official_assignment(self, assignment_id: str) -> None:
+        self.official_assignments.pop(assignment_id, None)
+
     def add_setup_audit(self, entry: SetupAuditLog) -> SetupAuditLog:
         self.setup_audit.append(entry)
         return entry
