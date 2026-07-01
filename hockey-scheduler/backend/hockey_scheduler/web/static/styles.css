@@ -247,6 +247,33 @@ select.player-picker {
   font-size: 15px; background: #fff; margin-bottom: 14px;
 }
 
+/* ----- roster selection surface (#46) ----- */
+.ros-summary { padding: 12px 14px; display: grid; gap: 12px; }
+.pos-stat .ps-top { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+.pos-stat .ps-label { font-weight: 700; font-size: 14px; }
+.pos-stat .ps-num { font-size: 12px; color: var(--muted); }
+.ps-bar { height: 7px; border-radius: 5px; background: #ececf1; margin-top: 6px; overflow: hidden; }
+.ps-bar span { display: block; height: 100%; border-radius: 5px; background: var(--green); }
+.ps-bar.open span { background: var(--orange); }
+.ros-warn { background: #fff5e8; border: 1px solid #ffd9a8; border-radius: 10px;
+  padding: 9px 12px; margin: 10px 0; font-size: 13px; color: #8a5a00; }
+.ros-toolbar { display: flex; gap: 8px; flex-wrap: wrap; margin: 10px 0 4px; }
+.ros-toolbar .act { flex: 1; }
+.avail-group { border-bottom: 1px solid var(--sep); }
+.avail-group:last-child { border-bottom: none; }
+.avail-head { display: flex; align-items: center; gap: 8px; padding: 8px 14px 4px;
+  font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .4px; color: var(--muted); }
+.need { text-transform: none; letter-spacing: 0; font-size: 11px; font-weight: 700;
+  background: #fff0db; color: #b86a00; border-radius: 10px; padding: 1px 8px; }
+.need.ok { background: #e3f9e8; color: #1c8c39; }
+.pos-tag { font-size: 10px; font-weight: 800; border-radius: 6px; padding: 2px 6px; }
+.pos-tag.g { background: #efe9ff; color: var(--purple); }
+.pos-tag.s { background: #e3f0ff; color: #0a64c4; }
+.jersey { font-size: 12px; color: var(--muted); font-weight: 600; }
+.xbtn { background: #fff !important; color: var(--red) !important; border: 1px solid #f3b7b4 !important;
+  padding: 6px 9px; }
+.xbtn:hover { background: #ffe5e3 !important; }
+
 .toast { margin-top: 14px; background: #1c1c1e; color: #fff; font-size: 12px; border-radius: 10px; padding: 10px 12px; }
 
 .locked-note {

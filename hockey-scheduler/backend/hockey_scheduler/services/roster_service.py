@@ -145,13 +145,24 @@ class RosterService:
             if not player.is_active:
                 raise NotEligibleError(f"{player.name} is not an active player.")
 
+            now = self.clock()
             existing = self.store.roster_entry_for_player(game_id, player_id)
-            if existing and existing.status.occupies_slot:
-                # idempotent: already selected
+            if existing is not None:
+                if existing.status.occupies_slot:
+                    # idempotent: already selected
+                    entries.append(existing)
+                    continue
+                # Revive a removed/unavailable row instead of inserting a
+                # duplicate (there is no unique (game_id, player_id) constraint).
+                existing.roster_role = RosterRole.SELECTED
+                existing.selection_source = SelectionSource.COACH_SELECTED
+                existing.status = RosterEntryStatus.SELECTED
+                existing.selected_by = actor_id
+                existing.updated_at = now
+                self.store.save_roster_entry(existing)
                 entries.append(existing)
                 continue
 
-            now = self.clock()
             entry = GameRosterEntry(
                 id=self.store.next_id("entry"),
                 game_id=game_id,
@@ -592,6 +603,38 @@ class RosterService:
             raise NotFoundError("Player is not on this game's roster.")
         self._back_out_entry(game, entry, actor_id, removed=True)
         return entry
+
+    def copy_previous_roster(
+        self, game_id: str, actor_id: Optional[str] = None
+    ) -> dict:
+        """Seed this game's roster from the team's most recent earlier game.
+
+        A time-saver for coaches: find the newest non-cancelled game where the
+        same team was home and had players occupying slots, then re-select those
+        players (skipping any who are no longer active on the team). The actual
+        selection goes through :meth:`select_roster`, so all eligibility, lock,
+        and audit rules still apply.
+        """
+        game = self._require_game(game_id)
+        self._guard_mutable(game)
+        earlier = [
+            g for g in self.store.all_games()
+            if g.id != game_id and g.home_team_id == game.home_team_id
+            and not g.cancelled and g.start_time is not None
+            and (game.start_time is None or g.start_time < game.start_time)
+        ]
+        earlier.sort(key=lambda g: g.start_time, reverse=True)
+        for src in earlier:
+            eligible = [
+                e.player_id for e in self.store.roster_for_game(src.id)
+                if e.status.occupies_slot
+                and (p := self.store.get_player(e.player_id)) is not None
+                and p.is_active and p.team_id == game.home_team_id
+            ]
+            if eligible:
+                self.select_roster(game_id, eligible, actor_id)
+                return {"copied": len(eligible), "from_game_id": src.id}
+        raise ValidationError("No previous roster to copy for this team.")
 
     @_transactional
     def lock_roster(self, game_id: str, actor_id: Optional[str] = None) -> Game:

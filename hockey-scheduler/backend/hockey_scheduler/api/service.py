@@ -115,6 +115,16 @@ class ApiService:
         return [_serialize(e) for e in entries]
 
     @catch
+    def remove_player(self, game_id: str, player_id: str,
+                      actor_id: Optional[str] = None) -> dict:
+        return _serialize(self.roster.remove_player(game_id, player_id, actor_id))
+
+    @catch
+    def copy_previous_roster(self, game_id: str,
+                             actor_id: Optional[str] = None) -> dict:
+        return self.roster.copy_previous_roster(game_id, actor_id)
+
+    @catch
     def set_roster_status(self, game_id: str, player_id: str, status: str,
                           actor_id: Optional[str] = None) -> dict:
         entry = self.roster.set_roster_entry_status(
