@@ -716,7 +716,10 @@ function availableGroups(available, s, locked) {
 function coachBody(board) {
   const s = board.status;
   const locked = s.status === "locked";
-  const canRoster = hasPerm("manage_roster");   // #24: coach/admin only
+  // Resource scoping (#51): a bound coach may edit only their own team's side.
+  const boundTeam = (currentUser && currentUser.scope) ? currentUser.scope.team_id : null;
+  const inScope = !boundTeam || board.team_id === boundTeam;
+  const canRoster = hasPerm("manage_roster") && inScope;   // #24 + #51
   const canEdit = !locked && canRoster;         // editable right now?
   const onRoster = board.players.filter((p) => p.group === "selected" && !p.backed_out);
   const backedOut = board.players.filter((p) => p.group === "selected" && p.backed_out);
@@ -773,9 +776,12 @@ function coachBody(board) {
     return playerRow(p, `${posTag(p)}${ctrl}${btn}`);
   }).join("") : `<div class="empty">No substitutes enrolled.</div>`;
 
-  // Footer: lock control for roster managers, else a read-only note by role.
+  // Footer: lock control for roster managers, else a read-only note by role/scope.
   let footer;
-  if (!canRoster) {
+  if (!inScope && hasPerm("manage_roster")) {
+    const team = currentUser.scope.team_name || "your team";
+    footer = `<div class="locked-note">🔒 Read-only — you manage <strong>${esc(team)}</strong>, not this team.</div>`;
+  } else if (!canRoster) {
     footer = `<div class="locked-note">🔒 Read-only — your role can't manage rosters.</div>`;
   } else if (locked) {
     footer = `<div class="locked-note">🔒 Roster locked. Selection disabled.
@@ -799,10 +805,15 @@ function coachBody(board) {
 function playerBody(board) {
   const players = board.players;
   const locked = board.status.status === "locked";
-  if (!pickedPlayer || !players.find((p) => p.id === pickedPlayer)) pickedPlayer = players[0] ? players[0].id : null;
+  // Resource scoping (#51): a bound player is locked to their own record and
+  // can only respond for themselves.
+  const ownPlayer = (currentUser && currentUser.scope) ? currentUser.scope.player_id : null;
+  const boundHere = ownPlayer && players.some((p) => p.id === ownPlayer);
+  if (boundHere) pickedPlayer = ownPlayer;
+  else if (!pickedPlayer || !players.find((p) => p.id === pickedPlayer)) pickedPlayer = players[0] ? players[0].id : null;
   const options = players.map((p) => opt(p.id, `${p.name} · ${p.position}`, p.id === pickedPlayer)).join("");
   const p = players.find((x) => x.id === pickedPlayer);
-  const canRespond = hasPerm("respond_availability");   // #24: player/coach/admin
+  const canRespond = hasPerm("respond_availability") && (!ownPlayer || pickedPlayer === ownPlayer);
   const acts = (html) => !canRespond
     ? `<div class="locked-note">🔒 Read-only — your role can't respond for players.</div>`
     : locked ? `<div class="locked-note">🔒 Roster locked — actions disabled.</div>`
@@ -827,8 +838,11 @@ function playerBody(board) {
       card = `<div class="banner neutral"><h2>Not selected</h2><p>Not enrolled.</p></div>
         ${acts(`<button class="act primary" data-act="enroll" data-id="${p.id}">Enroll as Substitute</button>`)}`;
   }
-  return `<div class="section-title">View as player</div>
-    <select class="player-picker" id="player-picker">${options}</select>${card}
+  const picker = boundHere
+    ? `<div class="scope-note">Signed in as <strong>${esc((p && p.name) || currentUser.scope.player_name || "you")}</strong> — you can only respond for yourself.</div>`
+    : `<div class="section-title">View as player</div>
+       <select class="player-picker" id="player-picker">${options}</select>`;
+  return `${picker}${card}
     <div class="privacy-note">👪 Guardians respond for juniors — workflow in <a href="${REPO}/26" target="_blank">#26</a>.</div>${toastHtml()}`;
 }
 
@@ -1148,6 +1162,13 @@ function renderRoleSwitch() {
     `<option value="${esc(a.username)}" ${a.role === currentRole ? "selected" : ""}>${esc(a.label)}</option>`).join("");
   // Switching the demo account performs a real server-side sign-in (#50).
   sel.onchange = (e) => signIn(e.target.value);
+  // Show what the session is bound to, if anything (#51).
+  const chip = document.getElementById("scope-chip");
+  if (chip) {
+    const sc = (currentUser && currentUser.scope) || {};
+    const name = sc.player_name || sc.team_name;
+    chip.textContent = name ? `· ${name}` : "";
+  }
 }
 async function bootstrap() {
   try {

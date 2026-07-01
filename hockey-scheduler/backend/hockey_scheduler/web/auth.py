@@ -37,8 +37,14 @@ class SessionManager:
         self._ttl = ttl_seconds
         self._clock = clock
 
-    def login(self, username: str, password: str):
-        """Return a new session token, or None on bad credentials."""
+    def login(self, username: str, password: str, scope=None):
+        """Return a new session token, or None on bad credentials.
+
+        ``scope`` optionally binds the session to a resource — ``team_id`` for a
+        coach, ``player_id`` for a player (#51) — so the server can enforce that
+        a coach only manages their own team and a player only responds for
+        themselves.
+        """
         role = DEMO_USERS.get((username or "").strip().lower())
         if role is None or password != DEMO_PASSWORD:
             return None
@@ -46,6 +52,7 @@ class SessionManager:
         self._sessions[token] = {
             "username": username.strip().lower(),
             "role": role,
+            "scope": dict(scope or {}),
             "expires": self._clock() + self._ttl,
         }
         return token
@@ -66,13 +73,28 @@ class SessionManager:
         self._sessions.pop(token, None)
 
 
-def user_view(session) -> dict:
-    """Public shape for a resolved session (no token)."""
+def user_view(session, store=None) -> dict:
+    """Public shape for a resolved session (no token).
+
+    When a ``store`` is given, the scope's team/player ids are enriched with
+    display names so the UI can show what the account is bound to (#51).
+    """
     role = session["role"]
+    scope = dict(session.get("scope") or {})
+    if store is not None:
+        tid = scope.get("team_id")
+        if tid:
+            team = store.get_team(tid)
+            scope["team_name"] = team.name if team else tid
+        pid = scope.get("player_id")
+        if pid:
+            player = store.get_player(pid)
+            scope["player_name"] = player.name if player else pid
     return {
         "username": session["username"],
         "role": role.value,
         "label": ROLE_LABELS[role],
+        "scope": scope,
     }
 
 

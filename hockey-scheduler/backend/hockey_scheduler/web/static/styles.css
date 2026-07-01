@@ -122,6 +122,9 @@ body {
 .role-picker .role-ico { font-size: 13px; }
 .role-picker select { border: none; background: transparent; font-size: 13px; font-weight: 600;
   color: var(--ink); cursor: pointer; padding: 2px; }
+.role-picker .scope-chip { font-size: 12px; font-weight: 700; color: var(--blue); }
+.scope-note { background: #eef5ff; border: 1px solid #bcd9ff; color: #0a64c4; border-radius: 10px;
+  padding: 9px 12px; font-size: 13px; margin-bottom: 12px; }
 
 /* ----- home / away lineup switch (#25) ----- */
 .lineup-switch { display: flex; gap: 8px; margin: 12px 16px 4px; }
