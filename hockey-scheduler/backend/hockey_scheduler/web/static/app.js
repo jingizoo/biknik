@@ -11,6 +11,8 @@ let calendarMode = "day";   // day | week
 let calFilters = { venueId: "all", rinkId: "all", divisionId: "all", teamId: "all" };
 let toast = "";
 let conflict = null;        // {ok, title, lines[], game, slot} — calendar side panel (#43)
+let drawer = null;          // {kind} when a Setup create drawer is open (#44)
+let drawerError = "";       // validation/API error shown inside the open drawer
 
 const DAY_MS = 86400000;
 function addDays(dateStr, n) {
@@ -115,88 +117,140 @@ function renderDashboard(ov, board) {
 }
 
 /* ---------- Setup ---------- */
+// Data-driven Setup (#44): each entity declares its card list projection and
+// its create-form fields once, so the record cards and the create drawer stay
+// in sync. The API endpoints are unchanged — the drawer just POSTs to them.
+const SETUP_ENTITIES = [
+  { key: "league", title: "Leagues", icon: "🏆", noun: "league",
+    list: (ov) => ov.leagues.map((l) => ({ title: l.name })),
+    fields: [{ id: "f-league", label: "League name", required: true, placeholder: "e.g. Coastal League" }] },
+  { key: "season", title: "Seasons", icon: "🗓️", noun: "season",
+    list: (ov) => ov.seasons.map((s) => ({ title: s.name, sub: nameById(ov.leagues, s.league_id) })),
+    fields: [
+      { id: "f-season-league", label: "League", type: "select", required: true, ofNoun: "league",
+        options: (ov) => ov.leagues.map((l) => [l.id, l.name]) },
+      { id: "f-season", label: "Season name", required: true, placeholder: "e.g. 2027–28" }] },
+  { key: "division", title: "Divisions", icon: "🏅", noun: "division",
+    list: (ov) => ov.divisions.map((d) => ({ title: d.name, sub: d.is_junior ? "Junior" : "" })),
+    fields: [
+      { id: "f-div-season", label: "Season", type: "select", required: true, ofNoun: "season",
+        options: (ov) => ov.seasons.map((s) => [s.id, s.name]) },
+      { id: "f-div", label: "Division name", required: true, placeholder: "e.g. U14" },
+      { id: "f-div-age", label: "Age group", placeholder: "e.g. U14 (optional)" }] },
+  { key: "club", title: "Clubs", icon: "🏒", noun: "club",
+    list: (ov) => ov.clubs.map((c) => ({ title: c.name })),
+    fields: [{ id: "f-club", label: "Club name", required: true, placeholder: "e.g. Eagles HC" }] },
+  { key: "team", title: "Teams", icon: "👥", noun: "team",
+    list: (ov) => ov.teams.map((t) => ({ title: t.name, sub: t.division_name || t.club_name || "" })),
+    fields: [
+      { id: "f-team-club", label: "Club", type: "select", required: true, ofNoun: "club",
+        options: (ov) => ov.clubs.map((c) => [c.id, c.name]) },
+      { id: "f-team-div", label: "Division", type: "select", required: true, ofNoun: "division",
+        options: (ov) => ov.divisions.map((d) => [d.id, d.name]) },
+      { id: "f-team", label: "Team name", required: true, placeholder: "e.g. U14 Eagles" }] },
+  { key: "venue", title: "Venues", icon: "🏟️", noun: "venue",
+    list: (ov) => ov.venues.map((v) => ({ title: v.name })),
+    fields: [{ id: "f-venue", label: "Venue name", required: true, placeholder: "e.g. South Arena" }] },
+  { key: "rink", title: "Rinks", icon: "⛸️", noun: "rink",
+    list: (ov) => ov.rinks.map((r) => ({ title: r.name, sub: r.venue_name || "" })),
+    fields: [
+      { id: "f-rink-venue", label: "Venue", type: "select", required: true, ofNoun: "venue",
+        options: (ov) => ov.venues.map((v) => [v.id, v.name]) },
+      { id: "f-rink", label: "Rink name", required: true, placeholder: "e.g. Rink 3" }] },
+  { key: "ice-slot", title: "Ice slots", icon: "🧊", noun: "ice slot",
+    list: null,  // ice inventory is managed visually on the Arena Calendar
+    fields: [
+      { id: "f-slot-rink", label: "Rink", type: "select", required: true, ofNoun: "rink",
+        options: (ov) => ov.rinks.map((r) => [r.id, `${r.venue_name ? r.venue_name + " · " : ""}${r.name}`]) },
+      { id: "f-slot-date", label: "Date", type: "date", required: true, value: "2026-09-05" },
+      { id: "f-slot-start", label: "Start", type: "time", required: true, value: "21:00" },
+      { id: "f-slot-end", label: "End", type: "time", required: true, value: "22:30" },
+      { id: "f-slot-type", label: "Type", type: "select", required: true,
+        options: () => [["game", "Game"], ["practice", "Practice"], ["public_skate", "Public skate"],
+                        ["maintenance", "Maintenance"], ["tournament", "Tournament"]] }] },
+];
+
+// Each entity's POST body, built from the drawer inputs (ids match the fields).
+const SETUP_POST = {
+  league: () => post("/api/setup/league", { name: val("f-league") }),
+  season: () => post("/api/setup/season", { league_id: val("f-season-league"), name: val("f-season") }),
+  division: () => post("/api/setup/division", { season_id: val("f-div-season"), name: val("f-div"), age_group: val("f-div-age") }),
+  club: () => post("/api/setup/club", { name: val("f-club") }),
+  team: () => post("/api/setup/team", { club_id: val("f-team-club"), division_id: val("f-team-div"), name: val("f-team") }),
+  venue: () => post("/api/setup/venue", { name: val("f-venue") }),
+  rink: () => post("/api/setup/rink", { venue_id: val("f-rink-venue"), name: val("f-rink") }),
+  "ice-slot": () => post("/api/setup/ice-slot", {
+    rink_id: val("f-slot-rink"),
+    start_time: `${val("f-slot-date")}T${val("f-slot-start")}:00+00:00`,
+    end_time: `${val("f-slot-date")}T${val("f-slot-end")}:00+00:00`,
+    slot_type: val("f-slot-type"),
+  }),
+};
+
+const nameById = (rows, id) => (rows.find((r) => r.id === id) || {}).name || "";
+
 function renderSetup(ov) {
-  const leagueOpts = ov.leagues.map((l) => opt(l.id, l.name)).join("");
-  const seasonOpts = ov.seasons.map((s) => opt(s.id, s.name)).join("");
-  const clubOpts = ov.clubs.map((c) => opt(c.id, c.name)).join("");
-  const divOpts = ov.divisions.map((d) => opt(d.id, d.name)).join("");
-  const venueOpts = ov.venues.map((v) => opt(v.id, v.name)).join("");
-  const rinkOpts = ov.rinks.map((r) => opt(r.id, `${r.venue_name || ""} · ${r.name}`)).join("");
-  return `
-    <div class="section-title">League &amp; season</div>
-    <div class="form">
-      <label>New league name</label><input id="f-league" placeholder="e.g. Coastal League" />
-      <button class="act primary" data-create="league">Create league</button>
-    </div>
-    <div class="form">
-      <label>Season — league</label><select id="f-season-league">${leagueOpts}</select>
-      <label>Season name</label><input id="f-season" placeholder="e.g. 2027–28" />
-      <button class="act primary" data-create="season">Create season</button>
-    </div>
-    <div class="form">
-      <label>Division — season</label><select id="f-div-season">${seasonOpts}</select>
-      <div class="row2">
-        <div><label>Division name</label><input id="f-div" placeholder="e.g. U14" /></div>
-        <div><label>Age group</label><input id="f-div-age" placeholder="U14" /></div>
-      </div>
-      <button class="act primary" data-create="division">Create division</button>
-    </div>
-    <div class="section-title">Clubs &amp; teams</div>
-    <div class="form">
-      <label>New club name</label><input id="f-club" placeholder="e.g. Eagles HC" />
-      <button class="act primary" data-create="club">Create club</button>
-    </div>
-    <div class="form">
-      <div class="row2">
-        <div><label>Team — club</label><select id="f-team-club">${clubOpts}</select></div>
-        <div><label>Division</label><select id="f-team-div">${divOpts}</select></div>
-      </div>
-      <label>Team name</label><input id="f-team" placeholder="e.g. U14 Eagles" />
-      <button class="act primary" data-create="team">Create team</button>
-    </div>
-    <div class="section-title">Arena</div>
-    <div class="form">
-      <label>New venue name</label><input id="f-venue" placeholder="e.g. South Arena" />
-      <button class="act primary" data-create="venue">Create venue</button>
-    </div>
-    <div class="form">
-      <label>Rink — venue</label><select id="f-rink-venue">${venueOpts}</select>
-      <label>Rink name</label><input id="f-rink" placeholder="e.g. Rink 3" />
-      <button class="act primary" data-create="rink">Create rink</button>
-    </div>
-    <div class="form">
-      <label>Ice slot — rink</label><select id="f-slot-rink">${rinkOpts}</select>
-      <label>Date</label><input id="f-slot-date" type="date" value="2026-09-05" />
-      <div class="row2">
-        <div><label>Start</label><input id="f-slot-start" type="time" value="21:00" /></div>
-        <div><label>End</label><input id="f-slot-end" type="time" value="22:30" /></div>
-      </div>
-      <label>Type</label>
-      <select id="f-slot-type">
-        <option value="game">Game</option>
-        <option value="practice">Practice</option>
-        <option value="public_skate">Public skate</option>
-        <option value="maintenance">Maintenance</option>
-        <option value="tournament">Tournament</option>
-      </select>
-      <button class="act primary" data-create="ice-slot">Add ice slot</button>
-    </div>
-    ${setupList("Leagues", ov.leagues.map((l) => l.name))}
-    ${setupList("Seasons", ov.seasons.map((s) => s.name))}
-    ${setupList("Divisions", ov.divisions.map((d) => d.name + (d.is_junior ? " · Junior" : "")))}
-    ${setupList("Clubs", ov.clubs.map((c) => c.name))}
-    ${setupList("Teams", ov.teams.map((t) => `${t.name} — ${t.division_name || ""}`))}
-    ${setupList("Venues", ov.venues.map((v) => v.name))}
-    ${setupList("Rinks", ov.rinks.map((r) => `${r.name} — ${r.venue_name || ""}`))}
-    ${toastHtml()}`;
+  const cards = SETUP_ENTITIES.map((ent) => setupCard(ent, ov)).join("");
+  return `<div class="setup-intro">Create your league structure and arena. Tap
+    <strong>＋ New</strong> on any card to open a form.</div>
+    <div class="setup-grid">${cards}</div>${renderDrawer(ov)}${toastHtml()}`;
 }
 
-function setupList(title, items) {
-  const rows = items.length
-    ? items.map((x) => `<div class="li"><div class="li-main"><div class="li-title">${esc(x)}</div></div>
-        <button class="act ghost" disabled title="Edit/delete is a follow-up">⋯</button></div>`).join("")
-    : `<div class="empty">None yet.</div>`;
-  return `<div class="section-title">${title} (${items.length})</div><div class="card">${rows}</div>`;
+function setupCard(ent, ov) {
+  const items = ent.list ? ent.list(ov) : null;
+  let body;
+  if (items === null) {
+    body = `<div class="setup-hint">Ice inventory lives on the
+      <button class="linklike" data-goto="calendar">Arena Calendar</button>.</div>`;
+  } else if (!items.length) {
+    body = `<div class="empty">None yet — create the first one.</div>`;
+  } else {
+    body = items.map((it) => `<div class="li"><div class="li-main">
+      <div class="li-title">${esc(it.title)}</div>
+      ${it.sub ? `<div class="li-sub">${esc(it.sub)}</div>` : ""}</div></div>`).join("");
+  }
+  const count = items ? `<span class="setup-count">${items.length}</span>` : "";
+  return `<section class="setup-card">
+    <header class="setup-card-head"><span class="sc-ico">${ent.icon}</span>
+      <span class="sc-title">${esc(ent.title)}</span>${count}
+      <button class="act primary sc-new" data-drawer="${ent.key}">＋ New</button></header>
+    <div class="setup-card-body">${body}</div>
+  </section>`;
+}
+
+function drawerField(f, ov) {
+  const req = f.required ? ` <span class="req">*</span>` : "";
+  if (f.type === "select") {
+    const rows = f.options(ov);
+    if (!rows.length) {
+      return `<label>${esc(f.label)}${req}</label>
+        <div class="drawer-note">Create a ${esc(f.ofNoun || "record")} first.</div>`;
+    }
+    const opts = rows.map(([v, label]) => `<option value="${esc(v)}">${esc(label)}</option>`).join("");
+    return `<label>${esc(f.label)}${req}</label><select id="${f.id}">${opts}</select>`;
+  }
+  const type = f.type || "text";
+  const attrs = `${f.value ? ` value="${esc(f.value)}"` : ""}${f.placeholder ? ` placeholder="${esc(f.placeholder)}"` : ""}`;
+  return `<label>${esc(f.label)}${req}</label><input id="${f.id}" type="${type}"${attrs} />`;
+}
+
+function renderDrawer(ov) {
+  if (!drawer) return "";
+  const ent = SETUP_ENTITIES.find((e) => e.key === drawer.kind);
+  if (!ent) return "";
+  const fields = ent.fields.map((f) => drawerField(f, ov)).join("");
+  const err = drawerError ? `<div class="drawer-err">⚠ ${esc(drawerError)}</div>` : "";
+  return `<div class="drawer-scrim" data-drawer-close></div>
+    <aside class="drawer" role="dialog" aria-modal="true" aria-label="New ${esc(ent.noun)}">
+      <header class="drawer-head"><span class="drawer-ico">${ent.icon}</span>
+        <span class="drawer-title">New ${esc(ent.noun)}</span>
+        <button class="drawer-x" data-drawer-close aria-label="Close">×</button></header>
+      <div class="drawer-body">${fields}${err}</div>
+      <footer class="drawer-foot">
+        <button class="act ghost" data-drawer-close>Cancel</button>
+        <button class="act primary" data-drawer-submit="${ent.key}">Create ${esc(ent.noun)}</button>
+      </footer>
+    </aside>`;
 }
 
 /* ---------- Arena Calendar (day + week, filtered) ---------- */
@@ -641,25 +695,25 @@ function renderPublic(ov) {
 }
 
 /* ---------- actions ---------- */
-async function createEntity(kind) {
+async function submitSetup(kind) {
+  const ent = SETUP_ENTITIES.find((e) => e.key === kind);
   toast = "";
-  const map = {
-    league: () => post("/api/setup/league", { name: val("f-league") }),
-    season: () => post("/api/setup/season", { league_id: val("f-season-league"), name: val("f-season") }),
-    division: () => post("/api/setup/division", { season_id: val("f-div-season"), name: val("f-div"), age_group: val("f-div-age") }),
-    club: () => post("/api/setup/club", { name: val("f-club") }),
-    team: () => post("/api/setup/team", { club_id: val("f-team-club"), division_id: val("f-team-div"), name: val("f-team") }),
-    venue: () => post("/api/setup/venue", { name: val("f-venue") }),
-    rink: () => post("/api/setup/rink", { venue_id: val("f-rink-venue"), name: val("f-rink") }),
-    "ice-slot": () => post("/api/setup/ice-slot", {
-      rink_id: val("f-slot-rink"),
-      start_time: `${val("f-slot-date")}T${val("f-slot-start")}:00+00:00`,
-      end_time: `${val("f-slot-date")}T${val("f-slot-end")}:00+00:00`,
-      slot_type: val("f-slot-type"),
-    }),
-  };
-  const res = await map[kind]();
-  if (res && !res.error) toast = `${kind === "ice-slot" ? "Ice slot" : kind[0].toUpperCase() + kind.slice(1)} created.`;
+  // Validate required fields client-side; the backend stays authoritative.
+  const missing = ent.fields.filter((f) => f.required && !val(f.id));
+  if (missing.length) {
+    drawerError = `Please fill in: ${missing.map((f) => f.label).join(", ")}.`;
+    return render();
+  }
+  drawerError = "";
+  const res = await SETUP_POST[kind]();
+  if (res && res.error) {
+    // Keep the drawer open and surface the server's message inside it.
+    drawerError = res.error.message;
+    toast = "";
+    return render();
+  }
+  drawer = null; drawerError = "";
+  toast = `${ent.noun[0].toUpperCase() + ent.noun.slice(1)} created.`;
   await render();
 }
 
@@ -721,7 +775,18 @@ async function render() {
     : renderPublic(ov);
 
   c.querySelectorAll("button[data-goto]").forEach((b) => b.onclick = () => switchTab(b.dataset.goto));
-  c.querySelectorAll("button[data-create]").forEach((b) => b.onclick = () => createEntity(b.dataset.create));
+  // Setup drawers (#44): open, close, submit.
+  c.querySelectorAll("[data-drawer]").forEach((b) => b.onclick = () => {
+    drawer = { kind: b.dataset.drawer }; drawerError = ""; toast = ""; render();
+  });
+  c.querySelectorAll("[data-drawer-close]").forEach((b) => b.onclick = () => {
+    drawer = null; drawerError = ""; render();
+  });
+  c.querySelectorAll("[data-drawer-submit]").forEach((b) => b.onclick = () => submitSetup(b.dataset.drawerSubmit));
+  if (drawer) {
+    const first = c.querySelector(".drawer-body input, .drawer-body select");
+    if (first) first.focus();
+  }
   c.querySelectorAll("button[data-act]").forEach((b) => b.onclick = () => rosterAction(b.dataset.act, b.dataset.id));
   c.querySelectorAll(".seg").forEach((b) => b.onclick = () => { gameView = b.dataset.view; toast = ""; render(); });
   c.querySelectorAll("[data-slot]").forEach((b) => b.onclick = () => { wizard = { slot_id: b.dataset.slot }; toast = ""; render(); });
@@ -795,6 +860,7 @@ async function render() {
 
 function switchTab(next) {
   view = next; toast = ""; if (next !== "calendar") { wizard = null; conflict = null; }
+  if (next !== "setup") { drawer = null; drawerError = ""; }
   document.querySelectorAll(".tab").forEach((x) => x.classList.toggle("active", x.dataset.tab === next));
   render();
 }
@@ -802,4 +868,8 @@ document.querySelectorAll(".tab").forEach((b) => b.onclick = () => switchTab(b.d
 // Topbar command actions (web shell) — outside #content, wired once.
 document.querySelectorAll(".topbar [data-goto]").forEach((b) => b.onclick = () => switchTab(b.dataset.goto));
 document.getElementById("reset-btn").onclick = async () => { await post("/api/reset", {}); toast = ""; currentGame = null; pickedPlayer = null; wizard = null; render(); };
+// Escape closes an open Setup drawer (#44).
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && drawer) { drawer = null; drawerError = ""; render(); }
+});
 render();
