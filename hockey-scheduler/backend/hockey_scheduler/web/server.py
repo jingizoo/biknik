@@ -20,6 +20,7 @@ from datetime import datetime, timedelta
 from http.cookies import SimpleCookie
 
 from ..api import ApiService
+from ..bootstrap import bootstrap_admin_from_env
 from ..domain import ROLE_LABELS, Role, permissions_for
 from ..full_demo import build_full_demo_store
 from ..services import email_transport_from_env, push_transport_from_env
@@ -106,10 +107,14 @@ class DemoState:
         self.game_id = game_id
         self.ids = ids
         # The shared-password demo personas are a demo-mode-only convenience
-        # (#68) — a production deployment must start with zero accounts and
-        # bootstrap its first operator out of band.
+        # (#68) — a production deployment must start with zero accounts.
         if _app_mode() != "production":
             self._seed_demo_accounts(ids)
+        else:
+            # Production first-admin bootstrap (#71): if BOOTSTRAP_ADMIN_USER /
+            # BOOTSTRAP_ADMIN_PASSWORD are set and no account exists yet, create
+            # the first league admin so the deployment is actually reachable.
+            bootstrap_admin_from_env(self.api, os.environ)
 
     def _seed_demo_accounts(self, ids: dict) -> None:
         """Create the six demo personas as real, operator-created accounts

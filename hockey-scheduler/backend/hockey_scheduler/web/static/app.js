@@ -63,6 +63,7 @@ const NAV = {
 };
 const POS_CLASS = { goalie: "pos-G", defense: "pos-D", forward: "pos-F", skater: "pos-D" };
 const REPO = "https://github.com/jingizoo/biknik/issues";
+const DEMO_PASSWORD = "demo";  // shared password for the demo personas (#67)
 
 const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) =>
   ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -1733,13 +1734,19 @@ document.getElementById("reset-btn").onclick = async () => {
   movingGameId = null; conflict = null; drawer = null; drawerError = ""; drawerValues = {};
   render();
 };
-// Sign out ends the server session and drops to the signed-out (viewer) state.
+// Sign out ends the server session and returns to the sign-in screen (#71).
 const signoutBtn = document.getElementById("signout-btn");
 if (signoutBtn) signoutBtn.onclick = async () => {
   await post("/api/auth/logout", {});
-  setUser(null);
-  toast = "Signed out — pick an account to sign in.";
-  renderRoleSwitch(); render();
+  setUser(null); toast = "";
+  renderRoleSwitch();
+  showLogin("You've been signed out.");
+};
+// Manual sign-in form (#71) — the only way in when the picker is empty.
+const loginForm = document.getElementById("login-form");
+if (loginForm) loginForm.onsubmit = (e) => {
+  e.preventDefault();
+  signIn(val("login-user"), document.getElementById("login-pass").value);
 };
 // Escape closes an open Setup drawer (#44).
 document.addEventListener("keydown", (e) => {
@@ -1775,11 +1782,50 @@ function setUser(user) {
   currentRole = user ? user.role : "viewer";
   applyRolePerms();
 }
-async function signIn(username) {
-  const r = await post("/api/auth/login", { username, password: "demo" });
-  if (r && !r.error) { setUser(r.user); toast = ""; }
+
+// Show/hide the full-screen sign-in overlay (#71). ``body.signed-out`` hides
+// the console shell so a signed-out visitor only ever sees the login card.
+function showLogin(message) {
+  const screen = document.getElementById("login-screen");
+  document.body.classList.add("signed-out");
+  if (screen) screen.hidden = false;
+  const err = document.getElementById("login-error");
+  if (err) { err.hidden = !message; err.textContent = message || ""; }
+  renderLoginPersonas();
+  const u = document.getElementById("login-user");
+  if (u) u.focus();
+}
+function hideLogin() {
+  document.body.classList.remove("signed-out");
+  const screen = document.getElementById("login-screen");
+  if (screen) screen.hidden = true;
+}
+// Demo mode exposes the seeded personas as one-click sign-ins; production
+// returns an empty list, leaving only the manual username/password form.
+function renderLoginPersonas() {
+  const box = document.getElementById("login-personas");
+  if (!box) return;
+  if (!accounts.length) { box.innerHTML = ""; return; }
+  box.innerHTML = `<div class="login-personas-label">Demo accounts · password "demo"</div>`
+    + accounts.map((a) =>
+      `<button type="button" class="login-persona" data-persona="${esc(a.username)}">
+         <span>${esc(a.username)}</span><span class="lp-role">${esc(a.label)}</span></button>`).join("");
+  box.querySelectorAll("[data-persona]").forEach((b) =>
+    b.onclick = () => signIn(b.dataset.persona, DEMO_PASSWORD));
+}
+
+async function signIn(username, password) {
+  const r = await post("/api/auth/login",
+    { username, password: password == null ? DEMO_PASSWORD : password });
+  if (!r || r.error) {
+    showLogin((r && r.error && r.error.message) || "Sign in failed.");
+    return false;
+  }
+  setUser(r.user); toast = "";
   drawer = null; movingGameId = null; conflict = null;
+  hideLogin();
   renderRoleSwitch(); render();
+  return true;
 }
 function renderRoleSwitch() {
   const sel = document.getElementById("role-switch");
@@ -1815,20 +1861,23 @@ async function bootstrap() {
     roleCatalog = rolesRes.roles || [];
     accounts = acctRes.accounts || [];
     const meRes = await meResp.json();
-    if (meResp.status === 401) {
-      // A stale/invalid session must NOT silently become a new admin session.
-      setUser(null);
-      toast = "Session expired — pick an account to sign in.";
-    } else if (meRes.user) {
+    if (meRes && meRes.user) {
       setUser(meRes.user);
+    } else if (meResp.status !== 401 && accounts.length) {
+      // Demo mode, fresh visit (no session, personas available): keep the
+      // zero-friction auto-login as League Admin.
+      const r = await post("/api/auth/login",
+        { username: "admin", password: DEMO_PASSWORD });
+      if (r && !r.error) setUser(r.user); else setUser(null);
     } else {
-      // No session at all: start the demo signed in as League Admin.
-      await post("/api/auth/login", { username: "admin", password: "demo" })
-        .then((r) => { if (r && !r.error) setUser(r.user); });
+      // Production (empty picker) or an expired/invalid session (401): no
+      // silent login — show the sign-in screen (#71).
+      setUser(null);
     }
-  } catch (_) { roleCatalog = []; accounts = []; }
+  } catch (_) { roleCatalog = []; accounts = []; setUser(null); }
   applyRolePerms();
   renderRoleSwitch();
-  render();
+  if (currentUser) { hideLogin(); render(); }
+  else { showLogin(); }
 }
 bootstrap();

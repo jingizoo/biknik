@@ -207,6 +207,42 @@ body[data-view="games"] .main > .content { max-width: 1480px; }
 
 .hint { display: none; }
 
+/* ---------- sign-in screen (#71) ---------- */
+.login-screen {
+  position: fixed; inset: 0; z-index: 100;
+  display: flex; align-items: center; justify-content: center; padding: 24px;
+  background: radial-gradient(circle at 30% 20%, #16233c, #0f1420 60%);
+}
+.login-screen[hidden] { display: none; }  /* class must not override [hidden] */
+.login-card {
+  width: 100%; max-width: 380px; background: #fff; border-radius: 16px;
+  padding: 30px 28px; box-shadow: 0 24px 60px rgba(0,0,0,.35);
+}
+.login-brand { display: flex; align-items: center; gap: 11px; margin-bottom: 20px; }
+.login-brand .brand-name { color: var(--ink); font-size: 15px; }
+.login-brand .brand-sub { color: var(--muted); }
+.login-title { margin: 0 0 16px; font-size: 20px; font-weight: 700; }
+.login-form { display: flex; flex-direction: column; gap: 12px; }
+.login-field { display: flex; flex-direction: column; gap: 5px; }
+.login-field span { font-size: 12px; font-weight: 600; color: var(--muted); }
+.login-field input {
+  border: 1px solid var(--line); border-radius: 9px; padding: 10px 12px;
+  font-size: 14px; background: #fff; color: var(--ink);
+}
+.login-field input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px rgba(37,99,235,.14); }
+.login-error { background: #fdeaea; color: #c62828; font-size: 13px; padding: 9px 11px; border-radius: 8px; }
+.login-submit { width: 100%; justify-content: center; padding: 11px; font-size: 14px; margin-top: 2px; }
+.login-personas { margin-top: 16px; display: flex; flex-direction: column; gap: 6px; }
+.login-personas-label { font-size: 11px; font-weight: 700; letter-spacing: .07em; text-transform: uppercase; color: var(--muted); margin-bottom: 2px; }
+.login-persona {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  border: 1px solid var(--line); background: #f8fafc; border-radius: 8px;
+  padding: 8px 11px; font-size: 13px; cursor: pointer; color: var(--ink);
+}
+.login-persona:hover { border-color: var(--accent); background: #f0f5ff; }
+.login-persona .lp-role { color: var(--muted); font-size: 12px; }
+body.signed-out .web { display: none; }
+
 /* ---------- responsive ---------- */
 @media (max-width: 1040px) {
   .dash-grid { grid-template-columns: 1fr; }
