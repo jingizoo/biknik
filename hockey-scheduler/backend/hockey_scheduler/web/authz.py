@@ -40,6 +40,9 @@ def required_permission(path: str):
     # Draining the notification delivery queue is an operator action (#58).
     if path == "/api/notifications/deliveries/process":
         return Permission.MANAGE_SCHEDULE
+    # Dead-letter retry/ignore are operator actions on the queue (#80).
+    if re.match(r"^/api/notifications/deliveries/[^/]+/(retry|ignore)$", path):
+        return Permission.MANAGE_SCHEDULE
     # Managing contact destinations is an operator action (#60).
     if path == "/api/notifications/contacts":
         return Permission.MANAGE_SCHEDULE

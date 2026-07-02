@@ -98,8 +98,11 @@ class DeliveryQueueTest(unittest.TestCase):
         for _ in range(MAX_ATTEMPTS + 3):
             worker.process_pending()
         for d in self.store.all_notification_deliveries():
-            self.assertEqual(d.status, DeliveryStatus.FAILED)
-            self.assertEqual(d.attempts, MAX_ATTEMPTS)  # not retried past budget
+            # Attempts exhausted → parked as dead-lettered, not retried past
+            # the budget (#80 changed the terminal state from failed).
+            self.assertEqual(d.status, DeliveryStatus.DEAD_LETTERED)
+            self.assertEqual(d.attempts, MAX_ATTEMPTS)
+            self.assertEqual(d.dead_lettered_at, _clock())
         # Once exhausted, the queue reports nothing deliverable.
         self.assertEqual(self.store.pending_deliveries(MAX_ATTEMPTS), [])
 

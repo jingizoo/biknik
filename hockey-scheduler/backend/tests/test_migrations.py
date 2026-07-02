@@ -24,6 +24,11 @@ def _applied(store):
     return [r["version"] for r in cur.fetchall()]
 
 
+# The full set of shipped migration versions, in order — derived from the
+# files so adding a migration doesn't require editing every assertion here.
+ALL_VERSIONS = [v for v, _ in _load_migrations()]
+
+
 def _table_columns(store, table):
     cur = store.conn.cursor()
     cur.execute(f"PRAGMA table_info({table})")
@@ -44,7 +49,7 @@ class MigrationDiscoveryTest(unittest.TestCase):
 class MigrationApplyTest(unittest.TestCase):
     def test_fresh_database_records_all_versions(self):
         store = SqlStore(":memory:")
-        self.assertEqual(_applied(store), ["001_initial", "002_sessions"])
+        self.assertEqual(_applied(store), ALL_VERSIONS)
 
     def test_reopen_applies_nothing_new(self):
         fd, path = tempfile.mkstemp(suffix=".db")
@@ -53,26 +58,33 @@ class MigrationApplyTest(unittest.TestCase):
             SqlStore(path)
             reopened = SqlStore(path)
             # Exactly the two versions — no duplicates, nothing re-run.
-            self.assertEqual(_applied(reopened), ["001_initial", "002_sessions"])
+            self.assertEqual(_applied(reopened), ALL_VERSIONS)
         finally:
             os.remove(path)
 
     def test_adoption_over_legacy_marker_is_safe(self):
         # A pre-#75 database recorded a single '0001_initial' marker and already
-        # has every table. Booting the numbered runner must not error; it
-        # backfills the numbered versions (DDL is IF NOT EXISTS).
+        # has the core tables — but not schema added by later numbered
+        # migrations. Booting the numbered runner must backfill every version
+        # without error: CREATE ... IF NOT EXISTS is safe over existing tables,
+        # and additive ALTERs land because a legacy DB genuinely lacks those
+        # columns. We simulate that legacy shape by dropping the #80 columns.
         fd, path = tempfile.mkstemp(suffix=".db")
         os.close(fd)
         try:
             store = SqlStore(path)
             cur = store.conn.cursor()
+            for col in ("last_attempt_at", "next_attempt_at", "dead_lettered_at"):
+                cur.execute(f"ALTER TABLE notification_deliveries DROP COLUMN {col}")
             cur.execute("DELETE FROM schema_migrations")
             cur.execute("INSERT INTO schema_migrations(version, applied_at) "
                         "VALUES ('0001_initial', '2026-01-01')")
             adopted = SqlStore(path)
-            self.assertEqual(
-                _applied(adopted),
-                ["0001_initial", "001_initial", "002_sessions"])
+            self.assertEqual(_applied(adopted), ["0001_initial"] + ALL_VERSIONS)
+            # The ALTER migration re-added its columns during adoption.
+            self.assertTrue(
+                {"last_attempt_at", "next_attempt_at", "dead_lettered_at"}
+                <= _table_columns(adopted, "notification_deliveries"))
         finally:
             os.remove(path)
 
@@ -111,7 +123,7 @@ class ResetSchemaTest(unittest.TestCase):
     def test_reset_schema_reapplies_from_scratch(self):
         store = SqlStore(":memory:")
         store.reset_schema()
-        self.assertEqual(_applied(store), ["001_initial", "002_sessions"])
+        self.assertEqual(_applied(store), ALL_VERSIONS)
 
     def test_reset_schema_recreates_tables(self):
         store = SqlStore(":memory:")
