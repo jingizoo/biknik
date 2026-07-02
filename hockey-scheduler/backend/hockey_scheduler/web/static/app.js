@@ -849,8 +849,10 @@ function renderDeliveryMonitor() {
       <p>Notifications fan out to the queue as they are emitted.</p></div>`;
   const st = ov.by_status || {}, ch = ov.by_channel || {};
   const emailMode = ov.email_mode || "dry_run";
+  const emailSender = ov.email_sender;
   const modeChip = emailMode === "smtp"
-    ? `<span class="badge red">Email: SMTP (live)</span>`
+    ? `<span class="badge red">Email: SMTP (live)</span>${emailSender
+        ? ` <span class="badge gray">from ${esc(emailSender)}</span>` : ""}`
     : `<span class="badge gray">Email: dry-run</span>`;
   const stat = (label, n, cls) =>
     `<div class="dq-stat ${cls}"><div class="dq-n">${n || 0}</div><div class="dq-l">${label}</div></div>`;

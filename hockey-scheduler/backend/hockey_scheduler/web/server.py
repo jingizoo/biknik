@@ -8,6 +8,7 @@ substitute engine through the same :class:`ApiService` used by the tests.
 """
 
 import json
+import os
 import re
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -21,6 +22,7 @@ from http.cookies import SimpleCookie
 from ..api import ApiService
 from ..domain import ROLE_LABELS, Role, permissions_for
 from ..full_demo import build_full_demo_store
+from ..services import email_transport_from_env
 from ..store import SqlStore, create_store
 from .auth import (
     DEMO_USERS,
@@ -84,7 +86,10 @@ class DemoState:
         if isinstance(store, SqlStore):
             store.reset_schema()
         store, game_id, ids = build_full_demo_store(store)
-        self.api = ApiService(store)
+        # Email transport comes from EMAIL_MODE / SMTP_* env (#63); dry-run by
+        # default, so the demo never sends real mail unless explicitly wired.
+        self.api = ApiService(
+            store, email_transport=email_transport_from_env(os.environ))
         self.game_id = game_id
         self.ids = ids
 
