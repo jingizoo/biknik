@@ -29,6 +29,7 @@ from ..domain import (
     League,
     ContactDestination,
     DeliveryStatus,
+    DeviceToken,
     Notification,
     NotificationAudience,
     NotificationChannel,
@@ -168,13 +169,14 @@ SPECS = {
                                 "sent_at": _dt()}),
     ContactDestination: Spec(ContactDestination, "contact_destinations",
                              {"channel": _enum(NotificationChannel)}),
+    DeviceToken: Spec(DeviceToken, "device_tokens", {"active": _bool()}),
 }
 
 # Column type for DDL: INTEGER for int/bool fields, else TEXT.
 _INT_FIELDS = {
     "target_goalies", "target_skaters", "max_skaters", "jersey_number",
     "priority_rank", "is_active", "locked", "cancelled", "published",
-    "home_score", "away_score", "attempts",
+    "home_score", "away_score", "attempts", "active",
 }
 
 
@@ -204,6 +206,7 @@ _INDEXES = [
     "CREATE INDEX IF NOT EXISTS ix_notif_deliv_status ON notification_deliveries(status)",
     "CREATE INDEX IF NOT EXISTS ix_notif_deliv_notif ON notification_deliveries(notification_id)",
     "CREATE INDEX IF NOT EXISTS ix_contacts_ref ON contact_destinations(recipient_ref, channel)",
+    "CREATE INDEX IF NOT EXISTS ix_device_tokens_ref ON device_tokens(recipient_ref, active)",
 ]
 
 
@@ -501,3 +504,24 @@ class SqlStore:
         return rows[0] if rows else None
     def all_contact_destinations(self):
         return self._query(ContactDestination, order="id")
+
+    # -- device token registry (#65) ---------------------------------------
+    def add_device_token(self, t): return self._insert(t)
+    def save_device_token(self, t): return self._update(t)
+    def get_device_token(self, token_id):
+        return self._get(DeviceToken, token_id)
+    def get_device_token_by_value(self, recipient_ref, token):
+        rows = self._query(
+            DeviceToken, "recipient_ref = ? AND token = ?",
+            (recipient_ref, token), order="id")
+        return rows[0] if rows else None
+    def device_tokens_for(self, recipient_ref):
+        return self._query(DeviceToken, "recipient_ref = ?",
+                           (recipient_ref,), order="id")
+    def active_device_token_for(self, recipient_ref):
+        rows = self._query(
+            DeviceToken, "recipient_ref = ? AND active = ?",
+            (recipient_ref, 1), order="id")
+        return rows[0] if rows else None
+    def all_device_tokens(self):
+        return self._query(DeviceToken, order="id")

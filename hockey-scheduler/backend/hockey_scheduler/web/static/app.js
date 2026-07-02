@@ -20,8 +20,9 @@ let rolePerms = new Set();         // permissions of the current role
 let officialsPool = [];            // [{id,name}] officials for the assign UI (#30)
 let standingsDivision = null;      // selected division for the Standings tab (#31)
 let notifState = { notifications: [], unread: 0 };  // feed for the bell (#32)
-let deliveryState = { contacts: [], overview: null };  // ops delivery admin (#61)
+let deliveryState = { contacts: [], overview: null, deviceTokens: [] };  // ops delivery admin (#61/#65)
 let contactForm = { recipient_ref: "", channel: "email", destination: "", label: "" };
+let tokenForm = { recipient_ref: "", provider: "fcm", token: "", label: "" };
 let movingGameId = null;    // click-to-move fallback: game awaiting a destination slot
 let conflict = null;        // {ok, title, lines[], game, slot} — calendar side panel (#43)
 let drawer = null;          // {kind} when a Setup create drawer is open (#44)
@@ -882,7 +883,8 @@ function renderDeliveryMonitor() {
     <tr>
       <td>${CHAN_ICON[d.channel] || ""} ${esc(d.channel)}</td>
       <td class="cd-ref">${esc(d.recipient_ref || "")}</td>
-      <td class="cd-dest">${esc(d.destination || "")}</td>
+      <td class="cd-dest">${esc(d.destination || "")}${d.placeholder
+        ? ` <span class="badge gray">placeholder</span>` : ""}</td>
       <td><span class="badge ${DELIV_BADGE[d.status] || "gray"}">${esc(d.status)}</span></td>
       <td class="dq-att">${d.attempts}</td>
       <td class="dq-err">${esc(d.last_error || "")}</td>
@@ -896,13 +898,60 @@ function renderDeliveryMonitor() {
   return `<div class="section-title">Delivery queue</div>${stats}${action}${table}`;
 }
 
+function renderDeviceTokensPanel(ov) {
+  const f = tokenForm;
+  const picks = recipientOptions(ov);
+  const pickOpts = [`<option value="">Quick pick…</option>`]
+    .concat(picks.map((p) => opt(p.ref, p.label, false))).join("");
+  const prov = (v, label) => opt(v, label, f.provider === v);
+  const form = `
+    <div class="card cd-form">
+      <div class="cd-grid">
+        <label class="cd-field"><span>Recipient</span>
+          <select id="token-pick" class="cd-input">${pickOpts}</select></label>
+        <label class="cd-field"><span>recipient_ref</span>
+          <input id="token-ref" class="cd-input" placeholder="official:… / team:… / scheduler"
+            value="${esc(f.recipient_ref)}" /></label>
+        <label class="cd-field cd-narrow"><span>Provider</span>
+          <select id="token-provider" class="cd-input">${prov("fcm", "FCM")}${prov("apns", "APNs")}${prov("web", "Web push")}</select></label>
+        <label class="cd-field"><span>Device token</span>
+          <input id="token-value" class="cd-input" placeholder="real provider token"
+            value="${esc(f.token)}" /></label>
+        <label class="cd-field"><span>Device name <em>(optional)</em></span>
+          <input id="token-label" class="cd-input" placeholder="e.g. Ref's iPhone"
+            value="${esc(f.label)}" /></label>
+        <div class="cd-submit"><button class="act primary" data-token-save>Register token</button></div>
+      </div>
+    </div>`;
+  const rows = (deliveryState.deviceTokens || []).map((t) => `
+    <tr class="${t.active ? "" : "dt-off"}">
+      <td class="cd-ref">${esc(t.recipient_ref)}</td>
+      <td>${esc(t.provider)}</td>
+      <td class="cd-dest">${esc(t.token)}</td>
+      <td>${esc(t.label || "")}</td>
+      <td><span class="badge ${t.active ? "green" : "gray"}">${t.active ? "active" : "inactive"}</span></td>
+      <td><button class="act ghost cd-edit" data-token-active="${esc(t.id)}"
+        data-token-next="${t.active ? "0" : "1"}">${t.active ? "Deactivate" : "Reactivate"}</button></td>
+    </tr>`).join("");
+  const table = rows
+    ? `<div class="card"><table class="cd-table">
+        <thead><tr><th>Recipient</th><th>Provider</th><th>Token</th><th>Device</th>
+          <th>Status</th><th></th></tr></thead>
+        <tbody>${rows}</tbody></table></div>`
+    : `<div class="banner neutral"><h2>No device tokens registered</h2>
+        <p>Push deliveries use a <code>push-token:</code> placeholder until a real
+        token is registered — live push refuses placeholders.</p></div>`;
+  return `<div class="section-title">Push device tokens</div>${form}${table}`;
+}
+
 function renderDelivery(ov) {
   if (!hasPerm("manage_schedule")) {
     return `<div class="banner neutral"><h2>Operators only</h2>
       <p>Delivery contacts and the queue monitor are available to league admins
       and arena managers.</p></div>`;
   }
-  return `${renderDeliveryMonitor()}${renderContactsPanel(ov)}${toastHtml()}`;
+  return `${renderDeliveryMonitor()}${renderContactsPanel(ov)}` +
+    `${renderDeviceTokensPanel(ov)}${toastHtml()}`;
 }
 
 /* ---------- Standings (#31) ---------- */
@@ -1292,15 +1341,17 @@ async function render() {
     if (nf && !nf.error) notifState = nf;
     // Delivery admin: contacts + queue overview, operator-only (#61).
     if (view === "delivery" && hasPerm("manage_schedule")) {
-      const [op, contacts, overview] = await Promise.all([
+      const [op, contacts, overview, tokens] = await Promise.all([
         getJSON("/api/officials"),
         getJSON("/api/notifications/contacts"),
         getJSON("/api/notifications/deliveries"),
+        getJSON("/api/notifications/device-tokens"),
       ]);
       officialsPool = (op && op.officials) || [];
       deliveryState = {
         contacts: (contacts && contacts.contacts) || [],
         overview: (overview && !overview.error) ? overview : null,
+        deviceTokens: (tokens && tokens.device_tokens) || [],
       };
     }
     // Standings for the selected division (#31).
@@ -1442,6 +1493,35 @@ async function render() {
       (res.failed ? ` · failed ${res.failed}` : "");
     await render();
   };
+  // Device tokens (#65): quick-pick, register, activate/deactivate.
+  const tokenPick = c.querySelector("#token-pick");
+  if (tokenPick) tokenPick.onchange = (e) => {
+    const ref = c.querySelector("#token-ref");
+    if (ref && e.target.value) ref.value = e.target.value;
+  };
+  const saveToken = c.querySelector("[data-token-save]");
+  if (saveToken) saveToken.onclick = async () => {
+    tokenForm = {
+      recipient_ref: val("token-ref"), provider: val("token-provider"),
+      token: val("token-value"), label: val("token-label"),
+    };
+    toast = "";
+    const res = await post("/api/notifications/device-tokens", {
+      recipient_ref: tokenForm.recipient_ref, provider: tokenForm.provider,
+      token: tokenForm.token, label: tokenForm.label || null,
+    });
+    if (res && !res.error) {
+      toast = "Device token registered.";
+      tokenForm = { recipient_ref: "", provider: "fcm", token: "", label: "" };
+    }
+    await render();
+  };
+  c.querySelectorAll("[data-token-active]").forEach((b) => b.onclick = async () => {
+    toast = "";
+    await post(`/api/notifications/device-tokens/${b.dataset.tokenActive}/active`,
+      { active: b.dataset.tokenNext === "1" });
+    await render();
+  });
   // Shared move: used by both drag/drop and the click-based Move fallback.
   const applyMove = async (gid, slotId) => {
     toast = "";

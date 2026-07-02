@@ -142,6 +142,32 @@ class ServerAuthzTest(unittest.TestCase):
         self.assertEqual(status, 401)
         self.assertEqual(body["error"]["code"], "unauthorized")
 
+    # -- device token registry is operator-only (#65) ---------------------
+    def test_viewer_cannot_read_or_write_device_tokens(self):
+        status, _ = self._get_h("/api/notifications/device-tokens", role="viewer")
+        self.assertEqual(status, 403)
+        status, _ = self._post("/api/notifications/device-tokens",
+                               {"recipient_ref": "scheduler", "provider": "fcm",
+                                "token": "tok"}, role="viewer")
+        self.assertEqual(status, 403)
+
+    def test_operator_can_manage_device_tokens(self):
+        status, body = self._post(
+            "/api/notifications/device-tokens",
+            {"recipient_ref": "scheduler", "provider": "fcm",
+             "token": "tok-http"}, role="league_admin")
+        self.assertEqual(status, 200)
+        self.assertTrue(body["active"])
+        status, deact = self._post(
+            f"/api/notifications/device-tokens/{body['id']}/active",
+            {"active": False}, role="league_admin")
+        self.assertEqual(status, 200)
+        self.assertFalse(deact["active"])
+        status, listing = self._get_h("/api/notifications/device-tokens",
+                                      role="arena_manager")
+        self.assertEqual(status, 200)
+        self.assertIn("device_tokens", listing)
+
 
 if __name__ == "__main__":
     unittest.main()

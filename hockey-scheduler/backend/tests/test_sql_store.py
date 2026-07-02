@@ -110,6 +110,19 @@ class SqlStoreParityTest(unittest.TestCase):
             if d["recipient_ref"] == "scheduler" and d["channel"] == "email")
         self.assertEqual(accepted_email["destination"], "ops@contacts.invalid")
 
+    def test_device_token_registry_roundtrips_on_sql(self):
+        # A registered device token (#65) persists and overrides the push
+        # placeholder on the next emission, through the SQL store.
+        self.api.register_device_token("scheduler", "fcm", "tok-sql")
+        listed = self.api.list_device_tokens()["device_tokens"]
+        self.assertEqual(listed[0]["token"], "tok-sql")
+        self.api.respond_assignment(self.ids["ref_assignment_id"], accept=True)
+        ov = self.api.get_delivery_overview()
+        push = next(d for d in ov["deliveries"]
+                    if d["recipient_ref"] == "scheduler" and d["channel"] == "push")
+        self.assertEqual(push["destination"], "tok-sql")
+        self.assertFalse(push["placeholder"])
+
 
 class SqlStoreTransactionTest(unittest.TestCase):
     """A failure mid multi-write operation must roll the whole thing back."""

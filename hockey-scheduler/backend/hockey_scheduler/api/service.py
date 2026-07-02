@@ -14,6 +14,7 @@ from typing import Callable, List, Optional
 from ..domain import (
     AvailabilityStatus,
     ContactDestination,
+    DeviceToken,
     IceSlotType,
     NotificationChannel,
     NotificationRecipient,
@@ -495,12 +496,21 @@ class ApiService:
 
     # -- notification delivery queue (#58) ---------------------------------
     @staticmethod
+    def _is_placeholder_destination(channel, destination) -> bool:
+        dest = destination or ""
+        if channel == NotificationChannel.PUSH:
+            return dest.startswith("push-token:")
+        return dest.endswith(".invalid")
+
+    @staticmethod
     def _delivery_row(d) -> dict:
         return {"id": d.id, "notification_id": d.notification_id,
                 "channel": d.channel.value, "status": d.status.value,
                 "attempts": d.attempts, "last_error": d.last_error,
                 "sent_at": d.sent_at.isoformat() if d.sent_at else None,
-                "recipient_ref": d.recipient_ref, "destination": d.destination}
+                "recipient_ref": d.recipient_ref, "destination": d.destination,
+                "placeholder": ApiService._is_placeholder_destination(
+                    d.channel, d.destination)}
 
     @catch
     def process_notification_deliveries(self) -> dict:
@@ -564,6 +574,59 @@ class ApiService:
             channel=ch, destination=destination, label=label)
         self.store.add_contact_destination(c)
         return self._contact_row(c)
+
+    # -- device token registry (#65) ---------------------------------------
+    @staticmethod
+    def _device_token_row(t) -> dict:
+        return {"id": t.id, "recipient_ref": t.recipient_ref,
+                "provider": t.provider, "token": t.token,
+                "label": t.label, "active": t.active}
+
+    @catch
+    def list_device_tokens(self) -> dict:
+        rows = [self._device_token_row(t)
+                for t in self.store.all_device_tokens()]
+        rows.sort(key=lambda r: (r["recipient_ref"], not r["active"], r["id"]))
+        return {"device_tokens": rows}
+
+    @catch
+    def register_device_token(self, recipient_ref: str, provider: str,
+                              token: str, label=None) -> dict:
+        """Register (or reactivate) a real push device token for a recipient."""
+        if not recipient_ref:
+            raise ValidationError("A recipient_ref is required.")
+        provider = (provider or "").strip()
+        if not provider:
+            raise ValidationError("A provider is required.")
+        token = (token or "").strip()
+        if not token:
+            raise ValidationError("A device token is required.")
+        # Reject the synthesized placeholder scheme — real tokens only (#65).
+        if token.startswith("push-token:"):
+            raise ValidationError(
+                "That looks like a placeholder token — register a real device "
+                "token from the provider.")
+        existing = self.store.get_device_token_by_value(recipient_ref, token)
+        if existing is not None:
+            existing.provider = provider
+            existing.label = label
+            existing.active = True
+            self.store.save_device_token(existing)
+            return self._device_token_row(existing)
+        t = DeviceToken(
+            id=self.store.next_id("devtok"), recipient_ref=recipient_ref,
+            provider=provider, token=token, label=label, active=True)
+        self.store.add_device_token(t)
+        return self._device_token_row(t)
+
+    @catch
+    def set_device_token_active(self, token_id: str, active: bool) -> dict:
+        t = self.store.get_device_token(token_id)
+        if t is None:
+            raise NotFoundError("Device token not found.")
+        t.active = bool(active)
+        self.store.save_device_token(t)
+        return self._device_token_row(t)
 
     @catch
     def get_official_inbox(self, official_id: str) -> dict:
