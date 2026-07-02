@@ -54,6 +54,12 @@ def required_permission(path: str):
         return Permission.MANAGE_USERS
     if re.match(r"^/api/accounts/[^/]+/active$", path):
         return Permission.MANAGE_USERS
+    # Viewing/revoking an account's login sessions is a user-management action
+    # held only by a league admin (#78).
+    if re.match(r"^/api/accounts/[^/]+/sessions$", path):
+        return Permission.MANAGE_USERS
+    if re.match(r"^/api/accounts/[^/]+/sessions/[^/]+/revoke$", path):
+        return Permission.MANAGE_USERS
     # Officials: an official accepts/declines their own assignment (#54);
     # unassigning is an operator/scheduling action (#30).
     m = re.match(r"^/api/officials/assignments/[^/]+/(accept|decline|unassign)$", path)

@@ -680,6 +680,48 @@ class ApiService:
         return {"user_accounts":
                 [self._account_row(a) for a in self.accounts.list_accounts()]}
 
+    # -- account sessions (#78) --------------------------------------------
+    @staticmethod
+    def _session_row(s, now) -> dict:
+        """Operator-safe view of a session. NEVER includes the raw token (which
+        is not stored anyway) or the token_hash — only lifecycle metadata."""
+        if s.revoked_at is not None:
+            status = "revoked"
+        elif s.expires_at < now:
+            status = "expired"
+        else:
+            status = "active"
+        return {"id": s.id, "issued_at": s.issued_at.isoformat(),
+                "expires_at": s.expires_at.isoformat(),
+                "revoked_at": s.revoked_at.isoformat() if s.revoked_at else None,
+                "user_agent": s.user_agent, "status": status}
+
+    @catch
+    def list_account_sessions(self, account_id: str) -> dict:
+        """List an account's sessions for a League Admin (#78), newest first.
+        No token material is exposed — only id/timestamps/user_agent/status."""
+        if self.store.get_user_account(account_id) is None:
+            raise NotFoundError("User account not found.")
+        now = self.roster.clock()
+        rows = sorted(self.store.sessions_for_user(account_id),
+                      key=lambda s: s.issued_at, reverse=True)
+        return {"sessions": [self._session_row(s, now) for s in rows]}
+
+    @catch
+    def revoke_account_session(self, account_id: str, session_id: str,
+                               actor_id: Optional[str] = None) -> dict:
+        """Revoke a single session belonging to an account (#78). Idempotent:
+        an already-revoked session keeps its original revoked_at."""
+        if self.store.get_user_account(account_id) is None:
+            raise NotFoundError("User account not found.")
+        sess = self.store.get_session(session_id)
+        if sess is None or sess.user_id != account_id:
+            raise NotFoundError("Session not found.")
+        if sess.revoked_at is None:
+            sess.revoked_at = self.roster.clock()
+            self.store.save_session(sess)
+        return self._session_row(sess, self.roster.clock())
+
     def verify_login(self, username: str, password: str) -> Optional[dict]:
         """Return the account row for valid, active credentials, else None.
 

@@ -21,6 +21,8 @@ let officialsPool = [];            // [{id,name}] officials for the assign UI (#
 let standingsDivision = null;      // selected division for the Standings tab (#31)
 let notifState = { notifications: [], unread: 0 };  // feed for the bell (#32)
 let deliveryState = { contacts: [], overview: null, deviceTokens: [] };  // ops delivery admin (#61/#65)
+let usersState = { accounts: [], sessions: [] };  // account/session admin (#78)
+let usersSelected = null;          // account id whose sessions are shown (#78)
 let contactForm = { recipient_ref: "", channel: "email", destination: "", label: "" };
 let tokenForm = { recipient_ref: "", provider: "fcm", token: "", label: "" };
 let movingGameId = null;    // click-to-move fallback: game awaiting a destination slot
@@ -59,7 +61,7 @@ const NAV = {
   games: "Games", roster: "Roster", sheet: "Game Sheet",
   inbox: "My Assignments", standings: "Standings",
   notifications: "Notifications", delivery: "Delivery", activity: "Activity",
-  public: "Public",
+  public: "Public", users: "Users",
 };
 const POS_CLASS = { goalie: "pos-G", defense: "pos-D", forward: "pos-F", skater: "pos-D" };
 const REPO = "https://github.com/jingizoo/biknik/issues";
@@ -1051,6 +1053,48 @@ function renderDelivery(ov) {
     `${renderDeviceTokensPanel(ov)}${toastHtml()}`;
 }
 
+/* ---------- Users / sessions admin (#78) ---------- */
+function renderUsers() {
+  if (!hasPerm("manage_users")) {
+    return `<div class="banner neutral"><h2>League admins only</h2>
+      <p>Account and session administration is limited to league admins.</p></div>`;
+  }
+  const accts = usersState.accounts;
+  const accountList = accts.length
+    ? accts.map((a) => `<button class="row-btn ${a.id === usersSelected ? "active" : ""}"
+        data-user-sessions="${esc(a.id)}">
+        <span class="row-main">${esc(a.username)}</span>
+        <span class="row-sub">${esc(a.role)}${a.active ? "" : " · inactive"}</span>
+      </button>`).join("")
+    : `<div class="empty">No accounts yet.</div>`;
+  const sessionPanel = usersSelected
+    ? renderUserSessions()
+    : `<p class="muted">Select an account to view its login sessions.</p>`;
+  return `
+    <div class="card">
+      <div class="section-title">Accounts</div>
+      <div class="row-list">${accountList}</div>
+    </div>
+    <div class="card">
+      <div class="section-title">Sessions</div>
+      ${sessionPanel}
+    </div>${toastHtml()}`;
+}
+
+function renderUserSessions() {
+  const rows = usersState.sessions;
+  if (!rows.length) return `<p class="muted">No sessions on record for this account.</p>`;
+  return `<div class="row-list">` + rows.map((s) => `
+    <div class="session-row">
+      <span class="row-main">${esc(s.user_agent || "Unknown device")}</span>
+      <span class="pill ${esc(s.status)}">${esc(s.status)}</span>
+      <span class="row-sub">issued ${fmtDateTime(s.issued_at)}</span>
+      ${s.status === "active"
+        ? `<button class="act danger" data-revoke-session="${esc(s.id)}">Revoke</button>`
+        : ""}
+    </div>`).join("") + `</div>`;
+}
+
 /* ---------- Standings (#31) ---------- */
 function renderStandings(ov, standings) {
   if (!ov.divisions.length) return `<div class="empty">No divisions yet. Create one in Setup.</div>`;
@@ -1458,6 +1502,20 @@ async function render() {
         deviceTokens: (tokens && tokens.device_tokens) || [],
       };
     }
+    // Account/session admin, League-Admin only (#78).
+    if (view === "users" && hasPerm("manage_users")) {
+      const acc = await getJSON("/api/accounts");
+      usersState.accounts = (acc && acc.user_accounts) || [];
+      if (usersSelected && !usersState.accounts.some((a) => a.id === usersSelected)) {
+        usersSelected = null;
+      }
+      if (usersSelected) {
+        const s = await getJSON(`/api/accounts/${usersSelected}/sessions`);
+        usersState.sessions = (s && s.sessions) || [];
+      } else {
+        usersState.sessions = [];
+      }
+    }
     // Standings for the selected division (#31).
     if (view === "standings") {
       if (!standingsDivision || !ov.divisions.some((d) => d.id === standingsDivision)) {
@@ -1501,6 +1559,7 @@ async function render() {
     : view === "inbox" ? renderInbox(inbox)
     : view === "notifications" ? renderNotifications()
     : view === "delivery" ? renderDelivery(ov)
+    : view === "users" ? renderUsers()
     : view === "standings" ? renderStandings(ov, standings)
     : view === "activity" ? renderActivity(board, ov)
     : renderPublic(ov);
@@ -1639,6 +1698,15 @@ async function render() {
     toast = "";
     await post(`/api/notifications/device-tokens/${b.dataset.tokenActive}/active`,
       { active: b.dataset.tokenNext === "1" });
+    await render();
+  });
+  // Account/session admin (#78): pick an account, revoke one of its sessions.
+  c.querySelectorAll("[data-user-sessions]").forEach((b) => b.onclick = () => {
+    usersSelected = b.dataset.userSessions; toast = ""; render();
+  });
+  c.querySelectorAll("[data-revoke-session]").forEach((b) => b.onclick = async () => {
+    toast = "";
+    await post(`/api/accounts/${usersSelected}/sessions/${b.dataset.revokeSession}/revoke`, {});
     await render();
   });
   // Shared move: used by both drag/drop and the click-based Move fallback.
@@ -1782,6 +1850,7 @@ function gateChrome() {
   toggle('.tab[data-tab="inbox"]', isOfficial);
   // The Delivery admin tab is operator-only (#61).
   toggle('.tab[data-tab="delivery"]', hasPerm("manage_schedule"));
+  toggle('.tab[data-tab="users"]', hasPerm("manage_users"));
   // Reset wipes all demo data — operator-only, like the API (hardening).
   toggle("#reset-btn", hasPerm("manage_schedule"));
   // Sign out only makes sense with a live session.

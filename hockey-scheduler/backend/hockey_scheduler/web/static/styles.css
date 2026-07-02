@@ -448,6 +448,25 @@ select.player-picker {
 .pill.junior { background: #efe9ff; color: #5a40c0; }
 .pill.scheduled { background: #e3f0ff; color: #0a64c4; }
 .pill.gray { background: #ececf1; color: #6b6b70; }
+/* Session lifecycle pills (#78). */
+.pill.active { background: #e3f9e8; color: #1c8c39; }
+.pill.revoked { background: #ffe5e3; color: #c0271b; }
+.pill.expired { background: #ececf1; color: #6b6b70; }
+
+/* Users / sessions admin (#78). */
+p.muted { color: var(--muted); font-size: 13px; }
+.row-list { display: flex; flex-direction: column; gap: 6px; }
+.row-btn { display: flex; flex-direction: column; align-items: flex-start; gap: 2px;
+  background: #fff; border: 1px solid var(--line); border-radius: 8px;
+  padding: 10px 12px; cursor: pointer; text-align: left; width: 100%; }
+.row-btn.active { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+.row-btn .row-main { font-weight: 600; font-size: 14px; }
+.row-btn .row-sub, .session-row .row-sub { color: var(--muted); font-size: 12px; }
+.session-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
+.session-row .row-main { font-weight: 600; font-size: 13px; }
+.session-row .act { margin-left: auto; }
+button.act.danger { background: #ffe5e3; color: #c0271b; }
 
 .kv { display: flex; justify-content: space-between; padding: 11px 14px; border-bottom: 1px solid var(--sep); font-size: 14px; }
 .kv:last-child { border-bottom: none; }
