@@ -960,7 +960,14 @@ function renderDeliveryMonitor() {
     ? `<span class="badge red">Push: live</span>${pushProvider
         ? ` <span class="badge gray">via ${esc(pushProvider)}</span>` : ""}`
     : `<span class="badge gray">Push: dry-run</span>`;
-  const modeChip = `${emailChip} ${pushChip}`;
+  // Worker loop posture (#79): enabled + running, or a manual-drain hint.
+  const w = ov.worker || {};
+  const workerChip = w.running
+    ? `<span class="badge red">Worker: on (every ${esc(w.interval_seconds)}s · batch ${esc(w.batch_size)})</span>`
+    : w.enabled
+      ? `<span class="badge gray">Worker: enabled, not running</span>`
+      : `<span class="badge gray">Worker: manual drain</span>`;
+  const modeChip = `${emailChip} ${pushChip} ${workerChip}`;
   const stat = (label, n, cls) =>
     `<div class="dq-stat ${cls}"><div class="dq-n">${n || 0}</div><div class="dq-l">${label}</div></div>`;
   const stats = `<div class="dq-stats">

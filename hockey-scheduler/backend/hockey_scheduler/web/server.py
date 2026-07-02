@@ -24,7 +24,11 @@ from ..api import ApiService
 from ..bootstrap import bootstrap_admin_from_env
 from ..domain import ROLE_LABELS, Role, permissions_for
 from ..full_demo import build_full_demo_store
-from ..services import email_transport_from_env, push_transport_from_env
+from ..services import (
+    delivery_loop_from_env,
+    email_transport_from_env,
+    push_transport_from_env,
+)
 from ..store import SqlStore, create_store
 from .auth import (
     DEFAULT_TTL_SECONDS,
@@ -752,6 +756,15 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def serve(host: str = "127.0.0.1", port: int = 8000) -> None:
+    # Configure the delivery worker loop from env and start it if enabled (#79).
+    # ApiService keeps a disabled loop by default (safe for tests); only the
+    # running server process reads env and may spin the background thread.
+    STATE.api.delivery_loop = delivery_loop_from_env(STATE.api.delivery,
+                                                     os.environ)
+    if STATE.api.delivery_loop.start():
+        print(f"Delivery worker loop started "
+              f"(every {STATE.api.delivery_loop.interval_seconds}s, "
+              f"batch {STATE.api.delivery_loop.batch_size}).")
     httpd = ThreadingHTTPServer((host, port), Handler)
     print(f"Hockey Scheduler demo running at http://{host}:{port}")
     print("Open that URL in your browser. Press Ctrl+C to stop.")
@@ -759,6 +772,8 @@ def serve(host: str = "127.0.0.1", port: int = 8000) -> None:
         httpd.serve_forever()
     except KeyboardInterrupt:
         print("\nStopped.")
+    finally:
+        STATE.api.delivery_loop.stop()
 
 
 if __name__ == "__main__":

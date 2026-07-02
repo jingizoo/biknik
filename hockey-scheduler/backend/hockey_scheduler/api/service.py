@@ -31,7 +31,13 @@ from ..domain.errors import (
     NotFoundError,
     ValidationError,
 )
-from ..services import AccountService, DeliveryWorker, RosterService, SetupService
+from ..services import (
+    AccountService,
+    DeliveryLoop,
+    DeliveryWorker,
+    RosterService,
+    SetupService,
+)
 from ..store import InMemoryStore
 
 
@@ -114,6 +120,9 @@ class ApiService:
         self.delivery = DeliveryWorker(self.store, self.roster.clock,
                                        email_transport=email_transport,
                                        push_transport=push_transport)
+        # Opt-in worker loop (#79): disabled by default; the server enables it
+        # from env at boot. Always available for run-once drains and status.
+        self.delivery_loop = DeliveryLoop(self.delivery)
         self.accounts = AccountService(self.store, self.roster.clock)
 
     # -- games -------------------------------------------------------------
@@ -545,6 +554,7 @@ class ApiService:
                 "email_sender": getattr(self.delivery.email_transport, "sender", None),
                 "push_mode": self.delivery.push_transport.mode,
                 "push_provider": getattr(self.delivery.push_transport, "provider", None),
+                "worker": self.delivery_loop.status(),
                 "deliveries": [self._delivery_row(d) for d in rows]}
 
     @catch

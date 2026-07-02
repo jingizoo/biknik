@@ -9,6 +9,8 @@ Everything here is pure and deterministic: the clock is injected and the
 sender is pluggable, so success / failure / retry are all unit-testable.
 """
 
+import threading
+
 from ..domain import (
     DeliveryStatus,
     NotificationAudience,
@@ -24,6 +26,11 @@ DEFAULT_CHANNELS = (NotificationChannel.EMAIL, NotificationChannel.PUSH)
 
 # How many times a single delivery is attempted before it is left failed.
 MAX_ATTEMPTS = 3
+
+# Worker-loop defaults (#79). Disabled by default so tests and the demo never
+# spin a background thread unless one is explicitly asked for.
+DEFAULT_WORKER_INTERVAL = 30
+DEFAULT_WORKER_BATCH = 50
 
 
 def recipient_ref(notification) -> str:
@@ -147,16 +154,34 @@ class DeliveryWorker:
         self.sender = sender or make_delivery_sender(
             self.email_transport, self.push_transport)
         self.max_attempts = max_attempts
+        # One process-wide lock guards the read-send-save critical section so
+        # the manual drain endpoint and the background worker loop (#79) cannot
+        # both claim the same pending rows and send them twice. Both paths call
+        # process_pending on the SAME worker instance, so the lock must live on
+        # the worker, not on the loop.
+        self._process_lock = threading.Lock()
 
-    def process_pending(self) -> dict:
+    def process_pending(self, limit=None) -> dict:
         """Attempt every deliverable row once; return a run summary.
 
         Deliverable = still ``pending``, or ``failed`` with attempts left.
         A row that fails its final attempt stays ``failed`` and is not picked
-        up again.
+        up again. ``limit`` caps how many rows are processed in one call (the
+        worker loop's batch size, #79); ``None`` processes all of them.
+
+        Serialized by ``self._process_lock`` so concurrent callers (manual
+        drain + background loop) drain the queue one batch at a time rather
+        than double-sending overlapping rows.
         """
+        with self._process_lock:
+            return self._process_pending_locked(limit)
+
+    def _process_pending_locked(self, limit=None) -> dict:
         processed = sent = failed = 0
-        for d in self.store.pending_deliveries(self.max_attempts):
+        rows = self.store.pending_deliveries(self.max_attempts)
+        if limit is not None:
+            rows = rows[:limit]
+        for d in rows:
             notification = self.store.get_notification_feed(d.notification_id)
             # Re-resolve the destination on every attempt so a contact or
             # device token registered AFTER emission applies to queued and
@@ -180,3 +205,93 @@ class DeliveryWorker:
             self.store.save_notification_delivery(d)
             processed += 1
         return {"processed": processed, "sent": sent, "failed": failed}
+
+
+class DeliveryLoop:
+    """A controllable loop around :class:`DeliveryWorker` (#79).
+
+    Turns manual drains into an opt-in background worker: ``run_once`` for a
+    single bounded batch, ``start``/``stop`` for a daemon loop on a fixed
+    interval. Disabled by default so nothing runs unless explicitly enabled —
+    tests and the demo never spin a thread implicitly. The underlying worker
+    (and its dry-run/live transports) is unchanged; the loop only decides
+    *when* and *how many* rows to process.
+    """
+
+    def __init__(self, worker: DeliveryWorker, enabled: bool = False,
+                 interval_seconds: int = DEFAULT_WORKER_INTERVAL,
+                 batch_size: int = DEFAULT_WORKER_BATCH):
+        self.worker = worker
+        self.enabled = bool(enabled)
+        # Preserve a fractional interval (tests drive sub-second loops); only
+        # clamp non-positive values up to a small positive floor so a bad
+        # config can never spin a hot loop.
+        self.interval_seconds = max(float(interval_seconds), 0.001)
+        self.batch_size = int(batch_size)
+        self._thread = None
+        self._stop = threading.Event()
+
+    def run_once(self) -> dict:
+        """Process a single batch (up to ``batch_size`` rows) and return the
+        run summary. Works regardless of ``enabled`` — it is the manual drain."""
+        return self.worker.process_pending(limit=self.batch_size)
+
+    def is_running(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
+
+    def start(self) -> bool:
+        """Start the background loop. No-op (returns False) when disabled or
+        already running; returns True when a thread was started."""
+        if not self.enabled or self.is_running():
+            return False
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._loop, daemon=True,
+                                        name="delivery-worker")
+        self._thread.start()
+        return True
+
+    def _loop(self) -> None:
+        # Wait first so start() returns promptly; keep looping until stopped.
+        # A transport error in one batch must not kill the loop.
+        while not self._stop.wait(self.interval_seconds):
+            try:
+                self.run_once()
+            except Exception:
+                pass
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=5)
+            self._thread = None
+
+    def status(self) -> dict:
+        """Serializable worker status for the delivery overview (#79)."""
+        return {"enabled": self.enabled, "running": self.is_running(),
+                "interval_seconds": self.interval_seconds,
+                "batch_size": self.batch_size}
+
+
+def delivery_loop_from_env(worker: DeliveryWorker, env) -> DeliveryLoop:
+    """Build a DeliveryLoop from environment config (#79).
+
+    DELIVERY_WORKER_ENABLED (truthy: 1/true/yes/on) enables the loop;
+    DELIVERY_WORKER_INTERVAL and DELIVERY_WORKER_BATCH override the interval
+    (seconds) and batch size. Absent/blank → safe disabled defaults.
+    """
+    def _truthy(v):
+        return str(v or "").strip().lower() in ("1", "true", "yes", "on")
+
+    def _int(v, default):
+        try:
+            n = int(str(v).strip())
+            return n if n > 0 else default
+        except (TypeError, ValueError):
+            return default
+
+    return DeliveryLoop(
+        worker,
+        enabled=_truthy(env.get("DELIVERY_WORKER_ENABLED")),
+        interval_seconds=_int(env.get("DELIVERY_WORKER_INTERVAL"),
+                              DEFAULT_WORKER_INTERVAL),
+        batch_size=_int(env.get("DELIVERY_WORKER_BATCH"), DEFAULT_WORKER_BATCH))

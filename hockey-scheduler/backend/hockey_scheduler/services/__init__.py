@@ -1,6 +1,8 @@
 from .account_service import AccountService
 from .delivery import (
+    DeliveryLoop,
     DeliveryWorker,
+    delivery_loop_from_env,
     destination_for,
     enqueue,
     make_delivery_sender,
@@ -27,7 +29,8 @@ from .push_transport import (
 from .roster_service import RosterService
 from .setup_service import SetupService
 
-__all__ = ["RosterService", "SetupService", "DeliveryWorker", "enqueue",
+__all__ = ["RosterService", "SetupService", "DeliveryWorker", "DeliveryLoop",
+           "delivery_loop_from_env", "enqueue",
            "mock_sender", "make_delivery_sender", "recipient_ref",
            "destination_for", "resolve_destination", "EmailTransport",
            "DryRunEmailTransport", "SmtpEmailTransport",
