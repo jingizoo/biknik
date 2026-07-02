@@ -15,6 +15,7 @@ from ..domain import (
     NotificationChannel,
     NotificationDelivery,
 )
+from ..domain.errors import ValidationError
 
 # Channels every notification fans out to in this slice.
 DEFAULT_CHANNELS = (NotificationChannel.EMAIL, NotificationChannel.PUSH)
@@ -30,16 +31,26 @@ def recipient_ref(notification) -> str:
     notification was addressed to; scheduler and public map to shared
     operator / broadcast targets. This is the routing key a real transport
     would later look up a mailbox or device token by.
+
+    Targeted audiences fail closed (#60): an OFFICIAL / COACH notification with
+    no ``audience_ref`` — or an unknown audience — raises rather than silently
+    broadening to ``public``, which can now point at a stored contact.
     """
     aud = notification.audience
     ref = notification.audience_ref
-    if aud == NotificationAudience.OFFICIAL and ref:
+    if aud == NotificationAudience.OFFICIAL:
+        if not ref:
+            raise ValidationError("An official notification needs an audience_ref.")
         return "official:" + ref
-    if aud == NotificationAudience.COACH and ref:
+    if aud == NotificationAudience.COACH:
+        if not ref:
+            raise ValidationError("A coach notification needs an audience_ref.")
         return "team:" + ref
     if aud == NotificationAudience.SCHEDULER:
         return "scheduler"
-    return "public"
+    if aud == NotificationAudience.PUBLIC:
+        return "public"
+    raise ValidationError(f"Unsupported notification audience '{aud}'.")
 
 
 def destination_for(recipient: str, channel) -> str:

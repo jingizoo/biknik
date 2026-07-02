@@ -1,10 +1,18 @@
 import unittest
+from datetime import datetime, timezone
 
 from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
 
 from hockey_scheduler.api import ApiService
-from hockey_scheduler.domain import NotificationChannel
+from hockey_scheduler.domain import (
+    Notification,
+    NotificationAudience,
+    NotificationChannel,
+    NotificationKind,
+)
+from hockey_scheduler.domain.errors import ValidationError
 from hockey_scheduler.full_demo import build_full_demo_store
+from hockey_scheduler.services.delivery import enqueue, recipient_ref
 
 
 class DeliveryRecipientTest(unittest.TestCase):
@@ -74,6 +82,36 @@ class DeliveryRecipientTest(unittest.TestCase):
         ov = self.api.get_delivery_overview()
         self.assertTrue(all("recipient_ref" in row and "destination" in row
                             for row in ov["deliveries"]))
+
+    # -- fail-closed routing (#60) ----------------------------------------
+    def _notif(self, audience, ref):
+        return Notification(
+            id="n_test", kind=NotificationKind.ASSIGNMENT_OFFERED,
+            audience=audience, title="t", message="m",
+            at=datetime(2026, 3, 1, tzinfo=timezone.utc), audience_ref=ref)
+
+    def test_official_without_ref_is_rejected(self):
+        with self.assertRaises(ValidationError):
+            recipient_ref(self._notif(NotificationAudience.OFFICIAL, None))
+
+    def test_coach_without_ref_is_rejected(self):
+        with self.assertRaises(ValidationError):
+            recipient_ref(self._notif(NotificationAudience.COACH, None))
+
+    def test_scheduler_and_public_need_no_ref(self):
+        self.assertEqual(
+            recipient_ref(self._notif(NotificationAudience.SCHEDULER, None)),
+            "scheduler")
+        self.assertEqual(
+            recipient_ref(self._notif(NotificationAudience.PUBLIC, None)),
+            "public")
+
+    def test_enqueue_rejects_malformed_targeted_notification(self):
+        # A malformed targeted notification must not fan out to any queue.
+        with self.assertRaises(ValidationError):
+            enqueue(self.store, self._notif(NotificationAudience.OFFICIAL, None))
+        self.assertEqual(
+            self.store.deliveries_for_notification("n_test"), [])
 
 
 if __name__ == "__main__":
