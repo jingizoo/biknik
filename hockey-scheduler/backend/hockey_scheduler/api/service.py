@@ -42,6 +42,7 @@ from ..services import (
     RosterService,
     SetupService,
     build_ics,
+    draft_schedule,
     hash_feed_token,
     new_feed_token,
 )
@@ -1108,6 +1109,20 @@ class ApiService:
         if g is None or not g.published:
             raise NotFoundError("Game not found.")
         return self._public_game_dto(g)
+
+    # -- season scheduler v1 (#84) -----------------------------------------
+    @catch
+    def draft_season_schedule(self, division_id: str, slot_ids=None) -> dict:
+        """Generate a draft round-robin schedule for a division (#84).
+
+        Returns a proposal only — no games are created or published here. The
+        result is deterministic and safe to regenerate.
+        """
+        if not division_id:
+            raise ValidationError("A division_id is required.")
+        if self.store.get_division(division_id) is None:
+            raise NotFoundError("Division not found.")
+        return draft_schedule(self.store, division_id, slot_ids=slot_ids)
 
     @staticmethod
     def _apply_result(row: dict, gf: int, ga: int) -> None:

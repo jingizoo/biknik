@@ -763,6 +763,12 @@ class Handler(BaseHTTPRequestHandler):
         if path.startswith("/api/setup/"):
             return self._handle_setup(path[len("/api/setup/"):], body, actor)
 
+        # Season scheduler v1 (#84): generate a draft round-robin proposal for a
+        # division. Returns a preview only — nothing is created or published.
+        if path == "/api/scheduler/draft":
+            return self._send_api(api.draft_season_schedule(
+                body.get("division_id"), slot_ids=body.get("slot_ids")))
+
         # Notification delivery worker: drain the pending queue (#58).
         if path == "/api/notifications/deliveries/process":
             return self._send_api(api.process_notification_deliveries())
