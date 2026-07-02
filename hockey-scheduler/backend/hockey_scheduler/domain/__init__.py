@@ -57,6 +57,7 @@ from .models import (
 )
 from .setup_models import (
     Club,
+    ContactDestination,
     Division,
     GameResult,
     IceSlot,
@@ -133,6 +134,7 @@ __all__ = [
     "Notification",
     "NotificationRecipient",
     "NotificationDelivery",
+    "ContactDestination",
     "NotificationKind",
     "NotificationAudience",
     "NotificationChannel",

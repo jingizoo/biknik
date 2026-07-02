@@ -174,6 +174,23 @@ class NotificationDelivery:
 
 
 @dataclass
+class ContactDestination:
+    """A stored, real destination for a recipient on a channel (#60).
+
+    Overrides the synthesized ``.invalid`` placeholder for its
+    ``(recipient_ref, channel)`` when a delivery is enqueued. There is still no
+    real transport in this slice — this just lets operators register where a
+    notification *would* be sent (an official's email, a team contact, the
+    scheduler group inbox, a push-token placeholder).
+    """
+    id: str
+    recipient_ref: str
+    channel: NotificationChannel
+    destination: str
+    label: Optional[str] = None
+
+
+@dataclass
 class SetupAuditLog:
     """Audit entry for organization/arena create/update/delete operations."""
     id: str

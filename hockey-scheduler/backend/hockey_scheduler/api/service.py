@@ -13,7 +13,9 @@ from typing import Callable, List, Optional
 
 from ..domain import (
     AvailabilityStatus,
+    ContactDestination,
     IceSlotType,
+    NotificationChannel,
     NotificationRecipient,
     OfficialRole,
     Position,
@@ -511,6 +513,47 @@ class ApiService:
         return {"total": len(rows), "by_status": by_status,
                 "by_channel": by_channel,
                 "deliveries": [self._delivery_row(d) for d in rows]}
+
+    # -- contact registry (#60) --------------------------------------------
+    @staticmethod
+    def _contact_row(c) -> dict:
+        return {"id": c.id, "recipient_ref": c.recipient_ref,
+                "channel": c.channel.value, "destination": c.destination,
+                "label": c.label}
+
+    @catch
+    def list_contact_destinations(self) -> dict:
+        rows = [self._contact_row(c)
+                for c in self.store.all_contact_destinations()]
+        rows.sort(key=lambda r: (r["recipient_ref"], r["channel"]))
+        return {"contacts": rows}
+
+    @catch
+    def set_contact_destination(self, recipient_ref: str, channel: str,
+                                destination: str, label=None) -> dict:
+        """Register (or update) the real destination for a recipient/channel."""
+        if not recipient_ref:
+            raise ValidationError("A recipient_ref is required.")
+        try:
+            ch = NotificationChannel(channel)
+        except ValueError:
+            raise ValidationError(f"Unknown channel '{channel}'.")
+        destination = (destination or "").strip()
+        if not destination:
+            raise ValidationError("A destination is required.")
+        if ch == NotificationChannel.EMAIL and "@" not in destination:
+            raise ValidationError("An email destination must contain '@'.")
+        existing = self.store.get_contact_destination(recipient_ref, ch)
+        if existing is not None:
+            existing.destination = destination
+            existing.label = label
+            self.store.save_contact_destination(existing)
+            return self._contact_row(existing)
+        c = ContactDestination(
+            id=self.store.next_id("contact"), recipient_ref=recipient_ref,
+            channel=ch, destination=destination, label=label)
+        self.store.add_contact_destination(c)
+        return self._contact_row(c)
 
     @catch
     def get_official_inbox(self, official_id: str) -> dict:

@@ -115,6 +115,33 @@ class ServerAuthzTest(unittest.TestCase):
         self.assertEqual(status, 401)
         self.assertEqual(body["error"]["code"], "unauthorized")
 
+    # -- contact registry is operator-only (#60) ---------------------------
+    def test_viewer_cannot_read_or_write_contacts(self):
+        status, _ = self._get_h("/api/notifications/contacts", role="viewer")
+        self.assertEqual(status, 403)
+        status, _ = self._post("/api/notifications/contacts",
+                               {"recipient_ref": "scheduler", "channel": "email",
+                                "destination": "x@y.invalid"}, role="viewer")
+        self.assertEqual(status, 403)
+
+    def test_operator_can_manage_contacts(self):
+        status, body = self._post(
+            "/api/notifications/contacts",
+            {"recipient_ref": "scheduler", "channel": "email",
+             "destination": "ops@contacts.invalid"}, role="league_admin")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["destination"], "ops@contacts.invalid")
+        status, body = self._get_h("/api/notifications/contacts",
+                                   role="arena_manager")
+        self.assertEqual(status, 200)
+        self.assertIn("contacts", body)
+
+    def test_invalid_cookie_on_contacts_is_401(self):
+        status, body = self._get_h("/api/notifications/contacts",
+                                   cookie="hs_sid=bogus-session")
+        self.assertEqual(status, 401)
+        self.assertEqual(body["error"]["code"], "unauthorized")
+
 
 if __name__ == "__main__":
     unittest.main()

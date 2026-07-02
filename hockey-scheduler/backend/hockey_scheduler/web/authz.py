@@ -38,6 +38,9 @@ def required_permission(path: str):
     # Draining the notification delivery queue is an operator action (#58).
     if path == "/api/notifications/deliveries/process":
         return Permission.MANAGE_SCHEDULE
+    # Managing contact destinations is an operator action (#60).
+    if path == "/api/notifications/contacts":
+        return Permission.MANAGE_SCHEDULE
     # Officials: an official accepts/declines their own assignment (#54);
     # unassigning is an operator/scheduling action (#30).
     m = re.match(r"^/api/officials/assignments/[^/]+/(accept|decline|unassign)$", path)
