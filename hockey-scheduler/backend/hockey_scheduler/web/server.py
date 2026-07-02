@@ -105,11 +105,19 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     # -- helpers -----------------------------------------------------------
+    def _security_headers(self) -> None:
+        """Baseline hardening headers on every response (API and static)."""
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "same-origin")
+
     def _send_json(self, payload, code: int = 200, extra_headers=None) -> None:
         body = json.dumps(payload, default=_json_default).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        # API payloads can be per-session (feed, scope) — never cache them.
+        self.send_header("Cache-Control", "no-store")
+        self._security_headers()
         for name, value in (extra_headers or []):
             self.send_header(name, value)
         self.end_headers()
@@ -209,6 +217,17 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
+        self._security_headers()
+        if target.suffix == ".html":
+            # The SPA loads one local script and stylesheet; inline styles are
+            # used as style="" attributes, so style-src keeps 'unsafe-inline'.
+            self.send_header("Content-Security-Policy",
+                             "default-src 'self'; script-src 'self'; "
+                             "style-src 'self' 'unsafe-inline'; "
+                             "img-src 'self' data:; connect-src 'self'; "
+                             "frame-ancestors 'none'; base-uri 'self'; "
+                             "form-action 'self'")
+            self.send_header("X-Frame-Options", "DENY")
         self.end_headers()
         self.wfile.write(data)
 
