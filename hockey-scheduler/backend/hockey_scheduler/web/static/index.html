@@ -11,59 +11,72 @@
   <div class="web">
     <aside class="sidebar">
       <div class="brand">
-        <span class="brand-ico" aria-hidden="true">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 18l7-7 4 4 7-9"/><circle cx="10" cy="11" r="1.6" fill="currentColor" stroke="none"/></svg>
-        </span>
+        <span class="brand-mark" aria-hidden="true">H</span>
         <div><div class="brand-name">Hockey Scheduler</div>
           <div class="brand-sub">Operator Console</div></div>
       </div>
 
       <nav class="side-nav">
-        <button class="tab active" data-tab="dashboard">
-          <svg class="ti" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="9" rx="1"/><rect x="14" y="3" width="7" height="5" rx="1"/><rect x="14" y="12" width="7" height="9" rx="1"/><rect x="3" y="16" width="7" height="5" rx="1"/></svg>Dashboard</button>
-        <button class="tab" data-tab="setup">
-          <svg class="ti" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>Setup</button>
-        <button class="tab" data-tab="calendar">
-          <svg class="ti" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/></svg>Arena Calendar</button>
-        <button class="tab" data-tab="games">
-          <svg class="ti" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 4h6a2 2 0 0 1 2 2v0H7v0a2 2 0 0 1 2-2z"/><rect x="5" y="4" width="14" height="18" rx="2"/><path d="M9 10h6M9 14h6M9 18h3"/></svg>Games</button>
-        <button class="tab" data-tab="roster">
-          <svg class="ti" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></svg>Roster</button>
-        <button class="tab" data-tab="sheet">
-          <svg class="ti" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6M16 13H8M16 17H8M10 9H8"/></svg>Game Sheet</button>
-        <button class="tab" data-tab="inbox" style="display:none">
-          <svg class="ti" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 12h-6l-2 3h-4l-2-3H2"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/></svg>My Assignments</button>
-        <button class="tab" data-tab="standings">
-          <svg class="ti" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v18h18"/><rect x="7" y="12" width="3" height="6"/><rect x="12" y="8" width="3" height="10"/><rect x="17" y="4" width="3" height="14"/></svg>Standings</button>
-        <button class="tab" data-tab="notifications">
-          <svg class="ti" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg>Notifications<span class="notif-badge" id="notif-badge" style="display:none"></span></button>
-        <button class="tab" data-tab="delivery" style="display:none">
-          <svg class="ti" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 2 11 13"/><path d="M22 2 15 22l-4-9-9-4z"/></svg>Delivery</button>
-        <button class="tab" data-tab="activity">
-          <svg class="ti" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg>Activity</button>
-        <button class="tab" data-tab="public">
-          <svg class="ti" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M2 12h20M12 2a15.3 15.3 0 0 1 0 20 15.3 15.3 0 0 1 0-20z"/></svg>Public</button>
+        <div class="nav-group">
+          <div class="nav-group-label">Overview</div>
+          <button class="tab active" data-tab="dashboard"><span class="nav-dot"></span><span class="nav-label">Dashboard</span></button>
+          <button class="tab" data-tab="activity"><span class="nav-dot"></span><span class="nav-label">Activity</span></button>
+        </div>
+        <div class="nav-group">
+          <div class="nav-group-label">Scheduling</div>
+          <button class="tab" data-tab="calendar"><span class="nav-dot"></span><span class="nav-label">Arena Calendar</span></button>
+          <button class="tab" data-tab="games"><span class="nav-dot"></span><span class="nav-label">Games</span></button>
+          <button class="tab" data-tab="setup"><span class="nav-dot"></span><span class="nav-label">Setup</span></button>
+        </div>
+        <div class="nav-group">
+          <div class="nav-group-label">People</div>
+          <button class="tab" data-tab="roster"><span class="nav-dot"></span><span class="nav-label">Roster</span></button>
+          <button class="tab" data-tab="inbox" style="display:none"><span class="nav-dot"></span><span class="nav-label">My Assignments</span></button>
+        </div>
+        <div class="nav-group">
+          <div class="nav-group-label">Competition</div>
+          <button class="tab" data-tab="standings"><span class="nav-dot"></span><span class="nav-label">Standings</span></button>
+          <button class="tab" data-tab="sheet"><span class="nav-dot"></span><span class="nav-label">Game Sheet</span></button>
+        </div>
+        <div class="nav-group">
+          <div class="nav-group-label">Comms</div>
+          <button class="tab" data-tab="notifications"><span class="nav-dot"></span><span class="nav-label">Notifications</span><span class="nav-badge" id="notif-badge" style="display:none"></span></button>
+          <button class="tab" data-tab="delivery" style="display:none"><span class="nav-dot"></span><span class="nav-label">Delivery</span></button>
+          <button class="tab" data-tab="public"><span class="nav-dot"></span><span class="nav-label">Public</span></button>
+        </div>
       </nav>
 
       <div class="side-foot">
-        <a class="mobile-link" href="/mobile">📱 Mobile preview</a>
-        <div class="side-note">Demo data · in-memory store</div>
+        <label class="side-switch">
+          <span class="side-switch-label">Signed in as</span>
+          <select id="role-switch"></select>
+        </label>
+        <div class="side-user">
+          <div class="side-user-av" id="user-avatar">–</div>
+          <div class="side-user-meta">
+            <div class="side-user-name" id="user-name">Signed out</div>
+            <div class="side-user-role"><span id="user-role"></span><span class="scope-chip" id="scope-chip"></span></div>
+          </div>
+          <button id="signout-btn" class="side-signout" title="Sign out of this session" aria-label="Sign out">⏻</button>
+        </div>
+        <a class="mobile-link" href="/mobile">Mobile preview →</a>
       </div>
     </aside>
 
     <main class="main">
       <header class="topbar">
-        <div class="topbar-title"><h1 id="nav-title">Dashboard</h1>
-          <div id="breadcrumb" class="crumbs"></div></div>
+        <div class="topbar-title">
+          <div class="topbar-heading">
+            <h1 id="nav-title">Dashboard</h1>
+            <span class="env-chip">Demo</span>
+            <span class="env-chip subtle">in-memory</span>
+          </div>
+          <div id="breadcrumb" class="crumbs"></div>
+        </div>
         <div class="topbar-actions">
-          <button class="act primary" data-goto="calendar">＋ Schedule Game</button>
           <button class="act ghost" data-open-drawer="ice-slot">＋ Add Ice</button>
-          <label class="role-picker" title="Signed-in demo account — the server authorizes each request">
-            <span class="role-ico">👤</span><select id="role-switch"></select>
-            <span class="scope-chip" id="scope-chip"></span></label>
-          <button id="signout-btn" class="act ghost" title="Sign out of this session">Sign out</button>
-          <button id="reset-btn" class="act ghost" title="Reset demo data">Reset</button>
-          <span class="env-pill">Demo</span>
+          <button class="act primary" data-goto="calendar">＋ Schedule Game</button>
+          <button id="reset-btn" class="act ghost icon-only" title="Reset demo data" aria-label="Reset demo data">↺</button>
         </div>
       </header>
       <div id="content" class="content"></div>

@@ -111,31 +111,126 @@ const stub = (icon, title, sub, issue) => `<div class="stub"><span class="stub-i
 const toastHtml = () => toast ? `<div class="toast">${esc(toast)}</div>` : "";
 const opt = (v, label, sel) => `<option value="${esc(v)}" ${sel ? "selected" : ""}>${esc(label)}</option>`;
 
-/* ---------- Dashboard ---------- */
-function renderDashboard(ov, board) {
-  const avail = ov.ice_slots.filter((s) => s.status === "available").length;
-  const confirmed = ov.schedule.filter((g) => g.roster_status === "roster_confirmed").length;
-  const lg = ov.league || {};
-  return `
-    <div class="hero"><div class="when">${esc((ov.seasons[0] || {}).name || "")}</div>
-      <h2>${esc(lg.name)}</h2><div class="where">${esc(lg.country || "")} · operator dashboard</div></div>
-    <div class="stats">
-      <div class="stat"><div class="n">${ov.schedule.length}</div><div class="l">Games scheduled</div></div>
-      <div class="stat"><div class="n">${avail}</div><div class="l">Ice slots available</div></div>
-      <div class="stat"><div class="n">${confirmed}</div><div class="l">Rosters confirmed</div></div>
-      <div class="stat warn"><div class="n">0</div><div class="l">Officials assigned</div></div>
-    </div>
-    <div class="section-title">Primary actions</div>
-    <div class="actions" style="flex-direction:column">
-      <button class="act primary" data-goto="setup">Create league / teams</button>
-      <button class="act primary" data-goto="calendar">Open arena calendar &amp; schedule</button>
-      <button class="act ghost" data-goto="games">Game operations</button>
-    </div>
-    <div class="section-title">Follow-up modules</div>
-    <div class="card">
-      ${stub("🦓", "Officials assignment", "Referees & linespersons", 30)}
-      ${stub("📊", "Results & standings", "Scores, standings, playoffs", 31)}
-      ${stub("📨", "Notification delivery", "Push / email worker", 32)}
+/* ---------- Dashboard (operator triage) ---------- */
+const fmtClock = (iso) => {
+  const m = /T(\d{2}):(\d{2})/.exec(iso || "");
+  if (!m) return "";
+  let h = +m[1]; const min = m[2]; const ap = h >= 12 ? "p" : "a";
+  h = h % 12 || 12;
+  return `${h}:${min}${ap}`;
+};
+const dayOf = (iso) => (iso || "").slice(0, 10);
+
+// Per-game triage: derive a status badge + a staffing note from the schedule
+// row's real fields (officials assigned/accepted, roster status, result).
+function gameTriage(g) {
+  if (g.result_status === "final")
+    return { badge: "final", label: "Final", note: "Result final", noteCls: "ok" };
+  const assigned = g.officials_assigned || 0;
+  const accepted = g.officials_accepted || 0;
+  const rosterOk = ["roster_confirmed", "locked"].includes(g.roster_status);
+  if (assigned === 0)
+    return { badge: "needs", label: "Needs staff", note: "No officials assigned", noteCls: "bad" };
+  if (accepted < assigned)
+    return { badge: "needs", label: "Needs staff", note: "Officials pending acceptance", noteCls: "warn" };
+  if (!rosterOk)
+    return { badge: "needs", label: "Roster open", note: "Roster not confirmed", noteCls: "warn" };
+  return { badge: "ready", label: "Ready", note: "Officials & roster set", noteCls: "ok" };
+}
+
+function renderDashboard(ov, standings) {
+  const games = ov.schedule || [];
+  const today = games.filter((g) => dayOf(g.start_time) === calendarDate);
+  const todayList = today.length ? today : games;   // fall back to all if none "today"
+  const upcoming = games.length - today.length;
+
+  // Ice utilisation.
+  const slots = ov.ice_slots || [];
+  const booked = slots.filter((s) => s.status !== "available").length;
+  const utilPct = slots.length ? Math.round((booked / slots.length) * 100) : 0;
+
+  // Staffing gaps across all scheduled games.
+  const needStaff = games.filter((g) => g.result_status !== "final" && gameTriage(g).badge === "needs");
+  const toConfirm = games.filter((g) =>
+    g.result_status !== "final" && !["roster_confirmed", "locked"].includes(g.roster_status));
+
+  const pill = (cls, txt) => `<span class="ds-pill ${cls}">${esc(txt)}</span>`;
+  const stat = (label, n, sub, pillHtml) => `
+    <div class="dash-stat">${pillHtml || ""}
+      <div class="ds-label">${esc(label)}</div>
+      <div class="ds-n">${n}</div>
+      <div class="ds-sub">${esc(sub)}</div></div>`;
+
+  const stats = `<div class="dash-stats">
+    ${stat("Games this week", games.length, `${today.length} today · ${upcoming} upcoming`,
+           today.length ? pill("green", `+${today.length}`) : "")}
+    ${stat("Ice slots booked", booked, `${utilPct}% of ${slots.length} slots`,
+           pill("gray", `${utilPct}%`))}
+    ${stat("Games needing staff", needStaff.length,
+           needStaff.length ? `officials still open` : "all games staffed",
+           needStaff.length ? pill("amber", "Fill") : pill("green", "Set"))}
+    ${stat("Rosters to confirm", toConfirm.length,
+           toConfirm.length ? `of ${games.length} games` : "all rosters set",
+           toConfirm.length ? pill("blue", "Review") : pill("green", "Ready"))}
+  </div>`;
+
+  // Today's games list.
+  const gameRows = todayList.map((g) => {
+    const t = gameTriage(g);
+    return `<div class="tg-row" data-open-sheet="${esc(g.game_id)}">
+      <div class="tg-time"><div class="tgt-h">${fmtClock(g.start_time)}</div>
+        <div class="tgt-r">${esc(g.rink_name || "")}</div></div>
+      <div class="tg-match">
+        <div class="tg-teams">${esc(g.home_team_name)}<span class="tg-vs">vs</span>${esc(g.away_team_name)}</div>
+        <div class="tg-meta"><span class="tg-div">${esc(g.division_name || "")}</span>
+          <span class="tg-note ${t.noteCls}">${esc(t.note)}</span></div>
+      </div>
+      <span class="tg-status ${t.badge}">${esc(t.label)}</span>
+    </div>`;
+  }).join("");
+  const gamesCard = `<div class="dash-card">
+    <div class="dash-card-head"><h3>${today.length ? "Today's Games" : "Scheduled Games"}</h3>
+      <span class="dch-sub">${todayList.length} game${todayList.length === 1 ? "" : "s"}</span>
+      <a class="dch-link" data-goto="games">Games →</a></div>
+    ${gameRows || '<div class="na-empty">No games scheduled yet.</div>'}</div>`;
+
+  // Needs Attention — real alerts only.
+  const alerts = [];
+  const noOfficials = games.filter((g) => g.result_status !== "final" && (g.officials_assigned || 0) === 0);
+  if (noOfficials.length) alerts.push({ ico: "red", glyph: "⚠", title:
+    `${noOfficials.length} game${noOfficials.length === 1 ? "" : "s"} missing officials`,
+    sub: "No referee or timekeeper assigned yet" });
+  if (toConfirm.length) alerts.push({ ico: "amber", glyph: "👥", title:
+    `${toConfirm.length} roster${toConfirm.length === 1 ? "" : "s"} not confirmed`,
+    sub: "Line-ups still open before game day" });
+  if ((notifState.unread || 0) > 0) alerts.push({ ico: "blue", glyph: "🔔", title:
+    `${notifState.unread} unread notification${notifState.unread === 1 ? "" : "s"}`,
+    sub: "New assignment, roster, or result activity" });
+  const alertRows = alerts.map((a) => `<div class="na-row">
+    <div class="na-ico ${a.ico}">${a.glyph}</div>
+    <div class="na-body"><div class="na-title">${esc(a.title)}</div>
+      <div class="na-sub">${esc(a.sub)}</div></div></div>`).join("");
+  const attentionCard = `<div class="dash-card">
+    <div class="dash-card-head"><span class="dch-dot"></span><h3>Needs Attention</h3></div>
+    ${alertRows || '<div class="na-empty">✓ You\'re all caught up.</div>'}</div>`;
+
+  // Standings snapshot (top 4).
+  const div0 = ov.divisions[0];
+  const rows = ((standings && standings.standings) || []).slice(0, 4);
+  const ssRows = rows.map((r, i) => `<div class="ss-row">
+    <span class="ss-rank">${i + 1}</span>
+    <span class="ss-team">${esc(r.team_name)}</span>
+    <span class="ss-rec">${r.w}-${r.l}${r.t ? "-" + r.t : ""}</span>
+    <span class="ss-pts">${r.pts}</span></div>`).join("");
+  const standingsCard = div0 ? `<div class="dash-card">
+    <div class="dash-card-head"><h3>${esc(div0.name)} · Standings</h3>
+      <a class="dch-link" data-goto="standings">All →</a></div>
+    ${ssRows || '<div class="na-empty">No games played yet.</div>'}</div>` : "";
+
+  return `${stats}
+    <div class="dash-grid">
+      <div>${gamesCard}</div>
+      <div style="display:flex;flex-direction:column;gap:16px">${attentionCard}${standingsCard}</div>
     </div>${toastHtml()}`;
 }
 
@@ -1308,7 +1403,15 @@ function setChrome(ov) {
   document.getElementById("nav-title").textContent = NAV[view];
   document.body.dataset.view = view;  // drives per-view max-width in web.css
   const bc = document.getElementById("breadcrumb");
-  if (bc) {
+  if (!bc) return;
+  if (view === "dashboard" && ov) {
+    const games = (ov.schedule || []).length;
+    const rinks = (ov.rinks || []).length;
+    const when = new Date(calendarDate + "T00:00:00Z").toLocaleDateString("en-GB",
+      { weekday: "long", day: "numeric", month: "long", timeZone: "UTC" });
+    bc.textContent = `${when} · ${games} game${games === 1 ? "" : "s"} this week`
+      + (rinks ? ` across ${rinks} rink${rinks === 1 ? "" : "s"}` : "");
+  } else {
     const league = (ov && ov.league && ov.league.name) || "No league yet";
     const season = (ov && ov.seasons && ov.seasons[0] && ov.seasons[0].name) || "No season yet";
     bc.textContent = `${league} · ${season}`;
@@ -1324,8 +1427,7 @@ async function render() {
     ov = await getJSON("/api/demo/overview");
     if (ov && ov.error) throw new Error(ov.error.message);
     if (!currentGame && ov.schedule[0]) currentGame = ov.schedule[0].game_id;
-    const needsBoard = ["activity", "dashboard"].includes(view);
-    board = (needsBoard && currentGame) ? await getJSON(`/api/games/${currentGame}/board`) : null;
+    board = (view === "activity" && currentGame) ? await getJSON(`/api/games/${currentGame}/board`) : null;
     // The roster tab and the game sheet both use both sides' lineups (#25/#48).
     lineups = (["roster", "sheet"].includes(view) && currentGame)
       ? await getJSON(`/api/games/${currentGame}/lineups`) : null;
@@ -1362,6 +1464,10 @@ async function render() {
       standings = standingsDivision
         ? await getJSON(`/api/standings/${standingsDivision}`) : null;
     }
+    // The Dashboard shows a standings snapshot for the first division.
+    if (view === "dashboard" && ov.divisions[0]) {
+      standings = await getJSON(`/api/standings/${ov.divisions[0].id}`);
+    }
   } catch (e) {
     setChrome(ov);
     c.innerHTML = `<div class="banner alert"><h2>Could not load data</h2>
@@ -1375,7 +1481,7 @@ async function render() {
   setChrome(ov);
   updateNotifBadge();
   c.innerHTML =
-    view === "dashboard" ? renderDashboard(ov, board)
+    view === "dashboard" ? renderDashboard(ov, standings)
     : view === "setup" ? renderSetup(ov)
     : view === "calendar" ? renderCalendar(ov)
     : view === "games" ? renderGames(ov)
@@ -1388,7 +1494,7 @@ async function render() {
     : view === "activity" ? renderActivity(board, ov)
     : renderPublic(ov);
 
-  c.querySelectorAll("button[data-goto]").forEach((b) => b.onclick = () => switchTab(b.dataset.goto));
+  c.querySelectorAll("[data-goto]").forEach((b) => b.onclick = () => switchTab(b.dataset.goto));
   // Setup drawers (#44): open, close, submit.
   c.querySelectorAll("[data-drawer]").forEach((b) => b.onclick = () => {
     drawer = { kind: b.dataset.drawer }; drawerError = ""; drawerValues = {}; toast = ""; render();
@@ -1677,20 +1783,27 @@ async function signIn(username) {
 }
 function renderRoleSwitch() {
   const sel = document.getElementById("role-switch");
-  if (!sel || !accounts.length) return;
-  const signedOut = currentUser ? "" :
-    `<option value="" selected disabled>Signed out</option>`;
-  sel.innerHTML = signedOut + accounts.map((a) =>
-    `<option value="${esc(a.username)}" ${currentUser && a.role === currentRole ? "selected" : ""}>${esc(a.label)}</option>`).join("");
-  // Switching the demo account performs a real server-side sign-in (#50).
-  sel.onchange = (e) => signIn(e.target.value);
-  // Show what the session is bound to, if anything (#51).
-  const chip = document.getElementById("scope-chip");
-  if (chip) {
-    const sc = (currentUser && currentUser.scope) || {};
-    const name = sc.player_name || sc.official_name || sc.team_name;
-    chip.textContent = name ? `· ${name}` : "";
+  if (sel && accounts.length) {
+    const signedOut = currentUser ? "" :
+      `<option value="" selected disabled>Signed out</option>`;
+    sel.innerHTML = signedOut + accounts.map((a) =>
+      `<option value="${esc(a.username)}" ${currentUser && a.username === currentUser.username ? "selected" : ""}>${esc(a.label)}</option>`).join("");
+    // Switching the demo account performs a real server-side sign-in (#50).
+    sel.onchange = (e) => signIn(e.target.value);
   }
+  // Sidebar user block: avatar initials, display name, role, scope.
+  const sc = (currentUser && currentUser.scope) || {};
+  const scopeName = sc.player_name || sc.official_name || sc.team_name;
+  const av = document.getElementById("user-avatar");
+  const nm = document.getElementById("user-name");
+  const rl = document.getElementById("user-role");
+  const chip = document.getElementById("scope-chip");
+  const uname = currentUser ? currentUser.username : "";
+  if (av) av.textContent = uname
+    ? uname.replace(/[^a-z0-9]/gi, "").slice(0, 2).toUpperCase() : "–";
+  if (nm) nm.textContent = currentUser ? uname : "Signed out";
+  if (rl) rl.textContent = currentUser ? (currentUser.label || currentRole) : "";
+  if (chip) chip.textContent = scopeName ? `· ${scopeName}` : "";
 }
 async function bootstrap() {
   try {
