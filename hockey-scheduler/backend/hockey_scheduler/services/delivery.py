@@ -55,6 +55,10 @@ def recipient_ref(notification) -> str:
         if not ref:
             raise ValidationError("A coach notification needs an audience_ref.")
         return "team:" + ref
+    if aud == NotificationAudience.PLAYER:
+        if not ref:
+            raise ValidationError("A player notification needs an audience_ref.")
+        return "player:" + ref
     if aud == NotificationAudience.SCHEDULER:
         return "scheduler"
     if aud == NotificationAudience.PUBLIC:
