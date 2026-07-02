@@ -658,11 +658,43 @@ class RosterService:
                         "team_id": team_id}
         raise ValidationError("No previous roster to copy for this team.")
 
+    def _game_label(self, game) -> str:
+        # A pure read helper — must NOT be @_transactional. It is called from
+        # inside the transactional lock/unlock/cancel methods (via
+        # _notify_game_change); decorating it would open a nested transaction
+        # and crash on SqlStore ("cannot start a transaction within a
+        # transaction"). InMemoryStore's no-op transaction hid this (#87).
+        def name(tid):
+            t = self.store.get_team(tid) if tid else None
+            return t.name if t else "TBD"
+        return f"{name(game.home_team_id)} vs {name(game.away_team_id)}"
+
+    def _notify_game_change(self, game, kind, title, message,
+                            include_public=False):
+        """Delivery-backed schedule-change notification to affected parties
+        (both teams, active officials, optional public), honoring channel
+        preferences (#81/#87)."""
+        for tid in (game.home_team_id, game.away_team_id):
+            if tid:
+                _push_notification(self.store, self.clock, kind,
+                                   NotificationAudience.COACH, title, message,
+                                   audience_ref=tid, game_id=game.id)
+        for a in self.store.assignments_for_game(game.id):
+            if a.status.is_active:
+                _push_notification(self.store, self.clock, kind,
+                                   NotificationAudience.OFFICIAL, title, message,
+                                   audience_ref=a.official_id, game_id=game.id)
+        if include_public:
+            _push_notification(self.store, self.clock, kind,
+                               NotificationAudience.PUBLIC, title, message,
+                               game_id=game.id)
+
     @_transactional
     def lock_roster(self, game_id: str, actor_id: Optional[str] = None) -> Game:
         game = self._require_game(game_id)
         if game.cancelled:
             raise GameCancelledError("Game is cancelled.")
+        was_locked = game.locked
         game.locked = True
         self.store.save_game(game)
         self._audit(game_id, AuditAction.ROSTER_LOCKED, actor_id=actor_id)
@@ -672,19 +704,29 @@ class RosterService:
             audience="team",
             message="Roster is locked for this game.",
         )
+        if not was_locked:  # only on the transition (#87 idempotency)
+            self._notify_game_change(
+                game, NotificationKind.ROSTER_LOCKED, "Roster locked",
+                f"The roster is locked for {self._game_label(game)}.")
         return game
 
     @_transactional
     def unlock_roster(self, game_id: str, actor_id: Optional[str] = None) -> Game:
         game = self._require_game(game_id)
+        was_locked = game.locked
         game.locked = False
         self.store.save_game(game)
         self._audit(game_id, AuditAction.ROSTER_UNLOCKED, actor_id=actor_id)
+        if was_locked:  # only on the transition (#87 idempotency)
+            self._notify_game_change(
+                game, NotificationKind.ROSTER_UNLOCKED, "Roster unlocked",
+                f"The roster is unlocked for {self._game_label(game)}.")
         return game
 
     @_transactional
     def cancel_game(self, game_id: str, actor_id: Optional[str] = None) -> Game:
         game = self._require_game(game_id)
+        was_cancelled = game.cancelled
         game.cancelled = True
         self.store.save_game(game)
         # Cancel any active substitute enrollments.
@@ -693,6 +735,11 @@ class RosterService:
                 sub.status = SubstituteStatus.CANCELLED
                 self.store.save_substitute(sub)
         self._audit(game_id, AuditAction.GAME_CANCELLED, actor_id=actor_id)
+        if not was_cancelled:  # only on the transition (#87 idempotency)
+            self._notify_game_change(
+                game, NotificationKind.GAME_CANCELLED, "Game cancelled",
+                f"{self._game_label(game)} has been cancelled.",
+                include_public=True)
         return game
 
     # ====================================================================

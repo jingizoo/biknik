@@ -166,6 +166,13 @@ class NotificationKind(str, Enum):
     ASSIGNMENT_DECLINED = "assignment_declined"    # → schedulers
     ROSTER_OPEN_SLOT = "roster_open_slot"          # → the coach
     RESULT_APPROVED = "result_approved"            # → public feed
+    # Schedule-change notifications (#87) → affected teams / officials / public.
+    GAME_PUBLISHED = "game_published"
+    GAME_MOVED = "game_moved"
+    GAME_CANCELLED = "game_cancelled"
+    ASSIGNMENT_UNASSIGNED = "assignment_unassigned"
+    ROSTER_LOCKED = "roster_locked"
+    ROSTER_UNLOCKED = "roster_unlocked"
 
 
 class NotificationAudience(str, Enum):

@@ -38,8 +38,10 @@ class NotificationsTest(unittest.TestCase):
         self.assertIn("result_approved", kinds)
 
     def test_viewer_sees_only_public(self):
-        kinds = self._kinds("viewer")
-        self.assertEqual(kinds, ["result_approved"])
+        # A viewer sees only public-audience notifications — the finalized
+        # result and the game-published announcement (#87), nothing private.
+        kinds = set(self._kinds("viewer"))
+        self.assertEqual(kinds, {"result_approved", "game_published"})
 
     def test_accept_notifies_scheduler(self):
         self.api.respond_assignment(self.ids["ref_assignment_id"], accept=True)
@@ -102,7 +104,9 @@ class NotificationsTest(unittest.TestCase):
         # unread count is untouched (per-recipient read state, #57).
         before_admin = self.api.get_notifications("league_admin", {})["unread"]
         res = self.api.mark_all_notifications_read("viewer", {})
-        self.assertEqual(res["marked"], 1)  # the single public notification
+        # Two public notifications now: the finalized result and the
+        # game-published announcement (#87).
+        self.assertEqual(res["marked"], 2)
         after_admin = self.api.get_notifications("league_admin", {})["unread"]
         self.assertEqual(after_admin, before_admin)
         # And the viewer's own copy is now read.

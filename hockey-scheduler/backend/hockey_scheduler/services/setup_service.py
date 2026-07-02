@@ -100,6 +100,30 @@ class SetupService:
         return _push_notification(self.store, self.clock, kind, audience,
                                   title, message, **links)
 
+    def _game_label(self, game) -> str:
+        def name(tid):
+            t = self.store.get_team(tid) if tid else None
+            return t.name if t else "TBD"
+        return f"{name(game.home_team_id)} vs {name(game.away_team_id)}"
+
+    def _notify_game_change(self, game, kind, title, message,
+                            include_public=False):
+        """Fan a schedule-change notification out to the affected parties (#87):
+        both teams (coach audience → team recipient), each actively-assigned
+        official, and optionally the public feed. Delivery honors each
+        recipient's channel preferences (#81)."""
+        for tid in (game.home_team_id, game.away_team_id):
+            if tid:
+                self._notify(kind, NotificationAudience.COACH, title, message,
+                             audience_ref=tid, game_id=game.id)
+        for a in self.store.assignments_for_game(game.id):
+            if a.status.is_active:
+                self._notify(kind, NotificationAudience.OFFICIAL, title, message,
+                             audience_ref=a.official_id, game_id=game.id)
+        if include_public:
+            self._notify(kind, NotificationAudience.PUBLIC, title, message,
+                         game_id=game.id)
+
     # -- league / season / division ---------------------------------------
     @_transactional
     def create_league(self, name: str, country: str = "", timezone_name: str = "UTC",
@@ -317,10 +341,18 @@ class SetupService:
         game = self.store.get_game(game_id)
         if game is None:
             raise NotFoundError(f"Game {game_id} not found.")
+        was_published = game.published
         game.published = published
         self.store.save_game(game)
         self._audit("game_published" if published else "game_unpublished",
                     "game", game_id, actor_id)
+        # Notify affected parties + public only on the false→true transition,
+        # so re-publishing an already-public game is a no-op (#87 idempotency).
+        if published and not was_published:
+            label = self._game_label(game)
+            self._notify_game_change(
+                game, NotificationKind.GAME_PUBLISHED, "Game published",
+                f"{label} has been published.", include_public=True)
         return game
 
     @_transactional
@@ -400,6 +432,11 @@ class SetupService:
             "reason": reason, "unpublished": was_published,
             "roster_unlocked": was_locked,
         })
+        when = game.start_time.isoformat() if game.start_time else "a new time"
+        self._notify_game_change(
+            game, NotificationKind.GAME_MOVED, "Game moved",
+            f"{self._game_label(game)} moved to {game.rink or 'a new rink'} "
+            f"({when}).{(' ' + reason) if reason else ''}")
         return game
 
     # -- convenience: add a player to a team ------------------------------
@@ -537,6 +574,13 @@ class SetupService:
         self.store.remove_official_assignment(assignment_id)
         self._audit("official_unassigned", "official_assignment", assignment_id,
                     actor_id, {"game_id": a.game_id, "official_id": a.official_id})
+        # Tell the official their assignment was removed (#87).
+        game = self.store.get_game(a.game_id)
+        label = self._game_label(game) if game else "a game"
+        self._notify(NotificationKind.ASSIGNMENT_UNASSIGNED,
+                     NotificationAudience.OFFICIAL, "Assignment removed",
+                     f"You are no longer assigned to {label}.",
+                     audience_ref=a.official_id, game_id=a.game_id)
         return a
 
     # -- results (#31) -----------------------------------------------------
