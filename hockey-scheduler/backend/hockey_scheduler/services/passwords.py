@@ -39,3 +39,9 @@ def verify_password(password: str, stored: str) -> bool:
         return hmac.compare_digest(digest.hex(), expected_hex)
     except (ValueError, AttributeError):
         return False
+
+
+# A real-cost placeholder hash for the "unknown username" login path, so that
+# case pays the same PBKDF2 work as a known username with a wrong password —
+# otherwise the response-time difference would leak whether an account exists.
+DUMMY_PASSWORD_HASH = hash_password("__dummy_password_never_valid__")

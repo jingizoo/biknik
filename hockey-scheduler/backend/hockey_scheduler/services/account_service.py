@@ -14,7 +14,7 @@ from typing import Callable, Optional
 from ..domain import Role, SetupAuditLog, UserAccount
 from ..domain.errors import NotFoundError, ValidationError
 from ..store import InMemoryStore
-from .passwords import hash_password, verify_password
+from .passwords import DUMMY_PASSWORD_HASH, hash_password, verify_password
 
 
 def _utcnow() -> datetime:
@@ -92,8 +92,9 @@ class AccountService:
         """
         username = (username or "").strip().lower()
         account = self.store.get_user_account_by_username(username)
-        stored_hash = account.password_hash if account is not None else (
-            "pbkdf2_sha256$1$00$00")  # dummy, deliberately fails verify_password
+        # A real-cost dummy so an unknown username pays the same PBKDF2 work
+        # as a known one with a wrong password (timing-safe existence check).
+        stored_hash = account.password_hash if account is not None else DUMMY_PASSWORD_HASH
         ok = verify_password(password or "", stored_hash)
         if account is None or not account.active or not ok:
             return None
