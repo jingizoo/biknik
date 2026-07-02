@@ -88,6 +88,15 @@ class InMemoryStore:
     def close(self) -> None:
         pass
 
+    # -- operational health (#90) ------------------------------------------
+    def db_reachable(self) -> bool:
+        return True  # the in-memory store is always reachable
+
+    def migration_status(self) -> dict:
+        # No SQL migrations for the in-memory store; trivially current.
+        return {"backend": self.backend, "applied": [], "expected": [],
+                "current": True}
+
     # -- id generation -----------------------------------------------------
     def next_id(self, prefix: str) -> str:
         if prefix not in self._counters:

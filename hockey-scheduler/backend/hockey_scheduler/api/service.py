@@ -25,6 +25,7 @@ from ..domain import (
     NotificationKind,
     NotificationPreference,
     NotificationRecipient,
+    Role,
     OfficialRole,
     Position,
     ResultStatus,
@@ -671,6 +672,48 @@ class ApiService:
             "email_mode": self.delivery.email_transport.mode,
             "push_mode": self.delivery.push_transport.mode,
         }
+
+    # -- operational health / readiness (#90) ------------------------------
+    def _active_admin_count(self) -> int:
+        return sum(1 for a in self.accounts.list_accounts()
+                   if a.role == Role.LEAGUE_ADMIN and a.active)
+
+    def get_health(self) -> dict:
+        """Liveness + dependency snapshot (#90). Public and non-sensitive: no
+        accounts, secrets, connection strings, or env values — only posture."""
+        return {
+            "status": "ok",
+            "store": getattr(self.store, "backend", "memory"),
+            "database_reachable": self.store.db_reachable(),
+            "migrations": self.store.migration_status(),
+            "delivery": {
+                "email_mode": self.delivery.email_transport.mode,
+                "push_mode": self.delivery.push_transport.mode,
+                "worker": self.delivery_loop.status(),
+            },
+        }
+
+    def get_readiness(self, app_mode: str, cookie_hardened: bool) -> dict:
+        """Deployment readiness checks (#90). In production, requires at least
+        one active admin, a reachable DB, current migrations, and cookie
+        hardening. Non-sensitive: booleans + counts only."""
+        production = (app_mode == "production")
+        mig = self.store.migration_status()
+        admins = self._active_admin_count()
+        checks = [
+            {"name": "database_reachable", "ok": self.store.db_reachable(),
+             "detail": f"store={getattr(self.store, 'backend', 'memory')}"},
+            {"name": "migrations_current", "ok": mig["current"],
+             "detail": f"{len(mig['applied'])}/{len(mig['expected'])} applied"},
+            {"name": "active_admin",
+             "ok": (admins > 0) if production else True,
+             "detail": f"{admins} active league admin(s)"},
+            {"name": "cookie_hardening",
+             "ok": cookie_hardened if production else True,
+             "detail": "Secure cookies" if cookie_hardened else "not enforced"},
+        ]
+        return {"ready": all(c["ok"] for c in checks),
+                "app_mode": app_mode, "checks": checks}
 
     # -- contact registry (#60) --------------------------------------------
     @staticmethod

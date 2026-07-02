@@ -473,6 +473,21 @@ class Handler(BaseHTTPRequestHandler):
             status = api.runtime_status()
             status["app_mode"] = _app_mode()
             return self._send_json(status)
+        if path == "/api/health":
+            # Liveness + dependency snapshot (#90). Public, non-sensitive.
+            return self._send_json(api.get_health())
+        if path == "/api/readiness":
+            # Deployment readiness (#90). The cookie-hardening check must exercise
+            # the *real* Secure-cookie decision (`_cookie_is_secure`, #76) rather
+            # than re-deriving it from app_mode — deriving `mode == "production"`
+            # here and again inside get_readiness only compares production-ness to
+            # itself, so it can never fail even if cookie hardening regressed. In
+            # production `_cookie_is_secure` is unconditionally True (deployments
+            # are HTTPS); a regression that stopped hardening it would now fail
+            # readiness instead of silently passing.
+            return self._send_json(
+                api.get_readiness(_app_mode(),
+                                  cookie_hardened=self._cookie_is_secure()))
         if path == "/api/auth/roles":
             # Roles + their permissions so the UI can build the switcher and
             # gate actions from the same policy the server enforces (#24).
