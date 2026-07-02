@@ -4,10 +4,9 @@ import threading
 import unittest
 import urllib.error
 import urllib.request
-from http.cookiejar import CookieJar
 from http.server import ThreadingHTTPServer
 
-from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
+from helpers import BACKEND, cookie_from_set_cookie  # noqa: F401  (sets up sys.path)
 
 from hockey_scheduler.domain import Role
 from hockey_scheduler.web import server as srv
@@ -44,14 +43,18 @@ class ProductionModeTest(unittest.TestCase):
         srv.STATE.reset()
 
     def _client(self):
-        return urllib.request.build_opener(
-            urllib.request.HTTPCookieProcessor(CookieJar()))
+        # A plain opener with NO cookie jar: in production the session cookie is
+        # Secure (#76), which a real client won't replay over plain-HTTP
+        # loopback, so authenticated tests propagate the cookie manually.
+        return urllib.request.build_opener()
 
-    def _req(self, opener, method, path, body=None, headers=None):
+    def _req(self, opener, method, path, body=None, headers=None, cookie=None):
         url = f"http://127.0.0.1:{self.port}{path}"
         data = json.dumps(body).encode() if body is not None else None
-        req = urllib.request.Request(url, data=data, method=method,
-                                     headers=headers or {})
+        hdrs = dict(headers or {})
+        if cookie:
+            hdrs["Cookie"] = cookie
+        req = urllib.request.Request(url, data=data, method=method, headers=hdrs)
         if data is not None:
             req.add_header("Content-Type", "application/json")
         try:
@@ -59,6 +62,22 @@ class ProductionModeTest(unittest.TestCase):
                 return r.status, json.loads(r.read() or b"{}")
         except urllib.error.HTTPError as e:
             return e.code, json.loads(e.read() or b"{}")
+
+    def _login(self, opener, username, password):
+        """Log in and return (status, body, cookie) — cookie is the manual
+        ``hs_sid=…`` header to send on subsequent authenticated requests."""
+        url = f"http://127.0.0.1:{self.port}/api/auth/login"
+        data = json.dumps({"username": username, "password": password}).encode()
+        req = urllib.request.Request(url, data=data, method="POST")
+        req.add_header("Content-Type", "application/json")
+        try:
+            with opener.open(req) as r:
+                body = json.loads(r.read() or b"{}")
+                cookie = cookie_from_set_cookie(
+                    r.headers.get("Set-Cookie"), srv.SESSION_COOKIE)
+                return r.status, body, cookie
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read() or b"{}"), None
 
     # -- no seeded accounts, no fallback -----------------------------------
     def test_demo_accounts_are_not_seeded(self):
@@ -113,16 +132,15 @@ class ProductionModeTest(unittest.TestCase):
         srv.STATE.api.accounts.create_account(
             "prod_admin", "a-real-password", Role.LEAGUE_ADMIN)
         c = self._client()
-        status, body = self._req(c, "POST", "/api/auth/login",
-                                 {"username": "prod_admin",
-                                  "password": "a-real-password"})
+        status, body, cookie = self._login(c, "prod_admin", "a-real-password")
         self.assertEqual(status, 200)
         self.assertEqual(body["user"]["role"], "league_admin")
+        self.assertIsNotNone(cookie)
         # The session — not any header — now drives authorization normally.
-        status, _ = self._req(c, "GET", "/api/notifications")
+        status, _ = self._req(c, "GET", "/api/notifications", cookie=cookie)
         self.assertEqual(status, 200)
         status, _ = self._req(c, "POST", "/api/setup/league",
-                              {"name": "Real League"})
+                              {"name": "Real League"}, cookie=cookie)
         self.assertNotEqual(status, 401)
         self.assertNotEqual(status, 403)
 
@@ -132,9 +150,8 @@ class ProductionModeTest(unittest.TestCase):
         srv.STATE.api.accounts.create_account(
             "prod_admin2", "pw", Role.LEAGUE_ADMIN)
         c = self._client()
-        self._req(c, "POST", "/api/auth/login",
-                 {"username": "prod_admin2", "password": "pw"})
-        status, body = self._req(c, "POST", "/api/reset", {})
+        _, _, cookie = self._login(c, "prod_admin2", "pw")
+        status, body = self._req(c, "POST", "/api/reset", {}, cookie=cookie)
         self.assertEqual(status, 403)
         self.assertEqual(body["error"]["code"], "forbidden")
 
