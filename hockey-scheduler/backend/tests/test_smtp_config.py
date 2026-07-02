@@ -49,6 +49,26 @@ class SmtpConfigTest(unittest.TestCase):
         cfg = email_config_from_env({"EMAIL_MODE": "smtp", "SMTP_HOST": "h"})
         self.assertTrue(cfg["use_tls"])
 
+    # -- fail-safe parsing of malformed optional values -------------------
+    def test_invalid_smtp_port_defaults_to_587(self):
+        cfg = email_config_from_env({
+            "EMAIL_MODE": "smtp", "SMTP_HOST": "smtp.example.test",
+            "SMTP_PORT": "abc"})
+        self.assertEqual(cfg["port"], 587)
+
+    def test_invalid_port_does_not_crash_even_in_dry_run(self):
+        # A bad port with no SMTP mode must not raise during config loading.
+        t = email_transport_from_env({"SMTP_PORT": "not-a-number"})
+        self.assertEqual(t.mode, "dry_run")
+
+    def test_blank_smtp_host_is_dry_run(self):
+        t = email_transport_from_env({"EMAIL_MODE": "smtp", "SMTP_HOST": "   "})
+        self.assertEqual(t.mode, "dry_run")
+
+    def test_blank_sender_uses_default(self):
+        cfg = email_config_from_env({"SMTP_SENDER": "   "})
+        self.assertEqual(cfg["sender"], "no-reply@hockey.invalid")
+
     def test_smtp_env_builds_configured_transport(self):
         t = email_transport_from_env(SMTP_ENV)
         self.assertIsInstance(t, SmtpEmailTransport)

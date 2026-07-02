@@ -129,20 +129,34 @@ def _as_bool(value, default: bool = True) -> bool:
     return str(value).strip().lower() in ("1", "true", "yes", "on")
 
 
+def _as_int(value, default: int) -> int:
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return default
+
+
+def _clean(value):
+    value = (value or "").strip()
+    return value or None
+
+
 def email_config_from_env(env) -> dict:
     """Map the EMAIL_MODE / SMTP_* environment variables to a config dict (#63).
 
     Returns a plain dict so it is easy to inspect and test; passwords are read
-    but never surfaced back to clients.
+    but never surfaced back to clients. Parsing is fail-safe: a malformed
+    optional value (e.g. a non-numeric ``SMTP_PORT`` or a whitespace-only
+    ``SMTP_HOST``) never crashes config loading — it falls back so the app
+    stays in its safe default.
     """
-    port = env.get("SMTP_PORT")
     return {
         "mode": (env.get("EMAIL_MODE") or "dry_run").strip().lower(),
-        "host": env.get("SMTP_HOST") or None,
-        "port": int(port) if port else 587,
-        "username": env.get("SMTP_USER") or None,
+        "host": _clean(env.get("SMTP_HOST")),
+        "port": _as_int(env.get("SMTP_PORT"), 587),
+        "username": _clean(env.get("SMTP_USER")),
         "password": env.get("SMTP_PASSWORD") or None,
-        "sender": env.get("SMTP_SENDER") or "no-reply@hockey.invalid",
+        "sender": _clean(env.get("SMTP_SENDER")) or "no-reply@hockey.invalid",
         "use_tls": _as_bool(env.get("SMTP_USE_TLS"), True),
     }
 
