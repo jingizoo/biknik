@@ -33,7 +33,7 @@ from .auth import (
     user_view,
 )
 from .authz import authorize, required_permission
-from .scope import scope_violation
+from .scope import can_read_private_game_data, scope_violation
 
 # Acting role resolution (#50): a server-issued session cookie is authoritative.
 # The X-Demo-Role header remains only as a dev fallback for scripts/curl; when
@@ -401,6 +401,27 @@ class Handler(BaseHTTPRequestHandler):
         m = re.match(r"^/api/games/([^/]+)(?:/(board|lineups|roster-status|roster|substitutes|officials))?$", path)
         if m:
             gid, sub = m.group(1), m.group(2)
+            # The bare game record is a public fixture (teams / time / rink /
+            # score) — no player data, so it stays open (#73).
+            if sub is None:
+                return self._send_api(api.get_game(gid))
+            # Everything else exposes player names, availability, roster
+            # internals, or official assignments — never public. Require an
+            # authenticated session (#73): in demo the headerless fallback is
+            # the operator; a production anonymous request → 401.
+            role, scope, user_id, err = self._resolve_role()
+            if err is not None:
+                code, payload = err
+                return self._send_json(payload, code)
+            # Authentication is not the whole gate: a signed-in viewer or an
+            # unrelated coach/player/official must not read another game's
+            # private data (#73 review). Operators see all; coach/player only
+            # their team's games; official only games they're assigned to.
+            if not can_read_private_game_data(role, scope, gid, api.store):
+                return self._send_json({"error": {
+                    "code": "forbidden",
+                    "message": "You cannot view private data for this game.",
+                    "details": {"role": role.value}}}, 403)
             if sub == "board":
                 return self._send_api(api.get_board(gid))
             if sub == "lineups":
@@ -413,8 +434,6 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_api(api.get_roster(gid))
             if sub == "substitutes":
                 return self._send_api(api.get_substitutes(gid))
-            if sub is None:
-                return self._send_api(api.get_game(gid))
         if path.startswith("/api/"):
             return self._send_json({"error": {"code": "not_found",
                                               "message": "Unknown endpoint."}}, 404)

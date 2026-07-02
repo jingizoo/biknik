@@ -78,3 +78,29 @@ def scope_violation(role, scope, path, body, store):
             if assignment is not None and assignment.official_id != own:
                 return "Officials can only respond to their own assignments."
     return None
+
+
+def can_read_private_game_data(role, scope, game_id, store) -> bool:
+    """May this signed-in user read a game's private player data? (#73)
+
+    Authentication alone isn't the privacy boundary — a signed-in viewer or an
+    unrelated coach/player/official must not see another game's rosters,
+    availability, substitutes, or staff assignments. Operators see everything;
+    a coach/player only their own team's games; an official only the games they
+    are assigned to; a plain viewer, none.
+    """
+    scope = scope or {}
+    if role in (Role.LEAGUE_ADMIN, Role.ARENA_MANAGER):
+        return True
+    game = store.get_game(game_id)
+    if game is None:
+        return True  # let the facade return its normal not_found payload
+    if role in (Role.COACH, Role.PLAYER):
+        team_id = scope.get("team_id")
+        return team_id in (game.home_team_id, game.away_team_id)
+    if role == Role.OFFICIAL:
+        official_id = scope.get("official_id")
+        return official_id is not None and any(
+            a.official_id == official_id
+            for a in store.assignments_for_game(game_id))
+    return False  # viewer / anything else
