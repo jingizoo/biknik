@@ -300,6 +300,13 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/demo/overview":
             return self._send_api(api.get_demo_overview())
+        if path == "/api/status":
+            # Deployment posture for the UI status chips (#72): app mode +
+            # store backend + email/push delivery modes. Non-sensitive, no
+            # auth — like a health endpoint.
+            status = api.runtime_status()
+            status["app_mode"] = _app_mode()
+            return self._send_json(status)
         if path == "/api/auth/roles":
             # Roles + their permissions so the UI can build the switcher and
             # gate actions from the same policy the server enforces (#24).

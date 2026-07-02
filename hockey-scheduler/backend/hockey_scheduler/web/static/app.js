@@ -64,6 +64,7 @@ const NAV = {
 const POS_CLASS = { goalie: "pos-G", defense: "pos-D", forward: "pos-F", skater: "pos-D" };
 const REPO = "https://github.com/jingizoo/biknik/issues";
 const DEMO_PASSWORD = "demo";  // shared password for the demo personas (#67)
+let envStatus = null;          // deployment posture for the topbar chips (#72)
 
 const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) =>
   ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -1851,15 +1852,36 @@ function renderRoleSwitch() {
   if (rl) rl.textContent = currentUser ? (currentUser.label || currentRole) : "";
   if (chip) chip.textContent = scopeName ? `· ${scopeName}` : "";
 }
+// Real deployment posture chips (#72): app mode, store backend, delivery modes.
+function renderEnvChips() {
+  const box = document.getElementById("env-chips");
+  if (!box || !envStatus) return;
+  const s = envStatus;
+  const storeLabel = { memory: "in-memory", sqlite: "sqlite", postgres: "postgres" }[s.store] || s.store;
+  const deliv = (label, mode, liveVal) => {
+    const live = mode === liveVal;
+    return `<span class="env-chip ${live ? "live" : "subtle"}">${label} ${live ? "live" : "dry-run"}</span>`;
+  };
+  box.innerHTML =
+    (s.app_mode === "production"
+      ? `<span class="env-chip prod">Production</span>`
+      : `<span class="env-chip">Demo</span>`)
+    + `<span class="env-chip subtle">${esc(storeLabel)}</span>`
+    + deliv("email", s.email_mode, "smtp")
+    + deliv("push", s.push_mode, "live");
+}
+
 async function bootstrap() {
   try {
-    const [rolesRes, acctRes, meResp] = await Promise.all([
+    const [rolesRes, acctRes, statusRes, meResp] = await Promise.all([
       fetch("/api/auth/roles").then((r) => r.json()),
       fetch("/api/auth/accounts").then((r) => r.json()),
+      fetch("/api/status").then((r) => r.json()).catch(() => null),
       fetch("/api/auth/me", { credentials: "same-origin" }),
     ]);
     roleCatalog = rolesRes.roles || [];
     accounts = acctRes.accounts || [];
+    envStatus = statusRes && !statusRes.error ? statusRes : null;
     const meRes = await meResp.json();
     if (meRes && meRes.user) {
       setUser(meRes.user);
@@ -1877,6 +1899,7 @@ async function bootstrap() {
   } catch (_) { roleCatalog = []; accounts = []; setUser(null); }
   applyRolePerms();
   renderRoleSwitch();
+  renderEnvChips();
   if (currentUser) { hideLogin(); render(); }
   else { showLogin(); }
 }
