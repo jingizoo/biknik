@@ -1,11 +1,11 @@
 """Roles and a coarse role-based permission model (#24).
 
 This is the authorization *policy* only — a pure, dependency-free mapping from a
-:class:`Role` to the set of :class:`Permission` it holds. Identity (real
-accounts, passwords, sessions) is deliberately out of scope for this slice; the
-web layer supplies the acting role and enforces these rules at the HTTP
-boundary. Keeping the policy here (domain) makes it fully unit-testable and the
-single source of truth for both the server guard and the UI.
+:class:`Role` to the set of :class:`Permission` it holds. The web layer
+resolves the acting role (from a real account's session as of #67) and
+enforces these rules at the HTTP boundary. Keeping the policy here (domain)
+makes it fully unit-testable and the single source of truth for both the
+server guard and the UI.
 """
 
 from enum import Enum
@@ -27,6 +27,7 @@ class Permission(str, Enum):
     MANAGE_ROSTER = "manage_roster"        # select / remove / lock / offer subs
     RESPOND_AVAILABILITY = "respond_availability"  # player availability / sub self-serve
     RESPOND_ASSIGNMENT = "respond_assignment"      # official accepts/declines own assignment
+    MANAGE_USERS = "manage_users"           # create / activate / deactivate login accounts (#67)
     VIEW = "view"                          # read everything in the demo
 
 
@@ -36,7 +37,7 @@ ROLE_PERMISSIONS = {
         Permission.MANAGE_SETUP, Permission.MANAGE_ARENA,
         Permission.MANAGE_SCHEDULE, Permission.MANAGE_ROSTER,
         Permission.RESPOND_AVAILABILITY, Permission.RESPOND_ASSIGNMENT,
-        Permission.VIEW,
+        Permission.MANAGE_USERS, Permission.VIEW,
     },
     Role.ARENA_MANAGER: {
         Permission.MANAGE_ARENA, Permission.MANAGE_SCHEDULE, Permission.VIEW,

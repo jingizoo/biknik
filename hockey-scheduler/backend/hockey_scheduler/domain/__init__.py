@@ -60,6 +60,7 @@ from .setup_models import (
     ContactDestination,
     DeviceToken,
     Division,
+    UserAccount,
     GameResult,
     IceSlot,
     League,
@@ -144,5 +145,6 @@ __all__ = [
     "Rink",
     "Season",
     "SetupAuditLog",
+    "UserAccount",
     "Venue",
 ]

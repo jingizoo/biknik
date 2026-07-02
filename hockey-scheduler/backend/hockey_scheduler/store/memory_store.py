@@ -34,6 +34,7 @@ from ..domain import (
     SetupAuditLog,
     SubstituteEnrollment,
     Team,
+    UserAccount,
     Venue,
 )
 
@@ -64,6 +65,7 @@ class InMemoryStore:
         self.notif_deliveries: Dict[str, NotificationDelivery] = {}
         self.contact_destinations: Dict[str, ContactDestination] = {}
         self.device_tokens: Dict[str, DeviceToken] = {}
+        self.user_accounts: Dict[str, UserAccount] = {}
         self.setup_audit: List[SetupAuditLog] = []
         self._counters: Dict[str, count] = {}
 
@@ -399,6 +401,27 @@ class InMemoryStore:
 
     def all_device_tokens(self) -> List[DeviceToken]:
         return list(self.device_tokens.values())
+
+    # -- user accounts (#67) -------------------------------------------------
+    def add_user_account(self, a: UserAccount) -> UserAccount:
+        self.user_accounts[a.id] = a
+        return a
+
+    def save_user_account(self, a: UserAccount) -> UserAccount:
+        self.user_accounts[a.id] = a
+        return a
+
+    def get_user_account(self, account_id: str) -> Optional[UserAccount]:
+        return self.user_accounts.get(account_id)
+
+    def get_user_account_by_username(self, username: str) -> Optional[UserAccount]:
+        for a in self.user_accounts.values():
+            if a.username == username:
+                return a
+        return None
+
+    def all_user_accounts(self) -> List[UserAccount]:
+        return list(self.user_accounts.values())
 
     def add_setup_audit(self, entry: SetupAuditLog) -> SetupAuditLog:
         self.setup_audit.append(entry)

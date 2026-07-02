@@ -123,6 +123,21 @@ class SqlStoreParityTest(unittest.TestCase):
         self.assertEqual(push["destination"], "tok-sql")
         self.assertFalse(push["placeholder"])
 
+    def test_user_account_roundtrips_on_sql(self):
+        # A created account (#67) persists — hashed password, role, scope,
+        # active flag — and login verification works through the SQL store.
+        row = self.api.create_user_account(
+            "sql_coach", "sql-pw", "coach", scope={"team_id": "team_sql"})
+        self.assertNotIn("password_hash", row)
+        listed = self.api.list_user_accounts()["user_accounts"]
+        self.assertIn("sql_coach", [a["username"] for a in listed])
+        self.assertIsNone(self.api.verify_login("sql_coach", "wrong"))
+        verified = self.api.verify_login("sql_coach", "sql-pw")
+        self.assertEqual(verified["role"], "coach")
+        self.assertEqual(verified["scope"], {"team_id": "team_sql"})
+        self.api.set_user_account_active(row["id"], False)
+        self.assertIsNone(self.api.verify_login("sql_coach", "sql-pw"))
+
 
 class SqlStoreTransactionTest(unittest.TestCase):
     """A failure mid multi-write operation must roll the whole thing back."""

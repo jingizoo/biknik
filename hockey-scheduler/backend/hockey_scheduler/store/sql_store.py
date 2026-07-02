@@ -45,6 +45,7 @@ from ..domain import (
     ResultStatus,
     Position,
     Rink,
+    Role,
     RosterEntryStatus,
     RosterRole,
     Season,
@@ -53,6 +54,7 @@ from ..domain import (
     SubstituteEnrollment,
     SubstituteStatus,
     Team,
+    UserAccount,
     Venue,
 )
 from ..domain.enums import NotificationType
@@ -170,6 +172,9 @@ SPECS = {
     ContactDestination: Spec(ContactDestination, "contact_destinations",
                              {"channel": _enum(NotificationChannel)}),
     DeviceToken: Spec(DeviceToken, "device_tokens", {"active": _bool()}),
+    UserAccount: Spec(UserAccount, "user_accounts",
+                      {"role": _enum(Role), "created_at": _dt(),
+                       "scope": _jsonc(), "active": _bool()}),
 }
 
 # Column type for DDL: INTEGER for int/bool fields, else TEXT.
@@ -207,6 +212,7 @@ _INDEXES = [
     "CREATE INDEX IF NOT EXISTS ix_notif_deliv_notif ON notification_deliveries(notification_id)",
     "CREATE INDEX IF NOT EXISTS ix_contacts_ref ON contact_destinations(recipient_ref, channel)",
     "CREATE INDEX IF NOT EXISTS ix_device_tokens_ref ON device_tokens(recipient_ref, active)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS ix_user_accounts_username ON user_accounts(username)",
 ]
 
 
@@ -525,3 +531,14 @@ class SqlStore:
         return rows[0] if rows else None
     def all_device_tokens(self):
         return self._query(DeviceToken, order="id")
+
+    # -- user accounts (#67) -------------------------------------------------
+    def add_user_account(self, a): return self._insert(a)
+    def save_user_account(self, a): return self._update(a)
+    def get_user_account(self, account_id):
+        return self._get(UserAccount, account_id)
+    def get_user_account_by_username(self, username):
+        rows = self._query(UserAccount, "username = ?", (username,), order="id")
+        return rows[0] if rows else None
+    def all_user_accounts(self):
+        return self._query(UserAccount, order="id")
