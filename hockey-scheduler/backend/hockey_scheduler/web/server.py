@@ -558,6 +558,16 @@ class Handler(BaseHTTPRequestHandler):
         sd = re.match(r"^/api/standings/([^/]+)$", path)
         if sd:
             return self._send_api(api.get_standings(sd.group(1)))
+        # Public, no-auth surface (#83): schedule / standings / game detail,
+        # public-safe fields only. Reachable unauthenticated in production.
+        if path == "/api/public/schedule":
+            return self._send_api(api.get_public_schedule())
+        ps = re.match(r"^/api/public/standings/([^/]+)$", path)
+        if ps:
+            return self._send_api(api.get_public_standings(ps.group(1)))
+        pg = re.match(r"^/api/public/games/([^/]+)$", path)
+        if pg:
+            return self._send_api(api.get_public_game(pg.group(1)))
         if path == "/api/auth/me":
             # Consistent with POST role resolution (#50): no cookie → signed out,
             # a valid cookie → the user, a present-but-invalid/expired cookie →
