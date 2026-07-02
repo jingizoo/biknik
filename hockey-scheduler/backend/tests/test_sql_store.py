@@ -81,6 +81,21 @@ class SqlStoreParityTest(unittest.TestCase):
         self.assertFalse(next(n for n in viewer["notifications"]
                               if n["id"] == public["id"])["read"])
 
+    def test_per_user_read_state_on_sql(self):
+        # Two accounts with the same role must not share read state (#69),
+        # through the SQL store.
+        public = next(n for n in self.api.get_notifications(
+            "viewer", {}, user_id="user_x")["notifications"]
+            if n["kind"] == "result_approved")
+        self.api.mark_notification_read(
+            public["id"], "viewer", {}, user_id="user_x")
+        x = self.api.get_notifications("viewer", {}, user_id="user_x")
+        y = self.api.get_notifications("viewer", {}, user_id="user_y")
+        self.assertTrue(next(n for n in x["notifications"]
+                             if n["id"] == public["id"])["read"])
+        self.assertFalse(next(n for n in y["notifications"]
+                              if n["id"] == public["id"])["read"])
+
     def test_delivery_queue_roundtrips_on_sql(self):
         # Emission fans out to notification_deliveries; the worker drains them
         # and the sent state persists through the SQL store (#58).

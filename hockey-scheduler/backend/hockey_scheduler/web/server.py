@@ -168,7 +168,7 @@ class Handler(BaseHTTPRequestHandler):
         return morsel.value if morsel else None
 
     def _resolve_role(self):
-        """Resolve the acting role + scope. Returns (role, scope, err_or_None).
+        """Resolve the acting identity. Returns (role, scope, user_id, err).
 
         Demo mode (default): a valid session cookie is authoritative, else the
         X-Demo-Role dev fallback (invalid → 403, no scope), else League Admin
@@ -179,26 +179,32 @@ class Handler(BaseHTTPRequestHandler):
         still authoritative, but there is no fallback at all — no
         X-Demo-Role (it is never even read), no headerless League Admin.
         Every request without a valid session is rejected (401).
+
+        ``user_id`` is the signed-in account's id when a real session backs
+        the request, else None (the X-Demo-Role/headerless demo paths have no
+        backing account). It drives per-user notification read state (#69):
+        a real session always gets its own read receipts; the identity-less
+        demo fallbacks share a coarser role/scope-derived bucket.
         """
         sid = self._cookie(SESSION_COOKIE)
         if sid is not None:
             sess = SESSIONS.resolve(sid)
             if sess is None:
-                return None, None, (401, {"error": {
+                return None, None, None, (401, {"error": {
                     "code": "unauthorized",
                     "message": "Session expired — please sign in again."}})
-            return sess["role"], sess.get("scope", {}), None
+            return sess["role"], sess.get("scope", {}), sess.get("user_id"), None
         if _app_mode() == "production":
-            return None, None, (401, {"error": {
+            return None, None, None, (401, {"error": {
                 "code": "unauthorized",
                 "message": "Sign in required."}})
         raw_role = self.headers.get(ROLE_HEADER)
         if raw_role is None or raw_role == "":
-            return Role.LEAGUE_ADMIN, {}, None
+            return Role.LEAGUE_ADMIN, {}, None, None
         try:
-            return Role(raw_role), {}, None
+            return Role(raw_role), {}, None, None
         except ValueError:
-            return None, None, (403, {"error": {
+            return None, None, None, (403, {"error": {
                 "code": "forbidden",
                 "message": f"Unknown role '{raw_role}'.",
                 "details": {"role": raw_role}}})
@@ -216,7 +222,7 @@ class Handler(BaseHTTPRequestHandler):
         invalid cookie → 401, and the ``guard`` path's permission → 403 for
         non-operators.
         """
-        role, scope, err = self._resolve_role()
+        role, scope, _uid, err = self._resolve_role()
         if err is not None:
             code, payload = err
             self._send_json(payload, code)
@@ -317,11 +323,12 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/notifications":
             # The signed-in user's feed (#32). Same resolution as POSTs: valid
             # session → its role/scope; invalid cookie → 401; else admin default.
-            role, scope, err = self._resolve_role()
+            role, scope, user_id, err = self._resolve_role()
             if err is not None:
                 code, payload = err
                 return self._send_json(payload, code)
-            return self._send_api(api.get_notifications(role.value, scope))
+            return self._send_api(
+                api.get_notifications(role.value, scope, user_id=user_id))
         if path == "/api/notifications/deliveries":
             # Delivery-queue overview for operators (#58). Exposes internal
             # queue state, so it is operator-only (invalid cookie → 401,
@@ -428,7 +435,7 @@ class Handler(BaseHTTPRequestHandler):
 
         # Authorize the acting role at the HTTP boundary (#24/#50). A session
         # cookie is authoritative; the X-Demo-Role header is a dev fallback.
-        role, scope, err = self._resolve_role()
+        role, scope, user_id, err = self._resolve_role()
         if err is not None:
             code, payload = err
             return self._send_json(payload, code)
@@ -522,11 +529,12 @@ class Handler(BaseHTTPRequestHandler):
 
         # Notifications feed: mark read / read-all (#32).
         if path == "/api/notifications/read-all":
-            return self._send_api(api.mark_all_notifications_read(role.value, scope))
+            return self._send_api(api.mark_all_notifications_read(
+                role.value, scope, user_id=user_id))
         nr = re.match(r"^/api/notifications/([^/]+)/read$", path)
         if nr:
-            return self._send_api(
-                api.mark_notification_read(nr.group(1), role.value, scope))
+            return self._send_api(api.mark_notification_read(
+                nr.group(1), role.value, scope, user_id=user_id))
 
         # Official accepts/declines a proposed assignment, or it's unassigned (#30).
         oa = re.match(r"^/api/officials/assignments/([^/]+)/(accept|decline|unassign)$", path)
