@@ -3,7 +3,12 @@ from datetime import datetime, timezone
 
 from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
 
-from hockey_scheduler.domain import DeliveryStatus, NotificationChannel
+from hockey_scheduler.api import ApiService
+from hockey_scheduler.domain import (
+    DeliveryStatus,
+    NotificationChannel,
+    NotificationDelivery,
+)
 from hockey_scheduler.full_demo import build_full_demo_store
 from hockey_scheduler.services import (
     DeliveryWorker,
@@ -84,39 +89,74 @@ class EmailTransportTest(unittest.TestCase):
         self.assertEqual(t.host, "smtp.example.invalid")
         self.assertEqual(t.port, 2525)
 
-    # -- SMTP adapter (faked connection) ----------------------------------
-    def test_smtp_success_sends_message(self):
+    # -- SMTP fail-closed on placeholder addresses ------------------------
+    def _email_delivery(self, destination):
+        return NotificationDelivery(
+            id="d_test", notification_id="n_test",
+            channel=NotificationChannel.EMAIL, destination=destination)
+
+    def test_smtp_rejects_placeholder_without_connecting(self):
+        connected = []
+        transport = SmtpEmailTransport(
+            host="mail.example", smtp_factory=lambda: connected.append(1) or FakeSMTP())
+        for bad in ("public@notify.invalid", "official-x@notify.invalid", "", "   "):
+            with self.assertRaises(ValueError):
+                transport.send(self._email_delivery(bad), None)
+        self.assertEqual(connected, [])  # never opened a connection
+
+    def test_worker_smtp_marks_placeholder_email_failed(self):
+        # With no registered contacts, seeded email deliveries are all .invalid
+        # placeholders — live SMTP must refuse them (and never connect).
         fake = FakeSMTP()
         transport = SmtpEmailTransport(
-            host="smtp.example.invalid", username="u", password="p",
+            host="mail.example", smtp_factory=lambda: fake)
+        worker = DeliveryWorker(self.store, _clock, email_transport=transport)
+        worker.process_pending()
+        for d in self._emails():
+            self.assertEqual(d.status, DeliveryStatus.FAILED)
+            self.assertIn("placeholder", (d.last_error or "").lower())
+        self.assertEqual(fake.sent, [])  # nothing was ever sent
+
+    # -- SMTP adapter with a real destination (faked connection) ----------
+    def _register_scheduler_email(self, address="ops@club.example"):
+        api = ApiService(self.store)
+        api.set_contact_destination("scheduler", "email", address)
+        api.respond_assignment(self.ids["ref_assignment_id"], accept=True)
+        return next(d for d in self._emails() if d.recipient_ref == "scheduler")
+
+    def test_smtp_success_sends_real_destination(self):
+        self._register_scheduler_email()
+        fake = FakeSMTP()
+        transport = SmtpEmailTransport(
+            host="mail.example", username="u", password="p",
             smtp_factory=lambda: fake)
         worker = DeliveryWorker(self.store, _clock, email_transport=transport)
         worker.process_pending()
-        emails = self._emails()
-        self.assertTrue(all(d.status == DeliveryStatus.SENT for d in emails))
-        self.assertEqual(len(fake.sent), len(emails))
+        sched = next(d for d in self._emails() if d.recipient_ref == "scheduler")
+        self.assertEqual(sched.status, DeliveryStatus.SENT)
+        self.assertTrue(any(m["To"] == "ops@club.example" for m in fake.sent))
         self.assertTrue(fake.started_tls)
         self.assertEqual(fake.logged_in, ("u", "p"))
         self.assertTrue(fake.quit_called)
 
-    def test_smtp_failure_marks_failed_then_retries_to_success(self):
+    def test_smtp_failure_then_retries_to_success(self):
+        self._register_scheduler_email()
         state = {"fail": True}
-        # A fresh fake per connection; flips to healthy after the first round.
-        def factory():
-            return FakeSMTP(fail=state["fail"])
         transport = SmtpEmailTransport(
-            host="smtp.example.invalid", smtp_factory=factory)
+            host="mail.example", smtp_factory=lambda: FakeSMTP(fail=state["fail"]))
         worker = DeliveryWorker(self.store, _clock, email_transport=transport)
-        worker.process_pending()  # email sends fail
-        emails = self._emails()
-        self.assertTrue(all(d.status == DeliveryStatus.FAILED for d in emails))
-        self.assertTrue(all(d.last_error for d in emails))
-        self.assertTrue(all(d.attempts == 1 for d in emails))
+
+        def sched():
+            return next(d for d in self._emails() if d.recipient_ref == "scheduler")
+
+        worker.process_pending()  # real-destination send fails
+        self.assertEqual(sched().status, DeliveryStatus.FAILED)
+        self.assertEqual(sched().attempts, 1)
+        self.assertTrue(sched().last_error)
         state["fail"] = False
-        worker.process_pending()  # retried and now succeed
-        emails = self._emails()
-        self.assertTrue(all(d.status == DeliveryStatus.SENT for d in emails))
-        self.assertTrue(all(d.attempts == 2 for d in emails))
+        worker.process_pending()  # retried and now succeeds
+        self.assertEqual(sched().status, DeliveryStatus.SENT)
+        self.assertEqual(sched().attempts, 2)
 
     # -- routing -----------------------------------------------------------
     def test_only_email_goes_through_transport(self):

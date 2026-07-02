@@ -81,6 +81,16 @@ class SmtpEmailTransport(EmailTransport):
         return msg
 
     def send(self, delivery, notification) -> None:
+        # Fail closed BEFORE opening any connection: never attempt a live send
+        # to a blank or placeholder (.invalid) fallback address (#62). The
+        # worker records this as a failed delivery and retries per its policy.
+        to = (delivery.destination or "").strip()
+        if not to:
+            raise ValueError("Refusing to send: no destination address.")
+        if to.lower().endswith(".invalid"):
+            raise ValueError(
+                f"Refusing to send to placeholder address '{to}' — register a "
+                f"real contact for this recipient first.")
         msg = self._build_message(delivery, notification)
         smtp = self._connect()
         try:
