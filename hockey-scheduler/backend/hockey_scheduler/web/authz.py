@@ -31,8 +31,10 @@ def required_permission(path: str):
     None means "no special permission" (e.g. the demo reset control) — still
     allowed for any role.
     """
-    if path in ("/api/reset",):
-        return None
+    # Resetting wipes and reseeds ALL demo data — destructive, so it is an
+    # operator action, not an anyone-can-press control (hardening review).
+    if path == "/api/reset":
+        return Permission.MANAGE_SCHEDULE
     if path == "/api/demo/add-ice-slot":
         return Permission.MANAGE_ARENA
     # Draining the notification delivery queue is an operator action (#58).

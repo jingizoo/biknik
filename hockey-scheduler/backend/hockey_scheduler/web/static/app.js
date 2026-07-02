@@ -1366,7 +1366,9 @@ async function render() {
     setChrome(ov);
     c.innerHTML = `<div class="banner alert"><h2>Could not load data</h2>
       <p>The backend may not be running. ${esc(e.message || e)}</p></div>
-      <div class="actions"><button class="act primary" onclick="render()">Retry</button></div>`;
+      <div class="actions"><button class="act primary" id="retry-btn">Retry</button></div>`;
+    const retry = document.getElementById("retry-btn");
+    if (retry) retry.onclick = () => render();  // no inline handler (CSP)
     return;
   }
 
@@ -1625,6 +1627,14 @@ document.getElementById("reset-btn").onclick = async () => {
   movingGameId = null; conflict = null; drawer = null; drawerError = ""; drawerValues = {};
   render();
 };
+// Sign out ends the server session and drops to the signed-out (viewer) state.
+const signoutBtn = document.getElementById("signout-btn");
+if (signoutBtn) signoutBtn.onclick = async () => {
+  await post("/api/auth/logout", {});
+  setUser(null);
+  toast = "Signed out — pick an account to sign in.";
+  renderRoleSwitch(); render();
+};
 // Escape closes an open Setup drawer (#44).
 document.addEventListener("keydown", (e) => {
   if (e.key !== "Escape") return;
@@ -1649,6 +1659,10 @@ function gateChrome() {
   toggle('.tab[data-tab="inbox"]', isOfficial);
   // The Delivery admin tab is operator-only (#61).
   toggle('.tab[data-tab="delivery"]', hasPerm("manage_schedule"));
+  // Reset wipes all demo data — operator-only, like the API (hardening).
+  toggle("#reset-btn", hasPerm("manage_schedule"));
+  // Sign out only makes sense with a live session.
+  toggle("#signout-btn", !!currentUser);
 }
 function setUser(user) {
   currentUser = user;
@@ -1664,8 +1678,10 @@ async function signIn(username) {
 function renderRoleSwitch() {
   const sel = document.getElementById("role-switch");
   if (!sel || !accounts.length) return;
-  sel.innerHTML = accounts.map((a) =>
-    `<option value="${esc(a.username)}" ${a.role === currentRole ? "selected" : ""}>${esc(a.label)}</option>`).join("");
+  const signedOut = currentUser ? "" :
+    `<option value="" selected disabled>Signed out</option>`;
+  sel.innerHTML = signedOut + accounts.map((a) =>
+    `<option value="${esc(a.username)}" ${currentUser && a.role === currentRole ? "selected" : ""}>${esc(a.label)}</option>`).join("");
   // Switching the demo account performs a real server-side sign-in (#50).
   sel.onchange = (e) => signIn(e.target.value);
   // Show what the session is bound to, if anything (#51).

@@ -82,8 +82,10 @@ class RequiredPermissionTest(unittest.TestCase):
             required_permission("/api/games/g1/substitutes/p9/accept"),
             Permission.RESPOND_AVAILABILITY)
 
-    def test_reset_is_unguarded(self):
-        self.assertIsNone(required_permission("/api/reset"))
+    def test_reset_is_operator_only(self):
+        # Reset wipes and reseeds all data — destructive, so operator-gated.
+        self.assertEqual(required_permission("/api/reset"),
+                         Permission.MANAGE_SCHEDULE)
 
 
 class AuthorizeTest(unittest.TestCase):
@@ -109,8 +111,9 @@ class AuthorizeTest(unittest.TestCase):
                      "/api/games/g1/availability", "/api/reset"):
             self.assertTrue(authorize(Role.LEAGUE_ADMIN, path), path)
 
-    def test_everyone_can_reset(self):
-        self.assertTrue(authorize(Role.VIEWER, "/api/reset"))
+    def test_viewer_cannot_reset(self):
+        self.assertFalse(authorize(Role.VIEWER, "/api/reset"))
+        self.assertTrue(authorize(Role.ARENA_MANAGER, "/api/reset"))
 
 
 if __name__ == "__main__":

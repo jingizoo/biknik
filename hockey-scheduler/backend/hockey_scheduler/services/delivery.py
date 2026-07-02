@@ -158,6 +158,13 @@ class DeliveryWorker:
         processed = sent = failed = 0
         for d in self.store.pending_deliveries(self.max_attempts):
             notification = self.store.get_notification_feed(d.notification_id)
+            # Re-resolve the destination on every attempt so a contact or
+            # device token registered AFTER emission applies to queued and
+            # retrying deliveries (they would otherwise fail forever on the
+            # placeholder stamped at enqueue time).
+            if d.recipient_ref:
+                d.destination = resolve_destination(
+                    self.store, d.recipient_ref, d.channel)
             d.attempts += 1
             try:
                 self.sender(d, notification)
