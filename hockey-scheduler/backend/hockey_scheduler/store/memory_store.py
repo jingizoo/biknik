@@ -20,6 +20,7 @@ from ..domain import (
     GameResult,
     ContactDestination,
     DeliveryStatus,
+    DeviceToken,
     League,
     Notification,
     NotificationDelivery,
@@ -62,6 +63,7 @@ class InMemoryStore:
         self.notif_recipients: Dict[str, NotificationRecipient] = {}
         self.notif_deliveries: Dict[str, NotificationDelivery] = {}
         self.contact_destinations: Dict[str, ContactDestination] = {}
+        self.device_tokens: Dict[str, DeviceToken] = {}
         self.setup_audit: List[SetupAuditLog] = []
         self._counters: Dict[str, count] = {}
 
@@ -364,6 +366,39 @@ class InMemoryStore:
 
     def all_contact_destinations(self) -> List[ContactDestination]:
         return list(self.contact_destinations.values())
+
+    # -- device token registry (#65) ---------------------------------------
+    def add_device_token(self, t: DeviceToken) -> DeviceToken:
+        self.device_tokens[t.id] = t
+        return t
+
+    def save_device_token(self, t: DeviceToken) -> DeviceToken:
+        self.device_tokens[t.id] = t
+        return t
+
+    def get_device_token(self, token_id: str) -> Optional[DeviceToken]:
+        return self.device_tokens.get(token_id)
+
+    def get_device_token_by_value(
+            self, recipient_ref: str, token: str) -> Optional[DeviceToken]:
+        for t in self.device_tokens.values():
+            if t.recipient_ref == recipient_ref and t.token == token:
+                return t
+        return None
+
+    def device_tokens_for(self, recipient_ref: str) -> List[DeviceToken]:
+        return [t for t in self.device_tokens.values()
+                if t.recipient_ref == recipient_ref]
+
+    def active_device_token_for(
+            self, recipient_ref: str) -> Optional[DeviceToken]:
+        for t in self.device_tokens.values():
+            if t.recipient_ref == recipient_ref and t.active:
+                return t
+        return None
+
+    def all_device_tokens(self) -> List[DeviceToken]:
+        return list(self.device_tokens.values())
 
     def add_setup_audit(self, entry: SetupAuditLog) -> SetupAuditLog:
         self.setup_audit.append(entry)

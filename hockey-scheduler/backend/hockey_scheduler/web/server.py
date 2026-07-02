@@ -258,6 +258,11 @@ class Handler(BaseHTTPRequestHandler):
             if self._operator_only("/api/notifications/contacts"):
                 return
             return self._send_api(api.list_contact_destinations())
+        if path == "/api/notifications/device-tokens":
+            # Device token registry listing for operators (#65); same guard.
+            if self._operator_only("/api/notifications/device-tokens"):
+                return
+            return self._send_api(api.list_device_tokens())
         if path == "/api/me/assignments":
             # The signed-in official's own inbox (#55). Identity comes from the
             # session cookie, with the same rules as /api/auth/me: no cookie →
@@ -413,6 +418,16 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_api(api.set_contact_destination(
                 body.get("recipient_ref"), body.get("channel"),
                 body.get("destination"), body.get("label")))
+
+        # Device token registry: register / activate-deactivate (#65).
+        if path == "/api/notifications/device-tokens":
+            return self._send_api(api.register_device_token(
+                body.get("recipient_ref"), body.get("provider"),
+                body.get("token"), body.get("label")))
+        dt = re.match(r"^/api/notifications/device-tokens/([^/]+)/active$", path)
+        if dt:
+            return self._send_api(api.set_device_token_active(
+                dt.group(1), bool(body.get("active"))))
 
         # Notifications feed: mark read / read-all (#32).
         if path == "/api/notifications/read-all":

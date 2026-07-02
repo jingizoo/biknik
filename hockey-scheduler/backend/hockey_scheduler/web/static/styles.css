@@ -703,3 +703,4 @@ select.player-picker {
   font-size: 14px; background: var(--card); color: var(--ink); width: 100%; }
 .cd-input:focus { outline: none; border-color: var(--blue); }
 .cd-submit { flex: 0 0 auto; }
+.cd-table tr.dt-off td { opacity: .55; }

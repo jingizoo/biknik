@@ -191,6 +191,24 @@ class ContactDestination:
 
 
 @dataclass
+class DeviceToken:
+    """A registered push device token for a recipient (#65).
+
+    A proper registry for push destinations: a recipient can have one or more
+    devices, each with its own ``token`` and ``provider`` (fcm/apns/…). Push
+    delivery resolves to the recipient's first *active* token; deactivated
+    tokens are kept for history but never used. Placeholder ``push-token:``
+    values are rejected at registration.
+    """
+    id: str
+    recipient_ref: str
+    provider: str
+    token: str
+    label: Optional[str] = None
+    active: bool = True
+
+
+@dataclass
 class SetupAuditLog:
     """Audit entry for organization/arena create/update/delete operations."""
     id: str

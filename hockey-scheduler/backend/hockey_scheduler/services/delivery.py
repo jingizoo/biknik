@@ -69,12 +69,18 @@ def destination_for(recipient: str, channel) -> str:
 
 
 def resolve_destination(store, recipient: str, channel) -> str:
-    """The real stored contact for (recipient, channel), else a placeholder (#60).
+    """The real stored destination for (recipient, channel), else a placeholder.
 
-    Operators can register a real destination via the contact registry; when
-    none exists we fall back to the synthesized ``.invalid`` placeholder so a
-    delivery always has somewhere (fictional) to go.
+    Resolution order:
+      1. push only — the recipient's first *active* device token (#65);
+      2. a registered contact destination (#60);
+      3. the synthesized ``.invalid`` / ``push-token:`` placeholder (#59),
+         so a delivery always has somewhere (fictional) to go.
     """
+    if channel == NotificationChannel.PUSH:
+        token = store.active_device_token_for(recipient)
+        if token is not None and token.token:
+            return token.token
     stored = store.get_contact_destination(recipient, channel)
     if stored is not None and stored.destination:
         return stored.destination
