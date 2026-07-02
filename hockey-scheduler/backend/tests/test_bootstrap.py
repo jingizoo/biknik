@@ -1,5 +1,6 @@
 import json
 import os
+import tempfile
 import threading
 import unittest
 import urllib.error
@@ -11,6 +12,7 @@ from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
 
 from hockey_scheduler.api import ApiService
 from hockey_scheduler.bootstrap import bootstrap_admin, bootstrap_admin_from_env
+from hockey_scheduler.store import SqlStore
 from hockey_scheduler.web import server as srv
 
 
@@ -114,6 +116,61 @@ class ProductionBootstrapHttpTest(unittest.TestCase):
         status, _ = self._req(c, "POST", "/api/auth/login",
                               {"username": "prodroot", "password": "nope"})
         self.assertEqual(status, 401)
+
+
+class ProductionResetPreservesSqlStoreTest(unittest.TestCase):
+    """Production startup/reset must NOT wipe a persistent SQL store (#71 review)."""
+
+    def setUp(self):
+        fd, self.db_path = tempfile.mkstemp(suffix=".sqlite")
+        os.close(fd)
+        os.environ["APP_MODE"] = "production"
+        os.environ["DATABASE_URL"] = self.db_path
+
+    def tearDown(self):
+        for k in ("APP_MODE", "DATABASE_URL",
+                  "BOOTSTRAP_ADMIN_USER", "BOOTSTRAP_ADMIN_PASSWORD"):
+            os.environ.pop(k, None)
+        try:
+            os.remove(self.db_path)
+        except OSError:
+            pass
+        srv.STATE.reset()  # restore the shared singleton to demo mode
+
+    def _accounts(self):
+        # A fresh connection to the same file to inspect persisted state.
+        api = ApiService(SqlStore(self.db_path))
+        return {a["username"] for a in api.list_user_accounts()["user_accounts"]}
+
+    def test_reset_does_not_drop_existing_accounts_and_bootstrap_skips(self):
+        # Boot once to create the first admin from env.
+        os.environ["BOOTSTRAP_ADMIN_USER"] = "firstadmin"
+        os.environ["BOOTSTRAP_ADMIN_PASSWORD"] = "pw1"
+        srv.DemoState()  # __init__ → reset(): production path, bootstraps admin
+        self.assertIn("firstadmin", self._accounts())
+
+        # Add a second, non-admin account directly to the persistent store.
+        ApiService(SqlStore(self.db_path)).create_user_account(
+            "returning_coach", "pw2", "coach")
+
+        # Reboot with a DIFFERENT bootstrap user set.
+        os.environ["BOOTSTRAP_ADMIN_USER"] = "shouldnotexist"
+        os.environ["BOOTSTRAP_ADMIN_PASSWORD"] = "pw3"
+        srv.DemoState()  # reboot
+
+        names = self._accounts()
+        # Nothing was wiped: both prior accounts survive the reboot.
+        self.assertIn("firstadmin", names)
+        self.assertIn("returning_coach", names)
+        # And bootstrap did NOT clobber/add a new admin (accounts already exist).
+        self.assertNotIn("shouldnotexist", names)
+
+    def test_production_reset_does_not_seed_demo_data(self):
+        srv.DemoState()
+        api = ApiService(SqlStore(self.db_path))
+        ov = api.get_demo_overview()
+        self.assertEqual(ov["teams"], [])
+        self.assertEqual(ov["schedule"], [])
 
 
 if __name__ == "__main__":
