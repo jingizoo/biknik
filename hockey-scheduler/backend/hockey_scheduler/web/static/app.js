@@ -28,6 +28,7 @@ let feedTokens = [];               // signed-in user's calendar feed tokens (#82
 let newFeedUrl = null;             // freshly-minted feed URL, shown once (#82)
 let publicState = { schedule: null, standings: null, division: null, game: null };
 let publicTab = "schedule";        // "schedule" | "standings" (#83)
+let schedulerState = { division: null, preview: null, drafts: [] };  // (#86)
 let contactForm = { recipient_ref: "", channel: "email", destination: "", label: "" };
 let tokenForm = { recipient_ref: "", provider: "fcm", token: "", label: "" };
 let movingGameId = null;    // click-to-move fallback: game awaiting a destination slot
@@ -66,7 +67,7 @@ const NAV = {
   games: "Games", roster: "Roster", sheet: "Game Sheet",
   inbox: "My Assignments", standings: "Standings",
   notifications: "Notifications", delivery: "Delivery", activity: "Activity",
-  public: "Public", users: "Users",
+  public: "Public", users: "Users", scheduler: "Scheduler",
 };
 const POS_CLASS = { goalie: "pos-G", defense: "pos-D", forward: "pos-F", skater: "pos-D" };
 const REPO = "https://github.com/jingizoo/biknik/issues";
@@ -1200,6 +1201,50 @@ function renderUserSessions() {
     </div>`).join("") + `</div>`;
 }
 
+/* ---------- Draft scheduler review + publish (#86) ---------- */
+function renderScheduler(ov) {
+  if (!hasPerm("manage_schedule")) {
+    return `<div class="banner neutral"><h2>Operators only</h2>
+      <p>The draft scheduler is available to league admins and arena managers.</p></div>`;
+  }
+  const divs = ov.divisions || [];
+  const opts = divs.map((d) =>
+    `<option value="${esc(d.id)}" ${d.id === schedulerState.division ? "selected" : ""}>${esc(d.name)}</option>`).join("");
+  const pv = schedulerState.preview;
+  let previewBlock = "";
+  if (pv) {
+    const games = (pv.draft_games || pv.created || []);
+    const gRows = games.map((g) => `<div class="li">
+      <span class="li-time">${fmt(g.start_time)}</span>
+      <div class="li-main"><div class="li-title">${esc(g.home_team_name)} vs ${esc(g.away_team_name)}</div>
+        <div class="li-sub">${esc(g.rink_name || "")}</div></div></div>`).join("");
+    const uRows = (pv.unscheduled || []).map((u) => `<div class="li">
+      <div class="li-main"><div class="li-title">${esc(u.home_team_name)} vs ${esc(u.away_team_name)}</div>
+        <div class="li-sub conflict">⚠ ${esc(u.reason)}</div></div></div>`).join("");
+    previewBlock = `<div class="section-title">Preview — ${games.length} game(s), ${(pv.unscheduled || []).length} conflict(s)</div>
+      <div class="card">${gRows || '<div class="empty">No games generated.</div>'}${uRows}</div>
+      <div class="dq-actions"><button class="act primary" data-sched-commit>Commit as draft</button></div>`;
+  }
+  const drafts = schedulerState.drafts || [];
+  const dRows = drafts.map((g) => `<div class="li">
+    <span class="li-time">${fmt(g.start_time)}</span>
+    <div class="li-main"><div class="li-title">${esc(g.home_team_name)} vs ${esc(g.away_team_name)}</div>
+      <div class="li-sub">${esc(g.division_name || "")} · ${esc(g.rink_name || "")}</div></div>
+    <span class="pill scheduled">draft</span></div>`).join("");
+  const draftBlock = `<div class="section-title">Draft games (${drafts.length})</div>
+    <div class="card">${dRows || '<div class="empty">No draft games. Generate and commit a schedule above.</div>'}</div>
+    ${drafts.length ? `<div class="dq-actions">
+      <button class="act primary" data-sched-publish>Publish all</button>
+      <button class="act ghost danger" data-sched-discard>Discard all</button></div>` : ""}`;
+  return `<div class="card">
+      <div class="section-title" style="margin-top:0">Generate draft schedule</div>
+      <div class="dq-actions">
+        <select id="sched-div">${opts}</select>
+        <button class="act" data-sched-generate>Generate</button>
+      </div></div>
+    ${previewBlock}${draftBlock}${toastHtml()}`;
+}
+
 /* ---------- Standings (#31) ---------- */
 function renderStandings(ov, standings) {
   if (!ov.divisions.length) return `<div class="empty">No divisions yet. Create one in Setup.</div>`;
@@ -1661,6 +1706,14 @@ async function render() {
         deviceTokens: (tokens && tokens.device_tokens) || [],
       };
     }
+    // Draft scheduler review (#86), operator-only.
+    if (view === "scheduler" && hasPerm("manage_schedule")) {
+      if (!schedulerState.division && ov.divisions[0]) {
+        schedulerState.division = ov.divisions[0].id;
+      }
+      const dr = await getJSON("/api/scheduler/drafts");
+      schedulerState.drafts = (dr && dr.draft_games) || [];
+    }
     // Account/session admin, League-Admin only (#78).
     if (view === "users" && hasPerm("manage_users")) {
       const acc = await getJSON("/api/accounts");
@@ -1731,6 +1784,7 @@ async function render() {
     : view === "notifications" ? renderNotifications()
     : view === "delivery" ? renderDelivery(ov)
     : view === "users" ? renderUsers()
+    : view === "scheduler" ? renderScheduler(ov)
     : view === "standings" ? renderStandings(ov, standings)
     : view === "activity" ? renderActivity(board, ov)
     : renderPublic(ov);
@@ -1919,6 +1973,37 @@ async function render() {
       { active: b.dataset.tokenNext === "1" });
     await render();
   });
+  // Draft scheduler (#86): generate preview, commit, publish, discard.
+  const schedDiv = c.querySelector("#sched-div");
+  if (schedDiv) schedDiv.onchange = () => { schedulerState.division = schedDiv.value; };
+  const schedGen = c.querySelector("[data-sched-generate]");
+  if (schedGen) schedGen.onclick = async () => {
+    toast = "";
+    const res = await post("/api/scheduler/draft", { division_id: schedulerState.division });
+    schedulerState.preview = (res && !res.error) ? res : null;
+    await render();
+  };
+  const schedCommit = c.querySelector("[data-sched-commit]");
+  if (schedCommit) schedCommit.onclick = async () => {
+    toast = "";
+    const res = await post("/api/scheduler/commit", { division_id: schedulerState.division });
+    if (res && !res.error) { schedulerState.preview = null; toast = `Committed ${res.created.length} draft game(s).`; }
+    await render();
+  };
+  const schedPub = c.querySelector("[data-sched-publish]");
+  if (schedPub) schedPub.onclick = async () => {
+    toast = "";
+    const res = await post("/api/scheduler/drafts/publish", { all: true });
+    if (res && !res.error) toast = `Published ${res.published} game(s).`;
+    await render();
+  };
+  const schedDis = c.querySelector("[data-sched-discard]");
+  if (schedDis) schedDis.onclick = async () => {
+    toast = "";
+    const res = await post("/api/scheduler/drafts/discard", { all: true });
+    if (res && !res.error) toast = `Discarded ${res.discarded} draft(s).`;
+    await render();
+  };
   // Account/session admin (#78): pick an account, revoke one of its sessions.
   c.querySelectorAll("[data-user-sessions]").forEach((b) => b.onclick = () => {
     usersSelected = b.dataset.userSessions; toast = ""; render();
@@ -2073,6 +2158,7 @@ function gateChrome() {
   // The Delivery admin tab is operator-only (#61).
   toggle('.tab[data-tab="delivery"]', hasPerm("manage_schedule"));
   toggle('.tab[data-tab="users"]', hasPerm("manage_users"));
+  toggle('.tab[data-tab="scheduler"]', hasPerm("manage_schedule"));
   // Reset wipes all demo data — operator-only, like the API (hardening).
   toggle("#reset-btn", hasPerm("manage_schedule"));
   // Sign out only makes sense with a live session.

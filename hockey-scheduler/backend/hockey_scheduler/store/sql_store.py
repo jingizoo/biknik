@@ -134,7 +134,8 @@ SPECS = {
                    "slot_type": _enum(IceSlotType), "status": _enum(IceSlotStatus)}),
     Game: Spec(Game, "games",
                {"start_time": _dt(), "end_time": _dt(), "roster_lock_time": _dt(),
-                "locked": _bool(), "cancelled": _bool(), "published": _bool()}),
+                "locked": _bool(), "cancelled": _bool(), "published": _bool(),
+                "is_draft": _bool()}),
     GameRosterEntry: Spec(GameRosterEntry, "game_roster_entries",
                           {"roster_role": _enum(RosterRole),
                            "selection_source": _enum(SelectionSource),
@@ -375,6 +376,9 @@ class SqlStore:
     def get_game(self, game_id): return self._get(Game, game_id)
     def all_games(self): return self._query(Game, order="id")
     def save_game(self, game): return self._update(game)
+    def delete_game(self, game_id):
+        with self._lock:
+            self._exec("DELETE FROM games WHERE id = ?", (game_id,))
 
     def game_using_ice_slot(self, slot_id):
         for g in self._query(Game, "ice_slot_id = ?", (slot_id,)):
