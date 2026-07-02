@@ -25,10 +25,10 @@ from ..full_demo import build_full_demo_store
 from ..services import email_transport_from_env, push_transport_from_env
 from ..store import SqlStore, create_store
 from .auth import (
+    DEMO_PASSWORD,
     DEMO_USERS,
     SESSION_COOKIE,
     SessionManager,
-    demo_accounts,
     user_view,
 )
 from .authz import authorize, required_permission
@@ -94,6 +94,24 @@ class DemoState:
             push_transport=push_transport_from_env(os.environ))
         self.game_id = game_id
         self.ids = ids
+        self._seed_demo_accounts(ids)
+
+    def _seed_demo_accounts(self, ids: dict) -> None:
+        """Create the six demo personas as real, operator-created accounts
+        (#67) — deterministic ids so existing sessions survive a reset (the
+        session cookie carries role/scope already, so this only matters for
+        display and for `/api/accounts` listings).
+        """
+        scopes = {
+            "coach": {"team_id": ids.get("home_team_id")},
+            "player": {"team_id": ids.get("home_team_id"),
+                      "player_id": ids.get("selected_player_id")},
+            "official": {"official_id": ids.get("referee_id")},
+        }
+        for username, role in DEMO_USERS.items():
+            self.api.accounts.create_account(
+                username, DEMO_PASSWORD, role, scope=scopes.get(username, {}),
+                actor_id="demo_seed", account_id=f"user_{username}")
 
 
 STATE = DemoState()
@@ -253,8 +271,19 @@ class Handler(BaseHTTPRequestHandler):
                 ],
             })
         if path == "/api/auth/accounts":
-            # The pickable demo accounts for the sign-in UI (#50).
-            return self._send_json({"accounts": demo_accounts()})
+            # The pickable, active accounts for the sign-in UI (#50/#67) —
+            # backed by real UserAccount rows now, not a static list.
+            rows = api.list_user_accounts().get("user_accounts", [])
+            return self._send_json({"accounts": [
+                {"username": a["username"], "role": a["role"],
+                 "label": ROLE_LABELS[Role(a["role"])]}
+                for a in rows if a["active"]]})
+        if path == "/api/accounts":
+            # Full account listing for operators (#67); same operator guard
+            # as the delivery/contacts/device-token registries.
+            if self._operator_only("/api/accounts"):
+                return
+            return self._send_api(api.list_user_accounts())
         if path == "/api/officials":
             return self._send_api({"officials": api.get_officials()})
         if path == "/api/notifications":
@@ -345,27 +374,19 @@ class Handler(BaseHTTPRequestHandler):
         pid: Optional[str] = body.get("player_id")
         actor = body.get("actor_id", "demo")
 
-        # -- authentication (#50): login / logout are open (no role required) ---
+        # -- authentication (#50/#67): login / logout are open (no role required) --
         if path == "/api/auth/login":
-            # Bind coach/player sessions to a resource so scoping can enforce
-            # "own team / own self" (#51). Demo ids are deterministic across
-            # resets, so binding at login stays valid.
-            uname = (body.get("username") or "").strip().lower()
-            prole = DEMO_USERS.get(uname)
-            scope = {}
-            if prole == Role.COACH:
-                scope["team_id"] = STATE.ids.get("home_team_id")
-            elif prole == Role.PLAYER:
-                scope["team_id"] = STATE.ids.get("home_team_id")
-                scope["player_id"] = STATE.ids.get("selected_player_id")
-            elif prole == Role.OFFICIAL:
-                scope["official_id"] = STATE.ids.get("referee_id")
-            token = SESSIONS.login(body.get("username", ""),
-                                   body.get("password", ""), scope=scope)
-            if token is None:
+            # Credentials are verified against a real, hashed UserAccount
+            # (#67); role + scope come from that account, not a login-time
+            # special case, so the session already carries "own team / own
+            # self" binding for scope enforcement (#51).
+            row = api.verify_login(body.get("username", ""),
+                                   body.get("password", ""))
+            if row is None:
                 return self._send_json({"error": {
                     "code": "unauthorized",
                     "message": "Invalid username or password."}}, 401)
+            token = SESSIONS.login(row["id"], Role(row["role"]), scope=row["scope"])
             sess = SESSIONS.resolve(token)
             cookie = (f"{SESSION_COOKIE}={token}; HttpOnly; Path=/; SameSite=Lax; "
                       f"Max-Age={8 * 60 * 60}")
@@ -447,6 +468,22 @@ class Handler(BaseHTTPRequestHandler):
         if dt:
             return self._send_api(api.set_device_token_active(
                 dt.group(1), bool(body.get("active"))))
+
+        # User accounts: operator creates a login, or activates/deactivates
+        # one (#67). No self-service signup — this is the only way an
+        # account comes into existence besides the demo seed.
+        if path == "/api/accounts":
+            return self._send_api(api.create_user_account(
+                body.get("username"), body.get("password"), body.get("role"),
+                scope=body.get("scope"), actor_id=actor))
+        acc = re.match(r"^/api/accounts/([^/]+)/active$", path)
+        if acc:
+            res = api.set_user_account_active(acc.group(1), bool(body.get("active")))
+            if isinstance(res, dict) and "error" not in res and not res.get("active"):
+                # Deactivating an account must end any session it already has,
+                # not just block future logins.
+                SESSIONS.revoke_for_user(acc.group(1))
+            return self._send_api(res)
 
         # Notifications feed: mark read / read-all (#32).
         if path == "/api/notifications/read-all":

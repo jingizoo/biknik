@@ -31,7 +31,7 @@ from ..domain.errors import (
     NotFoundError,
     ValidationError,
 )
-from ..services import DeliveryWorker, RosterService, SetupService
+from ..services import AccountService, DeliveryWorker, RosterService, SetupService
 from ..store import InMemoryStore
 
 
@@ -114,6 +114,7 @@ class ApiService:
         self.delivery = DeliveryWorker(self.store, self.roster.clock,
                                        email_transport=email_transport,
                                        push_transport=push_transport)
+        self.accounts = AccountService(self.store, self.roster.clock)
 
     # -- games -------------------------------------------------------------
     @catch
@@ -627,6 +628,43 @@ class ApiService:
         t.active = bool(active)
         self.store.save_device_token(t)
         return self._device_token_row(t)
+
+    # -- user accounts (#67) ------------------------------------------------
+    @staticmethod
+    def _account_row(a) -> dict:
+        # Never include password_hash — this row is safe to send to a client.
+        return {"id": a.id, "username": a.username, "role": a.role.value,
+                "scope": dict(a.scope), "active": a.active,
+                "created_at": a.created_at.isoformat()}
+
+    @catch
+    def create_user_account(self, username: str, password: str, role: str,
+                            scope: Optional[dict] = None,
+                            actor_id: Optional[str] = None) -> dict:
+        account = self.accounts.create_account(
+            username, password, role, scope=scope, actor_id=actor_id)
+        return self._account_row(account)
+
+    @catch
+    def set_user_account_active(self, account_id: str, active: bool,
+                                actor_id: Optional[str] = None) -> dict:
+        account = self.accounts.set_active(account_id, active, actor_id=actor_id)
+        return self._account_row(account)
+
+    @catch
+    def list_user_accounts(self) -> dict:
+        return {"user_accounts":
+                [self._account_row(a) for a in self.accounts.list_accounts()]}
+
+    def verify_login(self, username: str, password: str) -> Optional[dict]:
+        """Return the account row for valid, active credentials, else None.
+
+        Not wrapped in ``@catch``: this is a boolean-shaped check consumed
+        directly by the login route, not a REST endpoint returning a
+        structured error.
+        """
+        account = self.accounts.verify_login(username, password)
+        return self._account_row(account) if account is not None else None
 
     @catch
     def get_official_inbox(self, official_id: str) -> dict:

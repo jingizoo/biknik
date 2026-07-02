@@ -168,6 +168,48 @@ class ServerAuthzTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertIn("device_tokens", listing)
 
+    # -- user accounts are league-admin-only, narrower than MANAGE_SCHEDULE (#67) --
+    def test_viewer_cannot_read_or_write_accounts(self):
+        status, _ = self._get_h("/api/accounts", role="viewer")
+        self.assertEqual(status, 403)
+        status, _ = self._post("/api/accounts",
+                               {"username": "sneaky", "password": "pw",
+                                "role": "league_admin"}, role="viewer")
+        self.assertEqual(status, 403)
+
+    def test_arena_manager_cannot_manage_accounts(self):
+        # MANAGE_USERS is narrower than MANAGE_SCHEDULE — an arena manager can
+        # drain the delivery queue but must not be able to create logins.
+        status, _ = self._get_h("/api/accounts", role="arena_manager")
+        self.assertEqual(status, 403)
+        status, _ = self._post("/api/accounts",
+                               {"username": "sneaky2", "password": "pw",
+                                "role": "viewer"}, role="arena_manager")
+        self.assertEqual(status, 403)
+
+    def test_league_admin_can_create_and_deactivate_accounts(self):
+        status, body = self._post(
+            "/api/accounts",
+            {"username": "http_created", "password": "pw", "role": "coach",
+             "scope": {"team_id": "team_x"}}, role="league_admin")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["role"], "coach")
+        self.assertNotIn("password_hash", body)
+        status, listing = self._get_h("/api/accounts", role="league_admin")
+        self.assertEqual(status, 200)
+        self.assertIn("http_created",
+                      [a["username"] for a in listing["user_accounts"]])
+        status, deact = self._post(
+            f"/api/accounts/{body['id']}/active",
+            {"active": False}, role="league_admin")
+        self.assertEqual(status, 200)
+        self.assertFalse(deact["active"])
+
+    def test_invalid_cookie_on_accounts_is_401(self):
+        status, body = self._get_h("/api/accounts", cookie="hs_sid=bogus-session")
+        self.assertEqual(status, 401)
+        self.assertEqual(body["error"]["code"], "unauthorized")
+
 
 if __name__ == "__main__":
     unittest.main()

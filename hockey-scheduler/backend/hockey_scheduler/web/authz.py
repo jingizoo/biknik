@@ -48,6 +48,12 @@ def required_permission(path: str):
         return Permission.MANAGE_SCHEDULE
     if re.match(r"^/api/notifications/device-tokens/[^/]+/active$", path):
         return Permission.MANAGE_SCHEDULE
+    # Creating/activating login accounts is a distinct, narrower operator
+    # action than scheduling — only a league admin holds it (#67).
+    if path == "/api/accounts":
+        return Permission.MANAGE_USERS
+    if re.match(r"^/api/accounts/[^/]+/active$", path):
+        return Permission.MANAGE_USERS
     # Officials: an official accepts/declines their own assignment (#54);
     # unassigning is an operator/scheduling action (#30).
     m = re.match(r"^/api/officials/assignments/[^/]+/(accept|decline|unassign)$", path)

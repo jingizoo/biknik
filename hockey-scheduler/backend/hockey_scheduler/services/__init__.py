@@ -1,3 +1,4 @@
+from .account_service import AccountService
 from .delivery import (
     DeliveryWorker,
     destination_for,
@@ -33,4 +34,5 @@ __all__ = ["RosterService", "SetupService", "DeliveryWorker", "enqueue",
            "email_transport_from_config", "email_config_from_env",
            "email_transport_from_env", "PushTransport", "DryRunPushTransport",
            "ProviderPushTransport", "push_transport_from_config",
-           "push_config_from_env", "push_transport_from_env"]
+           "push_config_from_env", "push_transport_from_env",
+           "AccountService"]

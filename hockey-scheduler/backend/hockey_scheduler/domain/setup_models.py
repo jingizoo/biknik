@@ -20,6 +20,7 @@ from .enums import (
     OfficialRole,
     ResultStatus,
 )
+from .roles import Role
 
 
 @dataclass
@@ -205,6 +206,30 @@ class DeviceToken:
     provider: str
     token: str
     label: Optional[str] = None
+    active: bool = True
+
+
+@dataclass
+class UserAccount:
+    """A real, operator-created login for the app (#67).
+
+    Replaces the fixed shared-password demo personas with actual accounts:
+    a hashed password, a bound ``role`` + ``scope`` (the same shape used to
+    bind a session — ``team_id`` for a coach, ``player_id`` for a player,
+    ``official_id`` for an official), and an ``active`` flag an operator can
+    flip to revoke access without deleting history. There is no self-service
+    signup, password reset, or 2FA in this slice — every account is created
+    by an operator (or the demo seed, acting as one).
+
+    ``password_hash`` is opaque (see ``services/passwords.py``) and must
+    never be sent to a client.
+    """
+    id: str
+    username: str
+    password_hash: str
+    role: Role
+    created_at: datetime
+    scope: dict = field(default_factory=dict)
     active: bool = True
 
 

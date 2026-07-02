@@ -135,6 +135,51 @@ class AuthSessionTest(unittest.TestCase):
         self.assertEqual(roles, {"league_admin", "arena_manager", "coach",
                                  "player", "official", "viewer"})
 
+    # -- real accounts (#67): operator-created, hashed, session tied to id --
+    def test_operator_created_account_can_log_in(self):
+        admin = self._client()
+        self._req(admin, "POST", "/api/auth/login",
+                 {"username": "admin", "password": "demo"})
+        status, created = self._req(
+            admin, "POST", "/api/accounts",
+            {"username": "new_coach", "password": "real-pw", "role": "coach",
+             "scope": {"team_id": "team_z"}})
+        self.assertEqual(status, 200)
+
+        newbie = self._client()
+        status, body = self._req(newbie, "POST", "/api/auth/login",
+                                 {"username": "new_coach", "password": "real-pw"})
+        self.assertEqual(status, 200)
+        self.assertEqual(body["user"]["role"], "coach")
+        self.assertEqual(body["user"]["username"], "new_coach")
+        _, me = self._req(newbie, "GET", "/api/auth/me")
+        self.assertEqual(me["user"]["scope"]["team_id"], "team_z")
+
+    def test_deactivating_an_account_ends_its_live_session(self):
+        admin = self._client()
+        self._req(admin, "POST", "/api/auth/login",
+                 {"username": "admin", "password": "demo"})
+        _, created = self._req(
+            admin, "POST", "/api/accounts",
+            {"username": "to_revoke", "password": "pw", "role": "viewer"})
+
+        victim = self._client()
+        self._req(victim, "POST", "/api/auth/login",
+                 {"username": "to_revoke", "password": "pw"})
+        status, me = self._req(victim, "GET", "/api/auth/me")
+        self.assertEqual(me["user"]["role"], "viewer")  # session is live
+
+        self._req(admin, "POST", f"/api/accounts/{created['id']}/active",
+                 {"active": False})
+
+        # The already-issued session must be dead, not just future logins.
+        status, me2 = self._req(victim, "GET", "/api/auth/me")
+        self.assertEqual(status, 401)
+
+        status, relogin = self._req(victim, "POST", "/api/auth/login",
+                                    {"username": "to_revoke", "password": "pw"})
+        self.assertEqual(status, 401)
+
 
 if __name__ == "__main__":
     unittest.main()
