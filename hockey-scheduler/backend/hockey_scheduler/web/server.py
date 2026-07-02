@@ -199,7 +199,7 @@ class Handler(BaseHTTPRequestHandler):
         """
         sid = self._cookie(SESSION_COOKIE)
         if sid is not None:
-            sess = SESSIONS.resolve(sid)
+            sess = SESSIONS.resolve(STATE.api.store, sid)
             if sess is None:
                 return None, None, None, (401, {"error": {
                     "code": "unauthorized",
@@ -372,7 +372,7 @@ class Handler(BaseHTTPRequestHandler):
             sid = self._cookie(SESSION_COOKIE)
             if sid is None:
                 return self._send_json({"official_id": None, "assignments": []})
-            sess = SESSIONS.resolve(sid)
+            sess = SESSIONS.resolve(api.store, sid)
             if sess is None:
                 return self._send_json({"error": {
                     "code": "unauthorized",
@@ -391,7 +391,7 @@ class Handler(BaseHTTPRequestHandler):
             sid = self._cookie(SESSION_COOKIE)
             if sid is None:
                 return self._send_json({"user": None})
-            sess = SESSIONS.resolve(sid)
+            sess = SESSIONS.resolve(api.store, sid)
             if sess is None:
                 return self._send_json({"error": {
                     "code": "unauthorized",
@@ -458,14 +458,15 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_json({"error": {
                     "code": "unauthorized",
                     "message": "Invalid username or password."}}, 401)
-            token = SESSIONS.login(row["id"], Role(row["role"]), scope=row["scope"])
-            sess = SESSIONS.resolve(token)
+            token = SESSIONS.login(api.store, row["id"],
+                                   user_agent=self.headers.get("User-Agent"))
+            sess = SESSIONS.resolve(api.store, token)
             cookie = (f"{SESSION_COOKIE}={token}; HttpOnly; Path=/; SameSite=Lax; "
                       f"Max-Age={8 * 60 * 60}")
             return self._send_json({"user": user_view(sess, api.store)},
                                    extra_headers=[("Set-Cookie", cookie)])
         if path == "/api/auth/logout":
-            SESSIONS.logout(self._cookie(SESSION_COOKIE))
+            SESSIONS.logout(api.store, self._cookie(SESSION_COOKIE))
             expire = f"{SESSION_COOKIE}=; HttpOnly; Path=/; SameSite=Lax; Max-Age=0"
             return self._send_json({"ok": True},
                                    extra_headers=[("Set-Cookie", expire)])
@@ -502,7 +503,18 @@ class Handler(BaseHTTPRequestHandler):
                     "code": "forbidden",
                     "message": "Reset is disabled in production."}}, 403)
             STATE.reset()
-            return self._send_json({"ok": True})
+            # Reset rebuilds the store (dropping the sessions table), so the
+            # operator's cookie is now dangling (#74). Demo accounts reseed
+            # with deterministic ids, so re-issue a fresh session for the same
+            # user and hand back the new cookie to keep them signed in.
+            extra = None
+            if user_id and STATE.api.store.get_user_account(user_id):
+                token = SESSIONS.login(STATE.api.store, user_id,
+                                       user_agent=self.headers.get("User-Agent"))
+                extra = [("Set-Cookie",
+                          f"{SESSION_COOKIE}={token}; HttpOnly; Path=/; "
+                          f"SameSite=Lax; Max-Age={8 * 60 * 60}")]
+            return self._send_json({"ok": True}, extra_headers=extra)
 
         # Quick action: add an available 90-min game slot on a rink for the
         # given date, after the latest existing slot on that rink that day.
@@ -564,7 +576,7 @@ class Handler(BaseHTTPRequestHandler):
             if isinstance(res, dict) and "error" not in res and not res.get("active"):
                 # Deactivating an account must end any session it already has,
                 # not just block future logins.
-                SESSIONS.revoke_for_user(acc.group(1))
+                SESSIONS.revoke_for_user(api.store, acc.group(1))
             return self._send_api(res)
 
         # Notifications feed: mark read / read-all (#32).

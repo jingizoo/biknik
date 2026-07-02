@@ -234,6 +234,25 @@ class UserAccount:
 
 
 @dataclass
+class Session:
+    """A persisted login session (#74).
+
+    Only the SHA-256 ``token_hash`` is stored — never the raw token — so a
+    store dump can't be replayed. Role/scope are NOT duplicated here; they are
+    resolved from the backing ``UserAccount`` on each lookup, so the session
+    always reflects the account's current role/scope and active state. A
+    session is live when it is un-revoked and not past ``expires_at``.
+    """
+    id: str
+    token_hash: str
+    user_id: str
+    issued_at: datetime
+    expires_at: datetime
+    revoked_at: Optional[datetime] = None
+    user_agent: Optional[str] = None
+
+
+@dataclass
 class SetupAuditLog:
     """Audit entry for organization/arena create/update/delete operations."""
     id: str

@@ -11,10 +11,11 @@ Kept out of ``domain/`` on purpose: identity/session is a transport concern,
 while the role→permission policy stays a pure domain module.
 """
 
+import hashlib
 import secrets
-import time
+from datetime import datetime, timedelta, timezone
 
-from ..domain import ROLE_LABELS, Role
+from ..domain import ROLE_LABELS, Role, Session
 
 # The six demo personas seeded as real UserAccount rows on every reset (#67) —
 # see DemoState.reset(). Password is obviously-fictional and shared only for
@@ -33,49 +34,84 @@ SESSION_COOKIE = "hs_sid"
 DEFAULT_TTL_SECONDS = 8 * 60 * 60  # 8h
 
 
-class SessionManager:
-    """Issues and resolves session tokens for an already-verified account.
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
 
-    Sessions live outside the demo data store so signing in survives a demo
-    reset (which rebuilds the store, including its UserAccount rows).
+
+def hash_token(token: str) -> str:
+    """SHA-256 of a session token. Tokens are 24 bytes of ``secrets`` entropy,
+    so a fast unsalted hash is fine (no brute-force surface, unlike passwords)
+    — the point is that a store dump holds only hashes, never usable tokens.
+    """
+    return hashlib.sha256((token or "").encode("utf-8")).hexdigest()
+
+
+class SessionManager:
+    """Issues and resolves persistent sessions backed by the store (#74).
+
+    Only the token *hash* is persisted (``Session.token_hash``); the raw token
+    lives solely in the client cookie. Role and scope are NOT stored on the
+    session — they are resolved from the backing :class:`UserAccount` on every
+    lookup, so a session always reflects the account's current role/scope and
+    active state. Store handles are passed per call so a single module-global
+    manager works across demo resets (which rebuild the store).
     """
 
-    def __init__(self, ttl_seconds: int = DEFAULT_TTL_SECONDS, clock=time.time):
-        self._sessions = {}          # token -> {user_id, role, scope, expires}
+    def __init__(self, ttl_seconds: int = DEFAULT_TTL_SECONDS, clock=_utcnow):
         self._ttl = ttl_seconds
         self._clock = clock
 
-    def login(self, user_id: str, role: Role, scope=None) -> str:
-        """Issue a new session token for an already-authenticated account."""
+    def login(self, store, user_id: str, user_agent=None) -> str:
+        """Issue a new session for an already-authenticated account; return the
+        raw token (only its hash is persisted).
+        """
         token = secrets.token_urlsafe(24)
-        self._sessions[token] = {
-            "user_id": user_id,
-            "role": role,
-            "scope": dict(scope or {}),
-            "expires": self._clock() + self._ttl,
-        }
+        now = self._clock()
+        store.add_session(Session(
+            id=store.next_id("session"),
+            token_hash=hash_token(token),
+            user_id=user_id,
+            issued_at=now,
+            expires_at=now + timedelta(seconds=self._ttl),
+            user_agent=(user_agent or None),
+        ))
         return token
 
-    def resolve(self, token):
-        """Return the live session dict for a token, or None if unknown/expired."""
+    def resolve(self, store, token):
+        """Return ``{user_id, role, scope}`` for a live session, else None.
+
+        A session is invalid if unknown, revoked, expired, or if its backing
+        account is missing or deactivated (belt-and-suspenders with explicit
+        revocation on deactivation).
+        """
         if not token:
             return None
-        sess = self._sessions.get(token)
-        if sess is None:
+        sess = store.get_session_by_hash(hash_token(token))
+        if sess is None or sess.revoked_at is not None:
             return None
-        if sess["expires"] < self._clock():
-            self._sessions.pop(token, None)
+        if sess.expires_at < self._clock():
             return None
-        return sess
+        account = store.get_user_account(sess.user_id)
+        if account is None or not account.active:
+            return None
+        return {"user_id": sess.user_id, "role": account.role,
+                "scope": dict(account.scope or {})}
 
-    def logout(self, token) -> None:
-        self._sessions.pop(token, None)
+    def logout(self, store, token) -> None:
+        if not token:
+            return
+        sess = store.get_session_by_hash(hash_token(token))
+        if sess is not None and sess.revoked_at is None:
+            sess.revoked_at = self._clock()
+            store.save_session(sess)
 
-    def revoke_for_user(self, user_id: str) -> None:
-        """Kill every live session for a user — e.g. on account deactivation."""
-        for token, sess in list(self._sessions.items()):
-            if sess["user_id"] == user_id:
-                self._sessions.pop(token, None)
+    def revoke_for_user(self, store, user_id: str) -> None:
+        """Revoke every live session for a user — e.g. on deactivation."""
+        now = self._clock()
+        for sess in store.sessions_for_user(user_id):
+            if sess.revoked_at is None:
+                sess.revoked_at = now
+                store.save_session(sess)
 
 
 def user_view(session, store=None) -> dict:
