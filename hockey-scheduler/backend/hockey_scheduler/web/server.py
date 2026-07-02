@@ -37,7 +37,18 @@ from .scope import scope_violation
 # Acting role resolution (#50): a server-issued session cookie is authoritative.
 # The X-Demo-Role header remains only as a dev fallback for scripts/curl; when
 # neither is present we assume the full operator (League Admin) for convenience.
+# APP_MODE=production (#68) turns both of those off: a valid session is
+# required for anything gated, and the demo account seed is skipped.
 ROLE_HEADER = "X-Demo-Role"
+
+
+def _app_mode() -> str:
+    """Read APP_MODE fresh on every call (not cached) so tests and ops can
+    flip it without a process restart. Anything other than the literal
+    "production" is treated as the permissive demo posture — the default
+    must stay backward-compatible with the existing demo behavior.
+    """
+    return (os.environ.get("APP_MODE") or "demo").strip().lower()
 
 # Sessions live outside DemoState so signing in survives a demo-data reset.
 SESSIONS = SessionManager()
@@ -94,7 +105,11 @@ class DemoState:
             push_transport=push_transport_from_env(os.environ))
         self.game_id = game_id
         self.ids = ids
-        self._seed_demo_accounts(ids)
+        # The shared-password demo personas are a demo-mode-only convenience
+        # (#68) — a production deployment must start with zero accounts and
+        # bootstrap its first operator out of band.
+        if _app_mode() != "production":
+            self._seed_demo_accounts(ids)
 
     def _seed_demo_accounts(self, ids: dict) -> None:
         """Create the six demo personas as real, operator-created accounts
@@ -155,10 +170,15 @@ class Handler(BaseHTTPRequestHandler):
     def _resolve_role(self):
         """Resolve the acting role + scope. Returns (role, scope, err_or_None).
 
-        Priority: a valid session cookie (authoritative, carries scope), else the
-        X-Demo-Role dev fallback (invalid → 403, no scope), else League Admin (no
-        auth). A *present* session cookie that is invalid/expired is rejected
-        (401) rather than silently downgraded.
+        Demo mode (default): a valid session cookie is authoritative, else the
+        X-Demo-Role dev fallback (invalid → 403, no scope), else League Admin
+        (no auth) for convenience. A *present* session cookie that is
+        invalid/expired is rejected (401) rather than silently downgraded.
+
+        Production mode (APP_MODE=production, #68): the session cookie is
+        still authoritative, but there is no fallback at all — no
+        X-Demo-Role (it is never even read), no headerless League Admin.
+        Every request without a valid session is rejected (401).
         """
         sid = self._cookie(SESSION_COOKIE)
         if sid is not None:
@@ -168,6 +188,10 @@ class Handler(BaseHTTPRequestHandler):
                     "code": "unauthorized",
                     "message": "Session expired — please sign in again."}})
             return sess["role"], sess.get("scope", {}), None
+        if _app_mode() == "production":
+            return None, None, (401, {"error": {
+                "code": "unauthorized",
+                "message": "Sign in required."}})
         raw_role = self.headers.get(ROLE_HEADER)
         if raw_role is None or raw_role == "":
             return Role.LEAGUE_ADMIN, {}, None
@@ -422,6 +446,13 @@ class Handler(BaseHTTPRequestHandler):
             }}, 403)
 
         if path == "/api/reset":
+            # Wiping and reseeding all data has no legitimate use once an app
+            # is live — disabled outright in production (#68), not just
+            # permission-gated, regardless of the caller's role.
+            if _app_mode() == "production":
+                return self._send_json({"error": {
+                    "code": "forbidden",
+                    "message": "Reset is disabled in production."}}, 403)
             STATE.reset()
             return self._send_json({"ok": True})
 
