@@ -547,6 +547,18 @@ class ApiService:
                 "push_provider": getattr(self.delivery.push_transport, "provider", None),
                 "deliveries": [self._delivery_row(d) for d in rows]}
 
+    @catch
+    def runtime_status(self) -> dict:
+        """Non-sensitive deployment posture for the UI status chips (#72):
+        which store backs the app and whether email/push are live or dry-run.
+        No accounts, data, or secrets — safe to expose without auth.
+        """
+        return {
+            "store": getattr(self.store, "backend", "memory"),
+            "email_mode": self.delivery.email_transport.mode,
+            "push_mode": self.delivery.push_transport.mode,
+        }
+
     # -- contact registry (#60) --------------------------------------------
     @staticmethod
     def _contact_row(c) -> dict:

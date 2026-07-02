@@ -40,6 +40,8 @@ from ..domain import (
 
 
 class InMemoryStore:
+    backend = "memory"  # store kind, for the runtime status endpoint (#72)
+
     def __init__(self) -> None:
         self.teams: Dict[str, Team] = {}
         self.players: Dict[str, Player] = {}
