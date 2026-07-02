@@ -666,3 +666,40 @@ select.player-picker {
 .hint ul { padding-left: 18px; line-height: 1.6; font-size: 14px; }
 .hint em { color: #ffd479; font-style: normal; font-weight: 600; }
 .hint .muted { color: #9a9aa5; font-size: 13px; }
+
+/* -- Delivery admin: contacts + queue monitor (#61) -- */
+.dq-stats { display: flex; flex-wrap: wrap; gap: 10px; margin: 4px 0 12px; }
+.dq-stat { flex: 1 1 84px; background: var(--card); border: 1px solid var(--sep);
+  border-radius: 12px; padding: 12px; text-align: center; }
+.dq-stat .dq-n { font-size: 24px; font-weight: 800; line-height: 1; }
+.dq-stat .dq-l { font-size: 11px; text-transform: uppercase; letter-spacing: .5px;
+  color: var(--muted); margin-top: 6px; }
+.dq-stat.pend .dq-n { color: var(--orange); }
+.dq-stat.sent .dq-n { color: var(--green); }
+.dq-stat.fail .dq-n { color: var(--red); }
+.dq-stat.chan .dq-n { color: var(--muted); }
+.dq-actions { display: flex; align-items: center; gap: 12px; margin: 0 4px 14px; }
+.dq-actions .act[disabled] { opacity: .45; pointer-events: none; }
+.cd-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.cd-table th { text-align: left; font-size: 11px; text-transform: uppercase;
+  letter-spacing: .5px; color: var(--muted); padding: 10px 12px;
+  border-bottom: 1px solid var(--sep); }
+.cd-table td { padding: 10px 12px; border-bottom: 1px solid var(--sep);
+  vertical-align: middle; }
+.cd-table tr:last-child td { border-bottom: none; }
+.cd-ref { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+.cd-dest { color: var(--muted); word-break: break-all; }
+.cd-edit { padding: 2px 10px; font-size: 12px; }
+.dq-att { text-align: center; width: 42px; }
+.dq-err { color: var(--red); font-size: 12px; }
+.cd-form { padding: 14px; margin-bottom: 12px; }
+.cd-grid { display: flex; flex-wrap: wrap; gap: 12px; align-items: end; }
+.cd-field { display: flex; flex-direction: column; gap: 4px; flex: 1 1 150px; }
+.cd-field.cd-narrow { flex: 0 0 120px; }
+.cd-field span { font-size: 11px; text-transform: uppercase; letter-spacing: .5px;
+  color: var(--muted); }
+.cd-field span em { text-transform: none; letter-spacing: 0; font-style: normal; }
+.cd-input { border: 1px solid var(--sep); border-radius: 8px; padding: 8px 10px;
+  font-size: 14px; background: var(--card); color: var(--ink); width: 100%; }
+.cd-input:focus { outline: none; border-color: var(--blue); }
+.cd-submit { flex: 0 0 auto; }

@@ -20,6 +20,8 @@ let rolePerms = new Set();         // permissions of the current role
 let officialsPool = [];            // [{id,name}] officials for the assign UI (#30)
 let standingsDivision = null;      // selected division for the Standings tab (#31)
 let notifState = { notifications: [], unread: 0 };  // feed for the bell (#32)
+let deliveryState = { contacts: [], overview: null };  // ops delivery admin (#61)
+let contactForm = { recipient_ref: "", channel: "email", destination: "", label: "" };
 let movingGameId = null;    // click-to-move fallback: game awaiting a destination slot
 let conflict = null;        // {ok, title, lines[], game, slot} — calendar side panel (#43)
 let drawer = null;          // {kind} when a Setup create drawer is open (#44)
@@ -55,7 +57,8 @@ const NAV = {
   dashboard: "Dashboard", setup: "Setup", calendar: "Arena Calendar",
   games: "Games", roster: "Roster", sheet: "Game Sheet",
   inbox: "My Assignments", standings: "Standings",
-  notifications: "Notifications", activity: "Activity", public: "Public",
+  notifications: "Notifications", delivery: "Delivery", activity: "Activity",
+  public: "Public",
 };
 const POS_CLASS = { goalie: "pos-G", defense: "pos-D", forward: "pos-F", skater: "pos-D" };
 const REPO = "https://github.com/jingizoo/biknik/issues";
@@ -780,6 +783,112 @@ function renderNotifications() {
   return `${head}<div class="notif-list">${cards}</div>${toastHtml()}`;
 }
 
+/* ---------- Delivery admin: contacts + queue monitor (#61) ---------- */
+const CHAN_ICON = { email: "✉️", push: "📲" };
+const DELIV_BADGE = { pending: "gray", sent: "green", failed: "red" };
+
+function recipientOptions(ov) {
+  // Quick-pick suggestions for the recipient_ref field; manual entry still wins.
+  const opts = [
+    { ref: "scheduler", label: "Scheduler group" },
+    { ref: "public", label: "Public broadcast" },
+  ];
+  (officialsPool || []).forEach((o) =>
+    opts.push({ ref: "official:" + o.id, label: "Official — " + o.name }));
+  ((ov && ov.teams) || []).forEach((t) =>
+    opts.push({ ref: "team:" + t.id, label: "Team — " + t.name }));
+  return opts;
+}
+
+function renderContactsPanel(ov) {
+  const f = contactForm;
+  const picks = recipientOptions(ov);
+  const pickOpts = [`<option value="">Quick pick…</option>`]
+    .concat(picks.map((p) => opt(p.ref, p.label, false))).join("");
+  const chan = (v) => opt(v, v === "email" ? "Email" : "Push", f.channel === v);
+  const form = `
+    <div class="card cd-form">
+      <div class="cd-grid">
+        <label class="cd-field"><span>Recipient</span>
+          <select id="contact-pick" class="cd-input">${pickOpts}</select></label>
+        <label class="cd-field"><span>recipient_ref</span>
+          <input id="contact-ref" class="cd-input" placeholder="official:… / team:… / scheduler / public"
+            value="${esc(f.recipient_ref)}" /></label>
+        <label class="cd-field cd-narrow"><span>Channel</span>
+          <select id="contact-channel" class="cd-input">${chan("email")}${chan("push")}</select></label>
+        <label class="cd-field"><span>Destination</span>
+          <input id="contact-dest" class="cd-input" placeholder="name@club.invalid or push-token"
+            value="${esc(f.destination)}" /></label>
+        <label class="cd-field"><span>Label <em>(optional)</em></span>
+          <input id="contact-label" class="cd-input" placeholder="e.g. Ops Desk"
+            value="${esc(f.label)}" /></label>
+        <div class="cd-submit"><button class="act primary" data-contact-save>Save contact</button></div>
+      </div>
+    </div>`;
+  const rows = (deliveryState.contacts || []).map((c) => `
+    <tr>
+      <td class="cd-ref">${esc(c.recipient_ref)}</td>
+      <td>${CHAN_ICON[c.channel] || ""} ${esc(c.channel)}</td>
+      <td class="cd-dest">${esc(c.destination)}</td>
+      <td>${esc(c.label || "")}</td>
+      <td><button class="act ghost cd-edit" data-contact-edit="${esc(c.id)}">Edit</button></td>
+    </tr>`).join("");
+  const table = rows
+    ? `<div class="card"><table class="cd-table">
+        <thead><tr><th>Recipient</th><th>Channel</th><th>Destination</th><th>Label</th><th></th></tr></thead>
+        <tbody>${rows}</tbody></table></div>`
+    : `<div class="banner neutral"><h2>No contacts registered</h2>
+        <p>Deliveries fall back to a safe <code>.invalid</code> placeholder until you add one.</p></div>`;
+  return `<div class="section-title">Contact destinations</div>${form}${table}`;
+}
+
+function renderDeliveryMonitor() {
+  const ov = deliveryState.overview;
+  if (!ov) return `<div class="section-title">Delivery queue</div>
+    <div class="banner neutral"><h2>No deliveries yet</h2>
+      <p>Notifications fan out to the queue as they are emitted.</p></div>`;
+  const st = ov.by_status || {}, ch = ov.by_channel || {};
+  const stat = (label, n, cls) =>
+    `<div class="dq-stat ${cls}"><div class="dq-n">${n || 0}</div><div class="dq-l">${label}</div></div>`;
+  const stats = `<div class="dq-stats">
+    ${stat("Pending", st.pending, "pend")}
+    ${stat("Sent", st.sent, "sent")}
+    ${stat("Failed", st.failed, "fail")}
+    ${stat("Email", ch.email, "chan")}
+    ${stat("Push", ch.push, "chan")}</div>`;
+  const pending = st.pending || 0;
+  const action = `<div class="dq-actions">
+    <button class="act primary" data-process-deliveries ${pending ? "" : "disabled"}>
+      Process pending${pending ? ` (${pending})` : ""}</button>
+    <span class="gs-hint">Mock sender — no real email/push is sent (#58).</span></div>`;
+  const recent = (ov.deliveries || []).slice().reverse().slice(0, 12);
+  const rows = recent.map((d) => `
+    <tr>
+      <td>${CHAN_ICON[d.channel] || ""} ${esc(d.channel)}</td>
+      <td class="cd-ref">${esc(d.recipient_ref || "")}</td>
+      <td class="cd-dest">${esc(d.destination || "")}</td>
+      <td><span class="badge ${DELIV_BADGE[d.status] || "gray"}">${esc(d.status)}</span></td>
+      <td class="dq-att">${d.attempts}</td>
+      <td class="dq-err">${esc(d.last_error || "")}</td>
+    </tr>`).join("");
+  const table = recent.length
+    ? `<div class="card"><table class="cd-table dq-table">
+        <thead><tr><th>Channel</th><th>Recipient</th><th>Destination</th>
+          <th>Status</th><th>Att</th><th>Last error</th></tr></thead>
+        <tbody>${rows}</tbody></table></div>`
+    : "";
+  return `<div class="section-title">Delivery queue</div>${stats}${action}${table}`;
+}
+
+function renderDelivery(ov) {
+  if (!hasPerm("manage_schedule")) {
+    return `<div class="banner neutral"><h2>Operators only</h2>
+      <p>Delivery contacts and the queue monitor are available to league admins
+      and arena managers.</p></div>`;
+  }
+  return `${renderDeliveryMonitor()}${renderContactsPanel(ov)}${toastHtml()}`;
+}
+
 /* ---------- Standings (#31) ---------- */
 function renderStandings(ov, standings) {
   if (!ov.divisions.length) return `<div class="empty">No divisions yet. Create one in Setup.</div>`;
@@ -1165,6 +1274,19 @@ async function render() {
     // Notifications feed drives the bell badge on every view (#32).
     const nf = await getJSON("/api/notifications");
     if (nf && !nf.error) notifState = nf;
+    // Delivery admin: contacts + queue overview, operator-only (#61).
+    if (view === "delivery" && hasPerm("manage_schedule")) {
+      const [op, contacts, overview] = await Promise.all([
+        getJSON("/api/officials"),
+        getJSON("/api/notifications/contacts"),
+        getJSON("/api/notifications/deliveries"),
+      ]);
+      officialsPool = (op && op.officials) || [];
+      deliveryState = {
+        contacts: (contacts && contacts.contacts) || [],
+        overview: (overview && !overview.error) ? overview : null,
+      };
+    }
     // Standings for the selected division (#31).
     if (view === "standings") {
       if (!standingsDivision || !ov.divisions.some((d) => d.id === standingsDivision)) {
@@ -1192,6 +1314,7 @@ async function render() {
     : view === "sheet" ? renderGameSheet(lineups)
     : view === "inbox" ? renderInbox(inbox)
     : view === "notifications" ? renderNotifications()
+    : view === "delivery" ? renderDelivery(ov)
     : view === "standings" ? renderStandings(ov, standings)
     : view === "activity" ? renderActivity(board, ov)
     : renderPublic(ov);
@@ -1267,6 +1390,42 @@ async function render() {
   });
   const readAll = c.querySelector("[data-notif-readall]");
   if (readAll) readAll.onclick = async () => { await post("/api/notifications/read-all", {}); await render(); };
+  // Delivery admin (#61): quick-pick, save contact, edit, process queue.
+  const pick = c.querySelector("#contact-pick");
+  if (pick) pick.onchange = (e) => {
+    const ref = c.querySelector("#contact-ref");
+    if (ref && e.target.value) ref.value = e.target.value;
+  };
+  const saveContact = c.querySelector("[data-contact-save]");
+  if (saveContact) saveContact.onclick = async () => {
+    contactForm = {
+      recipient_ref: val("contact-ref"), channel: val("contact-channel"),
+      destination: val("contact-dest"), label: val("contact-label"),
+    };
+    toast = "";
+    const res = await post("/api/notifications/contacts", {
+      recipient_ref: contactForm.recipient_ref, channel: contactForm.channel,
+      destination: contactForm.destination, label: contactForm.label || null,
+    });
+    if (res && !res.error) {
+      toast = "Contact saved.";
+      contactForm = { recipient_ref: "", channel: "email", destination: "", label: "" };
+    }
+    await render();
+  };
+  c.querySelectorAll("[data-contact-edit]").forEach((b) => b.onclick = () => {
+    const cd = (deliveryState.contacts || []).find((x) => x.id === b.dataset.contactEdit);
+    if (cd) contactForm = { recipient_ref: cd.recipient_ref, channel: cd.channel,
+      destination: cd.destination, label: cd.label || "" };
+    toast = ""; render();
+  });
+  const procBtn = c.querySelector("[data-process-deliveries]");
+  if (procBtn) procBtn.onclick = async () => {
+    const res = await post("/api/notifications/deliveries/process", {});
+    if (res && !res.error) toast = `Processed ${res.processed} · sent ${res.sent}` +
+      (res.failed ? ` · failed ${res.failed}` : "");
+    await render();
+  };
   // Shared move: used by both drag/drop and the click-based Move fallback.
   const applyMove = async (gid, slotId) => {
     toast = "";
@@ -1392,6 +1551,8 @@ function gateChrome() {
   // The "My Assignments" tab is only for a signed-in official (#55).
   const isOfficial = !!(currentUser && currentUser.scope && currentUser.scope.official_id);
   toggle('.tab[data-tab="inbox"]', isOfficial);
+  // The Delivery admin tab is operator-only (#61).
+  toggle('.tab[data-tab="delivery"]', hasPerm("manage_schedule"));
 }
 function setUser(user) {
   currentUser = user;
