@@ -82,6 +82,27 @@
       <div id="content" class="content"></div>
     </main>
   </div>
+
+  <!-- Sign-in screen (#71): shown when there is no session. In production the
+       account picker is empty, so the manual form is the only way in. -->
+  <div id="login-screen" class="login-screen" hidden>
+    <div class="login-card">
+      <div class="login-brand"><span class="brand-mark">H</span>
+        <div><div class="brand-name">Hockey Scheduler</div>
+          <div class="brand-sub">Operator Console</div></div></div>
+      <h1 class="login-title">Sign in</h1>
+      <form id="login-form" class="login-form" autocomplete="on">
+        <label class="login-field"><span>Username</span>
+          <input id="login-user" type="text" autocomplete="username" autocapitalize="none" required /></label>
+        <label class="login-field"><span>Password</span>
+          <input id="login-pass" type="password" autocomplete="current-password" required /></label>
+        <div id="login-error" class="login-error" hidden></div>
+        <button type="submit" class="act primary login-submit">Sign in</button>
+      </form>
+      <div id="login-personas" class="login-personas"></div>
+    </div>
+  </div>
+
   <script src="/app.js"></script>
 </body>
 </html>

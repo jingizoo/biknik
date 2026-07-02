@@ -20,6 +20,7 @@ from datetime import datetime, timedelta
 from http.cookies import SimpleCookie
 
 from ..api import ApiService
+from ..bootstrap import bootstrap_admin_from_env
 from ..domain import ROLE_LABELS, Role, permissions_for
 from ..full_demo import build_full_demo_store
 from ..services import email_transport_from_env, push_transport_from_env
@@ -88,28 +89,38 @@ class DemoState:
     def __init__(self) -> None:
         self.reset()
 
+    def _make_api(self, store):
+        # Email/push transports come from EMAIL_MODE / SMTP_* (#63) and
+        # PUSH_MODE / PUSH_* (#64) env; both dry-run by default, so nothing
+        # sends real mail or push unless explicitly wired.
+        return ApiService(
+            store, email_transport=email_transport_from_env(os.environ),
+            push_transport=push_transport_from_env(os.environ))
+
     def reset(self) -> None:
-        # Build the full Alpine league/arena scenario via the real setup
-        # service, with one game rostered and confirmed, ready to demo a
-        # back-out → substitute flow. Honors DATABASE_URL (SQLite/Postgres);
-        # the demo reseeds a clean dataset on each reset.
-        store = create_store()
+        store = create_store()  # SqlStore.__init__ runs migrate() (CREATE IF NOT EXISTS)
+
+        # Production (#71): NEVER reset the schema or seed demo data — that
+        # would wipe a persistent DATABASE_URL store on every boot. Preserve
+        # whatever is there and only bootstrap the first admin from env if the
+        # store has no accounts yet.
+        if _app_mode() == "production":
+            self.api = self._make_api(store)
+            self.game_id = None
+            self.ids = {}
+            bootstrap_admin_from_env(self.api, os.environ)
+            return
+
+        # Demo mode: rebuild the full Alpine league/arena scenario via the real
+        # setup service (one game rostered & confirmed, ready to demo the
+        # back-out → substitute flow), reseeding a clean dataset each reset.
         if isinstance(store, SqlStore):
             store.reset_schema()
         store, game_id, ids = build_full_demo_store(store)
-        # Email/push transports come from EMAIL_MODE / SMTP_* (#63) and
-        # PUSH_MODE / PUSH_* (#64) env; both dry-run by default, so the demo
-        # never sends real mail or push unless explicitly wired.
-        self.api = ApiService(
-            store, email_transport=email_transport_from_env(os.environ),
-            push_transport=push_transport_from_env(os.environ))
+        self.api = self._make_api(store)
         self.game_id = game_id
         self.ids = ids
-        # The shared-password demo personas are a demo-mode-only convenience
-        # (#68) — a production deployment must start with zero accounts and
-        # bootstrap its first operator out of band.
-        if _app_mode() != "production":
-            self._seed_demo_accounts(ids)
+        self._seed_demo_accounts(ids)
 
     def _seed_demo_accounts(self, ids: dict) -> None:
         """Create the six demo personas as real, operator-created accounts
@@ -470,7 +481,10 @@ class Handler(BaseHTTPRequestHandler):
         # Quick action: add an available 90-min game slot on a rink for the
         # given date, after the latest existing slot on that rink that day.
         if path == "/api/demo/add-ice-slot":
-            rink_id = body.get("rink_id") or STATE.ids["main_rink_id"]
+            rink_id = body.get("rink_id") or STATE.ids.get("main_rink_id")
+            if not rink_id:
+                return self._send_api({"error": {"code": "validation_error",
+                    "message": "A rink_id is required."}})
             date = body.get("date")  # "YYYY-MM-DD"
             ends = [s.end_time for s in api.store.ice_slots.values()
                     if s.rink_id == rink_id
