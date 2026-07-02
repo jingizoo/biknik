@@ -103,6 +103,56 @@ class ProductionPublicPrivacyTest(_HttpBase):
                                  cookie=f"{srv.SESSION_COOKIE}=bogus")
         self.assertEqual(status, 401)
 
+    # -- role/scope authorization (#73 review) -----------------------------
+    def _get_as(self, account_id, role, scope, path):
+        # Mint a session directly for a role/scope and use its cookie.
+        token = srv.SESSIONS.login(account_id, role, scope=scope)
+        return self._get(path, cookie=f"{srv.SESSION_COOKIE}={token}")
+
+    def _game(self):
+        return srv.STATE.api.store.get_game(self.game_id)
+
+    def test_signed_in_viewer_is_denied_private_data(self):
+        from hockey_scheduler.domain import Role
+        status, body = self._get_as("u_v", Role.VIEWER, {},
+                                    f"/api/games/{self.game_id}/lineups")
+        self.assertEqual(status, 403)
+        self.assertEqual(body["error"]["code"], "forbidden")
+
+    def test_coach_scope_controls_roster_access(self):
+        from hockey_scheduler.domain import Role
+        g = self._game()
+        # In-scope coach (home team) → allowed.
+        ok, _ = self._get_as("u_c1", Role.COACH, {"team_id": g.home_team_id},
+                             f"/api/games/{self.game_id}/roster")
+        self.assertEqual(ok, 200)
+        # Unrelated coach → 403.
+        no, _ = self._get_as("u_c2", Role.COACH, {"team_id": "team_elsewhere"},
+                             f"/api/games/{self.game_id}/roster")
+        self.assertEqual(no, 403)
+
+    def test_player_scope_controls_roster_status_access(self):
+        from hockey_scheduler.domain import Role
+        g = self._game()
+        ok, _ = self._get_as("u_p1", Role.PLAYER, {"team_id": g.away_team_id},
+                             f"/api/games/{self.game_id}/roster-status")
+        self.assertEqual(ok, 200)
+        no, _ = self._get_as("u_p2", Role.PLAYER, {"team_id": "team_elsewhere"},
+                             f"/api/games/{self.game_id}/roster-status")
+        self.assertEqual(no, 403)
+
+    def test_official_assignment_controls_officials_access(self):
+        from hockey_scheduler.domain import Role
+        assigned = srv.STATE.api.store.assignments_for_game(self.game_id)
+        self.assertTrue(assigned, "seed should assign an official")
+        oid = assigned[0].official_id
+        ok, _ = self._get_as("u_o1", Role.OFFICIAL, {"official_id": oid},
+                             f"/api/games/{self.game_id}/officials")
+        self.assertEqual(ok, 200)
+        no, _ = self._get_as("u_o2", Role.OFFICIAL, {"official_id": "official_other"},
+                             f"/api/games/{self.game_id}/officials")
+        self.assertEqual(no, 403)
+
 
 class DemoPublicPrivacyTest(_HttpBase):
     """Demo mode keeps the headerless-operator convenience for player data."""

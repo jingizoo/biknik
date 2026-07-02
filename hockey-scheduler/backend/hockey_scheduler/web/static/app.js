@@ -1482,6 +1482,15 @@ async function render() {
 
   setChrome(ov);
   updateNotifBadge();
+  // Roster/Sheet expose private player data — a signed-in user outside the
+  // game's scope gets a 403 (#73). Show a clear "restricted" state instead of
+  // the generic backend-error banner.
+  if (["roster", "sheet"].includes(view) && lineups && lineups.error) {
+    c.innerHTML = `<div class="banner neutral"><h2>Restricted</h2>
+      <p>${esc(lineups.error.message
+        || "You don't have access to this game's roster.")}</p></div>`;
+    return;
+  }
   c.innerHTML =
     view === "dashboard" ? renderDashboard(ov, standings)
     : view === "setup" ? renderSetup(ov)

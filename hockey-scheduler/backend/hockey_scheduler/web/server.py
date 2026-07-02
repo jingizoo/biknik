@@ -33,7 +33,7 @@ from .auth import (
     user_view,
 )
 from .authz import authorize, required_permission
-from .scope import scope_violation
+from .scope import can_read_private_game_data, scope_violation
 
 # Acting role resolution (#50): a server-issued session cookie is authoritative.
 # The X-Demo-Role header remains only as a dev fallback for scripts/curl; when
@@ -413,6 +413,15 @@ class Handler(BaseHTTPRequestHandler):
             if err is not None:
                 code, payload = err
                 return self._send_json(payload, code)
+            # Authentication is not the whole gate: a signed-in viewer or an
+            # unrelated coach/player/official must not read another game's
+            # private data (#73 review). Operators see all; coach/player only
+            # their team's games; official only games they're assigned to.
+            if not can_read_private_game_data(role, scope, gid, api.store):
+                return self._send_json({"error": {
+                    "code": "forbidden",
+                    "message": "You cannot view private data for this game.",
+                    "details": {"role": role.value}}}, 403)
             if sub == "board":
                 return self._send_api(api.get_board(gid))
             if sub == "lineups":
