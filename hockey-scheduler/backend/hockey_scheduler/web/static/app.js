@@ -848,6 +848,10 @@ function renderDeliveryMonitor() {
     <div class="banner neutral"><h2>No deliveries yet</h2>
       <p>Notifications fan out to the queue as they are emitted.</p></div>`;
   const st = ov.by_status || {}, ch = ov.by_channel || {};
+  const emailMode = ov.email_mode || "dry_run";
+  const modeChip = emailMode === "smtp"
+    ? `<span class="badge red">Email: SMTP (live)</span>`
+    : `<span class="badge gray">Email: dry-run</span>`;
   const stat = (label, n, cls) =>
     `<div class="dq-stat ${cls}"><div class="dq-n">${n || 0}</div><div class="dq-l">${label}</div></div>`;
   const stats = `<div class="dq-stats">
@@ -860,7 +864,10 @@ function renderDeliveryMonitor() {
   const action = `<div class="dq-actions">
     <button class="act primary" data-process-deliveries ${pending ? "" : "disabled"}>
       Process pending${pending ? ` (${pending})` : ""}</button>
-    <span class="gs-hint">Mock sender — no real email/push is sent (#58).</span></div>`;
+    ${modeChip}
+    <span class="gs-hint">${emailMode === "smtp"
+      ? "Email routes to the configured SMTP server."
+      : "Dry-run — email is recorded, not sent (#62); push is still mocked."}</span></div>`;
   const recent = (ov.deliveries || []).slice().reverse().slice(0, 12);
   const rows = recent.map((d) => `
     <tr>
