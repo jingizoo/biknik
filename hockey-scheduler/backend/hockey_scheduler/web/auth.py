@@ -33,6 +33,11 @@ DEMO_USERS = {
 SESSION_COOKIE = "hs_sid"
 DEFAULT_TTL_SECONDS = 8 * 60 * 60  # 8h
 
+# How long a finished (expired or revoked) session is retained before cleanup
+# prunes it — a grace window so recently-revoked sessions stay visible for
+# audit/debugging (#77). Active sessions are never touched by cleanup.
+DEFAULT_RETENTION_SECONDS = 7 * 24 * 60 * 60  # 7 days
+
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
@@ -57,13 +62,19 @@ class SessionManager:
     manager works across demo resets (which rebuild the store).
     """
 
-    def __init__(self, ttl_seconds: int = DEFAULT_TTL_SECONDS, clock=_utcnow):
+    def __init__(self, ttl_seconds: int = DEFAULT_TTL_SECONDS, clock=_utcnow,
+                 retention_seconds: int = DEFAULT_RETENTION_SECONDS):
         self._ttl = ttl_seconds
         self._clock = clock
+        self._retention = retention_seconds
 
     def login(self, store, user_id: str, user_agent=None) -> str:
         """Issue a new session for an already-authenticated account; return the
         raw token (only its hash is persisted).
+
+        Opportunistically prunes long-finished sessions so the table can't grow
+        unbounded (#77) — cheap, piggy-backed on a naturally infrequent event,
+        and never touches active or recently-finished rows.
         """
         token = secrets.token_urlsafe(24)
         now = self._clock()
@@ -75,7 +86,15 @@ class SessionManager:
             expires_at=now + timedelta(seconds=self._ttl),
             user_agent=(user_agent or None),
         ))
+        self.cleanup(store)
         return token
+
+    def cleanup(self, store) -> int:
+        """Delete sessions that finished (expired or were revoked) more than the
+        retention window ago. Returns the number pruned. Safe to call anytime;
+        deterministic under the injected clock."""
+        cutoff = self._clock() - timedelta(seconds=self._retention)
+        return store.delete_sessions_before(cutoff)
 
     def resolve(self, store, token):
         """Return ``{user_id, role, scope}`` for a live session, else None.
