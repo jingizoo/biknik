@@ -23,6 +23,7 @@ let notifState = { notifications: [], unread: 0 };  // feed for the bell (#32)
 let deliveryState = { contacts: [], overview: null, deviceTokens: [] };  // ops delivery admin (#61/#65)
 let usersState = { accounts: [], sessions: [] };  // account/session admin (#78)
 let usersSelected = null;          // account id whose sessions are shown (#78)
+let notifPrefs = null;             // signed-in user's own channel prefs (#81)
 let contactForm = { recipient_ref: "", channel: "email", destination: "", label: "" };
 let tokenForm = { recipient_ref: "", provider: "fcm", token: "", label: "" };
 let movingGameId = null;    // click-to-move fallback: game awaiting a destination slot
@@ -861,13 +862,41 @@ function updateNotifBadge() {
   badge.textContent = n > 0 ? (n > 9 ? "9+" : String(n)) : "";
   badge.style.display = n > 0 ? "" : "none";
 }
+// The delivery recipient_ref the signed-in user speaks for (#81), used for the
+// self-service notification-preference toggles. Mirrors the server's mapping.
+function ownRecipientRef() {
+  const u = currentUser;
+  if (!u || !u.scope) return null;
+  if (u.role === "official" && u.scope.official_id) return "official:" + u.scope.official_id;
+  // Only a coach speaks for the shared team channel; a player has no own
+  // delivery target in this slice, so they get no self-service prefs panel
+  // (and cannot mute the whole team's notifications). Mirrors the server.
+  if (u.role === "coach" && u.scope.team_id) return "team:" + u.scope.team_id;
+  return null;
+}
+
+const PREF_CHAN_LABEL = { email: "Email", push: "Push" };
+
+function renderNotifPrefs() {
+  if (!notifPrefs) return "";
+  const toggles = (notifPrefs.preferences || []).map((p) => `
+    <label class="pref-toggle">
+      <input type="checkbox" data-pref-channel="${esc(p.channel)}" ${p.enabled ? "checked" : ""}>
+      <span>${CHAN_ICON[p.channel] || ""} ${esc(PREF_CHAN_LABEL[p.channel] || p.channel)}</span>
+    </label>`).join("");
+  return `<div class="card pref-card">
+    <div class="section-title" style="margin-top:0">Delivery preferences</div>
+    <p class="muted">In-app notifications always arrive here. Turn off a channel to stop those deliveries.</p>
+    <div class="pref-toggles">${toggles}</div></div>`;
+}
+
 function renderNotifications() {
   const rows = notifState.notifications || [];
   const unread = notifState.unread || 0;
   const head = `<div class="notif-head"><div class="section-title" style="margin:0">Notifications${unread ? ` · ${unread} unread` : ""}</div>
     ${unread ? `<button class="act ghost" data-notif-readall>Mark all read</button>` : ""}</div>`;
   if (!rows.length) {
-    return `${head}<div class="banner neutral"><h2>You're all caught up</h2>
+    return `${head}${renderNotifPrefs()}<div class="banner neutral"><h2>You're all caught up</h2>
       <p>Assignment offers, roster alerts, and final results will show up here.</p></div>`;
   }
   const cards = rows.map((n) => {
@@ -880,7 +909,7 @@ function renderNotifications() {
         <div class="notif-meta">${esc(fmtDateTime(n.at))}</div></div>
       ${link}</div>`;
   }).join("");
-  return `${head}<div class="notif-list">${cards}</div>${toastHtml()}`;
+  return `${head}${renderNotifPrefs()}<div class="notif-list">${cards}</div>${toastHtml()}`;
 }
 
 /* ---------- Delivery admin: contacts + queue monitor (#61) ---------- */
@@ -1524,6 +1553,16 @@ async function render() {
     // Notifications feed drives the bell badge on every view (#32).
     const nf = await getJSON("/api/notifications");
     if (nf && !nf.error) notifState = nf;
+    // Self-service channel preferences for the signed-in user (#81).
+    notifPrefs = null;
+    if (view === "notifications") {
+      const ref = ownRecipientRef();
+      if (ref) {
+        const pr = await getJSON(
+          `/api/notifications/preferences?recipient_ref=${encodeURIComponent(ref)}`);
+        if (pr && !pr.error) notifPrefs = pr;
+      }
+    }
     // Delivery admin: contacts + queue overview, operator-only (#61).
     if (view === "delivery" && hasPerm("manage_schedule")) {
       const [op, contacts, overview, tokens] = await Promise.all([
@@ -1672,6 +1711,15 @@ async function render() {
   });
   const readAll = c.querySelector("[data-notif-readall]");
   if (readAll) readAll.onclick = async () => { await post("/api/notifications/read-all", {}); await render(); };
+  // Self-service delivery-channel toggles (#81).
+  c.querySelectorAll("[data-pref-channel]").forEach((el) => el.onchange = async () => {
+    const ref = ownRecipientRef();
+    if (!ref) return;
+    toast = "";
+    await post("/api/notifications/preferences", {
+      recipient_ref: ref, channel: el.dataset.prefChannel, enabled: el.checked });
+    await render();
+  });
   // Delivery admin (#61): quick-pick, save contact, edit, process queue.
   const pick = c.querySelector("#contact-pick");
   if (pick) pick.onchange = (e) => {

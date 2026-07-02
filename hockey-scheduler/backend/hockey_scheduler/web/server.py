@@ -22,7 +22,7 @@ from http.cookies import SimpleCookie
 
 from ..api import ApiService
 from ..bootstrap import bootstrap_admin_from_env
-from ..domain import ROLE_LABELS, Role, permissions_for
+from ..domain import ROLE_LABELS, Permission, Role, can, permissions_for
 from ..full_demo import build_full_demo_store
 from ..services import (
     delivery_loop_from_env,
@@ -296,6 +296,42 @@ class Handler(BaseHTTPRequestHandler):
             return True
         return False
 
+    @staticmethod
+    def _own_recipient_ref(role, scope):
+        """The delivery recipient_ref the signed-in user speaks for (#81), used
+        to let a non-operator manage only their own preferences.
+
+        ``team:<id>`` is a single shared delivery target (the COACH audience) —
+        one preference row governs every notification sent to that team. Only a
+        coach speaks for it. A PLAYER must NOT map here: notification fan-out in
+        this slice never targets an individual player, so a player has no own
+        delivery channel to configure, and letting them edit ``team:<id>`` would
+        let one player mute the whole team's notifications."""
+        if role == Role.OFFICIAL and scope.get("official_id"):
+            return "official:" + scope["official_id"]
+        if role == Role.COACH and scope.get("team_id"):
+            return "team:" + scope["team_id"]
+        return None
+
+    def _prefs_guard(self, recipient_ref) -> bool:
+        """Send 401/403 and return True if the caller may not manage
+        ``recipient_ref``'s notification preferences (#81). An operator
+        (MANAGE_SCHEDULE) may manage anyone; anyone else only their own."""
+        role, scope, _uid, err = self._resolve_role()
+        if err is not None:
+            code, payload = err
+            self._send_json(payload, code)
+            return True
+        if can(role, Permission.MANAGE_SCHEDULE):
+            return False
+        if recipient_ref and recipient_ref == self._own_recipient_ref(role, scope):
+            return False
+        self._send_json({"error": {
+            "code": "forbidden",
+            "message": "You can only manage your own notification preferences."}},
+            403)
+        return True
+
     def _read_body(self) -> dict:
         length = int(self.headers.get("Content-Length", 0) or 0)
         if not length:
@@ -412,6 +448,15 @@ class Handler(BaseHTTPRequestHandler):
             if self._operator_only("/api/notifications/contacts"):
                 return
             return self._send_api(api.list_contact_destinations())
+        if path == "/api/notifications/preferences":
+            # A recipient's channel preferences (#81). Operator → any recipient;
+            # a signed-in user → only their own. recipient_ref via query string.
+            from urllib.parse import parse_qs, urlparse
+            qs = parse_qs(urlparse(self.path).query)
+            recipient_ref = (qs.get("recipient_ref") or [""])[0]
+            if self._prefs_guard(recipient_ref):
+                return
+            return self._send_api(api.get_notification_preferences(recipient_ref))
         if path == "/api/notifications/device-tokens":
             # Device token registry listing for operators (#65); same guard.
             if self._operator_only("/api/notifications/device-tokens"):
@@ -522,6 +567,21 @@ class Handler(BaseHTTPRequestHandler):
             expire = self._session_cookie("", 0)
             return self._send_json({"ok": True},
                                    extra_headers=[("Set-Cookie", expire)])
+
+        # Notification preferences (#81): custom access — an operator manages
+        # anyone's, a signed-in user only their own — so it is guarded here
+        # rather than by the role→permission gate below.
+        if path == "/api/notifications/preferences":
+            recipient_ref = body.get("recipient_ref")
+            if self._prefs_guard(recipient_ref):
+                return
+            # Attribute the change to the signed-in user, not a client-supplied
+            # actor_id, so the audit trail (#81) cannot be forged. The guard
+            # above already established the session is valid.
+            _role, _scope, actor_uid, _err = self._resolve_role()
+            return self._send_api(api.set_notification_preference(
+                recipient_ref, body.get("channel"), bool(body.get("enabled")),
+                digest=body.get("digest"), actor_id=actor_uid))
 
         # Authorize the acting role at the HTTP boundary (#24/#50). A session
         # cookie is authoritative; the X-Demo-Role header is a dev fallback.
