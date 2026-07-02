@@ -401,6 +401,18 @@ class Handler(BaseHTTPRequestHandler):
         m = re.match(r"^/api/games/([^/]+)(?:/(board|lineups|roster-status|roster|substitutes|officials))?$", path)
         if m:
             gid, sub = m.group(1), m.group(2)
+            # The bare game record is a public fixture (teams / time / rink /
+            # score) — no player data, so it stays open (#73).
+            if sub is None:
+                return self._send_api(api.get_game(gid))
+            # Everything else exposes player names, availability, roster
+            # internals, or official assignments — never public. Require an
+            # authenticated session (#73): in demo the headerless fallback is
+            # the operator; a production anonymous request → 401.
+            role, scope, user_id, err = self._resolve_role()
+            if err is not None:
+                code, payload = err
+                return self._send_json(payload, code)
             if sub == "board":
                 return self._send_api(api.get_board(gid))
             if sub == "lineups":
@@ -413,8 +425,6 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_api(api.get_roster(gid))
             if sub == "substitutes":
                 return self._send_api(api.get_substitutes(gid))
-            if sub is None:
-                return self._send_api(api.get_game(gid))
         if path.startswith("/api/"):
             return self._send_json({"error": {"code": "not_found",
                                               "message": "Unknown endpoint."}}, 404)
