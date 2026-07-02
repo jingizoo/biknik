@@ -16,6 +16,7 @@ from ..domain import (
     NotificationDelivery,
 )
 from ..domain.errors import ValidationError
+from .email_transport import DryRunEmailTransport
 
 # Channels every notification fans out to in this slice.
 DEFAULT_CHANNELS = (NotificationChannel.EMAIL, NotificationChannel.PUSH)
@@ -96,22 +97,42 @@ def enqueue(store, notification, channels=DEFAULT_CHANNELS):
 
 
 def mock_sender(delivery, notification) -> None:
-    """The default sender: a no-op stand-in that always "delivers".
+    """A no-op sender for non-email channels (push is still mocked, #62).
 
-    Real transports (email/push) replace this later. Raising an exception
-    signals a failed send, which the worker records and retries.
+    Raising an exception signals a failed send, which the worker records and
+    retries.
     """
     return None
 
 
-class DeliveryWorker:
-    """Drains pending notification deliveries through an injected sender."""
+def make_delivery_sender(email_transport, push_sender=mock_sender):
+    """A sender that routes email deliveries to ``email_transport`` (#62).
 
-    def __init__(self, store, clock, sender=mock_sender,
-                 max_attempts: int = MAX_ATTEMPTS):
+    Non-email channels fall through to ``push_sender`` (still the mock in this
+    slice). Any exception from either path signals a failed send.
+    """
+    def sender(delivery, notification) -> None:
+        if delivery.channel == NotificationChannel.EMAIL:
+            email_transport.send(delivery, notification)
+        else:
+            push_sender(delivery, notification)
+    return sender
+
+
+class DeliveryWorker:
+    """Drains pending notification deliveries through the configured transport.
+
+    Email deliveries go through ``email_transport`` (a safe dry-run by default,
+    so nothing is sent for real unless a real transport is configured). A fully
+    custom ``sender`` can still be injected for tests.
+    """
+
+    def __init__(self, store, clock, sender=None,
+                 max_attempts: int = MAX_ATTEMPTS, email_transport=None):
         self.store = store
         self.clock = clock
-        self.sender = sender
+        self.email_transport = email_transport or DryRunEmailTransport()
+        self.sender = sender or make_delivery_sender(self.email_transport)
         self.max_attempts = max_attempts
 
     def process_pending(self) -> dict:

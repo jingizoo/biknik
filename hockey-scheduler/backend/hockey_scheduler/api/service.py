@@ -512,6 +512,7 @@ class ApiService:
             by_channel[d.channel.value] = by_channel.get(d.channel.value, 0) + 1
         return {"total": len(rows), "by_status": by_status,
                 "by_channel": by_channel,
+                "email_mode": self.delivery.email_transport.mode,
                 "deliveries": [self._delivery_row(d) for d in rows]}
 
     # -- contact registry (#60) --------------------------------------------
