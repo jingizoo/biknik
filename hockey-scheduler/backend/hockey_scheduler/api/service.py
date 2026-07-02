@@ -103,14 +103,16 @@ def catch(fn: Callable):
 
 class ApiService:
     def __init__(self, store: Optional[InMemoryStore] = None,
-                 email_transport=None):
+                 email_transport=None, push_transport=None):
         self.store = store or InMemoryStore()
         self.roster = RosterService(self.store)
         self.setup = SetupService(self.store)
-        # Email delivery uses the configured transport (#63); default dry-run
-        # so nothing is ever sent for real unless explicitly configured.
+        # Email/push delivery use the configured transports (#63/#64); both
+        # default to dry-run so nothing is ever sent for real unless
+        # explicitly configured.
         self.delivery = DeliveryWorker(self.store, self.roster.clock,
-                                       email_transport=email_transport)
+                                       email_transport=email_transport,
+                                       push_transport=push_transport)
 
     # -- games -------------------------------------------------------------
     @catch
@@ -518,6 +520,8 @@ class ApiService:
                 "by_channel": by_channel,
                 "email_mode": self.delivery.email_transport.mode,
                 "email_sender": getattr(self.delivery.email_transport, "sender", None),
+                "push_mode": self.delivery.push_transport.mode,
+                "push_provider": getattr(self.delivery.push_transport, "provider", None),
                 "deliveries": [self._delivery_row(d) for d in rows]}
 
     # -- contact registry (#60) --------------------------------------------

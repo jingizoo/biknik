@@ -22,7 +22,7 @@ from http.cookies import SimpleCookie
 from ..api import ApiService
 from ..domain import ROLE_LABELS, Role, permissions_for
 from ..full_demo import build_full_demo_store
-from ..services import email_transport_from_env
+from ..services import email_transport_from_env, push_transport_from_env
 from ..store import SqlStore, create_store
 from .auth import (
     DEMO_USERS,
@@ -86,10 +86,12 @@ class DemoState:
         if isinstance(store, SqlStore):
             store.reset_schema()
         store, game_id, ids = build_full_demo_store(store)
-        # Email transport comes from EMAIL_MODE / SMTP_* env (#63); dry-run by
-        # default, so the demo never sends real mail unless explicitly wired.
+        # Email/push transports come from EMAIL_MODE / SMTP_* (#63) and
+        # PUSH_MODE / PUSH_* (#64) env; both dry-run by default, so the demo
+        # never sends real mail or push unless explicitly wired.
         self.api = ApiService(
-            store, email_transport=email_transport_from_env(os.environ))
+            store, email_transport=email_transport_from_env(os.environ),
+            push_transport=push_transport_from_env(os.environ))
         self.game_id = game_id
         self.ids = ids
 
