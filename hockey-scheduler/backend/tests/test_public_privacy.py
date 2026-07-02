@@ -105,8 +105,12 @@ class ProductionPublicPrivacyTest(_HttpBase):
 
     # -- role/scope authorization (#73 review) -----------------------------
     def _get_as(self, account_id, role, scope, path):
-        # Mint a session directly for a role/scope and use its cookie.
-        token = srv.SESSIONS.login(account_id, role, scope=scope)
+        # Create a real account with this role/scope, then issue a store-backed
+        # session for it (#74 — role/scope are resolved from the account).
+        store = srv.STATE.api.store
+        acct = srv.STATE.api.accounts.create_account(
+            username=account_id, password="pw", role=role, scope=scope)
+        token = srv.SESSIONS.login(store, acct.id)
         return self._get(path, cookie=f"{srv.SESSION_COOKIE}={token}")
 
     def _game(self):

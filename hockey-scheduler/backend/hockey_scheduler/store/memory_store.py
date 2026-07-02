@@ -31,6 +31,7 @@ from ..domain import (
     Player,
     Rink,
     Season,
+    Session,
     SetupAuditLog,
     SubstituteEnrollment,
     Team,
@@ -68,6 +69,7 @@ class InMemoryStore:
         self.contact_destinations: Dict[str, ContactDestination] = {}
         self.device_tokens: Dict[str, DeviceToken] = {}
         self.user_accounts: Dict[str, UserAccount] = {}
+        self.sessions: Dict[str, Session] = {}
         self.setup_audit: List[SetupAuditLog] = []
         self._counters: Dict[str, count] = {}
 
@@ -424,6 +426,24 @@ class InMemoryStore:
 
     def all_user_accounts(self) -> List[UserAccount]:
         return list(self.user_accounts.values())
+
+    # -- sessions (#74) ----------------------------------------------------
+    def add_session(self, s: Session) -> Session:
+        self.sessions[s.id] = s
+        return s
+
+    def save_session(self, s: Session) -> Session:
+        self.sessions[s.id] = s
+        return s
+
+    def get_session_by_hash(self, token_hash: str) -> Optional[Session]:
+        for s in self.sessions.values():
+            if s.token_hash == token_hash:
+                return s
+        return None
+
+    def sessions_for_user(self, user_id: str) -> List[Session]:
+        return [s for s in self.sessions.values() if s.user_id == user_id]
 
     def add_setup_audit(self, entry: SetupAuditLog) -> SetupAuditLog:
         self.setup_audit.append(entry)

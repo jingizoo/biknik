@@ -50,6 +50,7 @@ from ..domain import (
     RosterRole,
     Season,
     SelectionSource,
+    Session,
     SetupAuditLog,
     SubstituteEnrollment,
     SubstituteStatus,
@@ -175,6 +176,8 @@ SPECS = {
     UserAccount: Spec(UserAccount, "user_accounts",
                       {"role": _enum(Role), "created_at": _dt(),
                        "scope": _jsonc(), "active": _bool()}),
+    Session: Spec(Session, "sessions",
+                  {"issued_at": _dt(), "expires_at": _dt(), "revoked_at": _dt()}),
 }
 
 # Column type for DDL: INTEGER for int/bool fields, else TEXT.
@@ -213,6 +216,8 @@ _INDEXES = [
     "CREATE INDEX IF NOT EXISTS ix_contacts_ref ON contact_destinations(recipient_ref, channel)",
     "CREATE INDEX IF NOT EXISTS ix_device_tokens_ref ON device_tokens(recipient_ref, active)",
     "CREATE UNIQUE INDEX IF NOT EXISTS ix_user_accounts_username ON user_accounts(username)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS ix_sessions_token ON sessions(token_hash)",
+    "CREATE INDEX IF NOT EXISTS ix_sessions_user ON sessions(user_id)",
 ]
 
 
@@ -545,3 +550,12 @@ class SqlStore:
         return rows[0] if rows else None
     def all_user_accounts(self):
         return self._query(UserAccount, order="id")
+
+    # -- sessions (#74) ----------------------------------------------------
+    def add_session(self, sess): return self._insert(sess)
+    def save_session(self, sess): return self._update(sess)
+    def get_session_by_hash(self, token_hash):
+        rows = self._query(Session, "token_hash = ?", (token_hash,), order="id")
+        return rows[0] if rows else None
+    def sessions_for_user(self, user_id):
+        return self._query(Session, "user_id = ?", (user_id,), order="id")

@@ -60,6 +60,7 @@ from .setup_models import (
     ContactDestination,
     DeviceToken,
     Division,
+    Session,
     UserAccount,
     GameResult,
     IceSlot,
@@ -146,5 +147,6 @@ __all__ = [
     "Season",
     "SetupAuditLog",
     "UserAccount",
+    "Session",
     "Venue",
 ]
