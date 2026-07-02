@@ -24,6 +24,8 @@ let deliveryState = { contacts: [], overview: null, deviceTokens: [] };  // ops 
 let usersState = { accounts: [], sessions: [] };  // account/session admin (#78)
 let usersSelected = null;          // account id whose sessions are shown (#78)
 let notifPrefs = null;             // signed-in user's own channel prefs (#81)
+let feedTokens = [];               // signed-in user's calendar feed tokens (#82)
+let newFeedUrl = null;             // freshly-minted feed URL, shown once (#82)
 let contactForm = { recipient_ref: "", channel: "email", destination: "", label: "" };
 let tokenForm = { recipient_ref: "", provider: "fcm", token: "", label: "" };
 let movingGameId = null;    // click-to-move fallback: game awaiting a destination slot
@@ -875,6 +877,41 @@ function ownRecipientRef() {
   return null;
 }
 
+// The calendar-feed actor the signed-in user can subscribe to (#82).
+function ownFeedActor() {
+  const u = currentUser;
+  if (!u || !u.scope) return null;
+  if (u.role === "official" && u.scope.official_id)
+    return { actor_type: "official", actor_ref: u.scope.official_id };
+  if (u.role === "player" && u.scope.player_id)
+    return { actor_type: "player", actor_ref: u.scope.player_id };
+  if ((u.role === "coach" || u.role === "player") && u.scope.team_id)
+    return { actor_type: "team", actor_ref: u.scope.team_id };
+  return null;
+}
+
+function renderCalendarFeed() {
+  if (!ownFeedActor()) return "";
+  const minted = newFeedUrl
+    ? `<div class="feed-url"><code>${esc(location.origin + newFeedUrl)}</code>
+        <p class="muted">Copy this URL into your calendar app. It is shown once —
+        it won't be displayed again.</p></div>`
+    : "";
+  const active = feedTokens.length
+    ? `<div class="row-list">${feedTokens.map((t) => `
+        <div class="session-row">
+          <span class="row-main">Feed created ${fmtDateTime(t.created_at)}</span>
+          <button class="act ghost" data-feed-revoke="${esc(t.id)}">Revoke</button>
+        </div>`).join("")}</div>`
+    : `<p class="muted">No active calendar feed.</p>`;
+  return `<div class="card">
+    <div class="section-title" style="margin-top:0">Calendar subscription</div>
+    <p class="muted">Subscribe your calendar app to your games (fixtures only).</p>
+    ${minted}${active}
+    <div class="dq-actions"><button class="act primary" data-feed-create>Create feed URL</button></div>
+  </div>`;
+}
+
 const PREF_CHAN_LABEL = { email: "Email", push: "Push" };
 
 function renderNotifPrefs() {
@@ -896,7 +933,7 @@ function renderNotifications() {
   const head = `<div class="notif-head"><div class="section-title" style="margin:0">Notifications${unread ? ` · ${unread} unread` : ""}</div>
     ${unread ? `<button class="act ghost" data-notif-readall>Mark all read</button>` : ""}</div>`;
   if (!rows.length) {
-    return `${head}${renderNotifPrefs()}<div class="banner neutral"><h2>You're all caught up</h2>
+    return `${head}${renderNotifPrefs()}${renderCalendarFeed()}<div class="banner neutral"><h2>You're all caught up</h2>
       <p>Assignment offers, roster alerts, and final results will show up here.</p></div>`;
   }
   const cards = rows.map((n) => {
@@ -909,7 +946,7 @@ function renderNotifications() {
         <div class="notif-meta">${esc(fmtDateTime(n.at))}</div></div>
       ${link}</div>`;
   }).join("");
-  return `${head}${renderNotifPrefs()}<div class="notif-list">${cards}</div>${toastHtml()}`;
+  return `${head}${renderNotifPrefs()}${renderCalendarFeed()}<div class="notif-list">${cards}</div>${toastHtml()}`;
 }
 
 /* ---------- Delivery admin: contacts + queue monitor (#61) ---------- */
@@ -1555,12 +1592,19 @@ async function render() {
     if (nf && !nf.error) notifState = nf;
     // Self-service channel preferences for the signed-in user (#81).
     notifPrefs = null;
+    feedTokens = [];
     if (view === "notifications") {
       const ref = ownRecipientRef();
       if (ref) {
         const pr = await getJSON(
           `/api/notifications/preferences?recipient_ref=${encodeURIComponent(ref)}`);
         if (pr && !pr.error) notifPrefs = pr;
+      }
+      const actor = ownFeedActor();
+      if (actor) {
+        const ft = await getJSON(`/api/calendar-feeds?actor_type=${actor.actor_type}`
+          + `&actor_ref=${encodeURIComponent(actor.actor_ref)}`);
+        if (ft && !ft.error) feedTokens = (ft.feed_tokens || []).filter((t) => !t.revoked);
       }
     }
     // Delivery admin: contacts + queue overview, operator-only (#61).
@@ -1718,6 +1762,21 @@ async function render() {
     toast = "";
     await post("/api/notifications/preferences", {
       recipient_ref: ref, channel: el.dataset.prefChannel, enabled: el.checked });
+    await render();
+  });
+  // Calendar feed create / revoke (#82).
+  const feedCreate = c.querySelector("[data-feed-create]");
+  if (feedCreate) feedCreate.onclick = async () => {
+    const actor = ownFeedActor();
+    if (!actor) return;
+    toast = "";
+    const res = await post("/api/calendar-feeds", actor);
+    newFeedUrl = (res && res.url) || null;
+    await render();
+  };
+  c.querySelectorAll("[data-feed-revoke]").forEach((b) => b.onclick = async () => {
+    toast = ""; newFeedUrl = null;
+    await post(`/api/calendar-feeds/${b.dataset.feedRevoke}/revoke`, {});
     await render();
   });
   // Delivery admin (#61): quick-pick, save contact, edit, process queue.

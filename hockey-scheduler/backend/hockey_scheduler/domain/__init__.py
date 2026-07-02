@@ -56,6 +56,7 @@ from .models import (
     Team,
 )
 from .setup_models import (
+    CalendarFeedToken,
     Club,
     ContactDestination,
     DeviceToken,
@@ -150,5 +151,6 @@ __all__ = [
     "SetupAuditLog",
     "UserAccount",
     "Session",
+    "CalendarFeedToken",
     "Venue",
 ]

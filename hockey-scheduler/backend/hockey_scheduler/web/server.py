@@ -177,6 +177,51 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_ics(self, text: str) -> None:
+        body = text.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/calendar; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Content-Disposition", "inline; filename=calendar.ics")
+        self.send_header("Cache-Control", "no-store")
+        self._security_headers()
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _own_feed_actor(self, role, scope, actor_type, actor_ref) -> bool:
+        """Whether the signed-in user owns (team/official/player, ref) — used to
+        let a non-operator manage only their own calendar feeds (#82).
+
+        Role-specific, not just scope-based: a player carries ``team_id`` in
+        scope but does NOT own the shared team feed (that is the coach's), so
+        each actor_type is gated on the matching role. Otherwise a player could
+        create/revoke a coach's ``team:<id>`` feed via the API — the same
+        shared-resource bug fixed for preferences in #81."""
+        if actor_type == "official":
+            return role == Role.OFFICIAL and scope.get("official_id") == actor_ref
+        if actor_type == "team":
+            return role == Role.COACH and scope.get("team_id") == actor_ref
+        if actor_type == "player":
+            return role == Role.PLAYER and scope.get("player_id") == actor_ref
+        return False
+
+    def _feed_guard(self, actor_type, actor_ref) -> bool:
+        """Send 401/403 and return True if the caller may not manage feed tokens
+        for (actor_type, actor_ref): operator manages any, others only own (#82)."""
+        role, scope, _uid, err = self._resolve_role()
+        if err is not None:
+            code, payload = err
+            self._send_json(payload, code)
+            return True
+        if can(role, Permission.MANAGE_SCHEDULE):
+            return False
+        if actor_ref and self._own_feed_actor(role, scope, actor_type, actor_ref):
+            return False
+        self._send_json({"error": {
+            "code": "forbidden",
+            "message": "You can only manage your own calendar feeds."}}, 403)
+        return True
+
     def _cookie(self, name: str):
         raw = self.headers.get("Cookie")
         if not raw:
@@ -380,6 +425,15 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(204)
             self.end_headers()
             return
+        # Public iCal feed (#82): bearer token in the URL scopes access; no
+        # session. Unknown/revoked/mismatched token → 404 (don't confirm which).
+        cal = re.match(r"^/calendar/(team|official|player)/([^/]+)\.ics$", path)
+        if cal:
+            ics = api.calendar_feed_ics(cal.group(1), cal.group(2))
+            if ics is None:
+                return self._send_json({"error": {
+                    "code": "not_found", "message": "Calendar not found."}}, 404)
+            return self._send_ics(ics)
         if path == "/api/demo/overview":
             return self._send_api(api.get_demo_overview())
         if path == "/api/status":
@@ -457,6 +511,16 @@ class Handler(BaseHTTPRequestHandler):
             if self._prefs_guard(recipient_ref):
                 return
             return self._send_api(api.get_notification_preferences(recipient_ref))
+        if path == "/api/calendar-feeds":
+            # List an actor's feed tokens (#82). Operator → any; user → own.
+            from urllib.parse import parse_qs, urlparse
+            qs = parse_qs(urlparse(self.path).query)
+            actor_type = (qs.get("actor_type") or [""])[0]
+            actor_ref = (qs.get("actor_ref") or [""])[0]
+            if self._feed_guard(actor_type, actor_ref):
+                return
+            return self._send_api(
+                api.list_calendar_feed_tokens(actor_type, actor_ref))
         if path == "/api/notifications/device-tokens":
             # Device token registry listing for operators (#65); same guard.
             if self._operator_only("/api/notifications/device-tokens"):
@@ -582,6 +646,29 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_api(api.set_notification_preference(
                 recipient_ref, body.get("channel"), bool(body.get("enabled")),
                 digest=body.get("digest"), actor_id=actor_uid))
+
+        # Calendar feed tokens (#82): create / revoke. Custom access (operator
+        # or own actor), guarded here rather than by the permission gate below.
+        if path == "/api/calendar-feeds":
+            if self._feed_guard(body.get("actor_type"), body.get("actor_ref")):
+                return
+            # Attribute the mint to the signed-in user (server-resolved), never
+            # a client-supplied actor_id, so the audit trail (#82) is trusted.
+            _role, _scope, actor_uid, _err = self._resolve_role()
+            return self._send_api(api.create_calendar_feed_token(
+                body.get("actor_type"), body.get("actor_ref"),
+                label=body.get("label"), actor_id=actor_uid))
+        cfr = re.match(r"^/api/calendar-feeds/([^/]+)/revoke$", path)
+        if cfr:
+            tok = api.store.get_calendar_feed_token(cfr.group(1))
+            if tok is None:
+                return self._send_json({"error": {
+                    "code": "not_found", "message": "Feed token not found."}}, 404)
+            if self._feed_guard(tok.actor_type, tok.actor_ref):
+                return
+            _role, _scope, actor_uid, _err = self._resolve_role()
+            return self._send_api(api.revoke_calendar_feed_token(
+                cfr.group(1), actor_id=actor_uid))
 
         # Authorize the acting role at the HTTP boundary (#24/#50). A session
         # cookie is authoritative; the X-Demo-Role header is a dev fallback.

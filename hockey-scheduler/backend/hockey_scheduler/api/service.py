@@ -13,6 +13,7 @@ from typing import Callable, List, Optional
 
 from ..domain import (
     AvailabilityStatus,
+    CalendarFeedToken,
     ContactDestination,
     DeliveryStatus,
     DeviceToken,
@@ -34,11 +35,15 @@ from ..domain.errors import (
     ValidationError,
 )
 from ..services import (
+    ACTOR_TYPES,
     AccountService,
     DeliveryLoop,
     DeliveryWorker,
     RosterService,
     SetupService,
+    build_ics,
+    hash_feed_token,
+    new_feed_token,
 )
 from ..store import InMemoryStore
 
@@ -712,6 +717,85 @@ class ApiService:
              "digest": pref.digest})
         return {"recipient_ref": recipient_ref, "channel": ch.value,
                 "enabled": pref.enabled, "digest": pref.digest}
+
+    # -- calendar feed tokens (#82) ----------------------------------------
+    @staticmethod
+    def _feed_token_row(t) -> dict:
+        # Never include token_hash or the raw token — only lifecycle metadata.
+        return {"id": t.id, "actor_type": t.actor_type, "actor_ref": t.actor_ref,
+                "created_at": ApiService._iso(t.created_at),
+                "revoked_at": ApiService._iso(t.revoked_at),
+                "label": t.label, "revoked": t.revoked_at is not None,
+                "path": f"/calendar/{t.actor_type}/{{token}}.ics"}
+
+    @catch
+    def create_calendar_feed_token(self, actor_type: str, actor_ref: str,
+                                   label=None, actor_id=None) -> dict:
+        """Issue a feed token for an actor and return the raw token ONCE
+        (only its hash is stored). The caller builds the subscription URL."""
+        if actor_type not in ACTOR_TYPES:
+            raise ValidationError(f"Unknown actor_type '{actor_type}'.")
+        if not actor_ref:
+            raise ValidationError("An actor_ref is required.")
+        raw = new_feed_token()
+        tok = CalendarFeedToken(
+            id=self.store.next_id("calfeed"), token_hash=hash_feed_token(raw),
+            actor_type=actor_type, actor_ref=actor_ref,
+            created_at=self.roster.clock(), label=label)
+        self.store.add_calendar_feed_token(tok)
+        # Minting a feed token grants standing read access to an actor's
+        # schedule, so it is auditable (#82). Record only lifecycle metadata —
+        # never the raw token or its hash.
+        self.setup._audit(
+            "calendar_feed_token_created", "calendar_feed_token", tok.id,
+            actor_id,
+            {"actor_type": actor_type, "actor_ref": actor_ref, "label": label})
+        row = self._feed_token_row(tok)
+        row["token"] = raw  # returned once; not stored, not returned again
+        row["url"] = f"/calendar/{actor_type}/{raw}.ics"
+        return row
+
+    @catch
+    def list_calendar_feed_tokens(self, actor_type: str, actor_ref: str) -> dict:
+        rows = [self._feed_token_row(t) for t in
+                self.store.calendar_feed_tokens_for(actor_type, actor_ref)]
+        return {"feed_tokens": rows}
+
+    @catch
+    def revoke_calendar_feed_token(self, token_id: str, actor_id=None) -> dict:
+        tok = self.store.get_calendar_feed_token(token_id)
+        if tok is None:
+            raise NotFoundError("Feed token not found.")
+        already_revoked = tok.revoked_at is not None
+        if tok.revoked_at is None:
+            tok.revoked_at = self.roster.clock()
+            self.store.save_calendar_feed_token(tok)
+        # Revoking a feed token cuts off that read access, so it is auditable
+        # (#82). Only lifecycle metadata — no token material. A repeat revoke of
+        # an already-revoked token is recorded too (idempotent no-op flagged).
+        self.setup._audit(
+            "calendar_feed_token_revoked", "calendar_feed_token", tok.id,
+            actor_id,
+            {"actor_type": tok.actor_type, "actor_ref": tok.actor_ref,
+             "label": tok.label, "already_revoked": already_revoked})
+        return self._feed_token_row(tok)
+
+    def calendar_feed_ics(self, actor_type: str, raw_token: str):
+        """Resolve a raw feed token and render its ICS, or None if the token is
+        unknown, revoked, or its actor_type doesn't match the route (#82).
+
+        Not @catch-wrapped: the caller returns text/calendar or a 404, not a
+        JSON error envelope.
+        """
+        tok = self.store.get_calendar_feed_token_by_hash(
+            hash_feed_token(raw_token or ""))
+        if tok is None or tok.revoked_at is not None:
+            return None
+        if tok.actor_type != actor_type:
+            return None
+        name = f"{actor_type.title()} calendar"
+        return build_ics(self.store, tok.actor_type, tok.actor_ref,
+                         self.roster.clock(), calendar_name=name)
 
     # -- device token registry (#65) ---------------------------------------
     @staticmethod

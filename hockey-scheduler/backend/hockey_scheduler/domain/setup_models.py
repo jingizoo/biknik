@@ -197,6 +197,25 @@ class ContactDestination:
 
 
 @dataclass
+class CalendarFeedToken:
+    """A revocable, bearer token for a scoped iCal subscription feed (#82).
+
+    Possession of the raw token grants read access to one actor's calendar
+    (a team, an official, or a player) and nothing else. Only the SHA-256
+    ``token_hash`` is stored — the raw token lives in the subscription URL the
+    user pastes into their calendar app. ``actor_type`` is team/official/player
+    and ``actor_ref`` the corresponding id.
+    """
+    id: str
+    token_hash: str
+    actor_type: str
+    actor_ref: str
+    created_at: datetime
+    revoked_at: Optional[datetime] = None
+    label: Optional[str] = None
+
+
+@dataclass
 class NotificationPreference:
     """A recipient's opt-out for a delivery channel (#81).
 

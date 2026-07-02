@@ -18,6 +18,7 @@ from ..domain import (
     AuditAction,
     AuditLog,
     AvailabilityStatus,
+    CalendarFeedToken,
     Club,
     Division,
     Game,
@@ -185,6 +186,9 @@ SPECS = {
                        "scope": _jsonc(), "active": _bool()}),
     Session: Spec(Session, "sessions",
                   {"issued_at": _dt(), "expires_at": _dt(), "revoked_at": _dt()}),
+    CalendarFeedToken: Spec(
+        CalendarFeedToken, "calendar_feed_tokens",
+        {"created_at": _dt(), "revoked_at": _dt()}),
 }
 
 # Numbered, forward-only migrations (#75). Each ``NNN_name.sql`` file under
@@ -551,6 +555,20 @@ class SqlStore:
         return rows[0] if rows else None
     def all_device_tokens(self):
         return self._query(DeviceToken, order="id")
+
+    # -- calendar feed tokens (#82) ----------------------------------------
+    def add_calendar_feed_token(self, t): return self._insert(t)
+    def save_calendar_feed_token(self, t): return self._update(t)
+    def get_calendar_feed_token(self, token_id):
+        return self._get(CalendarFeedToken, token_id)
+    def get_calendar_feed_token_by_hash(self, token_hash):
+        rows = self._query(CalendarFeedToken, "token_hash = ?", (token_hash,),
+                           order="id")
+        return rows[0] if rows else None
+    def calendar_feed_tokens_for(self, actor_type, actor_ref):
+        return self._query(CalendarFeedToken,
+                           "actor_type = ? AND actor_ref = ?",
+                           (actor_type, actor_ref), order="id")
 
     # -- notification preferences (#81) ------------------------------------
     def save_notification_preference(self, p):
