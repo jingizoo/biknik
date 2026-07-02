@@ -98,7 +98,7 @@ class DemoState:
             push_transport=push_transport_from_env(os.environ))
 
     def reset(self) -> None:
-        store = create_store()  # SqlStore.__init__ runs migrate() (CREATE IF NOT EXISTS)
+        store = create_store()  # SqlStore.__init__ applies pending numbered migrations (#75)
 
         # Production (#71): NEVER reset the schema or seed demo data — that
         # would wipe a persistent DATABASE_URL store on every boot. Preserve

@@ -7,10 +7,11 @@ ISO-8601 text, booleans as 0/1, and dict payloads as JSON text.
 """
 
 import json
+import os
 import threading
 from contextlib import contextmanager
 from dataclasses import fields
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Optional
 
 from ..domain import (
@@ -180,61 +181,66 @@ SPECS = {
                   {"issued_at": _dt(), "expires_at": _dt(), "revoked_at": _dt()}),
 }
 
-# Column type for DDL: INTEGER for int/bool fields, else TEXT.
-_INT_FIELDS = {
-    "target_goalies", "target_skaters", "max_skaters", "jersey_number",
-    "priority_rank", "is_active", "locked", "cancelled", "published",
-    "home_score", "away_score", "attempts", "active",
-}
+# Numbered, forward-only migrations (#75). Each ``NNN_name.sql`` file under
+# migrations/ is applied at most once, in numeric order; ``schema_migrations``
+# records which versions have run and is the single source of truth. The DDL is
+# CREATE ... IF NOT EXISTS so adopting this system on a pre-#75 database (which
+# had all tables but no per-migration rows) is safe — the files re-run harmlessly
+# and simply backfill the version ledger. No migration ever drops or rewrites
+# data; a destructive rebuild is reset_schema(), demo-only and never run in prod.
+_MIGRATIONS_DIR = os.path.join(os.path.dirname(__file__), "migrations")
 
 
-def _ddl(spec) -> str:
-    defs = []
-    for name in spec.names:
-        coltype = "INTEGER" if name in _INT_FIELDS else "TEXT"
-        pk = " PRIMARY KEY" if name == "id" else ""
-        defs.append(f"{name} {coltype}{pk}")
-    return f"CREATE TABLE IF NOT EXISTS {spec.table} ({', '.join(defs)})"
+def _load_migrations():
+    """Return ``[(version, [statement, ...]), ...]`` in numeric version order.
 
-
-# Helpful indexes for the common lookups (created IF NOT EXISTS).
-_INDEXES = [
-    "CREATE INDEX IF NOT EXISTS ix_ice_slots_rink ON ice_slots(rink_id, start_time)",
-    "CREATE INDEX IF NOT EXISTS ix_games_slot ON games(ice_slot_id)",
-    "CREATE INDEX IF NOT EXISTS ix_games_teams ON games(home_team_id, away_team_id)",
-    "CREATE INDEX IF NOT EXISTS ix_players_team ON players(team_id)",
-    "CREATE INDEX IF NOT EXISTS ix_roster_game ON game_roster_entries(game_id, player_id)",
-    "CREATE INDEX IF NOT EXISTS ix_subs_game ON substitute_enrollments(game_id, player_id)",
-    "CREATE INDEX IF NOT EXISTS ix_avail_game ON game_availability(game_id, player_id)",
-    "CREATE INDEX IF NOT EXISTS ix_off_assign_game ON official_assignments(game_id)",
-    "CREATE INDEX IF NOT EXISTS ix_off_assign_official ON official_assignments(official_id)",
-    "CREATE INDEX IF NOT EXISTS ix_game_results_game ON game_results(game_id)",
-    "CREATE INDEX IF NOT EXISTS ix_notifs_feed_aud ON notifications_feed(audience, audience_ref)",
-    "CREATE INDEX IF NOT EXISTS ix_notif_recips_actor ON notification_recipients(actor_key)",
-    "CREATE INDEX IF NOT EXISTS ix_notif_deliv_status ON notification_deliveries(status)",
-    "CREATE INDEX IF NOT EXISTS ix_notif_deliv_notif ON notification_deliveries(notification_id)",
-    "CREATE INDEX IF NOT EXISTS ix_contacts_ref ON contact_destinations(recipient_ref, channel)",
-    "CREATE INDEX IF NOT EXISTS ix_device_tokens_ref ON device_tokens(recipient_ref, active)",
-    "CREATE UNIQUE INDEX IF NOT EXISTS ix_user_accounts_username ON user_accounts(username)",
-    "CREATE UNIQUE INDEX IF NOT EXISTS ix_sessions_token ON sessions(token_hash)",
-    "CREATE INDEX IF NOT EXISTS ix_sessions_user ON sessions(user_id)",
-]
+    Version is the filename stem (e.g. ``001_initial``); statements are the
+    file split on ``;`` with line comments and blanks removed, so each can be
+    executed individually — portable across drivers that don't run multi-
+    statement strings.
+    """
+    out = []
+    for fname in sorted(os.listdir(_MIGRATIONS_DIR)):
+        if not fname.endswith(".sql"):
+            continue
+        version = fname[:-len(".sql")]
+        with open(os.path.join(_MIGRATIONS_DIR, fname), encoding="utf-8") as fh:
+            raw = fh.read()
+        # Drop whole-line comments first (a comment may itself contain a ';',
+        # so it must go before we split statements on ';'), then split.
+        body = "\n".join(ln for ln in raw.splitlines()
+                         if not ln.strip().startswith("--"))
+        statements = [s.strip() for s in body.split(";") if s.strip()]
+        out.append((version, statements))
+    return out
 
 
 def migrate(conn, dialect) -> None:
+    """Apply every pending migration in order, forward only.
+
+    ``schema_migrations`` is authoritative: a version already recorded there is
+    skipped, and a version is recorded only after all of its statements succeed
+    (so a partially-applied file simply re-runs next boot — safe, since the DDL
+    is idempotent). Nothing here drops or mutates existing data.
+    """
     cur = conn.cursor()
     cur.execute("CREATE TABLE IF NOT EXISTS schema_migrations "
                 "(version TEXT PRIMARY KEY, applied_at TEXT)")
-    cur.execute("CREATE TABLE IF NOT EXISTS counters "
-                "(prefix TEXT PRIMARY KEY, value INTEGER)")
-    for spec in SPECS.values():
-        cur.execute(_ddl(spec))
-    for ddl in _INDEXES:
-        cur.execute(ddl)
-    cur.execute(dialect.sql(
-        "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?) "
-        "ON CONFLICT(version) DO NOTHING"),
-        ("0001_initial", datetime(2026, 1, 1).isoformat()))
+    cur.execute("SELECT version FROM schema_migrations")
+    # Both sqlite3.Row and psycopg dict_row support key access (not positional).
+    applied = {row["version"] for row in cur.fetchall()}
+    for version, statements in _load_migrations():
+        if version in applied:
+            continue
+        for stmt in statements:
+            cur.execute(stmt)
+        cur.execute(dialect.sql(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)"),
+            (version, _utcnow().isoformat()))
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 class SqlStore:

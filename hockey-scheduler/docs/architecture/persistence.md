@@ -43,14 +43,33 @@ domain/service logic is otherwise unchanged.
 - Rows ↔ dataclasses via per-table column specs with converters (enum,
   datetime, bool, json). IDs stay the existing opaque strings (`game_1`, …);
   a `counters` table makes `next_id` durable across restarts.
-- `migrate()` creates the tables (`CREATE TABLE IF NOT EXISTS`) and records a
-  row in `schema_migrations`.
+
+## Migrations (#75)
+
+Schema changes are applied by a small forward-only runner in `migrate()`:
+
+- Migrations live as numbered SQL files under `store/migrations/`
+  (`001_initial.sql`, `002_sessions.sql`, …), applied in numeric order.
+- `schema_migrations(version, applied_at)` is **authoritative**: a version
+  already recorded there is skipped, and a version is recorded only after all
+  of its statements succeed. The runner never drops or rewrites data — it only
+  applies pending migrations.
+- The DDL is `CREATE … IF NOT EXISTS`, so adopting this system on a database
+  that predates it (all tables present, no per-migration rows) is safe: the
+  files re-run harmlessly and backfill the ledger.
+- The only destructive path is `reset_schema()` (drop + re-migrate), used by
+  the demo Reset and tests. It is **never** invoked in production — the
+  production boot preserves the existing database and only runs pending
+  migrations forward.
 
 ## Tables
 
 `leagues, seasons, divisions, clubs, teams, players, venues, rinks, ice_slots,
 games, game_roster_entries, game_availability, substitute_enrollments,
-audit_logs, notification_events, setup_audit_logs, counters, schema_migrations`.
+audit_logs, notification_events, setup_audit_logs, officials,
+official_assignments, game_results, notifications_feed,
+notification_recipients, notification_deliveries, contact_destinations,
+device_tokens, user_accounts, sessions, counters, schema_migrations`.
 
 ## Testing
 
@@ -64,5 +83,5 @@ audit_logs, notification_events, setup_audit_logs, counters, schema_migrations`.
 ## Out of scope (future)
 
 Connection pooling, async drivers, read replicas, multi-tenant row-level
-security (lands with auth/RBAC, #24), and online schema migrations beyond the
-initial create.
+security (lands with auth/RBAC, #24), and down/rollback migrations (the runner
+is forward-only by design).
