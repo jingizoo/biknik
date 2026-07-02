@@ -295,8 +295,12 @@ class Handler(BaseHTTPRequestHandler):
                 ],
             })
         if path == "/api/auth/accounts":
-            # The pickable, active accounts for the sign-in UI (#50/#67) —
-            # backed by real UserAccount rows now, not a static list.
+            # The pickable, active accounts for the demo sign-in UI (#50/#67).
+            # This is a demo login-picker convenience — in production it would
+            # enumerate real usernames/roles without auth, so it returns an
+            # empty list there (#68); the UI just shows a manual sign-in form.
+            if _app_mode() == "production":
+                return self._send_json({"accounts": []})
             rows = api.list_user_accounts().get("user_accounts", [])
             return self._send_json({"accounts": [
                 {"username": a["username"], "role": a["role"],

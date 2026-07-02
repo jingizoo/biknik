@@ -66,6 +66,16 @@ class ProductionModeTest(unittest.TestCase):
         _, body = self._req(c, "GET", "/api/auth/accounts")
         self.assertEqual(body["accounts"], [])
 
+    def test_auth_accounts_does_not_list_real_accounts_in_production(self):
+        # Even after an account exists, the unauthenticated picker must not
+        # enumerate real usernames/roles in production (#68 review).
+        srv.STATE.api.accounts.create_account(
+            "prod_admin_visible", "pw", Role.LEAGUE_ADMIN)
+        c = self._client()
+        status, body = self._req(c, "GET", "/api/auth/accounts")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["accounts"], [])
+
     def test_headerless_request_is_unauthorized_not_admin(self):
         c = self._client()
         status, body = self._req(c, "GET", "/api/notifications")
