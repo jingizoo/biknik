@@ -421,16 +421,25 @@ class ApiService:
         return False
 
     @staticmethod
-    def _actor_key(role: str, scope: dict) -> str:
-        """A stable per-actor identity for read state, derived from role/scope.
+    def _actor_key(role: str, scope: dict, user_id: Optional[str] = None) -> str:
+        """A stable per-actor identity for read state (#57/#69).
 
-        Matches the granularity of feed visibility while keeping distinct
-        actors apart. The key is role-qualified because a player session
-        carries both ``team_id`` and ``player_id``: without the role guard a
-        player and their coach would share the team bucket and one could mark
-        the other's copy read. Officials key by official id, coaches by team,
-        players by player id, everyone else by role.
+        A real signed-in account (``user_id`` set — always true once #68
+        production mode is in effect, since it has no other way to
+        authenticate) gets its own bucket: two different accounts with the
+        same role/scope — e.g. two officials, or a demo persona logged in
+        twice — never share read state.
+
+        Without a backing account (the X-Demo-Role/headerless demo-mode
+        fallback, which has no identity at all) we fall back to the coarser
+        role/scope-derived key from #57: officials by official id, coaches by
+        team, players by player id, everyone else by role. The role guard
+        there still matters — a player session carries both ``team_id`` and
+        ``player_id``, and without it a player and their coach would share
+        the team bucket.
         """
+        if user_id:
+            return "user:" + user_id
         scope = scope or {}
         if role == "official" and scope.get("official_id"):
             return "official:" + scope["official_id"]
@@ -451,9 +460,10 @@ class ApiService:
                 "assignment_id": n.assignment_id}
 
     @catch
-    def get_notifications(self, role: str, scope: dict) -> dict:
+    def get_notifications(self, role: str, scope: dict,
+                          user_id: Optional[str] = None) -> dict:
         scope = scope or {}
-        actor_key = self._actor_key(role, scope)
+        actor_key = self._actor_key(role, scope, user_id)
         read_ids = {r.notification_id
                     for r in self.store.recipients_for_actor(actor_key)}
         items = [n for n in self.store.all_notifications_feed()
@@ -475,20 +485,22 @@ class ApiService:
 
     @catch
     def mark_notification_read(self, notification_id: str, role: str,
-                               scope: dict) -> dict:
+                               scope: dict,
+                               user_id: Optional[str] = None) -> dict:
         scope = scope or {}
         n = self.store.get_notification_feed(notification_id)
         if n is None:
             raise NotFoundError("Notification not found.")
         if not self._notif_visible(n, role, scope):
             raise NotAuthorizedError("You cannot mark this notification read.")
-        self._mark_read(n, self._actor_key(role, scope))
+        self._mark_read(n, self._actor_key(role, scope, user_id))
         return self._notif_row(n, True)
 
     @catch
-    def mark_all_notifications_read(self, role: str, scope: dict) -> dict:
+    def mark_all_notifications_read(self, role: str, scope: dict,
+                                    user_id: Optional[str] = None) -> dict:
         scope = scope or {}
-        actor_key = self._actor_key(role, scope)
+        actor_key = self._actor_key(role, scope, user_id)
         count = 0
         for n in self.store.all_notifications_feed():
             if self._notif_visible(n, role, scope) and self._mark_read(n, actor_key):
