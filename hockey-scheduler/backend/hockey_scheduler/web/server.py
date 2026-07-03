@@ -10,6 +10,7 @@ substitute engine through the same :class:`ApiService` used by the tests.
 import json
 import os
 import re
+import ssl
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -26,6 +27,7 @@ from ..full_demo import build_full_demo_store
 from ..services import email_transport_from_env, push_transport_from_env
 from ..store import SqlStore, create_store
 from .auth import (
+    DEFAULT_TTL_SECONDS,
     DEMO_PASSWORD,
     DEMO_USERS,
     SESSION_COOKIE,
@@ -53,6 +55,10 @@ def _app_mode() -> str:
 
 # Sessions live outside DemoState so signing in survives a demo-data reset.
 SESSIONS = SessionManager()
+
+# Cookie lifetime mirrors the session TTL so the browser drops the cookie when
+# the server-side session would already be expired (#76).
+SESSION_MAX_AGE = DEFAULT_TTL_SECONDS
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 CONTENT_TYPES = {
@@ -177,6 +183,42 @@ class Handler(BaseHTTPRequestHandler):
             return None
         morsel = jar.get(name)
         return morsel.value if morsel else None
+
+    def _cookie_is_secure(self) -> bool:
+        """Whether the session cookie should carry the ``Secure`` flag (#76).
+
+        Secure in production (deployments are always HTTPS) and whenever the
+        request itself arrived over TLS — directly, or via a reverse proxy that
+        terminates TLS and forwards the original scheme in
+        ``X-Forwarded-Proto``. In the local/demo HTTP posture it is omitted so
+        the cookie is still accepted over plain http://localhost.
+        """
+        if _app_mode() == "production":
+            return True
+        # Proxy-forwarded scheme: X-Forwarded-Proto (de-facto) or RFC 7239
+        # Forwarded: proto=https. Take the first hop only.
+        xfp = (self.headers.get("X-Forwarded-Proto") or "").split(",")[0]
+        if xfp.strip().lower() == "https":
+            return True
+        fwd = (self.headers.get("Forwarded") or "").split(",")[0].lower()
+        if "proto=https" in fwd:
+            return True
+        # Direct TLS: the request arrived on an ssl-wrapped socket.
+        return isinstance(getattr(self, "connection", None), ssl.SSLSocket)
+
+    def _session_cookie(self, token: str, max_age: int) -> str:
+        """Build a session Set-Cookie value with consistent security attributes.
+
+        HttpOnly + SameSite=Lax always; Secure conditionally (see
+        ``_cookie_is_secure``). Used for both issuing and clearing the cookie so
+        the two always share the same attributes (a browser only replaces a
+        cookie when Path/Secure match).
+        """
+        parts = [f"{SESSION_COOKIE}={token}", "HttpOnly", "Path=/",
+                 "SameSite=Lax", f"Max-Age={max_age}"]
+        if self._cookie_is_secure():
+            parts.append("Secure")
+        return "; ".join(parts)
 
     def _resolve_role(self):
         """Resolve the acting identity. Returns (role, scope, user_id, err).
@@ -461,13 +503,12 @@ class Handler(BaseHTTPRequestHandler):
             token = SESSIONS.login(api.store, row["id"],
                                    user_agent=self.headers.get("User-Agent"))
             sess = SESSIONS.resolve(api.store, token)
-            cookie = (f"{SESSION_COOKIE}={token}; HttpOnly; Path=/; SameSite=Lax; "
-                      f"Max-Age={8 * 60 * 60}")
+            cookie = self._session_cookie(token, SESSION_MAX_AGE)
             return self._send_json({"user": user_view(sess, api.store)},
                                    extra_headers=[("Set-Cookie", cookie)])
         if path == "/api/auth/logout":
             SESSIONS.logout(api.store, self._cookie(SESSION_COOKIE))
-            expire = f"{SESSION_COOKIE}=; HttpOnly; Path=/; SameSite=Lax; Max-Age=0"
+            expire = self._session_cookie("", 0)
             return self._send_json({"ok": True},
                                    extra_headers=[("Set-Cookie", expire)])
 
@@ -512,8 +553,7 @@ class Handler(BaseHTTPRequestHandler):
                 token = SESSIONS.login(STATE.api.store, user_id,
                                        user_agent=self.headers.get("User-Agent"))
                 extra = [("Set-Cookie",
-                          f"{SESSION_COOKIE}={token}; HttpOnly; Path=/; "
-                          f"SameSite=Lax; Max-Age={8 * 60 * 60}")]
+                          self._session_cookie(token, SESSION_MAX_AGE))]
             return self._send_json({"ok": True}, extra_headers=extra)
 
         # Quick action: add an available 90-min game slot on a rink for the

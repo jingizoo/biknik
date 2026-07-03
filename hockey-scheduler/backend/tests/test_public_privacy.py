@@ -4,10 +4,9 @@ import threading
 import unittest
 import urllib.error
 import urllib.request
-from http.cookiejar import CookieJar
 from http.server import ThreadingHTTPServer
 
-from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
+from helpers import BACKEND, cookie_from_set_cookie  # noqa: F401  (sets up sys.path)
 
 from hockey_scheduler.web import server as srv
 
@@ -30,15 +29,16 @@ class _HttpBase(unittest.TestCase):
             return e.code, json.loads(e.read() or b"{}")
 
     def _login(self, username, password):
-        opener = urllib.request.build_opener(
-            urllib.request.HTTPCookieProcessor(CookieJar()))
+        """Log in and return the manual ``hs_sid=…`` cookie header. In
+        production the cookie is Secure (#76) and won't auto-replay over the
+        test's plain-HTTP loopback, so we send it explicitly on later GETs."""
         url = f"http://127.0.0.1:{self.port}/api/auth/login"
         data = json.dumps({"username": username, "password": password}).encode()
         req = urllib.request.Request(url, data=data, method="POST")
         req.add_header("Content-Type", "application/json")
-        with opener.open(req) as r:
-            r.read()
-        return opener
+        with urllib.request.urlopen(req) as r:
+            set_cookie = r.headers.get("Set-Cookie")
+        return cookie_from_set_cookie(set_cookie, srv.SESSION_COOKIE)
 
 
 class ProductionPublicPrivacyTest(_HttpBase):
@@ -90,13 +90,12 @@ class ProductionPublicPrivacyTest(_HttpBase):
             self.assertNotIn(name, blob)
 
     def test_signed_in_user_can_read_player_data(self):
-        c = self._login("privadmin", "pw")
-        # Reuse the opener's cookie jar for an authenticated GET.
+        cookie = self._login("privadmin", "pw")
+        self.assertIsNotNone(cookie)
         for sub in PLAYER_DATA_SUBS:
-            req = urllib.request.Request(
-                f"http://127.0.0.1:{self.port}/api/games/{self.game_id}/{sub}")
-            with c.open(req) as r:
-                self.assertEqual(r.status, 200, sub)
+            status, _ = self._get(f"/api/games/{self.game_id}/{sub}",
+                                  cookie=cookie)
+            self.assertEqual(status, 200, sub)
 
     def test_invalid_cookie_is_rejected_on_player_data(self):
         status, body = self._get(f"/api/games/{self.game_id}/lineups",

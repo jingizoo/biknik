@@ -2,12 +2,30 @@
 
 import sys
 from datetime import datetime, timedelta, timezone
+from http.cookies import SimpleCookie
 from pathlib import Path
 
 # Make ``hockey_scheduler`` importable when tests run from any directory.
 BACKEND = Path(__file__).resolve().parents[1]
 if str(BACKEND) not in sys.path:
     sys.path.insert(0, str(BACKEND))
+
+
+def cookie_from_set_cookie(set_cookie_header, name):
+    """Extract a single cookie's ``name=value`` from a Set-Cookie header.
+
+    Used by production HTTP tests to propagate the session cookie manually: in
+    production the cookie is issued with ``Secure`` (#76), which a real client
+    (and Python's CookieJar) will not send back over plain-HTTP loopback. The
+    server issued it correctly — the test just replays it explicitly so we can
+    exercise authenticated behavior without pretending the transport is HTTPS.
+    """
+    if not set_cookie_header:
+        return None
+    jar = SimpleCookie()
+    jar.load(set_cookie_header)
+    morsel = jar.get(name)
+    return f"{name}={morsel.value}" if morsel else None
 
 from hockey_scheduler.domain import Game, Player, Position, Team  # noqa: E402
 from hockey_scheduler.services import RosterService  # noqa: E402

@@ -5,10 +5,9 @@ import threading
 import unittest
 import urllib.error
 import urllib.request
-from http.cookiejar import CookieJar
 from http.server import ThreadingHTTPServer
 
-from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
+from helpers import BACKEND, cookie_from_set_cookie  # noqa: F401  (sets up sys.path)
 
 from hockey_scheduler.api import ApiService
 from hockey_scheduler.bootstrap import bootstrap_admin, bootstrap_admin_from_env
@@ -83,13 +82,16 @@ class ProductionBootstrapHttpTest(unittest.TestCase):
         srv.STATE.reset()
 
     def _client(self):
-        return urllib.request.build_opener(
-            urllib.request.HTTPCookieProcessor(CookieJar()))
+        # Plain opener, no cookie jar: production cookies are Secure (#76) and
+        # won't auto-replay over plain-HTTP loopback, so propagate manually.
+        return urllib.request.build_opener()
 
-    def _req(self, opener, method, path, body=None):
+    def _req(self, opener, method, path, body=None, cookie=None):
         url = f"http://127.0.0.1:{self.port}{path}"
         data = json.dumps(body).encode() if body is not None else None
-        req = urllib.request.Request(url, data=data, method=method)
+        headers = {"Cookie": cookie} if cookie else {}
+        req = urllib.request.Request(url, data=data, method=method,
+                                     headers=headers)
         if data is not None:
             req.add_header("Content-Type", "application/json")
         try:
@@ -98,17 +100,31 @@ class ProductionBootstrapHttpTest(unittest.TestCase):
         except urllib.error.HTTPError as e:
             return e.code, json.loads(e.read() or b"{}")
 
+    def _login(self, opener, username, password):
+        url = f"http://127.0.0.1:{self.port}/api/auth/login"
+        data = json.dumps({"username": username, "password": password}).encode()
+        req = urllib.request.Request(url, data=data, method="POST")
+        req.add_header("Content-Type", "application/json")
+        try:
+            with opener.open(req) as r:
+                body = json.loads(r.read() or b"{}")
+                cookie = cookie_from_set_cookie(
+                    r.headers.get("Set-Cookie"), srv.SESSION_COOKIE)
+                return r.status, body, cookie
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read() or b"{}"), None
+
     def test_account_picker_is_empty_but_bootstrap_admin_can_log_in(self):
         c = self._client()
         # Production still hides the picker (no username/role enumeration, #68).
         _, accts = self._req(c, "GET", "/api/auth/accounts")
         self.assertEqual(accts["accounts"], [])
         # But the bootstrapped admin can sign in via the manual form path.
-        status, body = self._req(c, "POST", "/api/auth/login",
-                                 {"username": "prodroot", "password": "prod-pass"})
+        status, body, cookie = self._login(c, "prodroot", "prod-pass")
         self.assertEqual(status, 200)
         self.assertEqual(body["user"]["role"], "league_admin")
-        status, me = self._req(c, "GET", "/api/auth/me")
+        self.assertIsNotNone(cookie)
+        status, me = self._req(c, "GET", "/api/auth/me", cookie=cookie)
         self.assertEqual(me["user"]["username"], "prodroot")
 
     def test_wrong_bootstrap_password_is_rejected(self):
