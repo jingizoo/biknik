@@ -197,6 +197,23 @@ class ContactDestination:
 
 
 @dataclass
+class NotificationPreference:
+    """A recipient's opt-out for a delivery channel (#81).
+
+    Gates whether a delivery row is created for ``(recipient_ref, channel)``
+    when a notification is enqueued: an ``enabled=False`` row suppresses that
+    channel. Absent rows mean the channel is on by default (existing behavior).
+    The in-app feed is always delivered and is not represented here. ``digest``
+    is a placeholder for a future batching preference — unused this slice.
+    """
+    id: str
+    recipient_ref: str
+    channel: NotificationChannel
+    enabled: bool = True
+    digest: Optional[str] = None
+
+
+@dataclass
 class DeviceToken:
     """A registered push device token for a recipient (#65).
 

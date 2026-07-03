@@ -453,6 +453,11 @@ select.player-picker {
 .pill.revoked { background: #ffe5e3; color: #c0271b; }
 .pill.expired { background: #ececf1; color: #6b6b70; }
 
+/* Notification preferences (#81). */
+.pref-card .pref-toggles { display: flex; gap: 18px; flex-wrap: wrap; }
+.pref-toggle { display: inline-flex; align-items: center; gap: 7px; font-size: 14px; cursor: pointer; }
+.pref-toggle input { width: 16px; height: 16px; }
+
 /* Users / sessions admin (#78). */
 p.muted { color: var(--muted); font-size: 13px; }
 .row-list { display: flex; flex-direction: column; gap: 6px; }

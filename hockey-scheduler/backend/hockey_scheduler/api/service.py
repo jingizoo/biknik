@@ -18,6 +18,7 @@ from ..domain import (
     DeviceToken,
     IceSlotType,
     NotificationChannel,
+    NotificationPreference,
     NotificationRecipient,
     OfficialRole,
     Position,
@@ -653,6 +654,64 @@ class ApiService:
             channel=ch, destination=destination, label=label)
         self.store.add_contact_destination(c)
         return self._contact_row(c)
+
+    # -- notification preferences (#81) ------------------------------------
+    # The delivery channels a recipient can opt out of (in-app feed is always on).
+    PREF_CHANNELS = (NotificationChannel.EMAIL, NotificationChannel.PUSH)
+
+    @catch
+    def get_notification_preferences(self, recipient_ref: str) -> dict:
+        """A recipient's per-channel preferences, with defaults filled in for
+        any channel that has no stored row (enabled)."""
+        if not recipient_ref:
+            raise ValidationError("A recipient_ref is required.")
+        stored = {p.channel: p
+                  for p in self.store.preferences_for_recipient(recipient_ref)}
+        prefs = []
+        for ch in self.PREF_CHANNELS:
+            p = stored.get(ch)
+            prefs.append({"channel": ch.value,
+                          "enabled": p.enabled if p else True,
+                          "digest": p.digest if p else None})
+        return {"recipient_ref": recipient_ref, "preferences": prefs}
+
+    @catch
+    def set_notification_preference(self, recipient_ref: str, channel: str,
+                                    enabled: bool, digest=None,
+                                    actor_id=None) -> dict:
+        """Enable/disable a delivery channel for a recipient (#81)."""
+        if not recipient_ref:
+            raise ValidationError("A recipient_ref is required.")
+        try:
+            ch = NotificationChannel(channel)
+        except ValueError:
+            raise ValidationError(f"Unknown channel '{channel}'.")
+        if ch not in self.PREF_CHANNELS:
+            raise ValidationError(f"Channel '{channel}' is not configurable.")
+        existing = self.store.get_notification_preference(recipient_ref, ch)
+        prior_enabled = existing.enabled if existing is not None else None
+        if existing is not None:
+            existing.enabled = bool(enabled)
+            if digest is not None:
+                existing.digest = digest
+            self.store.save_notification_preference(existing)
+            pref = existing
+        else:
+            pref = NotificationPreference(
+                id=self.store.next_id("notif_pref"), recipient_ref=recipient_ref,
+                channel=ch, enabled=bool(enabled), digest=digest)
+            self.store.save_notification_preference(pref)
+        # Muting/unmuting a delivery channel is a state change that must be
+        # auditable (#81): who changed which recipient's channel, and from
+        # what prior value. No secret/token material is involved.
+        self.setup._audit(
+            "notification_preference_set", "notification_preference", pref.id,
+            actor_id,
+            {"recipient_ref": recipient_ref, "channel": ch.value,
+             "enabled": pref.enabled, "prior_enabled": prior_enabled,
+             "digest": pref.digest})
+        return {"recipient_ref": recipient_ref, "channel": ch.value,
+                "enabled": pref.enabled, "digest": pref.digest}
 
     # -- device token registry (#65) ---------------------------------------
     @staticmethod

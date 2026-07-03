@@ -94,11 +94,28 @@ def resolve_destination(store, recipient: str, channel) -> str:
     return destination_for(recipient, channel)
 
 
+def channel_enabled(store, recipient: str, channel) -> bool:
+    """Whether ``recipient`` accepts deliveries on ``channel`` (#81).
+
+    A stored preference with ``enabled=False`` opts the channel out; absent
+    preferences mean the channel is on (existing default behavior). The in-app
+    feed is always delivered and is not gated here.
+    """
+    pref = store.get_notification_preference(recipient, channel)
+    return True if pref is None else pref.enabled
+
+
 def enqueue(store, notification, channels=DEFAULT_CHANNELS):
-    """Create the pending delivery rows for a freshly emitted notification."""
+    """Create the pending delivery rows for a freshly emitted notification.
+
+    A channel the recipient has disabled in their preferences (#81) is skipped
+    — no delivery row is created for it — so the resolver honors opt-outs.
+    """
     recipient = recipient_ref(notification)
     created = []
     for channel in channels:
+        if not channel_enabled(store, recipient, channel):
+            continue
         d = NotificationDelivery(
             id=store.next_id("notif_delivery"),
             notification_id=notification.id,

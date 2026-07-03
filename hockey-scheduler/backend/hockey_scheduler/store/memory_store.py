@@ -26,6 +26,7 @@ from ..domain import (
     Notification,
     NotificationDelivery,
     NotificationEvent,
+    NotificationPreference,
     NotificationRecipient,
     Official,
     OfficialAssignment,
@@ -69,6 +70,7 @@ class InMemoryStore:
         self.notif_deliveries: Dict[str, NotificationDelivery] = {}
         self.contact_destinations: Dict[str, ContactDestination] = {}
         self.device_tokens: Dict[str, DeviceToken] = {}
+        self.notification_preferences: Dict[str, NotificationPreference] = {}
         self.user_accounts: Dict[str, UserAccount] = {}
         self.sessions: Dict[str, Session] = {}
         self.setup_audit: List[SetupAuditLog] = []
@@ -406,6 +408,24 @@ class InMemoryStore:
 
     def all_device_tokens(self) -> List[DeviceToken]:
         return list(self.device_tokens.values())
+
+    # -- notification preferences (#81) ------------------------------------
+    def save_notification_preference(
+            self, p: NotificationPreference) -> NotificationPreference:
+        self.notification_preferences[p.id] = p
+        return p
+
+    def get_notification_preference(
+            self, recipient_ref: str, channel) -> Optional[NotificationPreference]:
+        for p in self.notification_preferences.values():
+            if p.recipient_ref == recipient_ref and p.channel == channel:
+                return p
+        return None
+
+    def preferences_for_recipient(
+            self, recipient_ref: str) -> List[NotificationPreference]:
+        return [p for p in self.notification_preferences.values()
+                if p.recipient_ref == recipient_ref]
 
     # -- user accounts (#67) -------------------------------------------------
     def add_user_account(self, a: UserAccount) -> UserAccount:

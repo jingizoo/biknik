@@ -37,6 +37,7 @@ from ..domain import (
     NotificationDelivery,
     NotificationEvent,
     NotificationKind,
+    NotificationPreference,
     NotificationRecipient,
     Official,
     OfficialAssignment,
@@ -176,6 +177,9 @@ SPECS = {
     ContactDestination: Spec(ContactDestination, "contact_destinations",
                              {"channel": _enum(NotificationChannel)}),
     DeviceToken: Spec(DeviceToken, "device_tokens", {"active": _bool()}),
+    NotificationPreference: Spec(
+        NotificationPreference, "notification_preferences",
+        {"channel": _enum(NotificationChannel), "enabled": _bool()}),
     UserAccount: Spec(UserAccount, "user_accounts",
                       {"role": _enum(Role), "created_at": _dt(),
                        "scope": _jsonc(), "active": _bool()}),
@@ -547,6 +551,18 @@ class SqlStore:
         return rows[0] if rows else None
     def all_device_tokens(self):
         return self._query(DeviceToken, order="id")
+
+    # -- notification preferences (#81) ------------------------------------
+    def save_notification_preference(self, p):
+        return self._upsert(p)
+    def get_notification_preference(self, recipient_ref, channel):
+        rows = self._query(
+            NotificationPreference, "recipient_ref = ? AND channel = ?",
+            (recipient_ref, channel.value), order="id")
+        return rows[0] if rows else None
+    def preferences_for_recipient(self, recipient_ref):
+        return self._query(NotificationPreference, "recipient_ref = ?",
+                           (recipient_ref,), order="id")
 
     # -- user accounts (#67) -------------------------------------------------
     def add_user_account(self, a): return self._insert(a)
