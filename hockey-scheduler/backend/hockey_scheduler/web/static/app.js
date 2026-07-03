@@ -1972,6 +1972,9 @@ document.getElementById("reset-btn").onclick = async () => {
 const signoutBtn = document.getElementById("signout-btn");
 if (signoutBtn) signoutBtn.onclick = async () => {
   await post("/api/auth/logout", {});
+  // Remember the explicit sign-out so a refresh does NOT silently re-run the
+  // zero-friction demo auto-login — logout must stick until the user signs in.
+  try { localStorage.setItem("hs_signed_out", "1"); } catch (_) {}
   setUser(null); toast = "";
   renderRoleSwitch();
   showLogin("You've been signed out.");
@@ -2057,6 +2060,9 @@ async function signIn(username, password) {
     return false;
   }
   setUser(r.user); toast = "";
+  // An explicit sign-in clears the sticky sign-out so the demo auto-login can
+  // resume on future fresh visits.
+  try { localStorage.removeItem("hs_signed_out"); } catch (_) {}
   drawer = null; movingGameId = null; conflict = null;
   hideLogin();
   renderRoleSwitch(); render();
@@ -2105,6 +2111,13 @@ function renderEnvChips() {
     + deliv("push", s.push_mode, "live");
 }
 
+// Whether the user explicitly signed out on this device — suppresses the
+// zero-friction demo auto-login until the next explicit sign-in.
+function signedOutSticky() {
+  try { return localStorage.getItem("hs_signed_out") === "1"; }
+  catch (_) { return false; }
+}
+
 async function bootstrap() {
   try {
     const [rolesRes, acctRes, statusRes, meResp] = await Promise.all([
@@ -2119,15 +2132,17 @@ async function bootstrap() {
     const meRes = await meResp.json();
     if (meRes && meRes.user) {
       setUser(meRes.user);
-    } else if (meResp.status !== 401 && accounts.length) {
-      // Demo mode, fresh visit (no session, personas available): keep the
-      // zero-friction auto-login as League Admin.
+    } else if (meResp.status !== 401 && accounts.length && !signedOutSticky()) {
+      // Demo mode, fresh visit (no session, personas available, and the user
+      // has not explicitly signed out): keep the zero-friction auto-login as
+      // League Admin.
       const r = await post("/api/auth/login",
         { username: "admin", password: DEMO_PASSWORD });
       if (r && !r.error) setUser(r.user); else setUser(null);
     } else {
-      // Production (empty picker) or an expired/invalid session (401): no
-      // silent login — show the sign-in screen (#71).
+      // Production (empty picker), an expired/invalid session (401), or an
+      // explicit prior sign-out: no silent login — show the sign-in screen
+      // (#71) so logout is meaningful across a refresh.
       setUser(null);
     }
   } catch (_) { roleCatalog = []; accounts = []; setUser(null); }
