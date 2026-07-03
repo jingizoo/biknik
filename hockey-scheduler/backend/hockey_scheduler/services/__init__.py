@@ -1,4 +1,11 @@
 from .account_service import AccountService
+from .calendar import (
+    ACTOR_TYPES,
+    build_ics,
+    games_for_actor,
+    hash_feed_token,
+    new_feed_token,
+)
 from .delivery import (
     DeliveryLoop,
     DeliveryWorker,
@@ -31,6 +38,8 @@ from .setup_service import SetupService
 
 __all__ = ["RosterService", "SetupService", "DeliveryWorker", "DeliveryLoop",
            "delivery_loop_from_env", "enqueue",
+           "ACTOR_TYPES", "build_ics", "games_for_actor", "hash_feed_token",
+           "new_feed_token",
            "mock_sender", "make_delivery_sender", "recipient_ref",
            "destination_for", "resolve_destination", "EmailTransport",
            "DryRunEmailTransport", "SmtpEmailTransport",

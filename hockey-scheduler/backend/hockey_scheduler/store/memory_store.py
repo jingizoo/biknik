@@ -12,6 +12,7 @@ from typing import Dict, List, Optional
 
 from ..domain import (
     AuditLog,
+    CalendarFeedToken,
     Club,
     Division,
     Game,
@@ -71,6 +72,7 @@ class InMemoryStore:
         self.contact_destinations: Dict[str, ContactDestination] = {}
         self.device_tokens: Dict[str, DeviceToken] = {}
         self.notification_preferences: Dict[str, NotificationPreference] = {}
+        self.calendar_feed_tokens: Dict[str, CalendarFeedToken] = {}
         self.user_accounts: Dict[str, UserAccount] = {}
         self.sessions: Dict[str, Session] = {}
         self.setup_audit: List[SetupAuditLog] = []
@@ -408,6 +410,30 @@ class InMemoryStore:
 
     def all_device_tokens(self) -> List[DeviceToken]:
         return list(self.device_tokens.values())
+
+    # -- calendar feed tokens (#82) ----------------------------------------
+    def add_calendar_feed_token(self, t: CalendarFeedToken) -> CalendarFeedToken:
+        self.calendar_feed_tokens[t.id] = t
+        return t
+
+    def save_calendar_feed_token(self, t: CalendarFeedToken) -> CalendarFeedToken:
+        self.calendar_feed_tokens[t.id] = t
+        return t
+
+    def get_calendar_feed_token(self, token_id: str) -> Optional[CalendarFeedToken]:
+        return self.calendar_feed_tokens.get(token_id)
+
+    def get_calendar_feed_token_by_hash(
+            self, token_hash: str) -> Optional[CalendarFeedToken]:
+        for t in self.calendar_feed_tokens.values():
+            if t.token_hash == token_hash:
+                return t
+        return None
+
+    def calendar_feed_tokens_for(
+            self, actor_type: str, actor_ref: str) -> List[CalendarFeedToken]:
+        return [t for t in self.calendar_feed_tokens.values()
+                if t.actor_type == actor_type and t.actor_ref == actor_ref]
 
     # -- notification preferences (#81) ------------------------------------
     def save_notification_preference(
