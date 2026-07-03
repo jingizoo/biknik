@@ -189,9 +189,21 @@ class DemoModeIsTheDefaultTest(unittest.TestCase):
         self.assertEqual(roles, {"league_admin", "arena_manager", "coach",
                                  "player", "official", "viewer"})
 
-    def test_headerless_request_still_defaults_to_admin(self):
+    def test_headerless_request_is_signed_out(self):
+        # The headerless League Admin fallback is no longer the default: a
+        # cookieless request with no X-Demo-Role is signed out (401), so logout
+        # is meaningful and cookieless callers are not silently admin.
         status, body = self._get("/api/notifications")
-        self.assertEqual(status, 200)
+        self.assertEqual(status, 401)
+        self.assertEqual(body["error"]["code"], "unauthorized")
+
+    def test_headerless_admin_restored_by_opt_in_env(self):
+        os.environ["DEMO_HEADERLESS_ADMIN"] = "1"
+        try:
+            status, _ = self._get("/api/notifications")
+            self.assertEqual(status, 200)  # escape hatch restores old behavior
+        finally:
+            os.environ.pop("DEMO_HEADERLESS_ADMIN", None)
 
     def test_x_demo_role_header_still_works(self):
         status, _ = self._get("/api/notifications",
@@ -199,10 +211,11 @@ class DemoModeIsTheDefaultTest(unittest.TestCase):
         self.assertEqual(status, 200)
 
     def test_explicit_demo_value_behaves_the_same_as_unset(self):
+        # demo behaves like unset: a headerless request is signed out in both.
         os.environ["APP_MODE"] = "demo"
         try:
             status, body = self._get("/api/notifications")
-            self.assertEqual(status, 200)
+            self.assertEqual(status, 401)
         finally:
             os.environ.pop("APP_MODE", None)
 

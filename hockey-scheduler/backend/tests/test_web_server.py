@@ -11,10 +11,17 @@ from hockey_scheduler.web import server as web
 
 
 def _request(method, path, body=None):
-    """Return (status_code, parsed_json) for a request to the test server."""
+    """Return (status_code, parsed_json) for a request to the test server.
+
+    Acts as League Admin via the explicit X-Demo-Role dev header. The old
+    headerless admin fallback is now opt-in (DEMO_HEADERLESS_ADMIN), so these
+    web-server plumbing tests declare their role explicitly rather than relying
+    on an implicit signed-in identity.
+    """
     url = f"http://{HOST}:{PORT}{path}"
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(url, data=data, method=method)
+    req.add_header("X-Demo-Role", "league_admin")
     if data is not None:
         req.add_header("Content-Type", "application/json")
     try:

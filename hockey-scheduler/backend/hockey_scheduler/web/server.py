@@ -273,8 +273,10 @@ class Handler(BaseHTTPRequestHandler):
         """Resolve the acting identity. Returns (role, scope, user_id, err).
 
         Demo mode (default): a valid session cookie is authoritative, else the
-        X-Demo-Role dev fallback (invalid → 403, no scope), else League Admin
-        (no auth) for convenience. A *present* session cookie that is
+        X-Demo-Role dev fallback (invalid → 403, no scope), else signed out
+        (401). The old headerless League Admin convenience is now opt-in via
+        DEMO_HEADERLESS_ADMIN=1 so that logout is meaningful and cookieless
+        callers are not silently admin. A *present* session cookie that is
         invalid/expired is rejected (401) rather than silently downgraded.
 
         Production mode (APP_MODE=production, #68): the session cookie is
@@ -302,7 +304,17 @@ class Handler(BaseHTTPRequestHandler):
                 "message": "Sign in required."}})
         raw_role = self.headers.get(ROLE_HEADER)
         if raw_role is None or raw_role == "":
-            return Role.LEAGUE_ADMIN, {}, None, None
+            # No session and no explicit X-Demo-Role. The old headerless League
+            # Admin convenience is a footgun: it makes logout meaningless (a
+            # cookieless request silently becomes admin) and hides missing auth
+            # in tests. It is now opt-in via DEMO_HEADERLESS_ADMIN=1; otherwise
+            # a cookieless request is simply signed out (401), the same posture
+            # as production minus the explicit dev-role escape hatch below.
+            if os.environ.get("DEMO_HEADERLESS_ADMIN") == "1":
+                return Role.LEAGUE_ADMIN, {}, None, None
+            return None, None, None, (401, {"error": {
+                "code": "unauthorized",
+                "message": "Sign in required."}})
         try:
             return Role(raw_role), {}, None, None
         except ValueError:

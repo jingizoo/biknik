@@ -158,7 +158,8 @@ class ProductionPublicPrivacyTest(_HttpBase):
 
 
 class DemoPublicPrivacyTest(_HttpBase):
-    """Demo mode keeps the headerless-operator convenience for player data."""
+    """Demo mode exposes player data to an authenticated operator; a cookieless
+    request is signed out (the headerless-admin fallback is now opt-in)."""
 
     @classmethod
     def setUpClass(cls):
@@ -174,12 +175,22 @@ class DemoPublicPrivacyTest(_HttpBase):
         cls.httpd.shutdown()
         cls.thread.join(timeout=5)
 
-    def test_headerless_demo_still_reads_player_data(self):
-        # Demo's headerless fallback is the operator, so lineups load (no
-        # regression for the demo SPA / mobile preview).
+    def test_demo_operator_reads_player_data(self):
+        # Demo exposes player data (lineups/roster) to an authenticated
+        # operator, unlike production which also requires auth. The headerless
+        # fallback is gone, so the demo SPA/mobile preview signs in first.
+        cookie = self._login("admin", "demo")
+        for sub in PLAYER_DATA_SUBS:
+            status, _ = self._get(f"/api/games/{self.game_id}/{sub}",
+                                  cookie=cookie)
+            self.assertEqual(status, 200, sub)
+
+    def test_headerless_demo_player_data_now_signed_out(self):
+        # A cookieless demo request no longer silently becomes the operator:
+        # player data requires a session.
         for sub in PLAYER_DATA_SUBS:
             status, _ = self._get(f"/api/games/{self.game_id}/{sub}")
-            self.assertEqual(status, 200, sub)
+            self.assertEqual(status, 401, sub)
 
     def test_invalid_cookie_still_rejected_in_demo(self):
         status, _ = self._get(f"/api/games/{self.game_id}/roster",
