@@ -696,6 +696,8 @@ button.act.danger { background: #ffe5e3; color: #c0271b; }
 .dq-stat.pend .dq-n { color: var(--orange); }
 .dq-stat.sent .dq-n { color: var(--green); }
 .dq-stat.fail .dq-n { color: var(--red); }
+.dq-stat.dead .dq-n { color: var(--red); }
+.dq-stat.ign .dq-n { color: var(--muted); }
 .dq-stat.chan .dq-n { color: var(--muted); }
 .dq-actions { display: flex; align-items: center; gap: 12px; margin: 0 4px 14px; }
 .dq-actions .act[disabled] { opacity: .45; pointer-events: none; }

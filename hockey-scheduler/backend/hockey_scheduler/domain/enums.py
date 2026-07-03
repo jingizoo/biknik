@@ -191,3 +191,5 @@ class DeliveryStatus(str, Enum):
     PENDING = "pending"  # queued, not yet attempted (or awaiting retry)
     SENT = "sent"        # delivered by the (mock) sender
     FAILED = "failed"    # last attempt failed; retried until attempts exhausted
+    DEAD_LETTERED = "dead_lettered"  # attempts exhausted; parked for operator (#80)
+    IGNORED = "ignored"  # operator marked it as won't-deliver (#80)

@@ -165,9 +165,10 @@ class DeliveryWorker:
         """Attempt every deliverable row once; return a run summary.
 
         Deliverable = still ``pending``, or ``failed`` with attempts left.
-        A row that fails its final attempt stays ``failed`` and is not picked
-        up again. ``limit`` caps how many rows are processed in one call (the
-        worker loop's batch size, #79); ``None`` processes all of them.
+        A row that fails its final attempt is moved to ``dead_lettered`` and is
+        not picked up again until an operator retries it (#80). ``limit`` caps
+        how many rows are processed in one call (the worker loop's batch size,
+        #79); ``None`` processes all of them.
 
         Serialized by ``self._process_lock`` so concurrent callers (manual
         drain + background loop) drain the queue one batch at a time rather
@@ -177,7 +178,7 @@ class DeliveryWorker:
             return self._process_pending_locked(limit)
 
     def _process_pending_locked(self, limit=None) -> dict:
-        processed = sent = failed = 0
+        processed = sent = failed = dead_lettered = 0
         rows = self.store.pending_deliveries(self.max_attempts)
         if limit is not None:
             rows = rows[:limit]
@@ -190,21 +191,33 @@ class DeliveryWorker:
             if d.recipient_ref:
                 d.destination = resolve_destination(
                     self.store, d.recipient_ref, d.channel)
+            now = self.clock()
             d.attempts += 1
+            d.last_attempt_at = now
             try:
                 self.sender(d, notification)
             except Exception as exc:  # a mock/real transport failure
-                d.status = DeliveryStatus.FAILED
                 d.last_error = str(exc) or exc.__class__.__name__
+                if d.attempts >= self.max_attempts:
+                    # Attempt budget exhausted: park it for the operator (#80).
+                    d.status = DeliveryStatus.DEAD_LETTERED
+                    d.dead_lettered_at = now
+                    d.next_attempt_at = None
+                    dead_lettered += 1
+                else:
+                    d.status = DeliveryStatus.FAILED
+                    d.next_attempt_at = now  # eligible immediately in this slice
                 failed += 1
             else:
                 d.status = DeliveryStatus.SENT
-                d.sent_at = self.clock()
+                d.sent_at = now
                 d.last_error = None
+                d.next_attempt_at = None
                 sent += 1
             self.store.save_notification_delivery(d)
             processed += 1
-        return {"processed": processed, "sent": sent, "failed": failed}
+        return {"processed": processed, "sent": sent, "failed": failed,
+                "dead_lettered": dead_lettered}
 
 
 class DeliveryLoop:

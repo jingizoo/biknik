@@ -885,7 +885,8 @@ function renderNotifications() {
 
 /* ---------- Delivery admin: contacts + queue monitor (#61) ---------- */
 const CHAN_ICON = { email: "✉️", push: "📲" };
-const DELIV_BADGE = { pending: "gray", sent: "green", failed: "red" };
+const DELIV_BADGE = { pending: "gray", sent: "green", failed: "red",
+  dead_lettered: "red", ignored: "gray" };
 
 function recipientOptions(ov) {
   // Quick-pick suggestions for the recipient_ref field; manual entry still wins.
@@ -974,6 +975,8 @@ function renderDeliveryMonitor() {
     ${stat("Pending", st.pending, "pend")}
     ${stat("Sent", st.sent, "sent")}
     ${stat("Failed", st.failed, "fail")}
+    ${stat("Dead-letter", st.dead_lettered, "dead")}
+    ${stat("Ignored", st.ignored, "ign")}
     ${stat("Email", ch.email, "chan")}
     ${stat("Push", ch.push, "chan")}</div>`;
   const pending = st.pending || 0;
@@ -1001,7 +1004,34 @@ function renderDeliveryMonitor() {
           <th>Status</th><th>Att</th><th>Last error</th></tr></thead>
         <tbody>${rows}</tbody></table></div>`
     : "";
-  return `<div class="section-title">Delivery queue</div>${stats}${action}${table}`;
+  return `<div class="section-title">Delivery queue</div>${stats}${action}${table}`
+    + renderDeadLetterPanel(ov);
+}
+
+/* Dead-letter operations (#80): parked/failed rows with retry / ignore. */
+function renderDeadLetterPanel(ov) {
+  const stuck = (ov.deliveries || []).filter(
+    (d) => d.status === "dead_lettered" || d.status === "failed" || d.status === "ignored");
+  if (!stuck.length) return "";
+  const rows = stuck.map((d) => `
+    <tr>
+      <td>${CHAN_ICON[d.channel] || ""} ${esc(d.channel)}</td>
+      <td class="cd-ref">${esc(d.recipient_ref || "")}</td>
+      <td><span class="badge ${DELIV_BADGE[d.status] || "gray"}">${esc(d.status)}</span></td>
+      <td class="dq-att">${d.attempts}</td>
+      <td class="dq-err">${esc(d.last_error || "")}</td>
+      <td class="dq-ops">
+        ${d.status === "ignored" ? "" :
+          `<button class="act ghost" data-delivery-retry="${esc(d.id)}">Retry</button>`}
+        ${d.status === "ignored" ? "" :
+          `<button class="act ghost" data-delivery-ignore="${esc(d.id)}">Ignore</button>`}
+      </td>
+    </tr>`).join("");
+  return `<div class="section-title">Failed &amp; dead-letter</div>
+    <div class="card"><table class="cd-table dq-table">
+      <thead><tr><th>Channel</th><th>Recipient</th><th>Status</th>
+        <th>Att</th><th>Last error</th><th>Actions</th></tr></thead>
+      <tbody>${rows}</tbody></table></div>`;
 }
 
 function renderDeviceTokensPanel(ov) {
@@ -1675,9 +1705,21 @@ async function render() {
   if (procBtn) procBtn.onclick = async () => {
     const res = await post("/api/notifications/deliveries/process", {});
     if (res && !res.error) toast = `Processed ${res.processed} · sent ${res.sent}` +
-      (res.failed ? ` · failed ${res.failed}` : "");
+      (res.failed ? ` · failed ${res.failed}` : "") +
+      (res.dead_lettered ? ` · dead-lettered ${res.dead_lettered}` : "");
     await render();
   };
+  // Dead-letter operations (#80): requeue or ignore a stuck delivery.
+  c.querySelectorAll("[data-delivery-retry]").forEach((b) => b.onclick = async () => {
+    toast = "";
+    await post(`/api/notifications/deliveries/${b.dataset.deliveryRetry}/retry`, {});
+    await render();
+  });
+  c.querySelectorAll("[data-delivery-ignore]").forEach((b) => b.onclick = async () => {
+    toast = "";
+    await post(`/api/notifications/deliveries/${b.dataset.deliveryIgnore}/ignore`, {});
+    await render();
+  });
   // Device tokens (#65): quick-pick, register, activate/deactivate.
   const tokenPick = c.querySelector("#token-pick");
   if (tokenPick) tokenPick.onchange = (e) => {

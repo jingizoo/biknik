@@ -598,6 +598,14 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/notifications/deliveries/process":
             return self._send_api(api.process_notification_deliveries())
 
+        # Dead-letter operations (#80): requeue or permanently ignore one row.
+        dr = re.match(r"^/api/notifications/deliveries/([^/]+)/retry$", path)
+        if dr:
+            return self._send_api(api.retry_notification_delivery(dr.group(1)))
+        di = re.match(r"^/api/notifications/deliveries/([^/]+)/ignore$", path)
+        if di:
+            return self._send_api(api.ignore_notification_delivery(di.group(1)))
+
         # Contact registry: register/update a real destination (#60).
         if path == "/api/notifications/contacts":
             return self._send_api(api.set_contact_destination(

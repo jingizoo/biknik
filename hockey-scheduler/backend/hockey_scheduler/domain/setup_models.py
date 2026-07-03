@@ -172,6 +172,11 @@ class NotificationDelivery:
     sent_at: Optional[datetime] = None
     recipient_ref: Optional[str] = None
     destination: Optional[str] = None
+    # Dead-letter operations (#80): when the last attempt happened, when the
+    # next retry is eligible, and when attempts were exhausted (parked).
+    last_attempt_at: Optional[datetime] = None
+    next_attempt_at: Optional[datetime] = None
+    dead_lettered_at: Optional[datetime] = None
 
 
 @dataclass

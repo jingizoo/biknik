@@ -14,6 +14,7 @@ from typing import Callable, List, Optional
 from ..domain import (
     AvailabilityStatus,
     ContactDestination,
+    DeliveryStatus,
     DeviceToken,
     IceSlotType,
     NotificationChannel,
@@ -525,11 +526,18 @@ class ApiService:
         return dest.endswith(".invalid")
 
     @staticmethod
+    def _iso(dt):
+        return dt.isoformat() if dt else None
+
+    @staticmethod
     def _delivery_row(d) -> dict:
         return {"id": d.id, "notification_id": d.notification_id,
                 "channel": d.channel.value, "status": d.status.value,
                 "attempts": d.attempts, "last_error": d.last_error,
-                "sent_at": d.sent_at.isoformat() if d.sent_at else None,
+                "sent_at": ApiService._iso(d.sent_at),
+                "last_attempt_at": ApiService._iso(d.last_attempt_at),
+                "next_attempt_at": ApiService._iso(d.next_attempt_at),
+                "dead_lettered_at": ApiService._iso(d.dead_lettered_at),
                 "recipient_ref": d.recipient_ref, "destination": d.destination,
                 "placeholder": ApiService._is_placeholder_destination(
                     d.channel, d.destination)}
@@ -538,6 +546,42 @@ class ApiService:
     def process_notification_deliveries(self) -> dict:
         """Drain the pending delivery queue through the mock sender."""
         return self.delivery.process_pending()
+
+    @catch
+    def retry_notification_delivery(self, delivery_id: str) -> dict:
+        """Requeue a failed/dead-lettered delivery for another attempt (#80).
+
+        Resets the attempt budget and clears the dead-letter/error state so the
+        worker will pick it up again. A sent delivery is not requeued (nothing
+        to retry); an ignored one is — the operator explicitly asked for it.
+        """
+        d = self.store.get_notification_delivery(delivery_id)
+        if d is None:
+            raise NotFoundError("Delivery not found.")
+        if d.status == DeliveryStatus.SENT:
+            raise ValidationError("A delivered notification has nothing to retry.")
+        d.status = DeliveryStatus.PENDING
+        d.attempts = 0
+        d.last_error = None
+        d.dead_lettered_at = None
+        d.next_attempt_at = self.roster.clock()
+        self.store.save_notification_delivery(d)
+        return self._delivery_row(d)
+
+    @catch
+    def ignore_notification_delivery(self, delivery_id: str) -> dict:
+        """Mark a delivery as ignored so the worker never retries it (#80)."""
+        d = self.store.get_notification_delivery(delivery_id)
+        if d is None:
+            raise NotFoundError("Delivery not found.")
+        if d.status == DeliveryStatus.SENT:
+            # A completed delivery is history; rewriting it to "won't deliver"
+            # would corrupt the record. Mirror retry's sent-row guard.
+            raise ValidationError("A delivered notification cannot be ignored.")
+        d.status = DeliveryStatus.IGNORED
+        d.next_attempt_at = None
+        self.store.save_notification_delivery(d)
+        return self._delivery_row(d)
 
     @catch
     def get_delivery_overview(self) -> dict:
