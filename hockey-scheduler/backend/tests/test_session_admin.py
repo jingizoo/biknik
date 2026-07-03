@@ -129,6 +129,68 @@ class SessionAdminTest(unittest.TestCase):
         status, res = self._req(admin, "GET", "/api/accounts/nope/sessions")
         self.assertEqual(res["error"]["code"], "not_found")
 
+    # -- audit trail (post-review fix) --------------------------------------
+    # Session revoke is a security-sensitive admin action: the acting admin's
+    # identity and the fact that a revoke happened must be recorded, without
+    # ever logging token material.
+    def _admin_account_id(self):
+        return srv.STATE.api.store.get_user_account_by_username("admin").id
+
+    def test_admin_revoke_writes_one_audit_row(self):
+        cid = self._coach_account_id()
+        srv.SESSIONS.login(srv.STATE.api.store, cid, user_agent="Chrome")
+        sess_id = srv.STATE.api.store.sessions_for_user(cid)[-1].id
+        admin = self._client()
+        self._login(admin, "admin")
+        before = len(srv.STATE.api.store.all_setup_audit())
+        status, _ = self._req(
+            admin, "POST", f"/api/accounts/{cid}/sessions/{sess_id}/revoke")
+        self.assertEqual(status, 200)
+        after = srv.STATE.api.store.all_setup_audit()
+        self.assertEqual(len(after) - before, 1)
+
+    def test_audit_row_has_actor_and_entity_ids(self):
+        cid = self._coach_account_id()
+        srv.SESSIONS.login(srv.STATE.api.store, cid, user_agent="Chrome")
+        sess_id = srv.STATE.api.store.sessions_for_user(cid)[-1].id
+        admin = self._client()
+        self._login(admin, "admin")
+        self._req(admin, "POST",
+                 f"/api/accounts/{cid}/sessions/{sess_id}/revoke")
+        row = srv.STATE.api.store.all_setup_audit()[-1]
+        self.assertEqual(row.action, "session_revoked")
+        self.assertEqual(row.entity_type, "user_session")
+        self.assertEqual(row.entity_id, sess_id)
+        self.assertEqual(row.actor_id, self._admin_account_id())
+        self.assertEqual(row.detail["session_id"], sess_id)
+        self.assertEqual(row.detail["account_id"], cid)
+
+    def test_audit_detail_has_no_token_material(self):
+        cid = self._coach_account_id()
+        token = srv.SESSIONS.login(srv.STATE.api.store, cid, user_agent="Chrome")
+        sess_id = srv.STATE.api.store.sessions_for_user(cid)[-1].id
+        admin = self._client()
+        self._login(admin, "admin")
+        self._req(admin, "POST",
+                 f"/api/accounts/{cid}/sessions/{sess_id}/revoke")
+        row = srv.STATE.api.store.all_setup_audit()[-1]
+        blob = json.dumps(row.detail)
+        self.assertNotIn("token_hash", blob)
+        self.assertNotIn(token, blob)
+
+    def test_non_admin_failed_revoke_writes_no_audit_row(self):
+        cid = self._coach_account_id()
+        srv.SESSIONS.login(srv.STATE.api.store, cid, user_agent="Chrome")
+        sess_id = srv.STATE.api.store.sessions_for_user(cid)[-1].id
+        c = self._client()
+        self._login(c, "coach")
+        before = len(srv.STATE.api.store.all_setup_audit())
+        status, _ = self._req(
+            c, "POST", f"/api/accounts/{cid}/sessions/{sess_id}/revoke")
+        self.assertEqual(status, 403)
+        after = srv.STATE.api.store.all_setup_audit()
+        self.assertEqual(len(after), before)
+
 
 if __name__ == "__main__":
     unittest.main()

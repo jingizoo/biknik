@@ -629,9 +629,12 @@ class Handler(BaseHTTPRequestHandler):
         if rv:
             # Revoke one session (#78). Auto-guarded by the POST authorize()
             # gate above (MANAGE_USERS). The revoked session stops resolving
-            # immediately — the store is authoritative.
+            # immediately — the store is authoritative. actor_id is the
+            # signed-in admin's own user_id from the resolved session, NOT the
+            # client-suppliable body actor_id — this action is audited, so the
+            # acting identity must come from the server-verified session.
             return self._send_api(api.revoke_account_session(
-                rv.group(1), rv.group(2), actor_id=actor))
+                rv.group(1), rv.group(2), actor_id=user_id))
 
         # Notifications feed: mark read / read-all (#32).
         if path == "/api/notifications/read-all":

@@ -711,15 +711,27 @@ class ApiService:
     def revoke_account_session(self, account_id: str, session_id: str,
                                actor_id: Optional[str] = None) -> dict:
         """Revoke a single session belonging to an account (#78). Idempotent:
-        an already-revoked session keeps its original revoked_at."""
+        an already-revoked session keeps its original revoked_at.
+
+        Every accepted call is audited — a force-logout is a security-sensitive
+        admin action, so the record must show who did it, even when the target
+        was already revoked. The audit detail never carries the raw token or
+        its hash (neither is available here: Session only stores the hash, and
+        that is deliberately excluded from the logged detail).
+        """
         if self.store.get_user_account(account_id) is None:
             raise NotFoundError("User account not found.")
         sess = self.store.get_session(session_id)
         if sess is None or sess.user_id != account_id:
             raise NotFoundError("Session not found.")
+        prior_status = self._session_row(sess, self.roster.clock())["status"]
         if sess.revoked_at is None:
             sess.revoked_at = self.roster.clock()
             self.store.save_session(sess)
+        self.setup._audit(
+            "session_revoked", "user_session", session_id, actor_id,
+            {"account_id": account_id, "session_id": session_id,
+             "prior_status": prior_status, "user_agent": sess.user_agent})
         return self._session_row(sess, self.roster.clock())
 
     def verify_login(self, username: str, password: str) -> Optional[dict]:
