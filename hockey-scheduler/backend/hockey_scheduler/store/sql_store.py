@@ -565,3 +565,15 @@ class SqlStore:
         return rows[0] if rows else None
     def sessions_for_user(self, user_id):
         return self._query(Session, "user_id = ?", (user_id,), order="id")
+
+    def delete_sessions_before(self, cutoff):
+        """Delete finished sessions whose terminal time is before ``cutoff``:
+        revoked sessions by revoked_at, else expired ones by expires_at. Active
+        and recently-finished sessions are kept. Returns rows removed (#77)."""
+        iso = cutoff.isoformat()
+        with self._lock:
+            cur = self._exec(
+                "DELETE FROM sessions WHERE "
+                "(revoked_at IS NOT NULL AND revoked_at < ?) OR "
+                "(revoked_at IS NULL AND expires_at < ?)", (iso, iso))
+        return cur.rowcount if cur.rowcount is not None else 0

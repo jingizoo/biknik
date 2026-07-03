@@ -6,6 +6,7 @@ later without touching domain logic.
 """
 
 from contextlib import contextmanager
+from datetime import datetime
 from itertools import count
 from typing import Dict, List, Optional
 
@@ -444,6 +445,18 @@ class InMemoryStore:
 
     def sessions_for_user(self, user_id: str) -> List[Session]:
         return [s for s in self.sessions.values() if s.user_id == user_id]
+
+    def delete_sessions_before(self, cutoff: datetime) -> int:
+        """Delete finished sessions whose terminal time is before ``cutoff`` —
+        revoked sessions by ``revoked_at``, otherwise expired ones by
+        ``expires_at``. Active and recently-finished sessions are kept. Returns
+        the number removed (#77)."""
+        doomed = [sid for sid, s in self.sessions.items()
+                  if (s.revoked_at is not None and s.revoked_at < cutoff)
+                  or (s.revoked_at is None and s.expires_at < cutoff)]
+        for sid in doomed:
+            del self.sessions[sid]
+        return len(doomed)
 
     def add_setup_audit(self, entry: SetupAuditLog) -> SetupAuditLog:
         self.setup_audit.append(entry)
