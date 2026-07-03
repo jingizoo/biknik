@@ -378,6 +378,13 @@ class Handler(BaseHTTPRequestHandler):
             if self._operator_only("/api/accounts"):
                 return
             return self._send_api(api.list_user_accounts())
+        ms = re.match(r"^/api/accounts/([^/]+)/sessions$", path)
+        if ms:
+            # An account's login sessions, League-Admin only (#78). No token
+            # material is ever returned — only lifecycle metadata.
+            if self._operator_only(path):
+                return
+            return self._send_api(api.list_account_sessions(ms.group(1)))
         if path == "/api/officials":
             return self._send_api({"officials": api.get_officials()})
         if path == "/api/notifications":
@@ -618,6 +625,16 @@ class Handler(BaseHTTPRequestHandler):
                 # not just block future logins.
                 SESSIONS.revoke_for_user(api.store, acc.group(1))
             return self._send_api(res)
+        rv = re.match(r"^/api/accounts/([^/]+)/sessions/([^/]+)/revoke$", path)
+        if rv:
+            # Revoke one session (#78). Auto-guarded by the POST authorize()
+            # gate above (MANAGE_USERS). The revoked session stops resolving
+            # immediately — the store is authoritative. actor_id is the
+            # signed-in admin's own user_id from the resolved session, NOT the
+            # client-suppliable body actor_id — this action is audited, so the
+            # acting identity must come from the server-verified session.
+            return self._send_api(api.revoke_account_session(
+                rv.group(1), rv.group(2), actor_id=user_id))
 
         # Notifications feed: mark read / read-all (#32).
         if path == "/api/notifications/read-all":

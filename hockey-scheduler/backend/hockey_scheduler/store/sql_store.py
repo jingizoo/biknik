@@ -560,6 +560,7 @@ class SqlStore:
     # -- sessions (#74) ----------------------------------------------------
     def add_session(self, sess): return self._insert(sess)
     def save_session(self, sess): return self._update(sess)
+    def get_session(self, session_id): return self._get(Session, session_id)
     def get_session_by_hash(self, token_hash):
         rows = self._query(Session, "token_hash = ?", (token_hash,), order="id")
         return rows[0] if rows else None

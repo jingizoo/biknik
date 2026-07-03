@@ -437,6 +437,9 @@ class InMemoryStore:
         self.sessions[s.id] = s
         return s
 
+    def get_session(self, session_id: str) -> Optional[Session]:
+        return self.sessions.get(session_id)
+
     def get_session_by_hash(self, token_hash: str) -> Optional[Session]:
         for s in self.sessions.values():
             if s.token_hash == token_hash:
