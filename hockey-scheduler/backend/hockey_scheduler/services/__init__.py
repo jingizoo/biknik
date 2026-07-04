@@ -34,12 +34,13 @@ from .push_transport import (
     push_transport_from_env,
 )
 from .roster_service import RosterService
+from .scheduler import draft_schedule, round_robin_pairings
 from .setup_service import SetupService
 
 __all__ = ["RosterService", "SetupService", "DeliveryWorker", "DeliveryLoop",
            "delivery_loop_from_env", "enqueue",
            "ACTOR_TYPES", "build_ics", "games_for_actor", "hash_feed_token",
-           "new_feed_token",
+           "new_feed_token", "draft_schedule", "round_robin_pairings",
            "mock_sender", "make_delivery_sender", "recipient_ref",
            "destination_for", "resolve_destination", "EmailTransport",
            "DryRunEmailTransport", "SmtpEmailTransport",

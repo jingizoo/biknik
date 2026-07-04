@@ -37,6 +37,9 @@ def required_permission(path: str):
         return Permission.MANAGE_SCHEDULE
     if path == "/api/demo/add-ice-slot":
         return Permission.MANAGE_ARENA
+    # Generating a draft season schedule is a scheduling action (#84).
+    if path == "/api/scheduler/draft":
+        return Permission.MANAGE_SCHEDULE
     # Draining the notification delivery queue is an operator action (#58).
     if path == "/api/notifications/deliveries/process":
         return Permission.MANAGE_SCHEDULE
