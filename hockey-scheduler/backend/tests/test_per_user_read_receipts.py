@@ -38,7 +38,9 @@ class PerUserReadReceiptFacadeTest(unittest.TestCase):
                              if n["id"] == nid)["read"])
         self.assertFalse(next(n for n in v2["notifications"]
                               if n["id"] == nid)["read"])
-        self.assertEqual(v2["unread"], 1)
+        # v2 read nothing: both public notifications (result + game-published,
+        # #87) remain unread for them.
+        self.assertEqual(v2["unread"], 2)
 
     def test_two_officials_with_the_same_scope_stay_independent(self):
         # Even if two accounts somehow shared identical role+scope (the old
