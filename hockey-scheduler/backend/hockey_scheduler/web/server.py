@@ -767,7 +767,8 @@ class Handler(BaseHTTPRequestHandler):
         # division. Returns a preview only — nothing is created or published.
         if path == "/api/scheduler/draft":
             return self._send_api(api.draft_season_schedule(
-                body.get("division_id"), slot_ids=body.get("slot_ids")))
+                body.get("division_id"), slot_ids=body.get("slot_ids"),
+                constraints=body.get("constraints")))
 
         # Notification delivery worker: drain the pending queue (#58).
         if path == "/api/notifications/deliveries/process":

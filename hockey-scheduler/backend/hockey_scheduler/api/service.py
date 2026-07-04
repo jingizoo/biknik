@@ -1112,17 +1112,20 @@ class ApiService:
 
     # -- season scheduler v1 (#84) -----------------------------------------
     @catch
-    def draft_season_schedule(self, division_id: str, slot_ids=None) -> dict:
-        """Generate a draft round-robin schedule for a division (#84).
+    def draft_season_schedule(self, division_id: str, slot_ids=None,
+                              constraints=None) -> dict:
+        """Generate a draft round-robin schedule for a division (#84/#85).
 
         Returns a proposal only — no games are created or published here. The
-        result is deterministic and safe to regenerate.
+        result is deterministic and safe to regenerate. ``constraints`` may
+        carry blackout dates, minimum rest, and a max games/team/day cap (#85).
         """
         if not division_id:
             raise ValidationError("A division_id is required.")
         if self.store.get_division(division_id) is None:
             raise NotFoundError("Division not found.")
-        return draft_schedule(self.store, division_id, slot_ids=slot_ids)
+        return draft_schedule(self.store, division_id, slot_ids=slot_ids,
+                              constraints=constraints)
 
     @staticmethod
     def _apply_result(row: dict, gf: int, ga: int) -> None:
