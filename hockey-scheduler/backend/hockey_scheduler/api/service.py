@@ -1007,7 +1007,19 @@ class ApiService:
         """Standings for a division from FINAL results only (#31).
 
         Points: win = 2, tie = 1, loss = 0. Ranked by points, then goal
-        difference, then goals for, then name.
+        difference, then goals for, then name. Counts every division game
+        (operator view); the public variant is filtered to published games.
+        """
+        return self._standings_for_division(division_id, public_only=False)
+
+    def _standings_for_division(self, division_id: str,
+                                public_only: bool = False) -> dict:
+        """Compute a division's standings table.
+
+        ``public_only`` skips unpublished games so the public standings cannot
+        reveal a hidden/draft game's outcome by aggregation (#83) — the public
+        schedule and game-detail routes already hide unpublished games, and the
+        standings must stay consistent with them.
         """
         teams = [t for t in self.store.all_teams() if t.division_id == division_id]
         rows = {t.id: {"team_id": t.id, "team_name": t.name, "gp": 0,
@@ -1015,6 +1027,8 @@ class ApiService:
                 for t in teams}
         for g in self.store.all_games():
             if g.division_id != division_id or g.cancelled:
+                continue
+            if public_only and not g.published:
                 continue
             r = self.store.result_for_game(g.id)
             if r is None or r.status != ResultStatus.FINAL:
@@ -1027,6 +1041,73 @@ class ApiService:
         ranked = sorted(rows.values(),
                         key=lambda x: (-x["pts"], -x["gd"], -x["gf"], x["team_name"]))
         return {"division_id": division_id, "standings": ranked}
+
+    # -- public, no-auth surface (#83) -------------------------------------
+    # A clean public web surface (schedule / standings / result detail) built
+    # from public-safe fields only — team names, division, rink, date/time,
+    # score. Never player names, rosters, availability, or officials.
+    def _public_game_dto(self, g) -> dict:
+        team = lambda tid: (self.store.get_team(tid).name
+                            if tid and self.store.get_team(tid) else None)
+        venue_name = None
+        slot = self.store.get_ice_slot(g.ice_slot_id) if g.ice_slot_id else None
+        if slot is not None:
+            rink = self.store.get_rink(slot.rink_id) if slot.rink_id else None
+            if rink is not None:
+                venue = self.store.get_venue(rink.venue_id) if rink.venue_id else None
+                venue_name = venue.name if venue else None
+        div = self.store.get_division(g.division_id) if g.division_id else None
+        result = self.store.result_for_game(g.id)
+        final = result is not None and result.status == ResultStatus.FINAL
+        if g.cancelled:
+            status = "Cancelled"
+        elif final:
+            status = "Final"
+        else:
+            status = "Scheduled"
+        return {
+            "game_id": g.id,
+            "division_id": g.division_id,
+            "division_name": div.name if div else None,
+            "home_team_name": team(g.home_team_id),
+            "away_team_name": team(g.away_team_id),
+            "rink_name": g.rink, "venue_name": venue_name,
+            "start_time": g.start_time.isoformat() if g.start_time else None,
+            "status": status,
+            "home_score": result.home_score if final else None,
+            "away_score": result.away_score if final else None,
+        }
+
+    @catch
+    def get_public_schedule(self) -> dict:
+        """Published, non-cancelled-hidden fixtures for the public schedule."""
+        leagues = self.store.all_leagues()
+        league = leagues[0] if leagues else None
+        divisions = [{"id": d.id, "name": d.name}
+                     for d in self.store.all_divisions()]
+        fixtures = [self._public_game_dto(g)
+                    for g in sorted(self.store.all_games(),
+                                    key=lambda x: x.start_time or "")
+                    if g.published]
+        return {
+            "league_name": league.name if league else None,
+            "divisions": divisions,
+            "fixtures": fixtures,
+        }
+
+    @catch
+    def get_public_standings(self, division_id: str) -> dict:
+        """Public division standings — published games only, so an unpublished
+        game's final result cannot leak into the public table by aggregation."""
+        return self._standings_for_division(division_id, public_only=True)
+
+    @catch
+    def get_public_game(self, game_id: str) -> dict:
+        """Public-safe detail for one published game, else not found."""
+        g = self.store.get_game(game_id)
+        if g is None or not g.published:
+            raise NotFoundError("Game not found.")
+        return self._public_game_dto(g)
 
     @staticmethod
     def _apply_result(row: dict, gf: int, ga: int) -> None:

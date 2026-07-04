@@ -26,6 +26,8 @@ let usersSelected = null;          // account id whose sessions are shown (#78)
 let notifPrefs = null;             // signed-in user's own channel prefs (#81)
 let feedTokens = [];               // signed-in user's calendar feed tokens (#82)
 let newFeedUrl = null;             // freshly-minted feed URL, shown once (#82)
+let publicState = { schedule: null, standings: null, division: null, game: null };
+let publicTab = "schedule";        // "schedule" | "standings" (#83)
 let contactForm = { recipient_ref: "", channel: "email", destination: "", label: "" };
 let tokenForm = { recipient_ref: "", provider: "fcm", token: "", label: "" };
 let movingGameId = null;    // click-to-move fallback: game awaiting a destination slot
@@ -1481,19 +1483,56 @@ function renderActivity(board, ov) {
 
 /* ---------- Public Preview ---------- */
 function renderPublic(ov) {
-  const lg = ov.league || {};
-  const rows = ov.public_fixtures.map((f) => `<div class="li"><span class="li-time">${fmt(f.start_time)}</span>
-    <div class="li-main"><div class="li-title">${esc(f.home_team_name)} vs ${esc(f.away_team_name)}</div>
-      <div class="li-sub">${esc(f.division_name || "")} · ${esc(f.venue_name || "")} · ${esc(f.rink_name || "")}</div></div>
-    <span class="pill scheduled">${esc(f.status)}</span></div>`).join("");
-  return `<div class="hero"><div class="when">Public fixtures</div><h2>${esc(lg.name)}</h2>
-      <div class="where">${esc((ov.seasons[0] || {}).name || "")}</div></div>
-    <div class="section-title">Fixtures</div>
-    <div class="card">${rows || '<div class="empty">No fixtures.</div>'}</div>
-    <div class="actions"><button class="act ghost" disabled>Add to calendar — Coming #33</button></div>
-    <div class="privacy-note">🔒 Public view shows fixtures only. Junior player names and all
-      personal/guardian/medical data are never exposed (policy: #35).</div>
-    <div class="card">${stub("📊", "Standings & results", "Public table + game centre", 34)}</div>`;
+  const ps = publicState.schedule || { fixtures: [], divisions: [] };
+  const lgName = ps.league_name || (ov.league || {}).name || "League";
+  // A selected game's public result detail (#83).
+  if (publicState.game) {
+    const g = publicState.game;
+    const score = (g.home_score != null)
+      ? `<div class="pub-score">${g.home_score} – ${g.away_score}</div>` : "";
+    return `<div class="hero"><div class="when">${esc(g.status)}</div>
+        <h2>${esc(g.home_team_name)} vs ${esc(g.away_team_name || "TBD")}</h2>
+        <div class="where">${esc(g.division_name || "")} · ${esc(g.venue_name || "")} · ${esc(g.rink_name || "")}</div></div>
+      <div class="card pub-detail">${score}
+        <div class="li-sub">${esc(fmtDateTime(g.start_time))}</div></div>
+      <div class="actions"><button class="act ghost" data-public-back>← Back to schedule</button></div>`;
+  }
+  const tabBtn = (key, label) =>
+    `<button class="seg ${publicTab === key ? "active" : ""}" data-public-tab="${key}">${label}</button>`;
+  const tabs = `<div class="seg-group">${tabBtn("schedule", "Schedule")}${tabBtn("standings", "Standings")}</div>`;
+  let body;
+  if (publicTab === "standings") {
+    const divs = ps.divisions || [];
+    const opts = divs.map((d) =>
+      `<option value="${esc(d.id)}" ${d.id === publicState.division ? "selected" : ""}>${esc(d.name)}</option>`).join("");
+    const rows = ((publicState.standings && publicState.standings.standings) || []);
+    const trs = rows.length ? rows.map((r, i) => `<tr>
+        <td class="st-rank">${i + 1}</td><td class="st-team">${esc(r.team_name)}</td>
+        <td>${r.gp}</td><td>${r.w}</td><td>${r.l}</td><td>${r.t}</td>
+        <td>${r.gf}</td><td>${r.ga}</td><td>${r.gd > 0 ? "+" + r.gd : r.gd}</td>
+        <td class="st-pts">${r.pts}</td></tr>`).join("")
+      : `<tr><td colspan="10" class="empty">No results yet.</td></tr>`;
+    body = `${divs.length ? `<div class="actions"><select id="public-div">${opts}</select></div>` : ""}
+      <div class="card"><table class="st-table">
+        <thead><tr><th>#</th><th>Team</th><th>GP</th><th>W</th><th>L</th><th>T</th>
+          <th>GF</th><th>GA</th><th>GD</th><th>Pts</th></tr></thead>
+        <tbody>${trs}</tbody></table></div>`;
+  } else {
+    const rows = (ps.fixtures || []).map((f) => {
+      const score = (f.home_score != null) ? ` <strong>${f.home_score}–${f.away_score}</strong>` : "";
+      const cls = f.status === "Final" ? "gray" : f.status === "Cancelled" ? "blocked" : "scheduled";
+      return `<button class="li li-btn" data-public-game="${esc(f.game_id)}">
+        <span class="li-time">${fmt(f.start_time)}</span>
+        <div class="li-main"><div class="li-title">${esc(f.home_team_name)} vs ${esc(f.away_team_name || "TBD")}${score}</div>
+          <div class="li-sub">${esc(f.division_name || "")} · ${esc(f.venue_name || "")} · ${esc(f.rink_name || "")}</div></div>
+        <span class="pill ${cls}">${esc(f.status)}</span></button>`;
+    }).join("");
+    body = `<div class="card">${rows || '<div class="empty">No fixtures.</div>'}</div>`;
+  }
+  return `<div class="hero"><div class="when">Public</div><h2>${esc(lgName)}</h2></div>
+    ${tabs}${body}
+    <div class="privacy-note">🔒 Public view shows fixtures, scores, and standings only.
+      Player names and all personal data are never exposed (policy: #35).</div>`;
 }
 
 /* ---------- actions ---------- */
@@ -1636,6 +1675,18 @@ async function render() {
         usersState.sessions = [];
       }
     }
+    // Public surface (#83): schedule + standings from public-safe endpoints.
+    if (view === "public") {
+      const sch = await getJSON("/api/public/schedule");
+      publicState.schedule = (sch && !sch.error) ? sch : { fixtures: [], divisions: [] };
+      if (!publicState.division && publicState.schedule.divisions[0]) {
+        publicState.division = publicState.schedule.divisions[0].id;
+      }
+      if (publicTab === "standings" && publicState.division) {
+        publicState.standings = await getJSON(
+          `/api/public/standings/${publicState.division}`);
+      }
+    }
     // Standings for the selected division (#31).
     if (view === "standings") {
       if (!standingsDivision || !ov.divisions.some((d) => d.id === standingsDivision)) {
@@ -1685,6 +1736,18 @@ async function render() {
     : renderPublic(ov);
 
   c.querySelectorAll("[data-goto]").forEach((b) => b.onclick = () => switchTab(b.dataset.goto));
+  // Public surface (#83): tab switch, division select, game detail, back.
+  c.querySelectorAll("[data-public-tab]").forEach((b) => b.onclick = () => {
+    publicTab = b.dataset.publicTab; publicState.game = null; render();
+  });
+  const pubDiv = c.querySelector("#public-div");
+  if (pubDiv) pubDiv.onchange = () => { publicState.division = pubDiv.value; render(); };
+  c.querySelectorAll("[data-public-game]").forEach((b) => b.onclick = async () => {
+    const g = await getJSON(`/api/public/games/${b.dataset.publicGame}`);
+    publicState.game = (g && !g.error) ? g : null; render();
+  });
+  const pubBack = c.querySelector("[data-public-back]");
+  if (pubBack) pubBack.onclick = () => { publicState.game = null; render(); };
   // Setup drawers (#44): open, close, submit.
   c.querySelectorAll("[data-drawer]").forEach((b) => b.onclick = () => {
     drawer = { kind: b.dataset.drawer }; drawerError = ""; drawerValues = {}; toast = ""; render();
@@ -1698,7 +1761,7 @@ async function render() {
     if (first) first.focus();
   }
   c.querySelectorAll("button[data-act]").forEach((b) => b.onclick = () => rosterAction(b.dataset.act, b.dataset.id));
-  c.querySelectorAll(".seg").forEach((b) => b.onclick = () => { gameView = b.dataset.view; toast = ""; render(); });
+  c.querySelectorAll(".seg[data-view]").forEach((b) => b.onclick = () => { gameView = b.dataset.view; toast = ""; render(); });
   c.querySelectorAll("[data-side]").forEach((b) => b.onclick = () => { rosterSide = b.dataset.side; toast = ""; render(); });
   const printBtn = c.querySelector("[data-print]");
   if (printBtn) printBtn.onclick = () => window.print();
