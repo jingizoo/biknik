@@ -568,6 +568,11 @@ class Handler(BaseHTTPRequestHandler):
         pg = re.match(r"^/api/public/games/([^/]+)$", path)
         if pg:
             return self._send_api(api.get_public_game(pg.group(1)))
+        if path == "/api/scheduler/drafts":
+            # Current draft games for the review screen (#86), operator-only.
+            if self._operator_only("/api/scheduler/commit"):
+                return
+            return self._send_api(api.list_draft_games())
         if path == "/api/auth/me":
             # Consistent with POST role resolution (#50): no cookie → signed out,
             # a valid cookie → the user, a present-but-invalid/expired cookie →
@@ -769,6 +774,22 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_api(api.draft_season_schedule(
                 body.get("division_id"), slot_ids=body.get("slot_ids"),
                 constraints=body.get("constraints")))
+        # Draft review + publish (#86): commit a proposal to draft games, then
+        # publish or discard them. All operator-only (MANAGE_SCHEDULE gate).
+        # Attribute draft commit/publish/discard to the signed-in user resolved
+        # server-side (#86 audit trail), never a client-supplied actor_id.
+        if path == "/api/scheduler/commit":
+            return self._send_api(api.commit_draft_schedule(
+                body.get("division_id"), slot_ids=body.get("slot_ids"),
+                constraints=body.get("constraints"), actor_id=user_id))
+        if path == "/api/scheduler/drafts/publish":
+            return self._send_api(api.publish_draft_games(
+                game_ids=body.get("game_ids"), all_drafts=bool(body.get("all")),
+                actor_id=user_id))
+        if path == "/api/scheduler/drafts/discard":
+            return self._send_api(api.discard_draft_games(
+                game_ids=body.get("game_ids"), all_drafts=bool(body.get("all")),
+                actor_id=user_id))
 
         # Notification delivery worker: drain the pending queue (#58).
         if path == "/api/notifications/deliveries/process":

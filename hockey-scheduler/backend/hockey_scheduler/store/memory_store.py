@@ -539,6 +539,9 @@ class InMemoryStore:
     def all_games(self) -> List[Game]:
         return list(self.games.values())
 
+    def delete_game(self, game_id: str) -> None:
+        self.games.pop(game_id, None)
+
     def all_setup_audit(self) -> List[SetupAuditLog]:
         return list(self.setup_audit)
 

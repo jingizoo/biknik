@@ -453,6 +453,9 @@ select.player-picker {
 .pill.revoked { background: #ffe5e3; color: #c0271b; }
 .pill.expired { background: #ececf1; color: #6b6b70; }
 
+/* Draft scheduler (#86). */
+.li-sub.conflict { color: #c0271b; }
+
 /* Public schedule / standings (#83). */
 .seg-group { display: inline-flex; gap: 4px; background: #eceef3; border-radius: 9px; padding: 3px; margin: 6px 0 12px; }
 .li-btn { width: 100%; background: none; border: none; cursor: pointer; text-align: left; }

@@ -40,6 +40,10 @@ def required_permission(path: str):
     # Generating a draft season schedule is a scheduling action (#84).
     if path == "/api/scheduler/draft":
         return Permission.MANAGE_SCHEDULE
+    # Committing / publishing / discarding drafts are scheduling actions (#86).
+    if path in ("/api/scheduler/commit", "/api/scheduler/drafts/publish",
+                "/api/scheduler/drafts/discard"):
+        return Permission.MANAGE_SCHEDULE
     # Draining the notification delivery queue is an operator action (#58).
     if path == "/api/notifications/deliveries/process":
         return Permission.MANAGE_SCHEDULE

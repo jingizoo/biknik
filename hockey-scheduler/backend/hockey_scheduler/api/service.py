@@ -16,7 +16,9 @@ from ..domain import (
     CalendarFeedToken,
     ContactDestination,
     DeliveryStatus,
+    Game,
     DeviceToken,
+    IceSlotStatus,
     IceSlotType,
     NotificationChannel,
     NotificationPreference,
@@ -1127,6 +1129,111 @@ class ApiService:
         return draft_schedule(self.store, division_id, slot_ids=slot_ids,
                               constraints=constraints)
 
+    # -- draft review + publish (#86) --------------------------------------
+    def _draft_game_dto(self, g) -> dict:
+        team = lambda tid: (self.store.get_team(tid).name
+                            if tid and self.store.get_team(tid) else None)
+        div = self.store.get_division(g.division_id) if g.division_id else None
+        return {"game_id": g.id, "division_id": g.division_id,
+                "division_name": div.name if div else None,
+                "home_team_name": team(g.home_team_id),
+                "away_team_name": team(g.away_team_id),
+                "rink_name": g.rink,
+                "start_time": g.start_time.isoformat() if g.start_time else None,
+                "is_draft": g.is_draft, "published": g.published}
+
+    @catch
+    def commit_draft_schedule(self, division_id: str, slot_ids=None,
+                              constraints=None, actor_id=None) -> dict:
+        """Persist a generated draft as draft games (is_draft=True, unpublished),
+        so they can be reviewed and then published (#86). Regenerates the
+        proposal server-side (deterministic) and returns the created drafts +
+        any unscheduled pairings."""
+        proposal = self.draft_season_schedule(
+            division_id, slot_ids=slot_ids, constraints=constraints)
+        if isinstance(proposal, dict) and proposal.get("error"):
+            return proposal
+        created = []
+        for d in proposal["draft_games"]:
+            g = Game(
+                id=self.store.next_id("game"),
+                home_team_id=d["home_team_id"], away_team_id=d["away_team_id"],
+                start_time=datetime.fromisoformat(d["start_time"]),
+                end_time=datetime.fromisoformat(d["end_time"]) if d.get("end_time") else None,
+                rink=d.get("rink_name"), division_id=division_id,
+                ice_slot_id=d.get("ice_slot_id"),
+                published=False, is_draft=True)
+            self.store.add_game(g)
+            created.append(self._draft_game_dto(g))
+        # Committing a draft creates real (unpublished) rows — a state change,
+        # so it is audited (#86).
+        self.setup._audit(
+            "draft_schedule_committed", "division", division_id, actor_id,
+            {"created_count": len(created),
+             "game_ids": [c["game_id"] for c in created],
+             "unscheduled_count": len(proposal["unscheduled"])})
+        return {"division_id": division_id, "created": created,
+                "unscheduled": proposal["unscheduled"]}
+
+    @catch
+    def list_draft_games(self) -> dict:
+        rows = [self._draft_game_dto(g) for g in self.store.all_games()
+                if g.is_draft]
+        rows.sort(key=lambda r: r["start_time"] or "")
+        return {"draft_games": rows}
+
+    def _draft_targets(self, game_ids, all_drafts):
+        drafts = [g for g in self.store.all_games() if g.is_draft]
+        if all_drafts:
+            return drafts
+        wanted = set(game_ids or [])
+        return [g for g in drafts if g.id in wanted]
+
+    @catch
+    def publish_draft_games(self, game_ids=None, all_drafts=False,
+                            actor_id=None) -> dict:
+        """Publish draft games (#86).
+
+        Clears the draft flag, then routes each game through
+        ``setup.publish_game`` so bulk publish uses the *same* audited publish
+        path as single-game publish (a ``game_published`` audit entry per
+        game) rather than a silent direct save that bypasses the trail.
+        """
+        published = 0
+        for g in self._draft_targets(game_ids, all_drafts):
+            # Allocate the ice slot, matching the manual create_game invariant
+            # (a game's slot is ALLOCATED, not left AVAILABLE) — otherwise a
+            # published game sits on a slot the grid still treats as an open
+            # drop target.
+            slot = (self.store.get_ice_slot(g.ice_slot_id)
+                    if g.ice_slot_id else None)
+            if slot is not None:
+                slot.status = IceSlotStatus.ALLOCATED
+                self.store.save_ice_slot(slot)
+            # Persist the draft→real transition first so it survives the
+            # re-fetch inside publish_game (SqlStore returns fresh instances).
+            g.is_draft = False
+            self.store.save_game(g)
+            self.setup.publish_game(g.id, True, actor_id)  # published + audit
+            published += 1
+        return {"published": published}
+
+    @catch
+    def discard_draft_games(self, game_ids=None, all_drafts=False,
+                            actor_id=None) -> dict:
+        """Delete draft games (never touches published/real games) (#86).
+
+        Each discard is audited before deletion so the review action leaves a
+        trail (a draft is state; discarding it is a state change)."""
+        discarded = 0
+        for g in self._draft_targets(game_ids, all_drafts):
+            self.setup._audit("draft_game_discarded", "game", g.id, actor_id,
+                              {"division_id": g.division_id,
+                               "ice_slot_id": g.ice_slot_id})
+            self.store.delete_game(g.id)
+            discarded += 1
+        return {"discarded": discarded}
+
     @staticmethod
     def _apply_result(row: dict, gf: int, ga: int) -> None:
         row["gp"] += 1
@@ -1200,8 +1307,11 @@ class ApiService:
             for r in rinks.values()
         ]
 
+        # Draft games (#86) are proposals under review — they must never surface
+        # in the operator slot grid / schedule / calendar until published, so
+        # they are excluded here. The dedicated draft-review view lists them.
         game_by_slot = {g.ice_slot_id: g for g in self.store.all_games()
-                        if g.ice_slot_id}
+                        if g.ice_slot_id and not g.is_draft}
         slot_rows = []
         for s in sorted(self.store.all_ice_slots(),
                         key=lambda x: (x.rink_id, x.start_time)):
@@ -1219,6 +1329,8 @@ class ApiService:
 
         schedule, public_fixtures = [], []
         for g in self.store.all_games():
+            if g.is_draft:
+                continue  # unpublished draft — kept out of normal views (#86)
             div = divisions.get(g.division_id)
             rstatus = self.roster.compute_roster_status(g.id)
             venue_name = None

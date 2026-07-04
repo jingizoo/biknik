@@ -1,0 +1,213 @@
+"""Draft schedule review + publish (#86).
+
+Committing a generated draft persists it as draft games (is_draft=True,
+unpublished) that stay out of the public schedule until published. Publishing
+makes them public; discarding deletes them. Commit/publish/discard are
+operator-only.
+"""
+
+import json
+import threading
+import unittest
+import urllib.error
+import urllib.request
+from datetime import datetime, timedelta, timezone
+from http.cookiejar import CookieJar
+from http.server import ThreadingHTTPServer
+
+from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
+
+from hockey_scheduler.api import ApiService
+from hockey_scheduler.domain import Division, IceSlot, IceSlotStatus, Rink, Team
+from hockey_scheduler.store import InMemoryStore
+from hockey_scheduler.web import server as srv
+
+UTC = timezone.utc
+
+
+def _seeded_api():
+    s = InMemoryStore()
+    s.add_division(Division(id="d", season_id="se", name="D1"))
+    s.add_rink(Rink(id="r1", venue_id="v", name="Main"))
+    for i in range(4):
+        s.add_team(Team(id=f"t{i}", name=f"T{i}", division="D1", division_id="d"))
+    base = datetime(2026, 1, 5, 18, tzinfo=UTC)
+    for i in range(6):
+        s.add_ice_slot(IceSlot(id=f"s{i}", rink_id="r1",
+                               start_time=base + timedelta(days=i),
+                               end_time=base + timedelta(days=i, hours=1)))
+    return ApiService(s), s
+
+
+class DraftReviewServiceTest(unittest.TestCase):
+    def setUp(self):
+        self.api, self.store = _seeded_api()
+
+    def test_commit_persists_drafts_not_public(self):
+        res = self.api.commit_draft_schedule("d")
+        self.assertEqual(len(res["created"]), 6)
+        # Persisted as draft games...
+        self.assertEqual(len(self.api.list_draft_games()["draft_games"]), 6)
+        self.assertTrue(all(g.is_draft and not g.published
+                            for g in self.store.all_games()))
+        # ...and invisible to the public schedule.
+        self.assertEqual(self.api.get_public_schedule()["fixtures"], [])
+
+    def test_publish_makes_drafts_public(self):
+        self.api.commit_draft_schedule("d")
+        res = self.api.publish_draft_games(all_drafts=True)
+        self.assertEqual(res["published"], 6)
+        self.assertEqual(self.api.list_draft_games()["draft_games"], [])
+        self.assertEqual(len(self.api.get_public_schedule()["fixtures"]), 6)
+        self.assertTrue(all(g.published and not g.is_draft
+                            for g in self.store.all_games()))
+
+    def test_discard_removes_drafts(self):
+        self.api.commit_draft_schedule("d")
+        res = self.api.discard_draft_games(all_drafts=True)
+        self.assertEqual(res["discarded"], 6)
+        self.assertEqual(self.store.all_games(), [])
+
+    def test_publish_selected_only(self):
+        self.api.commit_draft_schedule("d")
+        drafts = self.api.list_draft_games()["draft_games"]
+        one = drafts[0]["game_id"]
+        self.api.publish_draft_games(game_ids=[one])
+        self.assertEqual(len(self.api.get_public_schedule()["fixtures"]), 1)
+        self.assertEqual(len(self.api.list_draft_games()["draft_games"]), 5)
+
+    def test_discard_never_touches_published_games(self):
+        self.api.commit_draft_schedule("d")
+        self.api.publish_draft_games(all_drafts=True)  # all now real
+        self.api.discard_draft_games(all_drafts=True)  # nothing is a draft
+        self.assertEqual(len(self.store.all_games()), 6)
+
+    def test_committed_drafts_stay_out_of_operator_overview(self):
+        # The leak: draft games must not appear in the operator schedule or
+        # claim a slot in the grid until they are published (#86).
+        self.api.commit_draft_schedule("d")
+        ov = self.api.get_demo_overview()
+        self.assertEqual(ov["schedule"], [])
+        self.assertTrue(all(s["game_id"] is None for s in ov["ice_slots"]))
+        # After publishing they DO appear in the operator schedule.
+        self.api.publish_draft_games(all_drafts=True)
+        ov2 = self.api.get_demo_overview()
+        self.assertEqual(len(ov2["schedule"]), 6)
+
+    def test_commit_and_discard_are_audited(self):
+        self.api.commit_draft_schedule("d", actor_id="user_admin")
+        commit = [a for a in self.store.all_setup_audit()
+                  if a.action == "draft_schedule_committed"]
+        self.assertEqual(len(commit), 1)
+        self.assertEqual(commit[0].actor_id, "user_admin")
+        self.assertEqual(commit[0].detail["created_count"], 6)
+        self.api.discard_draft_games(all_drafts=True, actor_id="user_admin")
+        discarded = [a for a in self.store.all_setup_audit()
+                     if a.action == "draft_game_discarded"]
+        self.assertEqual(len(discarded), 6)
+
+    def test_publish_uses_the_audited_single_game_publish_path(self):
+        self.api.commit_draft_schedule("d", actor_id="user_admin")
+        before = sum(1 for a in self.store.all_setup_audit()
+                     if a.action == "game_published")
+        self.api.publish_draft_games(all_drafts=True, actor_id="user_admin")
+        published = [a for a in self.store.all_setup_audit()
+                     if a.action == "game_published"]
+        # One game_published audit per published draft — the same path as
+        # single-game publish, not a silent direct save that bypasses the trail.
+        self.assertEqual(len(published) - before, 6)
+        self.assertTrue(all(a.actor_id == "user_admin" for a in published))
+
+    # -- slot allocation invariant (#86) -----------------------------------
+    def _slot_ids_of_drafts(self):
+        return [g.ice_slot_id for g in self.store.all_games() if g.is_draft]
+
+    def test_commit_leaves_slots_available(self):
+        self.api.commit_draft_schedule("d")
+        # A draft must not claim its slot — the grid still shows it available.
+        self.assertTrue(all(s.status == IceSlotStatus.AVAILABLE
+                            for s in self.store.all_ice_slots()))
+
+    def test_publish_allocates_the_slot(self):
+        self.api.commit_draft_schedule("d")
+        slot_ids = self._slot_ids_of_drafts()
+        self.assertTrue(slot_ids)
+        self.api.publish_draft_games(all_drafts=True)
+        for sid in slot_ids:
+            self.assertEqual(self.store.get_ice_slot(sid).status,
+                             IceSlotStatus.ALLOCATED)
+
+    def test_discard_leaves_slots_available(self):
+        self.api.commit_draft_schedule("d")
+        self.api.discard_draft_games(all_drafts=True)
+        self.assertTrue(all(s.status == IceSlotStatus.AVAILABLE
+                            for s in self.store.all_ice_slots()))
+
+    def test_published_draft_matches_manual_game_in_slot_grid(self):
+        # Regression: after publish, the operator slot grid shows the game AND
+        # marks the slot allocated — exactly like a manually-created game, so
+        # the calendar no longer treats an occupied slot as an open drop target.
+        res = self.api.commit_draft_schedule("d")
+        self.api.publish_draft_games(all_drafts=True)
+        ov = self.api.get_demo_overview()
+        occupied = [s for s in ov["ice_slots"] if s["game_id"]]
+        self.assertEqual(len(occupied), len(res["created"]))
+        self.assertTrue(all(s["status"] == "allocated" for s in occupied))
+
+
+class DraftReviewHttpTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        srv.STATE.reset()
+        cls.httpd = ThreadingHTTPServer(("127.0.0.1", 0), srv.Handler)
+        cls.port = cls.httpd.server_address[1]
+        cls.thread = threading.Thread(target=cls.httpd.serve_forever, daemon=True)
+        cls.thread.start()
+        cls.div = srv.STATE.api.store.all_divisions()[0].id
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.thread.join(timeout=5)
+
+    def _client(self):
+        return urllib.request.build_opener(
+            urllib.request.HTTPCookieProcessor(CookieJar()))
+
+    def _req(self, opener, method, path, body=None):
+        url = f"http://127.0.0.1:{self.port}{path}"
+        data = json.dumps(body).encode() if body is not None else None
+        req = urllib.request.Request(url, data=data, method=method)
+        if data is not None:
+            req.add_header("Content-Type", "application/json")
+        try:
+            with opener.open(req) as r:
+                return r.status, json.loads(r.read() or b"{}")
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read() or b"{}")
+
+    def test_only_operator_can_commit_publish_discard(self):
+        for who in ("coach", "player", "viewer"):
+            c = self._client()
+            self._req(c, "POST", "/api/auth/login", {"username": who, "password": "demo"})
+            for path in ("/api/scheduler/commit", "/api/scheduler/drafts/publish",
+                         "/api/scheduler/drafts/discard"):
+                status, _ = self._req(c, "POST", path, {"division_id": self.div, "all": True})
+                self.assertEqual(status, 403, f"{who} {path}")
+            status, _ = self._req(c, "GET", "/api/scheduler/drafts")
+            self.assertEqual(status, 403, who)
+
+    def test_operator_commit_and_discard_roundtrip(self):
+        c = self._client()
+        self._req(c, "POST", "/api/auth/login", {"username": "admin", "password": "demo"})
+        status, body = self._req(c, "POST", "/api/scheduler/commit",
+                                 {"division_id": self.div})
+        self.assertEqual(status, 200)
+        _, listed = self._req(c, "GET", "/api/scheduler/drafts")
+        self.assertEqual(len(listed["draft_games"]), len(body["created"]))
+        status, disc = self._req(c, "POST", "/api/scheduler/drafts/discard", {"all": True})
+        self.assertEqual(disc["discarded"], len(body["created"]))
+
+
+if __name__ == "__main__":
+    unittest.main()

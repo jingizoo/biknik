@@ -76,6 +76,7 @@ class MigrationApplyTest(unittest.TestCase):
             cur = store.conn.cursor()
             for col in ("last_attempt_at", "next_attempt_at", "dead_lettered_at"):
                 cur.execute(f"ALTER TABLE notification_deliveries DROP COLUMN {col}")
+            cur.execute("ALTER TABLE games DROP COLUMN is_draft")  # #86 additive col
             cur.execute("DELETE FROM schema_migrations")
             cur.execute("INSERT INTO schema_migrations(version, applied_at) "
                         "VALUES ('0001_initial', '2026-01-01')")
