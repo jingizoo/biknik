@@ -257,10 +257,31 @@ body.signed-out .web { display: none; }
   .side-nav { flex-direction: row; overflow-x: auto; padding: 8px; gap: 8px; }
   .nav-group { flex-direction: row; align-items: center; gap: 2px; }
   .nav-group-label { display: none; }
-  .side-nav .tab { white-space: nowrap; }
+  /* The unrelated bottom-tab-bar component's `.tab { flex: 1 0 auto }`
+     (styles.css) still matches these buttons via the shared class — with
+     .side-nav now a horizontal row, that width:100%/flex-basis:auto pair
+     forces every tab to claim its full row's width and refuse to shrink,
+     stretching/overlapping tabs across different nav-groups. Pin both back
+     down for the row layout. */
+  .side-nav .tab { white-space: nowrap; width: auto; flex: 0 0 auto; }
   .side-foot { flex-direction: row; flex-wrap: wrap; justify-content: space-between; align-items: center; }
   .topbar { flex-wrap: wrap; padding: 12px 16px; }
   .main > .content { padding: 8px 16px 40px; }
   .main .stats { grid-template-columns: repeat(2, 1fr); }
   .main .roster-cols { grid-template-columns: 1fr; }
+}
+
+/* ---------- phone (#100: responsive pass) ---------- */
+@media (max-width: 480px) {
+  /* Backstop: with the min-width:0 fixes above (styles.css) nothing should
+     overflow, but this guarantees it regardless of future regressions. */
+  html, body { overflow-x: hidden; }
+  .dash-stats { grid-template-columns: 1fr; }
+  .main .stats { grid-template-columns: 1fr; }
+  .main > .content { padding: 8px 14px 32px; }
+  .topbar-actions { flex-wrap: wrap; row-gap: 8px; }
+  .topbar-actions .act { padding: 10px 14px; }
+  .side-nav .tab { padding: 11px 10px; }
+  .login-field input { font-size: 16px; }
+  .side-switch select { font-size: 16px; }
 }
