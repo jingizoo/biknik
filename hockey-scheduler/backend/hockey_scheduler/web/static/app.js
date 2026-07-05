@@ -95,7 +95,7 @@ const hasPerm = (p) => rolePerms.has(p);
 // Client-side file download (#99) — no backend route needed, since the CSV
 // template/sample content already lives in IMPORT_TYPES. A throwaway <a>
 // with a Blob URL is the standard way to trigger a save-as without a server
-// round trip; the object URL is revoked right after the click is dispatched.
+// round trip.
 function downloadTextFile(filename, text) {
   const blob = new Blob([text], { type: "text/csv;charset=utf-8" });
   const url = URL.createObjectURL(blob);
@@ -103,9 +103,18 @@ function downloadTextFile(filename, text) {
   a.href = url;
   a.download = filename;
   document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-  URL.revokeObjectURL(url);
+  try {
+    a.click();
+  } finally {
+    document.body.removeChild(a);
+    // Revoking the object URL synchronously right after click() is
+    // unreliable on Safari/iOS (this app is iPhone-first, per CLAUDE.md) —
+    // the browser may still be reading the blob when the URL is
+    // invalidated, producing an empty/truncated download. Defer the revoke
+    // to a later macrotask so the download has already started; wrapped in
+    // try/finally so cleanup still runs even if click() itself throws.
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
 }
 
 // The session cookie carries identity; the server resolves the role from it
@@ -1513,8 +1522,9 @@ function renderImport(ov) {
     </div>
     <textarea id="import-${s.field}" rows="6" placeholder="${esc(s.placeholder)}"
       >${esc(importState.sheetsText[s.field] || "")}</textarea>`).join("");
-  const noteHtml = type.note ? `<div class="drawer-note">${esc(type.note)}</div>` : "";
-  const howToHtml = type.howTo ? `<div class="drawer-note">${esc(type.howTo)}</div>` : "";
+  const drawerNote = (text) => text ? `<div class="drawer-note">${esc(text)}</div>` : "";
+  const noteHtml = drawerNote(type.note);
+  const howToHtml = drawerNote(type.howTo);
 
   const { canCommit, commitTitle } = importCommitState(type);
 
@@ -2356,12 +2366,6 @@ async function render() {
     toast = "";
     render();
   });
-  // Per-sheet CSV template download (#99) — pure client-side, the sample
-  // text already lives on the sheet's own config entry.
-  c.querySelectorAll("[data-import-template]").forEach((b) => b.onclick = () => {
-    const sheet = importType().sheets.find((s) => s.field === b.dataset.importTemplate);
-    if (sheet) downloadTextFile(`${sheet.field.replace(/_csv$/, "")}.csv`, sheet.sample);
-  });
   // "Load sample data" (#99): fills every sheet for the current type at
   // once, so an operator can see the whole validate → commit flow work
   // without typing anything. A full render() is fine here (unlike the
@@ -2405,8 +2409,7 @@ async function render() {
   // unrelated render.
   currentImportType.sheets.forEach((s) => {
     const el = c.querySelector(`#import-${s.field}`);
-    if (!el) return;
-    el.oninput = () => {
+    if (el) el.oninput = () => {
       importState.sheetsText[s.field] = el.value;
       if (importCommitBtn) {
         const { canCommit, commitTitle } = importCommitState(currentImportType);
@@ -2414,21 +2417,33 @@ async function render() {
         importCommitBtn.title = commitTitle;
       }
     };
+    // Per-sheet CSV template download (#99): `s` is already this exact
+    // sheet's config (sample text included), so no click-time lookup is
+    // needed — reuse it directly instead of re-deriving it from a data
+    // attribute via importType().sheets.find(...) on every click.
+    const templateBtn = c.querySelector(`[data-import-template="${s.field}"]`);
+    if (templateBtn) templateBtn.onclick = () =>
+      downloadTextFile(`${s.field.replace(/_csv$/, "")}.csv`, s.sample);
   });
   const importValidate = c.querySelector("[data-import-validate]");
   if (importValidate) importValidate.onclick = async () => {
     const type = importType();
     const body = buildImportBody(type);
+    // Snapshot what's actually being validated so a response that arrives
+    // after the sheets changed underneath it (switched type, hit "Load
+    // sample data", or a live edit — not just a type switch) can be told
+    // apart from one that still matches what's on screen (review fix: this
+    // used to only guard against a type switch, so loading sample data
+    // while a Validate request was in flight could attach the OLD
+    // response's report to the NEW sample text and misreport it as
+    // already-validated).
+    const requestKey = importSnapshotKey(type);
     importState.committed = null;
     const res = await post("/api/import/dry-run", body);
-    // The user may have switched to a different import type while this
-    // request was in flight (that switch already reset report/committed
-    // for the NEW type) — applying a late response for the OLD type here
-    // would resurrect stale results under the wrong screen.
-    if (importState.type !== type.key) return;
+    if (importState.type !== type.key || importSnapshotKey(type) !== requestKey) return;
     toast = "";
     importState.report = res;
-    importState.validatedKey = (res && !res.error) ? importSnapshotKey(type) : null;
+    importState.validatedKey = (res && !res.error) ? requestKey : null;
     await render();
   };
   if (importCommitBtn) importCommitBtn.onclick = async () => {
@@ -2438,15 +2453,19 @@ async function render() {
     // cache) — a disabled button can still be reached via assistive tech,
     // and this is what actually stops a post-Validate edit from being
     // committed silently (review fix).
-    if (importSnapshotKey(type) !== importState.validatedKey) {
+    const requestKey = importSnapshotKey(type);
+    if (requestKey !== importState.validatedKey) {
       toast = "Sheets changed since Validate — please Validate again before committing.";
       return render();
     }
     const body = buildImportBody(type);
     if (type.needsSeason) body.season_id = importState.seasonId;
     const res = await post(type.commitPath, body);
-    // Same stale-response guard as Validate above.
-    if (importState.type !== type.key) return;
+    // Same stale-response guard as Validate above — discard this response
+    // if the sheets or the selected type changed while the request was in
+    // flight, rather than showing a commit result for content that's no
+    // longer what's on screen.
+    if (importState.type !== type.key || importSnapshotKey(type) !== requestKey) return;
     toast = "";
     importState.committed = res;
     if (res && res.committed) { importState.report = null; importState.validatedKey = null; }

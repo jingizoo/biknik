@@ -661,16 +661,23 @@ button.act.danger { background: #ffe5e3; color: #c0271b; }
 /* ----- Pilot onboarding import wizard (#96/#99) ----- */
 .import-form { padding: 0 16px 16px; }
 .import-form label { display: block; font-size: 12px; font-weight: 600; color: var(--muted); margin: 12px 0 4px; }
-.import-form label:first-child { margin-top: 0; }
 .import-form select { width: 100%; padding: 10px 11px; border: 1px solid var(--sep);
   border-radius: 9px; font-size: 14px; background: #fff; }
 .import-form textarea { width: 100%; padding: 10px 11px; border: 1px solid var(--sep); border-radius: 9px;
   font-size: 12px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; background: #fff; resize: vertical; }
 .import-form .req { color: var(--red); }
 .import-field-head { display: flex; justify-content: space-between; align-items: baseline; margin: 12px 0 4px; }
-.import-field-head:first-child { margin-top: 0; }
-.import-field-head label { margin: 0; }
+/* Higher specificity than ".import-form label" so this always wins
+   regardless of declaration order (a same-specificity override is fragile —
+   swapping the two rules' order would silently change the layout). */
+.import-form .import-field-head label { margin: 0; }
 .import-field-head .linklike { font-size: 12px; white-space: nowrap; }
+/* Zero the top margin of whichever element renders first in the form — the
+   "how to import" note (#99), the season picker, or a sheet field — rather
+   than hardcoding the assumption onto one specific element, which silently
+   stopped matching once every IMPORT_TYPES entry gained an always-present
+   `howTo` note ahead of everything else. */
+.import-form > *:first-child { margin-top: 0; }
 .import-report { margin: 0 4px 14px; }
 .import-report .li-sub.error { color: #c0271b; }
 .import-report .li-sub.warn { color: #9a6400; }
