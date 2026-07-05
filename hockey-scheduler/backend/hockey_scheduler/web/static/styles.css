@@ -783,7 +783,11 @@ button.act.danger { background: #ffe5e3; color: #c0271b; }
   .actions button { padding: 13px; }
   .seg { padding: 10px 0; }
   .cal-nav .act { padding: 8px 11px; font-size: 13px; }
-  /* Sub-16px text inputs trigger iOS Safari's auto-zoom on focus. */
-  .form input, .form select, .cal-filters select, .import-form select { font-size: 16px; }
+  /* Sub-16px text inputs trigger iOS Safari's auto-zoom on focus.
+     (Note: ".form" itself matches no rendered markup — the real form
+     classes are .avail-form/.cd-input/.drawer-body below.) */
+  .avail-form input, .avail-form select, .cd-input,
+  .drawer-body input, .drawer-body select,
+  .cal-filters select, .import-form select { font-size: 16px; }
   .import-form textarea { font-size: 14px; }
 }
