@@ -33,9 +33,17 @@ class SqlStoreParityTest(unittest.TestCase):
     def test_seed_and_overview(self):
         ov = self.api.get_demo_overview()
         self.assertEqual(ov["league"]["name"], "Alpine Ice Hockey League")
-        self.assertEqual({t["name"] for t in ov["teams"]},
-                         {"U16 Lions", "U16 Falcons", "U18 Lions", "Senior Lions"})
-        self.assertEqual(len(ov["public_fixtures"]), 1)  # seeded game published
+        # The pilot data pack (#97) grows this from the original 4-team demo
+        # to 12 teams across the 3 divisions.
+        self.assertEqual({t["name"] for t in ov["teams"]}, {
+            "U16 Lions", "U16 Falcons", "U16 Wolves", "U16 Comets",
+            "U16 Panthers", "U16 Sharks",
+            "U18 Lions", "U18 Falcons", "U18 Wolves", "U18 Bears",
+            "Senior Lions", "Senior Falcons",
+        })
+        # The core scenario's seeded game plus ~18 more published games (#97).
+        self.assertEqual(len(ov["public_fixtures"]),
+                         sum(1 for g in self.store.all_games() if g.published))
 
     def test_opens_confirmed(self):
         self.assertEqual(self.api.get_roster_status(self.game_id)["status"],
@@ -218,6 +226,7 @@ class SqlStoreReloadTest(unittest.TestCase):
         api.add_substitute_to_roster(gid, ids["substitute_player_id"], actor_id="c")
         api.lock_roster(gid, actor_id="c")
         ov = api.get_demo_overview()
+        before_public = len(ov["public_fixtures"])
         slot = next(s for s in ov["ice_slots"] if s["status"] == "available")
         u16 = [t for t in ov["teams"] if t["division_name"] == "U16 Elite"]
         g2 = api.create_game(ov["seasons"][0]["id"], u16[0]["division_id"],
@@ -233,13 +242,13 @@ class SqlStoreReloadTest(unittest.TestCase):
         # the second game persisted and is published (in public fixtures)
         ids2 = {g["game_id"] for g in ov2["schedule"]}
         self.assertIn(g2["id"], ids2)
-        self.assertEqual(len(ov2["public_fixtures"]), 2)
+        self.assertEqual(len(ov2["public_fixtures"]), before_public + 1)
         # its ice slot is now allocated (allocation persisted)
         slot2 = next(s for s in ov2["ice_slots"] if s["id"] == used_slot)
         self.assertEqual(slot2["status"], "allocated")
         # league/season/divisions/teams persisted
         self.assertEqual(ov2["league"]["name"], "Alpine Ice Hockey League")
-        self.assertEqual(len(ov2["teams"]), 4)
+        self.assertEqual(len(ov2["teams"]), 12)  # 12-team pilot data pack (#97)
 
     def test_create_store_factory_selects_sql_for_url(self):
         store = create_store(self.url)
