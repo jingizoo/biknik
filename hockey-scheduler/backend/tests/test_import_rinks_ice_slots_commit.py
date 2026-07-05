@@ -194,6 +194,16 @@ class ImportRinksIceSlotsCommitServiceContract:
         self.assertEqual(batches[0].entity_type, "import_batch")
         self.assertEqual(batches[0].detail["rinks_created"], 2)
         self.assertEqual(batches[0].detail["ice_slots_created"], 2)
+        self.assertEqual(batches[0].detail["import_type"], "rinks_ice_slots")
+        # #102: every row-level entry this commit wrote is tagged back to
+        # this same batch id, the link the Activity feed's drill-down groups
+        # rows by.
+        batch_id = batches[0].entity_id
+        row_entries = [a for a in self.store.all_setup_audit()
+                      if a.action in ("venue_created", "rink_created", "ice_slot_created")]
+        self.assertEqual(len(row_entries), 5)
+        for a in row_entries:
+            self.assertEqual(a.detail["import_batch_id"], batch_id)
 
     def test_audit_trail_on_repeat_commit(self):
         self.api.commit_rinks_ice_slots_import(

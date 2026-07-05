@@ -1505,7 +1505,8 @@ class ApiService:
         seasons = [_serialize(x) for x in self.store.all_seasons()]
         setup_audit = [
             {"action": a.action, "entity_type": a.entity_type,
-             "entity_id": a.entity_id, "at": a.at.isoformat()}
+             "entity_id": a.entity_id, "at": a.at.isoformat(),
+             "actor_id": a.actor_id, "detail": a.detail}
             for a in self.store.all_setup_audit()
         ]
         return {

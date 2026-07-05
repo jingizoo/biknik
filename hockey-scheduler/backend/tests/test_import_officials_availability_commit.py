@@ -246,6 +246,18 @@ class ImportOfficialsAvailabilityCommitServiceContract:
         self.assertEqual(batches[0].entity_type, "import_batch")
         self.assertEqual(batches[0].detail["officials_created"], 2)
         self.assertEqual(batches[0].detail["availability_created"], 2)
+        self.assertEqual(batches[0].detail["import_type"], "officials_availability")
+        # #102: official_availability_set is written via the shared
+        # set_official_availability() single-entity method (reused for the
+        # "brand new window" case) — confirm its extra_detail plumbing
+        # actually tags the row back to this commit's batch, same as every
+        # other row-level entry.
+        batch_id = batches[0].entity_id
+        row_entries = [a for a in self.store.all_setup_audit()
+                      if a.action in ("official_created", "official_availability_set")]
+        self.assertEqual(len(row_entries), 4)
+        for a in row_entries:
+            self.assertEqual(a.detail["import_batch_id"], batch_id)
 
     def test_audit_trail_on_repeat_commit(self):
         self.api.commit_officials_availability_import(
