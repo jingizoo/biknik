@@ -88,6 +88,10 @@ class Official:
     name: str
     home_club_id: Optional[str] = None   # for conflict-of-interest checks
     is_active: bool = True
+    # CSV-import matching key (#94), mirroring Team/Player's external_ref
+    # (#93): officials are matched across repeat uploads by this code (the
+    # sheet's official_code), not by name.
+    external_ref: Optional[str] = None
 
 
 @dataclass

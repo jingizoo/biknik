@@ -877,6 +877,13 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_api(api.commit_teams_players_import(
                 body.get("season_id"), body, actor_id=user_id))
 
+        # Pilot onboarding import COMMIT — officials + availability (#94).
+        # Server-resolved actor, not the forgeable body field — same fix
+        # #93 had to make after review, applied here from the start.
+        if path == "/api/import/commit/officials-availability":
+            return self._send_api(api.commit_officials_availability_import(
+                body, actor_id=user_id))
+
         # Season scheduler v1 (#84): generate a draft round-robin proposal for a
         # division. Returns a preview only — nothing is created or published.
         if path == "/api/scheduler/draft":

@@ -1664,3 +1664,42 @@ class ApiService:
             sheets[name] = parse_csv_text(text)
         return self.setup.commit_teams_players_import(
             season_id, sheets, actor_id=actor_id)
+
+    # ====================================================================
+    # Pilot onboarding import — officials + availability commit (#94)
+    # ====================================================================
+    @catch
+    def commit_officials_availability_import(self, sheets_csv: dict,
+                                              actor_id: Optional[str] = None
+                                              ) -> dict:
+        """Commit step 3 of the pilot onboarding import wizard.
+
+        Parses the present ``officials_csv``/``official_availability_csv``
+        text (note the latter key matches the sheet name
+        ``official_availability``, not ``officials_availability_csv``) and
+        delegates to ``SetupService.commit_officials_availability_import``,
+        which re-validates before writing anything. Teams/players/rinks/
+        ice_slots commit is out of scope here (#93 already owns
+        teams/players; rinks/ice_slots are #95) — reject the request
+        outright rather than silently dropping operator-submitted data.
+        """
+        sheets_csv = sheets_csv or {}
+        unsupported = [key for key in
+                      ("teams_csv", "players_csv", "rinks_csv", "ice_slots_csv")
+                      if sheets_csv.get(key)]
+        if unsupported:
+            raise ValidationError(
+                f"{', '.join(unsupported)} not supported by this commit "
+                f"endpoint — see #93/#95.")
+
+        sheets = {}
+        for name, key in (("officials", "officials_csv"),
+                          ("official_availability", "official_availability_csv")):
+            text = sheets_csv.get(key)
+            if not text:
+                continue
+            if not isinstance(text, str):
+                raise ValidationError(f"{key} must be a CSV text string.")
+            sheets[name] = parse_csv_text(text)
+        return self.setup.commit_officials_availability_import(
+            sheets, actor_id=actor_id)

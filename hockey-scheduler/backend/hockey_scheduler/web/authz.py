@@ -51,6 +51,15 @@ def required_permission(path: str):
     # both operator roles share for the read-only preview.
     if path == "/api/import/commit/teams-players":
         return Permission.MANAGE_SETUP
+    # Officials + availability import COMMIT (#94): unlike #93's
+    # teams/players commit above, creating/updating an Official already
+    # requires only MANAGE_SCHEDULE, not MANAGE_SETUP (see
+    # "/api/setup/official" below) — both League Admin and Arena Manager hold
+    # MANAGE_SCHEDULE, so both can run this import, matching that existing
+    # precedent rather than introducing a League-Admin-only rule for
+    # officials specifically.
+    if path == "/api/import/commit/officials-availability":
+        return Permission.MANAGE_SCHEDULE
     # Generating a draft season schedule is a scheduling action (#84).
     if path == "/api/scheduler/draft":
         return Permission.MANAGE_SCHEDULE

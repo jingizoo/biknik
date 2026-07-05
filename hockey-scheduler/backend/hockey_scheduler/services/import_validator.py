@@ -32,7 +32,7 @@ import io
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
-from ..domain import IceSlotType
+from ..domain import IceSlotType, OfficialAvailabilityStatus
 
 IMPORT_SHEET_NAMES = ("teams", "players", "officials", "rinks", "ice_slots")
 
@@ -52,6 +52,10 @@ _UNIQUE_FIELD = {
 }
 
 _VALID_SLOT_TYPES = {t.value for t in IceSlotType}
+_VALID_AVAILABILITY_STATUSES = {s.value for s in OfficialAvailabilityStatus}
+
+_REQUIRED_AVAILABILITY_FIELDS = (
+    "official_code", "start_time", "end_time", "status")
 
 
 def parse_csv_text(text: str) -> List[dict]:
@@ -235,3 +239,83 @@ def validate_import(sheets: Dict[str, List[dict]]) -> dict:
         "errors": report.errors,
         "warnings": report.warnings,
     }
+
+
+def validate_official_availability(rows: List[dict], official_codes_in_sheet: set,
+                                    existing_external_refs: set) -> dict:
+    """Validate ``official_availability`` sheet rows (#94).
+
+    A NEW sibling to :func:`validate_import`, not a change to it — that
+    function's own ``officials`` sheet checks are reused unchanged by the
+    caller (``SetupService.commit_officials_availability_import``) by passing
+    it only the ``officials`` key.
+
+    Deliberately DIFFERENT from #92/#93's sheet-internal-only cross-reference
+    rule: a row's ``official_code`` may resolve against EITHER (a) the
+    ``officials`` sheet of the SAME upload, OR (b) an official already
+    persisted from a PRIOR commit (``existing_external_refs``). #93's
+    team_code/rink_code were sheet-internal-only because there was no
+    persisted external-code concept yet; now that ``external_ref`` persists
+    for officials too (as of this PR), a real pilot workflow is "import
+    officials once, then import availability windows in a separate later
+    commit without re-sending officials.csv every time" — so this function
+    takes both sets and checks against their union. Flagged here for the
+    reviewer as an intentional divergence, not an oversight.
+
+    ``rows`` are already-parsed row dicts (same convention as
+    ``validate_import``); row numbers are 1-indexed against these data rows.
+    Returns ``{"errors": [...], "warnings": [...]}`` in the same shape as
+    ``validate_import``'s errors/warnings.
+    """
+    report = _Report()
+    sheet = "official_availability"
+    known_codes = official_codes_in_sheet | existing_external_refs
+
+    for i, row in enumerate(rows, start=1):
+        for field in _REQUIRED_AVAILABILITY_FIELDS:
+            if _blank(row.get(field)):
+                report.error(sheet, i, f"{field} is required.", field=field)
+
+    parsed = []
+    for i, row in enumerate(rows, start=1):
+        code = row.get("official_code")
+        code = None if _blank(code) else _clean(code)
+        if code is not None and code not in known_codes:
+            report.error(sheet, i, f"Unknown official_code {code}",
+                        field="official_code")
+
+        start = _parse_iso_utc(row.get("start_time"))
+        if not _blank(row.get("start_time")) and start is None:
+            report.error(sheet, i,
+                        f"Invalid start_time {row.get('start_time')!r}",
+                        field="start_time")
+        end = _parse_iso_utc(row.get("end_time"))
+        if not _blank(row.get("end_time")) and end is None:
+            report.error(sheet, i,
+                        f"Invalid end_time {row.get('end_time')!r}",
+                        field="end_time")
+        if start is not None and end is not None and end <= start:
+            report.error(sheet, i, "end_time must be after start_time.",
+                        field="end_time")
+
+        status = row.get("status")
+        if not _blank(status) and _clean(status) not in _VALID_AVAILABILITY_STATUSES:
+            allowed = ", ".join(sorted(_VALID_AVAILABILITY_STATUSES))
+            report.error(sheet, i,
+                        f"Unknown status {status!r}. Allowed: {allowed}.",
+                        field="status")
+
+        if code is not None and start is not None and end is not None:
+            parsed.append((i, code, start, end))
+
+    for idx, (row_a, code_a, start_a, end_a) in enumerate(parsed):
+        for row_b, code_b, start_b, end_b in parsed[idx + 1:]:
+            if code_a != code_b:
+                continue
+            if start_a < end_b and end_a > start_b:
+                report.warning(
+                    sheet, row_a,
+                    f"Availability window overlaps another window for the "
+                    f"same official (row {row_b}).")
+
+    return {"errors": report.errors, "warnings": report.warnings}
