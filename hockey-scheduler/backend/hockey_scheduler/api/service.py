@@ -50,6 +50,8 @@ from ..services import (
     draft_schedule,
     hash_feed_token,
     new_feed_token,
+    parse_csv_text,
+    validate_import,
 )
 from ..services.notifier import push as _push_notification
 from ..store import InMemoryStore
@@ -1599,3 +1601,30 @@ class ApiService:
             season_id, division_id, home_team_id, away_team_id, ice_slot_id,
             target_goalies, target_skaters, max_skaters,
             allow_division_override, actor_id))
+
+    # ====================================================================
+    # Pilot onboarding import — dry-run validator (#92)
+    # ====================================================================
+    @catch
+    def get_import_dry_run(self, sheets_csv: dict) -> dict:
+        """Validate a CSV-shaped onboarding import without writing anything.
+
+        ``sheets_csv`` maps ``"<sheet>_csv"`` -> raw CSV text for any of
+        ``teams``, ``players``, ``officials``, ``rinks``, ``ice_slots``; any
+        key may be absent (treated as an empty sheet). Parses each present
+        sheet, then delegates to the pure :func:`validate_import` — this
+        method (and everything it calls) never touches ``self.store``.
+        Row-level problems are collected into the returned report rather than
+        raised; ``@catch`` here only guards a malformed request itself (e.g. a
+        non-string CSV value).
+        """
+        sheets_csv = sheets_csv or {}
+        sheets = {}
+        for name in ("teams", "players", "officials", "rinks", "ice_slots"):
+            text = sheets_csv.get(f"{name}_csv")
+            if not text:
+                continue
+            if not isinstance(text, str):
+                raise ValidationError(f"{name}_csv must be a CSV text string.")
+            sheets[name] = parse_csv_text(text)
+        return validate_import(sheets)

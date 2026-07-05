@@ -25,6 +25,7 @@ from .email_transport import (
     email_transport_from_config,
     email_transport_from_env,
 )
+from .import_validator import IMPORT_SHEET_NAMES, parse_csv_text, validate_import
 from .push_transport import (
     DryRunPushTransport,
     ProviderPushTransport,
@@ -48,4 +49,5 @@ __all__ = ["RosterService", "SetupService", "DeliveryWorker", "DeliveryLoop",
            "email_transport_from_env", "PushTransport", "DryRunPushTransport",
            "ProviderPushTransport", "push_transport_from_config",
            "push_config_from_env", "push_transport_from_env",
-           "AccountService"]
+           "AccountService", "IMPORT_SHEET_NAMES", "parse_csv_text",
+           "validate_import"]

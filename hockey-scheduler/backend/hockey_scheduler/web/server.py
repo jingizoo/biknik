@@ -854,6 +854,12 @@ class Handler(BaseHTTPRequestHandler):
         if path.startswith("/api/setup/"):
             return self._handle_setup(path[len("/api/setup/"):], body, actor)
 
+        # Pilot onboarding import dry-run (#92): validates CSV-shaped rows and
+        # always returns 200 with the report itself (ok true/false) — nothing
+        # is written. Only a malformed request (caught below) isn't 200.
+        if path == "/api/import/dry-run":
+            return self._send_api(api.get_import_dry_run(body))
+
         # Season scheduler v1 (#84): generate a draft round-robin proposal for a
         # division. Returns a preview only — nothing is created or published.
         if path == "/api/scheduler/draft":
