@@ -43,6 +43,8 @@ from ..domain import (
     Official,
     OfficialAssignment,
     OfficialAssignmentStatus,
+    OfficialAvailability,
+    OfficialAvailabilityStatus,
     OfficialRole,
     Player,
     ResultStatus,
@@ -190,6 +192,10 @@ SPECS = {
     CalendarFeedToken: Spec(
         CalendarFeedToken, "calendar_feed_tokens",
         {"created_at": _dt(), "revoked_at": _dt()}),
+    OfficialAvailability: Spec(
+        OfficialAvailability, "official_availability",
+        {"start_time": _dt(), "end_time": _dt(),
+         "status": _enum(OfficialAvailabilityStatus)}),
 }
 
 # Numbered, forward-only migrations (#75). Each ``NNN_name.sql`` file under
@@ -559,6 +565,17 @@ class SqlStore:
         return rows[0] if rows else None
     def all_device_tokens(self):
         return self._query(DeviceToken, order="id")
+
+    # -- official availability (#88) ---------------------------------------
+    def add_official_availability(self, a): return self._insert(a)
+    def get_official_availability(self, avail_id):
+        return self._get(OfficialAvailability, avail_id)
+    def delete_official_availability(self, avail_id):
+        with self._lock:
+            self._exec("DELETE FROM official_availability WHERE id = ?", (avail_id,))
+    def availability_for_official(self, official_id):
+        return self._query(OfficialAvailability, "official_id = ?",
+                           (official_id,), order="id")
 
     # -- calendar feed tokens (#82) ----------------------------------------
     def add_calendar_feed_token(self, t): return self._insert(t)

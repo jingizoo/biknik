@@ -23,6 +23,8 @@ from ..domain import (
     Official,
     OfficialAssignment,
     OfficialAssignmentStatus,
+    OfficialAvailability,
+    OfficialAvailabilityStatus,
     OfficialRole,
     Player,
     ResultStatus,
@@ -473,10 +475,66 @@ class SetupService:
         end = game.end_time or (slot.end_time if slot else None)
         return start, end
 
+    # -- official availability (#88) ---------------------------------------
+    def set_official_availability(self, official_id, start_time, end_time,
+                                  status, note=None, actor_id=None):
+        """Declare an available/unavailable window for an official (#88).
+
+        Not ``@_transactional``: the decorator here was an orphan that had
+        drifted off ``assign_official`` (its rightful owner) onto this method
+        via the section comment. Restored to ``assign_official`` below; this is
+        a single add + audit like ``delete_official_availability``."""
+        if self.store.get_official(official_id) is None:
+            raise NotFoundError(f"Official {official_id} not found.")
+        try:
+            st = OfficialAvailabilityStatus(status) if not isinstance(
+                status, OfficialAvailabilityStatus) else status
+        except ValueError:
+            raise ValidationError(f"Unknown availability status '{status}'.")
+        if end_time <= start_time:
+            raise ValidationError("The end time must be after the start time.")
+        a = OfficialAvailability(
+            id=self.store.next_id("oavail"), official_id=official_id,
+            start_time=start_time, end_time=end_time, status=st, note=note)
+        self.store.add_official_availability(a)
+        self._audit("official_availability_set", "official_availability", a.id,
+                    actor_id, {"official_id": official_id, "status": st.value})
+        return a
+
+    def official_availabilities(self, official_id):
+        return sorted(self.store.availability_for_official(official_id),
+                      key=lambda a: a.start_time)
+
+    def delete_official_availability(self, avail_id, actor_id=None):
+        a = self.store.get_official_availability(avail_id)
+        if a is None:
+            raise NotFoundError("Availability window not found.")
+        self.store.delete_official_availability(avail_id)
+        self._audit("official_availability_deleted", "official_availability",
+                    avail_id, actor_id, {"official_id": a.official_id})
+        return a
+
+    def unavailable_window(self, official_id, start, end):
+        """The official's UNAVAILABLE window overlapping [start, end), else None."""
+        if start is None or end is None:
+            return None
+        for a in self.store.availability_for_official(official_id):
+            if a.status != OfficialAvailabilityStatus.UNAVAILABLE:
+                continue
+            if start < a.end_time and end > a.start_time:
+                return a
+        return None
+
     @_transactional
     def assign_official(self, game_id: str, official_id: str, role: OfficialRole,
-                        actor_id: Optional[str] = None) -> OfficialAssignment:
-        """Propose an official for a role on a game, with conflict checks."""
+                        actor_id: Optional[str] = None,
+                        override_unavailable: bool = False) -> OfficialAssignment:
+        """Propose an official for a role on a game, with conflict checks.
+
+        If the official has declared an overlapping UNAVAILABLE window (#88),
+        the assignment is blocked unless ``override_unavailable`` is set — an
+        explicit operator override, which is audited.
+        """
         game = self.store.get_game(game_id)
         if game is None:
             raise NotFoundError(f"Game {game_id} not found.")
@@ -516,6 +574,15 @@ class SetupService:
                         and start < o_end and end > o_start:
                     raise ScheduleConflictError(
                         f"{official.name} is already officiating an overlapping game.")
+
+        # Declared-unavailable window (#88): block unless the operator overrides.
+        unavail = self.unavailable_window(official_id, start, end)
+        if unavail is not None and not override_unavailable:
+            raise ScheduleConflictError(
+                f"{official.name} is marked unavailable at this time.",
+                details={"reason": "official_unavailable",
+                         "availability_id": unavail.id,
+                         "note": unavail.note})
 
         now = self.clock()
         assignment = OfficialAssignment(

@@ -150,6 +150,12 @@ class IceSlotStatus(str, Enum):
     BLOCKED = "blocked"
 
 
+class OfficialAvailabilityStatus(str, Enum):
+    """Whether an official's declared window is available or unavailable (#88)."""
+    AVAILABLE = "available"
+    UNAVAILABLE = "unavailable"
+
+
 class NotificationType(str, Enum):
     PLAYER_BACKED_OUT = "player_backed_out"
     SLOT_OPEN = "slot_open"

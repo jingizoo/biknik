@@ -453,6 +453,10 @@ select.player-picker {
 .pill.revoked { background: #ffe5e3; color: #c0271b; }
 .pill.expired { background: #ececf1; color: #6b6b70; }
 
+/* Official availability (#88). */
+.avail-form { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; align-items: center; }
+.avail-form input, .avail-form select { padding: 7px 9px; border: 1px solid var(--line); border-radius: 8px; font-size: 13px; }
+
 /* Draft scheduler (#86). */
 .li-sub.conflict { color: #c0271b; }
 

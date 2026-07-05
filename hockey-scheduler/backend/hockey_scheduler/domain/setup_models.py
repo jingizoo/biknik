@@ -17,6 +17,7 @@ from .enums import (
     NotificationChannel,
     NotificationKind,
     OfficialAssignmentStatus,
+    OfficialAvailabilityStatus,
     OfficialRole,
     ResultStatus,
 )
@@ -194,6 +195,22 @@ class ContactDestination:
     channel: NotificationChannel
     destination: str
     label: Optional[str] = None
+
+
+@dataclass
+class OfficialAvailability:
+    """A window an official declares available or unavailable to officiate (#88).
+
+    Used to warn/block an operator from assigning an official to a game that
+    overlaps an ``unavailable`` window. An official manages only their own; an
+    operator can view all.
+    """
+    id: str
+    official_id: str
+    start_time: datetime
+    end_time: datetime
+    status: OfficialAvailabilityStatus
+    note: Optional[str] = None
 
 
 @dataclass

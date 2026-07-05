@@ -29,6 +29,7 @@ let newFeedUrl = null;             // freshly-minted feed URL, shown once (#82)
 let publicState = { schedule: null, standings: null, division: null, game: null };
 let publicTab = "schedule";        // "schedule" | "standings" (#83)
 let schedulerState = { division: null, preview: null, drafts: [] };  // (#86)
+let officialAvailability = [];      // signed-in official's windows (#88)
 let contactForm = { recipient_ref: "", channel: "email", destination: "", label: "" };
 let tokenForm = { recipient_ref: "", provider: "fcm", token: "", label: "" };
 let movingGameId = null;    // click-to-move fallback: game awaiting a destination slot
@@ -823,6 +824,27 @@ function resultSection(lineups) {
   </section>`;
 }
 /* ---------- Official "My Assignments" inbox (#55) ---------- */
+function renderAvailability() {
+  // The signed-in official's declared availability windows (#88).
+  const rows = officialAvailability.map((a) => `<div class="session-row">
+    <span class="pill ${a.status === "unavailable" ? "blocked" : "available"}">${esc(a.status)}</span>
+    <span class="row-main">${esc(fmtDateTime(a.start_time))} → ${esc(fmtDateTime(a.end_time))}</span>
+    ${a.note ? `<span class="row-sub">${esc(a.note)}</span>` : ""}
+    <button class="act ghost danger" data-avail-del="${esc(a.id)}">Remove</button>
+  </div>`).join("");
+  return `<div class="card">
+    <div class="section-title" style="margin-top:0">Availability</div>
+    <p class="muted">Mark windows you can't officiate; schedulers are warned before assigning you.</p>
+    <div class="row-list">${rows || '<p class="muted">No availability windows set.</p>'}</div>
+    <div class="avail-form">
+      <input type="datetime-local" id="avail-start">
+      <input type="datetime-local" id="avail-end">
+      <select id="avail-status"><option value="unavailable">Unavailable</option><option value="available">Available</option></select>
+      <input type="text" id="avail-note" placeholder="Note (optional)">
+      <button class="act primary" data-avail-add>Add window</button>
+    </div></div>`;
+}
+
 function renderInbox(inbox) {
   if (!inbox || !inbox.official_id) {
     return `<div class="empty">Sign in as an <strong>Official</strong> to see your assignments.</div>`;
@@ -830,7 +852,8 @@ function renderInbox(inbox) {
   const rows = inbox.assignments || [];
   if (!rows.length) {
     return `<div class="banner neutral"><h2>No assignments yet</h2>
-      <p>When a scheduler assigns you to a game, it will appear here to accept or decline.</p></div>`;
+      <p>When a scheduler assigns you to a game, it will appear here to accept or decline.</p></div>
+      ${renderAvailability()}`;
   }
   const roleLabel = { referee: "👨‍⚖️ Referee", linesperson: "🚩 Linesperson", scorekeeper: "📝 Scorekeeper" };
   const badge = (st) => st === "accepted" ? `<span class="badge green">Accepted</span>`
@@ -852,7 +875,7 @@ function renderInbox(inbox) {
     </div>`;
   }).join("");
   return `<div class="section-title">Your upcoming assignments (${rows.length})</div>
-    <div class="inbox-list">${cards}</div>${toastHtml()}`;
+    <div class="inbox-list">${cards}</div>${renderAvailability()}${toastHtml()}`;
 }
 
 /* ---------- Notifications feed (#32) ---------- */
@@ -1671,6 +1694,12 @@ async function render() {
     }
     // The signed-in official's inbox (#55).
     if (view === "inbox") inbox = await getJSON("/api/me/assignments");
+    // The official's own availability windows (#88).
+    officialAvailability = [];
+    if (view === "inbox" && inbox && inbox.official_id) {
+      const av = await getJSON(`/api/officials/${inbox.official_id}/availability`);
+      if (av && !av.error) officialAvailability = av.availability || [];
+    }
     // Notifications feed drives the bell badge on every view (#32).
     const nf = await getJSON("/api/notifications");
     if (nf && !nf.error) notifState = nf;
@@ -1834,6 +1863,24 @@ async function render() {
   });
   c.querySelectorAll("[data-decline]").forEach((b) => b.onclick = async () => {
     await post(`/api/officials/assignments/${b.dataset.decline}/decline`, {}); await render();
+  });
+  // Official availability (#88): add / remove windows.
+  const availAdd = c.querySelector("[data-avail-add]");
+  if (availAdd) availAdd.onclick = async () => {
+    const oid = inbox && inbox.official_id;
+    const start = val("avail-start"), end = val("avail-end");
+    if (!oid || !start || !end) { toast = "Pick a start and end time."; return render(); }
+    toast = "";
+    // datetime-local has no zone; treat as UTC for the demo.
+    await post(`/api/officials/${oid}/availability`, {
+      start_time: start + ":00Z", end_time: end + ":00Z",
+      status: val("avail-status") || "unavailable", note: val("avail-note") });
+    await render();
+  };
+  c.querySelectorAll("[data-avail-del]").forEach((b) => b.onclick = async () => {
+    toast = "";
+    await post(`/api/officials/availability/${b.dataset.availDel}/delete`, {});
+    await render();
   });
   c.querySelectorAll("[data-unassign]").forEach((b) => b.onclick = async () => {
     await post(`/api/officials/assignments/${b.dataset.unassign}/unassign`, {});
