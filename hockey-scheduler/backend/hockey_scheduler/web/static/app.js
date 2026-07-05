@@ -1,7 +1,7 @@
 /* Hockey Scheduler — calendar-first operator demo.
    Drives the real backend (setup + roster/substitute) via the documented API. */
 
-let view = "dashboard";     // dashboard|setup|calendar|games|roster|activity|public
+let view = "dashboard";     // dashboard|setup|import|calendar|games|roster|activity|public
 let gameView = "coach";     // coach | player (roster)
 let rosterSide = "home";    // home | away — which lineup the roster tab shows (#25)
 let rosterTeamId = null;    // team_id of the currently shown lineup (for copy)
@@ -39,6 +39,15 @@ let conflict = null;        // {ok, title, lines[], game, slot} — calendar sid
 let drawer = null;          // {kind} when a Setup create drawer is open (#44)
 let drawerError = "";       // validation/API error shown inside the open drawer
 let drawerValues = {};      // {fieldId: value} preserved across re-render on error
+let importState = {         // Pilot onboarding import wizard (#96)
+  type: "teams_players",    // which IMPORT_TYPES entry is selected
+  seasonId: null,            // only used by the teams_players type
+  sheetsText: {},            // {csv field name: pasted text}, reset on type switch
+  report: null,              // last /api/import/dry-run result (or {error})
+  validatedKey: null,        // snapshot of sheetsText at the last successful validate;
+                             // Commit refuses to run if the current text has drifted
+  committed: null,           // last commit result (or {error})
+};
 
 const DAY_MS = 86400000;
 function addDays(dateStr, n) {
@@ -70,7 +79,7 @@ const NAV = {
   games: "Games", roster: "Roster", sheet: "Game Sheet",
   inbox: "My Assignments", standings: "Standings",
   notifications: "Notifications", delivery: "Delivery", activity: "Activity",
-  public: "Public", users: "Users", scheduler: "Scheduler",
+  public: "Public", users: "Users", scheduler: "Scheduler", import: "Import",
 };
 const POS_CLASS = { goalie: "pos-G", defense: "pos-D", forward: "pos-F", skater: "pos-D" };
 const REPO = "https://github.com/jingizoo/biknik/issues";
@@ -1300,6 +1309,157 @@ function renderScheduler(ov) {
     ${previewBlock}${draftBlock}${toastHtml()}`;
 }
 
+/* ---------- Pilot onboarding import wizard (#96) ----------
+   Wires the existing #92-#95 endpoints only — no new backend logic. Each
+   type below names the exact commit endpoint/permission #93/#94/#95 shipped;
+   /api/import/dry-run is shared by all three (gated by manage_arena, same
+   as the wizard tab itself), since #92's validator already covers every
+   sheet name except official_availability (see the officials_availability
+   type's `note` — that sheet is only checked at commit time, by #94's own
+   sibling validator, which /api/import/dry-run never calls). */
+const IMPORT_TYPES = [
+  { key: "teams_players", label: "Teams & Players", commitPerm: "manage_setup",
+    commitPath: "/api/import/commit/teams-players", needsSeason: true,
+    sheets: [
+      { field: "teams_csv", label: "teams.csv",
+        placeholder: "team_code,team_name,club_name,division_name" },
+      { field: "players_csv", label: "players.csv",
+        placeholder: "player_code,first_name,last_name,team_code,jersey_number,position,email" },
+    ] },
+  { key: "officials_availability", label: "Officials & Availability", commitPerm: "manage_schedule",
+    commitPath: "/api/import/commit/officials-availability", needsSeason: false,
+    note: "Validate only checks officials.csv — official_availability.csv rows "
+      + "are checked when you commit (#94).",
+    sheets: [
+      { field: "officials_csv", label: "officials.csv",
+        placeholder: "official_code,name,email,home_club_name" },
+      { field: "official_availability_csv", label: "official_availability.csv",
+        placeholder: "official_code,start_time,end_time,status,note" },
+    ] },
+  { key: "rinks_ice_slots", label: "Rinks & Ice Slots", commitPerm: "manage_arena",
+    commitPath: "/api/import/commit/rinks-ice-slots", needsSeason: false,
+    sheets: [
+      { field: "rinks_csv", label: "rinks.csv",
+        placeholder: "venue_name,rink_code,rink_name,address" },
+      { field: "ice_slots_csv", label: "ice_slots.csv",
+        placeholder: "rink_code,start_time,end_time,slot_type" },
+    ] },
+];
+
+function importType() {
+  return IMPORT_TYPES.find((t) => t.key === importState.type) || IMPORT_TYPES[0];
+}
+
+// Only the pasted sheet text counts toward "is this still what I validated?"
+// — season_id isn't part of validate_import's contract at all, so changing
+// the season between Validate and Commit doesn't need a re-validate.
+function importSnapshotKey(type) {
+  const parts = {};
+  type.sheets.forEach((s) => { parts[s.field] = importState.sheetsText[s.field] || ""; });
+  return JSON.stringify(parts);
+}
+
+function renderImportRows(items, cls) {
+  return items.map((it) => `<div class="li"><div class="li-main">
+    <div class="li-title">${esc(it.sheet || "")}${it.row != null ? ` — row ${it.row}` : ""}${it.field ? ` (${esc(it.field)})` : ""}</div>
+    <div class="li-sub ${cls}">${cls === "error" ? "⚠" : "ℹ"} ${esc(it.message)}</div></div></div>`).join("");
+}
+
+function renderImportReport(report) {
+  if (report.error) {
+    return `<div class="banner alert"><h2>Could not validate</h2><p>${esc(report.error.message)}</p></div>`;
+  }
+  const errs = report.errors || [];
+  const warns = report.warnings || [];
+  const summary = Object.entries(report.summary || {})
+    .map(([sheet, n]) => `${esc(sheet)}: ${n}`).join(" · ");
+  const status = report.ok
+    ? `<div class="banner ok"><h2>Looks good</h2><p>No errors — ready to commit.</p></div>`
+    : `<div class="banner alert"><h2>${errs.length} error(s) found</h2><p>Fix the rows below, then Validate again.</p></div>`;
+  const rows = renderImportRows(errs, "error") + renderImportRows(warns, "warn");
+  return `<div class="import-report">
+      <div class="section-title">Validation report — ${esc(summary)}</div>
+      ${status}
+      ${rows ? `<div class="card">${rows}</div>` : ""}
+    </div>`;
+}
+
+function importSummaryLine(summary) {
+  return Object.entries(summary || {}).map(([key, v]) => (v && typeof v === "object")
+    ? `${esc(key)}: ${v.created || 0} created, ${v.updated || 0} updated`
+    : `${esc(key)}: ${v}`).join(" · ");
+}
+
+function renderImportResult(result) {
+  if (result.error) {
+    return `<div class="banner alert"><h2>Commit failed</h2><p>${esc(result.error.message)}</p></div>`;
+  }
+  if (!result.committed) {
+    const errs = result.errors || [];
+    const warns = result.warnings || [];
+    return `<div class="import-report">
+        <div class="banner alert"><h2>Not committed</h2><p>${errs.length} error(s) blocked the commit.</p></div>
+        <div class="card">${renderImportRows(errs, "error")}${renderImportRows(warns, "warn")}</div>
+      </div>`;
+  }
+  const warns = result.warnings || [];
+  return `<div class="import-report">
+      <div class="banner ok"><h2>Committed</h2><p>${esc(importSummaryLine(result.summary))}</p></div>
+      ${warns.length ? `<div class="card">${renderImportRows(warns, "warn")}</div>` : ""}
+    </div>`;
+}
+
+function renderImport(ov) {
+  if (!hasPerm("manage_arena")) {
+    return `<div class="banner neutral"><h2>Operators only</h2>
+      <p>The import wizard is available to league admins and arena managers.</p></div>`;
+  }
+  const type = importType();
+  const typeButtons = IMPORT_TYPES.map((t) => `<button class="seg${t.key === type.key ? " active" : ""}"
+    data-import-type="${t.key}">${esc(t.label)}</button>`).join("");
+
+  const seasons = ov.seasons || [];
+  if (type.needsSeason && !importState.seasonId && seasons[0]) importState.seasonId = seasons[0].id;
+  const seasonField = !type.needsSeason ? "" : !seasons.length
+    ? `<label>Season <span class="req">*</span></label>
+       <div class="drawer-note">Create a season first.</div>`
+    : `<label>Season <span class="req">*</span></label>
+       <select id="import-season">${seasons.map((s) => `<option value="${esc(s.id)}"`
+          + `${s.id === importState.seasonId ? " selected" : ""}>${esc(s.name)}</option>`).join("")}</select>`;
+
+  const sheetFields = type.sheets.map((s) => `<label>${esc(s.label)}</label>
+    <textarea id="import-${s.field}" rows="6" placeholder="${esc(s.placeholder)}"
+      >${esc(importState.sheetsText[s.field] || "")}</textarea>`).join("");
+  const noteHtml = type.note ? `<div class="drawer-note">${esc(type.note)}</div>` : "";
+
+  const seasonOk = !type.needsSeason || !!importState.seasonId;
+  const canCommit = seasonOk && hasPerm(type.commitPerm)
+    && !!importState.report && importState.report.ok
+    && importState.validatedKey === importSnapshotKey(type);
+  const commitTitle = !hasPerm(type.commitPerm)
+    ? "Your role can't commit this import type."
+    : !seasonOk ? "Choose a season first."
+    : (!importState.report || !importState.report.ok
+        || importState.validatedKey !== importSnapshotKey(type))
+      ? "Validate successfully first."
+      : "";
+
+  const reportHtml = importState.report ? renderImportReport(importState.report) : "";
+  const resultHtml = importState.committed ? renderImportResult(importState.committed) : "";
+
+  return `<div class="card">
+      <div class="section-title" style="margin-top:0">Pilot onboarding import</div>
+      <div class="segmented">${typeButtons}</div>
+      <div class="import-form">${seasonField}${sheetFields}${noteHtml}</div>
+      <div class="dq-actions">
+        <button class="act" data-import-validate>Validate</button>
+        <button class="act primary" data-import-commit${canCommit ? "" : " disabled"}
+          title="${esc(commitTitle)}">Commit</button>
+      </div>
+    </div>
+    ${reportHtml}${resultHtml}${toastHtml()}`;
+}
+
 /* ---------- Standings (#31) ---------- */
 function renderStandings(ov, standings) {
   if (!ov.divisions.length) return `<div class="empty">No divisions yet. Create one in Setup.</div>`;
@@ -1845,6 +2005,7 @@ async function render() {
   c.innerHTML =
     view === "dashboard" ? renderDashboard(ov, standings)
     : view === "setup" ? renderSetup(ov)
+    : view === "import" ? renderImport(ov)
     : view === "calendar" ? renderCalendar(ov)
     : view === "games" ? renderGames(ov)
     : view === "roster" ? renderRoster(lineups)
@@ -2103,6 +2264,58 @@ async function render() {
     if (res && !res.error) toast = `Discarded ${res.discarded} draft(s).`;
     await render();
   };
+  // Pilot onboarding import wizard (#96): switch type, validate, commit.
+  c.querySelectorAll("[data-import-type]").forEach((b) => b.onclick = () => {
+    importState.type = b.dataset.importType;
+    importState.sheetsText = {};
+    importState.report = null;
+    importState.validatedKey = null;
+    importState.committed = null;
+    toast = "";
+    render();
+  });
+  const importSeason = c.querySelector("#import-season");
+  if (importSeason) importSeason.onchange = () => { importState.seasonId = importSeason.value; };
+  const importValidate = c.querySelector("[data-import-validate]");
+  if (importValidate) importValidate.onclick = async () => {
+    const type = importType();
+    const body = {};
+    type.sheets.forEach((s) => {
+      const el = document.getElementById(`import-${s.field}`);
+      const text = el ? el.value : "";
+      importState.sheetsText[s.field] = text;
+      if (text.trim()) body[s.field] = text;
+    });
+    importState.committed = null;
+    const res = await post("/api/import/dry-run", body);
+    toast = "";
+    importState.report = res;
+    importState.validatedKey = (res && !res.error) ? importSnapshotKey(type) : null;
+    await render();
+  };
+  const importCommit = c.querySelector("[data-import-commit]");
+  if (importCommit) importCommit.onclick = async () => {
+    const type = importType();
+    // Belt-and-suspenders: the button is already `disabled` unless this
+    // holds, but re-check at click time too — a disabled button can still
+    // be reached via the title tooltip's underlying element in some a11y
+    // tooling, and this keeps the guarantee in one place either way.
+    if (importSnapshotKey(type) !== importState.validatedKey) {
+      toast = "Sheets changed since Validate — please Validate again before committing.";
+      return render();
+    }
+    const body = {};
+    type.sheets.forEach((s) => {
+      const text = importState.sheetsText[s.field] || "";
+      if (text.trim()) body[s.field] = text;
+    });
+    if (type.needsSeason) body.season_id = importState.seasonId;
+    const res = await post(type.commitPath, body);
+    toast = "";
+    importState.committed = res;
+    if (res && res.committed) { importState.report = null; importState.validatedKey = null; }
+    await render();
+  };
   // Account/session admin (#78): pick an account, revoke one of its sessions.
   c.querySelectorAll("[data-user-sessions]").forEach((b) => b.onclick = () => {
     usersSelected = b.dataset.userSessions; toast = ""; render();
@@ -2258,6 +2471,10 @@ function gateChrome() {
   toggle('.tab[data-tab="delivery"]', hasPerm("manage_schedule"));
   toggle('.tab[data-tab="users"]', hasPerm("manage_users"));
   toggle('.tab[data-tab="scheduler"]', hasPerm("manage_schedule"));
+  // The Import wizard tab mirrors /api/import/dry-run's own gate (#96):
+  // manage_arena is the one permission both League Admin and Arena Manager
+  // hold, and it's the entry point for all three import types.
+  toggle('.tab[data-tab="import"]', hasPerm("manage_arena"));
   // Reset wipes all demo data — operator-only, like the API (hardening).
   toggle("#reset-btn", hasPerm("manage_schedule"));
   // Sign out only makes sense with a live session.
