@@ -1703,3 +1703,40 @@ class ApiService:
             sheets[name] = parse_csv_text(text)
         return self.setup.commit_officials_availability_import(
             sheets, actor_id=actor_id)
+
+    # ====================================================================
+    # Pilot onboarding import — rinks + ice slots commit (#95)
+    # ====================================================================
+    @catch
+    def commit_rinks_ice_slots_import(self, sheets_csv: dict,
+                                      actor_id: Optional[str] = None) -> dict:
+        """Commit step 4 of the pilot onboarding import wizard.
+
+        Parses the present ``rinks_csv``/``ice_slots_csv`` text (same shape
+        as :meth:`get_import_dry_run`) and delegates to
+        ``SetupService.commit_rinks_ice_slots_import``, which re-validates
+        via the same pure ``validate_import`` gate before writing anything.
+        Teams/players (#93) and officials/availability (#94) are out of
+        scope here — reject the request outright rather than silently
+        dropping operator-submitted data.
+        """
+        sheets_csv = sheets_csv or {}
+        unsupported = [key for key in
+                      ("teams_csv", "players_csv", "officials_csv",
+                       "official_availability_csv")
+                      if sheets_csv.get(key)]
+        if unsupported:
+            raise ValidationError(
+                f"{', '.join(unsupported)} not supported by this commit "
+                f"endpoint — see #93/#94.")
+
+        sheets = {}
+        for name in ("rinks", "ice_slots"):
+            text = sheets_csv.get(f"{name}_csv")
+            if not text:
+                continue
+            if not isinstance(text, str):
+                raise ValidationError(f"{name}_csv must be a CSV text string.")
+            sheets[name] = parse_csv_text(text)
+        return self.setup.commit_rinks_ice_slots_import(
+            sheets, actor_id=actor_id)

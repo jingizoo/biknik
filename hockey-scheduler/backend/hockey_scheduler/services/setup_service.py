@@ -890,6 +890,238 @@ class SetupService:
             "warnings": officials_result["warnings"] + avail_result["warnings"],
         }
 
+    # -- CSV import commit: rinks + ice slots (#95) --------------------------
+    def commit_rinks_ice_slots_import(self, sheets: dict,
+                                      actor_id: Optional[str] = None) -> dict:
+        """Commit step 4 of the pilot onboarding import wizard: rinks + their
+        ice slots.
+
+        ``sheets`` is ALREADY-PARSED row dicts (``{"rinks": [...],
+        "ice_slots": [...]}``) — CSV-text parsing stays at the API facade
+        layer, matching #93/#94's layering. No ``season_id`` param: rinks
+        aren't season-scoped (same as #94's officials).
+
+        Unlike #94, no new sibling validator is needed here: ``rinks`` and
+        ``ice_slots`` are already first-class ``IMPORT_SHEET_NAMES`` members
+        that #92's ``validate_import`` fully validates (required fields,
+        ``rink_code`` uniqueness, the ``ice_slots`` sheet's ``rink_code``
+        cross-reference, ISO-8601 UTC parsing, the ``slot_type`` enum, and
+        same-rink overlap warnings) — reused completely unchanged via a
+        single ``validate_import(sheets)`` call. That cross-reference is
+        deliberately SHEET-INTERNAL-ONLY, like #93's ``team_code`` (NOT
+        widened to persisted ``external_ref``s the way #94's
+        ``official_code`` was): a real pilot workflow sends ``rinks.csv`` and
+        ``ice_slots.csv`` together in one upload, not rinks now and
+        slots-for-those-rinks in a separate later commit. ``slot_type`` is
+        already validated against :class:`IceSlotType` by ``validate_import``
+        itself, so no extra gate is needed for its FORMAT — but see the
+        allocated-slot pre-write gate below, which is about its INTERACTION
+        with an already-booked game, not its format.
+
+        Venues are found-or-created by an exact (``.strip()``ped) name
+        match, the same simple v1 as #93/#94's club matching — never
+        updated in place even if a later row's ``address`` differs for the
+        same name. Rinks are matched across repeat uploads by
+        ``external_ref`` (the sheet's ``rink_code``), and ``rink_name`` is a
+        PARTIAL-FIELD-OVERWRITE on that update path (mirroring
+        ``commit_teams_players_import``'s player name/jersey_number/position
+        handling): since ``validate_import`` doesn't require ``rink_name``
+        (only ``venue_name``/``rink_code`` are required for the ``rinks``
+        sheet), a repeat row that omits it must leave the existing rink's
+        name alone rather than clobbering it back to the row's
+        ``rink_code`` — only a brand-new rink defaults its name to the code.
+        Ice slots have no code of their own and are matched by the natural
+        ``(rink_id, start_time, end_time)`` tuple, mirroring #94's
+        availability-window matching.
+
+        Not ``@_transactional``, for the same reason documented at length on
+        ``commit_teams_players_import``/``commit_officials_availability_import``
+        above — but note the DIFFERENT consequence here: ``create_rink`` AND
+        ``create_ice_slot`` are BOTH ``@_transactional`` (unlike
+        ``set_official_availability``, which #94 could call directly), so
+        this method must call neither — it duplicates their create logic via
+        raw store calls plus its own ``self._audit(...)`` calls, all inside
+        the single transaction it opens itself.
+
+        Correctness note: an ice slot's ``status`` also transitions to
+        ``ALLOCATED`` outside this import, when a game is scheduled onto it
+        (``create_game``/``move_game``). A repeat import that always
+        re-derived ``status`` from ``slot_type`` — the way ``create_ice_slot``
+        does on first creation — would silently downgrade an already-booked
+        slot back to ``AVAILABLE``/``BLOCKED`` while the game record still
+        points at it. The update-in-place path below therefore leaves
+        ``status`` untouched whenever ``store.game_using_ice_slot`` reports a
+        game already claims the slot.
+
+        That guard alone isn't enough, though: ``create_game`` also requires
+        a booked slot's ``slot_type`` to stay ``GAME`` (it refuses to host a
+        game on ``practice``/``maintenance``/etc ice), so silently changing
+        ``slot_type`` out from under an allocated slot would leave the game
+        record pointing at ice that's no longer game-bookable, even with
+        ``status`` correctly preserved. A pre-write gate below therefore
+        rejects the ENTIRE commit — before any writes, same all-or-nothing
+        guarantee as everything else here — if an incoming row would change
+        the ``slot_type`` of a slot a game already uses.
+
+        Also unlike ``create_ice_slot``'s single-entity route, this does NOT
+        hard-block on overlapping ice times via ``ScheduleConflictError`` —
+        ``validate_import``'s overlap check is a WARNING only (mirroring
+        #94's own availability-overlap warning), so newly-created slots here
+        are allowed to overlap; the warning surfaces in the response instead
+        of aborting the whole commit.
+        """
+        result = validate_import(sheets)
+        if not result["ok"]:
+            return {"committed": False, "summary": result["summary"],
+                    "errors": result["errors"], "warnings": result["warnings"]}
+
+        rink_rows = list(sheets.get("rinks") or [])
+        slot_rows = list(sheets.get("ice_slots") or [])
+
+        # Pre-write gate (mirrors #93's Position check): create_game requires
+        # a booked slot's slot_type to stay GAME (it refuses to schedule onto
+        # practice/maintenance/etc ice). Silently changing slot_type on a
+        # slot a game already uses would leave that game pointing at ice
+        # that's no longer game-bookable, even though the status-preserving
+        # guard below correctly leaves `status` alone (review fix). Block the
+        # WHOLE commit before any writes if any row would do this — the same
+        # all-or-nothing guarantee as everything else here.
+        for row in slot_rows:
+            rink_code = _clean(row.get("rink_code"))
+            existing_rink = next((r for r in self.store.all_rinks()
+                                 if r.external_ref == rink_code), None)
+            if existing_rink is None:
+                continue  # a brand-new rink can't yet have a booked slot
+            start = _parse_iso_utc(row.get("start_time"))
+            end = _parse_iso_utc(row.get("end_time"))
+            new_slot_type = IceSlotType(_clean(row.get("slot_type")))
+            existing_slot = next(
+                (s for s in self.store.all_ice_slots()
+                 if s.rink_id == existing_rink.id and s.start_time == start
+                 and s.end_time == end), None)
+            if existing_slot is None:
+                continue
+            if (existing_slot.slot_type != new_slot_type
+                    and self.store.game_using_ice_slot(existing_slot.id) is not None):
+                raise ValidationError(
+                    f"Ice slot {existing_slot.id} on rink_code {rink_code} "
+                    f"has a game scheduled on it; slot_type cannot change "
+                    f"from {existing_slot.slot_type.value} to "
+                    f"{new_slot_type.value}.")
+
+        counts = {"rinks_created": 0, "rinks_updated": 0,
+                  "ice_slots_created": 0, "ice_slots_updated": 0,
+                  "venues_created": 0}
+
+        with self.store.transaction():
+            rink_code_to_id = {}
+            for row in rink_rows:
+                rink_code = _clean(row.get("rink_code"))
+                venue_name = _clean(row.get("venue_name"))
+                rink_name_raw = row.get("rink_name")
+                # rink_name isn't in validate_import's required fields for
+                # "rinks" (only venue_name/rink_code are). A brand-new rink
+                # defaults its name to the code so it's never blank (an
+                # explicit judgment call mirroring #93's position-default,
+                # may want revisiting); an EXISTING rink's name is a
+                # partial-field-overwrite — a repeat row that omits
+                # rink_name must leave the current name alone rather than
+                # clobbering it back to the code (review fix).
+                rink_name_supplied = not _blank(rink_name_raw)
+                rink_name = _clean(rink_name_raw) if rink_name_supplied else None
+                address_raw = row.get("address")
+                address = _clean(address_raw) if not _blank(address_raw) else ""
+
+                venue = next((v for v in self.store.all_venues()
+                             if v.name == venue_name), None)
+                if venue is None:
+                    venue = Venue(id=self.store.next_id("venue"), name=venue_name,
+                                  address=address)
+                    self.store.add_venue(venue)
+                    self._audit("venue_created", "venue", venue.id, actor_id)
+                    counts["venues_created"] += 1
+
+                rink = next((r for r in self.store.all_rinks()
+                            if r.external_ref == rink_code), None)
+                if rink is not None:
+                    if rink_name_supplied:
+                        rink.name = rink_name
+                    rink.venue_id = venue.id
+                    self.store.save_rink(rink)
+                    self._audit("rink_updated", "rink", rink.id, actor_id,
+                                {"venue_id": venue.id})
+                    counts["rinks_updated"] += 1
+                else:
+                    rink = Rink(id=self.store.next_id("rink"), venue_id=venue.id,
+                               name=rink_name if rink_name_supplied else rink_code,
+                               external_ref=rink_code)
+                    self.store.add_rink(rink)
+                    self._audit("rink_created", "rink", rink.id, actor_id,
+                                {"venue_id": venue.id})
+                    counts["rinks_created"] += 1
+                rink_code_to_id[rink_code] = rink.id
+
+            for row in slot_rows:
+                rink_code = _clean(row.get("rink_code"))
+                # validate_import already guarantees this rink_code matches a
+                # row in THIS SAME upload's rinks sheet; .get() is just a
+                # defensive belt-and-suspenders check against a bug elsewhere.
+                rink_id = rink_code_to_id.get(rink_code)
+                if rink_id is None:
+                    raise ValidationError(
+                        f"Unknown rink_code {rink_code} for ice_slots row.")
+
+                start = _parse_iso_utc(row.get("start_time"))
+                end = _parse_iso_utc(row.get("end_time"))
+                slot_type = IceSlotType(_clean(row.get("slot_type")))
+
+                existing_slot = next(
+                    (s for s in self.store.all_ice_slots()
+                     if s.rink_id == rink_id and s.start_time == start
+                     and s.end_time == end), None)
+                if existing_slot is not None:
+                    existing_slot.slot_type = slot_type
+                    if self.store.game_using_ice_slot(existing_slot.id) is None:
+                        existing_slot.status = (
+                            IceSlotStatus.AVAILABLE
+                            if slot_type == IceSlotType.GAME
+                            else IceSlotStatus.BLOCKED)
+                    self.store.save_ice_slot(existing_slot)
+                    self._audit("ice_slot_updated", "ice_slot", existing_slot.id,
+                                actor_id, {"rink_id": rink_id,
+                                          "slot_type": slot_type.value})
+                    counts["ice_slots_updated"] += 1
+                else:
+                    status = (IceSlotStatus.AVAILABLE
+                             if slot_type == IceSlotType.GAME
+                             else IceSlotStatus.BLOCKED)
+                    slot = IceSlot(id=self.store.next_id("slot"), rink_id=rink_id,
+                                  start_time=start, end_time=end,
+                                  slot_type=slot_type, status=status)
+                    self.store.add_ice_slot(slot)
+                    self._audit("ice_slot_created", "ice_slot", slot.id, actor_id,
+                                {"rink_id": rink_id, "slot_type": slot_type.value})
+                    counts["ice_slots_created"] += 1
+
+            batch_id = self.store.next_id("importbatch")
+            # skipped/errors are always 0 here by construction — see the
+            # identical note on commit_teams_players_import's import_committed
+            # audit row above.
+            self._audit("import_committed", "import_batch", batch_id, actor_id,
+                        {"skipped": 0, "errors": 0, **counts})
+
+        return {
+            "committed": True,
+            "summary": {
+                "rinks": {"created": counts["rinks_created"],
+                         "updated": counts["rinks_updated"]},
+                "ice_slots": {"created": counts["ice_slots_created"],
+                             "updated": counts["ice_slots_updated"]},
+                "venues_created": counts["venues_created"],
+            },
+            "warnings": result["warnings"],
+        }
+
     # -- officials (#30) ---------------------------------------------------
     @_transactional
     def create_official(self, name: str, home_club_id: Optional[str] = None,
