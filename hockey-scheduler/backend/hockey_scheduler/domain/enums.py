@@ -179,6 +179,7 @@ class NotificationKind(str, Enum):
     ASSIGNMENT_UNASSIGNED = "assignment_unassigned"
     ROSTER_LOCKED = "roster_locked"
     ROSTER_UNLOCKED = "roster_unlocked"
+    AVAILABILITY_REMINDER = "availability_reminder"  # → each unresponded player (#89)
 
 
 class NotificationAudience(str, Enum):
@@ -187,6 +188,7 @@ class NotificationAudience(str, Enum):
     SCHEDULER = "scheduler"  # league admin / arena manager
     COACH = "coach"          # a team's coach (audience_ref = team_id)
     OFFICIAL = "official"    # a specific official (audience_ref = official_id)
+    PLAYER = "player"        # a specific player (audience_ref = player_id)
 
 
 class NotificationChannel(str, Enum):

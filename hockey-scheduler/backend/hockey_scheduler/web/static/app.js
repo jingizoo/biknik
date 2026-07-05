@@ -30,6 +30,8 @@ let publicState = { schedule: null, standings: null, division: null, game: null 
 let publicTab = "schedule";        // "schedule" | "standings" (#83)
 let schedulerState = { division: null, preview: null, drafts: [] };  // (#86)
 let officialAvailability = [];      // signed-in official's windows (#88)
+let availSummary = null;            // roster availability rollup (#89)
+let availFilter = "all";            // all|available|unavailable|maybe|no_response
 let contactForm = { recipient_ref: "", channel: "email", destination: "", label: "" };
 let tokenForm = { recipient_ref: "", provider: "fcm", token: "", label: "" };
 let movingGameId = null;    // click-to-move fallback: game awaiting a destination slot
@@ -712,6 +714,35 @@ function renderGames(ov) {
 }
 
 /* ---------- Roster (Coach/Player) ---------- */
+const AVAIL_PILL = { available: "available", unavailable: "blocked",
+  maybe: "junior", no_response: "gray" };
+const AVAIL_LABEL = { all: "All", available: "Available", unavailable: "Unavailable",
+  maybe: "Maybe", no_response: "No response" };
+
+function renderAvailSummary() {
+  if (!availSummary) return "";
+  const c = availSummary.counts;
+  const chip = (key) => {
+    const n = key === "all"
+      ? availSummary.players.length
+      : (c[key] || 0);
+    return `<button class="seg ${availFilter === key ? "active" : ""}" data-avail-filter="${key}">${AVAIL_LABEL[key]} ${n}</button>`;
+  };
+  const shown = availSummary.players.filter(
+    (p) => availFilter === "all" || p.status === availFilter);
+  const rows = shown.map((p) => `<div class="session-row">
+    <span class="row-main">${esc(p.name)}</span>
+    <span class="pill ${AVAIL_PILL[p.status] || "gray"}">${esc(p.status.replace("_", " "))}</span>
+  </div>`).join("");
+  const canRemind = hasPerm("manage_roster");
+  return `<div class="card">
+    <div class="section-title" style="margin-top:0">Availability
+      ${canRemind && c.no_response ? `<button class="act ghost" data-avail-remind>Remind ${c.no_response} unresponded</button>` : ""}</div>
+    <div class="seg-group">${["all", "available", "unavailable", "maybe", "no_response"].map(chip).join("")}</div>
+    <div class="row-list">${rows || '<p class="muted">No players in this filter.</p>'}</div>
+  </div>`;
+}
+
 function renderRoster(lineups) {
   if (!lineups) return `<div class="empty">Select a game from the Games tab.</div>`;
   if (!(rosterSide in lineups)) rosterSide = "home";
@@ -727,7 +758,8 @@ function renderRoster(lineups) {
     <div class="segmented">
       <button class="seg ${gameView === "coach" ? "active" : ""}" data-view="coach">Coach</button>
       <button class="seg ${gameView === "player" ? "active" : ""}" data-view="player">Player</button>
-    </div><div style="padding-top:8px">${gameView === "coach" ? coachBody(side) : playerBody(side)}</div>`;
+    </div><div style="padding-top:8px">${gameView === "coach" ? coachBody(side) : playerBody(side)}</div>
+    ${renderAvailSummary()}`;
 }
 
 /* ---------- Game Sheet (read-only, both lineups) (#48) ---------- */
@@ -1687,6 +1719,14 @@ async function render() {
     // The roster tab and the game sheet both use both sides' lineups (#25/#48).
     lineups = (["roster", "sheet"].includes(view) && currentGame)
       ? await getJSON(`/api/games/${currentGame}/lineups`) : null;
+    // Availability rollup for the roster screen's selected side (#89).
+    availSummary = null;
+    if (view === "roster" && lineups && lineups[rosterSide] && !lineups.error) {
+      const tid = lineups[rosterSide].team_id;
+      const s = await getJSON(
+        `/api/games/${currentGame}/availability-summary?team_id=${tid}`);
+      if (s && !s.error) availSummary = s;
+    }
     // The game sheet also needs the officials pool for its assign control (#30).
     if (view === "sheet") {
       const op = await getJSON("/api/officials");
@@ -1846,6 +1886,18 @@ async function render() {
   c.querySelectorAll("button[data-act]").forEach((b) => b.onclick = () => rosterAction(b.dataset.act, b.dataset.id));
   c.querySelectorAll(".seg[data-view]").forEach((b) => b.onclick = () => { gameView = b.dataset.view; toast = ""; render(); });
   c.querySelectorAll("[data-side]").forEach((b) => b.onclick = () => { rosterSide = b.dataset.side; toast = ""; render(); });
+  // Availability summary filter + remind (#89).
+  c.querySelectorAll("[data-avail-filter]").forEach((b) => b.onclick = () => {
+    availFilter = b.dataset.availFilter; render();
+  });
+  const remindBtn = c.querySelector("[data-avail-remind]");
+  if (remindBtn) remindBtn.onclick = async () => {
+    toast = "";
+    const tid = availSummary && availSummary.team_id;
+    const res = await post(`/api/games/${currentGame}/availability/remind`, { team_id: tid });
+    if (res && !res.error) toast = `Reminder sent for ${res.reminded} player(s).`;
+    await render();
+  };
   const printBtn = c.querySelector("[data-print]");
   if (printBtn) printBtn.onclick = () => window.print();
   // Officials assignment (#30): assign from the pool, official accepts/declines.

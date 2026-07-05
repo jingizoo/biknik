@@ -20,7 +20,9 @@ from ..domain import (
     DeviceToken,
     IceSlotStatus,
     IceSlotType,
+    NotificationAudience,
     NotificationChannel,
+    NotificationKind,
     NotificationPreference,
     NotificationRecipient,
     OfficialRole,
@@ -48,6 +50,7 @@ from ..services import (
     hash_feed_token,
     new_feed_token,
 )
+from ..services.notifier import push as _push_notification
 from ..store import InMemoryStore
 
 
@@ -176,6 +179,50 @@ class ApiService:
     def get_availability(self, game_id: str) -> List[dict]:
         self.roster._require_game(game_id)
         return [_serialize(a) for a in self.store.availability_for_game(game_id)]
+
+    @catch
+    def get_availability_summary(self, game_id: str, team_id: str) -> dict:
+        """Per-player availability for a team in a game (#89), bucketed into
+        available / unavailable / maybe / no_response, with counts. Private
+        (player names) — callers are gated by the same #73 access check."""
+        game = self.roster._require_game(game_id)
+        if team_id not in (game.home_team_id, game.away_team_id):
+            raise ValidationError("That team is not playing in this game.")
+        avail = {a.player_id: a
+                 for a in self.store.availability_for_game(game_id)}
+        counts = {"available": 0, "unavailable": 0, "maybe": 0, "no_response": 0}
+        players = []
+        for p in sorted(self.store.players_for_team(team_id), key=lambda x: x.name):
+            a = avail.get(p.id)
+            status = a.availability_status.value if a else "no_response"
+            if status == "pending":  # never-responded reads as no_response
+                status = "no_response"
+            counts[status if status in counts else "no_response"] += 1
+            players.append({"player_id": p.id, "name": p.name, "status": status})
+        return {"game_id": game_id, "team_id": team_id,
+                "counts": counts, "players": players}
+
+    @catch
+    def remind_unresponded(self, game_id: str, team_id: str,
+                           actor_id: Optional[str] = None) -> dict:
+        """Nudge the players who haven't set availability (#89): emit one
+        player-targeted AVAILABILITY_REMINDER per no-response player, so the
+        reminder actually reaches them (delivery honors each player's channel
+        preferences, #81). Returns the number of players reminded — a no-op
+        (emitting nothing) when everyone has already responded."""
+        summary = self.get_availability_summary(game_id, team_id)
+        if isinstance(summary, dict) and summary.get("error"):
+            return summary
+        unresponded = [p for p in summary["players"]
+                       if p["status"] == "no_response"]
+        for p in unresponded:
+            _push_notification(
+                self.store, self.roster.clock,
+                NotificationKind.AVAILABILITY_REMINDER,
+                NotificationAudience.PLAYER, "Availability reminder",
+                "Please confirm your availability for this game.",
+                audience_ref=p["player_id"], game_id=game_id)
+        return {"reminded": len(unresponded)}
 
     @catch
     def set_availability(self, game_id: str, player_id: str,
@@ -437,6 +484,9 @@ class ApiService:
         if aud == "coach":
             return role == "coach" and (
                 n.audience_ref is None or n.audience_ref == scope.get("team_id"))
+        if aud == "player":
+            pid = scope.get("player_id")
+            return pid is not None and n.audience_ref == pid
         return False
 
     @staticmethod

@@ -612,7 +612,7 @@ class Handler(BaseHTTPRequestHandler):
                     "message": "Session expired — please sign in again."}}, 401)
             return self._send_json({"user": user_view(sess, api.store)})
         # /api/games/{gid}/<sub>  — works for any game id, not just the seed.
-        m = re.match(r"^/api/games/([^/]+)(?:/(board|lineups|roster-status|roster|substitutes|officials))?$", path)
+        m = re.match(r"^/api/games/([^/]+)(?:/(board|lineups|roster-status|roster|substitutes|officials|availability-summary))?$", path)
         if m:
             gid, sub = m.group(1), m.group(2)
             # The bare game record is a public fixture (teams / time / rink /
@@ -648,6 +648,26 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_api(api.get_roster(gid))
             if sub == "substitutes":
                 return self._send_api(api.get_substitutes(gid))
+            if sub == "availability-summary":
+                # Availability rollup for a team (#89). The #73 gate above only
+                # proves the caller belongs to *a* team in this game — it does
+                # not bound *which* team's summary they may read. Add a
+                # team-level scope check (#89 review): a coach/player may read
+                # only their own team; operators (league admin / arena manager)
+                # any team in the game. The team defaults to the caller's own
+                # scope when not specified.
+                from urllib.parse import parse_qs, urlparse
+                qs = parse_qs(urlparse(self.path).query)
+                own_team = scope.get("team_id") or ""
+                team_id = (qs.get("team_id") or [own_team])[0]
+                if role in (Role.COACH, Role.PLAYER) and own_team \
+                        and team_id != own_team:
+                    return self._send_json({"error": {
+                        "code": "forbidden",
+                        "message": "You can only view your own team's "
+                                   "availability."}}, 403)
+                return self._send_api(
+                    api.get_availability_summary(gid, team_id))
         if path.startswith("/api/"):
             return self._send_json({"error": {"code": "not_found",
                                               "message": "Unknown endpoint."}}, 404)
@@ -921,6 +941,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_api(api.set_availability(
                     gid, pid, body.get("availability_status", "pending"),
                     body.get("response_source", "player"), actor))
+            if action == "availability/remind":
+                # One-click reminder to players who haven't responded (#89).
+                return self._send_api(api.remind_unresponded(
+                    gid, body.get("team_id") or scope.get("team_id"), actor))
             if action == "build-roster":
                 return self._send_api(api.auto_build_roster(
                     gid, body.get("team_id"), actor))
