@@ -912,19 +912,27 @@ class SetupService:
         widened to persisted ``external_ref``s the way #94's
         ``official_code`` was): a real pilot workflow sends ``rinks.csv`` and
         ``ice_slots.csv`` together in one upload, not rinks now and
-        slots-for-those-rinks in a separate later commit. Also unlike #93
-        (which needed an extra pre-write ``Position`` enum check because
-        ``validate_import`` doesn't validate ``position``), no extra gate is
-        needed here — ``slot_type`` is already validated against
-        :class:`IceSlotType` by ``validate_import`` itself.
+        slots-for-those-rinks in a separate later commit. ``slot_type`` is
+        already validated against :class:`IceSlotType` by ``validate_import``
+        itself, so no extra gate is needed for its FORMAT — but see the
+        allocated-slot pre-write gate below, which is about its INTERACTION
+        with an already-booked game, not its format.
 
         Venues are found-or-created by an exact (``.strip()``ped) name
         match, the same simple v1 as #93/#94's club matching — never
         updated in place even if a later row's ``address`` differs for the
         same name. Rinks are matched across repeat uploads by
-        ``external_ref`` (the sheet's ``rink_code``); ice slots have no code
-        of their own and are matched by the natural ``(rink_id, start_time,
-        end_time)`` tuple, mirroring #94's availability-window matching.
+        ``external_ref`` (the sheet's ``rink_code``), and ``rink_name`` is a
+        PARTIAL-FIELD-OVERWRITE on that update path (mirroring
+        ``commit_teams_players_import``'s player name/jersey_number/position
+        handling): since ``validate_import`` doesn't require ``rink_name``
+        (only ``venue_name``/``rink_code`` are required for the ``rinks``
+        sheet), a repeat row that omits it must leave the existing rink's
+        name alone rather than clobbering it back to the row's
+        ``rink_code`` — only a brand-new rink defaults its name to the code.
+        Ice slots have no code of their own and are matched by the natural
+        ``(rink_id, start_time, end_time)`` tuple, mirroring #94's
+        availability-window matching.
 
         Not ``@_transactional``, for the same reason documented at length on
         ``commit_teams_players_import``/``commit_officials_availability_import``
@@ -943,8 +951,17 @@ class SetupService:
         slot back to ``AVAILABLE``/``BLOCKED`` while the game record still
         points at it. The update-in-place path below therefore leaves
         ``status`` untouched whenever ``store.game_using_ice_slot`` reports a
-        game already claims the slot; only ``slot_type`` is updated in that
-        case.
+        game already claims the slot.
+
+        That guard alone isn't enough, though: ``create_game`` also requires
+        a booked slot's ``slot_type`` to stay ``GAME`` (it refuses to host a
+        game on ``practice``/``maintenance``/etc ice), so silently changing
+        ``slot_type`` out from under an allocated slot would leave the game
+        record pointing at ice that's no longer game-bookable, even with
+        ``status`` correctly preserved. A pre-write gate below therefore
+        rejects the ENTIRE commit — before any writes, same all-or-nothing
+        guarantee as everything else here — if an incoming row would change
+        the ``slot_type`` of a slot a game already uses.
 
         Also unlike ``create_ice_slot``'s single-entity route, this does NOT
         hard-block on overlapping ice times via ``ScheduleConflictError`` —
@@ -961,6 +978,37 @@ class SetupService:
         rink_rows = list(sheets.get("rinks") or [])
         slot_rows = list(sheets.get("ice_slots") or [])
 
+        # Pre-write gate (mirrors #93's Position check): create_game requires
+        # a booked slot's slot_type to stay GAME (it refuses to schedule onto
+        # practice/maintenance/etc ice). Silently changing slot_type on a
+        # slot a game already uses would leave that game pointing at ice
+        # that's no longer game-bookable, even though the status-preserving
+        # guard below correctly leaves `status` alone (review fix). Block the
+        # WHOLE commit before any writes if any row would do this — the same
+        # all-or-nothing guarantee as everything else here.
+        for row in slot_rows:
+            rink_code = _clean(row.get("rink_code"))
+            existing_rink = next((r for r in self.store.all_rinks()
+                                 if r.external_ref == rink_code), None)
+            if existing_rink is None:
+                continue  # a brand-new rink can't yet have a booked slot
+            start = _parse_iso_utc(row.get("start_time"))
+            end = _parse_iso_utc(row.get("end_time"))
+            new_slot_type = IceSlotType(_clean(row.get("slot_type")))
+            existing_slot = next(
+                (s for s in self.store.all_ice_slots()
+                 if s.rink_id == existing_rink.id and s.start_time == start
+                 and s.end_time == end), None)
+            if existing_slot is None:
+                continue
+            if (existing_slot.slot_type != new_slot_type
+                    and self.store.game_using_ice_slot(existing_slot.id) is not None):
+                raise ValidationError(
+                    f"Ice slot {existing_slot.id} on rink_code {rink_code} "
+                    f"has a game scheduled on it; slot_type cannot change "
+                    f"from {existing_slot.slot_type.value} to "
+                    f"{new_slot_type.value}.")
+
         counts = {"rinks_created": 0, "rinks_updated": 0,
                   "ice_slots_created": 0, "ice_slots_updated": 0,
                   "venues_created": 0}
@@ -972,12 +1020,15 @@ class SetupService:
                 venue_name = _clean(row.get("venue_name"))
                 rink_name_raw = row.get("rink_name")
                 # rink_name isn't in validate_import's required fields for
-                # "rinks" (only venue_name/rink_code are) — default a
-                # brand-new rink's name to its code so it's never blank, an
-                # explicit judgment call mirroring #93's position-default
-                # (may want revisiting).
-                rink_name = (_clean(rink_name_raw) if not _blank(rink_name_raw)
-                            else rink_code)
+                # "rinks" (only venue_name/rink_code are). A brand-new rink
+                # defaults its name to the code so it's never blank (an
+                # explicit judgment call mirroring #93's position-default,
+                # may want revisiting); an EXISTING rink's name is a
+                # partial-field-overwrite — a repeat row that omits
+                # rink_name must leave the current name alone rather than
+                # clobbering it back to the code (review fix).
+                rink_name_supplied = not _blank(rink_name_raw)
+                rink_name = _clean(rink_name_raw) if rink_name_supplied else None
                 address_raw = row.get("address")
                 address = _clean(address_raw) if not _blank(address_raw) else ""
 
@@ -993,7 +1044,8 @@ class SetupService:
                 rink = next((r for r in self.store.all_rinks()
                             if r.external_ref == rink_code), None)
                 if rink is not None:
-                    rink.name = rink_name
+                    if rink_name_supplied:
+                        rink.name = rink_name
                     rink.venue_id = venue.id
                     self.store.save_rink(rink)
                     self._audit("rink_updated", "rink", rink.id, actor_id,
@@ -1001,7 +1053,8 @@ class SetupService:
                     counts["rinks_updated"] += 1
                 else:
                     rink = Rink(id=self.store.next_id("rink"), venue_id=venue.id,
-                               name=rink_name, external_ref=rink_code)
+                               name=rink_name if rink_name_supplied else rink_code,
+                               external_ref=rink_code)
                     self.store.add_rink(rink)
                     self._audit("rink_created", "rink", rink.id, actor_id,
                                 {"venue_id": venue.id})

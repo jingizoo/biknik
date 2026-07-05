@@ -121,6 +121,21 @@ class ImportRinksIceSlotsCommitServiceContract:
         self.assertEqual(len(self.store.all_rinks()), 2)  # still no duplicate
         self.assertEqual(self._rink("R1").name, "Rink 1 Renamed")
 
+    # -- 2c. repeat import omitting rink_name must not clobber it (review fix)
+    def test_repeat_commit_without_rink_name_leaves_existing_name_unchanged(self):
+        self.api.commit_rinks_ice_slots_import(
+            _valid_sheets_csv(), actor_id="admin")
+        self.assertEqual(self._rink("R1").name, "Rink 1")
+        # rink_name isn't required by validate_import — a repeat row that
+        # omits it (only venue_name/rink_code supplied) must leave the
+        # existing name alone rather than clobbering it back to "R1".
+        bare_rinks_csv = "venue_name,rink_code\nIce Palace,R1\n"
+        res = self.api.commit_rinks_ice_slots_import(
+            {"rinks_csv": bare_rinks_csv}, actor_id="admin")
+        self.assertTrue(res["committed"])
+        self.assertEqual(res["summary"]["rinks"], {"created": 0, "updated": 1})
+        self.assertEqual(self._rink("R1").name, "Rink 1")
+
     # -- 3. venue dedup within one commit -------------------------------------
     def test_venue_dedup_within_one_commit(self):
         res = self.api.commit_rinks_ice_slots_import(
@@ -235,6 +250,46 @@ class ImportRinksIceSlotsCommitServiceContract:
         reimported_slot = self.store.get_ice_slot(slot.id)
         self.assertEqual(reimported_slot.status, IceSlotStatus.ALLOCATED)
         self.assertEqual(reimported_slot.slot_type.value, "game")
+
+    # -- 10. a repeat import must not change slot_type under a booked game ----
+    def test_repeat_import_with_changed_slot_type_on_allocated_slot_is_rejected(self):
+        # create_game requires a booked slot's slot_type to stay GAME. A
+        # repeat import that changes slot_type away from GAME on a slot a
+        # game already uses must be rejected outright (all-or-nothing), not
+        # silently applied — that would leave the game pointing at ice that
+        # is no longer game-bookable (review fix).
+        first = self.api.commit_rinks_ice_slots_import(
+            _valid_sheets_csv(), actor_id="admin")
+        self.assertTrue(first["committed"])
+        slot = next(s for s in self.store.all_ice_slots()
+                   if s.rink_id == self._rink("R1").id)
+
+        league = self.setup.create_league("Test League", actor_id="admin")
+        season = self.setup.create_season(
+            league.id, "2026 Season", actor_id="admin")
+        division = self.setup.create_division(
+            season.id, "U16", actor_id="admin")
+        club = self.setup.create_club("Test Club", actor_id="admin")
+        home = self.setup.create_team(club.id, division.id, "Home",
+                                      actor_id="admin")
+        away = self.setup.create_team(club.id, division.id, "Away",
+                                      actor_id="admin")
+        self.setup.create_game(season.id, division.id, home.id, away.id,
+                               slot.id, actor_id="admin")
+
+        changed_type_csv = (
+            "rink_code,start_time,end_time,slot_type\n"
+            "R1,2026-09-01T18:00:00+00:00,2026-09-01T19:30:00+00:00,practice\n"
+        )
+        res = self.api.commit_rinks_ice_slots_import(
+            {"rinks_csv": RINKS_CSV, "ice_slots_csv": changed_type_csv},
+            actor_id="admin")
+        self.assertIn("error", res)
+        self.assertEqual(res["error"]["code"], "validation_error")
+
+        unchanged_slot = self.store.get_ice_slot(slot.id)
+        self.assertEqual(unchanged_slot.slot_type.value, "game")
+        self.assertEqual(unchanged_slot.status, IceSlotStatus.ALLOCATED)
 
 
 class MemoryImportRinksIceSlotsCommitTest(
