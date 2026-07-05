@@ -772,3 +772,22 @@ button.act.danger { background: #ffe5e3; color: #c0271b; }
 .cd-input:focus { outline: none; border-color: var(--blue); }
 .cd-submit { flex: 0 0 auto; }
 .cd-table tr.dt-off td { opacity: .55; }
+
+/* ----- phone breakpoint (#100: responsive pass) ----- */
+@media (max-width: 480px) {
+  /* Flex children with no shrink limit force their row wider than the
+     viewport instead of using their own overflow-x:auto scrollbar — the
+     row (and eventually the body) overflows sideways instead. */
+  .cal-slots, .wk-days, .li .li-main { min-width: 0; }
+  button.act { padding: 9px 13px; }
+  .actions button { padding: 13px; }
+  .seg { padding: 10px 0; }
+  .cal-nav .act { padding: 8px 11px; font-size: 13px; }
+  /* Sub-16px text inputs trigger iOS Safari's auto-zoom on focus.
+     (Note: ".form" itself matches no rendered markup — the real form
+     classes are .avail-form/.cd-input/.drawer-body below.) */
+  .avail-form input, .avail-form select, .cd-input,
+  .drawer-body input, .drawer-body select,
+  .cal-filters select, .import-form select { font-size: 16px; }
+  .import-form textarea { font-size: 14px; }
+}

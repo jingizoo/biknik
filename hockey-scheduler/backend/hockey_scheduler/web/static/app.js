@@ -1858,7 +1858,7 @@ function renderPublic(ov) {
         <td class="st-pts">${r.pts}</td></tr>`).join("")
       : `<tr><td colspan="10" class="empty">No results yet.</td></tr>`;
     body = `${divs.length ? `<div class="actions"><select id="public-div">${opts}</select></div>` : ""}
-      <div class="card"><table class="st-table">
+      <div class="card st-card"><table class="st-table">
         <thead><tr><th>#</th><th>Team</th><th>GP</th><th>W</th><th>L</th><th>T</th>
           <th>GF</th><th>GA</th><th>GD</th><th>Pts</th></tr></thead>
         <tbody>${trs}</tbody></table></div>`;
