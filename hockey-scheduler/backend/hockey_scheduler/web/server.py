@@ -860,6 +860,23 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/import/dry-run":
             return self._send_api(api.get_import_dry_run(body))
 
+        # Pilot onboarding import COMMIT — teams + players only (#93). The
+        # path names the scope explicitly: officials/rinks/ice_slots commit
+        # are separate endpoints in #94/#95, not a query param on this one.
+        # Actually writes teams/players (and any find-or-created
+        # clubs/divisions) after re-validating via the same gate as the
+        # dry-run above. 200 either way (committed true/false is itself the
+        # report); only a malformed request (bad season_id, an unsupported
+        # sheet key) is a non-200 structured error.
+        if path == "/api/import/commit/teams-players":
+            # Server-resolved actor, not the forgeable body field (review):
+            # this writes a whole tree of audit rows (club/division/team/
+            # player/import_batch), so attribution must come from the
+            # already-authenticated session, matching the notification-
+            # preference/official-availability/calendar-feed precedent.
+            return self._send_api(api.commit_teams_players_import(
+                body.get("season_id"), body, actor_id=user_id))
+
         # Season scheduler v1 (#84): generate a draft round-robin proposal for a
         # division. Returns a preview only — nothing is created or published.
         if path == "/api/scheduler/draft":

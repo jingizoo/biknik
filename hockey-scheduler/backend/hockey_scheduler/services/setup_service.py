@@ -11,6 +11,7 @@ from typing import Callable, List, Optional
 
 from ..domain import (
     Club,
+    ContactDestination,
     Division,
     Game,
     IceSlot,
@@ -19,6 +20,7 @@ from ..domain import (
     League,
     GameResult,
     NotificationAudience,
+    NotificationChannel,
     NotificationKind,
     Official,
     OfficialAssignment,
@@ -43,11 +45,20 @@ from ..domain.errors import (
     ValidationError,
 )
 from ..store import InMemoryStore
+from .import_validator import validate_import
 from .notifier import push as _push_notification
 
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _blank(value) -> bool:
+    return value is None or not str(value).strip()
+
+
+def _clean(value) -> str:
+    return str(value).strip()
 
 
 def _transactional(fn):
@@ -455,6 +466,222 @@ class SetupService:
         self._audit("player_added", "player", player.id, actor_id,
                     {"team_id": team_id})
         return player
+
+    # -- CSV import commit (#93) --------------------------------------------
+    def commit_teams_players_import(self, season_id: str, sheets: dict,
+                                    actor_id: Optional[str] = None) -> dict:
+        """Commit step 2 of the pilot onboarding import wizard: teams+players.
+
+        ``sheets`` is ALREADY-PARSED row dicts (``{"teams": [...],
+        "players": [...]}``) — CSV-text parsing stays at the API facade layer
+        (see ``ApiService.commit_teams_players_import``), matching #92's
+        layering. ``validate_import`` (the SAME pure gate #92 added) is reused
+        unchanged as the pre-commit check: if it reports any errors, nothing
+        is written at all, not even otherwise-valid rows in the other sheet.
+
+        Teams and players are matched across repeat uploads by ``external_ref``
+        (the sheet's ``team_code``/``player_code``), so re-importing the same
+        payload updates existing rows in place instead of duplicating them.
+        This match is deliberately GLOBAL, not scoped to ``season_id``: a
+        ``team_code`` reused in a different season's import will move the
+        existing team into the new season rather than create a second one.
+        Acceptable for v1 if codes are treated as globally stable identifiers;
+        revisit if/when multi-season imports become a real workflow (#93
+        review).
+
+        Clubs and divisions have no external code in this slice — they are
+        found-or-created by an exact (``.strip()``ped) name match, division
+        scoped to ``season_id`` since the same division name can recur across
+        seasons. This is a deliberately simple v1: no fuzzy matching, no
+        dedup across near-identical names beyond whitespace-trimming.
+
+        Not ``@_transactional``: this method must call no other
+        ``@_transactional`` service method (``create_club``/``create_team``/
+        ``add_player`` all open their own transaction), or a nested
+        ``with store.transaction():`` raises ``sqlite3.OperationalError:
+        cannot start a transaction within a transaction`` on the SQL backend —
+        exactly the decorator/transaction-boundary bug that broke #87 and
+        #88. Instead this opens exactly one transaction itself below and
+        duplicates the small amount of create-logic it needs via raw store
+        calls + its own ``self._audit(...)`` calls.
+        """
+        if self.store.get_season(season_id) is None:
+            raise NotFoundError(f"Season {season_id} not found.")
+
+        result = validate_import(sheets)
+        if not result["ok"]:
+            return {"committed": False, "summary": result["summary"],
+                    "errors": result["errors"], "warnings": result["warnings"]}
+
+        team_rows = list(sheets.get("teams") or [])
+        player_rows = list(sheets.get("players") or [])
+
+        # #92's validator never checks that `position` is a recognized value
+        # (it doesn't require the column at all). Validate every row's
+        # position BEFORE any writes, so a bad value on a later row can't
+        # leave earlier rows (or the teams sheet) partially committed —
+        # the same all-or-nothing guarantee validate_import already gives us.
+        for row in player_rows:
+            value = row.get("position")
+            if _blank(value):
+                continue
+            try:
+                Position(_clean(value))
+            except ValueError:
+                raise ValidationError(
+                    f"Unknown position '{value}' for player_code "
+                    f"{row.get('player_code')}.")
+
+        counts = {"teams_created": 0, "teams_updated": 0,
+                  "players_created": 0, "players_updated": 0,
+                  "clubs_created": 0, "divisions_created": 0}
+
+        with self.store.transaction():
+            team_code_to_id = {}
+            for row in team_rows:
+                team_code = _clean(row.get("team_code"))
+                team_name = _clean(row.get("team_name"))
+
+                club_id = None
+                club_name_raw = row.get("club_name")
+                if not _blank(club_name_raw):
+                    club_name = _clean(club_name_raw)
+                    club = next((c for c in self.store.all_clubs()
+                                if c.name == club_name), None)
+                    if club is None:
+                        club = Club(id=self.store.next_id("club"), name=club_name)
+                        self.store.add_club(club)
+                        self._audit("club_created", "club", club.id, actor_id)
+                        counts["clubs_created"] += 1
+                    club_id = club.id
+
+                division = None
+                division_name_raw = row.get("division_name")
+                if not _blank(division_name_raw):
+                    division_name = _clean(division_name_raw)
+                    division = next(
+                        (d for d in self.store.all_divisions()
+                         if d.season_id == season_id and d.name == division_name),
+                        None)
+                    if division is None:
+                        division = Division(id=self.store.next_id("division"),
+                                            season_id=season_id, name=division_name)
+                        self.store.add_division(division)
+                        self._audit("division_created", "division", division.id,
+                                    actor_id, {"season_id": season_id})
+                        counts["divisions_created"] += 1
+
+                division_id = division.id if division else None
+                division_name_str = division.name if division else ""
+
+                team = next((t for t in self.store.all_teams()
+                            if t.external_ref == team_code), None)
+                if team is not None:
+                    team.name = team_name
+                    team.club_id = club_id
+                    team.division_id = division_id
+                    team.division = division_name_str
+                    self.store.save_team(team)
+                    self._audit("team_updated", "team", team.id, actor_id,
+                                {"club_id": club_id, "division_id": division_id})
+                    counts["teams_updated"] += 1
+                else:
+                    team = Team(id=self.store.next_id("team"), name=team_name,
+                               division=division_name_str, club_id=club_id,
+                               division_id=division_id, external_ref=team_code)
+                    self.store.add_team(team)
+                    self._audit("team_created", "team", team.id, actor_id,
+                                {"club_id": club_id, "division_id": division_id})
+                    counts["teams_created"] += 1
+                team_code_to_id[team_code] = team.id
+
+            for row in player_rows:
+                player_code = _clean(row.get("player_code"))
+                full_name = (f"{_clean(row.get('first_name'))} "
+                            f"{_clean(row.get('last_name'))}").strip()
+                # validate_import already guarantees this team_code matches a
+                # row in THIS SAME upload's teams sheet; .get() is just a
+                # defensive belt-and-suspenders check against a bug elsewhere.
+                team_id = team_code_to_id.get(_clean(row.get("team_code")))
+                if team_id is None:
+                    raise ValidationError(
+                        f"Unknown team_code for player_code {player_code}.")
+
+                jersey_raw = row.get("jersey_number")
+                jersey_number = (int(_clean(jersey_raw)) if not _blank(jersey_raw)
+                                else None)
+                position_raw = row.get("position")
+                position = (Position(_clean(position_raw))
+                           if not _blank(position_raw) else None)
+                email_raw = row.get("email")
+                email = _clean(email_raw) if not _blank(email_raw) else None
+
+                player = next((p for p in self.store.all_players()
+                              if p.external_ref == player_code), None)
+                if player is not None:
+                    # Partial-field-overwrite: only fields the sheet actually
+                    # supplies this time are updated.
+                    player.name = full_name
+                    player.team_id = team_id
+                    if jersey_number is not None:
+                        player.jersey_number = jersey_number
+                    if position is not None:
+                        player.position = position
+                    self.store.save_player(player)
+                    self._audit("player_updated", "player", player.id, actor_id,
+                                {"team_id": team_id})
+                    counts["players_updated"] += 1
+                else:
+                    # The domain model requires a Position with no default,
+                    # but #92 doesn't require the CSV to supply one — default
+                    # a brand-new player to FORWARD as an explicit judgment
+                    # call; may want revisiting.
+                    player = Player(id=self.store.next_id("player"), team_id=team_id,
+                                    name=full_name,
+                                    position=position or Position.FORWARD,
+                                    jersey_number=jersey_number,
+                                    external_ref=player_code)
+                    self.store.add_player(player)
+                    self._audit("player_added", "player", player.id, actor_id,
+                                {"team_id": team_id})
+                    counts["players_created"] += 1
+
+                if email is not None:
+                    recipient_ref = f"player:{player.id}"
+                    existing = self.store.get_contact_destination(
+                        recipient_ref, NotificationChannel.EMAIL)
+                    if existing is not None:
+                        existing.destination = email
+                        self.store.save_contact_destination(existing)
+                    else:
+                        self.store.add_contact_destination(ContactDestination(
+                            id=self.store.next_id("contact"),
+                            recipient_ref=recipient_ref,
+                            channel=NotificationChannel.EMAIL,
+                            destination=email))
+
+            batch_id = self.store.next_id("importbatch")
+            # skipped/errors are always 0 here by construction: the
+            # all-or-nothing gate above means the only way to reach this line
+            # is a fully clean validate_import result — any error blocks the
+            # transaction before an audit row is ever written. Present anyway
+            # for a stable import_committed detail shape across #93-#95.
+            self._audit("import_committed", "import_batch", batch_id, actor_id,
+                        {"season_id": season_id, "skipped": 0, "errors": 0,
+                         **counts})
+
+        return {
+            "committed": True,
+            "summary": {
+                "teams": {"created": counts["teams_created"],
+                         "updated": counts["teams_updated"]},
+                "players": {"created": counts["players_created"],
+                           "updated": counts["players_updated"]},
+                "clubs_created": counts["clubs_created"],
+                "divisions_created": counts["divisions_created"],
+            },
+            "warnings": result["warnings"],
+        }
 
     # -- officials (#30) ---------------------------------------------------
     @_transactional

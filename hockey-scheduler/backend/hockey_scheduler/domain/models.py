@@ -30,6 +30,10 @@ class Team:
     division: str = ""
     club_id: Optional[str] = None
     division_id: Optional[str] = None
+    # Idempotency key for the CSV import (#93): the ``team_code`` a repeat
+    # upload is matched against, so re-importing updates in place instead of
+    # creating duplicates. None for teams created outside the import flow.
+    external_ref: Optional[str] = None
 
 
 @dataclass
@@ -42,6 +46,10 @@ class Player:
     jersey_number: Optional[int] = None
     is_active: bool = True
     guardian_person_id: Optional[str] = None
+    # Idempotency key for the CSV import (#93): the ``player_code`` a repeat
+    # upload is matched against. None for players created outside the import
+    # flow.
+    external_ref: Optional[str] = None
 
     @property
     def slot_type(self) -> SlotType:

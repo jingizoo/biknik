@@ -397,11 +397,16 @@ class SqlStore:
     # -- teams / players ---------------------------------------------------
     def add_team(self, team): return self._insert(team)
     def get_team(self, team_id): return self._get(Team, team_id)
+    def save_team(self, team): return self._update(team)
     def add_player(self, player): return self._insert(player)
     def get_player(self, player_id): return self._get(Player, player_id)
+    def save_player(self, player): return self._update(player)
 
     def players_for_team(self, team_id):
         return self._query(Player, "team_id = ?", (team_id,), order="id")
+
+    def all_players(self):
+        return self._query(Player, order="id")
 
     # -- games -------------------------------------------------------------
     def add_game(self, game): return self._insert(game)
