@@ -289,6 +289,32 @@ class SqlStore:
     def close(self) -> None:
         self.conn.close()
 
+    # -- operational health (#90) ------------------------------------------
+    def db_reachable(self) -> bool:
+        try:
+            with self._lock:
+                cur = self.conn.cursor()
+                cur.execute("SELECT 1")
+                cur.fetchone()
+            return True
+        except Exception:
+            return False
+
+    def migration_status(self) -> dict:
+        """Applied vs. expected migration versions, and whether all shipped
+        migrations have been applied (#90)."""
+        expected = [v for v, _ in _load_migrations()]
+        try:
+            with self._lock:
+                cur = self.conn.cursor()
+                cur.execute("SELECT version FROM schema_migrations")
+                applied = sorted(r["version"] for r in cur.fetchall())
+            current = all(v in applied for v in expected)
+        except Exception:
+            applied, current = [], False
+        return {"backend": self.backend, "applied": applied,
+                "expected": expected, "current": current}
+
     def reset_schema(self) -> None:
         """Drop all tables and re-migrate — for a clean test database."""
         with self._lock:
