@@ -39,8 +39,14 @@ class PostgresSmokeTest(unittest.TestCase):
         self.assertEqual(api2.get_roster_status(gid)["status"], "locked")
         ov = api2.get_demo_overview()
         self.assertEqual(ov["league"]["name"], "Alpine Ice Hockey League")
-        self.assertEqual(len(ov["teams"]), 4)
-        self.assertEqual(len(ov["public_fixtures"]), 1)
+        # Pilot-scale demo data pack (#97): 12 teams, and the core scenario's
+        # seeded game plus ~18 more published games. Derived from the
+        # schedule itself (not hardcoded) so this doesn't drift again if the
+        # pack's exact game count ever changes.
+        self.assertEqual(len(ov["teams"]), 12)
+        published = [g for g in ov["schedule"] if g["published"]]
+        self.assertEqual(len(ov["public_fixtures"]), len(published))
+        self.assertEqual(len(published), 19)
 
 
 if __name__ == "__main__":

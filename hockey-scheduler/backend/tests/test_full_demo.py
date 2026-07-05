@@ -17,19 +17,27 @@ class FullDemoTest(unittest.TestCase):
         self.assertEqual(ov["league"]["name"], "Alpine Ice Hockey League")
         self.assertEqual({d["name"] for d in ov["divisions"]},
                          {"U16 Elite", "U18 Development", "Senior A"})
-        self.assertEqual({t["name"] for t in ov["teams"]},
-                         {"U16 Lions", "U16 Falcons", "U18 Lions", "Senior Lions"})
+        # The pilot data pack (#97) grows this from the original 4-team demo
+        # to 12 teams across the 3 divisions.
+        self.assertEqual({t["name"] for t in ov["teams"]}, {
+            "U16 Lions", "U16 Falcons", "U16 Wolves", "U16 Comets",
+            "U16 Panthers", "U16 Sharks",
+            "U18 Lions", "U18 Falcons", "U18 Wolves", "U18 Bears",
+            "Senior Lions", "Senior Falcons",
+        })
+        # 3 rinks across 2 venues (#97 adds Lakeside Rink at a second venue).
         self.assertEqual({r["name"] for r in ov["rinks"]},
-                         {"Main Rink", "Training Rink"})
-        # Two slots are allocated: the seeded published game and a future draft
-        # game (left unrostered for the roster-selection demo). Both are Lions
-        # vs Falcons; exactly one of them is published.
+                         {"Main Rink", "Training Rink", "Lakeside Rink"})
+        # The original seeded published game and its future draft game are
+        # still exactly as before, plus ~18 more games (#97) drawn from two
+        # weeks of ice inventory — one of which is left as another draft (the
+        # core scenario's own "next game"), the rest published.
         allocated = [s for s in ov["ice_slots"] if s["status"] == "allocated"]
-        self.assertEqual(len(allocated), 2)
-        self.assertEqual({s["game_label"] for s in allocated},
-                         {"U16 Lions vs U16 Falcons"})
+        self.assertEqual(len(allocated), 20)
+        self.assertIn("U16 Lions vs U16 Falcons",
+                      {s["game_label"] for s in allocated})
         published = [g for g in ov["schedule"] if g["published"]]
-        self.assertEqual(len(published), 1)
+        self.assertEqual(len(published), 19)
 
     def test_opens_on_confirmed_roster(self):
         status = self.api.get_roster_status(self.game_id)

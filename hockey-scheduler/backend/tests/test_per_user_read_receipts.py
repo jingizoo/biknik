@@ -38,9 +38,11 @@ class PerUserReadReceiptFacadeTest(unittest.TestCase):
                              if n["id"] == nid)["read"])
         self.assertFalse(next(n for n in v2["notifications"]
                               if n["id"] == nid)["read"])
-        # v2 read nothing: both public notifications (result + game-published,
-        # #87) remain unread for them.
-        self.assertEqual(v2["unread"], 2)
+        # v2 read nothing: every public notification (one "game published"
+        # per published game, plus the finalized result, #87) remains
+        # unread for them — the pilot data pack (#97) publishes 19 games.
+        expected_public = sum(1 for g in self.store.all_games() if g.published) + 1
+        self.assertEqual(v2["unread"], expected_public)
 
     def test_two_officials_with_the_same_scope_stay_independent(self):
         # Even if two accounts somehow shared identical role+scope (the old

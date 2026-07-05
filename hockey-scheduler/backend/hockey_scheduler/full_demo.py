@@ -6,13 +6,29 @@ rinks → ice slots, and a manual game on an allocated slot. Then seeds the home
 team's players and confirms a full roster, leaving one player available to act
 as a substitute so the live roster/substitute flow can be demonstrated.
 
+Beyond that core scenario (#97, the "pilot data pack"), the store is filled
+out to pilot scale — ~12 teams, ~180 players, ~24 officials, 3 rinks across 2
+venues, two weeks of ice inventory, and ~20 published games — so sales demos
+and screenshots look like a real multi-week league, not a 4-team toy. This is
+purely ADDITIVE: every id/entity the core scenario above returns in ``ids``
+(and that ~20 test files key off via ``STATE.ids``) is created exactly as
+before; the pilot-scale data is extra teams/players/officials/ice/games
+layered on top, never a replacement.
+
 No real PII — all names are obviously fictional.
 """
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Tuple
 
-from .domain import AvailabilityStatus, OfficialRole, Position
+from .domain import (
+    AvailabilityStatus,
+    IceSlotType,
+    OfficialAvailabilityStatus,
+    OfficialRole,
+    Position,
+)
+from .domain.errors import DomainError
 from .services import RosterService, SetupService
 from .store import InMemoryStore
 
@@ -121,6 +137,10 @@ def build_full_demo_store(store=None) -> Tuple[InMemoryStore, str, dict]:
     setup.record_result(game.id, 4, 2, actor_id=admin)
     setup.approve_result(game.id, actor_id=admin)
 
+    # Pilot-scale data pack (#97) — purely additive, see module docstring.
+    _seed_pilot_scale(setup, roster, admin, season, d_u16, d_u18, d_sen,
+                      club_falcons, main_rink)
+
     ids = {
         "next_game_id": game_next.id,
         "referee_id": ref.id,
@@ -137,3 +157,263 @@ def build_full_demo_store(store=None) -> Tuple[InMemoryStore, str, dict]:
         "selected_player_id": skaters[0].id,
     }
     return store, game.id, ids
+
+
+# ---------------------------------------------------------------------------
+# Pilot-scale data pack (#97)
+#
+# Names below are GENERATED, not hand-typed, so this stays maintainable at
+# ~180-player scale — no `random`/timestamp source anywhere, so a fresh reset
+# always produces the exact same dataset (deterministic, per CLAUDE.md).
+# ---------------------------------------------------------------------------
+
+_PLAYER_FIRST_NAMES = [
+    "Aarav", "Kabir", "Rohan", "Dev", "Neil", "Sam", "Leo", "Max", "Ivan", "Theo",
+    "Finn", "Zane", "Owen", "Cole", "Jude", "Reid", "Lukas", "Nico", "Emil", "Jonas",
+    "Tim", "Ravi", "Omar", "Felix", "Noah", "Liam", "Adam", "Eli", "Yusuf", "Karl",
+    "Ben", "Milo", "Arlo", "Hugo", "Jesse", "Kai", "Levi", "Miles", "Nate", "Otto",
+    "Pax", "Quinn", "Ryo", "Silas", "Tobias", "Uri", "Viggo", "Wyatt", "Xavier", "Yannick",
+]
+_LAST_INITIALS = list("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+
+# The first 3 entries match the officials already seeded above (Riley
+# Whistle, Lee Blueline, Sky Tally) so _seed_pilot_scale can just skip them
+# instead of keeping a second, easily-drifting name list in sync.
+_OFFICIAL_FIRST_NAMES = [
+    "Riley", "Lee", "Sky", "Casey", "Jordan", "Drew", "Morgan", "Taylor", "Alex",
+    "Sam", "Jamie", "Robin", "Charlie", "Frankie", "Bailey", "Reese", "Skyler",
+    "Rowan", "Blake", "Ellis", "Dakota", "Sage", "Remy", "Shiloh",
+]
+_OFFICIAL_SURNAMES = [
+    "Whistle", "Blueline", "Tally", "Icecheck", "Faceoff", "Redline", "Crease",
+    "Offside", "Powerplay", "Penalty", "Zamboni", "Boarding", "Deke", "Slapshot",
+    "Hattrick", "Crossbar", "Icetime", "Backcheck", "Wraparound", "Onetimer",
+    "Breakaway", "Neutral", "Overtime", "Shootout",
+]
+
+
+def _squad_names(count: int, offset: int):
+    """`count` deterministic, obviously-fictional "First I." names, drawing
+    from `offset` onward in the shared name space so different squads don't
+    repeat the same combo (50 first names × 26 initials = 1,300 combos, far
+    more than the ~184 players this pack ever needs)."""
+    names = []
+    for i in range(count):
+        idx = offset + i
+        first = _PLAYER_FIRST_NAMES[idx % len(_PLAYER_FIRST_NAMES)]
+        initial = _LAST_INITIALS[(idx // len(_PLAYER_FIRST_NAMES)) % len(_LAST_INITIALS)]
+        names.append(f"{first} {initial}.")
+    return names
+
+
+def _round_robin_pairs(team_ids, rounds):
+    """(home, away) pairs for `rounds` passes over `team_ids`, alternating
+    home/away each pass. A short division (e.g. Senior A's 2 teams) simply
+    plays the same rival every round — same as a real small division would."""
+    pairs = []
+    n = len(team_ids)
+    for r in range(rounds):
+        for i in range(0, n - 1, 2):
+            a, b = team_ids[i], team_ids[i + 1]
+            pairs.append((a, b) if r % 2 == 0 else (b, a))
+    return pairs
+
+
+def _seed_pilot_scale(setup, roster, admin, season, d_u16, d_u18, d_sen,
+                      club_falcons, main_rink):
+    """Fill the store out to pilot scale on top of the core scenario above:
+    12 teams, ~184 players, 24 officials, 3 rinks across 2 venues, two weeks
+    of ice inventory, and ~18 more published games (~19-20 total) with a
+    couple of officiating conflicts and player non-responses mixed in.
+    """
+    store = setup.store
+    club_bears = next(c for c in store.all_clubs() if c.name == "Bears HC")
+    club_wolves = setup.create_club("Wolves HC", country="AT", actor_id=admin)
+    club_comets = setup.create_club("Comets HC", country="AT", actor_id=admin)
+    club_panthers = setup.create_club("Panthers HC", country="AT", actor_id=admin)
+    club_sharks = setup.create_club("Sharks HC", country="AT", actor_id=admin)
+
+    u16_wolves = setup.create_team(club_wolves.id, d_u16.id, "U16 Wolves", actor_id=admin)
+    u16_comets = setup.create_team(club_comets.id, d_u16.id, "U16 Comets", actor_id=admin)
+    u16_panthers = setup.create_team(club_panthers.id, d_u16.id, "U16 Panthers", actor_id=admin)
+    u16_sharks = setup.create_team(club_sharks.id, d_u16.id, "U16 Sharks", actor_id=admin)
+
+    u18_lions = next(t for t in store.all_teams() if t.name == "U18 Lions")
+    u18_falcons = setup.create_team(club_falcons.id, d_u18.id, "U18 Falcons", actor_id=admin)
+    u18_wolves = setup.create_team(club_wolves.id, d_u18.id, "U18 Wolves", actor_id=admin)
+    u18_bears = setup.create_team(club_bears.id, d_u18.id, "U18 Bears", actor_id=admin)
+
+    senior_lions = next(t for t in store.all_teams() if t.name == "Senior Lions")
+    senior_falcons = setup.create_team(club_falcons.id, d_sen.id, "Senior Falcons",
+                                       actor_id=admin)
+
+    # Squads: a goalie + 14 skaters for every NEW or previously-empty team
+    # (15 each). U16 Lions/Falcons already have full 17-player squads from
+    # the core scenario above and are left untouched.
+    name_offset = 0
+    for team in (u18_lions, senior_lions, u16_wolves, u16_comets, u16_panthers,
+                u16_sharks, u18_falcons, u18_wolves, u18_bears, senior_falcons):
+        skater_names = _squad_names(14, name_offset)
+        name_offset += 20  # gap so consecutive squads never share a combo
+        setup.add_player(team.id, f"{skater_names[0].split()[0]} (G)",
+                         Position.GOALIE, jersey_number=30, actor_id=admin)
+        for i, name in enumerate(skater_names, start=1):
+            pos = Position.DEFENSE if i % 3 == 0 else Position.FORWARD
+            setup.add_player(team.id, name, pos, jersey_number=i, actor_id=admin)
+
+    # Officials: 24 total. The first 3 (Riley Whistle/Lee Blueline/Sky
+    # Tally) already exist from the core scenario above; add the other 21.
+    officials = list(store.all_officials())
+    for first, last in list(zip(_OFFICIAL_FIRST_NAMES, _OFFICIAL_SURNAMES))[3:]:
+        officials.append(setup.create_official(f"{first} {last}", actor_id=admin))
+
+    # A second venue/rink so the arena calendar spans more than one arena —
+    # 3 rinks total across 2 venues.
+    venue2 = setup.create_venue("Lakeside Ice Center", address="2 Harbor Rd",
+                                actor_id=admin)
+    lakeside_rink = setup.create_rink(venue2.id, "Lakeside Rink", actor_id=admin)
+    training_rink = next(r for r in store.all_rinks() if r.name == "Training Rink")
+    rinks = [main_rink, training_rink, lakeside_rink]
+
+    # Two weeks of ice inventory across all 3 rinks: one evening GAME slot
+    # per rink per day, plus a practice slot every 4th day for variety.
+    # Defensive: main_rink already has core-scenario bookings on a couple of
+    # these dates (e.g. the #93-style "next game" slot on day 6), so a slot
+    # that would overlap an existing one on the same rink is simply skipped
+    # rather than allowed to crash server startup on a date collision.
+    _START = datetime(2026, 9, 6, tzinfo=timezone.utc)
+    game_slots = []
+    for day in range(14):
+        d = _START + timedelta(days=day)
+        for rink in rinks:
+            try:
+                slot = setup.create_ice_slot(
+                    rink.id, d.replace(hour=18), d.replace(hour=19, minute=30),
+                    actor_id=admin)
+                game_slots.append(slot)
+            except DomainError:
+                pass
+            if day % 4 == 0:
+                try:
+                    setup.create_ice_slot(
+                        rink.id, d.replace(hour=16), d.replace(hour=17, minute=15),
+                        slot_type=IceSlotType.PRACTICE, actor_id=admin)
+                except DomainError:
+                    pass
+
+    # ~18 more published games across all three divisions, drawn from the
+    # ice inventory above. Wrapped defensively for the same reason as the
+    # ice slots: a seed script should never crash the whole server over a
+    # scheduling edge case, so any conflict just skips that pairing.
+    #
+    # Deliberately EXCLUDES u16_lions/u16_falcons: they're the core
+    # scenario's own teams, and a bunch of existing tests rely on their
+    # game history being EXACTLY the two core-scenario games (e.g. "copy
+    # previous roster" finds the most recent PRIOR game for a team — adding
+    # more games for these two specific teams silently changes which game
+    # that resolves to elsewhere in the suite). Every new game below is
+    # between teams this pack itself created (or a previously-empty core
+    # team like U18 Lions/Senior Lions that had zero games to begin with,
+    # so giving them some is a pure addition, not a behavior change).
+    matchups = (
+        _round_robin_pairs([u16_wolves.id, u16_comets.id,
+                           u16_panthers.id, u16_sharks.id], 3)
+        + _round_robin_pairs([u18_lions.id, u18_falcons.id, u18_wolves.id,
+                             u18_bears.id], 3)
+        + _round_robin_pairs([senior_lions.id, senior_falcons.id], 6)
+    )
+    division_of = {t.id: d_u16.id for t in
+                  (u16_wolves, u16_comets, u16_panthers, u16_sharks)}
+    division_of.update({t.id: d_u18.id for t in
+                       (u18_lions, u18_falcons, u18_wolves, u18_bears)})
+    division_of.update({t.id: d_sen.id for t in (senior_lions, senior_falcons)})
+
+    # Every rink's slot on a given day shares the same evening time-of-day,
+    # so two games on the same day are effectively simultaneous regardless
+    # of rink — a team can appear in at most one of them. Round-robin pairs
+    # from adjacent rounds don't align to day boundaries (e.g. a 4-team
+    # division plays 2 pairs/round against 3 same-day rink slots), so
+    # walking `game_slots` in raw generation order can hand the same team a
+    # second "simultaneous" game later the same day. Track which teams are
+    # already booked per day and skip forward to a day where neither team
+    # has a game yet, instead of relying solely on create_game's own
+    # conflict check (which would just as correctly reject it, but as a
+    # skipped pairing rather than a scheduled one — this way the ice
+    # inventory's day-spread is actually used instead of losing a third of
+    # the intended games to same-day collisions).
+    # Seeded from the ALREADY-existing games too (the core scenario's two
+    # U16 Lions/Falcons games above), not just the ones this function
+    # creates, so a new pairing can never be handed a day one of its teams
+    # is already booked on, however that booking got there.
+    booked_teams_by_day = {}
+    for existing in store.all_games():
+        if existing.cancelled:
+            continue
+        day_key = existing.start_time.date()
+        booked_teams_by_day.setdefault(day_key, set()).update(
+            {existing.home_team_id, existing.away_team_id} - {None})
+    used_slot_ids = set()
+    new_games = []
+    for home_id, away_id in matchups:
+        chosen = None
+        for slot in game_slots:
+            if slot.id in used_slot_ids:
+                continue
+            day_key = slot.start_time.date()
+            day_teams = booked_teams_by_day.setdefault(day_key, set())
+            if home_id in day_teams or away_id in day_teams:
+                continue
+            chosen = slot
+            break
+        if chosen is None:
+            break  # ice inventory exhausted for this pairing
+        used_slot_ids.add(chosen.id)
+        booked_teams_by_day[chosen.start_time.date()].update((home_id, away_id))
+        try:
+            g = setup.create_game(season.id, division_of[home_id], home_id, away_id,
+                                  chosen.id, actor_id=admin)
+            setup.publish_game(g.id, actor_id=admin)
+            new_games.append(g)
+        except DomainError:
+            continue
+
+    # Officiating: rotate the NEW officials (skip the first 3 — Riley
+    # Whistle/Lee Blueline/Sky Tally are the core scenario's own officials,
+    # and existing tests rely on their assignment/availability history being
+    # exactly what the core scenario above established) across the first
+    # several new games, and give two of them a declared-unavailable window
+    # that overlaps a game they're ALREADY assigned to — a realistic "arena
+    # manager needs to resolve this" conflict, seeded in the same order a
+    # real one would arise (assign first, the official's plans change
+    # afterward — assigning into an already-declared-unavailable window is
+    # blocked outright, so this is the only order that produces the
+    # conflict instead of an error).
+    new_officials = officials[3:]
+    for i, g in enumerate(new_games[:6]):
+        official = new_officials[i % len(new_officials)]
+        try:
+            setup.assign_official(g.id, official.id, OfficialRole.REFEREE,
+                                  actor_id=admin)
+        except DomainError:
+            continue
+        if i < 2:
+            setup.set_official_availability(
+                official.id, g.start_time, g.end_time,
+                OfficialAvailabilityStatus.UNAVAILABLE,
+                note="Schedule conflict — needs cover", actor_id=admin)
+
+    # Roster + some player no-responses: select a roster for the first few
+    # new games but leave a couple of players in PENDING (never responded)
+    # instead of confirming everyone, so the roster screen shows that real
+    # state too, not just a fully-confirmed squad.
+    for g in new_games[:3]:
+        home_players = [p for p in store.all_players() if p.team_id == g.home_team_id]
+        away_players = [p for p in store.all_players() if p.team_id == g.away_team_id]
+        selected = [p.id for p in (home_players[:15] + away_players[:15])]
+        if not selected:
+            continue
+        roster.select_roster(g.id, selected, actor_id="coach_demo")
+        for j, pid in enumerate(selected):
+            if j % 6 == 0:
+                continue  # left as PENDING — a player who hasn't responded
+            roster.set_availability(g.id, pid, AvailabilityStatus.AVAILABLE)

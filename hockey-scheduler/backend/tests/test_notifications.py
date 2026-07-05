@@ -104,9 +104,12 @@ class NotificationsTest(unittest.TestCase):
         # unread count is untouched (per-recipient read state, #57).
         before_admin = self.api.get_notifications("league_admin", {})["unread"]
         res = self.api.mark_all_notifications_read("viewer", {})
-        # Two public notifications now: the finalized result and the
-        # game-published announcement (#87).
-        self.assertEqual(res["marked"], 2)
+        # Public notifications: one "game published" announcement per
+        # published game, plus one finalized result — the pilot data pack
+        # (#97) publishes 19 games in total (the core scenario's own seeded
+        # game, plus ~18 more), so 20 total public notifications.
+        expected_public = sum(1 for g in self.store.all_games() if g.published) + 1
+        self.assertEqual(res["marked"], expected_public)
         after_admin = self.api.get_notifications("league_admin", {})["unread"]
         self.assertEqual(after_admin, before_admin)
         # And the viewer's own copy is now read.
