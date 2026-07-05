@@ -92,6 +92,31 @@ const fmt = (iso) => { const m = /T(\d{2}:\d{2})/.exec(iso || ""); return m ? m[
 const val = (id) => { const e = document.getElementById(id); return e ? e.value.trim() : ""; };
 const hasPerm = (p) => rolePerms.has(p);
 
+// Client-side file download (#99) — no backend route needed, since the CSV
+// template/sample content already lives in IMPORT_TYPES. A throwaway <a>
+// with a Blob URL is the standard way to trigger a save-as without a server
+// round trip.
+function downloadTextFile(filename, text) {
+  const blob = new Blob([text], { type: "text/csv;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  try {
+    a.click();
+  } finally {
+    document.body.removeChild(a);
+    // Revoking the object URL synchronously right after click() is
+    // unreliable on Safari/iOS (this app is iPhone-first, per CLAUDE.md) —
+    // the browser may still be reading the blob when the URL is
+    // invalidated, producing an empty/truncated download. Defer the revoke
+    // to a later macrotask so the download has already started; wrapped in
+    // try/finally so cleanup still runs even if click() itself throws.
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+}
+
 // The session cookie carries identity; the server resolves the role from it
 // and authorizes each request (#50). No client-asserted role header.
 async function getJSON(p) { return (await fetch(p, { credentials: "same-origin" })).json(); }
@@ -1309,40 +1334,71 @@ function renderScheduler(ov) {
     ${previewBlock}${draftBlock}${toastHtml()}`;
 }
 
-/* ---------- Pilot onboarding import wizard (#96) ----------
+/* ---------- Pilot onboarding import wizard (#96/#99) ----------
    Wires the existing #92-#95 endpoints only — no new backend logic. Each
    type below names the exact commit endpoint/permission #93/#94/#95 shipped;
    /api/import/dry-run is shared by all three (gated by manage_arena, same
    as the wizard tab itself), since #92's validator already covers every
    sheet name except official_availability (see the officials_availability
    type's `note` — that sheet is only checked at commit time, by #94's own
-   sibling validator, which /api/import/dry-run never calls). */
+   sibling validator, which /api/import/dry-run never calls).
+
+   `sample` (#99) is a ready-to-use multi-row CSV — the same column shapes
+   #92's own module docstring documents — used both for the per-sheet
+   "Download template" file and the per-type "Load sample data" action, so
+   an operator never has to guess the exact header row from scratch. */
 const IMPORT_TYPES = [
   { key: "teams_players", label: "Teams & Players", commitPerm: "manage_setup",
     commitPath: "/api/import/commit/teams-players", needsSeason: true,
+    howTo: "Upload teams.csv first, then players.csv — player rows reference "
+      + "their team by team_code. Existing teams/players are matched by code "
+      + "and updated in place on repeat import, so re-uploading a corrected "
+      + "file is always safe.",
     sheets: [
       { field: "teams_csv", label: "teams.csv",
-        placeholder: "team_code,team_name,club_name,division_name" },
+        placeholder: "team_code,team_name,club_name,division_name",
+        sample: "team_code,team_name,club_name,division_name\n"
+          + "U16-LIONS,U16 Lions,North Club,U16\n"
+          + "U16-FALCONS,U16 Falcons,South Club,U16\n" },
       { field: "players_csv", label: "players.csv",
-        placeholder: "player_code,first_name,last_name,team_code,jersey_number,position,email" },
+        placeholder: "player_code,first_name,last_name,team_code,jersey_number,position,email",
+        sample: "player_code,first_name,last_name,team_code,jersey_number,position,email\n"
+          + "P001,Aarav,Mehta,U16-LIONS,12,forward,aarav@example.com\n"
+          + "P002,Kabir,Shah,U16-LIONS,9,defense,\n"
+          + "P003,Sam,Green,U16-FALCONS,1,goalie,sam@example.com\n" },
     ] },
   { key: "officials_availability", label: "Officials & Availability", commitPerm: "manage_schedule",
     commitPath: "/api/import/commit/officials-availability", needsSeason: false,
     note: "Validate only checks officials.csv — official_availability.csv rows "
       + "are checked when you commit (#94).",
+    howTo: "official_code links the two sheets — an official already imported "
+      + "by code (even in an earlier commit) can get new availability windows "
+      + "without resending officials.csv every time.",
     sheets: [
       { field: "officials_csv", label: "officials.csv",
-        placeholder: "official_code,name,email,home_club_name" },
+        placeholder: "official_code,name,email,home_club_name",
+        sample: "official_code,name,email,home_club_name\n"
+          + "O001,Riley Whistle,riley@example.com,North Club\n"
+          + "O002,Lee Blueline,,South Club\n" },
       { field: "official_availability_csv", label: "official_availability.csv",
-        placeholder: "official_code,start_time,end_time,status,note" },
+        placeholder: "official_code,start_time,end_time,status,note",
+        sample: "official_code,start_time,end_time,status,note\n"
+          + "O001,2026-09-01T18:00:00+00:00,2026-09-01T22:00:00+00:00,unavailable,Work shift\n" },
     ] },
   { key: "rinks_ice_slots", label: "Rinks & Ice Slots", commitPerm: "manage_arena",
     commitPath: "/api/import/commit/rinks-ice-slots", needsSeason: false,
+    howTo: "ice_slots.csv rows reference their rink by rink_code from the "
+      + "SAME upload's rinks.csv — send both sheets together in one commit.",
     sheets: [
       { field: "rinks_csv", label: "rinks.csv",
-        placeholder: "venue_name,rink_code,rink_name,address" },
+        placeholder: "venue_name,rink_code,rink_name,address",
+        sample: "venue_name,rink_code,rink_name,address\n"
+          + "Main Arena,RINK1,Rink 1,123 Ice Road\n" },
       { field: "ice_slots_csv", label: "ice_slots.csv",
-        placeholder: "rink_code,start_time,end_time,slot_type" },
+        placeholder: "rink_code,start_time,end_time,slot_type",
+        sample: "rink_code,start_time,end_time,slot_type\n"
+          + "RINK1,2026-09-01T18:00:00+00:00,2026-09-01T19:30:00+00:00,game\n"
+          + "RINK1,2026-09-01T20:00:00+00:00,2026-09-01T21:00:00+00:00,practice\n" },
     ] },
 ];
 
@@ -1460,10 +1516,15 @@ function renderImport(ov) {
        <select id="import-season">${seasons.map((s) => `<option value="${esc(s.id)}"`
           + `${s.id === importState.seasonId ? " selected" : ""}>${esc(s.name)}</option>`).join("")}</select>`;
 
-  const sheetFields = type.sheets.map((s) => `<label>${esc(s.label)}</label>
+  const sheetFields = type.sheets.map((s) => `<div class="import-field-head">
+      <label>${esc(s.label)}</label>
+      <button type="button" class="linklike" data-import-template="${s.field}">Download template</button>
+    </div>
     <textarea id="import-${s.field}" rows="6" placeholder="${esc(s.placeholder)}"
       >${esc(importState.sheetsText[s.field] || "")}</textarea>`).join("");
-  const noteHtml = type.note ? `<div class="drawer-note">${esc(type.note)}</div>` : "";
+  const drawerNote = (text) => text ? `<div class="drawer-note">${esc(text)}</div>` : "";
+  const noteHtml = drawerNote(type.note);
+  const howToHtml = drawerNote(type.howTo);
 
   const { canCommit, commitTitle } = importCommitState(type);
 
@@ -1473,8 +1534,9 @@ function renderImport(ov) {
   return `<div class="card">
       <div class="section-title" style="margin-top:0">Pilot onboarding import</div>
       <div class="segmented">${typeButtons}</div>
-      <div class="import-form">${seasonField}${sheetFields}${noteHtml}</div>
+      <div class="import-form">${howToHtml}${seasonField}${sheetFields}${noteHtml}</div>
       <div class="dq-actions">
+        <button class="act ghost" data-import-sample>Load sample data</button>
         <button class="act" data-import-validate>Validate</button>
         <button class="act primary" data-import-commit${canCommit ? "" : " disabled"}
           title="${esc(commitTitle)}">Commit</button>
@@ -2304,6 +2366,21 @@ async function render() {
     toast = "";
     render();
   });
+  // "Load sample data" (#99): fills every sheet for the current type at
+  // once, so an operator can see the whole validate → commit flow work
+  // without typing anything. A full render() is fine here (unlike the
+  // per-keystroke sync below) since this is a single discrete click, not
+  // something that would fight the user for cursor focus.
+  const importSample = c.querySelector("[data-import-sample]");
+  if (importSample) importSample.onclick = () => {
+    const type = importType();
+    type.sheets.forEach((s) => { importState.sheetsText[s.field] = s.sample; });
+    importState.report = null;
+    importState.validatedKey = null;
+    importState.committed = null;
+    toast = "Sample data loaded — click Validate to preview it.";
+    render();
+  };
   const importSeason = c.querySelector("#import-season");
   if (importSeason) importSeason.onchange = () => { importState.seasonId = importSeason.value; };
   // Builds the POST body straight from the LIVE textarea DOM — always, for
@@ -2332,8 +2409,7 @@ async function render() {
   // unrelated render.
   currentImportType.sheets.forEach((s) => {
     const el = c.querySelector(`#import-${s.field}`);
-    if (!el) return;
-    el.oninput = () => {
+    if (el) el.oninput = () => {
       importState.sheetsText[s.field] = el.value;
       if (importCommitBtn) {
         const { canCommit, commitTitle } = importCommitState(currentImportType);
@@ -2341,21 +2417,33 @@ async function render() {
         importCommitBtn.title = commitTitle;
       }
     };
+    // Per-sheet CSV template download (#99): `s` is already this exact
+    // sheet's config (sample text included), so no click-time lookup is
+    // needed — reuse it directly instead of re-deriving it from a data
+    // attribute via importType().sheets.find(...) on every click.
+    const templateBtn = c.querySelector(`[data-import-template="${s.field}"]`);
+    if (templateBtn) templateBtn.onclick = () =>
+      downloadTextFile(`${s.field.replace(/_csv$/, "")}.csv`, s.sample);
   });
   const importValidate = c.querySelector("[data-import-validate]");
   if (importValidate) importValidate.onclick = async () => {
     const type = importType();
     const body = buildImportBody(type);
+    // Snapshot what's actually being validated so a response that arrives
+    // after the sheets changed underneath it (switched type, hit "Load
+    // sample data", or a live edit — not just a type switch) can be told
+    // apart from one that still matches what's on screen (review fix: this
+    // used to only guard against a type switch, so loading sample data
+    // while a Validate request was in flight could attach the OLD
+    // response's report to the NEW sample text and misreport it as
+    // already-validated).
+    const requestKey = importSnapshotKey(type);
     importState.committed = null;
     const res = await post("/api/import/dry-run", body);
-    // The user may have switched to a different import type while this
-    // request was in flight (that switch already reset report/committed
-    // for the NEW type) — applying a late response for the OLD type here
-    // would resurrect stale results under the wrong screen.
-    if (importState.type !== type.key) return;
+    if (importState.type !== type.key || importSnapshotKey(type) !== requestKey) return;
     toast = "";
     importState.report = res;
-    importState.validatedKey = (res && !res.error) ? importSnapshotKey(type) : null;
+    importState.validatedKey = (res && !res.error) ? requestKey : null;
     await render();
   };
   if (importCommitBtn) importCommitBtn.onclick = async () => {
@@ -2365,15 +2453,19 @@ async function render() {
     // cache) — a disabled button can still be reached via assistive tech,
     // and this is what actually stops a post-Validate edit from being
     // committed silently (review fix).
-    if (importSnapshotKey(type) !== importState.validatedKey) {
+    const requestKey = importSnapshotKey(type);
+    if (requestKey !== importState.validatedKey) {
       toast = "Sheets changed since Validate — please Validate again before committing.";
       return render();
     }
     const body = buildImportBody(type);
     if (type.needsSeason) body.season_id = importState.seasonId;
     const res = await post(type.commitPath, body);
-    // Same stale-response guard as Validate above.
-    if (importState.type !== type.key) return;
+    // Same stale-response guard as Validate above — discard this response
+    // if the sheets or the selected type changed while the request was in
+    // flight, rather than showing a commit result for content that's no
+    // longer what's on screen.
+    if (importState.type !== type.key || importSnapshotKey(type) !== requestKey) return;
     toast = "";
     importState.committed = res;
     if (res && res.committed) { importState.report = null; importState.validatedKey = null; }
