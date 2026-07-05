@@ -1365,20 +1365,31 @@ function renderImportRows(items, cls) {
     <div class="li-sub ${cls}">${cls === "error" ? "⚠" : "ℹ"} ${esc(it.message)}</div></div></div>`).join("");
 }
 
-function renderImportReport(report) {
+function renderImportReport(report, type) {
   if (report.error) {
     return `<div class="banner alert"><h2>Could not validate</h2><p>${esc(report.error.message)}</p></div>`;
   }
   const errs = report.errors || [];
   const warns = report.warnings || [];
+  // validate_import() always returns a count for all 5 canonical sheet
+  // names, even ones this type never sends — filter to the type's own
+  // sheets so e.g. officials_availability doesn't show a padded
+  // "teams: 0 · players: 0 · rinks: 0 · ice_slots: 0" that reads as if
+  // those sheets were checked too.
+  const relevant = new Set(type.sheets.map((s) => s.field.replace(/_csv$/, "")));
   const summary = Object.entries(report.summary || {})
+    .filter(([sheet]) => relevant.has(sheet))
     .map(([sheet, n]) => `${esc(sheet)}: ${n}`).join(" · ");
+  // A type with an unvalidated sheet (see its `note`) never gets to claim
+  // "ready to commit" — dry-run only checked part of what Commit will write.
+  const readyCopy = type.note ? "No errors in the checked sheet(s) above."
+    : "No errors — ready to commit.";
   const status = report.ok
-    ? `<div class="banner ok"><h2>Looks good</h2><p>No errors — ready to commit.</p></div>`
+    ? `<div class="banner ok"><h2>Looks good</h2><p>${readyCopy}</p></div>`
     : `<div class="banner alert"><h2>${errs.length} error(s) found</h2><p>Fix the rows below, then Validate again.</p></div>`;
   const rows = renderImportRows(errs, "error") + renderImportRows(warns, "warn");
   return `<div class="import-report">
-      <div class="section-title">Validation report — ${esc(summary)}</div>
+      <div class="section-title">Validation report — ${summary}</div>
       ${status}
       ${rows ? `<div class="card">${rows}</div>` : ""}
     </div>`;
@@ -1404,7 +1415,7 @@ function renderImportResult(result) {
   }
   const warns = result.warnings || [];
   return `<div class="import-report">
-      <div class="banner ok"><h2>Committed</h2><p>${esc(importSummaryLine(result.summary))}</p></div>
+      <div class="banner ok"><h2>Committed</h2><p>${importSummaryLine(result.summary)}</p></div>
       ${warns.length ? `<div class="card">${renderImportRows(warns, "warn")}</div>` : ""}
     </div>`;
 }
@@ -1419,7 +1430,6 @@ function renderImport(ov) {
     data-import-type="${t.key}">${esc(t.label)}</button>`).join("");
 
   const seasons = ov.seasons || [];
-  if (type.needsSeason && !importState.seasonId && seasons[0]) importState.seasonId = seasons[0].id;
   const seasonField = !type.needsSeason ? "" : !seasons.length
     ? `<label>Season <span class="req">*</span></label>
        <div class="drawer-note">Create a season first.</div>`
@@ -1433,18 +1443,18 @@ function renderImport(ov) {
   const noteHtml = type.note ? `<div class="drawer-note">${esc(type.note)}</div>` : "";
 
   const seasonOk = !type.needsSeason || !!importState.seasonId;
-  const canCommit = seasonOk && hasPerm(type.commitPerm)
-    && !!importState.report && importState.report.ok
+  // Computed once and reused by both canCommit and its tooltip text, rather
+  // than each re-deriving (and re-hashing sheetsText for) the same fact.
+  const validated = !!importState.report && importState.report.ok
     && importState.validatedKey === importSnapshotKey(type);
+  const canCommit = seasonOk && hasPerm(type.commitPerm) && validated;
   const commitTitle = !hasPerm(type.commitPerm)
     ? "Your role can't commit this import type."
     : !seasonOk ? "Choose a season first."
-    : (!importState.report || !importState.report.ok
-        || importState.validatedKey !== importSnapshotKey(type))
-      ? "Validate successfully first."
-      : "";
+    : !validated ? "Validate successfully first."
+    : "";
 
-  const reportHtml = importState.report ? renderImportReport(importState.report) : "";
+  const reportHtml = importState.report ? renderImportReport(importState.report, type) : "";
   const resultHtml = importState.committed ? renderImportResult(importState.committed) : "";
 
   return `<div class="card">
@@ -1943,6 +1953,13 @@ async function render() {
       const dr = await getJSON("/api/scheduler/drafts");
       schedulerState.drafts = (dr && dr.draft_games) || [];
     }
+    // Import wizard (#96): default the season picker once seasons exist,
+    // same pattern as schedulerState.division/standingsDivision above —
+    // the state default belongs here in the impure orchestrator, not
+    // inside renderImport() itself, which stays a pure string-builder.
+    if (view === "import" && !importState.seasonId && ov.seasons[0]) {
+      importState.seasonId = ov.seasons[0].id;
+    }
     // Account/session admin, League-Admin only (#78).
     if (view === "users" && hasPerm("manage_users")) {
       const acc = await getJSON("/api/accounts");
@@ -2276,18 +2293,35 @@ async function render() {
   });
   const importSeason = c.querySelector("#import-season");
   if (importSeason) importSeason.onchange = () => { importState.seasonId = importSeason.value; };
+  // Shared by Validate and Commit: build the POST body from `getText`, the
+  // one thing they differ on (Validate reads live DOM values and mirrors
+  // them into importState.sheetsText; Commit deliberately reads ONLY the
+  // last-synced sheetsText, never the live DOM, so a snapshot taken at
+  // Validate time can't silently drift before Commit runs).
+  const buildImportBody = (type, getText) => {
+    const body = {};
+    type.sheets.forEach((s) => {
+      const text = getText(s.field);
+      if (text.trim()) body[s.field] = text;
+    });
+    return body;
+  };
   const importValidate = c.querySelector("[data-import-validate]");
   if (importValidate) importValidate.onclick = async () => {
     const type = importType();
-    const body = {};
-    type.sheets.forEach((s) => {
-      const el = document.getElementById(`import-${s.field}`);
+    const body = buildImportBody(type, (field) => {
+      const el = document.getElementById(`import-${field}`);
       const text = el ? el.value : "";
-      importState.sheetsText[s.field] = text;
-      if (text.trim()) body[s.field] = text;
+      importState.sheetsText[field] = text;
+      return text;
     });
     importState.committed = null;
     const res = await post("/api/import/dry-run", body);
+    // The user may have switched to a different import type while this
+    // request was in flight (that switch already reset report/committed
+    // for the NEW type) — applying a late response for the OLD type here
+    // would resurrect stale results under the wrong screen.
+    if (importState.type !== type.key) return;
     toast = "";
     importState.report = res;
     importState.validatedKey = (res && !res.error) ? importSnapshotKey(type) : null;
@@ -2304,13 +2338,11 @@ async function render() {
       toast = "Sheets changed since Validate — please Validate again before committing.";
       return render();
     }
-    const body = {};
-    type.sheets.forEach((s) => {
-      const text = importState.sheetsText[s.field] || "";
-      if (text.trim()) body[s.field] = text;
-    });
+    const body = buildImportBody(type, (field) => importState.sheetsText[field] || "");
     if (type.needsSeason) body.season_id = importState.seasonId;
     const res = await post(type.commitPath, body);
+    // Same stale-response guard as Validate above.
+    if (importState.type !== type.key) return;
     toast = "";
     importState.committed = res;
     if (res && res.committed) { importState.report = null; importState.validatedKey = null; }
