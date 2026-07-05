@@ -658,6 +658,19 @@ button.act.danger { background: #ffe5e3; color: #c0271b; }
 .drawer-foot { display: flex; justify-content: flex-end; gap: 8px; padding: 12px 16px; border-top: 1px solid var(--sep); }
 @media (max-width: 480px) { .drawer { width: 100%; } }
 
+/* ----- Pilot onboarding import wizard (#96) ----- */
+.import-form { padding: 0 16px 16px; }
+.import-form label { display: block; font-size: 12px; font-weight: 600; color: var(--muted); margin: 12px 0 4px; }
+.import-form label:first-child { margin-top: 0; }
+.import-form select { width: 100%; padding: 10px 11px; border: 1px solid var(--sep);
+  border-radius: 9px; font-size: 14px; background: #fff; }
+.import-form textarea { width: 100%; padding: 10px 11px; border: 1px solid var(--sep); border-radius: 9px;
+  font-size: 12px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; background: #fff; resize: vertical; }
+.import-form .req { color: var(--red); }
+.import-report { margin: 0 4px 14px; }
+.import-report .li-sub.error { color: #c0271b; }
+.import-report .li-sub.warn { color: #9a6400; }
+
 /* ----- conflict side panel (#43) ----- */
 .cal-layout { display: flex; align-items: flex-start; gap: 14px; }
 .cal-main { flex: 1; min-width: 0; }
