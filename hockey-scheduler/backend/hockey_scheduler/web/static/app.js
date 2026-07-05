@@ -1353,10 +1353,33 @@ function importType() {
 // Only the pasted sheet text counts toward "is this still what I validated?"
 // — season_id isn't part of validate_import's contract at all, so changing
 // the season between Validate and Commit doesn't need a re-validate.
+//
+// Reads the LIVE textarea DOM, not importState.sheetsText: sheetsText is
+// just a cache kept for redisplay across renders (updated on every input
+// event below), and comparing against a cache instead of the actual DOM
+// would let an edit made after Validate go undetected if that cache were
+// ever out of sync — this must always reflect what the user is looking at
+// right now, at the moment Commit is clicked (review fix).
 function importSnapshotKey(type) {
   const parts = {};
-  type.sheets.forEach((s) => { parts[s.field] = importState.sheetsText[s.field] || ""; });
+  type.sheets.forEach((s) => {
+    const el = document.getElementById(`import-${s.field}`);
+    parts[s.field] = el ? el.value : (importState.sheetsText[s.field] || "");
+  });
   return JSON.stringify(parts);
+}
+
+function importCommitState(type) {
+  const seasonOk = !type.needsSeason || !!importState.seasonId;
+  const validated = !!importState.report && importState.report.ok
+    && importState.validatedKey === importSnapshotKey(type);
+  const canCommit = seasonOk && hasPerm(type.commitPerm) && validated;
+  const commitTitle = !hasPerm(type.commitPerm)
+    ? "Your role can't commit this import type."
+    : !seasonOk ? "Choose a season first."
+    : !validated ? "Validate successfully first."
+    : "";
+  return { canCommit, commitTitle };
 }
 
 function renderImportRows(items, cls) {
@@ -1442,17 +1465,7 @@ function renderImport(ov) {
       >${esc(importState.sheetsText[s.field] || "")}</textarea>`).join("");
   const noteHtml = type.note ? `<div class="drawer-note">${esc(type.note)}</div>` : "";
 
-  const seasonOk = !type.needsSeason || !!importState.seasonId;
-  // Computed once and reused by both canCommit and its tooltip text, rather
-  // than each re-deriving (and re-hashing sheetsText for) the same fact.
-  const validated = !!importState.report && importState.report.ok
-    && importState.validatedKey === importSnapshotKey(type);
-  const canCommit = seasonOk && hasPerm(type.commitPerm) && validated;
-  const commitTitle = !hasPerm(type.commitPerm)
-    ? "Your role can't commit this import type."
-    : !seasonOk ? "Choose a season first."
-    : !validated ? "Validate successfully first."
-    : "";
+  const { canCommit, commitTitle } = importCommitState(type);
 
   const reportHtml = importState.report ? renderImportReport(importState.report, type) : "";
   const resultHtml = importState.committed ? renderImportResult(importState.committed) : "";
@@ -2293,28 +2306,46 @@ async function render() {
   });
   const importSeason = c.querySelector("#import-season");
   if (importSeason) importSeason.onchange = () => { importState.seasonId = importSeason.value; };
-  // Shared by Validate and Commit: build the POST body from `getText`, the
-  // one thing they differ on (Validate reads live DOM values and mirrors
-  // them into importState.sheetsText; Commit deliberately reads ONLY the
-  // last-synced sheetsText, never the live DOM, so a snapshot taken at
-  // Validate time can't silently drift before Commit runs).
-  const buildImportBody = (type, getText) => {
+  // Builds the POST body straight from the LIVE textarea DOM — always, for
+  // both Validate and Commit. importState.sheetsText is a display cache
+  // only (kept in sync below by each textarea's own `input` handler so a
+  // re-render, e.g. after Commit, shows what's actually in the box); it is
+  // never the source of truth for what gets sent, so Commit can't send
+  // stale content out of sync with what's on screen (review fix).
+  const buildImportBody = (type) => {
     const body = {};
     type.sheets.forEach((s) => {
-      const text = getText(s.field);
+      const el = document.getElementById(`import-${s.field}`);
+      const text = el ? el.value : (importState.sheetsText[s.field] || "");
       if (text.trim()) body[s.field] = text;
     });
     return body;
   };
+  const importCommitBtn = c.querySelector("[data-import-commit]");
+  const currentImportType = importType();
+  // Every keystroke re-syncs the display cache and the Commit button's
+  // enabled/disabled state — WITHOUT a full render() (which would replace
+  // the textarea DOM node mid-edit and drop focus/cursor position). This is
+  // what actually makes "editing after Validate disables Commit" true: the
+  // staleness check above already re-reads the DOM at click time regardless,
+  // but without this the button's own visual state would lag until the next
+  // unrelated render.
+  currentImportType.sheets.forEach((s) => {
+    const el = c.querySelector(`#import-${s.field}`);
+    if (!el) return;
+    el.oninput = () => {
+      importState.sheetsText[s.field] = el.value;
+      if (importCommitBtn) {
+        const { canCommit, commitTitle } = importCommitState(currentImportType);
+        importCommitBtn.disabled = !canCommit;
+        importCommitBtn.title = commitTitle;
+      }
+    };
+  });
   const importValidate = c.querySelector("[data-import-validate]");
   if (importValidate) importValidate.onclick = async () => {
     const type = importType();
-    const body = buildImportBody(type, (field) => {
-      const el = document.getElementById(`import-${field}`);
-      const text = el ? el.value : "";
-      importState.sheetsText[field] = text;
-      return text;
-    });
+    const body = buildImportBody(type);
     importState.committed = null;
     const res = await post("/api/import/dry-run", body);
     // The user may have switched to a different import type while this
@@ -2327,18 +2358,18 @@ async function render() {
     importState.validatedKey = (res && !res.error) ? importSnapshotKey(type) : null;
     await render();
   };
-  const importCommit = c.querySelector("[data-import-commit]");
-  if (importCommit) importCommit.onclick = async () => {
+  if (importCommitBtn) importCommitBtn.onclick = async () => {
     const type = importType();
     // Belt-and-suspenders: the button is already `disabled` unless this
-    // holds, but re-check at click time too — a disabled button can still
-    // be reached via the title tooltip's underlying element in some a11y
-    // tooling, and this keeps the guarantee in one place either way.
+    // holds, but re-check at click time too, against the LIVE DOM (not a
+    // cache) — a disabled button can still be reached via assistive tech,
+    // and this is what actually stops a post-Validate edit from being
+    // committed silently (review fix).
     if (importSnapshotKey(type) !== importState.validatedKey) {
       toast = "Sheets changed since Validate — please Validate again before committing.";
       return render();
     }
-    const body = buildImportBody(type, (field) => importState.sheetsText[field] || "");
+    const body = buildImportBody(type);
     if (type.needsSeason) body.season_id = importState.seasonId;
     const res = await post(type.commitPath, body);
     // Same stale-response guard as Validate above.
