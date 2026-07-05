@@ -222,6 +222,24 @@ class Handler(BaseHTTPRequestHandler):
             "message": "You can only manage your own calendar feeds."}}, 403)
         return True
 
+    def _official_guard(self, official_id) -> bool:
+        """Send 401/403 and return True if the caller may not manage
+        ``official_id``'s availability: an operator (MANAGE_SCHEDULE) may manage
+        any, an official only their own (#88)."""
+        role, scope, _uid, err = self._resolve_role()
+        if err is not None:
+            code, payload = err
+            self._send_json(payload, code)
+            return True
+        if can(role, Permission.MANAGE_SCHEDULE):
+            return False
+        if official_id and scope.get("official_id") == official_id:
+            return False
+        self._send_json({"error": {
+            "code": "forbidden",
+            "message": "You can only manage your own availability."}}, 403)
+        return True
+
     def _cookie(self, name: str):
         raw = self.headers.get("Cookie")
         if not raw:
@@ -493,6 +511,13 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_api(api.list_account_sessions(ms.group(1)))
         if path == "/api/officials":
             return self._send_api({"officials": api.get_officials()})
+        oav = re.match(r"^/api/officials/([^/]+)/availability$", path)
+        if oav:
+            # An official's declared availability windows (#88). Operator → any;
+            # an official → only their own.
+            if self._official_guard(oav.group(1)):
+                return
+            return self._send_api(api.list_official_availability(oav.group(1)))
         if path == "/api/notifications":
             # The signed-in user's feed (#32). Same resolution as POSTs: valid
             # session → its role/scope; invalid cookie → 401; else admin default.
@@ -673,6 +698,32 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_api(api.set_notification_preference(
                 recipient_ref, body.get("channel"), bool(body.get("enabled")),
                 digest=body.get("digest"), actor_id=actor_uid))
+
+        # Official availability (#88): an official manages their own windows, an
+        # operator anyone's — guarded here rather than by the permission gate.
+        oavs = re.match(r"^/api/officials/([^/]+)/availability$", path)
+        if oavs:
+            if self._official_guard(oavs.group(1)):
+                return
+            # Attribute the change to the signed-in user, not a client-supplied
+            # actor_id, so the audit trail (#88) cannot be forged. The guard
+            # above already established the session is valid.
+            _role, _scope, actor_uid, _err = self._resolve_role()
+            return self._send_api(api.set_official_availability(
+                oavs.group(1), body.get("start_time"), body.get("end_time"),
+                body.get("status"), note=body.get("note"), actor_id=actor_uid))
+        oavd = re.match(r"^/api/officials/availability/([^/]+)/delete$", path)
+        if oavd:
+            avail = api.store.get_official_availability(oavd.group(1))
+            if avail is None:
+                return self._send_json({"error": {
+                    "code": "not_found", "message": "Availability not found."}}, 404)
+            if self._official_guard(avail.official_id):
+                return
+            # Server-resolved actor, not a forgeable body field (#88).
+            _role, _scope, actor_uid, _err = self._resolve_role()
+            return self._send_api(api.delete_official_availability(
+                oavd.group(1), actor_id=actor_uid))
 
         # Calendar feed tokens (#82): create / revoke. Custom access (operator
         # or own actor), guarded here rather than by the permission gate below.
@@ -883,7 +934,8 @@ class Handler(BaseHTTPRequestHandler):
                     gid, body.get("team_id"), actor))
             if action == "officials/assign":
                 return self._send_api(api.assign_official(
-                    gid, body.get("official_id"), body.get("role", "referee"), actor))
+                    gid, body.get("official_id"), body.get("role", "referee"),
+                    actor, override_unavailable=bool(body.get("override_unavailable"))))
             if action == "result":
                 return self._send_api(api.record_result(
                     gid, body.get("home_score"), body.get("away_score"), actor))

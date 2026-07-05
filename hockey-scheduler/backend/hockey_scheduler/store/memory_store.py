@@ -14,6 +14,7 @@ from ..domain import (
     AuditLog,
     CalendarFeedToken,
     Club,
+    OfficialAvailability,
     Division,
     Game,
     GameAvailability,
@@ -73,6 +74,7 @@ class InMemoryStore:
         self.device_tokens: Dict[str, DeviceToken] = {}
         self.notification_preferences: Dict[str, NotificationPreference] = {}
         self.calendar_feed_tokens: Dict[str, CalendarFeedToken] = {}
+        self.official_availability: Dict[str, OfficialAvailability] = {}
         self.user_accounts: Dict[str, UserAccount] = {}
         self.sessions: Dict[str, Session] = {}
         self.setup_audit: List[SetupAuditLog] = []
@@ -410,6 +412,21 @@ class InMemoryStore:
 
     def all_device_tokens(self) -> List[DeviceToken]:
         return list(self.device_tokens.values())
+
+    # -- official availability (#88) ---------------------------------------
+    def add_official_availability(self, a: OfficialAvailability) -> OfficialAvailability:
+        self.official_availability[a.id] = a
+        return a
+
+    def get_official_availability(self, avail_id: str) -> Optional[OfficialAvailability]:
+        return self.official_availability.get(avail_id)
+
+    def delete_official_availability(self, avail_id: str) -> None:
+        self.official_availability.pop(avail_id, None)
+
+    def availability_for_official(self, official_id: str) -> List[OfficialAvailability]:
+        return [a for a in self.official_availability.values()
+                if a.official_id == official_id]
 
     # -- calendar feed tokens (#82) ----------------------------------------
     def add_calendar_feed_token(self, t: CalendarFeedToken) -> CalendarFeedToken:

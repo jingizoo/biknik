@@ -973,10 +973,41 @@ class ApiService:
 
     @catch
     def assign_official(self, game_id: str, official_id: str, role: str,
-                        actor_id: Optional[str] = None) -> dict:
+                        actor_id: Optional[str] = None,
+                        override_unavailable: bool = False) -> dict:
         a = self.setup.assign_official(
-            game_id, official_id, _parse_enum(OfficialRole, role, "role"), actor_id)
+            game_id, official_id, _parse_enum(OfficialRole, role, "role"),
+            actor_id, override_unavailable=override_unavailable)
         return _serialize(a)
+
+    # -- official availability (#88) ---------------------------------------
+    @staticmethod
+    def _availability_row(a) -> dict:
+        return {"id": a.id, "official_id": a.official_id,
+                "start_time": a.start_time.isoformat(),
+                "end_time": a.end_time.isoformat(),
+                "status": a.status.value, "note": a.note}
+
+    @catch
+    def set_official_availability(self, official_id: str, start_time: str,
+                                  end_time: str, status: str, note=None,
+                                  actor_id: Optional[str] = None) -> dict:
+        a = self.setup.set_official_availability(
+            official_id, _parse_dt(start_time, "start_time"),
+            _parse_dt(end_time, "end_time"), status, note=note, actor_id=actor_id)
+        return self._availability_row(a)
+
+    @catch
+    def list_official_availability(self, official_id: str) -> dict:
+        return {"official_id": official_id,
+                "availability": [self._availability_row(a)
+                                 for a in self.setup.official_availabilities(official_id)]}
+
+    @catch
+    def delete_official_availability(self, avail_id: str,
+                                     actor_id: Optional[str] = None) -> dict:
+        self.setup.delete_official_availability(avail_id, actor_id=actor_id)
+        return {"deleted": avail_id}
 
     @catch
     def respond_assignment(self, assignment_id: str, accept: bool,
