@@ -37,6 +37,14 @@ def required_permission(path: str):
         return Permission.MANAGE_SCHEDULE
     if path == "/api/demo/add-ice-slot":
         return Permission.MANAGE_ARENA
+    # Onboarding import dry-run (#92): read-only against the store, but the
+    # rows describe league/arena setup, so gate it like those setup routes.
+    # Reuse MANAGE_ARENA (not MANAGE_SETUP) since it is the one permission the
+    # two intended operator roles — League Admin and Arena Manager — both
+    # hold, and it already covers the arena-side entities (rinks/ice slots)
+    # in this same import set.
+    if path == "/api/import/dry-run":
+        return Permission.MANAGE_ARENA
     # Generating a draft season schedule is a scheduling action (#84).
     if path == "/api/scheduler/draft":
         return Permission.MANAGE_SCHEDULE
