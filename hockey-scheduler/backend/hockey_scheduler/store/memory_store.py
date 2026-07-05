@@ -268,6 +268,10 @@ class InMemoryStore:
     def all_officials(self) -> List[Official]:
         return list(self.officials.values())
 
+    def save_official(self, official: Official) -> Official:
+        self.officials[official.id] = official
+        return official
+
     def add_official_assignment(self, a: OfficialAssignment) -> OfficialAssignment:
         self.official_assignments[a.id] = a
         return a
@@ -439,6 +443,11 @@ class InMemoryStore:
     def availability_for_official(self, official_id: str) -> List[OfficialAvailability]:
         return [a for a in self.official_availability.values()
                 if a.official_id == official_id]
+
+    def save_official_availability(
+            self, a: OfficialAvailability) -> OfficialAvailability:
+        self.official_availability[a.id] = a
+        return a
 
     # -- calendar feed tokens (#82) ----------------------------------------
     def add_calendar_feed_token(self, t: CalendarFeedToken) -> CalendarFeedToken:

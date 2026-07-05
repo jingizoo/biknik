@@ -45,7 +45,7 @@ from ..domain.errors import (
     ValidationError,
 )
 from ..store import InMemoryStore
-from .import_validator import validate_import
+from .import_validator import validate_import, validate_official_availability
 from .notifier import push as _push_notification
 
 
@@ -59,6 +59,26 @@ def _blank(value) -> bool:
 
 def _clean(value) -> str:
     return str(value).strip()
+
+
+def _parse_iso_utc(value) -> Optional[datetime]:
+    """Parse a timezone-aware ISO-8601 timestamp, else None.
+
+    Duplicated locally rather than imported from ``import_validator`` (same
+    precedent as ``_blank``/``_clean`` above) — by the time this is called
+    from ``commit_officials_availability_import`` the value has already
+    passed ``validate_official_availability``, so ``None`` here would
+    indicate a bug elsewhere, not a real user-facing validation failure.
+    """
+    if _blank(value):
+        return None
+    try:
+        parsed = datetime.fromisoformat(_clean(value))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    return parsed.astimezone(timezone.utc)
 
 
 def _transactional(fn):
@@ -681,6 +701,193 @@ class SetupService:
                 "divisions_created": counts["divisions_created"],
             },
             "warnings": result["warnings"],
+        }
+
+    # -- CSV import commit: officials + availability (#94) ------------------
+    def commit_officials_availability_import(self, sheets: dict,
+                                             actor_id: Optional[str] = None
+                                             ) -> dict:
+        """Commit step 3 of the pilot onboarding import wizard: officials +
+        their availability windows.
+
+        ``sheets`` is ALREADY-PARSED row dicts (``{"officials": [...],
+        "official_availability": [...]}``) — CSV-text parsing stays at the
+        API facade layer, matching #93's layering. No ``season_id`` param:
+        officials aren't season-scoped.
+
+        Validation happens FIRST, before any writes, all-or-nothing across
+        BOTH sheets: a bad ``official_availability`` row blocks an otherwise-
+        clean ``officials`` sheet, exactly like #93's cross-sheet guarantee.
+        The officials sheet reuses #92's existing (unmodified) checks via
+        ``validate_import({"officials": ...})`` — every other key is treated
+        as empty by that function. The availability sheet is checked by the
+        NEW sibling function ``validate_official_availability``, which
+        (deliberately, see its own docstring) resolves ``official_code``
+        against either this upload's officials sheet OR an official already
+        persisted from a prior commit.
+
+        Not ``@_transactional``, for the exact reason documented at length on
+        ``commit_teams_players_import`` above: this method must call no other
+        ``@_transactional`` service method (``create_official`` opens its own
+        transaction), or a nested ``with store.transaction():`` raises
+        ``sqlite3.OperationalError: cannot start a transaction within a
+        transaction`` on the SQL backend — the #87/#88 bug class. It opens
+        exactly one transaction itself below, duplicating the small amount of
+        create/update logic it needs via raw store calls plus its own
+        ``self._audit(...)`` calls. ``self.set_official_availability`` is NOT
+        ``@_transactional`` (see its docstring), so it is safe to call
+        directly from inside this method's single transaction for the
+        create-a-new-availability-window path.
+        """
+        officials_rows = list(sheets.get("officials") or [])
+        availability_rows = list(sheets.get("official_availability") or [])
+
+        officials_result = validate_import({"officials": officials_rows})
+        if officials_result["errors"]:
+            return {"committed": False, "summary": officials_result["summary"],
+                    "errors": officials_result["errors"],
+                    "warnings": officials_result["warnings"]}
+
+        official_codes_in_sheet = {
+            _clean(row.get("official_code")) for row in officials_rows
+            if not _blank(row.get("official_code"))
+        }
+        existing_external_refs = {
+            o.external_ref for o in self.store.all_officials() if o.external_ref
+        }
+        avail_result = validate_official_availability(
+            availability_rows, official_codes_in_sheet, existing_external_refs)
+        if avail_result["errors"]:
+            return {
+                "committed": False,
+                "summary": {"officials": len(officials_rows),
+                           "official_availability": len(availability_rows)},
+                "errors": officials_result["errors"] + avail_result["errors"],
+                "warnings": officials_result["warnings"] + avail_result["warnings"],
+            }
+
+        counts = {"officials_created": 0, "officials_updated": 0,
+                  "availability_created": 0, "availability_updated": 0,
+                  "clubs_created": 0}
+
+        with self.store.transaction():
+            official_code_to_id = {}
+            for row in officials_rows:
+                official_code = _clean(row.get("official_code"))
+                name = _clean(row.get("name"))
+                email_raw = row.get("email")
+                email = _clean(email_raw) if not _blank(email_raw) else None
+
+                club_id = None
+                club_name_raw = row.get("home_club_name")
+                if not _blank(club_name_raw):
+                    club_name = _clean(club_name_raw)
+                    club = next((c for c in self.store.all_clubs()
+                                if c.name == club_name), None)
+                    if club is None:
+                        club = Club(id=self.store.next_id("club"), name=club_name)
+                        self.store.add_club(club)
+                        self._audit("club_created", "club", club.id, actor_id)
+                        counts["clubs_created"] += 1
+                    club_id = club.id
+
+                official = next((o for o in self.store.all_officials()
+                                 if o.external_ref == official_code), None)
+                if official is not None:
+                    official.name = name
+                    official.home_club_id = club_id
+                    self.store.save_official(official)
+                    self._audit("official_updated", "official", official.id,
+                                actor_id, {"home_club_id": club_id})
+                    counts["officials_updated"] += 1
+                else:
+                    official = Official(id=self.store.next_id("official"),
+                                        name=name, home_club_id=club_id,
+                                        external_ref=official_code)
+                    self.store.add_official(official)
+                    self._audit("official_created", "official", official.id,
+                                actor_id)
+                    counts["officials_created"] += 1
+                official_code_to_id[official_code] = official.id
+
+                if email is not None:
+                    recipient_ref = f"official:{official.id}"
+                    existing = self.store.get_contact_destination(
+                        recipient_ref, NotificationChannel.EMAIL)
+                    if existing is not None:
+                        existing.destination = email
+                        self.store.save_contact_destination(existing)
+                    else:
+                        self.store.add_contact_destination(ContactDestination(
+                            id=self.store.next_id("contact"),
+                            recipient_ref=recipient_ref,
+                            channel=NotificationChannel.EMAIL,
+                            destination=email))
+
+            for row in availability_rows:
+                official_code = _clean(row.get("official_code"))
+                official_id = official_code_to_id.get(official_code)
+                if official_id is None:
+                    # Not in this upload's officials sheet — validation only
+                    # let this through because official_code matched an
+                    # existing_external_ref, i.e. an official created by a
+                    # PRIOR commit (#94's key new capability over #93).
+                    existing = next(
+                        (o for o in self.store.all_officials()
+                         if o.external_ref == official_code), None)
+                    official_id = existing.id if existing else None
+                if official_id is None:
+                    raise ValidationError(
+                        f"Unknown official_code {official_code} for "
+                        f"official_availability row.")
+
+                start = _parse_iso_utc(row.get("start_time"))
+                end = _parse_iso_utc(row.get("end_time"))
+                status_raw = _clean(row.get("status"))
+                note_raw = row.get("note")
+                note = _clean(note_raw) if not _blank(note_raw) else None
+
+                existing_window = next(
+                    (a for a in self.store.availability_for_official(official_id)
+                     if a.start_time == start and a.end_time == end), None)
+                if existing_window is not None:
+                    existing_window.status = OfficialAvailabilityStatus(status_raw)
+                    existing_window.note = note
+                    self.store.save_official_availability(existing_window)
+                    self._audit("official_availability_updated",
+                                "official_availability", existing_window.id,
+                                actor_id, {"official_id": official_id,
+                                          "status": status_raw})
+                    counts["availability_updated"] += 1
+                else:
+                    self.set_official_availability(
+                        official_id, start, end, status_raw, note=note,
+                        actor_id=actor_id)
+                    counts["availability_created"] += 1
+
+            batch_id = self.store.next_id("importbatch")
+            # skipped/errors are always 0 here by construction — see the
+            # identical note on commit_teams_players_import's import_committed
+            # audit row above.
+            self._audit("import_committed", "import_batch", batch_id, actor_id,
+                        {"officials_created": counts["officials_created"],
+                         "officials_updated": counts["officials_updated"],
+                         "availability_created": counts["availability_created"],
+                         "availability_updated": counts["availability_updated"],
+                         "clubs_created": counts["clubs_created"],
+                         "skipped": 0, "errors": 0})
+
+        return {
+            "committed": True,
+            "summary": {
+                "officials": {"created": counts["officials_created"],
+                             "updated": counts["officials_updated"]},
+                "official_availability": {
+                    "created": counts["availability_created"],
+                    "updated": counts["availability_updated"]},
+                "clubs_created": counts["clubs_created"],
+            },
+            "warnings": officials_result["warnings"] + avail_result["warnings"],
         }
 
     # -- officials (#30) ---------------------------------------------------

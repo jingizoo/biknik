@@ -507,6 +507,7 @@ class SqlStore:
     def add_official(self, official): return self._insert(official)
     def get_official(self, official_id): return self._get(Official, official_id)
     def all_officials(self): return self._query(Official, order="id")
+    def save_official(self, official): return self._update(official)
 
     def add_official_assignment(self, a): return self._insert(a)
     def save_official_assignment(self, a): return self._update(a)
@@ -607,6 +608,7 @@ class SqlStore:
     def availability_for_official(self, official_id):
         return self._query(OfficialAvailability, "official_id = ?",
                            (official_id,), order="id")
+    def save_official_availability(self, a): return self._update(a)
 
     # -- calendar feed tokens (#82) ----------------------------------------
     def add_calendar_feed_token(self, t): return self._insert(t)
