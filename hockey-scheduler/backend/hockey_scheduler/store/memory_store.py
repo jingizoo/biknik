@@ -118,6 +118,9 @@ class InMemoryStore:
     def players_for_team(self, team_id: str) -> List[Player]:
         return [p for p in self.players.values() if p.team_id == team_id]
 
+    def all_players(self) -> List[Player]:
+        return list(self.players.values())
+
     # -- games -------------------------------------------------------------
     def add_game(self, game: Game) -> Game:
         self.games[game.id] = game
@@ -578,6 +581,14 @@ class InMemoryStore:
     def save_game(self, game: Game) -> Game:
         self.games[game.id] = game
         return game
+
+    def save_team(self, team: Team) -> Team:
+        self.teams[team.id] = team
+        return team
+
+    def save_player(self, player: Player) -> Player:
+        self.players[player.id] = player
+        return player
 
     def save_ice_slot(self, slot: IceSlot) -> IceSlot:
         self.ice_slots[slot.id] = slot

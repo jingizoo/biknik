@@ -45,6 +45,12 @@ def required_permission(path: str):
     # in this same import set.
     if path == "/api/import/dry-run":
         return Permission.MANAGE_ARENA
+    # Onboarding import COMMIT (#93): unlike its dry-run sibling above, this
+    # one actually writes real league/team/player records, so it requires the
+    # League-Admin-only MANAGE_SETUP permission, not the wider MANAGE_ARENA
+    # both operator roles share for the read-only preview.
+    if path == "/api/import/commit/teams-players":
+        return Permission.MANAGE_SETUP
     # Generating a draft season schedule is a scheduling action (#84).
     if path == "/api/scheduler/draft":
         return Permission.MANAGE_SCHEDULE
