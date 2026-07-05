@@ -69,6 +69,10 @@ class Rink:
     id: str
     venue_id: str
     name: str
+    # CSV-import matching key (#95), mirroring Team/Player (#93) and Official
+    # (#94): rinks are matched across repeat uploads by this code (the
+    # sheet's rink_code), not by name.
+    external_ref: Optional[str] = None
 
 
 @dataclass

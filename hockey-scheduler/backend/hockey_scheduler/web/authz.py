@@ -60,6 +60,13 @@ def required_permission(path: str):
     # officials specifically.
     if path == "/api/import/commit/officials-availability":
         return Permission.MANAGE_SCHEDULE
+    # Rinks + ice slots import COMMIT (#95): mirrors "/api/setup/rink" and
+    # "/api/setup/ice-slot" below (both in _ARENA_SETUP) rather than #93's
+    # League-Admin-only MANAGE_SETUP — both League Admin and Arena Manager
+    # hold MANAGE_ARENA, and rinks/ice slots are arena-side entities just
+    # like their single-entity creation routes.
+    if path == "/api/import/commit/rinks-ice-slots":
+        return Permission.MANAGE_ARENA
     # Generating a draft season schedule is a scheduling action (#84).
     if path == "/api/scheduler/draft":
         return Permission.MANAGE_SCHEDULE

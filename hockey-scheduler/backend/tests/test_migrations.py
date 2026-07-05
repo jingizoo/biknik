@@ -80,6 +80,7 @@ class MigrationApplyTest(unittest.TestCase):
             cur.execute("ALTER TABLE teams DROP COLUMN external_ref")  # #93 additive col
             cur.execute("ALTER TABLE players DROP COLUMN external_ref")  # #93 additive col
             cur.execute("ALTER TABLE officials DROP COLUMN external_ref")  # #94 additive col
+            cur.execute("ALTER TABLE rinks DROP COLUMN external_ref")  # #95 additive col
             cur.execute("DELETE FROM schema_migrations")
             cur.execute("INSERT INTO schema_migrations(version, applied_at) "
                         "VALUES ('0001_initial', '2026-01-01')")
@@ -92,6 +93,7 @@ class MigrationApplyTest(unittest.TestCase):
             self.assertIn("external_ref", _table_columns(adopted, "teams"))
             self.assertIn("external_ref", _table_columns(adopted, "players"))
             self.assertIn("external_ref", _table_columns(adopted, "officials"))
+            self.assertIn("external_ref", _table_columns(adopted, "rinks"))
         finally:
             os.remove(path)
 

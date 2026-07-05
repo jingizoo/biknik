@@ -494,6 +494,7 @@ class SqlStore:
     def add_rink(self, rink): return self._insert(rink)
     def get_rink(self, rink_id): return self._get(Rink, rink_id)
     def all_rinks(self): return self._query(Rink, order="id")
+    def save_rink(self, rink): return self._update(rink)
 
     def add_ice_slot(self, slot): return self._insert(slot)
     def get_ice_slot(self, slot_id): return self._get(IceSlot, slot_id)

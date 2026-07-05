@@ -603,6 +603,10 @@ class InMemoryStore:
         self.ice_slots[slot.id] = slot
         return slot
 
+    def save_rink(self, rink: Rink) -> Rink:
+        self.rinks[rink.id] = rink
+        return rink
+
     def save_substitute(self, sub: SubstituteEnrollment) -> SubstituteEnrollment:
         self.substitutes[sub.id] = sub
         return sub
