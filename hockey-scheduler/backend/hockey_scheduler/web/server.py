@@ -595,6 +595,25 @@ class Handler(BaseHTTPRequestHandler):
             if not oid:
                 return self._send_json({"official_id": None, "assignments": []})
             return self._send_api(api.get_official_inbox(oid))
+        if path == "/api/me/player-home":
+            # The signed-in player's own home screen (#107). Same identity
+            # rules as /api/me/assignments: no cookie -> empty; invalid/
+            # expired cookie -> 401; a valid session without a player
+            # binding -> empty; a bound player -> their home data.
+            sid = self._cookie(SESSION_COOKIE)
+            empty = {"player_id": None, "next_game": None, "today_count": 0,
+                     "substitute_opportunities": [], "unread_notifications": 0}
+            if sid is None:
+                return self._send_json(empty)
+            sess = SESSIONS.resolve(api.store, sid)
+            if sess is None:
+                return self._send_json({"error": {
+                    "code": "unauthorized",
+                    "message": "Session expired — please sign in again."}}, 401)
+            pid = sess.get("scope", {}).get("player_id")
+            if not pid:
+                return self._send_json(empty)
+            return self._send_api(api.get_player_home(pid, user_id=sess.get("user_id")))
         sd = re.match(r"^/api/standings/([^/]+)$", path)
         if sd:
             return self._send_api(api.get_standings(sd.group(1)))

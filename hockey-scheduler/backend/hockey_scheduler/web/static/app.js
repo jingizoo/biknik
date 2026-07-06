@@ -1,7 +1,7 @@
 /* Hockey Scheduler — calendar-first operator demo.
    Drives the real backend (setup + roster/substitute) via the documented API. */
 
-let view = "dashboard";     // dashboard|setup|import|calendar|games|roster|activity|public|readiness
+let view = "dashboard";     // dashboard|setup|import|calendar|games|roster|activity|public|readiness|player_home
 let gameView = "coach";     // coach | player (roster)
 let rosterSide = "home";    // home | away — which lineup the roster tab shows (#25)
 let rosterTeamId = null;    // team_id of the currently shown lineup (for copy)
@@ -43,6 +43,7 @@ let conflict = null;        // {ok, title, lines[], game, slot} — calendar sid
 let drawer = null;          // {kind} when a Setup create drawer is open (#44)
 let drawerError = "";       // validation/API error shown inside the open drawer
 let drawerValues = {};      // {fieldId: value} preserved across re-render on error
+let checkoutConfirm = null;  // {game_id} while the Player Home "Can't Play" confirmation is open (#107)
 let activityExpandedBatches = new Set();  // import_batch_ids expanded in Activity (#102)
 let readinessCheck = null;  // /api/readiness snapshot for the Pilot Readiness card (#104)
 let importState = {         // Pilot onboarding import wizard (#96)
@@ -86,7 +87,7 @@ const NAV = {
   inbox: "My Assignments", standings: "Standings",
   notifications: "Notifications", delivery: "Delivery", activity: "Activity",
   public: "Public", users: "Users", scheduler: "Scheduler", import: "Import",
-  readiness: "Pilot Readiness",
+  readiness: "Pilot Readiness", player_home: "Home",
 };
 const POS_CLASS = { goalie: "pos-G", defense: "pos-D", forward: "pos-F", skater: "pos-D" };
 const REPO = "https://github.com/jingizoo/biknik/issues";
@@ -949,6 +950,109 @@ function renderInbox(inbox) {
   }).join("");
   return `<div class="section-title">Your upcoming assignments (${rows.length})</div>
     <div class="inbox-list">${cards}</div>${renderAvailability()}${toastHtml()}`;
+}
+
+/* ---------- Player Home (#107) ---------- */
+const PH_ATTENDANCE = {
+  not_responded: ["gray", "Not Responded"], confirmed: ["green", "Confirmed"],
+  checked_out: ["red", "Checked Out"], pending: ["orange", "Pending"],
+};
+const PH_TEAM_STATUS = {
+  full: ["green", "Full"], short: ["red", "Short"],
+  sub_search: ["orange", "Sub Search"], not_responded: ["gray", "Not Responded"],
+};
+function phBadge(map, key) {
+  const [cls, label] = map[key] || ["gray", key];
+  return `<span class="badge ${cls}">${esc(label)}</span>`;
+}
+// Status feed (#107 doc §6.6): small alert rows derived from the same data
+// the cards show — roster state, own attendance, and open opportunities.
+function phStatusFeed(ng, oppCount) {
+  const rows = [];
+  if (ng) {
+    if (ng.attendance_status === "not_responded")
+      rows.push(["orange", "You have not responded to your next game."]);
+    if (ng.attendance_status === "checked_out")
+      rows.push(["red", "You checked out of your next game."]);
+    if (ng.team_status === "full")
+      rows.push(["green", "Your team's roster is full."]);
+    if (ng.team_status === "sub_search")
+      rows.push(["orange", "Substitute search is active for your next game."]);
+  }
+  if (oppCount) rows.push(["blue", "New substitute opportunity available."]);
+  if (!rows.length) return "";
+  return `<div class="card"><div class="section-title" style="margin-top:0">Status</div>
+    ${rows.map(([cls, msg]) => `<div class="li"><span class="badge ${cls}">●</span>
+      <div class="li-main"><div class="li-sub">${esc(msg)}</div></div></div>`).join("")}</div>`;
+}
+function renderPlayerHome(playerHome) {
+  if (!playerHome || !playerHome.player_id) {
+    return `<div class="empty">Sign in as a <strong>Player</strong> to see your next game, attendance, and substitute opportunities.</div>`;
+  }
+  const ng = playerHome.next_game;
+  const welcome = `<div class="section-title" style="margin-top:0">Hi, ${esc(playerHome.player_name || "there")}</div>
+    <p class="muted">Ready for your next game?</p>`;
+  // "Tonight" + "Team Status" summary cards (#107 doc §6.3), reusing the
+  // dashboard's stat-tile classes (responsive stacking comes with them).
+  const summary = `<div class="dash-stats">
+      <div class="dash-stat"><div class="ds-label">Tonight</div>
+        <div class="ds-n">${playerHome.today_count || 0}</div>
+        <div class="ds-sub">game${playerHome.today_count === 1 ? "" : "s"} today</div></div>
+      <div class="dash-stat"><div class="ds-label">Team Status</div>
+        <div class="ds-n">${ng ? phBadge(PH_TEAM_STATUS, ng.team_status)
+          : `<span class="badge gray">No game</span>`}</div></div>
+    </div>`;
+  let nextGameBlock;
+  if (!ng) {
+    nextGameBlock = `<div class="banner neutral"><h2>No upcoming game</h2>
+      <p>You have no scheduled games right now.</p></div>
+      <div class="actions"><button class="act ghost" data-goto="public">View Schedule</button></div>`;
+  } else if (checkoutConfirm && checkoutConfirm.game_id === ng.game_id) {
+    nextGameBlock = `<div class="banner warn"><h2>Confirm checkout</h2>
+      <p>Are you sure you can't play? ${esc(ng.team_name)} vs ${esc(ng.opponent_name || "TBD")} — ${esc(fmtDateTime(ng.start_time))}</p></div>
+      <div class="actions">
+        <button class="act danger" data-ph-confirm-checkout>Confirm Can't Play</button>
+        <button class="act ghost" data-ph-cancel-checkout>Stay In</button>
+      </div>`;
+  } else {
+    const confirmed = ng.attendance_status === "confirmed";
+    nextGameBlock = `<div class="li">
+        <div class="li-main"><div class="li-title">${esc(ng.team_name)} vs ${esc(ng.opponent_name || "TBD")}</div>
+          <div class="li-sub">${esc(fmtDateTime(ng.start_time))}
+            ${ng.venue_name ? " · " + esc(ng.venue_name) : ""}${ng.rink_name ? " · " + esc(ng.rink_name) : ""}</div></div>
+      </div>
+      <div class="li">${phBadge(PH_ATTENDANCE, ng.attendance_status)}${phBadge(PH_TEAM_STATUS, ng.team_status)}</div>
+      <div class="actions">
+        <button class="act success" data-ph-confirm ${confirmed ? "disabled" : ""}>${confirmed ? "You're In ✓" : "I'm In"}</button>
+        <button class="act danger" data-ph-backout>Can't Play</button>
+        <button class="act ghost" data-open-roster="${esc(ng.game_id)}">View Roster</button>
+      </div>`;
+  }
+  const opps = playerHome.substitute_opportunities || [];
+  const shown = opps.slice(0, 3);  // up to 3 on Home (#107 §17)
+  const oppRows = shown.map((o) => `<div class="li">
+      <span class="li-time">${fmt(o.start_time)}</span>
+      <div class="li-main"><div class="li-title">${esc(o.team_name)} vs ${esc(o.opponent_name || "TBD")}</div>
+        <div class="li-sub">${esc(fmtDateTime(o.start_time))}
+          ${o.rink_name ? " · " + esc(o.rink_name) : ""} · needs ${esc(o.position_needed)}</div></div>
+      <button class="act primary" data-ph-enroll="${esc(o.game_id)}">Enroll</button>
+    </div>`).join("")
+    + (opps.length > 3 ? `<div class="li"><div class="li-main">
+        <div class="li-sub">+ ${opps.length - 3} more opportunity(ies)</div></div></div>` : "");
+  return `${welcome}${summary}
+    <div class="card">
+      <div class="section-title" style="margin-top:0">Next Game</div>
+      ${nextGameBlock}
+    </div>
+    <div class="card">
+      <div class="section-title" style="margin-top:0">Substitute Opportunities (${opps.length})</div>
+      ${oppRows || '<div class="empty">No open opportunities right now.</div>'}
+    </div>
+    ${phStatusFeed(ng, opps.length)}
+    <button class="row-btn" data-goto="notifications">
+      <span class="row-main">Notifications</span>
+      <span class="row-sub">${playerHome.unread_notifications} unread</span>
+    </button>${toastHtml()}`;
 }
 
 /* ---------- Notifications feed (#32) ---------- */
@@ -2152,7 +2256,7 @@ function setChrome(ov) {
 async function render() {
   const c = document.getElementById("content");
   document.body.dataset.view = view;
-  let ov, board, lineups, standings, inbox;
+  let ov, board, lineups, standings, inbox, playerHome;
   try {
     c.innerHTML = `<div class="skeleton"></div><div class="skeleton"></div><div class="skeleton"></div>`;
     ov = await getJSON("/api/demo/overview");
@@ -2183,6 +2287,9 @@ async function render() {
       const av = await getJSON(`/api/officials/${inbox.official_id}/availability`);
       if (av && !av.error) officialAvailability = av.availability || [];
     }
+    // The signed-in player's own home screen (#107): next game, attendance,
+    // substitute opportunities, unread count — all scoped server-side.
+    if (view === "player_home") playerHome = await getJSON("/api/me/player-home");
     // Notifications feed drives the bell badge on every view (#32).
     const nf = await getJSON("/api/notifications");
     if (nf && !nf.error) notifState = nf;
@@ -2318,6 +2425,7 @@ async function render() {
     : view === "roster" ? renderRoster(lineups)
     : view === "sheet" ? renderGameSheet(lineups)
     : view === "inbox" ? renderInbox(inbox)
+    : view === "player_home" ? renderPlayerHome(playerHome)
     : view === "notifications" ? renderNotifications()
     : view === "delivery" ? renderDelivery(ov)
     : view === "users" ? renderUsers()
@@ -2426,6 +2534,53 @@ async function render() {
   // Inbox: jump to a game's sheet (#55).
   c.querySelectorAll("[data-open-sheet]").forEach((b) => b.onclick = () => {
     currentGame = b.dataset.openSheet; switchTab("sheet");
+  });
+  // Player Home: jump to a game's roster (#107), same convention as
+  // data-open-sheet above.
+  c.querySelectorAll("[data-open-roster]").forEach((b) => b.onclick = () => {
+    currentGame = b.dataset.openRoster; switchTab("roster");
+  });
+  // Player Home attendance actions (#107) — dedicated handlers (not the
+  // shared rosterAction dispatcher, which keys off the global currentGame)
+  // so acting from Home never depends on or mutates whatever game the
+  // Roster/Sheet screens currently have in focus. ownPlayerId guards the
+  // scope read at the call site, matching the rest of the file's
+  // (currentUser && currentUser.scope) convention.
+  const ownPlayerId = () =>
+    (currentUser && currentUser.scope) ? currentUser.scope.player_id : null;
+  const phConfirm = c.querySelector("[data-ph-confirm]");
+  if (phConfirm) phConfirm.onclick = async () => {
+    const pid = ownPlayerId();
+    if (!pid || !playerHome || !playerHome.next_game) return;
+    await post(`/api/games/${playerHome.next_game.game_id}/availability`,
+      { player_id: pid, availability_status: "available" });
+    await render();
+  };
+  const phBackout = c.querySelector("[data-ph-backout]");
+  if (phBackout) phBackout.onclick = () => {
+    if (!playerHome || !playerHome.next_game) return;
+    checkoutConfirm = { game_id: playerHome.next_game.game_id };
+    render();
+  };
+  const phConfirmCheckout = c.querySelector("[data-ph-confirm-checkout]");
+  if (phConfirmCheckout) phConfirmCheckout.onclick = async () => {
+    const pid = ownPlayerId();
+    if (!pid || !checkoutConfirm) return;
+    await post(`/api/games/${checkoutConfirm.game_id}/availability`,
+      { player_id: pid, availability_status: "unavailable" });
+    checkoutConfirm = null;
+    await render();
+  };
+  const phCancelCheckout = c.querySelector("[data-ph-cancel-checkout]");
+  if (phCancelCheckout) phCancelCheckout.onclick = () => {
+    checkoutConfirm = null; render();
+  };
+  c.querySelectorAll("[data-ph-enroll]").forEach((b) => b.onclick = async () => {
+    const pid = ownPlayerId();
+    if (!pid) return;
+    await post(`/api/games/${b.dataset.phEnroll}/substitutes/enroll`,
+      { player_id: pid });
+    await render();
   });
   // Notifications (#32): mark read on tap, open the related game, mark all.
   c.querySelectorAll("[data-notif-open]").forEach((b) => b.onclick = async (e) => {
@@ -2830,6 +2985,10 @@ async function render() {
 function switchTab(next) {
   view = next; toast = ""; if (next !== "calendar") { wizard = null; conflict = null; movingGameId = null; }
   if (next !== "setup") { drawer = null; drawerError = ""; drawerValues = {}; }
+  // A pending checkout confirmation doesn't survive leaving Home (#107) —
+  // same reset discipline as drawer/wizard above, so a stale "are you
+  // sure?" never reappears over changed attendance state.
+  if (next !== "player_home") checkoutConfirm = null;
   document.querySelectorAll(".tab").forEach((x) => x.classList.toggle("active", x.dataset.tab === next));
   render();
 }
@@ -2886,6 +3045,9 @@ function gateChrome() {
   // The "My Assignments" tab is only for a signed-in official (#55).
   const isOfficial = !!(currentUser && currentUser.scope && currentUser.scope.official_id);
   toggle('.tab[data-tab="inbox"]', isOfficial);
+  // Player Home is only meaningful for a signed-in, bound player (#107).
+  const isPlayer = !!(currentUser && currentUser.scope && currentUser.scope.player_id);
+  toggle('.tab[data-tab="player_home"]', isPlayer);
   // The Delivery admin tab is operator-only (#61).
   toggle('.tab[data-tab="delivery"]', hasPerm("manage_schedule"));
   toggle('.tab[data-tab="users"]', hasPerm("manage_users"));
@@ -2906,6 +3068,16 @@ function setUser(user) {
   currentUser = user;
   currentRole = user ? user.role : "viewer";
   applyRolePerms();
+  // Players land on their Home page (#107 / HOME-001) instead of the
+  // operator dashboard — only while still on the untouched default view,
+  // so an explicit tab choice mid-session is never overridden. The inverse
+  // guard sends a non-player OFF the player-only Home (persona switches).
+  const isPlayerUser = !!(user && user.scope && user.scope.player_id);
+  if (isPlayerUser && view === "dashboard") view = "player_home";
+  else if (!isPlayerUser && view === "player_home") view = "dashboard";
+  else return;
+  document.querySelectorAll(".tab").forEach((x) =>
+    x.classList.toggle("active", x.dataset.tab === view));
 }
 
 // Show/hide the full-screen sign-in overlay (#71). ``body.signed-out`` hides

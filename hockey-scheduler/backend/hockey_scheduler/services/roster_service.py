@@ -658,6 +658,81 @@ class RosterService:
                         "team_id": team_id}
         raise ValidationError("No previous roster to copy for this team.")
 
+    @staticmethod
+    def _is_visible_team_game(g, team_id) -> bool:
+        """Published, non-draft, non-cancelled game involving ``team_id`` —
+        the shared "counts for the Player Home Page" predicate (#107), so
+        next-game, today-count, and substitute-opportunity scans can never
+        drift apart on what a player-visible game is."""
+        return (not g.cancelled and g.published and not g.is_draft
+                and g.start_time is not None
+                and team_id in (g.home_team_id, g.away_team_id))
+
+    def find_next_game_for_player(self, player_id: str) -> Optional[Game]:
+        """The player's next published, non-cancelled game in chronological
+        order — the Player Home Page's "next game" card (#107). A pure read
+        helper — must NOT be @_transactional."""
+        player = self.store.get_player(player_id)
+        if player is None or not player.is_active:
+            return None
+        now = self.clock()
+        upcoming = [
+            g for g in self.store.all_games()
+            if self._is_visible_team_game(g, player.team_id)
+            and g.start_time >= now
+        ]
+        upcoming.sort(key=lambda g: g.start_time)
+        return upcoming[0] if upcoming else None
+
+    def count_games_today_for_player(self, player_id: str) -> int:
+        """How many of the player's team's games fall on today's date — the
+        Player Home Page's "Tonight" summary card (#107). A pure read
+        helper — must NOT be @_transactional."""
+        player = self.store.get_player(player_id)
+        if player is None or not player.is_active:
+            return 0
+        today = self.clock().date()
+        return sum(1 for g in self.store.all_games()
+                   if self._is_visible_team_game(g, player.team_id)
+                   and g.start_time.date() == today)
+
+    def list_substitute_opportunities(self, player_id: str) -> List[Game]:
+        """Games where this player's own team has an open slot matching
+        their position and the player isn't already selected/enrolled — the
+        Player Home Page's substitute-opportunities section (#107).
+
+        Cross-team borrowing is off (the same constraint enroll_substitute
+        enforces at line 363), so this only ever surfaces the player's own
+        team's games. A pure read helper — must NOT be @_transactional.
+        """
+        player = self.store.get_player(player_id)
+        if player is None or not player.is_active:
+            return []
+        now = self.clock()
+        needed = player.position.slot_type
+        opportunities = []
+        for g in self.store.all_games():
+            if (not self._is_visible_team_game(g, player.team_id)
+                    or g.start_time < now):
+                continue
+            # A locked roster rejects enrolment (enroll_substitute goes
+            # through _guard_mutable) — don't advertise a dead-end button.
+            if g.locked:
+                continue
+            if self.store.roster_entry_for_player(g.id, player.id) is not None:
+                continue
+            existing_sub = self.store.substitute_for_player(g.id, player.id)
+            if existing_sub is not None and existing_sub.status in (
+                    SubstituteStatus.ENROLLED, SubstituteStatus.OFFERED):
+                continue
+            rstatus = self.compute_roster_status(g.id, player.team_id)
+            open_slots = (rstatus.open_goalie_slots if needed == SlotType.GOALIE
+                         else rstatus.open_skater_slots)
+            if open_slots > 0:
+                opportunities.append(g)
+        opportunities.sort(key=lambda g: g.start_time)
+        return opportunities
+
     def _game_label(self, game) -> str:
         # A pure read helper — must NOT be @_transactional. It is called from
         # inside the transactional lock/unlock/cancel methods (via
