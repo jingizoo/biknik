@@ -32,6 +32,7 @@ from ..domain import (
     RosterEntryStatus,
     SlotType,
     SubstituteStatus,
+    intervals_overlap,
 )
 from ..domain.errors import (
     DomainError,
@@ -1176,8 +1177,6 @@ class ApiService:
     # from public-safe fields only — team names, division, rink, date/time,
     # score. Never player names, rosters, availability, or officials.
     def _public_game_dto(self, g) -> dict:
-        team = lambda tid: (self.store.get_team(tid).name
-                            if tid and self.store.get_team(tid) else None)
         venue_name = None
         slot = self.store.get_ice_slot(g.ice_slot_id) if g.ice_slot_id else None
         if slot is not None:
@@ -1198,8 +1197,8 @@ class ApiService:
             "game_id": g.id,
             "division_id": g.division_id,
             "division_name": div.name if div else None,
-            "home_team_name": team(g.home_team_id),
-            "away_team_name": team(g.away_team_id),
+            "home_team_name": self._team_name(g.home_team_id),
+            "away_team_name": self._team_name(g.away_team_id),
             "rink_name": g.rink, "venue_name": venue_name,
             "start_time": g.start_time.isoformat() if g.start_time else None,
             "status": status,
@@ -1255,18 +1254,71 @@ class ApiService:
         return draft_schedule(self.store, division_id, slot_ids=slot_ids,
                               constraints=constraints)
 
+    def _team_name(self, team_id) -> Optional[str]:
+        """Shared by every game DTO builder (public/draft review) so a
+        missing/unknown team resolves to None the same way everywhere."""
+        t = self.store.get_team(team_id) if team_id else None
+        return t.name if t else None
+
     # -- draft review + publish (#86) --------------------------------------
+    def _active_officials(self, game_id: str):
+        """Active (proposed/accepted) assignments for a game — a declined
+        assignment frees the official (#30 review). Shared by the demo
+        overview and the scheduler review list (#106) so both report the
+        same officials posture."""
+        return [a for a in self.store.assignments_for_game(game_id)
+                if a.status.is_active]
+
     def _draft_game_dto(self, g) -> dict:
-        team = lambda tid: (self.store.get_team(tid).name
-                            if tid and self.store.get_team(tid) else None)
         div = self.store.get_division(g.division_id) if g.division_id else None
         return {"game_id": g.id, "division_id": g.division_id,
                 "division_name": div.name if div else None,
-                "home_team_name": team(g.home_team_id),
-                "away_team_name": team(g.away_team_id),
+                "home_team_name": self._team_name(g.home_team_id),
+                "away_team_name": self._team_name(g.away_team_id),
                 "rink_name": g.rink,
                 "start_time": g.start_time.isoformat() if g.start_time else None,
                 "is_draft": g.is_draft, "published": g.published}
+
+    # A roster in either of these states is ready to play — the same bar the
+    # operator dashboard's gameTriage() already holds games to client-side;
+    # kept here as the single source of truth for the review issue below.
+    _ROSTER_READY_STATUSES = frozenset({"roster_confirmed", "locked"})
+
+    def _draft_review_row(self, g, slot_games: dict, double_booked: bool) -> dict:
+        """Enriched per-draft-game row for the scheduler review screen (#106):
+        officials/roster posture and any review issues, so an operator can
+        spot problems before publishing rather than discovering them after."""
+        div = self.store.get_division(g.division_id) if g.division_id else None
+        slot = self.store.get_ice_slot(g.ice_slot_id) if g.ice_slot_id else None
+        active = self._active_officials(g.id)
+        accepted = sum(1 for a in active if a.status.value == "accepted")
+        roster_status = self.roster.compute_roster_status(g.id).status.value
+
+        issues = []
+        if not active:
+            issues.append("missing_officials")
+        elif accepted < len(active):
+            issues.append("officials_pending")
+        if roster_status not in self._ROSTER_READY_STATUSES:
+            issues.append("roster_not_ready")
+        if g.ice_slot_id and len(slot_games.get(g.ice_slot_id, ())) > 1:
+            issues.append("slot_conflict")
+        if double_booked:
+            issues.append("team_double_booked")
+
+        return {
+            "game_id": g.id, "division_id": g.division_id,
+            "division_name": div.name if div else None,
+            "rink_id": slot.rink_id if slot else None, "rink_name": g.rink,
+            "home_team_id": g.home_team_id, "away_team_id": g.away_team_id,
+            "home_team_name": self._team_name(g.home_team_id),
+            "away_team_name": self._team_name(g.away_team_id),
+            "start_time": g.start_time.isoformat() if g.start_time else None,
+            "end_time": g.end_time.isoformat() if g.end_time else None,
+            "is_draft": g.is_draft, "published": g.published,
+            "officials_assigned": len(active), "officials_accepted": accepted,
+            "roster_status": roster_status, "issues": issues,
+        }
 
     @catch
     def commit_draft_schedule(self, division_id: str, slot_ids=None,
@@ -1303,10 +1355,65 @@ class ApiService:
 
     @catch
     def list_draft_games(self) -> dict:
-        rows = [self._draft_game_dto(g) for g in self.store.all_games()
-                if g.is_draft]
+        """Draft games plus a review summary (#106): counts by division/rink,
+        published-vs-draft context, and a per-game issues list (missing
+        officials, roster not ready, or a slot/team conflict) so an operator
+        can review before publishing rather than discovering problems after.
+        """
+        all_games = self.store.all_games()
+        drafts = [g for g in all_games if g.is_draft]
+
+        # Slot-conflict detection: the generator (services/scheduler.py) never
+        # proposes a slot another game already holds, so this should rarely
+        # fire in practice — a defensive check for any two non-cancelled
+        # games somehow sharing a slot.
+        slot_games = {}
+        for g in all_games:
+            if g.ice_slot_id and not g.cancelled:
+                slot_games.setdefault(g.ice_slot_id, []).append(g.id)
+
+        # Team double-booking: the same overlap formula create_game already
+        # enforces at manual-creation time (setup_service.py) — applied here
+        # read-only, across ALL non-cancelled games, since a draft could in
+        # principle collide with a game outside its own division.
+        team_intervals = {}
+        for g in all_games:
+            if g.cancelled or g.start_time is None or g.end_time is None:
+                continue
+            for tid in (g.home_team_id, g.away_team_id):
+                if tid:
+                    team_intervals.setdefault(tid, []).append(
+                        (g.id, g.start_time, g.end_time))
+
+        def is_double_booked(g) -> bool:
+            if g.start_time is None or g.end_time is None:
+                return False
+            for tid in (g.home_team_id, g.away_team_id):
+                if not tid:
+                    continue
+                for gid, s, e in team_intervals.get(tid, ()):
+                    if gid != g.id and intervals_overlap(g.start_time, g.end_time, s, e):
+                        return True
+            return False
+
+        rows = [self._draft_review_row(g, slot_games, is_double_booked(g))
+                for g in drafts]
         rows.sort(key=lambda r: r["start_time"] or "")
-        return {"draft_games": rows}
+
+        by_division, by_rink = {}, {}
+        for r in rows:
+            dkey = r["division_name"] or "Unassigned"
+            rkey = r["rink_name"] or "Unassigned"
+            by_division[dkey] = by_division.get(dkey, 0) + 1
+            by_rink[rkey] = by_rink.get(rkey, 0) + 1
+        summary = {
+            "draft_count": len(rows),
+            "published_count": sum(1 for g in all_games if g.published),
+            "issue_count": sum(1 for r in rows if r["issues"]),
+            "by_division": by_division,
+            "by_rink": by_rink,
+        }
+        return {"draft_games": rows, "summary": summary}
 
     def _draft_targets(self, game_ids, all_drafts):
         drafts = [g for g in self.store.all_games() if g.is_draft]
@@ -1464,10 +1571,7 @@ class ApiService:
             if slot and slot.rink_id in rinks:
                 rk = rinks[slot.rink_id]
                 venue_name = venues[rk.venue_id].name if rk.venue_id in venues else None
-            # Only active (proposed/accepted) assignments count as "assigned";
-            # a declined assignment frees the official (#30 review).
-            g_active = [a for a in self.store.assignments_for_game(g.id)
-                        if a.status.is_active]
+            g_active = self._active_officials(g.id)
             g_result = self.store.result_for_game(g.id)
             schedule.append({
                 "game_id": g.id,

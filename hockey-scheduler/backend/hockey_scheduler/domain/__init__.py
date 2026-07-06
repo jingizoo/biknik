@@ -79,6 +79,7 @@ from .setup_models import (
     SetupAuditLog,
     Venue,
 )
+from .time_utils import intervals_overlap
 
 __all__ = [
     # enums
@@ -157,4 +158,5 @@ __all__ = [
     "Session",
     "CalendarFeedToken",
     "Venue",
+    "intervals_overlap",
 ]

@@ -36,6 +36,7 @@ from ..domain import (
     SetupAuditLog,
     Team,
     Venue,
+    intervals_overlap,
 )
 from ..domain.errors import (
     DivisionMismatchError,
@@ -333,8 +334,8 @@ class SetupService:
             ex_slot = self.store.get_ice_slot(ex.ice_slot_id)
             if ex_slot is None:
                 continue
-            overlaps = (slot.start_time < ex_slot.end_time
-                        and slot.end_time > ex_slot.start_time)
+            overlaps = intervals_overlap(slot.start_time, slot.end_time,
+                                         ex_slot.start_time, ex_slot.end_time)
             same_team = (ex.home_team_id in (home_team_id, away_team_id)
                          or ex.away_team_id in (home_team_id, away_team_id))
             if overlaps and same_team:
@@ -427,8 +428,8 @@ class SetupService:
             ex_slot = self.store.get_ice_slot(ex.ice_slot_id)
             if ex_slot is None:
                 continue
-            overlaps = (new_slot.start_time < ex_slot.end_time
-                        and new_slot.end_time > ex_slot.start_time)
+            overlaps = intervals_overlap(new_slot.start_time, new_slot.end_time,
+                                         ex_slot.start_time, ex_slot.end_time)
             same_team = (ex.home_team_id in (game.home_team_id, game.away_team_id)
                          or ex.away_team_id in (game.home_team_id, game.away_team_id))
             if overlaps and same_team:

@@ -18,7 +18,8 @@ from http.server import ThreadingHTTPServer
 from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
 
 from hockey_scheduler.api import ApiService
-from hockey_scheduler.domain import Division, IceSlot, IceSlotStatus, Rink, Team
+from hockey_scheduler.domain import (
+    Division, Game, IceSlot, IceSlotStatus, Official, Rink, Team)
 from hockey_scheduler.store import InMemoryStore
 from hockey_scheduler.web import server as srv
 
@@ -153,6 +154,90 @@ class DraftReviewServiceTest(unittest.TestCase):
         occupied = [s for s in ov["ice_slots"] if s["game_id"]]
         self.assertEqual(len(occupied), len(res["created"]))
         self.assertTrue(all(s["status"] == "allocated" for s in occupied))
+
+
+class SchedulerReviewIssuesTest(unittest.TestCase):
+    """Scheduler review polish (#106): summary counts + per-game issues on
+    top of the same commit/publish/discard workflow #86 already covers."""
+
+    def setUp(self):
+        self.api, self.store = _seeded_api()
+
+    def test_summary_counts_and_default_issues(self):
+        self.api.commit_draft_schedule("d")
+        res = self.api.list_draft_games()
+        summary = res["summary"]
+        self.assertEqual(summary["draft_count"], 6)
+        self.assertEqual(summary["published_count"], 0)
+        self.assertEqual(summary["by_division"], {"D1": 6})
+        self.assertEqual(summary["by_rink"], {"Main": 6})
+        # No officials assigned and no roster set on any of the seeded teams
+        # — every draft game starts out flagged for both.
+        self.assertEqual(summary["issue_count"], 6)
+        for row in res["draft_games"]:
+            self.assertEqual(set(row["issues"]),
+                             {"missing_officials", "roster_not_ready"})
+
+    def test_officials_pending_until_accepted(self):
+        self.store.add_official(Official(id="o1", name="Ref One"))
+        self.api.commit_draft_schedule("d")
+        gid = self.api.list_draft_games()["draft_games"][0]["game_id"]
+        assignment = self.api.assign_official(gid, "o1", "referee")
+        row = next(r for r in self.api.list_draft_games()["draft_games"]
+                   if r["game_id"] == gid)
+        self.assertEqual(row["officials_assigned"], 1)
+        self.assertEqual(row["officials_accepted"], 0)
+        self.assertNotIn("missing_officials", row["issues"])
+        self.assertIn("officials_pending", row["issues"])
+        self.api.respond_assignment(assignment["id"], True)
+        row = next(r for r in self.api.list_draft_games()["draft_games"]
+                   if r["game_id"] == gid)
+        self.assertEqual(row["officials_accepted"], 1)
+        self.assertNotIn("officials_pending", row["issues"])
+        self.assertNotIn("missing_officials", row["issues"])
+        # Roster is still unset — that issue is independent of officials.
+        self.assertIn("roster_not_ready", row["issues"])
+
+    def test_published_count_reflects_publish(self):
+        self.api.commit_draft_schedule("d")
+        drafts = self.api.list_draft_games()["draft_games"]
+        self.api.publish_draft_games(game_ids=[drafts[0]["game_id"]])
+        summary = self.api.list_draft_games()["summary"]
+        self.assertEqual(summary["draft_count"], 5)
+        self.assertEqual(summary["published_count"], 1)
+
+    def test_slot_conflict_flagged_defensively(self):
+        # The generator itself never proposes an already-used slot; this
+        # simulates data mutated out of band so the review screen still
+        # surfaces it rather than silently publishing a clash.
+        self.api.commit_draft_schedule("d")
+        drafts = self.api.list_draft_games()["draft_games"]
+        clashing_slot = drafts[0]["game_id"]
+        slot_id = next(g.ice_slot_id for g in self.store.all_games()
+                       if g.id == clashing_slot)
+        self.store.add_game(Game(
+            id="game_extra", home_team_id="t0", away_team_id="t1",
+            start_time=datetime(2030, 1, 1, tzinfo=UTC),
+            end_time=datetime(2030, 1, 1, 1, tzinfo=UTC),
+            ice_slot_id=slot_id, division_id="d"))
+        row = next(r for r in self.api.list_draft_games()["draft_games"]
+                   if r["game_id"] == clashing_slot)
+        self.assertIn("slot_conflict", row["issues"])
+
+    def test_team_double_booking_flagged_defensively(self):
+        self.api.commit_draft_schedule("d")
+        drafts = self.api.list_draft_games()["draft_games"]
+        target = drafts[0]
+        overlap_start = datetime.fromisoformat(target["start_time"])
+        overlap_end = datetime.fromisoformat(target["end_time"])
+        self.store.add_game(Game(
+            id="game_extra", home_team_id=target["home_team_id"],
+            away_team_id="t3" if target["home_team_id"] != "t3" else "t2",
+            start_time=overlap_start, end_time=overlap_end,
+            division_id="d"))
+        row = next(r for r in self.api.list_draft_games()["draft_games"]
+                   if r["game_id"] == target["game_id"])
+        self.assertIn("team_double_booked", row["issues"])
 
 
 class DraftReviewHttpTest(unittest.TestCase):

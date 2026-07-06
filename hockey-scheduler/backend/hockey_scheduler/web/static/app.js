@@ -28,7 +28,11 @@ let feedTokens = [];               // signed-in user's calendar feed tokens (#82
 let newFeedUrl = null;             // freshly-minted feed URL, shown once (#82)
 let publicState = { schedule: null, standings: null, division: null, game: null };
 let publicTab = "schedule";        // "schedule" | "standings" (#83)
-let schedulerState = { division: null, preview: null, drafts: [] };  // (#86)
+let schedulerState = {
+  division: null, preview: null, drafts: [], summary: null,
+  filters: { division: "all", rink: "all", issue: "all" },  // (#106)
+  selected: new Set(),  // game_ids picked for publish/discard (#106)
+};  // (#86)
 let officialAvailability = [];      // signed-in official's windows (#88)
 let availSummary = null;            // roster availability rollup (#89)
 let availFilter = "all";            // all|available|unavailable|maybe|no_response
@@ -1351,15 +1355,59 @@ function renderReadiness(ov) {
     ${rows.join("")}</div>${toastHtml()}`;
 }
 
-/* ---------- Draft scheduler review + publish (#86) ---------- */
+/* ---------- Draft scheduler review + publish (#86/#106) ---------- */
+// Reconciles schedulerState.selected against the latest drafts fetch against
+// `previousDrafts` (the prior fetch's snapshot, taken by the caller before
+// overwriting schedulerState.drafts): default-selects only NEWLY-seen clean
+// (issue-free) drafts, and drops a selection if a game the operator hadn't
+// looked at yet silently went from clean to flagged between fetches — so
+// publish can't include a problem game the operator never consciously
+// approved in its broken state. A game the operator explicitly selected
+// DESPITE a pre-existing issue (e.g. via "Select all") stays selected; only
+// a clean → flagged transition on an untouched selection clears it.
+function reconcileDraftSelection(drafts, previousDrafts) {
+  const previousIssues = new Map((previousDrafts || []).map((g) => [g.game_id, g.issues]));
+  const next = new Set();
+  for (const g of drafts) {
+    const wasSeen = previousIssues.has(g.game_id);
+    const wasClean = wasSeen && previousIssues.get(g.game_id).length === 0;
+    if (schedulerState.selected.has(g.game_id)) {
+      if (g.issues.length && wasClean) continue;  // drifted clean -> flagged
+      next.add(g.game_id);
+    } else if (!wasSeen && !g.issues.length) {
+      next.add(g.game_id);
+    }
+  }
+  schedulerState.selected = next;
+}
+const SCHED_ISSUE_LABEL = {
+  missing_officials: "Missing officials", officials_pending: "Officials pending",
+  roster_not_ready: "Roster not ready", slot_conflict: "Slot conflict",
+  team_double_booked: "Team double-booked",
+};
+// Blocking issues (no official assigned at all, or a hard scheduling clash)
+// read red; softer in-progress states (pending acceptance, roster not yet
+// confirmed) read as a warning — same red/orange split as everywhere else.
+const SCHED_ISSUE_SEVERE = new Set(["missing_officials", "slot_conflict", "team_double_booked"]);
+function schedDraftRow(g) {
+  const checked = schedulerState.selected.has(g.game_id);
+  const badges = g.issues.map((i) =>
+    `<span class="badge ${SCHED_ISSUE_SEVERE.has(i) ? "red" : "orange"}">${esc(SCHED_ISSUE_LABEL[i] || i)}</span>`).join(" ");
+  return `<div class="li">
+    <input type="checkbox" class="sched-pick" data-sched-pick="${esc(g.game_id)}" ${checked ? "checked" : ""} />
+    <span class="li-time">${fmt(g.start_time)}</span>
+    <div class="li-main"><div class="li-title">${esc(g.home_team_name)} vs ${esc(g.away_team_name)}</div>
+      <div class="li-sub">${esc(g.division_name || "")} · ${esc(g.rink_name || "")}${badges ? " · " + badges : ""}</div></div>
+    <span class="pill scheduled">draft</span></div>`;
+}
 function renderScheduler(ov) {
   if (!hasPerm("manage_schedule")) {
     return `<div class="banner neutral"><h2>Operators only</h2>
       <p>The draft scheduler is available to league admins and arena managers.</p></div>`;
   }
   const divs = ov.divisions || [];
-  const opts = divs.map((d) =>
-    `<option value="${esc(d.id)}" ${d.id === schedulerState.division ? "selected" : ""}>${esc(d.name)}</option>`).join("");
+  const divOptions = (selectedId) => divs.map((d) =>
+    `<option value="${esc(d.id)}" ${d.id === selectedId ? "selected" : ""}>${esc(d.name)}</option>`).join("");
   const pv = schedulerState.preview;
   let previewBlock = "";
   if (pv) {
@@ -1375,24 +1423,60 @@ function renderScheduler(ov) {
       <div class="card">${gRows || '<div class="empty">No games generated.</div>'}${uRows}</div>
       <div class="dq-actions"><button class="act primary" data-sched-commit>Commit as draft</button></div>`;
   }
-  const drafts = schedulerState.drafts || [];
-  const dRows = drafts.map((g) => `<div class="li">
-    <span class="li-time">${fmt(g.start_time)}</span>
-    <div class="li-main"><div class="li-title">${esc(g.home_team_name)} vs ${esc(g.away_team_name)}</div>
-      <div class="li-sub">${esc(g.division_name || "")} · ${esc(g.rink_name || "")}</div></div>
-    <span class="pill scheduled">draft</span></div>`).join("");
-  const draftBlock = `<div class="section-title">Draft games (${drafts.length})</div>
-    <div class="card">${dRows || '<div class="empty">No draft games. Generate and commit a schedule above.</div>'}</div>
-    ${drafts.length ? `<div class="dq-actions">
-      <button class="act primary" data-sched-publish>Publish all</button>
-      <button class="act ghost danger" data-sched-discard>Discard all</button></div>` : ""}`;
+
+  const allDrafts = schedulerState.drafts || [];
+  const summary = schedulerState.summary;
+  const f = schedulerState.filters;
+  const rinkOpts = (ov.rinks || []).map((r) =>
+    `<option value="${esc(r.id)}" ${r.id === f.rink ? "selected" : ""}>${esc(r.name)}</option>`).join("");
+  const drafts = allDrafts.filter((g) => {
+    if (f.division !== "all" && g.division_id !== f.division) return false;
+    if (f.rink !== "all" && g.rink_id !== f.rink) return false;
+    if (f.issue === "issues" && !g.issues.length) return false;
+    if (f.issue === "clean" && g.issues.length) return false;
+    return true;
+  });
+
+  const summaryBlock = summary ? `<div class="section-title" style="margin-top:0">
+      Review summary — ${summary.draft_count} draft, ${summary.published_count} published,
+      ${summary.issue_count} with issue${summary.issue_count === 1 ? "" : "s"}</div>
+    <div class="li-sub" style="padding:0 4px 12px">
+      By division: ${Object.entries(summary.by_division).map(([k, v]) => `${esc(k)} (${v})`).join(", ") || "—"}
+      &nbsp;·&nbsp; By rink: ${Object.entries(summary.by_rink).map(([k, v]) => `${esc(k)} (${v})`).join(", ") || "—"}
+    </div>` : "";
+
+  const filterBlock = allDrafts.length ? `<div class="dq-actions">
+      <select id="sched-filter-div"><option value="all">All divisions</option>${divOptions(f.division === "all" ? null : f.division)}</select>
+      <select id="sched-filter-rink"><option value="all">All rinks</option>${rinkOpts}</select>
+      <select id="sched-filter-issue">
+        <option value="all" ${f.issue === "all" ? "selected" : ""}>All</option>
+        <option value="issues" ${f.issue === "issues" ? "selected" : ""}>With issues</option>
+        <option value="clean" ${f.issue === "clean" ? "selected" : ""}>Clean only</option>
+      </select>
+    </div>` : "";
+
+  const dRows = drafts.map(schedDraftRow).join("");
+  const selectedCount = schedulerState.selected.size;
+  const draftBlock = `<div class="section-title">Draft games (${drafts.length}${drafts.length !== allDrafts.length ? ` of ${allDrafts.length}` : ""})</div>
+    ${filterBlock}
+    <div class="card">${dRows || '<div class="empty">No draft games match these filters.</div>'}</div>
+    ${allDrafts.length ? `<div class="dq-actions">
+      <button class="act ghost" data-sched-select-all>Select all</button>
+      <button class="act ghost" data-sched-select-clean>Select clean only</button>
+      <button class="act ghost" data-sched-select-none>Select none</button>
+    </div>
+    <div class="dq-actions">
+      <button class="act primary" data-sched-publish ${selectedCount ? "" : "disabled"}>Publish ${selectedCount} of ${allDrafts.length}</button>
+      <button class="act ghost danger" data-sched-discard ${selectedCount ? "" : "disabled"}>Discard ${selectedCount} of ${allDrafts.length}</button>
+    </div>` : ""}`;
+
   return `<div class="card">
       <div class="section-title" style="margin-top:0">Generate draft schedule</div>
       <div class="dq-actions">
-        <select id="sched-div">${opts}</select>
+        <select id="sched-div">${divOptions(schedulerState.division)}</select>
         <button class="act" data-sched-generate>Generate</button>
       </div></div>
-    ${previewBlock}${draftBlock}${toastHtml()}`;
+    ${previewBlock}${summaryBlock}${draftBlock}${toastHtml()}`;
 }
 
 /* ---------- Pilot onboarding import wizard (#96/#99) ----------
@@ -2147,13 +2231,17 @@ async function render() {
         deviceTokens: (tokens && tokens.device_tokens) || [],
       };
     }
-    // Draft scheduler review (#86), operator-only.
+    // Draft scheduler review (#86/#106), operator-only.
     if (view === "scheduler" && hasPerm("manage_schedule")) {
       if (!schedulerState.division && ov.divisions[0]) {
         schedulerState.division = ov.divisions[0].id;
       }
       const dr = await getJSON("/api/scheduler/drafts");
-      schedulerState.drafts = (dr && dr.draft_games) || [];
+      const drafts = (dr && dr.draft_games) || [];
+      const previousDrafts = schedulerState.drafts;
+      schedulerState.drafts = drafts;
+      schedulerState.summary = (dr && dr.summary) || null;
+      reconcileDraftSelection(drafts, previousDrafts);
     }
     // Import wizard (#96): default the season picker once seasons exist,
     // same pattern as schedulerState.division/standingsDivision above —
@@ -2470,18 +2558,59 @@ async function render() {
     if (res && !res.error) { schedulerState.preview = null; toast = `Committed ${res.created.length} draft game(s).`; }
     await render();
   };
+  // Review filters (#106) — re-render() like every other interaction in this
+  // app; reconcileDraftSelection preserves the current selection across it.
+  const schedFilterDiv = c.querySelector("#sched-filter-div");
+  if (schedFilterDiv) schedFilterDiv.onchange = () => {
+    schedulerState.filters.division = schedFilterDiv.value; render();
+  };
+  const schedFilterRink = c.querySelector("#sched-filter-rink");
+  if (schedFilterRink) schedFilterRink.onchange = () => {
+    schedulerState.filters.rink = schedFilterRink.value; render();
+  };
+  const schedFilterIssue = c.querySelector("#sched-filter-issue");
+  if (schedFilterIssue) schedFilterIssue.onchange = () => {
+    schedulerState.filters.issue = schedFilterIssue.value; render();
+  };
+  // Per-game publish/discard selection (#106).
+  c.querySelectorAll("[data-sched-pick]").forEach((el) => el.onchange = () => {
+    const id = el.dataset.schedPick;
+    if (el.checked) schedulerState.selected.add(id); else schedulerState.selected.delete(id);
+    render();
+  });
+  const schedSelectAll = c.querySelector("[data-sched-select-all]");
+  if (schedSelectAll) schedSelectAll.onclick = () => {
+    schedulerState.selected = new Set((schedulerState.drafts || []).map((g) => g.game_id));
+    render();
+  };
+  const schedSelectClean = c.querySelector("[data-sched-select-clean]");
+  if (schedSelectClean) schedSelectClean.onclick = () => {
+    schedulerState.selected = new Set((schedulerState.drafts || [])
+      .filter((g) => !g.issues.length).map((g) => g.game_id));
+    render();
+  };
+  const schedSelectNone = c.querySelector("[data-sched-select-none]");
+  if (schedSelectNone) schedSelectNone.onclick = () => {
+    schedulerState.selected = new Set(); render();
+  };
   const schedPub = c.querySelector("[data-sched-publish]");
   if (schedPub) schedPub.onclick = async () => {
+    if (!schedulerState.selected.size) return;
     toast = "";
-    const res = await post("/api/scheduler/drafts/publish", { all: true });
+    const ids = Array.from(schedulerState.selected);
+    const res = await post("/api/scheduler/drafts/publish", { game_ids: ids });
     if (res && !res.error) toast = `Published ${res.published} game(s).`;
+    ids.forEach((id) => schedulerState.selected.delete(id));
     await render();
   };
   const schedDis = c.querySelector("[data-sched-discard]");
   if (schedDis) schedDis.onclick = async () => {
+    if (!schedulerState.selected.size) return;
     toast = "";
-    const res = await post("/api/scheduler/drafts/discard", { all: true });
+    const ids = Array.from(schedulerState.selected);
+    const res = await post("/api/scheduler/drafts/discard", { game_ids: ids });
     if (res && !res.error) toast = `Discarded ${res.discarded} draft(s).`;
+    ids.forEach((id) => schedulerState.selected.delete(id));
     await render();
   };
   // Pilot onboarding import wizard (#96): switch type, validate, commit.
