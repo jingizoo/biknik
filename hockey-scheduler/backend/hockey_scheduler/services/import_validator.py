@@ -32,7 +32,7 @@ import io
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
-from ..domain import IceSlotType, OfficialAvailabilityStatus
+from ..domain import IceSlotType, OfficialAvailabilityStatus, intervals_overlap
 
 IMPORT_SHEET_NAMES = ("teams", "players", "officials", "rinks", "ice_slots")
 
@@ -204,7 +204,7 @@ def _check_overlaps(report: _Report, parsed_slots) -> None:
         for row_b, rink_b, start_b, end_b in parsed_slots[idx + 1:]:
             if rink_a != rink_b:
                 continue
-            if start_a < end_b and end_a > start_b:
+            if intervals_overlap(start_a, end_a, start_b, end_b):
                 report.warning(
                     "ice_slots", row_a,
                     f"Slot overlaps another slot on the same rink (row {row_b}).")
@@ -312,7 +312,7 @@ def validate_official_availability(rows: List[dict], official_codes_in_sheet: se
         for row_b, code_b, start_b, end_b in parsed[idx + 1:]:
             if code_a != code_b:
                 continue
-            if start_a < end_b and end_a > start_b:
+            if intervals_overlap(start_a, end_a, start_b, end_b):
                 report.warning(
                     sheet, row_a,
                     f"Availability window overlaps another window for the "
