@@ -205,6 +205,31 @@ class ImportCommitServiceContract:
         team_row = next(a for a in ov["setup_audit"] if a["action"] == "team_created")
         self.assertEqual(team_row["detail"]["import_batch_id"], batch["entity_id"])
 
+    # #102 review fix: /api/demo/overview is UNAUTHENTICATED (do_GET in
+    # web/server.py serves it with no session/permission check), so
+    # actor_id/detail must stay scoped to import-batch entries only — NOT
+    # leak for every setup-audit action. user_account_created's detail
+    # stores {"username", "role"}; confirm it's never exposed here, even
+    # though import batches on the SAME overview response do carry theirs.
+    def test_overview_omits_detail_for_non_import_audit_entries(self):
+        from hockey_scheduler.services.account_service import AccountService
+        AccountService(self.store).create_account(
+            "sidefx", "hunter2", "coach", actor_id="admin")
+        self.api.commit_teams_players_import(
+            self.season.id, _valid_sheets_csv(), actor_id="admin")
+        ov = self.api.get_demo_overview()
+        account_row = next(a for a in ov["setup_audit"]
+                           if a["action"] == "user_account_created")
+        self.assertNotIn("detail", account_row)
+        self.assertNotIn("actor_id", account_row)
+        blob = json.dumps(ov["setup_audit"])
+        self.assertNotIn("sidefx", blob)
+        self.assertNotIn("hunter2", blob)
+        # Import batch entries on the SAME response are unaffected by the fix.
+        batch = next(a for a in ov["setup_audit"] if a["action"] == "import_committed")
+        self.assertIn("detail", batch)
+        self.assertIn("actor_id", batch)
+
     def test_audit_trail_on_repeat_commit(self):
         self.api.commit_teams_players_import(
             self.season.id, _valid_sheets_csv(), actor_id="admin")
