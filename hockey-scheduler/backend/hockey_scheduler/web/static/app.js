@@ -44,6 +44,8 @@ let drawer = null;          // {kind} when a Setup create drawer is open (#44)
 let drawerError = "";       // validation/API error shown inside the open drawer
 let drawerValues = {};      // {fieldId: value} preserved across re-render on error
 let checkoutConfirm = null;  // {game_id} while the Player Home "Can't Play" confirmation is open (#107)
+let oppDetailGame = null;    // game_id of the substitute opportunity whose detail is open (#110)
+let oppDetail = null;        // fetched detail payload for oppDetailGame (#110)
 let activityExpandedBatches = new Set();  // import_batch_ids expanded in Activity (#102)
 let readinessCheck = null;  // /api/readiness snapshot for the Pilot Readiness card (#104)
 let importState = {         // Pilot onboarding import wizard (#96)
@@ -985,7 +987,46 @@ function phStatusFeed(ng, oppCount) {
     ${rows.map(([cls, msg]) => `<div class="li"><span class="badge ${cls}">●</span>
       <div class="li-main"><div class="li-sub">${esc(msg)}</div></div></div>`).join("")}</div>`;
 }
+// Substitute opportunity detail (#110): a scoped detail surface reached from
+// the Home opportunities list via "View Opportunity". Shows the game context
+// and either an Accept/Withdraw action or the plain reason the player can't
+// respond; the response reuses the existing enroll/withdraw workflow.
+function renderOppDetail(detail) {
+  if (!detail || detail.error) {
+    return `<div class="banner alert"><h2>Opportunity unavailable</h2>
+      <p>${esc((detail && detail.error && detail.error.message) || "This opportunity could not be loaded.")}</p></div>
+      <div class="actions"><button class="act ghost" data-opp-back>Back to Home</button></div>${toastHtml()}`;
+  }
+  const rows = [
+    ["Team", detail.team_name],
+    ["Opponent", detail.opponent_name || "TBD"],
+    ["When", fmtDateTime(detail.start_time)],
+    ["Venue", [detail.venue_name, detail.rink_name].filter(Boolean).join(" · ") || "—"],
+    ["Position needed", detail.position_needed],
+  ].map(([k, v]) => `<div class="li"><div class="li-main">
+      <div class="li-sub">${esc(k)}</div><div class="li-title">${esc(v)}</div></div></div>`).join("")
+    + `<div class="li"><div class="li-main"><div class="li-sub">Team status</div></div>
+        ${phBadge(PH_TEAM_STATUS, detail.team_status)}</div>`;
+  let actions;
+  if (detail.can_withdraw) {
+    actions = `<button class="act danger" data-opp-withdraw="${esc(detail.game_id)}">Withdraw</button>`;
+  } else if (detail.can_accept) {
+    actions = `<button class="act primary" data-opp-accept="${esc(detail.game_id)}">Accept — Enroll as Sub</button>`;
+  } else {
+    actions = `<div class="banner neutral"><p>${esc(detail.blocked_reason || "You can't respond to this opportunity right now.")}</p></div>`;
+  }
+  return `<div class="section-title" style="margin-top:0">Substitute Opportunity</div>
+    <div class="card">${rows}</div>
+    <div class="actions">${actions}
+      <button class="act ghost" data-opp-back>Back to Home</button>
+    </div>${toastHtml()}`;
+}
+
 function renderPlayerHome(playerHome) {
+  // An opportunity detail is open — show it in place of the Home dashboard.
+  // Checked before the player_id guard: while the detail is open the
+  // player-home payload is intentionally not re-fetched (render() skips it).
+  if (oppDetailGame) return renderOppDetail(oppDetail);
   if (!playerHome || !playerHome.player_id) {
     return `<div class="empty">Sign in as a <strong>Player</strong> to see your next game, attendance, and substitute opportunities.</div>`;
   }
@@ -1035,7 +1076,7 @@ function renderPlayerHome(playerHome) {
       <div class="li-main"><div class="li-title">${esc(o.team_name)} vs ${esc(o.opponent_name || "TBD")}</div>
         <div class="li-sub">${esc(fmtDateTime(o.start_time))}
           ${o.rink_name ? " · " + esc(o.rink_name) : ""} · needs ${esc(o.position_needed)}</div></div>
-      <button class="act primary" data-ph-enroll="${esc(o.game_id)}">Enroll</button>
+      <button class="act primary" data-ph-view-opp="${esc(o.game_id)}">View Opportunity</button>
     </div>`).join("")
     + (opps.length > 3 ? `<div class="li"><div class="li-main">
         <div class="li-sub">+ ${opps.length - 3} more opportunity(ies)</div></div></div>` : "");
@@ -2289,7 +2330,14 @@ async function render() {
     }
     // The signed-in player's own home screen (#107): next game, attendance,
     // substitute opportunities, unread count — all scoped server-side.
-    if (view === "player_home") playerHome = await getJSON("/api/me/player-home");
+    if (view === "player_home") {
+      // Skip the heavy player-home read while an opportunity detail is open —
+      // renderPlayerHome short-circuits to the detail and discards playerHome.
+      if (!oppDetailGame) playerHome = await getJSON("/api/me/player-home");
+      oppDetail = oppDetailGame
+        ? await getJSON(`/api/me/substitute-opportunities/${encodeURIComponent(oppDetailGame)}`)
+        : null;
+    }
     // Notifications feed drives the bell badge on every view (#32).
     const nf = await getJSON("/api/notifications");
     if (nf && !nf.error) notifState = nf;
@@ -2575,13 +2623,27 @@ async function render() {
   if (phCancelCheckout) phCancelCheckout.onclick = () => {
     checkoutConfirm = null; render();
   };
-  c.querySelectorAll("[data-ph-enroll]").forEach((b) => b.onclick = async () => {
-    const pid = ownPlayerId();
-    if (!pid) return;
-    await post(`/api/games/${b.dataset.phEnroll}/substitutes/enroll`,
-      { player_id: pid });
-    await render();
+  // Substitute opportunity detail + response (#110). The response actions hit
+  // signed-in-player scoped routes, so no player_id is sent from the browser.
+  c.querySelectorAll("[data-ph-view-opp]").forEach((b) => b.onclick = () => {
+    oppDetailGame = b.dataset.phViewOpp; oppDetail = null; toast = ""; render();
   });
+  const oppBack = c.querySelector("[data-opp-back]");
+  if (oppBack) oppBack.onclick = () => { oppDetailGame = null; oppDetail = null; render(); };
+  const oppAccept = c.querySelector("[data-opp-accept]");
+  if (oppAccept) oppAccept.onclick = async () => {
+    toast = "";
+    const r = await post(`/api/me/substitute-opportunities/${encodeURIComponent(oppAccept.dataset.oppAccept)}/enroll`, {});
+    if (r && !r.error) { toast = "You're enrolled as a substitute."; oppDetailGame = null; oppDetail = null; }
+    await render();
+  };
+  const oppWithdraw = c.querySelector("[data-opp-withdraw]");
+  if (oppWithdraw) oppWithdraw.onclick = async () => {
+    toast = "";
+    const r = await post(`/api/me/substitute-opportunities/${encodeURIComponent(oppWithdraw.dataset.oppWithdraw)}/withdraw`, {});
+    if (r && !r.error) { toast = "You've withdrawn from this opportunity."; oppDetailGame = null; oppDetail = null; }
+    await render();
+  };
   // Notifications (#32): mark read on tap, open the related game, mark all.
   c.querySelectorAll("[data-notif-open]").forEach((b) => b.onclick = async (e) => {
     e.stopPropagation();
@@ -2988,7 +3050,7 @@ function switchTab(next) {
   // A pending checkout confirmation doesn't survive leaving Home (#107) —
   // same reset discipline as drawer/wizard above, so a stale "are you
   // sure?" never reappears over changed attendance state.
-  if (next !== "player_home") checkoutConfirm = null;
+  if (next !== "player_home") { checkoutConfirm = null; oppDetailGame = null; oppDetail = null; }
   document.querySelectorAll(".tab").forEach((x) => x.classList.toggle("active", x.dataset.tab === next));
   render();
 }

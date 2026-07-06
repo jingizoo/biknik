@@ -696,6 +696,51 @@ class RosterService:
                    if self._is_visible_team_game(g, player.team_id)
                    and g.start_time.date() == today)
 
+    def substitute_block_reason(self, player_id: str, game_id: str,
+                                rstatus=None) -> Optional[str]:
+        """Why ``player_id`` cannot enrol as a substitute for ``game_id`` right
+        now, or ``None`` if they can. The single source of truth shared by the
+        Home opportunity list (#107, skip silently when blocked) and the #110
+        opportunity-detail view (show the reason). Does NOT consider an existing
+        enrolment — being already enrolled is a separate state (it offers a
+        Withdraw action), not a reason the player is ineligible.
+
+        ``rstatus`` may be a pre-computed :class:`RosterStatus` for this
+        game/team so a caller that already has one (the detail view) avoids a
+        second ``compute_roster_status`` pass. A pure read helper — must NOT be
+        @_transactional.
+        """
+        player = self.store.get_player(player_id)
+        if player is None:
+            return "Player not found."
+        if not player.is_active:
+            return "You are not an active player."
+        game = self.store.get_game(game_id)
+        if game is None:
+            return "Game not found."
+        if player.team_id not in (game.home_team_id, game.away_team_id):
+            return "You are not on a team in this game."
+        if game.cancelled:
+            return "This game has been cancelled."
+        if not game.published or game.is_draft:
+            return "This game has not been published yet."
+        if game.start_time is None or game.start_time < self.clock():
+            return "This game is no longer upcoming."
+        # A locked roster rejects enrolment (enroll_substitute goes through
+        # _guard_mutable) — surface that rather than advertise a dead end.
+        if game.locked:
+            return "The roster for this game is locked."
+        if self.store.roster_entry_for_player(game_id, player_id) is not None:
+            return "You are already on the roster for this game."
+        needed = player.position.slot_type
+        if rstatus is None:
+            rstatus = self.compute_roster_status(game_id, player.team_id)
+        open_slots = (rstatus.open_goalie_slots if needed == SlotType.GOALIE
+                      else rstatus.open_skater_slots)
+        if open_slots <= 0:
+            return "There is no open slot for your position right now."
+        return None
+
     def list_substitute_opportunities(self, player_id: str) -> List[Game]:
         """Games where this player's own team has an open slot matching
         their position and the player isn't already selected/enrolled — the
@@ -708,27 +753,16 @@ class RosterService:
         player = self.store.get_player(player_id)
         if player is None or not player.is_active:
             return []
-        now = self.clock()
-        needed = player.position.slot_type
         opportunities = []
         for g in self.store.all_games():
-            if (not self._is_visible_team_game(g, player.team_id)
-                    or g.start_time < now):
-                continue
-            # A locked roster rejects enrolment (enroll_substitute goes
-            # through _guard_mutable) — don't advertise a dead-end button.
-            if g.locked:
-                continue
-            if self.store.roster_entry_for_player(g.id, player.id) is not None:
-                continue
-            existing_sub = self.store.substitute_for_player(g.id, player.id)
+            # Already enrolled/offered here → don't re-advertise (the detail
+            # view still shows it, with a Withdraw action). Distinct from the
+            # ineligibility reasons substitute_block_reason covers.
+            existing_sub = self.store.substitute_for_player(g.id, player_id)
             if existing_sub is not None and existing_sub.status in (
                     SubstituteStatus.ENROLLED, SubstituteStatus.OFFERED):
                 continue
-            rstatus = self.compute_roster_status(g.id, player.team_id)
-            open_slots = (rstatus.open_goalie_slots if needed == SlotType.GOALIE
-                         else rstatus.open_skater_slots)
-            if open_slots > 0:
+            if self.substitute_block_reason(player_id, g.id) is None:
                 opportunities.append(g)
         opportunities.sort(key=lambda g: g.start_time)
         return opportunities
