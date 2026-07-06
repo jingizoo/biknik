@@ -1105,6 +1105,23 @@ class ApiService:
         """The other side of a game from ``team_id``'s point of view."""
         return g.away_team_id if g.home_team_id == team_id else g.home_team_id
 
+    def _opportunity_base_dict(self, g, player) -> dict:
+        """The fields a substitute opportunity carries in both the Home list
+        (#107) and the detail view (#110) — kept in one place so the two
+        surfaces can't drift on the shared shape."""
+        team = self.store.get_team(player.team_id) if player.team_id else None
+        opp_id = self._opponent_team_id(g, player.team_id)
+        opp_team = self.store.get_team(opp_id) if opp_id else None
+        return {
+            "game_id": g.id,
+            "team_name": team.name if team else player.team_id,
+            "opponent_name": opp_team.name if opp_team else None,
+            "start_time": g.start_time.isoformat() if g.start_time else None,
+            "venue_name": self._venue_name_for_game(g),
+            "rink_name": g.rink,
+            "position_needed": player.position.slot_type.value,
+        }
+
     @catch
     def get_player_home(self, player_id: str, user_id: Optional[str] = None) -> dict:
         """The signed-in player's home screen (#107): next game, attendance
@@ -1144,18 +1161,8 @@ class ApiService:
                     rstatus.status.value, "not_responded"),
             }
 
-        opportunities = []
-        for g in self.roster.list_substitute_opportunities(player_id):
-            opp_id = self._opponent_team_id(g, player.team_id)
-            opp_team = self.store.get_team(opp_id) if opp_id else None
-            opportunities.append({
-                "game_id": g.id,
-                "team_name": team.name if team else player.team_id,
-                "opponent_name": opp_team.name if opp_team else None,
-                "start_time": g.start_time.isoformat() if g.start_time else None,
-                "venue_name": self._venue_name_for_game(g), "rink_name": g.rink,
-                "position_needed": player.position.slot_type.value,
-            })
+        opportunities = [self._opportunity_base_dict(g, player)
+                         for g in self.roster.list_substitute_opportunities(player_id)]
 
         notif = self.get_notifications("player", {"player_id": player_id},
                                        user_id=user_id)
@@ -1168,6 +1175,50 @@ class ApiService:
             "today_count": self.roster.count_games_today_for_player(player_id),
             "substitute_opportunities": opportunities,
             "unread_notifications": unread,
+        }
+
+    @catch
+    def get_substitute_opportunity(self, player_id: str, game_id: str) -> dict:
+        """Detail for one substitute opportunity, scoped to the signed-in
+        player (#110): the game context, this player's current relationship to
+        it (can accept / can withdraw), and a plain-language reason when they
+        cannot respond."""
+        player = self.store.get_player(player_id)
+        if player is None:
+            raise NotFoundError("Player not found.")
+        game = self.store.get_game(game_id)
+        # Only a player on one of the participating teams may view the
+        # opportunity — don't confirm another team's game to a non-participant.
+        if game is None or player.team_id not in (
+                game.home_team_id, game.away_team_id):
+            raise NotFoundError("Opportunity not found.")
+        rstatus = self.roster.compute_roster_status(game_id, player.team_id)
+        enrollment = self.store.substitute_for_player(game_id, player_id)
+        enrolled = enrollment is not None and enrollment.status in (
+            SubstituteStatus.ENROLLED, SubstituteStatus.OFFERED)
+        if enrolled:
+            # Withdrawal routes through _guard_mutable, so only a locked or
+            # cancelled game blocks it — not the enrol-eligibility reasons.
+            # Surface that instead of offering a Withdraw button that dead-ends.
+            withdraw_block = (
+                "This game has been cancelled." if game.cancelled
+                else "The roster for this game is locked." if game.locked
+                else None)
+            can_accept, can_withdraw, blocked = False, withdraw_block is None, withdraw_block
+        else:
+            reason = self.roster.substitute_block_reason(player_id, game_id, rstatus)
+            can_accept, can_withdraw, blocked = reason is None, False, reason
+        return {
+            **self._opportunity_base_dict(game, player),
+            "roster_status": rstatus.status.value,
+            "team_status": self._PLAYER_TEAM_STATUS.get(
+                rstatus.status.value, "not_responded"),
+            "open_goalie_slots": rstatus.open_goalie_slots,
+            "open_skater_slots": rstatus.open_skater_slots,
+            "enrollment_status": enrollment.status.value if enrollment else None,
+            "can_accept": can_accept,
+            "can_withdraw": can_withdraw,
+            "blocked_reason": blocked,
         }
 
     @catch

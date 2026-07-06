@@ -371,6 +371,31 @@ class Handler(BaseHTTPRequestHandler):
             return True
         return False
 
+    def _require_player_scope(self):
+        """Resolve the signed-in player's id + user id from the session for a
+        player-scoped route (#110), so the browser never passes a player_id.
+        Returns ``(player_id, user_id, None)`` when a bound player session is
+        present, else ``(None, None, (status, payload))`` for the caller to
+        send: no/expired cookie → 401, a valid session without a player
+        binding → 403. Shared by the GET opportunity-detail and POST
+        accept/decline routes."""
+        sid = self._cookie(SESSION_COOKIE)
+        if sid is None:
+            return None, None, (401, {"error": {
+                "code": "unauthorized",
+                "message": "Sign in as a player to do this."}})
+        sess = SESSIONS.resolve(STATE.api.store, sid)
+        if sess is None:
+            return None, None, (401, {"error": {
+                "code": "unauthorized",
+                "message": "Session expired — please sign in again."}})
+        pid = sess.get("scope", {}).get("player_id")
+        if not pid:
+            return None, None, (403, {"error": {
+                "code": "forbidden",
+                "message": "This is only available to signed-in players."}})
+        return pid, sess.get("user_id"), None
+
     @staticmethod
     def _own_recipient_ref(role, scope):
         """The delivery recipient_ref the signed-in user speaks for (#81), used
@@ -614,6 +639,18 @@ class Handler(BaseHTTPRequestHandler):
             if not pid:
                 return self._send_json(empty)
             return self._send_api(api.get_player_home(pid, user_id=sess.get("user_id")))
+        mso = re.match(r"^/api/me/substitute-opportunities/([^/]+)$", path)
+        if mso:
+            # Detail for one substitute opportunity, scoped to the signed-in
+            # player (#110). Identity comes from the session, never a query
+            # param — same rules as /api/me/player-home, but a specific game
+            # detail has no meaningful "empty" form, so an unauthenticated or
+            # non-player caller gets a structured error rather than a stub.
+            pid, _uid, err = self._require_player_scope()
+            if err is not None:
+                return self._send_json(err[1], err[0])
+            return self._send_api(
+                api.get_substitute_opportunity(pid, mso.group(1)))
         sd = re.match(r"^/api/standings/([^/]+)$", path)
         if sd:
             return self._send_api(api.get_standings(sd.group(1)))
@@ -801,6 +838,25 @@ class Handler(BaseHTTPRequestHandler):
             _role, _scope, actor_uid, _err = self._resolve_role()
             return self._send_api(api.revoke_calendar_feed_token(
                 cfr.group(1), actor_id=actor_uid))
+
+        # Player substitute-opportunity response (#110): signed-in-player
+        # scoped, so the browser never passes a player_id — both the target
+        # player and the audit actor come from the session. The verbs match the
+        # services they call (enroll_substitute / withdraw_substitute), leaving
+        # accept/decline free for the distinct coach-OFFER transition the rest
+        # of the codebase already means by those words. No parallel workflow.
+        mso = re.match(
+            r"^/api/me/substitute-opportunities/([^/]+)/(enroll|withdraw)$", path)
+        if mso:
+            ppid, uid, err = self._require_player_scope()
+            if err is not None:
+                return self._send_json(err[1], err[0])
+            gid, action = mso.group(1), mso.group(2)
+            if action == "enroll":
+                return self._send_api(
+                    api.enroll_substitute(gid, ppid, actor_id=uid))
+            return self._send_api(
+                api.withdraw_substitute(gid, ppid, actor_id=uid))
 
         # Authorize the acting role at the HTTP boundary (#24/#50). A session
         # cookie is authoritative; the X-Demo-Role header is a dev fallback.
