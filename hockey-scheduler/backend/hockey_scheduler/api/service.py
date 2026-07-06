@@ -1503,11 +1503,25 @@ class ApiService:
 
         leagues = [_serialize(x) for x in self.store.all_leagues()]
         seasons = [_serialize(x) for x in self.store.all_seasons()]
-        setup_audit = [
-            {"action": a.action, "entity_type": a.entity_type,
-             "entity_id": a.entity_id, "at": a.at.isoformat()}
-            for a in self.store.all_setup_audit()
-        ]
+        # `/api/demo/overview` is unauthenticated (do_GET in web/server.py
+        # serves it with no session/permission check) — actor_id/detail must
+        # NOT be exposed for every setup-audit action, only for import
+        # batches (#102's Activity drill-down needs them there). Other
+        # actions' detail dicts can carry things this endpoint has no
+        # business handing to an anonymous caller (e.g. user_account_created
+        # stores {"username", "role"}). Scope the extra fields to exactly
+        # the import-batch summary row and its linked per-row children.
+        def _is_import_related(a):
+            return a.entity_type == "import_batch" or (a.detail or {}).get(
+                "import_batch_id") is not None
+        setup_audit = []
+        for a in self.store.all_setup_audit():
+            entry = {"action": a.action, "entity_type": a.entity_type,
+                     "entity_id": a.entity_id, "at": a.at.isoformat()}
+            if _is_import_related(a):
+                entry["actor_id"] = a.actor_id
+                entry["detail"] = a.detail
+            setup_audit.append(entry)
         return {
             "league": leagues[0] if leagues else None,
             "leagues": leagues,

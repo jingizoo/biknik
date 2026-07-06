@@ -179,6 +179,56 @@ class ImportCommitServiceContract:
         self.assertEqual(batches[0].detail["teams_created"], 2)
         self.assertEqual(batches[0].detail["players_created"], 3)
         self.assertEqual(batches[0].detail["season_id"], self.season.id)
+        # #102: the batch summary tags its own type, and every row-level
+        # entry this commit wrote is tagged back to this SAME batch id — the
+        # link the Activity feed's drill-down groups rows by.
+        self.assertEqual(batches[0].detail["import_type"], "teams_players")
+        batch_id = batches[0].entity_id
+        row_entries = [a for a in self.store.all_setup_audit()
+                      if a.action in ("team_created", "player_added")]
+        self.assertEqual(len(row_entries), 5)
+        for a in row_entries:
+            self.assertEqual(a.detail["import_batch_id"], batch_id)
+
+    # #102: get_demo_overview()'s setup_audit serialization must carry
+    # actor_id/detail so the Activity feed can group + label batches — it
+    # used to drop both, silently making import_committed indistinguishable
+    # from any other setup action in the API response.
+    def test_overview_serializes_actor_id_and_detail(self):
+        self.api.commit_teams_players_import(
+            self.season.id, _valid_sheets_csv(), actor_id="admin")
+        ov = self.api.get_demo_overview()
+        batch = next(a for a in ov["setup_audit"] if a["action"] == "import_committed")
+        self.assertEqual(batch["actor_id"], "admin")
+        self.assertEqual(batch["detail"]["import_type"], "teams_players")
+        self.assertEqual(batch["detail"]["teams_created"], 2)
+        team_row = next(a for a in ov["setup_audit"] if a["action"] == "team_created")
+        self.assertEqual(team_row["detail"]["import_batch_id"], batch["entity_id"])
+
+    # #102 review fix: /api/demo/overview is UNAUTHENTICATED (do_GET in
+    # web/server.py serves it with no session/permission check), so
+    # actor_id/detail must stay scoped to import-batch entries only — NOT
+    # leak for every setup-audit action. user_account_created's detail
+    # stores {"username", "role"}; confirm it's never exposed here, even
+    # though import batches on the SAME overview response do carry theirs.
+    def test_overview_omits_detail_for_non_import_audit_entries(self):
+        from hockey_scheduler.services.account_service import AccountService
+        AccountService(self.store).create_account(
+            "sidefx", "hunter2", "coach", actor_id="admin")
+        self.api.commit_teams_players_import(
+            self.season.id, _valid_sheets_csv(), actor_id="admin")
+        ov = self.api.get_demo_overview()
+        account_row = next(a for a in ov["setup_audit"]
+                           if a["action"] == "user_account_created")
+        self.assertNotIn("detail", account_row)
+        self.assertNotIn("actor_id", account_row)
+        blob = json.dumps(ov["setup_audit"])
+        self.assertNotIn("sidefx", blob)
+        self.assertNotIn("hunter2", blob)
+        # Import batch entries on the SAME response are unaffected by the fix.
+        batch = next(a for a in ov["setup_audit"] if a["action"] == "import_committed")
+        self.assertIn("detail", batch)
+        self.assertIn("actor_id", batch)
 
     def test_audit_trail_on_repeat_commit(self):
         self.api.commit_teams_players_import(
@@ -190,6 +240,18 @@ class ImportCommitServiceContract:
         self.assertEqual(actions.count("team_updated"), 2)
         self.assertEqual(actions.count("player_updated"), 3)
         self.assertEqual(actions.count("import_committed"), 2)
+        # #102: the two commits must produce two DISTINCT batch ids, and each
+        # repeat commit's own row-level entries must reference the SECOND
+        # (most recent) batch, not bleed into the first commit's batch.
+        batches = [a for a in self.store.all_setup_audit()
+                  if a.action == "import_committed"]
+        self.assertNotEqual(batches[0].entity_id, batches[1].entity_id)
+        second_batch_id = batches[1].entity_id
+        second_updates = [a for a in self.store.all_setup_audit()
+                          if a.action in ("team_updated", "player_updated")]
+        self.assertEqual(len(second_updates), 5)
+        for a in second_updates:
+            self.assertEqual(a.detail["import_batch_id"], second_batch_id)
 
     # -- 8. email contact destination -----------------------------------------
     def test_email_contact_destination(self):

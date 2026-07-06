@@ -555,6 +555,10 @@ class SetupService:
         counts = {"teams_created": 0, "teams_updated": 0,
                   "players_created": 0, "players_updated": 0,
                   "clubs_created": 0, "divisions_created": 0}
+        # Generated up front (not after the row loops) so every row-level
+        # audit entry below can be tagged with it, letting the Activity feed
+        # group a batch's individual creates/updates under its summary (#102).
+        batch_id = self.store.next_id("importbatch")
 
         with self.store.transaction():
             team_code_to_id = {}
@@ -571,7 +575,8 @@ class SetupService:
                     if club is None:
                         club = Club(id=self.store.next_id("club"), name=club_name)
                         self.store.add_club(club)
-                        self._audit("club_created", "club", club.id, actor_id)
+                        self._audit("club_created", "club", club.id, actor_id,
+                                    {"import_batch_id": batch_id})
                         counts["clubs_created"] += 1
                     club_id = club.id
 
@@ -588,7 +593,8 @@ class SetupService:
                                             season_id=season_id, name=division_name)
                         self.store.add_division(division)
                         self._audit("division_created", "division", division.id,
-                                    actor_id, {"season_id": season_id})
+                                    actor_id, {"season_id": season_id,
+                                              "import_batch_id": batch_id})
                         counts["divisions_created"] += 1
 
                 division_id = division.id if division else None
@@ -603,7 +609,8 @@ class SetupService:
                     team.division = division_name_str
                     self.store.save_team(team)
                     self._audit("team_updated", "team", team.id, actor_id,
-                                {"club_id": club_id, "division_id": division_id})
+                                {"club_id": club_id, "division_id": division_id,
+                                 "import_batch_id": batch_id})
                     counts["teams_updated"] += 1
                 else:
                     team = Team(id=self.store.next_id("team"), name=team_name,
@@ -611,7 +618,8 @@ class SetupService:
                                division_id=division_id, external_ref=team_code)
                     self.store.add_team(team)
                     self._audit("team_created", "team", team.id, actor_id,
-                                {"club_id": club_id, "division_id": division_id})
+                                {"club_id": club_id, "division_id": division_id,
+                                 "import_batch_id": batch_id})
                     counts["teams_created"] += 1
                 team_code_to_id[team_code] = team.id
 
@@ -649,7 +657,7 @@ class SetupService:
                         player.position = position
                     self.store.save_player(player)
                     self._audit("player_updated", "player", player.id, actor_id,
-                                {"team_id": team_id})
+                                {"team_id": team_id, "import_batch_id": batch_id})
                     counts["players_updated"] += 1
                 else:
                     # The domain model requires a Position with no default,
@@ -663,7 +671,7 @@ class SetupService:
                                     external_ref=player_code)
                     self.store.add_player(player)
                     self._audit("player_added", "player", player.id, actor_id,
-                                {"team_id": team_id})
+                                {"team_id": team_id, "import_batch_id": batch_id})
                     counts["players_created"] += 1
 
                 if email is not None:
@@ -680,15 +688,14 @@ class SetupService:
                             channel=NotificationChannel.EMAIL,
                             destination=email))
 
-            batch_id = self.store.next_id("importbatch")
             # skipped/errors are always 0 here by construction: the
             # all-or-nothing gate above means the only way to reach this line
             # is a fully clean validate_import result — any error blocks the
             # transaction before an audit row is ever written. Present anyway
             # for a stable import_committed detail shape across #93-#95.
             self._audit("import_committed", "import_batch", batch_id, actor_id,
-                        {"season_id": season_id, "skipped": 0, "errors": 0,
-                         **counts})
+                        {"import_type": "teams_players", "season_id": season_id,
+                         "skipped": 0, "errors": 0, **counts})
 
         return {
             "committed": True,
@@ -769,6 +776,9 @@ class SetupService:
         counts = {"officials_created": 0, "officials_updated": 0,
                   "availability_created": 0, "availability_updated": 0,
                   "clubs_created": 0}
+        # See commit_teams_players_import's identical note: generated up
+        # front so every row-level audit entry can be tagged with it (#102).
+        batch_id = self.store.next_id("importbatch")
 
         with self.store.transaction():
             official_code_to_id = {}
@@ -787,7 +797,8 @@ class SetupService:
                     if club is None:
                         club = Club(id=self.store.next_id("club"), name=club_name)
                         self.store.add_club(club)
-                        self._audit("club_created", "club", club.id, actor_id)
+                        self._audit("club_created", "club", club.id, actor_id,
+                                    {"import_batch_id": batch_id})
                         counts["clubs_created"] += 1
                     club_id = club.id
 
@@ -798,7 +809,8 @@ class SetupService:
                     official.home_club_id = club_id
                     self.store.save_official(official)
                     self._audit("official_updated", "official", official.id,
-                                actor_id, {"home_club_id": club_id})
+                                actor_id, {"home_club_id": club_id,
+                                          "import_batch_id": batch_id})
                     counts["officials_updated"] += 1
                 else:
                     official = Official(id=self.store.next_id("official"),
@@ -806,7 +818,7 @@ class SetupService:
                                         external_ref=official_code)
                     self.store.add_official(official)
                     self._audit("official_created", "official", official.id,
-                                actor_id)
+                                actor_id, {"import_batch_id": batch_id})
                     counts["officials_created"] += 1
                 official_code_to_id[official_code] = official.id
 
@@ -857,20 +869,22 @@ class SetupService:
                     self._audit("official_availability_updated",
                                 "official_availability", existing_window.id,
                                 actor_id, {"official_id": official_id,
-                                          "status": status_raw})
+                                          "status": status_raw,
+                                          "import_batch_id": batch_id})
                     counts["availability_updated"] += 1
                 else:
                     self.set_official_availability(
                         official_id, start, end, status_raw, note=note,
-                        actor_id=actor_id)
+                        actor_id=actor_id,
+                        extra_detail={"import_batch_id": batch_id})
                     counts["availability_created"] += 1
 
-            batch_id = self.store.next_id("importbatch")
             # skipped/errors are always 0 here by construction — see the
             # identical note on commit_teams_players_import's import_committed
             # audit row above.
             self._audit("import_committed", "import_batch", batch_id, actor_id,
-                        {"officials_created": counts["officials_created"],
+                        {"import_type": "officials_availability",
+                         "officials_created": counts["officials_created"],
                          "officials_updated": counts["officials_updated"],
                          "availability_created": counts["availability_created"],
                          "availability_updated": counts["availability_updated"],
@@ -1012,6 +1026,9 @@ class SetupService:
         counts = {"rinks_created": 0, "rinks_updated": 0,
                   "ice_slots_created": 0, "ice_slots_updated": 0,
                   "venues_created": 0}
+        # See commit_teams_players_import's identical note: generated up
+        # front so every row-level audit entry can be tagged with it (#102).
+        batch_id = self.store.next_id("importbatch")
 
         with self.store.transaction():
             rink_code_to_id = {}
@@ -1038,7 +1055,8 @@ class SetupService:
                     venue = Venue(id=self.store.next_id("venue"), name=venue_name,
                                   address=address)
                     self.store.add_venue(venue)
-                    self._audit("venue_created", "venue", venue.id, actor_id)
+                    self._audit("venue_created", "venue", venue.id, actor_id,
+                                {"import_batch_id": batch_id})
                     counts["venues_created"] += 1
 
                 rink = next((r for r in self.store.all_rinks()
@@ -1049,7 +1067,7 @@ class SetupService:
                     rink.venue_id = venue.id
                     self.store.save_rink(rink)
                     self._audit("rink_updated", "rink", rink.id, actor_id,
-                                {"venue_id": venue.id})
+                                {"venue_id": venue.id, "import_batch_id": batch_id})
                     counts["rinks_updated"] += 1
                 else:
                     rink = Rink(id=self.store.next_id("rink"), venue_id=venue.id,
@@ -1057,7 +1075,7 @@ class SetupService:
                                external_ref=rink_code)
                     self.store.add_rink(rink)
                     self._audit("rink_created", "rink", rink.id, actor_id,
-                                {"venue_id": venue.id})
+                                {"venue_id": venue.id, "import_batch_id": batch_id})
                     counts["rinks_created"] += 1
                 rink_code_to_id[rink_code] = rink.id
 
@@ -1089,7 +1107,8 @@ class SetupService:
                     self.store.save_ice_slot(existing_slot)
                     self._audit("ice_slot_updated", "ice_slot", existing_slot.id,
                                 actor_id, {"rink_id": rink_id,
-                                          "slot_type": slot_type.value})
+                                          "slot_type": slot_type.value,
+                                          "import_batch_id": batch_id})
                     counts["ice_slots_updated"] += 1
                 else:
                     status = (IceSlotStatus.AVAILABLE
@@ -1100,15 +1119,16 @@ class SetupService:
                                   slot_type=slot_type, status=status)
                     self.store.add_ice_slot(slot)
                     self._audit("ice_slot_created", "ice_slot", slot.id, actor_id,
-                                {"rink_id": rink_id, "slot_type": slot_type.value})
+                                {"rink_id": rink_id, "slot_type": slot_type.value,
+                                 "import_batch_id": batch_id})
                     counts["ice_slots_created"] += 1
 
-            batch_id = self.store.next_id("importbatch")
             # skipped/errors are always 0 here by construction — see the
             # identical note on commit_teams_players_import's import_committed
             # audit row above.
             self._audit("import_committed", "import_batch", batch_id, actor_id,
-                        {"skipped": 0, "errors": 0, **counts})
+                        {"import_type": "rinks_ice_slots", "skipped": 0,
+                         "errors": 0, **counts})
 
         return {
             "committed": True,
@@ -1143,8 +1163,14 @@ class SetupService:
 
     # -- official availability (#88) ---------------------------------------
     def set_official_availability(self, official_id, start_time, end_time,
-                                  status, note=None, actor_id=None):
+                                  status, note=None, actor_id=None,
+                                  extra_detail=None):
         """Declare an available/unavailable window for an official (#88).
+
+        ``extra_detail`` merges additional keys into the audit entry's
+        ``detail`` dict — used by ``commit_officials_availability_import``
+        (#102) to tag the entry with its ``import_batch_id`` without this
+        single-entity method needing to know anything about imports.
 
         Not ``@_transactional``: the decorator here was an orphan that had
         drifted off ``assign_official`` (its rightful owner) onto this method
@@ -1163,8 +1189,11 @@ class SetupService:
             id=self.store.next_id("oavail"), official_id=official_id,
             start_time=start_time, end_time=end_time, status=st, note=note)
         self.store.add_official_availability(a)
+        detail = {"official_id": official_id, "status": st.value}
+        if extra_detail:
+            detail.update(extra_detail)
         self._audit("official_availability_set", "official_availability", a.id,
-                    actor_id, {"official_id": official_id, "status": st.value})
+                    actor_id, detail)
         return a
 
     def official_availabilities(self, official_id):

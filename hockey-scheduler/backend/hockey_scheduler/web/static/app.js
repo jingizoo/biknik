@@ -39,6 +39,7 @@ let conflict = null;        // {ok, title, lines[], game, slot} — calendar sid
 let drawer = null;          // {kind} when a Setup create drawer is open (#44)
 let drawerError = "";       // validation/API error shown inside the open drawer
 let drawerValues = {};      // {fieldId: value} preserved across re-render on error
+let activityExpandedBatches = new Set();  // import_batch_ids expanded in Activity (#102)
 let importState = {         // Pilot onboarding import wizard (#96)
   type: "teams_players",    // which IMPORT_TYPES entry is selected
   seasonId: null,            // only used by the teams_players type
@@ -1794,20 +1795,73 @@ const AUDIT_LABEL = {
 const SETUP_LABEL = {
   league_created: "League created", season_created: "Season created",
   division_created: "Division created", club_created: "Club created",
-  team_created: "Team created", venue_created: "Venue created",
-  rink_created: "Rink created", ice_slot_created: "Ice slot created",
+  team_created: "Team created", team_updated: "Team updated",
+  venue_created: "Venue created",
+  rink_created: "Rink created", rink_updated: "Rink updated",
+  ice_slot_created: "Ice slot created", ice_slot_updated: "Ice slot updated",
   game_created: "Game scheduled", player_added: "Player added",
+  player_updated: "Player updated",
+  official_created: "Official created", official_updated: "Official updated",
+  official_availability_set: "Official availability set",
+  official_availability_updated: "Official availability updated",
+  import_committed: "Import committed",
 };
 function tlRow(time, msg, dotColor) {
   return `<div class="tl-item"><div class="tl-dot" style="background:${dotColor || "var(--blue)"}"></div>
     <div class="tl-body"><div class="tl-msg">${msg}</div></div>
     <div class="tl-time">${esc(time || "")}</div></div>`;
 }
+function humanizeAuditKey(k) {
+  return k.replace(/_/g, " ").replace(/^./, (c) => c.toUpperCase());
+}
+// The flat counts an import commit records (teams_created, skipped, errors,
+// …) minus the linking/grouping keys, humanized for display (#102).
+function importBatchSummaryLine(detail) {
+  const skip = new Set(["import_batch_id", "import_type", "season_id"]);
+  return Object.entries(detail || {})
+    .filter(([k]) => !skip.has(k))
+    .map(([k, v]) => `${humanizeAuditKey(k)}: ${v}`)
+    .join(" · ");
+}
+// Setup-audit entries for an import commit come in two shapes: one
+// entity_type="import_batch" summary row (counts in `detail`) plus N
+// per-row entries tagged `detail.import_batch_id` back to that summary.
+// Group them so the feed shows one line per import, expandable to the rows
+// underneath, instead of drowning the feed in every row it touched (#102).
+function renderSetupAuditFeed(ov) {
+  const all = [...((ov && ov.setup_audit) || [])].reverse();  // newest first
+  const isBatch = (a) => a.entity_type === "import_batch";
+  const batchIdOf = (a) => (a.detail && a.detail.import_batch_id) || null;
+  const topLevel = all.filter((a) => isBatch(a) || !batchIdOf(a)).slice(0, 40);
+  if (!topLevel.length) return `<div class="empty">No setup activity.</div>`;
+  return topLevel.map((a) => {
+    if (!isBatch(a)) {
+      return tlRow(fmt(a.at),
+        `<strong>${esc(SETUP_LABEL[a.action] || a.action)}</strong> · ${esc(a.entity_id)}`,
+        "#06b6d4");
+    }
+    const importType = (a.detail || {}).import_type;
+    const typeLabel = (IMPORT_TYPES.find((t) => t.key === importType) || {}).label || importType;
+    const children = all.filter((c) => !isBatch(c) && batchIdOf(c) === a.entity_id);
+    const expanded = activityExpandedBatches.has(a.entity_id);
+    const toggle = children.length
+      ? `<button class="linklike" data-audit-toggle="${esc(a.entity_id)}">${expanded ? "Hide" : "Show"} ${children.length} row${children.length === 1 ? "" : "s"}</button>`
+      : "";
+    const childrenHtml = expanded && children.length
+      ? `<div class="tl-children">${children.map((c) =>
+          tlRow(fmt(c.at), `${esc(SETUP_LABEL[c.action] || c.action)} · ${esc(c.entity_id)}`, "#94a3b8")).join("")}</div>`
+      : "";
+    return `<div class="tl-item"><div class="tl-dot" style="background:#06b6d4"></div>
+      <div class="tl-body">
+        <div class="tl-msg"><strong>${esc(SETUP_LABEL.import_committed)}${typeLabel ? " — " + esc(typeLabel) : ""}</strong>${a.actor_id ? " · " + esc(a.actor_id) : ""} ${toggle}</div>
+        <div class="tl-sub">${esc(importBatchSummaryLine(a.detail))}</div>
+        ${childrenHtml}
+      </div>
+      <div class="tl-time">${esc(fmt(a.at) || "")}</div></div>`;
+  }).join("");
+}
 function renderActivity(board, ov) {
-  const setup = [...((ov && ov.setup_audit) || [])].reverse().slice(0, 40);
-  const setupHtml = setup.length
-    ? setup.map((a) => tlRow(fmt(a.at), `<strong>${esc(SETUP_LABEL[a.action] || a.action)}</strong> · ${esc(a.entity_id)}`, "#06b6d4")).join("")
-    : `<div class="empty">No setup activity.</div>`;
+  const setupHtml = renderSetupAuditFeed(ov);
   const operatorSection = `<div class="section-title">Operator setup (${(ov && ov.setup_audit_count) || 0})</div><div class="card">${setupHtml}</div>`;
   if (!board) return operatorSection + `<div class="section-title">Game</div><div class="card"><div class="empty">Open a game roster to see its game activity.</div></div>`;
   const names = {}; board.players.forEach((p) => (names[p.id] = p.name));
@@ -2501,6 +2555,13 @@ async function render() {
   });
   c.querySelectorAll("[data-move-cancel]").forEach((b) => b.onclick = () => { movingGameId = null; render(); });
   c.querySelectorAll("[data-addslot]").forEach((b) => b.onclick = async () => { await post("/api/demo/add-ice-slot", { rink_id: b.dataset.addslot, date: calendarDate }); await render(); });
+  // Expand/collapse an import batch's row-level detail in the Activity feed (#102).
+  c.querySelectorAll("[data-audit-toggle]").forEach((b) => b.onclick = () => {
+    const id = b.dataset.auditToggle;
+    if (activityExpandedBatches.has(id)) activityExpandedBatches.delete(id);
+    else activityExpandedBatches.add(id);
+    render();
+  });
   c.querySelectorAll("[data-cal]").forEach((b) => b.onclick = () => {
     const v = +b.dataset.cal;
     if (v === 0) calendarDate = "2026-09-05";
