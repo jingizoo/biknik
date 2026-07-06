@@ -1050,22 +1050,125 @@ class ApiService:
                 continue
             home = self.store.get_team(g.home_team_id)
             away = self.store.get_team(g.away_team_id) if g.away_team_id else None
-            rink = self.store.get_ice_slot(g.ice_slot_id) if g.ice_slot_id else None
-            venue = None
-            if rink is not None:
-                rk = self.store.get_rink(rink.rink_id)
-                venue = self.store.get_venue(rk.venue_id).name if (
-                    rk and self.store.get_venue(rk.venue_id)) else None
             rows.append({
                 "assignment_id": a.id, "game_id": a.game_id,
                 "role": a.role.value, "status": a.status.value,
                 "home_team_name": home.name if home else g.home_team_id,
                 "away_team_name": away.name if away else None,
                 "start_time": g.start_time.isoformat() if g.start_time else None,
-                "rink": g.rink, "venue_name": venue, "cancelled": g.cancelled,
+                "rink": g.rink, "venue_name": self._venue_name_for_game(g),
+                "cancelled": g.cancelled,
             })
         rows.sort(key=lambda r: r["start_time"] or "")
         return {"official_id": official_id, "assignments": rows}
+
+    # -- player home (#107) --------------------------------------------------
+    # Collapses the roster-status engine's GameStatus into the four labels
+    # the Player Home Page shows — the engine itself needs no changes, this
+    # is presentation-layer relabeling only.
+    _PLAYER_TEAM_STATUS = {
+        "roster_confirmed": "full", "locked": "full", "final": "full",
+        "open_slot": "short", "needs_substitute": "sub_search",
+        "draft": "not_responded", "selected": "not_responded",
+        "awaiting_responses": "not_responded",
+    }
+
+    @staticmethod
+    def _player_attendance_status(row: Optional[dict]) -> str:
+        """Collapse a lineup row's availability/backed_out fields into the
+        Player Home Page's four attendance labels (#107)."""
+        if row is None:
+            return "not_responded"
+        if row["backed_out"]:
+            return "checked_out"
+        avail = row["availability"]
+        if avail == "available":
+            return "confirmed"
+        if avail == "unavailable":
+            return "checked_out"
+        if avail == "maybe":
+            return "pending"
+        return "not_responded"
+
+    def _venue_name_for_game(self, g) -> Optional[str]:
+        slot = self.store.get_ice_slot(g.ice_slot_id) if g.ice_slot_id else None
+        if slot is None:
+            return None
+        rink = self.store.get_rink(slot.rink_id) if slot.rink_id else None
+        if rink is None or not rink.venue_id:
+            return None
+        venue = self.store.get_venue(rink.venue_id)
+        return venue.name if venue else None
+
+    @staticmethod
+    def _opponent_team_id(g, team_id):
+        """The other side of a game from ``team_id``'s point of view."""
+        return g.away_team_id if g.home_team_id == team_id else g.home_team_id
+
+    @catch
+    def get_player_home(self, player_id: str, user_id: Optional[str] = None) -> dict:
+        """The signed-in player's home screen (#107): next game, attendance
+        status, team roster status, substitute opportunities, and unread
+        notification count — all scoped to this player only."""
+        player = self.store.get_player(player_id)
+        if player is None:
+            raise NotFoundError("Player not found.")
+        team = self.store.get_team(player.team_id) if player.team_id else None
+
+        next_game = self.roster.find_next_game_for_player(player_id)
+        next_game_dto = None
+        if next_game is not None:
+            my_team_id = player.team_id
+            opponent_id = self._opponent_team_id(next_game, my_team_id)
+            opponent = self.store.get_team(opponent_id) if opponent_id else None
+            rstatus = self.roster.compute_roster_status(next_game.id, my_team_id)
+            # Only this player's own roster entry + availability are needed —
+            # single-player lookups, not a full _lineup_rows pass over the team.
+            entry = self.store.roster_entry_for_player(next_game.id, player_id)
+            avail = self.store.availability_for_player(next_game.id, player_id)
+            my_row = {
+                "backed_out": entry is not None and not entry.status.occupies_slot,
+                "availability": (avail.availability_status.value
+                                 if avail else "pending"),
+            }
+            next_game_dto = {
+                "game_id": next_game.id, "team_id": my_team_id,
+                "team_name": team.name if team else my_team_id,
+                "opponent_name": opponent.name if opponent else None,
+                "start_time": next_game.start_time.isoformat()
+                             if next_game.start_time else None,
+                "venue_name": self._venue_name_for_game(next_game),
+                "rink_name": next_game.rink,
+                "attendance_status": self._player_attendance_status(my_row),
+                "team_status": self._PLAYER_TEAM_STATUS.get(
+                    rstatus.status.value, "not_responded"),
+            }
+
+        opportunities = []
+        for g in self.roster.list_substitute_opportunities(player_id):
+            opp_id = self._opponent_team_id(g, player.team_id)
+            opp_team = self.store.get_team(opp_id) if opp_id else None
+            opportunities.append({
+                "game_id": g.id,
+                "team_name": team.name if team else player.team_id,
+                "opponent_name": opp_team.name if opp_team else None,
+                "start_time": g.start_time.isoformat() if g.start_time else None,
+                "venue_name": self._venue_name_for_game(g), "rink_name": g.rink,
+                "position_needed": player.position.slot_type.value,
+            })
+
+        notif = self.get_notifications("player", {"player_id": player_id},
+                                       user_id=user_id)
+        unread = (notif.get("unread", 0)
+                 if isinstance(notif, dict) and "error" not in notif else 0)
+
+        return {
+            "player_id": player_id, "player_name": player.name,
+            "next_game": next_game_dto,
+            "today_count": self.roster.count_games_today_for_player(player_id),
+            "substitute_opportunities": opportunities,
+            "unread_notifications": unread,
+        }
 
     @catch
     def assign_official(self, game_id: str, official_id: str, role: str,
@@ -1177,13 +1280,7 @@ class ApiService:
     # from public-safe fields only — team names, division, rink, date/time,
     # score. Never player names, rosters, availability, or officials.
     def _public_game_dto(self, g) -> dict:
-        venue_name = None
-        slot = self.store.get_ice_slot(g.ice_slot_id) if g.ice_slot_id else None
-        if slot is not None:
-            rink = self.store.get_rink(slot.rink_id) if slot.rink_id else None
-            if rink is not None:
-                venue = self.store.get_venue(rink.venue_id) if rink.venue_id else None
-                venue_name = venue.name if venue else None
+        venue_name = self._venue_name_for_game(g)
         div = self.store.get_division(g.division_id) if g.division_id else None
         result = self.store.result_for_game(g.id)
         final = result is not None and result.status == ResultStatus.FINAL
