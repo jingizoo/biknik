@@ -1,7 +1,7 @@
 /* Hockey Scheduler — calendar-first operator demo.
    Drives the real backend (setup + roster/substitute) via the documented API. */
 
-let view = "dashboard";     // dashboard|setup|import|calendar|games|roster|activity|public
+let view = "dashboard";     // dashboard|setup|import|calendar|games|roster|activity|public|readiness
 let gameView = "coach";     // coach | player (roster)
 let rosterSide = "home";    // home | away — which lineup the roster tab shows (#25)
 let rosterTeamId = null;    // team_id of the currently shown lineup (for copy)
@@ -40,6 +40,7 @@ let drawer = null;          // {kind} when a Setup create drawer is open (#44)
 let drawerError = "";       // validation/API error shown inside the open drawer
 let drawerValues = {};      // {fieldId: value} preserved across re-render on error
 let activityExpandedBatches = new Set();  // import_batch_ids expanded in Activity (#102)
+let readinessCheck = null;  // /api/readiness snapshot for the Pilot Readiness card (#104)
 let importState = {         // Pilot onboarding import wizard (#96)
   type: "teams_players",    // which IMPORT_TYPES entry is selected
   seasonId: null,            // only used by the teams_players type
@@ -81,6 +82,7 @@ const NAV = {
   inbox: "My Assignments", standings: "Standings",
   notifications: "Notifications", delivery: "Delivery", activity: "Activity",
   public: "Public", users: "Users", scheduler: "Scheduler", import: "Import",
+  readiness: "Pilot Readiness",
 };
 const POS_CLASS = { goalie: "pos-G", defense: "pos-D", forward: "pos-F", skater: "pos-D" };
 const REPO = "https://github.com/jingizoo/biknik/issues";
@@ -1291,6 +1293,64 @@ function renderUserSessions() {
     </div>`).join("") + `</div>`;
 }
 
+/* ---------- Pilot readiness checklist (#104) ----------
+   Read-only operator view assembled entirely from data already on hand —
+   envStatus (#72, fetched once at bootstrap), the demo overview every view
+   already loads, and one lazy /api/readiness call for the db/migration/
+   admin/cookie checks. No new backend endpoint. */
+const READINESS_CHECK_LABEL = {
+  database_reachable: "Database reachable",
+  migrations_current: "Migrations current",
+  active_admin: "Active league admin",
+  cookie_hardening: "Secure cookie hardening",
+};
+const RD_BADGE_CLASS = { pass: "green", warn: "orange", fail: "red", info: "gray" };
+const RD_BADGE_TEXT = { pass: "PASS", warn: "WARN", fail: "FAIL", info: "INFO" };
+function rdRow(kind, label, detail) {
+  return `<div class="li">
+    <span class="badge ${RD_BADGE_CLASS[kind]}">${RD_BADGE_TEXT[kind]}</span>
+    <div class="li-main"><div class="li-title">${esc(label)}</div><div class="li-sub">${esc(detail)}</div></div>
+  </div>`;
+}
+function renderReadiness(ov) {
+  if (!hasPerm("manage_setup")) {
+    return `<div class="banner neutral"><h2>Operators only</h2>
+      <p>The pilot readiness checklist is available to league admins.</p></div>`;
+  }
+  const rd = readinessCheck;
+  if (!rd) {
+    return `<div class="banner alert"><h2>Could not load readiness</h2>
+      <p>The backend may not be running.</p></div>`;
+  }
+  const rows = [
+    rdRow("info", "App mode", envStatus ? appModeLabel(envStatus.app_mode) : "Unknown"),
+    rdRow("info", "Store backend",
+      envStatus ? (STORE_LABEL[envStatus.store] || envStatus.store) : "unknown"),
+  ];
+  (rd.checks || []).forEach((c) => rows.push(
+    rdRow(c.ok ? "pass" : "fail", READINESS_CHECK_LABEL[c.name] || c.name, c.detail)));
+  const leagueCount = (ov.leagues || []).length;
+  const teamCount = (ov.teams || []).length;
+  rows.push(rdRow(leagueCount && teamCount ? "pass" : "warn", "Demo/pilot data loaded",
+    `${leagueCount} league(s), ${teamCount} team(s)`));
+  const fixtureCount = (ov.public_fixtures || []).length;
+  rows.push(rdRow(fixtureCount ? "pass" : "warn", "Public schedule visible",
+    fixtureCount ? `${fixtureCount} published fixture(s)` : "No published fixtures yet"));
+  const canImport = hasPerm("manage_arena");
+  rows.push(rdRow(canImport ? "pass" : "info", "Import wizard available",
+    canImport ? "Available to this role" : "Not available to this role"));
+  const emailLive = !!envStatus && deliveryLive(envStatus.email_mode, "smtp");
+  const pushLive = !!envStatus && deliveryLive(envStatus.push_mode, "live");
+  rows.push(rdRow(emailLive && pushLive ? "pass" : "warn", "Notification delivery",
+    `email ${emailLive ? "live" : "dry-run"}, push ${pushLive ? "live" : "dry-run"}`));
+  rows.push(rdRow("info", "Mobile readiness",
+    "Phone layout implemented and verified down to a 390px viewport (#100/#101)."));
+  rows.push(rdRow("info", "Known limitations",
+    "CSV-only import (no native app or PWA yet); scheduler optimizer not built."));
+  return `<div class="card"><div class="section-title" style="margin-top:0">Pilot Readiness</div>
+    ${rows.join("")}</div>${toastHtml()}`;
+}
+
 /* ---------- Draft scheduler review + publish (#86) ---------- */
 function renderScheduler(ov) {
   if (!hasPerm("manage_schedule")) {
@@ -2042,6 +2102,19 @@ async function render() {
     // Notifications feed drives the bell badge on every view (#32).
     const nf = await getJSON("/api/notifications");
     if (nf && !nf.error) notifState = nf;
+    // Pilot readiness checklist (#104), operator-only. Everything else the
+    // card needs (app mode/store/delivery mode, demo data + fixture counts)
+    // already rides on envStatus and the overview fetched above — this is
+    // the one extra call, reusing /api/readiness's own check list rather
+    // than re-deriving db/migration/admin/cookie posture on the client.
+    // Kept as its own await (not bundled into Promise.all with the fetch
+    // above): Promise.all rejects the whole group on one failure, which
+    // would silently drop an otherwise-successful notifications refresh
+    // whenever this operator-only endpoint has a hiccup.
+    if (view === "readiness" && hasPerm("manage_setup")) {
+      const rd = await getJSON("/api/readiness");
+      readinessCheck = (rd && !rd.error) ? rd : null;
+    }
     // Self-service channel preferences for the signed-in user (#81).
     notifPrefs = null;
     feedTokens = [];
@@ -2160,6 +2233,7 @@ async function render() {
     : view === "notifications" ? renderNotifications()
     : view === "delivery" ? renderDelivery(ov)
     : view === "users" ? renderUsers()
+    : view === "readiness" ? renderReadiness(ov)
     : view === "scheduler" ? renderScheduler(ov)
     : view === "standings" ? renderStandings(ov, standings)
     : view === "activity" ? renderActivity(board, ov)
@@ -2687,6 +2761,9 @@ function gateChrome() {
   toggle('.tab[data-tab="delivery"]', hasPerm("manage_schedule"));
   toggle('.tab[data-tab="users"]', hasPerm("manage_users"));
   toggle('.tab[data-tab="scheduler"]', hasPerm("manage_schedule"));
+  // Pilot Readiness is an operator-facing summary card (#104) — same gate
+  // as the Setup entities it reports on.
+  toggle('.tab[data-tab="readiness"]', hasPerm("manage_setup"));
   // The Import wizard tab mirrors /api/import/dry-run's own gate (#96):
   // manage_arena is the one permission both League Admin and Arena Manager
   // hold, and it's the entry point for all three import types.
@@ -2773,14 +2850,18 @@ function renderRoleSwitch() {
   if (rl) rl.textContent = currentUser ? (currentUser.label || currentRole) : "";
   if (chip) chip.textContent = scopeName ? `· ${scopeName}` : "";
 }
-// Real deployment posture chips (#72): app mode, store backend, delivery modes.
+// Real deployment posture (#72): app mode, store backend, delivery modes.
+// Shared by the topbar env chips and the Pilot Readiness card (#104).
+const STORE_LABEL = { memory: "in-memory", sqlite: "sqlite", postgres: "postgres" };
+const appModeLabel = (mode) => mode === "production" ? "Production" : "Demo";
+const deliveryLive = (mode, liveVal) => mode === liveVal;
 function renderEnvChips() {
   const box = document.getElementById("env-chips");
   if (!box || !envStatus) return;
   const s = envStatus;
-  const storeLabel = { memory: "in-memory", sqlite: "sqlite", postgres: "postgres" }[s.store] || s.store;
+  const storeLabel = STORE_LABEL[s.store] || s.store;
   const deliv = (label, mode, liveVal) => {
-    const live = mode === liveVal;
+    const live = deliveryLive(mode, liveVal);
     return `<span class="env-chip ${live ? "live" : "subtle"}">${label} ${live ? "live" : "dry-run"}</span>`;
   };
   box.innerHTML =
