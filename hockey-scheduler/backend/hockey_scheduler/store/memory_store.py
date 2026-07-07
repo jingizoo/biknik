@@ -27,6 +27,7 @@ from ..domain import (
     League,
     Notification,
     NotificationDelivery,
+    GuardianLink,
     NotificationEvent,
     NotificationPreference,
     NotificationRecipient,
@@ -77,6 +78,7 @@ class InMemoryStore:
         self.official_availability: Dict[str, OfficialAvailability] = {}
         self.user_accounts: Dict[str, UserAccount] = {}
         self.sessions: Dict[str, Session] = {}
+        self.guardian_links: Dict[str, GuardianLink] = {}
         self.setup_audit: List[SetupAuditLog] = []
         self._counters: Dict[str, count] = {}
 
@@ -511,6 +513,29 @@ class InMemoryStore:
 
     def all_user_accounts(self) -> List[UserAccount]:
         return list(self.user_accounts.values())
+
+    # -- guardian ↔ junior links (#26) -------------------------------------
+    def add_guardian_link(self, link: GuardianLink) -> GuardianLink:
+        self.guardian_links[link.id] = link
+        return link
+
+    def save_guardian_link(self, link: GuardianLink) -> GuardianLink:
+        self.guardian_links[link.id] = link
+        return link
+
+    def get_guardian_link(self, link_id: str) -> Optional[GuardianLink]:
+        return self.guardian_links.get(link_id)
+
+    def guardian_links_for(self, guardian_user_id: str) -> List[GuardianLink]:
+        return [g for g in self.guardian_links.values()
+                if g.guardian_user_id == guardian_user_id]
+
+    def guardian_link_for(self, guardian_user_id: str,
+                          player_id: str) -> Optional[GuardianLink]:
+        for g in self.guardian_links.values():
+            if g.guardian_user_id == guardian_user_id and g.player_id == player_id:
+                return g
+        return None
 
     # -- sessions (#74) ----------------------------------------------------
     def add_session(self, s: Session) -> Session:

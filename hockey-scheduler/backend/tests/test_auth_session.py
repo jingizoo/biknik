@@ -133,7 +133,7 @@ class AuthSessionTest(unittest.TestCase):
         _, body = self._req(c, "GET", "/api/auth/accounts")
         roles = {a["role"] for a in body["accounts"]}
         self.assertEqual(roles, {"league_admin", "arena_manager", "coach",
-                                 "player", "official", "viewer"})
+                                 "player", "official", "viewer", "guardian"})
 
     # -- real accounts (#67): operator-created, hashed, session tied to id --
     def test_operator_created_account_can_log_in(self):

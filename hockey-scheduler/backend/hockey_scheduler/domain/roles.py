@@ -16,6 +16,7 @@ class Role(str, Enum):
     ARENA_MANAGER = "arena_manager"   # venues/rinks/ice + scheduling
     COACH = "coach"                   # team rosters + substitute decisions
     PLAYER = "player"                 # own availability / substitute self-serve
+    GUARDIAN = "guardian"             # responds on behalf of linked junior players (#26)
     OFFICIAL = "official"             # accept/decline own game assignments
     VIEWER = "viewer"                 # read-only
 
@@ -48,6 +49,12 @@ ROLE_PERMISSIONS = {
     Role.PLAYER: {
         Permission.RESPOND_AVAILABILITY, Permission.VIEW,
     },
+    # A guardian responds only for their linked juniors (#26). The link check
+    # is enforced per-action on the /api/me/guardian/* routes; this permission
+    # is the coarse gate that the guardian holds the same respond capability.
+    Role.GUARDIAN: {
+        Permission.RESPOND_AVAILABILITY, Permission.VIEW,
+    },
     Role.OFFICIAL: {
         Permission.RESPOND_ASSIGNMENT, Permission.VIEW,
     },
@@ -62,6 +69,7 @@ ROLE_LABELS = {
     Role.ARENA_MANAGER: "Arena Manager",
     Role.COACH: "Coach",
     Role.PLAYER: "Player",
+    Role.GUARDIAN: "Guardian",
     Role.OFFICIAL: "Official",
     Role.VIEWER: "Viewer",
 }

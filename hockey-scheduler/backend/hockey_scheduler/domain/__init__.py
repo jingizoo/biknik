@@ -62,6 +62,7 @@ from .setup_models import (
     ContactDestination,
     DeviceToken,
     Division,
+    GuardianLink,
     Session,
     UserAccount,
     GameResult,
@@ -131,6 +132,7 @@ __all__ = [
     # setup models
     "Club",
     "Division",
+    "GuardianLink",
     "IceSlot",
     "League",
     "Official",

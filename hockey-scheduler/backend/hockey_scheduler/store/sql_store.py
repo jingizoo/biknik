@@ -52,6 +52,7 @@ from ..domain import (
     Rink,
     Role,
     RosterEntryStatus,
+    GuardianLink,
     RosterRole,
     Season,
     SelectionSource,
@@ -189,6 +190,8 @@ SPECS = {
                        "scope": _jsonc(), "active": _bool()}),
     Session: Spec(Session, "sessions",
                   {"issued_at": _dt(), "expires_at": _dt(), "revoked_at": _dt()}),
+    GuardianLink: Spec(GuardianLink, "guardian_links",
+                       {"created_at": _dt(), "verified": _bool()}),
     CalendarFeedToken: Spec(
         CalendarFeedToken, "calendar_feed_tokens",
         {"created_at": _dt(), "revoked_at": _dt()}),
@@ -647,6 +650,20 @@ class SqlStore:
         return rows[0] if rows else None
     def all_user_accounts(self):
         return self._query(UserAccount, order="id")
+
+    # -- guardian ↔ junior links (#26) -------------------------------------
+    def add_guardian_link(self, link): return self._insert(link)
+    def save_guardian_link(self, link): return self._update(link)
+    def get_guardian_link(self, link_id):
+        return self._get(GuardianLink, link_id)
+    def guardian_links_for(self, guardian_user_id):
+        return self._query(GuardianLink, "guardian_user_id = ?",
+                           (guardian_user_id,), order="id")
+    def guardian_link_for(self, guardian_user_id, player_id):
+        rows = self._query(GuardianLink,
+                           "guardian_user_id = ? AND player_id = ?",
+                           (guardian_user_id, player_id), order="id")
+        return rows[0] if rows else None
 
     # -- sessions (#74) ----------------------------------------------------
     def add_session(self, sess): return self._insert(sess)

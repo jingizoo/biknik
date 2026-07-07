@@ -17,9 +17,11 @@ from datetime import datetime, timedelta, timezone
 
 from ..domain import ROLE_LABELS, Role, Session
 
-# The six demo personas seeded as real UserAccount rows on every reset (#67) —
+# The demo personas seeded as real UserAccount rows on every reset (#67) —
 # see DemoState.reset(). Password is obviously-fictional and shared only for
-# the demo; a real deployment would never seed accounts this way.
+# the demo; a real deployment would never seed accounts this way. The
+# "guardian" persona (#26) is linked+verified to a junior player at seed time
+# so the guardian linked-junior workflow is demoable out of the box.
 DEMO_PASSWORD = "demo"
 DEMO_USERS = {
     "admin": Role.LEAGUE_ADMIN,
@@ -28,6 +30,7 @@ DEMO_USERS = {
     "player": Role.PLAYER,
     "official": Role.OFFICIAL,
     "viewer": Role.VIEWER,
+    "guardian": Role.GUARDIAN,
 }
 
 SESSION_COOKIE = "hs_sid"

@@ -66,6 +66,16 @@ def scope_violation(role, scope, path, body, store):
         for pid in _player_ids(path, body):
             if pid != own:
                 return "Players can only respond for themselves."
+    elif role == Role.GUARDIAN:
+        # A guardian's authority is per-link and is enforced ONLY on the
+        # dedicated /api/me/guardian/* routes (which verify the guardian↔junior
+        # link before every action and never reach this gate). The general
+        # player/coach routes carry no such link check, so a guardian must
+        # never target a player through them — otherwise the verified-link
+        # requirement could be side-stepped by posting a player_id directly.
+        if _player_ids(path, body):
+            return ("Guardians respond through their linked-player screen, "
+                    "not this route.")
     elif role == Role.OFFICIAL:
         own = scope.get("official_id")
         m = _ASSIGN_RESPOND.match(path)

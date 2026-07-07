@@ -149,6 +149,16 @@ class DemoState:
                 username, DEMO_PASSWORD, role, scope=scopes.get(username, {}),
                 actor_id="demo_seed", account_id=f"user_{username}")
 
+        # Link+verify the guardian persona to a junior (U16) player (#26) so
+        # the guardian linked-junior workflow works out of the box. A guardian
+        # holds no session scope; authority comes solely from this verified
+        # link. Deterministic link id keeps demo audit ids stable across resets.
+        junior_id = ids.get("selected_player_id")
+        if junior_id:
+            self.api.guardians.link_guardian(
+                "user_guardian", junior_id, verified=True,
+                actor_id="demo_seed", link_id="glink_demo")
+
 
 STATE = DemoState()
 
@@ -395,6 +405,46 @@ class Handler(BaseHTTPRequestHandler):
                 "code": "forbidden",
                 "message": "This is only available to signed-in players."}})
         return pid, sess.get("user_id"), None
+
+    def _require_guardian_scope(self):
+        """Resolve the signed-in guardian's user id from the session for a
+        guardian-scoped route (#26). Returns ``(guardian_user_id, None)`` for a
+        guardian session, else ``(None, (status, payload))``: no/expired cookie
+        → 401, a session whose role is not guardian → 403. The *link* between
+        this guardian and a specific junior is checked separately, per action,
+        so this only establishes "you are signed in as a guardian"."""
+        sid = self._cookie(SESSION_COOKIE)
+        if sid is None:
+            return None, (401, {"error": {
+                "code": "unauthorized",
+                "message": "Sign in as a guardian to do this."}})
+        sess = SESSIONS.resolve(STATE.api.store, sid)
+        if sess is None:
+            return None, (401, {"error": {
+                "code": "unauthorized",
+                "message": "Session expired — please sign in again."}})
+        if sess.get("role") != Role.GUARDIAN.value:
+            return None, (403, {"error": {
+                "code": "forbidden",
+                "message": "This is only available to signed-in guardians."}})
+        uid = sess.get("user_id")
+        if not uid:
+            return None, (403, {"error": {
+                "code": "forbidden",
+                "message": "This is only available to signed-in guardians."}})
+        return uid, None
+
+    def _guardian_link_or_403(self, guardian_user_id, player_id):
+        """Send 403 and return True when this guardian is not *verified* to act
+        for ``player_id`` (#26) — the authority gate every guardian action
+        passes before touching the junior's data. A non-link is reported as a
+        plain forbidden without confirming the junior exists."""
+        if STATE.api.guardians.is_verified_guardian(guardian_user_id, player_id):
+            return False
+        self._send_json({"error": {
+            "code": "forbidden",
+            "message": "You are not a verified guardian for this player."}}, 403)
+        return True
 
     @staticmethod
     def _own_recipient_ref(role, scope):
@@ -652,6 +702,29 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_json(err[1], err[0])
             return self._send_api(
                 api.get_substitute_opportunity(pid, mso.group(1)))
+        if path == "/api/me/guardian/home":
+            # The signed-in guardian's linked-junior surface (#26): every
+            # verified junior's Player Home payload. Identity is the guardian's
+            # session; no junior id is passed by the browser. A non-guardian or
+            # unauthenticated caller gets a structured error, not a stub.
+            guid, err = self._require_guardian_scope()
+            if err is not None:
+                return self._send_json(err[1], err[0])
+            return self._send_api(api.get_guardian_home(guid))
+        mgo = re.match(
+            r"^/api/me/guardian/([^/]+)/substitute-opportunities/([^/]+)$", path)
+        if mgo:
+            # Detail for one substitute opportunity, viewed by a guardian on
+            # behalf of a linked junior (#26). The guardian must hold a verified
+            # link to that junior; otherwise 403 without confirming the game.
+            guid, err = self._require_guardian_scope()
+            if err is not None:
+                return self._send_json(err[1], err[0])
+            jid = mgo.group(1)
+            if self._guardian_link_or_403(guid, jid):
+                return
+            return self._send_api(
+                api.get_substitute_opportunity(jid, mgo.group(2)))
         sd = re.match(r"^/api/standings/([^/]+)$", path)
         if sd:
             return self._send_api(api.get_standings(sd.group(1)))
@@ -888,6 +961,41 @@ class Handler(BaseHTTPRequestHandler):
                     api.accept_substitute(gid, ppid, actor_id=uid))
             return self._send_api(
                 api.decline_substitute(gid, ppid, actor_id=uid))
+
+        # Guardian acting for a linked junior (#26): a verified guardian may set
+        # the junior's attendance and accept/decline coach offers on their
+        # behalf. The subject player (jid) comes from the path; the acting
+        # guardian (actor_id) comes from the session, so the audit trail records
+        # WHO acted (the guardian) separately from WHOM it was for (the junior),
+        # and `response_source="guardian"` marks the channel. Every action first
+        # passes the verified-link gate, so an unlinked guardian gets 403.
+        mga = re.match(
+            r"^/api/me/guardian/([^/]+)/games/([^/]+)/availability$", path)
+        if mga:
+            guid, err = self._require_guardian_scope()
+            if err is not None:
+                return self._send_json(err[1], err[0])
+            jid, gid = mga.group(1), mga.group(2)
+            if self._guardian_link_or_403(guid, jid):
+                return
+            return self._send_api(api.set_availability(
+                gid, jid, body.get("availability_status", "pending"),
+                "guardian", guid))
+        mgs = re.match(
+            r"^/api/me/guardian/([^/]+)/substitute-opportunities/([^/]+)/"
+            r"(accept-offer|decline-offer)$", path)
+        if mgs:
+            guid, err = self._require_guardian_scope()
+            if err is not None:
+                return self._send_json(err[1], err[0])
+            jid, gid, action = mgs.group(1), mgs.group(2), mgs.group(3)
+            if self._guardian_link_or_403(guid, jid):
+                return
+            if action == "accept-offer":
+                return self._send_api(
+                    api.accept_substitute(gid, jid, actor_id=guid))
+            return self._send_api(
+                api.decline_substitute(gid, jid, actor_id=guid))
 
         # Authorize the acting role at the HTTP boundary (#24/#50). A session
         # cookie is authoritative; the X-Demo-Role header is a dev fallback.

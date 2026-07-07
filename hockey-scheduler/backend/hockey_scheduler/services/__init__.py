@@ -1,4 +1,5 @@
 from .account_service import AccountService
+from .guardian_service import GuardianService
 from .calendar import (
     ACTOR_TYPES,
     build_ics,
@@ -54,5 +55,6 @@ __all__ = ["RosterService", "SetupService", "DeliveryWorker", "DeliveryLoop",
            "email_transport_from_env", "PushTransport", "DryRunPushTransport",
            "ProviderPushTransport", "push_transport_from_config",
            "push_config_from_env", "push_transport_from_env",
-           "AccountService", "IMPORT_SHEET_NAMES", "parse_csv_text",
+           "AccountService", "GuardianService", "IMPORT_SHEET_NAMES",
+           "parse_csv_text",
            "validate_import", "validate_official_availability"]
