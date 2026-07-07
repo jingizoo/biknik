@@ -171,6 +171,10 @@ class NotificationKind(str, Enum):
     ASSIGNMENT_ACCEPTED = "assignment_accepted"    # → schedulers
     ASSIGNMENT_DECLINED = "assignment_declined"    # → schedulers
     ROSTER_OPEN_SLOT = "roster_open_slot"          # → the coach
+    # Substitute outreach (#112) → the offered player / the team's coach.
+    SUBSTITUTE_OFFERED = "substitute_offered"      # → the player
+    SUBSTITUTE_ACCEPTED = "substitute_accepted"    # → the coach
+    SUBSTITUTE_DECLINED = "substitute_declined"    # → the coach
     RESULT_APPROVED = "result_approved"            # → public feed
     # Schedule-change notifications (#87) → affected teams / officials / public.
     GAME_PUBLISHED = "game_published"

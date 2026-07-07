@@ -1105,6 +1105,17 @@ class ApiService:
         """The other side of a game from ``team_id``'s point of view."""
         return g.away_team_id if g.home_team_id == team_id else g.home_team_id
 
+    @staticmethod
+    def _mutable_block(game) -> Optional[str]:
+        """The reason a game's roster can't be mutated (cancelled/locked), or
+        None — mirrors the service's _guard_mutable so a withdraw/decline
+        button isn't offered when it would dead-end (#110/#112)."""
+        if game.cancelled:
+            return "This game has been cancelled."
+        if game.locked:
+            return "The roster for this game is locked."
+        return None
+
     def _opportunity_base_dict(self, g, player) -> dict:
         """The fields a substitute opportunity carries in both the Home list
         (#107) and the detail view (#110) — kept in one place so the two
@@ -1163,6 +1174,11 @@ class ApiService:
 
         opportunities = [self._opportunity_base_dict(g, player)
                          for g in self.roster.list_substitute_opportunities(player_id)]
+        # Slots a coach has OFFERED this player (#112): shown separately so
+        # they can accept/decline — the self-enrol opportunities list excludes
+        # already-offered games.
+        offers = [self._opportunity_base_dict(g, player)
+                  for g in self.roster.list_player_offers(player_id)]
 
         notif = self.get_notifications("player", {"player_id": player_id},
                                        user_id=user_id)
@@ -1173,6 +1189,7 @@ class ApiService:
             "player_id": player_id, "player_name": player.name,
             "next_game": next_game_dto,
             "today_count": self.roster.count_games_today_for_player(player_id),
+            "substitute_offers": offers,
             "substitute_opportunities": opportunities,
             "unread_notifications": unread,
         }
@@ -1194,20 +1211,28 @@ class ApiService:
             raise NotFoundError("Opportunity not found.")
         rstatus = self.roster.compute_roster_status(game_id, player.team_id)
         enrollment = self.store.substitute_for_player(game_id, player_id)
-        enrolled = enrollment is not None and enrollment.status in (
-            SubstituteStatus.ENROLLED, SubstituteStatus.OFFERED)
-        if enrolled:
+        status = enrollment.status if enrollment else None
+        can_accept = can_withdraw = can_accept_offer = can_decline_offer = False
+        blocked = None
+        if status == SubstituteStatus.OFFERED:
+            # A coach has offered this player the slot (#112): respond with
+            # Accept/Decline, not Enroll/Withdraw. The accept-eligibility rules
+            # (cancelled/locked/past/expired/slot-filled) live in one service
+            # predicate so this pre-disable can't drift from accept_substitute;
+            # decline only needs a mutable game.
+            offer_block = self.roster.substitute_offer_block_reason(
+                player_id, game_id, enrollment, rstatus)
+            can_accept_offer = offer_block is None
+            can_decline_offer = self._mutable_block(game) is None
+            blocked = offer_block
+        elif status == SubstituteStatus.ENROLLED:
             # Withdrawal routes through _guard_mutable, so only a locked or
             # cancelled game blocks it — not the enrol-eligibility reasons.
-            # Surface that instead of offering a Withdraw button that dead-ends.
-            withdraw_block = (
-                "This game has been cancelled." if game.cancelled
-                else "The roster for this game is locked." if game.locked
-                else None)
-            can_accept, can_withdraw, blocked = False, withdraw_block is None, withdraw_block
+            withdraw_block = self._mutable_block(game)
+            can_withdraw, blocked = withdraw_block is None, withdraw_block
         else:
             reason = self.roster.substitute_block_reason(player_id, game_id, rstatus)
-            can_accept, can_withdraw, blocked = reason is None, False, reason
+            can_accept, blocked = reason is None, reason
         return {
             **self._opportunity_base_dict(game, player),
             "roster_status": rstatus.status.value,
@@ -1215,10 +1240,33 @@ class ApiService:
                 rstatus.status.value, "not_responded"),
             "open_goalie_slots": rstatus.open_goalie_slots,
             "open_skater_slots": rstatus.open_skater_slots,
-            "enrollment_status": enrollment.status.value if enrollment else None,
+            "enrollment_status": status.value if status else None,
             "can_accept": can_accept,
             "can_withdraw": can_withdraw,
+            "can_accept_offer": can_accept_offer,
+            "can_decline_offer": can_decline_offer,
             "blocked_reason": blocked,
+        }
+
+    @catch
+    def get_substitute_candidates(self, game_id: str,
+                                  team_id: Optional[str] = None) -> dict:
+        """The coach outreach queue for a game/team (#112): open slots by
+        position plus the ordered substitute candidates (who can be offered
+        right now). Operator-facing — gated at the route by MANAGE_ROSTER +
+        team scope."""
+        game = self.store.get_game(game_id)
+        if game is None:
+            raise NotFoundError("Game not found.")
+        team_id = team_id or game.home_team_id
+        rstatus = self.roster.compute_roster_status(game_id, team_id)
+        return {
+            "game_id": game_id, "team_id": team_id,
+            "open_goalie_slots": rstatus.open_goalie_slots,
+            "open_skater_slots": rstatus.open_skater_slots,
+            "locked": game.locked, "cancelled": game.cancelled,
+            "candidates": self.roster.list_substitute_candidates(
+                game_id, team_id, rstatus),
         }
 
     @catch
