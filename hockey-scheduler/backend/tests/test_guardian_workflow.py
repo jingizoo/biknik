@@ -43,6 +43,10 @@ def _seeded_api():
                         position=Position.FORWARD))
     api = ApiService(s)
     api.roster.clock = FakeClock()
+    # link_guardian requires a real account with the guardian role (#35) —
+    # "g1"/"g2" below are the guardian_user_ids this file's tests link/verify.
+    api.accounts.create_account("guardian1", "demo", "guardian", account_id="g1")
+    api.accounts.create_account("guardian2", "demo", "guardian", account_id="g2")
     return api, s
 
 

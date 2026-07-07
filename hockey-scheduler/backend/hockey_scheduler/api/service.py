@@ -1212,6 +1212,35 @@ class ApiService:
         return {"guardian_user_id": guardian_user_id, "juniors": juniors}
 
     @catch
+    def create_guardian_link(self, guardian_user_id: str, player_id: str,
+                             actor_id: Optional[str] = None) -> dict:
+        """Operator creates an unverified guardian↔junior link (#35) — the
+        first HTTP-reachable path for this; previously only deterministic
+        demo seeding could create one."""
+        return _serialize(self.guardians.link_guardian(
+            guardian_user_id, player_id, actor_id=actor_id))
+
+    @catch
+    def verify_guardian_link(self, link_id: str, consent_method: str,
+                             actor_id: Optional[str] = None) -> dict:
+        """Operator verifies a guardian link, recording a real consent
+        record (#35 — GDPR Art. 8). Unlike the underlying service method
+        (which leaves ``consent_method`` optional for internal/seed use),
+        every real operator-facing verification through this route must
+        record HOW authorization was obtained."""
+        consent_method = (consent_method or "").strip()
+        if not consent_method:
+            raise ValidationError(
+                "consent_method is required to verify a guardian link "
+                "(e.g. 'signed_form', 'verbal_confirmed', 'email_reply').")
+        return _serialize(self.guardians.verify_link(
+            link_id, actor_id=actor_id, consent_method=consent_method))
+
+    @catch
+    def list_guardian_links(self) -> List[dict]:
+        return [_serialize(l) for l in self.guardians.all_links()]
+
+    @catch
     def get_substitute_opportunity(self, player_id: str, game_id: str) -> dict:
         """Detail for one substitute opportunity, scoped to the signed-in
         player (#110): the game context, this player's current relationship to

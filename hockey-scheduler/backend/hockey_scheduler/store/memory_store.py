@@ -537,6 +537,9 @@ class InMemoryStore:
                 return g
         return None
 
+    def all_guardian_links(self) -> List[GuardianLink]:
+        return list(self.guardian_links.values())
+
     # -- sessions (#74) ----------------------------------------------------
     def add_session(self, s: Session) -> Session:
         self.sessions[s.id] = s

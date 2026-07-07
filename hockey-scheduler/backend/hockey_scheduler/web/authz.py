@@ -100,6 +100,14 @@ def required_permission(path: str):
         return Permission.MANAGE_USERS
     if re.match(r"^/api/accounts/[^/]+/sessions/[^/]+/revoke$", path):
         return Permission.MANAGE_USERS
+    # Guardian↔junior link creation/verification (#35) — the same
+    # league-admin-only user-management permission as account creation,
+    # since binding a guardian's authority to a junior is comparably
+    # sensitive identity administration.
+    if path == "/api/guardians/links":
+        return Permission.MANAGE_USERS
+    if re.match(r"^/api/guardians/links/[^/]+/verify$", path):
+        return Permission.MANAGE_USERS
     # Officials: an official accepts/declines their own assignment (#54);
     # unassigning is an operator/scheduling action (#30).
     m = re.match(r"^/api/officials/assignments/[^/]+/(accept|decline|unassign)$", path)

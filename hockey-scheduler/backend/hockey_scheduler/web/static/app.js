@@ -29,6 +29,8 @@ let notifState = { notifications: [], unread: 0 };  // feed for the bell (#32)
 let deliveryState = { contacts: [], overview: null, deviceTokens: [] };  // ops delivery admin (#61/#65)
 let usersState = { accounts: [], sessions: [] };  // account/session admin (#78)
 let usersSelected = null;          // account id whose sessions are shown (#78)
+let guardianLinksState = [];       // guardian↔junior links, Users tab (#35)
+let guardianLinkForm = { guardian_user_id: "", player_id: "" };
 let notifPrefs = null;             // signed-in user's own channel prefs (#81)
 let feedTokens = [];               // signed-in user's calendar feed tokens (#82)
 let newFeedUrl = null;             // freshly-minted feed URL, shown once (#82)
@@ -1664,7 +1666,58 @@ function renderUsers() {
     <div class="card">
       <div class="section-title">Sessions</div>
       ${sessionPanel}
-    </div>`;
+    </div>
+    ${renderGuardianLinks()}`;
+}
+
+// Guardian↔junior links (#35): create an (unverified) link, then verify it
+// with a real consent record — the GDPR Art. 8 gate the issue calls for.
+// Previously this had no HTTP path at all; a link could only come from
+// deterministic demo seeding.
+function renderGuardianLinks() {
+  const guardians = usersState.accounts.filter((a) => a.role === "guardian");
+  const nameForPlayer = (pid) => (playersList.find((p) => p.id === pid) || {}).name || pid;
+  const nameForGuardian = (uid) =>
+    (usersState.accounts.find((a) => a.id === uid) || {}).username || uid;
+  const guardianOpts = guardians.length
+    ? guardians.map((g) => opt(g.id, g.username, g.id === guardianLinkForm.guardian_user_id)).join("")
+    : `<option value="">No guardian accounts yet</option>`;
+  const playerOpts = playersList.length
+    ? playersList.map((p) => opt(p.id, p.name, p.id === guardianLinkForm.player_id)).join("")
+    : `<option value="">No players yet</option>`;
+  const form = `<div class="card cd-form">
+    <div class="cd-grid">
+      <label class="cd-field"><span>Guardian account</span>
+        <select id="glink-guardian" class="cd-input">${guardianOpts}</select></label>
+      <label class="cd-field"><span>Junior player</span>
+        <select id="glink-player" class="cd-input">${playerOpts}</select></label>
+      <div class="cd-submit"><button class="act primary" data-glink-create
+        ${guardians.length && playersList.length ? "" : "disabled"}>Link guardian</button></div>
+    </div>
+  </div>`;
+  const rows = guardianLinksState.length
+    ? guardianLinksState.map((l) => {
+        const status = l.verified
+          ? `<span class="pill scheduled">Verified${l.consent_method ? " · " + esc(l.consent_method) : ""}</span>`
+          : `<span class="pill gray">Unverified</span>`;
+        const verifyForm = l.verified ? "" : `
+          <input id="glink-consent-${esc(l.id)}" class="cd-input" style="max-width:180px"
+            placeholder="e.g. signed_form" />
+          <button class="act ghost" data-glink-verify="${esc(l.id)}">Verify</button>`;
+        return `<div class="li">
+          <div class="li-main">
+            <div class="li-title">${esc(nameForGuardian(l.guardian_user_id))} → ${esc(nameForPlayer(l.player_id))}</div>
+            <div class="li-sub">${status}</div>
+          </div>
+          ${verifyForm}
+        </div>`;
+      }).join("")
+    : `<div class="empty">No guardian links yet.</div>`;
+  return `<div class="card">
+    <div class="section-title">Guardian Links</div>
+    ${form}
+    <div class="row-list">${rows}</div>
+  </div>`;
 }
 
 const SESSION_STATUS_LABEL = { active: "Active", revoked: "Revoked", expired: "Expired" };
@@ -2750,6 +2803,14 @@ async function render() {
       } else {
         usersState.sessions = [];
       }
+      // Guardian↔junior links (#35) — same view, same operator. Player names
+      // come from the same /api/players call the Setup Players card uses
+      // (#114); manage_users implies manage_setup for every role that holds
+      // it today (only league admin), so this fetch never 403s in practice.
+      const gl = await getJSON("/api/guardians/links");
+      guardianLinksState = Array.isArray(gl) ? gl : [];
+      const pl = await getJSON("/api/players");
+      playersList = Array.isArray(pl) ? pl : [];
     }
     // Public surface (#83): schedule + standings from public-safe endpoints.
     if (view === "public") {
@@ -3350,6 +3411,25 @@ async function render() {
     await post(`/api/accounts/${usersSelected}/sessions/${b.dataset.revokeSession}/revoke`, {});
     await render();
   });
+  // Guardian↔junior links (#35): create an unverified link, then verify one
+  // with a real consent_method — the operator-facing consent record.
+  const glCreate = c.querySelector("[data-glink-create]");
+  if (glCreate) glCreate.onclick = async () => {
+    guardianLinkForm = { guardian_user_id: val("glink-guardian"), player_id: val("glink-player") };
+    toast = "";
+    const res = await post("/api/guardians/links", guardianLinkForm);
+    if (res && !res.error) toast = "Guardian link created — verify it below to grant authority.";
+    await render();
+  };
+  c.querySelectorAll("[data-glink-verify]").forEach((b) => b.onclick = async () => {
+    const linkId = b.dataset.glinkVerify;
+    const consentMethod = val(`glink-consent-${linkId}`);
+    toast = "";
+    const res = await post(`/api/guardians/links/${linkId}/verify`,
+      { consent_method: consentMethod });
+    if (res && !res.error) toast = "Guardian link verified.";
+    await render();
+  });
   // Shared move: used by both drag/drop and the click-based Move fallback.
   const applyMove = async (gid, slotId) => {
     toast = "";
@@ -3568,6 +3648,13 @@ function resetTransientUiState() {
   // without a page reload, that role would see the previous operator's
   // fetched player roster.
   playersList = [];
+  // guardianLinksState (#35) isn't currently reachable by a lower-privileged
+  // role either — renderUsers() gates its whole body (including the
+  // Guardian Links card) on hasPerm("manage_users") before touching this
+  // state, same as playersList's setupCard gate should but currently
+  // doesn't. Cleared here anyway for consistency/defense-in-depth with the
+  // playersList precedent above.
+  guardianLinksState = [];
 }
 function setUser(user) {
   const prevId = currentUser ? currentUser.username : null;

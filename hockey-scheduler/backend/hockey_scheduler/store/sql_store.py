@@ -191,7 +191,8 @@ SPECS = {
     Session: Spec(Session, "sessions",
                   {"issued_at": _dt(), "expires_at": _dt(), "revoked_at": _dt()}),
     GuardianLink: Spec(GuardianLink, "guardian_links",
-                       {"created_at": _dt(), "verified": _bool()}),
+                       {"created_at": _dt(), "verified": _bool(),
+                        "consented_at": _dt()}),
     CalendarFeedToken: Spec(
         CalendarFeedToken, "calendar_feed_tokens",
         {"created_at": _dt(), "revoked_at": _dt()}),
@@ -664,6 +665,8 @@ class SqlStore:
                            "guardian_user_id = ? AND player_id = ?",
                            (guardian_user_id, player_id), order="id")
         return rows[0] if rows else None
+    def all_guardian_links(self):
+        return self._query(GuardianLink, order="id")
 
     # -- sessions (#74) ----------------------------------------------------
     def add_session(self, sess): return self._insert(sess)
