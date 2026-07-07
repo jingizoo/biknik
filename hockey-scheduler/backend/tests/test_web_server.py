@@ -142,11 +142,19 @@ class WebServerTest(unittest.TestCase):
         self.assertIn("Operator Console", html)
         self.assertIn('class="sidebar"', html)
 
-    def test_mobile_route_serves_phone_shell(self):
+    def test_mobile_route_serves_web_console(self):
+        # /mobile used to serve a second, divergent HTML file (a decorative
+        # phone-bezel mockup) that drifted out of sync with the real console
+        # and dead-ended when signed out (#118). index.html is already a
+        # single responsive shell, so /mobile now serves it directly — one
+        # file, forever in sync, real phones just render it at their own
+        # width.
         with urllib.request.urlopen(f"http://{HOST}:{PORT}/mobile") as resp:
             html = resp.read().decode()
         self.assertEqual(resp.status, 200)
-        self.assertIn('class="phone"', html)
+        self.assertIn("Operator Console", html)
+        self.assertIn('class="sidebar"', html)
+        self.assertIn('id="login-screen"', html)
 
 
 if __name__ == "__main__":
