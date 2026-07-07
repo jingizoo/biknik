@@ -19,6 +19,7 @@ from .enums import (
     OfficialAssignmentStatus,
     OfficialAvailabilityStatus,
     OfficialRole,
+    RescheduleStatus,
     ResultStatus,
 )
 from .roles import Role
@@ -83,6 +84,31 @@ class IceSlot:
     end_time: datetime
     slot_type: IceSlotType = IceSlotType.GAME
     status: IceSlotStatus = IceSlotStatus.AVAILABLE
+
+
+@dataclass
+class RescheduleRequest:
+    """A controlled request→approval→republish flow to move a PUBLISHED
+    game (#29) — an uncontrolled move is the operator-only `move_game`
+    drag/drop; this is the coach-initiated, opponent-and-league-gated path.
+
+    ``requested_by_team_id`` must be one of the game's two teams; the other
+    team is "the opponent" who must accept before it ever reaches league
+    review. ``new_ice_slot_id``/``decision_note`` are set once the league
+    decides. Reuses `move_game`/`publish_game` verbatim for the actual slot
+    swap once approved, so it inherits the same one-game-per-slot and
+    team-overlap guarantees rather than re-implementing them.
+    """
+    id: str
+    game_id: str
+    requested_by_team_id: str
+    reason: str
+    status: RescheduleStatus
+    created_at: datetime
+    opponent_responded_at: Optional[datetime] = None
+    league_decided_at: Optional[datetime] = None
+    new_ice_slot_id: Optional[str] = None
+    decision_note: Optional[str] = None
 
 
 @dataclass

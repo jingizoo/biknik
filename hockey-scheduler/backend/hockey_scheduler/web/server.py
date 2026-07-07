@@ -232,6 +232,35 @@ class Handler(BaseHTTPRequestHandler):
             "message": "You can only manage your own calendar feeds."}}, 403)
         return True
 
+    def _reschedule_opponent_guard(self, request_id) -> bool:
+        """Send 401/403 and return True if the caller may not respond to
+        this reschedule request (#29): an operator (MANAGE_SCHEDULE) may
+        respond to any; a coach only if their team is the OPPONENT of the
+        team that requested it — not the requester itself, and not an
+        unrelated team's coach. scope.py's generic team_id body-key check
+        doesn't cover this (the respond action carries no team_id), so it's
+        enforced here instead."""
+        role, scope, _uid, err = self._resolve_role()
+        if err is not None:
+            code, payload = err
+            self._send_json(payload, code)
+            return True
+        if can(role, Permission.MANAGE_SCHEDULE):
+            return False
+        req = STATE.api.store.get_reschedule_request(request_id)
+        game = STATE.api.store.get_game(req.game_id) if req else None
+        if req is not None and game is not None:
+            opponent_id = (game.away_team_id
+                          if req.requested_by_team_id == game.home_team_id
+                          else game.home_team_id)
+            if role == Role.COACH and scope.get("team_id") == opponent_id:
+                return False
+        self._send_json({"error": {
+            "code": "forbidden",
+            "message": "Only the opponent team's coach (or an operator) can "
+                       "respond to this reschedule request."}}, 403)
+        return True
+
     def _official_guard(self, official_id) -> bool:
         """Send 401/403 and return True if the caller may not manage
         ``official_id``'s availability: an operator (MANAGE_SCHEDULE) may manage
@@ -622,6 +651,16 @@ class Handler(BaseHTTPRequestHandler):
             qs = parse_qs(urlparse(self.path).query)
             team_id = (qs.get("team_id") or [None])[0]
             return self._send_api(api.list_players(team_id))
+        if path == "/api/reschedule/pending":
+            # League-wide "awaiting my decision" queue (#29) — the opponent
+            # has already accepted; a league admin/arena manager just needs
+            # to see everything waiting on them across all games.
+            if self._operator_only("/api/reschedule/pending"):
+                return
+            all_requests = api.list_reschedule_requests()  # a plain store read, never errors
+            pending = [r for r in all_requests
+                      if r["status"] == "pending_league_approval"]
+            return self._send_api({"requests": pending})
         oav = re.match(r"^/api/officials/([^/]+)/availability$", path)
         if oav:
             # An official's declared availability windows (#88). Operator → any;
@@ -778,7 +817,7 @@ class Handler(BaseHTTPRequestHandler):
                     "message": "Session expired — please sign in again."}}, 401)
             return self._send_json({"user": user_view(sess, api.store)})
         # /api/games/{gid}/<sub>  — works for any game id, not just the seed.
-        m = re.match(r"^/api/games/([^/]+)(?:/(board|lineups|roster-status|roster|substitutes|substitute-candidates|substitute-addable|officials|availability-summary))?$", path)
+        m = re.match(r"^/api/games/([^/]+)(?:/(board|lineups|roster-status|roster|substitutes|substitute-candidates|substitute-addable|reschedule|officials|availability-summary))?$", path)
         if m:
             gid, sub = m.group(1), m.group(2)
             # The bare game record is a public fixture (teams / time / rink /
@@ -814,6 +853,13 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_api(api.get_roster(gid))
             if sub == "substitutes":
                 return self._send_api(api.get_substitutes(gid))
+            if sub == "reschedule":
+                # A game's own reschedule-request history/current pending
+                # request (#29) — same private-game-data gate as roster/
+                # substitutes above, no further scoping: either team's coach,
+                # any operator, or an assigned official may see it.
+                return self._send_api(
+                    {"requests": api.list_reschedule_requests(gid)})
             if sub == "availability-summary":
                 # Availability rollup for a team (#89). The #73 gate above only
                 # proves the caller belongs to *a* team in this game — it does
@@ -949,6 +995,21 @@ class Handler(BaseHTTPRequestHandler):
             _role, _scope, actor_uid, _err = self._resolve_role()
             return self._send_api(api.delete_official_availability(
                 oavd.group(1), actor_id=actor_uid))
+
+        # Reschedule opponent response (#29): the opponent team's coach OR
+        # an operator (MANAGE_SCHEDULE — e.g. an Arena Manager, who holds no
+        # MANAGE_ROSTER) may respond. That's richer than the single coarse
+        # permission the generic authorize() gate checks, which would
+        # otherwise reject an Arena Manager before _reschedule_opponent_guard
+        # ever got a chance to allow the operator fallback it's designed to
+        # grant — guarded here instead, mirroring official availability above.
+        resp = re.match(r"^/api/games/[^/]+/reschedule/([^/]+)/respond$", path)
+        if resp:
+            if self._reschedule_opponent_guard(resp.group(1)):
+                return
+            _role, _scope, actor_uid, _err = self._resolve_role()
+            return self._send_api(api.respond_to_reschedule(
+                resp.group(1), bool(body.get("accept")), actor_uid))
 
         # Calendar feed tokens (#82): create / revoke. Custom access (operator
         # or own actor), guarded here rather than by the permission gate below.
@@ -1290,6 +1351,25 @@ class Handler(BaseHTTPRequestHandler):
             if action == "move":
                 return self._send_api(api.move_game(
                     gid, body.get("ice_slot_id"), body.get("reason", ""), actor))
+            if action == "reschedule/request":
+                # actor_id is the signed-in coach's own user_id from the
+                # resolved session, NOT the client-suppliable body actor_id —
+                # every step of this workflow is an audited consent-adjacent
+                # decision, so the acting identity must not be forgeable
+                # (same reasoning as revoke_account_session / the #35
+                # guardian-link routes).
+                return self._send_api(api.request_reschedule(
+                    gid, body.get("team_id"), body.get("reason", ""), user_id))
+            # reschedule/{id}/respond is handled earlier, before the coarse
+            # gate above (see the custom-guarded block near official
+            # availability) — MANAGE_SCHEDULE-only operators need to reach it
+            # too, which the single-permission check here can't express.
+            resched = re.match(r"^reschedule/([^/]+)/decide$", action)
+            if resched:
+                return self._send_api(api.decide_reschedule(
+                    resched.group(1), bool(body.get("approve")),
+                    new_ice_slot_id=body.get("new_ice_slot_id"),
+                    note=body.get("note"), actor_id=user_id))
             if action == "substitutes/enroll":
                 return self._send_api(api.enroll_substitute(gid, pid, actor))
             if action == "substitutes/withdraw":

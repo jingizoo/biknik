@@ -46,6 +46,7 @@ let availSummary = null;            // roster availability rollup (#89)
 let subCandidates = null;           // coach substitute outreach queue (#112)
 let addableSubs = null;             // eligible-but-not-enrolled team players a coach can add (#114)
 let playersList = [];               // [{id,name,team_id,position,jersey_number,...}] for Setup (#114)
+let rescheduleRequests = null;      // reschedule request(s) for the current game (#29)
 let availFilter = "all";            // all|available|unavailable|maybe|no_response
 let contactForm = { recipient_ref: "", channel: "email", destination: "", label: "" };
 let tokenForm = { recipient_ref: "", provider: "fcm", token: "", label: "" };
@@ -861,7 +862,7 @@ function renderAvailSummary() {
   </div>`;
 }
 
-function renderRoster(lineups) {
+function renderRoster(lineups, ov) {
   if (!lineups) return `<div class="empty">Select a game from the Games tab.</div>`;
   if (!(rosterSide in lineups)) rosterSide = "home";
   const side = lineups[rosterSide];
@@ -876,7 +877,7 @@ function renderRoster(lineups) {
     <div class="segmented">
       <button class="seg ${gameView === "coach" ? "active" : ""}" data-view="coach">Coach</button>
       <button class="seg ${gameView === "player" ? "active" : ""}" data-view="player">Player</button>
-    </div><div style="padding-top:8px">${gameView === "coach" ? coachBody(side) : playerBody(side)}</div>
+    </div><div style="padding-top:8px">${gameView === "coach" ? coachBody(side, ov) : playerBody(side)}</div>
     ${renderAvailSummary()}`;
 }
 
@@ -2275,7 +2276,78 @@ function outreachPanel(canEdit) {
     <div class="card">${rows}</div>
     ${addableCard}`;
 }
-function coachBody(board) {
+
+// Reschedule request/approval workflow (#29): request a move for a
+// PUBLISHED game, the opponent coach accepts/rejects, then a league
+// admin/arena manager approves (picking a replacement slot — reusing the
+// same one-game-per-slot guarantee move_game already enforces) or denies.
+// A coach viewing either side of the game can always tell "am I the
+// opponent?" from `myTeam !== requested_by_team_id` — if they can see this
+// game at all, their team must be one of its only two teams.
+function renderReschedulePanel(canRequest, ov) {
+  if (!rescheduleRequests) return "";
+  const open = rescheduleRequests.find((r) =>
+    r.status === "pending_opponent" || r.status === "pending_league_approval");
+  const isOperator = hasPerm("manage_schedule");
+  const myTeam = (currentUser && currentUser.scope) ? currentUser.scope.team_id : null;
+
+  if (!open) {
+    if (!canRequest && !isOperator) return "";
+    return `<div class="section-title">Reschedule</div>
+      <div class="card cd-form">
+        <div class="cd-grid">
+          <label class="cd-field" style="flex:1"><span>Reason</span>
+            <input id="resched-reason" class="cd-input" placeholder="e.g. Rink unavailable" /></label>
+          <div class="cd-submit"><button class="act ghost" data-resched-request>Request reschedule</button></div>
+        </div>
+      </div>`;
+  }
+
+  const isOpponent = !!myTeam && myTeam !== open.requested_by_team_id;
+  if (open.status === "pending_opponent") {
+    if (isOpponent || isOperator) {
+      return `<div class="section-title">Reschedule</div>
+        <div class="card"><div class="li"><div class="li-main">
+          <div class="li-title">Reschedule requested</div>
+          <div class="li-sub">${esc(open.reason)}</div></div>
+          <button class="act primary" data-resched-respond="${esc(open.id)}" data-resched-accept="1">Accept</button>
+          <button class="act danger" data-resched-respond="${esc(open.id)}" data-resched-accept="0">Reject</button>
+        </div></div>`;
+    }
+    return `<div class="section-title">Reschedule</div>
+      <div class="card"><div class="li"><div class="li-main">
+        <div class="li-title">Reschedule requested</div>
+        <div class="li-sub">Awaiting the opponent's response · ${esc(open.reason)}</div></div></div></div>`;
+  }
+
+  // pending_league_approval
+  if (isOperator) {
+    const slots = (ov.ice_slots || []).filter(
+      (s) => s.status === "available" && s.slot_type === "game");
+    const rinkName = (id) => nameById(ov.rinks, id);
+    const slotOpts = slots.length
+      ? slots.map((s) => opt(s.id, `${fmtDateTime(s.start_time)} · ${rinkName(s.rink_id)}`, false)).join("")
+      : `<option value="">No open ice slots</option>`;
+    return `<div class="section-title">Reschedule — awaiting your decision</div>
+      <div class="card cd-form">
+        <div class="li-sub" style="padding:4px">${esc(open.reason)}</div>
+        <div class="cd-grid">
+          <label class="cd-field" style="flex:1"><span>Replacement ice slot</span>
+            <select id="resched-slot" class="cd-input">${slotOpts}</select></label>
+          <div class="cd-submit">
+            <button class="act primary" data-resched-decide="${esc(open.id)}"
+              data-approve="1" ${slots.length ? "" : "disabled"}>Approve</button>
+            <button class="act ghost" data-resched-decide="${esc(open.id)}" data-approve="0">Deny</button>
+          </div>
+        </div>
+      </div>`;
+  }
+  return `<div class="section-title">Reschedule</div>
+    <div class="card"><div class="li"><div class="li-main">
+      <div class="li-title">Reschedule accepted</div>
+      <div class="li-sub">Awaiting league approval · ${esc(open.reason)}</div></div></div></div>`;
+}
+function coachBody(board, ov) {
   const s = board.status;
   const locked = s.status === "locked";
   // Resource scoping (#51): a bound coach may edit only their own team's side.
@@ -2371,6 +2443,7 @@ function coachBody(board) {
     ${availableGroups(available, s, !canEdit)}
     ${subCandidates ? outreachPanel(canEdit) : subPoolCard()}
     ${footer}
+    ${renderReschedulePanel(canRoster, ov)}
     `;
 }
 function playerBody(board) {
@@ -2685,6 +2758,17 @@ async function render() {
         `/api/games/${currentGame}/substitute-addable?team_id=${tid}`);
       if (a && !a.error) addableSubs = a;
     }
+    // Reschedule request/approval state for the currently viewed game (#29)
+    // — visible to either team's coach or an operator (same audience as the
+    // outreach queue above, but not manage_roster-only: a league admin
+    // needs it here too, to decide a pending approval).
+    rescheduleRequests = null;
+    if (view === "roster" && gameView === "coach"
+        && (hasPerm("manage_roster") || hasPerm("manage_schedule"))
+        && currentGame) {
+      const rr = await getJSON(`/api/games/${currentGame}/reschedule`);
+      if (rr && !rr.error) rescheduleRequests = rr.requests;
+    }
     // The Setup Player card needs the league-wide player list (#114) — its
     // own authenticated call, never bundled into the public demo overview.
     if (view === "setup" && hasPerm("manage_setup")) {
@@ -2863,7 +2947,7 @@ async function render() {
     : view === "import" ? renderImport(ov)
     : view === "calendar" ? renderCalendar(ov)
     : view === "games" ? renderGames(ov)
-    : view === "roster" ? renderRoster(lineups)
+    : view === "roster" ? renderRoster(lineups, ov)
     : view === "sheet" ? renderGameSheet(lineups)
     : view === "inbox" ? renderInbox(inbox)
     : view === "player_home" ? renderPlayerHome(playerHome)
@@ -2917,6 +3001,34 @@ async function render() {
     if (res && !res.error) toast = `Reminder sent for ${res.reminded} player(s).`;
     await render();
   };
+  // Reschedule request/approval workflow (#29).
+  const reschedRequestBtn = c.querySelector("[data-resched-request]");
+  if (reschedRequestBtn) reschedRequestBtn.onclick = async () => {
+    toast = "";
+    const res = await post(`/api/games/${currentGame}/reschedule/request`, {
+      team_id: rosterTeamId, reason: val("resched-reason") });
+    if (res && !res.error) toast = "Reschedule requested — the opponent has been notified.";
+    await render();
+  };
+  c.querySelectorAll("[data-resched-respond]").forEach((b) => b.onclick = async () => {
+    toast = "";
+    const res = await post(
+      `/api/games/${currentGame}/reschedule/${b.dataset.reschedRespond}/respond`,
+      { accept: b.dataset.reschedAccept === "1" });
+    if (res && !res.error) toast = b.dataset.reschedAccept === "1"
+      ? "Accepted — awaiting league approval." : "Reschedule request rejected.";
+    await render();
+  });
+  c.querySelectorAll("[data-resched-decide]").forEach((b) => b.onclick = async () => {
+    toast = "";
+    const approve = b.dataset.approve === "1";
+    const res = await post(
+      `/api/games/${currentGame}/reschedule/${b.dataset.reschedDecide}/decide`,
+      { approve, new_ice_slot_id: approve ? val("resched-slot") : null });
+    if (res && !res.error) toast = approve
+      ? "Reschedule approved — game republished." : "Reschedule request denied.";
+    await render();
+  });
   const printBtn = c.querySelector("[data-print]");
   if (printBtn) printBtn.onclick = () => window.print();
   // Officials assignment (#30): assign from the pool, official accepts/declines.

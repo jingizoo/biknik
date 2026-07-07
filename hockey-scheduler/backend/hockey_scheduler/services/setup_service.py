@@ -31,6 +31,8 @@ from ..domain import (
     Player,
     ResultStatus,
     Position,
+    RescheduleRequest,
+    RescheduleStatus,
     Rink,
     Season,
     SetupAuditLog,
@@ -40,6 +42,7 @@ from ..domain import (
 )
 from ..domain.errors import (
     DivisionMismatchError,
+    InvalidTransitionError,
     NotEligibleError,
     NotFoundError,
     ScheduleConflictError,
@@ -472,6 +475,153 @@ class SetupService:
             f"{self._game_label(game)} moved to {game.rink or 'a new rink'} "
             f"({when}).{(' ' + reason) if reason else ''}")
         return game
+
+    # -- reschedule request / approval workflow (#29) -----------------------
+    # A controlled, coach-initiated way to move a PUBLISHED game — distinct
+    # from move_game above (an operator-only drag/drop). The opponent team
+    # must accept before it ever reaches league review; an approval reuses
+    # move_game/publish_game verbatim for the actual slot swap, so it
+    # inherits the same one-game-per-slot / team-overlap guarantees rather
+    # than re-implementing them.
+    _OPEN_RESCHEDULE_STATUSES = {
+        RescheduleStatus.PENDING_OPPONENT, RescheduleStatus.PENDING_LEAGUE_APPROVAL}
+
+    @_transactional
+    def request_reschedule(self, game_id: str, team_id: str, reason: str,
+                           actor_id: Optional[str] = None) -> RescheduleRequest:
+        game = self.store.get_game(game_id)
+        if game is None:
+            raise NotFoundError(f"Game {game_id} not found.")
+        if game.cancelled:
+            raise ValidationError("Cannot request a reschedule for a cancelled game.")
+        if not game.published:
+            raise ValidationError(
+                "Only a published game can have a reschedule requested.")
+        if team_id not in (game.home_team_id, game.away_team_id):
+            raise ValidationError(
+                "Only the game's own two teams may request a reschedule.")
+        reason = self._require_name(reason, "reason")
+        if any(r.status in self._OPEN_RESCHEDULE_STATUSES
+              for r in self.store.reschedule_requests_for_game(game_id)):
+            raise ScheduleConflictError(
+                "This game already has an open reschedule request.",
+                details={"reason": "reschedule_already_open"})
+        req = RescheduleRequest(
+            id=self.store.next_id("reschedule"), game_id=game_id,
+            requested_by_team_id=team_id, reason=reason,
+            status=RescheduleStatus.PENDING_OPPONENT, created_at=self.clock())
+        self.store.add_reschedule_request(req)
+        self._audit("reschedule_requested", "game", game_id, actor_id, {
+            "request_id": req.id, "requested_by_team_id": team_id, "reason": reason})
+        opponent_id = (game.away_team_id if team_id == game.home_team_id
+                      else game.home_team_id)
+        if opponent_id:
+            self._notify(
+                NotificationKind.RESCHEDULE_REQUESTED, NotificationAudience.COACH,
+                "Reschedule requested",
+                f"{self._matchup(game)}: a reschedule was requested ({reason}). "
+                f"Please respond.", audience_ref=opponent_id, game_id=game_id)
+        return req
+
+    @_transactional
+    def respond_to_reschedule(self, request_id: str, accept: bool,
+                              actor_id: Optional[str] = None) -> RescheduleRequest:
+        req = self.store.get_reschedule_request(request_id)
+        if req is None:
+            raise NotFoundError(f"Reschedule request {request_id} not found.")
+        if req.status != RescheduleStatus.PENDING_OPPONENT:
+            raise InvalidTransitionError(
+                "This reschedule request is not awaiting an opponent response.",
+                details={"status": req.status.value})
+        game = self.store.get_game(req.game_id)
+        req.status = (RescheduleStatus.PENDING_LEAGUE_APPROVAL if accept
+                     else RescheduleStatus.OPPONENT_REJECTED)
+        req.opponent_responded_at = self.clock()
+        self.store.save_reschedule_request(req)
+        self._audit("reschedule_accepted" if accept else "reschedule_rejected",
+                   "game", req.game_id, actor_id, {"request_id": req.id})
+        if accept:
+            self._notify(
+                NotificationKind.RESCHEDULE_ACCEPTED, NotificationAudience.SCHEDULER,
+                "Reschedule awaiting approval",
+                f"{self._matchup(game)}: the opponent accepted a reschedule "
+                f"request ({req.reason}). League approval needed.",
+                game_id=req.game_id)
+        else:
+            self._notify(
+                NotificationKind.RESCHEDULE_REJECTED, NotificationAudience.COACH,
+                "Reschedule rejected",
+                f"{self._matchup(game)}: the opponent rejected the reschedule "
+                f"request ({req.reason}).",
+                audience_ref=req.requested_by_team_id, game_id=req.game_id)
+        return req
+
+    def decide_reschedule(self, request_id: str, approve: bool,
+                          new_ice_slot_id: Optional[str] = None,
+                          note: Optional[str] = None,
+                          actor_id: Optional[str] = None) -> RescheduleRequest:
+        """NOT @_transactional: the approve path calls move_game/publish_game,
+        which already are — nested transaction() calls are not reentrant on
+        SqlStore (matches copy_previous_roster's call to select_roster)."""
+        req = self.store.get_reschedule_request(request_id)
+        if req is None:
+            raise NotFoundError(f"Reschedule request {request_id} not found.")
+        if req.status != RescheduleStatus.PENDING_LEAGUE_APPROVAL:
+            raise InvalidTransitionError(
+                "This reschedule request is not awaiting league approval.",
+                details={"status": req.status.value})
+        if not approve:
+            req.status = RescheduleStatus.DENIED
+            req.decision_note = note
+            req.league_decided_at = self.clock()
+            self.store.save_reschedule_request(req)
+            self._audit("reschedule_denied", "game", req.game_id, actor_id,
+                       {"request_id": req.id, "note": note})
+            game = self.store.get_game(req.game_id)
+            self._notify_game_change(
+                game, NotificationKind.RESCHEDULE_DENIED, "Reschedule denied",
+                f"{self._matchup(game)}: the reschedule request was denied."
+                f"{(' ' + note) if note else ''}")
+            return req
+        if not new_ice_slot_id:
+            raise ValidationError(
+                "A replacement ice slot is required to approve a reschedule.")
+        # This workflow's whole point is that by this step both the opponent
+        # and league have signed off, so — unlike a raw move_game drag/drop,
+        # which conservatively unpublishes pending human review — republish
+        # immediately rather than leaving it in limbo.
+        #
+        # move_game/publish_game are each their own committed transaction (not
+        # one atomic unit with the RescheduleRequest save below), so a crash
+        # between them could otherwise leave the game moved-but-unpublished
+        # with this request stuck PENDING_LEAGUE_APPROVAL forever — retrying
+        # with the same slot would hit move_game's own "already in that slot"
+        # guard before ever reaching the request update. Skip a step that's
+        # already done instead of re-running it, so re-approving (the natural
+        # recovery action) always completes the request rather than erroring.
+        game = self.store.get_game(req.game_id)
+        if game is None or game.ice_slot_id != new_ice_slot_id:
+            self.move_game(req.game_id, new_ice_slot_id,
+                           reason=f"Reschedule approved: {req.reason}",
+                           actor_id=actor_id)
+            game = self.store.get_game(req.game_id)
+        if not game.published:
+            self.publish_game(req.game_id, actor_id=actor_id)
+        req.status = RescheduleStatus.REPUBLISHED
+        req.new_ice_slot_id = new_ice_slot_id
+        req.decision_note = note
+        req.league_decided_at = self.clock()
+        self.store.save_reschedule_request(req)
+        self._audit("reschedule_republished", "game", req.game_id, actor_id,
+                   {"request_id": req.id, "new_ice_slot_id": new_ice_slot_id})
+        return req
+
+    def list_reschedule_requests(self, game_id: Optional[str] = None
+                                 ) -> List[RescheduleRequest]:
+        """Pure read helper — must NOT be @_transactional."""
+        rows = (self.store.reschedule_requests_for_game(game_id) if game_id
+               else self.store.all_reschedule_requests())
+        return sorted(rows, key=lambda r: r.created_at, reverse=True)
 
     # -- convenience: add a player to a team ------------------------------
     @_transactional
