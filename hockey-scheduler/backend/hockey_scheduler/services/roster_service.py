@@ -879,6 +879,61 @@ class RosterService:
             r["name"], r["player_id"]))
         return rows
 
+    def list_addable_players(self, game_id: str, team_id: Optional[str] = None,
+                             rstatus=None) -> List[dict]:
+        """Active same-team players a coach could add as a substitute
+        candidate right now (#114) — substitute_block_reason (the SAME gate
+        the player-side opportunity list uses) returns None for them, and
+        they aren't already an enrolled/offered substitute (that pair of
+        states already show up in the outreach queue with an Offer action;
+        re-adding them here would just hit enroll_substitute's own duplicate
+        check). A pure read helper — must NOT be @_transactional."""
+        game = self._require_game(game_id)
+        team_id = team_id or game.home_team_id
+        if rstatus is None:
+            rstatus = self.compute_roster_status(game_id, team_id)
+        already_sub = {
+            s.player_id for s in self.store.substitutes_for_game(game_id)
+            if s.status in (SubstituteStatus.ENROLLED, SubstituteStatus.OFFERED)
+        }
+        rows = []
+        for player in self.store.players_for_team(team_id):
+            if not player.is_active or player.id in already_sub:
+                continue
+            if self.substitute_block_reason(
+                    player.id, game_id, rstatus=rstatus) is not None:
+                continue
+            rows.append({
+                "player_id": player.id, "name": player.name,
+                "position": player.position.value,
+                "slot_type": player.position.slot_type.value,
+            })
+        rows.sort(key=lambda r: (r["name"], r["player_id"]))
+        return rows
+
+    def add_substitute_candidate(
+        self, game_id: str, player_id: str, actor_id: Optional[str] = None
+    ) -> SubstituteEnrollment:
+        """Coach/operator adds an eligible same-team player directly to the
+        substitute pool (#114) — reuses enroll_substitute (the same method
+        the player-side self-enroll flow calls), after first running the
+        FULL eligibility gate substitute_block_reason already encodes (open
+        slot, published/non-draft, not-yet-started, roster lock, cancelled,
+        team membership, active, not already rostered). enroll_substitute
+        itself does not check open-slot/publish-state/past-game, because a
+        player only ever reaches it through their own pre-filtered
+        opportunity list — a coach picking an arbitrary roster member has no
+        such pre-filter, so this method supplies it instead of loosening
+        enroll_substitute (which would change the player-facing path too).
+
+        NOT @_transactional itself: enroll_substitute already is, and the
+        in-memory/SQL transaction() context managers are not reentrant
+        (matches copy_previous_roster's call to select_roster, above)."""
+        reason = self.substitute_block_reason(player_id, game_id)
+        if reason is not None:
+            raise NotEligibleError(reason)
+        return self.enroll_substitute(game_id, player_id, actor_id=actor_id)
+
     def _game_label(self, game) -> str:
         # A pure read helper — must NOT be @_transactional. It is called from
         # inside the transactional lock/unlock/cancel methods (via

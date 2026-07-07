@@ -603,6 +603,18 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_api(api.list_account_sessions(ms.group(1)))
         if path == "/api/officials":
             return self._send_api({"officials": api.get_officials()})
+        if path == "/api/players":
+            # League-wide player list for the Setup "Players" card (#114) —
+            # never bundled into /api/demo/overview: that endpoint is
+            # unauthenticated and this app's own convention is that no player
+            # name (a junior, in most divisions) is ever exposed without a
+            # session. Gated the same as creating one (MANAGE_SETUP).
+            if self._operator_only("/api/setup/player"):
+                return
+            from urllib.parse import parse_qs, urlparse
+            qs = parse_qs(urlparse(self.path).query)
+            team_id = (qs.get("team_id") or [None])[0]
+            return self._send_api(api.list_players(team_id))
         oav = re.match(r"^/api/officials/([^/]+)/availability$", path)
         if oav:
             # An official's declared availability windows (#88). Operator → any;
@@ -759,7 +771,7 @@ class Handler(BaseHTTPRequestHandler):
                     "message": "Session expired — please sign in again."}}, 401)
             return self._send_json({"user": user_view(sess, api.store)})
         # /api/games/{gid}/<sub>  — works for any game id, not just the seed.
-        m = re.match(r"^/api/games/([^/]+)(?:/(board|lineups|roster-status|roster|substitutes|substitute-candidates|officials|availability-summary))?$", path)
+        m = re.match(r"^/api/games/([^/]+)(?:/(board|lineups|roster-status|roster|substitutes|substitute-candidates|substitute-addable|officials|availability-summary))?$", path)
         if m:
             gid, sub = m.group(1), m.group(2)
             # The bare game record is a public fixture (teams / time / rink /
@@ -835,6 +847,25 @@ class Handler(BaseHTTPRequestHandler):
                         "message": "You can only view your own team's queue."}}, 403)
                 return self._send_api(
                     api.get_substitute_candidates(gid, team_id))
+            if sub == "substitute-addable":
+                # Eligible-but-not-yet-enrolled team players a coach could add
+                # as a substitute candidate (#114) — same manage_roster +
+                # own-team gate as substitute-candidates above.
+                from urllib.parse import parse_qs, urlparse
+                if not can(role, Permission.MANAGE_ROSTER):
+                    return self._send_json({"error": {
+                        "code": "forbidden",
+                        "message": "Only a coach or operator can view "
+                                   "addable substitutes."}}, 403)
+                qs = parse_qs(urlparse(self.path).query)
+                own_team = scope.get("team_id") or ""
+                team_id = (qs.get("team_id") or [own_team])[0] or None
+                if role == Role.COACH and own_team and team_id != own_team:
+                    return self._send_json({"error": {
+                        "code": "forbidden",
+                        "message": "You can only view your own team's roster."}}, 403)
+                return self._send_api(
+                    api.get_addable_substitutes(gid, team_id))
         if path.startswith("/api/"):
             return self._send_json({"error": {"code": "not_found",
                                               "message": "Unknown endpoint."}}, 404)
@@ -1242,6 +1273,13 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_api(api.enroll_substitute(gid, pid, actor))
             if action == "substitutes/withdraw":
                 return self._send_api(api.withdraw_substitute(gid, pid, actor))
+            if action == "substitutes/add-candidate":
+                # Coach/operator adds an arbitrary eligible team player
+                # directly to the substitute pool (#114) — same enroll, a
+                # different (coach-side) actor and permission than the
+                # player's own self-service substitutes/enroll above.
+                return self._send_api(
+                    api.add_substitute_candidate(gid, pid, actor))
             sub = re.match(r"^substitutes/([^/]+)/(offer|accept|decline|add-to-roster)$", action)
             if sub:
                 player_id, op = sub.group(1), sub.group(2)
@@ -1300,6 +1338,11 @@ class Handler(BaseHTTPRequestHandler):
         if entity == "official":
             return self._send_api(api.create_official(
                 b.get("name"), b.get("home_club_id"), actor))
+        if entity == "player":
+            return self._send_api(api.create_player(
+                b.get("team_id"), b.get("name"), b.get("position"),
+                jersey_number=b.get("jersey_number"), email=b.get("email"),
+                actor_id=actor))
         return self._send_json({"error": {"code": "not_found",
                                           "message": "Unknown setup entity."}}, 404)
 
