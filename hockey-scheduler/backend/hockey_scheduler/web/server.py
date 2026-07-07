@@ -493,10 +493,12 @@ class Handler(BaseHTTPRequestHandler):
             return {}
 
     def _serve_static(self, path: str) -> None:
-        if path in ("/", ""):
-            rel = "index.html"            # desktop web console
-        elif path in ("/mobile", "/mobile/"):
-            rel = "mobile.html"           # iPhone-framed preview
+        if path in ("/", "", "/mobile", "/mobile/"):
+            # index.html is the single responsive shell (#118) — it already
+            # covers phone-width viewports (login screen, full nav, no tab
+            # drift), so /mobile serves the same file rather than a second,
+            # divergent copy that goes stale and dead-ends when signed out.
+            rel = "index.html"
         else:
             rel = path.lstrip("/")
         target = (STATIC_DIR / rel).resolve()
