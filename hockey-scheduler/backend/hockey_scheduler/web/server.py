@@ -996,6 +996,21 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_api(api.delete_official_availability(
                 oavd.group(1), actor_id=actor_uid))
 
+        # Reschedule opponent response (#29): the opponent team's coach OR
+        # an operator (MANAGE_SCHEDULE — e.g. an Arena Manager, who holds no
+        # MANAGE_ROSTER) may respond. That's richer than the single coarse
+        # permission the generic authorize() gate checks, which would
+        # otherwise reject an Arena Manager before _reschedule_opponent_guard
+        # ever got a chance to allow the operator fallback it's designed to
+        # grant — guarded here instead, mirroring official availability above.
+        resp = re.match(r"^/api/games/[^/]+/reschedule/([^/]+)/respond$", path)
+        if resp:
+            if self._reschedule_opponent_guard(resp.group(1)):
+                return
+            _role, _scope, actor_uid, _err = self._resolve_role()
+            return self._send_api(api.respond_to_reschedule(
+                resp.group(1), bool(body.get("accept")), actor_uid))
+
         # Calendar feed tokens (#82): create / revoke. Custom access (operator
         # or own actor), guarded here rather than by the permission gate below.
         if path == "/api/calendar-feeds":
@@ -1345,16 +1360,14 @@ class Handler(BaseHTTPRequestHandler):
                 # guardian-link routes).
                 return self._send_api(api.request_reschedule(
                     gid, body.get("team_id"), body.get("reason", ""), user_id))
-            resched = re.match(r"^reschedule/([^/]+)/(respond|decide)$", action)
+            # reschedule/{id}/respond is handled earlier, before the coarse
+            # gate above (see the custom-guarded block near official
+            # availability) — MANAGE_SCHEDULE-only operators need to reach it
+            # too, which the single-permission check here can't express.
+            resched = re.match(r"^reschedule/([^/]+)/decide$", action)
             if resched:
-                request_id, op = resched.group(1), resched.group(2)
-                if op == "respond":
-                    if self._reschedule_opponent_guard(request_id):
-                        return
-                    return self._send_api(api.respond_to_reschedule(
-                        request_id, bool(body.get("accept")), user_id))
                 return self._send_api(api.decide_reschedule(
-                    request_id, bool(body.get("approve")),
+                    resched.group(1), bool(body.get("approve")),
                     new_ice_slot_id=body.get("new_ice_slot_id"),
                     note=body.get("note"), actor_id=user_id))
             if action == "substitutes/enroll":

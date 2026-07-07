@@ -402,6 +402,24 @@ class RescheduleHttpTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(body["status"], "pending_league_approval")
 
+    def test_arena_manager_can_also_respond_as_operator_fallback(self):
+        # Arena Manager holds MANAGE_SCHEDULE but NOT MANAGE_ROSTER — this
+        # would previously 403 before even reaching _reschedule_opponent_guard
+        # because the coarse per-path permission check only accepted
+        # MANAGE_ROSTER for this action. Caught in review.
+        admin = self._login("admin")
+        gid = self._fresh_published_game(admin)
+        home_team = srv.STATE.ids["home_team_id"]
+        coach = self._login("coach")
+        arena = self._login("arena")
+        _, req = self._post(coach, f"/api/games/{gid}/reschedule/request",
+                            {"team_id": home_team, "reason": "weather"})
+        status, body = self._post(
+            arena, f"/api/games/{gid}/reschedule/{req['id']}/respond",
+            {"accept": True})
+        self.assertEqual(status, 200)
+        self.assertEqual(body["status"], "pending_league_approval")
+
     def test_coach_cannot_decide(self):
         admin = self._login("admin")
         gid = self._fresh_published_game(admin)
