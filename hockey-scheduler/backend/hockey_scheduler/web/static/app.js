@@ -461,7 +461,7 @@ function slotLabel(s) {
   if (s.slot_type === "public_skate") return "Blocked · Public skate";
   if (s.slot_type === "practice") return "Blocked · Practice";
   if (s.slot_type === "tournament") return "Blocked · Tournament";
-  return s.status;
+  return esc(s.status);
 }
 
 function calContext(ov) {
@@ -500,15 +500,15 @@ function slotCard(s, draggable, ctx) {
   // dragging is suspended so the two interaction modes don't fight.
   const canMove = hasPerm("manage_schedule");   // #24: arena manager / admin
   const isTarget = moving && draggable && s.status === "available";
-  const dropClick = (draggable && s.status === "available" && canMove) ? `data-slot="${s.id}" data-drop="${s.id}"` : "";
-  const drag = (draggable && s.game_id && !moving && canMove) ? `draggable="true" data-game="${s.game_id}"` : "";
+  const dropClick = (draggable && s.status === "available" && canMove) ? `data-slot="${esc(s.id)}" data-drop="${esc(s.id)}"` : "";
+  const drag = (draggable && s.game_id && !moving && canMove) ? `draggable="true" data-game="${esc(s.game_id)}"` : "";
   // Draft/Published state comes from the schedule game, not the slot row.
   const g = (s.game_id && ctx) ? ctx.gameById[s.game_id] : null;
   const state = g ? (g.published ? " · Published" : " · Draft") : "";
   const isMovingThis = s.game_id && s.game_id === movingGameId;
   // A Move button gives touch/mobile/keyboard users a drag-free path (#move-mode).
   const moveBtn = (draggable && s.game_id && !moving && canMove)
-    ? `<button class="slot-move" data-move-game="${s.game_id}">Move</button>` : "";
+    ? `<button class="slot-move" data-move-game="${esc(s.game_id)}">Move</button>` : "";
   const extra = `${isTarget ? " move-target" : ""}${isMovingThis ? " moving" : ""}`;
   const cta = isTarget ? " · tap to move here" : (draggable && s.game_id && !moving && canMove ? " · drag or Move" : "");
   return `<div class="slot-card ${cls}${extra}" ${dropClick} ${drag}><div class="t">${fmt(s.start_time)}–${fmt(s.end_time)}</div><div class="s">${slotLabel(s)}${state}${cta}</div>${moveBtn}</div>`;
@@ -642,7 +642,7 @@ function renderDay(ov, ctx, rinks) {
     const cards = slots.map((s) => slotCard(s, true, ctx)).join("")
       || `<div class="slot-card"><div class="s">No ice</div></div>`;
     const addIce = canArena
-      ? `<div class="slot-card available" data-addslot="${r.id}"><div class="t">＋</div><div class="s">Add ice</div></div>` : "";
+      ? `<div class="slot-card available" data-addslot="${esc(r.id)}"><div class="t">＋</div><div class="s">Add ice</div></div>` : "";
     return `<div class="cal-row"><div class="cal-rink">${esc(r.name)}</div>
       <div class="cal-slots">${cards}${addIce}</div></div>`;
   }).join("");
@@ -656,7 +656,7 @@ function renderDay(ov, ctx, rinks) {
     return slot ? slotPasses(slot, ctx) : true;
   });
   const tray = drafts.length ? `<div class="tray"><span class="tray-label">Draft games</span>
-    ${drafts.map((g) => `<span class="chip-drag${g.game_id === movingGameId ? " moving" : ""}" ${moving ? "" : `draggable="true" data-game="${g.game_id}"`}>⠿ ${esc(g.home_team_name)} vs ${esc(g.away_team_name)} · ${fmt(g.start_time)}${moving ? "" : ` <button class="chip-move" data-move-game="${g.game_id}">Move</button>`}</span>`).join("")}</div>` : "";
+    ${drafts.map((g) => `<span class="chip-drag${g.game_id === movingGameId ? " moving" : ""}" ${moving ? "" : `draggable="true" data-game="${esc(g.game_id)}"`}>⠿ ${esc(g.home_team_name)} vs ${esc(g.away_team_name)} · ${fmt(g.start_time)}${moving ? "" : ` <button class="chip-move" data-move-game="${esc(g.game_id)}">Move</button>`}</span>`).join("")}</div>` : "";
   const body = rinks.length
     ? moveBanner(ov) + tray + rows
     : `<div class="empty">No rinks match the selected filters.</div>`;
@@ -759,8 +759,8 @@ function renderGames(ov) {
         ${ck(g.published, "Public fixture", g.published ? "Published" : "Draft — not public")}
       </div>
       <div class="actions">
-        <button class="act primary" data-openroster="${g.game_id}">Open Roster</button>
-        ${g.published ? "" : `<button class="act success" data-publish="${g.game_id}">Publish</button>`}
+        <button class="act primary" data-openroster="${esc(g.game_id)}">Open Roster</button>
+        ${g.published ? "" : `<button class="act success" data-publish="${esc(g.game_id)}">Publish</button>`}
       </div>`;
   }).join("") + toastHtml();
 }
@@ -947,15 +947,15 @@ function renderInbox(inbox) {
     const matchup = `${esc(a.home_team_name)} vs ${esc(a.away_team_name || "TBD")}`;
     const where = `${esc(fmtDateTime(a.start_time))}${a.rink ? " · " + esc(a.rink) : ""}${a.venue_name ? " · " + esc(a.venue_name) : ""}`;
     const actions = a.status === "proposed" && !a.cancelled
-      ? `<button class="act success" data-accept="${a.assignment_id}">Accept</button>
-         <button class="act danger" data-decline="${a.assignment_id}">Decline</button>` : "";
+      ? `<button class="act success" data-accept="${esc(a.assignment_id)}">Accept</button>
+         <button class="act danger" data-decline="${esc(a.assignment_id)}">Decline</button>` : "";
     const cancelled = a.cancelled ? `<span class="badge red">Game cancelled</span>` : "";
     return `<div class="inbox-card">
-      <div class="inbox-top"><span class="inbox-role">${roleLabel[a.role] || a.role}</span>${badge(a.status)}${cancelled}</div>
+      <div class="inbox-top"><span class="inbox-role">${roleLabel[a.role] || esc(a.role)}</span>${badge(a.status)}${cancelled}</div>
       <div class="inbox-match">${matchup}</div>
       <div class="inbox-where">${where}</div>
       <div class="inbox-actions">${actions}
-        <button class="act ghost" data-open-sheet="${a.game_id}">Open game sheet</button></div>
+        <button class="act ghost" data-open-sheet="${esc(a.game_id)}">Open game sheet</button></div>
     </div>`;
   }).join("");
   return `<div class="section-title">Your upcoming assignments (${rows.length})</div>
@@ -1331,8 +1331,8 @@ function renderNotifications() {
   }
   const cards = rows.map((n) => {
     const link = n.game_id
-      ? `<button class="act ghost" data-notif-open="${n.game_id}">Open game</button>` : "";
-    return `<div class="notif-card ${n.read ? "read" : "unread"}" data-notif-read="${n.id}">
+      ? `<button class="act ghost" data-notif-open="${esc(n.game_id)}">Open game</button>` : "";
+    return `<div class="notif-card ${n.read ? "read" : "unread"}" data-notif-read="${esc(n.id)}">
       <span class="notif-ico">${NOTIF_ICON[n.kind] || "🔔"}</span>
       <div class="notif-body"><div class="notif-title">${esc(n.title)}${n.read ? "" : ` <span class="notif-dot"></span>`}</div>
         <div class="notif-msg">${esc(n.message)}</div>
@@ -2033,9 +2033,9 @@ function officialsPanel(lineups) {
         const mine = myOfficialId && a.official_id === myOfficialId;
         return `<div class="gs-off-row${mine ? " mine" : ""}"><span class="gs-off-name">${esc(a.official_name)}${mine ? ` <span class="you-tag">you</span>` : ""}</span>${badge(a.status)}
           ${canRespondTo(a)
-            ? `<button class="act success" data-accept="${a.assignment_id}">Accept</button>
-               <button class="act danger" data-decline="${a.assignment_id}">Decline</button>` : ""}
-          ${canManage ? `<button class="act danger ghost xbtn" data-unassign="${a.assignment_id}" title="Unassign">✕</button>` : ""}</div>`;
+            ? `<button class="act success" data-accept="${esc(a.assignment_id)}">Accept</button>
+               <button class="act danger" data-decline="${esc(a.assignment_id)}">Decline</button>` : ""}
+          ${canManage ? `<button class="act danger ghost xbtn" data-unassign="${esc(a.assignment_id)}" title="Unassign">✕</button>` : ""}</div>`;
       }).join("")
       : `<div class="gs-off-slot">Unassigned</div>`;
     return `<div class="gs-off-role"><div class="gs-off-title">${label}</div>${body}</div>`;
@@ -2072,7 +2072,7 @@ function availableGroups(available, s, locked) {
     if (!list.length) return "";
     const need = open > 0 ? `<span class="need">need ${open}</span>` : `<span class="need ok">full</span>`;
     const rows = list.map((p) => playerRow(p,
-      `${posTag(p)}${locked ? "" : `<button class="act primary" data-act="select" data-id="${p.id}">Add</button>`}`)).join("");
+      `${posTag(p)}${locked ? "" : `<button class="act primary" data-act="select" data-id="${esc(p.id)}">Add</button>`}`)).join("");
     return `<div class="avail-group"><div class="avail-head">${label} ${need}</div>${rows}</div>`;
   };
   const body = available.length
@@ -2157,14 +2157,14 @@ function coachBody(board) {
     if (canEdit) {
       if (p.backed_out) {
         btns = p.roster_status === "removed"
-          ? `<button class="act success" data-act="select" data-id="${p.id}">Add back</button>`
-          : `<button class="act success" data-act="confirm" data-id="${p.id}">Re-confirm</button>`;
+          ? `<button class="act success" data-act="select" data-id="${esc(p.id)}">Add back</button>`
+          : `<button class="act success" data-act="confirm" data-id="${esc(p.id)}">Re-confirm</button>`;
       } else if (p.availability === "available") {
-        btns = `<button class="act danger" data-act="backout" data-id="${p.id}">Can't play</button>`;
+        btns = `<button class="act danger" data-act="backout" data-id="${esc(p.id)}">Can't play</button>`;
       } else {
-        btns = `<button class="act ghost" data-act="confirm" data-id="${p.id}">Confirm</button>`;
+        btns = `<button class="act ghost" data-act="confirm" data-id="${esc(p.id)}">Confirm</button>`;
       }
-      btns += `<button class="act danger ghost xbtn" data-act="remove" data-id="${p.id}" title="Remove from roster">✕</button>`;
+      btns += `<button class="act danger ghost xbtn" data-act="remove" data-id="${esc(p.id)}" title="Remove from roster">✕</button>`;
     }
     return playerRow(p, `${posTag(p)}${statusBadge(p)}${btns}`);
   }).join("") || `<div class="empty">No players on the roster yet — add from Available below.</div>`;
@@ -2176,7 +2176,7 @@ function coachBody(board) {
     <div class="card">${subs.length ? subs.map((p) => {
       const canAdd = canEdit && (p.slot_type === "goalie" ? s.open_goalie_slots > 0 : s.open_skater_slots > 0);
       const ctrl = SUB_STATUS_BADGE[p.sub_status] || SUB_STATUS_BADGE.enrolled;
-      const btn = !canEdit ? "" : canAdd ? `<button class="act primary" data-act="add" data-id="${p.id}">Add</button>`
+      const btn = !canEdit ? "" : canAdd ? `<button class="act primary" data-act="add" data-id="${esc(p.id)}">Add</button>`
         : `<button class="act ghost" disabled>No slot</button>`;
       return playerRow(p, `${posTag(p)}${ctrl}${btn}`);
     }).join("") : `<div class="empty">No substitutes enrolled.</div>`}</div>`;
@@ -2232,21 +2232,21 @@ function playerBody(board) {
   if (p) {
     if (p.group === "selected" && !p.backed_out)
       card = `<div class="banner ok"><h2>You are selected</h2><p>Status: confirmed</p></div>
-        ${acts(`<button class="act success" data-act="confirm" data-id="${p.id}">I'm Available</button>
-                <button class="act danger" data-act="backout" data-id="${p.id}">I Can't Play</button>`)}`;
+        ${acts(`<button class="act success" data-act="confirm" data-id="${esc(p.id)}">I'm Available</button>
+                <button class="act danger" data-act="backout" data-id="${esc(p.id)}">I Can't Play</button>`)}`;
     else if (p.group === "selected" && p.backed_out)
       card = `<div class="banner alert"><h2>You marked yourself unavailable</h2><p>Coach notified.</p></div>
-        ${acts(`<button class="act success" data-act="confirm" data-id="${p.id}">I'm Available again</button>`)}`;
+        ${acts(`<button class="act success" data-act="confirm" data-id="${esc(p.id)}">I'm Available again</button>`)}`;
     else if (p.group === "substitute" && p.sub_status === "offered")
       card = `<div class="banner warn"><h2>A slot is available</h2><p>Accept?</p></div>
-        ${acts(`<button class="act success" data-act="accept" data-id="${p.id}">Accept</button>
-                <button class="act danger" data-act="decline" data-id="${p.id}">Decline</button>`)}`;
+        ${acts(`<button class="act success" data-act="accept" data-id="${esc(p.id)}">Accept</button>
+                <button class="act danger" data-act="decline" data-id="${esc(p.id)}">Decline</button>`)}`;
     else if (p.group === "substitute")
       card = `<div class="banner neutral"><h2>Enrolled as substitute</h2><p>Waiting for a slot.</p></div>
-        ${acts(`<button class="act ghost" data-act="withdraw" data-id="${p.id}">Withdraw</button>`)}`;
+        ${acts(`<button class="act ghost" data-act="withdraw" data-id="${esc(p.id)}">Withdraw</button>`)}`;
     else
       card = `<div class="banner neutral"><h2>Not selected</h2><p>Not enrolled.</p></div>
-        ${acts(`<button class="act primary" data-act="enroll" data-id="${p.id}">Enroll as Substitute</button>`)}`;
+        ${acts(`<button class="act primary" data-act="enroll" data-id="${esc(p.id)}">Enroll as Substitute</button>`)}`;
   }
   const picker = boundHere
     ? `<div class="scope-note">Signed in as <strong>${esc((p && p.name) || currentUser.scope.player_name || "you")}</strong> — you can only respond for yourself.</div>`
@@ -3409,6 +3409,16 @@ function resetTransientUiState() {
   gCheckout = null; gOpp = null; gOppDetail = null;
   newFeedUrl = null;
   publicState.game = null;
+  publicTab = "schedule";
+  // Per-view filters/selections below aren't secrets, but carrying them into
+  // the next signed-in identity is stale at best (#118 Phase 2) and unsafe at
+  // worst: a coach's pre-checked draft-game selection surviving into a
+  // different operator's session could get published by a click the new
+  // operator never meant to make.
+  rosterSide = "home";
+  availFilter = "all";
+  usersSelected = null;
+  schedulerState.selected = new Set();
 }
 function setUser(user) {
   const prevId = currentUser ? currentUser.username : null;
