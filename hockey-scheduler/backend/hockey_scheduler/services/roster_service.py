@@ -467,6 +467,14 @@ class RosterService:
             message="A game slot is available. Accept?",
             subject_player_id=player_id,
         )
+        # Deliver to the offered player's feed + delivery queue (#112) so it
+        # drives their Player Home unread count and any push/email channel.
+        _push_notification(
+            self.store, self.clock,
+            NotificationKind.SUBSTITUTE_OFFERED, NotificationAudience.PLAYER,
+            "Substitute offer",
+            "A game slot is available — accept or decline it.",
+            audience_ref=player_id, game_id=game_id)
         return sub
 
     @_transactional
@@ -478,6 +486,11 @@ class RosterService:
         sub = self.store.substitute_for_player(game_id, player_id)
         if sub is None or sub.status != SubstituteStatus.OFFERED:
             raise InvalidTransitionError("No active offer to accept.")
+        # A game whose start has passed can't be joined — an offer with no
+        # expiry (offer_expires_at=None) would otherwise stay acceptable
+        # forever, letting a player onto a game that already happened (#112).
+        if game.start_time is not None and self.clock() > game.start_time:
+            raise InvalidTransitionError("This game is no longer upcoming.")
         # Offers can expire: a lapsed offer returns the player to the pool.
         if sub.offer_expires_at and self.clock() > sub.offer_expires_at:
             sub.status = SubstituteStatus.EXPIRED
@@ -502,6 +515,13 @@ class RosterService:
             message="Substitute accepted and was added to roster.",
             subject_player_id=player_id,
         )
+        # Notify the team's coach via the feed + delivery queue (#112).
+        _push_notification(
+            self.store, self.clock,
+            NotificationKind.SUBSTITUTE_ACCEPTED, NotificationAudience.COACH,
+            "Substitute accepted",
+            "A substitute accepted the open slot and joined the roster.",
+            audience_ref=self._player_team(player_id), game_id=game_id)
         return entry
 
     @_transactional
@@ -522,6 +542,14 @@ class RosterService:
             actor_id=actor_id,
             subject_player_id=player_id,
         )
+        # Notify the team's coach so they can advance to the next candidate
+        # (#112) — the pre-#112 decline path emitted no notification at all.
+        _push_notification(
+            self.store, self.clock,
+            NotificationKind.SUBSTITUTE_DECLINED, NotificationAudience.COACH,
+            "Substitute declined",
+            "A substitute declined the offer — you can offer the next candidate.",
+            audience_ref=self._player_team(player_id), game_id=game_id)
         return sub
 
     @_transactional
@@ -766,6 +794,90 @@ class RosterService:
                 opportunities.append(g)
         opportunities.sort(key=lambda g: g.start_time)
         return opportunities
+
+    def substitute_offer_block_reason(self, player_id: str, game_id: str,
+                                      enrollment, rstatus=None) -> Optional[str]:
+        """Why an OFFERED player cannot ACCEPT the offer right now, or None if
+        they can (#112). Builds on substitute_block_reason (which already covers
+        cancelled / unpublished / past / locked / no-open-slot for the player's
+        position — the same guards accept_substitute enforces) and adds the
+        offer-specific expiry check, so the detail view's pre-disable logic
+        can't drift from what accept_substitute actually permits."""
+        base = self.substitute_block_reason(player_id, game_id, rstatus)
+        if base is not None:
+            return base
+        if (enrollment.offer_expires_at is not None
+                and self.clock() > enrollment.offer_expires_at):
+            return "This offer has expired."
+        return None
+
+    def list_player_offers(self, player_id: str) -> List[Game]:
+        """Games where this player currently has an OFFERED substitute slot —
+        a coach has offered them the spot and they must accept/decline (#112).
+        Distinct from list_substitute_opportunities (which is the self-enrol
+        pool and excludes already-offered games). Applies the same visible +
+        upcoming filter so a stale offer on a past/unpublished/cancelled game
+        never clutters Player Home. A pure read helper — must NOT be
+        @_transactional."""
+        player = self.store.get_player(player_id)
+        if player is None or not player.is_active:
+            return []
+        now = self.clock()
+        offers = []
+        for g in self.store.all_games():
+            if not self._is_visible_team_game(g, player.team_id) or g.start_time < now:
+                continue
+            sub = self.store.substitute_for_player(g.id, player_id)
+            if sub is not None and sub.status == SubstituteStatus.OFFERED:
+                offers.append(g)
+        offers.sort(key=lambda g: g.start_time)
+        return offers
+
+    # Order substitutes for the coach outreach queue (#112): an enrolled sub
+    # the coach can offer right now ranks ahead of one already offered, ahead
+    # of terminal states (accepted/declined/…). Within a tier, an explicit
+    # priority_rank wins, then name/id for a stable deterministic sort. This is
+    # the deliberately-simple V1 ordering — no fairness/travel/skill scoring.
+    _CANDIDATE_TIER = {"enrolled": 0, "offered": 1}
+
+    def list_substitute_candidates(self, game_id: str,
+                                   team_id: Optional[str] = None,
+                                   rstatus=None) -> List[dict]:
+        """The substitute outreach queue for a game/team (#112): each enrolled
+        (and offered/terminal) substitute with whether the coach can offer them
+        a slot right now, ordered enrolled-first. ``rstatus`` may be a
+        pre-computed RosterStatus for this game/team so a caller that already
+        has one avoids a second compute_roster_status pass. A pure read helper
+        — must NOT be @_transactional. Returns plain dicts."""
+        game = self._require_game(game_id)
+        team_id = team_id or game.home_team_id
+        if rstatus is None:
+            rstatus = self.compute_roster_status(game_id, team_id)
+        open_for = {
+            SlotType.GOALIE: rstatus.open_goalie_slots,
+            SlotType.SKATER: rstatus.open_skater_slots,
+        }
+        rows = []
+        for sub in self.store.substitutes_for_game(game_id):
+            player = self.store.get_player(sub.player_id)
+            if player is None or player.team_id != team_id:
+                continue
+            can_offer = (sub.status == SubstituteStatus.ENROLLED
+                         and not game.locked and not game.cancelled
+                         and open_for.get(sub.slot_type, 0) > 0)
+            rows.append({
+                "player_id": sub.player_id, "name": player.name,
+                "position": player.position.value,
+                "slot_type": sub.slot_type.value,
+                "status": sub.status.value,
+                "priority_rank": sub.priority_rank,
+                "can_offer": can_offer,
+            })
+        rows.sort(key=lambda r: (
+            self._CANDIDATE_TIER.get(r["status"], 2),
+            r["priority_rank"] if r["priority_rank"] is not None else float("inf"),
+            r["name"], r["player_id"]))
+        return rows
 
     def _game_label(self, game) -> str:
         # A pure read helper — must NOT be @_transactional. It is called from

@@ -35,6 +35,7 @@ let schedulerState = {
 };  // (#86)
 let officialAvailability = [];      // signed-in official's windows (#88)
 let availSummary = null;            // roster availability rollup (#89)
+let subCandidates = null;           // coach substitute outreach queue (#112)
 let availFilter = "all";            // all|available|unavailable|maybe|no_response
 let contactForm = { recipient_ref: "", channel: "email", destination: "", label: "" };
 let tokenForm = { recipient_ref: "", provider: "fcm", token: "", label: "" };
@@ -1007,15 +1008,25 @@ function renderOppDetail(detail) {
       <div class="li-sub">${esc(k)}</div><div class="li-title">${esc(v)}</div></div></div>`).join("")
     + `<div class="li"><div class="li-main"><div class="li-sub">Team status</div></div>
         ${phBadge(PH_TEAM_STATUS, detail.team_status)}</div>`;
-  let actions;
-  if (detail.can_withdraw) {
+  const offered = detail.enrollment_status === "offered";
+  let note = "", actions = "";
+  if (offered) {
+    // A coach has offered this player the slot (#112) — respond to the offer.
+    const btns = [];
+    if (detail.can_accept_offer) btns.push(`<button class="act success" data-opp-accept-offer="${esc(detail.game_id)}">Accept Offer</button>`);
+    if (detail.can_decline_offer) btns.push(`<button class="act danger" data-opp-decline-offer="${esc(detail.game_id)}">Decline Offer</button>`);
+    actions = btns.join("");
+    if (detail.blocked_reason)
+      note = `<div class="banner ${btns.length ? "warn" : "neutral"}"><p>${esc(detail.blocked_reason)}</p></div>`;
+  } else if (detail.can_withdraw) {
     actions = `<button class="act danger" data-opp-withdraw="${esc(detail.game_id)}">Withdraw</button>`;
   } else if (detail.can_accept) {
     actions = `<button class="act primary" data-opp-accept="${esc(detail.game_id)}">Accept — Enroll as Sub</button>`;
   } else {
-    actions = `<div class="banner neutral"><p>${esc(detail.blocked_reason || "You can't respond to this opportunity right now.")}</p></div>`;
+    note = `<div class="banner neutral"><p>${esc(detail.blocked_reason || "You can't respond to this opportunity right now.")}</p></div>`;
   }
-  return `<div class="section-title" style="margin-top:0">Substitute Opportunity</div>
+  return `<div class="section-title" style="margin-top:0">${offered ? "Substitute Offer" : "Substitute Opportunity"}</div>
+    ${note}
     <div class="card">${rows}</div>
     <div class="actions">${actions}
       <button class="act ghost" data-opp-back>Back to Home</button>
@@ -1069,15 +1080,24 @@ function renderPlayerHome(playerHome) {
         <button class="act ghost" data-open-roster="${esc(ng.game_id)}">View Roster</button>
       </div>`;
   }
-  const opps = playerHome.substitute_opportunities || [];
-  const shown = opps.slice(0, 3);  // up to 3 on Home (#107 §17)
-  const oppRows = shown.map((o) => `<div class="li">
+  // A row for a substitute opportunity/offer, with its call-to-action button.
+  const subRow = (o, label) => `<div class="li">
       <span class="li-time">${fmt(o.start_time)}</span>
       <div class="li-main"><div class="li-title">${esc(o.team_name)} vs ${esc(o.opponent_name || "TBD")}</div>
         <div class="li-sub">${esc(fmtDateTime(o.start_time))}
           ${o.rink_name ? " · " + esc(o.rink_name) : ""} · needs ${esc(o.position_needed)}</div></div>
-      <button class="act primary" data-ph-view-opp="${esc(o.game_id)}">View Opportunity</button>
-    </div>`).join("")
+      <button class="act primary" data-ph-view-opp="${esc(o.game_id)}">${label}</button>
+    </div>`;
+  // Slots a coach has OFFERED this player (#112) — surfaced first, since they
+  // are time-sensitive and need an explicit accept/decline.
+  const offers = playerHome.substitute_offers || [];
+  const offersCard = offers.length ? `<div class="card">
+      <div class="section-title" style="margin-top:0">Substitute Offers (${offers.length})</div>
+      ${offers.map((o) => subRow(o, "View Offer")).join("")}
+    </div>` : "";
+  const opps = playerHome.substitute_opportunities || [];
+  const shown = opps.slice(0, 3);  // up to 3 on Home (#107 §17)
+  const oppRows = shown.map((o) => subRow(o, "View Opportunity")).join("")
     + (opps.length > 3 ? `<div class="li"><div class="li-main">
         <div class="li-sub">+ ${opps.length - 3} more opportunity(ies)</div></div></div>` : "");
   return `${welcome}${summary}
@@ -1085,6 +1105,7 @@ function renderPlayerHome(playerHome) {
       <div class="section-title" style="margin-top:0">Next Game</div>
       ${nextGameBlock}
     </div>
+    ${offersCard}
     <div class="card">
       <div class="section-title" style="margin-top:0">Substitute Opportunities (${opps.length})</div>
       ${oppRows || '<div class="empty">No open opportunities right now.</div>'}
@@ -1933,6 +1954,38 @@ function availableGroups(available, s, locked) {
     <div class="card">${body}</div>`;
 }
 
+// Coach substitute outreach queue (#112): the ordered candidate list from
+// /api/games/{gid}/substitute-candidates, with a Send Offer for each enrolled
+// candidate that fits an open slot (offer → the player accepts/declines), plus
+// the existing Add-now coach override. Falls back to nothing until loaded.
+const SUB_STATUS_BADGE = {
+  enrolled: '<span class="badge blue">Enrolled</span>',
+  offered: '<span class="badge orange">Offered</span>',
+  accepted: '<span class="badge green">Accepted</span>',
+  declined: '<span class="badge gray">Declined</span>',
+};
+function outreachPanel(canEdit) {
+  const q = subCandidates;
+  const slotLine = `${q.open_goalie_slots} goalie · ${q.open_skater_slots} skater slot${q.open_skater_slots === 1 ? "" : "s"} open`;
+  const rows = (q.candidates || []).map((c) => {
+    const badge = SUB_STATUS_BADGE[c.status] || `<span class="badge gray">${esc(c.status)}</span>`;
+    // A slot fits this candidate's position and the game is still mutable, so
+    // the coach's "Add now" override (#4 coach-override-always-wins) applies to
+    // enrolled AND already-offered candidates.
+    const canAddNow = canEdit && !q.locked && !q.cancelled
+      && (c.slot_type === "goalie" ? q.open_goalie_slots > 0 : q.open_skater_slots > 0);
+    const addBtn = canAddNow ? `<button class="act ghost" data-act="add" data-id="${esc(c.player_id)}">Add now</button>` : "";
+    let btn = "";
+    if (canEdit && c.status === "offered") btn = `<span class="li-sub">Awaiting response</span>${addBtn}`;
+    else if (c.can_offer) btn = `<button class="act primary" data-act="offer" data-id="${esc(c.player_id)}">Send Offer</button>${addBtn}`;
+    return `<div class="li"><div class="li-main">
+        <div class="li-title">${esc(c.name)}</div>
+        <div class="li-sub">${esc(c.position)}</div></div>${badge}${btn}</div>`;
+  }).join("") || `<div class="empty">No substitutes enrolled yet.</div>`;
+  return `<div class="section-title">Substitute Outreach</div>
+    <div class="li-sub" style="padding:0 4px 8px">${slotLine}</div>
+    <div class="card">${rows}</div>`;
+}
 function coachBody(board) {
   const s = board.status;
   const locked = s.status === "locked";
@@ -1988,13 +2041,17 @@ function coachBody(board) {
     return playerRow(p, `${posTag(p)}${statusBadge(p)}${btns}`);
   }).join("") || `<div class="empty">No players on the roster yet — add from Available below.</div>`;
 
-  const subRows = subs.length ? subs.map((p) => {
-    const canAdd = canEdit && (p.slot_type === "goalie" ? s.open_goalie_slots > 0 : s.open_skater_slots > 0);
-    const ctrl = p.sub_status === "offered" ? '<span class="badge orange">Offered</span>' : '<span class="badge blue">Enrolled</span>';
-    const btn = !canEdit ? "" : canAdd ? `<button class="act primary" data-act="add" data-id="${p.id}">Add</button>`
-      : `<button class="act ghost" disabled>No slot</button>`;
-    return playerRow(p, `${posTag(p)}${ctrl}${btn}`);
-  }).join("") : `<div class="empty">No substitutes enrolled.</div>`;
+  // Fallback substitute pool for when the outreach queue hasn't loaded (a
+  // non-operator viewer, or a candidate-fetch failure) — built lazily so it is
+  // not computed on the common coach path where outreachPanel replaces it.
+  const subPoolCard = () => `<div class="section-title">Substitute pool</div>
+    <div class="card">${subs.length ? subs.map((p) => {
+      const canAdd = canEdit && (p.slot_type === "goalie" ? s.open_goalie_slots > 0 : s.open_skater_slots > 0);
+      const ctrl = SUB_STATUS_BADGE[p.sub_status] || SUB_STATUS_BADGE.enrolled;
+      const btn = !canEdit ? "" : canAdd ? `<button class="act primary" data-act="add" data-id="${p.id}">Add</button>`
+        : `<button class="act ghost" disabled>No slot</button>`;
+      return playerRow(p, `${posTag(p)}${ctrl}${btn}`);
+    }).join("") : `<div class="empty">No substitutes enrolled.</div>`}</div>`;
 
   // Footer: lock control for roster managers, else a read-only note by role/scope.
   let footer;
@@ -2023,8 +2080,7 @@ function coachBody(board) {
     <div class="section-title">Roster (${onRoster.length}/${total})</div>
     <div class="card">${rosterRows}</div>
     ${availableGroups(available, s, !canEdit)}
-    <div class="section-title">Substitute pool</div>
-    <div class="card">${subRows}</div>
+    ${subCandidates ? outreachPanel(canEdit) : subPoolCard()}
     ${footer}
     ${toastHtml()}`;
 }
@@ -2267,6 +2323,7 @@ async function rosterAction(act, id) {
   else if (act === "enroll") await post(`${B}/substitutes/enroll`, { player_id: id });
   else if (act === "withdraw") await post(`${B}/substitutes/withdraw`, { player_id: id });
   else if (act === "add") await post(`${B}/substitutes/${id}/add-to-roster`, {});
+  else if (act === "offer") { const r = await post(`${B}/substitutes/${id}/offer`, {}); if (r && !r.error) toast = "Offer sent to the substitute."; }
   else if (act === "accept") await post(`${B}/substitutes/${id}/accept`, {});
   else if (act === "decline") await post(`${B}/substitutes/${id}/decline`, {});
   else if (act === "lock") await post(`${B}/roster/lock`, {});
@@ -2314,6 +2371,15 @@ async function render() {
       const s = await getJSON(
         `/api/games/${currentGame}/availability-summary?team_id=${tid}`);
       if (s && !s.error) availSummary = s;
+    }
+    // Coach substitute outreach queue for the shown side (#112), operator-only.
+    subCandidates = null;
+    if (view === "roster" && gameView === "coach" && hasPerm("manage_roster")
+        && lineups && lineups[rosterSide] && !lineups.error) {
+      const tid = lineups[rosterSide].team_id;
+      const q = await getJSON(
+        `/api/games/${currentGame}/substitute-candidates?team_id=${tid}`);
+      if (q && !q.error) subCandidates = q;
     }
     // The game sheet also needs the officials pool for its assign control (#30).
     if (view === "sheet") {
@@ -2630,20 +2696,23 @@ async function render() {
   });
   const oppBack = c.querySelector("[data-opp-back]");
   if (oppBack) oppBack.onclick = () => { oppDetailGame = null; oppDetail = null; render(); };
-  const oppAccept = c.querySelector("[data-opp-accept]");
-  if (oppAccept) oppAccept.onclick = async () => {
-    toast = "";
-    const r = await post(`/api/me/substitute-opportunities/${encodeURIComponent(oppAccept.dataset.oppAccept)}/enroll`, {});
-    if (r && !r.error) { toast = "You're enrolled as a substitute."; oppDetailGame = null; oppDetail = null; }
-    await render();
+  // The four player opportunity actions all POST to the same scoped route
+  // family, toast on success, close the detail, and re-render (#110/#112).
+  const oppAction = (attr, verb, okMsg) => {
+    const btn = c.querySelector(`[${attr}]`);
+    if (!btn) return;
+    const gid = btn.getAttribute(attr);
+    btn.onclick = async () => {
+      toast = "";
+      const r = await post(`/api/me/substitute-opportunities/${encodeURIComponent(gid)}/${verb}`, {});
+      if (r && !r.error) { toast = okMsg; oppDetailGame = null; oppDetail = null; }
+      await render();
+    };
   };
-  const oppWithdraw = c.querySelector("[data-opp-withdraw]");
-  if (oppWithdraw) oppWithdraw.onclick = async () => {
-    toast = "";
-    const r = await post(`/api/me/substitute-opportunities/${encodeURIComponent(oppWithdraw.dataset.oppWithdraw)}/withdraw`, {});
-    if (r && !r.error) { toast = "You've withdrawn from this opportunity."; oppDetailGame = null; oppDetail = null; }
-    await render();
-  };
+  oppAction("data-opp-accept", "enroll", "You're enrolled as a substitute.");
+  oppAction("data-opp-withdraw", "withdraw", "You've withdrawn from this opportunity.");
+  oppAction("data-opp-accept-offer", "accept-offer", "Offer accepted — you're on the roster.");
+  oppAction("data-opp-decline-offer", "decline-offer", "Offer declined.");
   // Notifications (#32): mark read on tap, open the related game, mark all.
   c.querySelectorAll("[data-notif-open]").forEach((b) => b.onclick = async (e) => {
     e.stopPropagation();

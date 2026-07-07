@@ -627,7 +627,8 @@ class Handler(BaseHTTPRequestHandler):
             # binding -> empty; a bound player -> their home data.
             sid = self._cookie(SESSION_COOKIE)
             empty = {"player_id": None, "next_game": None, "today_count": 0,
-                     "substitute_opportunities": [], "unread_notifications": 0}
+                     "substitute_offers": [], "substitute_opportunities": [],
+                     "unread_notifications": 0}
             if sid is None:
                 return self._send_json(empty)
             sess = SESSIONS.resolve(api.store, sid)
@@ -683,7 +684,7 @@ class Handler(BaseHTTPRequestHandler):
                     "message": "Session expired — please sign in again."}}, 401)
             return self._send_json({"user": user_view(sess, api.store)})
         # /api/games/{gid}/<sub>  — works for any game id, not just the seed.
-        m = re.match(r"^/api/games/([^/]+)(?:/(board|lineups|roster-status|roster|substitutes|officials|availability-summary))?$", path)
+        m = re.match(r"^/api/games/([^/]+)(?:/(board|lineups|roster-status|roster|substitutes|substitute-candidates|officials|availability-summary))?$", path)
         if m:
             gid, sub = m.group(1), m.group(2)
             # The bare game record is a public fixture (teams / time / rink /
@@ -739,6 +740,26 @@ class Handler(BaseHTTPRequestHandler):
                                    "availability."}}, 403)
                 return self._send_api(
                     api.get_availability_summary(gid, team_id))
+            if sub == "substitute-candidates":
+                # Coach outreach queue (#112): manage_roster only — a player
+                # must not see the operator candidate list even for their own
+                # game. A coach is further bound to their own team; operators
+                # (league admin / arena manager) may read any team's queue.
+                from urllib.parse import parse_qs, urlparse
+                if not can(role, Permission.MANAGE_ROSTER):
+                    return self._send_json({"error": {
+                        "code": "forbidden",
+                        "message": "Only a coach or operator can view the "
+                                   "substitute outreach queue."}}, 403)
+                qs = parse_qs(urlparse(self.path).query)
+                own_team = scope.get("team_id") or ""
+                team_id = (qs.get("team_id") or [own_team])[0] or None
+                if role == Role.COACH and own_team and team_id != own_team:
+                    return self._send_json({"error": {
+                        "code": "forbidden",
+                        "message": "You can only view your own team's queue."}}, 403)
+                return self._send_api(
+                    api.get_substitute_candidates(gid, team_id))
         if path.startswith("/api/"):
             return self._send_json({"error": {"code": "not_found",
                                               "message": "Unknown endpoint."}}, 404)
@@ -846,17 +867,27 @@ class Handler(BaseHTTPRequestHandler):
         # accept/decline free for the distinct coach-OFFER transition the rest
         # of the codebase already means by those words. No parallel workflow.
         mso = re.match(
-            r"^/api/me/substitute-opportunities/([^/]+)/(enroll|withdraw)$", path)
+            r"^/api/me/substitute-opportunities/([^/]+)/"
+            r"(enroll|withdraw|accept-offer|decline-offer)$", path)
         if mso:
             ppid, uid, err = self._require_player_scope()
             if err is not None:
                 return self._send_json(err[1], err[0])
             gid, action = mso.group(1), mso.group(2)
+            # enroll/withdraw = the #110 self-service pool; accept-offer/
+            # decline-offer = responding to a coach OFFER (#112). All four are
+            # the same audited services, player identity from the session.
             if action == "enroll":
                 return self._send_api(
                     api.enroll_substitute(gid, ppid, actor_id=uid))
+            if action == "withdraw":
+                return self._send_api(
+                    api.withdraw_substitute(gid, ppid, actor_id=uid))
+            if action == "accept-offer":
+                return self._send_api(
+                    api.accept_substitute(gid, ppid, actor_id=uid))
             return self._send_api(
-                api.withdraw_substitute(gid, ppid, actor_id=uid))
+                api.decline_substitute(gid, ppid, actor_id=uid))
 
         # Authorize the acting role at the HTTP boundary (#24/#50). A session
         # cookie is authoritative; the X-Demo-Role header is a dev fallback.
