@@ -320,19 +320,28 @@ class Session:
 
 @dataclass
 class GuardianLink:
-    """A guardian ↔ junior-player authorization link (#26).
+    """A guardian ↔ junior-player authorization link (#26/#35).
 
     Binds a guardian's login (``guardian_user_id``) to a junior ``player_id``
     they may act for. ``verified`` gates real authority: an unverified link
     grants nothing (a guardian may only respond for a junior once the link is
     verified). No guardian contact/PII lives here — only the two opaque ids —
     so this record can never leak personal data into an operator view.
+
+    ``consent_method``/``consented_at`` are the GDPR Art. 8 consent record
+    (#35): how an operator obtained/confirmed guardian authorization (e.g.
+    "signed_form", "verbal_confirmed", "email_reply") and when. They are
+    optional at the model level — internal/seed callers may still flip
+    ``verified`` without them — but the operator-facing HTTP verify route
+    requires a real ``consent_method`` on every verification it performs.
     """
     id: str
     guardian_user_id: str
     player_id: str
     created_at: datetime
     verified: bool = False
+    consent_method: Optional[str] = None
+    consented_at: Optional[datetime] = None
 
 
 @dataclass

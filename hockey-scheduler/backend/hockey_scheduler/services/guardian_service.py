@@ -15,7 +15,7 @@ verified flag — so nothing here can leak personal data into an operator view.
 from datetime import datetime, timezone
 from typing import Callable, List, Optional
 
-from ..domain import GuardianLink, SetupAuditLog
+from ..domain import GuardianLink, Role, SetupAuditLog
 from ..domain.errors import NotFoundError, ValidationError
 from ..store import InMemoryStore
 
@@ -41,9 +41,19 @@ class GuardianService:
                       link_id: Optional[str] = None) -> GuardianLink:
         """Create (or return the existing) guardian↔junior link. New links are
         unverified by default — verification is a separate, deliberate step.
-        ``link_id``/``verified`` are for deterministic demo seeding only."""
+        ``link_id``/``verified`` are for deterministic demo seeding only.
+
+        ``guardian_user_id`` must reference an existing account with the
+        GUARDIAN role (#35) — before this, nothing stopped an arbitrary
+        opaque string from being recorded as a "guardian," which was safe
+        only because this method had no HTTP-reachable caller yet."""
         if not guardian_user_id or not player_id:
             raise ValidationError("A guardian and a player are required.")
+        account = self.store.get_user_account(guardian_user_id)
+        if account is None or account.role != Role.GUARDIAN:
+            raise ValidationError(
+                "guardian_user_id must be an existing account with the "
+                "guardian role.")
         if self.store.get_player(player_id) is None:
             raise NotFoundError("Player not found.")
         existing = self.store.guardian_link_for(guardian_user_id, player_id)
@@ -59,16 +69,27 @@ class GuardianService:
                             "player_id": player_id, "verified": bool(verified)})
         return link
 
-    def verify_link(self, link_id: str,
-                    actor_id: Optional[str] = None) -> GuardianLink:
+    def verify_link(self, link_id: str, actor_id: Optional[str] = None,
+                    consent_method: Optional[str] = None) -> GuardianLink:
+        """Grant authority. ``consent_method`` is the GDPR Art. 8 consent
+        record (#35) — how the operator obtained/confirmed authorization
+        (e.g. "signed_form", "verbal_confirmed", "email_reply"). Optional
+        here (internal/seed callers may flip ``verified`` without one), but
+        the operator-facing HTTP route requires it on every real
+        verification — see ``ApiService.verify_guardian_link``."""
         link = self.store.get_guardian_link(link_id)
         if link is None:
             raise NotFoundError("Guardian link not found.")
         link.verified = True
+        detail = {"guardian_user_id": link.guardian_user_id,
+                  "player_id": link.player_id}
+        if consent_method:
+            link.consent_method = consent_method
+            link.consented_at = self.clock()
+            detail["consent_method"] = consent_method
         self.store.save_guardian_link(link)
         self._audit("guardian_link_verified", link.id, actor_id=actor_id,
-                    detail={"guardian_user_id": link.guardian_user_id,
-                            "player_id": link.player_id})
+                    detail=detail)
         return link
 
     # -- read helpers the routes gate on -----------------------------------
@@ -82,3 +103,7 @@ class GuardianService:
         authority check every guardian action must pass."""
         link = self.store.guardian_link_for(guardian_user_id, player_id)
         return link is not None and link.verified
+
+    def all_links(self) -> List[GuardianLink]:
+        """Every guardian link, for the operator-facing admin list (#35)."""
+        return self.store.all_guardian_links()

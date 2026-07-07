@@ -601,6 +601,13 @@ class Handler(BaseHTTPRequestHandler):
             if self._operator_only(path):
                 return
             return self._send_api(api.list_account_sessions(ms.group(1)))
+        if path == "/api/guardians/links":
+            # Every guardian↔junior link, for the Users tab's admin surface
+            # (#35). Same operator guard as account listing — this is
+            # identity administration, not guardian-scoped self-service.
+            if self._operator_only("/api/accounts"):
+                return
+            return self._send_api(api.list_guardian_links())
         if path == "/api/officials":
             return self._send_api({"officials": api.get_officials()})
         if path == "/api/players":
@@ -1214,6 +1221,20 @@ class Handler(BaseHTTPRequestHandler):
             # acting identity must come from the server-verified session.
             return self._send_api(api.revoke_account_session(
                 rv.group(1), rv.group(2), actor_id=user_id))
+
+        # Guardian↔junior links: operator creates/verifies (#35). actor_id is
+        # the signed-in admin's own user_id from the resolved session, NOT the
+        # client-suppliable body actor_id — verification is a consent record,
+        # so the acting identity must come from the server-verified session
+        # (same reasoning as revoke_account_session above).
+        if path == "/api/guardians/links":
+            return self._send_api(api.create_guardian_link(
+                body.get("guardian_user_id"), body.get("player_id"),
+                actor_id=user_id))
+        glv = re.match(r"^/api/guardians/links/([^/]+)/verify$", path)
+        if glv:
+            return self._send_api(api.verify_guardian_link(
+                glv.group(1), body.get("consent_method"), actor_id=user_id))
 
         # Notifications feed: mark read / read-all (#32).
         if path == "/api/notifications/read-all":
