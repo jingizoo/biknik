@@ -477,15 +477,34 @@ class SetupService:
     @_transactional
     def add_player(self, team_id: str, name: str, position: Position,
                    jersey_number: Optional[int] = None,
+                   email: Optional[str] = None,
+                   is_active: bool = True,
                    actor_id: Optional[str] = None) -> Player:
+        """Manually create one Player (#114) — the same model/store the CSV
+        import path writes, so a league admin isn't forced through Import for
+        a single new arrival. Validation mirrors import_validator's row
+        checks (jersey_number > 0, an ``@`` with a ``.`` after it in email)
+        so a manual create can't slip in data the bulk path would reject."""
         if self.store.get_team(team_id) is None:
             raise NotFoundError(f"Team {team_id} not found.")
+        if jersey_number is not None and jersey_number <= 0:
+            raise ValidationError("jersey_number must be a positive number.")
+        if email:
+            at = email.find("@")
+            if at <= 0 or "." not in email[at + 1:]:
+                raise ValidationError(f"Invalid email {email}.")
         player = Player(id=self.store.next_id("player"), team_id=team_id,
                         name=self._require_name(name), position=position,
-                        jersey_number=jersey_number)
+                        jersey_number=jersey_number, is_active=is_active)
         self.store.add_player(player)
         self._audit("player_added", "player", player.id, actor_id,
                     {"team_id": team_id})
+        if email:
+            self.store.add_contact_destination(ContactDestination(
+                id=self.store.next_id("contact"),
+                recipient_ref=f"player:{player.id}",
+                channel=NotificationChannel.EMAIL,
+                destination=email))
         return player
 
     # -- CSV import commit (#93) --------------------------------------------

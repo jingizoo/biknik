@@ -1287,6 +1287,32 @@ class ApiService:
         }
 
     @catch
+    def get_addable_substitutes(self, game_id: str,
+                                team_id: Optional[str] = None) -> dict:
+        """Active same-team players a coach could add as a substitute
+        candidate right now (#114) — the roster the outreach queue's own
+        Enroll doesn't cover, since enroll_substitute only ever runs from the
+        player's own self-service action. Operator-facing — gated at the
+        route the same way get_substitute_candidates is."""
+        game = self.store.get_game(game_id)
+        if game is None:
+            raise NotFoundError("Game not found.")
+        team_id = team_id or game.home_team_id
+        rstatus = self.roster.compute_roster_status(game_id, team_id)
+        return {
+            "game_id": game_id, "team_id": team_id,
+            "locked": game.locked, "cancelled": game.cancelled,
+            "addable": self.roster.list_addable_players(
+                game_id, team_id, rstatus),
+        }
+
+    @catch
+    def add_substitute_candidate(self, game_id: str, player_id: str,
+                                 actor_id: Optional[str] = None) -> dict:
+        return _serialize(self.roster.add_substitute_candidate(
+            game_id, player_id, actor_id))
+
+    @catch
     def assign_official(self, game_id: str, official_id: str, role: str,
                         actor_id: Optional[str] = None,
                         override_unavailable: bool = False) -> dict:
@@ -1917,10 +1943,19 @@ class ApiService:
     @catch
     def create_player(self, team_id: str, name: str, position: str,
                       jersey_number: Optional[int] = None,
+                      email: Optional[str] = None,
+                      is_active: bool = True,
                       actor_id: Optional[str] = None) -> dict:
         return _serialize(self.setup.add_player(
             team_id, name, _parse_enum(Position, position, "position"),
-            jersey_number, actor_id))
+            jersey_number=jersey_number, email=email, is_active=is_active,
+            actor_id=actor_id))
+
+    @catch
+    def list_players(self, team_id: Optional[str] = None) -> List[dict]:
+        players = (self.store.players_for_team(team_id) if team_id
+                  else self.store.all_players())
+        return [_serialize(p) for p in players]
 
     @catch
     def create_game(self, season_id: str, division_id: str, home_team_id: str,

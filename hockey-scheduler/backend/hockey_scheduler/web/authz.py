@@ -12,13 +12,13 @@ from ..domain import Permission, can
 
 # League-structure setup entities vs arena entities (both under /api/setup/).
 _ARENA_SETUP = {"venue", "rink", "ice-slot"}
-_LEAGUE_SETUP = {"league", "season", "division", "club", "team"}
+_LEAGUE_SETUP = {"league", "season", "division", "club", "team", "player"}
 
 # Game sub-actions grouped by the permission they require.
 _SCHEDULE_ACTIONS = {"move", "publish", "result", "result/approve"}
 _ROSTER_ACTIONS = {
     "build-roster", "roster/select", "roster/remove", "roster/copy-previous",
-    "roster/lock", "roster/unlock", "cancel",
+    "roster/lock", "roster/unlock", "cancel", "substitutes/add-candidate",
 }
 _AVAILABILITY_ACTIONS = {
     "availability", "substitutes/enroll", "substitutes/withdraw",

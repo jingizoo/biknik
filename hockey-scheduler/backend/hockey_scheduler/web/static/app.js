@@ -42,6 +42,8 @@ let schedulerState = {
 let officialAvailability = [];      // signed-in official's windows (#88)
 let availSummary = null;            // roster availability rollup (#89)
 let subCandidates = null;           // coach substitute outreach queue (#112)
+let addableSubs = null;             // eligible-but-not-enrolled team players a coach can add (#114)
+let playersList = [];               // [{id,name,team_id,position,jersey_number,...}] for Setup (#114)
 let availFilter = "all";            // all|available|unavailable|maybe|no_response
 let contactForm = { recipient_ref: "", channel: "email", destination: "", label: "" };
 let tokenForm = { recipient_ref: "", provider: "fcm", token: "", label: "" };
@@ -383,6 +385,24 @@ const SETUP_ENTITIES = [
       { id: "f-official", label: "Official name", required: true, placeholder: "e.g. Riley Whistle" },
       { id: "f-official-club", label: "Home club (optional — for conflict checks)", type: "select",
         options: (ov) => [["", "— none —"]].concat(ov.clubs.map((c) => [c.id, c.name])) }] },
+  // Players (#114): a manual-create path so a late-arriving player doesn't
+  // force an operator through the CSV Import wizard for one row. Sourced
+  // from its own /api/players call (playersList, fetched in render() only
+  // while this view is open) — never from /api/demo/overview, which is
+  // unauthenticated and this app's own convention keeps player names out of.
+  { key: "player", title: "Players", icon: "🧑", noun: "player", perm: "manage_setup",
+    list: (ov) => playersList.map((p) => ({
+      title: p.name,
+      sub: `${nameById(ov.teams, p.team_id) || ""}${p.jersey_number != null ? " · #" + p.jersey_number : ""}`,
+    })),
+    fields: [
+      { id: "f-player-team", label: "Team", type: "select", required: true, ofNoun: "team",
+        options: (ov) => ov.teams.map((t) => [t.id, t.name]) },
+      { id: "f-player-name", label: "Player name", required: true, placeholder: "e.g. Jordan Lee" },
+      { id: "f-player-position", label: "Position", type: "select", required: true,
+        options: () => [["forward", "Forward"], ["defense", "Defense"], ["goalie", "Goalie"]] },
+      { id: "f-player-jersey", label: "Jersey number (optional)", type: "number", placeholder: "e.g. 17" },
+      { id: "f-player-email", label: "Email (optional)", type: "email", placeholder: "player@example.com" }] },
 ];
 
 // Each entity's POST body, built from the drawer inputs (ids match the fields).
@@ -402,6 +422,12 @@ const SETUP_POST = {
   }),
   official: () => post("/api/setup/official", {
     name: val("f-official"), home_club_id: val("f-official-club") || null,
+  }),
+  player: () => post("/api/setup/player", {
+    team_id: val("f-player-team"), name: val("f-player-name"),
+    position: val("f-player-position"),
+    jersey_number: val("f-player-jersey") ? Number(val("f-player-jersey")) : null,
+    email: val("f-player-email") || null,
   }),
 };
 
@@ -2179,9 +2205,22 @@ function outreachPanel(canEdit) {
         <div class="li-title">${esc(c.name)}</div>
         <div class="li-sub">${esc(c.position)}</div></div>${badge}${btn}</div>`;
   }).join("") || `<div class="empty">No substitutes enrolled yet.</div>`;
+  // Eligible-but-not-yet-enrolled team players (#114) — a coach can add one
+  // straight into the pool above without waiting for the player to
+  // self-enroll. Own card so it reads as a distinct "who could I add?"
+  // question from "who's already enrolled?" above.
+  const addable = (addableSubs && addableSubs.addable) || [];
+  const addableRows = addable.map((p) => `<div class="li"><div class="li-main">
+      <div class="li-title">${esc(p.name)}</div>
+      <div class="li-sub">${esc(p.position)}</div></div>
+      ${canEdit ? `<button class="act primary" data-act="add-candidate" data-id="${esc(p.player_id)}">Add as candidate</button>` : ""}
+    </div>`).join("");
+  const addableCard = addable.length ? `<div class="section-title">Eligible Players</div>
+    <div class="card">${addableRows}</div>` : "";
   return `<div class="section-title">Substitute Outreach</div>
     <div class="li-sub" style="padding:0 4px 8px">${slotLine}</div>
-    <div class="card">${rows}</div>`;
+    <div class="card">${rows}</div>
+    ${addableCard}`;
 }
 function coachBody(board) {
   const s = board.status;
@@ -2519,6 +2558,7 @@ async function rosterAction(act, id) {
   else if (act === "backout") await post(`${B}/availability`, { player_id: id, availability_status: "unavailable" });
   else if (act === "enroll") await post(`${B}/substitutes/enroll`, { player_id: id });
   else if (act === "withdraw") await post(`${B}/substitutes/withdraw`, { player_id: id });
+  else if (act === "add-candidate") { const r = await post(`${B}/substitutes/add-candidate`, { player_id: id }); if (r && !r.error) toast = "Added as a substitute candidate."; }
   else if (act === "add") await post(`${B}/substitutes/${id}/add-to-roster`, {});
   else if (act === "offer") { const r = await post(`${B}/substitutes/${id}/offer`, {}); if (r && !r.error) toast = "Offer sent to the substitute."; }
   else if (act === "accept") await post(`${B}/substitutes/${id}/accept`, {});
@@ -2578,12 +2618,25 @@ async function render() {
     }
     // Coach substitute outreach queue for the shown side (#112), operator-only.
     subCandidates = null;
+    addableSubs = null;
     if (view === "roster" && gameView === "coach" && hasPerm("manage_roster")
         && lineups && lineups[rosterSide] && !lineups.error) {
       const tid = lineups[rosterSide].team_id;
       const q = await getJSON(
         `/api/games/${currentGame}/substitute-candidates?team_id=${tid}`);
       if (q && !q.error) subCandidates = q;
+      // Eligible-but-not-yet-enrolled team players a coach can add directly
+      // (#114) — a separate list from the outreach queue above, which only
+      // ever shows players who already have some enrollment.
+      const a = await getJSON(
+        `/api/games/${currentGame}/substitute-addable?team_id=${tid}`);
+      if (a && !a.error) addableSubs = a;
+    }
+    // The Setup Player card needs the league-wide player list (#114) — its
+    // own authenticated call, never bundled into the public demo overview.
+    if (view === "setup" && hasPerm("manage_setup")) {
+      const pl = await getJSON("/api/players");
+      playersList = Array.isArray(pl) ? pl : [];
     }
     // The game sheet also needs the officials pool for its assign control (#30).
     if (view === "sheet") {
