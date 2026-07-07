@@ -3561,6 +3561,13 @@ function resetTransientUiState() {
   availFilter = "all";
   usersSelected = null;
   schedulerState.selected = new Set();
+  // playersList (#114) is real player names/teams fetched only for a
+  // manage_setup session — the Setup view itself isn't permission-gated
+  // (setupCard only hides the "+ New" button), so if it survived an
+  // identity switch to a lower-privileged role that lands back on "setup"
+  // without a page reload, that role would see the previous operator's
+  // fetched player roster.
+  playersList = [];
 }
 function setUser(user) {
   const prevId = currentUser ? currentUser.username : null;

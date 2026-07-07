@@ -227,6 +227,14 @@ class AddablePlayersListTest(unittest.TestCase):
         addable = self.api.get_addable_substitutes("g1", "home")
         self.assertEqual(addable["addable"], [])
 
+    def test_excludes_already_offered_players(self):
+        self.store.add_player(Player(id="p1", team_id="home", name="P1",
+                                     position=Position.FORWARD))
+        self.api.enroll_substitute("g1", "p1")
+        self.api.offer_substitute("g1", "p1")
+        addable = self.api.get_addable_substitutes("g1", "home")
+        self.assertEqual(addable["addable"], [])
+
     def test_excludes_inactive_players(self):
         self.store.add_player(Player(id="p1", team_id="home", name="P1",
                                      position=Position.FORWARD, is_active=False))

@@ -487,7 +487,8 @@ class SetupService:
         so a manual create can't slip in data the bulk path would reject."""
         if self.store.get_team(team_id) is None:
             raise NotFoundError(f"Team {team_id} not found.")
-        if jersey_number is not None and jersey_number <= 0:
+        if jersey_number is not None and (
+                not isinstance(jersey_number, int) or jersey_number <= 0):
             raise ValidationError("jersey_number must be a positive number.")
         if email:
             at = email.find("@")
