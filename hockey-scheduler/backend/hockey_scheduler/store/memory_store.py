@@ -539,6 +539,9 @@ class InMemoryStore:
                 return g
         return None
 
+    def guardian_links_for_player(self, player_id: str) -> List[GuardianLink]:
+        return [g for g in self.guardian_links.values() if g.player_id == player_id]
+
     def all_guardian_links(self) -> List[GuardianLink]:
         return list(self.guardian_links.values())
 

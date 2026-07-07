@@ -476,7 +476,7 @@ class Handler(BaseHTTPRequestHandler):
         return True
 
     @staticmethod
-    def _own_recipient_ref(role, scope):
+    def _own_recipient_ref(role, scope, user_id=None):
         """The delivery recipient_ref the signed-in user speaks for (#81), used
         to let a non-operator manage only their own preferences.
 
@@ -485,25 +485,33 @@ class Handler(BaseHTTPRequestHandler):
         coach speaks for it. A PLAYER must NOT map here: notification fan-out in
         this slice never targets an individual player, so a player has no own
         delivery channel to configure, and letting them edit ``team:<id>`` would
-        let one player mute the whole team's notifications."""
+        let one player mute the whole team's notifications.
+
+        A GUARDIAN speaks for ``guardian:<user_id>`` (#32) — the delivery
+        recipient a linked junior's PLAYER-audience notifications now also fan
+        out to. Unlike official/coach, a guardian's session carries no
+        ``scope`` at all (#26 — "authority comes solely from the verified
+        link"), so this is keyed off their own account id instead."""
         if role == Role.OFFICIAL and scope.get("official_id"):
             return "official:" + scope["official_id"]
         if role == Role.COACH and scope.get("team_id"):
             return "team:" + scope["team_id"]
+        if role == Role.GUARDIAN and user_id:
+            return "guardian:" + user_id
         return None
 
     def _prefs_guard(self, recipient_ref) -> bool:
         """Send 401/403 and return True if the caller may not manage
         ``recipient_ref``'s notification preferences (#81). An operator
         (MANAGE_SCHEDULE) may manage anyone; anyone else only their own."""
-        role, scope, _uid, err = self._resolve_role()
+        role, scope, uid, err = self._resolve_role()
         if err is not None:
             code, payload = err
             self._send_json(payload, code)
             return True
         if can(role, Permission.MANAGE_SCHEDULE):
             return False
-        if recipient_ref and recipient_ref == self._own_recipient_ref(role, scope):
+        if recipient_ref and recipient_ref == self._own_recipient_ref(role, scope, uid):
             return False
         self._send_json({"error": {
             "code": "forbidden",
