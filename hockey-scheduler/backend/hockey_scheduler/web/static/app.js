@@ -97,7 +97,7 @@ const NAV = {
   inbox: "My Assignments", standings: "Standings",
   notifications: "Notifications", delivery: "Delivery", activity: "Activity",
   public: "Public", users: "Users", scheduler: "Scheduler", import: "Import",
-  readiness: "Pilot Readiness", player_home: "Home",
+  readiness: "Pilot Readiness", player_home: "Home", guardian_home: "My Players",
 };
 const POS_CLASS = { goalie: "pos-G", defense: "pos-D", forward: "pos-F", skater: "pos-D" };
 const REPO = "https://github.com/jingizoo/biknik/issues";
@@ -3399,7 +3399,21 @@ function gateChrome() {
   // Sign out only makes sense with a live session.
   toggle("#signout-btn", !!currentUser);
 }
+// One-time/private per-identity UI state (#116 Phase 0.2): a checkout
+// confirmation, an open opportunity detail, or a just-minted "shown once"
+// feed URL belongs to the signed-in user, not the browser tab — carrying it
+// across a persona switch would show one user's confirmation/secret to the
+// next signed-in user.
+function resetTransientUiState() {
+  checkoutConfirm = null; oppDetailGame = null; oppDetail = null;
+  gCheckout = null; gOpp = null; gOppDetail = null;
+  newFeedUrl = null;
+  publicState.game = null;
+}
 function setUser(user) {
+  const prevId = currentUser ? currentUser.username : null;
+  const nextId = user ? user.username : null;
+  if (prevId !== nextId) resetTransientUiState();
   currentUser = user;
   currentRole = user ? user.role : "viewer";
   applyRolePerms();
