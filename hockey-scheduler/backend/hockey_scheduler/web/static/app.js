@@ -47,6 +47,13 @@ let drawerValues = {};      // {fieldId: value} preserved across re-render on er
 let checkoutConfirm = null;  // {game_id} while the Player Home "Can't Play" confirmation is open (#107)
 let oppDetailGame = null;    // game_id of the substitute opportunity whose detail is open (#110)
 let oppDetail = null;        // fetched detail payload for oppDetailGame (#110)
+// Guardian linked-junior surface (#26). A guardian acts FOR a junior, so every
+// piece of open UI state is keyed by the junior's player_id, never a global
+// "current player" — a guardian may have several linked juniors on screen.
+let guardianHome = null;     // fetched /api/me/guardian/home payload
+let gCheckout = null;        // {jid, game_id} while a junior's "Can't Play" confirm is open
+let gOpp = null;             // {jid, game_id} of the junior's opportunity detail open
+let gOppDetail = null;       // fetched detail payload for gOpp
 let activityExpandedBatches = new Set();  // import_batch_ids expanded in Activity (#102)
 let readinessCheck = null;  // /api/readiness snapshot for the Pilot Readiness card (#104)
 let importState = {         // Pilot onboarding import wizard (#96)
@@ -1115,6 +1122,127 @@ function renderPlayerHome(playerHome) {
       <span class="row-main">Notifications</span>
       <span class="row-sub">${playerHome.unread_notifications} unread</span>
     </button>${toastHtml()}`;
+}
+
+/* ---------- Guardian linked-junior surface (#26) ---------- */
+// A guardian responds ON BEHALF OF each verified junior. Every card reuses the
+// same shape as the player's own Home (next game + attendance, offers,
+// opportunities) but its action buttons carry the junior's player_id so the
+// server can record the guardian as actor and the junior as subject. No
+// guardian PII is ever rendered — the payload is entirely player-scoped.
+function renderGuardianHome(gh) {
+  // A junior's opportunity detail is open — show it in place of the list.
+  if (gOpp) return renderGuardianOppDetail(gOppDetail);
+  if (!gh || !gh.juniors) {
+    return `<div class="empty">Sign in as a <strong>Guardian</strong> to respond for your linked players.</div>`;
+  }
+  if (!gh.juniors.length) {
+    return `<div class="empty">No linked players yet. A league operator links a junior player to your guardian account before you can respond for them.</div>`;
+  }
+  const header = `<div class="section-title" style="margin-top:0">My Players</div>
+    <p class="muted">Respond to games and substitute requests for your linked players.</p>`;
+  return `${header}${gh.juniors.map(renderJuniorCard).join("")}${toastHtml()}`;
+}
+
+function renderJuniorCard(j) {
+  const jid = j.player_id;
+  const ng = j.next_game;
+  let nextGameBlock;
+  if (!ng) {
+    nextGameBlock = `<div class="banner neutral"><h2>No upcoming game</h2>
+      <p>${esc(j.player_name)} has no scheduled games right now.</p></div>`;
+  } else if (gCheckout && gCheckout.jid === jid && gCheckout.game_id === ng.game_id) {
+    nextGameBlock = `<div class="banner warn"><h2>Confirm checkout</h2>
+      <p>Confirm ${esc(j.player_name)} can't play? ${esc(ng.team_name)} vs ${esc(ng.opponent_name || "TBD")} — ${esc(fmtDateTime(ng.start_time))}</p></div>
+      <div class="actions">
+        <button class="act danger" data-g-confirm-checkout="${esc(jid)}">Confirm Can't Play</button>
+        <button class="act ghost" data-g-cancel-checkout="${esc(jid)}">Stay In</button>
+      </div>`;
+  } else {
+    const confirmed = ng.attendance_status === "confirmed";
+    nextGameBlock = `<div class="li">
+        <div class="li-main"><div class="li-title">${esc(ng.team_name)} vs ${esc(ng.opponent_name || "TBD")}</div>
+          <div class="li-sub">${esc(fmtDateTime(ng.start_time))}
+            ${ng.venue_name ? " · " + esc(ng.venue_name) : ""}${ng.rink_name ? " · " + esc(ng.rink_name) : ""}</div></div>
+      </div>
+      <div class="li">${phBadge(PH_ATTENDANCE, ng.attendance_status)}${phBadge(PH_TEAM_STATUS, ng.team_status)}</div>
+      <div class="actions">
+        <button class="act success" data-g-confirm="${esc(jid)}" ${confirmed ? "disabled" : ""}>${confirmed ? "In ✓" : "I'm In"}</button>
+        <button class="act danger" data-g-backout="${esc(jid)}">Can't Play</button>
+      </div>`;
+  }
+  // Offer/opportunity row with a per-junior call-to-action. `verb` chooses the
+  // wiring: offers get inline Accept/Decline, opportunities get "View".
+  const subRow = (o, kind) => {
+    let cta;
+    if (kind === "offer") {
+      cta = `<button class="act success" data-g-accept-offer="${esc(jid)}|${esc(o.game_id)}">Accept</button>
+        <button class="act danger" data-g-decline-offer="${esc(jid)}|${esc(o.game_id)}">Decline</button>`;
+    } else {
+      cta = `<button class="act primary" data-g-view-opp="${esc(jid)}|${esc(o.game_id)}">View</button>`;
+    }
+    return `<div class="li">
+      <span class="li-time">${fmt(o.start_time)}</span>
+      <div class="li-main"><div class="li-title">${esc(o.team_name)} vs ${esc(o.opponent_name || "TBD")}</div>
+        <div class="li-sub">${esc(fmtDateTime(o.start_time))}
+          ${o.rink_name ? " · " + esc(o.rink_name) : ""} · needs ${esc(o.position_needed)}</div></div>
+      <div class="actions" style="margin:0">${cta}</div>
+    </div>`;
+  };
+  const offers = j.substitute_offers || [];
+  const offersCard = offers.length ? `<div class="section-title">Substitute Offers (${offers.length})</div>
+    ${offers.map((o) => subRow(o, "offer")).join("")}` : "";
+  const opps = j.substitute_opportunities || [];
+  const shown = opps.slice(0, 3);
+  const oppRows = shown.map((o) => subRow(o, "opp")).join("")
+    + (opps.length > 3 ? `<div class="li"><div class="li-main">
+        <div class="li-sub">+ ${opps.length - 3} more opportunity(ies)</div></div></div>` : "");
+  return `<div class="card">
+      <div class="section-title" style="margin-top:0">${esc(j.player_name)}</div>
+      ${nextGameBlock}
+      ${offersCard}
+      ${opps.length ? `<div class="section-title">Substitute Opportunities (${opps.length})</div>${oppRows}` : ""}
+    </div>`;
+}
+
+// The junior's opportunity detail (#26), reached via "View" on a guardian
+// card. Offers can be accepted/declined here; an open opportunity is shown
+// read-only (guardian self-enrolment is out of this slice's scope).
+function renderGuardianOppDetail(detail) {
+  const jid = gOpp ? gOpp.jid : "";
+  if (!detail || detail.error) {
+    return `<div class="banner alert"><h2>Opportunity unavailable</h2>
+      <p>${esc((detail && detail.error && detail.error.message) || "This opportunity could not be loaded.")}</p></div>
+      <div class="actions"><button class="act ghost" data-g-opp-back>Back</button></div>${toastHtml()}`;
+  }
+  const rows = [
+    ["Team", detail.team_name],
+    ["Opponent", detail.opponent_name || "TBD"],
+    ["When", fmtDateTime(detail.start_time)],
+    ["Venue", [detail.venue_name, detail.rink_name].filter(Boolean).join(" · ") || "—"],
+    ["Position needed", detail.position_needed],
+  ].map(([k, v]) => `<div class="li"><div class="li-main">
+      <div class="li-sub">${esc(k)}</div><div class="li-title">${esc(v)}</div></div></div>`).join("")
+    + `<div class="li"><div class="li-main"><div class="li-sub">Team status</div></div>
+        ${phBadge(PH_TEAM_STATUS, detail.team_status)}</div>`;
+  const offered = detail.enrollment_status === "offered";
+  let note = "", actions = "";
+  if (offered) {
+    const btns = [];
+    if (detail.can_accept_offer) btns.push(`<button class="act success" data-g-accept-offer="${esc(jid)}|${esc(detail.game_id)}">Accept Offer</button>`);
+    if (detail.can_decline_offer) btns.push(`<button class="act danger" data-g-decline-offer="${esc(jid)}|${esc(detail.game_id)}">Decline Offer</button>`);
+    actions = btns.join("");
+    if (detail.blocked_reason)
+      note = `<div class="banner ${btns.length ? "warn" : "neutral"}"><p>${esc(detail.blocked_reason)}</p></div>`;
+  } else {
+    note = `<div class="banner neutral"><p>This is an open substitute opportunity. Enrolling ${esc(detail.team_name)}'s roster is handled by the player or a coach.</p></div>`;
+  }
+  return `<div class="section-title" style="margin-top:0">${offered ? "Substitute Offer" : "Substitute Opportunity"}</div>
+    ${note}
+    <div class="card">${rows}</div>
+    <div class="actions">${actions}
+      <button class="act ghost" data-g-opp-back>Back</button>
+    </div>${toastHtml()}`;
 }
 
 /* ---------- Notifications feed (#32) ---------- */
@@ -2404,6 +2532,15 @@ async function render() {
         ? await getJSON(`/api/me/substitute-opportunities/${encodeURIComponent(oppDetailGame)}`)
         : null;
     }
+    // The signed-in guardian's linked-junior surface (#26): each verified
+    // junior's Player Home payload, plus a junior-scoped opportunity detail
+    // when one is open. Same skip-the-list-while-detail-open shape as above.
+    if (view === "guardian_home") {
+      if (!gOpp) guardianHome = await getJSON("/api/me/guardian/home");
+      gOppDetail = gOpp
+        ? await getJSON(`/api/me/guardian/${encodeURIComponent(gOpp.jid)}/substitute-opportunities/${encodeURIComponent(gOpp.game_id)}`)
+        : null;
+    }
     // Notifications feed drives the bell badge on every view (#32).
     const nf = await getJSON("/api/notifications");
     if (nf && !nf.error) notifState = nf;
@@ -2540,6 +2677,7 @@ async function render() {
     : view === "sheet" ? renderGameSheet(lineups)
     : view === "inbox" ? renderInbox(inbox)
     : view === "player_home" ? renderPlayerHome(playerHome)
+    : view === "guardian_home" ? renderGuardianHome(guardianHome)
     : view === "notifications" ? renderNotifications()
     : view === "delivery" ? renderDelivery(ov)
     : view === "users" ? renderUsers()
@@ -2713,6 +2851,64 @@ async function render() {
   oppAction("data-opp-withdraw", "withdraw", "You've withdrawn from this opportunity.");
   oppAction("data-opp-accept-offer", "accept-offer", "Offer accepted — you're on the roster.");
   oppAction("data-opp-decline-offer", "decline-offer", "Offer declined.");
+
+  // Guardian actions for a linked junior (#26). Every button carries the
+  // junior's player_id ("jid|game_id") so the request is scoped to that
+  // specific junior — a guardian may have several on screen — and the server
+  // records the guardian as actor, the junior as subject. All routes are
+  // /api/me/guardian/{jid}/... which re-check the verified link server-side.
+  // querySelectorAll, not querySelector: a guardian may have several junior
+  // cards on screen at once, each with its own "I'm In"/"Can't Play" button —
+  // binding only the first would silently dead-button every other junior.
+  c.querySelectorAll("[data-g-confirm]").forEach((btn) => btn.onclick = async () => {
+    const jid = btn.getAttribute("data-g-confirm");
+    const j = (guardianHome.juniors || []).find((x) => x.player_id === jid);
+    if (!j || !j.next_game) return;
+    await post(`/api/me/guardian/${encodeURIComponent(jid)}/games/${encodeURIComponent(j.next_game.game_id)}/availability`,
+      { availability_status: "available" });
+    await render();
+  });
+  c.querySelectorAll("[data-g-backout]").forEach((btn) => btn.onclick = () => {
+    const jid = btn.getAttribute("data-g-backout");
+    const j = (guardianHome.juniors || []).find((x) => x.player_id === jid);
+    if (!j || !j.next_game) return;
+    gCheckout = { jid, game_id: j.next_game.game_id };
+    render();
+  });
+  const gConfirmCo = c.querySelector("[data-g-confirm-checkout]");
+  if (gConfirmCo) gConfirmCo.onclick = async () => {
+    if (!gCheckout) return;
+    const { jid, game_id } = gCheckout;
+    await post(`/api/me/guardian/${encodeURIComponent(jid)}/games/${encodeURIComponent(game_id)}/availability`,
+      { availability_status: "unavailable" });
+    gCheckout = null;
+    await render();
+  };
+  const gCancelCo = c.querySelector("[data-g-cancel-checkout]");
+  if (gCancelCo) gCancelCo.onclick = () => { gCheckout = null; render(); };
+  // "View" opens the junior-scoped opportunity detail.
+  c.querySelectorAll("[data-g-view-opp]").forEach((b) => b.onclick = () => {
+    const [jid, game_id] = b.getAttribute("data-g-view-opp").split("|");
+    gOpp = { jid, game_id }; gOppDetail = null; toast = ""; render();
+  });
+  const gOppBack = c.querySelector("[data-g-opp-back]");
+  if (gOppBack) gOppBack.onclick = () => { gOpp = null; gOppDetail = null; render(); };
+  // Offer accept/decline, both from the card and the detail. There may be
+  // several accept/decline buttons on the list, so bind them all.
+  const gOfferAction = (attr, verb, okMsg) => {
+    c.querySelectorAll(`[${attr}]`).forEach((btn) => {
+      btn.onclick = async () => {
+        toast = "";
+        const [jid, game_id] = btn.getAttribute(attr).split("|");
+        const r = await post(
+          `/api/me/guardian/${encodeURIComponent(jid)}/substitute-opportunities/${encodeURIComponent(game_id)}/${verb}`, {});
+        if (r && !r.error) { toast = okMsg; gOpp = null; gOppDetail = null; }
+        await render();
+      };
+    });
+  };
+  gOfferAction("data-g-accept-offer", "accept-offer", "Offer accepted — added to the roster.");
+  gOfferAction("data-g-decline-offer", "decline-offer", "Offer declined.");
   // Notifications (#32): mark read on tap, open the related game, mark all.
   c.querySelectorAll("[data-notif-open]").forEach((b) => b.onclick = async (e) => {
     e.stopPropagation();
@@ -3120,6 +3316,9 @@ function switchTab(next) {
   // same reset discipline as drawer/wizard above, so a stale "are you
   // sure?" never reappears over changed attendance state.
   if (next !== "player_home") { checkoutConfirm = null; oppDetailGame = null; oppDetail = null; }
+  // Same discipline for the guardian surface (#26): leaving "My Players"
+  // clears any open junior checkout confirm / opportunity detail.
+  if (next !== "guardian_home") { gCheckout = null; gOpp = null; gOppDetail = null; }
   document.querySelectorAll(".tab").forEach((x) => x.classList.toggle("active", x.dataset.tab === next));
   render();
 }
@@ -3179,6 +3378,11 @@ function gateChrome() {
   // Player Home is only meaningful for a signed-in, bound player (#107).
   const isPlayer = !!(currentUser && currentUser.scope && currentUser.scope.player_id);
   toggle('.tab[data-tab="player_home"]', isPlayer);
+  // "My Players" is the guardian's linked-junior surface (#26) — only for a
+  // signed-in guardian. A guardian holds no player/team scope; the role alone
+  // gates the tab, and each junior link is checked per action server-side.
+  const isGuardian = !!(currentUser && currentUser.role === "guardian");
+  toggle('.tab[data-tab="guardian_home"]', isGuardian);
   // The Delivery admin tab is operator-only (#61).
   toggle('.tab[data-tab="delivery"]', hasPerm("manage_schedule"));
   toggle('.tab[data-tab="users"]', hasPerm("manage_users"));
@@ -3204,8 +3408,11 @@ function setUser(user) {
   // so an explicit tab choice mid-session is never overridden. The inverse
   // guard sends a non-player OFF the player-only Home (persona switches).
   const isPlayerUser = !!(user && user.scope && user.scope.player_id);
+  const isGuardianUser = !!(user && user.role === "guardian");
   if (isPlayerUser && view === "dashboard") view = "player_home";
   else if (!isPlayerUser && view === "player_home") view = "dashboard";
+  else if (isGuardianUser && view === "dashboard") view = "guardian_home";
+  else if (!isGuardianUser && view === "guardian_home") view = "dashboard";
   else return;
   document.querySelectorAll(".tab").forEach((x) =>
     x.classList.toggle("active", x.dataset.tab === view));

@@ -43,6 +43,7 @@ from ..domain.errors import (
 from ..services import (
     ACTOR_TYPES,
     AccountService,
+    GuardianService,
     DeliveryLoop,
     DeliveryWorker,
     RosterService,
@@ -141,6 +142,7 @@ class ApiService:
         # from env at boot. Always available for run-once drains and status.
         self.delivery_loop = DeliveryLoop(self.delivery)
         self.accounts = AccountService(self.store, self.roster.clock)
+        self.guardians = GuardianService(self.store, self.roster.clock)
 
     # -- games -------------------------------------------------------------
     @catch
@@ -1193,6 +1195,21 @@ class ApiService:
             "substitute_opportunities": opportunities,
             "unread_notifications": unread,
         }
+
+    @catch
+    def get_guardian_home(self, guardian_user_id: str) -> dict:
+        """A guardian's linked-junior surface (#26): for each junior this
+        guardian is *verified* to act for, the same Player Home payload the
+        junior would see, so the guardian can respond on their behalf. Only
+        verified links are included — an unverified or absent link surfaces
+        nothing. Carries no guardian PII: the shape is entirely player-scoped."""
+        juniors = []
+        for jid in self.guardians.verified_junior_ids(guardian_user_id):
+            home = self.get_player_home(jid)
+            if isinstance(home, dict) and "error" not in home:
+                juniors.append(home)
+        juniors.sort(key=lambda h: (h.get("player_name") or "").lower())
+        return {"guardian_user_id": guardian_user_id, "juniors": juniors}
 
     @catch
     def get_substitute_opportunity(self, player_id: str, game_id: str) -> dict:

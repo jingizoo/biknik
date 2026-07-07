@@ -319,6 +319,23 @@ class Session:
 
 
 @dataclass
+class GuardianLink:
+    """A guardian ↔ junior-player authorization link (#26).
+
+    Binds a guardian's login (``guardian_user_id``) to a junior ``player_id``
+    they may act for. ``verified`` gates real authority: an unverified link
+    grants nothing (a guardian may only respond for a junior once the link is
+    verified). No guardian contact/PII lives here — only the two opaque ids —
+    so this record can never leak personal data into an operator view.
+    """
+    id: str
+    guardian_user_id: str
+    player_id: str
+    created_at: datetime
+    verified: bool = False
+
+
+@dataclass
 class SetupAuditLog:
     """Audit entry for organization/arena create/update/delete operations."""
     id: str

@@ -187,7 +187,7 @@ class DemoModeIsTheDefaultTest(unittest.TestCase):
         status, body = self._get("/api/auth/accounts")
         roles = {a["role"] for a in body["accounts"]}
         self.assertEqual(roles, {"league_admin", "arena_manager", "coach",
-                                 "player", "official", "viewer"})
+                                 "player", "official", "viewer", "guardian"})
 
     def test_headerless_request_is_signed_out(self):
         # The headerless League Admin fallback is no longer the default: a
