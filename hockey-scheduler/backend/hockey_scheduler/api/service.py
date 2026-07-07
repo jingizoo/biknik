@@ -349,6 +349,32 @@ class ApiService:
             },
         }
 
+    # -- reschedule request / approval workflow (#29) -----------------------
+    @catch
+    def request_reschedule(self, game_id: str, team_id: str, reason: str,
+                           actor_id: Optional[str] = None) -> dict:
+        return _serialize(self.setup.request_reschedule(
+            game_id, team_id, reason, actor_id=actor_id))
+
+    @catch
+    def respond_to_reschedule(self, request_id: str, accept: bool,
+                              actor_id: Optional[str] = None) -> dict:
+        return _serialize(self.setup.respond_to_reschedule(
+            request_id, accept, actor_id=actor_id))
+
+    @catch
+    def decide_reschedule(self, request_id: str, approve: bool,
+                          new_ice_slot_id: Optional[str] = None,
+                          note: Optional[str] = None,
+                          actor_id: Optional[str] = None) -> dict:
+        return _serialize(self.setup.decide_reschedule(
+            request_id, approve, new_ice_slot_id=new_ice_slot_id,
+            note=note, actor_id=actor_id))
+
+    @catch
+    def list_reschedule_requests(self, game_id: Optional[str] = None) -> List[dict]:
+        return [_serialize(r) for r in self.setup.list_reschedule_requests(game_id)]
+
     # -- screen view-model -------------------------------------------------
     @catch
     def get_board(self, game_id: str) -> dict:

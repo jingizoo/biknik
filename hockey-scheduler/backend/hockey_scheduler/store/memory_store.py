@@ -34,6 +34,7 @@ from ..domain import (
     Official,
     OfficialAssignment,
     Player,
+    RescheduleRequest,
     Rink,
     Season,
     Session,
@@ -79,6 +80,7 @@ class InMemoryStore:
         self.user_accounts: Dict[str, UserAccount] = {}
         self.sessions: Dict[str, Session] = {}
         self.guardian_links: Dict[str, GuardianLink] = {}
+        self.reschedule_requests: Dict[str, RescheduleRequest] = {}
         self.setup_audit: List[SetupAuditLog] = []
         self._counters: Dict[str, count] = {}
 
@@ -539,6 +541,24 @@ class InMemoryStore:
 
     def all_guardian_links(self) -> List[GuardianLink]:
         return list(self.guardian_links.values())
+
+    # -- reschedule requests (#29) ------------------------------------------
+    def add_reschedule_request(self, r: RescheduleRequest) -> RescheduleRequest:
+        self.reschedule_requests[r.id] = r
+        return r
+
+    def save_reschedule_request(self, r: RescheduleRequest) -> RescheduleRequest:
+        self.reschedule_requests[r.id] = r
+        return r
+
+    def get_reschedule_request(self, request_id: str) -> Optional[RescheduleRequest]:
+        return self.reschedule_requests.get(request_id)
+
+    def reschedule_requests_for_game(self, game_id: str) -> List[RescheduleRequest]:
+        return [r for r in self.reschedule_requests.values() if r.game_id == game_id]
+
+    def all_reschedule_requests(self) -> List[RescheduleRequest]:
+        return list(self.reschedule_requests.values())
 
     # -- sessions (#74) ----------------------------------------------------
     def add_session(self, s: Session) -> Session:

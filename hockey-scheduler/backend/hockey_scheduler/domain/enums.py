@@ -150,6 +150,21 @@ class IceSlotStatus(str, Enum):
     BLOCKED = "blocked"
 
 
+class RescheduleStatus(str, Enum):
+    """A reschedule request's approval state (#29).
+
+    PENDING_OPPONENT -> (opponent accepts) -> PENDING_LEAGUE_APPROVAL ->
+    (league approves + supplies a replacement slot, applied immediately via
+    the existing move_game/publish_game mechanics) -> REPUBLISHED.
+    OPPONENT_REJECTED and DENIED are terminal rejections at either step.
+    """
+    PENDING_OPPONENT = "pending_opponent"
+    PENDING_LEAGUE_APPROVAL = "pending_league_approval"
+    OPPONENT_REJECTED = "opponent_rejected"
+    DENIED = "denied"
+    REPUBLISHED = "republished"
+
+
 class OfficialAvailabilityStatus(str, Enum):
     """Whether an official's declared window is available or unavailable (#88)."""
     AVAILABLE = "available"
@@ -184,6 +199,13 @@ class NotificationKind(str, Enum):
     ROSTER_LOCKED = "roster_locked"
     ROSTER_UNLOCKED = "roster_unlocked"
     AVAILABILITY_REMINDER = "availability_reminder"  # → each unresponded player (#89)
+    # Reschedule request workflow (#29) → the opponent coach / scheduler /
+    # requesting coach at each transition. The final republish step reuses
+    # move_game/publish_game, which already emit GAME_MOVED/GAME_PUBLISHED.
+    RESCHEDULE_REQUESTED = "reschedule_requested"    # → the opponent coach
+    RESCHEDULE_ACCEPTED = "reschedule_accepted"      # → the scheduler (league)
+    RESCHEDULE_REJECTED = "reschedule_rejected"      # → the requesting coach
+    RESCHEDULE_DENIED = "reschedule_denied"          # → both coaches
 
 
 class NotificationAudience(str, Enum):

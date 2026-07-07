@@ -49,6 +49,8 @@ from ..domain import (
     Player,
     ResultStatus,
     Position,
+    RescheduleRequest,
+    RescheduleStatus,
     Rink,
     Role,
     RosterEntryStatus,
@@ -193,6 +195,10 @@ SPECS = {
     GuardianLink: Spec(GuardianLink, "guardian_links",
                        {"created_at": _dt(), "verified": _bool(),
                         "consented_at": _dt()}),
+    RescheduleRequest: Spec(
+        RescheduleRequest, "reschedule_requests",
+        {"status": _enum(RescheduleStatus), "created_at": _dt(),
+         "opponent_responded_at": _dt(), "league_decided_at": _dt()}),
     CalendarFeedToken: Spec(
         CalendarFeedToken, "calendar_feed_tokens",
         {"created_at": _dt(), "revoked_at": _dt()}),
@@ -667,6 +673,16 @@ class SqlStore:
         return rows[0] if rows else None
     def all_guardian_links(self):
         return self._query(GuardianLink, order="id")
+
+    # -- reschedule requests (#29) ------------------------------------------
+    def add_reschedule_request(self, r): return self._insert(r)
+    def save_reschedule_request(self, r): return self._update(r)
+    def get_reschedule_request(self, request_id):
+        return self._get(RescheduleRequest, request_id)
+    def reschedule_requests_for_game(self, game_id):
+        return self._query(RescheduleRequest, "game_id = ?", (game_id,), order="id")
+    def all_reschedule_requests(self):
+        return self._query(RescheduleRequest, order="id")
 
     # -- sessions (#74) ----------------------------------------------------
     def add_session(self, sess): return self._insert(sess)

@@ -74,6 +74,10 @@ def required_permission(path: str):
     if path in ("/api/scheduler/commit", "/api/scheduler/drafts/publish",
                 "/api/scheduler/drafts/discard"):
         return Permission.MANAGE_SCHEDULE
+    # League-wide reschedule approval queue is an operator action (#29) —
+    # same MANAGE_SCHEDULE gate as the per-request decide action above.
+    if path == "/api/reschedule/pending":
+        return Permission.MANAGE_SCHEDULE
     # Draining the notification delivery queue is an operator action (#58).
     if path == "/api/notifications/deliveries/process":
         return Permission.MANAGE_SCHEDULE
@@ -136,6 +140,16 @@ def required_permission(path: str):
             return Permission.MANAGE_ROSTER
         if action in _AVAILABILITY_ACTIONS:
             return Permission.RESPOND_AVAILABILITY
+        # Reschedule workflow (#29): a coach requests / the opponent coach
+        # responds (both MANAGE_ROSTER — coach-scoping is enforced
+        # separately, see scope.py and _reschedule_opponent_guard below);
+        # the league/arena decides (MANAGE_SCHEDULE, same as move/publish).
+        if action == "reschedule/request":
+            return Permission.MANAGE_ROSTER
+        resched = re.match(r"^reschedule/[^/]+/(respond|decide)$", action)
+        if resched:
+            return (Permission.MANAGE_ROSTER if resched.group(1) == "respond"
+                    else Permission.MANAGE_SCHEDULE)
         # substitutes/{pid}/(offer|accept|decline|add-to-roster)
         sub = re.match(r"^substitutes/[^/]+/(offer|accept|decline|add-to-roster)$", action)
         if sub:
