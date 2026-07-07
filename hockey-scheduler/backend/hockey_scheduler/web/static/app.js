@@ -12,6 +12,12 @@ let calendarDate = "2026-09-05";  // YYYY-MM-DD shown on the arena calendar
 let calendarMode = "day";   // day | week
 let calFilters = { venueId: "all", rinkId: "all", divisionId: "all", teamId: "all" };
 let toast = "";
+// Errors persist until the next interaction/close; success messages
+// auto-clear (#118 Phase 5). post() resets this at the start of every
+// mutating call and sets it back to true only when that call errors, so a
+// handful of purely client-side validation messages set it explicitly too.
+let toastIsError = false;
+let toastTimer = null;      // pending auto-clear timeout for a success toast
 let currentRole = "viewer";        // role of the signed-in user (from /api/auth/me)
 let currentUser = null;            // {username, role, label} or null when signed out
 let roleCatalog = [];              // [{id,label,permissions}] from /api/auth/roles
@@ -139,16 +145,25 @@ function downloadTextFile(filename, text) {
 // and authorizes each request (#50). No client-asserted role header.
 async function getJSON(p) { return (await fetch(p, { credentials: "same-origin" })).json(); }
 async function post(p, b) {
+  // Reset first: an explicit success message the caller sets after a clean
+  // response (the common `if (r && !r.error) toast = "..."` pattern) always
+  // runs after this point, so it inherits the correct "not an error" state
+  // without every one of those call sites needing to say so itself.
+  toastIsError = false;
   const r = await fetch(p, { method: "POST", credentials: "same-origin",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(b || {}) });
   const d = await r.json();
-  if (d && d.error) toast = d.error.message;
+  if (d && d.error) { toast = d.error.message; toastIsError = true; }
   return d;
 }
 
 /* ---------- shared ---------- */
 const bannerClass = (s) => s === "open_slot" ? "alert" : s === "needs_substitute" ? "warn" : s === "roster_confirmed" ? "ok" : "neutral";
+// Same ok/warn/alert/neutral → green/orange/red/gray mapping the .banner
+// classes use (styles.css), so a roster status badge never disagrees with the
+// banner shown for the same status elsewhere (#118 Phase 3.2).
+const GS_STATUS_BADGE = { ok: "green", warn: "orange", alert: "red", neutral: "gray" };
 const prettyStatus = (s) => ({
   draft: "Draft", selected: "Selected", awaiting_responses: "Awaiting Responses",
   roster_confirmed: "Roster Confirmed", needs_substitute: "Needs Substitute Decision",
@@ -158,6 +173,9 @@ function statusBadge(p) {
   if (p.backed_out) return `<span class="badge red">Backed out</span>`;
   if (p.availability === "available" || p.roster_status === "confirmed" || p.roster_status === "accepted") return `<span class="badge green">Confirmed</span>`;
   if (p.availability === "unavailable") return `<span class="badge red">Unavailable</span>`;
+  // Matches the roster availability summary's own maybe → purple/"Maybe"
+  // convention (AVAIL_PILL/AVAIL_LABEL) — same status, same color everywhere.
+  if (p.availability === "maybe") return `<span class="badge purple">Maybe</span>`;
   return `<span class="badge gray">Pending</span>`;
 }
 function avatar(p) {
@@ -173,7 +191,6 @@ function slotBar(label, c, t, open) {
 const stub = (icon, title, sub, issue) => `<div class="stub"><span class="stub-ico">${icon}</span>
   <div class="stub-main"><div class="stub-title">${title}</div><div class="stub-sub">${sub}</div></div>
   <a class="badge" href="${REPO}/${issue}" target="_blank">#${issue}</a></div>`;
-const toastHtml = () => toast ? `<div class="toast">${esc(toast)}</div>` : "";
 const opt = (v, label, sel) => `<option value="${esc(v)}" ${sel ? "selected" : ""}>${esc(label)}</option>`;
 
 /* ---------- Dashboard (operator triage) ---------- */
@@ -207,7 +224,15 @@ function renderDashboard(ov, standings) {
   const games = ov.schedule || [];
   const today = games.filter((g) => dayOf(g.start_time) === calendarDate);
   const todayList = today.length ? today : games;   // fall back to all if none "today"
-  const upcoming = games.length - today.length;
+  // "Games this week" (#118 Phase 7) means the 7-day window starting today —
+  // ov.schedule is every non-draft game in the whole demo, so counting its
+  // full length mislabeled arbitrarily-far-past/future games as "this week".
+  const weekEnd = addDays(calendarDate, 6);
+  const weekGames = games.filter((g) => {
+    const d = dayOf(g.start_time);
+    return d >= calendarDate && d <= weekEnd;
+  });
+  const upcoming = weekGames.length - today.length;
 
   // Ice utilisation.
   const slots = ov.ice_slots || [];
@@ -227,7 +252,7 @@ function renderDashboard(ov, standings) {
       <div class="ds-sub">${esc(sub)}</div></div>`;
 
   const stats = `<div class="dash-stats">
-    ${stat("Games this week", games.length, `${today.length} today · ${upcoming} upcoming`,
+    ${stat("Games this week", weekGames.length, `${today.length} today · ${upcoming} upcoming`,
            today.length ? pill("green", `+${today.length}`) : "")}
     ${stat("Ice slots booked", booked, `${utilPct}% of ${slots.length} slots`,
            pill("gray", `${utilPct}%`))}
@@ -242,7 +267,8 @@ function renderDashboard(ov, standings) {
   // Today's games list.
   const gameRows = todayList.map((g) => {
     const t = gameTriage(g);
-    return `<div class="tg-row" data-open-sheet="${esc(g.game_id)}">
+    return `<div class="tg-row" data-open-sheet="${esc(g.game_id)}" role="button" tabindex="0"
+        aria-label="Open game sheet: ${esc(g.home_team_name)} vs ${esc(g.away_team_name)}">
       <div class="tg-time"><div class="tgt-h">${fmtClock(g.start_time)}</div>
         <div class="tgt-r">${esc(g.rink_name || "")}</div></div>
       <div class="tg-match">
@@ -256,7 +282,7 @@ function renderDashboard(ov, standings) {
   const gamesCard = `<div class="dash-card">
     <div class="dash-card-head"><h3>${today.length ? "Today's Games" : "Scheduled Games"}</h3>
       <span class="dch-sub">${todayList.length} game${todayList.length === 1 ? "" : "s"}</span>
-      <a class="dch-link" data-goto="games">Games →</a></div>
+      <button class="linklike dch-link" data-goto="games">Games →</button></div>
     ${gameRows || '<div class="na-empty">No games scheduled yet.</div>'}</div>`;
 
   // Needs Attention — real alerts only.
@@ -289,14 +315,14 @@ function renderDashboard(ov, standings) {
     <span class="ss-pts">${r.pts}</span></div>`).join("");
   const standingsCard = div0 ? `<div class="dash-card">
     <div class="dash-card-head"><h3>${esc(div0.name)} · Standings</h3>
-      <a class="dch-link" data-goto="standings">All →</a></div>
+      <button class="linklike dch-link" data-goto="standings">All →</button></div>
     ${ssRows || '<div class="na-empty">No games played yet.</div>'}</div>` : "";
 
   return `${stats}
     <div class="dash-grid">
       <div>${gamesCard}</div>
       <div style="display:flex;flex-direction:column;gap:16px">${attentionCard}${standingsCard}</div>
-    </div>${toastHtml()}`;
+    </div>`;
 }
 
 /* ---------- Setup ---------- */
@@ -385,7 +411,7 @@ function renderSetup(ov) {
   const cards = SETUP_ENTITIES.map((ent) => setupCard(ent, ov)).join("");
   return `<div class="setup-intro">Create your league structure and arena. Tap
     <strong>＋ New</strong> on any card to open a form.</div>
-    <div class="setup-grid">${cards}</div>${renderDrawer(ov)}${toastHtml()}`;
+    <div class="setup-grid">${cards}</div>${renderDrawer(ov)}`;
 }
 
 function setupCard(ent, ov) {
@@ -461,7 +487,10 @@ function slotLabel(s) {
   if (s.slot_type === "public_skate") return "Blocked · Public skate";
   if (s.slot_type === "practice") return "Blocked · Practice";
   if (s.slot_type === "tournament") return "Blocked · Tournament";
-  return esc(s.status);
+  // Defensive fallback: an allocated game slot always carries a game_label,
+  // and every other blocked slot_type is named above — this only fires for
+  // a status this build doesn't otherwise recognize.
+  return s.status === "allocated" ? "Allocated" : s.status === "blocked" ? "Blocked" : esc(s.status);
 }
 
 function calContext(ov) {
@@ -500,7 +529,9 @@ function slotCard(s, draggable, ctx) {
   // dragging is suspended so the two interaction modes don't fight.
   const canMove = hasPerm("manage_schedule");   // #24: arena manager / admin
   const isTarget = moving && draggable && s.status === "available";
-  const dropClick = (draggable && s.status === "available" && canMove) ? `data-slot="${esc(s.id)}" data-drop="${esc(s.id)}"` : "";
+  const dropClick = (draggable && s.status === "available" && canMove)
+    ? `data-slot="${esc(s.id)}" data-drop="${esc(s.id)}" role="button" tabindex="0" aria-label="${
+        isTarget ? "Move game to" : "Schedule a game in"} this ${fmt(s.start_time)}–${fmt(s.end_time)} slot"` : "";
   const drag = (draggable && s.game_id && !moving && canMove) ? `draggable="true" data-game="${esc(s.game_id)}"` : "";
   // Draft/Published state comes from the schedule game, not the slot row.
   const g = (s.game_id && ctx) ? ctx.gameById[s.game_id] : null;
@@ -613,15 +644,14 @@ function conflictPanelHtml() {
 }
 
 function renderCalendar(ov) {
-  if (wizard) return renderWizard(ov) + toastHtml();
+  if (wizard) return renderWizard(ov);
   const ctx = calContext(ov);
   const rinks = visibleRinks(ov);
   const board = calendarMode === "week"
     ? renderWeek(ov, ctx, rinks)
     : renderDay(ov, ctx, rinks);
   return calToolbar(ov) +
-    `<div class="cal-layout"><div class="cal-main">${board}</div>${conflictPanelHtml()}</div>` +
-    toastHtml();
+    `<div class="cal-layout"><div class="cal-main">${board}</div>${conflictPanelHtml()}</div>`;
 }
 
 function moveBanner(ov) {
@@ -685,6 +715,14 @@ function renderWeek(ov, ctx, rinks) {
     <strong>Switch to Day view to move games</strong> (drag, or tap Move then a slot).</div>`;
 }
 
+// The venue of the SLOT being scheduled, not just the league's first venue
+// (#118 Phase 7) — a league with more than one venue was showing the wrong
+// arena name in the wizard's review step regardless of which rink/slot the
+// operator actually picked.
+function slotVenueName(ov, slot) {
+  const rink = ov.rinks.find((r) => r.id === slot.rink_id);
+  return (rink && rink.venue_name) || "";
+}
 function renderWizard(ov) {
   const slot = ov.ice_slots.find((s) => s.id === wizard.slot_id);
   if (!slot) { wizard = null; return renderCalendar(ov); }
@@ -711,7 +749,7 @@ function renderWizard(ov) {
       <div class="step">3 · Ice</div>
       <div class="li"><span class="li-time">${fmt(slot.start_time)}–${fmt(slot.end_time)}</span>
         <div class="li-main"><div class="li-title">${esc(slot.rink_name)}</div>
-          <div class="li-sub">${esc((ov.venues[0] || {}).name || "")}</div></div></div>
+          <div class="li-sub">${esc(slotVenueName(ov, slot))}</div></div></div>
       <div class="step">4 · Validation</div>
       ${v(!!teams.length, "Same division")}
       ${v(distinct, "Home and away are different teams")}
@@ -722,8 +760,8 @@ function renderWizard(ov) {
         <div class="kv"><span class="k">Division</span><span class="v">${esc((divs.find((d) => d.id === wizard.division_id) || {}).name || "")}</span></div>
         <div class="kv"><span class="k">Home</span><span class="v">${esc((teams.find((t) => t.id === wizard.home_id) || {}).name || "—")}</span></div>
         <div class="kv"><span class="k">Away</span><span class="v">${esc((awayTeams.find((t) => t.id === wizard.away_id) || {}).name || "—")}</span></div>
-        <div class="kv"><span class="k">Venue · Rink</span><span class="v">${esc((ov.venues[0] || {}).name || "")} · ${esc(slot.rink_name)}</span></div>
-        <div class="kv"><span class="k">Time</span><span class="v">Sat ${fmt(slot.start_time)}–${fmt(slot.end_time)}</span></div>
+        <div class="kv"><span class="k">Venue · Rink</span><span class="v">${esc(slotVenueName(ov, slot))} · ${esc(slot.rink_name)}</span></div>
+        <div class="kv"><span class="k">Time</span><span class="v">${esc(fmtDateTime(slot.start_time))}–${fmt(slot.end_time)}</span></div>
       </div>
       <div class="actions">
         <button class="act ghost" data-wizcancel="1">Cancel</button>
@@ -762,7 +800,7 @@ function renderGames(ov) {
         <button class="act primary" data-openroster="${esc(g.game_id)}">Open Roster</button>
         ${g.published ? "" : `<button class="act success" data-publish="${esc(g.game_id)}">Publish</button>`}
       </div>`;
-  }).join("") + toastHtml();
+  }).join("");
 }
 
 /* ---------- Roster (Coach/Player) ---------- */
@@ -784,7 +822,7 @@ function renderAvailSummary() {
     (p) => availFilter === "all" || p.status === availFilter);
   const rows = shown.map((p) => `<div class="session-row">
     <span class="row-main">${esc(p.name)}</span>
-    <span class="pill ${AVAIL_PILL[p.status] || "gray"}">${esc(p.status.replace("_", " "))}</span>
+    <span class="pill ${AVAIL_PILL[p.status] || "gray"}">${AVAIL_LABEL[p.status] || esc(p.status)}</span>
   </div>`).join("");
   const canRemind = hasPerm("manage_roster");
   return `<div class="card">
@@ -846,7 +884,7 @@ function sheetSide(side, label) {
     <header class="gs-side-head">
       <div><div class="gs-side-team">${esc(side.team_name)}</div>
         <div class="gs-side-label">${label}</div></div>
-      <span class="badge ${bannerClass(s.status) === "ok" ? "green" : bannerClass(s.status) === "alert" ? "red" : "gray"}">${prettyStatus(s.status)}</span>
+      <span class="badge ${GS_STATUS_BADGE[bannerClass(s.status)] || "gray"}">${prettyStatus(s.status)}</span>
     </header>
     <div class="gs-counts"><span>Goalies <strong>${gF}/${s.target_goalies}</strong></span>
       <span>Skaters <strong>${sF}/${s.target_skaters}</strong></span>
@@ -911,7 +949,7 @@ function resultSection(lineups) {
 function renderAvailability() {
   // The signed-in official's declared availability windows (#88).
   const rows = officialAvailability.map((a) => `<div class="session-row">
-    <span class="pill ${a.status === "unavailable" ? "blocked" : "available"}">${esc(a.status)}</span>
+    <span class="pill ${a.status === "unavailable" ? "blocked" : "available"}">${a.status === "unavailable" ? "Unavailable" : "Available"}</span>
     <span class="row-main">${esc(fmtDateTime(a.start_time))} → ${esc(fmtDateTime(a.end_time))}</span>
     ${a.note ? `<span class="row-sub">${esc(a.note)}</span>` : ""}
     <button class="act ghost danger" data-avail-del="${esc(a.id)}">Remove</button>
@@ -959,7 +997,7 @@ function renderInbox(inbox) {
     </div>`;
   }).join("");
   return `<div class="section-title">Your upcoming assignments (${rows.length})</div>
-    <div class="inbox-list">${cards}</div>${renderAvailability()}${toastHtml()}`;
+    <div class="inbox-list">${cards}</div>${renderAvailability()}`;
 }
 
 /* ---------- Player Home (#107) ---------- */
@@ -992,7 +1030,7 @@ function phStatusFeed(ng, oppCount) {
   if (oppCount) rows.push(["blue", "New substitute opportunity available."]);
   if (!rows.length) return "";
   return `<div class="card"><div class="section-title" style="margin-top:0">Status</div>
-    ${rows.map(([cls, msg]) => `<div class="li"><span class="badge ${cls}">●</span>
+    ${rows.map(([cls, msg]) => `<div class="li"><span class="badge ${cls}" aria-hidden="true">●</span>
       <div class="li-main"><div class="li-sub">${esc(msg)}</div></div></div>`).join("")}</div>`;
 }
 // Substitute opportunity detail (#110): a scoped detail surface reached from
@@ -1003,7 +1041,7 @@ function renderOppDetail(detail) {
   if (!detail || detail.error) {
     return `<div class="banner alert"><h2>Opportunity unavailable</h2>
       <p>${esc((detail && detail.error && detail.error.message) || "This opportunity could not be loaded.")}</p></div>
-      <div class="actions"><button class="act ghost" data-opp-back>Back to Home</button></div>${toastHtml()}`;
+      <div class="actions"><button class="act ghost" data-opp-back>Back to Home</button></div>`;
   }
   const rows = [
     ["Team", detail.team_name],
@@ -1028,7 +1066,7 @@ function renderOppDetail(detail) {
   } else if (detail.can_withdraw) {
     actions = `<button class="act danger" data-opp-withdraw="${esc(detail.game_id)}">Withdraw</button>`;
   } else if (detail.can_accept) {
-    actions = `<button class="act primary" data-opp-accept="${esc(detail.game_id)}">Accept — Enroll as Sub</button>`;
+    actions = `<button class="act success" data-opp-accept="${esc(detail.game_id)}">Accept — Enroll as Sub</button>`;
   } else {
     note = `<div class="banner neutral"><p>${esc(detail.blocked_reason || "You can't respond to this opportunity right now.")}</p></div>`;
   }
@@ -1037,7 +1075,7 @@ function renderOppDetail(detail) {
     <div class="card">${rows}</div>
     <div class="actions">${actions}
       <button class="act ghost" data-opp-back>Back to Home</button>
-    </div>${toastHtml()}`;
+    </div>`;
 }
 
 function renderPlayerHome(playerHome) {
@@ -1106,7 +1144,7 @@ function renderPlayerHome(playerHome) {
   const shown = opps.slice(0, 3);  // up to 3 on Home (#107 §17)
   const oppRows = shown.map((o) => subRow(o, "View Opportunity")).join("")
     + (opps.length > 3 ? `<div class="li"><div class="li-main">
-        <div class="li-sub">+ ${opps.length - 3} more opportunity(ies)</div></div></div>` : "");
+        <div class="li-sub">+ ${opps.length - 3} more opportunit${opps.length - 3 === 1 ? "y" : "ies"}</div></div></div>` : "");
   return `${welcome}${summary}
     <div class="card">
       <div class="section-title" style="margin-top:0">Next Game</div>
@@ -1121,7 +1159,7 @@ function renderPlayerHome(playerHome) {
     <button class="row-btn" data-goto="notifications">
       <span class="row-main">Notifications</span>
       <span class="row-sub">${playerHome.unread_notifications} unread</span>
-    </button>${toastHtml()}`;
+    </button>`;
 }
 
 /* ---------- Guardian linked-junior surface (#26) ---------- */
@@ -1141,7 +1179,7 @@ function renderGuardianHome(gh) {
   }
   const header = `<div class="section-title" style="margin-top:0">My Players</div>
     <p class="muted">Respond to games and substitute requests for your linked players.</p>`;
-  return `${header}${gh.juniors.map(renderJuniorCard).join("")}${toastHtml()}`;
+  return `${header}${gh.juniors.map(renderJuniorCard).join("")}`;
 }
 
 function renderJuniorCard(j) {
@@ -1196,7 +1234,7 @@ function renderJuniorCard(j) {
   const shown = opps.slice(0, 3);
   const oppRows = shown.map((o) => subRow(o, "opp")).join("")
     + (opps.length > 3 ? `<div class="li"><div class="li-main">
-        <div class="li-sub">+ ${opps.length - 3} more opportunity(ies)</div></div></div>` : "");
+        <div class="li-sub">+ ${opps.length - 3} more opportunit${opps.length - 3 === 1 ? "y" : "ies"}</div></div></div>` : "");
   return `<div class="card">
       <div class="section-title" style="margin-top:0">${esc(j.player_name)}</div>
       ${nextGameBlock}
@@ -1213,7 +1251,7 @@ function renderGuardianOppDetail(detail) {
   if (!detail || detail.error) {
     return `<div class="banner alert"><h2>Opportunity unavailable</h2>
       <p>${esc((detail && detail.error && detail.error.message) || "This opportunity could not be loaded.")}</p></div>
-      <div class="actions"><button class="act ghost" data-g-opp-back>Back</button></div>${toastHtml()}`;
+      <div class="actions"><button class="act ghost" data-g-opp-back>Back</button></div>`;
   }
   const rows = [
     ["Team", detail.team_name],
@@ -1242,7 +1280,7 @@ function renderGuardianOppDetail(detail) {
     <div class="card">${rows}</div>
     <div class="actions">${actions}
       <button class="act ghost" data-g-opp-back>Back</button>
-    </div>${toastHtml()}`;
+    </div>`;
 }
 
 /* ---------- Notifications feed (#32) ---------- */
@@ -1256,6 +1294,27 @@ function updateNotifBadge() {
   const n = notifState.unread || 0;
   badge.textContent = n > 0 ? (n > 9 ? "9+" : String(n)) : "";
   badge.style.display = n > 0 ? "" : "none";
+}
+// Drives the single fixed toast container directly (#118 Phase 5) — a light
+// DOM update, not a full render(), so a success toast can auto-clear itself
+// without refetching every API call render() makes for the current view.
+function updateToast() {
+  const root = document.getElementById("toast-root");
+  if (!root) return;
+  if (toastTimer) { clearTimeout(toastTimer); toastTimer = null; }
+  if (!toast) { root.hidden = true; return; }
+  root.hidden = false;
+  root.classList.toggle("error", !!toastIsError);
+  root.innerHTML = `<span class="toast-msg">${esc(toast)}</span>
+    <button class="toast-close" aria-label="Dismiss" data-toast-close>×</button>`;
+  root.querySelector("[data-toast-close]").onclick = () => {
+    toast = ""; toastIsError = false; updateToast();
+  };
+  if (!toastIsError) {
+    toastTimer = setTimeout(() => {
+      toast = ""; toastIsError = false; toastTimer = null; updateToast();
+    }, 4000);
+  }
 }
 // The delivery recipient_ref the signed-in user speaks for (#81), used for the
 // self-service notification-preference toggles. Mirrors the server's mapping.
@@ -1332,20 +1391,23 @@ function renderNotifications() {
   const cards = rows.map((n) => {
     const link = n.game_id
       ? `<button class="act ghost" data-notif-open="${esc(n.game_id)}">Open game</button>` : "";
-    return `<div class="notif-card ${n.read ? "read" : "unread"}" data-notif-read="${esc(n.id)}">
+    return `<div class="notif-card ${n.read ? "read" : "unread"}" data-notif-read="${esc(n.id)}"
+        role="button" tabindex="0" aria-label="${n.read ? "" : "Mark read: "}${esc(n.title)}">
       <span class="notif-ico">${NOTIF_ICON[n.kind] || "🔔"}</span>
-      <div class="notif-body"><div class="notif-title">${esc(n.title)}${n.read ? "" : ` <span class="notif-dot"></span>`}</div>
+      <div class="notif-body"><div class="notif-title">${esc(n.title)}${n.read ? "" : ` <span class="notif-dot" aria-hidden="true"></span>`}</div>
         <div class="notif-msg">${esc(n.message)}</div>
         <div class="notif-meta">${esc(fmtDateTime(n.at))}</div></div>
       ${link}</div>`;
   }).join("");
-  return `${head}${renderNotifPrefs()}${renderCalendarFeed()}<div class="notif-list">${cards}</div>${toastHtml()}`;
+  return `${head}${renderNotifPrefs()}${renderCalendarFeed()}<div class="notif-list">${cards}</div>`;
 }
 
 /* ---------- Delivery admin: contacts + queue monitor (#61) ---------- */
 const CHAN_ICON = { email: "✉️", push: "📲" };
 const DELIV_BADGE = { pending: "gray", sent: "green", failed: "red",
   dead_lettered: "red", ignored: "gray" };
+const DELIV_LABEL = { pending: "Pending", sent: "Sent", failed: "Failed",
+  dead_lettered: "Dead-lettered", ignored: "Ignored" };
 
 function recipientOptions(ov) {
   // Quick-pick suggestions for the recipient_ref field; manual entry still wins.
@@ -1453,7 +1515,7 @@ function renderDeliveryMonitor() {
       <td class="cd-ref">${esc(d.recipient_ref || "")}</td>
       <td class="cd-dest">${esc(d.destination || "")}${d.placeholder
         ? ` <span class="badge gray">placeholder</span>` : ""}</td>
-      <td><span class="badge ${DELIV_BADGE[d.status] || "gray"}">${esc(d.status)}</span></td>
+      <td><span class="badge ${DELIV_BADGE[d.status] || "gray"}">${DELIV_LABEL[d.status] || esc(d.status)}</span></td>
       <td class="dq-att">${d.attempts}</td>
       <td class="dq-err">${esc(d.last_error || "")}</td>
     </tr>`).join("");
@@ -1476,7 +1538,7 @@ function renderDeadLetterPanel(ov) {
     <tr>
       <td>${CHAN_ICON[d.channel] || ""} ${esc(d.channel)}</td>
       <td class="cd-ref">${esc(d.recipient_ref || "")}</td>
-      <td><span class="badge ${DELIV_BADGE[d.status] || "gray"}">${esc(d.status)}</span></td>
+      <td><span class="badge ${DELIV_BADGE[d.status] || "gray"}">${DELIV_LABEL[d.status] || esc(d.status)}</span></td>
       <td class="dq-att">${d.attempts}</td>
       <td class="dq-err">${esc(d.last_error || "")}</td>
       <td class="dq-ops">
@@ -1546,7 +1608,7 @@ function renderDelivery(ov) {
       and arena managers.</p></div>`;
   }
   return `${renderDeliveryMonitor()}${renderContactsPanel(ov)}` +
-    `${renderDeviceTokensPanel(ov)}${toastHtml()}`;
+    `${renderDeviceTokensPanel(ov)}`;
 }
 
 /* ---------- Users / sessions admin (#78) ---------- */
@@ -1556,11 +1618,13 @@ function renderUsers() {
       <p>Account and session administration is limited to league admins.</p></div>`;
   }
   const accts = usersState.accounts;
+  const roleLabelFor = (roleId) =>
+    (roleCatalog.find((r) => r.id === roleId) || {}).label || esc(roleId);
   const accountList = accts.length
     ? accts.map((a) => `<button class="row-btn ${a.id === usersSelected ? "active" : ""}"
         data-user-sessions="${esc(a.id)}">
         <span class="row-main">${esc(a.username)}</span>
-        <span class="row-sub">${esc(a.role)}${a.active ? "" : " · inactive"}</span>
+        <span class="row-sub">${roleLabelFor(a.role)}${a.active ? "" : " · inactive"}</span>
       </button>`).join("")
     : `<div class="empty">No accounts yet.</div>`;
   const sessionPanel = usersSelected
@@ -1574,16 +1638,17 @@ function renderUsers() {
     <div class="card">
       <div class="section-title">Sessions</div>
       ${sessionPanel}
-    </div>${toastHtml()}`;
+    </div>`;
 }
 
+const SESSION_STATUS_LABEL = { active: "Active", revoked: "Revoked", expired: "Expired" };
 function renderUserSessions() {
   const rows = usersState.sessions;
   if (!rows.length) return `<p class="muted">No sessions on record for this account.</p>`;
   return `<div class="row-list">` + rows.map((s) => `
     <div class="session-row">
       <span class="row-main">${esc(s.user_agent || "Unknown device")}</span>
-      <span class="pill ${esc(s.status)}">${esc(s.status)}</span>
+      <span class="pill ${esc(s.status)}">${SESSION_STATUS_LABEL[s.status] || esc(s.status)}</span>
       <span class="row-sub">issued ${fmtDateTime(s.issued_at)}</span>
       ${s.status === "active"
         ? `<button class="act danger" data-revoke-session="${esc(s.id)}">Revoke</button>`
@@ -1646,7 +1711,7 @@ function renderReadiness(ov) {
   rows.push(rdRow("info", "Known limitations",
     "CSV-only import (no native app or PWA yet); scheduler optimizer not built."));
   return `<div class="card"><div class="section-title" style="margin-top:0">Pilot Readiness</div>
-    ${rows.join("")}</div>${toastHtml()}`;
+    ${rows.join("")}</div>`;
 }
 
 /* ---------- Draft scheduler review + publish (#86/#106) ---------- */
@@ -1692,7 +1757,7 @@ function schedDraftRow(g) {
     <span class="li-time">${fmt(g.start_time)}</span>
     <div class="li-main"><div class="li-title">${esc(g.home_team_name)} vs ${esc(g.away_team_name)}</div>
       <div class="li-sub">${esc(g.division_name || "")} · ${esc(g.rink_name || "")}${badges ? " · " + badges : ""}</div></div>
-    <span class="pill scheduled">draft</span></div>`;
+    <span class="pill gray">Draft</span></div>`;
 }
 function renderScheduler(ov) {
   if (!hasPerm("manage_schedule")) {
@@ -1760,7 +1825,7 @@ function renderScheduler(ov) {
       <button class="act ghost" data-sched-select-none>Select none</button>
     </div>
     <div class="dq-actions">
-      <button class="act primary" data-sched-publish ${selectedCount ? "" : "disabled"}>Publish ${selectedCount} of ${allDrafts.length}</button>
+      <button class="act success" data-sched-publish ${selectedCount ? "" : "disabled"}>Publish ${selectedCount} of ${allDrafts.length}</button>
       <button class="act ghost danger" data-sched-discard ${selectedCount ? "" : "disabled"}>Discard ${selectedCount} of ${allDrafts.length}</button>
     </div>` : ""}`;
 
@@ -1770,7 +1835,7 @@ function renderScheduler(ov) {
         <select id="sched-div">${divOptions(schedulerState.division)}</select>
         <button class="act" data-sched-generate>Generate</button>
       </div></div>
-    ${previewBlock}${summaryBlock}${draftBlock}${toastHtml()}`;
+    ${previewBlock}${summaryBlock}${draftBlock}`;
 }
 
 /* ---------- Pilot onboarding import wizard (#96/#99) ----------
@@ -1981,7 +2046,7 @@ function renderImport(ov) {
           title="${esc(commitTitle)}">Commit</button>
       </div>
     </div>
-    ${reportHtml}${resultHtml}${toastHtml()}`;
+    ${reportHtml}${resultHtml}`;
 }
 
 /* ---------- Standings (#31) ---------- */
@@ -2010,7 +2075,7 @@ function renderStandings(ov, standings) {
         <th>GF</th><th>GA</th><th>GD</th><th>Pts</th></tr></thead>
       <tbody>${body}</tbody></table></div>
     ${anyPlayed ? "" : `<div class="privacy-note">No games have a Final result yet. Enter and approve a score on a game's Game Sheet.</div>`}
-    ${toastHtml()}`;
+    `;
 }
 function officialsPanel(lineups) {
   const canManage = hasPerm("manage_schedule");        // assign / unassign (operator)
@@ -2035,7 +2100,7 @@ function officialsPanel(lineups) {
           ${canRespondTo(a)
             ? `<button class="act success" data-accept="${esc(a.assignment_id)}">Accept</button>
                <button class="act danger" data-decline="${esc(a.assignment_id)}">Decline</button>` : ""}
-          ${canManage ? `<button class="act danger ghost xbtn" data-unassign="${esc(a.assignment_id)}" title="Unassign">✕</button>` : ""}</div>`;
+          ${canManage ? `<button class="act danger ghost xbtn" data-unassign="${esc(a.assignment_id)}" title="Unassign" aria-label="Unassign">✕</button>` : ""}</div>`;
       }).join("")
       : `<div class="gs-off-slot">Unassigned</div>`;
     return `<div class="gs-off-role"><div class="gs-off-title">${label}</div>${body}</div>`;
@@ -2091,10 +2156,14 @@ const SUB_STATUS_BADGE = {
   offered: '<span class="badge orange">Offered</span>',
   accepted: '<span class="badge green">Accepted</span>',
   declined: '<span class="badge gray">Declined</span>',
+  expired: '<span class="badge red">Expired</span>',
+  withdrawn: '<span class="badge gray">Withdrawn</span>',
+  cancelled: '<span class="badge gray">Cancelled</span>',
 };
 function outreachPanel(canEdit) {
   const q = subCandidates;
-  const slotLine = `${q.open_goalie_slots} goalie · ${q.open_skater_slots} skater slot${q.open_skater_slots === 1 ? "" : "s"} open`;
+  const slotLine = `${q.open_goalie_slots} goalie slot${q.open_goalie_slots === 1 ? "" : "s"} · `
+    + `${q.open_skater_slots} skater slot${q.open_skater_slots === 1 ? "" : "s"} open`;
   const rows = (q.candidates || []).map((c) => {
     const badge = SUB_STATUS_BADGE[c.status] || `<span class="badge gray">${esc(c.status)}</span>`;
     // A slot fits this candidate's position and the game is still mutable, so
@@ -2130,7 +2199,7 @@ function coachBody(board) {
   if (!board.players.length) {
     return `<div class="banner neutral"><h2>No roster yet</h2>
       <p>The home team has no players. Add players in Setup first (team player
-      management is a follow-up: #25).</p></div>${toastHtml()}`;
+      management is a follow-up: #25).</p></div>`;
   }
 
   const gFilled = s.target_goalies - s.open_goalie_slots;
@@ -2164,7 +2233,7 @@ function coachBody(board) {
       } else {
         btns = `<button class="act ghost" data-act="confirm" data-id="${esc(p.id)}">Confirm</button>`;
       }
-      btns += `<button class="act danger ghost xbtn" data-act="remove" data-id="${esc(p.id)}" title="Remove from roster">✕</button>`;
+      btns += `<button class="act danger ghost xbtn" data-act="remove" data-id="${esc(p.id)}" title="Remove from roster" aria-label="Remove from roster">✕</button>`;
     }
     return playerRow(p, `${posTag(p)}${statusBadge(p)}${btns}`);
   }).join("") || `<div class="empty">No players on the roster yet — add from Available below.</div>`;
@@ -2210,7 +2279,7 @@ function coachBody(board) {
     ${availableGroups(available, s, !canEdit)}
     ${subCandidates ? outreachPanel(canEdit) : subPoolCard()}
     ${footer}
-    ${toastHtml()}`;
+    `;
 }
 function playerBody(board) {
   const players = board.players;
@@ -2243,7 +2312,7 @@ function playerBody(board) {
                 <button class="act danger" data-act="decline" data-id="${esc(p.id)}">Decline</button>`)}`;
     else if (p.group === "substitute")
       card = `<div class="banner neutral"><h2>Enrolled as substitute</h2><p>Waiting for a slot.</p></div>
-        ${acts(`<button class="act ghost" data-act="withdraw" data-id="${esc(p.id)}">Withdraw</button>`)}`;
+        ${acts(`<button class="act danger" data-act="withdraw" data-id="${esc(p.id)}">Withdraw</button>`)}`;
     else
       card = `<div class="banner neutral"><h2>Not selected</h2><p>Not enrolled.</p></div>
         ${acts(`<button class="act primary" data-act="enroll" data-id="${esc(p.id)}">Enroll as Substitute</button>`)}`;
@@ -2253,7 +2322,7 @@ function playerBody(board) {
     : `<div class="section-title">View as player</div>
        <select class="player-picker" id="player-picker">${options}</select>`;
   return `${picker}${card}
-    <div class="privacy-note">👪 Guardians respond for juniors — workflow in <a href="${REPO}/26" target="_blank">#26</a>.</div>${toastHtml()}`;
+    <div class="privacy-note">👪 Guardians respond for juniors — workflow in <a href="${REPO}/26" target="_blank">#26</a>.</div>`;
 }
 
 /* ---------- Activity ---------- */
@@ -2383,7 +2452,7 @@ function renderPublic(ov) {
         <td>${r.gp}</td><td>${r.w}</td><td>${r.l}</td><td>${r.t}</td>
         <td>${r.gf}</td><td>${r.ga}</td><td>${r.gd > 0 ? "+" + r.gd : r.gd}</td>
         <td class="st-pts">${r.pts}</td></tr>`).join("")
-      : `<tr><td colspan="10" class="empty">No results yet.</td></tr>`;
+      : `<tr><td colspan="10" class="st-empty">No results yet.</td></tr>`;
     body = `${divs.length ? `<div class="actions"><select id="public-div">${opts}</select></div>` : ""}
       <div class="card st-card"><table class="st-table">
         <thead><tr><th>#</th><th>Team</th><th>GP</th><th>W</th><th>L</th><th>T</th>
@@ -2445,7 +2514,7 @@ async function rosterAction(act, id) {
   if (act === "build") await post(`${B}/build-roster`, { team_id: rosterTeamId });
   else if (act === "select") await post(`${B}/roster/select`, { player_ids: [id] });
   else if (act === "remove") await post(`${B}/roster/remove`, { player_id: id });
-  else if (act === "copy") { const r = await post(`${B}/roster/copy-previous`, { team_id: rosterTeamId }); if (r && !r.error) toast = `Copied ${r.copied} players from the previous game.`; }
+  else if (act === "copy") { const r = await post(`${B}/roster/copy-previous`, { team_id: rosterTeamId }); if (r && !r.error) toast = `Copied ${r.copied} player${r.copied === 1 ? "" : "s"} from the previous game.`; }
   else if (act === "confirm") await post(`${B}/availability`, { player_id: id, availability_status: "available" });
   else if (act === "backout") await post(`${B}/availability`, { player_id: id, availability_status: "unavailable" });
   else if (act === "enroll") await post(`${B}/substitutes/enroll`, { player_id: id });
@@ -2466,7 +2535,13 @@ function setChrome(ov) {
   const bc = document.getElementById("breadcrumb");
   if (!bc) return;
   if (view === "dashboard" && ov) {
-    const games = (ov.schedule || []).length;
+    // Same 7-day window as the dashboard's own "Games this week" stat tile
+    // (#118 Phase 7) — both used to count ov.schedule's full length instead.
+    const weekEnd = addDays(calendarDate, 6);
+    const games = (ov.schedule || []).filter((g) => {
+      const d = dayOf(g.start_time);
+      return d >= calendarDate && d <= weekEnd;
+    }).length;
     const rinks = (ov.rinks || []).length;
     const when = new Date(calendarDate + "T00:00:00Z").toLocaleDateString("en-GB",
       { weekday: "long", day: "numeric", month: "long", timeZone: "UTC" });
@@ -2480,6 +2555,7 @@ function setChrome(ov) {
 }
 
 async function render() {
+  updateToast();
   const c = document.getElementById("content");
   document.body.dataset.view = view;
   let ov, board, lineups, standings, inbox, playerHome;
@@ -2750,7 +2826,7 @@ async function render() {
   if (availAdd) availAdd.onclick = async () => {
     const oid = inbox && inbox.official_id;
     const start = val("avail-start"), end = val("avail-end");
-    if (!oid || !start || !end) { toast = "Pick a start and end time."; return render(); }
+    if (!oid || !start || !end) { toast = "Pick a start and end time."; toastIsError = true; return render(); }
     toast = "";
     // datetime-local has no zone; treat as UTC for the demo.
     await post(`/api/officials/${oid}/availability`, {
@@ -3118,6 +3194,7 @@ async function render() {
     importState.validatedKey = null;
     importState.committed = null;
     toast = "Sample data loaded — click Validate to preview it.";
+    toastIsError = true;  // instructional, not a completed action — don't auto-clear
     render();
   };
   const importSeason = c.querySelector("#import-season");
@@ -3195,6 +3272,7 @@ async function render() {
     const requestKey = importSnapshotKey(type);
     if (requestKey !== importState.validatedKey) {
       toast = "Sheets changed since Validate — please Validate again before committing.";
+      toastIsError = true;
       return render();
     }
     const body = buildImportBody(type);
@@ -3358,6 +3436,17 @@ document.addEventListener("keydown", (e) => {
   if (e.key !== "Escape") return;
   if (drawer) { drawer = null; drawerError = ""; drawerValues = {}; render(); }
   else if (movingGameId != null) { movingGameId = null; render(); }
+});
+// Activate any role="button" element (a clickable card/row that isn't a real
+// <button>, e.g. a dashboard game row or notification card) on Enter/Space,
+// same as a native button (#118 Phase 6) — reuses whatever onclick each
+// render already bound, rather than duplicating that logic here.
+document.addEventListener("keydown", (e) => {
+  if (e.key !== "Enter" && e.key !== " ") return;
+  const el = e.target.closest('[role="button"]');
+  if (!el) return;
+  e.preventDefault();
+  el.click();
 });
 
 // -- sign-in / session (demo auth, #50) ----------------------------------

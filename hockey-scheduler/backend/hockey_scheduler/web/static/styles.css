@@ -239,6 +239,7 @@ body {
 .badge.gray { background: #ececf1; color: #6b6b70; }
 .badge.blue { background: #e3f0ff; color: #0a64c4; }
 .badge.orange { background: #fff0db; color: #b86a00; }
+.badge.purple { background: #efe9ff; color: #5a40c0; }
 
 .avatar {
   width: 30px; height: 30px; border-radius: 50%;
@@ -399,7 +400,25 @@ select.player-picker {
   padding: 6px 9px; }
 .xbtn:hover { background: #ffe5e3 !important; }
 
-.toast { margin-top: 14px; background: #1c1c1e; color: #fff; font-size: 12px; border-radius: 10px; padding: 10px 12px; }
+/* Fixed action-feedback toast (#118 Phase 5) — always visible regardless of
+   scroll position or which view is showing. Bottom-center rather than top:
+   every view's header (breadcrumb, env chips, topbar actions) lives at the
+   top, so a top-anchored toast overlapped that content on several screens. */
+.toast-root {
+  position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
+  z-index: 500; display: flex; align-items: center; gap: 10px;
+  max-width: min(480px, calc(100vw - 32px));
+  background: #1c1c1e; color: #fff; font-size: 13px; border-radius: 10px;
+  padding: 10px 14px; box-shadow: 0 8px 24px rgba(0, 0, 0, 0.25);
+}
+.toast-root[hidden] { display: none; }
+.toast-root.error { background: #c0271b; }
+.toast-root .toast-msg { flex: 1; }
+.toast-root .toast-close {
+  background: none; border: none; color: inherit; opacity: 0.75;
+  font-size: 15px; line-height: 1; cursor: pointer; padding: 2px;
+}
+.toast-root .toast-close:hover { opacity: 1; }
 
 .locked-note {
   display: flex; align-items: center; gap: 8px;
@@ -551,6 +570,11 @@ button.act.danger { background: #ffe5e3; color: #c0271b; }
 .slot-card.allocated .s { color: #0a64c4; }
 .slot-card.maintenance { background: #f4f2f0; }
 .slot-card.maintenance .s { color: #8a6d3b; }
+/* Public skate / practice / tournament slots (slotCard's fallback "blocked"
+   class) — the legend promises a purple dot for these; give the card itself
+   a matching purple tint instead of the unstyled default (#118 Phase 3.2). */
+.slot-card.blocked { background: #efe9ff; }
+.slot-card.blocked .s { color: #5a40c0; }
 .slot-card[draggable="true"] { cursor: grab; }
 .slot-card.allocated[draggable="true"]:active { cursor: grabbing; }
 .slot-card.dragging { opacity: 0.5; }
@@ -790,4 +814,10 @@ button.act.danger { background: #ffe5e3; color: #c0271b; }
   .drawer-body input, .drawer-body select,
   .cal-filters select, .import-form select { font-size: 16px; }
   .import-form textarea { font-size: 14px; }
+  /* Touch-first tap targets (#118 Phase 6): these were sized for a mouse
+     pointer (~21px tall) — grow them toward the ~44px minimum recommended
+     for touch on the viewport width where touch is the only input. */
+  .slot-move, .chip-move { padding: 9px 13px; font-size: 13px; }
+  .cd-edit { padding: 9px 13px; font-size: 13px; }
+  .linklike { padding: 6px 2px; display: inline-block; }
 }

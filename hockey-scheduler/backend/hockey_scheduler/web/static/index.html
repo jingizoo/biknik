@@ -90,6 +90,11 @@
     </main>
   </div>
 
+  <!-- Action feedback (#118 Phase 5): a single fixed toast, always visible
+       regardless of scroll position, instead of one rendered inline at the
+       bottom of each view (which was below the fold on long pages). -->
+  <div id="toast-root" class="toast-root" hidden></div>
+
   <!-- Sign-in screen (#71): shown when there is no session. In production the
        account picker is empty, so the manual form is the only way in. -->
   <div id="login-screen" class="login-screen" hidden>
