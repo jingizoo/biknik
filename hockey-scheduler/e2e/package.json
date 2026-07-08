@@ -1,0 +1,11 @@
+{
+  "name": "hockey-scheduler-e2e",
+  "private": true,
+  "description": "Browser smoke gate for CI (#138). Dev-only tooling — the app itself has no build step and no npm dependency.",
+  "scripts": {
+    "smoke": "node smoke.js"
+  },
+  "devDependencies": {
+    "playwright": "^1.48.0"
+  }
+}
