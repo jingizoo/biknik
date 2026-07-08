@@ -497,6 +497,7 @@ select.player-picker {
 /* Calendar subscription (#82). */
 .feed-url { background: #f4f6fb; border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; margin: 8px 0; }
 .feed-url code { word-break: break-all; font-size: 12.5px; }
+.feed-copy-btn { display: block; margin-top: 8px; padding: 5px 12px; font-size: 12.5px; }
 
 /* Notification preferences (#81). */
 .pref-card .pref-toggles { display: flex; gap: 18px; flex-wrap: wrap; }
