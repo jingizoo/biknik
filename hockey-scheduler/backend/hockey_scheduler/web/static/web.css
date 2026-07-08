@@ -248,7 +248,18 @@ body[data-view="games"] .main > .content { max-width: 1480px; }
 }
 .login-persona:hover { border-color: var(--accent); background: #f0f5ff; }
 .login-persona .lp-role { color: var(--muted); font-size: 12px; }
+.login-guest-link { width: 100%; justify-content: center; margin-top: 14px; }
 body.signed-out .web { display: none; }
+
+/* ---------- public portal (#34) ---------- */
+.public-screen {
+  position: fixed; inset: 0; z-index: 90; overflow-y: auto;
+  background: var(--bg, #f4f6fb);
+}
+.public-screen[hidden] { display: none; }
+.public-shell { max-width: 640px; margin: 0 auto; padding: 20px 16px 40px; }
+.public-topbar { display: flex; align-items: center; justify-content: space-between; margin-bottom: 18px; gap: 10px; }
+.public-topbar .login-brand { margin-bottom: 0; }
 
 /* ---------- responsive ---------- */
 @media (max-width: 1040px) {
