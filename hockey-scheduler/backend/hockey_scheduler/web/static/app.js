@@ -1380,7 +1380,7 @@ function ownFeedActor() {
 function renderCalendarFeed() {
   if (!ownFeedActor()) return "";
   const minted = newFeedUrl
-    ? `<div class="feed-url"><code>${esc(location.origin + newFeedUrl)}</code>
+    ? `<div class="feed-url"><code>${esc(location.origin + newFeedUrl)}</code>${feedCopyBtn(location.origin + newFeedUrl)}
         <p class="muted">Copy this URL into your calendar app. It is shown once —
         it won't be displayed again.</p></div>`
     : "";
@@ -2630,14 +2630,14 @@ function renderPublic(ov) {
     const trs = rows.length ? rows.map((r, i) => `<tr>
         <td class="st-rank">${i + 1}</td>
         <td class="st-team">${esc(r.team_name)}
-          <button type="button" class="feed-sub-btn" data-feed-subscribe="team:${esc(r.team_id)}" data-feed-label="${esc(r.team_name)} calendar" title="Subscribe to ${esc(r.team_name)}'s calendar">📅</button>
+          <button type="button" class="feed-sub-btn" data-feed-subscribe="team:${esc(r.team_id)}" data-feed-label="${esc(r.team_name)} calendar" title="Subscribe to ${esc(r.team_name)}'s calendar" aria-label="Subscribe to ${esc(r.team_name)}'s calendar">📅</button>
         </td>
         <td>${r.gp}</td><td>${r.w}</td><td>${r.l}</td><td>${r.t}</td>
         <td>${r.gf}</td><td>${r.ga}</td><td>${r.gd > 0 ? "+" + r.gd : r.gd}</td>
         <td class="st-pts">${r.pts}</td></tr>`).join("")
       : `<tr><td colspan="10" class="st-empty">No results yet.</td></tr>`;
     const feedMsg = publicState.feedUrl
-      ? `<div class="feed-url"><code>${esc(location.origin + publicState.feedUrl)}</code>
+      ? `<div class="feed-url"><code>${esc(location.origin + publicState.feedUrl)}</code>${feedCopyBtn(location.origin + publicState.feedUrl)}
           <p class="muted">Copy this URL into your calendar app${publicState.feedLabel ? ` — ${esc(publicState.feedLabel)}` : ""}.
           It is shown once — it won't be displayed again, but the subscription keeps working.</p></div>`
       : "";
@@ -2681,6 +2681,30 @@ function wirePublicFeedSubscribe(container, rerender) {
     publicState.feedUrl = (res && res.url) || null;
     publicState.feedLabel = publicState.feedUrl ? (b.dataset.feedLabel || null) : null;
     rerender();
+  });
+}
+
+// Markup for a copy-to-clipboard button next to a freshly-minted feed URL
+// (#133) — shared by the authenticated "Calendar subscription" card
+// (renderCalendarFeed) and the public/guest subscribe flow (renderPublic).
+function feedCopyBtn(url) {
+  return `<button type="button" class="act ghost feed-copy-btn" data-copy-feed-url="${esc(url)}" aria-label="Copy calendar subscription URL">Copy</button>`;
+}
+// Wire copy-to-clipboard buttons rendered by feedCopyBtn() (#133). Clipboard
+// access requires a secure context (https, or http://localhost for local
+// dev/demo) — falls back to a clear error toast rather than failing silently
+// when unavailable (e.g. plain-HTTP production without TLS).
+function wireCopyFeedUrl(container) {
+  container.querySelectorAll("[data-copy-feed-url]").forEach((b) => b.onclick = async () => {
+    try {
+      if (!navigator.clipboard) throw new Error("Clipboard access unavailable.");
+      await navigator.clipboard.writeText(b.dataset.copyFeedUrl);
+      toast = "Copied to clipboard."; toastIsError = false;
+    } catch (e) {
+      toast = "Couldn't copy automatically — select and copy the URL manually.";
+      toastIsError = true;
+    }
+    updateToast();
   });
 }
 
@@ -3023,6 +3047,7 @@ async function render() {
   const pubBack = c.querySelector("[data-public-back]");
   if (pubBack) pubBack.onclick = () => { publicState.game = null; render(); };
   wirePublicFeedSubscribe(c, render);
+  wireCopyFeedUrl(c);
   // Setup drawers (#44): open, close, submit.
   c.querySelectorAll("[data-drawer]").forEach((b) => b.onclick = () => {
     drawer = { kind: b.dataset.drawer }; drawerError = ""; drawerValues = {}; toast = ""; render();
@@ -3878,13 +3903,25 @@ async function renderPublicGuest() {
   if (!box) return;
   updateToast();  // the guest screen has no other render() path to surface post() errors
   box.innerHTML = `<div class="skeleton"></div><div class="skeleton"></div>`;
-  const sch = await getJSON("/api/public/schedule");
-  publicState.schedule = (sch && !sch.error) ? sch : { fixtures: [], divisions: [] };
-  if (!publicState.division && publicState.schedule.divisions[0]) {
-    publicState.division = publicState.schedule.divisions[0].id;
-  }
-  if (publicTab === "standings" && publicState.division) {
-    publicState.standings = await getJSON(`/api/public/standings/${publicState.division}`);
+  try {
+    const sch = await getJSON("/api/public/schedule");
+    publicState.schedule = (sch && !sch.error) ? sch : { fixtures: [], divisions: [] };
+    if (!publicState.division && publicState.schedule.divisions[0]) {
+      publicState.division = publicState.schedule.divisions[0].id;
+    }
+    if (publicTab === "standings" && publicState.division) {
+      publicState.standings = await getJSON(`/api/public/standings/${publicState.division}`);
+    }
+  } catch (e) {
+    // getJSON() throws on a network failure or a non-JSON response body —
+    // an anonymous visitor gets the same clear error + retry render()
+    // already gives a signed-in user, instead of an infinite skeleton (#133).
+    box.innerHTML = `<div class="banner alert"><h2>Could not load the public schedule</h2>
+      <p>${esc(e.message || e)}</p></div>
+      <div class="actions"><button class="act primary" id="public-retry-btn">Retry</button></div>`;
+    const retry = document.getElementById("public-retry-btn");
+    if (retry) retry.onclick = () => renderPublicGuest();
+    return;
   }
   box.innerHTML = renderPublic({});
   box.querySelectorAll("[data-public-tab]").forEach((b) => b.onclick = () => {
@@ -3904,6 +3941,7 @@ async function renderPublicGuest() {
   const pubBack = box.querySelector("[data-public-back]");
   if (pubBack) pubBack.onclick = () => { publicState.game = null; renderPublicGuest(); };
   wirePublicFeedSubscribe(box, renderPublicGuest);
+  wireCopyFeedUrl(box);
 }
 function showPublicGuest() {
   // Same shell-hiding rule as showLogin(): body.signed-out keeps the
