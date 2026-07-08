@@ -58,6 +58,24 @@ def _app_mode() -> str:
     """
     return (os.environ.get("APP_MODE") or "demo").strip().lower()
 
+
+def _trust_proxy_headers() -> bool:
+    """Whether to trust ``X-Forwarded-For`` for the caller's real IP (#131,
+    #132 review).
+
+    Defaults to False: unlike ``X-Forwarded-Proto`` (used only for a cookie
+    security nicety), ``X-Forwarded-For`` feeds directly into rate-limiting —
+    an anonymous caller with no proxy in front of them can set this header to
+    whatever they like on every request, so trusting it unconditionally would
+    let them defeat rate limiting entirely by rotating a fake value each
+    time. Only set ``TRUST_PROXY_HEADERS=1`` when this process is actually
+    deployed behind a reverse proxy configured to strip/overwrite any
+    client-supplied ``X-Forwarded-For`` before appending its own — i.e. the
+    header is verified to represent the proxy's own view of the connection,
+    not client-controlled input.
+    """
+    return (os.environ.get("TRUST_PROXY_HEADERS") or "").strip().lower() in ("1", "true", "yes")
+
 # Sessions live outside DemoState so signing in survives a demo-data reset.
 SESSIONS = SessionManager()
 
@@ -396,22 +414,21 @@ class Handler(BaseHTTPRequestHandler):
         return self._send_json(payload)
 
     def _client_ip(self) -> str:
-        """The caller's IP for rate-limiting purposes (#131).
+        """The caller's IP for rate-limiting purposes (#131, #132 review).
 
-        The production runbook documents deployment "behind a
-        TLS-terminating proxy" as a supported posture, and
-        ``_cookie_is_secure`` already trusts ``X-Forwarded-Proto`` from
-        exactly that proxy for a security-relevant decision — so trusting
-        ``X-Forwarded-For``'s first (client-nearest) hop here for rate
-        limiting is the same, already-accepted trust boundary, not a new
-        one. Without this, every caller behind such a proxy would collapse
-        into one shared bucket keyed on the proxy's own IP (self-review).
-        Falls back to the raw connecting IP when unset — the direct-HTTP
-        demo/local posture, where nothing sits in front of this process.
+        Only honors ``X-Forwarded-For`` when ``TRUST_PROXY_HEADERS=1`` is
+        explicitly set (``_trust_proxy_headers``) — this header feeds
+        directly into rate-limiting, so trusting it unconditionally would
+        let ANY anonymous caller (proxy or not) defeat the limiter entirely
+        by sending a different value on every request. Without the deployer
+        explicitly confirming a real proxy strips/overwrites client-supplied
+        values first, the only trustworthy signal is the raw connecting
+        socket address.
         """
-        xff = (self.headers.get("X-Forwarded-For") or "").split(",")[0].strip()
-        if xff:
-            return xff
+        if _trust_proxy_headers():
+            xff = (self.headers.get("X-Forwarded-For") or "").split(",")[0].strip()
+            if xff:
+                return xff
         return self.client_address[0] if self.client_address else "unknown"
 
     def _rate_limited(self, bucket: str, limit: int, window_seconds: float) -> bool:

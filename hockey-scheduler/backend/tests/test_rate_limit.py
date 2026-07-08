@@ -8,6 +8,7 @@ other's limits.
 """
 
 import json
+import os
 import threading
 import unittest
 import urllib.error
@@ -180,33 +181,55 @@ class RateLimitHttpTest(unittest.TestCase):
                           {"actor_type": "team", "actor_ref": self.home})
         self.assertEqual(st, 429)
 
-    def test_x_forwarded_for_is_trusted_for_per_caller_isolation_behind_a_proxy(self):
-        # The production runbook documents deployment behind a
-        # TLS-terminating proxy, where every real caller would otherwise
-        # share one bucket keyed on the proxy's own connecting IP
-        # (self-review, #131) — this proves two distinct forwarded IPs get
-        # independent ceilings, and that the SAME forwarded IP is throttled
-        # consistently regardless of which real socket it arrives on.
-        for _ in range(5):
+    def test_x_forwarded_for_is_ignored_by_default(self):
+        # Without an explicit TRUST_PROXY_HEADERS=1 opt-in, X-Forwarded-For
+        # must NOT be trusted — otherwise any anonymous caller could defeat
+        # the limiter entirely by sending a different value on every request
+        # (PR #132 review: unconditional trust was a real regression, worse
+        # than the proxy-collapse problem it was meant to fix). All five
+        # "different" forwarded IPs below must still share ONE real bucket,
+        # keyed on the actual loopback socket.
+        for i in range(5):
             st, _ = self._req(
                 "POST", "/api/public/calendar-feeds",
                 {"actor_type": "team", "actor_ref": self.home},
-                headers={"X-Forwarded-For": "203.0.113.10"})
+                headers={"X-Forwarded-For": f"203.0.113.{i}"})
             self.assertEqual(st, 200)
         blocked, _ = self._req(
             "POST", "/api/public/calendar-feeds",
             {"actor_type": "team", "actor_ref": self.home},
-            headers={"X-Forwarded-For": "203.0.113.10"})
-        self.assertEqual(blocked, 429)
-        # A distinct forwarded IP is unaffected — proves isolation, not just
-        # that the header is read at all.
-        other, _ = self._req(
-            "POST", "/api/public/calendar-feeds",
-            {"actor_type": "team", "actor_ref": self.home},
             headers={"X-Forwarded-For": "203.0.113.99"})
-        self.assertEqual(other, 200)
-        st2, _ = self._req("GET", "/api/public/schedule")
-        self.assertEqual(st2, 200)
+        self.assertEqual(blocked, 429, "a spoofed X-Forwarded-For bypassed the limit")
+
+    def test_x_forwarded_for_is_trusted_only_with_explicit_opt_in(self):
+        # The production runbook documents deployment behind a
+        # TLS-terminating proxy, where every real caller would otherwise
+        # share one bucket keyed on the proxy's own connecting IP — but only
+        # once the deployer has explicitly confirmed that topology via
+        # TRUST_PROXY_HEADERS=1. This proves two distinct forwarded IPs get
+        # independent ceilings once trusted.
+        os.environ["TRUST_PROXY_HEADERS"] = "1"
+        try:
+            for _ in range(5):
+                st, _ = self._req(
+                    "POST", "/api/public/calendar-feeds",
+                    {"actor_type": "team", "actor_ref": self.home},
+                    headers={"X-Forwarded-For": "203.0.113.10"})
+                self.assertEqual(st, 200)
+            blocked, _ = self._req(
+                "POST", "/api/public/calendar-feeds",
+                {"actor_type": "team", "actor_ref": self.home},
+                headers={"X-Forwarded-For": "203.0.113.10"})
+            self.assertEqual(blocked, 429)
+            # A distinct forwarded IP is unaffected — proves isolation, not
+            # just that the header is read at all.
+            other, _ = self._req(
+                "POST", "/api/public/calendar-feeds",
+                {"actor_type": "team", "actor_ref": self.home},
+                headers={"X-Forwarded-For": "203.0.113.99"})
+            self.assertEqual(other, 200)
+        finally:
+            del os.environ["TRUST_PROXY_HEADERS"]
 
     def test_public_read_routes_share_a_generous_bucket(self):
         # limit=120 on the public_read bucket — well under it in a normal test.
