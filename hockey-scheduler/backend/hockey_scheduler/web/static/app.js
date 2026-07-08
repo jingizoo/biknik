@@ -3003,7 +3003,11 @@ async function render() {
     publicState.feedUrl = null; publicState.feedLabel = null; render();
   });
   const pubDiv = c.querySelector("#public-div");
-  if (pubDiv) pubDiv.onchange = () => { publicState.division = pubDiv.value; render(); };
+  if (pubDiv) pubDiv.onchange = () => {
+    publicState.division = pubDiv.value;
+    publicState.feedUrl = null; publicState.feedLabel = null;  // stale URL was for the OLD division (#33 review)
+    render();
+  };
   c.querySelectorAll("[data-public-game]").forEach((b) => b.onclick = async () => {
     const g = await getJSON(`/api/public/games/${b.dataset.publicGame}`);
     publicState.game = (g && !g.error) ? g : null; render();
@@ -3880,7 +3884,11 @@ async function renderPublicGuest() {
     publicState.feedUrl = null; publicState.feedLabel = null; renderPublicGuest();
   });
   const pubDiv = box.querySelector("#public-div");
-  if (pubDiv) pubDiv.onchange = () => { publicState.division = pubDiv.value; renderPublicGuest(); };
+  if (pubDiv) pubDiv.onchange = () => {
+    publicState.division = pubDiv.value;
+    publicState.feedUrl = null; publicState.feedLabel = null;  // stale URL was for the OLD division (#33 review)
+    renderPublicGuest();
+  };
   box.querySelectorAll("[data-public-game]").forEach((b) => b.onclick = async () => {
     const g = await getJSON(`/api/public/games/${b.dataset.publicGame}`);
     publicState.game = (g && !g.error) ? g : null; renderPublicGuest();

@@ -875,6 +875,8 @@ class ApiService:
             raise ValidationError(f"Unknown actor_type '{actor_type}'.")
         if not actor_ref or not isinstance(actor_ref, str):
             raise ValidationError("An actor_ref is required.")
+        if label is not None and not isinstance(label, str):
+            raise ValidationError("A label must be a string.")
         if not self._feed_actor_exists(actor_type, actor_ref):
             raise NotFoundError(f"{actor_type.title()} not found.")
         raw = new_feed_token()

@@ -492,6 +492,19 @@ class CalendarHttpTest(unittest.TestCase):
             self.assertEqual(st, 400, f"actor_ref={bad_ref!r} did not 400 cleanly")
             self.assertEqual(body["error"]["code"], "validation_error")
 
+    def test_public_mint_rejects_non_string_label_instead_of_crashing(self):
+        # Regression: a JSON array/object as label must not reach the raw
+        # CalendarFeedToken.label field and hit an unstructured store/DB
+        # error further downstream (PR #129 review).
+        anon = urllib.request.build_opener()
+        home = self.home
+        for bad_label in ([], {"a": 1}):
+            st, _, body = self._req(
+                anon, "POST", "/api/public/calendar-feeds",
+                {"actor_type": "team", "actor_ref": home, "label": bad_label})
+            self.assertEqual(st, 400, f"label={bad_label!r} did not 400 cleanly")
+            self.assertEqual(body["error"]["code"], "validation_error")
+
 
 if __name__ == "__main__":
     unittest.main()
