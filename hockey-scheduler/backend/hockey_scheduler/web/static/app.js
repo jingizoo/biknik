@@ -3798,6 +3798,7 @@ function setUser(user) {
 // Show/hide the full-screen sign-in overlay (#71). ``body.signed-out`` hides
 // the console shell so a signed-out visitor only ever sees the login card.
 function showLogin(message) {
+  hidePublicGuest();
   const screen = document.getElementById("login-screen");
   document.body.classList.add("signed-out");
   if (screen) screen.hidden = false;
@@ -3806,11 +3807,65 @@ function showLogin(message) {
   renderLoginPersonas();
   const u = document.getElementById("login-user");
   if (u) u.focus();
+  const guestLink = document.getElementById("guest-public-link");
+  if (guestLink) guestLink.onclick = () => showPublicGuest();
 }
 function hideLogin() {
+  hidePublicGuest();
   document.body.classList.remove("signed-out");
   const screen = document.getElementById("login-screen");
   if (screen) screen.hidden = true;
+}
+
+// Public portal (#34): the schedule/standings the backend already serves
+// unauthenticated (/api/public/*) weren't reachable by an anonymous visitor
+// — the whole console shell, "Public" tab included, sits behind the sign-in
+// wall. This is a lightweight guest surface, shown instead of (not inside)
+// the authenticated shell, that reuses the same renderPublic() markup and
+// publicState the signed-in "Public" tab already uses.
+function hidePublicGuest() {
+  const screen = document.getElementById("public-screen");
+  if (screen) screen.hidden = true;
+  if (location.hash === "#public") history.replaceState(null, "", location.pathname + location.search);
+}
+async function renderPublicGuest() {
+  const box = document.getElementById("public-content");
+  if (!box) return;
+  box.innerHTML = `<div class="skeleton"></div><div class="skeleton"></div>`;
+  const sch = await getJSON("/api/public/schedule");
+  publicState.schedule = (sch && !sch.error) ? sch : { fixtures: [], divisions: [] };
+  if (!publicState.division && publicState.schedule.divisions[0]) {
+    publicState.division = publicState.schedule.divisions[0].id;
+  }
+  if (publicTab === "standings" && publicState.division) {
+    publicState.standings = await getJSON(`/api/public/standings/${publicState.division}`);
+  }
+  box.innerHTML = renderPublic({});
+  box.querySelectorAll("[data-public-tab]").forEach((b) => b.onclick = () => {
+    publicTab = b.dataset.publicTab; publicState.game = null; renderPublicGuest();
+  });
+  const pubDiv = box.querySelector("#public-div");
+  if (pubDiv) pubDiv.onchange = () => { publicState.division = pubDiv.value; renderPublicGuest(); };
+  box.querySelectorAll("[data-public-game]").forEach((b) => b.onclick = async () => {
+    const g = await getJSON(`/api/public/games/${b.dataset.publicGame}`);
+    publicState.game = (g && !g.error) ? g : null; renderPublicGuest();
+  });
+  const pubBack = box.querySelector("[data-public-back]");
+  if (pubBack) pubBack.onclick = () => { publicState.game = null; renderPublicGuest(); };
+}
+function showPublicGuest() {
+  // Same shell-hiding rule as showLogin(): body.signed-out keeps the
+  // authenticated sidebar/nav out of the tab order and off-screen for
+  // assistive tech, not just visually covered by the fixed overlay.
+  document.body.classList.add("signed-out");
+  const login = document.getElementById("login-screen");
+  if (login) login.hidden = true;
+  const screen = document.getElementById("public-screen");
+  if (screen) screen.hidden = false;
+  if (location.hash !== "#public") history.replaceState(null, "", location.pathname + location.search + "#public");
+  const signIn = document.getElementById("public-signin-link");
+  if (signIn) signIn.onclick = () => showLogin();
+  renderPublicGuest();
 }
 // Demo mode exposes the seeded personas as one-click sign-ins; production
 // returns an empty list, leaving only the manual username/password form.
@@ -3928,6 +3983,9 @@ async function bootstrap() {
   renderRoleSwitch();
   renderEnvChips();
   if (currentUser) { hideLogin(); render(); }
+  // A bookmarked/shared #public link (#34) drops a signed-out visitor
+  // straight into the guest schedule instead of the sign-in wall.
+  else if (location.hash === "#public") { showPublicGuest(); }
   else { showLogin(); }
 }
 bootstrap();

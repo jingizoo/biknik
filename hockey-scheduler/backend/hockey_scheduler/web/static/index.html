@@ -112,6 +112,22 @@
         <button type="submit" class="act primary login-submit">Sign in</button>
       </form>
       <div id="login-personas" class="login-personas"></div>
+      <button type="button" id="guest-public-link" class="act ghost login-guest-link">View public schedule &amp; standings</button>
+    </div>
+  </div>
+
+  <!-- Public portal (#34): schedule + standings, reachable without signing
+       in — no session, no staff nav, just the public-safe data the backend
+       already serves at /api/public/*. Bookmarkable via #public. -->
+  <div id="public-screen" class="public-screen" hidden>
+    <div class="public-shell">
+      <div class="public-topbar">
+        <div class="login-brand"><span class="brand-mark">H</span>
+          <div><div class="brand-name">Hockey Scheduler</div>
+            <div class="brand-sub">Public Schedule</div></div></div>
+        <button type="button" id="public-signin-link" class="act ghost">Staff sign in</button>
+      </div>
+      <div id="public-content"></div>
     </div>
   </div>
 
