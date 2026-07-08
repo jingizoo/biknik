@@ -34,7 +34,8 @@ let guardianLinkForm = { guardian_user_id: "", player_id: "" };
 let notifPrefs = null;             // signed-in user's own channel prefs (#81)
 let feedTokens = [];               // signed-in user's calendar feed tokens (#82)
 let newFeedUrl = null;             // freshly-minted feed URL, shown once (#82)
-let publicState = { schedule: null, standings: null, division: null, game: null };
+let publicState = { schedule: null, standings: null, division: null, game: null,
+  feedUrl: null, feedLabel: null };  // feedUrl/feedLabel: freshly-minted public calendar subscription (#33)
 let publicTab = "schedule";        // "schedule" | "standings" (#83)
 let schedulerState = {
   division: null, preview: null, drafts: [], summary: null,
@@ -2614,16 +2615,28 @@ function renderPublic(ov) {
   let body;
   if (publicTab === "standings") {
     const divs = ps.divisions || [];
+    const divName = (divs.find((d) => d.id === publicState.division) || {}).name || "Division";
     const opts = divs.map((d) =>
       `<option value="${esc(d.id)}" ${d.id === publicState.division ? "selected" : ""}>${esc(d.name)}</option>`).join("");
     const rows = ((publicState.standings && publicState.standings.standings) || []);
     const trs = rows.length ? rows.map((r, i) => `<tr>
-        <td class="st-rank">${i + 1}</td><td class="st-team">${esc(r.team_name)}</td>
+        <td class="st-rank">${i + 1}</td>
+        <td class="st-team">${esc(r.team_name)}
+          <button type="button" class="feed-sub-btn" data-feed-subscribe="team:${esc(r.team_id)}" data-feed-label="${esc(r.team_name)} calendar" title="Subscribe to ${esc(r.team_name)}'s calendar">📅</button>
+        </td>
         <td>${r.gp}</td><td>${r.w}</td><td>${r.l}</td><td>${r.t}</td>
         <td>${r.gf}</td><td>${r.ga}</td><td>${r.gd > 0 ? "+" + r.gd : r.gd}</td>
         <td class="st-pts">${r.pts}</td></tr>`).join("")
       : `<tr><td colspan="10" class="st-empty">No results yet.</td></tr>`;
-    body = `${divs.length ? `<div class="actions"><select id="public-div">${opts}</select></div>` : ""}
+    const feedMsg = publicState.feedUrl
+      ? `<div class="feed-url"><code>${esc(location.origin + publicState.feedUrl)}</code>
+          <p class="muted">Copy this URL into your calendar app${publicState.feedLabel ? ` — ${esc(publicState.feedLabel)}` : ""}.
+          It is shown once — it won't be displayed again, but the subscription keeps working.</p></div>`
+      : "";
+    body = `${divs.length ? `<div class="actions"><select id="public-div">${opts}</select>
+        <button type="button" class="act ghost" data-feed-subscribe="division:${esc(publicState.division || "")}" data-feed-label="${esc(divName)} calendar">📅 Subscribe to ${esc(divName)} calendar</button>
+        </div>` : ""}
+      ${feedMsg}
       <div class="card st-card"><table class="st-table">
         <thead><tr><th>#</th><th>Team</th><th>GP</th><th>W</th><th>L</th><th>T</th>
           <th>GF</th><th>GA</th><th>GD</th><th>Pts</th></tr></thead>
@@ -2644,6 +2657,23 @@ function renderPublic(ov) {
     ${tabs}${body}
     <div class="privacy-note">🔒 Public view shows fixtures, scores, and standings only.
       Player names and all personal data are never exposed (policy: #35).</div>`;
+}
+
+// Wire "Subscribe to calendar" buttons (#33) rendered by renderPublic()'s
+// standings tab — shared by the signed-in "Public" tab (render()) and the
+// anonymous guest portal (renderPublicGuest()), since both render the exact
+// same markup. Team/division only: minting is unauthenticated, matching the
+// same public-safe fixtures already served at /api/public/schedule.
+function wirePublicFeedSubscribe(container, rerender) {
+  container.querySelectorAll("[data-feed-subscribe]").forEach((b) => b.onclick = async () => {
+    const [actorType, actorRef] = b.dataset.feedSubscribe.split(":");
+    if (!actorRef) return;
+    const res = await post("/api/public/calendar-feeds",
+      { actor_type: actorType, actor_ref: actorRef, label: b.dataset.feedLabel });
+    publicState.feedUrl = (res && res.url) || null;
+    publicState.feedLabel = publicState.feedUrl ? (b.dataset.feedLabel || null) : null;
+    rerender();
+  });
 }
 
 /* ---------- actions ---------- */
@@ -2969,7 +2999,8 @@ async function render() {
   c.querySelectorAll("[data-goto]").forEach((b) => b.onclick = () => switchTab(b.dataset.goto));
   // Public surface (#83): tab switch, division select, game detail, back.
   c.querySelectorAll("[data-public-tab]").forEach((b) => b.onclick = () => {
-    publicTab = b.dataset.publicTab; publicState.game = null; render();
+    publicTab = b.dataset.publicTab; publicState.game = null;
+    publicState.feedUrl = null; publicState.feedLabel = null; render();
   });
   const pubDiv = c.querySelector("#public-div");
   if (pubDiv) pubDiv.onchange = () => { publicState.division = pubDiv.value; render(); };
@@ -2979,6 +3010,7 @@ async function render() {
   });
   const pubBack = c.querySelector("[data-public-back]");
   if (pubBack) pubBack.onclick = () => { publicState.game = null; render(); };
+  wirePublicFeedSubscribe(c, render);
   // Setup drawers (#44): open, close, submit.
   c.querySelectorAll("[data-drawer]").forEach((b) => b.onclick = () => {
     drawer = { kind: b.dataset.drawer }; drawerError = ""; drawerValues = {}; toast = ""; render();
@@ -3748,6 +3780,7 @@ function resetTransientUiState() {
   gCheckout = null; gOpp = null; gOppDetail = null;
   newFeedUrl = null;
   publicState.game = null;
+  publicState.feedUrl = null; publicState.feedLabel = null;
   publicTab = "schedule";
   // Per-view filters/selections below aren't secrets, but carrying them into
   // the next signed-in identity is stale at best (#118 Phase 2) and unsafe at
@@ -3831,6 +3864,7 @@ function hidePublicGuest() {
 async function renderPublicGuest() {
   const box = document.getElementById("public-content");
   if (!box) return;
+  updateToast();  // the guest screen has no other render() path to surface post() errors
   box.innerHTML = `<div class="skeleton"></div><div class="skeleton"></div>`;
   const sch = await getJSON("/api/public/schedule");
   publicState.schedule = (sch && !sch.error) ? sch : { fixtures: [], divisions: [] };
@@ -3842,7 +3876,8 @@ async function renderPublicGuest() {
   }
   box.innerHTML = renderPublic({});
   box.querySelectorAll("[data-public-tab]").forEach((b) => b.onclick = () => {
-    publicTab = b.dataset.publicTab; publicState.game = null; renderPublicGuest();
+    publicTab = b.dataset.publicTab; publicState.game = null;
+    publicState.feedUrl = null; publicState.feedLabel = null; renderPublicGuest();
   });
   const pubDiv = box.querySelector("#public-div");
   if (pubDiv) pubDiv.onchange = () => { publicState.division = pubDiv.value; renderPublicGuest(); };
@@ -3852,6 +3887,7 @@ async function renderPublicGuest() {
   });
   const pubBack = box.querySelector("[data-public-back]");
   if (pubBack) pubBack.onclick = () => { publicState.game = null; renderPublicGuest(); };
+  wirePublicFeedSubscribe(box, renderPublicGuest);
 }
 function showPublicGuest() {
   // Same shell-hiding rule as showLogin(): body.signed-out keeps the

@@ -569,9 +569,9 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(204)
             self.end_headers()
             return
-        # Public iCal feed (#82): bearer token in the URL scopes access; no
+        # Public iCal feed (#82/#33): bearer token in the URL scopes access; no
         # session. Unknown/revoked/mismatched token → 404 (don't confirm which).
-        cal = re.match(r"^/calendar/(team|official|player)/([^/]+)\.ics$", path)
+        cal = re.match(r"^/calendar/(team|division|official|player)/([^/]+)\.ics$", path)
         if cal:
             ics = api.calendar_feed_ics(cal.group(1), cal.group(2))
             if ics is None:
@@ -962,6 +962,26 @@ class Handler(BaseHTTPRequestHandler):
             expire = self._session_cookie("", 0)
             return self._send_json({"ok": True},
                                    extra_headers=[("Set-Cookie", expire)])
+
+        # Public calendar subscription (#33): anyone may mint a team or
+        # division feed token, no session required — the resulting feed
+        # carries exactly the same public-safe fixtures already served
+        # unauthenticated at /api/public/schedule, so minting it needs no more
+        # authority than reading that page. Deliberately excludes "player" and
+        # "official": those feeds are gated to the owning account (or an
+        # operator) via /api/calendar-feeds below, since a junior's schedule
+        # is not public-safe to hand out from an anonymous portal (#26/#35 —
+        # a junior's authority is scoped to a verified guardian link, not to
+        # anyone who can reach a public page).
+        if path == "/api/public/calendar-feeds":
+            actor_type = body.get("actor_type")
+            if actor_type not in ("team", "division"):
+                return self._send_json({"error": {
+                    "code": "validation_error",
+                    "message": "Public calendar subscriptions are available "
+                               "for a team or division only."}}, 400)
+            return self._send_api(api.create_calendar_feed_token(
+                actor_type, body.get("actor_ref"), label=body.get("label")))
 
         # Notification preferences (#81): custom access — an operator manages
         # anyone's, a signed-in user only their own — so it is guarded here

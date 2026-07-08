@@ -1,9 +1,15 @@
-"""iCal (RFC 5545) subscription feeds, scoped by a bearer token (#82).
+"""iCal (RFC 5545) subscription feeds, scoped by a bearer token (#82/#33).
 
-Given a feed token bound to one actor — a team, an official, or a player — build
-a VCALENDAR of that actor's games. Feeds are public-safe fixtures only (teams,
-time, rink, division); no roster/player-name details leak into a team or player
-calendar. The official feed adds only the official's own assignment role.
+Given a feed token bound to one actor — a team, a division, an official, or a
+player — build a VCALENDAR of that actor's games. Feeds are public-safe
+fixtures only (teams, time, rink, division); no roster/player-name details
+leak into a team, division, or player calendar. The official feed adds only
+the official's own assignment role.
+
+A game keeps one stable UID (its own id) for its whole life, so a reschedule
+or cancellation updates the existing calendar event on the next poll instead
+of creating a duplicate — the feed is re-rendered from current game state on
+every request, not diffed/patched.
 
 Pure and deterministic: the store is passed in and the ``now`` used for DTSTAMP
 is injected, so output is reproducible and testable.
@@ -13,7 +19,7 @@ import hashlib
 import secrets
 from datetime import timedelta, timezone
 
-ACTOR_TYPES = ("team", "official", "player")
+ACTOR_TYPES = ("team", "division", "official", "player")
 # Fallback event length when a game has no explicit end_time.
 DEFAULT_GAME_MINUTES = 90
 
@@ -30,14 +36,18 @@ def hash_feed_token(token: str) -> str:
 def games_for_actor(store, actor_type: str, actor_ref: str):
     """The games that belong on ``actor_ref``'s calendar.
 
-    - team   → published games the team plays (home or away);
-    - player → the player's team's published games;
+    - team     → published games the team plays (home or away);
+    - division → published games in that division (#33);
+    - player   → the player's team's published games;
     - official → games the official is actively assigned to (published or not,
       since the token already scopes access to that official).
     """
     if actor_type == "team":
         return [g for g in store.all_games()
                 if g.published and actor_ref in (g.home_team_id, g.away_team_id)]
+    if actor_type == "division":
+        return [g for g in store.all_games()
+                if g.published and g.division_id == actor_ref]
     if actor_type == "player":
         player = store.get_player(actor_ref)
         if player is None:
