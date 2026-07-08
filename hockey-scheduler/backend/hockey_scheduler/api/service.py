@@ -853,7 +853,10 @@ class ApiService:
                 "created_at": ApiService._iso(t.created_at),
                 "revoked_at": ApiService._iso(t.revoked_at),
                 "label": t.label, "revoked": t.revoked_at is not None,
-                "path": f"/calendar/{t.actor_type}/{{token}}.ics"}
+                "path": f"/calendar/{t.actor_type}/{{token}}.ics",
+                "created_by": t.created_by,
+                "last_used_at": ApiService._iso(t.last_used_at),
+                "revoked_by": t.revoked_by}
 
     def _feed_actor_exists(self, actor_type: str, actor_ref: str) -> bool:
         if actor_type == "team":
@@ -883,7 +886,12 @@ class ApiService:
         tok = CalendarFeedToken(
             id=self.store.next_id("calfeed"), token_hash=hash_feed_token(raw),
             actor_type=actor_type, actor_ref=actor_ref,
-            created_at=self.roster.clock(), label=label)
+            created_at=self.roster.clock(), label=label,
+            # A public team/division mint (#33) carries no session, hence no
+            # actor_id — "anonymous" records that plainly rather than leaving
+            # created_by blank, which would be ambiguous with "not tracked
+            # yet" on a pre-#131 row (#131).
+            created_by=actor_id or "anonymous")
         self.store.add_calendar_feed_token(tok)
         # Minting a feed token grants standing read access to an actor's
         # schedule, so it is auditable (#82). Record only lifecycle metadata —
@@ -911,6 +919,7 @@ class ApiService:
         already_revoked = tok.revoked_at is not None
         if tok.revoked_at is None:
             tok.revoked_at = self.roster.clock()
+            tok.revoked_by = actor_id  # (#131) — revoke always requires a session
             self.store.save_calendar_feed_token(tok)
         # Revoking a feed token cuts off that read access, so it is auditable
         # (#82). Only lifecycle metadata — no token material. A repeat revoke of
@@ -935,6 +944,12 @@ class ApiService:
             return None
         if tok.actor_type != actor_type:
             return None
+        # Bumped on every successful resolution (#131) so an operator can
+        # tell a live subscription from an abandoned one — a calendar app
+        # polls this route repeatedly with no session, so this is the only
+        # "still in use" signal available.
+        tok.last_used_at = self.roster.clock()
+        self.store.save_calendar_feed_token(tok)
         name = f"{actor_type.title()} calendar"
         return build_ics(self.store, tok.actor_type, tok.actor_ref,
                          self.roster.clock(), calendar_name=name)

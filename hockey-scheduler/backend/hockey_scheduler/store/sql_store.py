@@ -201,7 +201,7 @@ SPECS = {
          "opponent_responded_at": _dt(), "league_decided_at": _dt()}),
     CalendarFeedToken: Spec(
         CalendarFeedToken, "calendar_feed_tokens",
-        {"created_at": _dt(), "revoked_at": _dt()}),
+        {"created_at": _dt(), "revoked_at": _dt(), "last_used_at": _dt()}),
     OfficialAvailability: Spec(
         OfficialAvailability, "official_availability",
         {"start_time": _dt(), "end_time": _dt(),

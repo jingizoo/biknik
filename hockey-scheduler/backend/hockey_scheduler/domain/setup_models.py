@@ -252,10 +252,17 @@ class CalendarFeedToken:
     """A revocable, bearer token for a scoped iCal subscription feed (#82).
 
     Possession of the raw token grants read access to one actor's calendar
-    (a team, an official, or a player) and nothing else. Only the SHA-256
-    ``token_hash`` is stored — the raw token lives in the subscription URL the
-    user pastes into their calendar app. ``actor_type`` is team/official/player
-    and ``actor_ref`` the corresponding id.
+    (a team, a division, an official, or a player) and nothing else. Only the
+    SHA-256 ``token_hash`` is stored — the raw token lives in the subscription
+    URL the user pastes into their calendar app. ``actor_type`` is
+    team/division/official/player and ``actor_ref`` the corresponding id.
+
+    ``created_by``/``revoked_by`` (#131) are the signed-in user id that
+    minted/revoked it, or the literal string ``"anonymous"`` for a public
+    team/division feed minted with no session (#33) — never a forgeable
+    client-supplied value; the web layer always resolves these server-side.
+    ``last_used_at`` is bumped on every successful ``.ics`` fetch so an
+    operator can tell a live subscription from an abandoned one.
     """
     id: str
     token_hash: str
@@ -264,6 +271,9 @@ class CalendarFeedToken:
     created_at: datetime
     revoked_at: Optional[datetime] = None
     label: Optional[str] = None
+    created_by: Optional[str] = None
+    last_used_at: Optional[datetime] = None
+    revoked_by: Optional[str] = None
 
 
 @dataclass

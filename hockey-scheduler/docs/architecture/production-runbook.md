@@ -26,6 +26,7 @@ once every check passes — notably, an active League Admin must exist.
 | `BOOTSTRAP_ADMIN_USER` / `BOOTSTRAP_ADMIN_PASSWORD` | First League Admin, created on boot only when the store has no accounts (idempotent). | — |
 | `DELIVERY_WORKER_ENABLED` / `_INTERVAL` / `_BATCH` | Opt-in background delivery worker (#79). | disabled / 30s / 50 |
 | Email/push transport vars | Configure real SMTP / push; default is dry-run (nothing sent). | dry-run |
+| `TRUST_PROXY_HEADERS` | `1` trusts `X-Forwarded-For` for anonymous-route rate limiting (#131). **Only set this if a real reverse proxy sits in front of the app and is configured to strip/overwrite any client-supplied `X-Forwarded-For` before appending its own** — otherwise any caller can spoof a new value per request and defeat rate limiting entirely. Unset when serving direct HTTP with no proxy. | unset (raw connecting IP) |
 
 Secrets are read from the environment only — they are never returned by any
 API, logged, or persisted in plaintext (passwords are PBKDF2-hashed).

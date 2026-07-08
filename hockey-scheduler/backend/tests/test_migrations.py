@@ -83,6 +83,9 @@ class MigrationApplyTest(unittest.TestCase):
             cur.execute("ALTER TABLE rinks DROP COLUMN external_ref")  # #95 additive col
             cur.execute("ALTER TABLE guardian_links DROP COLUMN consent_method")  # #35
             cur.execute("ALTER TABLE guardian_links DROP COLUMN consented_at")  # #35
+            cur.execute("ALTER TABLE calendar_feed_tokens DROP COLUMN created_by")  # #131
+            cur.execute("ALTER TABLE calendar_feed_tokens DROP COLUMN last_used_at")  # #131
+            cur.execute("ALTER TABLE calendar_feed_tokens DROP COLUMN revoked_by")  # #131
             cur.execute("DELETE FROM schema_migrations")
             cur.execute("INSERT INTO schema_migrations(version, applied_at) "
                         "VALUES ('0001_initial', '2026-01-01')")
@@ -99,6 +102,9 @@ class MigrationApplyTest(unittest.TestCase):
             self.assertTrue(
                 {"consent_method", "consented_at"}
                 <= _table_columns(adopted, "guardian_links"))
+            self.assertTrue(
+                {"created_by", "last_used_at", "revoked_by"}
+                <= _table_columns(adopted, "calendar_feed_tokens"))
         finally:
             os.remove(path)
 
