@@ -39,6 +39,7 @@ from .auth import (
     user_view,
 )
 from .authz import authorize, required_permission
+from .rate_limit import RateLimiter
 from .scope import can_read_private_game_data, scope_violation
 
 # Acting role resolution (#50): a server-issued session cookie is authoritative.
@@ -59,6 +60,12 @@ def _app_mode() -> str:
 
 # Sessions live outside DemoState so signing in survives a demo-data reset.
 SESSIONS = SessionManager()
+
+# Rate limiting for anonymous routes (#131) — outside DemoState for the same
+# reason SESSIONS is: a demo-data reset should not hand every caller a fresh
+# limit. DemoState.reset() clears it explicitly instead, so tests (which
+# reset demo state between classes) start each suite with a clean slate.
+RATE_LIMITER = RateLimiter()
 
 # Cookie lifetime mirrors the session TTL so the browser drops the cookie when
 # the server-side session would already be expired (#76).
@@ -108,6 +115,7 @@ class DemoState:
             push_transport=push_transport_from_env(os.environ))
 
     def reset(self) -> None:
+        RATE_LIMITER.reset()  # (#131) — a fresh demo/test dataset gets a clean rate-limit slate too
         store = create_store()  # SqlStore.__init__ applies pending numbered migrations (#75)
 
         # Production (#71): NEVER reset the schema or seed demo data — that
@@ -387,6 +395,37 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_json(payload, ERROR_HTTP_STATUS.get(code, 400))
         return self._send_json(payload)
 
+    def _client_ip(self) -> str:
+        """The caller's IP for rate-limiting purposes (#131).
+
+        The production runbook documents deployment "behind a
+        TLS-terminating proxy" as a supported posture, and
+        ``_cookie_is_secure`` already trusts ``X-Forwarded-Proto`` from
+        exactly that proxy for a security-relevant decision — so trusting
+        ``X-Forwarded-For``'s first (client-nearest) hop here for rate
+        limiting is the same, already-accepted trust boundary, not a new
+        one. Without this, every caller behind such a proxy would collapse
+        into one shared bucket keyed on the proxy's own IP (self-review).
+        Falls back to the raw connecting IP when unset — the direct-HTTP
+        demo/local posture, where nothing sits in front of this process.
+        """
+        xff = (self.headers.get("X-Forwarded-For") or "").split(",")[0].strip()
+        if xff:
+            return xff
+        return self.client_address[0] if self.client_address else "unknown"
+
+    def _rate_limited(self, bucket: str, limit: int, window_seconds: float) -> bool:
+        """Send 429 and return True if this caller has exceeded ``limit``
+        requests to ``bucket`` in the last ``window_seconds`` (#131)."""
+        key = self._client_ip()
+        if RATE_LIMITER.allow(bucket, key, limit, window_seconds):
+            return False
+        self._send_json({"error": {
+            "code": "rate_limited",
+            "message": "Too many requests. Please slow down and try again "
+                       "shortly."}}, 429)
+        return True
+
     def _operator_only(self, guard: str) -> bool:
         """For read-only operator routes: send 401/403 and return True if the
         caller may not operate, else False. Same resolution as the feed —
@@ -573,6 +612,11 @@ class Handler(BaseHTTPRequestHandler):
         # session. Unknown/revoked/mismatched token → 404 (don't confirm which).
         cal = re.match(r"^/calendar/(team|division|official|player)/([^/]+)\.ics$", path)
         if cal:
+            # (#131) — a real calendar app polls this every 15-60 min per
+            # subscription; a generous per-IP ceiling only catches abuse, not
+            # normal use, even for someone subscribed to several feeds.
+            if self._rate_limited("calendar_ics", limit=30, window_seconds=60):
+                return
             ics = api.calendar_feed_ics(cal.group(1), cal.group(2))
             if ics is None:
                 return self._send_json({"error": {
@@ -798,13 +842,22 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_api(api.get_standings(sd.group(1)))
         # Public, no-auth surface (#83): schedule / standings / game detail,
         # public-safe fields only. Reachable unauthenticated in production.
+        # Rate-limited (#131) — generous, since the public portal itself
+        # fires several of these per page load/tab switch; the ceiling is
+        # there to catch scraping/abuse, not normal browsing.
         if path == "/api/public/schedule":
+            if self._rate_limited("public_read", limit=120, window_seconds=60):
+                return
             return self._send_api(api.get_public_schedule())
         ps = re.match(r"^/api/public/standings/([^/]+)$", path)
         if ps:
+            if self._rate_limited("public_read", limit=120, window_seconds=60):
+                return
             return self._send_api(api.get_public_standings(ps.group(1)))
         pg = re.match(r"^/api/public/games/([^/]+)$", path)
         if pg:
+            if self._rate_limited("public_read", limit=120, window_seconds=60):
+                return
             return self._send_api(api.get_public_game(pg.group(1)))
         if path == "/api/scheduler/drafts":
             # Current draft games for the review screen (#86), operator-only.
@@ -973,7 +1026,29 @@ class Handler(BaseHTTPRequestHandler):
         # is not public-safe to hand out from an anonymous portal (#26/#35 —
         # a junior's authority is scoped to a verified guardian link, not to
         # anyone who can reach a public page).
+        #
+        # Existence-oracle decision (#131, reviewed per #130 Phase 2): this
+        # route 404s for a team/division id that doesn't exist, which is a
+        # narrow existence oracle for a team that's been created but never
+        # assigned to a division or published a game. Decided to KEEP the
+        # 404 rather than switch to a generic denial: (a) team existence is
+        # already public for any team actually reachable through normal use
+        # — every division-assigned team appears in /api/public/standings'
+        # rows, and every division id is already listed by
+        # /api/public/schedule regardless of whether it has published games
+        # — so the residual gap is only pre-onboarding/orphaned teams, which
+        # carry no data beyond the bare fact of an id existing; (b) a
+        # generic-denial response would degrade the legitimate error message
+        # for the overwhelmingly common case (a genuine typo/stale link) to
+        # protect a narrow, low-value edge case; (c) this route is already
+        # rate-limited (below), which is the more relevant control against
+        # enumeration than response-shape ambiguity.
         if path == "/api/public/calendar-feeds":
+            # Tightest limit of the anonymous surface (#131): this is the
+            # app's only anonymous route that writes to storage, so it gets
+            # a real ceiling rather than the generous read-route allowance.
+            if self._rate_limited("public_feed_mint", limit=5, window_seconds=60):
+                return
             actor_type = body.get("actor_type")
             if actor_type not in ("team", "division"):
                 return self._send_json({"error": {

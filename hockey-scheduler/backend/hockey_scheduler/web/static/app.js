@@ -1385,11 +1385,19 @@ function renderCalendarFeed() {
         it won't be displayed again.</p></div>`
     : "";
   const active = feedTokens.length
-    ? `<div class="row-list">${feedTokens.map((t) => `
+    ? `<div class="row-list">${feedTokens.map((t) => {
+        // Lifecycle metadata (#131): who minted it (an operator sees "anonymous"
+        // for a publicly-minted team/division feed) and whether it's actually
+        // being polled by a calendar app, not just sitting unused.
+        const lastUsed = t.last_used_at ? `last used ${fmtDateTime(t.last_used_at)}` : "never used";
+        const mintedBy = t.created_by ? ` · minted by ${esc(t.created_by)}` : "";
+        return `
         <div class="session-row">
           <span class="row-main">Feed created ${fmtDateTime(t.created_at)}</span>
+          <span class="row-sub">${lastUsed}${mintedBy}</span>
           <button class="act ghost" data-feed-revoke="${esc(t.id)}">Revoke</button>
-        </div>`).join("")}</div>`
+        </div>`;
+      }).join("")}</div>`
     : `<p class="muted">No active calendar feed.</p>`;
   return `<div class="card">
     <div class="section-title" style="margin-top:0">Calendar subscription</div>

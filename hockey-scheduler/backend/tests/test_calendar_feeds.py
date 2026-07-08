@@ -197,6 +197,53 @@ class CalendarServiceTest(unittest.TestCase):
         self.assertEqual(e.action, "calendar_feed_token_revoked")
         self.assertTrue(e.detail["already_revoked"])  # idempotent no-op recorded
 
+    # -- lifecycle metadata (#131) -------------------------------------------
+    def test_signed_in_mint_records_created_by(self):
+        row = self.api.create_calendar_feed_token(
+            "team", self.home, actor_id="user_admin")
+        self.assertEqual(row["created_by"], "user_admin")
+
+    def test_anonymous_mint_records_created_by_as_anonymous(self):
+        # No actor_id — mirrors the public /api/public/calendar-feeds route,
+        # which never passes one since it has no session to resolve.
+        row = self.api.create_calendar_feed_token("team", self.home)
+        self.assertEqual(row["created_by"], "anonymous")
+
+    def test_revoke_records_revoked_by(self):
+        row = self.api.create_calendar_feed_token(
+            "team", self.home, actor_id="user_admin")
+        self.assertIsNone(row["revoked_by"])
+        revoked = self.api.revoke_calendar_feed_token(
+            row["id"], actor_id="user_admin")
+        self.assertEqual(revoked["revoked_by"], "user_admin")
+
+    def test_fresh_token_has_never_been_used(self):
+        row = self.api.create_calendar_feed_token(
+            "team", self.home, actor_id="user_admin")
+        self.assertIsNone(row["last_used_at"])
+
+    def test_fetching_the_ics_bumps_last_used_at(self):
+        now = datetime(2026, 3, 1, tzinfo=UTC)
+        row = self.api.create_calendar_feed_token(
+            "team", self.home, actor_id="user_admin")
+        self.assertIsNone(row["last_used_at"])
+        self.api.calendar_feed_ics("team", row["token"])
+        refreshed = self.api.list_calendar_feed_tokens(
+            "team", self.home)["feed_tokens"]
+        mine = next(t for t in refreshed if t["id"] == row["id"])
+        self.assertIsNotNone(mine["last_used_at"])
+
+    def test_revoked_token_fetch_does_not_bump_last_used_at(self):
+        row = self.api.create_calendar_feed_token(
+            "team", self.home, actor_id="user_admin")
+        self.api.revoke_calendar_feed_token(row["id"], actor_id="user_admin")
+        ics = self.api.calendar_feed_ics("team", row["token"])
+        self.assertIsNone(ics)  # revoked → no content
+        refreshed = self.api.list_calendar_feed_tokens(
+            "team", self.home)["feed_tokens"]
+        mine = next(t for t in refreshed if t["id"] == row["id"])
+        self.assertIsNone(mine["last_used_at"])
+
 
 class CalendarHttpTest(unittest.TestCase):
     @classmethod
@@ -217,6 +264,13 @@ class CalendarHttpTest(unittest.TestCase):
     def tearDownClass(cls):
         cls.httpd.shutdown()
         cls.thread.join(timeout=5)
+
+    def setUp(self):
+        # Every test method in this class shares one server/rate-limiter
+        # instance and connects from the same loopback IP, so without this
+        # reset a real per-caller ceiling (#131) would trip from unrelated
+        # tests' request counts, not this test's own behavior.
+        self.srv.RATE_LIMITER.reset()
 
     def _client(self):
         return urllib.request.build_opener(
