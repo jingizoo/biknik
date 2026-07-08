@@ -486,6 +486,14 @@ select.player-picker {
 .pub-detail { text-align: center; padding: 22px; }
 .pub-score { font-size: 40px; font-weight: 800; letter-spacing: 2px; }
 
+/* Per-team public calendar subscribe icon (#33) — standings table. */
+.feed-sub-btn {
+  border: none; background: none; cursor: pointer; font-size: 13px;
+  margin-left: 4px; padding: 1px 3px; border-radius: 5px; vertical-align: middle;
+  opacity: 0.75;
+}
+.feed-sub-btn:hover { opacity: 1; background: #eceef3; }
+
 /* Calendar subscription (#82). */
 .feed-url { background: #f4f6fb; border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; margin: 8px 0; }
 .feed-url code { word-break: break-all; font-size: 12.5px; }

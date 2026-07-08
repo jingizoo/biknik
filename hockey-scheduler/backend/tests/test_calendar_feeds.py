@@ -1,8 +1,16 @@
-"""iCal calendar feeds (#82).
+"""iCal calendar feeds (#82/#33).
 
-A revocable bearer token scopes a public iCal feed to one actor. Team and
-player feeds are fixtures only (no roster/player names); the official feed
-covers only that official's assigned games. Only the token hash is stored.
+A revocable bearer token scopes a public iCal feed to one actor. Team,
+division, and player feeds are fixtures only (no roster/player names); the
+official feed covers only that official's assigned games. Only the token
+hash is stored.
+
+#33 adds a division scope and a way for an anonymous visitor to mint a
+team/division subscription straight from the public portal — team and
+division feeds are exactly as public-safe as the existing unauthenticated
+/api/public/schedule, so minting one needs no more authority than reading
+that page. Player/official feeds stay behind the existing owner-or-operator
+gate (a junior's schedule is not safe to hand out from an anonymous page).
 """
 
 import json
@@ -18,6 +26,7 @@ from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
 
 from hockey_scheduler.api import ApiService
 from hockey_scheduler.domain import Player
+from hockey_scheduler.domain.enums import IceSlotStatus, IceSlotType
 from hockey_scheduler.full_demo import build_full_demo_store
 from hockey_scheduler.services import build_ics, games_for_actor, hash_feed_token
 
@@ -70,6 +79,77 @@ class CalendarServiceTest(unittest.TestCase):
         now = datetime(2026, 3, 1, tzinfo=UTC)
         ics = build_ics(self.store, "official", self.ref, now)
         self.assertIn("Role:", ics)
+
+    # -- division scope (#33) -----------------------------------------------
+    def test_division_feed_only_includes_that_divisions_games(self):
+        div = self.store.get_game(self.gid).division_id
+        games = games_for_actor(self.store, "division", div)
+        self.assertTrue(games)
+        for g in games:
+            self.assertEqual(g.division_id, div)
+
+    def test_division_ics_is_wellformed_and_leaks_no_player_names(self):
+        now = datetime(2026, 3, 1, tzinfo=UTC)
+        div = self.store.get_game(self.gid).division_id
+        ics = build_ics(self.store, "division", div, now)
+        self.assertTrue(ics.startswith("BEGIN:VCALENDAR\r\n"))
+        self.assertIn("BEGIN:VEVENT", ics)
+        self.assertIn("X-WR-CALNAME:Division calendar",
+                      build_ics(self.store, "division", div, now,
+                               calendar_name="Division calendar"))
+        for p in self.store.players.values():
+            self.assertNotIn(p.name, ics)
+
+    # -- reschedule / cancellation must update the SAME event (#33) ---------
+    def _free_game_slot(self, exclude_id):
+        game = self.store.get_game(self.gid)
+        return next(
+            s for s in self.store.all_ice_slots()
+            if s.rink_id == self.store.get_ice_slot(game.ice_slot_id).rink_id
+            and s.slot_type == IceSlotType.GAME
+            and s.status == IceSlotStatus.AVAILABLE
+            and s.id != exclude_id)
+
+    def test_reschedule_updates_same_calendar_event_not_duplicate(self):
+        now = datetime(2026, 3, 1, tzinfo=UTC)
+        uid = f"UID:{self.gid}@hockey-scheduler"
+        before = build_ics(self.store, "team", self.home, now)
+        self.assertEqual(before.count(uid), 1)
+        before_start = next(l for l in before.split("\r\n")
+                            if l.startswith("DTSTART"))
+
+        game = self.store.get_game(self.gid)
+        new_slot = self._free_game_slot(game.ice_slot_id)
+        # Mirrors decide_reschedule's approve path (#29): move_game then
+        # publish_game — a raw move_game alone unpublishes pending review, so
+        # the fixture would (correctly) vanish from the public feed rather
+        # than duplicate; republishing is what puts the SAME event back with
+        # its new time.
+        self.api.move_game(self.gid, new_slot.id, actor_id="user_admin")
+        self.api.publish_game(self.gid, actor_id="user_admin")
+
+        after = build_ics(self.store, "team", self.home, now)
+        self.assertEqual(after.count(uid), 1)  # still exactly one VEVENT
+        after_start = next(l for l in after.split("\r\n")
+                           if l.startswith("DTSTART"))
+        self.assertNotEqual(before_start, after_start)
+
+    def test_cancelled_game_marked_cancelled_not_removed_or_duplicated(self):
+        now = datetime(2026, 3, 1, tzinfo=UTC)
+        uid = f"UID:{self.gid}@hockey-scheduler"
+        self.assertIn("STATUS:CONFIRMED",
+                      build_ics(self.store, "team", self.home, now))
+
+        self.api.cancel_game(self.gid, actor_id="user_admin")
+
+        ics = build_ics(self.store, "team", self.home, now)
+        self.assertEqual(ics.count(uid), 1)
+        # The event stays in the feed (so a subscribed calendar app removes
+        # its own copy via STATUS, per RFC 5545 convention for a
+        # METHOD:PUBLISH polling feed) rather than silently disappearing.
+        events = ics.split("BEGIN:VEVENT")
+        this_event = next(e for e in events if uid in e)
+        self.assertIn("STATUS:CANCELLED", this_event)
 
     # -- audit trail (#82) -------------------------------------------------
     def test_mint_writes_audit_without_token_material(self):
@@ -131,6 +211,7 @@ class CalendarHttpTest(unittest.TestCase):
         cls.home = srv.STATE.ids["home_team_id"]
         cls.ref = srv.STATE.ids["referee_id"]
         cls.player = srv.STATE.ids["selected_player_id"]
+        cls.division = srv.STATE.ids["division_id"]
 
     @classmethod
     def tearDownClass(cls):
@@ -324,6 +405,105 @@ class CalendarHttpTest(unittest.TestCase):
         s, ctype, _ = self._reqx(pub, f"/calendar/team/{team_feed['token']}.ics")
         self.assertEqual(s, 200)
         self.assertIn("text/calendar", ctype)
+
+    # -- public-portal calendar subscription, no session (#33) --------------
+    def test_anonymous_visitor_can_mint_team_and_division_feeds(self):
+        anon = urllib.request.build_opener()
+        for actor_type, ref in (("team", self.home), ("division", self.division)):
+            st, _, body = self._req(
+                anon, "POST", "/api/public/calendar-feeds",
+                {"actor_type": actor_type, "actor_ref": ref})
+            self.assertEqual(st, 200, f"anonymous mint denied for {actor_type}")
+            self.assertIn("token", body)
+            self.assertNotIn("token_hash", body)
+            # And the resulting subscription URL is itself fetchable, no
+            # session, exactly like a real calendar app would poll it.
+            s, ctype, ics = self._reqx(anon, body["url"])
+            self.assertEqual(s, 200)
+            self.assertIn("text/calendar", ctype)
+            self.assertIn("BEGIN:VCALENDAR", ics)
+
+    def test_public_mint_rejects_player_and_official_scopes(self):
+        anon = urllib.request.build_opener()
+        for actor_type, ref in (("player", self.player), ("official", self.ref)):
+            st, _, body = self._req(
+                anon, "POST", "/api/public/calendar-feeds",
+                {"actor_type": actor_type, "actor_ref": ref})
+            self.assertEqual(st, 400, f"anonymous mint unexpectedly allowed for {actor_type}")
+            self.assertEqual(body["error"]["code"], "validation_error")
+
+    def test_public_mint_rejects_unknown_team_or_division(self):
+        anon = urllib.request.build_opener()
+        st1, _, _ = self._req(
+            anon, "POST", "/api/public/calendar-feeds",
+            {"actor_type": "team", "actor_ref": "team_does_not_exist"})
+        self.assertEqual(st1, 404)
+        st2, _, _ = self._req(
+            anon, "POST", "/api/public/calendar-feeds",
+            {"actor_type": "division", "actor_ref": "division_does_not_exist"})
+        self.assertEqual(st2, 404)
+
+    def test_publicly_minted_feed_still_governed_by_the_real_owner_and_operator(self):
+        # A publicly-minted token is not a separate, ungoverned concept — it's
+        # the same CalendarFeedToken row an operator or the team's own coach
+        # already manages via the authenticated routes (#82), so it can be
+        # found and revoked through the exact same list/revoke flow.
+        anon = urllib.request.build_opener()
+        _, _, minted = self._req(
+            anon, "POST", "/api/public/calendar-feeds",
+            {"actor_type": "team", "actor_ref": self.home})
+
+        coach = self._login("coach")
+        st_l, _, listing = self._req(
+            coach, "GET",
+            f"/api/calendar-feeds?actor_type=team&actor_ref={self.home}")
+        self.assertEqual(st_l, 200)
+        self.assertIn(minted["id"], [t["id"] for t in listing["feed_tokens"]])
+
+        st_r, _, _ = self._req(
+            coach, "POST", f"/api/calendar-feeds/{minted['id']}/revoke")
+        self.assertEqual(st_r, 200)
+        s, _, _ = self._reqx(anon, minted["url"])
+        self.assertEqual(s, 404)
+
+    def test_division_feed_route_accepts_the_division_actor_type(self):
+        anon = urllib.request.build_opener()
+        _, _, minted = self._req(
+            anon, "POST", "/api/public/calendar-feeds",
+            {"actor_type": "division", "actor_ref": self.division})
+        s, ctype, ics = self._reqx(anon, f"/calendar/division/{minted['token']}.ics")
+        self.assertEqual(s, 200)
+        self.assertIn("text/calendar", ctype)
+        self.assertIn("BEGIN:VCALENDAR", ics)
+        # Wrong actor_type on the route for a division-scoped token → 404
+        # (mirrors the existing team/official mismatch guarantee).
+        s2, _, _ = self._reqx(anon, f"/calendar/team/{minted['token']}.ics")
+        self.assertEqual(s2, 404)
+
+    def test_public_mint_rejects_non_string_actor_ref_instead_of_crashing(self):
+        # Regression: a JSON array/object/number as actor_ref must not reach
+        # a raw, unhandled store lookup (self-review, #33) — that killed the
+        # request thread with no HTTP response at all, anonymously.
+        anon = urllib.request.build_opener()
+        for bad_ref in (["x"], {"a": 1}, 12345):
+            st, _, body = self._req(
+                anon, "POST", "/api/public/calendar-feeds",
+                {"actor_type": "team", "actor_ref": bad_ref})
+            self.assertEqual(st, 400, f"actor_ref={bad_ref!r} did not 400 cleanly")
+            self.assertEqual(body["error"]["code"], "validation_error")
+
+    def test_public_mint_rejects_non_string_label_instead_of_crashing(self):
+        # Regression: a JSON array/object as label must not reach the raw
+        # CalendarFeedToken.label field and hit an unstructured store/DB
+        # error further downstream (PR #129 review).
+        anon = urllib.request.build_opener()
+        home = self.home
+        for bad_label in ([], {"a": 1}):
+            st, _, body = self._req(
+                anon, "POST", "/api/public/calendar-feeds",
+                {"actor_type": "team", "actor_ref": home, "label": bad_label})
+            self.assertEqual(st, 400, f"label={bad_label!r} did not 400 cleanly")
+            self.assertEqual(body["error"]["code"], "validation_error")
 
 
 if __name__ == "__main__":

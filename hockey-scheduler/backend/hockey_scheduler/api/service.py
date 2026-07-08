@@ -855,6 +855,17 @@ class ApiService:
                 "label": t.label, "revoked": t.revoked_at is not None,
                 "path": f"/calendar/{t.actor_type}/{{token}}.ics"}
 
+    def _feed_actor_exists(self, actor_type: str, actor_ref: str) -> bool:
+        if actor_type == "team":
+            return self.store.get_team(actor_ref) is not None
+        if actor_type == "division":
+            return self.store.get_division(actor_ref) is not None
+        if actor_type == "player":
+            return self.store.get_player(actor_ref) is not None
+        if actor_type == "official":
+            return self.store.get_official(actor_ref) is not None
+        return False
+
     @catch
     def create_calendar_feed_token(self, actor_type: str, actor_ref: str,
                                    label=None, actor_id=None) -> dict:
@@ -862,8 +873,12 @@ class ApiService:
         (only its hash is stored). The caller builds the subscription URL."""
         if actor_type not in ACTOR_TYPES:
             raise ValidationError(f"Unknown actor_type '{actor_type}'.")
-        if not actor_ref:
+        if not actor_ref or not isinstance(actor_ref, str):
             raise ValidationError("An actor_ref is required.")
+        if label is not None and not isinstance(label, str):
+            raise ValidationError("A label must be a string.")
+        if not self._feed_actor_exists(actor_type, actor_ref):
+            raise NotFoundError(f"{actor_type.title()} not found.")
         raw = new_feed_token()
         tok = CalendarFeedToken(
             id=self.store.next_id("calfeed"), token_hash=hash_feed_token(raw),
