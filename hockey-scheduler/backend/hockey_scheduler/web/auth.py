@@ -163,6 +163,7 @@ def user_view(session, store=None) -> dict:
             official = store.get_official(oid)
             scope["official_name"] = official.name if official else oid
     return {
+        "id": session.get("user_id"),
         "username": username,
         "role": role.value,
         "label": ROLE_LABELS[role],

@@ -671,6 +671,8 @@ class SqlStore:
                            "guardian_user_id = ? AND player_id = ?",
                            (guardian_user_id, player_id), order="id")
         return rows[0] if rows else None
+    def guardian_links_for_player(self, player_id):
+        return self._query(GuardianLink, "player_id = ?", (player_id,), order="id")
     def all_guardian_links(self):
         return self._query(GuardianLink, order="id")
 

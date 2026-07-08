@@ -109,25 +109,44 @@ def channel_enabled(store, recipient: str, channel) -> bool:
     return True if pref is None else pref.enabled
 
 
+def _guardian_recipient_refs(store, player_id) -> list:
+    """Verified guardians linked to ``player_id``, as delivery recipient refs
+    (#32). An unverified link carries no authority — same gate the guardian
+    action routes use (#26) — so it gets no delivery either."""
+    return ["guardian:" + g.guardian_user_id
+            for g in store.guardian_links_for_player(player_id) if g.verified]
+
+
 def enqueue(store, notification, channels=DEFAULT_CHANNELS):
     """Create the pending delivery rows for a freshly emitted notification.
 
     A channel the recipient has disabled in their preferences (#81) is skipped
     — no delivery row is created for it — so the resolver honors opt-outs.
+
+    A PLAYER-addressed notification also reaches any verified guardian linked
+    to that junior (#32) — a junior may not check their own device, so their
+    guardian needs the same push/email delivery. This fans out here, in the
+    delivery layer itself, so every existing and future PLAYER-audience
+    emission site (today: substitute offers) gets it automatically without
+    each call site needing to know guardians exist.
     """
-    recipient = recipient_ref(notification)
+    recipients = [recipient_ref(notification)]
+    if notification.audience == NotificationAudience.PLAYER:
+        recipients.extend(
+            _guardian_recipient_refs(store, notification.audience_ref))
     created = []
-    for channel in channels:
-        if not channel_enabled(store, recipient, channel):
-            continue
-        d = NotificationDelivery(
-            id=store.next_id("notif_delivery"),
-            notification_id=notification.id,
-            channel=channel,
-            recipient_ref=recipient,
-            destination=resolve_destination(store, recipient, channel),
-        )
-        created.append(store.add_notification_delivery(d))
+    for recipient in recipients:
+        for channel in channels:
+            if not channel_enabled(store, recipient, channel):
+                continue
+            d = NotificationDelivery(
+                id=store.next_id("notif_delivery"),
+                notification_id=notification.id,
+                channel=channel,
+                recipient_ref=recipient,
+                destination=resolve_destination(store, recipient, channel),
+            )
+            created.append(store.add_notification_delivery(d))
     return created
 
 

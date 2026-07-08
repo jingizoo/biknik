@@ -1349,12 +1349,17 @@ function updateToast() {
 // self-service notification-preference toggles. Mirrors the server's mapping.
 function ownRecipientRef() {
   const u = currentUser;
-  if (!u || !u.scope) return null;
-  if (u.role === "official" && u.scope.official_id) return "official:" + u.scope.official_id;
+  if (!u) return null;
+  if (u.role === "official" && u.scope && u.scope.official_id) return "official:" + u.scope.official_id;
   // Only a coach speaks for the shared team channel; a player has no own
   // delivery target in this slice, so they get no self-service prefs panel
   // (and cannot mute the whole team's notifications). Mirrors the server.
-  if (u.role === "coach" && u.scope.team_id) return "team:" + u.scope.team_id;
+  if (u.role === "coach" && u.scope && u.scope.team_id) return "team:" + u.scope.team_id;
+  // A guardian has no session scope at all (#26 — authority comes solely
+  // from the verified link), but now DOES have their own delivery target
+  // (#32 — a linked junior's notifications fan out to them) keyed by their
+  // own account id instead.
+  if (u.role === "guardian" && u.id) return "guardian:" + u.id;
   return null;
 }
 
