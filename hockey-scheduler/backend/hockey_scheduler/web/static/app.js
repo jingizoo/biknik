@@ -31,6 +31,11 @@ let usersState = { accounts: [], sessions: [] };  // account/session admin (#78)
 let usersSelected = null;          // account id whose sessions are shown (#78)
 let guardianLinksState = [];       // guardian↔junior links, Users tab (#35)
 let guardianLinkForm = { guardian_user_id: "", player_id: "" };
+// New-account form, Users tab (#135). Deliberately holds no password field —
+// the password input is read live via val() only at submit time and never
+// assigned here, so it can never be re-rendered back onto the page.
+let newAccountForm = { username: "", role: "", team_id: "", player_id: "", official_id: "" };
+let newAccountError = "";
 let notifPrefs = null;             // signed-in user's own channel prefs (#81)
 let feedTokens = [];               // signed-in user's calendar feed tokens (#82)
 let newFeedUrl = null;             // freshly-minted feed URL, shown once (#82)
@@ -1655,7 +1660,57 @@ function renderDelivery(ov) {
 }
 
 /* ---------- Users / sessions admin (#78) ---------- */
-function renderUsers() {
+// Role-specific scope field for the create-account form (#135) — a
+// dropdown, never raw JSON, mirroring the actual UserAccount.scope shape
+// each role's session resolution expects (web/server.py's role-specific
+// scope keys: team_id/player_id/official_id).
+const NEW_ACCOUNT_SCOPE_FIELD = {
+  coach: { key: "team_id", label: "Team", inputId: "new-account-team" },
+  player: { key: "player_id", label: "Player", inputId: "new-account-player" },
+  official: { key: "official_id", label: "Official", inputId: "new-account-official" },
+};
+function renderCreateAccountForm(ov) {
+  const roleOpts = roleCatalog
+    .map((r) => opt(r.id, r.label, r.id === newAccountForm.role)).join("");
+  const scopeSpec = NEW_ACCOUNT_SCOPE_FIELD[newAccountForm.role];
+  let scopeField = "";
+  if (scopeSpec) {
+    const options = scopeSpec.key === "team_id" ? (ov.teams || []).map((t) => [t.id, t.name])
+      : scopeSpec.key === "player_id" ? playersList.map((p) => [p.id, p.name])
+      : officialsPool.map((o) => [o.id, o.name]);
+    const opts = options.length
+      ? options.map(([id, name]) => opt(id, name, id === newAccountForm[scopeSpec.key])).join("")
+      : `<option value="">None available yet</option>`;
+    scopeField = `<label class="cd-field"><span>${scopeSpec.label}</span>
+      <select id="${scopeSpec.inputId}" class="cd-input">${opts}</select></label>`;
+  }
+  const guardianNote = newAccountForm.role === "guardian"
+    ? `<p class="muted">Guardian access is granted by verified guardian links after account creation.</p>`
+    : "";
+  const err = newAccountError
+    ? `<div class="banner alert"><p>${esc(newAccountError)}</p></div>` : "";
+  return `<div class="card cd-form">
+    <div class="section-title" style="margin-top:0">Create account</div>
+    <p class="muted">Create accounts for staff, coaches, players, guardians, and officials.
+      Passwords are temporary; share them out of band.</p>
+    ${err}
+    <div class="cd-grid">
+      <label class="cd-field"><span>Username</span>
+        <input id="new-account-username" class="cd-input" placeholder="coach1"
+          value="${esc(newAccountForm.username)}" /></label>
+      <label class="cd-field"><span>Temporary password</span>
+        <input id="new-account-password" type="password" class="cd-input" autocomplete="new-password" /></label>
+      <label class="cd-field"><span>Role</span>
+        <select id="new-account-role" class="cd-input">
+          <option value="">Select a role</option>${roleOpts}
+        </select></label>
+      ${scopeField}
+      ${guardianNote}
+      <div class="cd-submit"><button class="act primary" data-account-create>Create account</button></div>
+    </div>
+  </div>`;
+}
+function renderUsers(ov) {
   if (!hasPerm("manage_users")) {
     return `<div class="banner neutral"><h2>League admins only</h2>
       <p>Account and session administration is limited to league admins.</p></div>`;
@@ -1674,6 +1729,7 @@ function renderUsers() {
     ? renderUserSessions()
     : `<p class="muted">Select an account to view its login sessions.</p>`;
   return `
+    ${renderCreateAccountForm(ov)}
     <div class="card">
       <div class="section-title">Accounts</div>
       <div class="row-list">${accountList}</div>
@@ -2962,6 +3018,10 @@ async function render() {
       guardianLinksState = Array.isArray(gl) ? gl : [];
       const pl = await getJSON("/api/players");
       playersList = Array.isArray(pl) ? pl : [];
+      // Officials pool for the create-account form's Official scope dropdown
+      // (#135) — same data the game sheet's assign control already uses.
+      const op = await getJSON("/api/officials");
+      officialsPool = (op && op.officials) || [];
     }
     // Public surface (#83): schedule + standings from public-safe endpoints.
     if (view === "public") {
@@ -3021,7 +3081,7 @@ async function render() {
     : view === "guardian_home" ? renderGuardianHome(guardianHome)
     : view === "notifications" ? renderNotifications()
     : view === "delivery" ? renderDelivery(ov)
-    : view === "users" ? renderUsers()
+    : view === "users" ? renderUsers(ov)
     : view === "readiness" ? renderReadiness(ov)
     : view === "scheduler" ? renderScheduler(ov)
     : view === "standings" ? renderStandings(ov, standings)
@@ -3597,6 +3657,70 @@ async function render() {
     await post(`/api/accounts/${usersSelected}/sessions/${b.dataset.revokeSession}/revoke`, {});
     await render();
   });
+  // Create-account form (#135): the Users tab re-renders on plenty of
+  // OTHER actions too (viewing an account's sessions, revoking a session,
+  // guardian-link create/verify) — every render() call replaces #content's
+  // whole innerHTML, so without this, typing into the username field (or
+  // picking a scope value) and then clicking something unrelated would
+  // silently wipe it (self-review). Keep newAccountForm continuously
+  // synced from the live DOM on every input, not just on submit/role-change.
+  const acctUsername = c.querySelector("#new-account-username");
+  if (acctUsername) acctUsername.oninput = () => { newAccountForm.username = acctUsername.value; };
+  const acctScope = c.querySelector("#new-account-team, #new-account-player, #new-account-official");
+  if (acctScope) acctScope.onchange = () => {
+    const spec = NEW_ACCOUNT_SCOPE_FIELD[newAccountForm.role];
+    if (spec) newAccountForm[spec.key] = acctScope.value;
+  };
+  // The role select needs its own change handler (not just the sync above)
+  // so the role-specific scope dropdown (team/player/official) appears
+  // immediately. Deliberately never captures the password into
+  // newAccountForm/state (read fresh via val() only at actual submit
+  // time) — but a re-render still replaces the password <input> with a
+  // fresh, empty one, so restore whatever was already typed via a local
+  // variable that lives only for this handler call, not via state, so
+  // filling password before switching role doesn't silently lose it.
+  const acctRoleSelect = c.querySelector("#new-account-role");
+  if (acctRoleSelect) acctRoleSelect.onchange = async () => {
+    const inProgressPassword = val("new-account-password");
+    newAccountForm.role = acctRoleSelect.value;
+    await render();
+    const pwInput = document.getElementById("new-account-password");
+    if (pwInput) pwInput.value = inProgressPassword;
+  };
+  const acctCreate = c.querySelector("[data-account-create]");
+  if (acctCreate) acctCreate.onclick = async () => {
+    const username = val("new-account-username");
+    const password = val("new-account-password");
+    const role = val("new-account-role");
+    const scopeSpec = NEW_ACCOUNT_SCOPE_FIELD[role];
+    const scopeValue = scopeSpec ? val(scopeSpec.inputId) : "";
+    newAccountForm = {
+      username, role,
+      team_id: role === "coach" ? scopeValue : "",
+      player_id: role === "player" ? scopeValue : "",
+      official_id: role === "official" ? scopeValue : "",
+    };
+    if (!username || !role) {
+      newAccountError = "Username and role are required.";
+    } else if (!password) {
+      newAccountError = "A temporary password is required.";
+    } else if (scopeSpec && !scopeValue) {
+      newAccountError = `Select a ${scopeSpec.label.toLowerCase()} for this role.`;
+    } else {
+      newAccountError = "";
+      toast = "";
+      const res = await post("/api/accounts",
+        { username, password, role, scope: scopeSpec ? { [scopeSpec.key]: scopeValue } : {} });
+      if (res && !res.error) {
+        newAccountForm = { username: "", role: "", team_id: "", player_id: "", official_id: "" };
+        usersSelected = res.id;
+        toast = "Account created.";
+      } else {
+        newAccountError = (res && res.error && res.error.message) || "Could not create account.";
+      }
+    }
+    await render();
+  };
   // Guardian↔junior links (#35): create an unverified link, then verify one
   // with a real consent_method — the operator-facing consent record.
   const glCreate = c.querySelector("[data-glink-create]");
@@ -3842,6 +3966,11 @@ function resetTransientUiState() {
   // doesn't. Cleared here anyway for consistency/defense-in-depth with the
   // playersList precedent above.
   guardianLinksState = [];
+  // New-account form (#135): same defense-in-depth as guardianLinksState —
+  // renderUsers() already gates this, but an in-progress username/role
+  // shouldn't survive an identity switch regardless. Never held a password.
+  newAccountForm = { username: "", role: "", team_id: "", player_id: "", official_id: "" };
+  newAccountError = "";
 }
 function setUser(user) {
   const prevId = currentUser ? currentUser.username : null;

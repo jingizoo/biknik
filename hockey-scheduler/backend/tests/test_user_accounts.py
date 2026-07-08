@@ -1,5 +1,11 @@
+import json
+import threading
 import unittest
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
+from http.cookiejar import CookieJar
+from http.server import ThreadingHTTPServer
 
 from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
 
@@ -12,6 +18,7 @@ from hockey_scheduler.services.passwords import (
     verify_password,
 )
 from hockey_scheduler.store import InMemoryStore
+from hockey_scheduler.web import server as srv
 
 
 def _clock():
@@ -182,6 +189,112 @@ class ApiServiceAccountFacadeTest(unittest.TestCase):
         self.assertEqual(row["role"], "official")
         self.assertEqual(row["scope"], {"official_id": "official_9"})
         self.assertNotIn("password_hash", row)
+
+
+class AccountCreationHttpTest(unittest.TestCase):
+    """POST /api/accounts over real HTTP (#135) — the League-Admin-only
+    create path a new "Create account" Users-tab form calls."""
+
+    @classmethod
+    def setUpClass(cls):
+        srv.STATE.reset()
+        cls.httpd = ThreadingHTTPServer(("127.0.0.1", 0), srv.Handler)
+        cls.port = cls.httpd.server_address[1]
+        cls.thread = threading.Thread(target=cls.httpd.serve_forever, daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.thread.join(timeout=5)
+
+    def _client(self):
+        return urllib.request.build_opener(
+            urllib.request.HTTPCookieProcessor(CookieJar()))
+
+    def _login(self, username, password="demo"):
+        opener = self._client()
+        self._req(opener, "POST", "/api/auth/login",
+                  {"username": username, "password": password})
+        return opener
+
+    def _req(self, opener, method, path, body=None):
+        url = f"http://127.0.0.1:{self.port}{path}"
+        data = json.dumps(body).encode() if body is not None else None
+        req = urllib.request.Request(url, data=data, method=method)
+        if data is not None:
+            req.add_header("Content-Type", "application/json")
+        try:
+            with opener.open(req) as r:
+                return r.status, json.loads(r.read() or b"{}")
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read() or b"{}")
+
+    def test_actor_attribution_is_server_resolved_not_client_supplied(self):
+        # The critical regression this issue's backend review item calls
+        # out: a forged body actor_id must never reach the audit trail —
+        # only the real, session-resolved league admin's own account id.
+        admin = self._login("admin")
+        admin_id = srv.STATE.api.store.get_user_account_by_username("admin").id
+        status, body = self._req(
+            admin, "POST", "/api/accounts",
+            {"username": "spoof_test", "password": "pw", "role": "viewer",
+             "actor_id": "spoofed_someone_else"})
+        self.assertEqual(status, 200)
+        entries = srv.STATE.api.store.all_setup_audit()
+        mint = next(e for e in reversed(entries)
+                   if e.action == "user_account_created" and e.entity_id == body["id"])
+        self.assertEqual(mint.actor_id, admin_id)
+        self.assertNotEqual(mint.actor_id, "spoofed_someone_else")
+
+    def test_league_admin_can_create_a_coach_account_with_team_scope(self):
+        admin = self._login("admin")
+        home_team = srv.STATE.ids["home_team_id"]
+        status, body = self._req(
+            admin, "POST", "/api/accounts",
+            {"username": "new_coach_http", "password": "pw", "role": "coach",
+             "scope": {"team_id": home_team}})
+        self.assertEqual(status, 200)
+        self.assertEqual(body["scope"], {"team_id": home_team})
+        self.assertNotIn("password_hash", body)
+        # The new account can actually sign in.
+        new_coach = self._login("new_coach_http", "pw")
+        me_status, me = self._req(new_coach, "GET", "/api/auth/me")
+        self.assertEqual(me_status, 200)
+        self.assertEqual(me["user"]["username"], "new_coach_http")
+
+    def test_non_admin_cannot_create_account(self):
+        coach = self._login("coach")
+        status, body = self._req(
+            coach, "POST", "/api/accounts",
+            {"username": "sneaky3", "password": "pw", "role": "viewer"})
+        self.assertEqual(status, 403)
+
+    def test_duplicate_username_over_http_is_a_structured_error(self):
+        admin = self._login("admin")
+        self._req(admin, "POST", "/api/accounts",
+                 {"username": "dupe_http", "password": "pw", "role": "viewer"})
+        status, body = self._req(
+            admin, "POST", "/api/accounts",
+            {"username": "dupe_http", "password": "pw2", "role": "viewer"})
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"]["code"], "validation_error")
+
+    def test_blank_username_over_http_is_a_structured_error(self):
+        admin = self._login("admin")
+        status, body = self._req(
+            admin, "POST", "/api/accounts",
+            {"username": "", "password": "pw", "role": "viewer"})
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"]["code"], "validation_error")
+
+    def test_blank_password_over_http_is_a_structured_error(self):
+        admin = self._login("admin")
+        status, body = self._req(
+            admin, "POST", "/api/accounts",
+            {"username": "blank_pw_http", "password": "", "role": "viewer"})
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"]["code"], "validation_error")
 
 
 if __name__ == "__main__":

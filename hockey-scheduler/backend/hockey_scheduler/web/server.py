@@ -1381,9 +1381,13 @@ class Handler(BaseHTTPRequestHandler):
         # one (#67). No self-service signup — this is the only way an
         # account comes into existence besides the demo seed.
         if path == "/api/accounts":
+            # Attribute the mint to the signed-in league admin (server-
+            # resolved), never a client-supplied actor_id, so the audit
+            # trail (#67) cannot be forged (#135).
+            _role, _scope, user_id, _err = self._resolve_role()
             return self._send_api(api.create_user_account(
                 body.get("username"), body.get("password"), body.get("role"),
-                scope=body.get("scope"), actor_id=actor))
+                scope=body.get("scope"), actor_id=user_id))
         acc = re.match(r"^/api/accounts/([^/]+)/active$", path)
         if acc:
             res = api.set_user_account_active(acc.group(1), bool(body.get("active")))
