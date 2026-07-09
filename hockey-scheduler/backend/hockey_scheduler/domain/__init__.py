@@ -76,6 +76,7 @@ from .setup_models import (
     Official,
     OfficialAssignment,
     OfficialAvailability,
+    Organization,
     RescheduleRequest,
     Rink,
     Season,
@@ -163,6 +164,7 @@ __all__ = [
     "UserAccount",
     "Session",
     "CalendarFeedToken",
+    "Organization",
     "Venue",
     "intervals_overlap",
 ]

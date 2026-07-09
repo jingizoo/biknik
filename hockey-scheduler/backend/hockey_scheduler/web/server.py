@@ -1555,9 +1555,13 @@ class Handler(BaseHTTPRequestHandler):
         if entity == "team":
             return self._send_api(api.create_team(
                 b.get("club_id"), b.get("division_id"), b.get("name"), actor_id))
+        if entity == "organization":
+            return self._send_api(api.create_organization(
+                b.get("name"), b.get("short_name", ""), actor_id))
         if entity == "venue":
             return self._send_api(api.create_venue(
-                b.get("name"), b.get("address", ""), b.get("timezone", "UTC"), actor_id))
+                b.get("name"), b.get("address", ""), b.get("timezone", "UTC"),
+                b.get("organization_id") or None, actor_id))
         if entity == "rink":
             return self._send_api(api.create_rink(
                 b.get("venue_id"), b.get("name"), actor_id))

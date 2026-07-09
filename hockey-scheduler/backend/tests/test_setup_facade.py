@@ -54,6 +54,38 @@ class SetupFacadeTest(unittest.TestCase):
         )
         self.assertEqual(result["error"]["code"], "validation_error")
 
+    def test_create_organization_through_facade(self):
+        org = self.api.create_organization("Summit Ice Facilities", short_name="Summit")
+        self.assertNotIn("error", org)
+        self.assertEqual(org["name"], "Summit Ice Facilities")
+        self.assertEqual(org["short_name"], "Summit")
+        json.dumps(org)  # must round-trip with no custom encoder
+
+    def test_create_venue_assigns_organization(self):
+        org = self.api.create_organization("Summit Ice Facilities")
+        venue = self.api.create_venue("Ice Palace", organization_id=org["id"])
+        self.assertNotIn("error", venue)
+        self.assertEqual(venue["organization_id"], org["id"])
+
+    def test_create_venue_without_organization_is_unassigned(self):
+        venue = self.api.create_venue("Ice Palace")
+        self.assertNotIn("error", venue)
+        self.assertIsNone(venue["organization_id"])
+
+    def test_create_venue_with_missing_organization_returns_not_found(self):
+        result = self.api.create_venue("Ice Palace", organization_id="org_missing")
+        self.assertEqual(result["error"]["code"], "not_found")
+
+    def test_overview_surfaces_organization_on_venue_rows(self):
+        org = self.api.create_organization("Summit Ice Facilities")
+        self.api.create_venue("Ice Palace", organization_id=org["id"])
+        overview = self.api.get_demo_overview()
+        self.assertIn("organizations", overview)
+        self.assertEqual(len(overview["organizations"]), 1)
+        row = next(v for v in overview["venues"] if v["name"] == "Ice Palace")
+        self.assertEqual(row["organization_id"], org["id"])
+        self.assertEqual(row["organization_name"], "Summit Ice Facilities")
+
     def test_created_game_drives_roster_endpoints(self):
         season, division, home, away, slot = self._build()
         game = self.api.create_game(

@@ -1847,6 +1847,7 @@ class ApiService:
         divisions = {d.id: d for d in self.store.all_divisions()}
         clubs = {c.id: c for c in self.store.all_clubs()}
         teams = {t.id: t for t in self.store.all_teams()}
+        orgs = {o.id: o for o in self.store.all_organizations()}
         venues = {v.id: v for v in self.store.all_venues()}
         rinks = {r.id: r for r in self.store.all_rinks()}
 
@@ -1877,6 +1878,15 @@ class ApiService:
             {"id": r.id, "venue_id": r.venue_id, "name": r.name,
              "venue_name": venues[r.venue_id].name if r.venue_id in venues else None}
             for r in rinks.values()
+        ]
+        # Venues now carry an optional owning organization (#166) — surface the
+        # id + resolved name so the Setup hierarchy can group venues by owner.
+        venue_rows = [
+            {"id": v.id, "name": v.name, "address": v.address, "timezone": v.timezone,
+             "organization_id": v.organization_id,
+             "organization_name": orgs[v.organization_id].name
+             if v.organization_id in orgs else None}
+            for v in venues.values()
         ]
 
         # Draft games (#86) are proposals under review — they must never surface
@@ -1972,7 +1982,8 @@ class ApiService:
             "divisions": division_rows,
             "clubs": [_serialize(c) for c in clubs.values()],
             "teams": team_rows,
-            "venues": [_serialize(v) for v in venues.values()],
+            "organizations": [_serialize(o) for o in orgs.values()],
+            "venues": venue_rows,
             "rinks": rink_rows,
             "ice_slots": slot_rows,
             "officials": [
@@ -2023,9 +2034,16 @@ class ApiService:
         return _serialize(self.setup.create_team(club_id, division_id, name, actor_id))
 
     @catch
+    def create_organization(self, name: str, short_name: str = "",
+                            actor_id: Optional[str] = None) -> dict:
+        return _serialize(self.setup.create_organization(name, short_name, actor_id))
+
+    @catch
     def create_venue(self, name: str, address: str = "", timezone: str = "UTC",
+                     organization_id: Optional[str] = None,
                      actor_id: Optional[str] = None) -> dict:
-        return _serialize(self.setup.create_venue(name, address, timezone, actor_id))
+        return _serialize(self.setup.create_venue(
+            name, address, timezone, organization_id, actor_id))
 
     @catch
     def create_rink(self, venue_id: str, name: str,

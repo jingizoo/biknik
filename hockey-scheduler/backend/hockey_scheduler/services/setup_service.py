@@ -33,6 +33,7 @@ from ..domain import (
     Position,
     RescheduleRequest,
     RescheduleStatus,
+    Organization,
     Rink,
     Season,
     SetupAuditLog,
@@ -227,14 +228,30 @@ class SetupService:
                     {"club_id": club_id, "division_id": division_id})
         return team
 
-    # -- venue / rink / ice slot ------------------------------------------
+    # -- organization / venue / rink / ice slot ---------------------------
+    @_transactional
+    def create_organization(self, name: str, short_name: str = "",
+                            actor_id: Optional[str] = None) -> Organization:
+        org = Organization(id=self.store.next_id("org"),
+                           name=self._require_name(name), short_name=short_name or "")
+        self.store.add_organization(org)
+        self._audit("organization_created", "organization", org.id, actor_id)
+        return org
+
     @_transactional
     def create_venue(self, name: str, address: str = "", timezone_name: str = "UTC",
+                     organization_id: Optional[str] = None,
                      actor_id: Optional[str] = None) -> Venue:
+        # An optional owning organization (#166) — validated when given so a
+        # venue never dangles off a non-existent org; null is fine (unassigned).
+        if organization_id and self.store.get_organization(organization_id) is None:
+            raise NotFoundError(f"Organization {organization_id} not found.")
         venue = Venue(id=self.store.next_id("venue"), name=self._require_name(name),
-                      address=address, timezone=timezone_name or "UTC")
+                      address=address, timezone=timezone_name or "UTC",
+                      organization_id=organization_id or None)
         self.store.add_venue(venue)
-        self._audit("venue_created", "venue", venue.id, actor_id)
+        self._audit("venue_created", "venue", venue.id, actor_id,
+                    {"organization_id": organization_id} if organization_id else None)
         return venue
 
     @_transactional
