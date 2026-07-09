@@ -232,7 +232,15 @@ function gameTriage(g) {
 }
 
 function renderDashboard(ov, standings) {
-  const games = ov.schedule || [];
+  // A coach's "what needs attention" is their own team, not the whole
+  // league (#145 research: coaches landed on the same league-wide operator
+  // dashboard as League Admin, with nothing scoped to them). Every stat/
+  // alert below derives from `games`, so filtering it here is enough —
+  // no separate coach-specific dashboard to build or keep in sync.
+  const coachTeamId = (currentRole === "coach" && currentUser
+    && currentUser.scope && currentUser.scope.team_id) || null;
+  const games = (ov.schedule || []).filter((g) => !coachTeamId
+    || g.home_team_id === coachTeamId || g.away_team_id === coachTeamId);
   const today = games.filter((g) => dayOf(g.start_time) === calendarDate);
   const todayList = today.length ? today : games;   // fall back to all if none "today"
   // "Games this week" (#118 Phase 7) means the 7-day window starting today —
@@ -262,11 +270,16 @@ function renderDashboard(ov, standings) {
       <div class="ds-n">${n}</div>
       <div class="ds-sub">${esc(sub)}</div></div>`;
 
+  // Ice slots are shared arena infrastructure, not owned by one team — there
+  // is no correct team-scoped version of this stat (review finding for
+  // #145), so it's dropped entirely for a coach rather than shown
+  // unscoped alongside three team-scoped tiles it would visually imply.
+  const iceStat = coachTeamId ? "" : stat("Ice slots booked", booked,
+    `${utilPct}% of ${slots.length} slots`, pill("gray", `${utilPct}%`));
   const stats = `<div class="dash-stats">
     ${stat("Games this week", weekGames.length, `${today.length} today · ${upcoming} upcoming`,
            today.length ? pill("green", `+${today.length}`) : "")}
-    ${stat("Ice slots booked", booked, `${utilPct}% of ${slots.length} slots`,
-           pill("gray", `${utilPct}%`))}
+    ${iceStat}
     ${stat("Games needing staff", needStaff.length,
            needStaff.length ? `officials still open` : "all games staffed",
            needStaff.length ? pill("amber", "Fill") : pill("green", "Set"))}
@@ -290,11 +303,15 @@ function renderDashboard(ov, standings) {
       <span class="tg-status ${t.badge}">${esc(t.label)}</span>
     </div>`;
   }).join("");
+  const gamesTitle = (today.length ? "Today's Games" : "Scheduled Games")
+    + (coachTeamId ? " · Your Team" : "");
   const gamesCard = `<div class="dash-card">
-    <div class="dash-card-head"><h3>${today.length ? "Today's Games" : "Scheduled Games"}</h3>
+    <div class="dash-card-head"><h3>${esc(gamesTitle)}</h3>
       <span class="dch-sub">${todayList.length} game${todayList.length === 1 ? "" : "s"}</span>
       <button class="linklike dch-link" data-goto="games">Games →</button></div>
-    ${gameRows || '<div class="na-empty">No games scheduled yet.</div>'}</div>`;
+    ${gameRows || (coachTeamId
+      ? '<div class="na-empty">No games scheduled yet for your team.</div>'
+      : '<div class="na-empty">No games scheduled yet.</div>')}</div>`;
 
   // Needs Attention — real alerts only.
   const alerts = [];
@@ -1724,7 +1741,7 @@ function renderUsers(ov) {
         <span class="row-main">${esc(a.username)}</span>
         <span class="row-sub">${roleLabelFor(a.role)}${a.active ? "" : " · inactive"}</span>
       </button>`).join("")
-    : `<div class="empty">No accounts yet.</div>`;
+    : `<div class="empty">No accounts yet. Use the "Create account" form above to add one.</div>`;
   const sessionPanel = usersSelected
     ? renderUserSessions()
     : `<p class="muted">Select an account to view its login sessions.</p>`;
@@ -2315,6 +2332,10 @@ function outreachPanel(canEdit) {
   const q = subCandidates;
   const slotLine = `${q.open_goalie_slots} goalie slot${q.open_goalie_slots === 1 ? "" : "s"} · `
     + `${q.open_skater_slots} skater slot${q.open_skater_slots === 1 ? "" : "s"} open`;
+  const addable = (addableSubs && addableSubs.addable) || [];
+  const noSubsMessage = canEdit && addable.length
+    ? "No substitutes enrolled yet. Add an eligible player from the Eligible Players list below, or wait for a player to self-enroll."
+    : "No substitutes enrolled yet.";
   const rows = (q.candidates || []).map((c) => {
     const badge = SUB_STATUS_BADGE[c.status] || `<span class="badge gray">${esc(c.status)}</span>`;
     // A slot fits this candidate's position and the game is still mutable, so
@@ -2329,12 +2350,11 @@ function outreachPanel(canEdit) {
     return `<div class="li"><div class="li-main">
         <div class="li-title">${esc(c.name)}</div>
         <div class="li-sub">${esc(c.position)}</div></div>${badge}${btn}</div>`;
-  }).join("") || `<div class="empty">No substitutes enrolled yet.</div>`;
+  }).join("") || `<div class="empty">${esc(noSubsMessage)}</div>`;
   // Eligible-but-not-yet-enrolled team players (#114) — a coach can add one
   // straight into the pool above without waiting for the player to
   // self-enroll. Own card so it reads as a distinct "who could I add?"
   // question from "who's already enrolled?" above.
-  const addable = (addableSubs && addableSubs.addable) || [];
   const addableRows = addable.map((p) => `<div class="li"><div class="li-main">
       <div class="li-title">${esc(p.name)}</div>
       <div class="li-sub">${esc(p.position)}</div></div>
@@ -2825,12 +2845,18 @@ function setChrome(ov) {
   const bc = document.getElementById("breadcrumb");
   if (!bc) return;
   if (view === "dashboard" && ov) {
-    // Same 7-day window as the dashboard's own "Games this week" stat tile
-    // (#118 Phase 7) — both used to count ov.schedule's full length instead.
+    // Same 7-day window AND same coach-team scoping as the dashboard's own
+    // "Games this week" stat tile (#118 Phase 7 / #145 review) — both used
+    // to count ov.schedule's full length instead, and before the #145
+    // review fix this breadcrumb kept showing the league-wide count while
+    // the card right below it already read the coach-scoped one.
+    const coachTeamId = (currentRole === "coach" && currentUser
+      && currentUser.scope && currentUser.scope.team_id) || null;
     const weekEnd = addDays(calendarDate, 6);
     const games = (ov.schedule || []).filter((g) => {
       const d = dayOf(g.start_time);
-      return d >= calendarDate && d <= weekEnd;
+      return d >= calendarDate && d <= weekEnd
+        && (!coachTeamId || g.home_team_id === coachTeamId || g.away_team_id === coachTeamId);
     }).length;
     const rinks = (ov.rinks || []).length;
     const when = new Date(calendarDate + "T00:00:00Z").toLocaleDateString("en-GB",
@@ -3984,13 +4010,34 @@ function setUser(user) {
   // operator dashboard — only while still on the untouched default view,
   // so an explicit tab choice mid-session is never overridden. The inverse
   // guard sends a non-player OFF the player-only Home (persona switches).
+  // Officials get the same treatment (#145): the generic operator
+  // dashboard's stats/alerts are all league-wide, not "what do I need to
+  // do" for an official — My Assignments (inbox) is their actual task
+  // list, mirroring player_home/guardian_home rather than leaving them on
+  // a dashboard with nothing relevant to them (research finding for #145).
+  //
+  // Two phases, not a single if/else-if chain (review finding for #145):
+  // with three mutually-exclusive special views, a direct persona switch
+  // (role-switch dropdown or sign-out/in with no page reload) can jump
+  // straight from one to another — e.g. Player (on player_home) becomes an
+  // Official in one setUser() call. A single-shot chain only ever applies
+  // ONE branch per call, so it would bounce player_home -> dashboard and
+  // stop there, never reaching the official_id branch below it. Phase 1
+  // unconditionally leaves any special view that no longer belongs to this
+  // user; phase 2 then lands on this user's own special view if — after
+  // phase 1 — view is still the untouched default, so an explicit tab
+  // choice mid-session is still never overridden.
   const isPlayerUser = !!(user && user.scope && user.scope.player_id);
   const isGuardianUser = !!(user && user.role === "guardian");
+  const isOfficialUser = !!(user && user.scope && user.scope.official_id);
+  const priorView = view;
+  if (!isPlayerUser && view === "player_home") view = "dashboard";
+  if (!isGuardianUser && view === "guardian_home") view = "dashboard";
+  if (!isOfficialUser && view === "inbox") view = "dashboard";
   if (isPlayerUser && view === "dashboard") view = "player_home";
-  else if (!isPlayerUser && view === "player_home") view = "dashboard";
   else if (isGuardianUser && view === "dashboard") view = "guardian_home";
-  else if (!isGuardianUser && view === "guardian_home") view = "dashboard";
-  else return;
+  else if (isOfficialUser && view === "dashboard") view = "inbox";
+  if (view === priorView) return;
   document.querySelectorAll(".tab").forEach((x) =>
     x.classList.toggle("active", x.dataset.tab === view));
 }

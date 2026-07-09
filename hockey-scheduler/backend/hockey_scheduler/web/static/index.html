@@ -16,42 +16,44 @@
           <div class="brand-sub">Operator Console</div></div>
       </div>
 
+      <!-- Grouped by task, not by implementation area (#145): Home for
+           every role's own landing/task list, Schedule for anything
+           game/calendar-shaped, People for roster + account management,
+           Operations for day-to-day comms/monitoring, Admin Setup for
+           one-time league/arena configuration. -->
       <nav class="side-nav">
         <div class="nav-group">
-          <div class="nav-group-label">Overview</div>
+          <div class="nav-group-label">Home</div>
           <button class="tab active" data-tab="dashboard"><span class="nav-dot"></span><span class="nav-label">Dashboard</span></button>
+          <button class="tab" data-tab="player_home" style="display:none"><span class="nav-dot"></span><span class="nav-label">Home</span></button>
+          <button class="tab" data-tab="guardian_home" style="display:none"><span class="nav-dot"></span><span class="nav-label">My Players</span></button>
+          <button class="tab" data-tab="inbox" style="display:none"><span class="nav-dot"></span><span class="nav-label">My Assignments</span></button>
           <button class="tab" data-tab="activity"><span class="nav-dot"></span><span class="nav-label">Activity</span></button>
         </div>
         <div class="nav-group">
-          <div class="nav-group-label">Scheduling</div>
+          <div class="nav-group-label">Schedule</div>
           <button class="tab" data-tab="calendar"><span class="nav-dot"></span><span class="nav-label">Arena Calendar</span></button>
           <button class="tab" data-tab="games"><span class="nav-dot"></span><span class="nav-label">Games</span></button>
           <button class="tab" data-tab="scheduler" style="display:none"><span class="nav-dot"></span><span class="nav-label">Scheduler</span></button>
-          <button class="tab" data-tab="setup"><span class="nav-dot"></span><span class="nav-label">Setup</span></button>
-          <button class="tab" data-tab="import" style="display:none"><span class="nav-dot"></span><span class="nav-label">Import</span></button>
-        </div>
-        <div class="nav-group">
-          <div class="nav-group-label">People</div>
-          <button class="tab" data-tab="player_home" style="display:none"><span class="nav-dot"></span><span class="nav-label">Home</span></button>
-          <button class="tab" data-tab="guardian_home" style="display:none"><span class="nav-dot"></span><span class="nav-label">My Players</span></button>
-          <button class="tab" data-tab="roster"><span class="nav-dot"></span><span class="nav-label">Roster</span></button>
-          <button class="tab" data-tab="inbox" style="display:none"><span class="nav-dot"></span><span class="nav-label">My Assignments</span></button>
-        </div>
-        <div class="nav-group">
-          <div class="nav-group-label">Competition</div>
           <button class="tab" data-tab="standings"><span class="nav-dot"></span><span class="nav-label">Standings</span></button>
           <button class="tab" data-tab="sheet"><span class="nav-dot"></span><span class="nav-label">Game Sheet</span></button>
-        </div>
-        <div class="nav-group">
-          <div class="nav-group-label">Comms</div>
-          <button class="tab" data-tab="notifications"><span class="nav-dot"></span><span class="nav-label">Notifications</span><span class="nav-badge" id="notif-badge" style="display:none"></span></button>
-          <button class="tab" data-tab="delivery" style="display:none"><span class="nav-dot"></span><span class="nav-label">Delivery</span></button>
           <button class="tab" data-tab="public"><span class="nav-dot"></span><span class="nav-label">Public</span></button>
         </div>
         <div class="nav-group">
-          <div class="nav-group-label">Admin</div>
+          <div class="nav-group-label">People</div>
+          <button class="tab" data-tab="roster"><span class="nav-dot"></span><span class="nav-label">Roster</span></button>
           <button class="tab" data-tab="users" style="display:none"><span class="nav-dot"></span><span class="nav-label">Users</span></button>
+        </div>
+        <div class="nav-group">
+          <div class="nav-group-label">Operations</div>
+          <button class="tab" data-tab="notifications"><span class="nav-dot"></span><span class="nav-label">Notifications</span><span class="nav-badge" id="notif-badge" style="display:none"></span></button>
+          <button class="tab" data-tab="delivery" style="display:none"><span class="nav-dot"></span><span class="nav-label">Delivery</span></button>
           <button class="tab" data-tab="readiness" style="display:none"><span class="nav-dot"></span><span class="nav-label">Pilot Readiness</span></button>
+          <button class="tab" data-tab="import" style="display:none"><span class="nav-dot"></span><span class="nav-label">Import</span></button>
+        </div>
+        <div class="nav-group">
+          <div class="nav-group-label">Admin Setup</div>
+          <button class="tab" data-tab="setup"><span class="nav-dot"></span><span class="nav-label">Setup</span></button>
         </div>
       </nav>
 
