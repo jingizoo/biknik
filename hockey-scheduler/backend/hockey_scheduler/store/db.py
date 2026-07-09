@@ -7,7 +7,7 @@ and the dialect translates for Postgres.
 """
 
 import sqlite3
-from typing import Tuple
+from typing import Optional, Tuple
 
 
 class Dialect:
@@ -21,18 +21,23 @@ class Dialect:
         return query.replace("?", "%s")
 
 
-def connect(url: str) -> Tuple[object, Dialect]:
-    """Open a connection for the given URL and return (conn, dialect).
+def connect(url: str) -> Tuple[object, Dialect, Optional[str]]:
+    """Open a connection for the given URL and return (conn, dialect, path).
 
-    - ``postgres://…`` / ``postgresql://…`` → psycopg (autocommit)
-    - ``sqlite:///path`` / ``sqlite://`` / a raw path / ``:memory:`` → sqlite3
+    - ``postgres://…`` / ``postgresql://…`` → psycopg (autocommit); ``path``
+      is always ``None`` (readiness (#143) only cares whether SQLite landed
+      on ``:memory:``, never a concern for Postgres).
+    - ``sqlite:///path`` / ``sqlite://`` / a raw path / ``:memory:`` →
+      sqlite3; ``path`` is the resolved filesystem path (or ``":memory:"``),
+      so a caller can tell a genuinely durable file apart from a SQLite
+      in-memory connection that's just as ephemeral as ``InMemoryStore``.
     """
     if url.startswith(("postgres://", "postgresql://")):
         import psycopg  # imported lazily; only needed for the Postgres target
         from psycopg.rows import dict_row
 
         conn = psycopg.connect(url, autocommit=True, row_factory=dict_row)
-        return conn, Dialect("pyformat")
+        return conn, Dialect("pyformat"), None
 
     if url.startswith("sqlite:///"):
         path = url[len("sqlite:///"):]
@@ -44,4 +49,4 @@ def connect(url: str) -> Tuple[object, Dialect]:
     conn = sqlite3.connect(path, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.isolation_level = None  # autocommit; transaction() manages explicit txns
-    return conn, Dialect("qmark")
+    return conn, Dialect("qmark"), path

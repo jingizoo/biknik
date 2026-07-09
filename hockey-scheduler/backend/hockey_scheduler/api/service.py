@@ -726,11 +726,22 @@ class ApiService:
 
     def get_readiness(self, app_mode: str, cookie_hardened: bool) -> dict:
         """Deployment readiness checks (#90). In production, requires at least
-        one active admin, a reachable DB, current migrations, and cookie
-        hardening. Non-sensitive: booleans + counts only."""
+        one active admin, a reachable DB, current migrations, cookie
+        hardening, and a durable store. Non-sensitive: booleans + counts
+        only."""
         production = (app_mode == "production")
         mig = self.store.migration_status()
         admins = self._active_admin_count()
+        # InMemoryStore.db_reachable()/migration_status() are both trivially
+        # always-true (#143) — a production deployment with a missing or
+        # typo'd DATABASE_URL would otherwise report ready:true while
+        # silently running on storage that resets on every restart. A
+        # SqlStore whose DATABASE_URL resolved to SQLite ":memory:" (or an
+        # empty path — sqlite3's temp-file mode) is exactly as ephemeral,
+        # so being a SqlStore *instance* isn't sufficient on its own
+        # (review finding) — also exclude that via is_memory_backed.
+        persistent = (not isinstance(self.store, InMemoryStore)
+                      and not getattr(self.store, "is_memory_backed", False))
         checks = [
             {"name": "database_reachable", "ok": self.store.db_reachable(),
              "detail": f"store={getattr(self.store, 'backend', 'memory')}"},
@@ -742,6 +753,10 @@ class ApiService:
             {"name": "cookie_hardening",
              "ok": cookie_hardened if production else True,
              "detail": "Secure cookies" if cookie_hardened else "not enforced"},
+            {"name": "persistent_store",
+             "ok": persistent if production else True,
+             "detail": (f"store={getattr(self.store, 'backend', 'memory')}"
+                        if persistent else "in-memory or ephemeral (no durable DATABASE_URL)")},
         ]
         return {"ready": all(c["ok"] for c in checks),
                 "app_mode": app_mode, "checks": checks}
