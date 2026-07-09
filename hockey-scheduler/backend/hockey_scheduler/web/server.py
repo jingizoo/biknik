@@ -1007,7 +1007,13 @@ class Handler(BaseHTTPRequestHandler):
         api = STATE.api
         body = self._read_body()
         pid: Optional[str] = body.get("player_id")
-        actor = body.get("actor_id", "demo")
+        # There is deliberately no shared client-suppliable `actor`/`actor_id`
+        # variable here (#136): every route below that writes to the audit
+        # trail uses a server-resolved `user_id` from `_resolve_role()` —
+        # either a route-local call some custom-guarded routes make before
+        # the generic gate, or the one at the generic authorize() gate below,
+        # which stays in scope for every route reached after it. A
+        # body-supplied actor_id must never reach an audit entry.
 
         # -- authentication (#50/#67): login / logout are open (no role required) --
         if path == "/api/auth/login":
@@ -1287,7 +1293,7 @@ class Handler(BaseHTTPRequestHandler):
 
         # Setup create endpoints — operator creates real records via the API.
         if path.startswith("/api/setup/"):
-            return self._handle_setup(path[len("/api/setup/"):], body, actor)
+            return self._handle_setup(path[len("/api/setup/"):], body, user_id)
 
         # Pilot onboarding import dry-run (#92): validates CSV-shaped rows and
         # always returns 200 with the report itself (ok true/false) — nothing
@@ -1435,8 +1441,8 @@ class Handler(BaseHTTPRequestHandler):
         if oa:
             aid, op = oa.group(1), oa.group(2)
             if op == "unassign":
-                return self._send_api(api.unassign_official(aid, actor))
-            return self._send_api(api.respond_assignment(aid, op == "accept", actor))
+                return self._send_api(api.unassign_official(aid, user_id))
+            return self._send_api(api.respond_assignment(aid, op == "accept", user_id))
 
         # /api/games/{gid}/<action>
         m = re.match(r"^/api/games/([^/]+)/(.+)$", path)
@@ -1445,36 +1451,36 @@ class Handler(BaseHTTPRequestHandler):
             if action == "availability":
                 return self._send_api(api.set_availability(
                     gid, pid, body.get("availability_status", "pending"),
-                    body.get("response_source", "player"), actor))
+                    body.get("response_source", "player"), user_id))
             if action == "availability/remind":
                 # One-click reminder to players who haven't responded (#89).
                 return self._send_api(api.remind_unresponded(
-                    gid, body.get("team_id") or scope.get("team_id"), actor))
+                    gid, body.get("team_id") or scope.get("team_id"), user_id))
             if action == "build-roster":
                 return self._send_api(api.auto_build_roster(
-                    gid, body.get("team_id"), actor))
+                    gid, body.get("team_id"), user_id))
             if action == "roster/select":
                 return self._send_api(api.select_roster(
-                    gid, body.get("player_ids", []), actor))
+                    gid, body.get("player_ids", []), user_id))
             if action == "roster/remove":
-                return self._send_api(api.remove_player(gid, pid, actor))
+                return self._send_api(api.remove_player(gid, pid, user_id))
             if action == "roster/copy-previous":
                 return self._send_api(api.copy_previous_roster(
-                    gid, body.get("team_id"), actor))
+                    gid, body.get("team_id"), user_id))
             if action == "officials/assign":
                 return self._send_api(api.assign_official(
                     gid, body.get("official_id"), body.get("role", "referee"),
-                    actor, override_unavailable=bool(body.get("override_unavailable"))))
+                    user_id, override_unavailable=bool(body.get("override_unavailable"))))
             if action == "result":
                 return self._send_api(api.record_result(
-                    gid, body.get("home_score"), body.get("away_score"), actor))
+                    gid, body.get("home_score"), body.get("away_score"), user_id))
             if action == "result/approve":
-                return self._send_api(api.approve_result(gid, actor))
+                return self._send_api(api.approve_result(gid, user_id))
             if action == "publish":
-                return self._send_api(api.publish_game(gid, actor))
+                return self._send_api(api.publish_game(gid, user_id))
             if action == "move":
                 return self._send_api(api.move_game(
-                    gid, body.get("ice_slot_id"), body.get("reason", ""), actor))
+                    gid, body.get("ice_slot_id"), body.get("reason", ""), user_id))
             if action == "reschedule/request":
                 # actor_id is the signed-in coach's own user_id from the
                 # resolved session, NOT the client-suppliable body actor_id —
@@ -1495,79 +1501,84 @@ class Handler(BaseHTTPRequestHandler):
                     new_ice_slot_id=body.get("new_ice_slot_id"),
                     note=body.get("note"), actor_id=user_id))
             if action == "substitutes/enroll":
-                return self._send_api(api.enroll_substitute(gid, pid, actor))
+                return self._send_api(api.enroll_substitute(gid, pid, user_id))
             if action == "substitutes/withdraw":
-                return self._send_api(api.withdraw_substitute(gid, pid, actor))
+                return self._send_api(api.withdraw_substitute(gid, pid, user_id))
             if action == "substitutes/add-candidate":
                 # Coach/operator adds an arbitrary eligible team player
                 # directly to the substitute pool (#114) — same enroll, a
                 # different (coach-side) actor and permission than the
                 # player's own self-service substitutes/enroll above.
                 return self._send_api(
-                    api.add_substitute_candidate(gid, pid, actor))
+                    api.add_substitute_candidate(gid, pid, user_id))
             sub = re.match(r"^substitutes/([^/]+)/(offer|accept|decline|add-to-roster)$", action)
             if sub:
                 player_id, op = sub.group(1), sub.group(2)
                 if op == "offer":
                     return self._send_api(api.offer_substitute(
-                        gid, player_id, actor, expires_at=body.get("expires_at")))
+                        gid, player_id, user_id, expires_at=body.get("expires_at")))
                 fn = {"accept": api.accept_substitute,
                       "decline": api.decline_substitute,
                       "add-to-roster": api.add_substitute_to_roster}[op]
-                return self._send_api(fn(gid, player_id, actor))
+                return self._send_api(fn(gid, player_id, user_id))
             coach = {"roster/lock": api.lock_roster,
                      "roster/unlock": api.unlock_roster,
                      "cancel": api.cancel_game}.get(action)
             if coach:
-                return self._send_api(coach(gid, actor))
+                return self._send_api(coach(gid, user_id))
 
         return self._send_json({"error": {"code": "not_found",
                                           "message": "Unknown endpoint."}}, 404)
 
-    def _handle_setup(self, entity: str, body: dict, actor: str):
-        """Dispatch /api/setup/<entity> to the matching facade create method."""
+    def _handle_setup(self, entity: str, body: dict, actor_id: str):
+        """Dispatch /api/setup/<entity> to the matching facade create method.
+
+        ``actor_id`` is always the caller's server-resolved session user id
+        (#136) — never a client-supplied body field, so the setup audit
+        trail can't be forged.
+        """
         api = STATE.api
         b = body
         if entity == "league":
             return self._send_api(api.create_league(
-                b.get("name"), b.get("country", ""), b.get("timezone", "UTC"), actor))
+                b.get("name"), b.get("country", ""), b.get("timezone", "UTC"), actor_id))
         if entity == "season":
             return self._send_api(api.create_season(
                 b.get("league_id"), b.get("name"),
-                b.get("start_date"), b.get("end_date"), actor))
+                b.get("start_date"), b.get("end_date"), actor_id))
         if entity == "division":
             return self._send_api(api.create_division(
-                b.get("season_id"), b.get("name"), b.get("age_group", ""), actor))
+                b.get("season_id"), b.get("name"), b.get("age_group", ""), actor_id))
         if entity == "club":
             return self._send_api(api.create_club(
-                b.get("name"), b.get("country", ""), actor))
+                b.get("name"), b.get("country", ""), actor_id))
         if entity == "team":
             return self._send_api(api.create_team(
-                b.get("club_id"), b.get("division_id"), b.get("name"), actor))
+                b.get("club_id"), b.get("division_id"), b.get("name"), actor_id))
         if entity == "venue":
             return self._send_api(api.create_venue(
-                b.get("name"), b.get("address", ""), b.get("timezone", "UTC"), actor))
+                b.get("name"), b.get("address", ""), b.get("timezone", "UTC"), actor_id))
         if entity == "rink":
             return self._send_api(api.create_rink(
-                b.get("venue_id"), b.get("name"), actor))
+                b.get("venue_id"), b.get("name"), actor_id))
         if entity == "ice-slot":
             return self._send_api(api.create_ice_slot(
                 b.get("rink_id"), b.get("start_time"), b.get("end_time"),
-                b.get("slot_type", "game"), actor))
+                b.get("slot_type", "game"), actor_id))
         if entity == "game":
             return self._send_api(api.create_game(
                 b.get("season_id"), b.get("division_id"), b.get("home_team_id"),
                 b.get("away_team_id"), b.get("ice_slot_id"),
                 allow_division_override=bool(b.get("allow_division_override")),
-                actor_id=actor))
+                actor_id=actor_id))
         if entity == "official":
             return self._send_api(api.create_official(
-                b.get("name"), b.get("home_club_id"), actor))
+                b.get("name"), b.get("home_club_id"), actor_id))
         if entity == "player":
             return self._send_api(api.create_player(
                 b.get("team_id"), b.get("name"), b.get("position"),
                 jersey_number=b.get("jersey_number"), email=b.get("email"),
-                actor_id=actor))
+                actor_id=actor_id))
         return self._send_json({"error": {"code": "not_found",
                                           "message": "Unknown setup entity."}}, 404)
 
