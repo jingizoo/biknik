@@ -175,6 +175,21 @@ class SqlStoreParityTest(unittest.TestCase):
         row = next(v for v in ov["venues"] if v["id"] == venue["id"])
         self.assertEqual(row["organization_name"], "Summit Ice Facilities")
 
+    def test_level_and_division_link_roundtrip_on_sql(self):
+        # A level (#166) persists through the levels table, and a division's
+        # level_id column roundtrips the level/tier link.
+        league = self.api.create_league("Over 55")
+        season = self.api.create_season(league["id"], "Fall 2026")
+        level = self.api.create_level(season["id"], "Level 1", sort_order=1)
+        div = self.api.create_division(season["id"], "Div A", level_id=level["id"])
+        self.assertEqual(div["level_id"], level["id"])
+        stored = self.store.get_division(div["id"])
+        self.assertEqual(stored.level_id, level["id"])
+        ov = self.api.get_demo_overview()
+        self.assertIn(level["id"], [lv["id"] for lv in ov["levels"]])
+        row = next(d for d in ov["divisions"] if d["id"] == div["id"])
+        self.assertEqual(row["level_name"], "Level 1")
+
 
 class SqlStoreTransactionTest(unittest.TestCase):
     """A failure mid multi-write operation must roll the whole thing back."""

@@ -43,11 +43,26 @@ class Season:
 
 
 @dataclass
+class Level:
+    """A competitive level/tier between Season and Division (#166). A season
+    like "Over 55" can run several levels ("Level 1", "Level 2"), each holding
+    its own divisions. Divisions link up via a nullable ``level_id`` so existing
+    divisions need no backfill and a level is always optional."""
+    id: str
+    season_id: str
+    name: str
+    sort_order: int = 0
+
+
+@dataclass
 class Division:
     id: str
     season_id: str
     name: str
     age_group: str = ""
+    # Owning competitive level/tier (#166). Nullable — pre-existing divisions
+    # and divisions created without a level sit directly under their season.
+    level_id: Optional[str] = None
 
 
 @dataclass

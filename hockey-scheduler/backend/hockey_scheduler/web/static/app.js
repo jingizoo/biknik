@@ -444,11 +444,26 @@ const SETUP_ENTITIES = [
       { id: "f-season-league", label: "League", type: "select", required: true, ofNoun: "league",
         options: (ov) => ov.leagues.map((l) => [l.id, l.name]) },
       { id: "f-season", label: "Season name", required: true, placeholder: "e.g. 2027–28" }] },
+  // Level/Tier (#166): an optional grouping between Season and Division — a
+  // season like "Over 55" can run "Level 1", "Level 2". League-structure side.
+  { key: "level", title: "Levels", icon: "🎚️", noun: "level", perm: "manage_setup",
+    list: (ov) => (ov.levels || []).map((lv) => ({
+      title: lv.name, sub: nameById(ov.seasons, lv.season_id) })),
+    fields: [
+      { id: "f-level-season", label: "Season", type: "select", required: true, ofNoun: "season",
+        options: (ov) => ov.seasons.map((s) => [s.id, s.name]) },
+      { id: "f-level", label: "Level name", required: true, placeholder: "e.g. Level 1" },
+      { id: "f-level-sort", label: "Sort order (optional)", type: "number", placeholder: "e.g. 1" }] },
   { key: "division", title: "Divisions", icon: "🏅", noun: "division", perm: "manage_setup",
-    list: (ov) => ov.divisions.map((d) => ({ title: d.name, sub: d.is_junior ? "Junior" : "" })),
+    list: (ov) => ov.divisions.map((d) => ({
+      title: d.name,
+      sub: [d.level_name, d.is_junior ? "Junior" : ""].filter(Boolean).join(" · ") })),
     fields: [
       { id: "f-div-season", label: "Season", type: "select", required: true, ofNoun: "season",
         options: (ov) => ov.seasons.map((s) => [s.id, s.name]) },
+      { id: "f-div-level", label: "Level (optional)", type: "select", ofNoun: "level",
+        options: (ov) => [["", "— none —"]].concat((ov.levels || []).map(
+          (lv) => [lv.id, `${nameById(ov.seasons, lv.season_id)} · ${lv.name}`])) },
       { id: "f-div", label: "Division name", required: true, placeholder: "e.g. U14" },
       { id: "f-div-age", label: "Age group", placeholder: "e.g. U14 (optional)" }] },
   { key: "club", title: "Clubs", icon: "🏒", noun: "club", perm: "manage_setup",
@@ -527,7 +542,8 @@ const SETUP_ENTITIES = [
 const SETUP_POST = {
   league: () => post("/api/setup/league", { name: val("f-league") }),
   season: () => post("/api/setup/season", { league_id: val("f-season-league"), name: val("f-season") }),
-  division: () => post("/api/setup/division", { season_id: val("f-div-season"), name: val("f-div"), age_group: val("f-div-age") }),
+  level: () => post("/api/setup/level", { season_id: val("f-level-season"), name: val("f-level"), sort_order: val("f-level-sort") ? Number(val("f-level-sort")) : 0 }),
+  division: () => post("/api/setup/division", { season_id: val("f-div-season"), name: val("f-div"), age_group: val("f-div-age"), level_id: val("f-div-level") || null }),
   club: () => post("/api/setup/club", { name: val("f-club") }),
   team: () => post("/api/setup/team", { club_id: val("f-team-club"), division_id: val("f-team-div"), name: val("f-team") }),
   organization: () => post("/api/setup/organization", { name: val("f-org"), short_name: val("f-org-short") }),
@@ -561,12 +577,16 @@ function groupBy(rows, key) {
 // A quick-create button that opens the existing Setup drawer with the parent
 // preselected (#165) — data-prefill-field/value seed drawerValues so the
 // drawer's parent <select> lands on the node the operator clicked under.
-function treeAdd(kind, label, prefillField, prefillValue) {
+function treeAdd(kind, label, prefillField, prefillValue, prefillField2, prefillValue2) {
   const ent = SETUP_ENTITIES.find((e) => e.key === kind);
   if (!ent || !hasPerm(ent.perm)) return "";
   const pf = prefillField
     ? ` data-prefill-field="${esc(prefillField)}" data-prefill-value="${esc(prefillValue || "")}"` : "";
-  return `<button class="act ghost tree-add" data-drawer="${esc(kind)}"${pf}>＋ ${esc(label)}</button>`;
+  // A second parent can be preselected too (e.g. a division under a level
+  // needs both its level and its season seeded) — #166.
+  const pf2 = prefillField2
+    ? ` data-prefill-field2="${esc(prefillField2)}" data-prefill-value2="${esc(prefillValue2 || "")}"` : "";
+  return `<button class="act ghost tree-add" data-drawer="${esc(kind)}"${pf}${pf2}>＋ ${esc(label)}</button>`;
 }
 const capWord = (s) => (s ? String(s).charAt(0).toUpperCase() + String(s).slice(1) : "");
 
@@ -633,33 +653,61 @@ function renderSetupHierarchy(ov) {
     <div class="tree-actions">${treeAdd("organization", "Add facility owner")}${treeAdd("venue", "Add venue")}</div>
   </section>`;
 
-  // -- Competition: League → Season → (Level n/a) → Division → Team --
+  // -- Competition: League → Season → Level → Division → Team (#166) --
   const seasonsByLeague = groupBy(ov.seasons, "league_id");
   const divsBySeason = groupBy(ov.divisions, "season_id");
+  const levelsBySeason = groupBy(ov.levels, "season_id");
   const teamsByDiv = groupBy(ov.teams, "division_id");
   const countTeams = (divs) => divs.reduce((n, d) => n + (teamsByDiv[d.id] || []).length, 0);
+  const divisionNode = (d) => {
+    const teams = teamsByDiv[d.id] || [];
+    const teamRows = teams.map((t) =>
+      `<div class="tn-leaf"><span class="tn-label">👥 ${esc(t.name)}</span><span class="tn-meta">${teamMeta(t)}</span></div>`).join("")
+      || `<div class="tn-empty">No teams in this division yet.</div>`;
+    return `<details class="tn" open><summary class="tn-sum">
+        <span class="tn-label">🏅 ${esc(d.name)}</span>
+        <span class="tn-meta">${teams.length} team${teams.length === 1 ? "" : "s"}</span></summary>
+      <div class="tn-children">${teamRows}${treeAdd("team", "Add team to " + d.name, "f-team-div", d.id)}</div>
+    </details>`;
+  };
   const leagueRows = (ov.leagues || []).map((lg) => {
     const seasons = seasonsByLeague[lg.id] || [];
     const lgTeams = seasons.reduce((n, s) => n + countTeams(divsBySeason[s.id] || []), 0);
     const seasonRows = seasons.map((s) => {
       const divs = divsBySeason[s.id] || [];
-      const divRows = divs.map((d) => {
-        const teams = teamsByDiv[d.id] || [];
-        const teamRows = teams.map((t) =>
-          `<div class="tn-leaf"><span class="tn-label">👥 ${esc(t.name)}</span><span class="tn-meta">${teamMeta(t)}</span></div>`).join("")
-          || `<div class="tn-empty">No teams in this division yet.</div>`;
+      const divsByLevel = groupBy(divs, "level_id");
+      // Levels group their divisions (sorted by sort_order); a "No level"
+      // bucket holds divisions created directly under the season (#166).
+      const levels = (levelsBySeason[s.id] || []).slice()
+        .sort((a, b) => (a.sort_order || 0) - (b.sort_order || 0) || a.name.localeCompare(b.name));
+      const levelSections = levels.map((lv) => {
+        const lvDivs = divsByLevel[lv.id] || [];
+        const inner = lvDivs.map(divisionNode).join("")
+          || `<div class="tn-empty">No divisions in this level yet.</div>`;
         return `<details class="tn" open><summary class="tn-sum">
-            <span class="tn-label">🏅 ${esc(d.name)}</span>
-            <span class="tn-meta">${teams.length} team${teams.length === 1 ? "" : "s"}</span></summary>
-          <div class="tn-children">${teamRows}${treeAdd("team", "Add team to " + d.name, "f-team-div", d.id)}</div>
+            <span class="tn-label">🎚️ ${esc(lv.name)}</span>
+            <span class="tn-meta">${lvDivs.length} division${lvDivs.length === 1 ? "" : "s"}</span></summary>
+          <div class="tn-children">${inner}${treeAdd("division", "Add division to " + lv.name, "f-div-level", lv.id, "f-div-season", s.id)}</div>
         </details>`;
-      }).join("") || `<div class="tn-empty">No divisions in this season yet.</div>`;
+      }).join("");
+      const orphanDivs = (divsByLevel[null] || []).concat(divsByLevel[undefined] || []);
+      const orphanDivSection = orphanDivs.length
+        ? (levels.length
+            ? `<details class="tn" open><summary class="tn-sum">
+                <span class="tn-label tn-warn-text">🏅 No level</span>
+                <span class="tn-meta">${orphanDivs.length} division${orphanDivs.length === 1 ? "" : "s"}</span></summary>
+              <div class="tn-children">${orphanDivs.map(divisionNode).join("")}</div>
+            </details>`
+            : orphanDivs.map(divisionNode).join(""))
+        : "";
+      const seasonBody = (levelSections || orphanDivSection)
+        ? `${levelSections}${orphanDivSection}`
+        : `<div class="tn-empty">No divisions in this season yet.</div>`;
       return `<details class="tn" open><summary class="tn-sum">
           <span class="tn-label">🗓️ ${esc(s.name)}</span>
           <span class="tn-meta">${divs.length} division(s) · ${countTeams(divs)} team(s)</span></summary>
-        <div class="tn-children">
-          <div class="tree-note sub">Levels aren't configured in this version — divisions are grouped directly under the season.</div>
-          ${divRows}${treeAdd("division", "Add division to " + s.name, "f-div-season", s.id)}</div>
+        <div class="tn-children">${seasonBody}
+          <div class="tree-actions sub">${treeAdd("level", "Add level to " + s.name, "f-level-season", s.id)}${treeAdd("division", "Add division to " + s.name, "f-div-season", s.id)}</div></div>
       </details>`;
     }).join("") || `<div class="tn-empty">No seasons in this league yet.</div>`;
     return `<details class="tn" open><summary class="tn-sum">
@@ -670,7 +718,7 @@ function renderSetupHierarchy(ov) {
   }).join("");
   const competition = `<section class="tree-panel">
     <div class="tree-head"><span class="tree-title">🏆 Competition</span>
-      <span class="tree-sub">League → Season → Division → Team</span></div>
+      <span class="tree-sub">League → Season → Level → Division → Team</span></div>
     ${leagueRows || `<div class="tn-empty">No leagues yet. Add a league to begin.</div>`}
     <div class="tree-actions">${treeAdd("league", "Add league")}</div>
   </section>`;
@@ -3635,6 +3683,7 @@ async function render() {
   c.querySelectorAll("[data-drawer]").forEach((b) => b.onclick = () => {
     drawer = { kind: b.dataset.drawer }; drawerError = ""; drawerValues = {};
     if (b.dataset.prefillField) drawerValues[b.dataset.prefillField] = b.dataset.prefillValue || "";
+    if (b.dataset.prefillField2) drawerValues[b.dataset.prefillField2] = b.dataset.prefillValue2 || "";
     toast = ""; render();
   });
   c.querySelectorAll("[data-drawer-close]").forEach((b) => b.onclick = () => {

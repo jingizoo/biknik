@@ -29,6 +29,7 @@ from ..domain import (
     IceSlotType,
     GameResult,
     League,
+    Level,
     ContactDestination,
     DeliveryStatus,
     DeviceToken,
@@ -128,6 +129,7 @@ class Spec:
 SPECS = {
     League: Spec(League, "leagues"),
     Season: Spec(Season, "seasons", {"start_date": _dt(), "end_date": _dt()}),
+    Level: Spec(Level, "levels"),
     Division: Spec(Division, "divisions"),
     Club: Spec(Club, "clubs"),
     Team: Spec(Team, "teams"),
@@ -493,6 +495,10 @@ class SqlStore:
     def all_seasons(self): return self._query(Season, order="id")
     def seasons_for_league(self, league_id):
         return self._query(Season, "league_id = ?", (league_id,), order="id")
+
+    def add_level(self, level): return self._insert(level)
+    def get_level(self, level_id): return self._get(Level, level_id)
+    def all_levels(self): return self._query(Level, order="id")
 
     def add_division(self, division): return self._insert(division)
     def get_division(self, division_id): return self._get(Division, division_id)

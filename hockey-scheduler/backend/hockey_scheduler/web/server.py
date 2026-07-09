@@ -1546,9 +1546,17 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_api(api.create_season(
                 b.get("league_id"), b.get("name"),
                 b.get("start_date"), b.get("end_date"), actor_id))
+        if entity == "level":
+            try:
+                sort_order = int(b.get("sort_order") or 0)
+            except (TypeError, ValueError):
+                sort_order = 0
+            return self._send_api(api.create_level(
+                b.get("season_id"), b.get("name"), sort_order, actor_id))
         if entity == "division":
             return self._send_api(api.create_division(
-                b.get("season_id"), b.get("name"), b.get("age_group", ""), actor_id))
+                b.get("season_id"), b.get("name"), b.get("age_group", ""),
+                b.get("level_id") or None, actor_id))
         if entity == "club":
             return self._send_api(api.create_club(
                 b.get("name"), b.get("country", ""), actor_id))
