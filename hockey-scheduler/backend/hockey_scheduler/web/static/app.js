@@ -1816,6 +1816,7 @@ const READINESS_CHECK_LABEL = {
   migrations_current: "Migrations current",
   active_admin: "Active league admin",
   cookie_hardening: "Secure cookie hardening",
+  persistent_store: "Persistent store",
 };
 const RD_BADGE_CLASS = { pass: "green", warn: "orange", fail: "red", info: "gray" };
 const RD_BADGE_TEXT = { pass: "PASS", warn: "WARN", fail: "FAIL", info: "INFO" };

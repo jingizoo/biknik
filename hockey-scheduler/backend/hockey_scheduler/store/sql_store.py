@@ -272,10 +272,16 @@ def _utcnow() -> datetime:
 
 class SqlStore:
     def __init__(self, url: str = ":memory:"):
-        self.conn, self.dialect = connect(url)
+        self.conn, self.dialect, resolved_path = connect(url)
         # Store kind for the runtime status endpoint (#72): psycopg uses the
         # "pyformat" paramstyle, sqlite3 uses "qmark".
         self.backend = "postgres" if self.dialect.paramstyle == "pyformat" else "sqlite"
+        # SQLite's ":memory:" (and an empty path, which sqlite3 treats as a
+        # temp file deleted on close) are exactly as ephemeral as
+        # InMemoryStore — readiness (#143) needs to tell them apart from a
+        # genuinely durable file/Postgres, since being a SqlStore instance
+        # alone doesn't guarantee that.
+        self.is_memory_backed = resolved_path in (":memory:", "")
         # Reentrant: transaction() holds the lock while inner _exec re-acquires.
         self._lock = threading.RLock()
         migrate(self.conn, self.dialect)

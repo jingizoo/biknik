@@ -11,11 +11,18 @@ Neither returns accounts, secrets, connection strings, or env values.
 | Endpoint | Purpose |
 | --- | --- |
 | `GET /api/health` | Liveness + dependencies: app up, DB reachable, migrations applied, delivery mode + worker status. |
-| `GET /api/readiness` | Deployment gate: DB reachable, migrations current, (production) ≥1 active admin, cookie hardening active. Returns `ready: true/false` and a per-check breakdown. |
+| `GET /api/readiness` | Deployment gate: DB reachable, migrations current, (production) ≥1 active admin, cookie hardening active, (production) a durable store. Returns `ready: true/false` and a per-check breakdown. |
 
 Point your load balancer / orchestrator liveness probe at `/api/health` and
 its readiness probe at `/api/readiness`. In production `ready` is only `true`
-once every check passes — notably, an active League Admin must exist.
+once every check passes — notably, an active League Admin must exist and the
+store must be durable (`persistent_store`, #143): a production deployment
+with a missing or typo'd `DATABASE_URL` fails this check immediately rather
+than silently running on in-memory storage that resets on every restart.
+This also catches `DATABASE_URL` values that resolve to SQLite's `:memory:`
+mode (or an empty path) — those produce a real `SqlStore`, but one that's
+exactly as ephemeral as no `DATABASE_URL` at all; only a real Postgres
+connection or an actual SQLite file counts as durable.
 
 `GET /api/health` returns (illustrative — a running Postgres-backed instance;
 `store`/`migrations.backend` reads `"memory"` with empty `applied`/`expected`
@@ -38,7 +45,7 @@ arrays for the in-memory demo store instead):
 | Variable | Purpose | Default |
 | --- | --- | --- |
 | `APP_MODE` | `production` disables demo conveniences (X-Demo-Role header, headerless-admin fallback, demo seeding, `/api/reset`) and enables `Secure` cookies. Anything else = demo. | `demo` |
-| `DATABASE_URL` | `postgres://…` (or a SQLite path) → durable `SqlStore`. Unset → in-memory (data lost on restart). | in-memory |
+| `DATABASE_URL` | `postgres://…` (or a real SQLite file path) → durable `SqlStore`. Unset, or a value that resolves to SQLite `:memory:`/empty (ephemeral, #143) → readiness fails in production. | in-memory |
 | `HOST` / `PORT` | Bind address/port for `python3 -m hockey_scheduler.web` (also settable via `--host`/`--port`). Many container platforms inject `PORT` automatically. | `127.0.0.1` / `8000` |
 | `BOOTSTRAP_ADMIN_USER` / `BOOTSTRAP_ADMIN_PASSWORD` | First League Admin, created on boot only when the store has no accounts (idempotent). | — |
 | `DELIVERY_WORKER_ENABLED` / `_INTERVAL` / `_BATCH` | Opt-in background delivery worker (#79). | disabled / 30s / 50 |
