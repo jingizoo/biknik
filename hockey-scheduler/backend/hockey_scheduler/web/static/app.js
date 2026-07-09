@@ -2745,7 +2745,17 @@ function renderSetupAuditFeed(ov) {
 function renderActivity(board, ov) {
   const setupHtml = renderSetupAuditFeed(ov);
   const operatorSection = `<div class="section-title">Operator setup (${(ov && ov.setup_audit_count) || 0})</div><div class="card">${setupHtml}</div>`;
-  if (!board) return operatorSection + `<div class="section-title">Game</div><div class="card"><div class="empty">Open a game roster to see its game activity.</div></div>`;
+  // No game selected, or the selected game's private data is out of this
+  // user's scope (a coach/operator can land on Activity for a game their team
+  // isn't in — the board comes back as a 403 error payload, not null). Either
+  // way, show the operator setup feed plus a plain note instead of reading
+  // board.players off an error object and crashing the whole view.
+  if (!board || board.error) {
+    const note = board && board.error
+      ? esc(board.error.message || "You don't have access to this game's activity.")
+      : "Open a game roster to see its game activity.";
+    return operatorSection + `<div class="section-title">Game</div><div class="card"><div class="empty">${note}</div></div>`;
+  }
   const names = {}; board.players.forEach((p) => (names[p.id] = p.name));
   const feed = [...(board.notifications || [])].reverse();
   const audit = [...(board.audit || [])].reverse();
@@ -4030,6 +4040,28 @@ function applyRolePerms() {
   rolePerms = new Set(r ? r.permissions : []);
   gateChrome();
 }
+// Role-level mirror of the backend's private-game read gate (scope.py's
+// can_read_private_game_data), ignoring the specific game: operators read
+// every game, a coach/player their own team's, an official their assigned
+// games; a viewer/guardian never any. The Roster and Game Sheet tabs show
+// nothing but private per-game data, so hiding them from roles that can
+// never read any game's private data avoids luring those users to a
+// guaranteed "Restricted" screen.
+function canReadAnyPrivateGame() {
+  if (!currentUser) return true;               // headerless demo operator
+  const role = currentUser.role, s = currentUser.scope || {};
+  if (role === "league_admin" || role === "arena_manager") return true;
+  if (role === "coach" || role === "player") return !!s.team_id;
+  if (role === "official") return !!s.official_id;
+  return false;                                // viewer, guardian
+}
+// The Dashboard and Activity tabs are operator/coach consoles — league-wide
+// (or coach-team) ops stats, alerts, and audit feeds. A player, guardian,
+// official, or viewer has their own home surface and no use for that operator
+// noise, so both tabs are gated to roles that manage rosters or the schedule.
+function canSeeOpsConsole() {
+  return hasPerm("manage_roster") || hasPerm("manage_schedule");
+}
 function gateChrome() {
   const toggle = (sel, ok) => document.querySelectorAll(sel).forEach((el) => {
     el.style.display = ok ? "" : "none";
@@ -4062,6 +4094,21 @@ function gateChrome() {
   toggle("#reset-btn", hasPerm("manage_schedule"));
   // Sign out only makes sense with a live session.
   toggle("#signout-btn", !!currentUser);
+  // Dashboard + Activity are operator/coach ops consoles; Roster + Game Sheet
+  // are private per-game data. Hide each from roles that would only ever land
+  // on operator noise or a "Restricted" screen (crash-fixed for Activity, but
+  // still a dead end). Each hidden role has its own home to land on instead.
+  toggle('.tab[data-tab="dashboard"]', canSeeOpsConsole());
+  toggle('.tab[data-tab="activity"]', canSeeOpsConsole());
+  toggle('.tab[data-tab="roster"]', canReadAnyPrivateGame());
+  toggle('.tab[data-tab="sheet"]', canReadAnyPrivateGame());
+  // Hide a nav group once all of its tabs are hidden, so its section label
+  // (Home / Schedule / People / …) doesn't hang orphaned above nothing.
+  document.querySelectorAll(".nav-group").forEach((g) => {
+    const anyTab = Array.from(g.querySelectorAll(".tab"))
+      .some((t) => t.style.display !== "none");
+    g.style.display = anyTab ? "" : "none";
+  });
 }
 // One-time/private per-identity UI state (#116 Phase 0.2): a checkout
 // confirmation, an open opportunity detail, or a just-minted "shown once"
@@ -4139,9 +4186,20 @@ function setUser(user) {
   if (!isPlayerUser && view === "player_home") view = "dashboard";
   if (!isGuardianUser && view === "guardian_home") view = "dashboard";
   if (!isOfficialUser && view === "inbox") view = "dashboard";
+  // Phase 1b: a no-reload persona switch (role-switch dropdown / sign-out+in)
+  // can leave a user on a tab their new role can no longer see — an operator
+  // on Activity/Dashboard becoming a viewer, say. Bounce off those to the
+  // default so phase 2 can re-land them; the tab itself is already hidden by
+  // gateChrome, but the *view* state has to follow or they'd stare at a
+  // now-invisible screen.
+  if (["dashboard", "activity"].includes(view) && !canSeeOpsConsole()) view = "dashboard";
+  if (["roster", "sheet"].includes(view) && !canReadAnyPrivateGame()) view = "dashboard";
   if (isPlayerUser && view === "dashboard") view = "player_home";
   else if (isGuardianUser && view === "dashboard") view = "guardian_home";
   else if (isOfficialUser && view === "dashboard") view = "inbox";
+  // A viewer has no dedicated home and can't see the operator Dashboard —
+  // Standings is public info everyone can read, so it's their landing.
+  else if (view === "dashboard" && !canSeeOpsConsole()) view = "standings";
   if (view === priorView) return;
   document.querySelectorAll(".tab").forEach((x) =>
     x.classList.toggle("active", x.dataset.tab === view));
