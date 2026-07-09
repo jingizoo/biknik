@@ -51,6 +51,8 @@ let officialAvailability = [];      // signed-in official's windows (#88)
 let availSummary = null;            // roster availability rollup (#89)
 let subCandidates = null;           // coach substitute outreach queue (#112)
 let addableSubs = null;             // eligible-but-not-enrolled team players a coach can add (#114)
+let dashAvailability = null;        // availability-summary for the coach dashboard's next game (#146)
+let dashSubQueue = null;            // substitute-candidates for the coach dashboard's next game (#146)
 let playersList = [];               // [{id,name,team_id,position,jersey_number,...}] for Setup (#114)
 let rescheduleRequests = null;      // reschedule request(s) for the current game (#29)
 let availFilter = "all";            // all|available|unavailable|maybe|no_response
@@ -244,6 +246,19 @@ function gameTriage(g) {
   return { badge: "ready", label: "Ready", note: "Officials & roster set", noteCls: "ok" };
 }
 
+// Shared between render()'s data-fetch step (needs the coach's next game's
+// id to pull its availability/substitute-queue detail) and renderDashboard's
+// display (which highlights that same game) — one definition of "next game"
+// used in both places (#146).
+function coachTeamGames(ov, teamId) {
+  return (ov.schedule || []).filter((g) => !teamId
+    || g.home_team_id === teamId || g.away_team_id === teamId);
+}
+function nextUpcomingGame(games) {
+  return games.filter((g) => g.result_status !== "final")
+    .slice().sort((a, b) => new Date(a.start_time) - new Date(b.start_time))[0] || null;
+}
+
 function renderDashboard(ov, standings) {
   // A coach's "what needs attention" is their own team, not the whole
   // league (#145 research: coaches landed on the same league-wide operator
@@ -252,8 +267,7 @@ function renderDashboard(ov, standings) {
   // no separate coach-specific dashboard to build or keep in sync.
   const coachTeamId = (currentRole === "coach" && currentUser
     && currentUser.scope && currentUser.scope.team_id) || null;
-  const games = (ov.schedule || []).filter((g) => !coachTeamId
-    || g.home_team_id === coachTeamId || g.away_team_id === coachTeamId);
+  const games = coachTeamGames(ov, coachTeamId);
   const today = games.filter((g) => dayOf(g.start_time) === calendarDate);
   const todayList = today.length ? today : games;   // fall back to all if none "today"
   // "Games this week" (#118 Phase 7) means the 7-day window starting today —
@@ -359,11 +373,57 @@ function renderDashboard(ov, standings) {
       <button class="linklike dch-link" data-goto="standings">All →</button></div>
     ${ssRows || '<div class="na-empty">No games played yet.</div>'}</div>` : "";
 
+  // Coach action card (#146): the coach dashboard research for #145 scoped
+  // the existing operator stats/alerts to the coach's team but stopped
+  // there — a coach still had to leave the dashboard to see whether their
+  // next game's roster is actually fillable. This surfaces the same
+  // availability-summary/substitute-candidates data the Roster tab already
+  // shows, but for the coach's single next game, with a link to go act on it.
+  const nextGame = coachTeamId ? nextUpcomingGame(games) : null;
+  const actionCard = nextGame ? renderCoachActionCard(nextGame) : "";
+  const linksCard = coachTeamId ? renderCoachQuickLinks() : "";
+
   return `${stats}
     <div class="dash-grid">
       <div>${gamesCard}</div>
-      <div style="display:flex;flex-direction:column;gap:16px">${attentionCard}${standingsCard}</div>
+      <div style="display:flex;flex-direction:column;gap:16px">${attentionCard}${actionCard}${standingsCard}${linksCard}</div>
     </div>`;
+}
+
+function renderCoachActionCard(nextGame) {
+  const av = dashAvailability;
+  const sq = dashSubQueue;
+  const availLine = av
+    ? `${av.counts.available} available · ${av.counts.unavailable} unavailable · ${av.counts.maybe} maybe · ${av.counts.no_response} no response`
+    : "Loading…";
+  const availWarn = av && (av.counts.unavailable + av.counts.no_response) > 0;
+  const openSlots = sq ? sq.open_goalie_slots + sq.open_skater_slots : 0;
+  const subLine = !sq ? "Loading…"
+    : openSlots === 0 ? "No open roster slots for this game."
+    : `${openSlots} open slot${openSlots === 1 ? "" : "s"} · ${sq.candidates.length} substitute${sq.candidates.length === 1 ? "" : "s"} available to offer`;
+  return `<div class="dash-card">
+    <div class="dash-card-head"><h3>Next Game · Roster &amp; Subs</h3>
+      <button class="linklike dch-link" data-goto="roster">Roster →</button></div>
+    <div class="na-row"><div class="na-ico blue">🗓️</div>
+      <div class="na-body"><div class="na-title">${esc(nextGame.home_team_name)} vs ${esc(nextGame.away_team_name || "TBD")}</div>
+        <div class="na-sub">${esc(fmtDateTime(nextGame.start_time))}${nextGame.rink_name ? " · " + esc(nextGame.rink_name) : ""}</div></div></div>
+    <div class="na-row"><div class="na-ico ${availWarn ? "amber" : "green"}">👥</div>
+      <div class="na-body"><div class="na-title">Availability</div><div class="na-sub">${esc(availLine)}</div></div></div>
+    <div class="na-row"><div class="na-ico ${openSlots > 0 ? "red" : "green"}">🔁</div>
+      <div class="na-body"><div class="na-title">Substitute queue</div><div class="na-sub">${esc(subLine)}</div></div></div>
+  </div>`;
+}
+
+function renderCoachQuickLinks() {
+  return `<div class="dash-card">
+    <div class="dash-card-head"><h3>Quick Links</h3></div>
+    <div class="dash-card-links">
+      <button class="act ghost" data-goto="roster">Roster</button>
+      <button class="act ghost" data-goto="games">Games</button>
+      <button class="act ghost" data-goto="notifications">Notifications</button>
+      <button class="act ghost" data-goto="notifications">📅 Subscribe to calendar</button>
+    </div>
+  </div>`;
 }
 
 /* ---------- Setup ---------- */
@@ -1041,8 +1101,12 @@ function renderInbox(inbox) {
   if (!rows.length) {
     return `<div class="banner neutral"><h2>No assignments yet</h2>
       <p>When a scheduler assigns you to a game, it will appear here to accept or decline.</p></div>
-      ${renderAvailability()}`;
+      ${renderAvailability()}${renderCalendarFeed()}`;
   }
+  // Pending-response count (#146): "upcoming assignments" already told an
+  // official how many games they're on; it didn't say how many still need
+  // an accept/decline from them specifically.
+  const pending = rows.filter((a) => a.status === "proposed" && !a.cancelled).length;
   const roleLabel = { referee: "👨‍⚖️ Referee", linesperson: "🚩 Linesperson", scorekeeper: "📝 Scorekeeper" };
   const badge = (st) => st === "accepted" ? `<span class="badge green">Accepted</span>`
     : st === "declined" ? `<span class="badge red">Declined</span>`
@@ -1062,8 +1126,10 @@ function renderInbox(inbox) {
         <button class="act ghost" data-open-sheet="${esc(a.game_id)}">Open game sheet</button></div>
     </div>`;
   }).join("");
-  return `<div class="section-title">Your upcoming assignments (${rows.length})</div>
-    <div class="inbox-list">${cards}</div>${renderAvailability()}`;
+  const pendingBadge = pending
+    ? `<span class="badge orange" style="margin-left:8px">${pending} pending your response</span>` : "";
+  return `<div class="section-title">Your upcoming assignments (${rows.length})${pendingBadge}</div>
+    <div class="inbox-list">${cards}</div>${renderAvailability()}${renderCalendarFeed()}`;
 }
 
 /* ---------- Player Home (#107) ---------- */
@@ -2926,6 +2992,22 @@ async function render() {
         `/api/games/${currentGame}/substitute-addable?team_id=${tid}`);
       if (a && !a.error) addableSubs = a;
     }
+    // Coach dashboard action card (#146): the next upcoming game's
+    // availability/substitute-queue detail, reusing the same team-scoped
+    // endpoints the Roster tab already calls — team_id is omitted so the
+    // route defaults to the coach's own team.
+    dashAvailability = null;
+    dashSubQueue = null;
+    if (view === "dashboard" && currentRole === "coach" && currentUser
+        && currentUser.scope && currentUser.scope.team_id) {
+      const next = nextUpcomingGame(coachTeamGames(ov, currentUser.scope.team_id));
+      if (next) {
+        const av = await getJSON(`/api/games/${next.game_id}/availability-summary`);
+        if (av && !av.error) dashAvailability = av;
+        const sq = await getJSON(`/api/games/${next.game_id}/substitute-candidates`);
+        if (sq && !sq.error) dashSubQueue = sq;
+      }
+    }
     // Reschedule request/approval state for the currently viewed game (#29)
     // — visible to either team's coach or an operator (same audience as the
     // outreach queue above, but not manage_roster-only: a league admin
@@ -3001,6 +3083,11 @@ async function render() {
           `/api/notifications/preferences?recipient_ref=${encodeURIComponent(ref)}`);
         if (pr && !pr.error) notifPrefs = pr;
       }
+    }
+    // Calendar feed tokens: the Notifications tab's full manage UI, and (#146)
+    // the Official inbox's calendar-subscription shortcut, both need the
+    // signed-in user's own feed state.
+    if (view === "notifications" || view === "inbox") {
       const actor = ownFeedActor();
       if (actor) {
         const ft = await getJSON(`/api/calendar-feeds?actor_type=${actor.actor_type}`
