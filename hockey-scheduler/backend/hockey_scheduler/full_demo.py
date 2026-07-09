@@ -62,10 +62,15 @@ def build_full_demo_store(store=None) -> Tuple[InMemoryStore, str, dict]:
                                  actor_id=admin)
     season = setup.create_season(league.id, "2026–27 Winter Season",
                                  actor_id=admin)
+    # A competitive level/tier groups divisions inside the season (#166). The
+    # junior divisions sit under it; Senior A is left level-less on purpose so
+    # the Setup hierarchy shows the "No level" bucket.
+    junior_tier = setup.create_level(season.id, "Junior Tier", sort_order=1,
+                                     actor_id=admin)
     d_u16 = setup.create_division(season.id, "U16 Elite", age_group="U16",
-                                  actor_id=admin)
+                                  level_id=junior_tier.id, actor_id=admin)
     d_u18 = setup.create_division(season.id, "U18 Development", age_group="U18",
-                                  actor_id=admin)
+                                  level_id=junior_tier.id, actor_id=admin)
     d_sen = setup.create_division(season.id, "Senior A", actor_id=admin)
 
     club_lions = setup.create_club("Lions HC", country="AT", actor_id=admin)

@@ -86,6 +86,48 @@ class SetupFacadeTest(unittest.TestCase):
         self.assertEqual(row["organization_id"], org["id"])
         self.assertEqual(row["organization_name"], "Summit Ice Facilities")
 
+    def test_create_level_and_assign_division(self):
+        league = self.api.create_league("Over 55")
+        season = self.api.create_season(league["id"], "Fall 2026")
+        level = self.api.create_level(season["id"], "Level 1", sort_order=1)
+        self.assertNotIn("error", level)
+        self.assertEqual(level["name"], "Level 1")
+        self.assertEqual(level["sort_order"], 1)
+        div = self.api.create_division(season["id"], "Div A", level_id=level["id"])
+        self.assertEqual(div["level_id"], level["id"])
+
+    def test_create_division_without_level_is_unassigned(self):
+        league = self.api.create_league("Over 55")
+        season = self.api.create_season(league["id"], "Fall 2026")
+        div = self.api.create_division(season["id"], "Div A")
+        self.assertIsNone(div["level_id"])
+
+    def test_create_division_with_missing_level_returns_not_found(self):
+        league = self.api.create_league("Over 55")
+        season = self.api.create_season(league["id"], "Fall 2026")
+        result = self.api.create_division(season["id"], "Div A", level_id="level_missing")
+        self.assertEqual(result["error"]["code"], "not_found")
+
+    def test_division_rejects_level_from_another_season(self):
+        league = self.api.create_league("Over 55")
+        season_a = self.api.create_season(league["id"], "Fall 2026")
+        season_b = self.api.create_season(league["id"], "Spring 2027")
+        level_a = self.api.create_level(season_a["id"], "Level 1")
+        result = self.api.create_division(season_b["id"], "Div A", level_id=level_a["id"])
+        self.assertEqual(result["error"]["code"], "validation_error")
+
+    def test_overview_surfaces_level_on_division_rows(self):
+        league = self.api.create_league("Over 55")
+        season = self.api.create_season(league["id"], "Fall 2026")
+        level = self.api.create_level(season["id"], "Level 1")
+        self.api.create_division(season["id"], "Div A", level_id=level["id"])
+        overview = self.api.get_demo_overview()
+        self.assertIn("levels", overview)
+        self.assertEqual(len(overview["levels"]), 1)
+        row = next(d for d in overview["divisions"] if d["name"] == "Div A")
+        self.assertEqual(row["level_id"], level["id"])
+        self.assertEqual(row["level_name"], "Level 1")
+
     def test_created_game_drives_roster_endpoints(self):
         season, division, home, away, slot = self._build()
         game = self.api.create_game(

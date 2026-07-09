@@ -82,6 +82,7 @@ class MigrationApplyTest(unittest.TestCase):
             cur.execute("ALTER TABLE officials DROP COLUMN external_ref")  # #94 additive col
             cur.execute("ALTER TABLE rinks DROP COLUMN external_ref")  # #95 additive col
             cur.execute("ALTER TABLE venues DROP COLUMN organization_id")  # #166 additive col
+            cur.execute("ALTER TABLE divisions DROP COLUMN level_id")  # #166 additive col
             cur.execute("ALTER TABLE guardian_links DROP COLUMN consent_method")  # #35
             cur.execute("ALTER TABLE guardian_links DROP COLUMN consented_at")  # #35
             cur.execute("ALTER TABLE calendar_feed_tokens DROP COLUMN created_by")  # #131

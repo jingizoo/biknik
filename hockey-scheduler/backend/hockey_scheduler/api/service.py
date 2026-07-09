@@ -1845,6 +1845,7 @@ class ApiService:
         personal data — only fixture information that is safe to show fans.
         """
         divisions = {d.id: d for d in self.store.all_divisions()}
+        levels = {lv.id: lv for lv in self.store.all_levels()}
         clubs = {c.id: c for c in self.store.all_clubs()}
         teams = {t.id: t for t in self.store.all_teams()}
         orgs = {o.id: o for o in self.store.all_organizations()}
@@ -1861,9 +1862,14 @@ class ApiService:
             t = teams.get(tid)
             return t.name if t else tid
 
+        # Divisions now carry an optional owning level/tier (#166) — surface the
+        # id + resolved name so the Setup hierarchy can group divisions by level.
         division_rows = [
             {"id": d.id, "season_id": d.season_id, "name": d.name,
-             "age_group": d.age_group, "is_junior": is_junior(d)}
+             "age_group": d.age_group, "is_junior": is_junior(d),
+             "level_id": d.level_id,
+             "level_name": levels[d.level_id].name
+             if d.level_id in levels else None}
             for d in divisions.values()
         ]
         team_rows = [
@@ -1979,6 +1985,7 @@ class ApiService:
             "league": leagues[0] if leagues else None,
             "leagues": leagues,
             "seasons": seasons,
+            "levels": [_serialize(lv) for lv in levels.values()],
             "divisions": division_rows,
             "clubs": [_serialize(c) for c in clubs.values()],
             "teams": team_rows,
@@ -2019,9 +2026,16 @@ class ApiService:
             _parse_dt(end_date, "end_date"), actor_id))
 
     @catch
+    def create_level(self, season_id: str, name: str, sort_order: int = 0,
+                     actor_id: Optional[str] = None) -> dict:
+        return _serialize(self.setup.create_level(season_id, name, sort_order, actor_id))
+
+    @catch
     def create_division(self, season_id: str, name: str, age_group: str = "",
+                        level_id: Optional[str] = None,
                         actor_id: Optional[str] = None) -> dict:
-        return _serialize(self.setup.create_division(season_id, name, age_group, actor_id))
+        return _serialize(self.setup.create_division(
+            season_id, name, age_group, level_id, actor_id))
 
     @catch
     def create_club(self, name: str, country: str = "",

@@ -18,6 +18,7 @@ from ..domain import (
     IceSlotStatus,
     IceSlotType,
     League,
+    Level,
     GameResult,
     NotificationAudience,
     NotificationChannel,
@@ -192,15 +193,40 @@ class SetupService:
         return season
 
     @_transactional
+    def create_level(self, season_id: str, name: str, sort_order: int = 0,
+                     actor_id: Optional[str] = None) -> Level:
+        if self.store.get_season(season_id) is None:
+            raise NotFoundError(f"Season {season_id} not found.")
+        level = Level(id=self.store.next_id("level"), season_id=season_id,
+                      name=self._require_name(name), sort_order=sort_order or 0)
+        self.store.add_level(level)
+        self._audit("level_created", "level", level.id, actor_id,
+                    {"season_id": season_id})
+        return level
+
+    @_transactional
     def create_division(self, season_id: str, name: str, age_group: str = "",
+                        level_id: Optional[str] = None,
                         actor_id: Optional[str] = None) -> Division:
         if self.store.get_season(season_id) is None:
             raise NotFoundError(f"Season {season_id} not found.")
+        # An optional owning level/tier (#166) — validated when given: it must
+        # exist AND belong to this division's season, so a division can never
+        # sit under a level from a different season. Null is fine (unassigned).
+        if level_id:
+            level = self.store.get_level(level_id)
+            if level is None:
+                raise NotFoundError(f"Level {level_id} not found.")
+            if level.season_id != season_id:
+                raise ValidationError(
+                    "Level belongs to a different season than the division.")
         division = Division(id=self.store.next_id("division"), season_id=season_id,
-                            name=self._require_name(name), age_group=age_group)
+                            name=self._require_name(name), age_group=age_group,
+                            level_id=level_id or None)
         self.store.add_division(division)
         self._audit("division_created", "division", division.id, actor_id,
-                    {"season_id": season_id})
+                    {"season_id": season_id,
+                     **({"level_id": level_id} if level_id else {})})
         return division
 
     # -- club / team -------------------------------------------------------

@@ -25,6 +25,7 @@ from ..domain import (
     DeliveryStatus,
     DeviceToken,
     League,
+    Level,
     Notification,
     NotificationDelivery,
     GuardianLink,
@@ -63,6 +64,7 @@ class InMemoryStore:
         self.organizations: Dict[str, Organization] = {}
         self.leagues: Dict[str, League] = {}
         self.seasons: Dict[str, Season] = {}
+        self.levels: Dict[str, Level] = {}
         self.divisions: Dict[str, Division] = {}
         self.clubs: Dict[str, Club] = {}
         self.venues: Dict[str, Venue] = {}
@@ -215,6 +217,13 @@ class InMemoryStore:
 
     def seasons_for_league(self, league_id: str) -> List[Season]:
         return [s for s in self.seasons.values() if s.league_id == league_id]
+
+    def add_level(self, level: Level) -> Level:
+        self.levels[level.id] = level
+        return level
+
+    def get_level(self, level_id: str) -> Optional[Level]:
+        return self.levels.get(level_id)
 
     def add_division(self, division: Division) -> Division:
         self.divisions[division.id] = division
@@ -615,6 +624,9 @@ class InMemoryStore:
 
     def all_seasons(self) -> List[Season]:
         return list(self.seasons.values())
+
+    def all_levels(self) -> List[Level]:
+        return list(self.levels.values())
 
     def all_divisions(self) -> List[Division]:
         return list(self.divisions.values())

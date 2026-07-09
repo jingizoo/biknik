@@ -13,7 +13,7 @@ from ..domain import Permission, can
 # League-structure setup entities vs arena entities (both under /api/setup/).
 # Organization owns venues, so it's arena-side (MANAGE_ARENA), like venue/rink (#166).
 _ARENA_SETUP = {"organization", "venue", "rink", "ice-slot"}
-_LEAGUE_SETUP = {"league", "season", "division", "club", "team", "player"}
+_LEAGUE_SETUP = {"league", "season", "level", "division", "club", "team", "player"}
 
 # Game sub-actions grouped by the permission they require.
 _SCHEDULE_ACTIONS = {"move", "publish", "result", "result/approve"}
