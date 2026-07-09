@@ -61,7 +61,8 @@ let gamesExpanded = new Set();      // game_ids whose full checklist is expanded
 let contactForm = { recipient_ref: "", channel: "email", destination: "", label: "" };
 let tokenForm = { recipient_ref: "", provider: "fcm", token: "", label: "" };
 let movingGameId = null;    // click-to-move fallback: game awaiting a destination slot
-let conflict = null;        // {ok, title, lines[], game, slot} — calendar side panel (#43)
+let conflict = null;        // {ok, title, lines[], undo?} — calendar side panel (#43/#153)
+let pendingMove = null;     // {gid, slotId, willUnpublish, willUnlock} — move awaiting confirmation (#153)
 let drawer = null;          // {kind} when a Setup create drawer is open (#44)
 let drawerError = "";       // validation/API error shown inside the open drawer
 let drawerValues = {};      // {fieldId: value} preserved across re-render on error
@@ -751,22 +752,59 @@ function buildConflict(res, ov, gameId, slotId) {
     const [title, lines] = MAP[reason] || ["Move blocked", [res.error.message]];
     return { ok: false, title, lines };
   }
-  // Success — surface consequences worth a heads-up.
+  // Success — surface consequences worth a heads-up, and carry the old slot so
+  // the move can be undone (#153) by moving the game straight back.
   const m = (res && res.moved) || {};
   const lines = [`${gameName(gameId)} now plays ${slotName(m.new_slot_id || slotId)}.`];
   if (m.unpublished) lines.push("It was published, so the fixture reverted to Draft — re-publish when you're ready.");
   if (m.roster_unlocked) lines.push("The roster was locked, so it reopened — players must reconfirm the new time.");
-  return { ok: true, title: "Game moved", lines };
+  return { ok: true, title: "Game moved", lines,
+    undo: m.old_slot_id ? { gid: gameId, oldSlotId: m.old_slot_id } : null };
 }
 
 function conflictPanelHtml() {
   if (!conflict) return "";
   const cls = conflict.ok ? "ok" : "bad";
   const icon = conflict.ok ? "✅" : "⛔";
+  // Undo restores the slot/time/rink only — a move that reverted publish/lock
+  // state can't silently re-apply it, so the copy says so (#153).
+  const undoBtn = (conflict.ok && conflict.undo)
+    ? `<div class="ca-actions"><button class="act ghost" data-move-undo>↩ Undo move</button></div>` : "";
   return `<aside class="cal-aside ${cls}">
     <div class="ca-head"><span class="ca-ico">${icon}</span><span class="ca-title">${esc(conflict.title)}</span>
       <button class="ca-x" data-conflict-dismiss aria-label="Dismiss">×</button></div>
-    <div class="ca-body">${conflict.lines.map((l) => `<p>${esc(l)}</p>`).join("")}</div>
+    <div class="ca-body">${conflict.lines.map((l) => `<p>${esc(l)}</p>`).join("")}${undoBtn}</div>
+  </aside>`;
+}
+
+// Pre-move confirmation (#153): moving a published/locked game silently
+// reverts it to Draft / unlocks the roster, so stage the move and make the
+// operator confirm — with the destination and the exact side effects spelled
+// out — before it commits. A harmless draft move skips this entirely.
+function movePanelHtml(ov) {
+  if (!pendingMove) return "";
+  const { gid, slotId, willUnpublish, willUnlock } = pendingMove;
+  const g = ov.schedule.find((x) => x.game_id === gid);
+  const name = g ? `${g.home_team_name} vs ${g.away_team_name}` : "this game";
+  const s = ov.ice_slots.find((x) => x.id === slotId);
+  const r = s && ov.rinks.find((rr) => rr.id === s.rink_id);
+  const dest = s
+    ? `${r ? r.name : "Rink"} · ${fmtDate(dayOf(s.start_time))} · ${fmt(s.start_time)}–${fmt(s.end_time)}`
+    : "the new slot";
+  const warn = [];
+  if (willUnpublish) warn.push("This fixture is <strong>Published</strong> — moving it unpublishes it (reverts to Draft).");
+  if (willUnlock) warn.push("The roster is <strong>locked</strong> — moving it unlocks the roster; players must reconfirm.");
+  return `<aside class="cal-aside confirm">
+    <div class="ca-head"><span class="ca-ico">🔀</span><span class="ca-title">Move this game?</span>
+      <button class="ca-x" data-move-cancel-pending aria-label="Cancel">×</button></div>
+    <div class="ca-body">
+      <p><strong>${esc(name)}</strong><br>→ ${esc(dest)}</p>
+      ${warn.map((w) => `<p class="ca-warn">⚠ ${w}</p>`).join("")}
+      <div class="ca-actions">
+        <button class="act primary" data-move-confirm>Move game</button>
+        <button class="act ghost" data-move-cancel-pending>Cancel</button>
+      </div>
+    </div>
   </aside>`;
 }
 
@@ -778,7 +816,7 @@ function renderCalendar(ov) {
     ? renderWeek(ov, ctx, rinks)
     : renderDay(ov, ctx, rinks);
   return calToolbar(ov) +
-    `<div class="cal-layout"><div class="cal-main">${board}</div>${conflictPanelHtml()}</div>`;
+    `<div class="cal-layout"><div class="cal-main">${board}</div>${movePanelHtml(ov)}${conflictPanelHtml()}</div>`;
 }
 
 function moveBanner(ov) {
@@ -3990,26 +4028,49 @@ async function render() {
     if (res && !res.error) toast = "Guardian link verified.";
     await render();
   });
-  // Shared move: used by both drag/drop and the click-based Move fallback.
-  const applyMove = async (gid, slotId) => {
+  // Commit a move to the server, then show the outcome panel (with Undo).
+  // Shared by confirmed moves, harmless direct moves, and undo (#43/#153).
+  const commitMove = async (gid, slotId) => {
     toast = "";
     const res = await post(`/api/games/${gid}/move`, { ice_slot_id: slotId, reason: "Moved on arena calendar" });
-    conflict = buildConflict(res, ov, gid, slotId);   // #43 side panel explains outcome
-    if (res && res.error) toast = "";
-    movingGameId = null;
+    conflict = buildConflict(res, ov, gid, slotId);   // #43 side panel explains outcome + offers undo
+    pendingMove = null; movingGameId = null;
     await render();
+  };
+  // Moving a published/locked game silently reverts it to Draft / unlocks the
+  // roster (#153). Stage those and confirm first so a stray drag can't undo
+  // game-day-ready state unnoticed; a harmless draft move commits immediately
+  // so routine scheduling keeps its one-gesture flow. Both offer Undo after.
+  const requestMove = (gid, slotId) => {
+    const g = ov.schedule.find((x) => x.game_id === gid);
+    const willUnpublish = !!(g && g.published);
+    const willUnlock = !!(g && g.roster_status === "locked");
+    if (willUnpublish || willUnlock) {
+      pendingMove = { gid, slotId, willUnpublish, willUnlock };
+      conflict = null; movingGameId = null; toast = ""; render();
+    } else {
+      commitMove(gid, slotId);
+    }
   };
   // Tapping an Available slot: complete a pending move, else open the wizard.
   c.querySelectorAll("[data-slot]").forEach((b) => b.onclick = () => {
-    if (movingGameId != null) return applyMove(movingGameId, b.dataset.slot);
+    if (movingGameId != null) return requestMove(movingGameId, b.dataset.slot);
     wizard = { slot_id: b.dataset.slot }; toast = ""; render();
   });
   // Enter move mode (drag-free path for touch/mobile/keyboard).
   c.querySelectorAll("[data-move-game]").forEach((b) => b.onclick = (e) => {
     e.stopPropagation();
-    movingGameId = b.dataset.moveGame; conflict = null; toast = ""; render();
+    movingGameId = b.dataset.moveGame; conflict = null; pendingMove = null; toast = ""; render();
   });
   c.querySelectorAll("[data-move-cancel]").forEach((b) => b.onclick = () => { movingGameId = null; render(); });
+  // Confirm / cancel a staged move, and undo a committed one (#153).
+  c.querySelectorAll("[data-move-confirm]").forEach((b) => b.onclick = () => {
+    if (pendingMove) commitMove(pendingMove.gid, pendingMove.slotId);
+  });
+  c.querySelectorAll("[data-move-cancel-pending]").forEach((b) => b.onclick = () => { pendingMove = null; render(); });
+  c.querySelectorAll("[data-move-undo]").forEach((b) => b.onclick = () => {
+    if (conflict && conflict.undo) commitMove(conflict.undo.gid, conflict.undo.oldSlotId);
+  });
   c.querySelectorAll("[data-addslot]").forEach((b) => b.onclick = async () => { await post("/api/demo/add-ice-slot", { rink_id: b.dataset.addslot, date: calendarDate }); await render(); });
   // Expand/collapse an import batch's row-level detail in the Activity feed (#102).
   c.querySelectorAll("[data-audit-toggle]").forEach((b) => b.onclick = () => {
@@ -4022,14 +4083,14 @@ async function render() {
     const v = +b.dataset.cal;
     if (v === 0) calendarDate = "2026-09-05";
     else shiftDate(v * (calendarMode === "week" ? 7 : 1));
-    toast = ""; conflict = null; movingGameId = null; render();
+    toast = ""; conflict = null; movingGameId = null; pendingMove = null; render();
   });
-  c.querySelectorAll("[data-mode]").forEach((b) => b.onclick = () => { calendarMode = b.dataset.mode; toast = ""; conflict = null; movingGameId = null; render(); });
+  c.querySelectorAll("[data-mode]").forEach((b) => b.onclick = () => { calendarMode = b.dataset.mode; toast = ""; conflict = null; movingGameId = null; pendingMove = null; render(); });
   c.querySelectorAll("[data-filter]").forEach((sel) => sel.onchange = (e) => {
     const key = sel.dataset.filter;
     calFilters[key] = e.target.value;
     if (key === "venueId") calFilters.rinkId = "all";  // rink list depends on venue
-    toast = ""; conflict = null; movingGameId = null; render();
+    toast = ""; conflict = null; movingGameId = null; pendingMove = null; render();
   });
   // Drag a game (allocated card or draft chip) onto an available slot to move it.
   c.querySelectorAll("[data-game]").forEach((el) => {
@@ -4048,8 +4109,8 @@ async function render() {
       el.classList.remove("drop-hover");
       const gid = e.dataTransfer.getData("text/plain");
       if (!gid) return;
-      // Same server-validated move + #43 conflict panel as the click fallback.
-      await applyMove(gid, el.dataset.drop);
+      // Same confirm-if-destructive + move + #43/#153 panel as the click path.
+      requestMove(gid, el.dataset.drop);
     });
   });
   const dismiss = c.querySelector("[data-conflict-dismiss]");
@@ -4081,7 +4142,7 @@ async function render() {
 }
 
 function switchTab(next) {
-  view = next; toast = ""; if (next !== "calendar") { wizard = null; conflict = null; movingGameId = null; }
+  view = next; toast = ""; if (next !== "calendar") { wizard = null; conflict = null; movingGameId = null; pendingMove = null; }
   if (next !== "setup") { drawer = null; drawerError = ""; drawerValues = {}; }
   // A pending checkout confirmation doesn't survive leaving Home (#107) —
   // same reset discipline as drawer/wizard above, so a stale "are you
@@ -4104,7 +4165,7 @@ document.querySelectorAll(".topbar [data-open-drawer]").forEach((b) => b.onclick
 document.getElementById("reset-btn").onclick = async () => {
   await post("/api/reset", {});
   toast = ""; currentGame = null; pickedPlayer = null; wizard = null;
-  movingGameId = null; conflict = null; drawer = null; drawerError = ""; drawerValues = {};
+  movingGameId = null; conflict = null; pendingMove = null; drawer = null; drawerError = ""; drawerValues = {};
   render();
 };
 // Sign out ends the server session and returns to the sign-in screen (#71).
@@ -4432,7 +4493,10 @@ async function signIn(username, password) {
   // An explicit sign-in clears the sticky sign-out so the demo auto-login can
   // resume on future fresh visits.
   try { localStorage.removeItem("hs_signed_out"); } catch (_) {}
-  drawer = null; movingGameId = null; conflict = null;
+  // Clear the calendar's transient move state on sign-in for the same
+  // cross-identity reason movingGameId/conflict are cleared here (#153): a
+  // move staged by the previous operator must not carry into the new session.
+  drawer = null; movingGameId = null; conflict = null; pendingMove = null;
   hideLogin();
   renderRoleSwitch(); render();
   return true;
