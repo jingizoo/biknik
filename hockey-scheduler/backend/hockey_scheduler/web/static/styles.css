@@ -504,6 +504,16 @@ select.player-picker {
 .pub-day-head:first-child { margin-top: 4px; }
 .pub-tznote { font-size: 12px; color: var(--muted); margin: 12px 4px 0; }
 
+/* Games list filters + compact rows (#152). */
+.games-filters { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 4px 8px; }
+.games-filters select, .games-filters input { padding: 7px 9px; border: 1px solid var(--line); border-radius: 8px; font-size: 13px; background: var(--card); color: var(--ink); }
+.games-count { font-size: 12px; color: var(--muted); margin: 0 4px 10px; }
+.games-row { gap: 10px; }
+.games-caret { font-size: 10px; color: var(--muted); flex: 0 0 auto; }
+.games-detail { padding: 6px 14px 12px; border-bottom: 1px solid var(--sep); }
+.games-detail:last-child { border-bottom: none; }
+.games-detail .actions { margin-top: 10px; }
+
 /* Per-team public calendar subscribe icon (#33) — standings table. */
 .feed-sub-btn {
   border: none; background: none; cursor: pointer; font-size: 13px;

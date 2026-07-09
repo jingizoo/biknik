@@ -56,6 +56,8 @@ let dashSubQueue = null;            // substitute-candidates for the coach dashb
 let playersList = [];               // [{id,name,team_id,position,jersey_number,...}] for Setup (#114)
 let rescheduleRequests = null;      // reschedule request(s) for the current game (#29)
 let availFilter = "all";            // all|available|unavailable|maybe|no_response
+let gamesFilter = { division: "all", team: "all", rink: "all", status: "all", from: "", to: "" };  // Games list filters (#152)
+let gamesExpanded = new Set();      // game_ids whose full checklist is expanded in the Games list (#152)
 let contactForm = { recipient_ref: "", channel: "email", destination: "", label: "" };
 let tokenForm = { recipient_ref: "", provider: "fcm", token: "", label: "" };
 let movingGameId = null;    // click-to-move fallback: game awaiting a destination slot
@@ -896,37 +898,100 @@ function renderWizard(ov) {
 }
 
 /* ---------- Games + operations checklist ---------- */
+// One compact Games-list row: matchup, time, rink, and a triage status badge,
+// with the full game-operations checklist + actions revealed on expand (#152).
+// The head is a <button> (the whole row toggles); the detail is a sibling, so
+// its own Open-Roster/Publish buttons are never nested inside a button.
+function gamesRow(g) {
+  const t = gameTriage(g);
+  const badgeCls = { final: "gray", needs: "blocked", ready: "available" }[t.badge] || "gray";
+  const expanded = gamesExpanded.has(g.game_id);
+  const head = `<button class="li li-btn games-row" data-games-toggle="${esc(g.game_id)}" aria-expanded="${expanded}">
+    <span class="li-time">${fmt(g.start_time)}</span>
+    <div class="li-main"><div class="li-title">${esc(g.home_team_name)} vs ${esc(g.away_team_name || "TBD")}</div>
+      <div class="li-sub">${esc(g.division_name || "")} · ${esc(g.rink_name || "")}</div></div>
+    <span class="pill ${badgeCls}">${esc(t.label)}</span>
+    <span class="games-caret" aria-hidden="true">${expanded ? "▲" : "▼"}</span></button>`;
+  if (!expanded) return head;
+  const confirmed = g.roster_status === "roster_confirmed" || g.roster_status === "locked";
+  const ck = (ok, lbl, meta) => `<div class="check ${ok ? "ok" : "todo"}"><span class="ic">${ok ? "✓" : "○"}</span>
+    <span class="lbl">${lbl}</span>${meta ? `<span class="meta">${meta}</span>` : ""}</div>`;
+  const detail = `<div class="games-detail">
+    ${ck(true, "Ice slot allocated")}
+    ${ck(confirmed, "Roster", prettyStatus(g.roster_status))}
+    ${ck((g.officials_assigned || 0) > 0 && (g.officials_accepted || 0) === g.officials_assigned, "Officials",
+         g.officials_assigned ? `${g.officials_accepted}/${g.officials_assigned} accepted` : "None assigned")}
+    ${ck(false, "Locker rooms", "Follow-up")}
+    ${ck(g.result_status === "final", "Result",
+         g.result_status === "final" ? "Final" : g.result_status === "draft" ? "Draft — approve to finalize" : "Not entered")}
+    ${ck(g.published, "Public fixture", g.published ? "Published" : "Draft — not public")}
+    <div class="actions">
+      <button class="act primary" data-openroster="${esc(g.game_id)}">Open Roster</button>
+      ${g.published ? "" : `<button class="act success" data-publish="${esc(g.game_id)}">Publish</button>`}
+    </div>
+  </div>`;
+  return head + detail;
+}
+
 function renderGames(ov) {
   const intro = pageIntro("Every scheduled game and its game-day readiness — ice, roster, officials, and result.");
-  if (!ov.schedule.length) return `${intro}<div class="empty">No games scheduled yet. Use the Calendar to schedule one.</div>`;
-  return intro + ov.schedule.map((g) => {
-    const confirmed = g.roster_status === "roster_confirmed" || g.roster_status === "locked";
-    const ck = (ok, lbl, meta) => `<div class="check ${ok ? "ok" : "todo"}"><span class="ic">${ok ? "✓" : "○"}</span>
-      <span class="lbl">${lbl}</span>${meta ? `<span class="meta">${meta}</span>` : ""}</div>`;
-    return `
-      <div class="section-title">${esc(g.home_team_name)} vs ${esc(g.away_team_name)}</div>
-      <div class="card">
-        <div class="li"><span class="li-time">${fmt(g.start_time)}</span>
-          <div class="li-main"><div class="li-title">${esc(g.division_name || "")}</div>
-            <div class="li-sub">${esc(g.venue_name || "")} · ${esc(g.rink_name || "")}</div></div>
-          <span class="pill ${g.published ? "scheduled" : "gray"}">${g.published ? "Published" : "Draft"}</span></div>
-      </div>
-      <div class="section-title">Game operations</div>
-      <div class="card">
-        ${ck(true, "Ice slot allocated")}
-        ${ck(confirmed, "Roster", prettyStatus(g.roster_status))}
-        ${ck((g.officials_assigned || 0) > 0 && (g.officials_accepted || 0) === g.officials_assigned, "Officials",
-             g.officials_assigned ? `${g.officials_accepted}/${g.officials_assigned} accepted` : "None assigned")}
-        ${ck(false, "Locker rooms", "Follow-up")}
-        ${ck(g.result_status === "final", "Result",
-             g.result_status === "final" ? "Final" : g.result_status === "draft" ? "Draft — approve to finalize" : "Not entered")}
-        ${ck(g.published, "Public fixture", g.published ? "Published" : "Draft — not public")}
-      </div>
-      <div class="actions">
-        <button class="act primary" data-openroster="${esc(g.game_id)}">Open Roster</button>
-        ${g.published ? "" : `<button class="act success" data-publish="${esc(g.game_id)}">Publish</button>`}
-      </div>`;
-  }).join("");
+  const all = ov.schedule || [];
+  if (!all.length) return `${intro}<div class="empty">No games scheduled yet. Use the Calendar to schedule one.</div>`;
+
+  // Filters (#152): a single endless card-per-game scroll doesn't survive a
+  // real 40-games-a-weekend league, so filter + group + collapse. Options are
+  // derived from the data actually present; status uses gameTriage's own label
+  // so the filter and the row badge can never disagree.
+  const f = gamesFilter;
+  const STATUSES = ["Needs staff", "Roster open", "Ready", "Final"];
+  const rinkNames = [...new Set(all.map((g) => g.rink_name).filter(Boolean))].sort();
+  const shown = all.filter((g) => {
+    if (f.division !== "all" && g.division_id !== f.division) return false;
+    if (f.team !== "all" && g.home_team_id !== f.team && g.away_team_id !== f.team) return false;
+    if (f.rink !== "all" && g.rink_name !== f.rink) return false;
+    if (f.status !== "all" && gameTriage(g).label !== f.status) return false;
+    const day = dayOf(g.start_time);
+    if (f.from && day && day < f.from) return false;   // date-less games ignore the range
+    if (f.to && day && day > f.to) return false;
+    return true;
+  });
+
+  const opt = (v, label, sel) => `<option value="${esc(v)}" ${v === sel ? "selected" : ""}>${esc(label)}</option>`;
+  const active = f.division !== "all" || f.team !== "all" || f.rink !== "all"
+    || f.status !== "all" || f.from || f.to;
+  const filterBlock = `<div class="games-filters">
+    <select id="games-f-div"><option value="all">All divisions</option>${(ov.divisions || []).map((d) => opt(d.id, d.name, f.division)).join("")}</select>
+    <select id="games-f-team"><option value="all">All teams</option>${(ov.teams || []).map((t) => opt(t.id, t.name, f.team)).join("")}</select>
+    <select id="games-f-rink"><option value="all">All rinks</option>${rinkNames.map((r) => opt(r, r, f.rink)).join("")}</select>
+    <select id="games-f-status"><option value="all">All statuses</option>${STATUSES.map((s) => opt(s, s, f.status)).join("")}</select>
+    <input type="date" id="games-f-from" value="${esc(f.from)}" aria-label="Games from date">
+    <input type="date" id="games-f-to" value="${esc(f.to)}" aria-label="Games to date">
+    ${active ? `<button class="act ghost" id="games-f-clear">Clear filters</button>` : ""}
+  </div>`;
+
+  let body;
+  if (!shown.length) {
+    body = `<div class="card"><div class="empty">No games match these filters.</div></div>`;
+  } else {
+    // ov.schedule isn't guaranteed sorted, so sort before grouping by day.
+    const sorted = shown.slice().sort((a, b) =>
+      (a.start_time || "") < (b.start_time || "") ? -1 : (a.start_time || "") > (b.start_time || "") ? 1 : 0);
+    const groups = [];
+    let cur = null;
+    sorted.forEach((g) => {
+      const day = dayOf(g.start_time);
+      if (!cur || cur.day !== day) { cur = { day, items: [] }; groups.push(cur); }
+      cur.items.push(g);
+    });
+    body = groups.map((grp) => {
+      const heading = grp.day ? fmtDate(grp.day) : "Date to be confirmed";
+      return `<div class="section-title">${esc(heading)}</div>
+        <div class="card">${grp.items.map(gamesRow).join("")}</div>`;
+    }).join("");
+  }
+  return `${intro}${filterBlock}
+    <div class="games-count">Showing ${shown.length} of ${all.length} game${all.length === 1 ? "" : "s"}</div>
+    ${body}`;
 }
 
 /* ---------- Roster (Coach/Player) ---------- */
@@ -3657,6 +3722,24 @@ async function render() {
   if (schedFilterIssue) schedFilterIssue.onchange = () => {
     schedulerState.filters.issue = schedFilterIssue.value; render();
   };
+  // Games list filters + expand/collapse (#152).
+  const gamesF = (id, key) => {
+    const el = c.querySelector(id);
+    if (el) el.onchange = () => { gamesFilter[key] = el.value; render(); };
+  };
+  gamesF("#games-f-div", "division"); gamesF("#games-f-team", "team");
+  gamesF("#games-f-rink", "rink"); gamesF("#games-f-status", "status");
+  gamesF("#games-f-from", "from"); gamesF("#games-f-to", "to");
+  const gamesClear = c.querySelector("#games-f-clear");
+  if (gamesClear) gamesClear.onclick = () => {
+    gamesFilter = { division: "all", team: "all", rink: "all", status: "all", from: "", to: "" };
+    render();
+  };
+  c.querySelectorAll("[data-games-toggle]").forEach((b) => b.onclick = () => {
+    const id = b.dataset.gamesToggle;
+    if (gamesExpanded.has(id)) gamesExpanded.delete(id); else gamesExpanded.add(id);
+    render();
+  });
   // Per-game publish/discard selection (#106).
   c.querySelectorAll("[data-sched-pick]").forEach((el) => el.onchange = () => {
     const id = el.dataset.schedPick;
@@ -4154,6 +4237,8 @@ function resetTransientUiState() {
   // operator never meant to make.
   rosterSide = "home";
   availFilter = "all";
+  gamesFilter = { division: "all", team: "all", rink: "all", status: "all", from: "", to: "" };
+  gamesExpanded = new Set();
   usersSelected = null;
   schedulerState.selected = new Set();
   // playersList (#114) is real player names/teams fetched only for a
