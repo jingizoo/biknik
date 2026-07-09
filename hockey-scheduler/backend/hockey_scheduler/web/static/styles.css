@@ -693,6 +693,38 @@ button.act.danger { background: #ffe5e3; color: #c0271b; }
 /* ----- Setup cards + create drawer (#44) ----- */
 .setup-intro { color: var(--muted); font-size: 13px; margin: 4px 4px 12px; }
 .setup-grid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); }
+
+/* Setup → Hierarchy tree (#165). */
+.setup-viewtoggle { margin: 0 4px 12px; }
+.setup-trees { display: grid; gap: 14px; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); align-items: start; }
+.tree-panel { background: var(--card); border: 1px solid var(--sep); border-radius: 12px; padding: 12px 14px; }
+.tree-panel.na { border-color: #e6b800; background: #fffdf5; }
+.tree-head { display: flex; align-items: baseline; gap: 8px; margin-bottom: 6px; }
+.tree-head .tree-title { font-size: 15px; font-weight: 700; }
+.tree-head .tree-sub { font-size: 12px; color: var(--muted); }
+.tree-note { font-size: 12px; color: var(--muted); margin: 2px 0 8px; }
+.tree-note.sub { margin: 2px 0 6px; }
+.tree-actions { margin-top: 8px; }
+details.tn { margin: 2px 0; }
+details.tn > .tn-sum { display: flex; align-items: center; gap: 8px; padding: 5px 4px; cursor: pointer;
+  list-style: none; border-radius: 7px; }
+details.tn > .tn-sum::-webkit-details-marker { display: none; }
+details.tn > .tn-sum::before { content: "▸"; color: var(--muted); font-size: 10px; width: 10px; flex: 0 0 10px; }
+details.tn[open] > .tn-sum::before { content: "▾"; }
+details.tn > .tn-sum:hover { background: #f6f7fb; }
+.tn-children { margin-left: 14px; padding-left: 8px; border-left: 1px solid var(--sep); }
+.tn-label { font-size: 13.5px; font-weight: 600; }
+.tn-meta { font-size: 12px; color: var(--muted); }
+.tn-badge { font-size: 10.5px; font-weight: 700; padding: 2px 7px; border-radius: 20px; margin-left: auto; }
+.tn-badge.ok { background: #e7f7ec; color: #1a8a44; }
+.tn-badge.warn { background: #fdf0dd; color: #b4690e; }
+.tn-leaf { display: flex; align-items: center; gap: 8px; padding: 4px 4px 4px 18px; }
+.tn-leaf.warn .tn-label { color: #b4690e; }
+.tn-warn-text { color: #b4690e; }
+.tn-empty { font-size: 12px; color: var(--muted); padding: 4px 4px 4px 18px; }
+.tree-add, button.tree-add { margin: 4px 0 2px 18px; font-size: 12px; }
+.na-group { margin-top: 6px; }
+.na-group-label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.4px; color: var(--muted); margin: 6px 0 2px 4px; }
 .setup-card { background: var(--card); border: 1px solid var(--sep); border-radius: 12px; overflow: hidden; display: flex; flex-direction: column; }
 .setup-card-head { display: flex; align-items: center; gap: 8px; padding: 11px 12px; border-bottom: 1px solid var(--sep); }
 .setup-card-head .sc-ico { font-size: 16px; }
