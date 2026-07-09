@@ -763,6 +763,12 @@ button.act.danger { background: #ffe5e3; color: #c0271b; }
 .cal-aside .ca-body { padding: 10px 12px 12px; }
 .cal-aside .ca-body p { margin: 0 0 8px; font-size: 13px; line-height: 1.45; color: var(--ink); }
 .cal-aside .ca-body p:last-child { margin-bottom: 0; }
+/* Pre-move confirm panel (#153): amber accent + side-effect warnings + a
+   two-button action row, reusing the #43 side-panel shell. */
+.cal-aside.confirm { border-color: var(--amber, #d98a00); }
+.cal-aside.confirm .ca-head { background: #fff4e0; color: #a65f00; }
+.cal-aside .ca-warn { color: #a65f00; }
+.cal-aside .ca-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
 @media (max-width: 720px) {
   .cal-layout { flex-direction: column; }
   .cal-aside { flex-basis: auto; width: 100%; position: static; }
