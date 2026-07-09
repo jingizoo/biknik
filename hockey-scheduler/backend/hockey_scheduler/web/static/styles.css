@@ -126,6 +126,15 @@ body {
 .scope-note { background: #eef5ff; border: 1px solid #bcd9ff; color: #0a64c4; border-radius: 10px;
   padding: 9px 12px; font-size: 13px; margin-bottom: 12px; }
 
+/* ----- roster game picker + selected-game context (#154) ----- */
+.roster-game-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between;
+  gap: 10px; margin: 4px 16px 0; padding: 10px 12px; border: 1px solid var(--sep);
+  background: #fff; border-radius: 11px; }
+.roster-game-head .rg-title { font-size: 14px; font-weight: 700; color: var(--ink); }
+.roster-game-head .rg-sub { font-size: 12px; color: var(--muted); margin-top: 1px; }
+.roster-game-head select { padding: 7px 9px; border: 1px solid var(--line); border-radius: 8px;
+  font-size: 13px; background: var(--card); color: var(--ink); max-width: 100%; }
+
 /* ----- home / away lineup switch (#25) ----- */
 .lineup-switch { display: flex; gap: 8px; margin: 12px 16px 4px; }
 .lineup-switch .ls { flex: 1; display: flex; flex-direction: column; align-items: flex-start;
