@@ -2821,7 +2821,8 @@ function renderPublic(ov) {
           <th>GF</th><th>GA</th><th>GD</th><th>Pts</th></tr></thead>
         <tbody>${trs}</tbody></table></div>`;
   } else {
-    const rows = (ps.fixtures || []).map((f) => {
+    const fixtures = ps.fixtures || [];
+    const rowHtml = (f) => {
       const score = (f.home_score != null) ? ` <strong>${f.home_score}–${f.away_score}</strong>` : "";
       const cls = f.status === "Final" ? "gray" : f.status === "Cancelled" ? "blocked" : "scheduled";
       return `<button class="li li-btn" data-public-game="${esc(f.game_id)}">
@@ -2829,8 +2830,32 @@ function renderPublic(ov) {
         <div class="li-main"><div class="li-title">${esc(f.home_team_name)} vs ${esc(f.away_team_name || "TBD")}${score}</div>
           <div class="li-sub">${esc(f.division_name || "")} · ${esc(f.venue_name || "")} · ${esc(f.rink_name || "")}</div></div>
         <span class="pill ${cls}">${esc(f.status)}</span></button>`;
-    }).join("");
-    body = `<div class="card">${rows || '<div class="empty">No games scheduled yet — check back once the league publishes its fixtures.</div>'}</div>`;
+    };
+    if (!fixtures.length) {
+      body = `<div class="card"><div class="empty">No games scheduled yet — check back once the league publishes its fixtures.</div></div>`;
+    } else {
+      // A row that shows only "18:00" leaves a fan unable to tell which day a
+      // game falls on (#151). Fixtures arrive already sorted by start_time
+      // (server-side), so one pass buckets them into day groups in order,
+      // each under a dated header; the row keeps just the time. dayOf/fmt both
+      // read the literal wall-clock, so a group's header date and its rows'
+      // times never disagree across a midnight boundary.
+      const groups = [];
+      let cur = null;
+      fixtures.forEach((f) => {
+        const day = dayOf(f.start_time);   // "" for a fixture with no start_time
+        if (!cur || cur.day !== day) { cur = { day, items: [] }; groups.push(cur); }
+        cur.items.push(f);
+      });
+      const groupsHtml = groups.map((g) => {
+        const heading = g.day ? fmtDate(g.day) : "Date to be confirmed";
+        return `<div class="pub-day-head">${esc(heading)}</div>
+          <div class="card">${g.items.map(rowHtml).join("")}</div>`;
+      }).join("");
+      // Times are stored/shown as UTC wall-clock (no per-venue time zone in the
+      // model yet), so label it once rather than leave a bare ambiguous time.
+      body = `${groupsHtml}<div class="pub-tznote">🕑 All game times are shown in UTC.</div>`;
+    }
   }
   return `<div class="hero"><div class="when">Public</div><h2>${esc(lgName)}</h2></div>
     ${tabs}${body}

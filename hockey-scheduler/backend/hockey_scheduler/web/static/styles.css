@@ -498,6 +498,12 @@ select.player-picker {
 .pub-detail { text-align: center; padding: 22px; }
 .pub-score { font-size: 40px; font-weight: 800; letter-spacing: 2px; }
 
+/* Public schedule day grouping (#151): a dated header governs each day's card
+   of fixtures, so a fan can place a game without a per-row date. */
+.pub-day-head { font-size: 13px; font-weight: 700; color: var(--ink); margin: 16px 4px 6px; }
+.pub-day-head:first-child { margin-top: 4px; }
+.pub-tznote { font-size: 12px; color: var(--muted); margin: 12px 4px 0; }
+
 /* Per-team public calendar subscribe icon (#33) — standings table. */
 .feed-sub-btn {
   border: none; background: none; cursor: pointer; font-size: 13px;
