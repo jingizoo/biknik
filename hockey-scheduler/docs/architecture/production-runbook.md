@@ -17,12 +17,29 @@ Point your load balancer / orchestrator liveness probe at `/api/health` and
 its readiness probe at `/api/readiness`. In production `ready` is only `true`
 once every check passes — notably, an active League Admin must exist.
 
+`GET /api/health` returns (illustrative — a running Postgres-backed instance;
+`store`/`migrations.backend` reads `"memory"` with empty `applied`/`expected`
+arrays for the in-memory demo store instead):
+
+```json
+{
+  "status": "ok",
+  "store": "postgres",
+  "database_reachable": true,
+  "migrations": {"backend": "postgres", "current": true,
+                 "applied": ["001_initial", "002_sessions", "..."],
+                 "expected": ["001_initial", "002_sessions", "..."]},
+  "delivery": {"email_mode": "dry_run", "push_mode": "dry_run", "worker": {"enabled": false}}
+}
+```
+
 ## Required environment variables
 
 | Variable | Purpose | Default |
 | --- | --- | --- |
 | `APP_MODE` | `production` disables demo conveniences (X-Demo-Role header, headerless-admin fallback, demo seeding, `/api/reset`) and enables `Secure` cookies. Anything else = demo. | `demo` |
 | `DATABASE_URL` | `postgres://…` (or a SQLite path) → durable `SqlStore`. Unset → in-memory (data lost on restart). | in-memory |
+| `HOST` / `PORT` | Bind address/port for `python3 -m hockey_scheduler.web` (also settable via `--host`/`--port`). Many container platforms inject `PORT` automatically. | `127.0.0.1` / `8000` |
 | `BOOTSTRAP_ADMIN_USER` / `BOOTSTRAP_ADMIN_PASSWORD` | First League Admin, created on boot only when the store has no accounts (idempotent). | — |
 | `DELIVERY_WORKER_ENABLED` / `_INTERVAL` / `_BATCH` | Opt-in background delivery worker (#79). | disabled / 30s / 50 |
 | Email/push transport vars | Configure real SMTP / push; default is dry-run (nothing sent). | dry-run |
@@ -30,6 +47,37 @@ once every check passes — notably, an active League Admin must exist.
 
 Secrets are read from the environment only — they are never returned by any
 API, logged, or persisted in plaintext (passwords are PBKDF2-hashed).
+
+## Durable Postgres setup
+
+The app talks to Postgres via `psycopg` (installed separately — it is not a
+runtime dependency of the stdlib-only app itself, only needed when
+`DATABASE_URL` points at Postgres): `pip install "psycopg[binary]>=3.1"`.
+
+1. Create a dedicated database and role (placeholder credentials below —
+   replace with real, secret values from your secrets manager, never
+   committed anywhere):
+
+   ```bash
+   createuser hockey_app --pwprompt
+   createdb hockey_scheduler --owner=hockey_app
+   ```
+
+2. Build the connection string and set it as `DATABASE_URL`:
+
+   ```bash
+   export DATABASE_URL="postgresql://hockey_app:<password>@<host>:5432/hockey_scheduler"
+   ```
+
+3. Start the app once with `APP_MODE=production` set. `SqlStore.__init__`
+   applies every pending numbered migration automatically, forward-only —
+   no separate migration step to run by hand (#75).
+4. Confirm with `GET /api/health` — `store` reads `"postgres"` and
+   `migrations.current` is `true`.
+
+A raw filesystem path (or `sqlite:///path`) is also accepted for a
+lighter-weight durable deployment; Postgres is the product target for
+concurrent multi-instance production traffic.
 
 ## First-admin bootstrap
 
@@ -55,16 +103,109 @@ the environment:
       `Secure` session cookie (#76) is honored.
 - [ ] `GET /api/readiness` returns `ready: true`.
 
+## Smoke test after deploy
+
+Run immediately after every deploy, before routing real traffic (or as an
+automated deployment gate). All of these are safe, anonymous, read-only
+checks — no credentials needed, nothing to clean up afterward.
+
+```bash
+BASE_URL="https://your-deployment"
+
+# 1. Liveness + dependency snapshot.
+curl -sf "$BASE_URL/api/health" | tee /tmp/health.json
+# Expect: "status":"ok", "database_reachable":true, "migrations":{"current":true,...}
+
+# 2. Deployment readiness gate — the authoritative go/no-go signal.
+curl -sf "$BASE_URL/api/readiness" | tee /tmp/readiness.json
+# Expect: "ready":true and every entry in "checks" has "ok":true
+
+# 3. A real request through the full stack: routing, TLS, app, DB round-trip.
+#    Anonymous and side-effect-free — safe to run against production.
+curl -sf "$BASE_URL/api/public/schedule" | head -c 200
+```
+
+If `/api/readiness` returns `ready: false`, do not consider the deploy
+complete — check `checks[].ok` for which gate failed (`database_reachable`,
+`migrations_current`, `active_admin`, or `cookie_hardening`) and treat it as
+a rollback trigger (below) rather than investigating live in production.
+
+## Rollback checklist
+
+Rollback has two independent halves — app code and data — because a bad
+deploy might involve either, both, or neither:
+
+- [ ] **App code**: redeploy the previous known-good version/image. This
+      alone is often sufficient — migrations are additive and forward-only
+      (#75), so an older app version keeps working against a newer schema
+      unless the bad release also shipped a breaking migration.
+- [ ] **Data**: only needed if the bad release corrupted or destroyed data.
+      Restore the most recent backup taken before the deploy (see Backup &
+      restore below). Prefer rolling back app code alone when possible —
+      restoring from backup loses any writes made since that backup.
+- [ ] Re-run the smoke test (above) against the rolled-back deployment
+      before resuming traffic.
+- [ ] Re-check `GET /api/readiness` returns `ready: true`.
+- [ ] File an incident note: what broke, which check caught it (readiness
+      gate vs. smoke test vs. user report), and what changed since the last
+      known-good deploy.
+
 ## Backup & restore
 
-- **State lives entirely in the SQL database** (`DATABASE_URL`). There is no
-  other durable state — the app process is stateless and sessions/tokens are
-  rows, not files.
-- **Backup**: use your database's native tooling (e.g. `pg_dump` for
-  PostgreSQL) on a schedule. A dump captures accounts, sessions, schedule,
-  rosters, notifications, feed tokens, and preferences.
-- **Restore**: load the dump into a fresh database and point `DATABASE_URL` at
-  it. On boot the migration runner applies any newer migrations forward-only;
-  it never drops or rewrites data (the only destructive path, `reset_schema`,
-  is demo/test-only and never runs in production).
-- **Never** run `/api/reset` in production — it is disabled there by design.
+State lives entirely in the SQL database (`DATABASE_URL`) — the app process
+itself is stateless, and sessions/tokens are rows, not files. A database
+dump captures everything: accounts, sessions, schedule, rosters,
+notifications, feed tokens, and preferences.
+
+**Backup** (custom format — compressed, supports parallel restore):
+
+```bash
+pg_dump "$DATABASE_URL" --format=custom --file="hockey_scheduler_$(date +%Y%m%d%H%M%S).dump"
+```
+
+Run this on a schedule (e.g. a daily cron / managed-database automated
+backup) and after any risky operation (a migration-bearing deploy, a bulk
+import). Store dumps somewhere durable and access-controlled, separate from
+the database host itself.
+
+**Restore** (into a fresh, empty database — never restore over a live one
+without first taking a fresh backup of its current state):
+
+```bash
+createdb hockey_scheduler_restored --owner=hockey_app
+pg_restore --dbname="postgresql://hockey_app:<password>@<host>:5432/hockey_scheduler_restored" \
+           --no-owner --jobs=4 hockey_scheduler_20260101120000.dump
+```
+
+Then point `DATABASE_URL` at the restored database and start the app — on
+boot the migration runner applies any migrations newer than the dump
+forward-only; it never drops or rewrites existing data (the only
+destructive path, `reset_schema`, is demo/test-only and never runs in
+production). Run migration verification (below) before routing traffic.
+
+**Never** run `/api/reset` in production — it is disabled there by design.
+
+## Migration verification
+
+After any restore, or any deploy that shipped a new migration, confirm the
+schema actually landed before trusting the deployment:
+
+```bash
+curl -sf "$BASE_URL/api/health" | python3 -c \
+  'import json,sys; m=json.load(sys.stdin)["migrations"]; \
+   print("current" if m["current"] else "STALE", m["applied"][-1] if m["applied"] else None)'
+```
+
+For a direct check against the database itself (useful when the app hasn't
+been started yet against the restored data, e.g. mid-rollback):
+
+```sql
+SELECT version, applied_at FROM schema_migrations ORDER BY version DESC LIMIT 5;
+```
+
+Compare the latest `version` there against the migration files in
+`hockey_scheduler/store/migrations/` — the restored database should be at or
+behind the app version's expected set (the app will bring it current on its
+own next boot; behind is fine, ahead is not and means a newer database was
+restored against an older app version, which should not happen if app code
+and data are rolled back together).
