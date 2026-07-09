@@ -81,6 +81,7 @@ class MigrationApplyTest(unittest.TestCase):
             cur.execute("ALTER TABLE players DROP COLUMN external_ref")  # #93 additive col
             cur.execute("ALTER TABLE officials DROP COLUMN external_ref")  # #94 additive col
             cur.execute("ALTER TABLE rinks DROP COLUMN external_ref")  # #95 additive col
+            cur.execute("ALTER TABLE venues DROP COLUMN organization_id")  # #166 additive col
             cur.execute("ALTER TABLE guardian_links DROP COLUMN consent_method")  # #35
             cur.execute("ALTER TABLE guardian_links DROP COLUMN consented_at")  # #35
             cur.execute("ALTER TABLE calendar_feed_tokens DROP COLUMN created_by")  # #131
@@ -105,6 +106,7 @@ class MigrationApplyTest(unittest.TestCase):
             self.assertTrue(
                 {"created_by", "last_used_at", "revoked_by"}
                 <= _table_columns(adopted, "calendar_feed_tokens"))
+            self.assertIn("organization_id", _table_columns(adopted, "venues"))
         finally:
             os.remove(path)
 

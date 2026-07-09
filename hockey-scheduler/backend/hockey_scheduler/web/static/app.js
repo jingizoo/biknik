@@ -467,9 +467,19 @@ const SETUP_ENTITIES = [
       { id: "f-team-div", label: "Division", type: "select", required: true, ofNoun: "division",
         options: (ov) => ov.divisions.map((d) => [d.id, d.name]) },
       { id: "f-team", label: "Team name", required: true, placeholder: "e.g. U14 Eagles" }] },
+  // Organization (#166): the facility owner/operator that owns venues — a rink
+  // company, distinct from a hockey Club. Arena-side, like venue/rink.
+  { key: "organization", title: "Facility owners", icon: "🏢", noun: "facility owner", perm: "manage_arena",
+    list: (ov) => (ov.organizations || []).map((o) => ({ title: o.name, sub: o.short_name || "" })),
+    fields: [
+      { id: "f-org", label: "Facility owner name", required: true, placeholder: "e.g. Summit Ice Facilities" },
+      { id: "f-org-short", label: "Short name (optional)", placeholder: "e.g. Summit" }] },
   { key: "venue", title: "Venues", icon: "🏟️", noun: "venue", perm: "manage_arena",
-    list: (ov) => ov.venues.map((v) => ({ title: v.name })),
-    fields: [{ id: "f-venue", label: "Venue name", required: true, placeholder: "e.g. South Arena" }] },
+    list: (ov) => ov.venues.map((v) => ({ title: v.name, sub: v.organization_name || "" })),
+    fields: [
+      { id: "f-venue", label: "Venue name", required: true, placeholder: "e.g. South Arena" },
+      { id: "f-venue-org", label: "Facility owner (optional)", type: "select", ofNoun: "organization",
+        options: (ov) => [["", "— none —"]].concat((ov.organizations || []).map((o) => [o.id, o.name])) }] },
   { key: "rink", title: "Rinks", icon: "⛸️", noun: "rink", perm: "manage_arena",
     list: (ov) => ov.rinks.map((r) => ({ title: r.name, sub: r.venue_name || "" })),
     fields: [
@@ -520,7 +530,8 @@ const SETUP_POST = {
   division: () => post("/api/setup/division", { season_id: val("f-div-season"), name: val("f-div"), age_group: val("f-div-age") }),
   club: () => post("/api/setup/club", { name: val("f-club") }),
   team: () => post("/api/setup/team", { club_id: val("f-team-club"), division_id: val("f-team-div"), name: val("f-team") }),
-  venue: () => post("/api/setup/venue", { name: val("f-venue") }),
+  organization: () => post("/api/setup/organization", { name: val("f-org"), short_name: val("f-org-short") }),
+  venue: () => post("/api/setup/venue", { name: val("f-venue"), organization_id: val("f-venue-org") || null }),
   rink: () => post("/api/setup/rink", { venue_id: val("f-rink-venue"), name: val("f-rink") }),
   "ice-slot": () => post("/api/setup/ice-slot", {
     rink_id: val("f-slot-rink"),
@@ -579,9 +590,9 @@ function renderSetupHierarchy(ov) {
     return `${club}${pc}`;
   };
 
-  // -- Facility: Venue → Rink (Organization not modeled — shown as a note) --
+  // -- Facility: Organization → Venue → Rink (#166) --
   const rinksByVenue = groupBy(ov.rinks, "venue_id");
-  const venueRows = (ov.venues || []).map((v) => {
+  const venueNode = (v) => {
     const rinks = rinksByVenue[v.id] || [];
     const badge = rinks.length
       ? `<span class="tn-badge ok">Ready</span>` : `<span class="tn-badge warn">Needs rinks</span>`;
@@ -593,13 +604,33 @@ function renderSetupHierarchy(ov) {
         <span class="tn-meta">${rinks.length} rink${rinks.length === 1 ? "" : "s"}</span>${badge}</summary>
       <div class="tn-children">${rinkRows}${treeAdd("rink", "Add rink to " + v.name, "f-rink-venue", v.id)}</div>
     </details>`;
+  };
+  const venuesByOrg = groupBy(ov.venues, "organization_id");
+  // Each facility owner groups its venues; a synthetic "Unassigned" bucket
+  // (organization_id === null) holds venues not yet linked to an owner.
+  const orgSections = (ov.organizations || []).map((o) => {
+    const vs = venuesByOrg[o.id] || [];
+    const venueRows = vs.map(venueNode).join("")
+      || `<div class="tn-empty">No venues yet. Add a venue owned by ${esc(o.name)}.</div>`;
+    return `<details class="tn" open><summary class="tn-sum">
+        <span class="tn-label">🏢 ${esc(o.name)}</span>
+        <span class="tn-meta">${vs.length} venue${vs.length === 1 ? "" : "s"}</span></summary>
+      <div class="tn-children">${venueRows}${treeAdd("venue", "Add venue to " + o.name, "f-venue-org", o.id)}</div>
+    </details>`;
   }).join("");
+  const orphanVenues = (venuesByOrg[null] || []).concat(venuesByOrg[undefined] || []);
+  const orphanSection = orphanVenues.length
+    ? `<details class="tn" open><summary class="tn-sum">
+        <span class="tn-label tn-warn-text">🏟️ No facility owner</span>
+        <span class="tn-meta">${orphanVenues.length} venue${orphanVenues.length === 1 ? "" : "s"}</span></summary>
+      <div class="tn-children">${orphanVenues.map(venueNode).join("")}</div>
+    </details>` : "";
   const facility = `<section class="tree-panel">
     <div class="tree-head"><span class="tree-title">🏟️ Facility</span>
-      <span class="tree-sub">${(ov.venues || []).length} venue(s) · ${(ov.rinks || []).length} rink(s)</span></div>
-    <div class="tree-note">Organization/owner grouping isn't modeled yet — venues are shown directly.</div>
-    ${venueRows || `<div class="tn-empty">No venues yet. Add a venue to start your arena setup.</div>`}
-    <div class="tree-actions">${treeAdd("venue", "Add venue")}</div>
+      <span class="tree-sub">${(ov.organizations || []).length} owner(s) · ${(ov.venues || []).length} venue(s) · ${(ov.rinks || []).length} rink(s)</span></div>
+    ${orgSections}${orphanSection}
+    ${!orgSections && !orphanSection ? `<div class="tn-empty">No venues yet. Add a facility owner or venue to start your arena setup.</div>` : ""}
+    <div class="tree-actions">${treeAdd("organization", "Add facility owner")}${treeAdd("venue", "Add venue")}</div>
   </section>`;
 
   // -- Competition: League → Season → (Level n/a) → Division → Team --

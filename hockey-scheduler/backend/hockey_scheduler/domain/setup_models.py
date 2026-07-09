@@ -58,11 +58,25 @@ class Club:
 
 
 @dataclass
+class Organization:
+    """A facility owner/operator that owns venues (#166). Distinct from Club,
+    which owns hockey teams — an organization like a rink company can own many
+    arenas across a region. Venues link up to an organization via a nullable
+    ``organization_id`` so existing venues need no backfill."""
+    id: str
+    name: str
+    short_name: str = ""
+
+
+@dataclass
 class Venue:
     id: str
     name: str
     address: str = ""
     timezone: str = "UTC"
+    # Owning facility organization (#166). Nullable — pre-existing venues and
+    # venues created without an owner simply have no organization.
+    organization_id: Optional[str] = None
 
 
 @dataclass

@@ -46,6 +46,7 @@ from ..domain import (
     OfficialAvailability,
     OfficialAvailabilityStatus,
     OfficialRole,
+    Organization,
     Player,
     ResultStatus,
     Position,
@@ -132,6 +133,7 @@ SPECS = {
     Team: Spec(Team, "teams"),
     Player: Spec(Player, "players",
                  {"position": _enum(Position), "is_active": _bool()}),
+    Organization: Spec(Organization, "organizations"),
     Venue: Spec(Venue, "venues"),
     Rink: Spec(Rink, "rinks"),
     IceSlot: Spec(IceSlot, "ice_slots",
@@ -502,6 +504,10 @@ class SqlStore:
     def get_club(self, club_id): return self._get(Club, club_id)
     def all_clubs(self): return self._query(Club, order="id")
     def all_teams(self): return self._query(Team, order="id")
+
+    def add_organization(self, org): return self._insert(org)
+    def get_organization(self, org_id): return self._get(Organization, org_id)
+    def all_organizations(self): return self._query(Organization, order="id")
 
     def add_venue(self, venue): return self._insert(venue)
     def get_venue(self, venue_id): return self._get(Venue, venue_id)

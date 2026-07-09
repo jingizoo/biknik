@@ -161,6 +161,20 @@ class SqlStoreParityTest(unittest.TestCase):
         self.api.set_user_account_active(row["id"], False)
         self.assertIsNone(self.api.verify_login("sql_coach", "sql-pw"))
 
+    def test_organization_and_venue_link_roundtrip_on_sql(self):
+        # An organization (#166) persists through the organizations table, and
+        # a venue's organization_id column roundtrips the ownership link.
+        org = self.api.create_organization("Summit Ice Facilities",
+                                           short_name="Summit")
+        venue = self.api.create_venue("Ice Palace", organization_id=org["id"])
+        self.assertEqual(venue["organization_id"], org["id"])
+        stored = self.store.get_venue(venue["id"])
+        self.assertEqual(stored.organization_id, org["id"])
+        ov = self.api.get_demo_overview()
+        self.assertIn(org["id"], [o["id"] for o in ov["organizations"]])
+        row = next(v for v in ov["venues"] if v["id"] == venue["id"])
+        self.assertEqual(row["organization_name"], "Summit Ice Facilities")
+
 
 class SqlStoreTransactionTest(unittest.TestCase):
     """A failure mid multi-write operation must roll the whole thing back."""

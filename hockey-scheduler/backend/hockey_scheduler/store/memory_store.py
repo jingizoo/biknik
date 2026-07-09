@@ -42,6 +42,7 @@ from ..domain import (
     SubstituteEnrollment,
     Team,
     UserAccount,
+    Organization,
     Venue,
 )
 
@@ -59,6 +60,7 @@ class InMemoryStore:
         self.audit: List[AuditLog] = []
         self.notifications: List[NotificationEvent] = []
         # Organization & arena setup collections.
+        self.organizations: Dict[str, Organization] = {}
         self.leagues: Dict[str, League] = {}
         self.seasons: Dict[str, Season] = {}
         self.divisions: Dict[str, Division] = {}
@@ -233,6 +235,13 @@ class InMemoryStore:
 
     def get_team(self, team_id: str) -> Optional[Team]:
         return self.teams.get(team_id)
+
+    def add_organization(self, org: Organization) -> Organization:
+        self.organizations[org.id] = org
+        return org
+
+    def get_organization(self, org_id: str) -> Optional[Organization]:
+        return self.organizations.get(org_id)
 
     def add_venue(self, venue: Venue) -> Venue:
         self.venues[venue.id] = venue
@@ -615,6 +624,9 @@ class InMemoryStore:
 
     def all_teams(self) -> List[Team]:
         return list(self.teams.values())
+
+    def all_organizations(self) -> List[Organization]:
+        return list(self.organizations.values())
 
     def all_venues(self) -> List[Venue]:
         return list(self.venues.values())
