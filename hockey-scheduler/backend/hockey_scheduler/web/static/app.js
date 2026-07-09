@@ -1062,6 +1062,45 @@ function renderAvailSummary() {
   </div>`;
 }
 
+// The games a signed-in user may open a roster for — mirrors the backend
+// private-game read gate at the role level (scope.py): operators see all,
+// a coach/player only their own team's. An official/other isn't cheaply
+// pre-filterable here, so they get the full list and an out-of-scope pick
+// falls through to the existing "Restricted" guard (#154).
+function accessibleGames(ov) {
+  const all = ov.schedule || [];
+  const u = currentUser;
+  if (!u || u.role === "league_admin" || u.role === "arena_manager") return all;
+  const tid = (u.scope || {}).team_id;
+  if ((u.role === "coach" || u.role === "player") && tid)
+    return all.filter((g) => g.home_team_id === tid || g.away_team_id === tid);
+  return all;
+}
+
+// A visible game picker + selected-game context at the top of the Roster
+// screen (#154): the editor used to operate silently on "the current game"
+// (whatever was clicked last, defaulting to the first in the schedule), so a
+// coach with several games could edit the wrong one without noticing. Per-side
+// roster status already shows in the lineup-switch tabs below, so this header
+// carries the identifying context only — matchup, date/time, rink, division.
+function rosterGamePicker(ov) {
+  const g = (ov.schedule || []).find((x) => x.game_id === currentGame);
+  if (!g) return "";
+  const games = accessibleGames(ov);
+  const opt = (x) => `<option value="${esc(x.game_id)}" ${x.game_id === currentGame ? "selected" : ""}>${
+    esc(x.home_team_name)} vs ${esc(x.away_team_name || "TBD")} · ${esc(fmtDateTime(x.start_time))}</option>`;
+  const picker = games.length > 1
+    ? `<select id="roster-game" aria-label="Select which game's roster to edit">${games.map(opt).join("")}</select>`
+    : "";
+  return `<div class="roster-game-head">
+    <div class="rg-ctx">
+      <div class="rg-title">${esc(g.home_team_name)} vs ${esc(g.away_team_name || "TBD")}</div>
+      <div class="rg-sub">${esc(fmtDateTime(g.start_time))}${g.rink_name ? " · " + esc(g.rink_name) : ""}${g.division_name ? " · " + esc(g.division_name) : ""}</div>
+    </div>
+    ${picker}
+  </div>`;
+}
+
 function renderRoster(lineups, ov) {
   if (!lineups) return `<div class="empty">Select a game from the Games tab.</div>`;
   if (!(rosterSide in lineups)) rosterSide = "home";
@@ -1073,7 +1112,7 @@ function renderRoster(lineups, ov) {
       <span class="ls-team">${icon} ${esc(l.team_name)}</span>
       <span class="ls-sub">${label} · ${prettyStatus(l.status.status)}</span></button>`;
   };
-  return `<div class="lineup-switch">${tab("home", "🏠", "Home")}${tab("away", "✈️", "Away")}</div>
+  return `${rosterGamePicker(ov)}<div class="lineup-switch">${tab("home", "🏠", "Home")}${tab("away", "✈️", "Away")}</div>
     <div class="segmented">
       <button class="seg ${gameView === "coach" ? "active" : ""}" data-view="coach">Coach</button>
       <button class="seg ${gameView === "player" ? "active" : ""}" data-view="player">Player</button>
@@ -3101,7 +3140,16 @@ async function render() {
     c.innerHTML = `<div class="skeleton"></div><div class="skeleton"></div><div class="skeleton"></div>`;
     ov = await getJSON("/api/demo/overview");
     if (ov && ov.error) throw new Error(ov.error.message);
-    if (!currentGame && ov.schedule[0]) currentGame = ov.schedule[0].game_id;
+    // Default the working game to the first one this user can actually open —
+    // for a coach that's their own team's game, not an arbitrary game[0] that
+    // would land Roster/Sheet on the "Restricted" guard before the game
+    // picker (#154) could even offer a way out. A game already chosen (deep
+    // link, prior pick) is kept as long as it still exists in the schedule.
+    if ((!currentGame || !(ov.schedule || []).some((g) => g.game_id === currentGame))
+        && ov.schedule[0]) {
+      const acc = accessibleGames(ov);
+      currentGame = (acc[0] || ov.schedule[0]).game_id;
+    }
     board = (view === "activity" && currentGame) ? await getJSON(`/api/games/${currentGame}/board`) : null;
     // The roster tab and the game sheet both use both sides' lineups (#25/#48).
     lineups = (["roster", "sheet"].includes(view) && currentGame)
@@ -3393,6 +3441,16 @@ async function render() {
   c.querySelectorAll("button[data-act]").forEach((b) => b.onclick = () => rosterAction(b.dataset.act, b.dataset.id));
   c.querySelectorAll(".seg[data-view]").forEach((b) => b.onclick = () => { gameView = b.dataset.view; toast = ""; render(); });
   c.querySelectorAll("[data-side]").forEach((b) => b.onclick = () => { rosterSide = b.dataset.side; toast = ""; render(); });
+  // Roster game picker (#154): switching the game resets the per-game view
+  // state (side, availability filter, the coach's fetched sub queues) so the
+  // new game's roster never renders against the previous game's data.
+  const rosterGameSel = c.querySelector("#roster-game");
+  if (rosterGameSel) rosterGameSel.onchange = () => {
+    currentGame = rosterGameSel.value;
+    rosterSide = "home"; availFilter = "all";
+    availSummary = null; subCandidates = null; addableSubs = null; rescheduleRequests = null;
+    toast = ""; render();
+  };
   // Availability summary filter + remind (#89).
   c.querySelectorAll("[data-avail-filter]").forEach((b) => b.onclick = () => {
     availFilter = b.dataset.availFilter; render();
