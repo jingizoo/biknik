@@ -5,6 +5,7 @@ on:
     paths:
       - "hockey-scheduler/backend/**"
       - "hockey-scheduler/docs/**"
+      - "hockey-scheduler/e2e/**"
       - ".github/workflows/hockey-scheduler-ci.yml"
   push:
     branches:
@@ -12,6 +13,7 @@ on:
     paths:
       - "hockey-scheduler/backend/**"
       - "hockey-scheduler/docs/**"
+      - "hockey-scheduler/e2e/**"
       - ".github/workflows/hockey-scheduler-ci.yml"
 
 jobs:
@@ -58,3 +60,36 @@ jobs:
         env:
           TEST_DATABASE_URL: postgresql://hockey:hockey@localhost:5432/hockey
         run: python -m unittest discover -s tests -v
+
+  frontend-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Syntax-check app.js (#138)
+        # No build step or bundler for the frontend by design — this is a
+        # cheap gate against a shipped syntax error, not a full lint pass.
+        run: node --check hockey-scheduler/backend/hockey_scheduler/web/static/app.js
+
+  browser-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install Playwright (#138)
+        working-directory: hockey-scheduler/e2e
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium
+      - name: Run browser smoke test (#138)
+        working-directory: hockey-scheduler/e2e
+        run: npm run smoke
