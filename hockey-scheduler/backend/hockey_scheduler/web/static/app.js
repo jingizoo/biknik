@@ -77,6 +77,7 @@ let gCheckout = null;        // {jid, game_id} while a junior's "Can't Play" con
 let gOpp = null;             // {jid, game_id} of the junior's opportunity detail open
 let gOppDetail = null;       // fetched detail payload for gOpp
 let activityExpandedBatches = new Set();  // import_batch_ids expanded in Activity (#102)
+let setupView = "hierarchy";  // "hierarchy" | "records" — Setup sub-view (#165)
 let readinessCheck = null;  // /api/readiness snapshot for the Pilot Readiness card (#104)
 let importState = {         // Pilot onboarding import wizard (#96)
   type: "teams_players",    // which IMPORT_TYPES entry is selected
@@ -454,7 +455,12 @@ const SETUP_ENTITIES = [
     list: (ov) => ov.clubs.map((c) => ({ title: c.name })),
     fields: [{ id: "f-club", label: "Club name", required: true, placeholder: "e.g. Eagles HC" }] },
   { key: "team", title: "Teams", icon: "👥", noun: "team", perm: "manage_setup",
-    list: (ov) => ov.teams.map((t) => ({ title: t.name, sub: t.division_name || t.club_name || "" })),
+    // Explicit "Club · Division" (#165) — the old "division OR club" subtitle
+    // hid whichever was missing, so an operator couldn't see a team's club.
+    list: (ov) => ov.teams.map((t) => ({
+      title: t.name,
+      sub: `${t.club_name || "No club"} · ${t.division_name || "No division"}`,
+    })),
     fields: [
       { id: "f-team-club", label: "Club", type: "select", required: true, ofNoun: "club",
         options: (ov) => ov.clubs.map((c) => [c.id, c.name]) },
@@ -535,11 +541,173 @@ const SETUP_POST = {
 
 const nameById = (rows, id) => (rows.find((r) => r.id === id) || {}).name || "";
 
+// Group a flat list of rows by a foreign-key field, for the setup trees (#165).
+function groupBy(rows, key) {
+  const m = {};
+  (rows || []).forEach((r) => { (m[r[key]] = m[r[key]] || []).push(r); });
+  return m;
+}
+// A quick-create button that opens the existing Setup drawer with the parent
+// preselected (#165) — data-prefill-field/value seed drawerValues so the
+// drawer's parent <select> lands on the node the operator clicked under.
+function treeAdd(kind, label, prefillField, prefillValue) {
+  const ent = SETUP_ENTITIES.find((e) => e.key === kind);
+  if (!ent || !hasPerm(ent.perm)) return "";
+  const pf = prefillField
+    ? ` data-prefill-field="${esc(prefillField)}" data-prefill-value="${esc(prefillValue || "")}"` : "";
+  return `<button class="act ghost tree-add" data-drawer="${esc(kind)}"${pf}>＋ ${esc(label)}</button>`;
+}
+const capWord = (s) => (s ? String(s).charAt(0).toUpperCase() + String(s).slice(1) : "");
+
+// Setup → Hierarchy (#165): a functional tree of the league's structure built
+// from the data already loaded (overview + playersList), with counts,
+// missing-assignment warnings, and quick-create actions that reuse the Setup
+// drawers. Facility (Venue→Rink) and Competition (League→Season→Division→Team)
+// are structure-only and safe for anyone; the Roster tree exposes player names
+// and so is gated to setup operators, matching where playersList is fetched.
+function renderSetupHierarchy(ov) {
+  const canSeePlayers = hasPerm("manage_setup");
+  const pCount = {};
+  const pByTeam = {};
+  (canSeePlayers ? playersList : []).forEach((p) => {
+    pCount[p.team_id] = (pCount[p.team_id] || 0) + 1;
+    (pByTeam[p.team_id] = pByTeam[p.team_id] || []).push(p);
+  });
+  const teamMeta = (t) => {
+    const club = t.club_name ? esc(t.club_name) : `<span class="tn-warn-text">No club</span>`;
+    const pc = canSeePlayers ? ` · ${pCount[t.id] || 0} player${(pCount[t.id] || 0) === 1 ? "" : "s"}` : "";
+    return `${club}${pc}`;
+  };
+
+  // -- Facility: Venue → Rink (Organization not modeled — shown as a note) --
+  const rinksByVenue = groupBy(ov.rinks, "venue_id");
+  const venueRows = (ov.venues || []).map((v) => {
+    const rinks = rinksByVenue[v.id] || [];
+    const badge = rinks.length
+      ? `<span class="tn-badge ok">Ready</span>` : `<span class="tn-badge warn">Needs rinks</span>`;
+    const rinkRows = rinks.map((r) =>
+      `<div class="tn-leaf"><span class="tn-label">⛸️ ${esc(r.name)}</span></div>`).join("")
+      || `<div class="tn-empty">No rinks yet. Add a rink so this venue can host games.</div>`;
+    return `<details class="tn" open><summary class="tn-sum">
+        <span class="tn-label">🏟️ ${esc(v.name)}</span>
+        <span class="tn-meta">${rinks.length} rink${rinks.length === 1 ? "" : "s"}</span>${badge}</summary>
+      <div class="tn-children">${rinkRows}${treeAdd("rink", "Add rink to " + v.name, "f-rink-venue", v.id)}</div>
+    </details>`;
+  }).join("");
+  const facility = `<section class="tree-panel">
+    <div class="tree-head"><span class="tree-title">🏟️ Facility</span>
+      <span class="tree-sub">${(ov.venues || []).length} venue(s) · ${(ov.rinks || []).length} rink(s)</span></div>
+    <div class="tree-note">Organization/owner grouping isn't modeled yet — venues are shown directly.</div>
+    ${venueRows || `<div class="tn-empty">No venues yet. Add a venue to start your arena setup.</div>`}
+    <div class="tree-actions">${treeAdd("venue", "Add venue")}</div>
+  </section>`;
+
+  // -- Competition: League → Season → (Level n/a) → Division → Team --
+  const seasonsByLeague = groupBy(ov.seasons, "league_id");
+  const divsBySeason = groupBy(ov.divisions, "season_id");
+  const teamsByDiv = groupBy(ov.teams, "division_id");
+  const countTeams = (divs) => divs.reduce((n, d) => n + (teamsByDiv[d.id] || []).length, 0);
+  const leagueRows = (ov.leagues || []).map((lg) => {
+    const seasons = seasonsByLeague[lg.id] || [];
+    const lgTeams = seasons.reduce((n, s) => n + countTeams(divsBySeason[s.id] || []), 0);
+    const seasonRows = seasons.map((s) => {
+      const divs = divsBySeason[s.id] || [];
+      const divRows = divs.map((d) => {
+        const teams = teamsByDiv[d.id] || [];
+        const teamRows = teams.map((t) =>
+          `<div class="tn-leaf"><span class="tn-label">👥 ${esc(t.name)}</span><span class="tn-meta">${teamMeta(t)}</span></div>`).join("")
+          || `<div class="tn-empty">No teams in this division yet.</div>`;
+        return `<details class="tn" open><summary class="tn-sum">
+            <span class="tn-label">🏅 ${esc(d.name)}</span>
+            <span class="tn-meta">${teams.length} team${teams.length === 1 ? "" : "s"}</span></summary>
+          <div class="tn-children">${teamRows}${treeAdd("team", "Add team to " + d.name, "f-team-div", d.id)}</div>
+        </details>`;
+      }).join("") || `<div class="tn-empty">No divisions in this season yet.</div>`;
+      return `<details class="tn" open><summary class="tn-sum">
+          <span class="tn-label">🗓️ ${esc(s.name)}</span>
+          <span class="tn-meta">${divs.length} division(s) · ${countTeams(divs)} team(s)</span></summary>
+        <div class="tn-children">
+          <div class="tree-note sub">Levels aren't configured in this version — divisions are grouped directly under the season.</div>
+          ${divRows}${treeAdd("division", "Add division to " + s.name, "f-div-season", s.id)}</div>
+      </details>`;
+    }).join("") || `<div class="tn-empty">No seasons in this league yet.</div>`;
+    return `<details class="tn" open><summary class="tn-sum">
+        <span class="tn-label">🏆 ${esc(lg.name)}</span>
+        <span class="tn-meta">${seasons.length} season(s) · ${lgTeams} team(s)</span></summary>
+      <div class="tn-children">${seasonRows}${treeAdd("season", "Add season to " + lg.name, "f-season-league", lg.id)}</div>
+    </details>`;
+  }).join("");
+  const competition = `<section class="tree-panel">
+    <div class="tree-head"><span class="tree-title">🏆 Competition</span>
+      <span class="tree-sub">League → Season → Division → Team</span></div>
+    ${leagueRows || `<div class="tn-empty">No leagues yet. Add a league to begin.</div>`}
+    <div class="tree-actions">${treeAdd("league", "Add league")}</div>
+  </section>`;
+
+  // -- Roster: Team → Players (operator-only; player names) --
+  let roster;
+  if (!canSeePlayers) {
+    roster = `<section class="tree-panel">
+      <div class="tree-head"><span class="tree-title">🧑 Rosters</span></div>
+      <div class="tree-note">Player rosters are visible to setup operators.</div></section>`;
+  } else {
+    const teamRows = (ov.teams || []).map((t) => {
+      const ps = pByTeam[t.id] || [];
+      const badge = ps.length ? "" : `<span class="tn-badge warn">No players</span>`;
+      const pRows = ps.map((p) =>
+        `<div class="tn-leaf"><span class="tn-label">🧑 ${esc(p.name)}</span><span class="tn-meta">${
+          esc(capWord(p.position))}${p.jersey_number != null ? " · #" + esc(String(p.jersey_number)) : ""}</span></div>`).join("")
+        || `<div class="tn-empty">No players yet. Add players before building rosters.</div>`;
+      return `<details class="tn"><summary class="tn-sum">
+          <span class="tn-label">👥 ${esc(t.name)}</span>
+          <span class="tn-meta">${t.division_name ? esc(t.division_name) + " · " : ""}${ps.length} player${ps.length === 1 ? "" : "s"}</span>${badge}</summary>
+        <div class="tn-children">${pRows}${treeAdd("player", "Add player to " + t.name, "f-player-team", t.id)}</div>
+      </details>`;
+    }).join("");
+    roster = `<section class="tree-panel">
+      <div class="tree-head"><span class="tree-title">🧑 Rosters</span>
+        <span class="tree-sub">${(ov.teams || []).length} team(s)</span></div>
+      ${teamRows || `<div class="tn-empty">No teams yet.</div>`}
+    </section>`;
+  }
+
+  // -- Needs assignment: broken/orphaned records, never hidden --
+  const venueIds = new Set((ov.venues || []).map((v) => v.id));
+  const teamIds = new Set((ov.teams || []).map((t) => t.id));
+  const orphanRinks = (ov.rinks || []).filter((r) => !r.venue_id || !venueIds.has(r.venue_id));
+  const noClubTeams = (ov.teams || []).filter((t) => !t.club_id && !t.club_name);
+  const noDivTeams = (ov.teams || []).filter((t) => !t.division_id);
+  const orphanPlayers = canSeePlayers
+    ? playersList.filter((p) => !p.team_id || !teamIds.has(p.team_id)) : [];
+  const naRow = (label, rows) => rows.length
+    ? `<div class="na-group"><div class="na-group-label">${esc(label)} (${rows.length})</div>${
+        rows.map((r) => `<div class="tn-leaf warn"><span class="tn-label">⚠ ${esc(r.name)}</span></div>`).join("")}</div>` : "";
+  const naBody = naRow("Rinks without a venue", orphanRinks)
+    + naRow("Teams without a club", noClubTeams)
+    + naRow("Teams without a division", noDivTeams)
+    + naRow("Players without a team", orphanPlayers);
+  const needsAssignment = naBody
+    ? `<section class="tree-panel na"><div class="tree-head"><span class="tree-title">⚠ Needs assignment</span></div>
+        <div class="tree-note">These records can't be scheduled until they're assigned.</div>${naBody}</section>` : "";
+
+  return `<div class="setup-trees">${facility}${competition}${roster}${needsAssignment}</div>`;
+}
+
 function renderSetup(ov) {
-  const cards = SETUP_ENTITIES.map((ent) => setupCard(ent, ov)).join("");
-  return `<div class="setup-intro">Create your league structure and arena. Tap
-    <strong>＋ New</strong> on any card to open a form.</div>
-    <div class="setup-grid">${cards}</div>${renderDrawer(ov)}`;
+  const toggle = `<div class="seg-group setup-viewtoggle">
+    <button class="seg ${setupView === "hierarchy" ? "active" : ""}" data-setup-view="hierarchy">Hierarchy</button>
+    <button class="seg ${setupView === "records" ? "active" : ""}" data-setup-view="records">Records</button>
+  </div>`;
+  let body;
+  if (setupView === "hierarchy") {
+    body = `${pageIntro("Review and fix how your venues, league, teams, and rosters are connected.")}${renderSetupHierarchy(ov)}`;
+  } else {
+    const cards = SETUP_ENTITIES.map((ent) => setupCard(ent, ov)).join("");
+    body = `<div class="setup-intro">Create your league structure and arena. Tap
+      <strong>＋ New</strong> on any card to open a form.</div>
+      <div class="setup-grid">${cards}</div>`;
+  }
+  return `${toggle}${body}${renderDrawer(ov)}`;
 }
 
 function setupCard(ent, ov) {
@@ -3426,9 +3594,17 @@ async function render() {
   if (pubBack) pubBack.onclick = () => { publicState.game = null; render(); };
   wirePublicFeedSubscribe(c, render);
   wireCopyFeedUrl(c);
-  // Setup drawers (#44): open, close, submit.
+  // Setup sub-view toggle (#165): Hierarchy tree vs the record cards.
+  c.querySelectorAll("[data-setup-view]").forEach((b) => b.onclick = () => {
+    setupView = b.dataset.setupView; toast = ""; render();
+  });
+  // Setup drawers (#44): open, close, submit. A drawer opened from the
+  // hierarchy tree (#165) can carry a data-prefill-field/value to preselect
+  // the parent record (e.g. the venue for a new rink) in the drawer.
   c.querySelectorAll("[data-drawer]").forEach((b) => b.onclick = () => {
-    drawer = { kind: b.dataset.drawer }; drawerError = ""; drawerValues = {}; toast = ""; render();
+    drawer = { kind: b.dataset.drawer }; drawerError = ""; drawerValues = {};
+    if (b.dataset.prefillField) drawerValues[b.dataset.prefillField] = b.dataset.prefillValue || "";
+    toast = ""; render();
   });
   c.querySelectorAll("[data-drawer-close]").forEach((b) => b.onclick = () => {
     drawer = null; drawerError = ""; drawerValues = {}; render();
