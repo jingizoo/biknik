@@ -210,6 +210,18 @@ body {
   margin: 18px 4px 6px;
 }
 
+/* Shared page-intro block (#146): a screen's title already lives in the
+   topbar (nav-title); this is just the "what is this / what do I do"
+   helper text plus an optional primary action, at the top of content. */
+.page-intro {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 0 4px 16px;
+}
+.page-intro p.muted { margin: 0; max-width: 640px; }
+
 .card { background: var(--card); border-radius: 12px; overflow: hidden; }
 
 /* ----- slot progress ----- */
