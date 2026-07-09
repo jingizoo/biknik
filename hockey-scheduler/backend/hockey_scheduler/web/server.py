@@ -641,6 +641,14 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_ics(ics)
         if path == "/api/demo/overview":
             return self._send_api(api.get_demo_overview())
+        if path == "/api/setup/hierarchy":
+            # Nested setup tree for the operator's mental model (#166 PR C).
+            # It carries player_count leaves, so gate it like the player list
+            # (MANAGE_SETUP) rather than leaving it on the unauthenticated
+            # overview — even a count is roster-adjacent.
+            if self._operator_only("/api/setup/player"):
+                return
+            return self._send_api(api.get_setup_hierarchy())
         if path == "/api/status":
             # Deployment posture for the UI status chips (#72): app mode +
             # store backend + email/push delivery modes. Non-sensitive, no

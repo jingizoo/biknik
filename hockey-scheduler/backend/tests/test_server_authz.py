@@ -115,6 +115,20 @@ class ServerAuthzTest(unittest.TestCase):
         self.assertEqual(status, 401)
         self.assertEqual(body["error"]["code"], "unauthorized")
 
+    # -- setup hierarchy tree is operator-only, MANAGE_SETUP (#166 PR C) ----
+    def test_viewer_cannot_read_setup_hierarchy(self):
+        status, body = self._get_h("/api/setup/hierarchy", role="viewer")
+        self.assertEqual(status, 403)
+        self.assertEqual(body["error"]["code"], "forbidden")
+        self.assertEqual(body["error"]["details"]["required"], "manage_setup")
+
+    def test_admin_can_read_setup_hierarchy(self):
+        status, body = self._get_h("/api/setup/hierarchy", role="league_admin")
+        self.assertEqual(status, 200)
+        self.assertIn("organizations", body)
+        self.assertIn("leagues", body)
+        self.assertIn("missing_assignments", body)
+
     # -- contact registry is operator-only (#60) ---------------------------
     def test_viewer_cannot_read_or_write_contacts(self):
         status, _ = self._get_h("/api/notifications/contacts", role="viewer")

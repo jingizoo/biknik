@@ -83,6 +83,18 @@ def _serialize(obj) -> dict:
     return _jsonify(obj)
 
 
+def _group(rows, attr):
+    """Index dataclass rows by a foreign-key attribute → {key: [rows]}.
+
+    Preserves input order within each bucket. Used to build the nested setup
+    hierarchy (#166) without an O(n²) re-scan per parent node.
+    """
+    out = {}
+    for r in rows:
+        out.setdefault(getattr(r, attr), []).append(r)
+    return out
+
+
 def _parse_enum(enum_cls, value, field_name: str):
     """Parse a client-supplied enum string, raising a structured error."""
     try:
@@ -2003,6 +2015,121 @@ class ApiService:
             "public_fixtures": public_fixtures,
             "setup_audit": setup_audit,
             "setup_audit_count": len(setup_audit),
+        }
+
+    @catch
+    def get_setup_hierarchy(self) -> dict:
+        """Nested, UI-ready setup tree (#166 PR C).
+
+        Two trees — facility ownership (Organization → Venue → Rink) and
+        competition structure (League → Season → Level → Division → Team) —
+        plus a ``missing_assignments`` block listing records whose parent link
+        is absent or dangling, so an operator can find and fix them. Leaves
+        carry counts (``ice_slot_count``, ``player_count``), never rosters, so
+        the structural payload stays light. This route is operator-gated
+        (MANAGE_SETUP) at the HTTP boundary; player *names* still never appear.
+        """
+        orgs = self.store.all_organizations()
+        venues = self.store.all_venues()
+        rinks = self.store.all_rinks()
+        leagues = self.store.all_leagues()
+        seasons = self.store.all_seasons()
+        levels = self.store.all_levels()
+        divisions = self.store.all_divisions()
+        teams = self.store.all_teams()
+        clubs = {c.id: c for c in self.store.all_clubs()}
+
+        # Counts indexed by parent id — one pass each, no per-node re-scan.
+        slot_count = {}
+        for s in self.store.all_ice_slots():
+            slot_count[s.rink_id] = slot_count.get(s.rink_id, 0) + 1
+        player_count = {}
+        for p in self.store.all_players():
+            player_count[p.team_id] = player_count.get(p.team_id, 0) + 1
+
+        rinks_by_venue = _group(rinks, "venue_id")
+        venues_by_org = _group(venues, "organization_id")
+        seasons_by_league = _group(seasons, "league_id")
+        levels_by_season = _group(levels, "season_id")
+        divs_by_season = _group(divisions, "season_id")
+        teams_by_div = _group(teams, "division_id")
+
+        def rink_node(r):
+            return {"id": r.id, "name": r.name,
+                    "ice_slot_count": slot_count.get(r.id, 0)}
+
+        def venue_node(v):
+            vr = rinks_by_venue.get(v.id, [])
+            return {"id": v.id, "name": v.name,
+                    "rinks": [rink_node(r) for r in vr]}
+
+        organizations = [
+            {"id": o.id, "name": o.name, "short_name": o.short_name,
+             "venues": [venue_node(v) for v in venues_by_org.get(o.id, [])]}
+            for o in orgs
+        ]
+
+        def team_node(t):
+            return {"id": t.id, "name": t.name, "club_id": t.club_id,
+                    "club_name": clubs[t.club_id].name if t.club_id in clubs else None,
+                    "player_count": player_count.get(t.id, 0)}
+
+        def division_node(d):
+            return {"id": d.id, "name": d.name,
+                    "teams": [team_node(t) for t in teams_by_div.get(d.id, [])]}
+
+        league_tree = []
+        for lg in leagues:
+            season_nodes = []
+            for s in seasons_by_league.get(lg.id, []):
+                season_levels = sorted(
+                    levels_by_season.get(s.id, []),
+                    key=lambda lv: (lv.sort_order or 0, lv.name))
+                level_ids = {lv.id for lv in season_levels}
+                divs_by_level = _group(divs_by_season.get(s.id, []), "level_id")
+                level_nodes = [
+                    {"id": lv.id, "name": lv.name, "sort_order": lv.sort_order,
+                     "divisions": [division_node(d) for d in divs_by_level.get(lv.id, [])]}
+                    for lv in season_levels
+                ]
+                # Divisions in this season with no level (or a dangling one).
+                no_level = [d for d in divs_by_season.get(s.id, [])
+                            if not d.level_id or d.level_id not in level_ids]
+                season_nodes.append({
+                    "id": s.id, "name": s.name, "levels": level_nodes,
+                    "divisions_without_level": [division_node(d) for d in no_level],
+                })
+            league_tree.append({"id": lg.id, "name": lg.name, "seasons": season_nodes})
+
+        org_ids = {o.id for o in orgs}
+        venue_ids = {v.id for v in venues}
+        division_ids = {d.id for d in divisions}
+        level_ids_all = {lv.id for lv in levels}
+        team_ids = {t.id for t in teams}
+        idname = lambda x: {"id": x.id, "name": x.name}
+        missing = {
+            "venues_without_organization":
+                [idname(v) for v in venues if not v.organization_id or v.organization_id not in org_ids],
+            "rinks_without_venue":
+                [idname(r) for r in rinks if not r.venue_id or r.venue_id not in venue_ids],
+            "divisions_without_level":
+                [idname(d) for d in divisions if not d.level_id or d.level_id not in level_ids_all],
+            "teams_without_club":
+                [idname(t) for t in teams if not t.club_id or t.club_id not in clubs],
+            "teams_without_division":
+                [idname(t) for t in teams if not t.division_id or t.division_id not in division_ids],
+            # Player *name* is PII and deliberately omitted even here — an
+            # orphan is surfaced by id only, keeping this tree name-free so the
+            # count-only privacy invariant holds end to end (#166).
+            "players_without_team":
+                [{"id": p.id} for p in self.store.all_players()
+                 if not p.team_id or p.team_id not in team_ids],
+        }
+
+        return {
+            "organizations": organizations,
+            "leagues": league_tree,
+            "missing_assignments": missing,
         }
 
     # ====================================================================
