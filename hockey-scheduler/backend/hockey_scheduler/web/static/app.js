@@ -127,6 +127,19 @@ const fmt = (iso) => { const m = /T(\d{2}:\d{2})/.exec(iso || ""); return m ? m[
 const val = (id) => { const e = document.getElementById(id); return e ? e.value.trim() : ""; };
 const hasPerm = (p) => rolePerms.has(p);
 
+// Shared page-intro block (#146): every view's *title* already comes from
+// the topbar's nav-title (set by setChrome() from the NAV map, #24) — this
+// is deliberately just the "what is this screen for, what do I do here"
+// helper text a tester's first 5 seconds on a screen actually needs,
+// optionally paired with the one primary action for that screen. Not a
+// full header component (title/breadcrumb/status already live in the
+// topbar shell) — adding a second, competing title inside content would
+// duplicate rather than clarify.
+function pageIntro(helperText, primaryActionHtml) {
+  return `<div class="page-intro"><p class="muted">${esc(helperText)}</p>
+    ${primaryActionHtml || ""}</div>`;
+}
+
 // Client-side file download (#99) — no backend route needed, since the CSV
 // template/sample content already lives in IMPORT_TYPES. A throwaway <a>
 // with a Blob URL is the standard way to trigger a save-as without a server
@@ -824,8 +837,9 @@ function renderWizard(ov) {
 
 /* ---------- Games + operations checklist ---------- */
 function renderGames(ov) {
-  if (!ov.schedule.length) return `<div class="empty">No games scheduled yet. Use the Calendar to schedule one.</div>`;
-  return ov.schedule.map((g) => {
+  const intro = pageIntro("Every scheduled game and its game-day readiness — ice, roster, officials, and result.");
+  if (!ov.schedule.length) return `${intro}<div class="empty">No games scheduled yet. Use the Calendar to schedule one.</div>`;
+  return intro + ov.schedule.map((g) => {
     const confirmed = g.roster_status === "roster_confirmed" || g.roster_status === "locked";
     const ck = (ok, lbl, meta) => `<div class="check ${ok ? "ok" : "todo"}"><span class="ic">${ok ? "✓" : "○"}</span>
       <span class="lbl">${lbl}</span>${meta ? `<span class="meta">${meta}</span>` : ""}</div>`;
@@ -1447,10 +1461,11 @@ function renderNotifPrefs() {
 function renderNotifications() {
   const rows = notifState.notifications || [];
   const unread = notifState.unread || 0;
+  const intro = pageIntro("Assignment offers, roster changes, and results that affect you or your team.");
   const head = `<div class="notif-head"><div class="section-title" style="margin:0">Notifications${unread ? ` · ${unread} unread` : ""}</div>
     ${unread ? `<button class="act ghost" data-notif-readall>Mark all read</button>` : ""}</div>`;
   if (!rows.length) {
-    return `${head}${renderNotifPrefs()}${renderCalendarFeed()}<div class="banner neutral"><h2>You're all caught up</h2>
+    return `${intro}${head}${renderNotifPrefs()}${renderCalendarFeed()}<div class="banner neutral"><h2>You're all caught up</h2>
       <p>Assignment offers, roster alerts, and final results will show up here.</p></div>`;
   }
   const cards = rows.map((n) => {
@@ -1464,7 +1479,7 @@ function renderNotifications() {
         <div class="notif-meta">${esc(fmtDateTime(n.at))}</div></div>
       ${link}</div>`;
   }).join("");
-  return `${head}${renderNotifPrefs()}${renderCalendarFeed()}<div class="notif-list">${cards}</div>`;
+  return `${intro}${head}${renderNotifPrefs()}${renderCalendarFeed()}<div class="notif-list">${cards}</div>`;
 }
 
 /* ---------- Delivery admin: contacts + queue monitor (#61) ---------- */
@@ -1672,8 +1687,8 @@ function renderDelivery(ov) {
       <p>Delivery contacts and the queue monitor are available to league admins
       and arena managers.</p></div>`;
   }
-  return `${renderDeliveryMonitor()}${renderContactsPanel(ov)}` +
-    `${renderDeviceTokensPanel(ov)}`;
+  return pageIntro("Where each notification actually went — sent, pending, or failed — and who it's sent to.")
+    + `${renderDeliveryMonitor()}${renderContactsPanel(ov)}${renderDeviceTokensPanel(ov)}`;
 }
 
 /* ---------- Users / sessions admin (#78) ---------- */
@@ -1746,6 +1761,7 @@ function renderUsers(ov) {
     ? renderUserSessions()
     : `<p class="muted">Select an account to view its login sessions.</p>`;
   return `
+    ${pageIntro("Create staff/coach/player/guardian/official accounts and review who's signed in.")}
     ${renderCreateAccountForm(ov)}
     <div class="card">
       <div class="section-title">Accounts</div>
@@ -1800,7 +1816,7 @@ function renderGuardianLinks() {
           ${verifyForm}
         </div>`;
       }).join("")
-    : `<div class="empty">No guardian links yet.</div>`;
+    : `<div class="empty">No guardian links yet. Use the form above to link a guardian to a junior player.</div>`;
   return `<div class="card">
     <div class="section-title">Guardian Links</div>
     ${form}
@@ -1878,7 +1894,8 @@ function renderReadiness(ov) {
     "Phone layout implemented and verified down to a 390px viewport (#100/#101)."));
   rows.push(rdRow("info", "Known limitations",
     "CSV-only import (no native app or PWA yet); scheduler optimizer not built."));
-  return `<div class="card"><div class="section-title" style="margin-top:0">Pilot Readiness</div>
+  return `${pageIntro("A pre-flight checklist for running this league in production: data, delivery, and deployment posture.")}
+    <div class="card"><div class="section-title" style="margin-top:0">Pilot Readiness</div>
     ${rows.join("")}</div>`;
 }
 
@@ -1997,7 +2014,8 @@ function renderScheduler(ov) {
       <button class="act ghost danger" data-sched-discard ${selectedCount ? "" : "disabled"}>Discard ${selectedCount} of ${allDrafts.length}</button>
     </div>` : ""}`;
 
-  return `<div class="card">
+  return `${pageIntro("Generate draft games from open ice slots, review for conflicts, then publish.")}
+    <div class="card">
       <div class="section-title" style="margin-top:0">Generate draft schedule</div>
       <div class="dq-actions">
         <select id="sched-div">${divOptions(schedulerState.division)}</select>
@@ -2553,7 +2571,7 @@ function playerBody(board) {
     ? `<div class="locked-note">🔒 Read-only — your role can't respond for players.</div>`
     : locked ? `<div class="locked-note">🔒 Roster locked — actions disabled.</div>`
     : `<div class="actions">${html}</div>`;
-  let card = `<div class="empty">No players.</div>`;
+  let card = `<div class="empty">No players on this game's roster yet.</div>`;
   if (p) {
     if (p.group === "selected" && !p.backed_out)
       card = `<div class="banner ok"><h2>You are selected</h2><p>Status: confirmed</p></div>
@@ -2631,7 +2649,7 @@ function renderSetupAuditFeed(ov) {
   const isBatch = (a) => a.entity_type === "import_batch";
   const batchIdOf = (a) => (a.detail && a.detail.import_batch_id) || null;
   const topLevel = all.filter((a) => isBatch(a) || !batchIdOf(a)).slice(0, 40);
-  if (!topLevel.length) return `<div class="empty">No setup activity.</div>`;
+  if (!topLevel.length) return `<div class="empty">No setup activity yet — league, team, and player changes will appear here.</div>`;
   return topLevel.map((a) => {
     if (!isBatch(a)) {
       return tlRow(fmt(a.at),
@@ -2736,7 +2754,7 @@ function renderPublic(ov) {
           <div class="li-sub">${esc(f.division_name || "")} · ${esc(f.venue_name || "")} · ${esc(f.rink_name || "")}</div></div>
         <span class="pill ${cls}">${esc(f.status)}</span></button>`;
     }).join("");
-    body = `<div class="card">${rows || '<div class="empty">No fixtures.</div>'}</div>`;
+    body = `<div class="card">${rows || '<div class="empty">No games scheduled yet — check back once the league publishes its fixtures.</div>'}</div>`;
   }
   return `<div class="hero"><div class="when">Public</div><h2>${esc(lgName)}</h2></div>
     ${tabs}${body}
