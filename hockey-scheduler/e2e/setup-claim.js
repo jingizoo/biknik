@@ -14,6 +14,7 @@ const HOST = "127.0.0.1";
 const BACKEND_DIR = path.resolve(__dirname, "..", "backend");
 const READY_TIMEOUT_MS = 15000;
 const SETUP_CODE = "browser-fixture-setup-code-7d4318b20f5e4cfa";
+const CLIENT_PASSWORD = "client-owned-password";
 const VIEWPORTS = [
   { label: "desktop", width: 1440, height: 900, port: 8131 },
   { label: "phone", width: 390, height: 844, port: 8132 },
@@ -70,6 +71,10 @@ async function checkViewport(browser, vp) {
         APP_MODE: "production",
         DATABASE_URL: databasePath,
         INITIAL_SETUP_CODE: SETUP_CODE,
+        // The browser-claim test must never be pre-empted by an inherited
+        // emergency operations bootstrap configuration.
+        BOOTSTRAP_ADMIN_USER: "",
+        BOOTSTRAP_ADMIN_PASSWORD: "",
       },
       stdio: ["ignore", "pipe", "pipe"],
     },
@@ -92,12 +97,12 @@ async function checkViewport(browser, vp) {
     await waitForServer(`${base}/api/bootstrap/status`, READY_TIMEOUT_MS);
     await page.goto(`${base}/setup`, { waitUntil: "domcontentloaded" });
     await page.waitForSelector("#claim-form:not([hidden])", { timeout: 10000 });
-    await page.locator("#setup-title").getByText("Claim this installation").waitFor();
+    await page.getByRole("heading", { name: "Claim this installation" }).waitFor();
 
     await page.fill("#setup-code", SETUP_CODE);
     await page.fill("#username", `client-admin-${vp.label}`);
-    await page.fill("#password", "client-owned-password");
-    await page.fill("#password-confirm", "client-owned-password");
+    await page.fill("#password", CLIENT_PASSWORD);
+    await page.fill("#password-confirm", CLIENT_PASSWORD);
 
     const responsePromise = page.waitForResponse((response) =>
       response.url() === `${base}/api/bootstrap/claim`
@@ -120,6 +125,14 @@ async function checkViewport(browser, vp) {
     });
     if (status.claim_available !== false || status.reason !== "already_claimed") {
       throw new Error(`[${vp.label}] unexpected post-claim status: ${JSON.stringify(status)}`);
+    }
+
+    const browserStorage = await page.evaluate(() => JSON.stringify({
+      local: { ...localStorage },
+      session: { ...sessionStorage },
+    }));
+    if (browserStorage.includes(SETUP_CODE) || browserStorage.includes(CLIENT_PASSWORD)) {
+      throw new Error(`[${vp.label}] a submitted secret appeared in browser storage`);
     }
     if (errors.length) {
       throw new Error(`[${vp.label}] console/page errors:\n${errors.join("\n")}`);
