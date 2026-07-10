@@ -99,7 +99,17 @@ jobs:
         run: npm run smoke
       - name: Run production first-admin claim journey
         run: npm run setup-claim
-      - name: Initial Setup desktop landing
+      - name: Initial Setup desktop automatic route
+        env:
+          ONBOARDING_VIEWPORT: desktop
+          ONBOARDING_PHASE: route
+        run: npm run onboarding-wizard
+      - name: Initial Setup desktop rendered content
+        env:
+          ONBOARDING_VIEWPORT: desktop
+          ONBOARDING_PHASE: content
+        run: npm run onboarding-wizard
+      - name: Initial Setup desktop persisted status
         env:
           ONBOARDING_VIEWPORT: desktop
           ONBOARDING_PHASE: landing
@@ -114,7 +124,17 @@ jobs:
           ONBOARDING_VIEWPORT: desktop
           ONBOARDING_PHASE: full
         run: npm run onboarding-wizard
-      - name: Initial Setup phone landing
+      - name: Initial Setup phone automatic route
+        env:
+          ONBOARDING_VIEWPORT: phone
+          ONBOARDING_PHASE: route
+        run: npm run onboarding-wizard
+      - name: Initial Setup phone rendered content
+        env:
+          ONBOARDING_VIEWPORT: phone
+          ONBOARDING_PHASE: content
+        run: npm run onboarding-wizard
+      - name: Initial Setup phone persisted status
         env:
           ONBOARDING_VIEWPORT: phone
           ONBOARDING_PHASE: landing
