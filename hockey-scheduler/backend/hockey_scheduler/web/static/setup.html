@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Claim installation</title>
+  <link rel="stylesheet" href="/setup.css">
+</head>
+<body>
+  <main class="setup-shell">
+    <section class="setup-card" aria-labelledby="setup-title">
+      <p class="eyebrow">Production setup</p>
+      <h1 id="setup-title">Claim this installation</h1>
+      <p id="setup-intro" class="muted">
+        Use the one-time setup code supplied through your secure deployment channel,
+        then choose the client-owned League Admin credentials.
+      </p>
+
+      <div id="setup-status" class="status" role="status" aria-live="polite">
+        Checking installation status…
+      </div>
+
+      <form id="claim-form" hidden novalidate>
+        <label>
+          One-time setup code
+          <input id="setup-code" name="setup_code" type="password"
+                 autocomplete="one-time-code" required>
+        </label>
+        <label>
+          Admin username
+          <input id="username" name="username" type="text"
+                 autocomplete="username" autocapitalize="none" spellcheck="false" required>
+        </label>
+        <label>
+          Admin password
+          <input id="password" name="password" type="password"
+                 autocomplete="new-password" required>
+        </label>
+        <label>
+          Confirm password
+          <input id="password-confirm" type="password"
+                 autocomplete="new-password" required>
+        </label>
+        <button id="claim-button" type="submit">Create League Admin</button>
+      </form>
+
+      <p id="setup-message" class="message" role="alert" aria-live="assertive"></p>
+      <a id="sign-in-link" class="sign-in" href="/" hidden>Go to sign in</a>
+
+      <p class="privacy-note">
+        The setup code and password are sent only in this claim request. They are
+        not displayed, stored in browser storage, or written to the audit trail.
+      </p>
+    </section>
+  </main>
+  <script src="/setup.js" defer></script>
+</body>
+</html>
