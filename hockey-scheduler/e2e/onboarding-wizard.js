@@ -100,6 +100,55 @@ async function checkViewport(browser, viewport) {
     await page.fill("#login-user", ADMIN_USER);
     await page.fill("#login-pass", ADMIN_PASSWORD);
     await page.click("#login-form button[type=submit]");
+    await page.waitForSelector("#login-screen[hidden]", { timeout: 10000 });
+    if (PHASE === "login") {
+      console.log(`[${viewport.label}] OK — production login response accepted.`);
+      return;
+    }
+
+    const me = await page.evaluate(async () => {
+      const response = await fetch("/api/auth/me", {
+        credentials: "same-origin",
+        cache: "no-store",
+      });
+      return { status: response.status, body: await response.json() };
+    });
+    if (me.status !== 200 || !me.body.user || me.body.user.role !== "league_admin") {
+      throw new Error(`[${viewport.label}] session did not persist: ${JSON.stringify(me)}`);
+    }
+    if (PHASE === "auth") {
+      console.log(`[${viewport.label}] OK — production session persisted.`);
+      return;
+    }
+
+    const extension = await page.evaluate(() => ({
+      loaded: typeof renderInitialSetup === "function",
+      currentRole: currentUser && currentUser.role,
+      currentView: view,
+    }));
+    if (!extension.loaded || extension.currentRole !== "league_admin") {
+      throw new Error(`[${viewport.label}] onboarding extension state: ${JSON.stringify(extension)}`);
+    }
+    if (PHASE === "extension") {
+      console.log(`[${viewport.label}] OK — onboarding extension loaded for League Admin.`);
+      return;
+    }
+
+    const status = await page.evaluate(async () => {
+      const response = await fetch("/api/onboarding/status", {
+        credentials: "same-origin",
+        cache: "no-store",
+      });
+      return { status: response.status, body: await response.json() };
+    });
+    if (status.status !== 200 || status.body.ready_to_schedule !== false
+        || !status.body.blocking.some((item) => item.code === "no_organization")) {
+      throw new Error(`[${viewport.label}] unexpected empty-install status: ${JSON.stringify(status)}`);
+    }
+    if (PHASE === "status") {
+      console.log(`[${viewport.label}] OK — onboarding status is authenticated and actionable.`);
+      return;
+    }
 
     await page.waitForSelector('body[data-view="onboarding"]', { timeout: 10000 });
     if (PHASE === "route") {
@@ -113,22 +162,6 @@ async function checkViewport(browser, viewport) {
     await page.getByText("Progress is recalculated from saved records", { exact: false }).waitFor();
     if (PHASE === "content") {
       console.log(`[${viewport.label}] OK — rendered the expected Initial Setup content.`);
-      return;
-    }
-
-    const status = await page.evaluate(async () => {
-      const response = await fetch("/api/onboarding/status", {
-        credentials: "same-origin",
-        cache: "no-store",
-      });
-      return response.json();
-    });
-    if (status.ready_to_schedule !== false
-        || !status.blocking.some((item) => item.code === "no_organization")) {
-      throw new Error(`[${viewport.label}] unexpected empty-install status: ${JSON.stringify(status)}`);
-    }
-    if (PHASE === "landing") {
-      console.log(`[${viewport.label}] OK — status matches the fresh persisted installation.`);
       return;
     }
 
