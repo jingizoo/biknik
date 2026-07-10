@@ -122,6 +122,14 @@ def required_permission(path: str):
     if path.startswith("/api/officials/assignments/"):
         return Permission.MANAGE_SCHEDULE
 
+    # Guided onboarding status (#174 PR C): aggregates setup + account/player
+    # onboarding state into one League-Admin-only read. MANAGE_SETUP is held by
+    # no role but League Admin, so this gates it to League Admins exactly (an
+    # Arena Manager, who holds MANAGE_ARENA/MANAGE_SCHEDULE, is 403), matching
+    # the "only a League Admin sees full onboarding data" rule (#174).
+    if path == "/api/onboarding/status":
+        return Permission.MANAGE_SETUP
+
     # Cross-domain league↔facility moves (#173) — tying a league to an owner or
     # a venue to a league spans both domains, so both require MANAGE_SETUP
     # (League-Admin-only), even though a venue's own arena-side moves don't.
