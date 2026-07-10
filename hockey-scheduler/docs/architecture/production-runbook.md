@@ -157,6 +157,40 @@ deploy might involve either, both, or neither:
       gate vs. smoke test vs. user report), and what changed since the last
       known-good deploy.
 
+## Data persistence & restart survival (#174)
+
+Everything a client configures is written to the durable database
+(`DATABASE_URL`) as it is created — there is no separate "save" step and no
+in-memory-only state to lose. Restarting or redeploying the application
+against the same database brings back the entire configuration intact:
+
+- the facility hierarchy — Organization → League → Venue → Rink → Ice Slot,
+  including the League↔owner and Venue↔league relationships (#173);
+- the competition hierarchy — League → Season → Level → Division → Team →
+  Player, plus Club → Team;
+- officials, user accounts (with their PBKDF2-hashed credentials, so logins
+  keep working after a restart), and the full setup **audit trail** with its
+  original actor attribution.
+
+Because the app process is stateless, a "restart" is simply a new process
+pointed at the same `DATABASE_URL`. No migration re-run rewrites data: the
+runner only applies *newer* migrations forward-only (see Backup & restore).
+
+This guarantee is a **regression test**, not just a claim:
+`backend/tests/test_production_restart.py` stands up an empty durable
+database, configures the whole hierarchy plus a staff account through the
+public API, drops the process, re-opens a fresh store against the same
+database, and asserts every record, relationship, account, login, and audit
+entry survived. It runs against a SQLite file locally and against PostgreSQL
+in CI (`TEST_DATABASE_URL`), so the promise is verified on the real
+production engine on every change.
+
+To confirm persistence on a live deployment by hand: create a record in
+Setup, restart the app process (the database is untouched), reload the app,
+and confirm the record is still present. The health endpoint's
+`persistent_store` readiness check (#143) independently guards against a
+deployment accidentally running on ephemeral storage in the first place.
+
 ## Backup & restore
 
 State lives entirely in the SQL database (`DATABASE_URL`) — the app process
