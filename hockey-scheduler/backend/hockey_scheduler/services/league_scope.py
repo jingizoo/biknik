@@ -73,24 +73,48 @@ def league_id_for_division(store, division_id: str) -> str:
 
 
 def league_id_for_game(store, game) -> Optional[str]:
-    """Best-effort league resolution for current and legacy game rows.
+    """Resolve and reconcile every available league signal on a game.
 
-    New games carry ``season_id``. Older draft/test rows may only carry a
-    division or team relationship, so those are safe deterministic fallbacks.
+    New games carry both ``season_id`` and ``division_id``. Legacy rows may
+    carry only a division or team relationship. Explicit but dangling links are
+    rejected; conflicting season/division/team relationships are never hidden
+    by simply trusting the first one encountered.
     """
     if game is None:
         return None
-    if getattr(game, "season_id", None):
-        season = store.get_season(game.season_id)
-        if season and season.league_id:
-            return season.league_id
-    if getattr(game, "division_id", None):
-        try:
-            return league_id_for_division(store, game.division_id)
-        except DomainError:
-            pass
 
     resolved = set()
+    season_id = getattr(game, "season_id", None)
+    if season_id:
+        season = store.get_season(season_id)
+        if season is None:
+            raise ValidationError(
+                "Game is linked to a missing season.",
+                details={
+                    "reason": "game_season_missing",
+                    "game_id": getattr(game, "id", None),
+                    "season_id": season_id,
+                },
+            )
+        if not season.league_id or store.get_league(season.league_id) is None:
+            raise ValidationError(
+                "Game season is not linked to a valid league.",
+                details={
+                    "reason": "season_league_missing",
+                    "game_id": getattr(game, "id", None),
+                    "season_id": season.id,
+                    "league_id": season.league_id,
+                },
+            )
+        resolved.add(season.league_id)
+
+    division_id = getattr(game, "division_id", None)
+    if division_id:
+        resolved.add(league_id_for_division(store, division_id))
+
+    # Team-derived context is a legacy fallback and a consistency check. A
+    # missing team does not prevent a valid explicit season/division from
+    # establishing scope; other game validation owns that relationship.
     for team_id in (getattr(game, "home_team_id", None),
                     getattr(game, "away_team_id", None)):
         team = store.get_team(team_id) if team_id else None
@@ -99,15 +123,19 @@ def league_id_for_game(store, game) -> Optional[str]:
         try:
             resolved.add(league_id_for_division(store, team.division_id))
         except DomainError:
-            continue
-    if len(resolved) == 1:
-        return next(iter(resolved))
+            if not season_id and not division_id:
+                continue
+
     if len(resolved) > 1:
         raise ValidationError(
-            "The game's teams resolve to different leagues.",
-            details={"reason": "game_league_ambiguous", "game_id": game.id},
+            "The game's season, division, or teams resolve to different leagues.",
+            details={
+                "reason": "game_league_ambiguous",
+                "game_id": getattr(game, "id", None),
+                "league_ids": sorted(resolved),
+            },
         )
-    return None
+    return next(iter(resolved)) if resolved else None
 
 
 def require_game_league_id(store, game) -> str:
