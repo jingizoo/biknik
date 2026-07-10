@@ -8,6 +8,7 @@ first-admin service, so they cannot race or create two initial administrators.
 """
 
 import argparse
+import hashlib
 import hmac
 import os
 import sys
@@ -60,8 +61,9 @@ def claim_installation(api, env, app_mode: str, setup_code: str,
                        username: str, password: str):
     """Validate the one-time code and atomically create the first League Admin.
 
-    The raw code is read only for this constant-time comparison. It is never
-    returned, persisted, audited, or included in an exception/detail payload.
+    The raw code is used only to compute fixed-length SHA-256 digests that are
+    compared with ``hmac.compare_digest``. It is never returned, persisted,
+    audited, or included in an exception/detail payload.
     """
     status = installation_claim_status(api, env, app_mode)
     if not status["claim_available"]:
@@ -73,7 +75,9 @@ def claim_installation(api, env, app_mode: str, setup_code: str,
 
     configured = str(env.get(INITIAL_SETUP_CODE) or "").encode("utf-8")
     submitted = (setup_code if isinstance(setup_code, str) else "").encode("utf-8")
-    if not hmac.compare_digest(configured, submitted):
+    configured_digest = hashlib.sha256(configured).digest()
+    submitted_digest = hashlib.sha256(submitted).digest()
+    if not hmac.compare_digest(configured_digest, submitted_digest):
         raise InvalidSetupCodeError(
             "Unable to claim the installation with those details.")
 
