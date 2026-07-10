@@ -243,7 +243,8 @@ class SqlStoreTransactionTest(unittest.TestCase):
         div = svc.create_division(season.id, "D")
         home = svc.create_team(svc.create_club("CA").id, div.id, "TA")
         away = svc.create_team(svc.create_club("CB").id, div.id, "TB")
-        rink = svc.create_rink(svc.create_venue("V").id, "R")
+        rink = svc.create_rink(
+            svc.create_venue("V", league_id=league.id).id, "R")
         slot = svc.create_ice_slot(rink.id, datetime(2026, 9, 1, 18, 30, tzinfo=UTC),
                                    datetime(2026, 9, 1, 20, 0, tzinfo=UTC))
         self.assertEqual(len(store.all_games()), 0)

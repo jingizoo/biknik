@@ -52,7 +52,7 @@ def universe():
     home = svc.create_team(svc.create_club("LH").id, div.id, "Lions")
     away = svc.create_team(svc.create_club("FH").id, div.id, "Falcons")
     other = svc.create_team(svc.create_club("OH").id, div.id, "Otters")
-    venue = svc.create_venue("Arena")
+    venue = svc.create_venue("Arena", league_id=league.id)
     rink = svc.create_rink(venue.id, "Rink 1")
     slot_a = svc.create_ice_slot(rink.id, dt(18, 30), dt(20))       # game lives here
     slot_b = svc.create_ice_slot(rink.id, dt(20, 30), dt(22))       # free target

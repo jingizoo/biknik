@@ -17,7 +17,8 @@ from http.server import ThreadingHTTPServer
 from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
 
 from hockey_scheduler.api import ApiService
-from hockey_scheduler.domain import Division, IceSlot, Rink, Team
+from hockey_scheduler.domain import (
+    Division, IceSlot, League, Organization, Rink, Season, Team, Venue)
 from hockey_scheduler.domain.errors import ValidationError
 from hockey_scheduler.store import InMemoryStore
 from hockey_scheduler.services import draft_schedule
@@ -30,7 +31,12 @@ def _store(n_teams, slot_times):
     """Build a division with ``n_teams`` teams and a game slot at each of
     ``slot_times`` (datetimes) on rink r1."""
     s = InMemoryStore()
+    s.add_organization(Organization(id="org", name="Owner"))
+    s.add_league(League(id="league", name="League", organization_id="org"))
+    s.add_season(Season(id="se", league_id="league", name="Season"))
     s.add_division(Division(id="d", season_id="se", name="D"))
+    s.add_venue(Venue(id="v", name="Arena", organization_id="org",
+                      league_id="league"))
     s.add_rink(Rink(id="r1", venue_id="v", name="Main"))
     for i in range(n_teams):
         s.add_team(Team(id=f"t{i}", name=f"T{i}", division="D", division_id="d"))

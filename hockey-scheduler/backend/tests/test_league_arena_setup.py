@@ -36,7 +36,7 @@ def full_universe(svc):
     club_b = svc.create_club("Falcons Club")
     home = svc.create_team(club_a.id, division.id, "U16 Lions")
     away = svc.create_team(club_b.id, division.id, "U16 Falcons")
-    venue = svc.create_venue("Ice Palace")
+    venue = svc.create_venue("Ice Palace", league_id=league.id)
     rink = svc.create_rink(venue.id, "Rink 2")
     slot = svc.create_ice_slot(rink.id, START, END)
     return {"season": season, "division": division, "home": home,
@@ -167,7 +167,8 @@ class LeagueArenaSetupTest(unittest.TestCase):
         dv = svc.create_division(se.id, "U16 B")
         ta = svc.create_team(svc.create_club("CA").id, dv.id, "TA")
         tb = svc.create_team(svc.create_club("CB").id, dv.id, "TB")
-        rink = svc.create_rink(svc.create_venue("VE").id, "RI")
+        rink = svc.create_rink(
+            svc.create_venue("VE", league_id=lg.id).id, "RI")
         slot = svc.create_ice_slot(rink.id, dt(18, 30), dt(20))
         game = svc.create_game(se.id, dv.id, ta.id, tb.id, slot.id)
         self.assertEqual(game.season_id, se.id)
