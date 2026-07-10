@@ -94,8 +94,8 @@ function onboardingCheck(label, done, detail) {
 }
 
 function onboardingGroupState(group, firstIncomplete) {
-  if (group.optional) return "optional";
   if (group.done) return "done";
+  if (group.optional) return "optional";
   return group.number === firstIncomplete ? "current" : "todo";
 }
 
@@ -398,3 +398,14 @@ render = async function renderWithInitialSetup() {
   }
   return result;
 };
+
+// app.js begins its async bootstrap before this extension file is requested. On
+// a fast local/production connection that bootstrap can finish and render the
+// dashboard before the wrappers above are installed. Reconcile that already-
+// authenticated state once after load; if bootstrap is still pending, the
+// wrapped setUser/render path handles it instead. This closes the timing race
+// without storing navigation or setup progress in the browser.
+if (currentUser && hasPerm("manage_setup") && view === "dashboard") {
+  onboardingRoutePending = true;
+  Promise.resolve().then(() => render()).catch(() => {});
+}
