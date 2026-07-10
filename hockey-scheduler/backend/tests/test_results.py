@@ -26,7 +26,7 @@ class ResultsTest(unittest.TestCase):
         self.lions = self.svc.create_team(self.svc.create_club("Lions").id, self.div.id, "Lions")
         self.falcons = self.svc.create_team(self.svc.create_club("Falcons").id, self.div.id, "Falcons")
         self.bears = self.svc.create_team(self.svc.create_club("Bears").id, self.div.id, "Bears")
-        venue = self.svc.create_venue("Arena")
+        venue = self.svc.create_venue("Arena", league_id=league.id)
         self.rink = self.svc.create_rink(venue.id, "Rink 1")
 
     def _game(self, home, away, h=18):
