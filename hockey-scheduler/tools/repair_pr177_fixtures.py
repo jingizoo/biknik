@@ -103,7 +103,9 @@ replace(
 
 replace(
     "test_setup_facade.py",
+    '        away = self.api.create_team(club_b["id"], division["id"], "U16 Falcons")\n'
     '        venue = self.api.create_venue("Ice Palace")',
+    '        away = self.api.create_team(club_b["id"], division["id"], "U16 Falcons")\n'
     '        venue = self.api.create_venue("Ice Palace", league_id=league["id"])',
 )
 replace(
