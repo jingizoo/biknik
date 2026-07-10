@@ -171,6 +171,36 @@ class LeagueIceIsolationTest(unittest.TestCase):
         row = next(r for r in review["draft_games"] if r["game_id"] == game.id)
         self.assertIn("wrong_league_ice", row["issues"])
 
+    def test_legacy_conflicting_season_and_division_is_reported(self):
+        game = Game(
+            id="legacy_conflicting_context",
+            home_team_id=self.a1.id,
+            away_team_id=self.a2.id,
+            season_id=self.season_a.id,
+            division_id=self.div_b.id,
+            ice_slot_id=self.same_1.id,
+            start_time=self.same_1.start_time,
+            end_time=self.same_1.end_time,
+            rink=self.rink_a.name,
+            published=False,
+            is_draft=True,
+        )
+        self.store.add_game(game)
+        api = ApiService(self.store)
+
+        result = api.publish_draft_games(game_ids=[game.id])
+        self.assertEqual(
+            result["error"]["details"]["reason"], "game_league_ambiguous")
+        self.assertEqual(
+            set(result["error"]["details"]["league_ids"]),
+            {self.league_a.id, self.league_b.id})
+        self.assertTrue(game.is_draft)
+        self.assertFalse(game.published)
+
+        review = api.list_draft_games()
+        row = next(r for r in review["draft_games"] if r["game_id"] == game.id)
+        self.assertIn("league_scope_missing", row["issues"])
+
     def test_no_assigned_ice_has_clear_unscheduled_reason(self):
         # Simulate malformed legacy inventory after initial setup.
         self.venue_a.league_id = None
