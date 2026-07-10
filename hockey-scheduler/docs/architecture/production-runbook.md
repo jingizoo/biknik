@@ -250,3 +250,41 @@ behind the app version's expected set (the app will bring it current on its
 own next boot; behind is fine, ahead is not and means a newer database was
 restored against an older app version, which should not happen if app code
 and data are rolled back together).
+
+## One-time client-owned admin claim
+
+For the normal client-owned setup path, do **not** configure
+`BOOTSTRAP_ADMIN_PASSWORD`. Generate a separate high-entropy one-time code and
+place it in the deployment secret manager:
+
+```bash
+python -c "import secrets; print(secrets.token_urlsafe(32))"
+```
+
+```text
+APP_MODE=production
+DATABASE_URL=<durable Postgres or real SQLite file>
+INITIAL_SETUP_CODE=<generated one-time code>
+```
+
+Deliver the code to the client through a secure channel. The client opens
+`/setup`, enters that code, and chooses their own League Admin username and
+password. The server compares the code in constant time, atomically creates one
+admin, writes only non-secret claim metadata/audit, and establishes a normal
+secure session. The setup code and password are never returned or persisted.
+
+Operational checks:
+
+```text
+GET /api/bootstrap/status
+```
+
+- `claim_available: true` means the fresh durable installation is ready.
+- `reason: already_claimed` means use the normal sign-in page.
+- Other unavailable reasons require deployment configuration/readiness review.
+
+After a successful claim, remove `INITIAL_SETUP_CODE` from deployment
+configuration. Reusing the code cannot create another admin because the durable
+single-row claim marker and existing-account check fail closed with HTTP 409.
+The environment/CLI bootstrap remains an emergency path and consumes the same
+atomic marker, so browser and operations bootstrap cannot race.

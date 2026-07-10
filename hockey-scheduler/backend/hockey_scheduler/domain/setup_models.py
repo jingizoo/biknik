@@ -348,6 +348,20 @@ class DeviceToken:
 
 
 @dataclass
+class InstallationState:
+    """Durable one-time installation-claim marker (#174).
+
+    The row contains only operational metadata. The setup code and the client's
+    password are never persisted. A single primary-key id (``primary``) is the
+    cross-process concurrency guard for first-admin creation.
+    """
+    id: str
+    claimed_at: datetime
+    claimed_by_user_id: str
+    claim_method: str
+
+
+@dataclass
 class UserAccount:
     """A real, operator-created login for the app (#67).
 

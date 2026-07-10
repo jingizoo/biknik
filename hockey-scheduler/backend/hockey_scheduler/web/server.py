@@ -21,8 +21,14 @@ from datetime import datetime, timedelta
 from http.cookies import SimpleCookie
 
 from ..api import ApiService
-from ..bootstrap import bootstrap_admin_from_env
-from ..domain import ROLE_LABELS, Permission, Role, can, permissions_for
+from ..bootstrap import (
+    bootstrap_admin_from_env,
+    claim_installation,
+    installation_claim_status,
+)
+from ..domain import (
+    DomainError, ROLE_LABELS, Permission, Role, can, permissions_for,
+)
 from ..full_demo import build_full_demo_store
 from ..services import (
     delivery_loop_from_env,
@@ -109,6 +115,9 @@ ERROR_HTTP_STATUS = {
     "forbidden": 403,
     "unauthorized": 401,
     "game_cancelled": 409,
+    "already_claimed": 409,
+    "invalid_setup_code": 401,
+    "claim_unavailable": 403,
 }
 
 
@@ -586,7 +595,11 @@ class Handler(BaseHTTPRequestHandler):
             return {}
 
     def _serve_static(self, path: str) -> None:
-        if path in ("/", "", "/mobile", "/mobile/"):
+        if path in ("/setup", "/setup/"):
+            # The one-time production claim is deliberately isolated from
+            # the normal application/login shell (#174 PR B).
+            rel = "setup.html"
+        elif path in ("/", "", "/mobile", "/mobile/"):
             # index.html is the single responsive shell (#118) — it already
             # covers phone-width viewports (login screen, full nav, no tab
             # drift), so /mobile serves the same file rather than a second,
@@ -649,6 +662,13 @@ class Handler(BaseHTTPRequestHandler):
             if self._operator_only("/api/setup/player"):
                 return
             return self._send_api(api.get_setup_hierarchy())
+        if path == "/api/bootstrap/status":
+            # Public-safe one-time claim posture (#174). No account count,
+            # database details, usernames, or configuration values.
+            if self._rate_limited("bootstrap_status", limit=60, window_seconds=60):
+                return
+            return self._send_json(installation_claim_status(
+                api, os.environ, _app_mode()))
         if path == "/api/status":
             # Deployment posture for the UI status chips (#72): app mode +
             # store backend + email/push delivery modes. Non-sensitive, no
@@ -1024,6 +1044,29 @@ class Handler(BaseHTTPRequestHandler):
         # body-supplied actor_id must never reach an audit entry.
 
         # -- authentication (#50/#67): login / logout are open (no role required) --
+        if path == "/api/bootstrap/claim":
+            # The only anonymous setup mutation (#174): fresh production,
+            # durable store, configured one-time code, and zero prior claim.
+            # Rate-limit before code comparison; neither submitted secret is
+            # logged, echoed, persisted, or placed in the URL.
+            if self._rate_limited("bootstrap_claim", limit=5, window_seconds=60):
+                return
+            try:
+                account = claim_installation(
+                    api, os.environ, _app_mode(),
+                    body.get("setup_code", ""),
+                    body.get("username", ""),
+                    body.get("password", ""))
+            except DomainError as exc:
+                return self._send_api(exc.to_dict())
+            token = SESSIONS.login(
+                api.store, account.id,
+                user_agent=self.headers.get("User-Agent"))
+            sess = SESSIONS.resolve(api.store, token)
+            cookie = self._session_cookie(token, SESSION_MAX_AGE)
+            return self._send_json(
+                {"user": user_view(sess, api.store)},
+                extra_headers=[("Set-Cookie", cookie)])
         if path == "/api/auth/login":
             # Credentials are verified against a real, hashed UserAccount
             # (#67); role + scope come from that account, not a login-time

@@ -1,15 +1,18 @@
-"""PostgreSQL smoke test — exercises the SQL store against real Postgres.
+"""PostgreSQL smoke tests — exercise the SQL store against real Postgres.
 
 Skipped unless TEST_DATABASE_URL is set (CI sets it to a Postgres service).
 The same SqlStore code path is covered against SQLite in test_sql_store.py.
 """
 
 import os
+import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 
 from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
 
 from hockey_scheduler.api import ApiService
+from hockey_scheduler.domain.errors import AlreadyClaimedError
 from hockey_scheduler.full_demo import build_full_demo_store
 from hockey_scheduler.store import SqlStore
 
@@ -20,7 +23,11 @@ URL = os.environ.get("TEST_DATABASE_URL")
 class PostgresSmokeTest(unittest.TestCase):
     def setUp(self):
         # Start from a clean schema so the run is isolated.
-        SqlStore(URL).reset_schema()
+        store = SqlStore(URL)
+        try:
+            store.reset_schema()
+        finally:
+            store.close()
 
     def test_seed_flow_and_reload_on_postgres(self):
         store = SqlStore(URL)
@@ -47,6 +54,39 @@ class PostgresSmokeTest(unittest.TestCase):
         published = [g for g in ov["schedule"] if g["published"]]
         self.assertEqual(len(ov["public_fixtures"]), len(published))
         self.assertEqual(len(published), 19)
+        store.close()
+        api2.store.close()
+
+    def test_concurrent_first_admin_claim_creates_exactly_one_account(self):
+        """Two independent Postgres connections race the durable claim marker."""
+        barrier = threading.Barrier(2)
+
+        def attempt(username):
+            store = SqlStore(URL)
+            api = ApiService(store)
+            try:
+                barrier.wait()
+                try:
+                    account = api.accounts.create_first_admin_if_unclaimed(
+                        username, "fixture-password", claim_method="browser")
+                    return account.username
+                except AlreadyClaimedError:
+                    return "already_claimed"
+            finally:
+                store.close()
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(attempt, ("admin-a", "admin-b")))
+
+        self.assertEqual(results.count("already_claimed"), 1)
+        inspector = SqlStore(URL)
+        try:
+            self.assertEqual(len(inspector.all_user_accounts()), 1)
+            marker = inspector.get_installation_state("primary")
+            self.assertIsNotNone(marker)
+            self.assertEqual(marker.claim_method, "browser")
+        finally:
+            inspector.close()
 
 
 if __name__ == "__main__":

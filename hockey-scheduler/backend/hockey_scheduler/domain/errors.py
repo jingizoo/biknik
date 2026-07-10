@@ -70,3 +70,21 @@ class DivisionMismatchError(DomainError):
 
 class NotAuthorizedError(DomainError):
     code = "forbidden"
+
+
+class AlreadyClaimedError(DomainError):
+    """A one-time installation claim has already been consumed (#174)."""
+
+    code = "already_claimed"
+
+
+class InvalidSetupCodeError(DomainError):
+    """The submitted one-time setup code did not match (#174)."""
+
+    code = "invalid_setup_code"
+
+
+class ClaimUnavailableError(DomainError):
+    """The deployment is not in a posture where browser claim is allowed."""
+
+    code = "claim_unavailable"

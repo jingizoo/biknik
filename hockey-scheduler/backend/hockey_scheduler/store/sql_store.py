@@ -57,6 +57,7 @@ from ..domain import (
     Role,
     RosterEntryStatus,
     GuardianLink,
+    InstallationState,
     RosterRole,
     Season,
     SelectionSource,
@@ -191,6 +192,9 @@ SPECS = {
     NotificationPreference: Spec(
         NotificationPreference, "notification_preferences",
         {"channel": _enum(NotificationChannel), "enabled": _bool()}),
+    InstallationState: Spec(
+        InstallationState, "installation_state",
+        {"claimed_at": _dt()}),
     UserAccount: Spec(UserAccount, "user_accounts",
                       {"role": _enum(Role), "created_at": _dt(),
                        "scope": _jsonc(), "active": _bool()}),
@@ -667,6 +671,11 @@ class SqlStore:
     def preferences_for_recipient(self, recipient_ref):
         return self._query(NotificationPreference, "recipient_ref = ?",
                            (recipient_ref,), order="id")
+
+    # -- installation claim state (#174) -----------------------------------
+    def add_installation_state(self, state): return self._insert(state)
+    def get_installation_state(self, state_id):
+        return self._get(InstallationState, state_id)
 
     # -- user accounts (#67) -------------------------------------------------
     def add_user_account(self, a): return self._insert(a)

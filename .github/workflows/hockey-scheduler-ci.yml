@@ -69,10 +69,11 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
-      - name: Syntax-check app.js (#138)
-        # No build step or bundler for the frontend by design — this is a
-        # cheap gate against a shipped syntax error, not a full lint pass.
-        run: node --check hockey-scheduler/backend/hockey_scheduler/web/static/app.js
+      - name: Syntax-check browser scripts
+        run: |
+          node --check hockey-scheduler/backend/hockey_scheduler/web/static/app.js
+          node --check hockey-scheduler/backend/hockey_scheduler/web/static/setup.js
+          node --check hockey-scheduler/e2e/setup-claim.js
 
   browser-smoke:
     runs-on: ubuntu-latest
@@ -90,6 +91,8 @@ jobs:
         run: |
           npm ci
           npx playwright install --with-deps chromium
-      - name: Run browser smoke test (#138)
+      - name: Run browser smoke and production claim journey
         working-directory: hockey-scheduler/e2e
-        run: npm run smoke
+        run: |
+          npm run smoke
+          npm run setup-claim

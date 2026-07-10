@@ -1,0 +1,136 @@
+:root {
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  color: #172033;
+  background: #f3f5f8;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  min-height: 100vh;
+}
+
+.setup-shell {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 32px 20px;
+}
+
+.setup-card {
+  width: min(100%, 520px);
+  background: #fff;
+  border: 1px solid #dfe4ec;
+  border-radius: 18px;
+  box-shadow: 0 18px 50px rgba(25, 39, 63, 0.10);
+  padding: 32px;
+}
+
+.eyebrow {
+  margin: 0 0 8px;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  font-size: 12px;
+  font-weight: 700;
+  color: #59677c;
+}
+
+h1 {
+  margin: 0 0 12px;
+  font-size: clamp(28px, 6vw, 38px);
+  line-height: 1.1;
+}
+
+.muted, .privacy-note {
+  color: #667085;
+  line-height: 1.55;
+}
+
+.status {
+  margin: 22px 0;
+  padding: 12px 14px;
+  border-radius: 10px;
+  background: #f4f7fb;
+  border: 1px solid #e3e8ef;
+  line-height: 1.45;
+}
+
+form {
+  display: grid;
+  gap: 16px;
+}
+
+label {
+  display: grid;
+  gap: 7px;
+  font-size: 14px;
+  font-weight: 650;
+}
+
+input {
+  width: 100%;
+  border: 1px solid #cbd3df;
+  border-radius: 10px;
+  padding: 12px 13px;
+  font: inherit;
+  color: inherit;
+  background: #fff;
+}
+
+input:focus {
+  outline: 3px solid rgba(46, 102, 255, 0.18);
+  border-color: #2e66ff;
+}
+
+button {
+  border: 0;
+  border-radius: 10px;
+  padding: 13px 16px;
+  font: inherit;
+  font-weight: 700;
+  color: #fff;
+  background: #234fd3;
+  cursor: pointer;
+}
+
+button:disabled {
+  cursor: wait;
+  opacity: 0.65;
+}
+
+.message {
+  min-height: 1.5em;
+  margin: 16px 0 0;
+  color: #b42318;
+  line-height: 1.45;
+}
+
+.message.success { color: #067647; }
+
+.sign-in {
+  display: inline-block;
+  margin-top: 8px;
+  font-weight: 700;
+  color: #234fd3;
+}
+
+.privacy-note {
+  margin: 24px 0 0;
+  padding-top: 18px;
+  border-top: 1px solid #e5e9f0;
+  font-size: 13px;
+}
+
+[hidden] { display: none !important; }
+
+@media (max-width: 520px) {
+  .setup-shell { padding: 0; place-items: stretch; }
+  .setup-card {
+    min-height: 100vh;
+    border: 0;
+    border-radius: 0;
+    box-shadow: none;
+    padding: 28px 20px;
+  }
+}

@@ -7,6 +7,7 @@ later without touching domain logic.
 
 from contextlib import contextmanager
 from datetime import datetime
+import threading
 from itertools import count
 from typing import Dict, List, Optional
 
@@ -29,6 +30,7 @@ from ..domain import (
     Notification,
     NotificationDelivery,
     GuardianLink,
+    InstallationState,
     NotificationEvent,
     NotificationPreference,
     NotificationRecipient,
@@ -81,17 +83,20 @@ class InMemoryStore:
         self.notification_preferences: Dict[str, NotificationPreference] = {}
         self.calendar_feed_tokens: Dict[str, CalendarFeedToken] = {}
         self.official_availability: Dict[str, OfficialAvailability] = {}
+        self.installation_state: Dict[str, InstallationState] = {}
         self.user_accounts: Dict[str, UserAccount] = {}
         self.sessions: Dict[str, Session] = {}
         self.guardian_links: Dict[str, GuardianLink] = {}
         self.reschedule_requests: Dict[str, RescheduleRequest] = {}
         self.setup_audit: List[SetupAuditLog] = []
         self._counters: Dict[str, count] = {}
+        self._lock = threading.RLock()
 
     @contextmanager
     def transaction(self):
-        """No-op for the in-memory store (single-process, by reference)."""
-        yield
+        """Serialize atomic service operations in the threaded test/demo store."""
+        with self._lock:
+            yield
 
     def close(self) -> None:
         pass
@@ -512,6 +517,16 @@ class InMemoryStore:
             self, recipient_ref: str) -> List[NotificationPreference]:
         return [p for p in self.notification_preferences.values()
                 if p.recipient_ref == recipient_ref]
+
+    # -- installation claim state (#174) -----------------------------------
+    def add_installation_state(
+            self, state: InstallationState) -> InstallationState:
+        self.installation_state[state.id] = state
+        return state
+
+    def get_installation_state(
+            self, state_id: str) -> Optional[InstallationState]:
+        return self.installation_state.get(state_id)
 
     # -- user accounts (#67) -------------------------------------------------
     def add_user_account(self, a: UserAccount) -> UserAccount:
