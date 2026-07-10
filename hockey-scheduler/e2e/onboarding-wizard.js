@@ -100,10 +100,19 @@ async function checkViewport(browser, viewport) {
     await page.click("#login-form button[type=submit]");
 
     await page.waitForSelector('body[data-view="onboarding"]', { timeout: 10000 });
+    if (PHASE === "route") {
+      console.log(`[${viewport.label}] OK — routed to Initial Setup.`);
+      return;
+    }
+
     await page.getByRole("heading", { name: "Complete the league foundation" }).waitFor();
     await page.waitForSelector('[data-onboarding-step="organization"].current');
     await page.waitForSelector('.tab[data-tab="onboarding"].active');
     await page.getByText("Progress is recalculated from saved records", { exact: false }).waitFor();
+    if (PHASE === "content") {
+      console.log(`[${viewport.label}] OK — rendered the expected Initial Setup content.`);
+      return;
+    }
 
     const status = await page.evaluate(async () => {
       const response = await fetch("/api/onboarding/status", {
@@ -117,7 +126,7 @@ async function checkViewport(browser, viewport) {
       throw new Error(`[${viewport.label}] unexpected empty-install status: ${JSON.stringify(status)}`);
     }
     if (PHASE === "landing") {
-      console.log(`[${viewport.label}] OK — auto-routed to persisted Initial Setup status.`);
+      console.log(`[${viewport.label}] OK — status matches the fresh persisted installation.`);
       return;
     }
 
