@@ -99,6 +99,26 @@ jobs:
         run: npm run smoke
       - name: Run production first-admin claim journey
         run: npm run setup-claim
+      - name: Initial Setup desktop login
+        env:
+          ONBOARDING_VIEWPORT: desktop
+          ONBOARDING_PHASE: login
+        run: npm run onboarding-wizard
+      - name: Initial Setup desktop persisted session
+        env:
+          ONBOARDING_VIEWPORT: desktop
+          ONBOARDING_PHASE: auth
+        run: npm run onboarding-wizard
+      - name: Initial Setup desktop extension load
+        env:
+          ONBOARDING_VIEWPORT: desktop
+          ONBOARDING_PHASE: extension
+        run: npm run onboarding-wizard
+      - name: Initial Setup desktop status access
+        env:
+          ONBOARDING_VIEWPORT: desktop
+          ONBOARDING_PHASE: status
+        run: npm run onboarding-wizard
       - name: Initial Setup desktop automatic route
         env:
           ONBOARDING_VIEWPORT: desktop
@@ -108,11 +128,6 @@ jobs:
         env:
           ONBOARDING_VIEWPORT: desktop
           ONBOARDING_PHASE: content
-        run: npm run onboarding-wizard
-      - name: Initial Setup desktop persisted status
-        env:
-          ONBOARDING_VIEWPORT: desktop
-          ONBOARDING_PHASE: landing
         run: npm run onboarding-wizard
       - name: Initial Setup desktop resume
         env:
@@ -124,6 +139,26 @@ jobs:
           ONBOARDING_VIEWPORT: desktop
           ONBOARDING_PHASE: full
         run: npm run onboarding-wizard
+      - name: Initial Setup phone login
+        env:
+          ONBOARDING_VIEWPORT: phone
+          ONBOARDING_PHASE: login
+        run: npm run onboarding-wizard
+      - name: Initial Setup phone persisted session
+        env:
+          ONBOARDING_VIEWPORT: phone
+          ONBOARDING_PHASE: auth
+        run: npm run onboarding-wizard
+      - name: Initial Setup phone extension load
+        env:
+          ONBOARDING_VIEWPORT: phone
+          ONBOARDING_PHASE: extension
+        run: npm run onboarding-wizard
+      - name: Initial Setup phone status access
+        env:
+          ONBOARDING_VIEWPORT: phone
+          ONBOARDING_PHASE: status
+        run: npm run onboarding-wizard
       - name: Initial Setup phone automatic route
         env:
           ONBOARDING_VIEWPORT: phone
@@ -133,11 +168,6 @@ jobs:
         env:
           ONBOARDING_VIEWPORT: phone
           ONBOARDING_PHASE: content
-        run: npm run onboarding-wizard
-      - name: Initial Setup phone persisted status
-        env:
-          ONBOARDING_VIEWPORT: phone
-          ONBOARDING_PHASE: landing
         run: npm run onboarding-wizard
       - name: Initial Setup phone resume
         env:
