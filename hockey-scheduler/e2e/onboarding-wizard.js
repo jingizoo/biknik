@@ -99,8 +99,16 @@ async function checkViewport(browser, viewport) {
     await page.waitForSelector("#login-screen:not([hidden])", { timeout: 10000 });
     await page.fill("#login-user", ADMIN_USER);
     await page.fill("#login-pass", ADMIN_PASSWORD);
+    const loginResponsePromise = page.waitForResponse((response) =>
+      response.url() === `${browserBase}/api/auth/login`
+      && response.request().method() === "POST");
     await page.click("#login-form button[type=submit]");
-    await page.waitForSelector("#login-screen[hidden]", { timeout: 10000 });
+    const loginResponse = await loginResponsePromise;
+    const loginBody = await loginResponse.json();
+    if (loginResponse.status() !== 200 || !loginBody.user
+        || loginBody.user.role !== "league_admin") {
+      throw new Error(`[${viewport.label}] login failed: HTTP ${loginResponse.status()} ${JSON.stringify(loginBody)}`);
+    }
     if (PHASE === "login") {
       console.log(`[${viewport.label}] OK — production login response accepted.`);
       return;
