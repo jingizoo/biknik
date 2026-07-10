@@ -129,6 +129,25 @@ class ServerAuthzTest(unittest.TestCase):
         self.assertIn("leagues", body)
         self.assertIn("missing_assignments", body)
 
+    # -- reassignment routes carry the same gate as their create sibling ----
+    def test_viewer_cannot_reassign_team_club(self):
+        status, body = self._post("/api/setup/team/team_x/assign-club",
+                                  {"club_id": "club_x"}, role="viewer")
+        self.assertEqual(status, 403)
+        self.assertEqual(body["error"]["details"]["required"], "manage_setup")
+
+    def test_arena_manager_gates_venue_vs_division_reassignment(self):
+        # An Arena Manager holds MANAGE_ARENA but not MANAGE_SETUP: the
+        # facility-side venue move is authorized (not 403), while the
+        # league-side division move is forbidden.
+        status, _ = self._post("/api/setup/venue/venue_x/assign-organization",
+                               {"organization_id": None}, role="arena_manager")
+        self.assertNotEqual(status, 403)
+        status, body = self._post("/api/setup/division/div_x/assign-level",
+                                  {"level_id": None}, role="arena_manager")
+        self.assertEqual(status, 403)
+        self.assertEqual(body["error"]["details"]["required"], "manage_setup")
+
     # -- contact registry is operator-only (#60) ---------------------------
     def test_viewer_cannot_read_or_write_contacts(self):
         status, _ = self._get_h("/api/notifications/contacts", role="viewer")

@@ -2174,6 +2174,42 @@ class ApiService:
                     actor_id: Optional[str] = None) -> dict:
         return _serialize(self.setup.create_team(club_id, division_id, name, actor_id))
 
+    # -- reassignment: move a record under a new parent (#166 PR D) --------
+    @catch
+    def assign_venue_organization(self, venue_id: str,
+                                  organization_id: Optional[str] = None,
+                                  actor_id: Optional[str] = None) -> dict:
+        return _serialize(self.setup.assign_venue_organization(
+            venue_id, organization_id, actor_id))
+
+    @catch
+    def assign_rink_venue(self, rink_id: str, venue_id: str,
+                          actor_id: Optional[str] = None) -> dict:
+        return _serialize(self.setup.assign_rink_venue(rink_id, venue_id, actor_id))
+
+    @catch
+    def assign_division_level(self, division_id: str,
+                              level_id: Optional[str] = None,
+                              actor_id: Optional[str] = None) -> dict:
+        return _serialize(self.setup.assign_division_level(
+            division_id, level_id, actor_id))
+
+    @catch
+    def assign_team_club(self, team_id: str, club_id: Optional[str] = None,
+                         actor_id: Optional[str] = None) -> dict:
+        return _serialize(self.setup.assign_team_club(team_id, club_id, actor_id))
+
+    @catch
+    def assign_team_division(self, team_id: str, division_id: str,
+                             actor_id: Optional[str] = None) -> dict:
+        return _serialize(self.setup.assign_team_division(
+            team_id, division_id, actor_id))
+
+    @catch
+    def assign_player_team(self, player_id: str, team_id: str,
+                           actor_id: Optional[str] = None) -> dict:
+        return _serialize(self.setup.assign_player_team(player_id, team_id, actor_id))
+
     @catch
     def create_organization(self, name: str, short_name: str = "",
                             actor_id: Optional[str] = None) -> dict:

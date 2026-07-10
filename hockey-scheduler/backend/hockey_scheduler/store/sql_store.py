@@ -503,6 +503,7 @@ class SqlStore:
     def add_division(self, division): return self._insert(division)
     def get_division(self, division_id): return self._get(Division, division_id)
     def all_divisions(self): return self._query(Division, order="id")
+    def save_division(self, division): return self._update(division)
     def divisions_for_season(self, season_id):
         return self._query(Division, "season_id = ?", (season_id,), order="id")
 
@@ -518,6 +519,7 @@ class SqlStore:
     def add_venue(self, venue): return self._insert(venue)
     def get_venue(self, venue_id): return self._get(Venue, venue_id)
     def all_venues(self): return self._query(Venue, order="id")
+    def save_venue(self, venue): return self._update(venue)
 
     def add_rink(self, rink): return self._insert(rink)
     def get_rink(self, rink_id): return self._get(Rink, rink_id)
