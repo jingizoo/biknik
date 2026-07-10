@@ -16,16 +16,10 @@ const BACKEND_DIR = path.resolve(__dirname, "..", "backend");
 const READY_TIMEOUT_MS = 15000;
 const ADMIN_USER = "onboarding-admin";
 const ADMIN_PASSWORD = "fixture-onboarding-password";
-const PHASE = process.env.ONBOARDING_PHASE || "full";
-const VIEWPORT_FILTER = process.env.ONBOARDING_VIEWPORT || "all";
 const VIEWPORTS = [
   { label: "desktop", width: 1440, height: 900, port: 8133 },
   { label: "phone", width: 390, height: 844, port: 8134 },
-].filter((viewport) => VIEWPORT_FILTER === "all" || viewport.label === VIEWPORT_FILTER);
-
-if (!VIEWPORTS.length) {
-  throw new Error(`Unknown ONBOARDING_VIEWPORT '${VIEWPORT_FILTER}'.`);
-}
+];
 
 function waitForServer(url, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
@@ -99,6 +93,7 @@ async function checkViewport(browser, viewport) {
     await page.waitForSelector("#login-screen:not([hidden])", { timeout: 10000 });
     await page.fill("#login-user", ADMIN_USER);
     await page.fill("#login-pass", ADMIN_PASSWORD);
+
     const loginResponsePromise = page.waitForResponse((response) =>
       response.url() === `${browserBase}/api/auth/login`
       && response.request().method() === "POST");
@@ -108,10 +103,6 @@ async function checkViewport(browser, viewport) {
     if (loginResponse.status() !== 200 || !loginBody.user
         || loginBody.user.role !== "league_admin") {
       throw new Error(`[${viewport.label}] login failed: HTTP ${loginResponse.status()} ${JSON.stringify(loginBody)}`);
-    }
-    if (PHASE === "login") {
-      console.log(`[${viewport.label}] OK — production login response accepted.`);
-      return;
     }
 
     const me = await page.evaluate(async () => {
@@ -124,23 +115,12 @@ async function checkViewport(browser, viewport) {
     if (me.status !== 200 || !me.body.user || me.body.user.role !== "league_admin") {
       throw new Error(`[${viewport.label}] session did not persist: ${JSON.stringify(me)}`);
     }
-    if (PHASE === "auth") {
-      console.log(`[${viewport.label}] OK — production session persisted.`);
-      return;
-    }
 
-    const extension = await page.evaluate(() => ({
-      loaded: typeof renderInitialSetup === "function",
-      currentRole: currentUser && currentUser.role,
-      currentView: view,
-    }));
-    if (!extension.loaded || extension.currentRole !== "league_admin") {
-      throw new Error(`[${viewport.label}] onboarding extension state: ${JSON.stringify(extension)}`);
-    }
-    if (PHASE === "extension") {
-      console.log(`[${viewport.label}] OK — onboarding extension loaded for League Admin.`);
-      return;
-    }
+    await page.waitForSelector('body[data-view="onboarding"]', { timeout: 10000 });
+    await page.getByRole("heading", { name: "Complete the league foundation" }).waitFor();
+    await page.waitForSelector('[data-onboarding-step="organization"].current');
+    await page.waitForSelector('.tab[data-tab="onboarding"].active');
+    await page.getByText("Progress is recalculated from saved records", { exact: false }).waitFor();
 
     const status = await page.evaluate(async () => {
       const response = await fetch("/api/onboarding/status", {
@@ -153,24 +133,15 @@ async function checkViewport(browser, viewport) {
         || !status.body.blocking.some((item) => item.code === "no_organization")) {
       throw new Error(`[${viewport.label}] unexpected empty-install status: ${JSON.stringify(status)}`);
     }
-    if (PHASE === "status") {
-      console.log(`[${viewport.label}] OK — onboarding status is authenticated and actionable.`);
-      return;
-    }
 
-    await page.waitForSelector('body[data-view="onboarding"]', { timeout: 10000 });
-    if (PHASE === "route") {
-      console.log(`[${viewport.label}] OK — routed to Initial Setup.`);
-      return;
-    }
-
-    await page.getByRole("heading", { name: "Complete the league foundation" }).waitFor();
-    await page.waitForSelector('[data-onboarding-step="organization"].current');
-    await page.waitForSelector('.tab[data-tab="onboarding"].active');
-    await page.getByText("Progress is recalculated from saved records", { exact: false }).waitFor();
-    if (PHASE === "content") {
-      console.log(`[${viewport.label}] OK — rendered the expected Initial Setup content.`);
-      return;
+    const storage = await page.evaluate(() => ({
+      local: Object.keys(localStorage),
+      session: Object.keys(sessionStorage),
+    }));
+    const forbiddenStorage = [...storage.local, ...storage.session]
+      .filter((key) => /onboarding|initial.?setup|setup.?step/i.test(key));
+    if (forbiddenStorage.length) {
+      throw new Error(`[${viewport.label}] onboarding progress leaked to browser storage: ${forbiddenStorage.join(", ")}`);
     }
 
     // Continue later is a real escape hatch, not a trap.
@@ -181,10 +152,6 @@ async function checkViewport(browser, viewport) {
     await page.click('.tab[data-tab="onboarding"]');
     await page.waitForSelector('body[data-view="onboarding"]', { timeout: 10000 });
     await page.waitForSelector('[data-onboarding-step="organization"].current');
-    if (PHASE === "resume") {
-      console.log(`[${viewport.label}] OK — left and resumed Initial Setup.`);
-      return;
-    }
 
     // The Fix action reuses the existing Setup drawer instead of a parallel form.
     await page.click('[data-onboarding-drawer="organization"]');
@@ -213,9 +180,9 @@ async function main() {
         : {},
     );
     for (const viewport of VIEWPORTS) await checkViewport(browser, viewport);
-    console.log(`Guided Initial Setup browser journey passed (${VIEWPORT_FILTER}/${PHASE}).`);
+    console.log("Guided Initial Setup browser journey passed.");
   } catch (error) {
-    console.error(`Guided Initial Setup browser journey FAILED (${VIEWPORT_FILTER}/${PHASE}).`);
+    console.error("Guided Initial Setup browser journey FAILED.");
     console.error(error && error.message ? error.message : error);
     process.exitCode = 1;
   } finally {
