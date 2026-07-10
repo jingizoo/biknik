@@ -99,5 +99,71 @@ class SetupReassignTest(unittest.TestCase):
         self.assertEqual(entry.detail["to"], self.org["id"])
 
 
+class LeagueVenueReassignTest(unittest.TestCase):
+    """Cross-domain league↔facility reassignment (#173 PR B): league owner and
+    venue league, with owner agreement, the owner-change guard, and the
+    stranded-game safety check."""
+
+    def setUp(self):
+        self.api = ApiService()
+        self.org = self.api.create_organization("Canlon")
+        self.org2 = self.api.create_organization("Rival Owner")
+        self.league = self.api.create_league("Over 55", organization_id=self.org["id"])
+        self.venue = self.api.create_venue("Plainfield")
+
+    def test_assign_league_organization(self):
+        league = self.api.create_league("New League")  # ownerless
+        r = self.api.assign_league_organization(league["id"], self.org["id"])
+        self.assertEqual(r["organization_id"], self.org["id"])
+
+    def test_assign_venue_league_derives_owner(self):
+        r = self.api.assign_venue_league(self.venue["id"], self.league["id"])
+        self.assertEqual(r["league_id"], self.league["id"])
+        self.assertEqual(r["organization_id"], self.org["id"])  # derived
+
+    def test_assign_venue_to_league_with_conflicting_owner_rejected(self):
+        owned = self.api.create_venue("Owned", organization_id=self.org2["id"])
+        r = self.api.assign_venue_league(owned["id"], self.league["id"])
+        self.assertEqual(r["error"]["code"], "validation_error")
+
+    def test_league_owner_change_with_attached_venue_rejected(self):
+        self.api.assign_venue_league(self.venue["id"], self.league["id"])
+        r = self.api.assign_league_organization(self.league["id"], self.org2["id"])
+        self.assertEqual(r["error"]["code"], "validation_error")
+
+    def test_unassign_venue_league(self):
+        self.api.assign_venue_league(self.venue["id"], self.league["id"])
+        r = self.api.assign_venue_league(self.venue["id"], None)
+        self.assertIsNone(r["league_id"])
+
+    def test_venue_league_reassignment_is_audited_from_to(self):
+        self.api.assign_venue_league(self.venue["id"], self.league["id"])
+        entry = next(a for a in self.api.store.all_setup_audit()
+                     if a.action == "venue_league_assigned")
+        self.assertIsNone(entry.detail["from"])
+        self.assertEqual(entry.detail["to"], self.league["id"])
+
+    def test_venue_reassignment_refuses_to_strand_scheduled_games(self):
+        # A game scheduled on the venue's ice belongs to the league; moving the
+        # venue to another league would strand it, so the move is refused.
+        season = self.api.create_season(self.league["id"], "Fall 2026")
+        div = self.api.create_division(season["id"], "Div A")
+        c1 = self.api.create_club("Club A")
+        c2 = self.api.create_club("Club B")
+        home = self.api.create_team(c1["id"], div["id"], "Team A")
+        away = self.api.create_team(c2["id"], div["id"], "Team B")
+        rink = self.api.create_rink(self.venue["id"], "Rink 1")
+        slot = self.api.create_ice_slot(
+            rink["id"], "2026-09-01T18:30:00+00:00", "2026-09-01T20:00:00+00:00")
+        self.api.assign_venue_league(self.venue["id"], self.league["id"])
+        self.api.create_game(season["id"], div["id"], home["id"], away["id"], slot["id"])
+        other = self.api.create_league("Other League", organization_id=self.org["id"])
+        r = self.api.assign_venue_league(self.venue["id"], other["id"])
+        self.assertEqual(r["error"]["code"], "validation_error")
+        # The venue stayed put.
+        self.assertEqual(self.api.store.get_venue(self.venue["id"]).league_id,
+                         self.league["id"])
+
+
 if __name__ == "__main__":
     unittest.main()

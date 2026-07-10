@@ -1550,6 +1550,12 @@ class Handler(BaseHTTPRequestHandler):
         api = STATE.api
         b = body
         combo = (entity, target)
+        if combo == ("league", "organization"):
+            return self._send_api(api.assign_league_organization(
+                record_id, b.get("organization_id") or None, actor_id))
+        if combo == ("venue", "league"):
+            return self._send_api(api.assign_venue_league(
+                record_id, b.get("league_id") or None, actor_id))
         if combo == ("venue", "organization"):
             return self._send_api(api.assign_venue_organization(
                 record_id, b.get("organization_id") or None, actor_id))
@@ -1583,7 +1589,7 @@ class Handler(BaseHTTPRequestHandler):
         b = body
         # Reassignment routes (#166 PR D): /api/setup/<entity>/<id>/assign-<parent>.
         # Move a record under a new parent, recording the old→new ids in audit.
-        m = re.match(r"^(venue|rink|division|team|player)/([^/]+)/assign-(\w+)$", entity)
+        m = re.match(r"^(league|venue|rink|division|team|player)/([^/]+)/assign-(\w+)$", entity)
         if m:
             return self._handle_reassign(m.group(1), m.group(2), m.group(3), b, actor_id)
         if entity == "league":

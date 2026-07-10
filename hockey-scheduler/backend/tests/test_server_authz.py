@@ -148,6 +148,18 @@ class ServerAuthzTest(unittest.TestCase):
         self.assertEqual(status, 403)
         self.assertEqual(body["error"]["details"]["required"], "manage_setup")
 
+    def test_cross_domain_league_venue_moves_are_setup_only(self):
+        # Tying a league to an owner or a venue to a league spans both domains
+        # (#173): MANAGE_SETUP only. An Arena Manager (MANAGE_ARENA) is
+        # forbidden even though its plain venue moves are allowed.
+        for path, body in (
+            ("/api/setup/league/league_x/assign-organization", {"organization_id": None}),
+            ("/api/setup/venue/venue_x/assign-league", {"league_id": None}),
+        ):
+            status, resp = self._post(path, body, role="arena_manager")
+            self.assertEqual(status, 403, path)
+            self.assertEqual(resp["error"]["details"]["required"], "manage_setup", path)
+
     # -- contact registry is operator-only (#60) ---------------------------
     def test_viewer_cannot_read_or_write_contacts(self):
         status, _ = self._get_h("/api/notifications/contacts", role="viewer")
