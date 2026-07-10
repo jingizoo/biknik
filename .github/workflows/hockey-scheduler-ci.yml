@@ -37,6 +37,12 @@ jobs:
         with:
           name: unit-test-log
           path: /tmp/unit-tests.log
+      - name: Upload test sources for fixture repair
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-sources
+          path: hockey-scheduler/backend/tests
 
   postgres:
     runs-on: ubuntu-latest
