@@ -10,7 +10,8 @@ const http = require("http");
 const os = require("os");
 const path = require("path");
 
-const HOST = "127.0.0.1";
+const BIND_HOST = "127.0.0.1";
+const BROWSER_HOST = "localhost";
 const BACKEND_DIR = path.resolve(__dirname, "..", "backend");
 const READY_TIMEOUT_MS = 15000;
 const ADMIN_USER = "onboarding-admin";
@@ -59,10 +60,11 @@ function stopServer(server) {
 async function checkViewport(browser, viewport) {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "hockey-onboarding-"));
   const databasePath = path.join(tempDir, "client.sqlite");
-  const base = `http://${HOST}:${viewport.port}`;
+  const browserBase = `http://${BROWSER_HOST}:${viewport.port}`;
+  const probeBase = `http://${BIND_HOST}:${viewport.port}`;
   const server = spawn(
     process.env.PYTHON || "python3",
-    ["-u", "-m", "hockey_scheduler.web.server", "--host", HOST,
+    ["-u", "-m", "hockey_scheduler.web.server", "--host", BIND_HOST,
       "--port", String(viewport.port)],
     {
       cwd: BACKEND_DIR,
@@ -92,8 +94,8 @@ async function checkViewport(browser, viewport) {
   });
 
   try {
-    await waitForServer(`${base}/api/health`, READY_TIMEOUT_MS);
-    await page.goto(base, { waitUntil: "domcontentloaded" });
+    await waitForServer(`${probeBase}/api/health`, READY_TIMEOUT_MS);
+    await page.goto(browserBase, { waitUntil: "domcontentloaded" });
     await page.waitForSelector("#login-screen:not([hidden])", { timeout: 10000 });
     await page.fill("#login-user", ADMIN_USER);
     await page.fill("#login-pass", ADMIN_PASSWORD);
