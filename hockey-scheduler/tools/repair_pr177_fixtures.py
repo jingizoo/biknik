@@ -8,6 +8,8 @@ ROOT = Path(__file__).resolve().parents[1] / "backend" / "tests"
 def replace(path, old, new, count=None):
     p = ROOT / path
     text = p.read_text()
+    if new in text:
+        return  # already applied by an earlier workflow run
     actual = text.count(old)
     expected = count if count is not None else 1
     if actual != expected:
