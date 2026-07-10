@@ -63,6 +63,7 @@ let tokenForm = { recipient_ref: "", provider: "fcm", token: "", label: "" };
 let movingGameId = null;    // click-to-move fallback: game awaiting a destination slot
 let conflict = null;        // {ok, title, lines[], undo?} — calendar side panel (#43/#153)
 let pendingMove = null;     // {gid, slotId, willUnpublish, willUnlock} — move awaiting confirmation (#153)
+let pendingReassign = null; // {kind, parent, id, name, curId, seasonId} — setup reassignment awaiting confirm (#166)
 let drawer = null;          // {kind} when a Setup create drawer is open (#44)
 let drawerError = "";       // validation/API error shown inside the open drawer
 let drawerValues = {};      // {fieldId: value} preserved across re-render on error
@@ -590,6 +591,88 @@ function treeAdd(kind, label, prefillField, prefillValue, prefillField2, prefill
 }
 const capWord = (s) => (s ? String(s).charAt(0).toUpperCase() + String(s).slice(1) : "");
 
+// Reassignment (#166 PR D UI): move a record under a new parent via the
+// /api/setup/<kind>/<id>/assign-<parent> endpoints. Each entry describes one
+// move: its permission, parent noun, whether it can be unassigned (nullable),
+// whether it's a risky move that warrants a warning, and how to build the
+// candidate-parent options from the overview.
+const REASSIGN = {
+  "venue:organization": {
+    perm: "manage_arena", noun: "facility owner", nullable: true, risky: false,
+    options: (ov) => (ov.organizations || []).map((o) => [o.id, o.name]) },
+  "rink:venue": {
+    perm: "manage_arena", noun: "venue", nullable: false, risky: false,
+    options: (ov) => (ov.venues || []).map((v) => [v.id, v.name]) },
+  "division:level": {
+    perm: "manage_setup", noun: "level", nullable: true, risky: false,
+    // Only levels in the division's own season — the backend rejects a
+    // cross-season link, so never offer one.
+    options: (ov, pr) => (ov.levels || [])
+      .filter((lv) => lv.season_id === pr.seasonId).map((lv) => [lv.id, lv.name]) },
+  "team:club": {
+    perm: "manage_setup", noun: "club", nullable: true, risky: false,
+    options: (ov) => (ov.clubs || []).map((c) => [c.id, c.name]) },
+  "team:division": {
+    perm: "manage_setup", noun: "division", nullable: false, risky: true,
+    warn: "Moving a team to a new division changes where it competes and can affect its scheduled games.",
+    options: (ov) => (ov.divisions || []).map((d) => [d.id, d.name]) },
+  "player:team": {
+    perm: "manage_setup", noun: "team", nullable: false, risky: true,
+    warn: "Moving a player changes which team's roster they belong to.",
+    options: (ov) => (ov.teams || []).map((t) => [t.id, t.name]) },
+};
+// A small "⇄ Move" button that opens the reassignment confirm panel, seeded
+// with the record's current parent so the operator sees where it sits now.
+function reassignBtn(kind, parent, rec, curId, seasonId) {
+  const cfg = REASSIGN[`${kind}:${parent}`];
+  if (!cfg || !hasPerm(cfg.perm)) return "";
+  return `<button class="act ghost xs tn-reassign-btn" data-reassign="${kind}:${parent}"
+    data-rz-id="${esc(rec.id)}" data-rz-name="${esc(rec.name || rec.id)}"
+    data-rz-cur="${esc(curId || "")}" data-rz-season="${esc(seasonId || "")}"
+    title="Move to a different ${esc(cfg.noun)}">⇄ Move</button>`;
+}
+// The confirm panel: pick a new parent, see a warning for risky moves, commit.
+function reassignPanelHtml(ov) {
+  if (!pendingReassign) return "";
+  const pr = pendingReassign;
+  const cfg = REASSIGN[`${pr.kind}:${pr.parent}`];
+  if (!cfg) return "";
+  const rows = (cfg.nullable ? [["", "— none —"]] : []).concat(cfg.options(ov, pr));
+  const optsHtml = rows.map(([v, label]) =>
+    `<option value="${esc(v)}"${v === (pr.curId || "") ? " selected" : ""}>${esc(label)}</option>`).join("");
+  const empty = !rows.length;
+  return `<aside class="cal-aside confirm rz-panel">
+    <div class="ca-head"><span class="ca-ico">⇄</span><span class="ca-title">Move to a different ${esc(cfg.noun)}</span>
+      <button class="ca-x" data-reassign-cancel aria-label="Cancel">×</button></div>
+    <div class="ca-body">
+      <p><strong>${esc(pr.name)}</strong></p>
+      ${empty
+        ? `<p class="tn-empty">No ${esc(cfg.noun)} available yet — create one first.</p>`
+        : `<label class="rz-label" for="reassign-target">New ${esc(cfg.noun)}</label>
+           <select id="reassign-target">${optsHtml}</select>`}
+      ${cfg.risky ? `<p class="ca-warn">⚠ ${esc(cfg.warn)}</p>` : ""}
+      <div class="ca-actions">
+        ${empty ? "" : `<button class="act primary" data-reassign-confirm>Move</button>`}
+        <button class="act ghost" data-reassign-cancel>Cancel</button>
+      </div>
+    </div>
+  </aside>`;
+}
+// POST the chosen parent to the reassignment endpoint, then refresh.
+async function commitReassign(newId) {
+  const pr = pendingReassign;
+  if (!pr) return;
+  const cfg = REASSIGN[`${pr.kind}:${pr.parent}`];
+  toast = "";
+  if ((newId || "") === (pr.curId || "")) { pendingReassign = null; return render(); }
+  const res = await post(`/api/setup/${pr.kind}/${pr.id}/assign-${pr.parent}`,
+    { [`${pr.parent}_id`]: newId || null });
+  if (res && res.error) { toast = res.error.message; pendingReassign = null; return render(); }
+  pendingReassign = null;
+  toast = newId ? `Moved to a new ${cfg.noun}.` : `Unassigned from its ${cfg.noun}.`;
+  await render();
+}
+
 // Setup → Hierarchy (#165): a functional tree of the league's structure built
 // from the data already loaded (overview + playersList), with counts,
 // missing-assignment warnings, and quick-create actions that reuse the Setup
@@ -617,11 +700,11 @@ function renderSetupHierarchy(ov) {
     const badge = rinks.length
       ? `<span class="tn-badge ok">Ready</span>` : `<span class="tn-badge warn">Needs rinks</span>`;
     const rinkRows = rinks.map((r) =>
-      `<div class="tn-leaf"><span class="tn-label">⛸️ ${esc(r.name)}</span></div>`).join("")
+      `<div class="tn-leaf"><span class="tn-label">⛸️ ${esc(r.name)}</span>${reassignBtn("rink", "venue", r, r.venue_id)}</div>`).join("")
       || `<div class="tn-empty">No rinks yet. Add a rink so this venue can host games.</div>`;
     return `<details class="tn" open><summary class="tn-sum">
         <span class="tn-label">🏟️ ${esc(v.name)}</span>
-        <span class="tn-meta">${rinks.length} rink${rinks.length === 1 ? "" : "s"}</span>${badge}</summary>
+        <span class="tn-meta">${rinks.length} rink${rinks.length === 1 ? "" : "s"}</span>${badge}${reassignBtn("venue", "organization", v, v.organization_id)}</summary>
       <div class="tn-children">${rinkRows}${treeAdd("rink", "Add rink to " + v.name, "f-rink-venue", v.id)}</div>
     </details>`;
   };
@@ -662,11 +745,12 @@ function renderSetupHierarchy(ov) {
   const divisionNode = (d) => {
     const teams = teamsByDiv[d.id] || [];
     const teamRows = teams.map((t) =>
-      `<div class="tn-leaf"><span class="tn-label">👥 ${esc(t.name)}</span><span class="tn-meta">${teamMeta(t)}</span></div>`).join("")
+      `<div class="tn-leaf"><span class="tn-label">👥 ${esc(t.name)}</span><span class="tn-meta">${teamMeta(t)}</span>${
+        reassignBtn("team", "club", t, t.club_id)}${reassignBtn("team", "division", t, t.division_id)}</div>`).join("")
       || `<div class="tn-empty">No teams in this division yet.</div>`;
     return `<details class="tn" open><summary class="tn-sum">
         <span class="tn-label">🏅 ${esc(d.name)}</span>
-        <span class="tn-meta">${teams.length} team${teams.length === 1 ? "" : "s"}</span></summary>
+        <span class="tn-meta">${teams.length} team${teams.length === 1 ? "" : "s"}</span>${reassignBtn("division", "level", d, d.level_id, d.season_id)}</summary>
       <div class="tn-children">${teamRows}${treeAdd("team", "Add team to " + d.name, "f-team-div", d.id)}</div>
     </details>`;
   };
@@ -735,7 +819,8 @@ function renderSetupHierarchy(ov) {
       const badge = ps.length ? "" : `<span class="tn-badge warn">No players</span>`;
       const pRows = ps.map((p) =>
         `<div class="tn-leaf"><span class="tn-label">🧑 ${esc(p.name)}</span><span class="tn-meta">${
-          esc(capWord(p.position))}${p.jersey_number != null ? " · #" + esc(String(p.jersey_number)) : ""}</span></div>`).join("")
+          esc(capWord(p.position))}${p.jersey_number != null ? " · #" + esc(String(p.jersey_number)) : ""}</span>${
+          reassignBtn("player", "team", p, p.team_id)}</div>`).join("")
         || `<div class="tn-empty">No players yet. Add players before building rosters.</div>`;
       return `<details class="tn"><summary class="tn-sum">
           <span class="tn-label">👥 ${esc(t.name)}</span>
@@ -758,18 +843,25 @@ function renderSetupHierarchy(ov) {
   const noDivTeams = (ov.teams || []).filter((t) => !t.division_id);
   const orphanPlayers = canSeePlayers
     ? playersList.filter((p) => !p.team_id || !teamIds.has(p.team_id)) : [];
-  const naRow = (label, rows) => rows.length
+  // Each orphan row carries the same "⇄ Move" control (labelled by its fix)
+  // so an operator can assign a parent inline — the primary fix surface (#166).
+  const naRow = (label, rows, fix) => rows.length
     ? `<div class="na-group"><div class="na-group-label">${esc(label)} (${rows.length})</div>${
-        rows.map((r) => `<div class="tn-leaf warn"><span class="tn-label">⚠ ${esc(r.name)}</span></div>`).join("")}</div>` : "";
-  const naBody = naRow("Rinks without a venue", orphanRinks)
-    + naRow("Teams without a club", noClubTeams)
-    + naRow("Teams without a division", noDivTeams)
-    + naRow("Players without a team", orphanPlayers);
+        rows.map((r) => `<div class="tn-leaf warn"><span class="tn-label">⚠ ${esc(r.name)}</span>${
+          fix ? fix(r) : ""}</div>`).join("")}</div>` : "";
+  const naBody = naRow("Rinks without a venue", orphanRinks,
+                       (r) => reassignBtn("rink", "venue", r, r.venue_id))
+    + naRow("Teams without a club", noClubTeams,
+            (t) => reassignBtn("team", "club", t, t.club_id))
+    + naRow("Teams without a division", noDivTeams,
+            (t) => reassignBtn("team", "division", t, t.division_id))
+    + naRow("Players without a team", orphanPlayers,
+            (p) => reassignBtn("player", "team", p, p.team_id));
   const needsAssignment = naBody
     ? `<section class="tree-panel na"><div class="tree-head"><span class="tree-title">⚠ Needs assignment</span></div>
         <div class="tree-note">These records can't be scheduled until they're assigned.</div>${naBody}</section>` : "";
 
-  return `<div class="setup-trees">${facility}${competition}${roster}${needsAssignment}</div>`;
+  return `${reassignPanelHtml(ov)}<div class="setup-trees">${facility}${competition}${roster}${needsAssignment}</div>`;
 }
 
 function renderSetup(ov) {
@@ -3690,6 +3782,24 @@ async function render() {
     drawer = null; drawerError = ""; drawerValues = {}; render();
   });
   c.querySelectorAll("[data-drawer-submit]").forEach((b) => b.onclick = () => submitSetup(b.dataset.drawerSubmit));
+  // Setup reassignment (#166): "⇄ Move" opens the confirm panel seeded with
+  // the record's current parent; confirm posts the chosen parent.
+  c.querySelectorAll("[data-reassign]").forEach((b) => b.onclick = (e) => {
+    // Some ⇄ Move buttons live inside a <summary>; stop the click from also
+    // toggling the parent <details> open/closed.
+    e.preventDefault();
+    const [kind, parent] = b.dataset.reassign.split(":");
+    pendingReassign = { kind, parent, id: b.dataset.rzId, name: b.dataset.rzName,
+                        curId: b.dataset.rzCur || "", seasonId: b.dataset.rzSeason || "" };
+    drawer = null; toast = ""; render();
+  });
+  c.querySelectorAll("[data-reassign-cancel]").forEach((b) => b.onclick = () => {
+    pendingReassign = null; render();
+  });
+  c.querySelectorAll("[data-reassign-confirm]").forEach((b) => b.onclick = () => {
+    const sel = c.querySelector("#reassign-target");
+    commitReassign(sel ? sel.value : "");
+  });
   if (drawer) {
     const first = c.querySelector(".drawer-body input, .drawer-body select");
     if (first) first.focus();
@@ -4457,7 +4567,7 @@ async function render() {
 
 function switchTab(next) {
   view = next; toast = ""; if (next !== "calendar") { wizard = null; conflict = null; movingGameId = null; pendingMove = null; }
-  if (next !== "setup") { drawer = null; drawerError = ""; drawerValues = {}; }
+  if (next !== "setup") { drawer = null; drawerError = ""; drawerValues = {}; pendingReassign = null; }
   // A pending checkout confirmation doesn't survive leaving Home (#107) —
   // same reset discipline as drawer/wizard above, so a stale "are you
   // sure?" never reappears over changed attendance state.
@@ -4480,6 +4590,7 @@ document.getElementById("reset-btn").onclick = async () => {
   await post("/api/reset", {});
   toast = ""; currentGame = null; pickedPlayer = null; wizard = null;
   movingGameId = null; conflict = null; pendingMove = null; drawer = null; drawerError = ""; drawerValues = {};
+  pendingReassign = null;
   render();
 };
 // Sign out ends the server session and returns to the sign-in screen (#71).
@@ -4810,7 +4921,8 @@ async function signIn(username, password) {
   // Clear the calendar's transient move state on sign-in for the same
   // cross-identity reason movingGameId/conflict are cleared here (#153): a
   // move staged by the previous operator must not carry into the new session.
-  drawer = null; movingGameId = null; conflict = null; pendingMove = null;
+  // pendingReassign is cleared for the same reason (#166).
+  drawer = null; movingGameId = null; conflict = null; pendingMove = null; pendingReassign = null;
   hideLogin();
   renderRoleSwitch(); render();
   return true;

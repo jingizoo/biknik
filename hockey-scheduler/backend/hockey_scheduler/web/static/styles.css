@@ -723,6 +723,15 @@ details.tn > .tn-sum:hover { background: #f6f7fb; }
 .tn-warn-text { color: #b4690e; }
 .tn-empty { font-size: 12px; color: var(--muted); padding: 4px 4px 4px 18px; }
 .tree-add, button.tree-add { margin: 4px 0 2px 18px; font-size: 12px; }
+/* Reassignment "⇄ Move" control (#166): compact, right-aligned on each node.
+   The first button in a row takes the auto margin so a pair (e.g. a team's
+   club + division moves) stays grouped instead of splitting the free space. */
+.act.xs { font-size: 11px; padding: 2px 8px; }
+.tn-reassign-btn { margin-left: 6px; white-space: nowrap; }
+.tn-leaf .tn-reassign-btn:first-of-type,
+.tn-sum .tn-reassign-btn:first-of-type { margin-left: auto; }
+.rz-panel .rz-label { display: block; font-size: 12px; color: var(--muted); margin: 8px 0 3px; }
+.rz-panel select { width: 100%; }
 .na-group { margin-top: 6px; }
 .na-group-label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.4px; color: var(--muted); margin: 6px 0 2px 4px; }
 .setup-card { background: var(--card); border: 1px solid var(--sep); border-radius: 12px; overflow: hidden; display: flex; flex-direction: column; }
