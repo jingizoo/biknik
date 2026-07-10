@@ -15,10 +15,16 @@ const BACKEND_DIR = path.resolve(__dirname, "..", "backend");
 const READY_TIMEOUT_MS = 15000;
 const ADMIN_USER = "onboarding-admin";
 const ADMIN_PASSWORD = "fixture-onboarding-password";
+const PHASE = process.env.ONBOARDING_PHASE || "full";
+const VIEWPORT_FILTER = process.env.ONBOARDING_VIEWPORT || "all";
 const VIEWPORTS = [
   { label: "desktop", width: 1440, height: 900, port: 8133 },
   { label: "phone", width: 390, height: 844, port: 8134 },
-];
+].filter((viewport) => VIEWPORT_FILTER === "all" || viewport.label === VIEWPORT_FILTER);
+
+if (!VIEWPORTS.length) {
+  throw new Error(`Unknown ONBOARDING_VIEWPORT '${VIEWPORT_FILTER}'.`);
+}
 
 function waitForServer(url, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
@@ -110,6 +116,10 @@ async function checkViewport(browser, viewport) {
         || !status.blocking.some((item) => item.code === "no_organization")) {
       throw new Error(`[${viewport.label}] unexpected empty-install status: ${JSON.stringify(status)}`);
     }
+    if (PHASE === "landing") {
+      console.log(`[${viewport.label}] OK — auto-routed to persisted Initial Setup status.`);
+      return;
+    }
 
     // Continue later is a real escape hatch, not a trap.
     await page.click('[data-onboarding-goto="dashboard"]');
@@ -119,6 +129,10 @@ async function checkViewport(browser, viewport) {
     await page.click('.tab[data-tab="onboarding"]');
     await page.waitForSelector('body[data-view="onboarding"]', { timeout: 10000 });
     await page.waitForSelector('[data-onboarding-step="organization"].current');
+    if (PHASE === "resume") {
+      console.log(`[${viewport.label}] OK — left and resumed Initial Setup.`);
+      return;
+    }
 
     // The Fix action reuses the existing Setup drawer instead of a parallel form.
     await page.click('[data-onboarding-drawer="organization"]');
@@ -147,9 +161,9 @@ async function main() {
         : {},
     );
     for (const viewport of VIEWPORTS) await checkViewport(browser, viewport);
-    console.log("Guided Initial Setup browser journey passed.");
+    console.log(`Guided Initial Setup browser journey passed (${VIEWPORT_FILTER}/${PHASE}).`);
   } catch (error) {
-    console.error("Guided Initial Setup browser journey FAILED.");
+    console.error(`Guided Initial Setup browser journey FAILED (${VIEWPORT_FILTER}/${PHASE}).`);
     console.error(error && error.message ? error.message : error);
     process.exitCode = 1;
   } finally {
