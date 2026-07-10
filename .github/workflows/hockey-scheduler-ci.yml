@@ -6,7 +6,6 @@ on:
       - "hockey-scheduler/backend/**"
       - "hockey-scheduler/docs/**"
       - "hockey-scheduler/e2e/**"
-      - "hockey-scheduler/tools/**"
       - ".github/workflows/hockey-scheduler-ci.yml"
   push:
     branches:
@@ -15,37 +14,9 @@ on:
       - "hockey-scheduler/backend/**"
       - "hockey-scheduler/docs/**"
       - "hockey-scheduler/e2e/**"
-      - "hockey-scheduler/tools/**"
       - ".github/workflows/hockey-scheduler-ci.yml"
 
-permissions:
-  contents: write
-  pull-requests: read
-
 jobs:
-  fixture-repair:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.head_ref }}
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-      - name: Apply one-shot #173 fixture alignment
-        run: python hockey-scheduler/tools/repair_pr177_fixtures.py
-      - name: Commit repaired fixtures when needed
-        run: |
-          if git diff --quiet; then
-            echo "Fixtures already aligned."
-            exit 0
-          fi
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add hockey-scheduler/backend/tests
-          git commit -m "Align legacy scheduling fixtures with league-owned venues (#173)"
-          git push origin HEAD:${{ github.head_ref }}
-
   test:
     runs-on: ubuntu-latest
     defaults:
@@ -57,15 +28,7 @@ jobs:
         with:
           python-version: "3.11"
       - name: Run unit tests (in-memory + SQLite)
-        run: |
-          set -o pipefail
-          python -m unittest discover -s tests -v 2>&1 | tee /tmp/unit-tests.log
-      - name: Upload unit-test diagnostics
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: unit-test-log
-          path: /tmp/unit-tests.log
+        run: python -m unittest discover -s tests -v
 
   postgres:
     runs-on: ubuntu-latest
@@ -96,15 +59,7 @@ jobs:
       - name: Run full suite against PostgreSQL
         env:
           TEST_DATABASE_URL: postgresql://hockey:hockey@localhost:5432/hockey
-        run: |
-          set -o pipefail
-          python -m unittest discover -s tests -v 2>&1 | tee /tmp/postgres-tests.log
-      - name: Upload PostgreSQL test diagnostics
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: postgres-test-log
-          path: /tmp/postgres-tests.log
+        run: python -m unittest discover -s tests -v
 
   frontend-check:
     runs-on: ubuntu-latest
