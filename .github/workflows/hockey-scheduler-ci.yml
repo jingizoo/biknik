@@ -73,7 +73,9 @@ jobs:
         run: |
           node --check hockey-scheduler/backend/hockey_scheduler/web/static/app.js
           node --check hockey-scheduler/backend/hockey_scheduler/web/static/setup.js
+          node --check hockey-scheduler/backend/hockey_scheduler/web/static/onboarding.js
           node --check hockey-scheduler/e2e/setup-claim.js
+          node --check hockey-scheduler/e2e/onboarding-wizard.js
 
   browser-smoke:
     runs-on: ubuntu-latest
@@ -91,8 +93,9 @@ jobs:
         run: |
           npm ci
           npx playwright install --with-deps chromium
-      - name: Run browser smoke and production claim journey
+      - name: Run browser smoke, production claim, and guided onboarding journeys
         working-directory: hockey-scheduler/e2e
         run: |
           npm run smoke
           npm run setup-claim
+          npm run onboarding-wizard
