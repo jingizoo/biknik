@@ -773,6 +773,241 @@ class ApiService:
         return {"ready": all(c["ok"] for c in checks),
                 "app_mode": app_mode, "checks": checks}
 
+    # -- guided onboarding status (#174 PR C) ------------------------------
+    def get_onboarding_status(self, app_mode: str = "demo") -> dict:
+        """Server-derived onboarding progress for the guided Setup wizard (#174).
+
+        Reports where a fresh client installation stands on the path to
+        scheduling its first game, computed entirely from *persisted* domain
+        records (never client-supplied hints) plus the #143 deployment checks
+        and the #173 owner/league/venue rules. The shape is::
+
+            {complete, ready_to_schedule, steps[], blocking[], warnings[]}
+
+        ``steps`` is the ordered milestone list the wizard renders, each
+        ``{key, label, status: done|todo, blocking, detail}``. ``blocking`` is
+        the flat list of hard gaps that keep the installation from scheduling —
+        each ``{code, message}`` is individually actionable, and downstream
+        gaps stay suppressed until their prerequisite exists so the operator
+        always sees the *next* real step, not a wall of consequences.
+        ``warnings`` are soft gaps (no players/officials yet, orphaned records)
+        that don't block scheduling but leave onboarding incomplete.
+
+        ``ready_to_schedule`` is true when ``blocking`` is empty — every hard
+        requirement for a first game is met. ``complete`` additionally requires
+        ``warnings`` to be empty, i.e. the installation is fully populated.
+
+        Privacy: this returns counts and structural names only. Player names
+        are PII and are never included (players are counted, never named);
+        account usernames, secrets, and the setup code never appear. Gated to a
+        League Admin at the HTTP boundary.
+        """
+        production = (app_mode == "production")
+
+        admins = self._active_admin_count()
+        mig = self.store.migration_status()
+        persistent = (not isinstance(self.store, InMemoryStore)
+                      and not getattr(self.store, "is_memory_backed", False))
+
+        orgs = self.store.all_organizations()
+        leagues = self.store.all_leagues()
+        venues = self.store.all_venues()
+        rinks = self.store.all_rinks()
+        seasons = self.store.all_seasons()
+        divisions = self.store.all_divisions()
+        teams = self.store.all_teams()
+        slots = self.store.all_ice_slots()
+        players = self.store.all_players()
+        officials = self.store.all_officials()
+
+        org_ids = {o.id for o in orgs}
+        league_ids = {lg.id for lg in leagues}
+        season_ids = {s.id for s in seasons}
+        division_ids = {d.id for d in divisions}
+        team_ids = {t.id for t in teams}
+        league_owner = {lg.id: (lg.organization_id or None) for lg in leagues}
+
+        # #173: a venue truly belongs to a league only when its league_id points
+        # at a real league AND the venue's own owner agrees with that league's
+        # owner. A mismatch is legacy-data-only (create/assign enforce
+        # agreement) but must be reconciled before the venue's ice is usable.
+        venues_in_league = [v for v in venues if v.league_id in league_ids]
+        venue_mismatches = [
+            v for v in venues_in_league
+            if (v.organization_id or None) != league_owner.get(v.league_id)]
+        mismatch_ids = {v.id for v in venue_mismatches}
+        sound_league_venue_ids = {
+            v.id for v in venues_in_league if v.id not in mismatch_ids}
+        # Only ice on a rink under a soundly-assigned league venue is
+        # schedulable (#173 isolation), and only an AVAILABLE GAME slot can
+        # hold a first game.
+        schedulable_rink_ids = {
+            r.id for r in rinks if r.venue_id in sound_league_venue_ids}
+        available_game_slots = [
+            s for s in slots
+            if s.rink_id in schedulable_rink_ids
+            and s.slot_type == IceSlotType.GAME
+            and s.status == IceSlotStatus.AVAILABLE]
+
+        # Leagues that exist but aren't tied to a real organization (#173).
+        leagues_without_org = [
+            lg for lg in leagues
+            if not lg.organization_id or lg.organization_id not in org_ids]
+
+        # Dangling required parents — a record whose mandatory parent link is
+        # missing or points at a deleted row. These are hard gaps: a season on a
+        # deleted league, a division on a deleted season, or a team on a deleted
+        # division can never be scheduled.
+        seasons_dangling = [s for s in seasons if s.league_id not in league_ids]
+        divisions_dangling = [d for d in divisions
+                              if d.season_id not in season_ids]
+        teams_dangling = [t for t in teams if t.division_id not in division_ids]
+
+        blocking = []
+        warnings = []
+        steps = []
+
+        def step(key, label, done, *, blocking_step=True, detail=""):
+            steps.append({"key": key, "label": label,
+                          "status": "done" if done else "todo",
+                          "blocking": blocking_step and not done,
+                          "detail": detail})
+
+        def block(done, code, message):
+            if not done:
+                blocking.append({"code": code, "message": message})
+
+        # 1. Deployment foundation — an admin to operate, durable storage in
+        #    production, and current migrations.
+        step("league_admin", "Create a League Admin account", admins > 0,
+             detail=f"{admins} active league admin(s)")
+        block(admins > 0, "no_active_admin",
+              "No active League Admin account exists to operate the installation.")
+
+        storage_ok = persistent or not production
+        step("durable_storage", "Run on durable storage", storage_ok,
+             blocking_step=production,
+             detail=("durable store" if storage_ok
+                     else "in-memory or ephemeral (no durable DATABASE_URL)"))
+        if production:
+            block(storage_ok, "non_durable_store",
+                  "Production is running on non-durable storage; data would be "
+                  "lost on restart.")
+
+        step("migrations", "Apply database migrations", mig["current"],
+             detail=f"{len(mig['applied'])}/{len(mig['expected'])} applied")
+        block(mig["current"], "migrations_stale",
+              "Database migrations are not up to date.")
+
+        # 2. Facility ownership chain: organization → league → venue → rink → ice.
+        has_org = len(orgs) > 0
+        step("organization", "Add a facility organization", has_org,
+             detail=f"{len(orgs)} organization(s)")
+        block(has_org, "no_organization",
+              "No facility organization has been created yet.")
+
+        has_league = len(leagues) > 0
+        step("league", "Create a league", has_league,
+             detail=f"{len(leagues)} league(s)")
+        block(has_league, "no_league", "No league has been created yet.")
+
+        # League ownership only becomes an actionable gap once a league exists.
+        ownership_ok = has_league and not leagues_without_org
+        step("league_ownership", "Tie every league to an organization",
+             ownership_ok,
+             detail=(f"{len(leagues_without_org)} league(s) without an owner"
+                     if leagues_without_org else "all leagues owned"))
+        if has_league:
+            block(not leagues_without_org, "league_without_organization",
+                  f"{len(leagues_without_org)} league(s) are not tied to an "
+                  "organization.")
+
+        # A venue is only schedulable once it's soundly under a league; gate the
+        # gap on a league existing so we don't ask for a venue before its parent.
+        venue_ok = bool(sound_league_venue_ids)
+        step("venue", "Assign a venue to a league", venue_ok,
+             detail=(f"{len(sound_league_venue_ids)} venue(s) under a league"
+                     if venue_ok else f"{len(venues)} venue(s), "
+                     f"{len(venues_in_league)} assigned"))
+        if has_league:
+            block(bool(venues_in_league), "no_venue_assigned_to_league",
+                  "No venue is assigned to a league yet.")
+            # Surfaced independently so an operator can reconcile the exact
+            # venues whose owner disagrees with their league's owner.
+            block(not venue_mismatches, "venue_owner_mismatch",
+                  f"{len(venue_mismatches)} venue(s) have an owner that "
+                  "disagrees with their league's owner.")
+
+        has_rink = bool(schedulable_rink_ids)
+        step("rink", "Add a rink to a league venue", has_rink,
+             detail=f"{len(schedulable_rink_ids)} rink(s) under a league venue")
+        if venue_ok:
+            block(has_rink, "no_rink",
+                  "No rink exists under a venue assigned to a league.")
+
+        has_ice = bool(available_game_slots)
+        step("ice", "Open an available game ice slot", has_ice,
+             detail=f"{len(available_game_slots)} available game slot(s)")
+        if has_rink:
+            block(has_ice, "no_available_ice",
+                  "No available game ice slot exists to schedule on.")
+
+        # 3. Competition structure: season → division → team.
+        has_season = bool(season_ids) and any(
+            s.league_id in league_ids for s in seasons)
+        step("season", "Create a season", has_season,
+             detail=f"{len(seasons)} season(s)")
+        if has_league:
+            block(has_season, "no_season", "No season has been created yet.")
+        if seasons_dangling:
+            block(False, "seasons_without_league",
+                  f"{len(seasons_dangling)} season(s) reference a league that "
+                  "no longer exists.")
+
+        has_division = any(d.season_id in season_ids for d in divisions)
+        step("division", "Create a division", has_division,
+             detail=f"{len(divisions)} division(s)")
+        if has_season:
+            block(has_division, "no_division",
+                  "No division has been created yet.")
+        if divisions_dangling:
+            block(False, "divisions_without_season",
+                  f"{len(divisions_dangling)} division(s) reference a season "
+                  "that no longer exists.")
+
+        has_team = any(t.division_id in division_ids for t in teams)
+        step("team", "Add a team", has_team,
+             detail=f"{len(teams)} team(s)")
+        if has_division:
+            block(has_team, "no_team", "No team has been added yet.")
+        if teams_dangling:
+            block(False, "teams_without_division",
+                  f"{len(teams_dangling)} team(s) reference a division that no "
+                  "longer exists.")
+
+        # 4. Soft gaps — recommended but not required to schedule a first game.
+        if not players:
+            warnings.append({"code": "no_players",
+                             "message": "No players have been added yet."})
+        if not officials:
+            warnings.append({"code": "no_officials",
+                             "message": "No officials have been added yet."})
+        orphan_players = [p for p in players if p.team_id not in team_ids]
+        if orphan_players:
+            warnings.append({
+                "code": "players_without_team",
+                "message": f"{len(orphan_players)} player(s) are not on any "
+                           "team."})
+
+        ready = not blocking
+        return {
+            "complete": ready and not warnings,
+            "ready_to_schedule": ready,
+            "steps": steps,
+            "blocking": blocking,
+            "warnings": warnings,
+        }
+
     # -- contact registry (#60) --------------------------------------------
     @staticmethod
     def _contact_row(c) -> dict:

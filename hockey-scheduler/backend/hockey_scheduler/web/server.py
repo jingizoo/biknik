@@ -662,6 +662,15 @@ class Handler(BaseHTTPRequestHandler):
             if self._operator_only("/api/setup/player"):
                 return
             return self._send_api(api.get_setup_hierarchy())
+        if path == "/api/onboarding/status":
+            # Guided onboarding progress for the Setup wizard (#174 PR C). It
+            # aggregates the full setup hierarchy plus account/player onboarding
+            # state, so it is League-Admin-only (MANAGE_SETUP, which no other
+            # role holds) — non-admins get 403. The payload is counts +
+            # structural names only: no player names, usernames, or secrets.
+            if self._operator_only("/api/onboarding/status"):
+                return
+            return self._send_api(api.get_onboarding_status(_app_mode()))
         if path == "/api/bootstrap/status":
             # Public-safe one-time claim posture (#174). No account count,
             # database details, usernames, or configuration values.
