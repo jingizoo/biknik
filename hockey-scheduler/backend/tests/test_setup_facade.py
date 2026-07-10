@@ -18,7 +18,7 @@ class SetupFacadeTest(unittest.TestCase):
         club_b = self.api.create_club("Falcons Club")
         home = self.api.create_team(club_a["id"], division["id"], "U16 Lions")
         away = self.api.create_team(club_b["id"], division["id"], "U16 Falcons")
-        venue = self.api.create_venue("Ice Palace")
+        venue = self.api.create_venue("Ice Palace", league_id=league["id"])
         rink = self.api.create_rink(venue["id"], "Rink 2")
         slot = self.api.create_ice_slot(
             rink["id"], "2026-09-01T18:30:00+00:00", "2026-09-01T20:00:00+00:00"

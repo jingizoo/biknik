@@ -32,7 +32,7 @@ class OfficialsServiceTest(unittest.TestCase):
         self.club_b = self.svc.create_club("Bees HC")
         self.home = self.svc.create_team(self.club_a.id, self.div.id, "Aces")
         self.away = self.svc.create_team(self.club_b.id, self.div.id, "Bees")
-        venue = self.svc.create_venue("Arena")
+        venue = self.svc.create_venue("Arena", league_id=league.id)
         self.rink = self.svc.create_rink(venue.id, "Rink 1")
         self.rink2 = self.svc.create_rink(venue.id, "Rink 2")
         # A second matchup (distinct teams) so an overlapping second game does

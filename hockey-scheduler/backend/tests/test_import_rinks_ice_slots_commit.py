@@ -239,6 +239,8 @@ class ImportRinksIceSlotsCommitServiceContract:
                    if s.rink_id == self._rink("R1").id)
 
         league = self.setup.create_league("Test League", actor_id="admin")
+        venue = self.store.get_venue(self._rink("R1").venue_id)
+        self.setup.assign_venue_league(venue.id, league.id, actor_id="admin")
         season = self.setup.create_season(
             league.id, "2026 Season", actor_id="admin")
         division = self.setup.create_division(
@@ -275,6 +277,8 @@ class ImportRinksIceSlotsCommitServiceContract:
                    if s.rink_id == self._rink("R1").id)
 
         league = self.setup.create_league("Test League", actor_id="admin")
+        venue = self.store.get_venue(self._rink("R1").venue_id)
+        self.setup.assign_venue_league(venue.id, league.id, actor_id="admin")
         season = self.setup.create_season(
             league.id, "2026 Season", actor_id="admin")
         division = self.setup.create_division(
