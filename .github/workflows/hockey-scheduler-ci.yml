@@ -99,5 +99,33 @@ jobs:
         run: npm run smoke
       - name: Run production first-admin claim journey
         run: npm run setup-claim
-      - name: Run guided Initial Setup journey
+      - name: Initial Setup desktop landing
+        env:
+          ONBOARDING_VIEWPORT: desktop
+          ONBOARDING_PHASE: landing
+        run: npm run onboarding-wizard
+      - name: Initial Setup desktop resume
+        env:
+          ONBOARDING_VIEWPORT: desktop
+          ONBOARDING_PHASE: resume
+        run: npm run onboarding-wizard
+      - name: Initial Setup desktop drawer reuse
+        env:
+          ONBOARDING_VIEWPORT: desktop
+          ONBOARDING_PHASE: full
+        run: npm run onboarding-wizard
+      - name: Initial Setup phone landing
+        env:
+          ONBOARDING_VIEWPORT: phone
+          ONBOARDING_PHASE: landing
+        run: npm run onboarding-wizard
+      - name: Initial Setup phone resume
+        env:
+          ONBOARDING_VIEWPORT: phone
+          ONBOARDING_PHASE: resume
+        run: npm run onboarding-wizard
+      - name: Initial Setup phone drawer reuse
+        env:
+          ONBOARDING_VIEWPORT: phone
+          ONBOARDING_PHASE: full
         run: npm run onboarding-wizard
