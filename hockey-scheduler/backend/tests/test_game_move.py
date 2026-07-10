@@ -29,7 +29,7 @@ def universe():
     away = svc.create_team(svc.create_club("FH").id, div.id, "Falcons")
     bears = svc.create_team(svc.create_club("BH").id, div.id, "Bears")
     eagles = svc.create_team(svc.create_club("EH").id, div.id, "Eagles")
-    venue = svc.create_venue("Arena")
+    venue = svc.create_venue("Arena", league_id=league.id)
     r1 = svc.create_rink(venue.id, "Rink 1")
     r2 = svc.create_rink(venue.id, "Rink 2")
     slot_a = svc.create_ice_slot(r1.id, dt(18, 30), dt(20))      # game lives here
