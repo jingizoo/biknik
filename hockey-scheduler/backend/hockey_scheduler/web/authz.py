@@ -122,6 +122,15 @@ def required_permission(path: str):
     if path.startswith("/api/officials/assignments/"):
         return Permission.MANAGE_SCHEDULE
 
+    # Cross-domain league↔facility moves (#173) — tying a league to an owner or
+    # a venue to a league spans both domains, so both require MANAGE_SETUP
+    # (League-Admin-only), even though a venue's own arena-side moves don't.
+    # These must precede the arena-side venue rule below.
+    if re.match(r"^/api/setup/league/[^/]+/assign-organization$", path):
+        return Permission.MANAGE_SETUP
+    if re.match(r"^/api/setup/venue/[^/]+/assign-league$", path):
+        return Permission.MANAGE_SETUP
+
     # Reassignment routes (#166 PR D): /api/setup/<entity>/<id>/assign-<parent>.
     # Facility-side moves (venue's owner, rink's venue) are arena actions;
     # league-structure moves (division/team/player parents) require setup.

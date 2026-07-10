@@ -489,6 +489,7 @@ class SqlStore:
     def add_league(self, league): return self._insert(league)
     def get_league(self, league_id): return self._get(League, league_id)
     def all_leagues(self): return self._query(League, order="id")
+    def save_league(self, league): return self._update(league)
 
     def add_season(self, season): return self._insert(season)
     def get_season(self, season_id): return self._get(Season, season_id)

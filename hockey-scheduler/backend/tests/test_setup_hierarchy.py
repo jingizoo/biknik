@@ -35,14 +35,16 @@ class SetupHierarchyTest(unittest.TestCase):
         json.dumps(h)  # must round-trip with no custom encoder
 
     def test_facility_tree_nests_org_venue_rink_with_slot_count(self):
+        # #173: venues nest under a league under the owner (Org → League → Venue).
         org = self.api.create_organization("Canlon")
-        venue = self.api.create_venue("Plainfield", organization_id=org["id"])
+        league = self.api.create_league("Over 55", organization_id=org["id"])
+        venue = self.api.create_venue("Plainfield", league_id=league["id"])
         rink = self.api.create_rink(venue["id"], "Rink 1")
         self.api.create_ice_slot(
             rink["id"], "2026-09-01T18:30:00+00:00", "2026-09-01T20:00:00+00:00")
         h = self.api.get_setup_hierarchy()
         o = next(o for o in h["organizations"] if o["id"] == org["id"])
-        v = o["venues"][0]
+        v = o["leagues"][0]["venues"][0]
         self.assertEqual(v["id"], venue["id"])
         self.assertEqual(v["rinks"][0]["ice_slot_count"], 1)
 
@@ -89,6 +91,31 @@ class SetupHierarchyTest(unittest.TestCase):
         self.assertIn(p["id"], [o["id"] for o in orphans])
         self.assertNotIn("name", orphans[0])
         self.assertNotIn("Orphan Name", json.dumps(h))
+
+    def test_facility_tree_nests_org_league_venue(self):
+        # #173: the facility tree now flows Organization → League → Venue → Rink.
+        org = self.api.create_organization("Canlon")
+        league = self.api.create_league("Over 55", organization_id=org["id"])
+        venue = self.api.create_venue("Plainfield", league_id=league["id"])
+        self.api.create_rink(venue["id"], "Rink 1")
+        h = self.api.get_setup_hierarchy()
+        o = next(o for o in h["organizations"] if o["id"] == org["id"])
+        lg = next(x for x in o["leagues"] if x["id"] == league["id"])
+        self.assertEqual(lg["venues"][0]["id"], venue["id"])
+        self.assertEqual(lg["venues"][0]["rinks"][0]["name"], "Rink 1")
+
+    def test_missing_assignments_has_league_venue_buckets(self):
+        # A league with no owner and a venue with no league surface as gaps.
+        self.api.create_league("Ownerless League")
+        self.api.create_organization("Canlon")
+        self.api.create_venue("Unleagued Arena")
+        h = self.api.get_setup_hierarchy()
+        ma = h["missing_assignments"]
+        self.assertIn("Ownerless League",
+                      [x["name"] for x in ma["leagues_without_organization"]])
+        self.assertIn("Unleagued Arena",
+                      [x["name"] for x in ma["venues_without_league"]])
+        self.assertIn("venue_owner_mismatches", ma)
 
     def test_missing_assignments_flags_orphans(self):
         # A venue with no owner and a team with no club surface as orphans.

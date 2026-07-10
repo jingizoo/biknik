@@ -666,6 +666,10 @@ class InMemoryStore:
         self.games[game.id] = game
         return game
 
+    def save_league(self, league: League) -> League:
+        self.leagues[league.id] = league
+        return league
+
     def save_venue(self, venue: Venue) -> Venue:
         self.venues[venue.id] = venue
         return venue

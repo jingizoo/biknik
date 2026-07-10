@@ -202,14 +202,16 @@ class SqlStoreParityTest(unittest.TestCase):
         self.assertEqual(row["level_name"], "Level 1")
 
     def test_setup_hierarchy_builds_on_sql(self):
-        # The nested setup tree (#166 PR C) must build from the SQL store's
-        # flat tables: the seeded owner nests its venues/rinks, and the seeded
-        # level nests its divisions.
+        # The nested setup tree (#166 PR C / #173 PR B) must build from the SQL
+        # store's flat tables: the owner nests its league → venues → rinks, and
+        # the seeded level nests its divisions.
         h = self.api.get_setup_hierarchy()
         org = next(o for o in h["organizations"]
                    if o["name"] == "Summit Ice Facilities")
-        self.assertTrue(org["venues"])
-        self.assertIn("ice_slot_count", org["venues"][0]["rinks"][0])
+        self.assertTrue(org["leagues"])
+        league = org["leagues"][0]
+        self.assertTrue(league["venues"])
+        self.assertIn("ice_slot_count", league["venues"][0]["rinks"][0])
         season = h["leagues"][0]["seasons"][0]
         self.assertIn("Junior Tier", [lv["name"] for lv in season["levels"]])
         self.assertIn("missing_assignments", h)

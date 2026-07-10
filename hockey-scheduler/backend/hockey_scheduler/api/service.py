@@ -1861,6 +1861,7 @@ class ApiService:
         clubs = {c.id: c for c in self.store.all_clubs()}
         teams = {t.id: t for t in self.store.all_teams()}
         orgs = {o.id: o for o in self.store.all_organizations()}
+        leagues_by_id = {lg.id: lg for lg in self.store.all_leagues()}
         venues = {v.id: v for v in self.store.all_venues()}
         rinks = {r.id: r for r in self.store.all_rinks()}
 
@@ -1897,13 +1898,17 @@ class ApiService:
              "venue_name": venues[r.venue_id].name if r.venue_id in venues else None}
             for r in rinks.values()
         ]
-        # Venues now carry an optional owning organization (#166) — surface the
-        # id + resolved name so the Setup hierarchy can group venues by owner.
+        # Venues carry an optional owning organization (#166) and league (#173)
+        # — surface both ids + resolved names so the Setup UI can label and
+        # group venues by owner and league.
         venue_rows = [
             {"id": v.id, "name": v.name, "address": v.address, "timezone": v.timezone,
              "organization_id": v.organization_id,
              "organization_name": orgs[v.organization_id].name
-             if v.organization_id in orgs else None}
+             if v.organization_id in orgs else None,
+             "league_id": v.league_id,
+             "league_name": leagues_by_id[v.league_id].name
+             if v.league_id in leagues_by_id else None}
             for v in venues.values()
         ]
 
@@ -2019,14 +2024,15 @@ class ApiService:
 
     @catch
     def get_setup_hierarchy(self) -> dict:
-        """Nested, UI-ready setup tree (#166 PR C).
+        """Nested, UI-ready setup tree (#166 PR C, extended in #173 PR B).
 
-        Two trees — facility ownership (Organization → Venue → Rink) and
-        competition structure (League → Season → Level → Division → Team) —
-        plus a ``missing_assignments`` block listing records whose parent link
-        is absent or dangling, so an operator can find and fix them. Leaves
-        carry counts (``ice_slot_count``, ``player_count``), never rosters, so
-        the structural payload stays light. This route is operator-gated
+        Two trees — facility ownership (Organization → League → Venue → Rink,
+        since a venue now belongs to a league under an owner) and competition
+        structure (League → Season → Level → Division → Team) — plus a
+        ``missing_assignments`` block listing records whose parent link is
+        absent or dangling, so an operator can find and fix them. Leaves carry
+        counts (``ice_slot_count``, ``player_count``), never rosters, so the
+        structural payload stays light. This route is operator-gated
         (MANAGE_SETUP) at the HTTP boundary; player *names* still never appear.
         """
         orgs = self.store.all_organizations()
@@ -2048,7 +2054,8 @@ class ApiService:
             player_count[p.team_id] = player_count.get(p.team_id, 0) + 1
 
         rinks_by_venue = _group(rinks, "venue_id")
-        venues_by_org = _group(venues, "organization_id")
+        venues_by_league = _group(venues, "league_id")
+        leagues_by_org = _group(leagues, "organization_id")
         seasons_by_league = _group(seasons, "league_id")
         levels_by_season = _group(levels, "season_id")
         divs_by_season = _group(divisions, "season_id")
@@ -2063,9 +2070,16 @@ class ApiService:
             return {"id": v.id, "name": v.name,
                     "rinks": [rink_node(r) for r in vr]}
 
+        # Facility tree now flows through the league (#173): Organization →
+        # League → Venue → Rink. Venues not yet under a league appear only in
+        # the missing-assignment queue, not in this tree.
+        def league_facility_node(lg):
+            return {"id": lg.id, "name": lg.name,
+                    "venues": [venue_node(v) for v in venues_by_league.get(lg.id, [])]}
+
         organizations = [
             {"id": o.id, "name": o.name, "short_name": o.short_name,
-             "venues": [venue_node(v) for v in venues_by_org.get(o.id, [])]}
+             "leagues": [league_facility_node(lg) for lg in leagues_by_org.get(o.id, [])]}
             for o in orgs
         ]
 
@@ -2106,8 +2120,22 @@ class ApiService:
         division_ids = {d.id for d in divisions}
         level_ids_all = {lv.id for lv in levels}
         team_ids = {t.id for t in teams}
+        league_owner = {lg.id: lg.organization_id for lg in leagues}
         idname = lambda x: {"id": x.id, "name": x.name}
         missing = {
+            # League↔facility relationship gaps (#173).
+            "leagues_without_organization":
+                [idname(lg) for lg in leagues
+                 if not lg.organization_id or lg.organization_id not in org_ids],
+            "venues_without_league":
+                [idname(v) for v in venues if not v.league_id or v.league_id not in league_owner],
+            # A venue assigned to a league whose owner differs from the venue's
+            # own owner — only reachable via legacy data, since create/assign
+            # enforce agreement; surfaced so an operator can reconcile it.
+            "venue_owner_mismatches":
+                [idname(v) for v in venues
+                 if v.league_id in league_owner
+                 and (v.organization_id or None) != (league_owner.get(v.league_id) or None)],
             "venues_without_organization":
                 [idname(v) for v in venues if not v.organization_id or v.organization_id not in org_ids],
             "rinks_without_venue":
@@ -2211,6 +2239,18 @@ class ApiService:
     def assign_player_team(self, player_id: str, team_id: str,
                            actor_id: Optional[str] = None) -> dict:
         return _serialize(self.setup.assign_player_team(player_id, team_id, actor_id))
+
+    @catch
+    def assign_league_organization(self, league_id: str,
+                                   organization_id: Optional[str] = None,
+                                   actor_id: Optional[str] = None) -> dict:
+        return _serialize(self.setup.assign_league_organization(
+            league_id, organization_id, actor_id))
+
+    @catch
+    def assign_venue_league(self, venue_id: str, league_id: Optional[str] = None,
+                            actor_id: Optional[str] = None) -> dict:
+        return _serialize(self.setup.assign_venue_league(venue_id, league_id, actor_id))
 
     @catch
     def create_organization(self, name: str, short_name: str = "",
