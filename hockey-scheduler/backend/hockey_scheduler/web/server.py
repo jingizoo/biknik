@@ -1538,6 +1538,40 @@ class Handler(BaseHTTPRequestHandler):
         return self._send_json({"error": {"code": "not_found",
                                           "message": "Unknown endpoint."}}, 404)
 
+    def _handle_reassign(self, entity: str, record_id: str, target: str,
+                         body: dict, actor_id: str):
+        """Dispatch /api/setup/<entity>/<id>/assign-<target> (#166 PR D).
+
+        Each moves ``record_id`` under a new parent id read from the body; the
+        facade validates the target exists (or accepts null to unassign the
+        nullable links) and audits the old→new ids. ``actor_id`` is the
+        server-resolved session user (#136), never client-supplied.
+        """
+        api = STATE.api
+        b = body
+        combo = (entity, target)
+        if combo == ("venue", "organization"):
+            return self._send_api(api.assign_venue_organization(
+                record_id, b.get("organization_id") or None, actor_id))
+        if combo == ("rink", "venue"):
+            return self._send_api(api.assign_rink_venue(
+                record_id, b.get("venue_id"), actor_id))
+        if combo == ("division", "level"):
+            return self._send_api(api.assign_division_level(
+                record_id, b.get("level_id") or None, actor_id))
+        if combo == ("team", "club"):
+            return self._send_api(api.assign_team_club(
+                record_id, b.get("club_id") or None, actor_id))
+        if combo == ("team", "division"):
+            return self._send_api(api.assign_team_division(
+                record_id, b.get("division_id"), actor_id))
+        if combo == ("player", "team"):
+            return self._send_api(api.assign_player_team(
+                record_id, b.get("team_id"), actor_id))
+        return self._send_json({"error": {
+            "code": "not_found",
+            "message": f"Unknown reassignment {entity}/assign-{target}."}}, 404)
+
     def _handle_setup(self, entity: str, body: dict, actor_id: str):
         """Dispatch /api/setup/<entity> to the matching facade create method.
 
@@ -1547,6 +1581,11 @@ class Handler(BaseHTTPRequestHandler):
         """
         api = STATE.api
         b = body
+        # Reassignment routes (#166 PR D): /api/setup/<entity>/<id>/assign-<parent>.
+        # Move a record under a new parent, recording the old→new ids in audit.
+        m = re.match(r"^(venue|rink|division|team|player)/([^/]+)/assign-(\w+)$", entity)
+        if m:
+            return self._handle_reassign(m.group(1), m.group(2), m.group(3), b, actor_id)
         if entity == "league":
             return self._send_api(api.create_league(
                 b.get("name"), b.get("country", ""), b.get("timezone", "UTC"), actor_id))

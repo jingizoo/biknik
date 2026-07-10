@@ -122,6 +122,16 @@ def required_permission(path: str):
     if path.startswith("/api/officials/assignments/"):
         return Permission.MANAGE_SCHEDULE
 
+    # Reassignment routes (#166 PR D): /api/setup/<entity>/<id>/assign-<parent>.
+    # Facility-side moves (venue's owner, rink's venue) are arena actions;
+    # league-structure moves (division/team/player parents) require setup.
+    m = re.match(r"^/api/setup/(venue|rink)/[^/]+/assign-\w+$", path)
+    if m:
+        return Permission.MANAGE_ARENA
+    m = re.match(r"^/api/setup/(division|team|player)/[^/]+/assign-\w+$", path)
+    if m:
+        return Permission.MANAGE_SETUP
+
     if path.startswith("/api/setup/"):
         entity = path[len("/api/setup/"):]
         if entity in ("game", "official"):

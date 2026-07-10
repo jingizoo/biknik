@@ -254,6 +254,110 @@ class SetupService:
                     {"club_id": club_id, "division_id": division_id})
         return team
 
+    # -- reassignment: move a record under a new parent (#166 PR D) --------
+    # Each records the old→new parent id in the audit detail so a move is
+    # traceable. Nullable links (venue→org, division→level, team→club) accept
+    # None to unassign; required links (rink→venue, team→division,
+    # player→team) demand a valid target so a move never orphans a record.
+    @_transactional
+    def assign_venue_organization(self, venue_id: str,
+                                  organization_id: Optional[str] = None,
+                                  actor_id: Optional[str] = None) -> Venue:
+        venue = self.store.get_venue(venue_id)
+        if venue is None:
+            raise NotFoundError(f"Venue {venue_id} not found.")
+        if organization_id and self.store.get_organization(organization_id) is None:
+            raise NotFoundError(f"Organization {organization_id} not found.")
+        old = venue.organization_id
+        venue.organization_id = organization_id or None
+        self.store.save_venue(venue)
+        self._audit("venue_organization_assigned", "venue", venue.id, actor_id,
+                    {"from": old, "to": venue.organization_id})
+        return venue
+
+    @_transactional
+    def assign_rink_venue(self, rink_id: str, venue_id: str,
+                          actor_id: Optional[str] = None) -> Rink:
+        rink = self.store.get_rink(rink_id)
+        if rink is None:
+            raise NotFoundError(f"Rink {rink_id} not found.")
+        if not venue_id or self.store.get_venue(venue_id) is None:
+            raise NotFoundError(f"Venue {venue_id} not found.")
+        old = rink.venue_id
+        rink.venue_id = venue_id
+        self.store.save_rink(rink)
+        self._audit("rink_venue_assigned", "rink", rink.id, actor_id,
+                    {"from": old, "to": venue_id})
+        return rink
+
+    @_transactional
+    def assign_division_level(self, division_id: str,
+                              level_id: Optional[str] = None,
+                              actor_id: Optional[str] = None) -> Division:
+        division = self.store.get_division(division_id)
+        if division is None:
+            raise NotFoundError(f"Division {division_id} not found.")
+        if level_id:
+            level = self.store.get_level(level_id)
+            if level is None:
+                raise NotFoundError(f"Level {level_id} not found.")
+            if level.season_id != division.season_id:
+                raise ValidationError(
+                    "Level belongs to a different season than the division.")
+        old = division.level_id
+        division.level_id = level_id or None
+        self.store.save_division(division)
+        self._audit("division_level_assigned", "division", division.id, actor_id,
+                    {"from": old, "to": division.level_id})
+        return division
+
+    @_transactional
+    def assign_team_club(self, team_id: str, club_id: Optional[str] = None,
+                         actor_id: Optional[str] = None) -> Team:
+        team = self.store.get_team(team_id)
+        if team is None:
+            raise NotFoundError(f"Team {team_id} not found.")
+        if club_id and self.store.get_club(club_id) is None:
+            raise NotFoundError(f"Club {club_id} not found.")
+        old = team.club_id
+        team.club_id = club_id or None
+        self.store.save_team(team)
+        self._audit("team_club_assigned", "team", team.id, actor_id,
+                    {"from": old, "to": team.club_id})
+        return team
+
+    @_transactional
+    def assign_team_division(self, team_id: str, division_id: str,
+                             actor_id: Optional[str] = None) -> Team:
+        team = self.store.get_team(team_id)
+        if team is None:
+            raise NotFoundError(f"Team {team_id} not found.")
+        division = self.store.get_division(division_id) if division_id else None
+        if division is None:
+            raise NotFoundError(f"Division {division_id} not found.")
+        old = team.division_id
+        team.division_id = division_id
+        team.division = division.name  # keep the denormalized label in sync
+        self.store.save_team(team)
+        self._audit("team_division_assigned", "team", team.id, actor_id,
+                    {"from": old, "to": division_id})
+        return team
+
+    @_transactional
+    def assign_player_team(self, player_id: str, team_id: str,
+                           actor_id: Optional[str] = None) -> Player:
+        player = self.store.get_player(player_id)
+        if player is None:
+            raise NotFoundError(f"Player {player_id} not found.")
+        if not team_id or self.store.get_team(team_id) is None:
+            raise NotFoundError(f"Team {team_id} not found.")
+        old = player.team_id
+        player.team_id = team_id
+        self.store.save_player(player)
+        self._audit("player_team_assigned", "player", player.id, actor_id,
+                    {"from": old, "to": team_id})
+        return player
+
     # -- organization / venue / rink / ice slot ---------------------------
     @_transactional
     def create_organization(self, name: str, short_name: str = "",

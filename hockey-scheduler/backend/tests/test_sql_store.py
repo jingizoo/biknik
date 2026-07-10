@@ -203,6 +203,21 @@ class SqlStoreParityTest(unittest.TestCase):
         self.assertIn("Junior Tier", [lv["name"] for lv in season["levels"]])
         self.assertIn("missing_assignments", h)
 
+    def test_reassignment_persists_on_sql(self):
+        # Moving a record under a new parent (#166 PR D) must UPDATE the row in
+        # the SQL store, not just mutate an in-memory object.
+        league = self.api.create_league("Over 55")
+        season = self.api.create_season(league["id"], "Fall 2026")
+        level = self.api.create_level(season["id"], "Level 1")
+        div = self.api.create_division(season["id"], "Div A")
+        moved = self.api.assign_division_level(div["id"], level["id"])
+        self.assertEqual(moved["level_id"], level["id"])
+        # Re-read straight from the store to prove it persisted.
+        self.assertEqual(self.store.get_division(div["id"]).level_id, level["id"])
+        cleared = self.api.assign_division_level(div["id"], None)
+        self.assertIsNone(cleared["level_id"])
+        self.assertIsNone(self.store.get_division(div["id"]).level_id)
+
 
 class SqlStoreTransactionTest(unittest.TestCase):
     """A failure mid multi-write operation must roll the whole thing back."""
