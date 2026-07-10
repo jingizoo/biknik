@@ -6,6 +6,7 @@ on:
       - "hockey-scheduler/backend/**"
       - "hockey-scheduler/docs/**"
       - "hockey-scheduler/e2e/**"
+      - "hockey-scheduler/tools/**"
       - ".github/workflows/hockey-scheduler-ci.yml"
   push:
     branches:
@@ -14,6 +15,7 @@ on:
       - "hockey-scheduler/backend/**"
       - "hockey-scheduler/docs/**"
       - "hockey-scheduler/e2e/**"
+      - "hockey-scheduler/tools/**"
       - ".github/workflows/hockey-scheduler-ci.yml"
 
 jobs:
@@ -69,10 +71,10 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
-      - name: Syntax-check app.js (#138)
-        # No build step or bundler for the frontend by design — this is a
-        # cheap gate against a shipped syntax error, not a full lint pass.
-        run: node --check hockey-scheduler/backend/hockey_scheduler/web/static/app.js
+      - name: Syntax-check app.js and setup.js
+        run: |
+          node --check hockey-scheduler/backend/hockey_scheduler/web/static/app.js
+          node --check hockey-scheduler/backend/hockey_scheduler/web/static/setup.js
 
   browser-smoke:
     runs-on: ubuntu-latest
@@ -93,3 +95,33 @@ jobs:
       - name: Run browser smoke test (#138)
         working-directory: hockey-scheduler/e2e
         run: npm run smoke
+
+  source-wiring:
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Apply one-time PR B wiring
+        run: |
+          if grep -q "class InstallationState" hockey-scheduler/backend/hockey_scheduler/domain/setup_models.py; then
+            echo "PR B wiring already applied"
+            exit 0
+          fi
+          python hockey-scheduler/tools/apply_pr174b.py
+      - name: Commit wired sources when needed
+        run: |
+          if git diff --quiet; then
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add hockey-scheduler
+          git commit -m "Wire atomic production installation claim (#174 PR B)"
+          git push origin HEAD:${{ github.head_ref }}
