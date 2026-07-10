@@ -166,12 +166,20 @@ class SetupService:
     # -- league / season / division ---------------------------------------
     @_transactional
     def create_league(self, name: str, country: str = "", timezone_name: str = "UTC",
+                      organization_id: Optional[str] = None,
                       actor_id: Optional[str] = None) -> League:
+        # Optional owning organization (#173) — validated when given so a league
+        # never dangles off a non-existent owner. Nullable for migration/legacy;
+        # null-owner leagues surface in the missing-assignment queue.
+        if organization_id and self.store.get_organization(organization_id) is None:
+            raise NotFoundError(f"Organization {organization_id} not found.")
         league = League(id=self.store.next_id("league"),
                         name=self._require_name(name), country=country,
-                        timezone=timezone_name or "UTC")
+                        timezone=timezone_name or "UTC",
+                        organization_id=organization_id or None)
         self.store.add_league(league)
-        self._audit("league_created", "league", league.id, actor_id)
+        self._audit("league_created", "league", league.id, actor_id,
+                    {"organization_id": organization_id} if organization_id else None)
         return league
 
     @_transactional
@@ -371,17 +379,32 @@ class SetupService:
     @_transactional
     def create_venue(self, name: str, address: str = "", timezone_name: str = "UTC",
                      organization_id: Optional[str] = None,
+                     league_id: Optional[str] = None,
                      actor_id: Optional[str] = None) -> Venue:
         # An optional owning organization (#166) — validated when given so a
         # venue never dangles off a non-existent org; null is fine (unassigned).
         if organization_id and self.store.get_organization(organization_id) is None:
             raise NotFoundError(f"Organization {organization_id} not found.")
+        # An optional owning league (#173). A league carries its own owner, so
+        # the venue's owner must agree with it: prefer deriving the owner from
+        # the league, and reject an explicitly-supplied conflicting owner rather
+        # than silently transferring facility ownership.
+        if league_id:
+            league = self.store.get_league(league_id)
+            if league is None:
+                raise NotFoundError(f"League {league_id} not found.")
+            league_owner = league.organization_id
+            if organization_id and league_owner and organization_id != league_owner:
+                raise ValidationError(
+                    "Venue owner must match the league's owner.")
+            organization_id = league_owner or organization_id
         venue = Venue(id=self.store.next_id("venue"), name=self._require_name(name),
                       address=address, timezone=timezone_name or "UTC",
-                      organization_id=organization_id or None)
+                      organization_id=organization_id or None, league_id=league_id or None)
         self.store.add_venue(venue)
-        self._audit("venue_created", "venue", venue.id, actor_id,
-                    {"organization_id": organization_id} if organization_id else None)
+        detail = {k: v for k, v in
+                  {"organization_id": organization_id, "league_id": league_id}.items() if v}
+        self._audit("venue_created", "venue", venue.id, actor_id, detail or None)
         return venue
 
     @_transactional

@@ -83,6 +83,12 @@ class MigrationApplyTest(unittest.TestCase):
             cur.execute("ALTER TABLE rinks DROP COLUMN external_ref")  # #95 additive col
             cur.execute("ALTER TABLE venues DROP COLUMN organization_id")  # #166 additive col
             cur.execute("ALTER TABLE divisions DROP COLUMN level_id")  # #166 additive col
+            # #173 columns carry indexes; a pre-#173 DB has neither, so drop the
+            # indexes before the columns (SQLite rejects dropping an indexed col).
+            cur.execute("DROP INDEX IF EXISTS ix_leagues_organization")  # #173
+            cur.execute("DROP INDEX IF EXISTS ix_venues_league")  # #173
+            cur.execute("ALTER TABLE leagues DROP COLUMN organization_id")  # #173 additive col
+            cur.execute("ALTER TABLE venues DROP COLUMN league_id")  # #173 additive col
             cur.execute("ALTER TABLE guardian_links DROP COLUMN consent_method")  # #35
             cur.execute("ALTER TABLE guardian_links DROP COLUMN consented_at")  # #35
             cur.execute("ALTER TABLE calendar_feed_tokens DROP COLUMN created_by")  # #131
@@ -108,6 +114,8 @@ class MigrationApplyTest(unittest.TestCase):
                 {"created_by", "last_used_at", "revoked_by"}
                 <= _table_columns(adopted, "calendar_feed_tokens"))
             self.assertIn("organization_id", _table_columns(adopted, "venues"))
+            self.assertIn("organization_id", _table_columns(adopted, "leagues"))
+            self.assertIn("league_id", _table_columns(adopted, "venues"))
         finally:
             os.remove(path)
 

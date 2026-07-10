@@ -54,6 +54,39 @@ class SetupFacadeTest(unittest.TestCase):
         )
         self.assertEqual(result["error"]["code"], "validation_error")
 
+    def test_create_league_with_owner(self):
+        org = self.api.create_organization("Canlon")
+        league = self.api.create_league("Over 55", organization_id=org["id"])
+        self.assertNotIn("error", league)
+        self.assertEqual(league["organization_id"], org["id"])
+
+    def test_create_league_with_missing_owner_returns_not_found(self):
+        result = self.api.create_league("Over 55", organization_id="org_missing")
+        self.assertEqual(result["error"]["code"], "not_found")
+
+    def test_create_league_without_owner_is_unassigned(self):
+        league = self.api.create_league("Over 55")
+        self.assertIsNone(league["organization_id"])
+
+    def test_venue_with_league_derives_owner(self):
+        org = self.api.create_organization("Canlon")
+        league = self.api.create_league("Over 55", organization_id=org["id"])
+        venue = self.api.create_venue("Plainfield", league_id=league["id"])
+        self.assertEqual(venue["league_id"], league["id"])
+        self.assertEqual(venue["organization_id"], org["id"])  # derived
+
+    def test_venue_owner_mismatch_with_league_rejected(self):
+        org = self.api.create_organization("Canlon")
+        other = self.api.create_organization("Other Owner")
+        league = self.api.create_league("Over 55", organization_id=org["id"])
+        result = self.api.create_venue(
+            "Plainfield", organization_id=other["id"], league_id=league["id"])
+        self.assertEqual(result["error"]["code"], "validation_error")
+
+    def test_venue_with_missing_league_returns_not_found(self):
+        result = self.api.create_venue("Plainfield", league_id="league_missing")
+        self.assertEqual(result["error"]["code"], "not_found")
+
     def test_create_organization_through_facade(self):
         org = self.api.create_organization("Summit Ice Facilities", short_name="Summit")
         self.assertNotIn("error", org)

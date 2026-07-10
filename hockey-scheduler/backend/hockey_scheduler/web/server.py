@@ -1588,7 +1588,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._handle_reassign(m.group(1), m.group(2), m.group(3), b, actor_id)
         if entity == "league":
             return self._send_api(api.create_league(
-                b.get("name"), b.get("country", ""), b.get("timezone", "UTC"), actor_id))
+                b.get("name"), b.get("country", ""), b.get("timezone", "UTC"),
+                b.get("organization_id") or None, actor_id))
         if entity == "season":
             return self._send_api(api.create_season(
                 b.get("league_id"), b.get("name"),
@@ -1616,7 +1617,7 @@ class Handler(BaseHTTPRequestHandler):
         if entity == "venue":
             return self._send_api(api.create_venue(
                 b.get("name"), b.get("address", ""), b.get("timezone", "UTC"),
-                b.get("organization_id") or None, actor_id))
+                b.get("organization_id") or None, b.get("league_id") or None, actor_id))
         if entity == "rink":
             return self._send_api(api.create_rink(
                 b.get("venue_id"), b.get("name"), actor_id))
