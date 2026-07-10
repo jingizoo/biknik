@@ -2137,8 +2137,10 @@ class ApiService:
     # ====================================================================
     @catch
     def create_league(self, name: str, country: str = "", timezone: str = "UTC",
+                      organization_id: Optional[str] = None,
                       actor_id: Optional[str] = None) -> dict:
-        return _serialize(self.setup.create_league(name, country, timezone, actor_id))
+        return _serialize(self.setup.create_league(
+            name, country, timezone, organization_id, actor_id))
 
     @catch
     def list_leagues(self) -> List[dict]:
@@ -2218,9 +2220,10 @@ class ApiService:
     @catch
     def create_venue(self, name: str, address: str = "", timezone: str = "UTC",
                      organization_id: Optional[str] = None,
+                     league_id: Optional[str] = None,
                      actor_id: Optional[str] = None) -> dict:
         return _serialize(self.setup.create_venue(
-            name, address, timezone, organization_id, actor_id))
+            name, address, timezone, organization_id, league_id, actor_id))
 
     @catch
     def create_rink(self, venue_id: str, name: str,

@@ -58,8 +58,13 @@ def build_full_demo_store(store=None) -> Tuple[InMemoryStore, str, dict]:
     roster = RosterService(store)
     admin = "league_admin"
 
+    # Facility owner that operates the league and owns its arenas (#166/#173) —
+    # a rink company, distinct from a hockey Club. The league links up to it,
+    # and its venues link to the league (deriving the same owner).
+    org = setup.create_organization("Summit Ice Facilities", short_name="Summit",
+                                    actor_id=admin)
     league = setup.create_league("Alpine Ice Hockey League", country="AT",
-                                 actor_id=admin)
+                                 organization_id=org.id, actor_id=admin)
     season = setup.create_season(league.id, "2026–27 Winter Season",
                                  actor_id=admin)
     # A competitive level/tier groups divisions inside the season (#166). The
@@ -84,13 +89,9 @@ def build_full_demo_store(store=None) -> Tuple[InMemoryStore, str, dict]:
     setup.create_team(club_lions.id, d_u18.id, "U18 Lions", actor_id=admin)
     setup.create_team(club_lions.id, d_sen.id, "Senior Lions", actor_id=admin)
 
-    # Facility owner that owns the arenas (#166) — a rink company, distinct
-    # from a hockey Club. Both demo venues belong to it; a real deployment can
-    # leave a venue's organization null until assigned.
-    org = setup.create_organization("Summit Ice Facilities", short_name="Summit",
-                                    actor_id=admin)
+    # Both demo venues belong to the league (and, through it, the owner above).
     venue = setup.create_venue("Nord Arena", address="Alpine Way 1",
-                               organization_id=org.id, actor_id=admin)
+                               league_id=league.id, actor_id=admin)
     main_rink = setup.create_rink(venue.id, "Main Rink", actor_id=admin)
     setup.create_rink(venue.id, "Training Rink", actor_id=admin)
 
@@ -149,7 +150,7 @@ def build_full_demo_store(store=None) -> Tuple[InMemoryStore, str, dict]:
 
     # Pilot-scale data pack (#97) — purely additive, see module docstring.
     _seed_pilot_scale(setup, roster, admin, season, d_u16, d_u18, d_sen,
-                      club_falcons, main_rink, org)
+                      club_falcons, main_rink, league)
 
     ids = {
         "next_game_id": game_next.id,
@@ -230,7 +231,7 @@ def _round_robin_pairs(team_ids, rounds):
 
 
 def _seed_pilot_scale(setup, roster, admin, season, d_u16, d_u18, d_sen,
-                      club_falcons, main_rink, org):
+                      club_falcons, main_rink, league):
     """Fill the store out to pilot scale on top of the core scenario above:
     12 teams, ~184 players, 24 officials, 3 rinks across 2 venues, two weeks
     of ice inventory, and ~18 more published games (~19-20 total) with a
@@ -280,7 +281,7 @@ def _seed_pilot_scale(setup, roster, admin, season, d_u16, d_u18, d_sen,
     # A second venue/rink so the arena calendar spans more than one arena —
     # 3 rinks total across 2 venues.
     venue2 = setup.create_venue("Lakeside Ice Center", address="2 Harbor Rd",
-                                organization_id=org.id, actor_id=admin)
+                                league_id=league.id, actor_id=admin)
     lakeside_rink = setup.create_rink(venue2.id, "Lakeside Rink", actor_id=admin)
     training_rink = next(r for r in store.all_rinks() if r.name == "Training Rink")
     rinks = [main_rink, training_rink, lakeside_rink]

@@ -31,6 +31,9 @@ class League:
     name: str
     country: str = ""
     timezone: str = "UTC"
+    # Owning facility organization (#173). Nullable — pre-existing leagues and
+    # leagues created without an owner have none until one is assigned.
+    organization_id: Optional[str] = None
 
 
 @dataclass
@@ -92,6 +95,10 @@ class Venue:
     # Owning facility organization (#166). Nullable — pre-existing venues and
     # venues created without an owner simply have no organization.
     organization_id: Optional[str] = None
+    # Owning league (#173). Nullable — a venue belongs to at most one league;
+    # legacy/unassigned inventory has none. When set, the venue's owner must
+    # match the league's owner (enforced in the service layer).
+    league_id: Optional[str] = None
 
 
 @dataclass

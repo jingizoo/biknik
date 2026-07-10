@@ -161,6 +161,17 @@ class SqlStoreParityTest(unittest.TestCase):
         self.api.set_user_account_active(row["id"], False)
         self.assertIsNone(self.api.verify_login("sql_coach", "sql-pw"))
 
+    def test_league_owner_and_venue_league_roundtrip_on_sql(self):
+        # League.organization_id and Venue.league_id (#173) must persist through
+        # their columns, and the venue must derive the league's owner.
+        org = self.api.create_organization("Canlon")
+        league = self.api.create_league("Over 55", organization_id=org["id"])
+        venue = self.api.create_venue("Plainfield", league_id=league["id"])
+        self.assertEqual(self.store.get_league(league["id"]).organization_id, org["id"])
+        stored_venue = self.store.get_venue(venue["id"])
+        self.assertEqual(stored_venue.league_id, league["id"])
+        self.assertEqual(stored_venue.organization_id, org["id"])
+
     def test_organization_and_venue_link_roundtrip_on_sql(self):
         # An organization (#166) persists through the organizations table, and
         # a venue's organization_id column roundtrips the ownership link.
