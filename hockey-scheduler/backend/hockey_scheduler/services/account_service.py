@@ -11,10 +11,13 @@ role/scope model already enforces.
 from datetime import datetime, timezone
 from typing import Callable, Optional
 
-from ..domain import Role, SetupAuditLog, UserAccount
-from ..domain.errors import NotFoundError, ValidationError
+from ..domain import InstallationState, Role, SetupAuditLog, UserAccount
+from ..domain.errors import AlreadyClaimedError, NotFoundError, ValidationError
 from ..store import InMemoryStore
 from .passwords import DUMMY_PASSWORD_HASH, hash_password, verify_password
+
+
+_INSTALLATION_STATE_ID = "primary"
 
 
 def _utcnow() -> datetime:
@@ -27,8 +30,8 @@ class AccountService:
         self.clock = clock
 
     def _audit(self, action: str, account_id: str,
-              actor_id: Optional[str] = None, detail: Optional[dict] = None
-              ) -> SetupAuditLog:
+               actor_id: Optional[str] = None, detail: Optional[dict] = None
+               ) -> SetupAuditLog:
         return self.store.add_setup_audit(SetupAuditLog(
             id=self.store.next_id("setupaudit"), action=action,
             entity_type="user_account", entity_id=account_id, at=self.clock(),
@@ -69,8 +72,68 @@ class AccountService:
         )
         self.store.add_user_account(account)
         self._audit("user_account_created", account.id, actor_id=actor_id,
-                   detail={"username": username, "role": role.value})
+                    detail={"username": username, "role": role.value})
         return account
+
+    def create_first_admin_if_unclaimed(
+            self, username: str, password: str,
+            actor_id: Optional[str] = None,
+            claim_method: str = "operations") -> UserAccount:
+        """Atomically create the installation's one and only first admin (#174).
+
+        The durable ``InstallationState`` marker is inserted *before* the account
+        row inside the same transaction. Its single primary key serializes two
+        concurrent claimers even across separate application processes: one
+        transaction wins, and the losing transaction rolls back before creating
+        an account. An existing account also closes the claim path for databases
+        created before the marker migration.
+        """
+        username = (username or "").strip().lower()
+        if not username:
+            raise ValidationError("A username is required.")
+        if not isinstance(password, str) or not password:
+            raise ValidationError("A password is required.")
+        method = (claim_method or "operations").strip()[:40] or "operations"
+
+        try:
+            with self.store.transaction():
+                if (self.store.get_installation_state(_INSTALLATION_STATE_ID)
+                        is not None or self.store.all_user_accounts()):
+                    raise AlreadyClaimedError(
+                        "This installation has already been claimed.")
+
+                account_id = self.store.next_id("user")
+                effective_actor = actor_id or account_id
+                self.store.add_installation_state(InstallationState(
+                    id=_INSTALLATION_STATE_ID,
+                    claimed_at=self.clock(),
+                    claimed_by_user_id=account_id,
+                    claim_method=method,
+                ))
+                account = self.create_account(
+                    username, password, Role.LEAGUE_ADMIN,
+                    actor_id=effective_actor, account_id=account_id)
+                self._audit(
+                    "installation_claimed", account.id,
+                    actor_id=effective_actor,
+                    detail={"claim_method": method})
+                return account
+        except AlreadyClaimedError:
+            raise
+        except Exception:
+            # A second process may have won the unique-marker insert while this
+            # transaction was waiting. Translate that database-specific unique
+            # violation into the same stable, secret-free conflict response.
+            try:
+                claimed = self.store.get_installation_state(
+                    _INSTALLATION_STATE_ID) is not None
+                has_accounts = bool(self.store.all_user_accounts())
+            except Exception:
+                claimed = has_accounts = False
+            if claimed or has_accounts:
+                raise AlreadyClaimedError(
+                    "This installation has already been claimed.") from None
+            raise
 
     def set_active(self, account_id: str, active: bool,
                    actor_id: Optional[str] = None) -> UserAccount:
