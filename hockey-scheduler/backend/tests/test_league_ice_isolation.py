@@ -97,6 +97,28 @@ class LeagueIceIsolationTest(unittest.TestCase):
         self.assertEqual(self.same_1.status, IceSlotStatus.ALLOCATED)
         self.assertEqual(self.cross.status, IceSlotStatus.AVAILABLE)
 
+    def test_reschedule_approval_inherits_cross_league_rejection(self):
+        game = self.setup.create_game(
+            self.season_a.id, self.div_a.id,
+            self.a1.id, self.a2.id, self.same_1.id)
+        self.setup.publish_game(game.id)
+        request = self.setup.request_reschedule(
+            game.id, self.a1.id, "Weather")
+        request = self.setup.respond_to_reschedule(request.id, True)
+
+        reason = self._error_reason(lambda: self.setup.decide_reschedule(
+            request.id, True, new_ice_slot_id=self.cross.id,
+            actor_id="league_admin"))
+        self.assertEqual(reason, "cross_league_slot")
+
+        reloaded = self.store.get_reschedule_request(request.id)
+        self.assertEqual(reloaded.status.value, "pending_league_approval")
+        self.assertIsNone(reloaded.new_ice_slot_id)
+        self.assertEqual(game.ice_slot_id, self.same_1.id)
+        self.assertTrue(game.published)
+        self.assertEqual(self.same_1.status, IceSlotStatus.ALLOCATED)
+        self.assertEqual(self.cross.status, IceSlotStatus.AVAILABLE)
+
     def test_draft_automatically_filters_to_divisions_league(self):
         api = ApiService(self.store)
         result = api.draft_season_schedule(self.div_a.id)
