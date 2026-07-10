@@ -114,6 +114,11 @@ class InstallationClaimServiceTest(unittest.TestCase):
             self.assertIn("installation_claimed", audit_blob)
 
             api.store.close()
+            with open(path, "rb") as database_file:
+                database_bytes = database_file.read()
+            self.assertNotIn(SETUP_CODE.encode(), database_bytes)
+            self.assertNotIn(b"client-password", database_bytes)
+
             reloaded = ApiService(SqlStore(path))
             try:
                 self.assertIsNotNone(reloaded.verify_login(
