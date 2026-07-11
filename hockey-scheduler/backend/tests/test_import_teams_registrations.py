@@ -18,7 +18,7 @@ from helpers import BACKEND  # noqa: F401
 
 from hockey_scheduler.api import ApiService
 from hockey_scheduler.domain import (
-    Division, Season, SeasonTeamRegistration, Team)
+    Club, Division, Season, SeasonTeamRegistration, Team)
 from hockey_scheduler.store import InMemoryStore, SqlStore
 
 ORGANIZATIONS = (
@@ -32,9 +32,9 @@ COMPETITION = (
     "OVER55,FALL26,Fall 2026,,,,DIVA,Division A,Adult\n"
     "OVER55,FALL26,Fall 2026,,,,DIVB,Division B,Adult\n")
 PERMANENT_TEAMS = (
-    "league_code,team_code,team_name,club_name\n"
-    "OVER55,LIONS,Lions,Lions HC\n"
-    "OVER55,BEARS,Bears,Bears HC\n")
+    "league_code,team_code,team_name\n"
+    "OVER55,LIONS,Lions\n"
+    "OVER55,BEARS,Bears\n")
 REGISTRATIONS = (
     "season_code,team_code,division_code\n"
     "FALL26,LIONS,DIVA\n"
@@ -90,7 +90,10 @@ class ImportConvergenceContract:
         # Permanent league team: owned by the league, no division on the Team.
         self.assertEqual(lions.league_id, league.id)
         self.assertIsNone(lions.division_id)
-        self.assertTrue(any(c.name == "Lions HC" for c in self.store.all_clubs()))
+        # Club association is deferred from this slice (#214 review): the team
+        # imports with no club, and the import creates no Club records.
+        self.assertIsNone(lions.club_id)
+        self.assertEqual(self.store.all_clubs(), [])
         # Participation lives in the registration.
         season = self._by_ref(self.store.all_seasons(), "FALL26")
         diva = self._by_ref(self.store.all_divisions(), "DIVA")
@@ -290,7 +293,7 @@ class ImportConvergenceContract:
         # PUMAS has no registrations, so moving its league is safe and audited.
         base = dict(payload())
         base["permanent_teams_csv"] = (
-            PERMANENT_TEAMS + "OVER55,PUMAS,Pumas,Pumas HC\n")
+            PERMANENT_TEAMS + "OVER55,PUMAS,Pumas\n")
         self.api.commit_hierarchy_import(base, actor_id="admin")
         over55 = self._by_ref(self.store.all_leagues(), "OVER55")
         pumas = self._team("PUMAS")
@@ -438,20 +441,41 @@ class ImportConvergenceContract:
             id="streg_legacy", season_id=season.id, team_id="team_legacy",
             division_id=diva.id, active=True))
         reimport = {"import_type": "hierarchy", "permanent_teams_csv":
-                    "league_code,team_code,team_name,club_name\n"
-                    "OVER55,LEGACY,New Name,New Club\n"}
+                    "league_code,team_code,team_name\n"
+                    "OVER55,LEGACY,New Name\n"}
         result = self.api.commit_hierarchy_import(reimport, actor_id="admin")
         self.assertTrue(result["committed"], result.get("errors"))
         team = self._team("LEGACY")
         # Permanent fields converged.
         self.assertEqual(team.name, "New Name")
-        self.assertTrue(any(c.name == "New Club" for c in self.store.all_clubs()))
         self.assertEqual(team.league_id, league.id)
         # Legacy compatibility fields and legacy game scope preserved.
         self.assertEqual(team.division_id, diva.id)
         self.assertEqual(team.division, "Division A")
         reg = self.store.registration_for_team_in_season(season.id, team.id)
         self.assertEqual(reg.division_id, diva.id)
+
+    def test_import_never_creates_or_clears_clubs(self):
+        # Club association is deferred from this slice (#214 review): the import
+        # creates no Club records and never touches an existing team's club_id,
+        # so there is no non-deterministic name-matching.
+        self.api.commit_hierarchy_import(payload(), actor_id="admin")
+        self.assertEqual(self.store.all_clubs(), [])  # commit created no clubs
+        league = self._by_ref(self.store.all_leagues(), "OVER55")
+        club = Club(id="club_x", name="Existing Club")
+        self.store.add_club(club)
+        self.store.add_team(Team(id="team_wc", name="WithClub", external_ref="WC",
+                                 club_id=club.id, division_id=None,
+                                 league_id=league.id))
+        clubs_before = len(self.store.all_clubs())
+        reimport = {"import_type": "hierarchy", "permanent_teams_csv":
+                    "league_code,team_code,team_name\nOVER55,WC,Renamed\n"}
+        result = self.api.commit_hierarchy_import(reimport, actor_id="admin")
+        self.assertTrue(result["committed"], result.get("errors"))
+        team = self._team("WC")
+        self.assertEqual(team.name, "Renamed")               # name converged
+        self.assertEqual(team.club_id, club.id)              # club_id untouched
+        self.assertEqual(len(self.store.all_clubs()), clubs_before)  # no new clubs
 
     def test_preflight_runs_inside_the_transaction(self):
         # #214 review: validation/preflight must run under the same transaction

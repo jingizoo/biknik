@@ -11,7 +11,7 @@ from collections import OrderedDict
 from typing import Dict, Iterable, List, Optional, Tuple
 
 from ..domain import (
-    Club, Division, League, Level, Organization, Rink, Season,
+    Division, League, Level, Organization, Rink, Season,
     SeasonTeamRegistration, Team, Venue)
 
 
@@ -39,10 +39,12 @@ HIERARCHY_TEMPLATES = {
     ),
     # Permanent league teams (#180): a team is a permanent member of a league,
     # keyed by team_code; it carries no division here — season participation is
-    # a separate registration sheet below.
+    # a separate registration sheet below. Club association is deferred from
+    # this slice (#214 review): Club has no stable external code yet, so it is
+    # left to a dedicated Club-identity slice.
     "permanent_teams_csv": (
-        "league_code,team_code,team_name,club_name\n"
-        "OVER55,LIONS,Lions,Lions HC\n"
+        "league_code,team_code,team_name\n"
+        "OVER55,LIONS,Lions\n"
     ),
     # Season registrations (#180): one row per team's participation in a season,
     # keyed by (season_code, team_code), assigning that season's division.
@@ -194,7 +196,7 @@ def validate_hierarchy_import(sheets: Dict[str, List[dict]], store) -> dict:
         ("season_code", "level_name", "level_sort_order"))
     _consistent_groups(
         report, "permanent_teams", rows["permanent_teams"], "team_code",
-        ("league_code", "team_name", "club_name"))
+        ("league_code", "team_name"))
 
     existing_orgs = _existing_map(
         report, store.all_organizations(), "organization")
@@ -405,8 +407,7 @@ def _new_counts() -> dict:
     return {name: {"created": 0, "updated": 0, "skipped": 0}
             for name in (
                 "organizations", "leagues", "venues", "rinks", "seasons",
-                "levels", "divisions", "clubs", "permanent_teams",
-                "registrations")}
+                "levels", "divisions", "permanent_teams", "registrations")}
 
 
 def _preflight_reassignment_safety(store, rows) -> List[dict]:
@@ -832,37 +833,23 @@ def commit_hierarchy_import(setup, sheets: Dict[str, List[dict]],
                     counts["divisions"]["skipped"] += 1
 
         # Permanent league teams (#180): keyed by team_code, owned by a league,
-        # carrying no division. Clubs have no external code, so they are
-        # found-or-created by exact name (as the legacy teams import does).
-        club_by_name = {c.name: c for c in store.all_clubs()}
+        # carrying no division. Only league + name converge on re-import. Club
+        # association is deferred from this slice (#214 review) — Club has no
+        # stable external code, so the import never sets or clears club_id — and
+        # the legacy division_id/division compatibility fields are preserved
+        # (review-4), cleared only by the later migration that removes their
+        # readers. Both are left untouched on update.
         for code, row in _group_first(
                 rows["permanent_teams"], "team_code").items():
             league = leagues[_clean(row.get("league_code"))]
-            club_id = None
-            club_name = _optional(row.get("club_name"))
-            if club_name:
-                club = club_by_name.get(club_name)
-                if club is None:
-                    club = Club(id=store.next_id("club"), name=club_name)
-                    store.add_club(club)
-                    club_by_name[club_name] = club
-                    counts["clubs"]["created"] += 1
-                    setup._audit("club_created", "club", club.id, actor_id,
-                                 {"import_batch_id": batch_id})
-                club_id = club.id
-            # Only the permanent fields converge on re-import.
-            values = {"name": _clean(row.get("team_name")), "club_id": club_id,
+            values = {"name": _clean(row.get("team_name")),
                       "league_id": league.id}
             obj = teams.get(code)
             if obj is None:
-                # A genuinely NEW permanent team carries no division (#180) —
-                # participation lives in a registration. An EXISTING team keeps
-                # its legacy division_id/division compatibility fields untouched
-                # (#214 review): those are cleared only by the later migration
-                # that removes all legacy Team.division_id readers, never by an
-                # import upsert, so legacy game scope isn't silently lost.
+                # A genuinely NEW permanent team carries no club and no division
+                # (#180) — participation lives in a registration.
                 obj = Team(id=store.next_id("team"), external_ref=code,
-                           division_id=None, division="", **values)
+                           club_id=None, division_id=None, division="", **values)
                 store.add_team(obj)
                 teams[code] = obj
                 counts["permanent_teams"]["created"] += 1

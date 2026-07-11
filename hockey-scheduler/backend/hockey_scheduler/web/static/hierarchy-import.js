@@ -19,8 +19,8 @@ const hierarchyImportTemplates = {
     "league_code,season_code,season_name,level_code,level_name,level_sort_order,division_code,division_name,age_group\n" +
     "OVER55,FALL26,Fall 2026,L1,Level 1,1,DIVA,Division A,Adult\n",
   permanent_teams_csv:
-    "league_code,team_code,team_name,club_name\n" +
-    "OVER55,LIONS,Lions,Lions HC\n",
+    "league_code,team_code,team_name\n" +
+    "OVER55,LIONS,Lions\n",
   registrations_csv:
     "season_code,team_code,division_code\n" +
     "FALL26,LIONS,DIVA\n",

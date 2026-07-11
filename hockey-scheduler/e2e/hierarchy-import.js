@@ -33,8 +33,8 @@ const SHEETS = {
     "league_code,season_code,season_name,level_code,level_name,level_sort_order,division_code,division_name,age_group\n" +
     "BROWSERLEAGUE,BROWSERSEASON,Browser Season,BROWSERLEVEL,Browser Level,1,BROWSERDIV,Browser Division,Adult\n",
   permanent_teams_csv:
-    "league_code,team_code,team_name,club_name\n" +
-    "BROWSERLEAGUE,BROWSERTEAM,Browser Team,Browser Club\n",
+    "league_code,team_code,team_name\n" +
+    "BROWSERLEAGUE,BROWSERTEAM,Browser Team\n",
   registrations_csv:
     "season_code,team_code,division_code\n" +
     "BROWSERSEASON,BROWSERTEAM,BROWSERDIV\n",
