@@ -25,6 +25,7 @@ from hockey_scheduler.domain import (
     Organization,
     Rink,
     Season,
+    SeasonTeamRegistration,
     Team,
     Venue,
 )
@@ -76,6 +77,10 @@ class DraftScheduleTest(unittest.TestCase):
         for i in range(n_teams):
             s.add_team(Team(id=f"t{i}", name=f"Team {i}", division="D1",
                             division_id="div1"))
+            # Draft scheduling reads the season registration, not division_id (#180).
+            s.add_season_team_registration(SeasonTeamRegistration(
+                id=f"streg_t{i}", season_id="se1", team_id=f"t{i}",
+                division_id="div1", active=True))
         base = datetime(2026, 1, 5, 18, tzinfo=UTC)
         for i in range(n_slots):
             s.add_ice_slot(IceSlot(

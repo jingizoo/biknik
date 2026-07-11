@@ -82,12 +82,25 @@ def build_full_demo_store(store=None) -> Tuple[InMemoryStore, str, dict]:
     club_falcons = setup.create_club("Falcons HC", country="AT", actor_id=admin)
     setup.create_club("Bears HC", country="AT", actor_id=admin)
 
+    # A team plays in a season+division only via a SeasonTeamRegistration
+    # (#180): scheduling, moves, publishing and standings all read the
+    # registration, not Team.division_id. Register idempotently so re-running
+    # or double-registering is a no-op.
+    def _register(team_id, division_id):
+        if setup.store.registration_for_team_in_season(season.id, team_id) is None:
+            setup.register_team_for_season(season.id, team_id, division_id,
+                                           actor_id=admin)
+
     u16_lions = setup.create_team(club_lions.id, d_u16.id, "U16 Lions",
                                   actor_id=admin)
     u16_falcons = setup.create_team(club_falcons.id, d_u16.id, "U16 Falcons",
                                     actor_id=admin)
     setup.create_team(club_lions.id, d_u18.id, "U18 Lions", actor_id=admin)
     setup.create_team(club_lions.id, d_sen.id, "Senior Lions", actor_id=admin)
+    # The core-scenario U16 teams play games below (before the round-robin's
+    # bulk registration), so register them now.
+    _register(u16_lions.id, d_u16.id)
+    _register(u16_falcons.id, d_u16.id)
 
     # Both demo venues belong to the league (and, through it, the owner above).
     venue = setup.create_venue("Nord Arena", address="Alpine Way 1",
@@ -338,6 +351,12 @@ def _seed_pilot_scale(setup, roster, admin, season, d_u16, d_u18, d_sen,
     division_of.update({t.id: d_u18.id for t in
                        (u18_lions, u18_falcons, u18_wolves, u18_bears)})
     division_of.update({t.id: d_sen.id for t in (senior_lions, senior_falcons)})
+    # Register every round-robin team into its season+division before any game
+    # is scheduled for it (#180 shared guard). Idempotent so a team already
+    # registered by the core scenario is skipped.
+    for _tid, _did in division_of.items():
+        if setup.store.registration_for_team_in_season(season.id, _tid) is None:
+            setup.register_team_for_season(season.id, _tid, _did, actor_id=admin)
 
     # Every rink's slot on a given day shares the same evening time-of-day,
     # so two games on the same day are effectively simultaneous regardless

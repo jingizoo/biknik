@@ -36,6 +36,10 @@ def full_universe(svc):
     club_b = svc.create_club("Falcons Club")
     home = svc.create_team(club_a.id, division.id, "U16 Lions")
     away = svc.create_team(club_b.id, division.id, "U16 Falcons")
+    # Participation now lives in a season registration (#180); a team must be
+    # registered in the season+division to be scheduled there.
+    svc.register_team_for_season(season.id, home.id, division.id)
+    svc.register_team_for_season(season.id, away.id, division.id)
     venue = svc.create_venue("Ice Palace", league_id=league.id)
     rink = svc.create_rink(venue.id, "Rink 2")
     slot = svc.create_ice_slot(rink.id, START, END)
@@ -167,6 +171,8 @@ class LeagueArenaSetupTest(unittest.TestCase):
         dv = svc.create_division(se.id, "U16 B")
         ta = svc.create_team(svc.create_club("CA").id, dv.id, "TA")
         tb = svc.create_team(svc.create_club("CB").id, dv.id, "TB")
+        svc.register_team_for_season(se.id, ta.id, dv.id)
+        svc.register_team_for_season(se.id, tb.id, dv.id)
         rink = svc.create_rink(
             svc.create_venue("VE", league_id=lg.id).id, "RI")
         slot = svc.create_ice_slot(rink.id, dt(18, 30), dt(20))
@@ -214,6 +220,7 @@ class LeagueArenaSetupTest(unittest.TestCase):
         svc.create_game(u["season"].id, u["division"].id,
                         u["home"].id, u["away"].id, u["slot"].id)
         bears = svc.create_team(svc.create_club("Bears").id, u["division"].id, "Bears")
+        svc.register_team_for_season(u["season"].id, bears.id, u["division"].id)
         with self.assertRaises(ScheduleConflictError):
             svc.create_game(u["season"].id, u["division"].id,
                             u["home"].id, bears.id, slot2.id)
@@ -226,6 +233,7 @@ class LeagueArenaSetupTest(unittest.TestCase):
         svc.create_game(u["season"].id, u["division"].id,
                         u["home"].id, u["away"].id, u["slot"].id)
         bears = svc.create_team(svc.create_club("Bears").id, u["division"].id, "Bears")
+        svc.register_team_for_season(u["season"].id, bears.id, u["division"].id)
         game = svc.create_game(u["season"].id, u["division"].id,
                                u["home"].id, bears.id, slot2.id)
         self.assertIsNotNone(game.id)
@@ -239,6 +247,8 @@ class LeagueArenaSetupTest(unittest.TestCase):
                         u["home"].id, u["away"].id, u["slot"].id)
         bears = svc.create_team(svc.create_club("Bears").id, u["division"].id, "Bears")
         eagles = svc.create_team(svc.create_club("Eagles").id, u["division"].id, "Eagles")
+        svc.register_team_for_season(u["season"].id, bears.id, u["division"].id)
+        svc.register_team_for_season(u["season"].id, eagles.id, u["division"].id)
         game = svc.create_game(u["season"].id, u["division"].id,
                                bears.id, eagles.id, slot2.id)
         self.assertIsNotNone(game.id)

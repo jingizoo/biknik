@@ -102,6 +102,8 @@ class FullDemoTest(unittest.TestCase):
         dv = api.create_division(se["id"], "D")
         ta = api.create_team(api.create_club("CA")["id"], dv["id"], "TA")
         tb = api.create_team(api.create_club("CB")["id"], dv["id"], "TB")
+        api.register_team_for_season(se["id"], ta["id"], dv["id"])
+        api.register_team_for_season(se["id"], tb["id"], dv["id"])
         # Only 2 skaters, no goalie — well below the 1 goalie / 15 skater target.
         for n in ("Skater A", "Skater B"):
             api.create_player(ta["id"], n, "forward")
@@ -141,6 +143,8 @@ class FullDemoTest(unittest.TestCase):
         dv = api.create_division(se["id"], "D")
         ta = api.create_team(api.create_club("CA")["id"], dv["id"], "TA")
         tb = api.create_team(api.create_club("CB")["id"], dv["id"], "TB")
+        api.register_team_for_season(se["id"], ta["id"], dv["id"])
+        api.register_team_for_season(se["id"], tb["id"], dv["id"])
         rink = api.create_rink(api.create_venue("V", league_id=lg["id"])["id"], "R")
         slot = api.create_ice_slot(rink["id"], "2026-09-01T18:30:00+00:00",
                                    "2026-09-01T20:00:00+00:00")

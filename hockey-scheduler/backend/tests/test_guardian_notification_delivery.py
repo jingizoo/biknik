@@ -52,6 +52,9 @@ def _seeded_api():
     div = api.setup.create_division(season.id, "U16")
     home = api.setup.create_team(api.setup.create_club("LH").id, div.id, "Lions")
     away = api.setup.create_team(api.setup.create_club("FH").id, div.id, "Falcons")
+    # Participation comes from the season registration (#180).
+    api.setup.register_team_for_season(season.id, home.id, div.id)
+    api.setup.register_team_for_season(season.id, away.id, div.id)
     venue = api.setup.create_venue("Arena", league_id=league.id)
     rink = api.setup.create_rink(venue.id, "Rink 1")
     base = datetime(2026, 9, 1, 18, 30, tzinfo=UTC)

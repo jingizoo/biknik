@@ -250,6 +250,10 @@ class ImportRinksIceSlotsCommitServiceContract:
                                       actor_id="admin")
         away = self.setup.create_team(club.id, division.id, "Away",
                                       actor_id="admin")
+        self.setup.register_team_for_season(season.id, home.id, division.id,
+                                            actor_id="admin")
+        self.setup.register_team_for_season(season.id, away.id, division.id,
+                                            actor_id="admin")
         self.setup.create_game(season.id, division.id, home.id, away.id,
                                slot.id, actor_id="admin")
 
@@ -288,6 +292,10 @@ class ImportRinksIceSlotsCommitServiceContract:
                                       actor_id="admin")
         away = self.setup.create_team(club.id, division.id, "Away",
                                       actor_id="admin")
+        self.setup.register_team_for_season(season.id, home.id, division.id,
+                                            actor_id="admin")
+        self.setup.register_team_for_season(season.id, away.id, division.id,
+                                            actor_id="admin")
         self.setup.create_game(season.id, division.id, home.id, away.id,
                                slot.id, actor_id="admin")
 

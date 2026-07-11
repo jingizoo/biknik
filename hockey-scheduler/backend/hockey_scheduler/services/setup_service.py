@@ -847,6 +847,44 @@ class SetupService:
                     {"rink_id": rink_id, "slot_type": slot_type.value})
         return slot
 
+    # -- shared season-registration guard (#180) ---------------------------
+    # A team's participation in a (season, division) is resolved through its
+    # SeasonTeamRegistration — the single source of truth — not the legacy
+    # Team.division_id. Game creation, moves, publishing, and standings all go
+    # through these helpers so the same rule is enforced everywhere; a team may
+    # only play in a season+division it is actively registered in.
+    def _require_team_registered(self, season_id: str, team_id: str,
+                                 division_id: Optional[str], team=None):
+        """Raise ``DivisionMismatchError`` unless ``team_id`` is actively
+        registered in ``season_id`` and, when ``division_id`` is given, in that
+        division. Returns the registration on success."""
+        resolved = team if team is not None else self.store.get_team(team_id)
+        label = resolved.name if resolved is not None else team_id
+        reg = self.store.registration_for_team_in_season(season_id, team_id)
+        if reg is None or not reg.active:
+            raise DivisionMismatchError(
+                f"{label} is not registered in this season.",
+                {"reason": "team_not_registered", "team_id": team_id,
+                 "season_id": season_id})
+        if division_id is not None and reg.division_id != division_id:
+            raise DivisionMismatchError(
+                f"{label} is not registered in this division.",
+                {"reason": "team_wrong_division", "team_id": team_id,
+                 "season_id": season_id, "division_id": division_id,
+                 "registered_division_id": reg.division_id})
+        return reg
+
+    def registered_team_ids_in_division(self, division_id: str) -> set:
+        """Team ids actively registered in ``division_id`` — the division's
+        membership/standings roster, replacing the legacy Team.division_id
+        filter. Empty when the division does not exist."""
+        division = self.store.get_division(division_id)
+        if division is None:
+            return set()
+        return {r.team_id
+                for r in self.store.registrations_for_season(division.season_id)
+                if r.active and r.division_id == division_id}
+
     # -- manual game creation ---------------------------------------------
     @_transactional
     def create_game(self, season_id: str, division_id: str, home_team_id: str,
@@ -874,13 +912,13 @@ class SetupService:
         if away is None:
             raise NotFoundError(f"Team {away_team_id} not found.")
 
+        # Participation is resolved through SeasonTeamRegistration (#180), not
+        # the legacy Team.division_id: both teams must be actively registered in
+        # this season+division. The override flag still forces a game between
+        # teams that are not co-registered.
         if not allow_division_override:
-            for team in (home, away):
-                if team.division_id != division_id:
-                    raise DivisionMismatchError(
-                        f"{team.name} is not in division {division.name}. "
-                        f"Use the override flag to force this game."
-                    )
+            self._require_team_registered(season_id, home_team_id, division_id, home)
+            self._require_team_registered(season_id, away_team_id, division_id, away)
 
         slot = self.store.get_ice_slot(ice_slot_id)
         if slot is None:
@@ -947,6 +985,14 @@ class SetupService:
         game = self.store.get_game(game_id)
         if game is None:
             raise NotFoundError(f"Game {game_id} not found.")
+        # A game may only be made public while both teams are still co-registered
+        # in its season+division (#180 shared guard). Unpublishing is unguarded so
+        # an invalid fixture can always be pulled back from public view.
+        if published and game.season_id and game.division_id:
+            self._require_team_registered(
+                game.season_id, game.home_team_id, game.division_id)
+            self._require_team_registered(
+                game.season_id, game.away_team_id, game.division_id)
         was_published = game.published
         game.published = published
         self.store.save_game(game)
@@ -972,6 +1018,14 @@ class SetupService:
         if game.cancelled:
             raise ValidationError("Cannot move a cancelled game.",
                                   details={"reason": "game_cancelled"})
+        # A move can't revive a fixture whose participation has since become
+        # invalid: both teams must still be co-registered in the game's
+        # season+division (#180 shared guard).
+        if game.season_id and game.division_id:
+            self._require_team_registered(
+                game.season_id, game.home_team_id, game.division_id)
+            self._require_team_registered(
+                game.season_id, game.away_team_id, game.division_id)
 
         new_slot = self.store.get_ice_slot(new_ice_slot_id)
         if new_slot is None:

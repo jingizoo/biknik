@@ -18,7 +18,8 @@ from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
 
 from hockey_scheduler.api import ApiService
 from hockey_scheduler.domain import (
-    Division, IceSlot, League, Organization, Rink, Season, Team, Venue)
+    Division, IceSlot, League, Organization, Rink, Season,
+    SeasonTeamRegistration, Team, Venue)
 from hockey_scheduler.domain.errors import ValidationError
 from hockey_scheduler.store import InMemoryStore
 from hockey_scheduler.services import draft_schedule
@@ -40,6 +41,10 @@ def _store(n_teams, slot_times):
     s.add_rink(Rink(id="r1", venue_id="v", name="Main"))
     for i in range(n_teams):
         s.add_team(Team(id=f"t{i}", name=f"T{i}", division="D", division_id="d"))
+        # Draft scheduling reads the season registration, not division_id (#180).
+        s.add_season_team_registration(SeasonTeamRegistration(
+            id=f"streg_t{i}", season_id="se", team_id=f"t{i}",
+            division_id="d", active=True))
     for i, t in enumerate(slot_times):
         s.add_ice_slot(IceSlot(id=f"s{i}", rink_id="r1", start_time=t,
                                end_time=t + timedelta(hours=1)))

@@ -172,8 +172,14 @@ def draft_schedule(store, division_id, slot_ids=None, constraints=None):
     games-per-team-per-day cap); a pairing with no valid slot is returned in
     ``unscheduled`` with the reason(s) that blocked it. Nothing is persisted.
     """
-    teams = sorted(t.id for t in store.all_teams()
-                   if t.division_id == division_id)
+    # A division's teams are those actively registered in it this season (#180
+    # shared guard), not the legacy Team.division_id — the same source of truth
+    # game creation, moves, publishing, and standings use.
+    division = store.get_division(division_id)
+    teams = sorted(
+        r.team_id
+        for r in store.registrations_for_season(division.season_id)
+        if r.active and r.division_id == division_id) if division else []
     pairings = round_robin_pairings(teams)
     slots = _available_game_slots(store, slot_ids)
     con = _normalize_constraints(constraints)
