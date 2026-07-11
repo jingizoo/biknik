@@ -40,6 +40,7 @@ from ..domain import (
     RescheduleRequest,
     Rink,
     Season,
+    SeasonTeamRegistration,
     Session,
     SetupAuditLog,
     SubstituteEnrollment,
@@ -68,6 +69,7 @@ class InMemoryStore:
         self.seasons: Dict[str, Season] = {}
         self.levels: Dict[str, Level] = {}
         self.divisions: Dict[str, Division] = {}
+        self.season_team_registrations: Dict[str, SeasonTeamRegistration] = {}
         self.clubs: Dict[str, Club] = {}
         self.venues: Dict[str, Venue] = {}
         self.rinks: Dict[str, Rink] = {}
@@ -249,6 +251,37 @@ class InMemoryStore:
 
     def get_team(self, team_id: str) -> Optional[Team]:
         return self.teams.get(team_id)
+
+    def teams_for_league(self, league_id: str) -> List[Team]:
+        return [t for t in self.teams.values() if t.league_id == league_id]
+
+    # -- season team registrations (#180) ----------------------------------
+    def add_season_team_registration(
+            self, reg: SeasonTeamRegistration) -> SeasonTeamRegistration:
+        self.season_team_registrations[reg.id] = reg
+        return reg
+
+    def get_season_team_registration(
+            self, reg_id: str) -> Optional[SeasonTeamRegistration]:
+        return self.season_team_registrations.get(reg_id)
+
+    def save_season_team_registration(
+            self, reg: SeasonTeamRegistration) -> SeasonTeamRegistration:
+        self.season_team_registrations[reg.id] = reg
+        return reg
+
+    def all_season_team_registrations(self) -> List[SeasonTeamRegistration]:
+        return list(self.season_team_registrations.values())
+
+    def registrations_for_season(
+            self, season_id: str) -> List[SeasonTeamRegistration]:
+        return [r for r in self.season_team_registrations.values()
+                if r.season_id == season_id]
+
+    def registration_for_team_in_season(
+            self, season_id: str, team_id: str) -> Optional[SeasonTeamRegistration]:
+        return next((r for r in self.season_team_registrations.values()
+                     if r.season_id == season_id and r.team_id == team_id), None)
 
     def add_organization(self, org: Organization) -> Organization:
         self.organizations[org.id] = org

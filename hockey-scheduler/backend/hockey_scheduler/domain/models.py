@@ -34,6 +34,12 @@ class Team:
     # upload is matched against, so re-importing updates in place instead of
     # creating duplicates. None for teams created outside the import flow.
     external_ref: Optional[str] = None
+    # Permanent owning league (#180). A team is a permanent member of one
+    # league; season-specific division participation lives in
+    # SeasonTeamRegistration, not on the Team. Nullable — pre-#180 teams are
+    # backfilled from their division's season league by migration 021, and a
+    # team created without a division has none until one is derived/assigned.
+    league_id: Optional[str] = None
 
 
 @dataclass

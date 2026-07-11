@@ -82,6 +82,25 @@ class Division:
 
 
 @dataclass
+class SeasonTeamRegistration:
+    """A permanent league team's participation in one season (#180).
+
+    A team belongs permanently to its league; each season it plays in is a
+    separate registration that carries the season-specific division/group
+    assignment. This is what makes a team "FIFA-group-like" — the same team can
+    be Division A one season and Division B the next without the Team record or
+    prior-season history changing. Uniqueness is ``(season_id, team_id)``:
+    exactly one registration per team per season, so changing division updates
+    this row rather than creating a second simultaneous participation.
+    """
+    id: str
+    season_id: str
+    team_id: str
+    division_id: Optional[str] = None
+    active: bool = True
+
+
+@dataclass
 class Club:
     id: str
     name: str

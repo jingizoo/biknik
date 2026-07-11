@@ -2439,6 +2439,38 @@ class ApiService:
                     actor_id: Optional[str] = None) -> dict:
         return _serialize(self.setup.create_team(club_id, division_id, name, actor_id))
 
+    # -- permanent teams + season registrations (#180) ---------------------
+    @catch
+    def register_team_for_season(self, season_id: str, team_id: str,
+                                 division_id: Optional[str] = None,
+                                 actor_id: Optional[str] = None) -> dict:
+        return _serialize(self.setup.register_team_for_season(
+            season_id, team_id, division_id, actor_id))
+
+    @catch
+    def assign_season_team_division(self, registration_id: str,
+                                    division_id: Optional[str] = None,
+                                    actor_id: Optional[str] = None) -> dict:
+        return _serialize(self.setup.assign_season_team_division(
+            registration_id, division_id, actor_id))
+
+    @catch
+    def unregister_team_from_season(self, registration_id: str,
+                                    actor_id: Optional[str] = None) -> dict:
+        return _serialize(self.setup.unregister_team_from_season(
+            registration_id, actor_id))
+
+    @catch
+    def list_season_team_registrations(self, season_id: str) -> dict:
+        rows = [_serialize(r)
+                for r in self.store.registrations_for_season(season_id)]
+        return {"registrations": rows}
+
+    @catch
+    def list_league_teams(self, league_id: str) -> dict:
+        rows = [_serialize(t) for t in self.store.teams_for_league(league_id)]
+        return {"teams": rows}
+
     # -- reassignment: move a record under a new parent (#166 PR D) --------
     @catch
     def assign_venue_organization(self, venue_id: str,

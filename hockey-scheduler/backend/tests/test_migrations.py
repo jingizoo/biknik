@@ -96,6 +96,11 @@ class MigrationApplyTest(unittest.TestCase):
                         "levels", "divisions"):
                 cur.execute(f"DROP INDEX IF EXISTS ix_{tbl}_external_ref")
                 cur.execute(f"ALTER TABLE {tbl} DROP COLUMN external_ref")
+            # #180 permanent teams: teams.league_id is indexed, and
+            # season_team_registrations is a brand-new table a pre-#180 DB lacks.
+            cur.execute("DROP INDEX IF EXISTS ix_teams_league")
+            cur.execute("ALTER TABLE teams DROP COLUMN league_id")
+            cur.execute("DROP TABLE IF EXISTS season_team_registrations")
             cur.execute("ALTER TABLE guardian_links DROP COLUMN consent_method")  # #35
             cur.execute("ALTER TABLE guardian_links DROP COLUMN consented_at")  # #35
             cur.execute("ALTER TABLE calendar_feed_tokens DROP COLUMN created_by")  # #131
@@ -127,6 +132,10 @@ class MigrationApplyTest(unittest.TestCase):
             for tbl in ("organizations", "leagues", "venues", "seasons",
                         "levels", "divisions"):
                 self.assertIn("external_ref", _table_columns(adopted, tbl))
+            # #180 permanent-teams column + registrations table re-landed.
+            self.assertIn("league_id", _table_columns(adopted, "teams"))
+            self.assertIn("season_id",
+                          _table_columns(adopted, "season_team_registrations"))
         finally:
             os.remove(path)
 
