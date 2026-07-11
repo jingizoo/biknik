@@ -151,6 +151,108 @@ class ImportConvergenceContract:
             slot["id"])
         self.assertNotIn("error", game)
 
+    # -- #214 review: import must not bypass the reassignment safety guards --
+    def _commit_game(self):
+        """Commit the base import, then schedule one committed LIONS vs BEARS
+        game in FALL26/DIVA. Returns the game id."""
+        self.api.commit_hierarchy_import(payload(), actor_id="admin")
+        league = self._by_ref(self.store.all_leagues(), "OVER55")
+        season = self._by_ref(self.store.all_seasons(), "FALL26")
+        diva = self._by_ref(self.store.all_divisions(), "DIVA")
+        rink = self.api.create_rink(
+            self.api.create_venue("Ice", league_id=league.id)["id"], "R1")
+        slot = self.api.create_ice_slot(
+            rink["id"], "2026-11-01T18:00:00+00:00", "2026-11-01T20:00:00+00:00")
+        game = self.api.create_game(
+            season.id, diva.id, self._team("LIONS").id, self._team("BEARS").id,
+            slot["id"])
+        return game["id"]
+
+    def test_import_cannot_strand_games_by_moving_registration_division(self):
+        game_id = self._commit_game()
+        season = self._by_ref(self.store.all_seasons(), "FALL26")
+        diva = self._by_ref(self.store.all_divisions(), "DIVA")
+        lions = self._team("LIONS")
+        audits_before = len(self.store.all_setup_audit())
+        moved = payload(registrations_csv=(
+            "season_code,team_code,division_code\nFALL26,LIONS,DIVB\n"))
+        result = self.api.commit_hierarchy_import(moved, actor_id="admin")
+        self.assertFalse(result["committed"])
+        err = result["errors"][0]
+        self.assertEqual(err["reason"], "registration_division_move_strands_games")
+        self.assertIn(game_id, err["affected_game_ids"])
+        # Atomic zero-write: registration still in DIVA, no new audits.
+        self.assertEqual(
+            self.store.registration_for_team_in_season(season.id, lions.id).division_id,
+            diva.id)
+        self.assertEqual(len(self.store.all_setup_audit()), audits_before)
+
+    def test_import_cannot_move_team_league_while_registrations_remain(self):
+        self.api.commit_hierarchy_import(payload(), actor_id="admin")
+        # A second league so LIONS has somewhere to be (wrongly) moved.
+        second = {"import_type": "hierarchy", "organizations_csv": ORGANIZATIONS,
+                  "leagues_csv": LEAGUES + "OTHER,CANLON,Other,US,America/Chicago\n",
+                  "competition_csv":
+                      COMPETITION + "OTHER,OSEA,Other,,,,ODIV,Other Div,Adult\n"}
+        self.assertTrue(
+            self.api.commit_hierarchy_import(second, actor_id="admin")["committed"])
+        over55 = self._by_ref(self.store.all_leagues(), "OVER55")
+        season = self._by_ref(self.store.all_seasons(), "FALL26")
+        lions = self._team("LIONS")
+        reg = self.store.registration_for_team_in_season(season.id, lions.id)
+        audits_before = len(self.store.all_setup_audit())
+        move = {"import_type": "hierarchy", "permanent_teams_csv":
+                "league_code,team_code,team_name\nOTHER,LIONS,Lions\n"}
+        result = self.api.commit_hierarchy_import(move, actor_id="admin")
+        self.assertFalse(result["committed"])
+        err = result["errors"][0]
+        self.assertEqual(err["reason"], "team_league_move_strands_registrations")
+        self.assertIn(reg.id, err["affected_registration_ids"])
+        # Atomic zero-write: LIONS still in OVER55, no new audits.
+        self.assertEqual(self._team("LIONS").league_id, over55.id)
+        self.assertEqual(len(self.store.all_setup_audit()), audits_before)
+
+    def test_safe_registration_move_records_exact_from_and_to(self):
+        # No games scheduled → moving LIONS DIVA -> DIVB is safe and audited.
+        self.api.commit_hierarchy_import(payload(), actor_id="admin")
+        season = self._by_ref(self.store.all_seasons(), "FALL26")
+        diva = self._by_ref(self.store.all_divisions(), "DIVA")
+        divb = self._by_ref(self.store.all_divisions(), "DIVB")
+        moved = payload(registrations_csv=(
+            "season_code,team_code,division_code\n"
+            "FALL26,LIONS,DIVB\nFALL26,BEARS,DIVA\n"))
+        result = self.api.commit_hierarchy_import(moved, actor_id="admin")
+        self.assertTrue(result["committed"], result.get("errors"))
+        self.assertEqual(result["summary"]["registrations"]["updated"], 1)
+        reg = self.store.registration_for_team_in_season(
+            season.id, self._team("LIONS").id)
+        entry = next(a for a in self.store.all_setup_audit()
+                     if a.action == "season_team_registration_updated"
+                     and a.entity_id == reg.id)
+        self.assertEqual(entry.detail["from_division_id"], diva.id)
+        self.assertEqual(entry.detail["to_division_id"], divb.id)
+
+    def test_safe_team_league_move_records_exact_from_and_to(self):
+        # PUMAS has no registrations, so moving its league is safe and audited.
+        base = dict(payload())
+        base["permanent_teams_csv"] = (
+            PERMANENT_TEAMS + "OVER55,PUMAS,Pumas,Pumas HC\n")
+        self.api.commit_hierarchy_import(base, actor_id="admin")
+        over55 = self._by_ref(self.store.all_leagues(), "OVER55")
+        pumas = self._team("PUMAS")
+        two_league = {"import_type": "hierarchy", "organizations_csv": ORGANIZATIONS,
+                      "leagues_csv":
+                          LEAGUES + "OTHER,CANLON,Other,US,America/Chicago\n",
+                      "permanent_teams_csv":
+                          "league_code,team_code,team_name\nOTHER,PUMAS,Pumas\n"}
+        result = self.api.commit_hierarchy_import(two_league, actor_id="admin")
+        self.assertTrue(result["committed"], result.get("errors"))
+        other = self._by_ref(self.store.all_leagues(), "OTHER")
+        entry = next(a for a in self.store.all_setup_audit()
+                     if a.action == "team_updated" and a.entity_id == pumas.id)
+        self.assertEqual(entry.detail["from_league_id"], over55.id)
+        self.assertEqual(entry.detail["to_league_id"], other.id)
+
 
 class MemoryImportConvergenceTest(ImportConvergenceContract, unittest.TestCase):
     def make_store(self):

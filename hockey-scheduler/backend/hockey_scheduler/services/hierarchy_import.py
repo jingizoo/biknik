@@ -402,6 +402,85 @@ def _new_counts() -> dict:
                 "registrations")}
 
 
+def _preflight_reassignment_safety(store, rows) -> List[dict]:
+    """Reject unsafe league/division *moves* before any write (#214 review).
+
+    Direct upsert would otherwise bypass the guards the interactive service
+    enforces: moving a registration's division can strand committed games (see
+    ``assign_season_team_division``), and moving a Team's league can leave its
+    active registrations cross-league. Compares by external code so a target
+    created in this same batch is handled without needing its id yet. Returns a
+    list of structured errors (empty when every move is safe); the caller aborts
+    the whole batch with zero writes when it is non-empty.
+    """
+    errors: List[dict] = []
+    teams = {t.external_ref: t for t in store.all_teams() if t.external_ref}
+    seasons = {s.external_ref: s for s in store.all_seasons() if s.external_ref}
+    league_code_by_id = {lg.id: lg.external_ref for lg in store.all_leagues()
+                         if lg.external_ref}
+    division_code_by_id = {d.id: d.external_ref for d in store.all_divisions()
+                           if d.external_ref}
+    all_regs = store.all_season_team_registrations()
+
+    # (a) A team's league move must keep every active registration in that
+    #     league — otherwise the existing registrations become cross-league.
+    for index, row in enumerate(
+            _group_first(rows["permanent_teams"], "team_code").values(), start=1):
+        code = _clean(row.get("team_code"))
+        team = teams.get(code)
+        if team is None:
+            continue  # a new team has no existing registrations to strand
+        new_league_code = _clean(row.get("league_code"))
+        if new_league_code == league_code_by_id.get(team.league_id):
+            continue  # league unchanged
+        stranded = []
+        for reg in all_regs:
+            if reg.team_id != team.id or not reg.active:
+                continue
+            season = store.get_season(reg.season_id)
+            reg_league = (league_code_by_id.get(season.league_id)
+                          if season is not None else None)
+            if reg_league != new_league_code:
+                stranded.append(reg.id)
+        if stranded:
+            errors.append({
+                "sheet": "permanent_teams", "row": index, "field": "league_code",
+                "message": (f"Moving team {code} to league {new_league_code} "
+                            f"would leave {len(stranded)} active registration(s) "
+                            "in another league; unregister or re-register them "
+                            "first."),
+                "reason": "team_league_move_strands_registrations",
+                "team_code": code, "affected_registration_ids": stranded})
+
+    # (b) A registration's division move must not strand committed games.
+    for index, row in enumerate(rows["registrations"], start=1):
+        season = seasons.get(_clean(row.get("season_code")))
+        team = teams.get(_clean(row.get("team_code")))
+        if season is None or team is None:
+            continue  # a new season/team has no existing registration to move
+        reg = store.registration_for_team_in_season(season.id, team.id)
+        if reg is None or not reg.active:
+            continue  # a new registration moves nothing
+        new_division_code = _clean(row.get("division_code"))
+        if new_division_code == division_code_by_id.get(reg.division_id):
+            continue  # division unchanged
+        stranded = [g.id for g in store.all_games()
+                    if g.season_id == season.id and not g.cancelled
+                    and not getattr(g, "is_draft", False)
+                    and team.id in (g.home_team_id, g.away_team_id)]
+        if stranded:
+            errors.append({
+                "sheet": "registrations", "row": index, "field": "division_code",
+                "message": (f"Moving team {_clean(row.get('team_code'))} to "
+                            f"division {new_division_code} in season "
+                            f"{_clean(row.get('season_code'))} would strand "
+                            f"{len(stranded)} scheduled game(s); resolve them "
+                            "first."),
+                "reason": "registration_division_move_strands_games",
+                "affected_game_ids": stranded})
+    return errors
+
+
 def commit_hierarchy_import(setup, sheets: Dict[str, List[dict]],
                             actor_id: Optional[str] = None) -> dict:
     """Revalidate and atomically upsert the complete hierarchy batch."""
@@ -418,6 +497,20 @@ def commit_hierarchy_import(setup, sheets: Dict[str, List[dict]],
     store = setup.store
     rows = {name: list((sheets or {}).get(name) or [])
             for name in HIERARCHY_SHEET_NAMES}
+
+    # Reassignment safety (#214 review): a league/division move that would
+    # strand games or orphan registrations aborts the whole batch with zero
+    # writes, before the transaction opens.
+    unsafe = _preflight_reassignment_safety(store, rows)
+    if unsafe:
+        return {
+            "committed": False,
+            "import_type": "hierarchy",
+            "summary": _new_counts(),
+            "errors": unsafe,
+            "warnings": result["warnings"],
+        }
+
     counts = _new_counts()
 
     with store.transaction():
@@ -669,12 +762,16 @@ def commit_hierarchy_import(setup, sheets: Dict[str, List[dict]],
                 counts["permanent_teams"]["created"] += 1
                 audit("team_created", "team", obj, {"league_id": league.id})
             else:
+                old_league_id = obj.league_id
                 changed = _apply_changes(obj, values)
                 if changed:
                     store.save_team(obj)
                     counts["permanent_teams"]["updated"] += 1
-                    audit("team_updated", "team", obj,
-                          {"league_id": league.id, "changed_fields": changed})
+                    detail = {"league_id": league.id, "changed_fields": changed}
+                    if "league_id" in changed:  # exact from/to on a league move
+                        detail["from_league_id"] = old_league_id
+                        detail["to_league_id"] = league.id
+                    audit("team_updated", "team", obj, detail)
                 else:
                     counts["permanent_teams"]["skipped"] += 1
 
@@ -700,6 +797,7 @@ def commit_hierarchy_import(setup, sheets: Dict[str, List[dict]],
                                "import_batch_id": batch_id})
             else:
                 changed = []
+                old_division_id = reg.division_id
                 if reg.division_id != division.id:
                     reg.division_id = division.id
                     changed.append("division_id")
@@ -709,12 +807,16 @@ def commit_hierarchy_import(setup, sheets: Dict[str, List[dict]],
                 if changed:
                     store.save_season_team_registration(reg)
                     counts["registrations"]["updated"] += 1
+                    detail = {"season_id": season.id, "team_id": team.id,
+                              "division_id": division.id,
+                              "changed_fields": changed,
+                              "import_batch_id": batch_id}
+                    if "division_id" in changed:  # exact from/to on a move
+                        detail["from_division_id"] = old_division_id
+                        detail["to_division_id"] = division.id
                     setup._audit(
                         "season_team_registration_updated",
-                        "season_team_registration", reg.id, actor_id,
-                        {"season_id": season.id, "team_id": team.id,
-                         "division_id": division.id, "changed_fields": changed,
-                         "import_batch_id": batch_id})
+                        "season_team_registration", reg.id, actor_id, detail)
                 else:
                     counts["registrations"]["skipped"] += 1
 
