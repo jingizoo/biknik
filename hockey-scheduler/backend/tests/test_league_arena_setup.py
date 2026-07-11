@@ -71,26 +71,25 @@ class LeagueArenaSetupTest(unittest.TestCase):
             svc.create_game(u["season"].id, u["division"].id,
                             u["home"].id, u["away"].id, u["slot"].id)
 
-    def test_wrong_division_rejected_and_override_allows(self):
+    def test_wrong_division_rejected_even_with_override(self):
         svc, _ = build()
         u = full_universe(svc)
-        # A team in a different division.
+        # A team registered in a DIFFERENT division of the same season.
         other_div = svc.create_division(u["season"].id, "Senior")
         club_c = svc.create_club("Bears Club")
         outsider = svc.create_team(club_c.id, other_div.id, "Senior Bears")
-        # Registered in the season (just a different division) — so the override
-        # is a valid cross-division exhibition, not an unregistered team (#200).
         svc.register_team_for_season(u["season"].id, outsider.id, other_div.id)
 
+        # Cross-division is rejected, and the override no longer relaxes it
+        # (#200 review): cross-division games are deprecated until an explicit
+        # competition mode exists, so a game can never dead-end at move/publish.
         with self.assertRaises(DivisionMismatchError):
             svc.create_game(u["season"].id, u["division"].id,
                             u["home"].id, outsider.id, u["slot"].id)
-
-        # Override flag forces the cross-division game.
-        game = svc.create_game(u["season"].id, u["division"].id,
-                               u["home"].id, outsider.id, u["slot"].id,
-                               allow_division_override=True)
-        self.assertEqual(game.away_team_id, outsider.id)
+        with self.assertRaises(DivisionMismatchError):
+            svc.create_game(u["season"].id, u["division"].id,
+                            u["home"].id, outsider.id, u["slot"].id,
+                            allow_division_override=True)
 
     def test_missing_entities_raise_not_found(self):
         svc, _ = build()

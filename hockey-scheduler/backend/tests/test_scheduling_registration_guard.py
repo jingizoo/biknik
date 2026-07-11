@@ -14,7 +14,8 @@ from datetime import datetime, timezone
 from helpers import FakeClock
 
 from hockey_scheduler.api import ApiService
-from hockey_scheduler.domain import IceSlotStatus, SeasonTeamRegistration
+from hockey_scheduler.domain import (
+    Division, IceSlotStatus, Season, SeasonTeamRegistration, Team)
 from hockey_scheduler.domain.errors import DivisionMismatchError
 from hockey_scheduler.services import SetupService
 from hockey_scheduler.services.league_scoped_setup_service import (
@@ -81,15 +82,19 @@ class CreateGameGuardTest(_Base):
             self.svc.create_game(self.season.id, self.div.id,
                                  self.home.id, self.away.id, self._slot().id)
 
-    def test_override_relaxes_division_but_requires_registration(self):
-        # A cross-division exhibition: both teams ARE registered this season,
-        # just in different divisions. Override permits the game.
+    def test_cross_division_override_is_rejected(self):
+        # Cross-division games are deprecated (#200 review, finding 1): even with
+        # the override flag, two teams registered in DIFFERENT divisions cannot
+        # be scheduled — so no game can dead-end at move/publish — and nothing
+        # is written.
         self.svc.register_team_for_season(self.season.id, self.home.id, self.div.id)
         self.svc.register_team_for_season(self.season.id, self.away.id, self.other_div.id)
-        game = self.svc.create_game(self.season.id, self.div.id,
-                                    self.home.id, self.away.id, self._slot().id,
-                                    allow_division_override=True)
-        self.assertEqual(game.away_team_id, self.away.id)
+        slot = self._slot()
+        with self.assertRaises(DivisionMismatchError):
+            self.svc.create_game(self.season.id, self.div.id,
+                                 self.home.id, self.away.id, slot.id,
+                                 allow_division_override=True)
+        self._assert_no_write(slot)
 
     def test_override_still_rejects_unregistered_teams(self):
         # #200 review: the override relaxes only the division match — an
@@ -171,6 +176,15 @@ class MoveAndPublishGuardTest(_Base):
         self.store.save_season_team_registration(reg)
         unpub = self.svc.publish_game(game.id, published=False)
         self.assertFalse(unpub.published)
+
+    def test_co_registered_game_survives_full_lifecycle(self):
+        # A normally co-registered game creates, moves, and publishes with no
+        # dead-end (#200 review, finding 1 — the reason cross-division override
+        # is rejected rather than persisted).
+        game = self._game()
+        moved = self.svc.move_game(game.id, self._slot(21).id, reason="drag")
+        published = self.svc.publish_game(moved.id)
+        self.assertTrue(published.published)
 
 
 class StandingsRosterTest(_Base):
@@ -274,6 +288,55 @@ class LeagueScopedIceGuardTest(unittest.TestCase):
         game = self.svc.create_game(self.sa.id, self.da.id, self.home.id,
                                     self.away.id, self.home_slot.id)
         self.assertIsNotNone(game.id)
+
+
+class NullLeagueAndDanglingSeasonTest(_Base):
+    """A registration is valid only when the season has a concrete league AND
+    the Team has the same concrete league — a missing league on either side is
+    never a match (#200 review, finding 2)."""
+
+    def _inject_null_league_team(self):
+        ghost = Team(id="team_nl", name="NoLeague",
+                     division_id=self.div.id, league_id=None)
+        self.store.add_team(ghost)
+        self.store.add_season_team_registration(SeasonTeamRegistration(
+            id="streg_nl", season_id=self.season.id, team_id=ghost.id,
+            division_id=self.div.id, active=True))
+        return ghost
+
+    def test_null_league_team_rejected_on_create(self):
+        self.svc.register_team_for_season(self.season.id, self.home.id, self.div.id)
+        ghost = self._inject_null_league_team()
+        slot = self._slot()
+        with self.assertRaises(DivisionMismatchError):
+            self.svc.create_game(self.season.id, self.div.id,
+                                 self.home.id, ghost.id, slot.id)
+        self._assert_no_write(slot)
+
+    def test_null_league_team_excluded_from_standings_and_drafts(self):
+        api = ApiService(self.store)
+        self._register_both()
+        self._inject_null_league_team()
+        self._slot(18)
+        ids = {r["team_id"] for r in api.get_standings(self.div.id)["standings"]}
+        self.assertEqual(ids, {self.home.id, self.away.id})
+        result = draft_schedule(self.store, self.div.id, constraints=None)
+        self.assertEqual(result["team_count"], 2)
+
+    def test_dangling_season_league_yields_empty_roster(self):
+        # A season whose league is missing/empty (or a division whose season is
+        # dangling) must trust no registration into create, standings, or drafts.
+        self.store.add_season(Season(id="se_nl", league_id="", name="NL"))
+        self.store.add_division(Division(id="d_nl", season_id="se_nl", name="D"))
+        self.store.add_team(Team(id="t_nl", name="T", division_id="d_nl",
+                                 league_id=""))
+        self.store.add_season_team_registration(SeasonTeamRegistration(
+            id="streg_dnl", season_id="se_nl", team_id="t_nl",
+            division_id="d_nl", active=True))
+        api = ApiService(self.store)
+        self.assertEqual(api.get_standings("d_nl")["standings"], [])
+        self.assertEqual(
+            draft_schedule(self.store, "d_nl", constraints=None)["team_count"], 0)
 
 
 if __name__ == "__main__":

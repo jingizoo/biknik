@@ -884,7 +884,8 @@ class SetupService:
                  "season_id": season_id})
         rteam = self.store.get_team(team_id)
         season_league = season.league_id if season is not None else None
-        if rteam is None or (rteam.league_id or None) != (season_league or None):
+        if (rteam is None or not rteam.league_id or not season_league
+                or rteam.league_id != season_league):
             raise DivisionMismatchError(
                 f"{label}'s registration does not belong to this league.",
                 {"reason": "registration_cross_league", "team_id": team_id,
@@ -940,14 +941,14 @@ class SetupService:
 
         # Participation is resolved through SeasonTeamRegistration (#180), not
         # the legacy Team.division_id: both teams must have an active, league-
-        # consistent registration in this season. allow_division_override
-        # relaxes ONLY the division match (a cross-division exhibition) — it
-        # never lets an unregistered team be scheduled (#200 review). The
-        # override is recorded in the game_created audit below.
-        self._require_team_registered(season_id, home_team_id, division_id, home,
-                                      require_division=not allow_division_override)
-        self._require_team_registered(season_id, away_team_id, division_id, away,
-                                      require_division=not allow_division_override)
+        # consistent registration in this season AND division. Cross-division
+        # games are deprecated until an explicit competition mode exists (#200
+        # review): allow_division_override no longer relaxes the division match,
+        # so every game's teams are co-registered and it can be moved,
+        # rescheduled, and published without a dead-end. The flag is retained
+        # (and audited below) for API compatibility.
+        self._require_team_registered(season_id, home_team_id, division_id, home)
+        self._require_team_registered(season_id, away_team_id, division_id, away)
 
         slot = self.store.get_ice_slot(ice_slot_id)
         if slot is None:
