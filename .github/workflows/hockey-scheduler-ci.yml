@@ -78,6 +78,7 @@ jobs:
           node --check hockey-scheduler/backend/hockey_scheduler/web/static/hierarchy-import.js
           node --check hockey-scheduler/e2e/setup-claim.js
           node --check hockey-scheduler/e2e/onboarding-wizard.js
+          node --check hockey-scheduler/e2e/hierarchy-import.js
 
   browser-smoke:
     runs-on: ubuntu-latest
@@ -103,3 +104,5 @@ jobs:
         run: npm run setup-claim
       - name: Run guided Initial Setup journey
         run: npm run onboarding-wizard
+      - name: Run complete hierarchy import journey
+        run: npm run hierarchy-import
