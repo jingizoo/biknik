@@ -151,6 +151,49 @@ async function checkViewport(browser, viewport) {
     await page.getByText("permanent_teams", { exact: true }).waitFor();
     await page.getByText("registrations", { exact: true }).waitFor();
 
+    // Verify the ACTUAL resulting records via the setup APIs (#214 review),
+    // not just the summary labels: the imported permanent Team exists exactly
+    // once in its league (no division), with one active Season/Division
+    // registration.
+    const verify = await page.evaluate(async () => {
+      const getJson = async (url) =>
+        (await fetch(url, { credentials: "same-origin" })).json();
+      const hierarchy = await getJson("/api/setup/hierarchy");
+      const league = (hierarchy.leagues || []).find((l) => l.name === "Browser League");
+      const season = league && (league.seasons || []).find((s) => s.name === "Browser Season");
+      const divisions = season
+        ? [...(season.levels || []).flatMap((lv) => lv.divisions || []),
+          ...(season.divisions_without_level || [])]
+        : [];
+      const division = divisions.find((d) => d.name === "Browser Division");
+      const teams = league ? await getJson(`/api/setup/leagues/${league.id}/teams`) : { teams: [] };
+      const imported = (teams.teams || []).filter((t) => t.name === "Browser Team");
+      const team = imported[0];
+      const regsResp = season
+        ? await getJson(`/api/setup/seasons/${season.id}/team-registrations`)
+        : { registrations: [] };
+      const regs = team ? (regsResp.registrations || []).filter((r) => r.team_id === team.id) : [];
+      return {
+        leagueId: league && league.id, divisionId: division && division.id,
+        teamCount: imported.length, teamLeagueId: team && team.league_id,
+        teamDivisionId: team ? team.division_id : "no-team",
+        regCount: regs.length, regDivisionId: regs[0] && regs[0].division_id,
+        regActive: regs[0] && regs[0].active,
+      };
+    });
+    if (verify.teamCount !== 1) {
+      throw new Error(`[${viewport.label}] expected exactly one imported Browser Team, got ${verify.teamCount}`);
+    }
+    if (verify.teamLeagueId !== verify.leagueId) {
+      throw new Error(`[${viewport.label}] imported team is not owned by Browser League`);
+    }
+    if (verify.teamDivisionId !== null) {
+      throw new Error(`[${viewport.label}] a permanent team must carry no division, got ${verify.teamDivisionId}`);
+    }
+    if (verify.regCount !== 1 || verify.regDivisionId !== verify.divisionId || !verify.regActive) {
+      throw new Error(`[${viewport.label}] expected one active registration in Browser Division: ${JSON.stringify(verify)}`);
+    }
+
     const browserStorage = await page.evaluate(() => JSON.stringify({
       local: { ...localStorage },
       session: { ...sessionStorage },

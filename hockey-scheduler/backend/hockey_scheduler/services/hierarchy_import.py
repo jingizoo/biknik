@@ -432,6 +432,11 @@ def _preflight_reassignment_safety(store, rows) -> List[dict]:
     division_code_by_id = {d.id: d.external_ref for d in store.all_divisions()
                            if d.external_ref}
     all_regs = store.all_season_team_registrations()
+    all_teams = store.all_teams()
+    all_games = store.all_games()
+    divisions_by_season = {}
+    for _division in store.all_divisions():
+        divisions_by_season.setdefault(_division.season_id, set()).add(_division.id)
 
     # (a) A team's league move must keep EVERY retained dependency in that
     #     league. This means all registrations — active AND inactive/historical,
@@ -491,7 +496,7 @@ def _preflight_reassignment_safety(store, rows) -> List[dict]:
         new_division_code = _clean(row.get("division_code"))
         if new_division_code == division_code_by_id.get(reg.division_id):
             continue  # division unchanged
-        stranded = [g.id for g in store.all_games()
+        stranded = [g.id for g in all_games
                     if g.season_id == season.id and not g.cancelled
                     and not getattr(g, "is_draft", False)
                     and team.id in (g.home_team_id, g.away_team_id)]
@@ -506,9 +511,11 @@ def _preflight_reassignment_safety(store, rows) -> List[dict]:
                 "reason": "registration_division_move_strands_games",
                 "affected_game_ids": stranded})
 
-    # (c) A season's league move strands every active registration in it — the
-    #     registered teams belong to the old league (#214 review). Don't mutate
-    #     the parent beneath existing participation.
+    # (c) A season's league move must keep EVERY retained dependency in that
+    #     league (#214 review): ALL registrations in the season (active AND
+    #     inactive/historical) and every legacy Team whose division_id points to
+    #     a division under this season — otherwise the team's permanent league
+    #     and its legacy division hierarchy disagree after the move.
     for index, row in enumerate(
             _group_first(rows["competition"], "season_code").values(), start=1):
         code = _clean(row.get("season_code"))
@@ -518,19 +525,28 @@ def _preflight_reassignment_safety(store, rows) -> List[dict]:
         new_league_code = _clean(row.get("league_code"))
         if new_league_code == league_code_by_id.get(season.league_id):
             continue  # league unchanged
-        affected = [r.id for r in all_regs if r.season_id == season.id and r.active]
-        if affected:
+        affected_regs = [r.id for r in all_regs if r.season_id == season.id]
+        season_division_ids = divisions_by_season.get(season.id, set())
+        affected_teams = [t.id for t in all_teams
+                          if t.division_id in season_division_ids]
+        if affected_regs or affected_teams:
             errors.append({
                 "sheet": "competition", "row": index, "field": "league_code",
                 "message": (f"Moving season {code} to league {new_league_code} "
-                            f"would leave {len(affected)} active registration(s) "
-                            "in another league; move or unregister the teams "
+                            f"would leave {len(affected_regs)} registration(s) "
+                            f"and {len(affected_teams)} legacy team-division "
+                            "link(s) in another league; migrate that history "
                             "first."),
-                "reason": "season_league_move_strands_registrations",
-                "season_code": code, "affected_registration_ids": affected})
+                "reason": "season_league_move_strands_history",
+                "season_code": code,
+                "affected_registration_ids": affected_regs,
+                "affected_team_ids": affected_teams})
 
-    # (d) A division's season move strands the registrations assigned to it and
-    #     any games scheduled in it (#214 review).
+    # (d) A division's season move must preserve ALL retained history (#214
+    #     review): all registrations assigned to it (active AND inactive), all
+    #     persisted games in it (INCLUDING cancelled history, whose season_id/
+    #     division_id would otherwise disagree), and every legacy Team whose
+    #     division_id points to it.
     for index, row in enumerate(rows["competition"], start=1):
         code = _clean(row.get("division_code"))
         division = divisions.get(code)
@@ -539,21 +555,22 @@ def _preflight_reassignment_safety(store, rows) -> List[dict]:
         new_season_code = _clean(row.get("season_code"))
         if new_season_code == season_code_by_id.get(division.season_id):
             continue  # season unchanged
-        affected_regs = [r.id for r in all_regs
-                         if r.division_id == division.id and r.active]
-        affected_games = [g.id for g in store.all_games()
-                          if g.division_id == division.id and not g.cancelled]
-        if affected_regs or affected_games:
+        affected_regs = [r.id for r in all_regs if r.division_id == division.id]
+        affected_games = [g.id for g in all_games if g.division_id == division.id]
+        affected_teams = [t.id for t in all_teams if t.division_id == division.id]
+        if affected_regs or affected_games or affected_teams:
             errors.append({
                 "sheet": "competition", "row": index, "field": "season_code",
                 "message": (f"Moving division {code} to season {new_season_code} "
-                            f"would strand {len(affected_regs)} registration(s) "
-                            f"and {len(affected_games)} game(s) outside their "
-                            "season; resolve them first."),
+                            f"would strand {len(affected_regs)} registration(s), "
+                            f"{len(affected_games)} game(s), and "
+                            f"{len(affected_teams)} legacy team link(s) outside "
+                            "their season; migrate that history first."),
                 "reason": "division_season_move_strands_dependents",
                 "division_code": code,
                 "affected_registration_ids": affected_regs,
-                "affected_game_ids": affected_games})
+                "affected_game_ids": affected_games,
+                "affected_team_ids": affected_teams})
     return errors
 
 
