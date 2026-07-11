@@ -10,11 +10,14 @@ single store transaction; missing rows are never treated as deletes.
 from collections import OrderedDict
 from typing import Dict, Iterable, List, Optional, Tuple
 
-from ..domain import Division, League, Level, Organization, Rink, Season, Venue
+from ..domain import (
+    Club, Division, League, Level, Organization, Rink, Season,
+    SeasonTeamRegistration, Team, Venue)
 
 
 HIERARCHY_SHEET_NAMES = (
-    "organizations", "leagues", "venues_rinks", "competition")
+    "organizations", "leagues", "venues_rinks", "competition",
+    "permanent_teams", "registrations")
 HIERARCHY_CSV_KEYS = tuple(f"{name}_csv" for name in HIERARCHY_SHEET_NAMES)
 
 HIERARCHY_TEMPLATES = {
@@ -34,6 +37,19 @@ HIERARCHY_TEMPLATES = {
         "league_code,season_code,season_name,level_code,level_name,level_sort_order,division_code,division_name,age_group\n"
         "OVER55,FALL26,Fall 2026,L1,Level 1,1,DIVA,Division A,Adult\n"
     ),
+    # Permanent league teams (#180): a team is a permanent member of a league,
+    # keyed by team_code; it carries no division here — season participation is
+    # a separate registration sheet below.
+    "permanent_teams_csv": (
+        "league_code,team_code,team_name,club_name\n"
+        "OVER55,LIONS,Lions,Lions HC\n"
+    ),
+    # Season registrations (#180): one row per team's participation in a season,
+    # keyed by (season_code, team_code), assigning that season's division.
+    "registrations_csv": (
+        "season_code,team_code,division_code\n"
+        "FALL26,LIONS,DIVA\n"
+    ),
 }
 
 _REQUIRED = {
@@ -45,6 +61,8 @@ _REQUIRED = {
     "competition": (
         "league_code", "season_code", "season_name", "division_code",
         "division_name"),
+    "permanent_teams": ("league_code", "team_code", "team_name"),
+    "registrations": ("season_code", "team_code", "division_code"),
 }
 
 
@@ -161,6 +179,7 @@ def validate_hierarchy_import(sheets: Dict[str, List[dict]], store) -> dict:
     _check_unique(report, "leagues", rows["leagues"], "league_code")
     _check_unique(report, "venues_rinks", rows["venues_rinks"], "rink_code")
     _check_unique(report, "competition", rows["competition"], "division_code")
+    _check_unique(report, "permanent_teams", rows["permanent_teams"], "team_code")
 
     _consistent_groups(
         report, "venues_rinks", rows["venues_rinks"], "venue_code",
@@ -173,15 +192,19 @@ def validate_hierarchy_import(sheets: Dict[str, List[dict]], store) -> dict:
     _consistent_groups(
         report, "competition", level_rows, "level_code",
         ("season_code", "level_name", "level_sort_order"))
+    _consistent_groups(
+        report, "permanent_teams", rows["permanent_teams"], "team_code",
+        ("league_code", "team_name", "club_name"))
 
     existing_orgs = _existing_map(
         report, store.all_organizations(), "organization")
     existing_leagues = _existing_map(report, store.all_leagues(), "league")
     _existing_map(report, store.all_venues(), "venue")
     _existing_map(report, store.all_rinks(), "rink")
-    _existing_map(report, store.all_seasons(), "season")
+    existing_seasons = _existing_map(report, store.all_seasons(), "season")
     _existing_map(report, store.all_levels(), "level")
-    _existing_map(report, store.all_divisions(), "division")
+    existing_divisions = _existing_map(report, store.all_divisions(), "division")
+    existing_teams = _existing_map(report, store.all_teams(), "team")
 
     upload_org_codes = {
         _clean(row.get("organization_code")) for row in rows["organizations"]
@@ -254,6 +277,93 @@ def validate_hierarchy_import(sheets: Dict[str, List[dict]], store) -> dict:
                     f"Invalid level_sort_order {row.get('level_sort_order')!r}.",
                     "level_sort_order")
 
+    # -- permanent teams + season registrations (#180) ---------------------
+    # Codes may resolve from this upload or from existing external_refs. Build
+    # the league of each season/team and the season of each division so a
+    # registration can be checked for division-in-season and (the #200 guard)
+    # team-league == season-league before any write.
+    league_ref_by_id = {lg.id: code for code, lg in existing_leagues.items()}
+    season_ref_by_id = {s.id: code for code, s in existing_seasons.items()}
+
+    season_league = {}
+    for row in rows["competition"]:
+        code = _optional(row.get("season_code"))
+        if code:
+            season_league.setdefault(code, _optional(row.get("league_code")))
+    for code, season in existing_seasons.items():
+        season_league.setdefault(code, league_ref_by_id.get(season.league_id))
+
+    division_season = {}
+    for row in rows["competition"]:
+        code = _optional(row.get("division_code"))
+        if code:
+            division_season.setdefault(code, _optional(row.get("season_code")))
+    for code, div in existing_divisions.items():
+        division_season.setdefault(code, season_ref_by_id.get(div.season_id))
+
+    team_league = {}
+    for row in rows["permanent_teams"]:
+        code = _optional(row.get("team_code"))
+        if code:
+            team_league.setdefault(code, _optional(row.get("league_code")))
+    for code, team in existing_teams.items():
+        team_league.setdefault(code, league_ref_by_id.get(team.league_id))
+
+    known_season_codes = {_clean(r.get("season_code"))
+                          for r in rows["competition"]
+                          if not _blank(r.get("season_code"))} | set(existing_seasons)
+    known_division_codes = {_clean(r.get("division_code"))
+                            for r in rows["competition"]
+                            if not _blank(r.get("division_code"))} | set(existing_divisions)
+    known_team_codes = {_clean(r.get("team_code"))
+                        for r in rows["permanent_teams"]
+                        if not _blank(r.get("team_code"))} | set(existing_teams)
+
+    for index, row in enumerate(rows["permanent_teams"], start=1):
+        league_code = _optional(row.get("league_code"))
+        if league_code and league_code not in known_league_codes:
+            report.error("permanent_teams", index,
+                         f"Unknown league_code {league_code}.", "league_code")
+
+    seen_registrations = set()
+    for index, row in enumerate(rows["registrations"], start=1):
+        season_code = _optional(row.get("season_code"))
+        team_code = _optional(row.get("team_code"))
+        division_code = _optional(row.get("division_code"))
+        if season_code and season_code not in known_season_codes:
+            report.error("registrations", index,
+                         f"Unknown season_code {season_code}.", "season_code")
+        if team_code and team_code not in known_team_codes:
+            report.error("registrations", index,
+                         f"Unknown team_code {team_code}.", "team_code")
+        if division_code and division_code not in known_division_codes:
+            report.error("registrations", index,
+                         f"Unknown division_code {division_code}.", "division_code")
+        # The division must belong to the season being registered into.
+        div_season = division_season.get(division_code)
+        if division_code and season_code and div_season not in (None, season_code):
+            report.error(
+                "registrations", index,
+                f"division_code {division_code} belongs to season "
+                f"{div_season}, not {season_code}.", "division_code")
+        # The team's permanent league must match the season's league (#200).
+        tl = team_league.get(team_code)
+        sl = season_league.get(season_code)
+        if team_code and season_code and tl and sl and tl != sl:
+            report.error(
+                "registrations", index,
+                f"team_code {team_code} (league {tl}) cannot register in "
+                f"season {season_code} (league {sl}).", "team_code")
+        # One registration per team per season.
+        if season_code and team_code:
+            key = (season_code, team_code)
+            if key in seen_registrations:
+                report.error(
+                    "registrations", index,
+                    f"Duplicate registration for team {team_code} in season "
+                    f"{season_code}.", "team_code")
+            seen_registrations.add(key)
+
     entity_summary = {
         "organizations": len(rows["organizations"]),
         "leagues": len(rows["leagues"]),
@@ -262,6 +372,8 @@ def validate_hierarchy_import(sheets: Dict[str, List[dict]], store) -> dict:
         "seasons": len(_group_first(rows["competition"], "season_code")),
         "levels": len(_group_first(level_rows, "level_code")),
         "divisions": len(rows["competition"]),
+        "permanent_teams": len(_group_first(rows["permanent_teams"], "team_code")),
+        "registrations": len(rows["registrations"]),
     }
     return {
         "ok": not report.errors,
@@ -286,7 +398,8 @@ def _new_counts() -> dict:
     return {name: {"created": 0, "updated": 0, "skipped": 0}
             for name in (
                 "organizations", "leagues", "venues", "rinks", "seasons",
-                "levels", "divisions")}
+                "levels", "divisions", "clubs", "permanent_teams",
+                "registrations")}
 
 
 def commit_hierarchy_import(setup, sheets: Dict[str, List[dict]],
@@ -324,6 +437,8 @@ def commit_hierarchy_import(setup, sheets: Dict[str, List[dict]],
                   if o.external_ref}
         divisions = {o.external_ref: o for o in store.all_divisions()
                      if o.external_ref}
+        teams = {o.external_ref: o for o in store.all_teams()
+                 if o.external_ref}
 
         def audit(action, entity, obj, detail=None):
             payload = {"import_batch_id": batch_id,
@@ -524,6 +639,84 @@ def commit_hierarchy_import(setup, sheets: Dict[str, List[dict]],
                            "changed_fields": changed})
                 else:
                     counts["divisions"]["skipped"] += 1
+
+        # Permanent league teams (#180): keyed by team_code, owned by a league,
+        # carrying no division. Clubs have no external code, so they are
+        # found-or-created by exact name (as the legacy teams import does).
+        club_by_name = {c.name: c for c in store.all_clubs()}
+        for code, row in _group_first(
+                rows["permanent_teams"], "team_code").items():
+            league = leagues[_clean(row.get("league_code"))]
+            club_id = None
+            club_name = _optional(row.get("club_name"))
+            if club_name:
+                club = club_by_name.get(club_name)
+                if club is None:
+                    club = Club(id=store.next_id("club"), name=club_name)
+                    store.add_club(club)
+                    club_by_name[club_name] = club
+                    counts["clubs"]["created"] += 1
+                    setup._audit("club_created", "club", club.id, actor_id,
+                                 {"import_batch_id": batch_id})
+                club_id = club.id
+            values = {"name": _clean(row.get("team_name")), "club_id": club_id,
+                      "league_id": league.id, "division_id": None, "division": ""}
+            obj = teams.get(code)
+            if obj is None:
+                obj = Team(id=store.next_id("team"), external_ref=code, **values)
+                store.add_team(obj)
+                teams[code] = obj
+                counts["permanent_teams"]["created"] += 1
+                audit("team_created", "team", obj, {"league_id": league.id})
+            else:
+                changed = _apply_changes(obj, values)
+                if changed:
+                    store.save_team(obj)
+                    counts["permanent_teams"]["updated"] += 1
+                    audit("team_updated", "team", obj,
+                          {"league_id": league.id, "changed_fields": changed})
+                else:
+                    counts["permanent_teams"]["skipped"] += 1
+
+        # Season registrations (#180): one per (season, team), assigning the
+        # season's division. SeasonTeamRegistration has no external code — the
+        # (season_id, team_id) pair is its identity, so a repeat import updates
+        # the division in place rather than duplicating.
+        for row in rows["registrations"]:
+            season = seasons[_clean(row.get("season_code"))]
+            team = teams[_clean(row.get("team_code"))]
+            division = divisions[_clean(row.get("division_code"))]
+            reg = store.registration_for_team_in_season(season.id, team.id)
+            if reg is None:
+                reg = SeasonTeamRegistration(
+                    id=store.next_id("streg"), season_id=season.id,
+                    team_id=team.id, division_id=division.id, active=True)
+                store.add_season_team_registration(reg)
+                counts["registrations"]["created"] += 1
+                setup._audit(
+                    "season_team_registered", "season_team_registration", reg.id,
+                    actor_id, {"season_id": season.id, "team_id": team.id,
+                               "division_id": division.id,
+                               "import_batch_id": batch_id})
+            else:
+                changed = []
+                if reg.division_id != division.id:
+                    reg.division_id = division.id
+                    changed.append("division_id")
+                if not reg.active:
+                    reg.active = True
+                    changed.append("active")
+                if changed:
+                    store.save_season_team_registration(reg)
+                    counts["registrations"]["updated"] += 1
+                    setup._audit(
+                        "season_team_registration_updated",
+                        "season_team_registration", reg.id, actor_id,
+                        {"season_id": season.id, "team_id": team.id,
+                         "division_id": division.id, "changed_fields": changed,
+                         "import_batch_id": batch_id})
+                else:
+                    counts["registrations"]["skipped"] += 1
 
         totals = {
             key: sum(values[key] for values in counts.values())
