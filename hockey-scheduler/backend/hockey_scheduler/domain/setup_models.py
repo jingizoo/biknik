@@ -34,6 +34,10 @@ class League:
     # Owning facility organization (#173). Nullable — pre-existing leagues and
     # leagues created without an owner have none until one is assigned.
     organization_id: Optional[str] = None
+    # Stable import-matching key (#174 PR E), mirroring Rink/Team/Player/
+    # Official's external_ref (#93-#95): leagues are matched across repeat
+    # hierarchy uploads by this code (the sheet's league_code), not by name.
+    external_ref: Optional[str] = None
 
 
 @dataclass
@@ -43,6 +47,9 @@ class Season:
     name: str
     start_date: Optional[datetime] = None
     end_date: Optional[datetime] = None
+    # Stable import-matching key (#174 PR E) — seasons are matched across
+    # repeat hierarchy uploads by this code (the sheet's season_code).
+    external_ref: Optional[str] = None
 
 
 @dataclass
@@ -55,6 +62,9 @@ class Level:
     season_id: str
     name: str
     sort_order: int = 0
+    # Stable import-matching key (#174 PR E) — levels are matched across
+    # repeat hierarchy uploads by this code (the sheet's level_code).
+    external_ref: Optional[str] = None
 
 
 @dataclass
@@ -66,6 +76,9 @@ class Division:
     # Owning competitive level/tier (#166). Nullable — pre-existing divisions
     # and divisions created without a level sit directly under their season.
     level_id: Optional[str] = None
+    # Stable import-matching key (#174 PR E) — divisions are matched across
+    # repeat hierarchy uploads by this code (the sheet's division_code).
+    external_ref: Optional[str] = None
 
 
 @dataclass
@@ -84,6 +97,9 @@ class Organization:
     id: str
     name: str
     short_name: str = ""
+    # Stable import-matching key (#174 PR E) — organizations are matched across
+    # repeat hierarchy uploads by this code (the sheet's organization_code).
+    external_ref: Optional[str] = None
 
 
 @dataclass
@@ -99,6 +115,10 @@ class Venue:
     # legacy/unassigned inventory has none. When set, the venue's owner must
     # match the league's owner (enforced in the service layer).
     league_id: Optional[str] = None
+    # Stable import-matching key (#174 PR E), mirroring Rink's external_ref —
+    # venues are matched across repeat hierarchy uploads by this code (the
+    # sheet's venue_code), not by name.
+    external_ref: Optional[str] = None
 
 
 @dataclass

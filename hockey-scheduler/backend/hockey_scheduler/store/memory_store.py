@@ -693,6 +693,18 @@ class InMemoryStore:
         self.divisions[division.id] = division
         return division
 
+    def save_organization(self, org: Organization) -> Organization:
+        self.organizations[org.id] = org
+        return org
+
+    def save_season(self, season: Season) -> Season:
+        self.seasons[season.id] = season
+        return season
+
+    def save_level(self, level: Level) -> Level:
+        self.levels[level.id] = level
+        return level
+
     def save_team(self, team: Team) -> Team:
         self.teams[team.id] = team
         return team

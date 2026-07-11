@@ -89,6 +89,13 @@ class MigrationApplyTest(unittest.TestCase):
             cur.execute("DROP INDEX IF EXISTS ix_venues_league")  # #173
             cur.execute("ALTER TABLE leagues DROP COLUMN organization_id")  # #173 additive col
             cur.execute("ALTER TABLE venues DROP COLUMN league_id")  # #173 additive col
+            # #174 PR E hierarchy external_ref columns each carry an index, so
+            # drop the index before the indexed column (SQLite rejects
+            # dropping an indexed col), same as the #173 columns above.
+            for tbl in ("organizations", "leagues", "venues", "seasons",
+                        "levels", "divisions"):
+                cur.execute(f"DROP INDEX IF EXISTS ix_{tbl}_external_ref")
+                cur.execute(f"ALTER TABLE {tbl} DROP COLUMN external_ref")
             cur.execute("ALTER TABLE guardian_links DROP COLUMN consent_method")  # #35
             cur.execute("ALTER TABLE guardian_links DROP COLUMN consented_at")  # #35
             cur.execute("ALTER TABLE calendar_feed_tokens DROP COLUMN created_by")  # #131
@@ -116,6 +123,10 @@ class MigrationApplyTest(unittest.TestCase):
             self.assertIn("organization_id", _table_columns(adopted, "venues"))
             self.assertIn("organization_id", _table_columns(adopted, "leagues"))
             self.assertIn("league_id", _table_columns(adopted, "venues"))
+            # #174 PR E hierarchy external_ref columns re-landed on every table.
+            for tbl in ("organizations", "leagues", "venues", "seasons",
+                        "levels", "divisions"):
+                self.assertIn("external_ref", _table_columns(adopted, tbl))
         finally:
             os.remove(path)
 

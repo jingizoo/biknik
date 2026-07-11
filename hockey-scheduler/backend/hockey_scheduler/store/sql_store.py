@@ -498,12 +498,14 @@ class SqlStore:
     def add_season(self, season): return self._insert(season)
     def get_season(self, season_id): return self._get(Season, season_id)
     def all_seasons(self): return self._query(Season, order="id")
+    def save_season(self, season): return self._update(season)
     def seasons_for_league(self, league_id):
         return self._query(Season, "league_id = ?", (league_id,), order="id")
 
     def add_level(self, level): return self._insert(level)
     def get_level(self, level_id): return self._get(Level, level_id)
     def all_levels(self): return self._query(Level, order="id")
+    def save_level(self, level): return self._update(level)
 
     def add_division(self, division): return self._insert(division)
     def get_division(self, division_id): return self._get(Division, division_id)
@@ -520,6 +522,7 @@ class SqlStore:
     def add_organization(self, org): return self._insert(org)
     def get_organization(self, org_id): return self._get(Organization, org_id)
     def all_organizations(self): return self._query(Organization, order="id")
+    def save_organization(self, org): return self._update(org)
 
     def add_venue(self, venue): return self._insert(venue)
     def get_venue(self, venue_id): return self._get(Venue, venue_id)
