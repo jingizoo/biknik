@@ -7,7 +7,8 @@
     "setup-claim": "node setup-claim.js",
     "onboarding-wizard": "node onboarding-wizard.js",
     "hierarchy-import": "node hierarchy-import.js",
-    "season-participation": "node season-participation.js"
+    "season-participation": "node season-participation.js",
+    "permanent-teams": "node permanent-teams.js"
   },
   "devDependencies": {
     "playwright": "^1.48.0"

@@ -479,17 +479,18 @@ const SETUP_ENTITIES = [
     list: (ov) => ov.clubs.map((c) => ({ title: c.name })),
     fields: [{ id: "f-club", label: "Club name", required: true, placeholder: "e.g. Eagles HC" }] },
   { key: "team", title: "Teams", icon: "👥", noun: "team", perm: "manage_setup",
-    // Explicit "Club · Division" (#165) — the old "division OR club" subtitle
-    // hid whichever was missing, so an operator couldn't see a team's club.
+    // A team is a permanent member of a LEAGUE (#180) — its season/division is
+    // set separately via Season participation, so the subtitle shows the club
+    // only, not a (now season-specific) division.
     list: (ov) => ov.teams.map((t) => ({
       title: t.name,
-      sub: `${t.club_name || "No club"} · ${t.division_name || "No division"}`,
+      sub: t.club_name || "No club",
     })),
     fields: [
       { id: "f-team-club", label: "Club", type: "select", required: true, ofNoun: "club",
         options: (ov) => ov.clubs.map((c) => [c.id, c.name]) },
-      { id: "f-team-div", label: "Division", type: "select", required: true, ofNoun: "division",
-        options: (ov) => ov.divisions.map((d) => [d.id, d.name]) },
+      { id: "f-team-league", label: "League", type: "select", required: true, ofNoun: "league",
+        options: (ov) => (ov.leagues || []).map((l) => [l.id, l.name]) },
       { id: "f-team", label: "Team name", required: true, placeholder: "e.g. U14 Eagles" }] },
   // Organization (#166): the facility owner/operator that owns venues — a rink
   // company, distinct from a hockey Club. Arena-side, like venue/rink.
@@ -559,7 +560,7 @@ const SETUP_POST = {
   level: () => post("/api/setup/level", { season_id: val("f-level-season"), name: val("f-level"), sort_order: val("f-level-sort") ? Number(val("f-level-sort")) : 0 }),
   division: () => post("/api/setup/division", { season_id: val("f-div-season"), name: val("f-div"), age_group: val("f-div-age"), level_id: val("f-div-level") || null }),
   club: () => post("/api/setup/club", { name: val("f-club") }),
-  team: () => post("/api/setup/team", { club_id: val("f-team-club"), division_id: val("f-team-div"), name: val("f-team") }),
+  team: () => post("/api/setup/team", { club_id: val("f-team-club"), league_id: val("f-team-league"), name: val("f-team") }),
   organization: () => post("/api/setup/organization", { name: val("f-org"), short_name: val("f-org-short") }),
   venue: () => post("/api/setup/venue", { name: val("f-venue"), league_id: val("f-venue-league") || null }),
   rink: () => post("/api/setup/rink", { venue_id: val("f-rink-venue"), name: val("f-rink") }),
@@ -710,11 +711,6 @@ function renderSetupHierarchy(ov) {
     pCount[p.team_id] = (pCount[p.team_id] || 0) + 1;
     (pByTeam[p.team_id] = pByTeam[p.team_id] || []).push(p);
   });
-  const teamMeta = (t) => {
-    const club = t.club_name ? esc(t.club_name) : `<span class="tn-warn-text">No club</span>`;
-    const pc = canSeePlayers ? ` · ${pCount[t.id] || 0} player${(pCount[t.id] || 0) === 1 ? "" : "s"}` : "";
-    return `${club}${pc}`;
-  };
 
   // -- Facility: Organization → League → Venue → Rink (#173) --
   const rinksByVenue = groupBy(ov.rinks, "venue_id");
@@ -777,22 +773,26 @@ function renderSetupHierarchy(ov) {
     <div class="tree-actions">${treeAdd("organization", "Add facility owner")}${treeAdd("league", "Add league")}</div>
   </section>`;
 
-  // -- Competition: League → Season → Level → Division → Team (#166) --
+  // -- Competition: League → Season → Level → Division (#166/#180) --
+  // Teams are NOT children of a division here: a team belongs permanently to a
+  // league (see the "Permanent league teams" panel), and its per-season
+  // division is shown under "Season participation". So the competition tree is
+  // the structure only; each division is a leaf, and the team count is the
+  // teams *registered* for that season/division, not division-owned teams.
   const seasonsByLeague = groupBy(ov.seasons, "league_id");
   const divsBySeason = groupBy(ov.divisions, "season_id");
   const levelsBySeason = groupBy(ov.levels, "season_id");
-  const teamsByDiv = groupBy(ov.teams, "division_id");
-  const countTeams = (divs) => divs.reduce((n, d) => n + (teamsByDiv[d.id] || []).length, 0);
+  const regsForDiv = (sid, did) => (seasonRegs[sid] || [])
+    .filter((r) => r.active && r.division_id === did).length;
+  const countTeams = (divs) => divs.reduce(
+    (n, d) => n + regsForDiv(d.season_id, d.id), 0);
   const divisionNode = (d) => {
-    const teams = teamsByDiv[d.id] || [];
-    const teamRows = teams.map((t) =>
-      `<div class="tn-leaf"><span class="tn-label">👥 ${esc(t.name)}</span><span class="tn-meta">${teamMeta(t)}</span>${
-        reassignBtn("team", "club", t, t.club_id)}${reassignBtn("team", "division", t, t.division_id)}</div>`).join("")
-      || `<div class="tn-empty">No teams in this division yet.</div>`;
-    return `<details class="tn" open><summary class="tn-sum">
+    const n = regsForDiv(d.season_id, d.id);
+    return `<details class="tn"><summary class="tn-sum">
         <span class="tn-label">🏅 ${esc(d.name)}</span>
-        <span class="tn-meta">${teams.length} team${teams.length === 1 ? "" : "s"}</span>${reassignBtn("division", "level", d, d.level_id, d.season_id)}</summary>
-      <div class="tn-children">${teamRows}${treeAdd("team", "Add team to " + d.name, "f-team-div", d.id)}</div>
+        <span class="tn-meta">${n} team${n === 1 ? "" : "s"} registered</span>${reassignBtn("division", "level", d, d.level_id, d.season_id)}</summary>
+      <div class="tn-children"><div class="tn-empty">Register teams for this division under
+        <button class="linklike" data-goto="setup">Season participation</button>.</div></div>
     </details>`;
   };
   const leagueRows = (ov.leagues || []).map((lg) => {
@@ -842,10 +842,30 @@ function renderSetupHierarchy(ov) {
     </details>`;
   }).join("");
   const competition = `<section class="tree-panel">
-    <div class="tree-head"><span class="tree-title">🏆 Competition</span>
-      <span class="tree-sub">League → Season → Level → Division → Team</span></div>
+    <div class="tree-head"><span class="tree-title">🏆 Competition structure</span>
+      <span class="tree-sub">League → Season → Level → Division</span></div>
     ${leagueRows || `<div class="tn-empty">No leagues yet. Add a league to begin.</div>`}
     <div class="tree-actions">${treeAdd("league", "Add league")}</div>
+  </section>`;
+
+  // -- Permanent league teams (#180): a team belongs permanently to its
+  // league, independent of any season. This is the first-class place a team
+  // "exists"; season/division is participation, shown separately below. --
+  const permanentTeams = `<section class="tree-panel">
+    <div class="tree-head"><span class="tree-title">👥 Permanent league teams</span>
+      <span class="tree-sub">League → its permanent member teams</span></div>
+    ${(ov.leagues || []).map((lg) => {
+      const teams = leagueTeams[lg.id] || [];
+      const rows = teams.map((t) =>
+        `<div class="tn-leaf"><span class="tn-label">👥 ${esc(t.name)}</span>${
+          reassignBtn("team", "club", t, t.club_id)}</div>`).join("")
+        || `<div class="tn-empty">No teams yet. Add a permanent team to ${esc(lg.name)}.</div>`;
+      return `<details class="tn" open><summary class="tn-sum">
+          <span class="tn-label">🏆 ${esc(lg.name)}</span>
+          <span class="tn-meta">${teams.length} team${teams.length === 1 ? "" : "s"}</span></summary>
+        <div class="tn-children">${rows}${treeAdd("team", "Add team to " + lg.name, "f-team-league", lg.id)}</div>
+      </details>`;
+    }).join("") || `<div class="tn-empty">No leagues yet. Add a league, then its teams.</div>`}
   </section>`;
 
   // -- Roster: Team → Players (operator-only; player names) --
@@ -865,7 +885,7 @@ function renderSetupHierarchy(ov) {
         || `<div class="tn-empty">No players yet. Add players before building rosters.</div>`;
       return `<details class="tn"><summary class="tn-sum">
           <span class="tn-label">👥 ${esc(t.name)}</span>
-          <span class="tn-meta">${t.division_name ? esc(t.division_name) + " · " : ""}${ps.length} player${ps.length === 1 ? "" : "s"}</span>${badge}</summary>
+          <span class="tn-meta">${ps.length} player${ps.length === 1 ? "" : "s"}</span>${badge}</summary>
         <div class="tn-children">${pRows}${treeAdd("player", "Add player to " + t.name, "f-player-team", t.id)}</div>
       </details>`;
     }).join("");
@@ -881,7 +901,6 @@ function renderSetupHierarchy(ov) {
   const teamIds = new Set((ov.teams || []).map((t) => t.id));
   const orphanRinks = (ov.rinks || []).filter((r) => !r.venue_id || !venueIds.has(r.venue_id));
   const noClubTeams = (ov.teams || []).filter((t) => !t.club_id && !t.club_name);
-  const noDivTeams = (ov.teams || []).filter((t) => !t.division_id);
   const orphanPlayers = canSeePlayers
     ? playersList.filter((p) => !p.team_id || !teamIds.has(p.team_id)) : [];
   // League↔facility gaps (#173): leagues without an owner, venues without a
@@ -908,15 +927,13 @@ function renderSetupHierarchy(ov) {
             (r) => reassignBtn("rink", "venue", r, r.venue_id))
     + naRow("Teams without a club", noClubTeams,
             (t) => reassignBtn("team", "club", t, t.club_id))
-    + naRow("Teams without a division", noDivTeams,
-            (t) => reassignBtn("team", "division", t, t.division_id))
     + naRow("Players without a team", orphanPlayers,
             (p) => reassignBtn("player", "team", p, p.team_id));
   const needsAssignment = naBody
     ? `<section class="tree-panel na"><div class="tree-head"><span class="tree-title">⚠ Needs assignment</span></div>
         <div class="tree-note">These records can't be scheduled until they're assigned.</div>${naBody}</section>` : "";
 
-  return `${reassignPanelHtml(ov)}<div class="setup-trees">${facility}${competition}${renderSeasonParticipation(ov)}${roster}${needsAssignment}</div>`;
+  return `${reassignPanelHtml(ov)}<div class="setup-trees">${facility}${permanentTeams}${competition}${renderSeasonParticipation(ov)}${roster}${needsAssignment}</div>`;
 }
 
 // Season participation (#180): permanent league teams and which season/division

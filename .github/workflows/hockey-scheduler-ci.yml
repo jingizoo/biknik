@@ -80,6 +80,7 @@ jobs:
           node --check hockey-scheduler/e2e/onboarding-wizard.js
           node --check hockey-scheduler/e2e/hierarchy-import.js
           node --check hockey-scheduler/e2e/season-participation.js
+          node --check hockey-scheduler/e2e/permanent-teams.js
 
   browser-smoke:
     runs-on: ubuntu-latest
@@ -109,3 +110,5 @@ jobs:
         run: npm run hierarchy-import
       - name: Run season participation journey
         run: npm run season-participation
+      - name: Run permanent-teams structure journey
+        run: npm run permanent-teams

@@ -48,6 +48,27 @@ class TeamLeagueMembershipTest(unittest.TestCase):
                  for t in self.api.list_league_teams(league["id"])["teams"]]
         self.assertEqual(sorted(names), ["Falcons", "Lions"])
 
+    def test_create_team_under_league_without_a_division(self):
+        # #180 UI correction: a team is created under the LEAGUE directly; its
+        # season/division comes later via registration, not at creation.
+        league, season, division, club = _fixture(self.api)
+        team = self.api.create_team(club["id"], name="Bears",
+                                    league_id=league["id"], actor_id=ADMIN)
+        self.assertEqual(team["league_id"], league["id"])
+        self.assertIsNone(team["division_id"])
+
+    def test_create_team_needs_a_league_or_division(self):
+        _, _, _, club = _fixture(self.api)
+        res = self.api.create_team(club["id"], name="Nowhere", actor_id=ADMIN)
+        self.assertEqual(res["error"]["code"], "validation_error")
+
+    def test_create_team_rejects_division_from_a_different_league(self):
+        league_a, _, div_a, club = _fixture(self.api, "League A")
+        league_b = self.api.create_league("League B", actor_id=ADMIN)
+        res = self.api.create_team(club["id"], div_a["id"], "Mismatch",
+                                   league_id=league_b["id"], actor_id=ADMIN)
+        self.assertEqual(res["error"]["code"], "validation_error")
+
 
 class SeasonRegistrationServiceTest(unittest.TestCase):
     def setUp(self):

@@ -249,26 +249,49 @@ class SetupService:
         return club
 
     @_transactional
-    def create_team(self, club_id: str, division_id: str, name: str,
-                    actor_id: Optional[str] = None) -> Team:
+    def create_team(self, club_id: str, division_id: Optional[str] = None,
+                    name: str = "", actor_id: Optional[str] = None,
+                    league_id: Optional[str] = None) -> Team:
+        """Create a permanent league team (#180).
+
+        A team belongs permanently to a *league*, not a division — its
+        season-specific division participation lives in SeasonTeamRegistration.
+        Two ways to say which league:
+
+        - Pass ``league_id`` directly (the #180-correct path: create the team
+          under the league, register it into a season/division separately).
+        - Pass a ``division_id`` (legacy/back-compat, still used by the CSV
+          import and older callers): the league is derived from the division's
+          season, and division_id is retained on the Team for now.
+
+        Exactly one is required. When both are given, the division's league
+        wins (and must not contradict a supplied league_id).
+        """
         if self.store.get_club(club_id) is None:
             raise NotFoundError(f"Club {club_id} not found.")
-        division = self.store.get_division(division_id)
-        if division is None:
-            raise NotFoundError(f"Division {division_id} not found.")
-        # #180: a team is a permanent member of a league. Derive that league
-        # from the division's season so new teams carry league_id from the
-        # start (existing teams are backfilled the same way by migration 021).
-        # The season-specific division participation still lives on the Team's
-        # division_id for now; the registration model overlays it additively.
-        season = self.store.get_season(division.season_id)
-        league_id = season.league_id if season else None
+        division = None
+        if division_id:
+            division = self.store.get_division(division_id)
+            if division is None:
+                raise NotFoundError(f"Division {division_id} not found.")
+            season = self.store.get_season(division.season_id)
+            derived_league = season.league_id if season else None
+            if league_id and derived_league and league_id != derived_league:
+                raise ValidationError(
+                    "The chosen division belongs to a different league.")
+            league_id = derived_league
+        if not league_id:
+            raise ValidationError(
+                "A team needs a league (choose a league, or a division to "
+                "derive it from).")
+        if self.store.get_league(league_id) is None:
+            raise NotFoundError(f"League {league_id} not found.")
         team = Team(id=self.store.next_id("team"), name=self._require_name(name),
-                    division=division.name, club_id=club_id, division_id=division_id,
-                    league_id=league_id)
+                    division=division.name if division else "", club_id=club_id,
+                    division_id=division_id or None, league_id=league_id)
         self.store.add_team(team)
         self._audit("team_created", "team", team.id, actor_id,
-                    {"club_id": club_id, "division_id": division_id,
+                    {"club_id": club_id, "division_id": division_id or None,
                      "league_id": league_id})
         return team
 
