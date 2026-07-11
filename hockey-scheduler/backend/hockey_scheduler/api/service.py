@@ -1743,7 +1743,12 @@ class ApiService:
         schedule and game-detail routes already hide unpublished games, and the
         standings must stay consistent with them.
         """
-        teams = [t for t in self.store.all_teams() if t.division_id == division_id]
+        # The division roster comes from active SeasonTeamRegistrations (#180
+        # shared guard), not the legacy Team.division_id — a team plays in a
+        # division only for the season(s) it is registered there.
+        team_ids = self.setup.registered_team_ids_in_division(division_id)
+        teams = [t for t in (self.store.get_team(tid) for tid in team_ids)
+                 if t is not None]
         rows = {t.id: {"team_id": t.id, "team_name": t.name, "gp": 0,
                        "w": 0, "l": 0, "t": 0, "gf": 0, "ga": 0, "gd": 0, "pts": 0}
                 for t in teams}

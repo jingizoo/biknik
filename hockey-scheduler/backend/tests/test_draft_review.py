@@ -20,7 +20,7 @@ from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
 from hockey_scheduler.api import ApiService
 from hockey_scheduler.domain import (
     Division, Game, IceSlot, IceSlotStatus, League, Official, Organization,
-    Rink, Season, Team, Venue)
+    Rink, Season, SeasonTeamRegistration, Team, Venue)
 from hockey_scheduler.store import InMemoryStore
 from hockey_scheduler.web import server as srv
 
@@ -37,7 +37,13 @@ def _seeded_api():
                       league_id="league"))
     s.add_rink(Rink(id="r1", venue_id="v", name="Main"))
     for i in range(4):
-        s.add_team(Team(id=f"t{i}", name=f"T{i}", division="D1", division_id="d"))
+        s.add_team(Team(id=f"t{i}", name=f"T{i}", division="D1", division_id="d",
+                        league_id="league"))
+        # Participation is per-season (#180): draft scheduling reads the
+        # registration, so register each seeded team into the season+division.
+        s.add_season_team_registration(SeasonTeamRegistration(
+            id=f"streg_t{i}", season_id="se", team_id=f"t{i}",
+            division_id="d", active=True))
     base = datetime(2026, 1, 5, 18, tzinfo=UTC)
     for i in range(6):
         s.add_ice_slot(IceSlot(id=f"s{i}", rink_id="r1",

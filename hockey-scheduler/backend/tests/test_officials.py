@@ -41,6 +41,9 @@ class OfficialsServiceTest(unittest.TestCase):
         self.club_d = self.svc.create_club("Dogs HC")
         self.home2 = self.svc.create_team(self.club_c.id, self.div.id, "Cats")
         self.away2 = self.svc.create_team(self.club_d.id, self.div.id, "Dogs")
+        # Games resolve participation via the season registration (#180).
+        for _t in (self.home, self.away, self.home2, self.away2):
+            self.svc.register_team_for_season(season.id, _t.id, self.div.id)
         self.slot = self.svc.create_ice_slot(self.rink.id, dt(18), dt(20))
         self.game = self.svc.create_game(season.id, self.div.id,
                                          self.home.id, self.away.id, self.slot.id)

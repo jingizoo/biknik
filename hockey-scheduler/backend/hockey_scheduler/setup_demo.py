@@ -24,6 +24,10 @@ def main() -> None:
     club_b = api.create_club("Falcons Club", actor_id=actor)
     home = api.create_team(club_a["id"], division["id"], "U16 Lions", actor_id=actor)
     away = api.create_team(club_b["id"], division["id"], "U16 Falcons", actor_id=actor)
+    # Scheduling reads participation from the season registration (#180), so
+    # register both teams into the season+division before creating a game.
+    api.register_team_for_season(season["id"], home["id"], division["id"], actor_id=actor)
+    api.register_team_for_season(season["id"], away["id"], division["id"], actor_id=actor)
 
     venue = api.create_venue("Ice Palace", actor_id=actor)
     rink = api.create_rink(venue["id"], "Rink 2", actor_id=actor)

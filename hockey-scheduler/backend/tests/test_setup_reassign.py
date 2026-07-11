@@ -152,6 +152,8 @@ class LeagueVenueReassignTest(unittest.TestCase):
         c2 = self.api.create_club("Club B")
         home = self.api.create_team(c1["id"], div["id"], "Team A")
         away = self.api.create_team(c2["id"], div["id"], "Team B")
+        self.api.register_team_for_season(season["id"], home["id"], div["id"])
+        self.api.register_team_for_season(season["id"], away["id"], div["id"])
         rink = self.api.create_rink(self.venue["id"], "Rink 1")
         slot = self.api.create_ice_slot(
             rink["id"], "2026-09-01T18:30:00+00:00", "2026-09-01T20:00:00+00:00")

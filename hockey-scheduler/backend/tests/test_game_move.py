@@ -29,6 +29,10 @@ def universe():
     away = svc.create_team(svc.create_club("FH").id, div.id, "Falcons")
     bears = svc.create_team(svc.create_club("BH").id, div.id, "Bears")
     eagles = svc.create_team(svc.create_club("EH").id, div.id, "Eagles")
+    # Scheduling/moves/publishing read participation from the season
+    # registration (#180), so register every team into the season+division.
+    for _t in (home, away, bears, eagles):
+        svc.register_team_for_season(season.id, _t.id, div.id)
     venue = svc.create_venue("Arena", league_id=league.id)
     r1 = svc.create_rink(venue.id, "Rink 1")
     r2 = svc.create_rink(venue.id, "Rink 2")

@@ -40,6 +40,12 @@ class LeagueIceIsolationTest(unittest.TestCase):
         self.a2 = self.setup.create_team(club_a.id, self.div_a.id, "A2")
         self.b1 = self.setup.create_team(club_b.id, self.div_b.id, "B1")
         self.b2 = self.setup.create_team(club_b.id, self.div_b.id, "B2")
+        # Participation is per-season (#180): register each team in its league's
+        # season+division so its games can be scheduled.
+        self.setup.register_team_for_season(self.season_a.id, self.a1.id, self.div_a.id)
+        self.setup.register_team_for_season(self.season_a.id, self.a2.id, self.div_a.id)
+        self.setup.register_team_for_season(self.season_b.id, self.b1.id, self.div_b.id)
+        self.setup.register_team_for_season(self.season_b.id, self.b2.id, self.div_b.id)
 
         self.venue_a = self.setup.create_venue(
             "Arena A", league_id=self.league_a.id)

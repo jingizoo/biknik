@@ -26,6 +26,10 @@ class ResultsTest(unittest.TestCase):
         self.lions = self.svc.create_team(self.svc.create_club("Lions").id, self.div.id, "Lions")
         self.falcons = self.svc.create_team(self.svc.create_club("Falcons").id, self.div.id, "Falcons")
         self.bears = self.svc.create_team(self.svc.create_club("Bears").id, self.div.id, "Bears")
+        # Participation (scheduling + standings roster) comes from the season
+        # registration (#180), so register each team into the season+division.
+        for _t in (self.lions, self.falcons, self.bears):
+            self.svc.register_team_for_season(self.season.id, _t.id, self.div.id)
         venue = self.svc.create_venue("Arena", league_id=league.id)
         self.rink = self.svc.create_rink(venue.id, "Rink 1")
 

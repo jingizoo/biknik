@@ -33,11 +33,16 @@ class SetupService(_BaseSetupService):
             division = self.store.get_division(division_id) if division_id else None
             home = self.store.get_team(home_team_id) if home_team_id else None
             away = self.store.get_team(away_team_id) if away_team_id else None
+            # Participation is resolved through SeasonTeamRegistration (#180),
+            # not Team.division_id (#200 review): a league-first team created
+            # with division_id=None but correctly registered must still count as
+            # a valid matchup so the cross-league ice guard runs. Both teams must
+            # be co-registered in this division (cross-division override is
+            # deprecated), so allow_division_override does not affect this check.
             teams_match = (
-                allow_division_override
-                or (home is not None and away is not None
-                    and home.division_id == division_id
-                    and away.division_id == division_id)
+                season is not None
+                and self._team_participates(season, home_team_id, division_id)
+                and self._team_participates(season, away_team_id, division_id)
             )
             structure_valid = (
                 season is not None

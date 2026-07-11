@@ -138,6 +138,60 @@ def league_id_for_game(store, game) -> Optional[str]:
     return next(iter(resolved)) if resolved else None
 
 
+# -- season-registration resolver (#180) -------------------------------------
+# Participation is resolved through SeasonTeamRegistration, but a registration
+# row is only trusted once its Team is resolved and the Team's permanent league
+# matches the season's league. As #199 established, the registration store can
+# hold orphaned or cross-league rows; scheduling, standings, and draft
+# generation must never silently trust one. These two helpers are the single
+# shared resolver every scheduling path uses so the rule cannot drift.
+
+def team_registration_valid(store, season, team_id, division_id=None,
+                            require_division=True):
+    """Return the active, league-consistent registration for ``team_id`` in
+    ``season``, or ``None``. A row is trusted only if it is active, its Team
+    exists, and the Team's permanent ``league_id`` equals the season's league.
+    When ``require_division`` and ``division_id`` is given, the registration's
+    division must match too. A registration is valid only when the season has a
+    concrete league and the Team has the *same* concrete league — a missing
+    league on either side is never treated as a match (#200 review)."""
+    if season is None or not season.league_id:
+        return None
+    reg = store.registration_for_team_in_season(season.id, team_id)
+    if reg is None or not reg.active:
+        return None
+    team = store.get_team(team_id)
+    if team is None or not team.league_id or team.league_id != season.league_id:
+        return None
+    if require_division and division_id is not None and reg.division_id != division_id:
+        return None
+    return reg
+
+
+def registered_team_ids_in_division(store, division_id):
+    """Team ids validly registered in ``division_id`` this season: the row is
+    active and in this division, its Team exists, and the Team's permanent
+    league matches the division's season league. Orphaned/cross-league rows are
+    excluded rather than trusted (#199). Shared by standings and draft
+    generation so both read exactly the same roster."""
+    division = store.get_division(division_id)
+    if division is None:
+        return set()
+    season = store.get_season(division.season_id)
+    if season is None or not season.league_id:
+        return set()  # dangling season, or a season with no league — trust nothing
+    league_id = season.league_id
+    ids = set()
+    for reg in store.registrations_for_season(division.season_id):
+        if not reg.active or reg.division_id != division_id:
+            continue
+        team = store.get_team(reg.team_id)
+        if team is None or not team.league_id or team.league_id != league_id:
+            continue  # orphaned, null-league, or cross-league row — never trusted
+        ids.add(reg.team_id)
+    return ids
+
+
 def require_game_league_id(store, game) -> str:
     """Return a game's league or reject a row with no usable league context."""
     league_id = league_id_for_game(store, game)
