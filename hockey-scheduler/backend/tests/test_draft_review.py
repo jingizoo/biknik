@@ -37,7 +37,8 @@ def _seeded_api():
                       league_id="league"))
     s.add_rink(Rink(id="r1", venue_id="v", name="Main"))
     for i in range(4):
-        s.add_team(Team(id=f"t{i}", name=f"T{i}", division="D1", division_id="d"))
+        s.add_team(Team(id=f"t{i}", name=f"T{i}", division="D1", division_id="d",
+                        league_id="league"))
         # Participation is per-season (#180): draft scheduling reads the
         # registration, so register each seeded team into the season+division.
         s.add_season_team_registration(SeasonTeamRegistration(

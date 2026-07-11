@@ -53,6 +53,10 @@ from ..domain.errors import (
 )
 from ..store import InMemoryStore
 from .import_validator import validate_import, validate_official_availability
+from .league_scope import (
+    registered_team_ids_in_division as _registered_team_ids,
+    team_registration_valid,
+)
 from .notifier import push as _push_notification
 
 
@@ -854,36 +858,58 @@ class SetupService:
     # through these helpers so the same rule is enforced everywhere; a team may
     # only play in a season+division it is actively registered in.
     def _require_team_registered(self, season_id: str, team_id: str,
-                                 division_id: Optional[str], team=None):
-        """Raise ``DivisionMismatchError`` unless ``team_id`` is actively
-        registered in ``season_id`` and, when ``division_id`` is given, in that
-        division. Returns the registration on success."""
+                                 division_id: Optional[str], team=None,
+                                 *, require_division: bool = True):
+        """Raise ``DivisionMismatchError`` unless ``team_id`` has an active,
+        league-consistent registration in ``season_id`` — and, when
+        ``require_division``, in ``division_id``. A registration is trusted only
+        if its Team exists and the Team's permanent league matches the season's
+        (#199: rows can be orphaned or cross-league). ``require_division=False``
+        (the override path) still demands an active season registration; it
+        relaxes only the division match. Returns the registration on success."""
+        season = self.store.get_season(season_id) if season_id else None
         resolved = team if team is not None else self.store.get_team(team_id)
         label = resolved.name if resolved is not None else team_id
-        reg = self.store.registration_for_team_in_season(season_id, team_id)
-        if reg is None or not reg.active:
+        reg = team_registration_valid(self.store, season, team_id, division_id,
+                                      require_division=require_division)
+        if reg is not None:
+            return reg
+        # No valid registration — surface the precise reason.
+        raw = (self.store.registration_for_team_in_season(season_id, team_id)
+               if season is not None else None)
+        if raw is None or not raw.active:
             raise DivisionMismatchError(
                 f"{label} is not registered in this season.",
                 {"reason": "team_not_registered", "team_id": team_id,
                  "season_id": season_id})
-        if division_id is not None and reg.division_id != division_id:
+        rteam = self.store.get_team(team_id)
+        season_league = season.league_id if season is not None else None
+        if rteam is None or (rteam.league_id or None) != (season_league or None):
             raise DivisionMismatchError(
-                f"{label} is not registered in this division.",
-                {"reason": "team_wrong_division", "team_id": team_id,
-                 "season_id": season_id, "division_id": division_id,
-                 "registered_division_id": reg.division_id})
-        return reg
+                f"{label}'s registration does not belong to this league.",
+                {"reason": "registration_cross_league", "team_id": team_id,
+                 "season_id": season_id})
+        raise DivisionMismatchError(
+            f"{label} is not registered in this division.",
+            {"reason": "team_wrong_division", "team_id": team_id,
+             "season_id": season_id, "division_id": division_id,
+             "registered_division_id": raw.division_id})
+
+    def _team_participates(self, season, team_id: str,
+                           division_id: Optional[str],
+                           require_division: bool = True) -> bool:
+        """Non-raising counterpart of ``_require_team_registered`` — used where
+        participation gates a *decision* (e.g. whether to run the cross-league
+        ice guard) rather than a hard failure."""
+        return team_registration_valid(
+            self.store, season, team_id, division_id,
+            require_division=require_division) is not None
 
     def registered_team_ids_in_division(self, division_id: str) -> set:
-        """Team ids actively registered in ``division_id`` — the division's
-        membership/standings roster, replacing the legacy Team.division_id
-        filter. Empty when the division does not exist."""
-        division = self.store.get_division(division_id)
-        if division is None:
-            return set()
-        return {r.team_id
-                for r in self.store.registrations_for_season(division.season_id)
-                if r.active and r.division_id == division_id}
+        """Team ids validly registered in ``division_id`` — the division's
+        membership/standings roster. Delegates to the shared resolver so it
+        excludes orphaned/cross-league rows exactly as draft generation does."""
+        return _registered_team_ids(self.store, division_id)
 
     # -- manual game creation ---------------------------------------------
     @_transactional
@@ -913,12 +939,15 @@ class SetupService:
             raise NotFoundError(f"Team {away_team_id} not found.")
 
         # Participation is resolved through SeasonTeamRegistration (#180), not
-        # the legacy Team.division_id: both teams must be actively registered in
-        # this season+division. The override flag still forces a game between
-        # teams that are not co-registered.
-        if not allow_division_override:
-            self._require_team_registered(season_id, home_team_id, division_id, home)
-            self._require_team_registered(season_id, away_team_id, division_id, away)
+        # the legacy Team.division_id: both teams must have an active, league-
+        # consistent registration in this season. allow_division_override
+        # relaxes ONLY the division match (a cross-division exhibition) — it
+        # never lets an unregistered team be scheduled (#200 review). The
+        # override is recorded in the game_created audit below.
+        self._require_team_registered(season_id, home_team_id, division_id, home,
+                                      require_division=not allow_division_override)
+        self._require_team_registered(season_id, away_team_id, division_id, away,
+                                      require_division=not allow_division_override)
 
         slot = self.store.get_ice_slot(ice_slot_id)
         if slot is None:

@@ -76,7 +76,7 @@ class DraftScheduleTest(unittest.TestCase):
         s.add_rink(Rink(id="r1", venue_id="v1", name="Main"))
         for i in range(n_teams):
             s.add_team(Team(id=f"t{i}", name=f"Team {i}", division="D1",
-                            division_id="div1"))
+                            division_id="div1", league_id="league1"))
             # Draft scheduling reads the season registration, not division_id (#180).
             s.add_season_team_registration(SeasonTeamRegistration(
                 id=f"streg_t{i}", season_id="se1", team_id=f"t{i}",

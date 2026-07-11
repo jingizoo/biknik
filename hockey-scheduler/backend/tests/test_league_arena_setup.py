@@ -78,12 +78,15 @@ class LeagueArenaSetupTest(unittest.TestCase):
         other_div = svc.create_division(u["season"].id, "Senior")
         club_c = svc.create_club("Bears Club")
         outsider = svc.create_team(club_c.id, other_div.id, "Senior Bears")
+        # Registered in the season (just a different division) — so the override
+        # is a valid cross-division exhibition, not an unregistered team (#200).
+        svc.register_team_for_season(u["season"].id, outsider.id, other_div.id)
 
         with self.assertRaises(DivisionMismatchError):
             svc.create_game(u["season"].id, u["division"].id,
                             u["home"].id, outsider.id, u["slot"].id)
 
-        # Override flag forces it.
+        # Override flag forces the cross-division game.
         game = svc.create_game(u["season"].id, u["division"].id,
                                u["home"].id, outsider.id, u["slot"].id,
                                allow_division_override=True)

@@ -11,6 +11,7 @@ from datetime import date, timedelta
 
 from ..domain import IceSlotStatus, IceSlotType
 from ..domain.errors import ValidationError
+from .league_scope import registered_team_ids_in_division
 
 
 def round_robin_pairings(team_ids):
@@ -172,14 +173,12 @@ def draft_schedule(store, division_id, slot_ids=None, constraints=None):
     games-per-team-per-day cap); a pairing with no valid slot is returned in
     ``unscheduled`` with the reason(s) that blocked it. Nothing is persisted.
     """
-    # A division's teams are those actively registered in it this season (#180
-    # shared guard), not the legacy Team.division_id — the same source of truth
-    # game creation, moves, publishing, and standings use.
-    division = store.get_division(division_id)
-    teams = sorted(
-        r.team_id
-        for r in store.registrations_for_season(division.season_id)
-        if r.active and r.division_id == division_id) if division else []
+    # A division's teams are those validly registered in it this season (#180),
+    # via the shared resolver — active rows whose Team exists and whose league
+    # matches, so an orphaned or cross-league registration row can never enter a
+    # draft (#199/#200 review). Same source of truth game creation, moves,
+    # publishing, and standings use.
+    teams = sorted(registered_team_ids_in_division(store, division_id))
     pairings = round_robin_pairings(teams)
     slots = _available_game_slots(store, slot_ids)
     con = _normalize_constraints(constraints)

@@ -40,7 +40,8 @@ def _store(n_teams, slot_times):
                       league_id="league"))
     s.add_rink(Rink(id="r1", venue_id="v", name="Main"))
     for i in range(n_teams):
-        s.add_team(Team(id=f"t{i}", name=f"T{i}", division="D", division_id="d"))
+        s.add_team(Team(id=f"t{i}", name=f"T{i}", division="D", division_id="d",
+                        league_id="league"))
         # Draft scheduling reads the season registration, not division_id (#180).
         s.add_season_team_registration(SeasonTeamRegistration(
             id=f"streg_t{i}", season_id="se", team_id=f"t{i}",
