@@ -1677,6 +1677,14 @@ class Handler(BaseHTTPRequestHandler):
         if mx:
             return self._send_api(api.unregister_team_from_season(
                 mx.group(1), actor_id))
+        # Season rollover (#180): copy a prior season's participation forward
+        # into this one, reusing the permanent teams. body carries the source
+        # season and an optional per-team target-division selection.
+        mrf = re.match(r"^seasons/([^/]+)/roll-forward$", entity)
+        if mrf:
+            return self._send_api(api.roll_forward_registrations(
+                b.get("from_season_id"), mrf.group(1), b.get("selections"),
+                actor_id))
         if entity == "league":
             return self._send_api(api.create_league(
                 b.get("name"), b.get("country", ""), b.get("timezone", "UTC"),
