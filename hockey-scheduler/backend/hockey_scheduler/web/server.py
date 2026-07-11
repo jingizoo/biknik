@@ -1708,8 +1708,11 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_api(api.create_club(
                 b.get("name"), b.get("country", ""), actor_id))
         if entity == "team":
+            # #180: a team is created under a league (league_id); division_id is
+            # the legacy/import path that derives the league. Either works.
             return self._send_api(api.create_team(
-                b.get("club_id"), b.get("division_id"), b.get("name"), actor_id))
+                b.get("club_id"), b.get("division_id") or None, b.get("name"),
+                actor_id, league_id=b.get("league_id") or None))
         if entity == "organization":
             return self._send_api(api.create_organization(
                 b.get("name"), b.get("short_name", ""), actor_id))

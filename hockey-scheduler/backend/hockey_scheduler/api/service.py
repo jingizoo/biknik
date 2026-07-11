@@ -2435,9 +2435,11 @@ class ApiService:
         return _serialize(self.setup.create_club(name, country, actor_id))
 
     @catch
-    def create_team(self, club_id: str, division_id: str, name: str,
-                    actor_id: Optional[str] = None) -> dict:
-        return _serialize(self.setup.create_team(club_id, division_id, name, actor_id))
+    def create_team(self, club_id: str, division_id: Optional[str] = None,
+                    name: str = "", actor_id: Optional[str] = None,
+                    league_id: Optional[str] = None) -> dict:
+        return _serialize(self.setup.create_team(
+            club_id, division_id, name, actor_id, league_id=league_id))
 
     # -- permanent teams + season registrations (#180) ---------------------
     @catch
