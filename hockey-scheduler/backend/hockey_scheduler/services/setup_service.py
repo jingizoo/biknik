@@ -439,6 +439,12 @@ class SetupService:
         nested — it opens its own single transaction (via the decorator) and
         inlines the per-team writes rather than calling the transactional
         register method, since the store's transaction isn't reentrant.
+
+        Every carried team is resolved and league-checked in a pre-write gate
+        (#197): a source season's registration rows may be legacy, orphaned, or
+        cross-league, and the store transaction is a lock rather than a
+        rollback, so a missing or foreign team aborts the entire batch before
+        any registration or audit is written.
         """
         src = self.store.get_season(from_season_id)
         if src is None:
@@ -456,17 +462,56 @@ class SetupService:
                          for r in self.store.registrations_for_season(from_season_id)
                          if r.active}
         if selections is not None:
+            # Malformed HTTP input must surface as a structured validation
+            # error, not an AttributeError 500 (#197): ``selections`` is a list
+            # of ``{team_id, division_id}`` objects, each with a non-empty
+            # team_id. ``catch`` only translates DomainError, so an attribute
+            # access on a non-dict selection would otherwise escape as a 500.
+            if not isinstance(selections, list):
+                raise ValidationError(
+                    "selections must be a list of {team_id, division_id} objects.")
             wanted = {}
             for sel in selections:
-                tid = (sel or {}).get("team_id")
+                if not isinstance(sel, dict):
+                    raise ValidationError(
+                        "Each selection must be an object with a team_id.")
+                tid = sel.get("team_id")
+                if _blank(tid):
+                    raise ValidationError(
+                        "Each selection needs a non-empty team_id.")
                 if tid not in source_active:
                     raise ValidationError(
                         f"Team {tid} is not registered in the source season.")
-                wanted[tid] = (sel or {}).get("division_id") or None
+                wanted[tid] = sel.get("division_id") or None
         else:
             wanted = {tid: None for tid in source_active}
-        # Pre-write gate — every target division must belong to the target
-        # season, so a bad selection aborts the whole rollover with no writes.
+        # Pre-write gate. The store's transaction is a lock, not a rollback
+        # (see ``memory_store.transaction``), so every check that can fail must
+        # run *before* the first write; any failure below aborts the whole
+        # batch with zero registrations and zero audits.
+        #
+        # (a) Every carried team must be a real permanent Team whose permanent
+        # league matches this rollover (#197). A source season's registration
+        # rows can be legacy, orphaned, or cross-league, so ``source_active``
+        # alone is not trustworthy — resolve each Team and verify its permanent
+        # ``league_id`` before writing. This is what stops a rollover from
+        # materializing a target registration for a missing or foreign team.
+        # Deliberately stricter than ``register_team_for_season`` (which
+        # tolerates a null team league): manual registration is an operator
+        # vouching for one team, whereas rollover blindly trusts a batch of
+        # source rows, so a null/other league_id here is treated as bad data.
+        league_id = src.league_id
+        for tid in wanted:
+            team = self.store.get_team(tid)
+            if team is None:
+                raise ValidationError(
+                    f"Team {tid} in the source season no longer exists; "
+                    "it cannot be rolled forward.")
+            if (team.league_id or None) != league_id:
+                raise ValidationError(
+                    f"Team {tid} belongs to a different league than this "
+                    "rollover; it cannot be carried into this season.")
+        # (b) Every target division must belong to the target season.
         for div_id in set(wanted.values()):
             if div_id is not None:
                 division = self.store.get_division(div_id)
