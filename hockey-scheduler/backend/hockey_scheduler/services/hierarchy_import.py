@@ -492,8 +492,12 @@ def _preflight_reassignment_safety(store, rows) -> List[dict]:
         if season is None or team is None:
             continue  # a new season/team has no existing registration to move
         reg = store.registration_for_team_in_season(season.id, team.id)
-        if reg is None or not reg.active:
-            continue  # a new registration moves nothing
+        if reg is None:
+            continue  # a genuinely new registration moves nothing
+        # An INACTIVE/historical registration is still a move candidate (#214
+        # review): commit reactivates it and may change its division, so a
+        # committed game in the old division must still block the move. Safe
+        # reactivation with no committed games stays allowed.
         new_division_code = _clean(row.get("division_code"))
         if new_division_code == division_code_by_id.get(reg.division_id):
             continue  # division unchanged

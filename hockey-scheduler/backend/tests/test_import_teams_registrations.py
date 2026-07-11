@@ -455,6 +455,49 @@ class ImportConvergenceContract:
         reg = self.store.registration_for_team_in_season(season.id, team.id)
         self.assertEqual(reg.division_id, diva.id)
 
+    def test_inactive_registration_with_committed_game_cannot_move_division(self):
+        # An inactive/historical registration is still a move candidate: commit
+        # would reactivate it and change its division, so a committed game in the
+        # old division must still block the move (#214 review), with zero writes.
+        game_id = self._commit_game()  # committed LIONS vs BEARS in FALL26/DIVA
+        season = self._by_ref(self.store.all_seasons(), "FALL26")
+        diva = self._by_ref(self.store.all_divisions(), "DIVA")
+        lions = self._team("LIONS")
+        reg = self.store.registration_for_team_in_season(season.id, lions.id)
+        reg.active = False  # historical registration; the game stays committed
+        self.store.save_season_team_registration(reg)
+        audits_before = len(self.store.all_setup_audit())
+        moved = payload(registrations_csv=(
+            "season_code,team_code,division_code\nFALL26,LIONS,DIVB\n"))
+        result = self.api.commit_hierarchy_import(moved, actor_id="admin")
+        self.assertFalse(result["committed"])
+        err = next(e for e in result["errors"]
+                   if e["reason"] == "registration_division_move_strands_games")
+        self.assertIn(game_id, err["affected_game_ids"])
+        # Zero writes: registration still inactive and still in DIVA.
+        reg2 = self.store.registration_for_team_in_season(season.id, lions.id)
+        self.assertFalse(reg2.active)
+        self.assertEqual(reg2.division_id, diva.id)
+        self.assertEqual(len(self.store.all_setup_audit()), audits_before)
+
+    def test_inactive_registration_with_no_games_can_reactivate_and_move(self):
+        # A safe reactivation: an inactive registration with no committed games
+        # can be reactivated and moved to a new division by import.
+        self.api.commit_hierarchy_import(payload(), actor_id="admin")
+        season = self._by_ref(self.store.all_seasons(), "FALL26")
+        divb = self._by_ref(self.store.all_divisions(), "DIVB")
+        lions = self._team("LIONS")
+        reg = self.store.registration_for_team_in_season(season.id, lions.id)
+        reg.active = False
+        self.store.save_season_team_registration(reg)
+        moved = payload(registrations_csv=(
+            "season_code,team_code,division_code\nFALL26,LIONS,DIVB\n"))
+        result = self.api.commit_hierarchy_import(moved, actor_id="admin")
+        self.assertTrue(result["committed"], result.get("errors"))
+        reg2 = self.store.registration_for_team_in_season(season.id, lions.id)
+        self.assertTrue(reg2.active)                 # reactivated
+        self.assertEqual(reg2.division_id, divb.id)  # moved
+
     def test_import_never_creates_or_clears_clubs(self):
         # Club association is deferred from this slice (#214 review): the import
         # creates no Club records and never touches an existing team's club_id,
