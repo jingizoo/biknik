@@ -75,6 +75,7 @@ jobs:
           node --check hockey-scheduler/backend/hockey_scheduler/web/static/setup.js
           node --check hockey-scheduler/backend/hockey_scheduler/web/static/onboarding.js
           node --check hockey-scheduler/backend/hockey_scheduler/web/static/onboarding-bootstrap.js
+          node --check hockey-scheduler/backend/hockey_scheduler/web/static/hierarchy-import.js
           node --check hockey-scheduler/e2e/setup-claim.js
           node --check hockey-scheduler/e2e/onboarding-wizard.js
 
