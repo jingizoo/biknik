@@ -662,6 +662,22 @@ class Handler(BaseHTTPRequestHandler):
             if self._operator_only("/api/setup/player"):
                 return
             return self._send_api(api.get_setup_hierarchy())
+        mlt = re.match(r"^/api/setup/leagues/([^/]+)/teams$", path)
+        if mlt:
+            # A league's permanent teams (#180). Operator-gated (MANAGE_SETUP)
+            # like the rest of the setup surface — team names aren't PII but the
+            # roster-adjacent read stays behind the same gate as the hierarchy.
+            if self._operator_only("/api/setup/player"):
+                return
+            return self._send_api(api.list_league_teams(mlt.group(1)))
+        mtr = re.match(r"^/api/setup/seasons/([^/]+)/team-registrations$", path)
+        if mtr:
+            # A season's team registrations (#180) — which permanent teams play
+            # this season and in which division.
+            if self._operator_only("/api/setup/player"):
+                return
+            return self._send_api(
+                api.list_season_team_registrations(mtr.group(1)))
         if path == "/api/onboarding/status":
             # Guided onboarding progress for the Setup wizard (#174 PR C). It
             # aggregates the full setup hierarchy plus account/player onboarding
@@ -1644,6 +1660,23 @@ class Handler(BaseHTTPRequestHandler):
         m = re.match(r"^(league|venue|rink|division|team|player)/([^/]+)/assign-(\w+)$", entity)
         if m:
             return self._handle_reassign(m.group(1), m.group(2), m.group(3), b, actor_id)
+        # Season team registrations (#180): register a permanent league team for
+        # a season, reassign its division for that season, or remove it from the
+        # season. All League-Admin (MANAGE_SETUP) via the /api/setup/ authz
+        # catch-all; the actor is the server-resolved session user.
+        mr = re.match(r"^seasons/([^/]+)/team-registrations$", entity)
+        if mr:
+            return self._send_api(api.register_team_for_season(
+                mr.group(1), b.get("team_id"), b.get("division_id") or None,
+                actor_id))
+        ma = re.match(r"^season-team-registration/([^/]+)/assign-division$", entity)
+        if ma:
+            return self._send_api(api.assign_season_team_division(
+                ma.group(1), b.get("division_id") or None, actor_id))
+        mx = re.match(r"^season-team-registration/([^/]+)/remove$", entity)
+        if mx:
+            return self._send_api(api.unregister_team_from_season(
+                mx.group(1), actor_id))
         if entity == "league":
             return self._send_api(api.create_league(
                 b.get("name"), b.get("country", ""), b.get("timezone", "UTC"),
