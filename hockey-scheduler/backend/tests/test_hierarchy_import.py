@@ -284,12 +284,14 @@ class HierarchyImportHttpTest(unittest.TestCase):
     def test_league_admin_can_validate_and_commit(self):
         client = self.client()
         self.login(client, "admin")
+        before = len(self.srv.STATE.api.store.all_organizations())
         status, preview = self.request(
             client, "/api/import/commit/teams-players",
             payload(dry_run=True))
         self.assertEqual(status, 200)
         self.assertTrue(preview["ok"])
-        self.assertEqual(self.srv.STATE.api.store.all_organizations(), [])
+        self.assertEqual(
+            len(self.srv.STATE.api.store.all_organizations()), before)
 
         status, committed = self.request(
             client, "/api/import/commit/teams-players", payload())
