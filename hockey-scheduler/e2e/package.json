@@ -6,7 +6,8 @@
     "smoke": "node smoke.js",
     "setup-claim": "node setup-claim.js",
     "onboarding-wizard": "node onboarding-wizard.js",
-    "hierarchy-import": "node hierarchy-import.js"
+    "hierarchy-import": "node hierarchy-import.js",
+    "season-participation": "node season-participation.js"
   },
   "devDependencies": {
     "playwright": "^1.48.0"

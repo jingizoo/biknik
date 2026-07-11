@@ -54,6 +54,8 @@ let addableSubs = null;             // eligible-but-not-enrolled team players a 
 let dashAvailability = null;        // availability-summary for the coach dashboard's next game (#146)
 let dashSubQueue = null;            // substitute-candidates for the coach dashboard's next game (#146)
 let playersList = [];               // [{id,name,team_id,position,jersey_number,...}] for Setup (#114)
+let leagueTeams = {};               // league_id -> [{id,name,league_id}] permanent members (#180)
+let seasonRegs = {};                // season_id -> [{id,team_id,division_id,active}] registrations (#180)
 let rescheduleRequests = null;      // reschedule request(s) for the current game (#29)
 let availFilter = "all";            // all|available|unavailable|maybe|no_response
 let gamesFilter = { division: "all", team: "all", rink: "all", status: "all", from: "", to: "" };  // Games list filters (#152)
@@ -914,7 +916,74 @@ function renderSetupHierarchy(ov) {
     ? `<section class="tree-panel na"><div class="tree-head"><span class="tree-title">⚠ Needs assignment</span></div>
         <div class="tree-note">These records can't be scheduled until they're assigned.</div>${naBody}</section>` : "";
 
-  return `${reassignPanelHtml(ov)}<div class="setup-trees">${facility}${competition}${roster}${needsAssignment}</div>`;
+  return `${reassignPanelHtml(ov)}<div class="setup-trees">${facility}${competition}${renderSeasonParticipation(ov)}${roster}${needsAssignment}</div>`;
+}
+
+// Season participation (#180): permanent league teams and which season/division
+// each plays. Kept separate from the competition tree above (which still shows
+// teams by their legacy division_id) so the two ideas — a team's permanent
+// league membership vs. its per-season participation — read distinctly. Data
+// comes from the dedicated /api/setup endpoints loaded in render() (leagueTeams,
+// seasonRegs), never the legacy Team.division_id.
+function renderSeasonParticipation(ov) {
+  if (!hasPerm("manage_setup")) return "";
+  const seasonsByLeague = groupBy(ov.seasons, "league_id");
+  const divsBySeason = groupBy(ov.divisions, "season_id");
+  const divName = (id) => (((ov.divisions || []).find((d) => d.id === id)) || {}).name || "";
+  const leaguesWithSeasons = (ov.leagues || []).filter((lg) => (seasonsByLeague[lg.id] || []).length);
+  if (!leaguesWithSeasons.length) return "";
+  const divOpts = (sid, sel) => (divsBySeason[sid] || []).map((d) => opt(d.id, d.name, d.id === sel)).join("");
+
+  const leagueBlocks = leaguesWithSeasons.map((lg) => {
+    const teams = leagueTeams[lg.id] || [];
+    const teamName = (tid) => ((teams.find((t) => t.id === tid)) || {}).name || tid;
+    const seasonBlocks = (seasonsByLeague[lg.id] || []).map((s) => {
+      const regs = (seasonRegs[s.id] || []).filter((r) => r.active);
+      const registered = new Set(regs.map((r) => r.team_id));
+      const hasDivs = (divsBySeason[s.id] || []).length > 0;
+      const regRows = regs.map((r) => {
+        const divCtl = hasDivs
+          ? `<select class="reg-div" id="regdiv-${esc(r.id)}"><option value="">No division</option>${divOpts(s.id, r.division_id)}</select>
+             <button class="act" data-reg-assign="${esc(r.id)}">Save</button>` : "";
+        const tag = `${esc(s.name)} · ${r.division_id ? esc(divName(r.division_id)) : "No division"}`;
+        return `<div class="tn-leaf reg-row">
+          <span class="tn-label">👥 ${esc(teamName(r.team_id))}</span>
+          <span class="tn-meta reg-tag">${tag}</span>
+          ${divCtl}<button class="act" data-reg-remove="${esc(r.id)}">Remove</button></div>`;
+      }).join("") || `<div class="tn-empty">No teams registered for this season yet.</div>`;
+      const available = teams.filter((t) => !registered.has(t.id));
+      const addCtl = available.length
+        ? `<div class="tn-leaf reg-add">
+            <select id="reg-team-${esc(s.id)}"><option value="">Add a league team…</option>${
+              available.map((t) => opt(t.id, t.name)).join("")}</select>
+            <select id="reg-div-${esc(s.id)}"><option value="">No division</option>${divOpts(s.id, "")}</select>
+            <button class="act primary" data-reg-add="${esc(s.id)}">Register</button></div>`
+        : (teams.length
+            ? `<div class="tn-empty">Every league team is registered for this season.</div>`
+            : `<div class="tn-empty">Create a league team first, then register it here.</div>`);
+      return `<details class="tn" open><summary class="tn-sum">
+          <span class="tn-label">🗓️ ${esc(s.name)}</span>
+          <span class="tn-meta">${regs.length} team${regs.length === 1 ? "" : "s"}</span></summary>
+        <div class="tn-children">${regRows}${addCtl}</div></details>`;
+    }).join("");
+    // Permanent members not registered for ANY season this league — surfaced so
+    // an operator sees teams that exist but sit out every current season.
+    const idle = teams.filter((t) => !(seasonsByLeague[lg.id] || [])
+      .some((s) => (seasonRegs[s.id] || []).some((r) => r.active && r.team_id === t.id)));
+    const idleRows = idle.length
+      ? `<div class="tn-leaf reg-row"><span class="tn-meta">${idle.length} league team${
+          idle.length === 1 ? "" : "s"} not in any current season: ${
+          idle.map((t) => esc(t.name)).join(", ")}</span></div>` : "";
+    return `<details class="tn" open><summary class="tn-sum">
+        <span class="tn-label">🏆 ${esc(lg.name)}</span>
+        <span class="tn-meta">${teams.length} league team${teams.length === 1 ? "" : "s"}</span></summary>
+      <div class="tn-children">${seasonBlocks}${idleRows}</div></details>`;
+  }).join("");
+
+  return `<section class="tree-panel">
+    <div class="tree-head"><span class="tree-title">🗓️ Season participation</span>
+      <span class="tree-sub">Permanent league teams → seasons &amp; divisions they play</span></div>
+    ${leagueBlocks}</section>`;
 }
 
 function renderSetup(ov) {
@@ -3602,6 +3671,20 @@ async function render() {
     if (view === "setup" && hasPerm("manage_setup")) {
       const pl = await getJSON("/api/players");
       playersList = Array.isArray(pl) ? pl : [];
+      // Season participation (#180): a league's permanent teams and each
+      // season's registrations, each its own authenticated call (like the
+      // player list above), so the Setup page can show which permanent team
+      // plays which season/division — never derived from the legacy
+      // Team.division_id.
+      leagueTeams = {}; seasonRegs = {};
+      for (const lg of (ov.leagues || [])) {
+        const r = await getJSON(`/api/setup/leagues/${lg.id}/teams`);
+        leagueTeams[lg.id] = (r && r.teams) || [];
+      }
+      for (const s of (ov.seasons || [])) {
+        const r = await getJSON(`/api/setup/seasons/${s.id}/team-registrations`);
+        seasonRegs[s.id] = (r && r.registrations) || [];
+      }
     }
     // The game sheet also needs the officials pool for its assign control (#30).
     if (view === "sheet") {
@@ -3852,6 +3935,36 @@ async function render() {
   c.querySelectorAll("[data-reassign-confirm]").forEach((b) => b.onclick = () => {
     const sel = c.querySelector("#reassign-target");
     commitReassign(sel ? sel.value : "");
+  });
+  // Season participation (#180): register a league team for a season, change
+  // its season division, or remove it. Each posts to the setup registration
+  // routes then re-renders; the toast reflects the server's structured error
+  // (e.g. a team with scheduled games can't be removed).
+  c.querySelectorAll("[data-reg-add]").forEach((b) => b.onclick = async () => {
+    const sid = b.dataset.regAdd;
+    const team = c.querySelector(`#reg-team-${sid}`);
+    const div = c.querySelector(`#reg-div-${sid}`);
+    if (!team || !team.value) { toast = "Choose a league team to register."; toastIsError = true; return render(); }
+    toast = "";
+    const res = await post(`/api/setup/seasons/${sid}/team-registrations`,
+      { team_id: team.value, division_id: (div && div.value) || null });
+    if (res && !res.error) toast = "Team registered for the season.";
+    await render();
+  });
+  c.querySelectorAll("[data-reg-assign]").forEach((b) => b.onclick = async () => {
+    const rid = b.dataset.regAssign;
+    const div = c.querySelector(`#regdiv-${rid}`);
+    toast = "";
+    const res = await post(`/api/setup/season-team-registration/${rid}/assign-division`,
+      { division_id: (div && div.value) || null });
+    if (res && !res.error) toast = "Division updated for the season.";
+    await render();
+  });
+  c.querySelectorAll("[data-reg-remove]").forEach((b) => b.onclick = async () => {
+    toast = "";
+    const res = await post(`/api/setup/season-team-registration/${b.dataset.regRemove}/remove`, {});
+    if (res && !res.error) toast = "Team removed from the season.";
+    await render();
   });
   if (drawer) {
     const first = c.querySelector(".drawer-body input, .drawer-body select");

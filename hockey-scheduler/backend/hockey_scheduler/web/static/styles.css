@@ -730,6 +730,11 @@ details.tn > .tn-sum:hover { background: #f6f7fb; }
 .tn-reassign-btn { margin-left: 6px; white-space: nowrap; }
 .tn-leaf .tn-reassign-btn:first-of-type,
 .tn-sum .tn-reassign-btn:first-of-type { margin-left: auto; }
+/* Season participation rows (#180): let the team/division controls wrap under
+   the label on a narrow (390px) phone instead of overflowing the row. */
+.reg-row, .reg-add { flex-wrap: wrap; }
+.reg-row .reg-tag { margin-right: auto; }
+.reg-add select, .reg-row select { max-width: 100%; }
 .rz-panel .rz-label { display: block; font-size: 12px; color: var(--muted); margin: 8px 0 3px; }
 .rz-panel select { width: 100%; }
 .na-group { margin-top: 6px; }
