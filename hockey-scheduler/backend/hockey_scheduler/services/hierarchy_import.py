@@ -433,35 +433,51 @@ def _preflight_reassignment_safety(store, rows) -> List[dict]:
                            if d.external_ref}
     all_regs = store.all_season_team_registrations()
 
-    # (a) A team's league move must keep every active registration in that
-    #     league — otherwise the existing registrations become cross-league.
+    # (a) A team's league move must keep EVERY retained dependency in that
+    #     league. This means all registrations — active AND inactive/historical,
+    #     since an inactive prior-season row would become cross-league on any
+    #     later reactivation — and the preserved legacy Team.division_id (kept
+    #     for legacy game scope), whose division's season must also resolve to
+    #     the target league (#214 review). Historical placement is never
+    #     silently rewritten.
     for index, row in enumerate(
             _group_first(rows["permanent_teams"], "team_code").values(), start=1):
         code = _clean(row.get("team_code"))
         team = teams.get(code)
         if team is None:
-            continue  # a new team has no existing registrations to strand
+            continue  # a new team has no history to strand
         new_league_code = _clean(row.get("league_code"))
         if new_league_code == league_code_by_id.get(team.league_id):
             continue  # league unchanged
-        stranded = []
+        stranded_regs = []
         for reg in all_regs:
-            if reg.team_id != team.id or not reg.active:
+            if reg.team_id != team.id:
                 continue
             season = store.get_season(reg.season_id)
             reg_league = (league_code_by_id.get(season.league_id)
                           if season is not None else None)
             if reg_league != new_league_code:
-                stranded.append(reg.id)
-        if stranded:
+                stranded_regs.append(reg.id)
+        stranded_divisions = []
+        if team.division_id:
+            division = store.get_division(team.division_id)
+            div_season = (store.get_season(division.season_id)
+                          if division is not None else None)
+            div_league = (league_code_by_id.get(div_season.league_id)
+                          if div_season is not None else None)
+            if div_league != new_league_code:
+                stranded_divisions.append(team.division_id)
+        if stranded_regs or stranded_divisions:
             errors.append({
                 "sheet": "permanent_teams", "row": index, "field": "league_code",
                 "message": (f"Moving team {code} to league {new_league_code} "
-                            f"would leave {len(stranded)} active registration(s) "
-                            "in another league; unregister or re-register them "
-                            "first."),
-                "reason": "team_league_move_strands_registrations",
-                "team_code": code, "affected_registration_ids": stranded})
+                            f"would leave {len(stranded_regs)} registration(s) "
+                            f"and {len(stranded_divisions)} legacy division(s) in "
+                            "another league; move or clear that history first."),
+                "reason": "team_league_move_strands_history",
+                "team_code": code,
+                "affected_registration_ids": stranded_regs,
+                "affected_division_ids": stranded_divisions})
 
     # (b) A registration's division move must not strand committed games.
     for index, row in enumerate(rows["registrations"], start=1):

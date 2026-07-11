@@ -209,10 +209,61 @@ class ImportConvergenceContract:
         result = self.api.commit_hierarchy_import(move, actor_id="admin")
         self.assertFalse(result["committed"])
         err = result["errors"][0]
-        self.assertEqual(err["reason"], "team_league_move_strands_registrations")
+        self.assertEqual(err["reason"], "team_league_move_strands_history")
         self.assertIn(reg.id, err["affected_registration_ids"])
         # Atomic zero-write: LIONS still in OVER55, no new audits.
         self.assertEqual(self._team("LIONS").league_id, over55.id)
+        self.assertEqual(len(self.store.all_setup_audit()), audits_before)
+
+    def test_inactive_registration_blocks_team_league_move(self):
+        # An INACTIVE prior-season registration is still a retained dependency:
+        # moving the team's league would make a later reactivation cross-league
+        # (#214 review), so the import is rejected with zero writes.
+        self.api.commit_hierarchy_import(payload(), actor_id="admin")
+        second = {"import_type": "hierarchy", "organizations_csv": ORGANIZATIONS,
+                  "leagues_csv": LEAGUES + "OTHER,CANLON,Other,US,America/Chicago\n"}
+        self.assertTrue(
+            self.api.commit_hierarchy_import(second, actor_id="admin")["committed"])
+        season = self._by_ref(self.store.all_seasons(), "FALL26")
+        over55 = self._by_ref(self.store.all_leagues(), "OVER55")
+        lions = self._team("LIONS")
+        reg = self.store.registration_for_team_in_season(season.id, lions.id)
+        reg.active = False  # historical registration
+        self.store.save_season_team_registration(reg)
+        audits_before = len(self.store.all_setup_audit())
+        move = {"import_type": "hierarchy", "permanent_teams_csv":
+                "league_code,team_code,team_name\nOTHER,LIONS,Lions\n"}
+        result = self.api.commit_hierarchy_import(move, actor_id="admin")
+        self.assertFalse(result["committed"])
+        err = next(e for e in result["errors"]
+                   if e["reason"] == "team_league_move_strands_history")
+        self.assertIn(reg.id, err["affected_registration_ids"])
+        self.assertEqual(self._team("LIONS").league_id, over55.id)
+        self.assertEqual(len(self.store.all_setup_audit()), audits_before)
+
+    def test_legacy_division_blocks_team_league_move(self):
+        # A preserved legacy Team.division_id in the old league is a retained
+        # dependency too: moving the team's league would make legacy game scope
+        # cross-league (#214 review), so the import is rejected with zero writes.
+        self.api.commit_hierarchy_import(payload(), actor_id="admin")
+        over55 = self._by_ref(self.store.all_leagues(), "OVER55")
+        diva = self._by_ref(self.store.all_divisions(), "DIVA")
+        self.store.add_team(Team(id="team_ld", name="Legacy", external_ref="LEGDIV",
+                                 club_id=None, division_id=diva.id,
+                                 division="Division A", league_id=over55.id))
+        second = {"import_type": "hierarchy", "organizations_csv": ORGANIZATIONS,
+                  "leagues_csv": LEAGUES + "OTHER,CANLON,Other,US,America/Chicago\n"}
+        self.assertTrue(
+            self.api.commit_hierarchy_import(second, actor_id="admin")["committed"])
+        audits_before = len(self.store.all_setup_audit())
+        move = {"import_type": "hierarchy", "permanent_teams_csv":
+                "league_code,team_code,team_name\nOTHER,LEGDIV,Legacy\n"}
+        result = self.api.commit_hierarchy_import(move, actor_id="admin")
+        self.assertFalse(result["committed"])
+        err = next(e for e in result["errors"]
+                   if e["reason"] == "team_league_move_strands_history")
+        self.assertIn(diva.id, err["affected_division_ids"])
+        self.assertEqual(self._team("LEGDIV").league_id, over55.id)
         self.assertEqual(len(self.store.all_setup_audit()), audits_before)
 
     def test_safe_registration_move_records_exact_from_and_to(self):
