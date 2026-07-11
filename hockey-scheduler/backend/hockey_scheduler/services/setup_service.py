@@ -328,6 +328,15 @@ class SetupService:
                      "division_id": reg.division_id})
         return reg
 
+    def _games_scheduled_for_team_in_season(self, season_id, team_id):
+        """Ids of committed (non-cancelled, non-draft) games in ``season_id``
+        that ``team_id`` plays in — the games a removal or division change would
+        strand. Draft proposals aren't real games yet, so they don't block."""
+        return [g.id for g in self.store.all_games()
+                if g.season_id == season_id and not g.cancelled
+                and not g.is_draft
+                and team_id in (g.home_team_id, g.away_team_id)]
+
     @_transactional
     def assign_season_team_division(self, registration_id: str,
                                     division_id: Optional[str] = None,
@@ -345,6 +354,19 @@ class SetupService:
                 raise ValidationError(
                     "Division belongs to a different season.")
         old = reg.division_id
+        # Safety — a division change would leave already-scheduled games in the
+        # old division mismatched against the team's participation. Refuse and
+        # report the affected games so the operator can resolve them first,
+        # rather than silently invalidating a published schedule.
+        if (division_id or None) != (old or None):
+            stranded = self._games_scheduled_for_team_in_season(
+                reg.season_id, reg.team_id)
+            if stranded:
+                raise ValidationError(
+                    "Cannot change this team's division while it has scheduled "
+                    "games this season; resolve those games first.",
+                    {"reason": "team_has_scheduled_games",
+                     "affected_game_ids": stranded, "count": len(stranded)})
         reg.division_id = division_id or None
         self.store.save_season_team_registration(reg)
         self._audit("season_team_division_assigned", "season_team_registration",
@@ -357,12 +379,20 @@ class SetupService:
                                     ) -> SeasonTeamRegistration:
         # Rule 6 — removing a team from a season deactivates only this season's
         # registration; the permanent Team and prior-season registrations are
-        # untouched. (The scheduled-game safety check that blocks an unsafe
-        # removal lands with the scheduling-guard slice, once games resolve
-        # participation through registrations.)
+        # untouched.
         reg = self.store.get_season_team_registration(registration_id)
         if reg is None:
             raise NotFoundError(f"Registration {registration_id} not found.")
+        # Safety — refuse to strand a team that still has committed games this
+        # season, returning the affected game ids so they can be resolved first.
+        stranded = self._games_scheduled_for_team_in_season(
+            reg.season_id, reg.team_id)
+        if stranded:
+            raise ValidationError(
+                "Cannot remove this team from the season while it has scheduled "
+                "games; resolve those games first.",
+                {"reason": "team_has_scheduled_games",
+                 "affected_game_ids": stranded, "count": len(stranded)})
         reg.active = False
         self.store.save_season_team_registration(reg)
         self._audit("season_team_unregistered", "season_team_registration",
