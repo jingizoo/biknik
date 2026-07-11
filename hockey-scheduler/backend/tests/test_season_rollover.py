@@ -4,7 +4,9 @@ When a new season starts, an operator carries the prior season's participation
 forward — the same permanent teams, into the new season's divisions — without
 recreating Team records or touching the prior season. These tests cover the
 service (copy-all and selective, cross-league/wrong-division rejection,
-idempotent skip, Team reuse, audit) and the HTTP route's authorization.
+idempotent skip, Team reuse, audit), the #197 corrective integrity gate
+(orphan / cross-league source teams and malformed selections rejected before
+any write), and the HTTP route's authorization.
 """
 
 import json
@@ -17,6 +19,7 @@ from http.server import ThreadingHTTPServer
 from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
 
 from hockey_scheduler.api import ApiService
+from hockey_scheduler.domain import SeasonTeamRegistration
 from hockey_scheduler.store import InMemoryStore
 from hockey_scheduler.web.server import STATE, Handler
 
@@ -40,6 +43,130 @@ class SeasonRolloverServiceTest(unittest.TestCase):
 
     def _active(self, season_id):
         return [r for r in self.api.store.registrations_for_season(season_id) if r.active]
+
+    def _audit_count(self):
+        return len(self.api.store.all_setup_audit())
+
+    def _inject_source_reg(self, team_id, division_id=None):
+        """Force an inconsistent participation row into the source season.
+
+        The rollover gate exists precisely because the registration store can
+        hold legacy/orphaned/cross-league rows that never passed
+        ``register_team_for_season``'s own guard. These rows can't be created
+        through the service (it would reject them), so the tests inject them
+        directly to reproduce the data the gate must defend against.
+        """
+        reg = SeasonTeamRegistration(
+            id=self.api.store.next_id("streg"), season_id=self.s1["id"],
+            team_id=team_id, division_id=division_id, active=True)
+        self.api.store.add_season_team_registration(reg)
+        return reg
+
+    # -- #197 corrective gate: orphan / cross-league / malformed input -----
+    # roll_forward_registrations previously trusted source registration
+    # team_ids without resolving the Team or checking its league, and threw an
+    # AttributeError on malformed selections. Every failure below must be a
+    # structured validation error that writes zero registrations and zero
+    # audits (the store transaction is a lock, not a rollback, so the gate has
+    # to run entirely before the first write).
+
+    def test_orphan_source_registration_is_rejected_with_no_writes(self):
+        # A source row pointing at a Team that no longer exists must abort the
+        # whole batch — not silently materialize a registration for a ghost.
+        self._inject_source_reg("team_ghost")
+        audits_before = self._audit_count()
+        res = self.api.roll_forward_registrations(
+            self.s1["id"], self.s2["id"], actor_id=ADMIN)
+        self.assertEqual(res["error"]["code"], "validation_error")
+        # All-or-nothing: the valid Lions/Bears were NOT written either.
+        self.assertEqual(self._active(self.s2["id"]), [])
+        self.assertEqual(self._audit_count(), audits_before)
+
+    def test_cross_league_source_team_is_rejected_with_no_writes(self):
+        # A source row whose Team permanently belongs to another league must
+        # abort rather than carry a foreign team into this league's season.
+        other = self.api.create_league("Other", actor_id=ADMIN)
+        other_season = self.api.create_season(other["id"], "OS", actor_id=ADMIN)
+        other_div = self.api.create_division(other_season["id"], "OD", actor_id=ADMIN)
+        foreign = self.api.create_team(
+            self.api.create_club("FC", actor_id=ADMIN)["id"],
+            other_div["id"], "Foreign", actor_id=ADMIN)
+        self.assertEqual(foreign["league_id"], other["id"])
+        self._inject_source_reg(foreign["id"])
+        audits_before = self._audit_count()
+        res = self.api.roll_forward_registrations(
+            self.s1["id"], self.s2["id"], actor_id=ADMIN)
+        self.assertEqual(res["error"]["code"], "validation_error")
+        self.assertEqual(self._active(self.s2["id"]), [])
+        self.assertEqual(self._audit_count(), audits_before)
+
+    def test_cross_league_team_via_selection_is_rejected(self):
+        # Same defense on the selective path: a hand-picked team whose Team is
+        # cross-league is rejected before any write.
+        other = self.api.create_league("Other", actor_id=ADMIN)
+        other_season = self.api.create_season(other["id"], "OS", actor_id=ADMIN)
+        other_div = self.api.create_division(other_season["id"], "OD", actor_id=ADMIN)
+        foreign = self.api.create_team(
+            self.api.create_club("FC", actor_id=ADMIN)["id"],
+            other_div["id"], "Foreign", actor_id=ADMIN)
+        self._inject_source_reg(foreign["id"])
+        audits_before = self._audit_count()
+        res = self.api.roll_forward_registrations(
+            self.s1["id"], self.s2["id"],
+            selections=[{"team_id": foreign["id"]}], actor_id=ADMIN)
+        self.assertEqual(res["error"]["code"], "validation_error")
+        self.assertEqual(self._active(self.s2["id"]), [])
+        self.assertEqual(self._audit_count(), audits_before)
+
+    def test_malformed_selections_return_structured_validation_errors(self):
+        # Each malformed shape must return a structured validation_error rather
+        # than raise an AttributeError (which catch does not translate → 500).
+        malformed = [
+            "not-a-list",                          # not a list at all
+            {"team_id": self.lions["id"]},          # a bare object, not a list
+            ["just-a-string"],                      # element is not an object
+            [None],                                 # element is None
+            [{"division_id": self.d2["id"]}],       # missing team_id
+            [{"team_id": ""}],                      # blank team_id
+            [{"team_id": "   "}],                   # whitespace-only team_id
+            [{"team_id": None}],                    # null team_id
+            [{"team_id": 123}],                     # non-string (int) team_id
+            [{"team_id": ["t1"]}],                  # unhashable (list) team_id
+            [{"team_id": {"x": 1}}],                # unhashable (dict) team_id
+            # valid team but unhashable division_id (would TypeError on de-dup)
+            [{"team_id": self.lions["id"], "division_id": {"x": 1}}],
+            [{"team_id": self.lions["id"], "division_id": ["d1"]}],
+        ]
+        audits_before = self._audit_count()
+        for bad in malformed:
+            res = self.api.roll_forward_registrations(
+                self.s1["id"], self.s2["id"], selections=bad, actor_id=ADMIN)
+            self.assertIn("error", res, f"expected an error for selections={bad!r}")
+            self.assertEqual(res["error"]["code"], "validation_error",
+                             f"expected validation_error for selections={bad!r}")
+        # A non-string season id must also be a structured 400, not a TypeError
+        # from store.get_season(dict.get(unhashable)).
+        for bad_season in (["s1"], {"id": "s1"}, 123, ""):
+            res = self.api.roll_forward_registrations(
+                bad_season, self.s2["id"], actor_id=ADMIN)
+            self.assertEqual(res["error"]["code"], "validation_error",
+                             f"expected validation_error for from_season_id={bad_season!r}")
+        # Every rejection was pre-write: target season empty, no audits written.
+        self.assertEqual(self._active(self.s2["id"]), [])
+        self.assertEqual(self._audit_count(), audits_before)
+
+    def test_orphan_selected_team_is_rejected_by_the_gate(self):
+        # A hand-picked team that IS active in the source season but whose Team
+        # record is missing must be caught by the existence gate (not merely by
+        # the source-membership check), on the selective path.
+        self._inject_source_reg("team_ghost")
+        audits_before = self._audit_count()
+        res = self.api.roll_forward_registrations(
+            self.s1["id"], self.s2["id"],
+            selections=[{"team_id": "team_ghost"}], actor_id=ADMIN)
+        self.assertEqual(res["error"]["code"], "validation_error")
+        self.assertEqual(self._active(self.s2["id"]), [])
+        self.assertEqual(self._audit_count(), audits_before)
 
     def test_copy_all_forward_without_division(self):
         res = self.api.roll_forward_registrations(self.s1["id"], self.s2["id"], actor_id=ADMIN)
@@ -151,6 +278,31 @@ class SeasonRolloverHttpTest(unittest.TestCase):
                                  {"from_season_id": s1["id"]}, "league_admin")
         self.assertEqual(status, 200)
         self.assertEqual(res["rolled_forward"], 1)
+
+    def test_malformed_body_returns_400_not_500(self):
+        # Req #4 is a transport guarantee: malformed HTTP input must map to a
+        # structured 400, never a 500 from an uncaught TypeError/AttributeError.
+        # Exercise the full route -> facade -> ERROR_HTTP_STATUS path.
+        _, league = self._post("/api/setup/league", {"name": "ML"}, "league_admin")
+        _, s1 = self._post("/api/setup/season", {"league_id": league["id"], "name": "A"}, "league_admin")
+        _, s2 = self._post("/api/setup/season", {"league_id": league["id"], "name": "B"}, "league_admin")
+        _, d1 = self._post("/api/setup/division", {"season_id": s1["id"], "name": "D"}, "league_admin")
+        _, club = self._post("/api/setup/club", {"name": "C"}, "league_admin")
+        _, team = self._post("/api/setup/team",
+                             {"club_id": club["id"], "division_id": d1["id"], "name": "T"}, "league_admin")
+        self._post(f"/api/setup/seasons/{s1['id']}/team-registrations",
+                   {"team_id": team["id"], "division_id": d1["id"]}, "league_admin")
+        rf = f"/api/setup/seasons/{s2['id']}/roll-forward"
+        for body in (
+            {"from_season_id": s1["id"], "selections": "not-a-list"},
+            {"from_season_id": s1["id"], "selections": [{"team_id": ["t1"]}]},
+            {"from_season_id": s1["id"], "selections": [{"team_id": team["id"],
+                                                         "division_id": {"x": 1}}]},
+            {"from_season_id": ["x"]},               # unhashable season id
+        ):
+            status, resp = self._post(rf, body, "league_admin")
+            self.assertEqual(status, 400, f"expected 400 for body={body!r}, got {status}")
+            self.assertEqual(resp["error"]["code"], "validation_error")
 
 
 if __name__ == "__main__":
