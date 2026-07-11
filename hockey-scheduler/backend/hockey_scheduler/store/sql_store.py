@@ -60,6 +60,7 @@ from ..domain import (
     InstallationState,
     RosterRole,
     Season,
+    SeasonTeamRegistration,
     SelectionSource,
     Session,
     SetupAuditLog,
@@ -132,6 +133,8 @@ SPECS = {
     Season: Spec(Season, "seasons", {"start_date": _dt(), "end_date": _dt()}),
     Level: Spec(Level, "levels"),
     Division: Spec(Division, "divisions"),
+    SeasonTeamRegistration: Spec(
+        SeasonTeamRegistration, "season_team_registrations", {"active": _bool()}),
     Club: Spec(Club, "clubs"),
     Team: Spec(Team, "teams"),
     Player: Spec(Player, "players",
@@ -422,6 +425,8 @@ class SqlStore:
     def add_team(self, team): return self._insert(team)
     def get_team(self, team_id): return self._get(Team, team_id)
     def save_team(self, team): return self._update(team)
+    def teams_for_league(self, league_id):
+        return self._query(Team, "league_id = ?", (league_id,), order="id")
     def add_player(self, player): return self._insert(player)
     def get_player(self, player_id): return self._get(Player, player_id)
     def save_player(self, player): return self._update(player)
@@ -513,6 +518,21 @@ class SqlStore:
     def save_division(self, division): return self._update(division)
     def divisions_for_season(self, season_id):
         return self._query(Division, "season_id = ?", (season_id,), order="id")
+
+    # -- season team registrations (#180) ----------------------------------
+    def add_season_team_registration(self, reg): return self._insert(reg)
+    def get_season_team_registration(self, reg_id):
+        return self._get(SeasonTeamRegistration, reg_id)
+    def save_season_team_registration(self, reg): return self._update(reg)
+    def all_season_team_registrations(self):
+        return self._query(SeasonTeamRegistration, order="id")
+    def registrations_for_season(self, season_id):
+        return self._query(SeasonTeamRegistration, "season_id = ?",
+                           (season_id,), order="id")
+    def registration_for_team_in_season(self, season_id, team_id):
+        rows = self._query(SeasonTeamRegistration,
+                           "season_id = ? AND team_id = ?", (season_id, team_id))
+        return rows[0] if rows else None
 
     def add_club(self, club): return self._insert(club)
     def get_club(self, club_id): return self._get(Club, club_id)

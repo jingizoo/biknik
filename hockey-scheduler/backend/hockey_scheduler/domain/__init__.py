@@ -85,6 +85,7 @@ from .setup_models import (
     RescheduleRequest,
     Rink,
     Season,
+    SeasonTeamRegistration,
     SetupAuditLog,
     Venue,
 )

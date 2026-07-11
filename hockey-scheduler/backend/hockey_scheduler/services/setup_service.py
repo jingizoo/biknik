@@ -37,6 +37,7 @@ from ..domain import (
     Organization,
     Rink,
     Season,
+    SeasonTeamRegistration,
     SetupAuditLog,
     Team,
     Venue,
@@ -255,12 +256,119 @@ class SetupService:
         division = self.store.get_division(division_id)
         if division is None:
             raise NotFoundError(f"Division {division_id} not found.")
+        # #180: a team is a permanent member of a league. Derive that league
+        # from the division's season so new teams carry league_id from the
+        # start (existing teams are backfilled the same way by migration 021).
+        # The season-specific division participation still lives on the Team's
+        # division_id for now; the registration model overlays it additively.
+        season = self.store.get_season(division.season_id)
+        league_id = season.league_id if season else None
         team = Team(id=self.store.next_id("team"), name=self._require_name(name),
-                    division=division.name, club_id=club_id, division_id=division_id)
+                    division=division.name, club_id=club_id, division_id=division_id,
+                    league_id=league_id)
         self.store.add_team(team)
         self._audit("team_created", "team", team.id, actor_id,
-                    {"club_id": club_id, "division_id": division_id})
+                    {"club_id": club_id, "division_id": division_id,
+                     "league_id": league_id})
         return team
+
+    # -- permanent teams + season registrations (#180) ---------------------
+    # A team belongs permanently to its league; each season it plays in is a
+    # SeasonTeamRegistration carrying that season's division. These overlay the
+    # legacy Team.division_id additively — scheduling still reads division_id
+    # until a later slice moves it onto registrations, so nothing here changes
+    # existing game validation yet.
+    @_transactional
+    def register_team_for_season(self, season_id: str, team_id: str,
+                                 division_id: Optional[str] = None,
+                                 actor_id: Optional[str] = None
+                                 ) -> SeasonTeamRegistration:
+        season = self.store.get_season(season_id)
+        if season is None:
+            raise NotFoundError(f"Season {season_id} not found.")
+        team = self.store.get_team(team_id)
+        if team is None:
+            raise NotFoundError(f"Team {team_id} not found.")
+        # Rule 4 — league consistency: the team's permanent league must match
+        # the season's league. Cross-league registration is rejected.
+        if team.league_id and team.league_id != season.league_id:
+            raise ValidationError(
+                "Team belongs to a different league than this season.")
+        if division_id:
+            division = self.store.get_division(division_id)
+            if division is None:
+                raise NotFoundError(f"Division {division_id} not found.")
+            # Rule 4 — a division from another season can't be used here.
+            if division.season_id != season_id:
+                raise ValidationError(
+                    "Division belongs to a different season.")
+        # Rule 5 — one registration per team per season. A prior *inactive*
+        # registration (a team removed then re-added) is reactivated in place
+        # rather than duplicated, honoring the (season_id, team_id) uniqueness.
+        existing = self.store.registration_for_team_in_season(season_id, team_id)
+        if existing is not None:
+            if existing.active:
+                raise ValidationError(
+                    f"Team {team_id} is already registered for this season.")
+            existing.active = True
+            existing.division_id = division_id or None
+            self.store.save_season_team_registration(existing)
+            self._audit("season_team_registered", "season_team_registration",
+                        existing.id, actor_id,
+                        {"season_id": season_id, "team_id": team_id,
+                         "division_id": existing.division_id, "reactivated": True})
+            return existing
+        reg = SeasonTeamRegistration(
+            id=self.store.next_id("streg"), season_id=season_id, team_id=team_id,
+            division_id=division_id or None, active=True)
+        self.store.add_season_team_registration(reg)
+        self._audit("season_team_registered", "season_team_registration",
+                    reg.id, actor_id,
+                    {"season_id": season_id, "team_id": team_id,
+                     "division_id": reg.division_id})
+        return reg
+
+    @_transactional
+    def assign_season_team_division(self, registration_id: str,
+                                    division_id: Optional[str] = None,
+                                    actor_id: Optional[str] = None
+                                    ) -> SeasonTeamRegistration:
+        reg = self.store.get_season_team_registration(registration_id)
+        if reg is None:
+            raise NotFoundError(f"Registration {registration_id} not found.")
+        if division_id:
+            division = self.store.get_division(division_id)
+            if division is None:
+                raise NotFoundError(f"Division {division_id} not found.")
+            # Rule 3/4 — a registration's division must be in its own season.
+            if division.season_id != reg.season_id:
+                raise ValidationError(
+                    "Division belongs to a different season.")
+        old = reg.division_id
+        reg.division_id = division_id or None
+        self.store.save_season_team_registration(reg)
+        self._audit("season_team_division_assigned", "season_team_registration",
+                    reg.id, actor_id, {"from": old, "to": reg.division_id})
+        return reg
+
+    @_transactional
+    def unregister_team_from_season(self, registration_id: str,
+                                    actor_id: Optional[str] = None
+                                    ) -> SeasonTeamRegistration:
+        # Rule 6 — removing a team from a season deactivates only this season's
+        # registration; the permanent Team and prior-season registrations are
+        # untouched. (The scheduled-game safety check that blocks an unsafe
+        # removal lands with the scheduling-guard slice, once games resolve
+        # participation through registrations.)
+        reg = self.store.get_season_team_registration(registration_id)
+        if reg is None:
+            raise NotFoundError(f"Registration {registration_id} not found.")
+        reg.active = False
+        self.store.save_season_team_registration(reg)
+        self._audit("season_team_unregistered", "season_team_registration",
+                    reg.id, actor_id,
+                    {"season_id": reg.season_id, "team_id": reg.team_id})
+        return reg
 
     # -- reassignment: move a record under a new parent (#166 PR D) --------
     # Each records the old→new parent id in the audit detail so a move is
