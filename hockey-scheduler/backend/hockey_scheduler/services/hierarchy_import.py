@@ -339,21 +339,28 @@ def validate_hierarchy_import(sheets: Dict[str, List[dict]], store) -> dict:
         if division_code and division_code not in known_division_codes:
             report.error("registrations", index,
                          f"Unknown division_code {division_code}.", "division_code")
-        # The division must belong to the season being registered into.
-        div_season = division_season.get(division_code)
-        if division_code and season_code and div_season not in (None, season_code):
-            report.error(
-                "registrations", index,
-                f"division_code {division_code} belongs to season "
-                f"{div_season}, not {season_code}.", "division_code")
-        # The team's permanent league must match the season's league (#200).
-        tl = team_league.get(team_code)
-        sl = season_league.get(season_code)
-        if team_code and season_code and tl and sl and tl != sl:
-            report.error(
-                "registrations", index,
-                f"team_code {team_code} (league {tl}) cannot register in "
-                f"season {season_code} (league {sl}).", "team_code")
+        # Deeper consistency only once the three codes resolve (unknown codes
+        # are already reported above, so this avoids double-reporting).
+        if (season_code in known_season_codes
+                and team_code in known_team_codes
+                and division_code in known_division_codes):
+            # The division must resolve to EXACTLY this season — a null or
+            # different parent season is invalid, not a pass (#214 review).
+            if division_season.get(division_code) != season_code:
+                report.error(
+                    "registrations", index,
+                    f"division_code {division_code} does not belong to "
+                    f"season_code {season_code}.", "division_code")
+            # The team and season must both resolve to the SAME concrete league;
+            # a missing league on either side is invalid (#200/#214 review).
+            tl = team_league.get(team_code)
+            sl = season_league.get(season_code)
+            if not tl or not sl or tl != sl:
+                report.error(
+                    "registrations", index,
+                    f"team_code {team_code} (league {tl or 'none'}) cannot "
+                    f"register in season {season_code} (league {sl or 'none'}).",
+                    "team_code")
         # One registration per team per season.
         if season_code and team_code:
             key = (season_code, team_code)
@@ -416,8 +423,12 @@ def _preflight_reassignment_safety(store, rows) -> List[dict]:
     errors: List[dict] = []
     teams = {t.external_ref: t for t in store.all_teams() if t.external_ref}
     seasons = {s.external_ref: s for s in store.all_seasons() if s.external_ref}
+    divisions = {d.external_ref: d for d in store.all_divisions()
+                 if d.external_ref}
     league_code_by_id = {lg.id: lg.external_ref for lg in store.all_leagues()
                          if lg.external_ref}
+    season_code_by_id = {s.id: s.external_ref for s in store.all_seasons()
+                         if s.external_ref}
     division_code_by_id = {d.id: d.external_ref for d in store.all_divisions()
                            if d.external_ref}
     all_regs = store.all_season_team_registrations()
@@ -478,42 +489,96 @@ def _preflight_reassignment_safety(store, rows) -> List[dict]:
                             "first."),
                 "reason": "registration_division_move_strands_games",
                 "affected_game_ids": stranded})
+
+    # (c) A season's league move strands every active registration in it — the
+    #     registered teams belong to the old league (#214 review). Don't mutate
+    #     the parent beneath existing participation.
+    for index, row in enumerate(
+            _group_first(rows["competition"], "season_code").values(), start=1):
+        code = _clean(row.get("season_code"))
+        season = seasons.get(code)
+        if season is None:
+            continue
+        new_league_code = _clean(row.get("league_code"))
+        if new_league_code == league_code_by_id.get(season.league_id):
+            continue  # league unchanged
+        affected = [r.id for r in all_regs if r.season_id == season.id and r.active]
+        if affected:
+            errors.append({
+                "sheet": "competition", "row": index, "field": "league_code",
+                "message": (f"Moving season {code} to league {new_league_code} "
+                            f"would leave {len(affected)} active registration(s) "
+                            "in another league; move or unregister the teams "
+                            "first."),
+                "reason": "season_league_move_strands_registrations",
+                "season_code": code, "affected_registration_ids": affected})
+
+    # (d) A division's season move strands the registrations assigned to it and
+    #     any games scheduled in it (#214 review).
+    for index, row in enumerate(rows["competition"], start=1):
+        code = _clean(row.get("division_code"))
+        division = divisions.get(code)
+        if division is None:
+            continue
+        new_season_code = _clean(row.get("season_code"))
+        if new_season_code == season_code_by_id.get(division.season_id):
+            continue  # season unchanged
+        affected_regs = [r.id for r in all_regs
+                         if r.division_id == division.id and r.active]
+        affected_games = [g.id for g in store.all_games()
+                          if g.division_id == division.id and not g.cancelled]
+        if affected_regs or affected_games:
+            errors.append({
+                "sheet": "competition", "row": index, "field": "season_code",
+                "message": (f"Moving division {code} to season {new_season_code} "
+                            f"would strand {len(affected_regs)} registration(s) "
+                            f"and {len(affected_games)} game(s) outside their "
+                            "season; resolve them first."),
+                "reason": "division_season_move_strands_dependents",
+                "division_code": code,
+                "affected_registration_ids": affected_regs,
+                "affected_game_ids": affected_games})
     return errors
 
 
 def commit_hierarchy_import(setup, sheets: Dict[str, List[dict]],
                             actor_id: Optional[str] = None) -> dict:
-    """Revalidate and atomically upsert the complete hierarchy batch."""
-    result = validate_hierarchy_import(sheets, setup.store)
-    if not result["ok"]:
-        return {
-            "committed": False,
-            "import_type": "hierarchy",
-            "summary": _new_counts(),
-            "errors": result["errors"],
-            "warnings": result["warnings"],
-        }
+    """Revalidate and atomically upsert the complete hierarchy batch.
 
+    Validation and the reassignment preflight run INSIDE the transaction, before
+    the first write, so under the threaded server no concurrent request can
+    create a game or registration between the safety check and the write (#214
+    review) — the whole check-then-write is one atomic critical section held by
+    the store's transaction lock.
+    """
     store = setup.store
     rows = {name: list((sheets or {}).get(name) or [])
             for name in HIERARCHY_SHEET_NAMES}
-
-    # Reassignment safety (#214 review): a league/division move that would
-    # strand games or orphan registrations aborts the whole batch with zero
-    # writes, before the transaction opens.
-    unsafe = _preflight_reassignment_safety(store, rows)
-    if unsafe:
-        return {
-            "committed": False,
-            "import_type": "hierarchy",
-            "summary": _new_counts(),
-            "errors": unsafe,
-            "warnings": result["warnings"],
-        }
-
     counts = _new_counts()
 
     with store.transaction():
+        result = validate_hierarchy_import(sheets, store)
+        if not result["ok"]:
+            return {
+                "committed": False,
+                "import_type": "hierarchy",
+                "summary": _new_counts(),
+                "errors": result["errors"],
+                "warnings": result["warnings"],
+            }
+        # Reassignment safety (#214 review): a league/division/season move that
+        # would strand games or orphan registrations aborts the whole batch with
+        # zero writes.
+        unsafe = _preflight_reassignment_safety(store, rows)
+        if unsafe:
+            return {
+                "committed": False,
+                "import_type": "hierarchy",
+                "summary": _new_counts(),
+                "errors": unsafe,
+                "warnings": result["warnings"],
+            }
+
         batch_id = store.next_id("importbatch")
 
         orgs = {o.external_ref: o for o in store.all_organizations()

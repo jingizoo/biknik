@@ -3,7 +3,7 @@
    This extends the existing Import screen without changing its current import
    types. Data lives only in this page's memory. Both validate and commit use the
    League-Admin-only import envelope with import_type="hierarchy"; the backend
-   revalidates the same four files before the single-transaction commit. */
+   revalidates every sheet before the single-transaction commit. */
 
 const hierarchyImportTemplates = {
   organizations_csv:
@@ -18,10 +18,19 @@ const hierarchyImportTemplates = {
   competition_csv:
     "league_code,season_code,season_name,level_code,level_name,level_sort_order,division_code,division_name,age_group\n" +
     "OVER55,FALL26,Fall 2026,L1,Level 1,1,DIVA,Division A,Adult\n",
+  permanent_teams_csv:
+    "league_code,team_code,team_name,club_name\n" +
+    "OVER55,LIONS,Lions,Lions HC\n",
+  registrations_csv:
+    "season_code,team_code,division_code\n" +
+    "FALL26,LIONS,DIVA\n",
 };
 
 let hierarchyImportState = {
-  sheets: { organizations_csv: "", leagues_csv: "", venues_rinks_csv: "", competition_csv: "" },
+  sheets: {
+    organizations_csv: "", leagues_csv: "", venues_rinks_csv: "",
+    competition_csv: "", permanent_teams_csv: "", registrations_csv: "",
+  },
   report: null,
   committed: null,
   validatedKey: null,
@@ -32,6 +41,8 @@ const hierarchySheetMeta = [
   ["leagues_csv", "leagues.csv", "Leagues and their owner"],
   ["venues_rinks_csv", "venues_rinks.csv", "Venues and rink surfaces"],
   ["competition_csv", "competition.csv", "Seasons, levels, and divisions"],
+  ["permanent_teams_csv", "permanent_teams.csv", "Permanent league teams"],
+  ["registrations_csv", "registrations.csv", "Season registrations"],
 ];
 
 function hierarchyPayload(dryRun) {
@@ -78,7 +89,7 @@ function renderHierarchyImportPanel() {
     && hierarchyImportState.validatedKey === hierarchySnapshot();
   return `<section class="card" id="hierarchy-import-panel">
       <div class="section-title" style="margin-top:0">Complete client hierarchy</div>
-      <p class="muted">Import owners, leagues, venues/rinks, seasons, levels, and divisions using stable codes. Validate checks all four files and existing records before any write.</p>
+      <p class="muted">Import owners, leagues, venues/rinks, seasons, levels, divisions, permanent teams, and season registrations using stable codes. Validate checks every sheet and existing records before any write.</p>
       <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px">${fields}</div>
       <div class="actions">
         <button type="button" class="act primary" data-hierarchy-validate>Validate hierarchy</button>

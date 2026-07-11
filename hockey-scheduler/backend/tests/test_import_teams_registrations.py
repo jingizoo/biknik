@@ -9,6 +9,7 @@ registration's division must belong to its season and the team's league must
 match the season's league. Commit is idempotent and single-transaction.
 """
 
+import contextlib
 import os
 import tempfile
 import unittest
@@ -16,6 +17,7 @@ import unittest
 from helpers import BACKEND  # noqa: F401
 
 from hockey_scheduler.api import ApiService
+from hockey_scheduler.domain import Division, Season, Team
 from hockey_scheduler.store import InMemoryStore, SqlStore
 
 ORGANIZATIONS = (
@@ -253,6 +255,85 @@ class ImportConvergenceContract:
         self.assertEqual(entry.detail["from_league_id"], over55.id)
         self.assertEqual(entry.detail["to_league_id"], other.id)
 
+    def test_import_cannot_move_season_league_with_registrations(self):
+        self.api.commit_hierarchy_import(payload(), actor_id="admin")
+        second = {"import_type": "hierarchy", "organizations_csv": ORGANIZATIONS,
+                  "leagues_csv": LEAGUES + "OTHER,CANLON,Other,US,America/Chicago\n"}
+        self.assertTrue(
+            self.api.commit_hierarchy_import(second, actor_id="admin")["committed"])
+        season = self._by_ref(self.store.all_seasons(), "FALL26")
+        over55 = self._by_ref(self.store.all_leagues(), "OVER55")
+        audits_before = len(self.store.all_setup_audit())
+        # Re-import FALL26 under a different league while teams are registered.
+        moved = {"import_type": "hierarchy", "competition_csv": (
+            "league_code,season_code,season_name,level_code,level_name,"
+            "level_sort_order,division_code,division_name,age_group\n"
+            "OTHER,FALL26,Fall 2026,,,,DIVA,Division A,Adult\n"
+            "OTHER,FALL26,Fall 2026,,,,DIVB,Division B,Adult\n")}
+        result = self.api.commit_hierarchy_import(moved, actor_id="admin")
+        self.assertFalse(result["committed"])
+        err = next(e for e in result["errors"]
+                   if e["reason"] == "season_league_move_strands_registrations")
+        self.assertTrue(err["affected_registration_ids"])
+        self.assertEqual(self.store.get_season(season.id).league_id, over55.id)
+        self.assertEqual(len(self.store.all_setup_audit()), audits_before)
+
+    def test_import_cannot_move_division_season_with_dependents(self):
+        self.api.commit_hierarchy_import(payload(), actor_id="admin")
+        second = {"import_type": "hierarchy", "competition_csv": (
+            COMPETITION + "OVER55,SPRING,Spring,,,,DIVC,Division C,Adult\n")}
+        self.assertTrue(
+            self.api.commit_hierarchy_import(second, actor_id="admin")["committed"])
+        diva = self._by_ref(self.store.all_divisions(), "DIVA")
+        fall = self._by_ref(self.store.all_seasons(), "FALL26")
+        audits_before = len(self.store.all_setup_audit())
+        # Re-import DIVA under a different season while teams are registered in it.
+        moved = {"import_type": "hierarchy", "competition_csv": (
+            "league_code,season_code,season_name,level_code,level_name,"
+            "level_sort_order,division_code,division_name,age_group\n"
+            "OVER55,SPRING,Spring,,,,DIVA,Division A,Adult\n")}
+        result = self.api.commit_hierarchy_import(moved, actor_id="admin")
+        self.assertFalse(result["committed"])
+        err = next(e for e in result["errors"]
+                   if e["reason"] == "division_season_move_strands_dependents")
+        self.assertTrue(err["affected_registration_ids"])
+        self.assertEqual(self.store.get_division(diva.id).season_id, fall.id)
+        self.assertEqual(len(self.store.all_setup_audit()), audits_before)
+
+    def test_preflight_runs_inside_the_transaction(self):
+        # #214 review: validation/preflight must run under the same transaction
+        # lock as the writes, so there is no check->write gap. Prove the
+        # preflight's game read happens while a transaction is held.
+        self.api.commit_hierarchy_import(payload(), actor_id="admin")
+        state = {"depth": 0, "preflight_inside": None}
+        orig_txn = self.store.transaction
+
+        @contextlib.contextmanager
+        def tracking_txn():
+            state["depth"] += 1
+            try:
+                with orig_txn():
+                    yield
+            finally:
+                state["depth"] -= 1
+
+        orig_all_games = self.store.all_games
+
+        def hooked_all_games():
+            if state["preflight_inside"] is None:
+                state["preflight_inside"] = state["depth"] > 0
+            return orig_all_games()
+
+        self.store.transaction = tracking_txn
+        self.store.all_games = hooked_all_games
+        # A registration division move reaches the preflight's game-stranding read.
+        moved = payload(registrations_csv=(
+            "season_code,team_code,division_code\n"
+            "FALL26,LIONS,DIVB\nFALL26,BEARS,DIVA\n"))
+        self.api.commit_hierarchy_import(moved, actor_id="admin")
+        self.assertTrue(state["preflight_inside"],
+                        "preflight game read ran outside the transaction lock")
+
 
 class MemoryImportConvergenceTest(ImportConvergenceContract, unittest.TestCase):
     def make_store(self):
@@ -299,7 +380,7 @@ class ImportConvergenceValidationTest(unittest.TestCase):
                 "season_code,team_code,division_code\nSPRING,LIONS,DIVA\n"
                 "FALL26,BEARS,DIVA\n")))
         self.assertFalse(result["ok"])
-        self.assertTrue(self._has(result, "belongs to season"))
+        self.assertTrue(self._has(result, "does not belong to season_code"))
 
     def test_cross_league_registration_rejected(self):
         leagues = LEAGUES + "OTHER,CANLON,Other,US,America/Chicago\n"
@@ -336,6 +417,47 @@ class ImportConvergenceValidationTest(unittest.TestCase):
         self.assertFalse(result["committed"])
         self.assertEqual(self.store.all_teams(), [])
         self.assertEqual(self.store.all_season_team_registrations(), [])
+
+    # -- #214 review: reject null/dangling parent leagues, with zero writes ----
+    def test_null_team_league_registration_rejected(self):
+        base = {"import_type": "hierarchy", "organizations_csv": ORGANIZATIONS,
+                "leagues_csv": LEAGUES, "competition_csv": COMPETITION}
+        self.api.commit_hierarchy_import(base, actor_id="admin")
+        self.store.add_team(Team(id="team_nl", name="NoLeague",
+                                 external_ref="NOLG", division_id=None,
+                                 league_id=None))
+        reg = {"import_type": "hierarchy", "registrations_csv":
+               "season_code,team_code,division_code\nFALL26,NOLG,DIVA\n"}
+        self.assertFalse(self.api.get_hierarchy_import_dry_run(reg)["ok"])
+        self.assertTrue(self._has(
+            self.api.get_hierarchy_import_dry_run(reg), "cannot register"))
+        before = len(self.store.all_season_team_registrations())
+        self.assertFalse(
+            self.api.commit_hierarchy_import(reg, actor_id="admin")["committed"])
+        self.assertEqual(
+            len(self.store.all_season_team_registrations()), before)
+
+    def test_null_season_league_registration_rejected(self):
+        self.api.commit_hierarchy_import(payload(), actor_id="admin")
+        self.store.add_season(Season(id="se_nl", league_id="", name="NL",
+                                     external_ref="SNL"))
+        self.store.add_division(Division(id="d_nl", season_id="se_nl", name="D",
+                                         external_ref="DNL"))
+        reg = {"import_type": "hierarchy", "registrations_csv":
+               "season_code,team_code,division_code\nSNL,LIONS,DNL\n"}
+        result = self.api.get_hierarchy_import_dry_run(reg)
+        self.assertFalse(result["ok"])
+        self.assertTrue(self._has(result, "cannot register"))
+
+    def test_dangling_division_season_registration_rejected(self):
+        self.api.commit_hierarchy_import(payload(), actor_id="admin")
+        self.store.add_division(Division(id="d_dangle", season_id="missing",
+                                         name="D", external_ref="DDG"))
+        reg = {"import_type": "hierarchy", "registrations_csv":
+               "season_code,team_code,division_code\nFALL26,LIONS,DDG\n"}
+        result = self.api.get_hierarchy_import_dry_run(reg)
+        self.assertFalse(result["ok"])
+        self.assertTrue(self._has(result, "does not belong to season_code"))
 
 
 if __name__ == "__main__":
