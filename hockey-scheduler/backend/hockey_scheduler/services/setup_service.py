@@ -446,6 +446,14 @@ class SetupService:
         rollback, so a missing or foreign team aborts the entire batch before
         any registration or audit is written.
         """
+        # Season ids must be strings before they reach the store: an unhashable
+        # JSON value (list/dict) from a malformed body would otherwise raise a
+        # TypeError inside ``store.get_season`` (dict.get / SQL bind) — a 500,
+        # not the structured validation_error (#197) this route must return.
+        if not isinstance(from_season_id, str) or _blank(from_season_id):
+            raise ValidationError("from_season_id must be a non-empty string.")
+        if not isinstance(to_season_id, str) or _blank(to_season_id):
+            raise ValidationError("to_season_id must be a non-empty string.")
         src = self.store.get_season(from_season_id)
         if src is None:
             raise NotFoundError(f"Season {from_season_id} not found.")
@@ -476,13 +484,24 @@ class SetupService:
                     raise ValidationError(
                         "Each selection must be an object with a team_id.")
                 tid = sel.get("team_id")
-                if _blank(tid):
+                # Must be a non-empty *string*: a non-string id (incl. an
+                # unhashable list/dict) would slip past ``_blank`` — which
+                # stringifies its argument — and then raise a TypeError on the
+                # ``in source_active`` set-membership test below.
+                if not isinstance(tid, str) or _blank(tid):
                     raise ValidationError(
                         "Each selection needs a non-empty team_id.")
                 if tid not in source_active:
                     raise ValidationError(
                         f"Team {tid} is not registered in the source season.")
-                wanted[tid] = sel.get("division_id") or None
+                div = sel.get("division_id")
+                # Likewise reject a non-string division_id before it reaches the
+                # ``set(wanted.values())`` de-dup, which would TypeError on an
+                # unhashable value.
+                if div is not None and not isinstance(div, str):
+                    raise ValidationError(
+                        "A selection's division_id must be a string or null.")
+                wanted[tid] = div or None
         else:
             wanted = {tid: None for tid in source_active}
         # Pre-write gate. The store's transaction is a lock, not a rollback
@@ -500,7 +519,7 @@ class SetupService:
         # tolerates a null team league): manual registration is an operator
         # vouching for one team, whereas rollover blindly trusts a batch of
         # source rows, so a null/other league_id here is treated as bad data.
-        league_id = src.league_id
+        league_id = src.league_id or None
         for tid in wanted:
             team = self.store.get_team(tid)
             if team is None:
