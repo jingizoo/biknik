@@ -226,6 +226,31 @@ production). Run migration verification (below) before routing traffic.
 
 **Never** run `/api/reset` in production — it is disabled there by design.
 
+### Backup/restore acceptance check (#174)
+
+Taking a dump is only half the guarantee — a dump you cannot successfully
+restore is worthless. After configuring a client (and periodically
+thereafter), prove the round trip end to end with the checked-in acceptance
+smoke, which backs a deployment up, restores it into a **fresh, empty**
+database, starts the app against that restore, and verifies the record census
+and server-derived onboarding status match the source:
+
+```bash
+# Verify a durable single-instance SQLite deployment restores faithfully:
+python -m hockey_scheduler.acceptance.backup_restore --database-url ./client.db
+
+# Or exercise the whole round trip on a throwaway sample (safe anywhere):
+python -m hockey_scheduler.acceptance.backup_restore
+```
+
+It prints the restored record census plus migration/onboarding status and
+exits non-zero on any divergence. The file-copy backup path is SQLite-only
+(the pilot single-instance path); for PostgreSQL, back up with the
+`pg_dump`/`pg_restore` commands above and then apply the same logical
+acceptance — compare `GET /api/onboarding/status` and record counts on the
+restored database against the source. `test_backup_restore_acceptance.py`
+runs this check (and proves it *fails* on a divergent restore) in CI.
+
 ## Migration verification
 
 After any restore, or any deploy that shipped a new migration, confirm the
