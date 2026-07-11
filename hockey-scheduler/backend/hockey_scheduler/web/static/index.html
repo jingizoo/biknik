@@ -6,6 +6,7 @@
   <title>Hockey Scheduler — Operator Console</title>
   <link rel="stylesheet" href="/styles.css" />
   <link rel="stylesheet" href="/web.css" />
+  <link rel="stylesheet" href="/onboarding.css" />
 </head>
 <body class="web-body">
   <div class="web">
@@ -53,6 +54,7 @@
         </div>
         <div class="nav-group">
           <div class="nav-group-label">Admin Setup</div>
+          <button class="tab" data-tab="onboarding" style="display:none"><span class="nav-dot"></span><span class="nav-label">Initial Setup</span><span class="nav-badge" id="onboarding-badge" hidden></span></button>
           <button class="tab" data-tab="setup"><span class="nav-dot"></span><span class="nav-label">Setup</span></button>
         </div>
       </nav>
@@ -134,5 +136,7 @@
   </div>
 
   <script src="/app.js"></script>
+  <script src="/onboarding.js"></script>
+  <script src="/onboarding-bootstrap.js"></script>
 </body>
 </html>

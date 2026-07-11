@@ -4,7 +4,8 @@
   "description": "Browser smoke gates for the hockey scheduler. Dev-only tooling — the app itself has no build step and no npm dependency.",
   "scripts": {
     "smoke": "node smoke.js",
-    "setup-claim": "node setup-claim.js"
+    "setup-claim": "node setup-claim.js",
+    "onboarding-wizard": "node onboarding-wizard.js"
   },
   "devDependencies": {
     "playwright": "^1.48.0"
