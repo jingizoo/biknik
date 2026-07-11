@@ -17,7 +17,8 @@ import unittest
 from helpers import BACKEND  # noqa: F401
 
 from hockey_scheduler.api import ApiService
-from hockey_scheduler.domain import Division, Season, Team
+from hockey_scheduler.domain import (
+    Division, Season, SeasonTeamRegistration, Team)
 from hockey_scheduler.store import InMemoryStore, SqlStore
 
 ORGANIZATIONS = (
@@ -299,6 +300,38 @@ class ImportConvergenceContract:
         self.assertTrue(err["affected_registration_ids"])
         self.assertEqual(self.store.get_division(diva.id).season_id, fall.id)
         self.assertEqual(len(self.store.all_setup_audit()), audits_before)
+
+    def test_reimport_preserves_legacy_division_fields_on_existing_team(self):
+        # An existing coded team retains #180's legacy division_id/division
+        # compatibility fields; a re-import converges league/name/club but must
+        # NOT clear them (#214 review) — legacy game scope reads them until the
+        # migration that removes those readers lands.
+        self.api.commit_hierarchy_import(payload(), actor_id="admin")
+        league = self._by_ref(self.store.all_leagues(), "OVER55")
+        season = self._by_ref(self.store.all_seasons(), "FALL26")
+        diva = self._by_ref(self.store.all_divisions(), "DIVA")
+        self.store.add_team(Team(id="team_legacy", name="Old Name",
+                                 external_ref="LEGACY", club_id=None,
+                                 division_id=diva.id, division="Division A",
+                                 league_id=league.id))
+        self.store.add_season_team_registration(SeasonTeamRegistration(
+            id="streg_legacy", season_id=season.id, team_id="team_legacy",
+            division_id=diva.id, active=True))
+        reimport = {"import_type": "hierarchy", "permanent_teams_csv":
+                    "league_code,team_code,team_name,club_name\n"
+                    "OVER55,LEGACY,New Name,New Club\n"}
+        result = self.api.commit_hierarchy_import(reimport, actor_id="admin")
+        self.assertTrue(result["committed"], result.get("errors"))
+        team = self._team("LEGACY")
+        # Permanent fields converged.
+        self.assertEqual(team.name, "New Name")
+        self.assertTrue(any(c.name == "New Club" for c in self.store.all_clubs()))
+        self.assertEqual(team.league_id, league.id)
+        # Legacy compatibility fields and legacy game scope preserved.
+        self.assertEqual(team.division_id, diva.id)
+        self.assertEqual(team.division, "Division A")
+        reg = self.store.registration_for_team_in_season(season.id, team.id)
+        self.assertEqual(reg.division_id, diva.id)
 
     def test_preflight_runs_inside_the_transaction(self):
         # #214 review: validation/preflight must run under the same transaction

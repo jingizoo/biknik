@@ -817,11 +817,19 @@ def commit_hierarchy_import(setup, sheets: Dict[str, List[dict]],
                     setup._audit("club_created", "club", club.id, actor_id,
                                  {"import_batch_id": batch_id})
                 club_id = club.id
+            # Only the permanent fields converge on re-import.
             values = {"name": _clean(row.get("team_name")), "club_id": club_id,
-                      "league_id": league.id, "division_id": None, "division": ""}
+                      "league_id": league.id}
             obj = teams.get(code)
             if obj is None:
-                obj = Team(id=store.next_id("team"), external_ref=code, **values)
+                # A genuinely NEW permanent team carries no division (#180) —
+                # participation lives in a registration. An EXISTING team keeps
+                # its legacy division_id/division compatibility fields untouched
+                # (#214 review): those are cleared only by the later migration
+                # that removes all legacy Team.division_id readers, never by an
+                # import upsert, so legacy game scope isn't silently lost.
+                obj = Team(id=store.next_id("team"), external_ref=code,
+                           division_id=None, division="", **values)
                 store.add_team(obj)
                 teams[code] = obj
                 counts["permanent_teams"]["created"] += 1
