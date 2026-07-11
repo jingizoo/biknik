@@ -1,3 +1,3 @@
-from .league_scoped_service import ApiService
+from .hierarchy_import_service import ApiService
 
 __all__ = ["ApiService"]
