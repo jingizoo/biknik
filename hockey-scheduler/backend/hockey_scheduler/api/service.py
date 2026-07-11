@@ -2461,6 +2461,16 @@ class ApiService:
             registration_id, actor_id))
 
     @catch
+    def roll_forward_registrations(self, from_season_id: str, to_season_id: str,
+                                   selections: Optional[list] = None,
+                                   actor_id: Optional[str] = None) -> dict:
+        result = self.setup.roll_forward_registrations(
+            from_season_id, to_season_id, selections, actor_id)
+        return {"rolled_forward": result["rolled_forward"],
+                "skipped": result["skipped"],
+                "registrations": [_serialize(r) for r in result["registrations"]]}
+
+    @catch
     def list_season_team_registrations(self, season_id: str) -> dict:
         rows = [_serialize(r)
                 for r in self.store.registrations_for_season(season_id)]

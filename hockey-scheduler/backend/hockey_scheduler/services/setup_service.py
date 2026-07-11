@@ -400,6 +400,89 @@ class SetupService:
                     {"season_id": reg.season_id, "team_id": reg.team_id})
         return reg
 
+    @_transactional
+    def roll_forward_registrations(self, from_season_id: str, to_season_id: str,
+                                   selections: Optional[list] = None,
+                                   actor_id: Optional[str] = None) -> dict:
+        """Copy participation from one season into another (#180 rollover).
+
+        Creates a registration in ``to_season_id`` for each carried-forward team
+        that plays in ``from_season_id``, reusing the permanent Team — Team
+        records are never copied. ``selections`` is an optional list of
+        ``{"team_id", "division_id"}`` (division_id in the *target* season); when
+        omitted, every team active in the source season is carried with no
+        division so the operator assigns them afterward. A team already active in
+        the target season is skipped, not duplicated. Not ``@_transactional``-
+        nested — it opens its own single transaction (via the decorator) and
+        inlines the per-team writes rather than calling the transactional
+        register method, since the store's transaction isn't reentrant.
+        """
+        src = self.store.get_season(from_season_id)
+        if src is None:
+            raise NotFoundError(f"Season {from_season_id} not found.")
+        dst = self.store.get_season(to_season_id)
+        if dst is None:
+            raise NotFoundError(f"Season {to_season_id} not found.")
+        if from_season_id == to_season_id:
+            raise ValidationError("Source and target seasons must differ.")
+        # Rule 4 — a rollover stays within one league.
+        if (src.league_id or None) != (dst.league_id or None):
+            raise ValidationError(
+                "Cannot roll participation between seasons of different leagues.")
+        source_active = {r.team_id
+                         for r in self.store.registrations_for_season(from_season_id)
+                         if r.active}
+        if selections is not None:
+            wanted = {}
+            for sel in selections:
+                tid = (sel or {}).get("team_id")
+                if tid not in source_active:
+                    raise ValidationError(
+                        f"Team {tid} is not registered in the source season.")
+                wanted[tid] = (sel or {}).get("division_id") or None
+        else:
+            wanted = {tid: None for tid in source_active}
+        # Pre-write gate — every target division must belong to the target
+        # season, so a bad selection aborts the whole rollover with no writes.
+        for div_id in set(wanted.values()):
+            if div_id is not None:
+                division = self.store.get_division(div_id)
+                if division is None:
+                    raise NotFoundError(f"Division {div_id} not found.")
+                if division.season_id != to_season_id:
+                    raise ValidationError(
+                        "A target division belongs to a different season.")
+
+        rolled, skipped, created = 0, 0, []
+        for tid, div_id in wanted.items():
+            existing = self.store.registration_for_team_in_season(to_season_id, tid)
+            if existing is not None and existing.active:
+                skipped += 1
+                continue
+            if existing is not None:  # reactivate a prior inactive registration
+                existing.active = True
+                existing.division_id = div_id
+                self.store.save_season_team_registration(existing)
+                reg = existing
+            else:
+                reg = SeasonTeamRegistration(
+                    id=self.store.next_id("streg"), season_id=to_season_id,
+                    team_id=tid, division_id=div_id, active=True)
+                self.store.add_season_team_registration(reg)
+            self._audit("season_team_registered", "season_team_registration",
+                        reg.id, actor_id,
+                        {"season_id": to_season_id, "team_id": tid,
+                         "division_id": div_id,
+                         "rolled_forward_from": from_season_id})
+            rolled += 1
+            created.append(reg)
+        self._audit("season_registrations_rolled_forward", "season",
+                    to_season_id, actor_id,
+                    {"from_season_id": from_season_id,
+                     "rolled_forward": rolled, "skipped": skipped})
+        return {"rolled_forward": rolled, "skipped": skipped,
+                "registrations": created}
+
     # -- reassignment: move a record under a new parent (#166 PR D) --------
     # Each records the old→new parent id in the audit detail so a move is
     # traceable. Nullable links (venue→org, division→level, team→club) accept
