@@ -14,12 +14,16 @@
 -- enforces. Null/invalid references are out of scope here — they belong to the
 -- later not-null / foreign-key relationship work (#201).
 --
--- Replaces the redundant non-unique ix_roster_game on the same columns (it
--- served the same (game_id, player_id) lookups; the unique index covers them).
+-- Keep the existing non-partial ix_roster_game on (game_id, player_id): it still
+-- serves the per-game roster read (SqlStore.roster_for_game, WHERE game_id = ?),
+-- which the PARTIAL unique index below cannot — NULL-player rows are outside the
+-- partial index, so the DB couldn't use it for that scan. Once the later NOT NULL
+-- migration removes nullable references, ix_roster_game becomes genuinely
+-- redundant and can be dropped then.
+--
 -- A forward-only pre-migration check (store.integrity_checks) reports any
 -- pre-existing duplicate concrete (game, player) rows before this index is
 -- created, so an upgrade fails loudly rather than with an opaque index error.
-DROP INDEX IF EXISTS ix_roster_game;
 CREATE UNIQUE INDEX IF NOT EXISTS ux_roster_game_player
   ON game_roster_entries (game_id, player_id)
   WHERE game_id IS NOT NULL AND player_id IS NOT NULL;
