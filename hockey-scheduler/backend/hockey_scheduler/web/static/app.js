@@ -57,6 +57,7 @@ let playersList = [];               // [{id,name,team_id,position,jersey_number,
 let leagueTeams = {};               // league_id -> [{id,name,league_id}] permanent members (#180)
 let seasonRegs = {};                // season_id -> [{id,team_id,division_id,active}] registrations (#180)
 let rollover = { leagueId: "", fromSeasonId: "", toSeasonId: "", result: null };  // season rollover picker (#180)
+let modal = null;                   // themed confirm/blocked modal (#204): {type, ...}
 let rescheduleRequests = null;      // reschedule request(s) for the current game (#29)
 let availFilter = "all";            // all|available|unavailable|maybe|no_response
 let gamesFilter = { division: "all", team: "all", rink: "all", status: "all", from: "", to: "" };  // Games list filters (#152)
@@ -136,6 +137,10 @@ const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) =>
 const fmt = (iso) => { const m = /T(\d{2}:\d{2})/.exec(iso || ""); return m ? m[1] : ""; };
 const val = (id) => { const e = document.getElementById(id); return e ? e.value.trim() : ""; };
 const hasPerm = (p) => rolePerms.has(p);
+// Demo vs production posture (#204): the "Reset demo" action and demo-only
+// affordances only make sense outside production. Defaults to demo until the
+// status probe resolves, matching the server default (APP_MODE=demo).
+const isDemo = () => !envStatus || envStatus.app_mode !== "production";
 
 // Shared page-intro block (#146): every view's *title* already comes from
 // the topbar's nav-title (set by setChrome() from the NAV map, #24) — this
@@ -698,6 +703,131 @@ async function commitReassign(newId) {
   await render();
 }
 
+// -- Safe destructive deletion UI (#204) --------------------------------
+// A compact, neutral outlined "Delete" control for a setup record. It reads as
+// a quiet secondary action (red only on hover, see .del-btn in styles.css) and
+// never deletes on click — it opens a themed confirmation modal. ``kind`` is
+// the route entity (league|season|division|club|team|venue|rink|ice-slot).
+function delBtn(kind, id, name, label) {
+  if (!hasPerm("manage_setup")) return "";
+  return `<button class="act ghost xs del-btn" data-del="${esc(kind)}"
+    data-del-id="${esc(id)}" data-del-name="${esc(name || id)}"
+    title="Delete ${esc(name || "")}">🗑 ${esc(label || "Delete")}</button>`;
+}
+
+// Human labels for the entity kinds shown in the confirm/blocked modals.
+const DEL_NOUN = {
+  league: "league", season: "season", division: "division", club: "club",
+  team: "team", venue: "venue", rink: "rink", "ice-slot": "ice slot",
+  game: "game",
+};
+
+function renderModal() {
+  if (!modal) return "";
+  if (modal.type === "reset") return resetModalHtml();
+  if (modal.type === "confirm-delete") return confirmDeleteModalHtml(modal);
+  if (modal.type === "blocked") return blockedModalHtml(modal);
+  return "";
+}
+
+function modalShell(kind, title, body, foot) {
+  return `<div class="modal-scrim" data-modal-close></div>
+    <div class="modal ${kind}" role="dialog" aria-modal="true" aria-label="${esc(title)}">
+      <header class="modal-head"><h2>${esc(title)}</h2>
+        <button class="modal-x" data-modal-close aria-label="Close">×</button></header>
+      <div class="modal-body">${body}</div>
+      <footer class="modal-foot">${foot}</footer>
+    </div>`;
+}
+
+function resetModalHtml() {
+  return modalShell("danger", "Reset demo data",
+    `<p>This permanently clears all demo data and reseeds the sample league.
+       Everyone using this demo will see it restart. This can't be undone.</p>
+     <label class="modal-confirm-label" for="reset-confirm">Type <code>RESET</code> to confirm</label>
+     <input id="reset-confirm" class="modal-confirm-input" autocomplete="off"
+       spellcheck="false" placeholder="RESET">`,
+    `<button class="act ghost" data-modal-close>Cancel</button>
+     <button class="act danger" data-reset-confirm disabled>Reset demo</button>`);
+}
+
+function confirmDeleteModalHtml(m) {
+  const noun = DEL_NOUN[m.kind] || "record";
+  return modalShell("danger", `Delete this ${noun}?`,
+    `<p>You're about to permanently delete the ${esc(noun)}
+       <strong>${esc(m.name)}</strong>. This can't be undone.</p>
+     <p class="muted">If anything depends on it, the delete is refused and nothing changes.</p>`,
+    `<button class="act ghost" data-modal-close>Cancel</button>
+     <button class="act danger" data-del-confirm>Delete ${esc(noun)}</button>`);
+}
+
+function blockedModalHtml(m) {
+  const noun = DEL_NOUN[m.kind] || "record";
+  const deps = (m.error && m.error.details && m.error.details.dependencies) || [];
+  const rows = deps.map((g) => {
+    const names = (g.names || []).map(esc).join(", ");
+    const more = g.count > (g.names || []).length ? ", …" : "";
+    return `<div class="li"><div class="li-main">
+      <div class="li-title">${esc(g.count)} ${esc(g.type)}${g.count === 1 ? "" : "s"}</div>
+      ${names ? `<div class="li-sub">${names}${more}</div>` : ""}</div></div>`;
+  }).join("");
+  return modalShell("blocked", `Can't delete this ${noun}`,
+    `<p>${esc((m.error && m.error.message) || "This record still has dependents.")}</p>
+     <div class="card">${rows || `<div class="li"><div class="li-sub">Dependent records exist.</div></div>`}</div>
+     <p class="muted">Remove or reassign these first, then delete the ${esc(noun)}.</p>`,
+    `<button class="act primary" data-modal-close>Close</button>`);
+}
+
+// Clear per-view interaction state after a demo reset rebuilds the store, so no
+// stale id (a game, a picked player, an open drawer) survives the reseed.
+function clearTransientStateAfterReset() {
+  toast = ""; currentGame = null; pickedPlayer = null; wizard = null;
+  movingGameId = null; conflict = null; pendingMove = null;
+  drawer = null; drawerError = ""; drawerValues = {};
+  pendingReassign = null; modal = null;
+}
+
+function wireModal(c) {
+  c.querySelectorAll("[data-modal-close]").forEach((b) =>
+    b.onclick = () => { modal = null; render(); });
+  // Reset flow: enable the destructive button only once "RESET" is typed.
+  const resetInput = c.querySelector("#reset-confirm");
+  const resetConfirm = c.querySelector("[data-reset-confirm]");
+  if (resetInput && resetConfirm) {
+    resetInput.oninput = () => {
+      resetConfirm.disabled = resetInput.value.trim().toUpperCase() !== "RESET";
+    };
+    resetInput.focus();
+    resetConfirm.onclick = async () => {
+      if (resetInput.value.trim().toUpperCase() !== "RESET") return;
+      await post("/api/reset", {});
+      clearTransientStateAfterReset();
+      onboardingStatusDirty = true;
+      toast = "Demo data reset.";
+      render();
+    };
+  }
+  // Confirm-delete flow: POST the delete; a has_dependencies error swaps this
+  // modal for the blocked view (which lists what's in the way) rather than
+  // just flashing a toast.
+  const delConfirm = c.querySelector("[data-del-confirm]");
+  if (delConfirm && modal && modal.type === "confirm-delete") {
+    const m = modal;
+    delConfirm.onclick = async () => {
+      toast = "";
+      const res = await post(`/api/setup/${m.kind}/${m.id}/delete`, {});
+      if (res && res.error && res.error.code === "has_dependencies") {
+        modal = { type: "blocked", kind: m.kind, name: m.name, error: res.error };
+        return render();
+      }
+      if (res && res.error) { modal = null; return render(); }  // post() set the toast
+      modal = null;
+      toast = `Deleted ${DEL_NOUN[m.kind] || "record"} “${m.name}”.`;
+      await render();
+    };
+  }
+}
+
 // Setup → Hierarchy (#165): a functional tree of the league's structure built
 // from the data already loaded (overview + playersList), with counts,
 // missing-assignment warnings, and quick-create actions that reuse the Setup
@@ -720,11 +850,11 @@ function renderSetupHierarchy(ov) {
     const badge = rinks.length
       ? `<span class="tn-badge ok">Ready</span>` : `<span class="tn-badge warn">Needs rinks</span>`;
     const rinkRows = rinks.map((r) =>
-      `<div class="tn-leaf"><span class="tn-label">⛸️ ${esc(r.name)}</span>${reassignBtn("rink", "venue", r, r.venue_id)}</div>`).join("")
+      `<div class="tn-leaf"><span class="tn-label">⛸️ ${esc(r.name)}</span>${reassignBtn("rink", "venue", r, r.venue_id)}${delBtn("rink", r.id, r.name)}</div>`).join("")
       || `<div class="tn-empty">No rinks yet. Add a rink so this venue can host games.</div>`;
     return `<details class="tn" open><summary class="tn-sum">
         <span class="tn-label">🏟️ ${esc(v.name)}</span>
-        <span class="tn-meta">${rinks.length} rink${rinks.length === 1 ? "" : "s"}</span>${badge}${reassignBtn("venue", "league", v, v.league_id)}</summary>
+        <span class="tn-meta">${rinks.length} rink${rinks.length === 1 ? "" : "s"}</span>${badge}${reassignBtn("venue", "league", v, v.league_id)}${delBtn("venue", v.id, v.name)}</summary>
       <div class="tn-children">${rinkRows}${treeAdd("rink", "Add rink to " + v.name, "f-rink-venue", v.id)}</div>
     </details>`;
   };
@@ -791,7 +921,7 @@ function renderSetupHierarchy(ov) {
     const n = regsForDiv(d.season_id, d.id);
     return `<details class="tn"><summary class="tn-sum">
         <span class="tn-label">🏅 ${esc(d.name)}</span>
-        <span class="tn-meta">${n} team${n === 1 ? "" : "s"} registered</span>${reassignBtn("division", "level", d, d.level_id, d.season_id)}</summary>
+        <span class="tn-meta">${n} team${n === 1 ? "" : "s"} registered</span>${reassignBtn("division", "level", d, d.level_id, d.season_id)}${delBtn("division", d.id, d.name)}</summary>
       <div class="tn-children"><div class="tn-empty">Register teams for this division under
         <button class="linklike" data-goto="setup">Season participation</button>.</div></div>
     </details>`;
@@ -831,14 +961,14 @@ function renderSetupHierarchy(ov) {
         : `<div class="tn-empty">No divisions in this season yet.</div>`;
       return `<details class="tn" open><summary class="tn-sum">
           <span class="tn-label">🗓️ ${esc(s.name)}</span>
-          <span class="tn-meta">${divs.length} division(s) · ${countTeams(divs)} team(s)</span></summary>
+          <span class="tn-meta">${divs.length} division(s) · ${countTeams(divs)} team(s)</span>${delBtn("season", s.id, s.name)}</summary>
         <div class="tn-children">${seasonBody}
           <div class="tree-actions sub">${treeAdd("level", "Add level to " + s.name, "f-level-season", s.id)}${treeAdd("division", "Add division to " + s.name, "f-div-season", s.id)}</div></div>
       </details>`;
     }).join("") || `<div class="tn-empty">No seasons in this league yet.</div>`;
     return `<details class="tn" open><summary class="tn-sum">
         <span class="tn-label">🏆 ${esc(lg.name)}</span>
-        <span class="tn-meta">${seasons.length} season(s) · ${lgTeams} team(s)</span></summary>
+        <span class="tn-meta">${seasons.length} season(s) · ${lgTeams} team(s)</span>${delBtn("league", lg.id, lg.name)}</summary>
       <div class="tn-children">${seasonRows}${treeAdd("season", "Add season to " + lg.name, "f-season-league", lg.id)}</div>
     </details>`;
   }).join("");
@@ -859,7 +989,7 @@ function renderSetupHierarchy(ov) {
       const teams = leagueTeams[lg.id] || [];
       const rows = teams.map((t) =>
         `<div class="tn-leaf"><span class="tn-label">👥 ${esc(t.name)}</span>${
-          reassignBtn("team", "club", t, t.club_id)}</div>`).join("")
+          reassignBtn("team", "club", t, t.club_id)}${delBtn("team", t.id, t.name)}</div>`).join("")
         || `<div class="tn-empty">No teams yet. Add a permanent team to ${esc(lg.name)}.</div>`;
       return `<details class="tn" open><summary class="tn-sum">
           <span class="tn-label">🏆 ${esc(lg.name)}</span>
@@ -967,7 +1097,7 @@ function renderSeasonParticipation(ov) {
         return `<div class="tn-leaf reg-row">
           <span class="tn-label">👥 ${esc(teamName(r.team_id))}</span>
           <span class="tn-meta reg-tag">${tag}</span>
-          ${divCtl}<button class="act" data-reg-remove="${esc(r.id)}">Remove</button></div>`;
+          ${divCtl}<button class="act ghost xs del-btn" data-reg-remove="${esc(r.id)}">Remove from season</button></div>`;
       }).join("") || `<div class="tn-empty">No teams registered for this season yet.</div>`;
       const available = teams.filter((t) => !registered.has(t.id));
       const addCtl = available.length
@@ -4045,7 +4175,12 @@ async function render() {
     : view === "standings" ? renderStandings(ov, standings)
     : view === "activity" ? renderActivity(board, ov)
     : renderPublic(ov);
+  // The themed confirm/blocked modal (#204) overlays whatever view is showing
+  // (it can be opened from the header's Reset demo action too), so append it
+  // after the view content on every render and wire it below.
+  c.innerHTML += renderModal();
 
+  wireModal(c);
   c.querySelectorAll("[data-goto]").forEach((b) => b.onclick = () => switchTab(b.dataset.goto));
   // Public surface (#83): tab switch, division select, game detail, back.
   c.querySelectorAll("[data-public-tab]").forEach((b) => b.onclick = () => {
@@ -4130,6 +4265,14 @@ async function render() {
     const res = await post(`/api/setup/season-team-registration/${b.dataset.regRemove}/remove`, {});
     if (res && !res.error) toast = "Team removed from the season.";
     await render();
+  });
+  // Safe destructive delete (#204): a Delete control opens the themed confirm
+  // modal; the modal's confirm handler (wireModal) posts the delete and shows
+  // the dependency breakdown if the server refuses.
+  c.querySelectorAll("[data-del]").forEach((b) => b.onclick = () => {
+    modal = { type: "confirm-delete", kind: b.dataset.del,
+              id: b.dataset.delId, name: b.dataset.delName };
+    render();
   });
   // Season rollover (#180): the league/season pickers reset the selection and
   // any stale result so the preview always matches the chosen pair; commit
@@ -4975,11 +5118,12 @@ document.querySelectorAll(".topbar [data-open-drawer]").forEach((b) => b.onclick
   drawer = { kind: b.dataset.openDrawer }; drawerError = ""; drawerValues = {};
   switchTab("setup");
 });
-document.getElementById("reset-btn").onclick = async () => {
-  await post("/api/reset", {});
-  toast = ""; currentGame = null; pickedPlayer = null; wizard = null;
-  movingGameId = null; conflict = null; pendingMove = null; drawer = null; drawerError = ""; drawerValues = {};
-  pendingReassign = null;
+// Reset demo (#204): open the themed confirm modal (which requires typing
+// RESET) rather than wiping immediately. The actual reseed + state-clear runs
+// from the modal's confirm handler (wireModal).
+document.getElementById("reset-btn").onclick = () => {
+  if (!hasPerm("manage_setup") || !isDemo()) return;  // defense in depth
+  modal = { type: "reset" };
   render();
 };
 // Sign out ends the server session and returns to the sign-in screen (#71).
@@ -5002,7 +5146,8 @@ if (loginForm) loginForm.onsubmit = (e) => {
 // Escape closes an open Setup drawer (#44).
 document.addEventListener("keydown", (e) => {
   if (e.key !== "Escape") return;
-  if (drawer) { drawer = null; drawerError = ""; drawerValues = {}; render(); }
+  if (modal) { modal = null; render(); }
+  else if (drawer) { drawer = null; drawerError = ""; drawerValues = {}; render(); }
   else if (movingGameId != null) { movingGameId = null; render(); }
 });
 // Activate any role="button" element (a clickable card/row that isn't a real
@@ -5073,8 +5218,10 @@ function gateChrome() {
   // manage_arena is the one permission both League Admin and Arena Manager
   // hold, and it's the entry point for all three import types.
   toggle('.tab[data-tab="import"]', hasPerm("manage_arena"));
-  // Reset wipes all demo data — operator-only, like the API (hardening).
-  toggle("#reset-btn", hasPerm("manage_schedule"));
+  // Reset wipes and reseeds all demo data — shown only in demo mode and only to
+  // a League Admin (MANAGE_SETUP), matching the server, which hard-disables the
+  // reset route in production (#204).
+  toggle("#reset-btn", hasPerm("manage_setup") && isDemo());
   // Sign out only makes sense with a live session.
   toggle("#signout-btn", !!currentUser);
   // Dashboard + Activity are operator/coach ops consoles; Roster + Game Sheet

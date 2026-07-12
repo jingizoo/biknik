@@ -9,7 +9,8 @@
     "hierarchy-import": "node hierarchy-import.js",
     "season-participation": "node season-participation.js",
     "season-rollover": "node season-rollover.js",
-    "permanent-teams": "node permanent-teams.js"
+    "permanent-teams": "node permanent-teams.js",
+    "safe-destructive": "node safe-destructive.js"
   },
   "devDependencies": {
     "playwright": "^1.48.0"

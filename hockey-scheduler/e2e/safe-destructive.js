@@ -1,0 +1,224 @@
+// Safe destructive actions browser journey (#204).
+//
+// At desktop and phone widths, a League Admin exercises the four destructive
+// surfaces end to end:
+//   1. Blocked deletion — deleting a league that still has a season/team is
+//      refused with a themed dependency modal listing what's in the way, and
+//      nothing is deleted.
+//   2. Successful deletion — a bare team is deleted through the confirm modal.
+//   3. Remove from season — the redesigned "Remove from season" action
+//      deactivates a registration.
+//   4. Reset demo — the header "Reset demo" button opens a confirm modal that
+//      requires typing RESET, then atomically reseeds the demo.
+// Fails on any browser console/page error.
+const { chromium } = require("playwright");
+const { spawn } = require("child_process");
+const http = require("http");
+const path = require("path");
+
+const HOST = "127.0.0.1";
+const BACKEND_DIR = path.resolve(__dirname, "..", "backend");
+const READY_TIMEOUT_MS = 15000;
+const VIEWPORTS = [
+  { label: "desktop", width: 1440, height: 900, port: 8155 },
+  { label: "phone", width: 390, height: 844, port: 8156 },
+];
+
+function waitForServer(url, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  return new Promise((resolve, reject) => {
+    const attempt = () => {
+      const request = http.get(url, (response) => { response.resume(); resolve(); });
+      request.setTimeout(2000, () => request.destroy(new Error("request timed out")));
+      request.on("error", () => {
+        if (Date.now() > deadline) reject(new Error(`Server never came up at ${url}`));
+        else setTimeout(attempt, 250);
+      });
+    };
+    attempt();
+  });
+}
+
+function stopServer(server) {
+  return new Promise((resolve) => {
+    if (server.exitCode !== null || server.signalCode !== null) return resolve();
+    const escalate = setTimeout(() => server.kill("SIGKILL"), 3000);
+    server.once("exit", () => { clearTimeout(escalate); resolve(); });
+    server.kill("SIGTERM");
+  });
+}
+
+async function checkViewport(browser, viewport) {
+  const base = `http://${HOST}:${viewport.port}`;
+  const server = spawn(
+    process.env.PYTHON || "python3",
+    ["-u", "-m", "hockey_scheduler.web.server", "--host", HOST, "--port", String(viewport.port)],
+    { cwd: BACKEND_DIR, stdio: ["ignore", "pipe", "pipe"] });
+  let serverOutput = "";
+  server.stdout.on("data", (d) => { serverOutput += d.toString(); });
+  server.stderr.on("data", (d) => { serverOutput += d.toString(); });
+
+  const context = await browser.newContext({
+    viewport: { width: viewport.width, height: viewport.height },
+  });
+  const page = await context.newPage();
+  const errors = [];
+  page.on("pageerror", (e) => errors.push(`[pageerror] ${e.message}`));
+  page.on("console", (m) => {
+    // This journey deliberately exercises an error path (a blocked delete
+    // returns HTTP 409, handled gracefully by the app's modal). Chromium logs
+    // any non-2xx fetch as a "Failed to load resource" console error, so ignore
+    // that network-status noise; real JS exceptions still arrive as pageerror
+    // and app-level console.error messages, which stay fatal.
+    if (m.type() === "error" && !/Failed to load resource/.test(m.text())) {
+      errors.push(`[console] ${m.text()}`);
+    }
+  });
+
+  try {
+    await waitForServer(`${base}/api/health`, READY_TIMEOUT_MS);
+    await page.goto(base, { waitUntil: "domcontentloaded" });
+    await page.waitForSelector("#content > *", { timeout: 10000 });
+
+    // Build a league with a registered team (so it can't be deleted) plus a
+    // bare team (which can). The demo default role is League Admin.
+    const ids = await page.evaluate(async () => {
+      const post = async (p, b) => (await fetch(p, {
+        method: "POST", credentials: "same-origin",
+        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
+      })).json();
+      const league = await post("/api/setup/league", { name: "Del League" });
+      const season = await post("/api/setup/season", { league_id: league.id, name: "Del Season" });
+      const div = await post("/api/setup/division", { season_id: season.id, name: "Del Div" });
+      const club = await post("/api/setup/club", { name: "Del Club" });
+      const team = await post("/api/setup/team", { club_id: club.id, league_id: league.id, name: "Del Team" });
+      await post(`/api/setup/seasons/${season.id}/team-registrations`,
+        { team_id: team.id, division_id: div.id });
+      const bare = await post("/api/setup/team", { club_id: club.id, league_id: league.id, name: "Bare Team" });
+      return { league: league.id, season: season.id, div: div.id,
+        club: club.id, team: team.id, bare: bare.id };
+    });
+
+    const getJson = (p) => page.evaluate(
+      (u) => fetch(u, { credentials: "same-origin" }).then((r) => r.json()), p);
+
+    await page.click('.tab[data-tab="setup"]');
+    await page.waitForSelector(`[data-del="league"][data-del-id="${ids.league}"]`, { timeout: 15000 });
+
+    // (1) Blocked deletion: delete the populated league → confirm → the server
+    // refuses and the blocked modal lists the dependents; the league survives.
+    await page.click(`[data-del="league"][data-del-id="${ids.league}"]`);
+    await page.waitForSelector(".modal.danger [data-del-confirm]", { timeout: 10000 });
+    await page.click("[data-del-confirm]");
+    await page.waitForSelector(".modal.blocked", { timeout: 10000 });
+    const blockedText = await page.textContent(".modal.blocked .modal-body");
+    if (!/season/i.test(blockedText) || !/team/i.test(blockedText)) {
+      throw new Error(`[${viewport.label}] blocked modal missing dependency breakdown: ${blockedText}`);
+    }
+    if (!(await getJson(`/api/setup/hierarchy`)).leagues.some((l) => l.id === ids.league)) {
+      throw new Error(`[${viewport.label}] a blocked delete removed the league anyway`);
+    }
+    await page.click(".modal.blocked [data-modal-close]");
+    await page.waitForSelector(".modal", { state: "detached", timeout: 10000 });
+
+    // (2) Successful deletion: the bare team deletes cleanly via the confirm
+    // modal.
+    await page.click(`[data-del="team"][data-del-id="${ids.bare}"]`);
+    await page.waitForSelector(".modal.danger [data-del-confirm]", { timeout: 10000 });
+    const delResp = page.waitForResponse((r) =>
+      r.url() === `${base}/api/setup/team/${ids.bare}/delete` && r.request().method() === "POST");
+    await page.click("[data-del-confirm]");
+    if ((await delResp).status() !== 200) {
+      throw new Error(`[${viewport.label}] team delete returned non-200`);
+    }
+    await page.waitForSelector(".modal", { state: "detached", timeout: 10000 });
+    const teamsAfter = await getJson(`/api/setup/leagues/${ids.league}/teams`);
+    if (teamsAfter.teams.some((t) => t.id === ids.bare)) {
+      throw new Error(`[${viewport.label}] bare team was not deleted`);
+    }
+    if (!teamsAfter.teams.some((t) => t.id === ids.team)) {
+      throw new Error(`[${viewport.label}] delete removed the wrong team`);
+    }
+
+    // (3) Remove from season: the redesigned action deactivates the
+    // registration (and reads "Remove from season", not the old "Remove"). The
+    // demo seed carries its own registrations, so target OUR registration by id
+    // rather than the first Remove button on the page.
+    const before = await getJson(`/api/setup/seasons/${ids.season}/team-registrations`);
+    const reg = before.registrations.find((r) => r.team_id === ids.team && r.active);
+    if (!reg) throw new Error(`[${viewport.label}] the Del Team registration is missing`);
+    const removeBtn = await page.waitForSelector(
+      `[data-reg-remove="${reg.id}"]`, { timeout: 10000 });
+    if (!/Remove from season/.test(await removeBtn.textContent())) {
+      throw new Error(`[${viewport.label}] the season-registration action was not relabeled`);
+    }
+    const rmResp = page.waitForResponse((r) =>
+      r.url().endsWith(`/season-team-registration/${reg.id}/remove`)
+      && r.request().method() === "POST");
+    await removeBtn.click();
+    await rmResp;
+    const regs = await getJson(`/api/setup/seasons/${ids.season}/team-registrations`);
+    if (regs.registrations.some((r) => r.team_id === ids.team && r.active)) {
+      throw new Error(`[${viewport.label}] the team is still active after Remove from season`);
+    }
+
+    // (4) Reset demo: the header button is visible in demo, opens a confirm
+    // modal that requires typing RESET, and atomically reseeds — our Del League
+    // is gone afterward.
+    const resetBtn = await page.waitForSelector("#reset-btn", { state: "visible", timeout: 10000 });
+    if (!/Reset demo/.test(await resetBtn.textContent())) {
+      throw new Error(`[${viewport.label}] the reset button is not labeled "Reset demo"`);
+    }
+    await resetBtn.click();
+    await page.waitForSelector(".modal.danger #reset-confirm", { timeout: 10000 });
+    // Commit is disabled until RESET is typed exactly.
+    if (!(await page.$eval("[data-reset-confirm]", (b) => b.disabled))) {
+      throw new Error(`[${viewport.label}] reset was enabled before typing RESET`);
+    }
+    await page.fill("#reset-confirm", "RESET");
+    await page.waitForFunction(
+      () => !document.querySelector("[data-reset-confirm]").disabled, null, { timeout: 5000 });
+    const resetResp = page.waitForResponse((r) =>
+      r.url() === `${base}/api/reset` && r.request().method() === "POST");
+    await page.click("[data-reset-confirm]");
+    if ((await resetResp).status() !== 200) {
+      throw new Error(`[${viewport.label}] reset returned non-200`);
+    }
+    await page.waitForSelector(".modal", { state: "detached", timeout: 10000 });
+    const afterReset = await getJson(`/api/setup/hierarchy`);
+    if (afterReset.leagues.some((l) => l.id === ids.league)) {
+      throw new Error(`[${viewport.label}] reset did not clear the created league`);
+    }
+    if (!afterReset.leagues.length) {
+      throw new Error(`[${viewport.label}] reset did not reseed the demo league`);
+    }
+
+    if (errors.length) {
+      throw new Error(`[${viewport.label}] console/page errors:\n${errors.join("\n")}`);
+    }
+    console.log(`[${viewport.label}] OK — blocked delete, clean delete, remove-from-season, reset.`);
+  } catch (error) {
+    throw new Error(`${error.message}\n--- demo server output ---\n${serverOutput}`);
+  } finally {
+    await context.close();
+    await stopServer(server);
+  }
+}
+
+async function main() {
+  let browser;
+  try {
+    browser = await chromium.launch(
+      process.env.SMOKE_CHROMIUM_PATH ? { executablePath: process.env.SMOKE_CHROMIUM_PATH } : {});
+    for (const viewport of VIEWPORTS) await checkViewport(browser, viewport);
+    console.log("Safe destructive actions browser journey passed.");
+  } catch (error) {
+    console.error("Safe destructive actions browser journey FAILED.");
+    console.error(error && error.message ? error.message : error);
+    process.exitCode = 1;
+  } finally {
+    if (browser) await browser.close();
+  }
+}
+
+main();

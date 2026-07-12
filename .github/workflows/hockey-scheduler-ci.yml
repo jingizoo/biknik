@@ -82,6 +82,7 @@ jobs:
           node --check hockey-scheduler/e2e/season-participation.js
           node --check hockey-scheduler/e2e/season-rollover.js
           node --check hockey-scheduler/e2e/permanent-teams.js
+          node --check hockey-scheduler/e2e/safe-destructive.js
 
   browser-smoke:
     runs-on: ubuntu-latest
@@ -115,3 +116,5 @@ jobs:
         run: npm run season-rollover
       - name: Run permanent-teams structure journey
         run: npm run permanent-teams
+      - name: Run safe destructive actions journey
+        run: npm run safe-destructive

@@ -381,6 +381,11 @@ class SqlStore:
             return self._insert(obj)
         return self._update(obj)
 
+    def _delete(self, model, pk):
+        spec = SPECS[model]
+        with self._lock:
+            self._exec(f"DELETE FROM {spec.table} WHERE id = ?", (pk,))
+
     def _row_to_obj(self, model, row):
         spec = SPECS[model]
         kwargs = {c.name: c.from_db(row[c.name]) for c in spec.cols}
@@ -561,6 +566,19 @@ class SqlStore:
 
     def add_setup_audit(self, entry): return self._insert(entry)
     def all_setup_audit(self): return self._query(SetupAuditLog, order="id")
+
+    # -- setup-entity deletion (#204 safe destructive actions) -------------
+    # Single-record hard deletes; the service runs a pre-write dependency gate
+    # before calling these, so they never cascade.
+    def delete_league(self, league_id): self._delete(League, league_id)
+    def delete_season(self, season_id): self._delete(Season, season_id)
+    def delete_level(self, level_id): self._delete(Level, level_id)
+    def delete_division(self, division_id): self._delete(Division, division_id)
+    def delete_club(self, club_id): self._delete(Club, club_id)
+    def delete_team(self, team_id): self._delete(Team, team_id)
+    def delete_venue(self, venue_id): self._delete(Venue, venue_id)
+    def delete_rink(self, rink_id): self._delete(Rink, rink_id)
+    def delete_ice_slot(self, slot_id): self._delete(IceSlot, slot_id)
 
     # -- officials (#30) ---------------------------------------------------
     def add_official(self, official): return self._insert(official)

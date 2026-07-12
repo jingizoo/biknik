@@ -45,6 +45,7 @@ from ..domain import (
 )
 from ..domain.errors import (
     DivisionMismatchError,
+    HasDependenciesError,
     InvalidTransitionError,
     NotEligibleError,
     NotFoundError,
@@ -2244,3 +2245,206 @@ class SetupService:
 
     def list_divisions(self, season_id: str) -> List[Division]:
         return self.store.divisions_for_season(season_id)
+
+    # -- safe destructive deletion (#204) ---------------------------------
+    # Every delete runs a *pre-write* dependency gate: if any dependent record
+    # or history exists it raises HasDependenciesError with a structured
+    # breakdown and writes nothing. The gate must precede the first write
+    # because the in-memory store's transaction is a lock, not a rollback, so a
+    # mid-delete abort would not undo anything. Deletion is never a silent
+    # cascade — the operator must clear the dependents first. All eight routed
+    # under /api/setup (MANAGE_SETUP → League Admin only), each audited with the
+    # server-resolved actor id.
+    _DEP_SAMPLE = 8  # cap sample names per dependency group in the error detail
+
+    def _dep_group(self, label: str, items: list, name_fn) -> dict:
+        return {"type": label, "count": len(items),
+                "names": [name_fn(x) for x in items[:self._DEP_SAMPLE]]}
+
+    def _block_if_dependents(self, entity_type: str, entity_id: str,
+                             entity_label: str, groups: list) -> None:
+        groups = [g for g in groups if g["count"]]
+        if not groups:
+            return
+        total = sum(g["count"] for g in groups)
+        parts = ", ".join(f"{g['count']} {g['type']}"
+                          f"{'' if g['count'] == 1 else 's'}" for g in groups)
+        raise HasDependenciesError(
+            f"Can't delete this {entity_label} — {total} dependent "
+            f"record(s) still exist ({parts}). Remove them first.",
+            details={"entity_type": entity_type, "entity_id": entity_id,
+                     "dependencies": groups})
+
+    def _team_name(self, team_id) -> str:
+        team = self.store.get_team(team_id) if team_id else None
+        return team.name if team else (team_id or "—")
+
+    def _season_name(self, season_id) -> str:
+        season = self.store.get_season(season_id) if season_id else None
+        return season.name if season else (season_id or "—")
+
+    def _slot_label(self, slot) -> str:
+        rink = self.store.get_rink(slot.rink_id) if slot.rink_id else None
+        when = slot.start_time.isoformat() if slot.start_time else ""
+        return f"{rink.name if rink else 'ice slot'} {when}".strip()
+
+    @_transactional
+    def delete_league(self, league_id: str, actor_id: Optional[str] = None) -> League:
+        league = self.store.get_league(league_id)
+        if league is None:
+            raise NotFoundError(f"League {league_id} not found.")
+        seasons = self.store.seasons_for_league(league_id)
+        teams = self.store.teams_for_league(league_id)
+        venues = [v for v in self.store.all_venues() if v.league_id == league_id]
+        self._block_if_dependents("league", league_id, "league", [
+            self._dep_group("season", seasons, lambda s: s.name),
+            self._dep_group("team", teams, lambda t: t.name),
+            self._dep_group("venue", venues, lambda v: v.name)])
+        self.store.delete_league(league_id)
+        self._audit("league_deleted", "league", league_id, actor_id,
+                    {"name": league.name})
+        return league
+
+    @_transactional
+    def delete_season(self, season_id: str, actor_id: Optional[str] = None) -> Season:
+        season = self.store.get_season(season_id)
+        if season is None:
+            raise NotFoundError(f"Season {season_id} not found.")
+        levels = [lv for lv in self.store.all_levels() if lv.season_id == season_id]
+        divisions = self.store.divisions_for_season(season_id)
+        regs = self.store.registrations_for_season(season_id)
+        self._block_if_dependents("season", season_id, "season", [
+            self._dep_group("level", levels, lambda lv: lv.name),
+            self._dep_group("division", divisions, lambda d: d.name),
+            self._dep_group("team registration", regs,
+                            lambda r: self._team_name(r.team_id))])
+        self.store.delete_season(season_id)
+        self._audit("season_deleted", "season", season_id, actor_id,
+                    {"name": season.name, "league_id": season.league_id})
+        return season
+
+    @_transactional
+    def delete_division(self, division_id: str,
+                        actor_id: Optional[str] = None) -> Division:
+        division = self.store.get_division(division_id)
+        if division is None:
+            raise NotFoundError(f"Division {division_id} not found.")
+        regs = [r for r in self.store.all_season_team_registrations()
+                if r.division_id == division_id]
+        games = [g for g in self.store.all_games() if g.division_id == division_id]
+        # Teams still pointing at this division via the legacy Team.division_id
+        # link (#180) block deletion too, so a division is never removed out
+        # from under a team that references it.
+        teams = [t for t in self.store.all_teams()
+                 if getattr(t, "division_id", None) == division_id]
+        self._block_if_dependents("division", division_id, "division", [
+            self._dep_group("team registration", regs,
+                            lambda r: self._team_name(r.team_id)),
+            self._dep_group("game", games, self._matchup),
+            self._dep_group("team (legacy division link)", teams, lambda t: t.name)])
+        self.store.delete_division(division_id)
+        self._audit("division_deleted", "division", division_id, actor_id,
+                    {"name": division.name, "season_id": division.season_id})
+        return division
+
+    @_transactional
+    def delete_club(self, club_id: str, actor_id: Optional[str] = None) -> Club:
+        club = self.store.get_club(club_id)
+        if club is None:
+            raise NotFoundError(f"Club {club_id} not found.")
+        teams = [t for t in self.store.all_teams() if t.club_id == club_id]
+        self._block_if_dependents("club", club_id, "club", [
+            self._dep_group("team", teams, lambda t: t.name)])
+        self.store.delete_club(club_id)
+        self._audit("club_deleted", "club", club_id, actor_id, {"name": club.name})
+        return club
+
+    @_transactional
+    def delete_team(self, team_id: str, actor_id: Optional[str] = None) -> Team:
+        team = self.store.get_team(team_id)
+        if team is None:
+            raise NotFoundError(f"Team {team_id} not found.")
+        regs = [r for r in self.store.all_season_team_registrations()
+                if r.team_id == team_id]
+        games = [g for g in self.store.all_games()
+                 if team_id in (g.home_team_id, g.away_team_id)]
+        players = self.store.players_for_team(team_id)
+        self._block_if_dependents("team", team_id, "team", [
+            self._dep_group("season registration", regs,
+                            lambda r: self._season_name(r.season_id)),
+            self._dep_group("game", games, self._matchup),
+            self._dep_group("player", players, lambda p: p.name)])
+        self.store.delete_team(team_id)
+        self._audit("team_deleted", "team", team_id, actor_id,
+                    {"name": team.name, "league_id": team.league_id})
+        return team
+
+    @_transactional
+    def delete_venue(self, venue_id: str, actor_id: Optional[str] = None) -> Venue:
+        venue = self.store.get_venue(venue_id)
+        if venue is None:
+            raise NotFoundError(f"Venue {venue_id} not found.")
+        rinks = [r for r in self.store.all_rinks() if r.venue_id == venue_id]
+        self._block_if_dependents("venue", venue_id, "venue", [
+            self._dep_group("rink", rinks, lambda r: r.name)])
+        self.store.delete_venue(venue_id)
+        self._audit("venue_deleted", "venue", venue_id, actor_id,
+                    {"name": venue.name})
+        return venue
+
+    @_transactional
+    def delete_rink(self, rink_id: str, actor_id: Optional[str] = None) -> Rink:
+        rink = self.store.get_rink(rink_id)
+        if rink is None:
+            raise NotFoundError(f"Rink {rink_id} not found.")
+        slots = [s for s in self.store.all_ice_slots() if s.rink_id == rink_id]
+        self._block_if_dependents("rink", rink_id, "rink", [
+            self._dep_group("ice slot", slots, self._slot_label)])
+        self.store.delete_rink(rink_id)
+        self._audit("rink_deleted", "rink", rink_id, actor_id,
+                    {"name": rink.name, "venue_id": rink.venue_id})
+        return rink
+
+    @_transactional
+    def delete_ice_slot(self, slot_id: str, actor_id: Optional[str] = None) -> IceSlot:
+        slot = self.store.get_ice_slot(slot_id)
+        if slot is None:
+            raise NotFoundError(f"Ice slot {slot_id} not found.")
+        # Any game on the slot (including a cancelled one — it's still history)
+        # is a game dependency that blocks deletion.
+        games = [g for g in self.store.all_games() if g.ice_slot_id == slot_id]
+        self._block_if_dependents("ice slot", slot_id, "ice slot", [
+            self._dep_group("game", games, self._matchup)])
+        self.store.delete_ice_slot(slot_id)
+        self._audit("ice_slot_deleted", "ice_slot", slot_id, actor_id,
+                    {"rink_id": slot.rink_id})
+        return slot
+
+    @_transactional
+    def delete_game(self, game_id: str, actor_id: Optional[str] = None) -> Game:
+        """Delete a draft (unpublished) game only (#204).
+
+        A published, cancelled, or otherwise historical game is never deleted —
+        it must be cancelled so its record and notifications are preserved. Any
+        roster entry or official assignment on the game is a dependency that
+        blocks deletion, so a game with attached work is never silently erased.
+        """
+        game = self.store.get_game(game_id)
+        if game is None:
+            raise NotFoundError(f"Game {game_id} not found.")
+        if game.published or game.cancelled \
+                or self.store.result_for_game(game_id) is not None:
+            raise ValidationError(
+                "Only a draft (unpublished) game can be deleted; a published "
+                "or historical game must be cancelled instead.")
+        roster = self.store.roster_for_game(game_id)
+        assignments = self.store.assignments_for_game(game_id)
+        self._block_if_dependents("game", game_id, "game", [
+            self._dep_group("roster entry", roster,
+                            lambda e: self._team_name(getattr(e, "team_id", None))),
+            self._dep_group("official assignment", assignments,
+                            lambda a: getattr(a, "official_id", "official"))])
+        self.store.delete_game(game_id)
+        self._audit("game_deleted", "game", game_id, actor_id,
+                    {"matchup": self._matchup(game)})
+        return game

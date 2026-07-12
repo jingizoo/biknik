@@ -115,6 +115,7 @@ ERROR_HTTP_STATUS = {
     "forbidden": 403,
     "unauthorized": 401,
     "game_cancelled": 409,
+    "has_dependencies": 409,  # delete refused: dependent records/history exist (#204)
     "already_claimed": 409,
     "invalid_setup_code": 401,
     "claim_unavailable": 403,
@@ -1677,6 +1678,23 @@ class Handler(BaseHTTPRequestHandler):
         if mx:
             return self._send_api(api.unregister_team_from_season(
                 mx.group(1), actor_id))
+        # Safe destructive deletion (#204): /api/setup/<entity>/<id>/delete.
+        # League-Admin only via the /api/setup MANAGE_SETUP catch-all; the actor
+        # is the server-resolved session user. Each facade method runs a
+        # pre-write dependency gate and returns a structured has_dependencies
+        # error (with a details breakdown) when blocked, writing nothing.
+        md = re.match(
+            r"^(league|season|division|club|team|venue|rink|ice-slot|game)"
+            r"/([^/]+)/delete$", entity)
+        if md:
+            deleter = {
+                "league": api.delete_league, "season": api.delete_season,
+                "division": api.delete_division, "club": api.delete_club,
+                "team": api.delete_team, "venue": api.delete_venue,
+                "rink": api.delete_rink, "ice-slot": api.delete_ice_slot,
+                "game": api.delete_game,
+            }[md.group(1)]
+            return self._send_api(deleter(md.group(2), actor_id))
         # Season rollover (#180): copy a prior season's participation forward
         # into this one, reusing the permanent teams. body carries the source
         # season and an optional per-team target-division selection.
