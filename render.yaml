@@ -1,11 +1,46 @@
+# Render Blueprint — persistent production deployment.
+#
+# Why this changed: with neither DATABASE_URL nor APP_MODE set, the app runs as
+# a DEMO on an in-memory store that resets to a clean slate on every boot, so all
+# data is lost on any restart/redeploy/spin-down. Production mode + a managed
+# Postgres makes the data durable (the web instance's own disk is ephemeral, so
+# do NOT use a local SQLite file here — keep state in Postgres).
+#
+# NOTE: the two BOOTSTRAP_ADMIN_* values are secrets (sync: false) — set them in
+# the Render dashboard, not in this file. On later boots the app detects the
+# existing installation and does not create another admin, so leaving them set is
+# safe. (Alternatively, drop them and set INITIAL_SETUP_CODE to claim the first
+# admin from the browser once.)
 services:
   - type: web
+    # Keep the existing service name so this updates the current service rather
+    # than creating a new one. (Rename separately in the dashboard if desired.)
     name: hockey-scheduler-demo
     runtime: python
-    plan: free
+    plan: free  # the web instance is stateless; durable data lives in Postgres
+    region: oregon  # must match the database's region below
     rootDir: hockey-scheduler/backend
     buildCommand: pip install -r requirements.txt
     startCommand: python -m hockey_scheduler.web --host 0.0.0.0 --port $PORT
     envVars:
+      # Pin to a tested interpreter. Production had defaulted to 3.14, which
+      # exposed a version-specific crash (fixed in #224); pinning keeps the
+      # runtime on a version the test suite actually runs against.
       - key: PYTHON_VERSION
         value: "3.12.7"
+      - key: APP_MODE
+        value: production
+      - key: DATABASE_URL
+        fromDatabase:
+          name: hockey-scheduler-db
+          property: connectionString
+      - key: BOOTSTRAP_ADMIN_USER
+        sync: false
+      - key: BOOTSTRAP_ADMIN_PASSWORD
+        sync: false
+
+databases:
+  - name: hockey-scheduler-db
+    plan: free  # NOTE: Render's free Postgres is deleted after ~90 days —
+                # move to a paid plan for anything you can't afford to lose.
+    region: oregon  # keep in the same region as the web service above
