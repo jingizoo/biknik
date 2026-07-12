@@ -5,6 +5,7 @@ the public methods here, so a SQL-backed implementation can be substituted
 later without touching domain logic.
 """
 
+import copy
 from contextlib import contextmanager
 from datetime import datetime
 import threading
@@ -93,12 +94,82 @@ class InMemoryStore:
         self.setup_audit: List[SetupAuditLog] = []
         self._counters: Dict[str, count] = {}
         self._lock = threading.RLock()
+        # Depth of the current (possibly nested) transaction; 0 = none open.
+        self._txn_depth = 0
+
+    # Instance attributes that are NOT part of the persisted state and so must
+    # never be snapshotted/restored by a transaction (the lock is unpicklable
+    # and the depth counter drives the rollback machinery itself).
+    _NON_SNAPSHOT = frozenset({"_lock", "_txn_depth"})
+
+    @staticmethod
+    def _snapshot_value(value):
+        # Copy a state attribute for the pre-image. Collections are rebuilt with
+        # a shallow copy of every element: services mutate a stored dataclass by
+        # reassigning its fields (`game.published = True`), and copy.copy gives
+        # the pre-image its own instance so that reassignment can't reach it.
+        # A shallow element copy (not deepcopy) keeps this cheap — the store's
+        # dataclasses hold scalars, and their few dict fields (audit detail,
+        # account scope) are replaced wholesale, never mutated in place.
+        # itertools.count copies cleanly and preserves position, so id counters
+        # roll back with the rest.
+        if isinstance(value, dict):
+            return {k: copy.copy(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [copy.copy(v) for v in value]
+        return copy.copy(value)
+
+    def _snapshot(self) -> Dict[str, object]:
+        return {k: self._snapshot_value(v) for k, v in self.__dict__.items()
+                if k not in self._NON_SNAPSHOT}
+
+    def _restore(self, snapshot: Dict[str, object]) -> None:
+        # Restore in place so the identity of each collection is preserved — any
+        # caller holding a reference to, say, ``store.games`` still sees the
+        # rolled-back contents rather than a detached old container.
+        for key, value in snapshot.items():
+            current = getattr(self, key, None)
+            if isinstance(current, dict) and isinstance(value, dict):
+                current.clear()
+                current.update(value)
+            elif isinstance(current, list) and isinstance(value, list):
+                current[:] = value
+            else:
+                setattr(self, key, value)
 
     @contextmanager
     def transaction(self):
-        """Serialize atomic service operations in the threaded test/demo store."""
+        """Atomic, reentrant unit of work — the shared store transaction contract.
+
+        Contract (identical observable behavior in every store implementation):
+
+        * All writes between entering and exiting the outermost ``transaction()``
+          commit together, or — if the body raises — none of them persist. A
+          failure after the first write leaves zero partial state.
+        * Transactions are reentrant: a nested ``transaction()`` joins the
+          enclosing one (it does not open a second unit), so a service method
+          that itself opens a transaction can be called from within another.
+          Only the outermost context commits or rolls back.
+        * The block is serialized against other writers (a re-entrant lock here;
+          a real DB transaction in :class:`SqlStore`).
+
+        The SQL store gets rollback from the database. This store gets it by
+        snapshotting all state on entry to the outermost transaction and
+        restoring that snapshot if the body raises — so the in-memory store is a
+        faithful atomicity reference for tests, not merely a lock (#201).
+        """
         with self._lock:
-            yield
+            outermost = self._txn_depth == 0
+            snapshot = self._snapshot() if outermost else None
+            self._txn_depth += 1
+            try:
+                yield
+            except BaseException:
+                if outermost:
+                    self._restore(snapshot)
+                raise
+            finally:
+                self._txn_depth -= 1
 
     def close(self) -> None:
         pass

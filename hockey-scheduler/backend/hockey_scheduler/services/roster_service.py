@@ -477,7 +477,6 @@ class RosterService:
             audience_ref=player_id, game_id=game_id)
         return sub
 
-    @_transactional
     def accept_substitute(
         self, game_id: str, player_id: str, actor_id: Optional[str] = None
     ) -> GameRosterEntry:
@@ -491,13 +490,25 @@ class RosterService:
         # forever, letting a player onto a game that already happened (#112).
         if game.start_time is not None and self.clock() > game.start_time:
             raise InvalidTransitionError("This game is no longer upcoming.")
-        # Offers can expire: a lapsed offer returns the player to the pool.
+        # Offers can expire: a lapsed offer returns the player to the pool. This
+        # EXPIRED transition is a real, durable state change that must persist
+        # even though acceptance itself fails, so it is committed on its own —
+        # not inside the accept unit, whose rollback would otherwise unmark it
+        # (#201: a write-then-raise must not depend on a non-atomic store).
         if sub.offer_expires_at and self.clock() > sub.offer_expires_at:
-            sub.status = SubstituteStatus.EXPIRED
-            self.store.save_substitute(sub)
+            with self.store.transaction():
+                sub.status = SubstituteStatus.EXPIRED
+                self.store.save_substitute(sub)
             raise InvalidTransitionError("This substitute offer has expired.")
+        return self._accept_offered_substitute(game, sub, player_id, actor_id)
+
+    @_transactional
+    def _accept_offered_substitute(
+        self, game, sub, player_id: str, actor_id: Optional[str]
+    ) -> GameRosterEntry:
         # First-accepted-wins: the slot must still be open.
-        self._require_open_slot(game_id, sub.slot_type, self._player_team(sub.player_id))
+        self._require_open_slot(game.id, sub.slot_type, self._player_team(sub.player_id))
+        game_id = game.id
         sub.status = SubstituteStatus.ACCEPTED
         sub.accepted_at = self.clock()
         self.store.save_substitute(sub)
