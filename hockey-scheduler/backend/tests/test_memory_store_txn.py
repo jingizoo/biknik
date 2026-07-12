@@ -104,6 +104,51 @@ class MemoryStoreTransactionTest(unittest.TestCase):
         self.assertEqual(store.next_id("thing"),
                          f"thing_{int(first.split('_')[1]) + 1}")
 
+    def test_id_counters_are_copy_safe_plain_ints(self):
+        # Regression: id counters were itertools.count objects, which are not
+        # copyable on Python 3.14 (copy.copy raises "cannot pickle
+        # 'itertools.count'"), so the transaction snapshot crashed every
+        # in-memory write in production while CI on an older Python stayed green.
+        # Counters must be plain ints, and a snapshot of a populated store must
+        # not raise on any supported version.
+        store = InMemoryStore()
+        store.next_id("thing")
+        store.next_id("thing")
+        self.assertTrue(all(isinstance(v, int) for v in store._counters.values()))
+        store._snapshot()  # must not raise
+        with store.transaction():  # the full write path must not raise either
+            store.add_team(_bare_team(store, "t"))
+
+    def test_next_id_is_unique_under_concurrency(self):
+        # next_id is a read-modify-write (no longer itertools.count's atomic
+        # next()) and may be called outside a transaction on the threaded
+        # server, so concurrent callers must never receive a duplicate id.
+        import threading
+        store = InMemoryStore()
+        threads_n, per_thread = 8, 200
+        ids = []
+        ids_lock = threading.Lock()
+        barrier = threading.Barrier(threads_n)
+
+        def worker():
+            barrier.wait(timeout=5)  # maximize overlap on the increment
+            local = [store.next_id("thing") for _ in range(per_thread)]
+            with ids_lock:
+                ids.extend(local)
+
+        workers = [threading.Thread(target=worker) for _ in range(threads_n)]
+        for t in workers:
+            t.start()
+        for t in workers:
+            t.join(timeout=10)
+
+        total = threads_n * per_thread
+        self.assertEqual(len(ids), total)
+        self.assertEqual(len(set(ids)), total, "duplicate ids handed out")
+        self.assertEqual(store._counters["thing"], total)
+        # The sequence continues correctly after the concurrent burst.
+        self.assertEqual(store.next_id("thing"), f"thing_{total + 1}")
+
     def test_nested_transaction_joins_the_outer_unit(self):
         # A nested transaction does not open a second unit: if the OUTER body
         # fails after an inner transaction "completed", the inner writes roll
