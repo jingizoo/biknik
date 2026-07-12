@@ -482,7 +482,8 @@ const SETUP_ENTITIES = [
       { id: "f-div", label: "Division name", required: true, placeholder: "e.g. U14" },
       { id: "f-div-age", label: "Age group", placeholder: "e.g. U14 (optional)" }] },
   { key: "club", title: "Clubs", icon: "🏒", noun: "club", perm: "manage_setup",
-    list: (ov) => ov.clubs.map((c) => ({ title: c.name })),
+    delKind: "club",  // a club with no team can be deleted from here (#215)
+    list: (ov) => ov.clubs.map((c) => ({ id: c.id, title: c.name })),
     fields: [{ id: "f-club", label: "Club name", required: true, placeholder: "e.g. Eagles HC" }] },
   { key: "team", title: "Teams", icon: "👥", noun: "team", perm: "manage_setup",
     // A team is a permanent member of a LEAGUE (#180) — its season/division is
@@ -730,8 +731,20 @@ function renderModal() {
   if (!modal) return "";
   if (modal.type === "reset") return resetModalHtml();
   if (modal.type === "confirm-delete") return confirmDeleteModalHtml(modal);
+  if (modal.type === "cancel-game") return cancelGameModalHtml(modal);
   if (modal.type === "blocked") return blockedModalHtml(modal);
   return "";
+}
+
+// Cancel game (#215): a committed/published fixture is never hard-deleted — it
+// is cancelled, preserving its fixture and result history.
+function cancelGameModalHtml(m) {
+  return modalShell("danger", "Cancel this game?",
+    `<p>You're about to cancel <strong>${esc(m.name || "this game")}</strong>. The
+       fixture and any result history are kept — this is not a delete.</p>
+     <p class="muted">Rosters can no longer be changed for a cancelled game.</p>`,
+    `<button class="act ghost" data-modal-close>Keep game</button>
+     <button class="act danger" data-cancel-game-confirm>Cancel game</button>`);
 }
 
 function modalShell(kind, title, body, foot) {
@@ -779,11 +792,16 @@ function blockedModalHtml(m) {
   const noun = DEL_NOUN[m.kind] || "record";
   const deps = (m.error && m.error.details && m.error.details.dependencies) || [];
   const rows = deps.map((g) => {
-    const names = (g.names || []).map(esc).join(", ");
-    const more = g.count > (g.names || []).length ? ", …" : "";
+    // Prefer id+name pairs so a specific blocker is identifiable even when
+    // names collide (#215 review 4); fall back to bare names for older shapes.
+    const items = g.items || (g.names || []).map((n) => ({ name: n }));
+    const shown = items.map((it) => it.id
+      ? `<span class="dep-item">${esc(it.name)} <code>${esc(it.id)}</code></span>`
+      : `<span class="dep-item">${esc(it.name)}</span>`).join(", ");
+    const more = g.count > items.length ? ", …" : "";
     return `<div class="li"><div class="li-main">
       <div class="li-title">${esc(g.count)} ${esc(g.type)}${g.count === 1 ? "" : "s"}</div>
-      ${names ? `<div class="li-sub">${names}${more}</div>` : ""}</div></div>`;
+      ${shown ? `<div class="li-sub">${shown}${more}</div>` : ""}</div></div>`;
   }).join("");
   return modalShell("blocked", `Can't delete this ${noun}`,
     `<p>${esc((m.error && m.error.message) || "This record still has dependents.")}</p>
@@ -851,6 +869,18 @@ function wireModal(c) {
       if (res && res.error) { modal = null; return render(); }  // post() set the toast
       modal = null;
       toast = `Deleted ${DEL_NOUN[m.kind] || "record"} “${m.name}”.`;
+      await render();
+    };
+  }
+  // Cancel-game confirm: posts to the roster cancel route (history preserved).
+  const cancelGameBtn = c.querySelector("[data-cancel-game-confirm]");
+  if (cancelGameBtn && modal && modal.type === "cancel-game") {
+    const m = modal;
+    cancelGameBtn.onclick = async () => {
+      toast = "";
+      const res = await post(`/api/games/${m.game_id}/cancel`, {});
+      modal = null;
+      if (res && !res.error) toast = "Game cancelled; history preserved.";
       await render();
     };
   }
@@ -1337,7 +1367,8 @@ function setupCard(ent, ov) {
   } else {
     body = items.map((it) => `<div class="li"><div class="li-main">
       <div class="li-title">${esc(it.title)}</div>
-      ${it.sub ? `<div class="li-sub">${esc(it.sub)}</div>` : ""}</div></div>`).join("");
+      ${it.sub ? `<div class="li-sub">${esc(it.sub)}</div>` : ""}</div>${
+        ent.delKind && it.id ? delBtn(ent.delKind, it.id, it.title) : ""}</div>`).join("");
   }
   const count = items ? `<span class="setup-count">${items.length}</span>` : "";
   const newBtn = hasPerm(ent.perm)
@@ -1454,7 +1485,17 @@ function slotCard(s, draggable, ctx) {
     ? `<button class="slot-move" data-move-game="${esc(s.game_id)}">Move</button>` : "";
   const extra = `${isTarget ? " move-target" : ""}${isMovingThis ? " moving" : ""}`;
   const cta = isTarget ? " · tap to move here" : (draggable && s.game_id && !moving && canMove ? " · drag or Move" : "");
-  return `<div class="slot-card ${cls}${extra}" ${dropClick} ${drag}><div class="t">${fmt(s.start_time)}–${fmt(s.end_time)}</div><div class="s">${slotLabel(s)}${state}${cta}</div>${moveBtn}</div>`;
+  // An unused, future, available slot can be deleted straight from the Day
+  // board (#215). The trash sits inside the card, which is itself a
+  // click-to-schedule target, so the handler stops propagation.
+  const canDeleteSlot = draggable && !moving && s.status === "available"
+    && !s.game_id && hasPerm("manage_setup") && s.start_time
+    && s.start_time > new Date().toISOString();
+  const delSlot = canDeleteSlot
+    ? `<button class="slot-del del-btn" data-del="ice-slot" data-del-id="${esc(s.id)}"
+        data-del-name="${esc(slotLabel(s))}" title="Delete this ice slot"
+        aria-label="Delete this ice slot">🗑</button>` : "";
+  return `<div class="slot-card ${cls}${extra}" ${dropClick} ${drag}><div class="t">${fmt(s.start_time)}–${fmt(s.end_time)}</div><div class="s">${slotLabel(s)}${state}${cta}</div>${moveBtn}${delSlot}</div>`;
 }
 
 function calToolbar(ov) {
@@ -1750,7 +1791,11 @@ function gamesRow(g) {
     <div class="actions">
       <button class="act primary" data-openroster="${esc(g.game_id)}">Open Roster</button>
       ${g.published ? "" : `<button class="act success" data-publish="${esc(g.game_id)}">Publish</button>`}
+      ${!g.cancelled && hasPerm("manage_schedule")
+        ? `<button class="act danger" data-game-cancel="${esc(g.game_id)}"
+            data-game-name="${esc(g.home_team_name + " vs " + (g.away_team_name || "TBD"))}">Cancel game</button>` : ""}
     </div>
+    ${g.cancelled ? `<div class="muted" style="padding:6px 2px">This game is cancelled; its fixture and result history are preserved.</div>` : ""}
   </div>`;
   return head + detail;
 }
@@ -2934,7 +2979,8 @@ function schedDraftRow(g) {
     <span class="li-time">${fmt(g.start_time)}</span>
     <div class="li-main"><div class="li-title">${esc(g.home_team_name)} vs ${esc(g.away_team_name)}</div>
       <div class="li-sub">${esc(g.division_name || "")} · ${esc(g.rink_name || "")}${badges ? " · " + badges : ""}</div></div>
-    <span class="pill gray">Draft</span></div>`;
+    <span class="pill gray">Draft</span>${delBtn("game", g.game_id,
+      g.home_team_name + " vs " + g.away_team_name, "Delete draft")}</div>`;
 }
 function renderScheduler(ov) {
   if (!hasPerm("manage_schedule")) {
@@ -4297,9 +4343,19 @@ async function render() {
   // Safe destructive delete (#215): a Delete control opens the themed confirm
   // modal; the modal's confirm handler (wireModal) posts the delete and shows
   // the dependency breakdown if the server refuses.
-  c.querySelectorAll("[data-del]").forEach((b) => b.onclick = () => {
+  c.querySelectorAll("[data-del]").forEach((b) => b.onclick = (e) => {
+    // A delete control can sit inside a click target (e.g. an available slot
+    // card that schedules on click), so don't let the click bubble to it.
+    e.stopPropagation();
     modal = { type: "confirm-delete", kind: b.dataset.del,
               id: b.dataset.delId, name: b.dataset.delName };
+    render();
+  });
+  // Cancel game (#215): committed/published fixtures are cancelled, not deleted.
+  c.querySelectorAll("[data-game-cancel]").forEach((b) => b.onclick = (e) => {
+    e.stopPropagation();
+    modal = { type: "cancel-game", game_id: b.dataset.gameCancel,
+              name: b.dataset.gameName };
     render();
   });
   // Season rollover (#180): the league/season pickers reset the selection and

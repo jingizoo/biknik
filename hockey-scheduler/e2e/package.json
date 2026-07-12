@@ -11,6 +11,7 @@
     "season-rollover": "node season-rollover.js",
     "permanent-teams": "node permanent-teams.js",
     "safe-destructive": "node safe-destructive.js",
+    "destructive-surfaces": "node destructive-surfaces.js",
     "reset-visibility": "node reset-visibility.js"
   },
   "devDependencies": {

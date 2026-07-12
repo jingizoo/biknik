@@ -15,8 +15,10 @@ SQL store (SQLite locally, PostgreSQL in CI via TEST_DATABASE_URL).
 import os
 import unittest
 
+from datetime import datetime, timezone
+
 from hockey_scheduler.api.service import ApiService
-from hockey_scheduler.domain import IceSlotStatus
+from hockey_scheduler.domain import CalendarFeedToken, IceSlotStatus, Role
 from hockey_scheduler.store import InMemoryStore, SqlStore
 
 
@@ -81,6 +83,13 @@ class DeletionContract:
             self.assertIn("type", group)
             self.assertGreaterEqual(group["count"], 1)
             self.assertIsInstance(group["names"], list)
+            # Each blocker carries a capped {id, name} pair so it can be
+            # located even when names collide (#215 review 4).
+            self.assertIsInstance(group["items"], list)
+            self.assertTrue(group["items"])
+            for item in group["items"]:
+                self.assertIn("id", item)
+                self.assertIn("name", item)
         if expect_types is not None:
             self.assertEqual({g["type"] for g in deps}, set(expect_types))
 
@@ -175,6 +184,45 @@ class DeletionContract:
         blocked = self.api.delete_team(team, actor_id=self.ACTOR)
         self.assertBlocked(blocked, expect_types={"player"})
         self.assertIsNotNone(self.store.get_team(team))
+
+    def test_team_blocked_by_coach_account(self):
+        # A coach account scoped to the team is a live identity pointing at it,
+        # so the team can't be hard-deleted out from under it (#215 r4).
+        lg = self._league()
+        club = self._club()
+        team = self._team(club, lg)
+        self.api.accounts.create_account(
+            "coach_x", "a-real-password", Role.COACH,
+            scope={"team_id": team}, actor_id=self.ACTOR)
+        blocked = self.api.delete_team(team, actor_id=self.ACTOR)
+        self.assertBlocked(blocked, expect_types={"account"})
+        self.assertIsNotNone(self.store.get_team(team))  # zero-write
+
+    def test_team_blocked_by_live_calendar_feed(self):
+        lg = self._league()
+        club = self._club()
+        team = self._team(club, lg)
+        self.store.add_calendar_feed_token(CalendarFeedToken(
+            id=self.store.next_id("cft"), token_hash="hash_x",
+            actor_type="team", actor_ref=team,
+            created_at=datetime(2026, 1, 1, tzinfo=timezone.utc)))
+        blocked = self.api.delete_team(team, actor_id=self.ACTOR)
+        self.assertBlocked(blocked, expect_types={"calendar feed"})
+        self.assertIsNotNone(self.store.get_team(team))
+
+    def test_revoked_feed_does_not_block_team_delete(self):
+        # A revoked feed is inert history, not a live pointer, so it must not
+        # block an otherwise-bare team.
+        lg = self._league()
+        club = self._club()
+        team = self._team(club, lg)
+        self.store.add_calendar_feed_token(CalendarFeedToken(
+            id=self.store.next_id("cft"), token_hash="hash_y",
+            actor_type="team", actor_ref=team,
+            created_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            revoked_at=datetime(2026, 2, 1, tzinfo=timezone.utc)))
+        self.assertDeleted(self.api.delete_team(team, actor_id=self.ACTOR),
+                           self.store.get_team, team, "team_deleted")
 
     def test_team_deletable_when_bare(self):
         lg = self._league()
@@ -276,6 +324,22 @@ class DeletionContract:
         blocked = self.api.delete_game(gid, actor_id=self.ACTOR)
         self.assertEqual(blocked["error"]["code"], "validation_error")
         self.assertIsNotNone(self.store.get_game(gid))
+
+    # -- dependency details carry identifiers ------------------------------
+    def test_blocked_details_distinguish_duplicate_named_blockers(self):
+        # Two teams with the SAME name block a club delete; the details must
+        # still expose two distinct ids so the UI can locate each (#215 r4).
+        lg = self._league()
+        club = self._club()
+        self._team(club, lg, "Dup")
+        self._team(club, lg, "Dup")
+        blocked = self.api.delete_club(club, actor_id=self.ACTOR)
+        self.assertBlocked(blocked, expect_types={"team"})
+        group = blocked["error"]["details"]["dependencies"][0]
+        self.assertEqual(group["count"], 2)
+        ids = {item["id"] for item in group["items"]}
+        self.assertEqual(len(ids), 2)
+        self.assertEqual({item["name"] for item in group["items"]}, {"Dup"})
 
     # -- organization ------------------------------------------------------
     def test_organization_blocked_by_league_and_venue(self):

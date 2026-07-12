@@ -489,6 +489,12 @@ class InMemoryStore:
     def all_device_tokens(self) -> List[DeviceToken]:
         return list(self.device_tokens.values())
 
+    def all_calendar_feed_tokens(self) -> List[CalendarFeedToken]:
+        return list(self.calendar_feed_tokens.values())
+
+    def all_notification_preferences(self) -> List[NotificationPreference]:
+        return list(self.notification_preferences.values())
+
     # -- official availability (#88) ---------------------------------------
     def add_official_availability(self, a: OfficialAvailability) -> OfficialAvailability:
         self.official_availability[a.id] = a

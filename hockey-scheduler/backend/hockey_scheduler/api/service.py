@@ -2198,6 +2198,7 @@ class ApiService:
                 "start_time": g.start_time.isoformat(),
                 "roster_status": rstatus.status.value,
                 "published": g.published,
+                "cancelled": g.cancelled,  # Games view offers Cancel, not Delete (#215)
                 # Officials summary for the Games operations checklist (#30).
                 "officials_assigned": len(g_active),
                 "officials_accepted": sum(

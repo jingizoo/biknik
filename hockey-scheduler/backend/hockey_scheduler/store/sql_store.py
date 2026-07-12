@@ -697,6 +697,10 @@ class SqlStore:
         return rows[0] if rows else None
     def all_device_tokens(self):
         return self._query(DeviceToken, order="id")
+    def all_calendar_feed_tokens(self):
+        return self._query(CalendarFeedToken, order="id")
+    def all_notification_preferences(self):
+        return self._query(NotificationPreference, order="id")
 
     # -- official availability (#88) ---------------------------------------
     def add_official_availability(self, a): return self._insert(a)

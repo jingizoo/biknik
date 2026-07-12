@@ -143,8 +143,22 @@ class DemoState:
             push_transport=push_transport_from_env(os.environ))
 
     def reset(self, actor_id: Optional[str] = None) -> None:
-        RATE_LIMITER.reset()  # (#131) — a fresh demo/test dataset gets a clean rate-limit slate too
+        """Rebuild the demo baseline (#215).
+
+        Demo-mode assumption: reset is a single-operator action. It is not
+        serialized against concurrent in-flight mutations on the threaded demo
+        server — a demo has one operator pressing the button — so we do not take
+        a global request lock. What we DO guarantee is atomicity of the reseed
+        itself and clean resource handling: the new baseline is built fully
+        before any live reference is swapped, non-database side effects
+        (rate-limit slate) are applied only on success, the superseded store is
+        closed after a successful swap, and a half-built store is closed on
+        failure. So a mid-seed failure leaves the previous dataset — and the
+        live self.api — untouched, and repeated resets don't leak connections.
+        """
         store = create_store()  # SqlStore.__init__ applies pending numbered migrations (#75)
+        old = getattr(self, "api", None)
+        old_store = old.store if old is not None else None
 
         # Production (#71): NEVER reset the schema or seed demo data — that
         # would wipe a persistent DATABASE_URL store on every boot. Preserve
@@ -155,6 +169,8 @@ class DemoState:
             self.game_id = None
             self.ids = {}
             bootstrap_admin_from_env(self.api, os.environ)
+            RATE_LIMITER.reset()  # (#131) fresh process → clean rate-limit slate
+            self._close_store(old_store, store)
             return
 
         # Demo mode: rebuild the full Alpine league/arena scenario via the real
@@ -163,9 +179,7 @@ class DemoState:
         # SQL store it runs inside a single transaction (the reentrant
         # transaction() makes reset_schema + every @_transactional seed call
         # commit or roll back as one unit), and for the in-memory store we build
-        # into a fresh object and only swap the live references on success. So a
-        # mid-seed failure leaves the previous dataset — and the live self.api —
-        # untouched, never a half-rebuilt demo.
+        # into a fresh object and only swap the live references on success.
         def _seed():
             if isinstance(store, SqlStore):
                 store.reset_schema()
@@ -178,14 +192,32 @@ class DemoState:
                 api.setup.record_demo_reset(actor_id)
             return api, game_id, ids
 
-        if isinstance(store, SqlStore):
-            with store.transaction():
+        try:
+            if isinstance(store, SqlStore):
+                with store.transaction():
+                    api, game_id, ids = _seed()
+            else:
                 api, game_id, ids = _seed()
-        else:
-            api, game_id, ids = _seed()
+        except Exception:
+            # Failed reseed — discard the half-built store's connection and
+            # leave the live state completely untouched.
+            self._close_store(store, None)
+            raise
         # Success — swap the live references in one step, only now that the new
-        # baseline is fully built.
+        # baseline is fully built. Then apply the non-DB side effect and release
+        # the superseded store.
         self.api, self.game_id, self.ids = api, game_id, ids
+        RATE_LIMITER.reset()  # (#131) only after the reset actually succeeded
+        self._close_store(old_store, store)
+
+    @staticmethod
+    def _close_store(store, keep) -> None:
+        """Close ``store`` unless it's the one we're keeping (or None)."""
+        if store is not None and store is not keep:
+            try:
+                store.close()
+            except Exception:
+                pass
 
     def _seed_demo_accounts(self, api, ids: dict) -> None:
         """Create the six demo personas as real, operator-created accounts

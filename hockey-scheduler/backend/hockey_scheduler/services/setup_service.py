@@ -2267,9 +2267,20 @@ class SetupService:
     # server-resolved actor id.
     _DEP_SAMPLE = 8  # cap sample names per dependency group in the error detail
 
-    def _dep_group(self, label: str, items: list, name_fn) -> dict:
+    def _dep_group(self, label: str, items: list, name_fn, id_fn=None) -> dict:
+        """One dependency group for a blocked delete.
+
+        Carries the full ``count`` plus a capped list of ``items`` — each an
+        ``{id, name}`` pair — so the UI can locate a specific blocker even when
+        names collide (#215 review 4). ``id_fn`` defaults to the record's ``id``
+        attribute; pass one when the blocker's identifier lives elsewhere.
+        ``names`` is retained as a convenience mirror of the item names.
+        """
+        id_of = id_fn or (lambda x: getattr(x, "id", None))
+        sample = items[:self._DEP_SAMPLE]
+        pairs = [{"id": id_of(x), "name": name_fn(x)} for x in sample]
         return {"type": label, "count": len(items),
-                "names": [name_fn(x) for x in items[:self._DEP_SAMPLE]]}
+                "items": pairs, "names": [p["name"] for p in pairs]}
 
     def _block_if_dependents(self, entity_type: str, entity_id: str,
                              entity_label: str, groups: list) -> None:
@@ -2416,11 +2427,38 @@ class SetupService:
         games = [g for g in self.store.all_games()
                  if team_id in (g.home_team_id, g.away_team_id)]
         players = self.store.players_for_team(team_id)
+        # Live scoped/integration state also references a Team directly (#215
+        # review 4): a coach account bound to it, a live team calendar feed, and
+        # any team-targeted contact/preference/device rows. Deleting the Team
+        # while these exist would strand an active identity or integration
+        # pointing at a missing record, so they block the delete too. (This is a
+        # block, not a silent cascade or account erasure — the latter is an
+        # explicit non-goal of #215.)
+        accounts = [a for a in self.store.all_user_accounts()
+                    if (a.scope or {}).get("team_id") == team_id]
+        feeds = [t for t in self.store.all_calendar_feed_tokens()
+                 if t.actor_type == "team" and t.actor_ref == team_id
+                 and t.revoked_at is None]
+        contacts = [c for c in self.store.all_contact_destinations()
+                    if c.recipient_ref == team_id]
+        prefs = [p for p in self.store.all_notification_preferences()
+                 if p.recipient_ref == team_id]
+        devices = [d for d in self.store.all_device_tokens()
+                   if d.recipient_ref == team_id]
         self._block_if_dependents("team", team_id, "team", [
             self._dep_group("season registration", regs,
                             lambda r: self._season_name(r.season_id)),
             self._dep_group("game", games, self._matchup),
-            self._dep_group("player", players, lambda p: p.name)])
+            self._dep_group("player", players, lambda p: p.name),
+            self._dep_group("account", accounts, lambda a: a.username),
+            self._dep_group("calendar feed", feeds,
+                            lambda t: t.label or t.actor_ref),
+            self._dep_group("contact destination", contacts,
+                            lambda c: c.label or c.destination),
+            self._dep_group("notification preference", prefs,
+                            lambda p: p.channel.value),
+            self._dep_group("device token", devices,
+                            lambda d: d.label or d.provider)])
         self.store.delete_team(team_id)
         self._audit("team_deleted", "team", team_id, actor_id,
                     {"name": team.name, "league_id": team.league_id})

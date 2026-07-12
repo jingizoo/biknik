@@ -606,8 +606,17 @@ button.act.danger { background: #ffe5e3; color: #c0271b; }
 .cal-slots::-webkit-scrollbar { height: 5px; }
 .slot-card {
   flex: 0 0 auto; min-width: 96px; border-radius: 10px; padding: 8px 10px;
-  border: 1px solid var(--sep); background: #fff; cursor: default;
+  border: 1px solid var(--sep); background: #fff; cursor: default; position: relative;
 }
+/* Delete affordance on an unused future available slot (#215). */
+.slot-del {
+  position: absolute; top: 4px; right: 4px; border: none; background: transparent;
+  cursor: pointer; font-size: 12px; line-height: 1; padding: 2px; border-radius: 6px;
+  opacity: 0.55;
+}
+.slot-del:hover, .slot-del:focus { opacity: 1; background: #ffe5e3; }
+/* Identifier chip in the blocked-delete dependency list (#215 r4). */
+.dep-item code { font-size: 10px; color: var(--muted); }
 .slot-card .t { font-size: 12px; font-weight: 700; }
 .slot-card .s { font-size: 11px; margin-top: 3px; }
 .slot-card.available { border-color: #bfe6c8; background: #f1fbf3; cursor: pointer; }

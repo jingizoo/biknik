@@ -53,6 +53,10 @@ class DemoResetContract:
     def make_env(self):
         raise NotImplementedError
 
+    def assert_store_closed(self, store):
+        """Assert the store's backing resource is released (backend-specific)."""
+        raise NotImplementedError
+
     def _demo_resets(self, state):
         return [a for a in state.api.store.all_setup_audit()
                 if a.action == "demo_reset"]
@@ -112,10 +116,59 @@ class DemoResetContract:
             after_leagues = sorted(lg.name for lg in state.api.store.all_leagues())
             self.assertEqual(before_leagues, after_leagues)
 
+    def test_successful_reset_closes_the_superseded_store(self):
+        # Repeated resets must not leak the old store's connection (#215 r4).
+        with self.make_env() as state:
+            old_store = state.api.store
+            state.reset(actor_id="user_admin")
+            self.assertIsNot(state.api.store, old_store)
+            self.assert_store_closed(old_store)
+
+    def test_rate_limit_slate_is_reset_only_on_success(self):
+        with self.make_env() as state:
+            calls = []
+            saved = srv.RATE_LIMITER.reset
+            srv.RATE_LIMITER.reset = lambda: calls.append(1)
+            original = srv.build_full_demo_store
+            try:
+                srv.build_full_demo_store = \
+                    lambda _s: (_ for _ in ()).throw(RuntimeError("boom"))
+                with self.assertRaises(RuntimeError):
+                    state.reset(actor_id="user_admin")
+                self.assertEqual(calls, [])  # failure → no side effect
+                srv.build_full_demo_store = original
+                state.reset(actor_id="user_admin")
+                self.assertEqual(len(calls), 1)  # success → reset once
+            finally:
+                srv.RATE_LIMITER.reset = saved
+                srv.build_full_demo_store = original
+
+    def test_failed_reset_closes_the_half_built_store(self):
+        with self.make_env() as state:
+            made = []
+            real_create = srv.create_store
+            original = srv.build_full_demo_store
+            srv.create_store = lambda *a, **k: made.append(real_create(*a, **k)) or made[-1]
+            srv.build_full_demo_store = \
+                lambda _s: (_ for _ in ()).throw(RuntimeError("boom"))
+            try:
+                with self.assertRaises(RuntimeError):
+                    state.reset(actor_id="user_admin")
+            finally:
+                srv.create_store = real_create
+                srv.build_full_demo_store = original
+            self.assertTrue(made)
+            self.assert_store_closed(made[-1])
+
 
 class MemoryDemoResetTest(DemoResetContract, unittest.TestCase):
     def make_env(self):
         return _ResetEnv(database_url=None)  # in-memory store
+
+    def assert_store_closed(self, store):
+        # In-memory close() is a no-op (no external resource); the swap itself
+        # is the observable contract, already asserted by the caller.
+        pass
 
 
 class DurableDemoResetTest(DemoResetContract, unittest.TestCase):
@@ -145,6 +198,11 @@ class DurableDemoResetTest(DemoResetContract, unittest.TestCase):
 
     def make_env(self):
         return _ResetEnv(database_url=self._url)
+
+    def assert_store_closed(self, store):
+        # A closed SQL connection can no longer serve queries.
+        with self.assertRaises(Exception):
+            store.all_leagues()
 
 
 if __name__ == "__main__":
