@@ -56,6 +56,7 @@ let dashSubQueue = null;            // substitute-candidates for the coach dashb
 let playersList = [];               // [{id,name,team_id,position,jersey_number,...}] for Setup (#114)
 let leagueTeams = {};               // league_id -> [{id,name,league_id}] permanent members (#180)
 let seasonRegs = {};                // season_id -> [{id,team_id,division_id,active}] registrations (#180)
+let rollover = { leagueId: "", fromSeasonId: "", toSeasonId: "", result: null };  // season rollover picker (#180)
 let rescheduleRequests = null;      // reschedule request(s) for the current game (#29)
 let availFilter = "all";            // all|available|unavailable|maybe|no_response
 let gamesFilter = { division: "all", team: "all", rink: "all", status: "all", from: "", to: "" };  // Games list filters (#152)
@@ -933,7 +934,7 @@ function renderSetupHierarchy(ov) {
     ? `<section class="tree-panel na"><div class="tree-head"><span class="tree-title">⚠ Needs assignment</span></div>
         <div class="tree-note">These records can't be scheduled until they're assigned.</div>${naBody}</section>` : "";
 
-  return `${reassignPanelHtml(ov)}<div class="setup-trees">${facility}${permanentTeams}${competition}${renderSeasonParticipation(ov)}${roster}${needsAssignment}</div>`;
+  return `${reassignPanelHtml(ov)}<div class="setup-trees">${facility}${permanentTeams}${competition}${renderSeasonParticipation(ov)}${renderRollover(ov)}${roster}${needsAssignment}</div>`;
 }
 
 // Season participation (#180): permanent league teams and which season/division
@@ -1001,6 +1002,153 @@ function renderSeasonParticipation(ov) {
     <div class="tree-head"><span class="tree-title">🗓️ Season participation</span>
       <span class="tree-sub">Permanent league teams → seasons &amp; divisions they play</span></div>
     ${leagueBlocks}</section>`;
+}
+
+// Season rollover (#180): carry a prior season's participation forward into a
+// new season of the SAME league, reusing the permanent teams. A bounded,
+// functional picker — choose a source and a target season, pick which eligible
+// teams to carry and each one's target-season division, then commit through the
+// hardened rollover service (services/setup_service.roll_forward_registrations),
+// which re-checks league membership before any write. Source rows that aren't
+// permanent members of this league (orphaned or cross-league data) and teams
+// already active in the target are shown but never sent. The full Setup and
+// navigation redesign, and the remaining Team.division_id cleanup, stay out of
+// this slice (#204).
+function renderRollover(ov) {
+  if (!hasPerm("manage_setup")) return "";
+  const seasonsByLeague = groupBy(ov.seasons, "league_id");
+  const divsBySeason = groupBy(ov.divisions, "season_id");
+  // A rollover needs a source and a distinct target, so only leagues with at
+  // least two seasons can be rolled.
+  const eligibleLeagues = (ov.leagues || []).filter(
+    (lg) => (seasonsByLeague[lg.id] || []).length >= 2);
+  if (!eligibleLeagues.length) return "";
+  let leagueId = rollover.leagueId;
+  if (!eligibleLeagues.some((lg) => lg.id === leagueId)) leagueId = eligibleLeagues[0].id;
+  const seasons = seasonsByLeague[leagueId] || [];
+  const fromId = seasons.some((s) => s.id === rollover.fromSeasonId) ? rollover.fromSeasonId : "";
+  const toId = seasons.some((s) => s.id === rollover.toSeasonId) && rollover.toSeasonId !== fromId
+    ? rollover.toSeasonId : "";
+  const teams = leagueTeams[leagueId] || [];
+  const teamById = (tid) => teams.find((t) => t.id === tid);
+
+  const leagueSel = eligibleLeagues.length > 1
+    ? `<label class="ro-field">League
+        <select data-rollover-league>${eligibleLeagues.map((lg) =>
+          opt(lg.id, lg.name, lg.id === leagueId)).join("")}</select></label>` : "";
+  const fromSel = `<label class="ro-field">Copy from
+      <select data-rollover-from><option value="">Choose a season…</option>${
+        seasons.map((s) => opt(s.id, s.name, s.id === fromId)).join("")}</select></label>`;
+  const toSel = `<label class="ro-field">Into
+      <select data-rollover-to><option value="">Choose a season…</option>${
+        seasons.filter((s) => s.id !== fromId).map((s) =>
+          opt(s.id, s.name, s.id === toId)).join("")}</select></label>`;
+
+  let body;
+  if (!fromId || !toId) {
+    body = `<div class="tn-empty">Choose a source and a target season to preview which teams can be carried forward.</div>`;
+  } else {
+    // Split the source season's active registrations three ways using the data
+    // already loaded for Season participation: teams eligible to carry, teams
+    // already registered in the target (the service skips these), and source
+    // rows whose team isn't a permanent member of this league (orphaned or
+    // cross-league — the service rejects these, so they're never offered).
+    const srcRegs = (seasonRegs[fromId] || []).filter((r) => r.active);
+    const targetActive = new Set((seasonRegs[toId] || [])
+      .filter((r) => r.active).map((r) => r.team_id));
+    const targetDivs = divsBySeason[toId] || [];
+    const divOptions = targetDivs.map((d) => opt(d.id, d.name)).join("");
+    const eligible = [], already = [], ineligible = [];
+    srcRegs.forEach((r) => {
+      const team = teamById(r.team_id);
+      if (!team) ineligible.push(r);
+      else if (targetActive.has(r.team_id)) already.push(team);
+      else eligible.push(team);
+    });
+    // Every carried team must land in a concrete target-season division —
+    // a null-division registration is unusable by division-scoped scheduling
+    // and standings, so the UI never lets one be created (review #216).
+    // Rows start unchecked (no implicit bulk null assignment); the per-row
+    // division defaults to a "Choose a division…" placeholder unless the
+    // target season has exactly one division, which is preselected. The commit
+    // button stays disabled until every checked team has a division.
+    const single = targetDivs.length === 1;
+    const carryRows = eligible.map((team) => {
+      const divOpts = single
+        ? opt(targetDivs[0].id, targetDivs[0].name, true)
+        : `<option value="">Choose a division…</option>${divOptions}`;
+      return `<div class="tn-leaf reg-row">
+        <label class="ro-pick"><input type="checkbox" data-rollover-pick="${esc(team.id)}">
+          <span class="tn-label">👥 ${esc(team.name)}</span></label>
+        <select class="reg-div" data-rollover-div="${esc(team.id)}">${divOpts}</select>
+        <span class="ro-row-err" hidden>Pick a target division</span></div>`;
+    }).join("");
+    let carry;
+    if (!targetDivs.length) {
+      // The target season has no divisions — block the rollover outright rather
+      // than offer a path that could only produce null-division registrations.
+      carry = `<div class="tn-empty">The target season has no divisions yet.
+        Create a target division first, then roll teams into it.</div>`;
+    } else if (!eligible.length) {
+      carry = `<div class="tn-empty">No eligible teams left to carry into the target season.</div>`;
+    } else {
+      carry = `<div class="tn-leaf reg-add"><label class="ro-pick">
+          <input type="checkbox" data-rollover-all> Select all (${eligible.length})</label></div>${carryRows}
+        <div class="actions"><button class="act primary" data-rollover-commit disabled>Roll forward selected teams</button></div>`;
+    }
+    const alreadyRow = already.length
+      ? `<div class="tn-leaf reg-row"><span class="tn-meta">Already registered in the target season (will be skipped): ${
+          already.map((t) => esc(t.name)).join(", ")}</span></div>` : "";
+    const ineligibleRow = ineligible.length
+      ? `<div class="tn-leaf warn"><span class="tn-meta">⚠ ${ineligible.length} source registration${
+          ineligible.length === 1 ? "" : "s"} can't be carried — the team isn't a permanent member of this league (orphaned or cross-league data).</span></div>` : "";
+    body = `<div class="tn-children">${carry}${alreadyRow}${ineligibleRow}${rolloverResultHtml()}</div>`;
+  }
+
+  return `<section class="tree-panel">
+    <div class="tree-head"><span class="tree-title">↪ Season rollover</span>
+      <span class="tree-sub">Carry a prior season's teams into a new season of the same league</span></div>
+    <div class="ro-controls">${leagueSel}${fromSel}${toSel}</div>
+    ${body}</section>`;
+}
+
+// The rollover service returns {rolled_forward, skipped, registrations} or a
+// structured {error}. Render whichever the last commit produced.
+function rolloverResultHtml() {
+  const res = rollover.result;
+  if (!res) return "";
+  if (res.error) {
+    return `<div class="banner alert"><h2>Rollover failed</h2><p>${esc(res.error.message)}</p></div>`;
+  }
+  const parts = [`Carried ${res.rolled_forward} team${res.rolled_forward === 1 ? "" : "s"} forward`];
+  if (res.skipped) parts.push(`skipped ${res.skipped} already registered`);
+  return `<div class="banner ok"><h2>Rollover complete</h2><p>${esc(parts.join(" · "))}.</p></div>`;
+}
+
+// Rollover commit gate (review #216): reflect the current selection without a
+// full re-render (which would drop the checkbox/division state). A checked team
+// with no target division shows an inline row error, and the commit button is
+// enabled only when at least one team is checked and every checked team has a
+// division — so a rollover request can never be submitted with an unassigned
+// team, matching the backend's per-selection division validation.
+function updateRolloverCommitState(c) {
+  const commit = c.querySelector("[data-rollover-commit]");
+  if (!commit) return;
+  let anyChecked = false, allAssigned = true;
+  c.querySelectorAll("[data-rollover-pick]").forEach((cb) => {
+    const div = c.querySelector(`[data-rollover-div="${cb.dataset.rolloverPick}"]`);
+    const assigned = !!(div && div.value);
+    const row = cb.closest(".reg-row");
+    const err = row && row.querySelector(".ro-row-err");
+    if (cb.checked) {
+      anyChecked = true;
+      if (!assigned) allAssigned = false;
+      if (err) err.hidden = assigned;
+    } else if (err) {
+      err.hidden = true;
+    }
+  });
+  commit.disabled = !(anyChecked && allAssigned);
 }
 
 function renderSetup(ov) {
@@ -3983,6 +4131,64 @@ async function render() {
     if (res && !res.error) toast = "Team removed from the season.";
     await render();
   });
+  // Season rollover (#180): the league/season pickers reset the selection and
+  // any stale result so the preview always matches the chosen pair; commit
+  // gathers the checked teams and their target divisions and posts to the
+  // hardened rollover route, then re-renders (which reloads season
+  // registrations, so carried teams move into "already registered").
+  const roLeague = c.querySelector("[data-rollover-league]");
+  if (roLeague) roLeague.onchange = () => {
+    rollover.leagueId = roLeague.value;
+    rollover.fromSeasonId = ""; rollover.toSeasonId = ""; rollover.result = null;
+    render();
+  };
+  const roFrom = c.querySelector("[data-rollover-from]");
+  if (roFrom) roFrom.onchange = () => {
+    rollover.fromSeasonId = roFrom.value;
+    if (rollover.toSeasonId === roFrom.value) rollover.toSeasonId = "";
+    rollover.result = null; render();
+  };
+  const roTo = c.querySelector("[data-rollover-to]");
+  if (roTo) roTo.onchange = () => {
+    rollover.toSeasonId = roTo.value; rollover.result = null; render();
+  };
+  const roAll = c.querySelector("[data-rollover-all]");
+  if (roAll) roAll.onchange = () => {
+    c.querySelectorAll("[data-rollover-pick]").forEach((cb) => { cb.checked = roAll.checked; });
+    updateRolloverCommitState(c);
+  };
+  // Every checkbox/division change re-evaluates the commit gate in place, so
+  // inline row errors and the button's enabled state track the selection
+  // without a re-render dropping it (review #216).
+  c.querySelectorAll("[data-rollover-pick]").forEach((cb) =>
+    cb.onchange = () => updateRolloverCommitState(c));
+  c.querySelectorAll("[data-rollover-div]").forEach((sel) =>
+    sel.onchange = () => updateRolloverCommitState(c));
+  const roCommit = c.querySelector("[data-rollover-commit]");
+  if (roCommit) {
+    updateRolloverCommitState(c);  // set the initial disabled state
+    roCommit.onclick = async () => {
+      const selections = [];
+      c.querySelectorAll("[data-rollover-pick]").forEach((cb) => {
+        if (!cb.checked) return;
+        const div = c.querySelector(`[data-rollover-div="${cb.dataset.rolloverPick}"]`);
+        if (div && div.value) selections.push({ team_id: cb.dataset.rolloverPick, division_id: div.value });
+      });
+      // Defensive: the button is disabled unless every checked team is
+      // assigned, but re-check before sending so an unassigned selection can
+      // never reach the server.
+      const checked = c.querySelectorAll("[data-rollover-pick]:checked").length;
+      if (!selections.length || selections.length !== checked) {
+        updateRolloverCommitState(c);
+        return;
+      }
+      toast = "";
+      rollover.result = await post(`/api/setup/seasons/${rollover.toSeasonId}/roll-forward`,
+        { from_season_id: rollover.fromSeasonId, selections });
+      if (rollover.result && !rollover.result.error) toast = "Season rollover complete.";
+      await render();
+    };
+  }
   if (drawer) {
     const first = c.querySelector(".drawer-body input, .drawer-body select");
     if (first) first.focus();
