@@ -11,7 +11,6 @@ match the season's league. Commit is idempotent and single-transaction.
 
 import contextlib
 import os
-import tempfile
 import unittest
 
 from helpers import BACKEND  # noqa: F401
@@ -562,10 +561,13 @@ class MemoryImportConvergenceTest(ImportConvergenceContract, unittest.TestCase):
 
 class DurableImportConvergenceTest(ImportConvergenceContract, unittest.TestCase):
     def make_store(self):
-        fd, path = tempfile.mkstemp(suffix=".db")
-        os.close(fd)
-        self.addCleanup(lambda: os.path.exists(path) and os.remove(path))
-        return SqlStore(path)
+        # Honor TEST_DATABASE_URL so the PostgreSQL CI job actually exercises
+        # these tests against Postgres (#214 review); fall back to SQLite
+        # otherwise. Mirrors DurableHierarchyImportTest.
+        url = os.environ.get("TEST_DATABASE_URL") or ":memory:"
+        store = SqlStore(url)
+        store.reset_schema()
+        return store
 
 
 class ImportConvergenceValidationTest(unittest.TestCase):
