@@ -86,6 +86,7 @@ jobs:
           node --check hockey-scheduler/e2e/safe-destructive.js
           node --check hockey-scheduler/e2e/destructive-surfaces.js
           node --check hockey-scheduler/e2e/reset-visibility.js
+          node --check hockey-scheduler/e2e/demo-lifecycle.js
 
   browser-smoke:
     runs-on: ubuntu-latest
@@ -127,3 +128,5 @@ jobs:
         run: npm run destructive-surfaces
       - name: Run reset-demo visibility journey
         run: npm run reset-visibility
+      - name: Run demo lifecycle journey
+        run: npm run demo-lifecycle

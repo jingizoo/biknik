@@ -86,10 +86,9 @@ class RequiredPermissionTest(unittest.TestCase):
         # Reset wipes and reseeds all data — League-Admin-only (#215): gated on
         # MANAGE_SETUP, which only League Admin holds. The canonical route and
         # its alias map to the same permission.
-        self.assertEqual(required_permission("/api/reset"),
-                         Permission.MANAGE_SETUP)
-        self.assertEqual(required_permission("/api/demo/reset"),
-                         Permission.MANAGE_SETUP)
+        for p in ("/api/reset", "/api/demo/reset",
+                  "/api/demo/load", "/api/demo/clear"):
+            self.assertEqual(required_permission(p), Permission.MANAGE_SETUP, p)
 
 
 class AuthorizeTest(unittest.TestCase):
