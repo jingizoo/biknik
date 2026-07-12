@@ -1,9 +1,11 @@
 // Complete hierarchy import browser journey (#174 PR E2).
 //
 // At desktop and phone widths, a League Admin opens the existing Import screen,
-// downloads every explicit template, validates all four hierarchy CSVs, commits
-// the batch, and verifies that no pasted hierarchy data was written to browser
-// storage. Fails on browser console/page errors.
+// downloads every explicit template, validates every hierarchy CSV (including
+// the permanent-teams and season-registrations sheets), commits the batch,
+// verifies the resulting team + registration appear in the commit summary, and
+// checks that no pasted hierarchy data was written to browser storage. Fails on
+// browser console/page errors.
 const { chromium } = require("playwright");
 const { spawn } = require("child_process");
 const http = require("http");
@@ -30,6 +32,12 @@ const SHEETS = {
   competition_csv:
     "league_code,season_code,season_name,level_code,level_name,level_sort_order,division_code,division_name,age_group\n" +
     "BROWSERLEAGUE,BROWSERSEASON,Browser Season,BROWSERLEVEL,Browser Level,1,BROWSERDIV,Browser Division,Adult\n",
+  permanent_teams_csv:
+    "league_code,team_code,team_name\n" +
+    "BROWSERLEAGUE,BROWSERTEAM,Browser Team\n",
+  registrations_csv:
+    "season_code,team_code,division_code\n" +
+    "BROWSERSEASON,BROWSERTEAM,BROWSERDIV\n",
 };
 
 const FILENAMES = {
@@ -37,6 +45,8 @@ const FILENAMES = {
   leagues_csv: "leagues.csv",
   venues_rinks_csv: "venues_rinks.csv",
   competition_csv: "competition.csv",
+  permanent_teams_csv: "permanent_teams.csv",
+  registrations_csv: "registrations.csv",
 };
 
 function waitForServer(url, timeoutMs) {
@@ -136,12 +146,60 @@ async function checkViewport(browser, viewport) {
     await page.getByRole("heading", { name: "Hierarchy committed" }).waitFor();
     await page.getByText("organizations", { exact: true }).waitFor();
     await page.getByText("rinks", { exact: true }).waitFor();
+    // The permanent team and its season registration were created (#180 import
+    // convergence): the commit summary lists both entities.
+    await page.getByText("permanent_teams", { exact: true }).waitFor();
+    await page.getByText("registrations", { exact: true }).waitFor();
+
+    // Verify the ACTUAL resulting records via the setup APIs (#214 review),
+    // not just the summary labels: the imported permanent Team exists exactly
+    // once in its league (no division), with one active Season/Division
+    // registration.
+    const verify = await page.evaluate(async () => {
+      const getJson = async (url) =>
+        (await fetch(url, { credentials: "same-origin" })).json();
+      const hierarchy = await getJson("/api/setup/hierarchy");
+      const league = (hierarchy.leagues || []).find((l) => l.name === "Browser League");
+      const season = league && (league.seasons || []).find((s) => s.name === "Browser Season");
+      const divisions = season
+        ? [...(season.levels || []).flatMap((lv) => lv.divisions || []),
+          ...(season.divisions_without_level || [])]
+        : [];
+      const division = divisions.find((d) => d.name === "Browser Division");
+      const teams = league ? await getJson(`/api/setup/leagues/${league.id}/teams`) : { teams: [] };
+      const imported = (teams.teams || []).filter((t) => t.name === "Browser Team");
+      const team = imported[0];
+      const regsResp = season
+        ? await getJson(`/api/setup/seasons/${season.id}/team-registrations`)
+        : { registrations: [] };
+      const regs = team ? (regsResp.registrations || []).filter((r) => r.team_id === team.id) : [];
+      return {
+        leagueId: league && league.id, divisionId: division && division.id,
+        teamCount: imported.length, teamLeagueId: team && team.league_id,
+        teamDivisionId: team ? team.division_id : "no-team",
+        regCount: regs.length, regDivisionId: regs[0] && regs[0].division_id,
+        regActive: regs[0] && regs[0].active,
+      };
+    });
+    if (verify.teamCount !== 1) {
+      throw new Error(`[${viewport.label}] expected exactly one imported Browser Team, got ${verify.teamCount}`);
+    }
+    if (verify.teamLeagueId !== verify.leagueId) {
+      throw new Error(`[${viewport.label}] imported team is not owned by Browser League`);
+    }
+    if (verify.teamDivisionId !== null) {
+      throw new Error(`[${viewport.label}] a permanent team must carry no division, got ${verify.teamDivisionId}`);
+    }
+    if (verify.regCount !== 1 || verify.regDivisionId !== verify.divisionId || !verify.regActive) {
+      throw new Error(`[${viewport.label}] expected one active registration in Browser Division: ${JSON.stringify(verify)}`);
+    }
 
     const browserStorage = await page.evaluate(() => JSON.stringify({
       local: { ...localStorage },
       session: { ...sessionStorage },
     }));
-    for (const marker of ["BROWSERORG", "BROWSERLEAGUE", "BROWSERVENUE", "BROWSERDIV"]) {
+    for (const marker of ["BROWSERORG", "BROWSERLEAGUE", "BROWSERVENUE",
+      "BROWSERDIV", "BROWSERTEAM"]) {
       if (browserStorage.includes(marker)) {
         throw new Error(`[${viewport.label}] hierarchy data appeared in browser storage`);
       }

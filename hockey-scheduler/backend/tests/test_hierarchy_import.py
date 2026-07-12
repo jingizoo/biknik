@@ -132,10 +132,16 @@ class HierarchyImportContract:
         self.api.commit_hierarchy_import(payload(), actor_id="admin")
         result = self.api.commit_hierarchy_import(payload(), actor_id="admin")
         self.assertTrue(result["committed"])
+        # Nothing is created or updated on an identical repeat.
         for counts in result["summary"].values():
             self.assertEqual(counts["created"], 0)
             self.assertEqual(counts["updated"], 0)
-            self.assertGreater(counts["skipped"], 0)
+        # Every entity present in this payload was skipped (not re-created). The
+        # teams/registrations sheets aren't part of this payload, so they carry
+        # no rows and are legitimately 0/0/0.
+        for name in ("organizations", "leagues", "venues", "rinks",
+                     "seasons", "levels", "divisions"):
+            self.assertGreater(result["summary"][name]["skipped"], 0)
         self.assertEqual(len(self.store.all_organizations()), 1)
         self.assertEqual(len(self.store.all_leagues()), 1)
         self.assertEqual(len(self.store.all_venues()), 1)
