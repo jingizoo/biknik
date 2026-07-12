@@ -84,10 +84,13 @@ class FullDemoTest(unittest.TestCase):
         # build a roster for it — both U16 teams are seeded with players.
         ov = self.api.get_demo_overview()
         slot = next(s for s in ov["ice_slots"] if s["status"] == "available")
-        u16 = [t for t in ov["teams"] if t["division_name"] == "U16 Elite"]
+        u16_div = next(d for d in ov["divisions"] if d["name"] == "U16 Elite")
+        reg_ids = {r["team_id"] for r in ov["registrations"]
+                   if r["division_id"] == u16_div["id"]}
+        u16 = [t for t in ov["teams"] if t["id"] in reg_ids]
         falcons = next(t for t in u16 if t["name"] == "U16 Falcons")
         lions = next(t for t in u16 if t["name"] == "U16 Lions")
-        game = self.api.create_game(ov["seasons"][0]["id"], falcons["division_id"],
+        game = self.api.create_game(u16_div["season_id"], u16_div["id"],
                                     falcons["id"], lions["id"], slot["id"])
         self.assertNotIn("error", game)
         status = self.api.auto_build_roster(game["id"])
@@ -121,10 +124,11 @@ class FullDemoTest(unittest.TestCase):
     def test_scheduled_game_is_draft_until_published(self):
         ov = self.api.get_demo_overview()
         slot = next(s for s in ov["ice_slots"] if s["status"] == "available")
-        u16 = [t for t in ov["teams"] if t["division_name"] == "U16 Elite"]
+        u16_div = next(d for d in ov["divisions"] if d["name"] == "U16 Elite")
+        u16 = [r for r in ov["registrations"] if r["division_id"] == u16_div["id"]]
         before = len(ov["public_fixtures"])  # only the seeded (published) game
-        game = self.api.create_game(ov["seasons"][0]["id"], u16[0]["division_id"],
-                                    u16[0]["id"], u16[1]["id"], slot["id"])
+        game = self.api.create_game(u16_div["season_id"], u16_div["id"],
+                                    u16[0]["team_id"], u16[1]["team_id"], slot["id"])
         # A freshly scheduled game is a draft and is NOT public yet.
         ov2 = self.api.get_demo_overview()
         sched = next(g for g in ov2["schedule"] if g["game_id"] == game["id"])

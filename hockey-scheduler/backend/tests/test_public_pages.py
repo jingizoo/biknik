@@ -115,10 +115,13 @@ class PublicStandingsPublishLeakTest(unittest.TestCase):
     def setUp(self):
         self.store, _gid, _ids = build_full_demo_store()
         self.api = ApiService(self.store)
+        # #180: teams participate in a division via registration, not the legacy
+        # Team.division_id — find a division with two registered teams.
         by_div = defaultdict(list)
-        for t in self.store.all_teams():
-            if t.division_id:
-                by_div[t.division_id].append(t)
+        teams_by_id = {t.id: t for t in self.store.all_teams()}
+        for r in self.store.all_season_team_registrations():
+            if r.active and r.division_id and r.team_id in teams_by_id:
+                by_div[r.division_id].append(teams_by_id[r.team_id])
         self.div_id, teams = next(
             (d, ts) for d, ts in by_div.items() if len(ts) >= 2)
         self.home, self.away = teams[0], teams[1]

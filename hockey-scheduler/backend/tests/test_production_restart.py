@@ -126,7 +126,9 @@ class ProductionRestartTest(unittest.TestCase):
         self.assertEqual(store.get_division(ids["division"]).season_id, ids["season"])
         team = store.get_team(ids["team_a"])
         self.assertEqual(team.club_id, ids["club"])
-        self.assertEqual(team.division_id, ids["division"])
+        # #180: the surviving competition relationship is the permanent league,
+        # not the legacy Team.division_id (which is no longer written).
+        self.assertEqual(team.league_id, ids["league"])
         self.assertEqual(store.get_player(ids["player"]).team_id, ids["team_a"])
 
     def test_account_and_login_survive_restart(self):

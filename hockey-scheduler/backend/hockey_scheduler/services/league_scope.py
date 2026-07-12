@@ -112,19 +112,17 @@ def league_id_for_game(store, game) -> Optional[str]:
     if division_id:
         resolved.add(league_id_for_division(store, division_id))
 
-    # Team-derived context is a legacy fallback and a consistency check. A
-    # missing team does not prevent a valid explicit season/division from
-    # establishing scope; other game validation owns that relationship.
+    # Team-derived context is a consistency check on top of the explicit
+    # season/division. A Team's league is its permanent ``league_id`` (#180),
+    # never re-derived through its legacy division. A team with no concrete
+    # league_id can't corroborate scope and is skipped here; where a Team's
+    # league is actually required (registration validity, scheduling), the
+    # missing league is rejected rather than guessed.
     for team_id in (getattr(game, "home_team_id", None),
                     getattr(game, "away_team_id", None)):
         team = store.get_team(team_id) if team_id else None
-        if not team or not team.division_id:
-            continue
-        try:
-            resolved.add(league_id_for_division(store, team.division_id))
-        except DomainError:
-            if not season_id and not division_id:
-                continue
+        if team and team.league_id:
+            resolved.add(team.league_id)
 
     if len(resolved) > 1:
         raise ValidationError(
@@ -156,6 +154,11 @@ def team_registration_valid(store, season, team_id, division_id=None,
     concrete league and the Team has the *same* concrete league — a missing
     league on either side is never treated as a match (#200 review)."""
     if season is None or not season.league_id:
+        return None
+    # The shared league must actually EXIST (#180 review): a season and team
+    # that share a dangling/non-existent league id are not league-consistent —
+    # no operational consumer may trust such a row.
+    if store.get_league(season.league_id) is None:
         return None
     reg = store.registration_for_team_in_season(season.id, team_id)
     if reg is None or not reg.active:

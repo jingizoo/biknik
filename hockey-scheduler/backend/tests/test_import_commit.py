@@ -18,7 +18,7 @@ from http.server import ThreadingHTTPServer
 from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
 
 from hockey_scheduler.api import ApiService
-from hockey_scheduler.domain import NotificationChannel
+from hockey_scheduler.domain import NotificationChannel, Season
 from hockey_scheduler.services import SetupService
 from hockey_scheduler.store import InMemoryStore, SqlStore
 
@@ -111,6 +111,162 @@ class ImportCommitServiceContract:
         self.assertEqual(second["summary"]["players"], {"created": 0, "updated": 3})
         self.assertEqual(len(self.store.all_teams()), teams_after_first)
         self.assertEqual(len(self.store.all_players()), players_after_first)
+
+    # -- #180: import converges Team league_id + season registration --------
+    def test_import_sets_team_league_and_active_registration(self):
+        res = self.api.commit_teams_players_import(
+            self.season.id, _valid_sheets_csv(), actor_id="admin")
+        self.assertTrue(res["committed"])
+        season = self.store.get_season(self.season.id)
+        t1 = self._team("T1")
+        # Permanent league is the imported season's league; NO legacy division.
+        self.assertEqual(t1.league_id, season.league_id)
+        self.assertIsNone(t1.division_id)
+        # An active registration ties T1 to the season + its imported division,
+        # so the imported team is immediately schedulable (not teams_without_league).
+        reg = self.store.registration_for_team_in_season(self.season.id, t1.id)
+        self.assertIsNotNone(reg)
+        self.assertTrue(reg.active)
+        u16 = next(d for d in self.store.all_divisions()
+                   if d.name == "U16" and d.season_id == self.season.id)
+        self.assertEqual(reg.division_id, u16.id)
+
+    def test_import_registration_is_idempotent(self):
+        self.api.commit_teams_players_import(
+            self.season.id, _valid_sheets_csv(), actor_id="admin")
+        t1 = self._team("T1")
+        before = [r for r in self.store.all_season_team_registrations()
+                  if r.team_id == t1.id]
+        self.api.commit_teams_players_import(
+            self.season.id, _valid_sheets_csv(), actor_id="admin")
+        after = [r for r in self.store.all_season_team_registrations()
+                 if r.team_id == t1.id]
+        self.assertEqual(len(before), 1)
+        self.assertEqual(len(after), 1)  # updated in place, never duplicated
+
+    def test_import_into_second_season_leaves_first_registration_untouched(self):
+        self.api.commit_teams_players_import(
+            self.season.id, _valid_sheets_csv(), actor_id="admin")
+        t1 = self._team("T1")
+        first = self.store.registration_for_team_in_season(self.season.id, t1.id)
+        first_div = first.division_id
+        league_id = self.store.get_season(self.season.id).league_id
+        season2 = self.setup.create_season(league_id, "2027", actor_id="admin")
+        self.api.commit_teams_players_import(
+            season2.id, _valid_sheets_csv(), actor_id="admin")
+        # Season 1's registration is unchanged…
+        again = self.store.registration_for_team_in_season(self.season.id, t1.id)
+        self.assertEqual(again.division_id, first_div)
+        self.assertTrue(again.active)
+        # …and a distinct registration now exists for season 2.
+        second = self.store.registration_for_team_in_season(season2.id, t1.id)
+        self.assertIsNotNone(second)
+        self.assertNotEqual(second.id, first.id)
+
+    # -- #180 review: import integrity gate --------------------------------
+    def test_import_does_not_re_home_a_team_across_leagues(self):
+        # First import establishes T1's permanent league.
+        self.api.commit_teams_players_import(
+            self.season.id, _valid_sheets_csv(), actor_id="admin")
+        t1 = self._team("T1")
+        league1 = self.store.get_season(self.season.id).league_id
+        self.assertEqual(t1.league_id, league1)
+        # Re-import the SAME team_code into a DIFFERENT league's season.
+        league2 = self.setup.create_league("Other League", actor_id="admin").id
+        season2 = self.setup.create_season(league2, "2027", actor_id="admin")
+        res = self.api.commit_teams_players_import(
+            season2.id, _valid_sheets_csv(), actor_id="admin")
+        self.assertFalse(res["committed"])
+        self.assertTrue(any(e["reason"] == "team_league_move_blocked"
+                            for e in res["errors"]))
+        # Zero writes: T1 keeps its league; no registration was made in season2.
+        self.assertEqual(self._team("T1").league_id, league1)
+        self.assertIsNone(
+            self.store.registration_for_team_in_season(season2.id, t1.id))
+
+    def test_import_rejects_a_season_without_a_valid_league(self):
+        orphan = Season(id=self.store.next_id("season"), league_id=None,
+                        name="Orphan")
+        self.store.add_season(orphan)
+        res = self.api.commit_teams_players_import(
+            orphan.id, _valid_sheets_csv(), actor_id="admin")
+        self.assertFalse(res["committed"])
+        self.assertTrue(any(e["reason"] == "season_league_missing"
+                            for e in res["errors"]))
+        self.assertEqual(self.store.all_teams(), [])  # zero writes
+
+    def _u16(self):
+        return next(d for d in self.store.all_divisions()
+                    if d.name == "U16" and d.season_id == self.season.id)
+
+    def _t1_with_committed_game(self):
+        """Import, then a committed U16 game for T1. Returns (t1, u16, game_id)."""
+        self.api.commit_teams_players_import(
+            self.season.id, _valid_sheets_csv(), actor_id="admin")
+        t1 = self._team("T1")
+        u16 = self._u16()
+        league = self.store.get_season(self.season.id).league_id
+        club2 = self.setup.create_club("C2", actor_id="admin").id
+        mate = self.api.create_team(club2, u16.id, "Mate", actor_id="admin")["id"]
+        self.api.register_team_for_season(
+            self.season.id, mate, u16.id, actor_id="admin")
+        venue = self.setup.create_venue("V", league_id=league, actor_id="admin").id
+        rink = self.setup.create_rink(venue, "R", actor_id="admin").id
+        slot = self.api.create_ice_slot(
+            rink, "2027-06-01T18:00:00+00:00", "2027-06-01T19:00:00+00:00",
+            actor_id="admin")["id"]
+        game = self.api.create_game(
+            self.season.id, u16.id, t1.id, mate, slot, actor_id="admin")
+        self.assertNotIn("error", game)
+        return t1, u16, game["id"]
+
+    def _reimport(self, division_value):
+        moved = TEAMS_CSV.replace(
+            "T1,Team One,Lions Club,U16",
+            f"T1,Team One,Lions Club,{division_value}")
+        return self.api.commit_teams_players_import(
+            self.season.id, {"teams_csv": moved, "players_csv": PLAYERS_CSV},
+            actor_id="admin")
+
+    def test_import_division_move_stranding_a_committed_game_is_rejected(self):
+        t1, u16, game_id = self._t1_with_committed_game()
+        res = self._reimport("U20")  # move T1 to a different named division
+        self.assertFalse(res["committed"])
+        err = next(e for e in res["errors"]
+                   if e["reason"] == "registration_division_move_strands_games")
+        self.assertIn(game_id, err["affected_game_ids"])
+        reg = self.store.registration_for_team_in_season(self.season.id, t1.id)
+        self.assertEqual(reg.division_id, u16.id)  # zero writes
+
+    def test_import_clearing_division_with_committed_game_is_rejected(self):
+        # A BLANK division would clear the registration — must hit the same
+        # game-safety guard (#180 review, blank-to-unassigned path).
+        t1, u16, game_id = self._t1_with_committed_game()
+        res = self._reimport("")  # blank division_name
+        self.assertFalse(res["committed"])
+        err = next(e for e in res["errors"]
+                   if e["reason"] == "registration_division_move_strands_games")
+        self.assertIn(game_id, err["affected_game_ids"])
+        reg = self.store.registration_for_team_in_season(self.season.id, t1.id)
+        self.assertEqual(reg.division_id, u16.id)  # zero writes, still assigned
+        self.assertTrue(reg.active)
+
+    def test_import_moving_inactive_registration_with_committed_game_is_rejected(self):
+        # An inactive/historical registration + a committed (non-cancelled)
+        # game: a re-import that reactivates it into a different (or blank)
+        # division still strands the game and is rejected.
+        t1, u16, game_id = self._t1_with_committed_game()
+        reg = self.store.registration_for_team_in_season(self.season.id, t1.id)
+        reg.active = False
+        self.store.save_season_team_registration(reg)
+        res = self._reimport("")  # blank while inactive
+        self.assertFalse(res["committed"])
+        err = next(e for e in res["errors"]
+                   if e["reason"] == "registration_division_move_strands_games")
+        self.assertIn(game_id, err["affected_game_ids"])
+        again = self.store.registration_for_team_in_season(self.season.id, t1.id)
+        self.assertEqual(again.division_id, u16.id)  # zero writes
+        self.assertFalse(again.active)
 
     # -- 2b. repeat import with a changed name updates in place -------------
     def test_repeat_commit_with_changed_name_updates_existing_record(self):

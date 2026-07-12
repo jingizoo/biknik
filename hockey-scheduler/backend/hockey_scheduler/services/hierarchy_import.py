@@ -433,19 +433,13 @@ def _preflight_reassignment_safety(store, rows) -> List[dict]:
     division_code_by_id = {d.id: d.external_ref for d in store.all_divisions()
                            if d.external_ref}
     all_regs = store.all_season_team_registrations()
-    all_teams = store.all_teams()
     all_games = store.all_games()
-    divisions_by_season = {}
-    for _division in store.all_divisions():
-        divisions_by_season.setdefault(_division.season_id, set()).add(_division.id)
 
-    # (a) A team's league move must keep EVERY retained dependency in that
-    #     league. This means all registrations — active AND inactive/historical,
-    #     since an inactive prior-season row would become cross-league on any
-    #     later reactivation — and the preserved legacy Team.division_id (kept
-    #     for legacy game scope), whose division's season must also resolve to
-    #     the target league (#214 review). Historical placement is never
-    #     silently rewritten.
+    # (a) A team's league move must keep EVERY retained registration in that
+    #     league — active AND inactive/historical, since an inactive prior-season
+    #     row would become cross-league on any later reactivation (#214). Only
+    #     registrations count now (#180): the legacy Team.division_id is no longer
+    #     operational, so it never strands history. Placement is never rewritten.
     for index, row in enumerate(
             _group_first(rows["permanent_teams"], "team_code").values(), start=1):
         code = _clean(row.get("team_code"))
@@ -464,26 +458,18 @@ def _preflight_reassignment_safety(store, rows) -> List[dict]:
                           if season is not None else None)
             if reg_league != new_league_code:
                 stranded_regs.append(reg.id)
-        stranded_divisions = []
-        if team.division_id:
-            division = store.get_division(team.division_id)
-            div_season = (store.get_season(division.season_id)
-                          if division is not None else None)
-            div_league = (league_code_by_id.get(div_season.league_id)
-                          if div_season is not None else None)
-            if div_league != new_league_code:
-                stranded_divisions.append(team.division_id)
-        if stranded_regs or stranded_divisions:
+        # Only real participation history — SeasonTeamRegistration — gates a
+        # team's league move (#180). A stale legacy Team.division_id is not read
+        # operationally, so it no longer strands anything.
+        if stranded_regs:
             errors.append({
                 "sheet": "permanent_teams", "row": index, "field": "league_code",
                 "message": (f"Moving team {code} to league {new_league_code} "
-                            f"would leave {len(stranded_regs)} registration(s) "
-                            f"and {len(stranded_divisions)} legacy division(s) in "
+                            f"would leave {len(stranded_regs)} registration(s) in "
                             "another league; move or clear that history first."),
                 "reason": "team_league_move_strands_history",
                 "team_code": code,
-                "affected_registration_ids": stranded_regs,
-                "affected_division_ids": stranded_divisions})
+                "affected_registration_ids": stranded_regs})
 
     # (b) A registration's division move must not strand committed games.
     for index, row in enumerate(rows["registrations"], start=1):
@@ -516,11 +502,10 @@ def _preflight_reassignment_safety(store, rows) -> List[dict]:
                 "reason": "registration_division_move_strands_games",
                 "affected_game_ids": stranded})
 
-    # (c) A season's league move must keep EVERY retained dependency in that
-    #     league (#214 review): ALL registrations in the season (active AND
-    #     inactive/historical) and every legacy Team whose division_id points to
-    #     a division under this season — otherwise the team's permanent league
-    #     and its legacy division hierarchy disagree after the move.
+    # (c) A season's league move must keep EVERY retained registration in that
+    #     league (#214): ALL registrations in the season, active AND
+    #     inactive/historical. Legacy Team.division_id links are no longer
+    #     operational (#180), so they no longer constrain the move.
     for index, row in enumerate(
             _group_first(rows["competition"], "season_code").values(), start=1):
         code = _clean(row.get("season_code"))
@@ -531,27 +516,21 @@ def _preflight_reassignment_safety(store, rows) -> List[dict]:
         if new_league_code == league_code_by_id.get(season.league_id):
             continue  # league unchanged
         affected_regs = [r.id for r in all_regs if r.season_id == season.id]
-        season_division_ids = divisions_by_season.get(season.id, set())
-        affected_teams = [t.id for t in all_teams
-                          if t.division_id in season_division_ids]
-        if affected_regs or affected_teams:
+        if affected_regs:
             errors.append({
                 "sheet": "competition", "row": index, "field": "league_code",
                 "message": (f"Moving season {code} to league {new_league_code} "
                             f"would leave {len(affected_regs)} registration(s) "
-                            f"and {len(affected_teams)} legacy team-division "
-                            "link(s) in another league; migrate that history "
-                            "first."),
+                            "in another league; migrate that history first."),
                 "reason": "season_league_move_strands_history",
                 "season_code": code,
-                "affected_registration_ids": affected_regs,
-                "affected_team_ids": affected_teams})
+                "affected_registration_ids": affected_regs})
 
-    # (d) A division's season move must preserve ALL retained history (#214
-    #     review): all registrations assigned to it (active AND inactive), all
+    # (d) A division's season move must preserve ALL retained history (#214):
+    #     all registrations assigned to it (active AND inactive) and all
     #     persisted games in it (INCLUDING cancelled history, whose season_id/
-    #     division_id would otherwise disagree), and every legacy Team whose
-    #     division_id points to it.
+    #     division_id would otherwise disagree). Legacy Team.division_id links are
+    #     no longer operational (#180) and no longer constrain the move.
     for index, row in enumerate(rows["competition"], start=1):
         code = _clean(row.get("division_code"))
         division = divisions.get(code)
@@ -562,20 +541,17 @@ def _preflight_reassignment_safety(store, rows) -> List[dict]:
             continue  # season unchanged
         affected_regs = [r.id for r in all_regs if r.division_id == division.id]
         affected_games = [g.id for g in all_games if g.division_id == division.id]
-        affected_teams = [t.id for t in all_teams if t.division_id == division.id]
-        if affected_regs or affected_games or affected_teams:
+        if affected_regs or affected_games:
             errors.append({
                 "sheet": "competition", "row": index, "field": "season_code",
                 "message": (f"Moving division {code} to season {new_season_code} "
-                            f"would strand {len(affected_regs)} registration(s), "
-                            f"{len(affected_games)} game(s), and "
-                            f"{len(affected_teams)} legacy team link(s) outside "
-                            "their season; migrate that history first."),
+                            f"would strand {len(affected_regs)} registration(s) "
+                            f"and {len(affected_games)} game(s) outside their "
+                            "season; migrate that history first."),
                 "reason": "division_season_move_strands_dependents",
                 "division_code": code,
                 "affected_registration_ids": affected_regs,
-                "affected_game_ids": affected_games,
-                "affected_team_ids": affected_teams})
+                "affected_game_ids": affected_games})
     return errors
 
 
@@ -851,9 +827,10 @@ def commit_hierarchy_import(setup, sheets: Dict[str, List[dict]],
             obj = teams.get(code)
             if obj is None:
                 # A genuinely NEW permanent team carries no club and no division
-                # (#180) — participation lives in a registration.
+                # (#180) — participation lives in a registration, and the legacy
+                # Team.division_id/division are left at their (unset) defaults.
                 obj = Team(id=store.next_id("team"), external_ref=code,
-                           club_id=None, division_id=None, division="", **values)
+                           club_id=None, **values)
                 store.add_team(obj)
                 teams[code] = obj
                 counts["permanent_teams"]["created"] += 1

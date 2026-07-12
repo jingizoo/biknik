@@ -9,6 +9,7 @@
     "hierarchy-import": "node hierarchy-import.js",
     "season-participation": "node season-participation.js",
     "season-rollover": "node season-rollover.js",
+    "team-division-participation": "node team-division-participation.js",
     "permanent-teams": "node permanent-teams.js",
     "safe-destructive": "node safe-destructive.js",
     "destructive-surfaces": "node destructive-surfaces.js",

@@ -22,6 +22,9 @@ class SetupHierarchyTest(unittest.TestCase):
         div = self.api.create_division(season["id"], "Div A", level_id=level["id"])
         club = self.api.create_club("Club X")
         team = self.api.create_team(club["id"], div["id"], "Team1")
+        # #180: a team nests under a division via its registration, not the
+        # legacy Team.division_id.
+        self.api.register_team_for_season(season["id"], team["id"], div["id"])
         return league, season, level, div, club, team
 
     def test_empty_hierarchy_has_all_sections(self):
@@ -30,7 +33,7 @@ class SetupHierarchyTest(unittest.TestCase):
         self.assertEqual(h["leagues"], [])
         for key in ("venues_without_organization", "rinks_without_venue",
                     "divisions_without_level", "teams_without_club",
-                    "teams_without_division", "players_without_team"):
+                    "teams_without_league", "players_without_team"):
             self.assertEqual(h["missing_assignments"][key], [])
         json.dumps(h)  # must round-trip with no custom encoder
 
