@@ -199,19 +199,53 @@ function downloadTextFile(filename, text) {
   }
 }
 
+// Read an API Response defensively. A healthy endpoint returns JSON — either a
+// payload or the structured `{error:{...}}` shape — but a proxy 5xx (e.g. Render
+// returning a 502 "Bad Gateway" HTML page), an empty body, or a dropped
+// connection would make a bare `.json()` throw an uncaught SyntaxError and leave
+// the UI silently hung. Instead, surface those as the same `{error:{...}}` shape
+// so every existing `if (d && d.error)` call site shows a message and recovers.
+async function readApiResponse(r) {
+  let text = "";
+  try { text = await r.text(); } catch (_) { text = ""; }
+  if (text) {
+    try { return JSON.parse(text); } catch (_) { /* not JSON (e.g. a 502 page) */ }
+  }
+  if (r.ok) return {};  // a successful but empty body (e.g. 204) — not an error
+  const msg = r.status >= 500 || r.status === 0
+    ? `The server is temporarily unavailable (${r.status}). Please try again in a moment.`
+    : `The request could not be completed (${r.status}).`;
+  return { error: { code: "server_unavailable", message: msg } };
+}
+function networkErrorResult() {
+  return { error: { code: "network_error",
+    message: "Couldn't reach the server. Check your connection and try again." } };
+}
+
 // The session cookie carries identity; the server resolves the role from it
 // and authorizes each request (#50). No client-asserted role header.
-async function getJSON(p) { return (await fetch(p, { credentials: "same-origin" })).json(); }
+async function getJSON(p) {
+  try {
+    return await readApiResponse(await fetch(p, { credentials: "same-origin" }));
+  } catch (_) {
+    return networkErrorResult();
+  }
+}
 async function post(p, b) {
   // Reset first: an explicit success message the caller sets after a clean
   // response (the common `if (r && !r.error) toast = "..."` pattern) always
   // runs after this point, so it inherits the correct "not an error" state
   // without every one of those call sites needing to say so itself.
   toastIsError = false;
-  const r = await fetch(p, { method: "POST", credentials: "same-origin",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(b || {}) });
-  const d = await r.json();
+  let d;
+  try {
+    const r = await fetch(p, { method: "POST", credentials: "same-origin",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(b || {}) });
+    d = await readApiResponse(r);
+  } catch (_) {
+    d = networkErrorResult();
+  }
   if (d && d.error) { toast = d.error.message; toastIsError = true; }
   return d;
 }
