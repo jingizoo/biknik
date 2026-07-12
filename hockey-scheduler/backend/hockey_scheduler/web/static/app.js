@@ -57,7 +57,7 @@ let playersList = [];               // [{id,name,team_id,position,jersey_number,
 let leagueTeams = {};               // league_id -> [{id,name,league_id}] permanent members (#180)
 let seasonRegs = {};                // season_id -> [{id,team_id,division_id,active}] registrations (#180)
 let rollover = { leagueId: "", fromSeasonId: "", toSeasonId: "", result: null };  // season rollover picker (#180)
-let modal = null;                   // themed confirm/blocked modal (#204): {type, ...}
+let modal = null;                   // themed confirm/blocked modal (#215): {type, ...}
 let rescheduleRequests = null;      // reschedule request(s) for the current game (#29)
 let availFilter = "all";            // all|available|unavailable|maybe|no_response
 let gamesFilter = { division: "all", team: "all", rink: "all", status: "all", from: "", to: "" };  // Games list filters (#152)
@@ -137,7 +137,7 @@ const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) =>
 const fmt = (iso) => { const m = /T(\d{2}:\d{2})/.exec(iso || ""); return m ? m[1] : ""; };
 const val = (id) => { const e = document.getElementById(id); return e ? e.value.trim() : ""; };
 const hasPerm = (p) => rolePerms.has(p);
-// Demo vs production posture (#204): the "Reset demo" action and demo-only
+// Demo vs production posture (#215): the "Reset demo" action and demo-only
 // affordances only make sense outside production. Defaults to demo until the
 // status probe resolves, matching the server default (APP_MODE=demo).
 const isDemo = () => !envStatus || envStatus.app_mode !== "production";
@@ -703,7 +703,7 @@ async function commitReassign(newId) {
   await render();
 }
 
-// -- Safe destructive deletion UI (#204) --------------------------------
+// -- Safe destructive deletion UI (#215) --------------------------------
 // A compact, neutral outlined "Delete" control for a setup record. It reads as
 // a quiet secondary action (red only on hover, see .del-btn in styles.css) and
 // never deletes on click — it opens a themed confirmation modal. ``kind`` is
@@ -717,9 +717,9 @@ function delBtn(kind, id, name, label) {
 
 // Human labels for the entity kinds shown in the confirm/blocked modals.
 const DEL_NOUN = {
-  league: "league", season: "season", division: "division", club: "club",
-  team: "team", venue: "venue", rink: "rink", "ice-slot": "ice slot",
-  game: "game",
+  organization: "facility owner", league: "league", season: "season",
+  level: "level", division: "division", club: "club", team: "team",
+  venue: "venue", rink: "rink", "ice-slot": "ice slot", game: "game",
 };
 
 function renderModal() {
@@ -800,7 +800,10 @@ function wireModal(c) {
     resetInput.focus();
     resetConfirm.onclick = async () => {
       if (resetInput.value.trim().toUpperCase() !== "RESET") return;
-      await post("/api/reset", {});
+      resetConfirm.disabled = true;  // prevent a duplicate submit while running
+      // Server re-checks demo mode, MANAGE_SETUP, and the confirm value (#215).
+      const res = await post("/api/demo/reset", { confirm: "RESET" });
+      if (res && res.error) { modal = null; return render(); }  // post() set the toast
       clearTransientStateAfterReset();
       onboardingStatusDirty = true;
       toast = "Demo data reset.";
@@ -877,7 +880,7 @@ function renderSetupHierarchy(ov) {
       || `<div class="tn-empty">No leagues yet. Add a league operated by ${esc(o.name)}.</div>`;
     return `<details class="tn" open><summary class="tn-sum">
         <span class="tn-label">🏢 ${esc(o.name)}</span>
-        <span class="tn-meta">${lgs.length} league${lgs.length === 1 ? "" : "s"}</span></summary>
+        <span class="tn-meta">${lgs.length} league${lgs.length === 1 ? "" : "s"}</span>${delBtn("organization", o.id, o.name)}</summary>
       <div class="tn-children">${leagueRows}${treeAdd("league", "Add league to " + o.name, "f-league-org", o.id)}</div>
     </details>`;
   }).join("");
@@ -942,7 +945,7 @@ function renderSetupHierarchy(ov) {
           || `<div class="tn-empty">No divisions in this level yet.</div>`;
         return `<details class="tn" open><summary class="tn-sum">
             <span class="tn-label">🎚️ ${esc(lv.name)}</span>
-            <span class="tn-meta">${lvDivs.length} division${lvDivs.length === 1 ? "" : "s"}</span></summary>
+            <span class="tn-meta">${lvDivs.length} division${lvDivs.length === 1 ? "" : "s"}</span>${delBtn("level", lv.id, lv.name)}</summary>
           <div class="tn-children">${inner}${treeAdd("division", "Add division to " + lv.name, "f-div-level", lv.id, "f-div-season", s.id)}</div>
         </details>`;
       }).join("");
@@ -1143,7 +1146,7 @@ function renderSeasonParticipation(ov) {
 // permanent members of this league (orphaned or cross-league data) and teams
 // already active in the target are shown but never sent. The full Setup and
 // navigation redesign, and the remaining Team.division_id cleanup, stay out of
-// this slice (#204).
+// this slice (#215).
 function renderRollover(ov) {
   if (!hasPerm("manage_setup")) return "";
   const seasonsByLeague = groupBy(ov.seasons, "league_id");
@@ -4175,7 +4178,7 @@ async function render() {
     : view === "standings" ? renderStandings(ov, standings)
     : view === "activity" ? renderActivity(board, ov)
     : renderPublic(ov);
-  // The themed confirm/blocked modal (#204) overlays whatever view is showing
+  // The themed confirm/blocked modal (#215) overlays whatever view is showing
   // (it can be opened from the header's Reset demo action too), so append it
   // after the view content on every render and wire it below.
   c.innerHTML += renderModal();
@@ -4266,7 +4269,7 @@ async function render() {
     if (res && !res.error) toast = "Team removed from the season.";
     await render();
   });
-  // Safe destructive delete (#204): a Delete control opens the themed confirm
+  // Safe destructive delete (#215): a Delete control opens the themed confirm
   // modal; the modal's confirm handler (wireModal) posts the delete and shows
   // the dependency breakdown if the server refuses.
   c.querySelectorAll("[data-del]").forEach((b) => b.onclick = () => {
@@ -5118,7 +5121,7 @@ document.querySelectorAll(".topbar [data-open-drawer]").forEach((b) => b.onclick
   drawer = { kind: b.dataset.openDrawer }; drawerError = ""; drawerValues = {};
   switchTab("setup");
 });
-// Reset demo (#204): open the themed confirm modal (which requires typing
+// Reset demo (#215): open the themed confirm modal (which requires typing
 // RESET) rather than wiping immediately. The actual reseed + state-clear runs
 // from the modal's confirm handler (wireModal).
 document.getElementById("reset-btn").onclick = () => {
@@ -5220,7 +5223,7 @@ function gateChrome() {
   toggle('.tab[data-tab="import"]', hasPerm("manage_arena"));
   // Reset wipes and reseeds all demo data — shown only in demo mode and only to
   // a League Admin (MANAGE_SETUP), matching the server, which hard-disables the
-  // reset route in production (#204).
+  // reset route in production (#215).
   toggle("#reset-btn", hasPerm("manage_setup") && isDemo());
   // Sign out only makes sense with a live session.
   toggle("#signout-btn", !!currentUser);

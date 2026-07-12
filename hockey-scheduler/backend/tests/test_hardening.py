@@ -90,19 +90,39 @@ class HardeningHttpTest(unittest.TestCase):
         status, _, _ = self._req("GET", "/api/auth/me", None, {"Cookie": sid})
         self.assertEqual(status, 401)
 
-    # -- destructive reset is operator-only -----------------------------------
+    # -- destructive reset is League-Admin-only (#215) ------------------------
     def test_viewer_cannot_reset(self):
-        status, _, body = self._req("POST", "/api/reset", {},
+        status, _, body = self._req("POST", "/api/reset",
+                                    {"confirm": "RESET"},
                                     {"X-Demo-Role": "viewer",
                                      "Content-Type": "application/json"})
         self.assertEqual(status, 403)
         self.assertEqual(json.loads(body)["error"]["code"], "forbidden")
 
-    def test_operator_can_reset(self):
-        status, _, _ = self._req("POST", "/api/reset", {},
-                                 {"X-Demo-Role": "arena_manager",
+    def test_arena_manager_cannot_reset(self):
+        # #215: reset is MANAGE_SETUP (League-Admin-only), so the arena manager
+        # — who can create rinks/ice — is nonetheless rejected.
+        status, _, body = self._req("POST", "/api/reset",
+                                    {"confirm": "RESET"},
+                                    {"X-Demo-Role": "arena_manager",
+                                     "Content-Type": "application/json"})
+        self.assertEqual(status, 403)
+        self.assertEqual(json.loads(body)["error"]["code"], "forbidden")
+
+    def test_league_admin_can_reset(self):
+        status, _, _ = self._req("POST", "/api/reset",
+                                 {"confirm": "RESET"},
+                                 {"X-Demo-Role": "league_admin",
                                   "Content-Type": "application/json"})
         self.assertEqual(status, 200)
+
+    def test_reset_requires_typed_confirmation(self):
+        # An empty POST (no confirm value) is refused server-side (#215).
+        status, _, body = self._req("POST", "/api/reset", {},
+                                    {"X-Demo-Role": "league_admin",
+                                     "Content-Type": "application/json"})
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(body)["error"]["code"], "validation_error")
 
     # -- static traversal stays blocked ----------------------------------------
     def test_path_traversal_is_rejected(self):

@@ -115,7 +115,7 @@ ERROR_HTTP_STATUS = {
     "forbidden": 403,
     "unauthorized": 401,
     "game_cancelled": 409,
-    "has_dependencies": 409,  # delete refused: dependent records/history exist (#204)
+    "has_dependencies": 409,  # delete refused: dependent records/history exist (#215)
     "already_claimed": 409,
     "invalid_setup_code": 401,
     "claim_unavailable": 403,
@@ -142,7 +142,7 @@ class DemoState:
             store, email_transport=email_transport_from_env(os.environ),
             push_transport=push_transport_from_env(os.environ))
 
-    def reset(self) -> None:
+    def reset(self, actor_id: Optional[str] = None) -> None:
         RATE_LIMITER.reset()  # (#131) — a fresh demo/test dataset gets a clean rate-limit slate too
         store = create_store()  # SqlStore.__init__ applies pending numbered migrations (#75)
 
@@ -159,20 +159,41 @@ class DemoState:
 
         # Demo mode: rebuild the full Alpine league/arena scenario via the real
         # setup service (one game rostered & confirmed, ready to demo the
-        # back-out → substitute flow), reseeding a clean dataset each reset.
-        if isinstance(store, SqlStore):
-            store.reset_schema()
-        store, game_id, ids = build_full_demo_store(store)
-        self.api = self._make_api(store)
-        self.game_id = game_id
-        self.ids = ids
-        self._seed_demo_accounts(ids)
+        # back-out → substitute flow). The whole reseed is ATOMIC (#215): for a
+        # SQL store it runs inside a single transaction (the reentrant
+        # transaction() makes reset_schema + every @_transactional seed call
+        # commit or roll back as one unit), and for the in-memory store we build
+        # into a fresh object and only swap the live references on success. So a
+        # mid-seed failure leaves the previous dataset — and the live self.api —
+        # untouched, never a half-rebuilt demo.
+        def _seed():
+            if isinstance(store, SqlStore):
+                store.reset_schema()
+            _, game_id, ids = build_full_demo_store(store)
+            api = self._make_api(store)
+            self._seed_demo_accounts(api, ids)
+            if actor_id:
+                # One audit row, written after the canonical baseline exists,
+                # naming the authenticated actor and the reset time (#215).
+                api.setup.record_demo_reset(actor_id)
+            return api, game_id, ids
 
-    def _seed_demo_accounts(self, ids: dict) -> None:
+        if isinstance(store, SqlStore):
+            with store.transaction():
+                api, game_id, ids = _seed()
+        else:
+            api, game_id, ids = _seed()
+        # Success — swap the live references in one step, only now that the new
+        # baseline is fully built.
+        self.api, self.game_id, self.ids = api, game_id, ids
+
+    def _seed_demo_accounts(self, api, ids: dict) -> None:
         """Create the six demo personas as real, operator-created accounts
         (#67) — deterministic ids so existing sessions survive a reset (the
         session cookie carries role/scope already, so this only matters for
-        display and for `/api/accounts` listings).
+        display and for `/api/accounts` listings). Seeds into the passed-in
+        ``api`` (the freshly built one), not ``self.api``, so it runs before the
+        live-reference swap and stays inside the atomic reseed (#215).
         """
         scopes = {
             "coach": {"team_id": ids.get("home_team_id")},
@@ -181,7 +202,7 @@ class DemoState:
             "official": {"official_id": ids.get("referee_id")},
         }
         for username, role in DEMO_USERS.items():
-            self.api.accounts.create_account(
+            api.accounts.create_account(
                 username, DEMO_PASSWORD, role, scope=scopes.get(username, {}),
                 actor_id="demo_seed", account_id=f"user_{username}")
 
@@ -191,7 +212,7 @@ class DemoState:
         # link. Deterministic link id keeps demo audit ids stable across resets.
         junior_id = ids.get("selected_player_id")
         if junior_id:
-            self.api.guardians.link_guardian(
+            api.guardians.link_guardian(
                 "user_guardian", junior_id, verified=True,
                 actor_id="demo_seed", link_id="glink_demo")
 
@@ -1324,15 +1345,33 @@ class Handler(BaseHTTPRequestHandler):
                 "details": {"role": role.value, "scope": scope},
             }}, 403)
 
-        if path == "/api/reset":
-            # Wiping and reseeding all data has no legitimate use once an app
-            # is live — disabled outright in production (#68), not just
-            # permission-gated, regardless of the caller's role.
+        if path in ("/api/reset", "/api/demo/reset"):
+            # Demo reset (#215): canonical route /api/demo/reset (/api/reset is a
+            # back-compat alias). Already MANAGE_SETUP-gated above (League Admin
+            # only). Two further server-side guards, independent of the hidden
+            # button: it is unavailable in production, and the caller must send
+            # the typed confirmation value so the reset can't fire on an
+            # accidental empty POST.
             if _app_mode() == "production":
                 return self._send_json({"error": {
-                    "code": "forbidden",
-                    "message": "Reset is disabled in production."}}, 403)
-            STATE.reset()
+                    "code": "demo_reset_not_available",
+                    "message": "Demo reset is not available in this environment."}}, 403)
+            if (body.get("confirm") or "").strip().upper() != "RESET":
+                return self._send_json({"error": {
+                    "code": "validation_error",
+                    "message": "Type RESET to confirm the demo reset."}}, 400)
+            # Atomic reseed, attributed to the authenticated session actor so the
+            # new baseline carries a demo_reset audit row naming who did it. The
+            # reseed is all-or-nothing (#215); if it somehow fails, the previous
+            # dataset is left intact and we return a deterministic error rather
+            # than a half-rebuilt demo.
+            try:
+                STATE.reset(actor_id=user_id)
+            except Exception:
+                return self._send_json({"error": {
+                    "code": "demo_reset_failed",
+                    "message": ("The demo reset could not be completed; the "
+                                "previous data is unchanged.")}}, 500)
             # Reset rebuilds the store (dropping the sessions table), so the
             # operator's cookie is now dangling (#74). Demo accounts reseed
             # with deterministic ids, so re-issue a fresh session for the same
@@ -1678,21 +1717,22 @@ class Handler(BaseHTTPRequestHandler):
         if mx:
             return self._send_api(api.unregister_team_from_season(
                 mx.group(1), actor_id))
-        # Safe destructive deletion (#204): /api/setup/<entity>/<id>/delete.
+        # Safe destructive deletion (#215): /api/setup/<entity>/<id>/delete.
         # League-Admin only via the /api/setup MANAGE_SETUP catch-all; the actor
         # is the server-resolved session user. Each facade method runs a
         # pre-write dependency gate and returns a structured has_dependencies
         # error (with a details breakdown) when blocked, writing nothing.
         md = re.match(
-            r"^(league|season|division|club|team|venue|rink|ice-slot|game)"
-            r"/([^/]+)/delete$", entity)
+            r"^(organization|league|season|level|division|club|team|venue|rink"
+            r"|ice-slot|game)/([^/]+)/delete$", entity)
         if md:
             deleter = {
+                "organization": api.delete_organization,
                 "league": api.delete_league, "season": api.delete_season,
-                "division": api.delete_division, "club": api.delete_club,
-                "team": api.delete_team, "venue": api.delete_venue,
-                "rink": api.delete_rink, "ice-slot": api.delete_ice_slot,
-                "game": api.delete_game,
+                "level": api.delete_level, "division": api.delete_division,
+                "club": api.delete_club, "team": api.delete_team,
+                "venue": api.delete_venue, "rink": api.delete_rink,
+                "ice-slot": api.delete_ice_slot, "game": api.delete_game,
             }[md.group(1)]
             return self._send_api(deleter(md.group(2), actor_id))
         # Season rollover (#180): copy a prior season's participation forward

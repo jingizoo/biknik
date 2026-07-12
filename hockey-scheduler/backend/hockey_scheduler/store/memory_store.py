@@ -703,9 +703,12 @@ class InMemoryStore:
     def delete_game(self, game_id: str) -> None:
         self.games.pop(game_id, None)
 
-    # -- setup-entity deletion (#204 safe destructive actions) -------------
+    # -- setup-entity deletion (#215 safe destructive actions) -------------
     # Hard deletes of a single record. The service layer runs a pre-write
     # dependency gate before calling these, so they never cascade.
+    def delete_organization(self, org_id: str) -> None:
+        self.organizations.pop(org_id, None)
+
     def delete_league(self, league_id: str) -> None:
         self.leagues.pop(league_id, None)
 

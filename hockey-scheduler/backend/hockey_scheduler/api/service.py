@@ -2488,14 +2488,23 @@ class ApiService:
         rows = [_serialize(t) for t in self.store.teams_for_league(league_id)]
         return {"teams": rows}
 
-    # -- safe destructive deletion (#204) ---------------------------------
+    # -- safe destructive deletion (#215) ---------------------------------
     # Each returns the serialized deleted record on success, or the structured
     # dependency error (code "has_dependencies", with a details breakdown) when
     # blocked. The service runs a pre-write dependency gate, so a blocked delete
     # writes nothing.
     @catch
+    def delete_organization(self, org_id: str,
+                            actor_id: Optional[str] = None) -> dict:
+        return _serialize(self.setup.delete_organization(org_id, actor_id))
+
+    @catch
     def delete_league(self, league_id: str, actor_id: Optional[str] = None) -> dict:
         return _serialize(self.setup.delete_league(league_id, actor_id))
+
+    @catch
+    def delete_level(self, level_id: str, actor_id: Optional[str] = None) -> dict:
+        return _serialize(self.setup.delete_level(level_id, actor_id))
 
     @catch
     def delete_season(self, season_id: str, actor_id: Optional[str] = None) -> dict:

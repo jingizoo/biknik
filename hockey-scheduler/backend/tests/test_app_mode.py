@@ -151,9 +151,10 @@ class ProductionModeTest(unittest.TestCase):
             "prod_admin2", "pw", Role.LEAGUE_ADMIN)
         c = self._client()
         _, _, cookie = self._login(c, "prod_admin2", "pw")
-        status, body = self._req(c, "POST", "/api/reset", {}, cookie=cookie)
+        status, body = self._req(c, "POST", "/api/reset", {"confirm": "RESET"},
+                                 cookie=cookie)
         self.assertEqual(status, 403)
-        self.assertEqual(body["error"]["code"], "forbidden")
+        self.assertEqual(body["error"]["code"], "demo_reset_not_available")
 
 
 class DemoModeIsTheDefaultTest(unittest.TestCase):

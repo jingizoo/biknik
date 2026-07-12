@@ -82,10 +82,14 @@ class RequiredPermissionTest(unittest.TestCase):
             required_permission("/api/games/g1/substitutes/p9/accept"),
             Permission.RESPOND_AVAILABILITY)
 
-    def test_reset_is_operator_only(self):
-        # Reset wipes and reseeds all data — destructive, so operator-gated.
+    def test_reset_is_league_admin_only(self):
+        # Reset wipes and reseeds all data — League-Admin-only (#215): gated on
+        # MANAGE_SETUP, which only League Admin holds. The canonical route and
+        # its alias map to the same permission.
         self.assertEqual(required_permission("/api/reset"),
-                         Permission.MANAGE_SCHEDULE)
+                         Permission.MANAGE_SETUP)
+        self.assertEqual(required_permission("/api/demo/reset"),
+                         Permission.MANAGE_SETUP)
 
 
 class AuthorizeTest(unittest.TestCase):
@@ -111,9 +115,14 @@ class AuthorizeTest(unittest.TestCase):
                      "/api/games/g1/availability", "/api/reset"):
             self.assertTrue(authorize(Role.LEAGUE_ADMIN, path), path)
 
-    def test_viewer_cannot_reset(self):
+    def test_only_league_admin_can_reset(self):
+        # #215: reset is League-Admin-only, so a viewer AND an arena manager are
+        # both rejected; only the League Admin passes.
         self.assertFalse(authorize(Role.VIEWER, "/api/reset"))
-        self.assertTrue(authorize(Role.ARENA_MANAGER, "/api/reset"))
+        self.assertFalse(authorize(Role.ARENA_MANAGER, "/api/reset"))
+        self.assertTrue(authorize(Role.LEAGUE_ADMIN, "/api/reset"))
+        self.assertTrue(authorize(Role.LEAGUE_ADMIN, "/api/demo/reset"))
+        self.assertFalse(authorize(Role.ARENA_MANAGER, "/api/demo/reset"))
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-"""Safe destructive deletion of setup records (#204).
+"""Safe destructive deletion of setup records (#215).
 
 Every entity delete must:
   * succeed and write an audit row when nothing depends on the record;
@@ -16,6 +16,7 @@ import os
 import unittest
 
 from hockey_scheduler.api.service import ApiService
+from hockey_scheduler.domain import IceSlotStatus
 from hockey_scheduler.store import InMemoryStore, SqlStore
 
 
@@ -230,14 +231,38 @@ class DeletionContract:
         slot = self._slot(self._rink(self._venue(league_id=lg)))
         return self._game(s, d, home, away, slot)
 
-    def test_draft_game_deletable(self):
+    def _make_draft(self, gid):
+        """Flip a freshly created game into a scheduler draft in the store."""
+        game = self.store.get_game(gid)
+        game.is_draft = True
+        self.store.save_game(game)
+        return game
+
+    def test_draft_game_deletable_and_releases_slot(self):
         gid = self._built_game()
+        slot_id = self.store.get_game(gid).ice_slot_id
+        # create_game allocated the slot; a draft holds it the same way.
+        self.assertEqual(self.store.get_ice_slot(slot_id).status,
+                         IceSlotStatus.ALLOCATED)
+        self._make_draft(gid)
         self.assertDeleted(self.api.delete_game(gid, actor_id=self.ACTOR),
                            self.store.get_game, gid, "game_deleted")
+        # The slot is returned to the available pool so it can be rebooked.
+        self.assertEqual(self.store.get_ice_slot(slot_id).status,
+                         IceSlotStatus.AVAILABLE)
+
+    def test_ordinary_unpublished_game_not_deletable(self):
+        # A manually created game is NOT a draft (is_draft=False), so even
+        # unpublished it must be cancelled, never hard-deleted (#215).
+        gid = self._built_game()
+        self.assertFalse(self.store.get_game(gid).is_draft)
+        blocked = self.api.delete_game(gid, actor_id=self.ACTOR)
+        self.assertEqual(blocked["error"]["code"], "validation_error")
+        self.assertIsNotNone(self.store.get_game(gid))  # zero-write
 
     def test_published_game_not_deletable(self):
         gid = self._built_game()
-        game = self.store.get_game(gid)
+        game = self._make_draft(gid)
         game.published = True
         self.store.save_game(game)
         blocked = self.api.delete_game(gid, actor_id=self.ACTOR)
@@ -246,14 +271,81 @@ class DeletionContract:
 
     def test_cancelled_game_not_deletable(self):
         gid = self._built_game()
+        self._make_draft(gid)
         self.api.cancel_game(gid, actor_id=self.ACTOR)
         blocked = self.api.delete_game(gid, actor_id=self.ACTOR)
         self.assertEqual(blocked["error"]["code"], "validation_error")
         self.assertIsNotNone(self.store.get_game(gid))
 
+    # -- organization ------------------------------------------------------
+    def test_organization_blocked_by_league_and_venue(self):
+        org = self.api.create_organization("Org", actor_id=self.ACTOR)["id"]
+        self.api.create_league("Owned", organization_id=org, actor_id=self.ACTOR)
+        self.api.create_venue("Owned Venue", organization_id=org, actor_id=self.ACTOR)
+        blocked = self.api.delete_organization(org, actor_id=self.ACTOR)
+        self.assertBlocked(blocked, expect_types={"league", "venue"})
+        self.assertIsNotNone(self.store.get_organization(org))
+        empty = self.api.create_organization("Empty Org", actor_id=self.ACTOR)["id"]
+        self.assertDeleted(self.api.delete_organization(empty, actor_id=self.ACTOR),
+                           self.store.get_organization, empty, "organization_deleted")
+
+    # -- level -------------------------------------------------------------
+    def test_level_blocked_by_division(self):
+        lg = self._league()
+        s = self._season(lg)
+        level = self.api.create_level(s, "Level A", actor_id=self.ACTOR)["id"]
+        self.api.create_division(s, "In Level", level_id=level, actor_id=self.ACTOR)
+        blocked = self.api.delete_level(level, actor_id=self.ACTOR)
+        self.assertBlocked(blocked, expect_types={"division"})
+        self.assertIsNotNone(self.store.get_level(level))
+        empty = self.api.create_level(s, "Empty Level", actor_id=self.ACTOR)["id"]
+        self.assertDeleted(self.api.delete_level(empty, actor_id=self.ACTOR),
+                           self.store.get_level, empty, "level_deleted")
+
+    # -- season blocked by a game (direct season_id reference) -------------
+    def test_season_blocked_by_game(self):
+        lg = self._league()
+        s = self._season(lg)
+        d = self._division(s)
+        club = self._club()
+        home = self._team(club, lg, "Home")
+        away = self._team(club, lg, "Away")
+        self._register(s, home, d)
+        self._register(s, away, d)
+        slot = self._slot(self._rink(self._venue(league_id=lg)))
+        self._game(s, d, home, away, slot)
+        blocked = self.api.delete_season(s, actor_id=self.ACTOR)
+        deps = {g["type"] for g in blocked["error"]["details"]["dependencies"]}
+        self.assertIn("game", deps)
+        self.assertIsNotNone(self.store.get_season(s))
+
+    # -- ice slot state rules: only an unused future available slot --------
+    def test_past_slot_not_deletable(self):
+        slot = self.api.create_ice_slot(
+            self._rink(self._venue()),
+            "2020-01-01T10:00:00+00:00", "2020-01-01T11:00:00+00:00",
+            actor_id=self.ACTOR)["id"]
+        blocked = self.api.delete_ice_slot(slot, actor_id=self.ACTOR)
+        self.assertEqual(blocked["error"]["code"], "validation_error")
+        self.assertIsNotNone(self.store.get_ice_slot(slot))
+
+    def test_non_available_slot_not_deletable(self):
+        # A future maintenance/blocked slot (slot_type != game → BLOCKED) is not
+        # a free opening, so it can't be deleted even with no game on it.
+        slot = self.api.create_ice_slot(
+            self._rink(self._venue()),
+            "2027-01-01T10:00:00+00:00", "2027-01-01T11:00:00+00:00",
+            slot_type="maintenance", actor_id=self.ACTOR)["id"]
+        self.assertNotEqual(self.store.get_ice_slot(slot).status,
+                            IceSlotStatus.AVAILABLE)
+        blocked = self.api.delete_ice_slot(slot, actor_id=self.ACTOR)
+        self.assertEqual(blocked["error"]["code"], "validation_error")
+        self.assertIsNotNone(self.store.get_ice_slot(slot))
+
     # -- not found ---------------------------------------------------------
     def test_missing_ids_report_not_found(self):
-        for fn in (self.api.delete_league, self.api.delete_season,
+        for fn in (self.api.delete_organization, self.api.delete_league,
+                   self.api.delete_season, self.api.delete_level,
                    self.api.delete_division, self.api.delete_club,
                    self.api.delete_team, self.api.delete_venue,
                    self.api.delete_rink, self.api.delete_ice_slot,

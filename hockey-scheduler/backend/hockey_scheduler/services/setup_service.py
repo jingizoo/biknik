@@ -2246,7 +2246,17 @@ class SetupService:
     def list_divisions(self, season_id: str) -> List[Division]:
         return self.store.divisions_for_season(season_id)
 
-    # -- safe destructive deletion (#204) ---------------------------------
+    def record_demo_reset(self, actor_id: Optional[str] = None) -> SetupAuditLog:
+        """Audit a demo reset (#215) once the new baseline exists.
+
+        Written by DemoState.reset after the reseed, inside the same atomic unit
+        for a SQL store, so the reset and its audit row commit together. Not
+        ``@_transactional``: the caller already owns the transaction.
+        """
+        return self._audit("demo_reset", "demo", "demo", actor_id,
+                           {"reset_at": self.clock().isoformat()})
+
+    # -- safe destructive deletion (#215) ---------------------------------
     # Every delete runs a *pre-write* dependency gate: if any dependent record
     # or history exists it raises HasDependenciesError with a structured
     # breakdown and writes nothing. The gate must precede the first write
@@ -2289,6 +2299,38 @@ class SetupService:
         return f"{rink.name if rink else 'ice slot'} {when}".strip()
 
     @_transactional
+    def delete_organization(self, org_id: str,
+                            actor_id: Optional[str] = None) -> Organization:
+        org = self.store.get_organization(org_id)
+        if org is None:
+            raise NotFoundError(f"Organization {org_id} not found.")
+        leagues = [lg for lg in self.store.all_leagues()
+                   if lg.organization_id == org_id]
+        venues = [v for v in self.store.all_venues()
+                  if v.organization_id == org_id]
+        self._block_if_dependents("organization", org_id, "facility owner", [
+            self._dep_group("league", leagues, lambda lg: lg.name),
+            self._dep_group("venue", venues, lambda v: v.name)])
+        self.store.delete_organization(org_id)
+        self._audit("organization_deleted", "organization", org_id, actor_id,
+                    {"name": org.name})
+        return org
+
+    @_transactional
+    def delete_level(self, level_id: str, actor_id: Optional[str] = None) -> Level:
+        level = self.store.get_level(level_id)
+        if level is None:
+            raise NotFoundError(f"Level {level_id} not found.")
+        divisions = [d for d in self.store.all_divisions()
+                     if d.level_id == level_id]
+        self._block_if_dependents("level", level_id, "level", [
+            self._dep_group("division", divisions, lambda d: d.name)])
+        self.store.delete_level(level_id)
+        self._audit("level_deleted", "level", level_id, actor_id,
+                    {"name": level.name, "season_id": level.season_id})
+        return level
+
+    @_transactional
     def delete_league(self, league_id: str, actor_id: Optional[str] = None) -> League:
         league = self.store.get_league(league_id)
         if league is None:
@@ -2313,11 +2355,16 @@ class SetupService:
         levels = [lv for lv in self.store.all_levels() if lv.season_id == season_id]
         divisions = self.store.divisions_for_season(season_id)
         regs = self.store.registrations_for_season(season_id)
+        # Games/results/history reference the season directly (#215): a game
+        # whose division is legacy/null/mismatched still carries season_id, so
+        # check by season_id rather than trusting the division tree above.
+        games = [g for g in self.store.all_games() if g.season_id == season_id]
         self._block_if_dependents("season", season_id, "season", [
             self._dep_group("level", levels, lambda lv: lv.name),
             self._dep_group("division", divisions, lambda d: d.name),
             self._dep_group("team registration", regs,
-                            lambda r: self._team_name(r.team_id))])
+                            lambda r: self._team_name(r.team_id)),
+            self._dep_group("game", games, self._matchup)])
         self.store.delete_season(season_id)
         self._audit("season_deleted", "season", season_id, actor_id,
                     {"name": season.name, "league_id": season.league_id})
@@ -2410,11 +2457,22 @@ class SetupService:
         slot = self.store.get_ice_slot(slot_id)
         if slot is None:
             raise NotFoundError(f"Ice slot {slot_id} not found.")
-        # Any game on the slot (including a cancelled one — it's still history)
-        # is a game dependency that blocks deletion.
+        # Only an UNUSED, FUTURE, still-AVAILABLE slot may be deleted (#215).
+        # A game referencing the slot is a true dependency (report it first, with
+        # counts/ids). Otherwise past inventory is history and an
+        # allocated/blocked/maintenance slot is in use — neither is a free future
+        # opening; those are state rules that raise a plain validation error.
+        # Every path is zero-write.
         games = [g for g in self.store.all_games() if g.ice_slot_id == slot_id]
         self._block_if_dependents("ice slot", slot_id, "ice slot", [
             self._dep_group("game", games, self._matchup)])
+        if slot.start_time is not None and slot.start_time <= self.clock():
+            raise ValidationError(
+                "Only a future ice slot can be deleted; past slots are history.")
+        if slot.status != IceSlotStatus.AVAILABLE:
+            raise ValidationError(
+                "Only an available ice slot can be deleted; this slot is "
+                f"{slot.status.value} (in use or reserved).")
         self.store.delete_ice_slot(slot_id)
         self._audit("ice_slot_deleted", "ice_slot", slot_id, actor_id,
                     {"rink_id": slot.rink_id})
@@ -2422,29 +2480,49 @@ class SetupService:
 
     @_transactional
     def delete_game(self, game_id: str, actor_id: Optional[str] = None) -> Game:
-        """Delete a draft (unpublished) game only (#204).
+        """Delete a scheduler *draft* game only (#215).
 
-        A published, cancelled, or otherwise historical game is never deleted —
-        it must be cancelled so its record and notifications are preserved. Any
-        roster entry or official assignment on the game is a dependency that
-        blocks deletion, so a game with attached work is never silently erased.
+        Only a true draft (``is_draft`` True, not published, not cancelled, no
+        result) may be hard-deleted. A manually created or committed game — even
+        an unpublished one — is NOT a draft and must be cancelled instead so its
+        fixture and notification history survive. A clean draft carries no
+        operational work; if any roster entry, official assignment, availability
+        response, substitute request, or reschedule request exists, deletion is
+        blocked rather than silently orphaning it. On deletion the draft's
+        allocated ice slot is released back to AVAILABLE so it can be rebooked.
         """
         game = self.store.get_game(game_id)
         if game is None:
             raise NotFoundError(f"Game {game_id} not found.")
-        if game.published or game.cancelled \
+        if not getattr(game, "is_draft", False) or game.published \
+                or game.cancelled \
                 or self.store.result_for_game(game_id) is not None:
             raise ValidationError(
-                "Only a draft (unpublished) game can be deleted; a published "
-                "or historical game must be cancelled instead.")
+                "Only a draft game can be deleted; a scheduled, published, or "
+                "historical game must be cancelled instead.")
         roster = self.store.roster_for_game(game_id)
         assignments = self.store.assignments_for_game(game_id)
-        self._block_if_dependents("game", game_id, "game", [
+        availability = self.store.availability_for_game(game_id)
+        substitutes = self.store.substitutes_for_game(game_id)
+        reschedules = self.store.reschedule_requests_for_game(game_id)
+        self._block_if_dependents("game", game_id, "draft game", [
             self._dep_group("roster entry", roster,
-                            lambda e: self._team_name(getattr(e, "team_id", None))),
+                            lambda e: getattr(e, "player_id", "player")),
             self._dep_group("official assignment", assignments,
-                            lambda a: getattr(a, "official_id", "official"))])
+                            lambda a: getattr(a, "official_id", "official")),
+            self._dep_group("availability response", availability,
+                            lambda a: getattr(a, "player_id", "player")),
+            self._dep_group("substitute request", substitutes,
+                            lambda s: getattr(s, "player_id", "player")),
+            self._dep_group("reschedule request", reschedules, lambda r: r.id)])
+        # Release the slot the draft held so the ice reads as bookable again.
+        if game.ice_slot_id:
+            slot = self.store.get_ice_slot(game.ice_slot_id)
+            if slot is not None and slot.status == IceSlotStatus.ALLOCATED:
+                slot.status = IceSlotStatus.AVAILABLE
+                self.store.save_ice_slot(slot)
         self.store.delete_game(game_id)
         self._audit("game_deleted", "game", game_id, actor_id,
-                    {"matchup": self._matchup(game)})
+                    {"matchup": self._matchup(game),
+                     "ice_slot_id": game.ice_slot_id})
         return game

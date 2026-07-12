@@ -78,7 +78,7 @@ class HasDependenciesError(DomainError):
     Carries a structured ``details`` payload so the client can explain exactly
     what blocks the deletion (a list of ``{type, count, names}`` groups) rather
     than only rendering an English sentence. Deletion is never a silent cascade
-    — the caller must clear the dependents first (#204 safe destructive actions).
+    — the caller must clear the dependents first (#215 safe destructive actions).
     """
 
     code = "has_dependencies"

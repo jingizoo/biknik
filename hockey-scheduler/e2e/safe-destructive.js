@@ -1,4 +1,4 @@
-// Safe destructive actions browser journey (#204).
+// Safe destructive actions browser journey (#215).
 //
 // At desktop and phone widths, a League Admin exercises the four destructive
 // surfaces end to end:
@@ -179,7 +179,7 @@ async function checkViewport(browser, viewport) {
     await page.waitForFunction(
       () => !document.querySelector("[data-reset-confirm]").disabled, null, { timeout: 5000 });
     const resetResp = page.waitForResponse((r) =>
-      r.url() === `${base}/api/reset` && r.request().method() === "POST");
+      r.url() === `${base}/api/demo/reset` && r.request().method() === "POST");
     await page.click("[data-reset-confirm]");
     if ((await resetResp).status() !== 200) {
       throw new Error(`[${viewport.label}] reset returned non-200`);
@@ -191,6 +191,17 @@ async function checkViewport(browser, viewport) {
     }
     if (!afterReset.leagues.length) {
       throw new Error(`[${viewport.label}] reset did not reseed the demo league`);
+    }
+
+    // No destructive form state is persisted to browser storage (#215): the
+    // confirm value and the records we acted on live only in page memory.
+    const stored = await page.evaluate(() => JSON.stringify({
+      local: { ...localStorage }, session: { ...sessionStorage },
+    }));
+    for (const marker of ["RESET", "Del League", "Bare Team"]) {
+      if (stored.includes(marker)) {
+        throw new Error(`[${viewport.label}] destructive form data leaked into browser storage: ${marker}`);
+      }
     }
 
     if (errors.length) {

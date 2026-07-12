@@ -56,7 +56,7 @@ class WebServerTest(unittest.TestCase):
     def setUp(self):
         # Fresh, fully-confirmed roster before each test, and derive a
         # selected player id from the board (ids depend on the seed).
-        _request("POST", "/api/reset", {})
+        _request("POST", "/api/reset", {"confirm": "RESET"})
         _, board = _request("GET", "/api/games/game_1/board")
         self.selected_id = next(p["id"] for p in board["players"]
                                 if p["group"] == "selected")

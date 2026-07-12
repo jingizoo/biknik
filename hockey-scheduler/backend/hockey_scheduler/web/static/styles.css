@@ -781,7 +781,7 @@ details.tn > .tn-sum:hover { background: #f6f7fb; }
 .drawer-foot { display: flex; justify-content: flex-end; gap: 8px; padding: 12px 16px; border-top: 1px solid var(--sep); }
 @media (max-width: 480px) { .drawer { width: 100%; } }
 
-/* ----- Safe destructive actions (#204): reset + delete ----- */
+/* ----- Safe destructive actions (#215): reset + delete ----- */
 /* Compact header "Reset demo" button. */
 .reset-demo-btn { white-space: nowrap; }
 /* A quiet, neutral outlined delete control that only reveals destructive red
