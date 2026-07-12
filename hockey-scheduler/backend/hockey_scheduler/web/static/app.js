@@ -5823,9 +5823,12 @@ async function bootstrap() {
   } catch (_) {
     return showBootstrapOutage();  // network unreachable — an outage, not "signed out"
   }
-  // A 5xx / non-JSON proxy error on the identity-critical calls is an outage,
-  // not a normal signed-out state — surface it rather than clearing the session.
-  if (isServerError(rolesR) || isServerError(meR)) return showBootstrapOutage();
+  // A 5xx / non-JSON proxy error on ANY of the four bootstrap calls is an
+  // outage, not a normal state — surface it rather than letting it masquerade:
+  // a roles/me failure would look "signed out", an accounts failure would skip
+  // the demo auto-login into a bare sign-in screen, and a status failure would
+  // leave envStatus null so isDemo() fails OPEN (demo controls in production).
+  if ([rolesR, acctR, statusR, meR].some(isServerError)) return showBootstrapOutage();
 
   const rolesRes = await readApiResponse(rolesR);
   const acctRes = await readApiResponse(acctR);

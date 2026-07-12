@@ -94,19 +94,26 @@ async function checkPublicGetError(browser) {
   } finally { await context.close(); }
 }
 
-// (3) A bootstrap identity call that 502s shows an outage, not a bare sign-in.
+// (3) A 502 on ANY of the four bootstrap calls shows an outage, not a bare
+// sign-in / demo-looking state (accounts and status included, so an outage
+// never masquerades as signed-out or leaves isDemo() failing open).
 async function checkBootstrapError(browser) {
-  const { context, page, pageErrors } = await newPage(browser);
-  try {
-    await page.route("**/api/auth/roles", (r) => r.fulfill(BAD_GATEWAY));
-    await page.goto(BASE, { waitUntil: "domcontentloaded" });
-    await page.waitForFunction(() => {
-      const e = document.getElementById("login-error");
-      return e && !e.hidden && /unavailable/i.test(e.textContent || "");
-    }, null, { timeout: 10000 });
-    if (pageErrors.length) throw new Error(`uncaught page errors: ${pageErrors.join("; ")}`);
-    console.log("[bootstrap] OK — startup 502 shows an outage message, not a silent sign-out.");
-  } finally { await context.close(); }
+  for (const endpoint of ["/api/auth/roles", "/api/auth/accounts",
+                          "/api/status", "/api/auth/me"]) {
+    const { context, page, pageErrors } = await newPage(browser);
+    try {
+      await page.route(`**${endpoint}`, (r) => r.fulfill(BAD_GATEWAY));
+      await page.goto(BASE, { waitUntil: "domcontentloaded" });
+      await page.waitForFunction(() => {
+        const e = document.getElementById("login-error");
+        return e && !e.hidden && /unavailable/i.test(e.textContent || "");
+      }, null, { timeout: 10000 }).catch(() => {
+        throw new Error(`no outage message when ${endpoint} returned 502`);
+      });
+      if (pageErrors.length) throw new Error(`${endpoint}: uncaught page errors: ${pageErrors.join("; ")}`);
+    } finally { await context.close(); }
+  }
+  console.log("[bootstrap] OK — a 502 on roles/accounts/status/me each shows an outage.");
 }
 
 async function main() {
