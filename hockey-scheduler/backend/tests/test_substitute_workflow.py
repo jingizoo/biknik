@@ -1,3 +1,4 @@
+import threading
 import unittest
 
 from helpers import make_service, select_and_confirm
@@ -273,6 +274,82 @@ class SubstituteWorkflowTest(unittest.TestCase):
             service.accept_substitute(game_id, "player_skater_5")
         sub = store.substitute_for_player(game_id, "player_skater_5")
         self.assertEqual(sub.status, SubstituteStatus.EXPIRED)
+
+
+class SubstituteAcceptInterleavingTest(unittest.TestCase):
+    """accept_substitute must serialize its whole read→validate→write path.
+
+    Regression for #201: the check→write path runs inside one transaction, so a
+    concurrent request cannot change the game/offer between validation and the
+    write. Proven by pausing an acceptance mid-transaction and showing another
+    transactional request (lock_roster) cannot make progress until it commits.
+    """
+
+    def _offered(self, service, game_id):
+        select_and_confirm(
+            service, game_id,
+            ["player_goalie_1", "player_skater_1", "player_skater_2",
+             "player_skater_3", "player_skater_4"])
+        service.enroll_substitute(game_id, "player_skater_5")
+        service.set_availability(
+            game_id, "player_skater_1", AvailabilityStatus.UNAVAILABLE)
+        service.offer_substitute(game_id, "player_skater_5")
+
+    def test_concurrent_lock_cannot_interleave_with_acceptance(self):
+        service, store, game_id = make_service(target_skaters=4)
+        self._offered(service, game_id)
+
+        inside = threading.Event()   # acceptance has entered its transaction
+        release = threading.Event()  # let the paused acceptance finish
+        original_save = store.save_substitute
+
+        def paused_save(sub):
+            # Pause exactly once, mid-transaction, right as acceptance is about
+            # to persist the ACCEPTED status — the store transaction lock is
+            # held for the whole accept unit at this point.
+            if sub.status == SubstituteStatus.ACCEPTED and not inside.is_set():
+                inside.set()
+                self.assertTrue(release.wait(timeout=5))
+            return original_save(sub)
+        store.save_substitute = paused_save
+
+        errors = []
+
+        def do_accept():
+            try:
+                service.accept_substitute(game_id, "player_skater_5")
+            except Exception as exc:  # pragma: no cover - failure is asserted
+                errors.append(exc)
+
+        accepter = threading.Thread(target=do_accept)
+        accepter.start()
+        self.assertTrue(inside.wait(timeout=5), "acceptance never entered its txn")
+
+        # A concurrent transactional request must NOT be able to slip in while
+        # acceptance holds the transaction.
+        locked = threading.Event()
+
+        def do_lock():
+            service.lock_roster(game_id)
+            locked.set()
+        locker = threading.Thread(target=do_lock)
+        locker.start()
+        self.assertFalse(
+            locked.wait(timeout=0.4),
+            "lock_roster interleaved with an in-flight acceptance")
+
+        # Release acceptance; now the lock can proceed, strictly after commit.
+        release.set()
+        accepter.join(timeout=5)
+        self.assertTrue(locked.wait(timeout=5), "lock_roster never completed")
+        locker.join(timeout=5)
+
+        self.assertEqual(errors, [])
+        sub = store.substitute_for_player(game_id, "player_skater_5")
+        self.assertEqual(sub.status, SubstituteStatus.ACCEPTED)
+        entry = store.roster_entry_for_player(game_id, "player_skater_5")
+        self.assertIsNotNone(entry)
+        self.assertTrue(store.get_game(game_id).locked)
 
 
 if __name__ == "__main__":

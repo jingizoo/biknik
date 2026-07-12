@@ -477,27 +477,52 @@ class RosterService:
             audience_ref=player_id, game_id=game_id)
         return sub
 
-    @_transactional
     def accept_substitute(
         self, game_id: str, player_id: str, actor_id: Optional[str] = None
     ) -> GameRosterEntry:
-        game = self._require_game(game_id)
-        self._guard_mutable(game)
-        sub = self.store.substitute_for_player(game_id, player_id)
-        if sub is None or sub.status != SubstituteStatus.OFFERED:
-            raise InvalidTransitionError("No active offer to accept.")
-        # A game whose start has passed can't be joined — an offer with no
-        # expiry (offer_expires_at=None) would otherwise stay acceptable
-        # forever, letting a player onto a game that already happened (#112).
-        if game.start_time is not None and self.clock() > game.start_time:
-            raise InvalidTransitionError("This game is no longer upcoming.")
-        # Offers can expire: a lapsed offer returns the player to the pool.
-        if sub.offer_expires_at and self.clock() > sub.offer_expires_at:
-            sub.status = SubstituteStatus.EXPIRED
-            self.store.save_substitute(sub)
+        # The whole read → validate → decide → write path runs inside ONE
+        # transaction, so no concurrent request can cancel/lock the game or
+        # change the offer between the checks and the write — restoring the
+        # method-level atomicity the pre-#201 @_transactional gave.
+        #
+        # A lapsed offer is a durable EXPIRED transition that must persist even
+        # though acceptance fails. We therefore do NOT raise inside the
+        # transaction (that would roll the EXPIRED write back); the outcome is
+        # recorded and InvalidTransitionError is raised only after the
+        # transaction commits (#201).
+        expired = False
+        entry = None
+        with self.store.transaction():
+            game = self._require_game(game_id)
+            self._guard_mutable(game)
+            sub = self.store.substitute_for_player(game_id, player_id)
+            if sub is None or sub.status != SubstituteStatus.OFFERED:
+                raise InvalidTransitionError("No active offer to accept.")
+            # A game whose start has passed can't be joined — an offer with no
+            # expiry (offer_expires_at=None) would otherwise stay acceptable
+            # forever, letting a player onto a game that already happened (#112).
+            if game.start_time is not None and self.clock() > game.start_time:
+                raise InvalidTransitionError("This game is no longer upcoming.")
+            # Offers can expire: a lapsed offer returns the player to the pool.
+            if sub.offer_expires_at and self.clock() > sub.offer_expires_at:
+                sub.status = SubstituteStatus.EXPIRED
+                self.store.save_substitute(sub)
+                expired = True
+            else:
+                entry = self._accept_offered_substitute(
+                    game, sub, player_id, actor_id)
+        if expired:
             raise InvalidTransitionError("This substitute offer has expired.")
+        return entry
+
+    def _accept_offered_substitute(
+        self, game, sub, player_id: str, actor_id: Optional[str]
+    ) -> GameRosterEntry:
+        # Runs inside accept_substitute's transaction (the game/sub were fetched
+        # and validated within that same unit, so no interleaving is possible).
         # First-accepted-wins: the slot must still be open.
-        self._require_open_slot(game_id, sub.slot_type, self._player_team(sub.player_id))
+        self._require_open_slot(game.id, sub.slot_type, self._player_team(sub.player_id))
+        game_id = game.id
         sub.status = SubstituteStatus.ACCEPTED
         sub.accepted_at = self.clock()
         self.store.save_substitute(sub)
