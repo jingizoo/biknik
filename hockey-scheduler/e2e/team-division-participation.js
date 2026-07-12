@@ -83,8 +83,10 @@ async function checkViewport(browser, viewport) {
       const venue = await post("/api/setup/venue", { name: "V", league_id: league.id });
       const rink = await post("/api/setup/rink", { venue_id: venue.id, name: "R" });
       const club = await post("/api/setup/club", { name: "Club" });
+      // #180: create the permanent Team under its LEAGUE (no division); its
+      // season/division placement is set separately via registration below.
       const team = async (n) =>
-        (await post("/api/setup/team", { club_id: club.id, division_id: d1.id, name: n })).id;
+        (await post("/api/setup/team", { club_id: club.id, league_id: league.id, name: n })).id;
       const perma = await team("Perma");   // the one permanent team we track
       const mateA = await team("Mate A");
       const mateB = await team("Mate B");

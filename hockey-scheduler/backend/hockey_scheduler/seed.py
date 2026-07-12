@@ -17,7 +17,7 @@ def build_seeded_store() -> Tuple[InMemoryStore, str]:
     """
     store = InMemoryStore()
 
-    team = Team(id="team_lions", name="U16 Lions", division="U16")
+    team = Team(id="team_lions", name="U16 Lions")
     store.add_team(team)
 
     start = datetime(2026, 7, 4, 18, 30, tzinfo=timezone.utc)

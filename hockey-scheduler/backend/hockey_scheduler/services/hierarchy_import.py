@@ -827,9 +827,10 @@ def commit_hierarchy_import(setup, sheets: Dict[str, List[dict]],
             obj = teams.get(code)
             if obj is None:
                 # A genuinely NEW permanent team carries no club and no division
-                # (#180) — participation lives in a registration.
+                # (#180) — participation lives in a registration, and the legacy
+                # Team.division_id/division are left at their (unset) defaults.
                 obj = Team(id=store.next_id("team"), external_ref=code,
-                           club_id=None, division_id=None, division="", **values)
+                           club_id=None, **values)
                 store.add_team(obj)
                 teams[code] = obj
                 counts["permanent_teams"]["created"] += 1

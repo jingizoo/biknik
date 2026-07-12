@@ -55,6 +55,7 @@ from ..services import (
     parse_csv_text,
     validate_import,
 )
+from ..services.league_scope import team_registration_valid
 from ..services.notifier import push as _push_notification
 from ..store import InMemoryStore
 
@@ -2093,6 +2094,25 @@ class ApiService:
     # Full E2E demo overview (League / Arena / Schedule / Public)
     # ====================================================================
     @catch
+    def _registration_is_operational(self, r) -> bool:
+        """True only for a registration safe to act on (#180 review).
+
+        Reuses the shared scheduling guard (season has a league, Team exists and
+        its permanent league matches the season) and additionally requires any
+        named division to actually belong to the registration's season — so a
+        wrong-season / cross-league / missing-Team / missing-League row is never
+        exposed to the operational UI.
+        """
+        season = self.store.get_season(r.season_id)
+        if team_registration_valid(
+                self.store, season, r.team_id, r.division_id) is None:
+            return False
+        if r.division_id is not None:
+            division = self.store.get_division(r.division_id)
+            if division is None or division.season_id != r.season_id:
+                return False
+        return True
+
     def get_demo_overview(self) -> dict:
         """Assemble the League/Arena/Schedule/Public view for the E2E demo.
 
@@ -2267,11 +2287,15 @@ class ApiService:
             # Active season/division participation (#180): the source of truth
             # for which Team plays which Division in which Season. Operational UI
             # (e.g. the scheduling wizard) filters teams through these, never the
-            # legacy Team.division_id.
+            # legacy Team.division_id. Only OPERATIONALLY-VALID rows are exposed
+            # (review): a corrupt/retained row — wrong season, cross-league or
+            # missing Team/League, or a division that isn't in the row's season —
+            # is filtered out here so it can never be offered in the picker.
             "registrations": [
                 {"team_id": r.team_id, "season_id": r.season_id,
                  "division_id": r.division_id}
-                for r in self.store.all_season_team_registrations() if r.active
+                for r in self.store.all_season_team_registrations()
+                if r.active and self._registration_is_operational(r)
             ],
             "setup_audit": setup_audit,
             "setup_audit_count": len(setup_audit),
@@ -2314,7 +2338,16 @@ class ApiService:
         seasons_by_league = _group(seasons, "league_id")
         levels_by_season = _group(levels, "season_id")
         divs_by_season = _group(divisions, "season_id")
-        teams_by_div = _group(teams, "division_id")
+        # Teams nest under a Division via their active SeasonTeamRegistration
+        # (#180), never the legacy Team.division_id — so a permanent team with a
+        # null legacy division still shows under the division it's registered in.
+        teams_by_id = {t.id: t for t in teams}
+        teams_by_div = {}
+        for _reg in self.store.all_season_team_registrations():
+            if _reg.active and _reg.division_id:
+                _tm = teams_by_id.get(_reg.team_id)
+                if _tm is not None:
+                    teams_by_div.setdefault(_reg.division_id, []).append(_tm)
 
         def rink_node(r):
             return {"id": r.id, "name": r.name,

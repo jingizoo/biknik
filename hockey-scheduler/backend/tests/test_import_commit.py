@@ -112,6 +112,57 @@ class ImportCommitServiceContract:
         self.assertEqual(len(self.store.all_teams()), teams_after_first)
         self.assertEqual(len(self.store.all_players()), players_after_first)
 
+    # -- #180: import converges Team league_id + season registration --------
+    def test_import_sets_team_league_and_active_registration(self):
+        res = self.api.commit_teams_players_import(
+            self.season.id, _valid_sheets_csv(), actor_id="admin")
+        self.assertTrue(res["committed"])
+        season = self.store.get_season(self.season.id)
+        t1 = self._team("T1")
+        # Permanent league is the imported season's league; NO legacy division.
+        self.assertEqual(t1.league_id, season.league_id)
+        self.assertIsNone(t1.division_id)
+        # An active registration ties T1 to the season + its imported division,
+        # so the imported team is immediately schedulable (not teams_without_league).
+        reg = self.store.registration_for_team_in_season(self.season.id, t1.id)
+        self.assertIsNotNone(reg)
+        self.assertTrue(reg.active)
+        u16 = next(d for d in self.store.all_divisions()
+                   if d.name == "U16" and d.season_id == self.season.id)
+        self.assertEqual(reg.division_id, u16.id)
+
+    def test_import_registration_is_idempotent(self):
+        self.api.commit_teams_players_import(
+            self.season.id, _valid_sheets_csv(), actor_id="admin")
+        t1 = self._team("T1")
+        before = [r for r in self.store.all_season_team_registrations()
+                  if r.team_id == t1.id]
+        self.api.commit_teams_players_import(
+            self.season.id, _valid_sheets_csv(), actor_id="admin")
+        after = [r for r in self.store.all_season_team_registrations()
+                 if r.team_id == t1.id]
+        self.assertEqual(len(before), 1)
+        self.assertEqual(len(after), 1)  # updated in place, never duplicated
+
+    def test_import_into_second_season_leaves_first_registration_untouched(self):
+        self.api.commit_teams_players_import(
+            self.season.id, _valid_sheets_csv(), actor_id="admin")
+        t1 = self._team("T1")
+        first = self.store.registration_for_team_in_season(self.season.id, t1.id)
+        first_div = first.division_id
+        league_id = self.store.get_season(self.season.id).league_id
+        season2 = self.setup.create_season(league_id, "2027", actor_id="admin")
+        self.api.commit_teams_players_import(
+            season2.id, _valid_sheets_csv(), actor_id="admin")
+        # Season 1's registration is unchanged…
+        again = self.store.registration_for_team_in_season(self.season.id, t1.id)
+        self.assertEqual(again.division_id, first_div)
+        self.assertTrue(again.active)
+        # …and a distinct registration now exists for season 2.
+        second = self.store.registration_for_team_in_season(season2.id, t1.id)
+        self.assertIsNotNone(second)
+        self.assertNotEqual(second.id, first.id)
+
     # -- 2b. repeat import with a changed name updates in place -------------
     def test_repeat_commit_with_changed_name_updates_existing_record(self):
         self.api.commit_teams_players_import(

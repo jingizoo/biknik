@@ -197,9 +197,13 @@ class SeasonRegistrationPersistenceTest(unittest.TestCase):
         team = api.create_team(club["id"], division["id"], "Lions", actor_id=ADMIN)
         store = api.store
         cur = store.conn.cursor()
-        # Simulate the legacy shape: drop the #180 additions and their ledger
-        # entry, then reopen so migration 021 re-runs its backfill over the
-        # existing team/division/season rows.
+        # Simulate the legacy shape: a pre-#180 team carried a Team.division_id
+        # (create_team no longer writes one). Set it directly so migration 021
+        # has the legacy link to backfill league_id + a registration from.
+        cur.execute("UPDATE teams SET division_id = ? WHERE id = ?",
+                    (division["id"], team["id"]))
+        # Then drop the #180 additions and their ledger entry, and reopen so
+        # migration 021 re-runs its backfill over the legacy team/division rows.
         cur.execute("DROP INDEX IF EXISTS ix_teams_league")
         cur.execute("ALTER TABLE teams DROP COLUMN league_id")
         cur.execute("DROP TABLE IF EXISTS season_team_registrations")

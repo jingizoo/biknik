@@ -23,54 +23,84 @@ from hockey_scheduler.store import InMemoryStore, SqlStore
 
 _PKG = Path(__file__).resolve().parents[1] / "hockey_scheduler"
 
-# Modules that implement current behavior (scheduling, standings, scoping,
-# imports, deletion, the API facade). None of these may READ a Team's legacy
-# division_id. The legacy teams-players import may still WRITE it (deferred to
-# #205); writes are in Store context and are not flagged by the read guard.
-_OPERATIONAL_MODULES = [
-    "api/service.py",
-    "services/setup_service.py",
-    "services/league_scope.py",
-    "services/scheduler.py",
-    "services/league_scoped_scheduler.py",
-    "services/league_scoped_setup_service.py",
-    "services/calendar.py",
-    "services/hierarchy_import.py",
-    "services/roster_service.py",
-]
-_TEAM_NAMES = {"team", "t", "home", "away", "home_team", "away_team", "tm"}
+# The ONLY files allowed to touch a Team's legacy division_id/division fields —
+# the compat model + the persistence layer that maps the retained column and the
+# (SQL) migration. Every other module must be free of any Team.division_id read
+# OR write (#180 review). Migrations themselves are .sql and are never scanned.
+_COMPAT_ALLOWLIST = {
+    "domain/models.py",        # the field declaration itself
+    "store/memory_store.py",   # in-memory persistence of the retained column
+    "store/sql_store.py",      # SQL persistence of the retained column
+}
+# Names that denote a Team object at an access site.
+_TEAM_NAMES = {"team", "t", "home", "away", "home_team", "away_team", "tm",
+               "hometeam", "awayteam", "existing_team", "new_team"}
+_TEAM_GETTERS = {"get_team", "get_home_team", "get_away_team"}
+_LEGACY_ATTRS = {"division_id", "division"}
 
 
-class NoOperationalReadGuardTest(unittest.TestCase):
-    def _team_division_reads(self, path):
-        """Load-context `.division_id` accesses whose base is a Team."""
+class NoTeamDivisionIdUsageGuardTest(unittest.TestCase):
+    """Whole-package guard: no non-compat module reads OR writes a Team's legacy
+    division_id/division. Covers attribute reads/writes on team-named variables
+    and on get_team(...) chains, and Team(...) constructions carrying the legacy
+    fields — so the "no operational usage" claim is proven structurally, not by
+    a narrow name allowlist."""
+
+    def _team_legacy_usages(self, path):
         tree = ast.parse(path.read_text())
         hits = []
         for node in ast.walk(tree):
-            if (isinstance(node, ast.Attribute) and node.attr == "division_id"
-                    and isinstance(node.ctx, ast.Load)):
+            # Attribute access (READ or WRITE) of a legacy field on a Team.
+            if isinstance(node, ast.Attribute) and node.attr in _LEGACY_ATTRS:
                 base = node.value
                 is_team_name = (isinstance(base, ast.Name)
                                 and base.id in _TEAM_NAMES)
-                is_get_team = (isinstance(base, ast.Call)
-                               and isinstance(base.func, ast.Attribute)
-                               and base.func.attr == "get_team")
-                if is_team_name or is_get_team:
-                    hits.append(node.lineno)
+                is_getter = (isinstance(base, ast.Call)
+                             and isinstance(base.func, ast.Attribute)
+                             and base.func.attr in _TEAM_GETTERS)
+                if is_team_name or is_getter:
+                    hits.append((node.lineno, node.attr))
+            # Team(...) construction carrying a legacy field.
+            if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                    and node.func.id == "Team"):
+                for kw in node.keywords:
+                    if kw.arg in _LEGACY_ATTRS:
+                        hits.append((node.lineno, f"Team(..{kw.arg}=..)"))
+            # String-keyed access aliases the attribute past the check above:
+            #   _group(teams, "division_id")  /  getattr(team, "division_id")
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+                fn = node.func.id
+                args = node.args
+                if (fn in {"_group", "group_by", "groupBy"} and len(args) >= 2
+                        and isinstance(args[0], ast.Name)
+                        and args[0].id in {"teams", "all_teams"}
+                        and isinstance(args[1], ast.Constant)
+                        and args[1].value in _LEGACY_ATTRS):
+                    hits.append((node.lineno, f"_group(teams, {args[1].value!r})"))
+                if fn == "getattr" and len(args) >= 2:
+                    base = args[0]
+                    base_is_team = (
+                        (isinstance(base, ast.Name) and base.id in _TEAM_NAMES)
+                        or (isinstance(base, ast.Call)
+                            and isinstance(base.func, ast.Attribute)
+                            and base.func.attr in _TEAM_GETTERS))
+                    if (base_is_team and isinstance(args[1], ast.Constant)
+                            and args[1].value in _LEGACY_ATTRS):
+                        hits.append((node.lineno, f"getattr(team, {args[1].value!r})"))
         return hits
 
-    def test_no_operational_service_reads_team_division_id(self):
+    def test_no_module_outside_compat_uses_team_division_id(self):
         offenders = {}
-        for rel in _OPERATIONAL_MODULES:
-            path = _PKG / rel
-            if not path.exists():
+        for path in _PKG.rglob("*.py"):
+            rel = path.relative_to(_PKG).as_posix()
+            if rel in _COMPAT_ALLOWLIST:
                 continue
-            lines = self._team_division_reads(path)
-            if lines:
-                offenders[rel] = lines
+            usages = self._team_legacy_usages(path)
+            if usages:
+                offenders[rel] = usages
         self.assertEqual(
             offenders, {},
-            f"operational code still reads Team.division_id: {offenders}")
+            f"non-compat code still uses Team.division_id/division: {offenders}")
 
 
 class LegacyFieldIsInertContract:
@@ -189,6 +219,43 @@ class LegacyFieldIsInertContract:
         bad = self.api.create_game(season, dA, orphan.id, other, self._slot(),
                                    actor_id=self.ACTOR)
         self.assertIn("error", bad)
+
+    def test_overview_exposes_only_operationally_valid_registrations(self):
+        # The scheduling wizard reads overview["registrations"]; a corrupt or
+        # retained row must never appear there (#180 review) so it can't be
+        # offered in the picker or reach a create request.
+        season = self._season("S")
+        dA = self._division(season, "A")
+        good = self._team("Good")
+        self._register(season, good, dA)
+
+        def bad_reg(team_id, division_id):
+            self.store.add_season_team_registration(SeasonTeamRegistration(
+                id=self.store.next_id("streg"), season_id=season,
+                team_id=team_id, division_id=division_id, active=True))
+
+        # cross-league team
+        other = self.api.create_league("Other", actor_id=self.ACTOR)["id"]
+        cross = Team(id=self.store.next_id("team"), name="Cross", league_id=other)
+        self.store.add_team(cross)
+        bad_reg(cross.id, dA)
+        # missing team
+        bad_reg("team_missing", dA)
+        # league-less team
+        orphan = Team(id=self.store.next_id("team"), name="Orphan", league_id=None)
+        self.store.add_team(orphan)
+        bad_reg(orphan.id, dA)
+        # wrong-season: the division belongs to a different season than the row
+        s2 = self._season("S2")
+        d2 = self._division(s2, "D2")
+        wrong = self._team("Wrong")
+        bad_reg(wrong, d2)
+
+        exposed = {r["team_id"]
+                   for r in self.api.get_demo_overview()["registrations"]}
+        self.assertIn(good, exposed)
+        for hidden in (cross.id, "team_missing", orphan.id, wrong):
+            self.assertNotIn(hidden, exposed)
 
     def test_delete_division_ignores_stale_legacy_team_pointer(self):
         # A division with no registrations/games deletes cleanly even if a team's

@@ -22,6 +22,9 @@ class SetupHierarchyTest(unittest.TestCase):
         div = self.api.create_division(season["id"], "Div A", level_id=level["id"])
         club = self.api.create_club("Club X")
         team = self.api.create_team(club["id"], div["id"], "Team1")
+        # #180: a team nests under a division via its registration, not the
+        # legacy Team.division_id.
+        self.api.register_team_for_season(season["id"], team["id"], div["id"])
         return league, season, level, div, club, team
 
     def test_empty_hierarchy_has_all_sections(self):

@@ -261,20 +261,21 @@ class SetupService:
 
         A team belongs permanently to a *league*, not a division — its
         season-specific division participation lives in SeasonTeamRegistration.
-        Two ways to say which league:
+        The legacy ``Team.division_id`` is NEVER written here (#180): the created
+        team carries only its permanent ``league_id``. Two ways to say which
+        league:
 
         - Pass ``league_id`` directly (the #180-correct path: create the team
-          under the league, register it into a season/division separately).
-        - Pass a ``division_id`` (legacy/back-compat, still used by the CSV
-          import and older callers): the league is derived from the division's
-          season, and division_id is retained on the Team for now.
+          under the league, then register it into a season/division separately).
+        - Pass a ``division_id`` (back-compat convenience for seeds/import): the
+          league is *derived* from the division's season — a read only; the
+          division is not stored on the Team.
 
         Exactly one is required. When both are given, the division's league
         wins (and must not contradict a supplied league_id).
         """
         if self.store.get_club(club_id) is None:
             raise NotFoundError(f"Club {club_id} not found.")
-        division = None
         if division_id:
             division = self.store.get_division(division_id)
             if division is None:
@@ -292,12 +293,10 @@ class SetupService:
         if self.store.get_league(league_id) is None:
             raise NotFoundError(f"League {league_id} not found.")
         team = Team(id=self.store.next_id("team"), name=self._require_name(name),
-                    division=division.name if division else "", club_id=club_id,
-                    division_id=division_id or None, league_id=league_id)
+                    club_id=club_id, league_id=league_id)
         self.store.add_team(team)
         self._audit("team_created", "team", team.id, actor_id,
-                    {"club_id": club_id, "division_id": division_id or None,
-                     "league_id": league_id})
+                    {"club_id": club_id, "league_id": league_id})
         return team
 
     # -- permanent teams + season registrations (#180) ---------------------
@@ -1338,8 +1337,12 @@ class SetupService:
         duplicates the small amount of create-logic it needs via raw store
         calls + its own ``self._audit(...)`` calls.
         """
-        if self.store.get_season(season_id) is None:
+        _season = self.store.get_season(season_id)
+        if _season is None:
             raise NotFoundError(f"Season {season_id} not found.")
+        # The permanent league every imported team belongs to (#180): the league
+        # of the season being imported into.
+        season_league_id = _season.league_id
 
         result = validate_import(sheets)
         if not result["ok"]:
@@ -1411,30 +1414,58 @@ class SetupService:
                         counts["divisions_created"] += 1
 
                 division_id = division.id if division else None
-                division_name_str = division.name if division else ""
 
+                # #180: a team's participation is converged onto the permanent
+                # league_id + a SeasonTeamRegistration, never the legacy
+                # Team.division_id. The team is a permanent member of THIS
+                # import's season league; the imported division lives on the
+                # registration for (season_id, team), not on the Team.
                 team = next((t for t in self.store.all_teams()
                             if t.external_ref == team_code), None)
                 if team is not None:
                     team.name = team_name
                     team.club_id = club_id
-                    team.division_id = division_id
-                    team.division = division_name_str
+                    if season_league_id:
+                        team.league_id = season_league_id
                     self.store.save_team(team)
                     self._audit("team_updated", "team", team.id, actor_id,
-                                {"club_id": club_id, "division_id": division_id,
+                                {"club_id": club_id, "league_id": team.league_id,
                                  "import_batch_id": batch_id})
                     counts["teams_updated"] += 1
                 else:
                     team = Team(id=self.store.next_id("team"), name=team_name,
-                               division=division_name_str, club_id=club_id,
-                               division_id=division_id, external_ref=team_code)
+                               club_id=club_id, league_id=season_league_id,
+                               external_ref=team_code)
                     self.store.add_team(team)
                     self._audit("team_created", "team", team.id, actor_id,
-                                {"club_id": club_id, "division_id": division_id,
+                                {"club_id": club_id, "league_id": season_league_id,
                                  "import_batch_id": batch_id})
                     counts["teams_created"] += 1
                 team_code_to_id[team_code] = team.id
+
+                # Idempotently upsert THIS season's registration with the
+                # imported division; never touch another season's row.
+                reg = self.store.registration_for_team_in_season(season_id, team.id)
+                if reg is not None:
+                    if not reg.active or reg.division_id != division_id:
+                        reg.active = True
+                        reg.division_id = division_id
+                        self.store.save_season_team_registration(reg)
+                        self._audit("season_team_registration_updated",
+                                    "season_team_registration", reg.id, actor_id,
+                                    {"season_id": season_id, "team_id": team.id,
+                                     "division_id": division_id,
+                                     "import_batch_id": batch_id})
+                else:
+                    reg = SeasonTeamRegistration(
+                        id=self.store.next_id("streg"), season_id=season_id,
+                        team_id=team.id, division_id=division_id, active=True)
+                    self.store.add_season_team_registration(reg)
+                    self._audit("season_team_registered",
+                                "season_team_registration", reg.id, actor_id,
+                                {"season_id": season_id, "team_id": team.id,
+                                 "division_id": division_id,
+                                 "import_batch_id": batch_id})
 
             for row in player_rows:
                 player_code = _clean(row.get("player_code"))
