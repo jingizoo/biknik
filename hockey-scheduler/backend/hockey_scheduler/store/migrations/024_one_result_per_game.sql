@@ -1,0 +1,31 @@
+-- At most one result row per game (#201 Slice 3C).
+--
+-- The service layer already keeps a single result per game — record_result
+-- reads result_for_game() and updates that row in place, only inserting when
+-- none exists (setup_service.record_result) — but that check-then-write is not
+-- safe under a cross-process race: two concurrent first-time recordings can both
+-- see no row and both insert. A UNIQUE index makes the invariant hold in the
+-- database, so the losing writer gets a translated conflict instead of a
+-- duplicate result. Draft vs FINAL is a status on the single row, not a second
+-- row, so no partial-status predicate is needed.
+--
+-- Uniqueness applies only to CONCRETE game_id values. game_id is nullable, and
+-- both SQLite and PostgreSQL treat NULLs as distinct in a unique index, so a
+-- plain index would silently allow duplicate NULL-bearing rows. The partial
+-- predicate makes uniqueness apply only to real games — and is identical to the
+-- pre-migration check, so the validation describes exactly what the index
+-- enforces. Null/invalid references are out of scope here — they belong to the
+-- later not-null / foreign-key relationship work (#201).
+--
+-- Keep the existing non-partial ix_game_results_game on (game_id): it still
+-- serves the per-game result read (SqlStore.result_for_game, WHERE game_id = ?)
+-- on both engines, including any NULL-game_id rows the PARTIAL unique index
+-- excludes. Once the later NOT NULL migration removes nullable references,
+-- ix_game_results_game becomes genuinely redundant and can be dropped then.
+--
+-- A forward-only pre-migration check (store.integrity_checks) reports any
+-- pre-existing game with duplicate result rows before this index is created, so
+-- an upgrade fails loudly rather than with an opaque index error.
+CREATE UNIQUE INDEX IF NOT EXISTS ux_game_result_game
+  ON game_results (game_id)
+  WHERE game_id IS NOT NULL;
