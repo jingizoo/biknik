@@ -71,6 +71,24 @@ class MemoryStoreTransactionTest(unittest.TestCase):
                 raise RuntimeError("abort")
         self.assertFalse(store.get_game(game.id).published)
 
+    def test_rollback_undoes_wholesale_dict_field_replacement(self):
+        # The snapshot invariant is that nested dict fields (audit detail,
+        # account scope) are replaced wholesale, not mutated in place. Prove the
+        # supported pattern rolls back: reassigning such a field to a new dict is
+        # undone on rollback.
+        from hockey_scheduler.domain import UserAccount
+        store = InMemoryStore()
+        acct = UserAccount(id=store.next_id("user"), username="u",
+                           password_hash="h", role="viewer",
+                           created_at=datetime(2026, 1, 1, tzinfo=UTC),
+                           scope={"team_id": "t1"})
+        store.user_accounts[acct.id] = acct
+        with self.assertRaises(RuntimeError):
+            with store.transaction():
+                store.user_accounts[acct.id].scope = {"team_id": "t2"}  # wholesale
+                raise RuntimeError("abort")
+        self.assertEqual(store.user_accounts[acct.id].scope, {"team_id": "t1"})
+
     def test_rollback_restores_id_counter(self):
         # Ids consumed inside a rolled-back transaction are handed back, so the
         # next successful write reuses them (parity with the SQL counters table,

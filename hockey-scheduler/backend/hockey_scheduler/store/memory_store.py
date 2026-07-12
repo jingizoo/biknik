@@ -102,15 +102,22 @@ class InMemoryStore:
     # and the depth counter drives the rollback machinery itself).
     _NON_SNAPSHOT = frozenset({"_lock", "_txn_depth"})
 
+    # Snapshot invariant: a stored dataclass's nested mutable fields (the only
+    # ones today are AuditLog.detail, SetupAuditLog.detail and
+    # UserAccount.scope) are always replaced WHOLESALE, never mutated in place.
+    # The snapshot shallow-copies each element (see _snapshot_value), so a field
+    # REASSIGNMENT rolls back but an in-place edit of a shared nested dict would
+    # not. If a future change edits such a dict in place, switch that field to a
+    # deep copy here (and extend the rollback tests).
+
     @staticmethod
     def _snapshot_value(value):
         # Copy a state attribute for the pre-image. Collections are rebuilt with
         # a shallow copy of every element: services mutate a stored dataclass by
         # reassigning its fields (`game.published = True`), and copy.copy gives
         # the pre-image its own instance so that reassignment can't reach it.
-        # A shallow element copy (not deepcopy) keeps this cheap — the store's
-        # dataclasses hold scalars, and their few dict fields (audit detail,
-        # account scope) are replaced wholesale, never mutated in place.
+        # A shallow element copy (not deepcopy) keeps this cheap — see the
+        # snapshot invariant above for the nested-dict constraint this relies on.
         # itertools.count copies cleanly and preserves position, so id counters
         # roll back with the rest.
         if isinstance(value, dict):
