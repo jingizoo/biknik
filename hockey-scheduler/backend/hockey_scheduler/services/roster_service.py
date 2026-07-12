@@ -156,7 +156,8 @@ class RosterService:
                     entries.append(existing)
                     continue
                 # Revive a removed/unavailable row instead of inserting a
-                # duplicate (there is no unique (game_id, player_id) constraint).
+                # duplicate — one row per (game_id, player_id), now also enforced
+                # by a unique index (#201 Slice 3B, migration 023).
                 existing.roster_role = RosterRole.SELECTED
                 existing.selection_source = SelectionSource.COACH_SELECTED
                 existing.status = RosterEntryStatus.SELECTED

@@ -40,10 +40,17 @@ def assert_no_duplicate_active_ice_slots(conn):
 
 
 def find_duplicate_roster_players(conn):
-    """(game_id, player_id) pairs that already have more than one roster row."""
+    """Concrete (game_id, player_id) pairs with more than one roster row.
+
+    Only non-null pairs are considered — matching the partial unique index
+    (migration 023), which excludes NULL-bearing rows because both SQLite and
+    PostgreSQL treat NULLs as distinct. Filtering here keeps the check aligned
+    with what the index enforces and avoids ordering mixed None/str tuples.
+    """
     cur = conn.cursor()
     cur.execute(
         "SELECT game_id, player_id FROM game_roster_entries "
+        "WHERE game_id IS NOT NULL AND player_id IS NOT NULL "
         "GROUP BY game_id, player_id HAVING COUNT(*) > 1")
     return sorted((row["game_id"], row["player_id"]) for row in cur.fetchall())
 

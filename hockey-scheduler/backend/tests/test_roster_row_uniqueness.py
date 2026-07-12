@@ -69,34 +69,70 @@ def _downgrade_023(store):
 
 
 class PreMigrationValidationTest(unittest.TestCase):
-    def test_duplicate_roster_rows_are_detected_and_named(self):
-        store = SqlStore(":memory:")
-        try:
-            _downgrade_023(store)
-            with store.transaction():
-                store.add_roster_entry(_entry("e1", "g1", "p1"))
-                store.add_roster_entry(_entry("e2", "g1", "p1"))  # dup, now allowed
-                store.add_roster_entry(_entry("e3", "g1", "p2"))
-            self.assertEqual(find_duplicate_roster_players(store.conn),
-                             [("g1", "p1")])
-            with self.assertRaises(MigrationDataError) as ctx:
-                assert_no_duplicate_roster_players(store.conn)
-            self.assertIn("g1/p1", str(ctx.exception))
-        finally:
-            store.close()
+    """The pre-enable check matches the partial index exactly, on each backend.
 
-    def test_migrate_aborts_when_existing_data_would_violate(self):
-        store = SqlStore(":memory:")
-        try:
-            _downgrade_023(store)
-            with store.transaction():
-                store.add_roster_entry(_entry("e1", "g1", "p1"))
-                store.add_roster_entry(_entry("e2", "g1", "p1"))
-            with self.assertRaises(MigrationDataError) as ctx:
-                migrate(store.conn, store.dialect)
-            self.assertIn("g1/p1", str(ctx.exception))
-        finally:
-            store.close()
+    Parametrized over SQLite + PostgreSQL (in CI) so the NULL semantics — which
+    differ from a naive GROUP BY — are proven on both, not just SQLite.
+    """
+
+    def _pre023(self, url):
+        store = _fresh(url)
+        _downgrade_023(store)
+        return store
+
+    def test_concrete_duplicates_detected_and_migrate_aborts(self):
+        for label, url in _sql_backends():
+            store = self._pre023(url)
+            try:
+                with store.transaction():
+                    store.add_roster_entry(_entry("e1", "g1", "p1"))
+                    store.add_roster_entry(_entry("e2", "g1", "p1"))  # dup
+                    store.add_roster_entry(_entry("e3", "g1", "p2"))
+                self.assertEqual(find_duplicate_roster_players(store.conn),
+                                 [("g1", "p1")], label)
+                with self.assertRaises(MigrationDataError, msg=label) as ctx:
+                    assert_no_duplicate_roster_players(store.conn)
+                self.assertIn("g1/p1", str(ctx.exception))
+                with self.assertRaises(MigrationDataError, msg=label):
+                    migrate(store.conn, store.dialect)  # aborts on dirty data
+            finally:
+                store.close()
+
+    def test_null_bearing_duplicates_are_not_flagged_and_do_not_crash(self):
+        # game_id/player_id are nullable and NULLs are distinct in the partial
+        # index, so repeated NULL-bearing rows are NOT duplicates. The check must
+        # agree (no false positive) and must not raise ordering the tuples.
+        for label, url in _sql_backends():
+            store = self._pre023(url)
+            try:
+                with store.transaction():
+                    store.add_roster_entry(_entry("e1", None, "p1"))
+                    store.add_roster_entry(_entry("e2", None, "p1"))
+                    store.add_roster_entry(_entry("e3", "g1", None))
+                    store.add_roster_entry(_entry("e4", "g1", None))
+                self.assertEqual(find_duplicate_roster_players(store.conn), [], label)
+                assert_no_duplicate_roster_players(store.conn)  # must not raise
+                migrate(store.conn, store.dialect)  # succeeds; index is created
+                self.assertIn(_VERSION, store.migration_status()["applied"], label)
+            finally:
+                store.close()
+
+    def test_mixed_null_and_concrete_group_reports_only_the_concrete_pair(self):
+        # A dirty mix — (NULL,'p1') alongside two ('g1','p1') — must report only
+        # the concrete duplicate and never raise a TypeError ordering None vs str.
+        for label, url in _sql_backends():
+            store = self._pre023(url)
+            try:
+                with store.transaction():
+                    store.add_roster_entry(_entry("e1", None, "p1"))
+                    store.add_roster_entry(_entry("e2", "g1", "p1"))
+                    store.add_roster_entry(_entry("e3", "g1", "p1"))
+                self.assertEqual(find_duplicate_roster_players(store.conn),
+                                 [("g1", "p1")], label)
+                with self.assertRaises(MigrationDataError, msg=label):
+                    assert_no_duplicate_roster_players(store.conn)
+            finally:
+                store.close()
 
 
 class ConstraintEnforcementTest(unittest.TestCase):
@@ -135,6 +171,23 @@ class ConstraintEnforcementTest(unittest.TestCase):
                     store.save_roster_entry(entry)
                 rows = [e for e in store.roster_for_game("g1") if e.player_id == "p1"]
                 self.assertEqual(len(rows), 1, label)  # still exactly one row
+            finally:
+                store.close()
+
+    def test_null_bearing_rows_are_allowed_by_the_partial_index(self):
+        # The index only constrains concrete (game_id, player_id) pairs, so
+        # NULL-bearing rows never conflict (matching the pre-migration check).
+        for label, url in _sql_backends():
+            store = _fresh(url)
+            try:
+                with store.transaction():  # none of these raise a conflict
+                    store.add_roster_entry(_entry("e1", None, "p1"))
+                    store.add_roster_entry(_entry("e2", None, "p1"))
+                    store.add_roster_entry(_entry("e3", "g1", None))
+                    store.add_roster_entry(_entry("e4", "g1", None))
+                cur = store.conn.cursor()
+                cur.execute("SELECT COUNT(*) AS n FROM game_roster_entries")
+                self.assertEqual(cur.fetchone()["n"], 4, label)
             finally:
                 store.close()
 
