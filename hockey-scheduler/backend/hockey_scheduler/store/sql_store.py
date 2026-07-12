@@ -73,6 +73,7 @@ from ..domain import (
 from ..domain.enums import NotificationType
 from .db import connect
 from .db_errors import translate_db_exception
+from .integrity_checks import assert_no_duplicate_active_ice_slots
 
 
 # ---- column converters -------------------------------------------------
@@ -254,6 +255,15 @@ def _load_migrations():
     return out
 
 
+# Data validations that must pass BEFORE a given migration's statements run
+# (#201): a constraint migration first reports any existing rows that would
+# violate it, so an upgrade fails with the offending records named rather than
+# an opaque driver error. Keyed by migration version (filename stem).
+_PRE_MIGRATION_CHECKS = {
+    "022_one_active_game_per_slot": assert_no_duplicate_active_ice_slots,
+}
+
+
 def migrate(conn, dialect) -> None:
     """Apply every pending migration in order, forward only.
 
@@ -261,6 +271,10 @@ def migrate(conn, dialect) -> None:
     skipped, and a version is recorded only after all of its statements succeed
     (so a partially-applied file simply re-runs next boot — safe, since the DDL
     is idempotent). Nothing here drops or mutates existing data.
+
+    A version with a registered pre-migration check (``_PRE_MIGRATION_CHECKS``)
+    runs that check first; it raises (aborting the upgrade) if existing data
+    would violate the constraint the migration adds.
     """
     cur = conn.cursor()
     cur.execute("CREATE TABLE IF NOT EXISTS schema_migrations "
@@ -271,6 +285,9 @@ def migrate(conn, dialect) -> None:
     for version, statements in _load_migrations():
         if version in applied:
             continue
+        check = _PRE_MIGRATION_CHECKS.get(version)
+        if check is not None:
+            check(conn)
         for stmt in statements:
             cur.execute(stmt)
         cur.execute(dialect.sql(
