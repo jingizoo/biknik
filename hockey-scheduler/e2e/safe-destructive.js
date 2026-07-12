@@ -105,10 +105,17 @@ async function checkViewport(browser, viewport) {
     await page.click('.tab[data-tab="setup"]');
     await page.waitForSelector(`[data-del="league"][data-del-id="${ids.league}"]`, { timeout: 15000 });
 
-    // (1) Blocked deletion: delete the populated league → confirm → the server
-    // refuses and the blocked modal lists the dependents; the league survives.
+    // (1) Blocked deletion: league is a high-risk record, so its Delete button
+    // stays disabled until DELETE is typed (#215); then the server refuses and
+    // the blocked modal lists the dependents; the league survives.
     await page.click(`[data-del="league"][data-del-id="${ids.league}"]`);
     await page.waitForSelector(".modal.danger [data-del-confirm]", { timeout: 10000 });
+    if (!(await page.$eval("[data-del-confirm]", (b) => b.disabled))) {
+      throw new Error(`[${viewport.label}] high-risk delete was enabled before typing DELETE`);
+    }
+    await page.fill("#del-confirm", "DELETE");
+    await page.waitForFunction(
+      () => !document.querySelector("[data-del-confirm]").disabled, null, { timeout: 5000 });
     await page.click("[data-del-confirm]");
     await page.waitForSelector(".modal.blocked", { timeout: 10000 });
     const blockedText = await page.textContent(".modal.blocked .modal-body");
@@ -121,10 +128,35 @@ async function checkViewport(browser, viewport) {
     await page.click(".modal.blocked [data-modal-close]");
     await page.waitForSelector(".modal", { state: "detached", timeout: 10000 });
 
-    // (2) Successful deletion: the bare team deletes cleanly via the confirm
-    // modal.
+    // (2) The bare team is also high-risk. Prove: Cancel sends no request; the
+    // button starts disabled; invalid text can't enable it; the exact name
+    // enables it; the delete then succeeds.
+    let deleteRequests = 0;
+    const countDelete = (r) => {
+      if (r.url() === `${base}/api/setup/team/${ids.bare}/delete`) deleteRequests += 1;
+    };
+    page.on("request", countDelete);
+    // Cancel path: open, then Cancel — no request must fire.
     await page.click(`[data-del="team"][data-del-id="${ids.bare}"]`);
     await page.waitForSelector(".modal.danger [data-del-confirm]", { timeout: 10000 });
+    await page.click(".modal [data-modal-close]");
+    await page.waitForSelector(".modal", { state: "detached", timeout: 10000 });
+    if (deleteRequests !== 0) {
+      throw new Error(`[${viewport.label}] Cancel sent a delete request`);
+    }
+    // Delete path with the typed-confirm gate.
+    await page.click(`[data-del="team"][data-del-id="${ids.bare}"]`);
+    await page.waitForSelector(".modal.danger [data-del-confirm]", { timeout: 10000 });
+    if (!(await page.$eval("[data-del-confirm]", (b) => b.disabled))) {
+      throw new Error(`[${viewport.label}] team delete was enabled before typing DELETE`);
+    }
+    await page.fill("#del-confirm", "wrong name");
+    if (!(await page.$eval("[data-del-confirm]", (b) => b.disabled))) {
+      throw new Error(`[${viewport.label}] team delete enabled on invalid confirmation text`);
+    }
+    await page.fill("#del-confirm", "DELETE");
+    await page.waitForFunction(
+      () => !document.querySelector("[data-del-confirm]").disabled, null, { timeout: 5000 });
     const delResp = page.waitForResponse((r) =>
       r.url() === `${base}/api/setup/team/${ids.bare}/delete` && r.request().method() === "POST");
     await page.click("[data-del-confirm]");
@@ -132,6 +164,7 @@ async function checkViewport(browser, viewport) {
       throw new Error(`[${viewport.label}] team delete returned non-200`);
     }
     await page.waitForSelector(".modal", { state: "detached", timeout: 10000 });
+    page.off("request", countDelete);
     const teamsAfter = await getJson(`/api/setup/leagues/${ids.league}/teams`);
     if (teamsAfter.teams.some((t) => t.id === ids.bare)) {
       throw new Error(`[${viewport.label}] bare team was not deleted`);

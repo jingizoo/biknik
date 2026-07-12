@@ -721,6 +721,10 @@ const DEL_NOUN = {
   level: "level", division: "division", club: "club", team: "team",
   venue: "venue", rink: "rink", "ice-slot": "ice slot", game: "game",
 };
+// Higher-level records (#215) demand a typed confirmation — the operator must
+// type the record's name or DELETE before the destructive button enables.
+// Lower-risk entities keep a single-click confirm.
+const HIGH_RISK_DELETE = new Set(["league", "season", "team", "venue", "rink"]);
 
 function renderModal() {
   if (!modal) return "";
@@ -753,12 +757,22 @@ function resetModalHtml() {
 
 function confirmDeleteModalHtml(m) {
   const noun = DEL_NOUN[m.kind] || "record";
+  const highRisk = HIGH_RISK_DELETE.has(m.kind);
+  // High-risk records require typing the name (or DELETE) before the button
+  // enables (#215); lower-risk ones confirm in one click.
+  const confirmField = highRisk
+    ? `<label class="modal-confirm-label" for="del-confirm">Type the ${esc(noun)}'s name
+         (<strong>${esc(m.name)}</strong>) or <code>DELETE</code> to confirm</label>
+       <input id="del-confirm" class="modal-confirm-input" autocomplete="off"
+         spellcheck="false" placeholder="DELETE">`
+    : "";
   return modalShell("danger", `Delete this ${noun}?`,
     `<p>You're about to permanently delete the ${esc(noun)}
        <strong>${esc(m.name)}</strong>. This can't be undone.</p>
-     <p class="muted">If anything depends on it, the delete is refused and nothing changes.</p>`,
+     <p class="muted">If anything depends on it, the delete is refused and nothing changes.</p>
+     ${confirmField}`,
     `<button class="act ghost" data-modal-close>Cancel</button>
-     <button class="act danger" data-del-confirm>Delete ${esc(noun)}</button>`);
+     <button class="act danger" data-del-confirm ${highRisk ? "disabled" : ""}>Delete ${esc(noun)}</button>`);
 }
 
 function blockedModalHtml(m) {
@@ -816,7 +830,18 @@ function wireModal(c) {
   const delConfirm = c.querySelector("[data-del-confirm]");
   if (delConfirm && modal && modal.type === "confirm-delete") {
     const m = modal;
+    // For a high-risk record the button stays disabled until the name or
+    // DELETE is typed (#215); the input is absent for lower-risk kinds.
+    const delInput = c.querySelector("#del-confirm");
+    const confirmed = () => !delInput
+      || delInput.value.trim() === m.name
+      || delInput.value.trim().toUpperCase() === "DELETE";
+    if (delInput) {
+      delInput.oninput = () => { delConfirm.disabled = !confirmed(); };
+      delInput.focus();
+    }
     delConfirm.onclick = async () => {
+      if (!confirmed()) return;  // defense in depth; the button is disabled too
       toast = "";
       const res = await post(`/api/setup/${m.kind}/${m.id}/delete`, {});
       if (res && res.error && res.error.code === "has_dependencies") {

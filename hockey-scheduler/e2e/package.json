@@ -10,7 +10,8 @@
     "season-participation": "node season-participation.js",
     "season-rollover": "node season-rollover.js",
     "permanent-teams": "node permanent-teams.js",
-    "safe-destructive": "node safe-destructive.js"
+    "safe-destructive": "node safe-destructive.js",
+    "reset-visibility": "node reset-visibility.js"
   },
   "devDependencies": {
     "playwright": "^1.48.0"

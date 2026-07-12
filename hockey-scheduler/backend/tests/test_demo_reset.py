@@ -33,6 +33,12 @@ class _ResetEnv:
         return self.state
 
     def __exit__(self, *exc):
+        # Close the live store so a durable (Postgres) backend doesn't leak the
+        # connection between tests.
+        try:
+            self.state.api.store.close()
+        except Exception:
+            pass
         for key, val in self._saved.items():
             if val is None:
                 os.environ.pop(key, None)
@@ -112,22 +118,33 @@ class MemoryDemoResetTest(DemoResetContract, unittest.TestCase):
         return _ResetEnv(database_url=None)  # in-memory store
 
 
-class SqliteDemoResetTest(DemoResetContract, unittest.TestCase):
+class DurableDemoResetTest(DemoResetContract, unittest.TestCase):
+    """Reset atomicity against a durable SQL store.
+
+    Honors TEST_DATABASE_URL so the PostgreSQL CI job exercises the reentrant
+    transaction + transactional-DDL reset path against Postgres; falls back to a
+    real SQLite file locally (not ``:memory:``, so the reset's fresh SqlStore and
+    the live one share one durable database — the setting where a non-atomic
+    reseed could otherwise strand a half-empty schema).
+    """
+
     def setUp(self):
-        # A real file (not :memory:) so the reset's fresh SqlStore and the live
-        # one share one durable database — the setting where a non-atomic reseed
-        # could otherwise strand a half-empty schema.
-        fd, self._db_path = tempfile.mkstemp(suffix=".db")
-        os.close(fd)
+        self._db_path = None
+        self._url = os.environ.get("TEST_DATABASE_URL")
+        if not self._url:
+            fd, self._db_path = tempfile.mkstemp(suffix=".db")
+            os.close(fd)
+            self._url = self._db_path
 
     def tearDown(self):
-        try:
-            os.remove(self._db_path)
-        except OSError:
-            pass
+        if self._db_path:
+            try:
+                os.remove(self._db_path)
+            except OSError:
+                pass
 
     def make_env(self):
-        return _ResetEnv(database_url=self._db_path)
+        return _ResetEnv(database_url=self._url)
 
 
 if __name__ == "__main__":
