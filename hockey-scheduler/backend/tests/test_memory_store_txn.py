@@ -104,6 +104,21 @@ class MemoryStoreTransactionTest(unittest.TestCase):
         self.assertEqual(store.next_id("thing"),
                          f"thing_{int(first.split('_')[1]) + 1}")
 
+    def test_id_counters_are_copy_safe_plain_ints(self):
+        # Regression: id counters were itertools.count objects, which are not
+        # copyable on Python 3.14 (copy.copy raises "cannot pickle
+        # 'itertools.count'"), so the transaction snapshot crashed every
+        # in-memory write in production while CI on an older Python stayed green.
+        # Counters must be plain ints, and a snapshot of a populated store must
+        # not raise on any supported version.
+        store = InMemoryStore()
+        store.next_id("thing")
+        store.next_id("thing")
+        self.assertTrue(all(isinstance(v, int) for v in store._counters.values()))
+        store._snapshot()  # must not raise
+        with store.transaction():  # the full write path must not raise either
+            store.add_team(_bare_team(store, "t"))
+
     def test_nested_transaction_joins_the_outer_unit(self):
         # A nested transaction does not open a second unit: if the OUTER body
         # fails after an inner transaction "completed", the inner writes roll

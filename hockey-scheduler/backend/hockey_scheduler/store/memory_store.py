@@ -9,7 +9,6 @@ import copy
 from contextlib import contextmanager
 from datetime import datetime
 import threading
-from itertools import count
 from typing import Dict, List, Optional
 
 from ..domain import (
@@ -92,7 +91,11 @@ class InMemoryStore:
         self.guardian_links: Dict[str, GuardianLink] = {}
         self.reschedule_requests: Dict[str, RescheduleRequest] = {}
         self.setup_audit: List[SetupAuditLog] = []
-        self._counters: Dict[str, count] = {}
+        # Plain int counters (not itertools.count): a count object is not
+        # copyable on Python 3.14 (copy.copy raises "cannot pickle
+        # 'itertools.count'"), which would break the transaction snapshot; an
+        # int copies trivially on every version and rolls back the same way.
+        self._counters: Dict[str, int] = {}
         self._lock = threading.RLock()
         # Depth of the current (possibly nested) transaction; 0 = none open.
         self._txn_depth = 0
@@ -118,8 +121,8 @@ class InMemoryStore:
         # the pre-image its own instance so that reassignment can't reach it.
         # A shallow element copy (not deepcopy) keeps this cheap — see the
         # snapshot invariant above for the nested-dict constraint this relies on.
-        # itertools.count copies cleanly and preserves position, so id counters
-        # roll back with the rest.
+        # Every value here (dataclasses, primitives, and the plain-int id
+        # counters) is copy.copy-safe on all supported Python versions.
         if isinstance(value, dict):
             return {k: copy.copy(v) for k, v in value.items()}
         if isinstance(value, list):
@@ -192,9 +195,8 @@ class InMemoryStore:
 
     # -- id generation -----------------------------------------------------
     def next_id(self, prefix: str) -> str:
-        if prefix not in self._counters:
-            self._counters[prefix] = count(1)
-        return f"{prefix}_{next(self._counters[prefix])}"
+        self._counters[prefix] = self._counters.get(prefix, 0) + 1
+        return f"{prefix}_{self._counters[prefix]}"
 
     # -- teams / players ---------------------------------------------------
     def add_team(self, team: Team) -> Team:
