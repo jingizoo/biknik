@@ -195,8 +195,15 @@ class InMemoryStore:
 
     # -- id generation -----------------------------------------------------
     def next_id(self, prefix: str) -> str:
-        self._counters[prefix] = self._counters.get(prefix, 0) + 1
-        return f"{prefix}_{self._counters[prefix]}"
+        # itertools.count's next() was a single atomic step; a plain
+        # read-modify-write is not, and next_id() may be called outside a
+        # transaction on the threaded server, so serialize it to avoid two
+        # requests handing out the same id. The lock is the same re-entrant one
+        # transaction() holds, so calling this from within a transaction is safe.
+        with self._lock:
+            value = self._counters.get(prefix, 0) + 1
+            self._counters[prefix] = value
+            return f"{prefix}_{value}"
 
     # -- teams / players ---------------------------------------------------
     def add_team(self, team: Team) -> Team:
