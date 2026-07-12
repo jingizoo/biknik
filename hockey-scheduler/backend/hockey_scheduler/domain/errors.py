@@ -100,3 +100,29 @@ class ClaimUnavailableError(DomainError):
     """The deployment is not in a posture where browser claim is allowed."""
 
     code = "claim_unavailable"
+
+
+class IntegrityConflictError(DomainError):
+    """A write violated a database integrity rule (unique / FK / check / not-null).
+
+    Raised by the store's exception-translation boundary (#201 Slice 2) after a
+    failed transaction has rolled back. The message is generic and secret-free;
+    ``details["reason"]`` carries a stable machine-readable subtype (e.g.
+    ``"unique_violation"``) with no table, column, constraint name, or driver
+    text. A specific workflow may catch this to raise a more precise domain
+    error (e.g. a duplicate installation-claim → AlreadyClaimedError).
+    """
+
+    code = "conflict"
+
+
+class ConcurrencyConflictError(DomainError):
+    """A write failed due to concurrent activity (serialization / deadlock / lock).
+
+    Translated from the driver by the store boundary (#201 Slice 2) after
+    rollback. ``details`` carries a stable ``reason`` and ``retryable: True`` so
+    a caller can safely retry; the message never leaks driver or connection
+    details.
+    """
+
+    code = "concurrency_conflict"

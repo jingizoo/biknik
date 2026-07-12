@@ -119,6 +119,8 @@ ERROR_HTTP_STATUS = {
     "already_claimed": 409,
     "invalid_setup_code": 401,
     "claim_unavailable": 403,
+    "conflict": 409,               # DB integrity conflict, translated (#201)
+    "concurrency_conflict": 409,   # serialization/deadlock/lock, retryable (#201)
 }
 
 

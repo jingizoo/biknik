@@ -72,6 +72,7 @@ from ..domain import (
 )
 from ..domain.enums import NotificationType
 from .db import connect
+from .db_errors import translate_db_exception
 
 
 # ---- column converters -------------------------------------------------
@@ -321,17 +322,29 @@ class SqlStore:
                 return
             self._txn_depth = 1
             try:
-                if self.dialect.paramstyle == "pyformat":  # psycopg manages it
-                    with self.conn.transaction():
-                        yield
-                else:  # sqlite (autocommit) — explicit txn
-                    try:
-                        self.conn.execute("BEGIN")
-                        yield
-                        self.conn.commit()
-                    except Exception:
-                        self.conn.rollback()
-                        raise
+                try:
+                    if self.dialect.paramstyle == "pyformat":  # psycopg manages it
+                        with self.conn.transaction():
+                            yield
+                    else:  # sqlite (autocommit) — explicit txn
+                        try:
+                            self.conn.execute("BEGIN")
+                            yield
+                            self.conn.commit()
+                        except Exception:
+                            self.conn.rollback()
+                            raise
+                except Exception as exc:
+                    # The transaction has now rolled back, so there is zero
+                    # partial state. Translate a recognized DB integrity/
+                    # concurrency failure into a stable, secret-free domain
+                    # error (#201 Slice 2); anything unrecognized propagates
+                    # unchanged so it surfaces as an internal error rather than
+                    # a misclassified user error.
+                    translated = translate_db_exception(exc)
+                    if translated is not None:
+                        raise translated from exc
+                    raise
             finally:
                 self._txn_depth = 0
 
