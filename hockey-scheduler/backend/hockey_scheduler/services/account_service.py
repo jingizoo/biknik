@@ -12,7 +12,12 @@ from datetime import datetime, timezone
 from typing import Callable, Optional
 
 from ..domain import InstallationState, Role, SetupAuditLog, UserAccount
-from ..domain.errors import AlreadyClaimedError, NotFoundError, ValidationError
+from ..domain.errors import (
+    AlreadyClaimedError,
+    IntegrityConflictError,
+    NotFoundError,
+    ValidationError,
+)
 from ..store import InMemoryStore
 from .passwords import DUMMY_PASSWORD_HASH, hash_password, verify_password
 
@@ -120,16 +125,15 @@ class AccountService:
                 return account
         except AlreadyClaimedError:
             raise
-        except Exception:
-            # A second process may have won the unique-marker insert while this
-            # transaction was waiting. Translate that database-specific unique
-            # violation into the same stable, secret-free conflict response.
-            try:
-                claimed = self.store.get_installation_state(
-                    _INSTALLATION_STATE_ID) is not None
-                has_accounts = bool(self.store.all_user_accounts())
-            except Exception:
-                claimed = has_accounts = False
+        except IntegrityConflictError:
+            # A second process won the unique installation-marker insert while
+            # this transaction was waiting. The store already translated that
+            # DB-specific unique violation into a stable conflict (#201 Slice 2);
+            # re-check and surface the domain-specific claimed error instead of
+            # inspecting driver exceptions here.
+            claimed = self.store.get_installation_state(
+                _INSTALLATION_STATE_ID) is not None
+            has_accounts = bool(self.store.all_user_accounts())
             if claimed or has_accounts:
                 raise AlreadyClaimedError(
                     "This installation has already been claimed.") from None
