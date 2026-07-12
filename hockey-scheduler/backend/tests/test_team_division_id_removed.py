@@ -16,7 +16,7 @@ import unittest
 from pathlib import Path
 
 from hockey_scheduler.api.service import ApiService
-from hockey_scheduler.domain import SeasonTeamRegistration, Team
+from hockey_scheduler.domain import Season, SeasonTeamRegistration, Team
 from hockey_scheduler.services.league_scope import (
     league_id_for_game, team_registration_valid)
 from hockey_scheduler.store import InMemoryStore, SqlStore
@@ -256,6 +256,24 @@ class LegacyFieldIsInertContract:
         self.assertIn(good, exposed)
         for hidden in (cross.id, "team_missing", orphan.id, wrong):
             self.assertNotIn(hidden, exposed)
+
+    def test_registration_with_a_dangling_shared_league_is_excluded(self):
+        # Season and Team agree on a league id that has NO League row (#180
+        # review): the resolver must still reject it, not trust matching-but-
+        # dangling ids.
+        ghost = "league_ghost"
+        season = Season(id=self.store.next_id("season"), league_id=ghost, name="S")
+        self.store.add_season(season)
+        team = Team(id=self.store.next_id("team"), name="Ghost", league_id=ghost)
+        self.store.add_team(team)
+        self.store.add_season_team_registration(SeasonTeamRegistration(
+            id=self.store.next_id("streg"), season_id=season.id,
+            team_id=team.id, division_id=None, active=True))
+        self.assertIsNone(
+            team_registration_valid(self.store, season, team.id, None))
+        exposed = {r["team_id"]
+                   for r in self.api.get_demo_overview()["registrations"]}
+        self.assertNotIn(team.id, exposed)
 
     def test_delete_division_ignores_stale_legacy_team_pointer(self):
         # A division with no registrations/games deletes cleanly even if a team's

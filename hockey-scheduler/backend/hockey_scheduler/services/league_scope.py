@@ -155,6 +155,11 @@ def team_registration_valid(store, season, team_id, division_id=None,
     league on either side is never treated as a match (#200 review)."""
     if season is None or not season.league_id:
         return None
+    # The shared league must actually EXIST (#180 review): a season and team
+    # that share a dangling/non-existent league id are not league-consistent —
+    # no operational consumer may trust such a row.
+    if store.get_league(season.league_id) is None:
+        return None
     reg = store.registration_for_team_in_season(season.id, team_id)
     if reg is None or not reg.active:
         return None

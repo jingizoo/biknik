@@ -364,6 +364,11 @@ class SetupService:
                 and not g.is_draft
                 and team_id in (g.home_team_id, g.away_team_id)]
 
+    def _registration_league(self, reg):
+        """The league a registration resolves to (via its season), or None."""
+        season = self.store.get_season(reg.season_id)
+        return season.league_id if season else None
+
     @_transactional
     def assign_season_team_division(self, registration_id: str,
                                     division_id: Optional[str] = None,
@@ -1377,6 +1382,78 @@ class SetupService:
         batch_id = self.store.next_id("importbatch")
 
         with self.store.transaction():
+            # Pre-write integrity gate (#180 review): before ANY write, prove the
+            # import won't silently re-home a permanent Team across leagues or
+            # strand committed games by moving a registration's division. A
+            # violation returns a structured error with zero writes.
+            if (not season_league_id
+                    or self.store.get_league(season_league_id) is None):
+                return {"committed": False, "summary": result["summary"],
+                        "errors": [{"sheet": "teams",
+                            "reason": "season_league_missing",
+                            "message": ("The import target season is not linked "
+                                        "to a valid league."),
+                            "season_id": season_id}],
+                        "warnings": result["warnings"]}
+            gate_errors = []
+            for row in team_rows:
+                code = _clean(row.get("team_code"))
+                existing = next((t for t in self.store.all_teams()
+                                 if t.external_ref == code), None)
+                if existing is None:
+                    continue
+                team_regs = [r for r in self.store.all_season_team_registrations()
+                             if r.team_id == existing.id]
+                # (1) The import must never move a permanent Team's league.
+                if (existing.league_id or None) != season_league_id:
+                    if existing.league_id is None:
+                        # A league-less team is repaired to the target league
+                        # only if EVERY retained registration already resolves
+                        # there; otherwise its history would go cross-league.
+                        stray = [r.id for r in team_regs
+                                 if self._registration_league(r) != season_league_id]
+                        if stray:
+                            gate_errors.append({
+                                "sheet": "teams", "team_code": code,
+                                "reason": "team_league_ambiguous",
+                                "message": (f"Team {code} has registrations in "
+                                            "another league; assign its permanent "
+                                            "league before importing."),
+                                "affected_registration_ids": stray})
+                    else:
+                        gate_errors.append({
+                            "sheet": "teams", "team_code": code,
+                            "reason": "team_league_move_blocked",
+                            "message": (f"Team {code} already belongs to a "
+                                        "different league; the import can't "
+                                        "re-home it."),
+                            "affected_registration_ids": [r.id for r in team_regs],
+                            "affected_game_ids": [
+                                g.id for g in self.store.all_games()
+                                if existing.id in (g.home_team_id, g.away_team_id)]})
+                # (2) A registration's division move must not strand committed
+                # games — the same guard assign_season_team_division enforces.
+                div_name = row.get("division_name")
+                reg = self.store.registration_for_team_in_season(
+                    season_id, existing.id)
+                if reg is not None and not _blank(div_name):
+                    cur = (self.store.get_division(reg.division_id)
+                           if reg.division_id else None)
+                    if _clean(div_name) != (cur.name if cur else ""):
+                        stranded = self._games_scheduled_for_team_in_season(
+                            season_id, existing.id)
+                        if stranded:
+                            gate_errors.append({
+                                "sheet": "teams", "team_code": code,
+                                "reason": "registration_division_move_strands_games",
+                                "message": (f"Re-importing team {code} into a "
+                                            "different division would strand "
+                                            "scheduled games; resolve them first."),
+                                "affected_game_ids": stranded})
+            if gate_errors:
+                return {"committed": False, "summary": result["summary"],
+                        "errors": gate_errors, "warnings": result["warnings"]}
+
             team_code_to_id = {}
             for row in team_rows:
                 team_code = _clean(row.get("team_code"))
