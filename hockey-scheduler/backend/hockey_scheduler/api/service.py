@@ -861,7 +861,11 @@ class ApiService:
         seasons_dangling = [s for s in seasons if s.league_id not in league_ids]
         divisions_dangling = [d for d in divisions
                               if d.season_id not in season_ids]
-        teams_dangling = [t for t in teams if t.division_id not in division_ids]
+        # A Team belongs permanently to a League via league_id (#180); a team
+        # with no valid league is the invalid-legacy-data case, not a
+        # missing-division one.
+        teams_dangling = [t for t in teams
+                          if not t.league_id or t.league_id not in league_ids]
 
         blocking = []
         warnings = []
@@ -975,15 +979,14 @@ class ApiService:
                   f"{len(divisions_dangling)} division(s) reference a season "
                   "that no longer exists.")
 
-        has_team = any(t.division_id in division_ids for t in teams)
+        has_team = any(t.league_id in league_ids for t in teams)
         step("team", "Add a team", has_team,
              detail=f"{len(teams)} team(s)")
         if has_division:
             block(has_team, "no_team", "No team has been added yet.")
         if teams_dangling:
-            block(False, "teams_without_division",
-                  f"{len(teams_dangling)} team(s) reference a division that no "
-                  "longer exists.")
+            block(False, "teams_without_league",
+                  f"{len(teams_dangling)} team(s) are not tied to a valid league.")
 
         # 4. Soft gaps — recommended but not required to schedule a first game.
         if not players:
@@ -2125,12 +2128,14 @@ class ApiService:
              if d.level_id in levels else None}
             for d in divisions.values()
         ]
+        # A Team is a permanent member of a League (#180); its season/division
+        # participation is NOT on the Team — it lives in SeasonTeamRegistration,
+        # exposed as `registrations` below. The legacy Team.division_id is no
+        # longer surfaced here so no operational UI can key off it.
         team_rows = [
             {"id": t.id, "name": t.name, "club_id": t.club_id,
-             "division_id": t.division_id,
-             "club_name": clubs[t.club_id].name if t.club_id in clubs else None,
-             "division_name": divisions[t.division_id].name
-             if t.division_id in divisions else t.division}
+             "league_id": t.league_id,
+             "club_name": clubs[t.club_id].name if t.club_id in clubs else None}
             for t in teams.values()
         ]
         rink_rows = [
@@ -2259,6 +2264,15 @@ class ApiService:
             ],
             "schedule": schedule,
             "public_fixtures": public_fixtures,
+            # Active season/division participation (#180): the source of truth
+            # for which Team plays which Division in which Season. Operational UI
+            # (e.g. the scheduling wizard) filters teams through these, never the
+            # legacy Team.division_id.
+            "registrations": [
+                {"team_id": r.team_id, "season_id": r.season_id,
+                 "division_id": r.division_id}
+                for r in self.store.all_season_team_registrations() if r.active
+            ],
             "setup_audit": setup_audit,
             "setup_audit_count": len(setup_audit),
         }
@@ -2358,7 +2372,7 @@ class ApiService:
 
         org_ids = {o.id for o in orgs}
         venue_ids = {v.id for v in venues}
-        division_ids = {d.id for d in divisions}
+        league_ids_all = {lg.id for lg in leagues}
         level_ids_all = {lv.id for lv in levels}
         team_ids = {t.id for t in teams}
         league_owner = {lg.id: lg.organization_id for lg in leagues}
@@ -2385,8 +2399,10 @@ class ApiService:
                 [idname(d) for d in divisions if not d.level_id or d.level_id not in level_ids_all],
             "teams_without_club":
                 [idname(t) for t in teams if not t.club_id or t.club_id not in clubs],
-            "teams_without_division":
-                [idname(t) for t in teams if not t.division_id or t.division_id not in division_ids],
+            # A Team must belong to a valid League (#180); a missing/invalid
+            # league_id is the real "needs assignment", not a missing division.
+            "teams_without_league":
+                [idname(t) for t in teams if not t.league_id or t.league_id not in league_ids_all],
             # Player *name* is PII and deliberately omitted even here — an
             # orphan is surfaced by id only, keeping this tree name-free so the
             # count-only privacy invariant holds end to end (#166).
@@ -2565,11 +2581,8 @@ class ApiService:
                          actor_id: Optional[str] = None) -> dict:
         return _serialize(self.setup.assign_team_club(team_id, club_id, actor_id))
 
-    @catch
-    def assign_team_division(self, team_id: str, division_id: str,
-                             actor_id: Optional[str] = None) -> dict:
-        return _serialize(self.setup.assign_team_division(
-            team_id, division_id, actor_id))
+    # assign_team_division removed (#180) — see SetupService; a Team's seasonal
+    # division lives in SeasonTeamRegistration (assign_season_team_division).
 
     @catch
     def assign_player_team(self, player_id: str, team_id: str,

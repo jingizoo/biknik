@@ -110,14 +110,16 @@ class WebServerTest(unittest.TestCase):
         self.assertEqual(body["name"], "Eagles HC")
 
     def test_schedule_game_from_available_slot(self):
-        # Find an available slot and the two U16 teams from the overview.
+        # Find an available slot and two teams REGISTERED in U16 Elite (#180 —
+        # participation comes from registrations, not the legacy Team.division_id).
         _, ov = _request("GET", "/api/demo/overview")
         slot = next(s for s in ov["ice_slots"] if s["status"] == "available")
-        u16 = [t for t in ov["teams"] if t["division_name"] == "U16 Elite"]
+        u16_div = next(d for d in ov["divisions"] if d["name"] == "U16 Elite")
+        u16 = [r for r in ov["registrations"] if r["division_id"] == u16_div["id"]]
         status, game = _request("POST", "/api/setup/game", {
-            "season_id": ov["seasons"][0]["id"],
-            "division_id": u16[0]["division_id"],
-            "home_team_id": u16[0]["id"], "away_team_id": u16[1]["id"],
+            "season_id": u16_div["season_id"],
+            "division_id": u16_div["id"],
+            "home_team_id": u16[0]["team_id"], "away_team_id": u16[1]["team_id"],
             "ice_slot_id": slot["id"],
         })
         self.assertEqual(status, 200)

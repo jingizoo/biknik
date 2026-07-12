@@ -647,22 +647,10 @@ class SetupService:
                     {"from": old, "to": team.club_id})
         return team
 
-    @_transactional
-    def assign_team_division(self, team_id: str, division_id: str,
-                             actor_id: Optional[str] = None) -> Team:
-        team = self.store.get_team(team_id)
-        if team is None:
-            raise NotFoundError(f"Team {team_id} not found.")
-        division = self.store.get_division(division_id) if division_id else None
-        if division is None:
-            raise NotFoundError(f"Division {division_id} not found.")
-        old = team.division_id
-        team.division_id = division_id
-        team.division = division.name  # keep the denormalized label in sync
-        self.store.save_team(team)
-        self._audit("team_division_assigned", "team", team.id, actor_id,
-                    {"from": old, "to": division_id})
-        return team
+    # assign_team_division was removed (#180): a Team's season/division placement
+    # lives in SeasonTeamRegistration (assign_season_team_division), never on the
+    # legacy Team.division_id. The legacy field is retained only for persistence/
+    # migration compatibility and is no longer written by any current workflow.
 
     @_transactional
     def assign_player_team(self, player_id: str, team_id: str,
@@ -2390,16 +2378,13 @@ class SetupService:
         regs = [r for r in self.store.all_season_team_registrations()
                 if r.division_id == division_id]
         games = [g for g in self.store.all_games() if g.division_id == division_id]
-        # Teams still pointing at this division via the legacy Team.division_id
-        # link (#180) block deletion too, so a division is never removed out
-        # from under a team that references it.
-        teams = [t for t in self.store.all_teams()
-                 if getattr(t, "division_id", None) == division_id]
+        # Deletion keys off real operational dependents only (#180): season
+        # registrations and games. A stale legacy Team.division_id pointer is no
+        # longer read operationally, so it never blocks a division delete.
         self._block_if_dependents("division", division_id, "division", [
             self._dep_group("team registration", regs,
                             lambda r: self._team_name(r.team_id)),
-            self._dep_group("game", games, self._matchup),
-            self._dep_group("team (legacy division link)", teams, lambda t: t.name)])
+            self._dep_group("game", games, self._matchup)])
         self.store.delete_division(division_id)
         self._audit("division_deleted", "division", division_id, actor_id,
                     {"name": division.name, "season_id": division.season_id})

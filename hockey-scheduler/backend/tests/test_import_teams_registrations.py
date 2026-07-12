@@ -243,10 +243,10 @@ class ImportConvergenceContract:
         self.assertEqual(self._team("LIONS").league_id, over55.id)
         self.assertEqual(len(self.store.all_setup_audit()), audits_before)
 
-    def test_legacy_division_blocks_team_league_move(self):
-        # A preserved legacy Team.division_id in the old league is a retained
-        # dependency too: moving the team's league would make legacy game scope
-        # cross-league (#214 review), so the import is rejected with zero writes.
+    def test_legacy_division_does_not_block_team_league_move(self):
+        # #180: a preserved legacy Team.division_id is no longer operational, so
+        # it never strands a team's league move. With no registrations to strand,
+        # the move commits and the team's permanent league changes.
         self.api.commit_hierarchy_import(payload(), actor_id="admin")
         over55 = self._by_ref(self.store.all_leagues(), "OVER55")
         diva = self._by_ref(self.store.all_divisions(), "DIVA")
@@ -257,16 +257,12 @@ class ImportConvergenceContract:
                   "leagues_csv": LEAGUES + "OTHER,CANLON,Other,US,America/Chicago\n"}
         self.assertTrue(
             self.api.commit_hierarchy_import(second, actor_id="admin")["committed"])
-        audits_before = len(self.store.all_setup_audit())
         move = {"import_type": "hierarchy", "permanent_teams_csv":
                 "league_code,team_code,team_name\nOTHER,LEGDIV,Legacy\n"}
         result = self.api.commit_hierarchy_import(move, actor_id="admin")
-        self.assertFalse(result["committed"])
-        err = next(e for e in result["errors"]
-                   if e["reason"] == "team_league_move_strands_history")
-        self.assertIn(diva.id, err["affected_division_ids"])
-        self.assertEqual(self._team("LEGDIV").league_id, over55.id)
-        self.assertEqual(len(self.store.all_setup_audit()), audits_before)
+        self.assertTrue(result["committed"], result.get("errors"))
+        other = self._by_ref(self.store.all_leagues(), "OTHER")
+        self.assertEqual(self._team("LEGDIV").league_id, other.id)
 
     def test_safe_registration_move_records_exact_from_and_to(self):
         # No games scheduled → moving LIONS DIVA -> DIVB is safe and audited.
@@ -332,26 +328,21 @@ class ImportConvergenceContract:
         self.assertEqual(self.store.get_season(season.id).league_id, over55.id)
         self.assertEqual(len(self.store.all_setup_audit()), audits_before)
 
-    def test_season_league_move_blocked_by_inactive_reg_and_legacy_team(self):
-        # #214 review-6: a season league move must also account for INACTIVE
-        # registrations and legacy Team->Division links under the season.
+    def test_season_league_move_blocked_by_inactive_registration(self):
+        # #214 review-6: a season league move must account for INACTIVE
+        # registrations too. (#180: legacy Team->Division links no longer count.)
         self.api.commit_hierarchy_import(payload(), actor_id="admin")
         second = {"import_type": "hierarchy", "organizations_csv": ORGANIZATIONS,
                   "leagues_csv": LEAGUES + "OTHER,CANLON,Other,US,America/Chicago\n"}
         self.assertTrue(
             self.api.commit_hierarchy_import(second, actor_id="admin")["committed"])
         season = self._by_ref(self.store.all_seasons(), "FALL26")
-        diva = self._by_ref(self.store.all_divisions(), "DIVA")
         over55 = self._by_ref(self.store.all_leagues(), "OVER55")
-        # Make both registrations historical (inactive) and add a legacy Team
-        # pointing at a division under FALL26.
+        # Make both registrations historical (inactive).
         for reg in list(self.store.all_season_team_registrations()):
             if reg.season_id == season.id:
                 reg.active = False
                 self.store.save_season_team_registration(reg)
-        self.store.add_team(Team(id="team_ld", name="Legacy", external_ref="LEGT",
-                                 club_id=None, division_id=diva.id,
-                                 division="Division A", league_id=over55.id))
         audits_before = len(self.store.all_setup_audit())
         moved = {"import_type": "hierarchy", "competition_csv": (
             "league_code,season_code,season_name,level_code,level_name,"
@@ -362,13 +353,12 @@ class ImportConvergenceContract:
         err = next(e for e in result["errors"]
                    if e["reason"] == "season_league_move_strands_history")
         self.assertTrue(err["affected_registration_ids"])   # inactive counted
-        self.assertIn("team_ld", err["affected_team_ids"])  # legacy link counted
         self.assertEqual(self.store.get_season(season.id).league_id, over55.id)
         self.assertEqual(len(self.store.all_setup_audit()), audits_before)
 
-    def test_division_season_move_blocked_by_cancelled_game_and_legacy_team(self):
+    def test_division_season_move_blocked_by_cancelled_game(self):
         # #214 review-6: a division season move must account for cancelled
-        # historical games and legacy Team->Division links too.
+        # historical games too. (#180: legacy Team->Division links don't count.)
         game_id = self._commit_game()  # a committed FALL26/DIVA game
         self.api.cancel_game(game_id, actor_id="admin")  # now cancelled history
         second = {"import_type": "hierarchy", "competition_csv": (
@@ -377,15 +367,11 @@ class ImportConvergenceContract:
             self.api.commit_hierarchy_import(second, actor_id="admin")["committed"])
         diva = self._by_ref(self.store.all_divisions(), "DIVA")
         fall = self._by_ref(self.store.all_seasons(), "FALL26")
-        over55 = self._by_ref(self.store.all_leagues(), "OVER55")
-        # Deactivate the DIVA registrations and add a legacy Team on DIVA.
+        # Deactivate the DIVA registrations; the cancelled game still strands.
         for reg in list(self.store.all_season_team_registrations()):
             if reg.division_id == diva.id:
                 reg.active = False
                 self.store.save_season_team_registration(reg)
-        self.store.add_team(Team(id="team_ldd", name="LegacyD", external_ref="LEGD",
-                                 club_id=None, division_id=diva.id,
-                                 division="Division A", league_id=over55.id))
         audits_before = len(self.store.all_setup_audit())
         moved = {"import_type": "hierarchy", "competition_csv": (
             "league_code,season_code,season_name,level_code,level_name,"
@@ -396,7 +382,6 @@ class ImportConvergenceContract:
         err = next(e for e in result["errors"]
                    if e["reason"] == "division_season_move_strands_dependents")
         self.assertIn(game_id, err["affected_game_ids"])      # cancelled counted
-        self.assertIn("team_ldd", err["affected_team_ids"])   # legacy link counted
         self.assertTrue(err["affected_registration_ids"])     # inactive counted
         self.assertEqual(self.store.get_division(diva.id).season_id, fall.id)
         self.assertEqual(len(self.store.all_setup_audit()), audits_before)

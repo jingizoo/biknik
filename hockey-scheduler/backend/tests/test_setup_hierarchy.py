@@ -30,7 +30,7 @@ class SetupHierarchyTest(unittest.TestCase):
         self.assertEqual(h["leagues"], [])
         for key in ("venues_without_organization", "rinks_without_venue",
                     "divisions_without_level", "teams_without_club",
-                    "teams_without_division", "players_without_team"):
+                    "teams_without_league", "players_without_team"):
             self.assertEqual(h["missing_assignments"][key], [])
         json.dumps(h)  # must round-trip with no custom encoder
 

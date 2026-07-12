@@ -1708,9 +1708,9 @@ class Handler(BaseHTTPRequestHandler):
         if combo == ("team", "club"):
             return self._send_api(api.assign_team_club(
                 record_id, b.get("club_id") or None, actor_id))
-        if combo == ("team", "division"):
-            return self._send_api(api.assign_team_division(
-                record_id, b.get("division_id"), actor_id))
+        # ("team", "division") reassignment removed (#180): a Team's seasonal
+        # division is set through its SeasonTeamRegistration, not the legacy
+        # Team.division_id.
         if combo == ("player", "team"):
             return self._send_api(api.assign_player_team(
                 record_id, b.get("team_id"), actor_id))

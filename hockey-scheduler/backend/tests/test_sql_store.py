@@ -64,12 +64,13 @@ class SqlStoreParityTest(unittest.TestCase):
     def test_scheduling_rules_enforced_on_sql(self):
         ov = self.api.get_demo_overview()
         slot = next(s for s in ov["ice_slots"] if s["status"] == "available")
-        u16 = [t for t in ov["teams"] if t["division_name"] == "U16 Elite"]
+        u16_div = next(d for d in ov["divisions"] if d["name"] == "U16 Elite")
+        u16 = [r for r in ov["registrations"] if r["division_id"] == u16_div["id"]]
         # schedule a draft game, then double-book the slot → conflict
-        self.api.create_game(ov["seasons"][0]["id"], u16[0]["division_id"],
-                             u16[0]["id"], u16[1]["id"], slot["id"])
-        dup = self.api.create_game(ov["seasons"][0]["id"], u16[0]["division_id"],
-                                   u16[0]["id"], u16[1]["id"], slot["id"])
+        self.api.create_game(u16_div["season_id"], u16_div["id"],
+                             u16[0]["team_id"], u16[1]["team_id"], slot["id"])
+        dup = self.api.create_game(u16_div["season_id"], u16_div["id"],
+                                   u16[0]["team_id"], u16[1]["team_id"], slot["id"])
         self.assertEqual(dup["error"]["code"], "schedule_conflict")
 
     def test_per_recipient_read_state_on_sql(self):
@@ -301,9 +302,10 @@ class SqlStoreReloadTest(unittest.TestCase):
         ov = api.get_demo_overview()
         before_public = len(ov["public_fixtures"])
         slot = next(s for s in ov["ice_slots"] if s["status"] == "available")
-        u16 = [t for t in ov["teams"] if t["division_name"] == "U16 Elite"]
-        g2 = api.create_game(ov["seasons"][0]["id"], u16[0]["division_id"],
-                             u16[0]["id"], u16[1]["id"], slot["id"])
+        u16_div = next(d for d in ov["divisions"] if d["name"] == "U16 Elite")
+        u16 = [r for r in ov["registrations"] if r["division_id"] == u16_div["id"]]
+        g2 = api.create_game(u16_div["season_id"], u16_div["id"],
+                             u16[0]["team_id"], u16[1]["team_id"], slot["id"])
         api.publish_game(g2["id"], actor_id="c")
         used_slot = slot["id"]
 

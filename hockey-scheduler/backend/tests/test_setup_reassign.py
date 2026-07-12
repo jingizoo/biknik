@@ -62,22 +62,18 @@ class SetupReassignTest(unittest.TestCase):
         r = self.api.assign_division_level(div_other["id"], self.level["id"])
         self.assertEqual(r["error"]["code"], "validation_error")
 
-    # -- team → club (nullable) / team → division (required) ---------------
+    # -- team → club (nullable) --------------------------------------------
     def test_assign_and_clear_team_club(self):
         assigned = self.api.assign_team_club(self.team["id"], self.club2["id"])
         self.assertEqual(assigned["club_id"], self.club2["id"])
         cleared = self.api.assign_team_club(self.team["id"], None)
         self.assertIsNone(cleared["club_id"])
 
-    def test_assign_team_division_syncs_label(self):
-        d2 = self.api.create_division(self.season["id"], "Div Z")
-        r = self.api.assign_team_division(self.team["id"], d2["id"])
-        self.assertEqual(r["division_id"], d2["id"])
-        self.assertEqual(r["division"], "Div Z")
-
-    def test_assign_team_missing_division_not_found(self):
-        r = self.api.assign_team_division(self.team["id"], "div_missing")
-        self.assertEqual(r["error"]["code"], "not_found")
+    def test_assign_team_division_is_removed(self):
+        # #180: the legacy Team→Division reassignment no longer exists; a Team's
+        # seasonal division lives in SeasonTeamRegistration.
+        self.assertFalse(hasattr(self.api, "assign_team_division"))
+        self.assertFalse(hasattr(self.api.setup, "assign_team_division"))
 
     # -- player → team (required) ------------------------------------------
     def test_assign_player_team(self):

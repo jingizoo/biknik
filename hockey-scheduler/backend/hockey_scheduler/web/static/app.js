@@ -1200,8 +1200,7 @@ function renderSeasonParticipation(ov) {
 // which re-checks league membership before any write. Source rows that aren't
 // permanent members of this league (orphaned or cross-league data) and teams
 // already active in the target are shown but never sent. The full Setup and
-// navigation redesign, and the remaining Team.division_id cleanup, stay out of
-// this slice (#215).
+// navigation redesign stays out of this slice (#204).
 function renderRollover(ov) {
   if (!hasPerm("manage_setup")) return "";
   const seasonsByLeague = groupBy(ov.seasons, "league_id");
@@ -1718,7 +1717,14 @@ function renderWizard(ov) {
   if (!slot) { wizard = null; return renderCalendar(ov); }
   const divs = ov.divisions;
   if (!wizard.division_id && divs[0]) wizard.division_id = divs[0].id;
-  const teams = ov.teams.filter((t) => t.division_id === wizard.division_id);
+  // Teams eligible for this game are those with an ACTIVE SeasonTeamRegistration
+  // in the chosen division (#180) — never the legacy Team.division_id. This
+  // mirrors the server's registration-based game-creation guard, so the picker
+  // only offers teams the server will accept.
+  const registeredIds = new Set((ov.registrations || [])
+    .filter((r) => r.division_id === wizard.division_id)
+    .map((r) => r.team_id));
+  const teams = ov.teams.filter((t) => registeredIds.has(t.id));
   if (!teams.find((t) => t.id === wizard.home_id)) wizard.home_id = teams[0] ? teams[0].id : "";
   const awayTeams = teams.filter((t) => t.id !== wizard.home_id);
   if (!awayTeams.find((t) => t.id === wizard.away_id)) wizard.away_id = awayTeams[0] ? awayTeams[0].id : "";
