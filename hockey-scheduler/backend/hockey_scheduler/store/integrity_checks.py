@@ -37,3 +37,32 @@ def assert_no_duplicate_active_ice_slots(conn):
             "Cannot enforce one active game per ice slot: "
             f"{len(duplicates)} ice slot(s) already have multiple active games: "
             f"{shown}{more}. Cancel or move the extra games before upgrading.")
+
+
+def find_duplicate_roster_players(conn):
+    """Concrete (game_id, player_id) pairs with more than one roster row.
+
+    Only non-null pairs are considered — matching the partial unique index
+    (migration 023), which excludes NULL-bearing rows because both SQLite and
+    PostgreSQL treat NULLs as distinct. Filtering here keeps the check aligned
+    with what the index enforces and avoids ordering mixed None/str tuples.
+    """
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT game_id, player_id FROM game_roster_entries "
+        "WHERE game_id IS NOT NULL AND player_id IS NOT NULL "
+        "GROUP BY game_id, player_id HAVING COUNT(*) > 1")
+    return sorted((row["game_id"], row["player_id"]) for row in cur.fetchall())
+
+
+def assert_no_duplicate_roster_players(conn):
+    """Abort the migration if any (game, player) has multiple roster rows (#201 3B)."""
+    duplicates = find_duplicate_roster_players(conn)
+    if duplicates:
+        pairs = [f"{game}/{player}" for game, player in duplicates[:20]]
+        more = "" if len(duplicates) <= 20 else f" (+{len(duplicates) - 20} more)"
+        raise MigrationDataError(
+            "Cannot enforce one roster row per player per game: "
+            f"{len(duplicates)} (game, player) pair(s) already have duplicate "
+            f"roster rows: {', '.join(pairs)}{more}. Resolve the duplicates "
+            "before upgrading.")
