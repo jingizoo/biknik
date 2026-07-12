@@ -1431,23 +1431,36 @@ class SetupService:
                             "affected_game_ids": [
                                 g.id for g in self.store.all_games()
                                 if existing.id in (g.home_team_id, g.away_team_id)]})
-                # (2) A registration's division move must not strand committed
-                # games — the same guard assign_season_team_division enforces.
+                # (2) ANY change to a registration's division must not strand
+                # committed games — the same guard assign_season_team_division
+                # enforces. The target is resolved for every row, including
+                # None for a blank division (which would CLEAR the division), so
+                # a blank re-import can't quietly unassign a team that still has
+                # scheduled games. Applies to inactive/historical registrations
+                # too (a re-import reactivates and may re-place them).
                 div_name = row.get("division_name")
                 reg = self.store.registration_for_team_in_season(
                     season_id, existing.id)
-                if reg is not None and not _blank(div_name):
-                    cur = (self.store.get_division(reg.division_id)
-                           if reg.division_id else None)
-                    if _clean(div_name) != (cur.name if cur else ""):
+                if reg is not None:
+                    if _blank(div_name):
+                        target_div_id = None
+                    else:
+                        match = next(
+                            (d for d in self.store.all_divisions()
+                             if d.season_id == season_id
+                             and d.name == _clean(div_name)), None)
+                        # A not-yet-created named division is necessarily a
+                        # different placement than the current one.
+                        target_div_id = match.id if match else object()
+                    if target_div_id != reg.division_id:
                         stranded = self._games_scheduled_for_team_in_season(
                             season_id, existing.id)
                         if stranded:
                             gate_errors.append({
                                 "sheet": "teams", "team_code": code,
                                 "reason": "registration_division_move_strands_games",
-                                "message": (f"Re-importing team {code} into a "
-                                            "different division would strand "
+                                "message": (f"Re-importing team {code} would move "
+                                            "or clear its division while it has "
                                             "scheduled games; resolve them first."),
                                 "affected_game_ids": stranded})
             if gate_errors:
