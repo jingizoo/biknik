@@ -295,23 +295,45 @@ class SqlStore:
         self.is_memory_backed = resolved_path in (":memory:", "")
         # Reentrant: transaction() holds the lock while inner _exec re-acquires.
         self._lock = threading.RLock()
+        # Transaction nesting depth (#215): a nested transaction() call joins the
+        # outer one instead of opening a second (SQLite can't nest BEGIN, and we
+        # want one all-or-nothing unit anyway). Lets an operation that must be
+        # atomic — e.g. the demo reset's reset_schema + full reseed — wrap many
+        # @_transactional service calls in a single commit/rollback.
+        self._txn_depth = 0
         migrate(self.conn, self.dialect)
 
     @contextmanager
     def transaction(self):
-        """Atomic multi-write block: commit on success, roll back on error."""
+        """Atomic multi-write block: commit on success, roll back on error.
+
+        Reentrant (#215): only the outermost ``transaction()`` opens and
+        commits/rolls back the real database transaction; nested calls simply
+        run inside it, so the whole nest succeeds or fails as one unit.
+        """
         with self._lock:
-            if self.dialect.paramstyle == "pyformat":  # psycopg manages it
-                with self.conn.transaction():
-                    yield
-            else:  # sqlite (autocommit) — explicit txn
+            if self._txn_depth > 0:  # already inside a transaction — just join it
+                self._txn_depth += 1
                 try:
-                    self.conn.execute("BEGIN")
                     yield
-                    self.conn.commit()
-                except Exception:
-                    self.conn.rollback()
-                    raise
+                finally:
+                    self._txn_depth -= 1
+                return
+            self._txn_depth = 1
+            try:
+                if self.dialect.paramstyle == "pyformat":  # psycopg manages it
+                    with self.conn.transaction():
+                        yield
+                else:  # sqlite (autocommit) — explicit txn
+                    try:
+                        self.conn.execute("BEGIN")
+                        yield
+                        self.conn.commit()
+                    except Exception:
+                        self.conn.rollback()
+                        raise
+            finally:
+                self._txn_depth = 0
 
     def close(self) -> None:
         self.conn.close()
@@ -380,6 +402,11 @@ class SqlStore:
         if self._get(type(obj), obj.id) is None:
             return self._insert(obj)
         return self._update(obj)
+
+    def _delete(self, model, pk):
+        spec = SPECS[model]
+        with self._lock:
+            self._exec(f"DELETE FROM {spec.table} WHERE id = ?", (pk,))
 
     def _row_to_obj(self, model, row):
         spec = SPECS[model]
@@ -562,6 +589,20 @@ class SqlStore:
     def add_setup_audit(self, entry): return self._insert(entry)
     def all_setup_audit(self): return self._query(SetupAuditLog, order="id")
 
+    # -- setup-entity deletion (#215 safe destructive actions) -------------
+    # Single-record hard deletes; the service runs a pre-write dependency gate
+    # before calling these, so they never cascade.
+    def delete_organization(self, org_id): self._delete(Organization, org_id)
+    def delete_league(self, league_id): self._delete(League, league_id)
+    def delete_season(self, season_id): self._delete(Season, season_id)
+    def delete_level(self, level_id): self._delete(Level, level_id)
+    def delete_division(self, division_id): self._delete(Division, division_id)
+    def delete_club(self, club_id): self._delete(Club, club_id)
+    def delete_team(self, team_id): self._delete(Team, team_id)
+    def delete_venue(self, venue_id): self._delete(Venue, venue_id)
+    def delete_rink(self, rink_id): self._delete(Rink, rink_id)
+    def delete_ice_slot(self, slot_id): self._delete(IceSlot, slot_id)
+
     # -- officials (#30) ---------------------------------------------------
     def add_official(self, official): return self._insert(official)
     def get_official(self, official_id): return self._get(Official, official_id)
@@ -656,6 +697,10 @@ class SqlStore:
         return rows[0] if rows else None
     def all_device_tokens(self):
         return self._query(DeviceToken, order="id")
+    def all_calendar_feed_tokens(self):
+        return self._query(CalendarFeedToken, order="id")
+    def all_notification_preferences(self):
+        return self._query(NotificationPreference, order="id")
 
     # -- official availability (#88) ---------------------------------------
     def add_official_availability(self, a): return self._insert(a)

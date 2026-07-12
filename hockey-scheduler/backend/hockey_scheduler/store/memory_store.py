@@ -489,6 +489,12 @@ class InMemoryStore:
     def all_device_tokens(self) -> List[DeviceToken]:
         return list(self.device_tokens.values())
 
+    def all_calendar_feed_tokens(self) -> List[CalendarFeedToken]:
+        return list(self.calendar_feed_tokens.values())
+
+    def all_notification_preferences(self) -> List[NotificationPreference]:
+        return list(self.notification_preferences.values())
+
     # -- official availability (#88) ---------------------------------------
     def add_official_availability(self, a: OfficialAvailability) -> OfficialAvailability:
         self.official_availability[a.id] = a
@@ -702,6 +708,39 @@ class InMemoryStore:
 
     def delete_game(self, game_id: str) -> None:
         self.games.pop(game_id, None)
+
+    # -- setup-entity deletion (#215 safe destructive actions) -------------
+    # Hard deletes of a single record. The service layer runs a pre-write
+    # dependency gate before calling these, so they never cascade.
+    def delete_organization(self, org_id: str) -> None:
+        self.organizations.pop(org_id, None)
+
+    def delete_league(self, league_id: str) -> None:
+        self.leagues.pop(league_id, None)
+
+    def delete_season(self, season_id: str) -> None:
+        self.seasons.pop(season_id, None)
+
+    def delete_level(self, level_id: str) -> None:
+        self.levels.pop(level_id, None)
+
+    def delete_division(self, division_id: str) -> None:
+        self.divisions.pop(division_id, None)
+
+    def delete_club(self, club_id: str) -> None:
+        self.clubs.pop(club_id, None)
+
+    def delete_team(self, team_id: str) -> None:
+        self.teams.pop(team_id, None)
+
+    def delete_venue(self, venue_id: str) -> None:
+        self.venues.pop(venue_id, None)
+
+    def delete_rink(self, rink_id: str) -> None:
+        self.rinks.pop(rink_id, None)
+
+    def delete_ice_slot(self, slot_id: str) -> None:
+        self.ice_slots.pop(slot_id, None)
 
     def all_setup_audit(self) -> List[SetupAuditLog]:
         return list(self.setup_audit)

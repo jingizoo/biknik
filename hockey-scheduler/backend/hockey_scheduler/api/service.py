@@ -2198,6 +2198,7 @@ class ApiService:
                 "start_time": g.start_time.isoformat(),
                 "roster_status": rstatus.status.value,
                 "published": g.published,
+                "cancelled": g.cancelled,  # Games view offers Cancel, not Delete (#215)
                 # Officials summary for the Games operations checklist (#30).
                 "officials_assigned": len(g_active),
                 "officials_accepted": sum(
@@ -2487,6 +2488,57 @@ class ApiService:
     def list_league_teams(self, league_id: str) -> dict:
         rows = [_serialize(t) for t in self.store.teams_for_league(league_id)]
         return {"teams": rows}
+
+    # -- safe destructive deletion (#215) ---------------------------------
+    # Each returns the serialized deleted record on success, or the structured
+    # dependency error (code "has_dependencies", with a details breakdown) when
+    # blocked. The service runs a pre-write dependency gate, so a blocked delete
+    # writes nothing.
+    @catch
+    def delete_organization(self, org_id: str,
+                            actor_id: Optional[str] = None) -> dict:
+        return _serialize(self.setup.delete_organization(org_id, actor_id))
+
+    @catch
+    def delete_league(self, league_id: str, actor_id: Optional[str] = None) -> dict:
+        return _serialize(self.setup.delete_league(league_id, actor_id))
+
+    @catch
+    def delete_level(self, level_id: str, actor_id: Optional[str] = None) -> dict:
+        return _serialize(self.setup.delete_level(level_id, actor_id))
+
+    @catch
+    def delete_season(self, season_id: str, actor_id: Optional[str] = None) -> dict:
+        return _serialize(self.setup.delete_season(season_id, actor_id))
+
+    @catch
+    def delete_division(self, division_id: str,
+                        actor_id: Optional[str] = None) -> dict:
+        return _serialize(self.setup.delete_division(division_id, actor_id))
+
+    @catch
+    def delete_club(self, club_id: str, actor_id: Optional[str] = None) -> dict:
+        return _serialize(self.setup.delete_club(club_id, actor_id))
+
+    @catch
+    def delete_team(self, team_id: str, actor_id: Optional[str] = None) -> dict:
+        return _serialize(self.setup.delete_team(team_id, actor_id))
+
+    @catch
+    def delete_venue(self, venue_id: str, actor_id: Optional[str] = None) -> dict:
+        return _serialize(self.setup.delete_venue(venue_id, actor_id))
+
+    @catch
+    def delete_rink(self, rink_id: str, actor_id: Optional[str] = None) -> dict:
+        return _serialize(self.setup.delete_rink(rink_id, actor_id))
+
+    @catch
+    def delete_ice_slot(self, slot_id: str, actor_id: Optional[str] = None) -> dict:
+        return _serialize(self.setup.delete_ice_slot(slot_id, actor_id))
+
+    @catch
+    def delete_game(self, game_id: str, actor_id: Optional[str] = None) -> dict:
+        return _serialize(self.setup.delete_game(game_id, actor_id))
 
     # -- reassignment: move a record under a new parent (#166 PR D) --------
     @catch

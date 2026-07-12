@@ -32,10 +32,13 @@ def required_permission(path: str):
     None means "no special permission" (e.g. the demo reset control) — still
     allowed for any role.
     """
-    # Resetting wipes and reseeds ALL demo data — destructive, so it is an
-    # operator action, not an anyone-can-press control (hardening review).
-    if path == "/api/reset":
-        return Permission.MANAGE_SCHEDULE
+    # Resetting wipes and reseeds ALL demo data — a League-Admin-only operation
+    # (#215): gated on MANAGE_SETUP so a scheduler/arena role can't invoke it
+    # directly even though the header button is hidden from them. The canonical
+    # route is /api/demo/reset; /api/reset is kept as a back-compat alias with
+    # the same gate.
+    if path in ("/api/reset", "/api/demo/reset"):
+        return Permission.MANAGE_SETUP
     if path == "/api/demo/add-ice-slot":
         return Permission.MANAGE_ARENA
     # Onboarding import dry-run (#92): read-only against the store, but the

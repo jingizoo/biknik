@@ -606,8 +606,17 @@ button.act.danger { background: #ffe5e3; color: #c0271b; }
 .cal-slots::-webkit-scrollbar { height: 5px; }
 .slot-card {
   flex: 0 0 auto; min-width: 96px; border-radius: 10px; padding: 8px 10px;
-  border: 1px solid var(--sep); background: #fff; cursor: default;
+  border: 1px solid var(--sep); background: #fff; cursor: default; position: relative;
 }
+/* Delete affordance on an unused future available slot (#215). */
+.slot-del {
+  position: absolute; top: 4px; right: 4px; border: none; background: transparent;
+  cursor: pointer; font-size: 12px; line-height: 1; padding: 2px; border-radius: 6px;
+  opacity: 0.55;
+}
+.slot-del:hover, .slot-del:focus { opacity: 1; background: #ffe5e3; }
+/* Identifier chip in the blocked-delete dependency list (#215 r4). */
+.dep-item code { font-size: 10px; color: var(--muted); }
 .slot-card .t { font-size: 12px; font-weight: 700; }
 .slot-card .s { font-size: 11px; margin-top: 3px; }
 .slot-card.available { border-color: #bfe6c8; background: #f1fbf3; cursor: pointer; }
@@ -780,6 +789,38 @@ details.tn > .tn-sum:hover { background: #f6f7fb; }
   border-radius: 9px; padding: 10px 12px; font-size: 13px; }
 .drawer-foot { display: flex; justify-content: flex-end; gap: 8px; padding: 12px 16px; border-top: 1px solid var(--sep); }
 @media (max-width: 480px) { .drawer { width: 100%; } }
+
+/* ----- Safe destructive actions (#215): reset + delete ----- */
+/* Compact header "Reset demo" button. */
+.reset-demo-btn { white-space: nowrap; }
+/* A quiet, neutral outlined delete control that only reveals destructive red
+   on hover/focus — so a destructive action never shouts from a resting list. */
+.del-btn { border: 1px solid var(--sep); background: transparent; color: var(--muted); }
+.del-btn:hover, .del-btn:focus-visible { border-color: var(--red); color: var(--red); background: #fff5f5; }
+/* Centered confirmation/blocked modal. */
+.modal-scrim { position: fixed; inset: 0; background: rgba(0,0,0,.4); z-index: 50; animation: fade .15s ease; }
+.modal { position: fixed; z-index: 51; top: 50%; left: 50%; transform: translate(-50%, -50%);
+  width: 420px; max-width: 92vw; max-height: 88vh; overflow-y: auto; background: var(--card);
+  border-radius: 14px; box-shadow: 0 12px 40px rgba(0,0,0,.28); animation: modalpop .16s ease; }
+@keyframes modalpop { from { opacity: 0; transform: translate(-50%, -46%); } to { opacity: 1; transform: translate(-50%, -50%); } }
+.modal-head { display: flex; align-items: center; gap: 8px; padding: 15px 18px; border-bottom: 1px solid var(--sep); }
+.modal-head h2 { font-size: 16px; font-weight: 700; flex: 1; margin: 0; }
+.modal.danger .modal-head h2 { color: var(--red); }
+.modal-x { border: none; background: transparent; font-size: 22px; line-height: 1; cursor: pointer; color: var(--muted); }
+.modal-x:hover { color: var(--ink); }
+.modal-body { padding: 16px 18px; font-size: 14px; }
+.modal-body p { margin: 0 0 10px; }
+.modal-body .muted { color: var(--muted); font-size: 13px; }
+.modal-body .card { margin: 8px 0; }
+.modal-confirm-label { display: block; font-size: 12px; font-weight: 600; color: var(--muted); margin: 12px 0 4px; }
+.modal-confirm-label code, .modal-body code { background: var(--bg); border-radius: 5px; padding: 1px 5px; font-weight: 700; }
+.modal-confirm-input { width: 100%; padding: 10px 11px; border: 1px solid var(--sep); border-radius: 9px;
+  font-size: 14px; background: #fff; box-sizing: border-box; letter-spacing: .08em; text-transform: uppercase; }
+.modal-foot { display: flex; justify-content: flex-end; gap: 8px; padding: 12px 18px 16px; }
+/* The destructive commit button shows solid red ONLY here, inside the modal. */
+.modal .act.danger { background: var(--red); color: #fff; }
+.modal .act.danger:hover:not(:disabled) { filter: brightness(.94); }
+.modal .act.danger:disabled { opacity: .5; cursor: not-allowed; }
 
 /* ----- Pilot onboarding import wizard (#96/#99) ----- */
 .import-form { padding: 0 16px 16px; }

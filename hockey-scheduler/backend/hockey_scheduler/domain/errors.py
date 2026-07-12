@@ -72,6 +72,18 @@ class NotAuthorizedError(DomainError):
     code = "forbidden"
 
 
+class HasDependenciesError(DomainError):
+    """A record can't be deleted because dependent records/history exist.
+
+    Carries a structured ``details`` payload so the client can explain exactly
+    what blocks the deletion (a list of ``{type, count, names}`` groups) rather
+    than only rendering an English sentence. Deletion is never a silent cascade
+    — the caller must clear the dependents first (#215 safe destructive actions).
+    """
+
+    code = "has_dependencies"
+
+
 class AlreadyClaimedError(DomainError):
     """A one-time installation claim has already been consumed (#174)."""
 
