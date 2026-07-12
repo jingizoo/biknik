@@ -1,1 +1,10 @@
-# Hockey Scheduler demo — standard library only, no third-party dependencies.
+# Hockey Scheduler — runtime dependencies.
+#
+# The domain, services, and store layers are standard-library only, so the test
+# suite runs anywhere against SQLite (stdlib sqlite3) with no install step.
+#
+# PostgreSQL is the production target: store/db.py imports psycopg lazily for
+# postgresql:// URLs, so the Postgres driver is the one third-party runtime
+# dependency. It is only imported when DATABASE_URL points at Postgres; SQLite
+# and demo/in-memory deploys never load it.
+psycopg[binary]>=3.1
