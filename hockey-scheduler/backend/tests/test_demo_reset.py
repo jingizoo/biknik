@@ -61,14 +61,24 @@ class DemoResetContract:
         return [a for a in state.api.store.all_setup_audit()
                 if a.action == "demo_reset"]
 
+    def test_boot_is_a_clean_slate(self):
+        # #215: the demo boots empty (no auto-seed), with only the admin persona.
+        with self.make_env() as state:
+            self.assertEqual(state.api.store.all_leagues(), [])
+            self.assertEqual(state.api.store.all_teams(), [])
+            self.assertIsNone(state.game_id)
+            self.assertIsNotNone(state.api.store.get_user_account("user_admin"))
+
     def test_reset_seeds_the_baseline(self):
         with self.make_env() as state:
+            state.reset()  # Load/Reset builds the canonical sample dataset
             self.assertTrue(state.api.store.all_leagues())
             self.assertTrue(state.api.store.all_teams())
             self.assertIsNotNone(state.game_id)
 
     def test_reset_is_idempotent(self):
         with self.make_env() as state:
+            state.reset()
             names1 = sorted(lg.name for lg in state.api.store.all_leagues())
             teams1 = len(state.api.store.all_teams())
             state.reset()
@@ -77,8 +87,17 @@ class DemoResetContract:
             self.assertEqual(names1, names2)
             self.assertEqual(teams1, teams2)
 
-    def test_boot_reset_writes_no_demo_reset_audit(self):
-        # The initial seed (no actor) records no demo_reset row.
+    def test_clear_returns_to_a_clean_slate(self):
+        with self.make_env() as state:
+            state.reset()  # seed
+            self.assertTrue(state.api.store.all_leagues())
+            state.reset(seed=False, audit_action="demo_cleared")
+            self.assertEqual(state.api.store.all_leagues(), [])
+            self.assertEqual(state.api.store.all_teams(), [])
+            self.assertIsNotNone(state.api.store.get_user_account("user_admin"))
+
+    def test_boot_writes_no_demo_reset_audit(self):
+        # The clean-slate boot (no actor) records no demo_reset row.
         with self.make_env() as state:
             self.assertEqual(self._demo_resets(state), [])
 
@@ -88,7 +107,7 @@ class DemoResetContract:
             resets = self._demo_resets(state)
             self.assertEqual(len(resets), 1)
             self.assertEqual(resets[0].actor_id, "user_admin")
-            self.assertIn("reset_at", resets[0].detail)
+            self.assertIn("at", resets[0].detail)
 
     def test_reset_is_atomic_on_seed_failure(self):
         # Establish a baseline, then force the reseed to fail partway. The live

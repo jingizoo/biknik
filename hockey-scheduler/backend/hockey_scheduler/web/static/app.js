@@ -58,6 +58,7 @@ let leagueTeams = {};               // league_id -> [{id,name,league_id}] perman
 let seasonRegs = {};                // season_id -> [{id,team_id,division_id,active}] registrations (#180)
 let rollover = { leagueId: "", fromSeasonId: "", toSeasonId: "", result: null };  // season rollover picker (#180)
 let modal = null;                   // themed confirm/blocked modal (#215): {type, ...}
+let demoMenuOpen = false;           // header demo (database) dropdown open? (#215)
 let rescheduleRequests = null;      // reschedule request(s) for the current game (#29)
 let availFilter = "all";            // all|available|unavailable|maybe|no_response
 let gamesFilter = { division: "all", team: "all", rink: "all", status: "all", from: "", to: "" };  // Games list filters (#152)
@@ -141,6 +142,24 @@ const hasPerm = (p) => rolePerms.has(p);
 // affordances only make sense outside production. Defaults to demo until the
 // status probe resolves, matching the server default (APP_MODE=demo).
 const isDemo = () => !envStatus || envStatus.app_mode !== "production";
+// True when the demo setup is a clean slate (#215) — drives Load vs Reset and
+// the "Start your league" empty state. Server-computed; defaults to false so a
+// missing status never hides Reset on a populated demo.
+const isDemoEmpty = () => !!(envStatus && envStatus.demo_empty);
+
+// Theme-aligned inline SVG icons (#215): 20×20, stroke=currentColor so a button
+// class controls colour (neutral at rest, red on destructive hover/focus). Kept
+// tiny and dependency-free — no icon font, no external asset.
+const _svg = (paths) => `<svg class="ico" viewBox="0 0 24 24" fill="none" `
+  + `stroke="currentColor" stroke-width="2" stroke-linecap="round" `
+  + `stroke-linejoin="round" aria-hidden="true" focusable="false">${paths}</svg>`;
+const ICONS = {
+  trash: _svg('<path d="M3 6h18"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/>'),
+  swap: _svg('<path d="M8 3L4 7l4 4"/><path d="M4 7h16"/><path d="M16 21l4-4-4-4"/><path d="M20 17H4"/>'),
+  circleMinus: _svg('<circle cx="12" cy="12" r="9"/><path d="M8 12h8"/>'),
+  circleX: _svg('<circle cx="12" cy="12" r="9"/><path d="M15 9l-6 6"/><path d="M9 9l6 6"/>'),
+  database: _svg('<ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v14c0 1.7 3.6 3 8 3s8-1.3 8-3V5"/><path d="M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"/>'),
+};
 
 // Shared page-intro block (#146): every view's *title* already comes from
 // the topbar's nav-title (set by setChrome() from the NAV map, #24) — this
@@ -711,9 +730,13 @@ async function commitReassign(newId) {
 // the route entity (league|season|division|club|team|venue|rink|ice-slot).
 function delBtn(kind, id, name, label) {
   if (!hasPerm("manage_setup")) return "";
-  return `<button class="act ghost xs del-btn" data-del="${esc(kind)}"
+  // Compact neutral icon button (#215): a trash glyph, red only on hover/focus
+  // (see .icon-btn.danger). The accessible label carries the full intent; the
+  // click opens a themed confirmation, never deletes outright.
+  const aria = `${label || "Delete"}${name ? " " + name : ""}`;
+  return `<button class="icon-btn danger" data-del="${esc(kind)}"
     data-del-id="${esc(id)}" data-del-name="${esc(name || id)}"
-    title="Delete ${esc(name || "")}">🗑 ${esc(label || "Delete")}</button>`;
+    title="${esc(aria)}" aria-label="${esc(aria)}">${ICONS.trash}</button>`;
 }
 
 // Human labels for the entity kinds shown in the confirm/blocked modals.
@@ -729,7 +752,7 @@ const HIGH_RISK_DELETE = new Set(["league", "season", "team", "venue", "rink"]);
 
 function renderModal() {
   if (!modal) return "";
-  if (modal.type === "reset") return resetModalHtml();
+  if (modal.type === "demo-confirm") return demoConfirmModalHtml(modal);
   if (modal.type === "confirm-delete") return confirmDeleteModalHtml(modal);
   if (modal.type === "cancel-game") return cancelGameModalHtml(modal);
   if (modal.type === "blocked") return blockedModalHtml(modal);
@@ -757,15 +780,25 @@ function modalShell(kind, title, body, foot) {
     </div>`;
 }
 
-function resetModalHtml() {
-  return modalShell("danger", "Reset demo data",
-    `<p>This permanently clears all demo data and reseeds the sample league.
-       Everyone using this demo will see it restart. This can't be undone.</p>
-     <label class="modal-confirm-label" for="reset-confirm">Type <code>RESET</code> to confirm</label>
-     <input id="reset-confirm" class="modal-confirm-input" autocomplete="off"
-       spellcheck="false" placeholder="RESET">`,
+// Demo reset/clear confirmation (#215): both are destructive and typed-confirm
+// gated. Reset rebuilds the sample dataset (RESET); Clear returns to an empty
+// setup (CLEAR).
+function demoConfirmModalHtml(m) {
+  const clear = m.action === "clear";
+  const word = clear ? "CLEAR" : "RESET";
+  const title = clear ? "Clear demo data" : "Reset demo data";
+  const lead = clear
+    ? `<p>This clears all demo data and returns to an empty setup. Everyone
+         using this demo will see it emptied. This can't be undone.</p>`
+    : `<p>This clears all demo data and rebuilds the sample league. Everyone
+         using this demo will see it restart. This can't be undone.</p>`;
+  return modalShell("danger", title,
+    `${lead}
+     <label class="modal-confirm-label" for="demo-confirm-input">Type <code>${word}</code> to confirm</label>
+     <input id="demo-confirm-input" class="modal-confirm-input" autocomplete="off"
+       spellcheck="false" placeholder="${word}">`,
     `<button class="act ghost" data-modal-close>Cancel</button>
-     <button class="act danger" data-reset-confirm disabled>Reset demo</button>`);
+     <button class="act danger" data-demo-confirm disabled>${esc(title)}</button>`);
 }
 
 function confirmDeleteModalHtml(m) {
@@ -819,27 +852,44 @@ function clearTransientStateAfterReset() {
   pendingReassign = null; modal = null;
 }
 
+// After any demo lifecycle change (Load / Reset / Clear): drop transient view
+// state, refresh the demo-empty status (which flips the header Load↔Reset and
+// the empty-state card), and re-render. envStatus is refetched because
+// demo_empty is server-computed and not part of the overview (#215).
+async function afterDemoLifecycleChange(message) {
+  clearTransientStateAfterReset();
+  onboardingStatusDirty = true;
+  demoMenuOpen = false;
+  const status = await getJSON("/api/status");
+  if (status && !status.error) envStatus = status;
+  toast = message;
+  modal = null;
+  await render();
+}
+
 function wireModal(c) {
   c.querySelectorAll("[data-modal-close]").forEach((b) =>
     b.onclick = () => { modal = null; render(); });
-  // Reset flow: enable the destructive button only once "RESET" is typed.
-  const resetInput = c.querySelector("#reset-confirm");
-  const resetConfirm = c.querySelector("[data-reset-confirm]");
-  if (resetInput && resetConfirm) {
-    resetInput.oninput = () => {
-      resetConfirm.disabled = resetInput.value.trim().toUpperCase() !== "RESET";
+  // Demo reset/clear flow: enable the destructive button only once the exact
+  // word is typed, then POST the matching route.
+  const demoInput = c.querySelector("#demo-confirm-input");
+  const demoConfirm = c.querySelector("[data-demo-confirm]");
+  if (demoInput && demoConfirm && modal && modal.type === "demo-confirm") {
+    const clear = modal.action === "clear";
+    const word = clear ? "CLEAR" : "RESET";
+    demoInput.oninput = () => {
+      demoConfirm.disabled = demoInput.value.trim().toUpperCase() !== word;
     };
-    resetInput.focus();
-    resetConfirm.onclick = async () => {
-      if (resetInput.value.trim().toUpperCase() !== "RESET") return;
-      resetConfirm.disabled = true;  // prevent a duplicate submit while running
+    demoInput.focus();
+    demoConfirm.onclick = async () => {
+      if (demoInput.value.trim().toUpperCase() !== word) return;
+      demoConfirm.disabled = true;  // prevent a duplicate submit while running
       // Server re-checks demo mode, MANAGE_SETUP, and the confirm value (#215).
-      const res = await post("/api/demo/reset", { confirm: "RESET" });
+      const res = await post(clear ? "/api/demo/clear" : "/api/demo/reset",
+                             { confirm: word });
       if (res && res.error) { modal = null; return render(); }  // post() set the toast
-      clearTransientStateAfterReset();
-      onboardingStatusDirty = true;
-      toast = "Demo data reset.";
-      render();
+      await afterDemoLifecycleChange(clear ? "Demo data cleared."
+                                           : "Demo data reset.");
     };
   }
   // Confirm-delete flow: POST the delete; a has_dependencies error swaps this
@@ -892,7 +942,30 @@ function wireModal(c) {
 // drawers. Facility (Venue→Rink) and Competition (League→Season→Division→Team)
 // are structure-only and safe for anyone; the Roster tree exposes player names
 // and so is gated to setup operators, matching where playersList is fetched.
+// Clean-slate empty state (#215): when there's nothing set up yet, invite the
+// operator to build by hand or load the sample dataset instead of showing empty
+// trees. Shown only to an operator who can manage setup.
+function startYourLeagueCard() {
+  const load = (hasPerm("manage_setup") && isDemo())
+    ? `<button class="act ghost" data-demo-load>Load demo data</button>` : "";
+  return `<section class="card start-league">
+    <div class="section-title" style="margin-top:0">Start your league</div>
+    <p class="muted">Create your league structure from scratch, or load the
+      complete sample dataset to explore the app.</p>
+    <div class="actions">
+      <button class="act primary" data-drawer="league">Create manually</button>
+      ${load}
+    </div>
+  </section>`;
+}
+
 function renderSetupHierarchy(ov) {
+  // A brand-new demo (or any empty setup) opens on the "Start your league"
+  // card rather than empty trees (#215).
+  if (hasPerm("manage_setup") && !(ov.leagues || []).length
+      && !(ov.teams || []).length && !(ov.organizations || []).length) {
+    return startYourLeagueCard();
+  }
   const canSeePlayers = hasPerm("manage_setup");
   const pCount = {};
   const pByTeam = {};
@@ -1155,7 +1228,8 @@ function renderSeasonParticipation(ov) {
         return `<div class="tn-leaf reg-row">
           <span class="tn-label">👥 ${esc(teamName(r.team_id))}</span>
           <span class="tn-meta reg-tag">${tag}</span>
-          ${divCtl}<button class="act ghost xs del-btn" data-reg-remove="${esc(r.id)}">Remove from season</button></div>`;
+          ${divCtl}<button class="icon-btn danger" data-reg-remove="${esc(r.id)}"
+            title="Remove from season" aria-label="Remove ${esc(teamName(r.team_id))} from ${esc(s.name)}">${ICONS.circleMinus}</button></div>`;
       }).join("") || `<div class="tn-empty">No teams registered for this season yet.</div>`;
       const available = teams.filter((t) => !registered.has(t.id));
       const addCtl = available.length
@@ -1481,7 +1555,8 @@ function slotCard(s, draggable, ctx) {
   const isMovingThis = s.game_id && s.game_id === movingGameId;
   // A Move button gives touch/mobile/keyboard users a drag-free path (#move-mode).
   const moveBtn = (draggable && s.game_id && !moving && canMove)
-    ? `<button class="slot-move" data-move-game="${esc(s.game_id)}">Move</button>` : "";
+    ? `<button class="icon-btn" data-move-game="${esc(s.game_id)}"
+        title="Move game" aria-label="Move game">${ICONS.swap}</button>` : "";
   const extra = `${isTarget ? " move-target" : ""}${isMovingThis ? " moving" : ""}`;
   const cta = isTarget ? " · tap to move here" : (draggable && s.game_id && !moving && canMove ? " · drag or Move" : "");
   // An unused, future, available slot can be deleted straight from the Day
@@ -1491,9 +1566,9 @@ function slotCard(s, draggable, ctx) {
     && !s.game_id && hasPerm("manage_setup") && s.start_time
     && s.start_time > new Date().toISOString();
   const delSlot = canDeleteSlot
-    ? `<button class="slot-del del-btn" data-del="ice-slot" data-del-id="${esc(s.id)}"
+    ? `<button class="icon-btn danger slot-del" data-del="ice-slot" data-del-id="${esc(s.id)}"
         data-del-name="${esc(slotLabel(s))}" title="Delete this ice slot"
-        aria-label="Delete this ice slot">🗑</button>` : "";
+        aria-label="Delete this ice slot">${ICONS.trash}</button>` : "";
   return `<div class="slot-card ${cls}${extra}" ${dropClick} ${drag}><div class="t">${fmt(s.start_time)}–${fmt(s.end_time)}</div><div class="s">${slotLabel(s)}${state}${cta}</div>${moveBtn}${delSlot}</div>`;
 }
 
@@ -1675,7 +1750,7 @@ function renderDay(ov, ctx, rinks) {
     return slot ? slotPasses(slot, ctx) : true;
   });
   const tray = drafts.length ? `<div class="tray"><span class="tray-label">Draft games</span>
-    ${drafts.map((g) => `<span class="chip-drag${g.game_id === movingGameId ? " moving" : ""}" ${moving ? "" : `draggable="true" data-game="${esc(g.game_id)}"`}>⠿ ${esc(g.home_team_name)} vs ${esc(g.away_team_name)} · ${fmt(g.start_time)}${moving ? "" : ` <button class="chip-move" data-move-game="${esc(g.game_id)}">Move</button>`}</span>`).join("")}</div>` : "";
+    ${drafts.map((g) => `<span class="chip-drag${g.game_id === movingGameId ? " moving" : ""}" ${moving ? "" : `draggable="true" data-game="${esc(g.game_id)}"`}>⠿ ${esc(g.home_team_name)} vs ${esc(g.away_team_name)} · ${fmt(g.start_time)}${moving ? "" : ` <button class="icon-btn" data-move-game="${esc(g.game_id)}" title="Move game" aria-label="Move game">${ICONS.swap}</button>`}</span>`).join("")}</div>` : "";
   const body = rinks.length
     ? moveBanner(ov) + tray + rows
     : `<div class="empty">No rinks match the selected filters.</div>`;
@@ -1798,8 +1873,9 @@ function gamesRow(g) {
       <button class="act primary" data-openroster="${esc(g.game_id)}">Open Roster</button>
       ${g.published ? "" : `<button class="act success" data-publish="${esc(g.game_id)}">Publish</button>`}
       ${!g.cancelled && hasPerm("manage_schedule")
-        ? `<button class="act danger" data-game-cancel="${esc(g.game_id)}"
-            data-game-name="${esc(g.home_team_name + " vs " + (g.away_team_name || "TBD"))}">Cancel game</button>` : ""}
+        ? `<button class="icon-btn danger" data-game-cancel="${esc(g.game_id)}"
+            data-game-name="${esc(g.home_team_name + " vs " + (g.away_team_name || "TBD"))}"
+            title="Cancel game" aria-label="Cancel game ${esc(g.home_team_name + " vs " + (g.away_team_name || "TBD"))}">${ICONS.circleX}</button>` : ""}
     </div>
     ${g.cancelled ? `<div class="muted" style="padding:6px 2px">This game is cancelled; its fixture and result history are preserved.</div>` : ""}
   </div>`;
@@ -4227,6 +4303,15 @@ async function render() {
 
   setChrome(ov);
   updateNotifBadge();
+  // Keep the header demo control's Load↔Reset label in step with the actual
+  // data (#215): the demo boots empty and can be populated by the demo Load, a
+  // manual build, or an import — all of which flow through render(), whereas
+  // envStatus.demo_empty is only refetched on session/lifecycle changes. The
+  // overview is authoritative for what leagues/teams exist right now.
+  if (isDemo() && envStatus) {
+    envStatus.demo_empty = !(ov.leagues || []).length && !(ov.teams || []).length;
+  }
+  renderDemoMenu();
   // Roster/Sheet expose private player data — a signed-in user outside the
   // game's scope gets a 403 (#73). Show a clear "restricted" state instead of
   // the generic backend-error banner.
@@ -4294,6 +4379,13 @@ async function render() {
     if (b.dataset.prefillField2) drawerValues[b.dataset.prefillField2] = b.dataset.prefillValue2 || "";
     toast = ""; render();
   });
+  // Empty-state "Load demo data" (#215): builds the sample dataset then refreshes.
+  const demoLoad = c.querySelector("[data-demo-load]");
+  if (demoLoad) demoLoad.onclick = async () => {
+    const res = await post("/api/demo/load", {});
+    if (res && res.error) return render();
+    await afterDemoLifecycleChange("Sample demo data loaded.");
+  };
   c.querySelectorAll("[data-drawer-close]").forEach((b) => b.onclick = () => {
     drawer = null; drawerError = ""; drawerValues = {}; render();
   });
@@ -5208,14 +5300,63 @@ document.querySelectorAll(".topbar [data-open-drawer]").forEach((b) => b.onclick
   drawer = { kind: b.dataset.openDrawer }; drawerError = ""; drawerValues = {};
   switchTab("setup");
 });
-// Reset demo (#215): open the themed confirm modal (which requires typing
-// RESET) rather than wiping immediately. The actual reseed + state-clear runs
-// from the modal's confirm handler (wireModal).
-document.getElementById("reset-btn").onclick = () => {
-  if (!hasPerm("manage_setup") || !isDemo()) return;  // defense in depth
-  modal = { type: "reset" };
-  render();
+// Demo data control (#215): one database-icon button + dropdown whose contents
+// depend on whether the demo is a clean slate — Load when empty; Reset + Clear
+// when populated. Load runs immediately (non-destructive build); Reset/Clear
+// open a typed-confirm modal. The button state is (re)painted by gateChrome via
+// renderDemoMenu(); here we wire the click behaviour once.
+const demoBtn = document.getElementById("demo-btn");
+const demoDropdown = document.getElementById("demo-dropdown");
+if (demoBtn) demoBtn.onclick = (e) => {
+  e.stopPropagation();
+  if (!hasPerm("manage_setup") || !isDemo()) return;
+  demoMenuOpen = !demoMenuOpen;
+  renderDemoMenu();
 };
+if (demoDropdown) demoDropdown.onclick = async (e) => {
+  const item = e.target.closest("[data-demo-action]");
+  if (!item) return;
+  e.stopPropagation();
+  demoMenuOpen = false;
+  const action = item.dataset.demoAction;
+  if (action === "load") {
+    const res = await post("/api/demo/load", {});
+    if (res && res.error) return renderDemoMenu();
+    await afterDemoLifecycleChange("Sample demo data loaded.");
+  } else {
+    modal = { type: "demo-confirm", action };  // reset | clear
+    renderDemoMenu();
+    render();
+  }
+};
+// A click anywhere else closes the dropdown.
+document.addEventListener("click", () => {
+  if (demoMenuOpen) { demoMenuOpen = false; renderDemoMenu(); }
+});
+
+// Paint the header demo control for the current state. Hidden entirely outside
+// demo mode or without manage_setup.
+function renderDemoMenu() {
+  const menu = document.getElementById("demo-menu");
+  const btn = document.getElementById("demo-btn");
+  const dd = document.getElementById("demo-dropdown");
+  if (!menu || !btn || !dd) return;
+  const show = hasPerm("manage_setup") && isDemo();
+  menu.hidden = !show;
+  if (!show) { demoMenuOpen = false; dd.hidden = true; return; }
+  const empty = isDemoEmpty();
+  const primary = empty ? "Load demo data" : "Reset demo data";
+  btn.innerHTML = ICONS.database;
+  btn.title = primary;
+  btn.setAttribute("aria-label", primary);
+  btn.setAttribute("aria-expanded", demoMenuOpen ? "true" : "false");
+  const items = empty
+    ? [["load", "Load demo data"]]
+    : [["reset", "Reset demo data"], ["clear", "Clear demo data"]];
+  dd.innerHTML = items.map(([a, label]) =>
+    `<button class="demo-item" role="menuitem" data-demo-action="${a}">${esc(label)}</button>`).join("");
+  dd.hidden = !demoMenuOpen;
+}
 // Sign out ends the server session and returns to the sign-in screen (#71).
 const signoutBtn = document.getElementById("signout-btn");
 if (signoutBtn) signoutBtn.onclick = async () => {
@@ -5311,7 +5452,7 @@ function gateChrome() {
   // Reset wipes and reseeds all demo data — shown only in demo mode and only to
   // a League Admin (MANAGE_SETUP), matching the server, which hard-disables the
   // reset route in production (#215).
-  toggle("#reset-btn", hasPerm("manage_setup") && isDemo());
+  renderDemoMenu();  // header demo (database) control, state-aware (#215)
   // Sign out only makes sense with a live session.
   toggle("#signout-btn", !!currentUser);
   // Dashboard + Activity are operator/coach ops consoles; Roster + Game Sheet

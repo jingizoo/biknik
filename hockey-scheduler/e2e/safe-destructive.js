@@ -182,8 +182,11 @@ async function checkViewport(browser, viewport) {
     if (!reg) throw new Error(`[${viewport.label}] the Del Team registration is missing`);
     const removeBtn = await page.waitForSelector(
       `[data-reg-remove="${reg.id}"]`, { timeout: 10000 });
-    if (!/Remove from season/.test(await removeBtn.textContent())) {
-      throw new Error(`[${viewport.label}] the season-registration action was not relabeled`);
+    // The action is now an icon button (#215): its intent lives in the
+    // tooltip/accessible label rather than visible text.
+    if (!/Remove from season/.test(await removeBtn.getAttribute("title"))
+        || !/Remove/.test(await removeBtn.getAttribute("aria-label"))) {
+      throw new Error(`[${viewport.label}] the season-registration icon action lacks its label`);
     }
     const rmResp = page.waitForResponse((r) =>
       r.url().endsWith(`/season-team-registration/${reg.id}/remove`)
@@ -195,31 +198,38 @@ async function checkViewport(browser, viewport) {
       throw new Error(`[${viewport.label}] the team is still active after Remove from season`);
     }
 
-    // (4) Reset demo: the header button is visible in demo, opens a confirm
-    // modal that requires typing RESET, and atomically reseeds — our Del League
-    // is gone afterward.
-    const resetBtn = await page.waitForSelector("#reset-btn", { state: "visible", timeout: 10000 });
-    if (!/Reset demo/.test(await resetBtn.textContent())) {
-      throw new Error(`[${viewport.label}] the reset button is not labeled "Reset demo"`);
+    // (4) Reset demo: the header database-icon control is visible in demo, and
+    // because data exists its dropdown offers "Reset demo data", which opens a
+    // confirm modal requiring RESET and atomically reseeds — our Del League is
+    // gone afterward.
+    const demoBtn = await page.waitForSelector("#demo-btn", { state: "visible", timeout: 10000 });
+    if (!/Reset demo data/.test(await demoBtn.getAttribute("title"))) {
+      throw new Error(`[${viewport.label}] the demo control is not labeled "Reset demo data"`);
     }
-    await resetBtn.click();
-    await page.waitForSelector(".modal.danger #reset-confirm", { timeout: 10000 });
+    await demoBtn.click();
+    const resetItem = await page.waitForSelector(
+      '[data-demo-action="reset"]', { state: "visible", timeout: 10000 });
+    await resetItem.click();
+    await page.waitForSelector(".modal.danger #demo-confirm-input", { timeout: 10000 });
     // Commit is disabled until RESET is typed exactly.
-    if (!(await page.$eval("[data-reset-confirm]", (b) => b.disabled))) {
+    if (!(await page.$eval("[data-demo-confirm]", (b) => b.disabled))) {
       throw new Error(`[${viewport.label}] reset was enabled before typing RESET`);
     }
-    await page.fill("#reset-confirm", "RESET");
+    await page.fill("#demo-confirm-input", "RESET");
     await page.waitForFunction(
-      () => !document.querySelector("[data-reset-confirm]").disabled, null, { timeout: 5000 });
+      () => !document.querySelector("[data-demo-confirm]").disabled, null, { timeout: 5000 });
     const resetResp = page.waitForResponse((r) =>
       r.url() === `${base}/api/demo/reset` && r.request().method() === "POST");
-    await page.click("[data-reset-confirm]");
+    await page.click("[data-demo-confirm]");
     if ((await resetResp).status() !== 200) {
       throw new Error(`[${viewport.label}] reset returned non-200`);
     }
     await page.waitForSelector(".modal", { state: "detached", timeout: 10000 });
     const afterReset = await getJson(`/api/setup/hierarchy`);
-    if (afterReset.leagues.some((l) => l.id === ids.league)) {
+    // Match by name, not id: reset rebuilds from a fresh store whose sequential
+    // id generator restarts, so the canonical demo league legitimately reuses
+    // the id our "Del League" had — the name is what proves the wipe/reseed.
+    if (afterReset.leagues.some((l) => l.name === "Del League")) {
       throw new Error(`[${viewport.label}] reset did not clear the created league`);
     }
     if (!afterReset.leagues.length) {

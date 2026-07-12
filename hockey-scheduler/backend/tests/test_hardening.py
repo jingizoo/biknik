@@ -124,6 +124,35 @@ class HardeningHttpTest(unittest.TestCase):
         self.assertEqual(status, 400)
         self.assertEqual(json.loads(body)["error"]["code"], "validation_error")
 
+    def _admin(self):
+        return {"X-Demo-Role": "league_admin", "Content-Type": "application/json"}
+
+    def _leagues(self):
+        _, _, body = self._req("GET", "/api/demo/overview", None)
+        return json.loads(body)["leagues"]
+
+    def test_demo_load_and_clear_roundtrip(self):
+        # #215: Load builds the sample dataset; Clear (typed CLEAR) empties it.
+        status, _, _ = self._req("POST", "/api/demo/load", {}, self._admin())
+        self.assertEqual(status, 200)
+        self.assertTrue(self._leagues())
+        # Clear needs the typed confirmation.
+        status, _, body = self._req("POST", "/api/demo/clear", {}, self._admin())
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(body)["error"]["code"], "validation_error")
+        status, _, _ = self._req("POST", "/api/demo/clear",
+                                 {"confirm": "CLEAR"}, self._admin())
+        self.assertEqual(status, 200)
+        self.assertEqual(self._leagues(), [])
+
+    def test_demo_load_and_clear_are_league_admin_only(self):
+        for route, body in (("/api/demo/load", {}),
+                            ("/api/demo/clear", {"confirm": "CLEAR"})):
+            status, _, _ = self._req("POST", route, body,
+                                     {"X-Demo-Role": "viewer",
+                                      "Content-Type": "application/json"})
+            self.assertEqual(status, 403, route)
+
     # -- static traversal stays blocked ----------------------------------------
     def test_path_traversal_is_rejected(self):
         for probe in ("/../CLAUDE.md", "/..%2f..%2fetc%2fpasswd",

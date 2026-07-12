@@ -2355,15 +2355,17 @@ class SetupService:
     def list_divisions(self, season_id: str) -> List[Division]:
         return self.store.divisions_for_season(season_id)
 
-    def record_demo_reset(self, actor_id: Optional[str] = None) -> SetupAuditLog:
-        """Audit a demo reset (#215) once the new baseline exists.
+    def record_demo_event(self, action: str,
+                          actor_id: Optional[str] = None) -> SetupAuditLog:
+        """Audit a demo-lifecycle event (#215) — ``demo_reset``/``demo_loaded``/
+        ``demo_cleared`` — once the new dataset exists.
 
-        Written by DemoState.reset after the reseed, inside the same atomic unit
-        for a SQL store, so the reset and its audit row commit together. Not
-        ``@_transactional``: the caller already owns the transaction.
+        Written by DemoState.reset after the (re)build, inside the same atomic
+        unit for a SQL store, so the action and its audit row commit together.
+        Not ``@_transactional``: the caller already owns the transaction.
         """
-        return self._audit("demo_reset", "demo", "demo", actor_id,
-                           {"reset_at": self.clock().isoformat()})
+        return self._audit(action, "demo", "demo", actor_id,
+                           {"at": self.clock().isoformat()})
 
     # -- safe destructive deletion (#215) ---------------------------------
     # Every delete runs a *pre-write* dependency gate: if any dependent record

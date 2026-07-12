@@ -13,7 +13,8 @@
     "permanent-teams": "node permanent-teams.js",
     "safe-destructive": "node safe-destructive.js",
     "destructive-surfaces": "node destructive-surfaces.js",
-    "reset-visibility": "node reset-visibility.js"
+    "reset-visibility": "node reset-visibility.js",
+    "demo-lifecycle": "node demo-lifecycle.js"
   },
   "devDependencies": {
     "playwright": "^1.48.0"

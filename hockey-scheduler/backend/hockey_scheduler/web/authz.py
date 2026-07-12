@@ -37,7 +37,8 @@ def required_permission(path: str):
     # directly even though the header button is hidden from them. The canonical
     # route is /api/demo/reset; /api/reset is kept as a back-compat alias with
     # the same gate.
-    if path in ("/api/reset", "/api/demo/reset"):
+    if path in ("/api/reset", "/api/demo/reset",
+                "/api/demo/load", "/api/demo/clear"):
         return Permission.MANAGE_SETUP
     if path == "/api/demo/add-ice-slot":
         return Permission.MANAGE_ARENA

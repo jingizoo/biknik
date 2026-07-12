@@ -129,10 +129,13 @@ def _json_default(obj):
 
 
 class DemoState:
-    """Holds the seeded game + facade; can reset itself for the demo."""
+    """Holds the demo facade; can (re)build or clear itself for the demo."""
 
     def __init__(self) -> None:
-        self.reset()
+        # Demo mode boots to a CLEAN SLATE (#215): an empty setup the operator
+        # can Load sample data into or build by hand. (Production ignores `seed`
+        # and preserves its durable store.)
+        self.reset(seed=False)
 
     def _make_api(self, store):
         # Email/push transports come from EMAIL_MODE / SMTP_* (#63) and
@@ -142,19 +145,23 @@ class DemoState:
             store, email_transport=email_transport_from_env(os.environ),
             push_transport=push_transport_from_env(os.environ))
 
-    def reset(self, actor_id: Optional[str] = None) -> None:
-        """Rebuild the demo baseline (#215).
+    def reset(self, actor_id: Optional[str] = None, seed: bool = True,
+              audit_action: str = "demo_reset") -> None:
+        """Rebuild the demo dataset (#215).
 
-        Demo-mode assumption: reset is a single-operator action. It is not
-        serialized against concurrent in-flight mutations on the threaded demo
-        server — a demo has one operator pressing the button — so we do not take
-        a global request lock. What we DO guarantee is atomicity of the reseed
-        itself and clean resource handling: the new baseline is built fully
-        before any live reference is swapped, non-database side effects
-        (rate-limit slate) are applied only on success, the superseded store is
-        closed after a successful swap, and a half-built store is closed on
-        failure. So a mid-seed failure leaves the previous dataset — and the
-        live self.api — untouched, and repeated resets don't leak connections.
+        ``seed=True`` builds the full canonical Alpine scenario (Load / Reset);
+        ``seed=False`` produces a CLEAN SLATE — an empty setup with only the
+        League-Admin persona so the operator can auto-sign-in and build (or Load)
+        from scratch (Clear, and the demo's own cold boot).
+
+        Demo-mode assumption: this is a single-operator action, not serialized
+        against concurrent in-flight mutations on the threaded demo server. What
+        we DO guarantee is atomicity and clean resource handling: the new dataset
+        is built fully before any live reference is swapped, non-database side
+        effects (rate-limit slate) are applied only on success, the superseded
+        store is closed after a successful swap, and a half-built store is closed
+        on failure. So a mid-build failure leaves the previous dataset — and the
+        live self.api — untouched, and repeats don't leak connections.
         """
         store = create_store()  # SqlStore.__init__ applies pending numbered migrations (#75)
         old = getattr(self, "api", None)
@@ -173,33 +180,35 @@ class DemoState:
             self._close_store(old_store, store)
             return
 
-        # Demo mode: rebuild the full Alpine league/arena scenario via the real
-        # setup service (one game rostered & confirmed, ready to demo the
-        # back-out → substitute flow). The whole reseed is ATOMIC (#215): for a
-        # SQL store it runs inside a single transaction (the reentrant
-        # transaction() makes reset_schema + every @_transactional seed call
-        # commit or roll back as one unit), and for the in-memory store we build
-        # into a fresh object and only swap the live references on success.
-        def _seed():
+        # The whole (re)build is ATOMIC (#215): for a SQL store it runs inside a
+        # single transaction (the reentrant transaction() makes reset_schema +
+        # every @_transactional seed call commit or roll back as one unit), and
+        # for the in-memory store we build into a fresh object and only swap the
+        # live references on success.
+        def _build():
             if isinstance(store, SqlStore):
                 store.reset_schema()
-            _, game_id, ids = build_full_demo_store(store)
             api = self._make_api(store)
-            self._seed_demo_accounts(api, ids)
+            if seed:
+                _, game_id, ids = build_full_demo_store(store)
+                self._seed_demo_accounts(api, ids)
+            else:
+                game_id, ids = None, {}
+                self._seed_admin_account(api)  # clean slate keeps a sign-in path
             if actor_id:
-                # One audit row, written after the canonical baseline exists,
-                # naming the authenticated actor and the reset time (#215).
-                api.setup.record_demo_reset(actor_id)
+                # One audit row, written after the new baseline exists, naming
+                # the authenticated actor and the action (#215).
+                api.setup.record_demo_event(audit_action, actor_id)
             return api, game_id, ids
 
         try:
             if isinstance(store, SqlStore):
                 with store.transaction():
-                    api, game_id, ids = _seed()
+                    api, game_id, ids = _build()
             else:
-                api, game_id, ids = _seed()
+                api, game_id, ids = _build()
         except Exception:
-            # Failed reseed — discard the half-built store's connection and
+            # Failed build — discard the half-built store's connection and
             # leave the live state completely untouched.
             self._close_store(store, None)
             raise
@@ -207,8 +216,17 @@ class DemoState:
         # baseline is fully built. Then apply the non-DB side effect and release
         # the superseded store.
         self.api, self.game_id, self.ids = api, game_id, ids
-        RATE_LIMITER.reset()  # (#131) only after the reset actually succeeded
+        RATE_LIMITER.reset()  # (#131) only after the (re)build actually succeeded
         self._close_store(old_store, store)
+
+    def _seed_admin_account(self, api) -> None:
+        """The clean-slate demo keeps just the League-Admin persona so the demo
+        still auto-signs-in and the operator can Load sample data or build by
+        hand. Deterministic id keeps an existing admin session valid across a
+        Clear/Load cycle."""
+        api.accounts.create_account(
+            "admin", DEMO_PASSWORD, DEMO_USERS["admin"], scope={},
+            actor_id="demo_seed", account_id="user_admin")
 
     @staticmethod
     def _close_store(store, keep) -> None:
@@ -754,6 +772,12 @@ class Handler(BaseHTTPRequestHandler):
             # auth — like a health endpoint.
             status = api.runtime_status()
             status["app_mode"] = _app_mode()
+            # Whether the demo setup is a clean slate (#215): drives the header's
+            # Load-vs-Reset control and the "Start your league" empty state. Demo
+            # mode only; never relevant in production.
+            status["demo_empty"] = (_app_mode() != "production"
+                                    and not api.store.all_leagues()
+                                    and not api.store.all_teams())
             return self._send_json(status)
         if path == "/api/health":
             # Liveness + dependency snapshot (#90). Public, non-sensitive.
@@ -1377,32 +1401,38 @@ class Handler(BaseHTTPRequestHandler):
                 "details": {"role": role.value, "scope": scope},
             }}, 403)
 
-        if path in ("/api/reset", "/api/demo/reset"):
-            # Demo reset (#215): canonical route /api/demo/reset (/api/reset is a
-            # back-compat alias). Already MANAGE_SETUP-gated above (League Admin
-            # only). Two further server-side guards, independent of the hidden
-            # button: it is unavailable in production, and the caller must send
-            # the typed confirmation value so the reset can't fire on an
-            # accidental empty POST.
+        if path in ("/api/reset", "/api/demo/reset",
+                    "/api/demo/load", "/api/demo/clear"):
+            # Demo lifecycle (#215), all MANAGE_SETUP-gated (League Admin only)
+            # and unavailable in production:
+            #   /api/demo/load  → build the canonical sample dataset (no confirm)
+            #   /api/demo/reset → wipe + rebuild the sample dataset (type RESET)
+            #   /api/demo/clear → wipe to a clean slate (type CLEAR)
+            # /api/reset is a back-compat alias for reset.
             if _app_mode() == "production":
                 return self._send_json({"error": {
                     "code": "demo_reset_not_available",
-                    "message": "Demo reset is not available in this environment."}}, 403)
-            if (body.get("confirm") or "").strip().upper() != "RESET":
+                    "message": "Demo controls are not available in this environment."}}, 403)
+            if path == "/api/demo/load":
+                seed, audit_action, confirm_word = True, "demo_loaded", None
+            elif path == "/api/demo/clear":
+                seed, audit_action, confirm_word = False, "demo_cleared", "CLEAR"
+            else:
+                seed, audit_action, confirm_word = True, "demo_reset", "RESET"
+            if confirm_word and (body.get("confirm") or "").strip().upper() != confirm_word:
                 return self._send_json({"error": {
                     "code": "validation_error",
-                    "message": "Type RESET to confirm the demo reset."}}, 400)
-            # Atomic reseed, attributed to the authenticated session actor so the
-            # new baseline carries a demo_reset audit row naming who did it. The
-            # reseed is all-or-nothing (#215); if it somehow fails, the previous
-            # dataset is left intact and we return a deterministic error rather
-            # than a half-rebuilt demo.
+                    "message": f"Type {confirm_word} to confirm."}}, 400)
+            # Atomic (re)build, attributed to the authenticated session actor so
+            # the new dataset carries a demo_loaded/demo_reset/demo_cleared audit
+            # row. All-or-nothing (#215); on failure the previous dataset is left
+            # intact and we return a deterministic error, not a half-built demo.
             try:
-                STATE.reset(actor_id=user_id)
+                STATE.reset(actor_id=user_id, seed=seed, audit_action=audit_action)
             except Exception:
                 return self._send_json({"error": {
                     "code": "demo_reset_failed",
-                    "message": ("The demo reset could not be completed; the "
+                    "message": ("The demo action could not be completed; the "
                                 "previous data is unchanged.")}}, 500)
             # Reset rebuilds the store (dropping the sessions table), so the
             # operator's cookie is now dangling (#74). Demo accounts reseed

@@ -81,8 +81,21 @@ async function newPage(browser, viewport) {
 }
 
 async function resetVisible(page) {
-  const btn = page.locator("#reset-btn");
-  return (await btn.count()) > 0 && (await btn.isVisible());
+  // The demo data control is now a database-icon menu (#215); it is hidden
+  // (the whole #demo-menu carries `hidden`) unless the signed-in user can
+  // manage setup in demo mode.
+  const menu = page.locator("#demo-menu");
+  return (await menu.count()) > 0 && (await menu.isVisible());
+}
+
+function loadDemo(page) {
+  return page.evaluate(async () => {
+    const r = await fetch("/api/demo/load", {
+      method: "POST", credentials: "same-origin",
+      headers: { "Content-Type": "application/json" }, body: "{}",
+    });
+    return r.status;
+  });
 }
 
 async function checkViewport(browser, viewport) {
@@ -102,10 +115,16 @@ async function checkViewport(browser, viewport) {
     if ((await login(demoPage, "admin", "demo")) !== 200) {
       throw new Error(`[${viewport.label}] demo admin login failed`);
     }
+    // The demo now boots as a clean slate (#215). Load the sample dataset so a
+    // non-admin (coach) account exists to prove the negative case below; the
+    // admin control is visible either way, but with data it reads "Reset".
+    if ((await loadDemo(demoPage)) !== 200) {
+      throw new Error(`[${viewport.label}] demo data load failed`);
+    }
     await demoPage.reload({ waitUntil: "domcontentloaded" });
     await demoPage.waitForSelector("#content > *", { timeout: 10000 });
     await demoPage.waitForFunction(
-      () => { const b = document.querySelector("#reset-btn"); return b && b.offsetParent !== null; },
+      () => { const b = document.querySelector("#demo-menu"); return b && b.offsetParent !== null; },
       null, { timeout: 10000 });
 
     if ((await login(demoPage, "coach", "demo")) !== 200) {
