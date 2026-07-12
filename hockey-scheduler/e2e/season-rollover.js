@@ -4,11 +4,13 @@
 // registered in a source season, pre-registers one of them in the target season,
 // then uses the Setup "Season rollover" panel to carry the source season's
 // participation forward: the pre-registered team is shown as already registered
-// (and never offered), the remaining team is selected, assigned a target-season
-// division, and committed through the hardened rollover service. The journey
-// verifies the carried team lands in the chosen target division, the
-// already-registered team is untouched, and no permanent Team is duplicated.
-// Fails on any browser console/page error.
+// (and never offered), the remaining team is selected, and — crucially — the
+// commit stays disabled with an inline row error until that team is assigned a
+// target-season division, so an unassigned selection can never be submitted and
+// no write happens before a valid choice (review #216). The journey then
+// commits and verifies the carried team lands in the chosen target division,
+// the already-registered team is untouched, and no permanent Team is
+// duplicated. Fails on any browser console/page error.
 const { chromium } = require("playwright");
 const { spawn } = require("child_process");
 const http = require("http");
@@ -82,6 +84,9 @@ async function checkViewport(browser, viewport) {
       const league = await post("/api/setup/league", { name: "Rollover League" });
       const src = await post("/api/setup/season", { league_id: league.id, name: "2026-27" });
       const dst = await post("/api/setup/season", { league_id: league.id, name: "2027-28" });
+      // A third season in the same league with NO divisions — the rollover must
+      // refuse it as a target (review #216, point 3).
+      const empty = await post("/api/setup/season", { league_id: league.id, name: "2028-29" });
       const dSrc = await post("/api/setup/division", { season_id: src.id, name: "Source Div" });
       const dstA = await post("/api/setup/division", { season_id: dst.id, name: "Target A" });
       const dstB = await post("/api/setup/division", { season_id: dst.id, name: "Target B" });
@@ -99,7 +104,7 @@ async function checkViewport(browser, viewport) {
       // skip it, not duplicate it.
       await post(`/api/setup/seasons/${dst.id}/team-registrations`,
         { team_id: lions.id, division_id: dstA.id });
-      return { league: league.id, src: src.id, dst: dst.id,
+      return { league: league.id, src: src.id, dst: dst.id, empty: empty.id,
         dstA: dstA.id, dstB: dstB.id, lions: lions.id, bears: bears.id };
     });
 
@@ -114,6 +119,17 @@ async function checkViewport(browser, viewport) {
       await page.selectOption("[data-rollover-league]", ids.league);
     }
     await page.selectOption("[data-rollover-from]", ids.src);
+
+    // Point a rollover at the divisionless season: the panel blocks it with a
+    // clear message and offers no commit path (review #216, point 3).
+    await page.selectOption("[data-rollover-to]", ids.empty);
+    await page.waitForFunction(
+      () => /no divisions yet/i.test(document.querySelector("#content").textContent),
+      null, { timeout: 10000 });
+    if (await page.$("[data-rollover-commit]")) {
+      throw new Error(`[${viewport.label}] a divisionless target season still offered a commit control`);
+    }
+
     await page.selectOption("[data-rollover-to]", ids.dst);
 
     // Preview: Bears is eligible (a pick checkbox), Lions is not offered (it's
@@ -125,8 +141,41 @@ async function checkViewport(browser, viewport) {
       throw new Error(`[${viewport.label}] Lions was offered for rollover despite already being registered`);
     }
 
-    // Assign Bears to Target B and commit the rollover.
+    // Commit is disabled before any team is chosen (target has two divisions,
+    // so nothing is preselected).
+    if (!(await page.$eval("[data-rollover-commit]", (b) => b.disabled))) {
+      throw new Error(`[${viewport.label}] commit was enabled with nothing selected`);
+    }
+
+    // Check Bears but leave its division unassigned: the row shows an inline
+    // error and commit stays disabled — an unassigned team cannot be submitted
+    // (review #216).
+    await page.check(`[data-rollover-pick="${ids.bears}"]`);
+    await page.waitForFunction((b) => {
+      const row = document.querySelector(`[data-rollover-pick="${b}"]`).closest(".reg-row");
+      const err = row.querySelector(".ro-row-err");
+      const commit = document.querySelector("[data-rollover-commit]");
+      return err && !err.hidden && commit && commit.disabled;
+    }, ids.bears, { timeout: 10000 });
+
+    // Zero writes so far: the target season still holds only the pre-registered
+    // Lions. (No rollover request could have been sent from the disabled path.)
+    const before = await page.evaluate(async (i) => {
+      const get = async (p) => (await fetch(p, { credentials: "same-origin" })).json();
+      const regs = (await get(`/api/setup/seasons/${i.dst}/team-registrations`)).registrations;
+      return regs.filter((r) => r.active).length;
+    }, ids);
+    if (before !== 1) {
+      throw new Error(`[${viewport.label}] target season was written before a valid commit: ${before} active regs`);
+    }
+
+    // Assign Bears to Target B — the inline error clears and commit enables.
     await page.selectOption(`[data-rollover-div="${ids.bears}"]`, ids.dstB);
+    await page.waitForFunction(() => {
+      const commit = document.querySelector("[data-rollover-commit]");
+      return commit && !commit.disabled;
+    }, null, { timeout: 10000 });
+
     const resp = page.waitForResponse((r) =>
       r.url() === `${base}/api/setup/seasons/${ids.dst}/roll-forward`
       && r.request().method() === "POST");
