@@ -87,6 +87,7 @@ jobs:
           node --check hockey-scheduler/e2e/destructive-surfaces.js
           node --check hockey-scheduler/e2e/reset-visibility.js
           node --check hockey-scheduler/e2e/demo-lifecycle.js
+          node --check hockey-scheduler/e2e/api-error-resilience.js
 
   browser-smoke:
     runs-on: ubuntu-latest
@@ -130,3 +131,5 @@ jobs:
         run: npm run reset-visibility
       - name: Run demo lifecycle journey
         run: npm run demo-lifecycle
+      - name: Run API error-resilience journey
+        run: npm run api-error-resilience
