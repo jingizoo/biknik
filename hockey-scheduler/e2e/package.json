@@ -14,7 +14,8 @@
     "safe-destructive": "node safe-destructive.js",
     "destructive-surfaces": "node destructive-surfaces.js",
     "reset-visibility": "node reset-visibility.js",
-    "demo-lifecycle": "node demo-lifecycle.js"
+    "demo-lifecycle": "node demo-lifecycle.js",
+    "api-error-resilience": "node api-error-resilience.js"
   },
   "devDependencies": {
     "playwright": "^1.48.0"

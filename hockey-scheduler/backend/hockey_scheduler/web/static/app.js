@@ -199,19 +199,53 @@ function downloadTextFile(filename, text) {
   }
 }
 
+// Read an API Response defensively. A healthy endpoint returns JSON — either a
+// payload or the structured `{error:{...}}` shape — but a proxy 5xx (e.g. Render
+// returning a 502 "Bad Gateway" HTML page), an empty body, or a dropped
+// connection would make a bare `.json()` throw an uncaught SyntaxError and leave
+// the UI silently hung. Instead, surface those as the same `{error:{...}}` shape
+// so every existing `if (d && d.error)` call site shows a message and recovers.
+async function readApiResponse(r) {
+  let text = "";
+  try { text = await r.text(); } catch (_) { text = ""; }
+  if (text) {
+    try { return JSON.parse(text); } catch (_) { /* not JSON (e.g. a 502 page) */ }
+  }
+  if (r.ok) return {};  // a successful but empty body (e.g. 204) — not an error
+  const msg = r.status >= 500 || r.status === 0
+    ? `The server is temporarily unavailable (${r.status}). Please try again in a moment.`
+    : `The request could not be completed (${r.status}).`;
+  return { error: { code: "server_unavailable", message: msg } };
+}
+function networkErrorResult() {
+  return { error: { code: "network_error",
+    message: "Couldn't reach the server. Check your connection and try again." } };
+}
+
 // The session cookie carries identity; the server resolves the role from it
 // and authorizes each request (#50). No client-asserted role header.
-async function getJSON(p) { return (await fetch(p, { credentials: "same-origin" })).json(); }
+async function getJSON(p) {
+  try {
+    return await readApiResponse(await fetch(p, { credentials: "same-origin" }));
+  } catch (_) {
+    return networkErrorResult();
+  }
+}
 async function post(p, b) {
   // Reset first: an explicit success message the caller sets after a clean
   // response (the common `if (r && !r.error) toast = "..."` pattern) always
   // runs after this point, so it inherits the correct "not an error" state
   // without every one of those call sites needing to say so itself.
   toastIsError = false;
-  const r = await fetch(p, { method: "POST", credentials: "same-origin",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(b || {}) });
-  const d = await r.json();
+  let d;
+  try {
+    const r = await fetch(p, { method: "POST", credentials: "same-origin",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(b || {}) });
+    d = await readApiResponse(r);
+  } catch (_) {
+    d = networkErrorResult();
+  }
   if (d && d.error) { toast = d.error.message; toastIsError = true; }
   return d;
 }
@@ -4270,13 +4304,17 @@ async function render() {
     // Public surface (#83): schedule + standings from public-safe endpoints.
     if (view === "public") {
       const sch = await getJSON("/api/public/schedule");
-      publicState.schedule = (sch && !sch.error) ? sch : { fixtures: [], divisions: [] };
+      // A 5xx/non-JSON outage (now surfaced by getJSON as {error}) routes to the
+      // shared "Could not load data" + Retry banner below, not an empty schedule.
+      if (sch && sch.error) throw new Error(sch.error.message);
+      publicState.schedule = sch || { fixtures: [], divisions: [] };
       if (!publicState.division && publicState.schedule.divisions[0]) {
         publicState.division = publicState.schedule.divisions[0].id;
       }
       if (publicTab === "standings" && publicState.division) {
-        publicState.standings = await getJSON(
-          `/api/public/standings/${publicState.division}`);
+        const st = await getJSON(`/api/public/standings/${publicState.division}`);
+        if (st && st.error) throw new Error(st.error.message);
+        publicState.standings = st;
       }
     }
     // Standings for the selected division (#31).
@@ -5606,25 +5644,31 @@ async function renderPublicGuest() {
   if (!box) return;
   updateToast();  // the guest screen has no other render() path to surface post() errors
   box.innerHTML = `<div class="skeleton"></div><div class="skeleton"></div>`;
+  // A network failure or a non-JSON/5xx response — getJSON now surfaces the
+  // latter as {error} rather than throwing — must give an anonymous visitor the
+  // same clear error + Retry a signed-in user gets, not an empty schedule or an
+  // infinite skeleton (#133).
+  const fail = (message) => {
+    box.innerHTML = `<div class="banner alert"><h2>Could not load the public schedule</h2>
+      <p>${esc(message)}</p></div>
+      <div class="actions"><button class="act primary" id="public-retry-btn">Retry</button></div>`;
+    const retry = document.getElementById("public-retry-btn");
+    if (retry) retry.onclick = () => renderPublicGuest();
+  };
   try {
     const sch = await getJSON("/api/public/schedule");
-    publicState.schedule = (sch && !sch.error) ? sch : { fixtures: [], divisions: [] };
+    if (sch && sch.error) return fail(sch.error.message);
+    publicState.schedule = sch || { fixtures: [], divisions: [] };
     if (!publicState.division && publicState.schedule.divisions[0]) {
       publicState.division = publicState.schedule.divisions[0].id;
     }
     if (publicTab === "standings" && publicState.division) {
-      publicState.standings = await getJSON(`/api/public/standings/${publicState.division}`);
+      const st = await getJSON(`/api/public/standings/${publicState.division}`);
+      if (st && st.error) return fail(st.error.message);
+      publicState.standings = st;
     }
   } catch (e) {
-    // getJSON() throws on a network failure or a non-JSON response body —
-    // an anonymous visitor gets the same clear error + retry render()
-    // already gives a signed-in user, instead of an infinite skeleton (#133).
-    box.innerHTML = `<div class="banner alert"><h2>Could not load the public schedule</h2>
-      <p>${esc(e.message || e)}</p></div>
-      <div class="actions"><button class="act primary" id="public-retry-btn">Retry</button></div>`;
-    const retry = document.getElementById("public-retry-btn");
-    if (retry) retry.onclick = () => renderPublicGuest();
-    return;
+    return fail(e.message || String(e));
   }
   box.innerHTML = renderPublic({});
   box.querySelectorAll("[data-public-tab]").forEach((b) => b.onclick = () => {
@@ -5639,6 +5683,7 @@ async function renderPublicGuest() {
   };
   box.querySelectorAll("[data-public-game]").forEach((b) => b.onclick = async () => {
     const g = await getJSON(`/api/public/games/${b.dataset.publicGame}`);
+    if (g && g.error) { toast = g.error.message; toastIsError = true; }
     publicState.game = (g && !g.error) ? g : null; renderPublicGuest();
   });
   const pubBack = box.querySelector("[data-public-back]");
@@ -5748,34 +5793,66 @@ function signedOutSticky() {
   catch (_) { return false; }
 }
 
+// A server/proxy outage (5xx or unreachable) — distinct from a 4xx such as the
+// 401 that simply means "no session".
+function isServerError(response) {
+  return !response || response.status === 0 || response.status >= 500;
+}
+
+// A startup outage must NOT masquerade as a normal signed-out/empty-account
+// state (which would silently clear roles and drop the user to the sign-in wall
+// as if nothing were wrong). Show the sign-in screen with a clear, retryable
+// outage message instead.
+function showBootstrapOutage() {
+  roleCatalog = []; accounts = []; setUser(null);
+  applyRolePerms();
+  renderRoleSwitch();
+  renderEnvChips();
+  showLogin("The server is temporarily unavailable. Please refresh in a moment.");
+}
+
 async function bootstrap() {
+  let rolesR, acctR, statusR, meR;
   try {
-    const [rolesRes, acctRes, statusRes, meResp] = await Promise.all([
-      fetch("/api/auth/roles").then((r) => r.json()),
-      fetch("/api/auth/accounts").then((r) => r.json()),
-      fetch("/api/status").then((r) => r.json()).catch(() => null),
+    [rolesR, acctR, statusR, meR] = await Promise.all([
+      fetch("/api/auth/roles", { credentials: "same-origin" }),
+      fetch("/api/auth/accounts", { credentials: "same-origin" }),
+      fetch("/api/status", { credentials: "same-origin" }),
       fetch("/api/auth/me", { credentials: "same-origin" }),
     ]);
-    roleCatalog = rolesRes.roles || [];
-    accounts = acctRes.accounts || [];
-    envStatus = statusRes && !statusRes.error ? statusRes : null;
-    const meRes = await meResp.json();
-    if (meRes && meRes.user) {
-      setUser(meRes.user);
-    } else if (meResp.status !== 401 && accounts.length && !signedOutSticky()) {
-      // Demo mode, fresh visit (no session, personas available, and the user
-      // has not explicitly signed out): keep the zero-friction auto-login as
-      // League Admin.
-      const r = await post("/api/auth/login",
-        { username: "admin", password: DEMO_PASSWORD });
-      if (r && !r.error) setUser(r.user); else setUser(null);
-    } else {
-      // Production (empty picker), an expired/invalid session (401), or an
-      // explicit prior sign-out: no silent login — show the sign-in screen
-      // (#71) so logout is meaningful across a refresh.
-      setUser(null);
-    }
-  } catch (_) { roleCatalog = []; accounts = []; setUser(null); }
+  } catch (_) {
+    return showBootstrapOutage();  // network unreachable — an outage, not "signed out"
+  }
+  // A 5xx / non-JSON proxy error on ANY of the four bootstrap calls is an
+  // outage, not a normal state — surface it rather than letting it masquerade:
+  // a roles/me failure would look "signed out", an accounts failure would skip
+  // the demo auto-login into a bare sign-in screen, and a status failure would
+  // leave envStatus null so isDemo() fails OPEN (demo controls in production).
+  if ([rolesR, acctR, statusR, meR].some(isServerError)) return showBootstrapOutage();
+
+  const rolesRes = await readApiResponse(rolesR);
+  const acctRes = await readApiResponse(acctR);
+  const statusRes = await readApiResponse(statusR);
+  roleCatalog = (rolesRes && rolesRes.roles) || [];
+  accounts = (acctRes && acctRes.accounts) || [];
+  envStatus = statusRes && !statusRes.error ? statusRes : null;
+
+  const meRes = meR.ok ? await readApiResponse(meR) : null;
+  if (meRes && meRes.user) {
+    setUser(meRes.user);
+  } else if (meR.status !== 401 && accounts.length && !signedOutSticky()) {
+    // Demo mode, fresh visit (no session, personas available, and the user has
+    // not explicitly signed out — /api/auth/me answers 200 with no user, not a
+    // 401): keep the zero-friction auto-login as League Admin.
+    const r = await post("/api/auth/login",
+      { username: "admin", password: DEMO_PASSWORD });
+    if (r && !r.error) setUser(r.user); else setUser(null);
+  } else {
+    // Production (empty picker), an expired/invalid session (401), or an
+    // explicit prior sign-out: no silent login — show the sign-in screen (#71)
+    // so logout is meaningful across a refresh.
+    setUser(null);
+  }
   applyRolePerms();
   renderRoleSwitch();
   renderEnvChips();
