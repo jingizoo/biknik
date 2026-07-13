@@ -141,3 +141,33 @@ def assert_results_have_game(conn):
             "Cannot require a game for every result: "
             f"{len(missing)} result row(s) have no game_id: {shown}{more}. "
             "Attach them to a game or remove them before upgrading.")
+
+
+def find_orphan_roster_refs(conn):
+    """Roster row ids whose non-null game_id or player_id names a missing parent.
+
+    These are the rows the game_roster_entries → games/players foreign keys
+    (migration 027) would reject. NULLs are excluded: a nullable foreign key
+    permits NULL, so only dangling concrete references block the upgrade.
+    """
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT DISTINCT r.id FROM game_roster_entries r "
+        "LEFT JOIN games g ON g.id = r.game_id "
+        "LEFT JOIN players p ON p.id = r.player_id "
+        "WHERE (r.game_id IS NOT NULL AND g.id IS NULL) "
+        "   OR (r.player_id IS NOT NULL AND p.id IS NULL)")
+    return sorted(row["id"] for row in cur.fetchall())
+
+
+def assert_roster_refs_exist(conn):
+    """Abort the migration if any roster row references a missing game/player
+    (#201 3F)."""
+    orphans = find_orphan_roster_refs(conn)
+    if orphans:
+        shown = ", ".join(orphans[:20])
+        more = "" if len(orphans) <= 20 else f" (+{len(orphans) - 20} more)"
+        raise MigrationDataError(
+            "Cannot add the roster → game/player foreign keys: "
+            f"{len(orphans)} roster row(s) reference a game or player that does "
+            f"not exist: {shown}{more}. Reattach or remove them before upgrading.")
