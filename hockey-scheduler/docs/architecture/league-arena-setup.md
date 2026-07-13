@@ -143,7 +143,7 @@ POST /api/setup/league        create_league   (the umbrella; = Program)
 POST /api/setup/season        create_season   (body: league_id, …)
 POST /api/setup/level         create_level    (the grouping; = League)
 POST /api/setup/division      create_division (body: season_id, level_id?)
-POST /api/setup/team          create_team     (body: league_id, club_id?, …)
+POST /api/setup/team          create_team     (body: league_id, club_id, …)   # club_id required in v1
 POST /api/setup/venue         create_venue    (body: organization_id?, league_id?)
 POST /api/setup/game          create_game     (body: season_id, division_id, …)
 
