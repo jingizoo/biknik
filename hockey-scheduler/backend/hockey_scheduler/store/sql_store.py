@@ -343,8 +343,16 @@ def _apply_migration(conn, dialect, version, statements) -> None:
             (version, _utcnow().isoformat()))
 
     if dialect.backend == "postgres":
-        with conn.transaction():  # psycopg: group the autocommit statements
+        # psycopg: group the autocommit statements. Nesting is safe — if migrate()
+        # runs inside an outer transaction (e.g. the demo reset), this opens a
+        # savepoint rather than a second transaction.
+        with conn.transaction():
             body()
+    elif conn.in_transaction:
+        # Already inside a transaction (e.g. reset_schema called within the demo
+        # reset's store.transaction()) — join it; SQLite can't nest BEGIN, and the
+        # outer transaction already makes this migration all-or-nothing.
+        body()
     else:  # sqlite (autocommit) — explicit txn so the rebuild is all-or-nothing
         try:
             conn.execute("BEGIN")
@@ -459,21 +467,30 @@ class SqlStore:
 
         Foreign keys (#201) make drop order matter: dropping a parent while a
         child still references it fails. Postgres uses ``DROP ... CASCADE`` to
-        also remove the dependent constraint; SQLite has no such clause, so its
-        FK enforcement is suspended for the duration of the drops instead.
+        also remove the dependent constraint. SQLite has no such clause, so its
+        FK enforcement is suspended for the drops — but the *how* depends on
+        whether a transaction is already open (the demo reset runs reset_schema
+        inside one for atomicity): ``PRAGMA foreign_keys`` is a no-op mid-
+        transaction, so ``defer_foreign_keys`` (which holds checks until COMMIT,
+        by which point every table is gone, and resets itself there) is used
+        instead; standalone, plain ``foreign_keys = OFF`` around the drops works.
         """
         cascade = " CASCADE" if self.backend == "postgres" else ""
         with self._lock:
             cur = self.conn.cursor()
+            deferred = self.backend == "sqlite" and self.conn.in_transaction
             if self.backend == "sqlite":
-                cur.execute("PRAGMA foreign_keys = OFF")
+                cur.execute("PRAGMA defer_foreign_keys = ON" if deferred
+                            else "PRAGMA foreign_keys = OFF")
             try:
                 for spec in SPECS.values():
                     cur.execute(f"DROP TABLE IF EXISTS {spec.table}{cascade}")
                 cur.execute(f"DROP TABLE IF EXISTS counters{cascade}")
                 cur.execute(f"DROP TABLE IF EXISTS schema_migrations{cascade}")
             finally:
-                if self.backend == "sqlite":
+                # defer_foreign_keys resets itself at COMMIT; only the standalone
+                # foreign_keys toggle needs restoring here.
+                if self.backend == "sqlite" and not deferred:
                     cur.execute("PRAGMA foreign_keys = ON")
         migrate(self.conn, self.dialect)
 
