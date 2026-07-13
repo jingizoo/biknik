@@ -75,6 +75,7 @@ from .db import connect
 from .db_errors import translate_db_exception
 from .integrity_checks import (
     assert_no_duplicate_active_ice_slots,
+    assert_no_duplicate_result_games,
     assert_no_duplicate_roster_players,
 )
 
@@ -265,6 +266,7 @@ def _load_migrations():
 _PRE_MIGRATION_CHECKS = {
     "022_one_active_game_per_slot": assert_no_duplicate_active_ice_slots,
     "023_one_roster_row_per_player": assert_no_duplicate_roster_players,
+    "024_one_result_per_game": assert_no_duplicate_result_games,
 }
 
 

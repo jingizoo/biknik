@@ -66,3 +66,31 @@ def assert_no_duplicate_roster_players(conn):
             f"{len(duplicates)} (game, player) pair(s) already have duplicate "
             f"roster rows: {', '.join(pairs)}{more}. Resolve the duplicates "
             "before upgrading.")
+
+
+def find_duplicate_result_games(conn):
+    """Concrete game_ids that already back more than one result row.
+
+    Only non-null game_ids are considered — matching the partial unique index
+    (migration 024), which excludes NULL-bearing rows because both SQLite and
+    PostgreSQL treat NULLs as distinct. Filtering here keeps the check aligned
+    with what the index enforces.
+    """
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT game_id FROM game_results "
+        "WHERE game_id IS NOT NULL "
+        "GROUP BY game_id HAVING COUNT(*) > 1")
+    return sorted(row["game_id"] for row in cur.fetchall())
+
+
+def assert_no_duplicate_result_games(conn):
+    """Abort the migration if any game has multiple result rows (#201 3C)."""
+    duplicates = find_duplicate_result_games(conn)
+    if duplicates:
+        shown = ", ".join(duplicates[:20])
+        more = "" if len(duplicates) <= 20 else f" (+{len(duplicates) - 20} more)"
+        raise MigrationDataError(
+            "Cannot enforce one result per game: "
+            f"{len(duplicates)} game(s) already have multiple result rows: "
+            f"{shown}{more}. Resolve the duplicates before upgrading.")
