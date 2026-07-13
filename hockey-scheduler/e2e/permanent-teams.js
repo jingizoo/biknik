@@ -8,9 +8,14 @@
 //  - #233 B1: the Setup surface shows the canonical hierarchy nouns
 //    (Program / League) everywhere the operator reads them — Records-view card
 //    titles, create-drawer field labels and titles, empty-select notes (which
-//    must show the display noun, never the internal league/level key), and the
-//    Season-participation add control. The internal entity keys and the v1 API
-//    (POST /api/setup/{league,level}) are unchanged.
+//    must show the display noun, never the internal league/level key), the
+//    Season-participation add control, the move/reassign dialog nouns + legacy
+//    warnings, and the delete-modal nouns. The Venue→Program link and the
+//    Program→org coupling are labelled as temporary legacy v1 relationships, and
+//    the Program operator is an "operating organization" (never "facility
+//    owner"). The visible trees never expose the internal "level" grouping word,
+//    and the unrelated "League Admin" policy role is left untouched. The internal
+//    entity keys and the v1 API (POST /api/setup/{league,level}) are unchanged.
 // Fails on any browser console/page error.
 const { chromium } = require("playwright");
 const { spawn } = require("child_process");
@@ -86,6 +91,32 @@ async function checkViewport(browser, viewport) {
     await page.click(".drawer-foot [data-drawer-close]");
     await page.waitForFunction(() => !document.querySelector(".drawer[role=dialog]"), null, { timeout: 5000 });
   };
+  // Open a delete-confirm modal for an entity kind from the Setup trees and read
+  // its heading back, then dismiss it.
+  const delModalTitle = async (kind) => {
+    await page.click(`.setup-trees [data-del="${kind}"]`);
+    await page.waitForSelector(".modal.danger[role=dialog]", { timeout: 5000 });
+    const title = await page.$eval(".modal.danger h2", (h) => h.textContent.trim());
+    await page.click(".modal.danger .modal-x");
+    await page.waitForFunction(() => !document.querySelector(".modal[role=dialog]"), null, { timeout: 5000 });
+    return title;
+  };
+  // Open a reassignment panel by "kind:parent" from the Setup trees, read its
+  // title + any warning, then cancel out.
+  const reassignPanel = async (key) => {
+    await page.click(`.setup-trees [data-reassign="${key}"]`);
+    await page.waitForSelector(".rz-panel", { timeout: 5000 });
+    const info = await page.evaluate(() => {
+      const p = document.querySelector(".rz-panel");
+      return {
+        title: (p.querySelector(".ca-title") || {}).textContent || "",
+        warn: (p.querySelector(".ca-warn") || {}).textContent || "",
+      };
+    });
+    await page.click(".rz-panel [data-reassign-cancel]");
+    await page.waitForFunction(() => !document.querySelector(".rz-panel"), null, { timeout: 5000 });
+    return info;
+  };
 
   try {
     await waitForServer(`${base}/api/health`, READY_TIMEOUT_MS);
@@ -122,36 +153,51 @@ async function checkViewport(browser, viewport) {
     const programLabels = programDrawer.labels.join(" | ");
     if (!/Program name/.test(programLabels)) fail(`Program drawer missing "Program name" field`);
     if (!/Operating organization/.test(programLabels)) fail(`Program drawer missing "Operating organization" field`);
-    if (!programDrawer.notes.some((n) => /Create a facility owner first/i.test(n)))
-      fail(`Program drawer empty operator select note wrong (got ${JSON.stringify(programDrawer.notes)})`);
+    // The empty-operator note must name the parent by the Program-operator role
+    // ("operating organization"), never "facility owner" — that role word is
+    // for Venue ownership, not Program operation (ADR 0001).
+    const programNote = programDrawer.notes.join(" | ");
+    if (!/Create an operating organization first/i.test(programNote))
+      fail(`Program drawer empty operator note is not "Create an operating organization first" (got ${JSON.stringify(programDrawer.notes)})`);
+    if (/facility owner/i.test(programNote))
+      fail(`Program drawer operator note still says "facility owner" (got ${JSON.stringify(programDrawer.notes)})`);
     await closeDrawer();
 
-    // 3) Now build a program → season → club → permanent team through the v1
-    //    API (still POST /api/setup/{league,season,club,team}); the team is
-    //    created under the LEAGUE, not a division (#180).
+    // 3) Now build a program → season → league(grouping) → division, plus a
+    //    club → permanent team, through the v1 API (still POST
+    //    /api/setup/{league,season,level,division,club,team}). The team is
+    //    created under the umbrella LEAGUE (= Program), not a division (#180).
+    //    The grouping + division give the hierarchy real League and Division
+    //    nodes so their move/delete dialog nouns can be asserted below.
     const ids = await page.evaluate(async () => {
       const post = async (p, b) => (await fetch(p, {
         method: "POST", credentials: "same-origin",
         headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
       })).json();
       const league = await post("/api/setup/league", { name: "Permanent League" });
-      await post("/api/setup/season", { league_id: league.id, name: "2026-27" });
+      const season = await post("/api/setup/season", { league_id: league.id, name: "2026-27" });
+      const level = await post("/api/setup/level", { season_id: season.id, name: "Diamond" });
+      const division = await post("/api/setup/division",
+        { season_id: season.id, level_id: level.id, name: "U14" });
       const club = await post("/api/setup/club", { name: "Perma Club" });
       const team = await post("/api/setup/team",
         { club_id: club.id, league_id: league.id, name: "Perma Bruins" });
       return { league: league.id, team: team.id,
-               teamOk: !team.error && team.league_id === league.id && !team.division_id };
+               teamOk: !team.error && team.league_id === league.id && !team.division_id,
+               structureOk: !level.error && !division.error };
     });
     if (!ids.teamOk) fail(`team not created under league`);
+    if (!ids.structureOk) fail(`league grouping / division not created`);
 
-    // 4) With a program present, the Venue drawer's operating-program field is
-    //    labelled "Operating program (optional)" — not the old "sets the owner".
+    // 4) With a program present, the Venue drawer's program field is labelled as
+    //    an explicitly legacy/transitional link (removed in Slice E) — never the
+    //    old "sets the owner" nor a target-model "operating program" phrasing.
     await page.click('[data-setup-view="records"]');
     await page.waitForSelector(".setup-card", { timeout: 10000 });
     const venueDrawer = await openDrawer("venue");
     const venueLabels = venueDrawer.labels.join(" | ");
-    if (!/Operating program \(optional\)/.test(venueLabels))
-      fail(`Venue drawer missing "Operating program (optional)" (got ${JSON.stringify(venueDrawer.labels)})`);
+    if (!/Legacy program grouping/i.test(venueLabels) || !/removed in Slice E/i.test(venueLabels))
+      fail(`Venue drawer program field not marked legacy/transitional (got ${JSON.stringify(venueDrawer.labels)})`);
     if (/sets the owner/i.test(venueLabels))
       fail(`Venue drawer still says "sets the owner"`);
     await closeDrawer();
@@ -189,6 +235,44 @@ async function checkViewport(browser, viewport) {
     if (!checks.addProgramTeam) fail(`Season participation add control is not "Add a program team…"`);
     if (checks.leaksLeagueTeam) fail(`Setup still says "league team" somewhere`);
     if (checks.leaksNoLeagues) fail(`Setup still says "No leagues yet"`);
+
+    // 6) The visible Setup trees must not expose the internal "level" grouping
+    //    noun anywhere — it renders as "League" now (the old "Level"/"Add
+    //    level"/"No level" strings are gone). data-* attributes still carry the
+    //    frozen key; only user-visible text is checked.
+    const treeText = await page.$eval(".setup-trees", (el) => el.textContent);
+    if (/\blevel\b/i.test(treeText)) fail(`Setup trees still show the internal "level" grouping noun`);
+
+    // 7) Move/reassign dialog nouns + legacy warnings. The Program's operator
+    //    move says "operating organization" (not "facility owner") and warns
+    //    that the venue coupling is a temporary legacy v1 rule; moving a Division
+    //    targets a "league" (the grouping), never a "level".
+    const progMove = await reassignPanel("league:organization");
+    if (!/operating organization/i.test(progMove.title))
+      fail(`Program move dialog title is not "…operating organization" (got "${progMove.title}")`);
+    if (/facility owner/i.test(progMove.title))
+      fail(`Program move dialog still says "facility owner"`);
+    if (!/legacy v1/i.test(progMove.warn) || !/Slice E/i.test(progMove.warn))
+      fail(`Program move warning does not flag the legacy v1 coupling (got "${progMove.warn}")`);
+    const divMove = await reassignPanel("division:level");
+    if (!/\bleague\b/i.test(divMove.title) || /\blevel\b/i.test(divMove.title))
+      fail(`Division move dialog does not target a "league" (got "${divMove.title}")`);
+
+    // 8) Delete-modal nouns: the umbrella deletes a "program"; the grouping
+    //    deletes a "league" — never "level".
+    const progDel = await delModalTitle("league");
+    if (!/Delete this program\?/i.test(progDel)) fail(`umbrella delete modal is not "Delete this program?" (got "${progDel}")`);
+    const grpDel = await delModalTitle("level");
+    if (!/Delete this league\?/i.test(grpDel) || /Delete this level\?/i.test(grpDel))
+      fail(`grouping delete modal is not "Delete this league?" (got "${grpDel}")`);
+
+    // 9) The League Admin *role* is unrelated to the competition-model rename and
+    //    must be untouched — its policy label stays exactly "League Admin".
+    const roles = await page.evaluate(() =>
+      fetch("/api/auth/roles", { credentials: "same-origin" }).then((r) => r.json()));
+    const laRole = (roles.roles || []).find((r) => r.id === "league_admin");
+    if (!laRole || laRole.label !== "League Admin")
+      fail(`League Admin role label changed (got ${JSON.stringify(laRole && laRole.label)})`);
 
     if (errors.length) fail(`console/page errors:\n${errors.join("\n")}`);
     console.log(`[${tag}] OK — permanent team under league; Setup uses Program/League nouns end to end.`);

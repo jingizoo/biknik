@@ -507,7 +507,8 @@ const SETUP_ENTITIES = [
       { id: "f-league", label: "Program name", required: true, placeholder: "e.g. Adult Men" },
       // A program is operated by an organization (#233) — required, so create
       // an organization first if none exists.
-      { id: "f-league-org", label: "Operating organization", type: "select", required: true, ofNoun: "organization",
+      { id: "f-league-org", label: "Operating organization", type: "select", required: true,
+        ofNoun: "organization", ofNounDisplay: "operating organization",
         options: (ov) => (ov.organizations || []).map((o) => [o.id, o.name]) }] },
   { key: "season", title: "Seasons", icon: "🗓️", noun: "season", perm: "manage_setup",
     list: (ov) => ov.seasons.map((s) => ({ title: s.name, sub: nameById(ov.leagues, s.league_id) })),
@@ -573,9 +574,10 @@ const SETUP_ENTITIES = [
       sub: [v.organization_name, v.league_name].filter(Boolean).join(" · ") || "Unassigned" })),
     fields: [
       { id: "f-venue", label: "Venue name", required: true, placeholder: "e.g. South Arena" },
-      { id: "f-venue-league", label: "Operating program (optional)", type: "select", ofNoun: "league",
+      { id: "f-venue-league", label: "Legacy program grouping (temporary, optional — removed in Slice E)",
+        type: "select", ofNoun: "league",
         options: (ov) => [["", "— none —"]].concat((ov.leagues || []).map(
-          (l) => [l.id, `${nameById(ov.organizations, l.organization_id) || "No owner"} · ${l.name}`])) }] },
+          (l) => [l.id, `${nameById(ov.organizations, l.organization_id) || "No operating org"} · ${l.name}`])) }] },
   { key: "rink", title: "Rinks", icon: "⛸️", noun: "rink", perm: "manage_arena",
     list: (ov) => ov.rinks.map((r) => ({ title: r.name, sub: r.venue_name || "" })),
     fields: [
@@ -626,8 +628,12 @@ const entNoun = (e) => e.displayNoun || e.noun;
 
 // Display noun for a field's parent entity (`ofNoun` holds the parent's internal
 // key). Maps to the parent's display noun so empty-select notes never expose the
-// internal league/level tokens (#233).
+// internal league/level tokens (#233). A field may set `ofNounDisplay` to override
+// the shared entity's noun where the role differs: the `organization` entity is a
+// "facility owner" when it owns venues, but a Program's parent org is its
+// "operating organization" — the same table in a different role (ADR 0001).
 const ofNounLabel = (f) => {
+  if (f.ofNounDisplay) return f.ofNounDisplay;
   if (!f.ofNoun) return "record";
   const e = SETUP_ENTITIES.find((x) => x.key === f.ofNoun);
   return e ? entNoun(e) : f.ofNoun;
@@ -717,13 +723,13 @@ const REASSIGN = {
   // Cross-domain program↔facility moves (#173) — both MANAGE_SETUP.
   "league:organization": {
     perm: "manage_setup", noun: "facility owner", displayNoun: "operating organization", nullable: true, risky: true,
-    warn: "A program's operating organization can't change while venues are attached — unassign its venues first.",
+    warn: "Legacy v1 blocks changing a program's operating organization while venues are still attached to it — unassign its venues first. This coupling is a temporary v1 rule, not the target model; it goes away when Season↔Venue access lands in Slice E.",
     options: (ov) => (ov.organizations || []).map((o) => [o.id, o.name]) },
   "venue:league": {
     perm: "manage_setup", noun: "league", displayNoun: "program", nullable: true, risky: true,
-    warn: "Moving a venue to another program changes which program's games may use its ice; the venue's owner follows the program.",
+    warn: "Legacy v1 only: linking a venue to a program derives the venue's facility owner from that program's operating organization. This is a temporary v1 coupling — the venue↔program link is removed when Season↔Venue access lands in Slice E.",
     options: (ov) => (ov.leagues || []).map(
-      (l) => [l.id, `${nameById(ov.organizations, l.organization_id) || "No owner"} · ${l.name}`]) },
+      (l) => [l.id, `${nameById(ov.organizations, l.organization_id) || "No operating org"} · ${l.name}`]) },
 };
 // A small "⇄ Move" button that opens the reassignment confirm panel, seeded
 // with the record's current parent so the operator sees where it sits now.
@@ -1080,13 +1086,13 @@ function renderSetupHierarchy(ov) {
   const orphanVenues = (venuesByLeague[null] || []).concat(venuesByLeague[undefined] || []);
   const orphanVenueSection = orphanVenues.length
     ? `<details class="tn" open><summary class="tn-sum">
-        <span class="tn-label tn-warn-text">🏟️ No program</span>
+        <span class="tn-label tn-warn-text">🏟️ No legacy program grouping</span>
         <span class="tn-meta">${orphanVenues.length} venue${orphanVenues.length === 1 ? "" : "s"}</span></summary>
       <div class="tn-children">${orphanVenues.map(venueNode).join("")}</div>
     </details>` : "";
   const facility = `<section class="tree-panel">
     <div class="tree-head"><span class="tree-title">🏟️ Facility</span>
-      <span class="tree-sub">Facility owner → Venue → Rink · grouped by operating program</span></div>
+      <span class="tree-sub">Facility owner → Venue → Rink · grouped by legacy program link until Slice E</span></div>
     ${orgSections}${orphanLeagueSection}${orphanVenueSection}
     ${!orgSections && !orphanLeagueSection && !orphanVenueSection ? `<div class="tn-empty">No owners yet. Add a facility owner to start your arena setup.</div>` : ""}
     <div class="tree-actions">${treeAdd("organization", "Add facility owner")}${treeAdd("league", "Add program")}</div>
@@ -1239,9 +1245,9 @@ function renderSetupHierarchy(ov) {
           fix ? fix(r) : ""}</div>`).join("")}</div>` : "";
   const naBody = naRow("Programs without an operating organization", noOwnerLeagues,
                        (l) => reassignBtn("league", "organization", l, l.organization_id))
-    + naRow("Venues without a program", noLeagueVenues,
+    + naRow("Venues without a legacy program grouping", noLeagueVenues,
             (v) => reassignBtn("venue", "league", v, v.league_id))
-    + naRow("Venues whose owner ≠ program owner", ownerMismatchVenues,
+    + naRow("Venue facility owner ≠ program operating organization (legacy v1 link)", ownerMismatchVenues,
             (v) => reassignBtn("venue", "league", v, v.league_id))
     + naRow("Rinks without a venue", orphanRinks,
             (r) => reassignBtn("rink", "venue", r, r.venue_id))
@@ -1519,8 +1525,10 @@ function drawerField(f, ov) {
   if (f.type === "select") {
     const rows = f.options(ov);
     if (!rows.length) {
+      const noun = ofNounLabel(f);
+      const article = /^[aeiou]/i.test(noun) ? "an" : "a";
       return `<label>${esc(f.label)}${req}</label>
-        <div class="drawer-note">Create a ${esc(ofNounLabel(f))} first.</div>`;
+        <div class="drawer-note">Create ${article} ${esc(noun)} first.</div>`;
     }
     const sel = current || rows[0][0];
     const opts = rows.map(([v, label]) =>
