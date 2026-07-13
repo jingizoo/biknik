@@ -1,19 +1,18 @@
 # Data Model
 
-> **⚠️ Competition hierarchy is being reset (epic #233).** The
-> League → Season → Level → Division and permanent-League→Venue relationships
-> described below for the *competition/venue* layer are **superseded** by
-> [ADR 0001 — Competition model reset](decisions/0001-competition-model-reset.md)
-> (canonical target: Program → Season → League → optional Division; Season↔Venue
-> many-to-many). Use the ADR as the source of truth until this document is
-> rewritten in epic #233 Slice B.
+> **⚠️ Competition hierarchy is being reset (epic #233).** The competition/venue
+> layer (Program → Season → League → optional Division; Organization-owned Venues
+> shared with Seasons) is documented in
+> [Competition + Facility Setup](league-arena-setup.md) and defined by
+> [ADR 0001 — Competition model reset](decisions/0001-competition-model-reset.md).
+> This page covers only the **roster + substitute** slice.
 >
-> Two entities described below **also change** and are covered by the ADR:
-> **`Team`** — its permanent owner becomes a **Program** (`league_id` →
-> `program_id`), and `club_id` stays nullable; and **`Game`** — it gains a
-> `league_id` competition-scope column (Season + League + optional Division). The
-> roster/substitute *workflow* entities (`GameRosterEntry`, `GameAvailability`,
-> `SubstituteEnrollment`, `AuditLog`) and computed `RosterStatus` are unaffected.
+> Two entities on this page **also change** (per the ADR): **`Team`** — its permanent
+> owner becomes a **Program** (`league_id` → `program_id`), `club_id` stays nullable;
+> and **`Game`** — it gains a `league_id` competition-scope column (Season + League +
+> optional Division). The roster/substitute *workflow* entities (`GameRosterEntry`,
+> `GameAvailability`, `SubstituteEnrollment`, `AuditLog`) and computed `RosterStatus`
+> are unaffected.
 
 Entities for the roster + substitute slice. `RosterStatus` is **calculated
 dynamically** from the other entities (not stored).
