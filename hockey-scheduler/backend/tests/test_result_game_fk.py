@@ -77,21 +77,31 @@ def _add_result_raw(store, rid, game_id):
         (rid, game_id, 3, 2, "draft", "actor", now))
 
 
-def _downgrade_025(store):
-    """Simulate a pre-025 database: drop the FK and un-record the migration.
+_V026 = "026_result_game_not_null"
 
-    Postgres drops the named constraint; SQLite rebuilds the table without the
-    foreign key (its enforcement is suspended for the swap). Either way the
-    game_results.game_id → games(id) reference is gone and legacy dangling rows
-    can be planted before the upgrade re-runs.
+
+def _downgrade_025(store):
+    """Restore the pre-025 state: nullable game_id, no foreign key, and the
+    partial-unique + lookup indexes.
+
+    This undoes BOTH the 025 foreign key and the 026 NOT NULL that now sits on top
+    of it, and un-records both — so a re-migrate re-applies 025 (whose orphan
+    pre-check this exercises) and then 026. Legacy dangling or NULL rows can be
+    planted in this restored, nullable, FK-free schema before the upgrade re-runs.
     """
     with store.transaction():
         cur = store.conn.cursor()
         if store.backend == "postgres":
+            cur.execute("ALTER TABLE game_results ALTER COLUMN game_id DROP NOT NULL")
             cur.execute("ALTER TABLE game_results "
                         "DROP CONSTRAINT IF EXISTS fk_game_results_game")
+            cur.execute("DROP INDEX IF EXISTS ux_game_result_game")
+            cur.execute("CREATE UNIQUE INDEX ux_game_result_game "
+                        "ON game_results (game_id) WHERE game_id IS NOT NULL")
+            cur.execute("CREATE INDEX IF NOT EXISTS ix_game_results_game "
+                        "ON game_results (game_id)")
         else:
-            cur.execute("PRAGMA foreign_keys = OFF")
+            cur.execute("PRAGMA defer_foreign_keys = ON")
             cur.execute(
                 "CREATE TABLE game_results_old (id TEXT PRIMARY KEY, game_id TEXT, "
                 "home_score INTEGER, away_score INTEGER, status TEXT, "
@@ -107,9 +117,9 @@ def _downgrade_025(store):
                         "ON game_results (game_id)")
             cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_game_result_game "
                         "ON game_results (game_id) WHERE game_id IS NOT NULL")
-            cur.execute("PRAGMA foreign_keys = ON")
-        cur.execute(store.dialect.sql(
-            "DELETE FROM schema_migrations WHERE version = ?"), (_VERSION,))
+        for version in (_V026, _VERSION):
+            cur.execute(store.dialect.sql(
+                "DELETE FROM schema_migrations WHERE version = ?"), (version,))
 
 
 def _fk_present(store):
@@ -154,14 +164,17 @@ class PreMigrationValidationTest(unittest.TestCase):
             finally:
                 self._cleanup(store)
 
-    def test_valid_and_null_references_upgrade_cleanly(self):
+    def test_valid_references_upgrade_cleanly(self):
+        # A NULL game_id used to be allowed after 025 (nullable FK), but the
+        # re-migrate now also applies 026 (NOT NULL) — so this exercises only
+        # valid references; the NULL-rejection path lives in
+        # test_result_game_not_null.
         for label, url in _sql_backends():
             store = self._pre025(url)
             try:
                 _add_game(store, "g1")
                 with store.transaction():
                     _add_result_raw(store, "r1", "g1")   # valid
-                    _add_result_raw(store, "r2", None)   # NULL — allowed
                 self.assertEqual(find_orphan_result_games(store.conn), [], label)
                 assert_result_games_exist(store.conn)  # must not raise
                 migrate(store.conn, store.dialect)     # succeeds; FK added
@@ -207,9 +220,9 @@ class RebuildPreservesDataTest(unittest.TestCase):
         for label, url in _sql_backends():
             store = self._downgraded_with_rows(url)
             try:
-                migrate(store.conn, store.dialect)  # apply 025 over real rows
+                migrate(store.conn, store.dialect)  # apply 025 (+026) over real rows
                 self.assertTrue(_fk_present(store), label)
-                # Both rows preserved, including the NULL-game_id one.
+                # Both rows (for two different games) survive the rebuild.
                 cur = store.conn.cursor()
                 cur.execute("SELECT COUNT(*) AS n FROM game_results")
                 self.assertEqual(cur.fetchone()["n"], 2, label)
@@ -227,9 +240,10 @@ class RebuildPreservesDataTest(unittest.TestCase):
         store = _fresh(url)
         _downgrade_025(store)
         _add_game(store, "g1")
+        _add_game(store, "g2")
         with store.transaction():
             _add_result_raw(store, "r1", "g1")
-            _add_result_raw(store, "r2", None)
+            _add_result_raw(store, "r2", "g2")
         return store
 
 
