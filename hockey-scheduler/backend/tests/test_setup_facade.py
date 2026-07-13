@@ -177,5 +177,61 @@ class SetupFacadeTest(unittest.TestCase):
         self.assertEqual(status["game_id"], game["id"])
 
 
+class SetupValidationWordingTest(unittest.TestCase):
+    """#233 B1: setup validation/deletion messages use the canonical display
+    nouns — Program for the umbrella (internal ``league``), League for the
+    grouping (internal ``level``), and facility-owner / operating-organization
+    for the venue↔program org roles. Error codes stay frozen."""
+
+    def setUp(self):
+        self.api = ApiService()
+
+    def _msg(self, result):
+        return result["error"]["message"]
+
+    def test_missing_umbrella_parent_says_program(self):
+        r = self.api.create_season("nope", "S")
+        self.assertEqual(r["error"]["code"], "not_found")
+        self.assertEqual(self._msg(r), "Program nope not found.")
+
+    def test_team_without_umbrella_says_program(self):
+        club = self.api.create_club("C")
+        r = self.api.create_team(club["id"], None, "T")  # no league/division
+        self.assertIn("A team needs a program", self._msg(r))
+        self.assertNotRegex(self._msg(r), r"(?i)\bleague\b")
+
+    def test_missing_grouping_parent_says_league(self):
+        league = self.api.create_league("P")
+        season = self.api.create_season(league["id"], "S")
+        r = self.api.create_division(season["id"], "D", level_id="nope")
+        self.assertEqual(self._msg(r), "League nope not found.")
+
+    def test_venue_program_owner_mismatch_uses_role_nouns(self):
+        org1 = self.api.create_organization("O1")
+        org2 = self.api.create_organization("O2")
+        league = self.api.create_league("P", organization_id=org1["id"])
+        venue = self.api.create_venue("V", organization_id=org2["id"])
+        r = self.api.assign_venue_league(venue["id"], league["id"])
+        msg = self._msg(r)
+        self.assertIn("facility owner", msg)
+        self.assertIn("operating organization", msg)
+        self.assertNotRegex(msg, r"(?i)\bleague\b")
+
+    def test_delete_umbrella_blocked_says_program(self):
+        league = self.api.create_league("P")
+        self.api.create_season(league["id"], "S")
+        r = self.api.delete_league(league["id"])
+        self.assertEqual(r["error"]["code"], "has_dependencies")
+        self.assertIn("Can't delete this program", self._msg(r))
+
+    def test_delete_grouping_blocked_says_league(self):
+        league = self.api.create_league("P")
+        season = self.api.create_season(league["id"], "S")
+        level = self.api.create_level(season["id"], "Grp")
+        self.api.create_division(season["id"], "D", level_id=level["id"])
+        r = self.api.delete_level(level["id"])
+        self.assertIn("Can't delete this league", self._msg(r))
+
+
 if __name__ == "__main__":
     unittest.main()
