@@ -2,7 +2,7 @@
 //
 // The demo now boots as a clean slate and is populated/emptied explicitly. At
 // desktop and 390px this proves the full lifecycle a League Admin drives:
-//   * first launch shows a blank setup with the "Start your league" card, and
+//   * first launch shows a blank setup with the "Start your competition" card, and
 //     the header database-icon control reads "Load demo data";
 //   * Load (from the empty-state card) builds the sample dataset, the card is
 //     replaced by the league trees, and the header now reads "Reset demo data";
@@ -121,8 +121,8 @@ async function checkViewport(browser, viewport) {
     await page.reload({ waitUntil: "domcontentloaded" });
     await page.waitForSelector("#content > *", { timeout: 10000 });
 
-    // (1) First launch: a clean slate. Setup opens on "Start your league", the
-    // header control is present and offers Load, and no league exists yet.
+    // (1) First launch: a clean slate. Setup opens on "Start your competition", the
+    // header control is present and offers Load, and no program exists yet.
     await openSetup();
     await page.waitForSelector(".start-league", { timeout: 10000 });
     await page.waitForFunction(
