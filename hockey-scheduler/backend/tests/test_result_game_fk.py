@@ -198,19 +198,6 @@ class ForeignKeyEnforcementTest(unittest.TestCase):
             finally:
                 store.close()
 
-    def test_null_game_id_is_still_allowed(self):
-        # The foreign key is nullable, so a result not yet tied to a game is fine.
-        for label, url in _sql_backends():
-            store = _fresh(url)
-            try:
-                with store.transaction():
-                    store.add_game_result(_result("r1", None))
-                cur = store.conn.cursor()
-                cur.execute("SELECT COUNT(*) AS n FROM game_results")
-                self.assertEqual(cur.fetchone()["n"], 1, label)
-            finally:
-                store.close()
-
 
 class RebuildPreservesDataTest(unittest.TestCase):
     """The SQLite table rebuild must carry every row and index across the swap;

@@ -74,42 +74,13 @@ def _downgrade_024(store):
             "DELETE FROM schema_migrations WHERE version = ?"), (_VERSION,))
 
 
-def _game_lookup_index_present(store):
-    """True if a NON-partial ix_game_results_game (usable for result_for_game's
-    WHERE game_id = ? scan, including any NULL-game_id rows) exists."""
-    cur = store.conn.cursor()
-    if store.backend == "sqlite":
-        cur.execute("PRAGMA index_list('game_results')")
-        return any(row["name"] == "ix_game_results_game" and row["partial"] == 0
-                   for row in cur.fetchall())
-    cur.execute("SELECT indexname, indexdef FROM pg_indexes "
-                "WHERE tablename = 'game_results'")
-    return any(row["indexname"] == "ix_game_results_game"
-               and "WHERE" not in row["indexdef"].upper()
-               for row in cur.fetchall())
-
-
-def _unique_partial_index_present(store):
-    """True if the PARTIAL unique ux_game_result_game (concrete game_id
-    uniqueness, NULL-bearing rows excluded) exists."""
-    cur = store.conn.cursor()
-    if store.backend == "sqlite":
-        cur.execute("PRAGMA index_list('game_results')")
-        return any(row["name"] == _INDEX and row["unique"] == 1
-                   and row["partial"] == 1 for row in cur.fetchall())
-    cur.execute("SELECT indexname, indexdef FROM pg_indexes "
-                "WHERE tablename = 'game_results'")
-    return any(row["indexname"] == _INDEX
-               and "UNIQUE" in row["indexdef"].upper()
-               and "WHERE" in row["indexdef"].upper()
-               for row in cur.fetchall())
-
-
 class PreMigrationValidationTest(unittest.TestCase):
-    """The pre-enable check matches the partial index exactly, on each backend.
+    """024's duplicate-detection check aborts an upgrade that already has two
+    results for the same game, on each backend.
 
-    Parametrized over SQLite + PostgreSQL (in CI) so the NULL semantics — which
-    differ from a naive GROUP BY — are proven on both, not just SQLite.
+    (game_id became NOT NULL in Slice 3E / migration 026, so the NULL-semantics
+    cases the 024 partial index once needed are covered by test_result_game_not_null
+    now — a fully-migrated database can no longer hold a NULL-game result row.)
     """
 
     def _pre024(self, url):
@@ -142,41 +113,6 @@ class PreMigrationValidationTest(unittest.TestCase):
                 self.assertIn("g1", str(ctx.exception))
                 with self.assertRaises(MigrationDataError, msg=label):
                     migrate(store.conn, store.dialect)  # aborts on dirty data
-            finally:
-                self._cleanup(store)
-
-    def test_null_bearing_duplicates_are_not_flagged_and_do_not_crash(self):
-        # game_id is nullable and NULLs are distinct in the partial index, so
-        # repeated NULL-bearing rows are NOT duplicates. The check must agree
-        # (no false positive) and the migration must still apply.
-        for label, url in _sql_backends():
-            store = self._pre024(url)
-            try:
-                with store.transaction():
-                    store.add_game_result(_result("r1", None))
-                    store.add_game_result(_result("r2", None))
-                self.assertEqual(find_duplicate_result_games(store.conn), [], label)
-                assert_no_duplicate_result_games(store.conn)  # must not raise
-                migrate(store.conn, store.dialect)  # succeeds; index is created
-                self.assertIn(_VERSION, store.migration_status()["applied"], label)
-            finally:
-                self._cleanup(store)
-
-    def test_mixed_null_and_concrete_reports_only_the_concrete_game(self):
-        # A dirty mix — (NULL) alongside two ('g1') — must report only the
-        # concrete duplicate game.
-        for label, url in _sql_backends():
-            store = self._pre024(url)
-            try:
-                _ensure_games(store, "g1")
-                with store.transaction():
-                    store.add_game_result(_result("r1", None))
-                    store.add_game_result(_result("r2", "g1"))
-                    store.add_game_result(_result("r3", "g1"))
-                self.assertEqual(find_duplicate_result_games(store.conn),
-                                 ["g1"], label)
-                with self.assertRaises(MigrationDataError, msg=label):
-                    assert_no_duplicate_result_games(store.conn)
             finally:
                 self._cleanup(store)
 
@@ -221,21 +157,6 @@ class ConstraintEnforcementTest(unittest.TestCase):
                 self.assertEqual(len(rows), 1, label)  # still exactly one row
                 self.assertEqual(rows[0].home_score, 4, label)
                 self.assertEqual(rows[0].status, ResultStatus.FINAL, label)
-            finally:
-                store.close()
-
-    def test_null_bearing_rows_are_allowed_by_the_partial_index(self):
-        # The index only constrains concrete game_id, so NULL-bearing rows never
-        # conflict (matching the pre-migration check).
-        for label, url in _sql_backends():
-            store = _fresh(url)
-            try:
-                with store.transaction():  # neither of these raises a conflict
-                    store.add_game_result(_result("r1", None))
-                    store.add_game_result(_result("r2", None))
-                cur = store.conn.cursor()
-                cur.execute("SELECT COUNT(*) AS n FROM game_results")
-                self.assertEqual(cur.fetchone()["n"], 2, label)
             finally:
                 store.close()
 
@@ -300,52 +221,22 @@ class ResultRaceTest(unittest.TestCase):
             checker.close()
 
 
-class IndexShapeTest(unittest.TestCase):
-    """After migration 024 both indexes must coexist on every backend: the
-    PARTIAL unique index that enforces one row per concrete game, and a
-    NON-partial ix_game_results_game that still serves result_for_game's
-    ``WHERE game_id = ?`` scan (including any NULL-game_id rows the partial
-    index excludes). Dropping the latter for the former would silently
-    full-scan.
-    """
-
-    def test_partial_unique_and_nonpartial_lookup_indexes_coexist(self):
-        for label, url in _sql_backends():
-            store = _fresh(url)
-            try:
-                _ensure_games(store, "g1")
-                with store.transaction():
-                    store.add_game_result(_result("r1", "g1"))
-                self.assertTrue(_game_lookup_index_present(store),
-                                f"{label}: non-partial ix_game_results_game missing")
-                self.assertTrue(_unique_partial_index_present(store),
-                                f"{label}: partial ux_game_result_game missing")
-                self.assertIsNotNone(store.result_for_game("g1"), label)
-                with self.assertRaises(IntegrityConflictError, msg=label):
-                    with store.transaction():
-                        store.add_game_result(_result("r2", "g1"))
-            finally:
-                store.close()
-
-
 class MigrationLedgerTest(unittest.TestCase):
     def test_recorded_and_enforced_after_reopen(self):
+        # (The finalized single-plain-index shape and its survival across a
+        # restart are asserted in test_result_game_not_null; here we just prove
+        # one-result-per-game stays enforced after reopening the database.)
         fd, path = tempfile.mkstemp(suffix=".db")
         os.close(fd)
         try:
             first = SqlStore(path)
             self.assertIn(_VERSION, first.migration_status()["applied"])
-            self.assertTrue(_game_lookup_index_present(first))
-            self.assertTrue(_unique_partial_index_present(first))
             _ensure_games(first, "g1")
             with first.transaction():
                 first.add_game_result(_result("r1", "g1"))
             first.close()
             second = SqlStore(path)
             self.assertTrue(second.migration_status()["current"])
-            # Both index shapes survive the restart, not just the unique one.
-            self.assertTrue(_game_lookup_index_present(second))
-            self.assertTrue(_unique_partial_index_present(second))
             with self.assertRaises(IntegrityConflictError):
                 with second.transaction():
                     second.add_game_result(_result("r2", "g1"))  # still enforced

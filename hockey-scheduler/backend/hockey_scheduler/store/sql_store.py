@@ -78,6 +78,7 @@ from .integrity_checks import (
     assert_no_duplicate_result_games,
     assert_no_duplicate_roster_players,
     assert_result_games_exist,
+    assert_results_have_game,
 )
 
 
@@ -312,6 +313,7 @@ _PRE_MIGRATION_CHECKS = {
     "023_one_roster_row_per_player": assert_no_duplicate_roster_players,
     "024_one_result_per_game": assert_no_duplicate_result_games,
     "025_result_game_fk": assert_result_games_exist,
+    "026_result_game_not_null": assert_results_have_game,
 }
 
 
