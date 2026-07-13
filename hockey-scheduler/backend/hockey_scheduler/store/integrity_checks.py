@@ -122,3 +122,22 @@ def assert_result_games_exist(conn):
             "Cannot add the result → game foreign key: "
             f"{len(orphans)} result row(s) reference a game that does not "
             f"exist: {shown}{more}. Reattach or remove them before upgrading.")
+
+
+def find_results_missing_game(conn):
+    """Result row ids whose game_id is NULL (would fail the NOT NULL migration)."""
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM game_results WHERE game_id IS NULL")
+    return sorted(row["id"] for row in cur.fetchall())
+
+
+def assert_results_have_game(conn):
+    """Abort the migration if any result has no game_id (#201 3E)."""
+    missing = find_results_missing_game(conn)
+    if missing:
+        shown = ", ".join(missing[:20])
+        more = "" if len(missing) <= 20 else f" (+{len(missing) - 20} more)"
+        raise MigrationDataError(
+            "Cannot require a game for every result: "
+            f"{len(missing)} result row(s) have no game_id: {shown}{more}. "
+            "Attach them to a game or remove them before upgrading.")
