@@ -4,13 +4,15 @@ Migration 025 adds a game_results.game_id → games(id) foreign key. This is the
 foundation slice for #201's relationship integrity: it turns on SQLite foreign-
 key enforcement (PostgreSQL already enforces), adds per-dialect migration support
 (SQLite rebuilds the table; PostgreSQL runs an ALTER), and validates existing
-data first. The column stays nullable — a nullable FK still permits NULL — so
-only a concrete, dangling reference is rejected; requiring the column (NOT NULL)
-is a later slice.
+data first. At 025 the column is nullable — a nullable FK still permits NULL — so
+only a concrete, dangling reference is rejected. (The follow-up Slice 3E /
+migration 026 then makes game_id NOT NULL; the NULL-rejection and final index
+shape are covered in test_result_game_not_null, and this suite's pre-025
+downgrade undoes 026 as well so it exercises a genuine sequential upgrade.)
 
 Covers pre-migration orphan detection/report + upgrade abort, the FK enforced as
-a translated conflict on SQLite + PostgreSQL, NULL still allowed, the SQLite
-rebuild preserving rows + indexes, and enforcement surviving a restart.
+a translated conflict on SQLite + PostgreSQL, the SQLite rebuild preserving
+rows + indexes, and enforcement surviving a restart.
 """
 
 import os

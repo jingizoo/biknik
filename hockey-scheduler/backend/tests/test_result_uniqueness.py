@@ -65,13 +65,47 @@ def _fresh(url):
     return store
 
 
+_V025 = "025_result_game_fk"
+_V026 = "026_result_game_not_null"
+
+
 def _downgrade_024(store):
-    """Simulate a pre-024 database: drop the unique index and un-record it."""
+    """Restore a real pre-024 predecessor state: nullable game_id, no result→game
+    foreign key, the base non-unique lookup index and NO uniqueness index.
+
+    This undoes the whole 024→026 chain in reverse and un-records all three
+    versions, so a re-migrate re-applies them contiguously (024's uniqueness
+    check, then 025's FK, then 026's NOT NULL) — never leaving a non-contiguous
+    ledger that would claim the database is current while an older schema is
+    manually restored.
+    """
     with store.transaction():
         cur = store.conn.cursor()
-        cur.execute(f"DROP INDEX IF EXISTS {_INDEX}")
-        cur.execute(store.dialect.sql(
-            "DELETE FROM schema_migrations WHERE version = ?"), (_VERSION,))
+        if store.backend == "postgres":
+            cur.execute("ALTER TABLE game_results ALTER COLUMN game_id DROP NOT NULL")
+            cur.execute("ALTER TABLE game_results "
+                        "DROP CONSTRAINT IF EXISTS fk_game_results_game")
+            cur.execute(f"DROP INDEX IF EXISTS {_INDEX}")
+            cur.execute("CREATE INDEX IF NOT EXISTS ix_game_results_game "
+                        "ON game_results (game_id)")
+        else:
+            cur.execute("PRAGMA defer_foreign_keys = ON")
+            cur.execute(
+                "CREATE TABLE game_results_pre24 (id TEXT PRIMARY KEY, "
+                "game_id TEXT, home_score INTEGER, away_score INTEGER, "
+                "status TEXT, recorded_by TEXT, recorded_at TEXT, "
+                "approved_by TEXT, approved_at TEXT)")
+            cur.execute(
+                "INSERT INTO game_results_pre24 SELECT id, game_id, home_score, "
+                "away_score, status, recorded_by, recorded_at, approved_by, "
+                "approved_at FROM game_results")
+            cur.execute("DROP TABLE game_results")
+            cur.execute("ALTER TABLE game_results_pre24 RENAME TO game_results")
+            cur.execute("CREATE INDEX IF NOT EXISTS ix_game_results_game "
+                        "ON game_results (game_id)")
+        for version in (_V026, _V025, _VERSION):
+            cur.execute(store.dialect.sql(
+                "DELETE FROM schema_migrations WHERE version = ?"), (version,))
 
 
 class PreMigrationValidationTest(unittest.TestCase):
@@ -219,6 +253,68 @@ class ResultRaceTest(unittest.TestCase):
             self.assertEqual(cur.fetchone()["n"], 1)
         finally:
             checker.close()
+
+
+def _result_index_shape(store):
+    """{index_name: (is_unique, is_partial)} for game_results, excluding the
+    implicit primary-key autoindex."""
+    cur = store.conn.cursor()
+    if store.backend == "sqlite":
+        cur.execute("PRAGMA index_list('game_results')")
+        return {row["name"]: (bool(row["unique"]), bool(row["partial"]))
+                for row in cur.fetchall()
+                if not row["name"].startswith("sqlite_autoindex")}
+    cur.execute("SELECT indexname, indexdef FROM pg_indexes "
+                "WHERE tablename = 'game_results'")
+    out = {}
+    for row in cur.fetchall():
+        d = row["indexdef"].upper()
+        out[row["indexname"]] = ("UNIQUE" in d, "WHERE" in d)
+    return out
+
+
+class SequentialUpgradeRegressionTest(unittest.TestCase):
+    """Re-upgrading from a genuine pre-024 predecessor through the current head
+    lands on 3E's final shape — proving the historical downgrade helper restores
+    a contiguous ledger rather than manufacturing a "current" claim over an older
+    schema."""
+
+    def test_full_downgrade_then_reupgrade_reaches_head(self):
+        for label, url in _sql_backends():
+            store = _fresh(url)
+            try:
+                _ensure_games(store, "g1")
+                _downgrade_024(store)  # nullable, no FK, no uniqueness index
+                self.assertFalse(store.migration_status()["current"], label)
+                with store.transaction():
+                    store.add_game_result(_result("r1", "g1"))  # valid row
+                migrate(store.conn, store.dialect)  # 024 → 025 → 026, contiguous
+                # Ledger genuinely current — every version applied in order.
+                self.assertTrue(store.migration_status()["current"], label)
+                # Exactly one plain unique index; the lookup index is gone.
+                shape = _result_index_shape(store)
+                self.assertEqual(shape.get(_INDEX), (True, False), f"{label}: {shape}")
+                self.assertNotIn("ix_game_results_game", shape, label)
+                # game_id is actually NOT NULL and the FK is actually enforced.
+                with self.assertRaises(IntegrityConflictError, msg=label) as nn:
+                    with store.transaction():
+                        store.add_game_result(_result("r2", None))
+                self.assertEqual(nn.exception.details["reason"],
+                                 "not_null_violation", label)
+                with self.assertRaises(IntegrityConflictError, msg=label) as fk:
+                    with store.transaction():
+                        store.add_game_result(_result("r3", "ghost"))
+                self.assertEqual(fk.exception.details["reason"],
+                                 "foreign_key_violation", label)
+                # The row carried across the whole sequence, and uniqueness holds.
+                self.assertIsNotNone(store.result_for_game("g1"), label)
+                with self.assertRaises(IntegrityConflictError, msg=label):
+                    with store.transaction():
+                        store.add_game_result(_result("r4", "g1"))
+            finally:
+                if store.backend != "sqlite":
+                    store.reset_schema()
+                store.close()
 
 
 class MigrationLedgerTest(unittest.TestCase):
