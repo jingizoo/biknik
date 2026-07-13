@@ -161,23 +161,35 @@ async function checkViewport(browser, viewport) {
     need(/facility owner/i.test(s.organization.text) && /operating organization/i.test(s.organization.text),
       `step 1 does not separate facility owner from operating organization`);
 
-    // Step 3 marks the Venue→Program link as temporary v1 compatibility.
+    // Step 3 marks the Venue→Program link as temporary v1 compatibility that
+    // Season-to-Venue access replaces (Slice E); venues stay Organization-owned.
     need(/temporary v1/i.test(s.venues.text) && /Program-linked venue/i.test(s.venues.text),
       `step 3 does not mark the venue→program link as temporary v1`);
+    need(/Season-to-Venue access replaces/i.test(s.venues.text),
+      `step 3 does not say Season-to-Venue access replaces the temporary link`);
 
     // Step 4 teaches the target model — leagues required, division optional — and
-    // no longer says "Leagues remain optional"; the grouping action is "Add
-    // league" (not "Add optional league"/"Add optional level").
+    // no longer says "Leagues remain optional".
     need(/leagues \(required\)/i.test(s.season.text) && /optional split of a league/i.test(s.season.text),
       `step 4 does not teach league-required / division-optional target model`);
     need(!/Leagues remain optional/i.test(s.season.text) && !/Levels remain/i.test(s.season.text),
       `step 4 still says "Leagues remain optional"`);
-    need(s.season.actions.includes("Add league") && !s.season.actions.some((a) => /optional (league|level)/i.test(a)),
-      `step 4 grouping action is not a plain "Add league" (got ${JSON.stringify(s.season.actions)})`);
+    // Action order must respect the frozen v1 drawer dependencies: at empty
+    // install (no Season) the only action is "Add season" — never a dead-end
+    // "Add league" whose drawer requires a Season — and never "Add optional …".
+    need(s.season.actions.includes("Add season") && !s.season.actions.includes("Add league"),
+      `step 4 empty-install action must be "Add season", not a dead-end "Add league" (got ${JSON.stringify(s.season.actions)})`);
+    need(!s.season.actions.some((a) => /optional (league|level)/i.test(a)),
+      `step 4 still offers an "Add optional league/level" action (got ${JSON.stringify(s.season.actions)})`);
 
     // Step 5 frames teams as permanent program members placed seasonally.
     need(/permanently to its program/i.test(s.teams.text) && /optional division/i.test(s.teams.text),
       `step 5 does not describe permanent program ownership + seasonal placement`);
+
+    // Step 7 (frozen key "ice") uses neutral facility wording — a rink at a
+    // configured venue, never "program rink".
+    need(/rink at a configured venue/i.test(s.ice.text) && !/program rink/i.test(s.ice.text),
+      `step 7 does not use neutral "rink at a configured venue" wording (got ${JSON.stringify(s.ice.text)})`);
 
     // The internal grouping key "level"/"Level" is never shown to the operator.
     need(!/\bLevel\b/.test(wiz.allText), `wizard still exposes the internal "Level" noun`);

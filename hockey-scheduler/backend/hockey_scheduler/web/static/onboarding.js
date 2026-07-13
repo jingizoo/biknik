@@ -147,7 +147,7 @@ function buildOnboardingGroups(status) {
     },
     {
       number: 3, key: "venues", title: "Venues and rinks",
-      description: "Assign a venue to the program — a temporary v1 compatibility link (venues become Season-scoped in Slice E) — then add the rink surfaces used for scheduling.",
+      description: "Assign a venue to the program — a temporary v1 compatibility link that Season-to-Venue access replaces in Slice E; venues remain owned by the organization — then add the rink surfaces used for scheduling.",
       done: done("venue", "rink"),
       checks: [
         onboardingCheck("Program-linked venue (temporary v1)", done("venue"), detail("venue")),
@@ -166,10 +166,16 @@ function buildOnboardingGroups(status) {
         onboardingCheck("Season", done("season"), detail("season")),
         onboardingCheck("Division (required in v1; optional in the new model)", done("division"), detail("division")),
       ],
-      actions: [
-        { label: "Add league", attrs: { "onboarding-drawer": "level" } },
-        { label: done("season") ? "Add division" : "Add season", attrs: { "onboarding-drawer": done("season") ? "division" : "season" } },
-      ],
+      // Action order follows the frozen v1 drawer dependencies: the league and
+      // division drawers both require a Season, so before one exists the only
+      // offered action is "Add season". Once a Season exists, lead with the
+      // (target-required) league, then the v1-required division.
+      actions: done("season")
+        ? [
+            { label: "Add league", attrs: { "onboarding-drawer": "level" } },
+            { label: "Add division", attrs: { "onboarding-drawer": "division" } },
+          ]
+        : [{ label: "Add season", attrs: { "onboarding-drawer": "season" } }],
     },
     {
       number: 5, key: "teams", title: "Clubs and teams",
@@ -198,7 +204,7 @@ function buildOnboardingGroups(status) {
     },
     {
       number: 7, key: "ice", title: "Game ice inventory",
-      description: "Add at least one available Game ice slot under a program rink.",
+      description: "Add at least one available Game ice slot under a rink at a configured venue.",
       done: done("ice"),
       checks: [onboardingCheck("Available Game ice", done("ice"), detail("ice"))],
       actions: [
