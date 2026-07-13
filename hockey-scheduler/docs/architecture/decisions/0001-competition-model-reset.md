@@ -229,17 +229,18 @@ circular (see Slice E1/E2 in the sequencing):
   1. **assign** the venue to the specific Season(s) that use it via the E1
      route/import (creates real `SeasonVenueAccess` rows); or
   2. record a reviewed **`no_current_season_access`** decision — the venue is
-     intentionally eligible for **no** current Season. This is a first-class,
-     audited migration decision (stored so the report is satisfied and the choice is
-     traceable), **not** a placeholder access row. It covers both the
-     "program has no Seasons yet" case and the "operator deliberately grants the
-     venue to none this cycle" case, so a real venue is never stranded and E2 is never
-     permanently blocked.
+     intentionally eligible for **no** current Season. This decision is **durably
+     stored** by E1 (the `venue_access_review` record E1 creates), so E2's
+     pre-migration check reads it directly; the audit-log entry is written *in
+     addition*, never as the sole source of truth. It is **not** a placeholder access
+     row. It covers both the "program has no Seasons yet" case and the "operator
+     deliberately grants the venue to none this cycle" case, so a real venue is never
+     stranded and E2 is never permanently blocked.
 
   Re-running E2 then finds every venue either covered by real access rows or carrying
-  an explicit `no_current_season_access` decision, and completes. The venue and its
-  future access are re-enabled the moment the operator adds a `SeasonVenueAccess` row
-  once a Season exists.
+  a durably-stored `no_current_season_access` decision, and completes. The venue and
+  its future access are re-enabled the moment the operator adds a `SeasonVenueAccess`
+  row once a Season exists.
 
 ## Migration compatibility & sequencing
 
@@ -268,7 +269,7 @@ cutover):
   callers through the deprecation window.
 - **D — optional Clubs:** `team.club_id` nullable end-to-end; drop any create/import Club requirement; `NA`/blank/null → no Club.
 - **E — venue decoupling, staged in two migrations** so the remediation target exists before anything is dropped:
-  - **E1 (additive):** create the `SeasonVenueAccess` table and the Season↔Venue routes/import (`POST /api/v2/setup/seasons/{id}/venues`, `DELETE …/venues/{venue_id}`, and the sheet section). Auto-populate the unambiguous single-Season case from `Venue.league_id`. **`Venue.league_id` stays.** After E1 the new table and API exist and operators can add access rows.
+  - **E1 (additive):** create the `SeasonVenueAccess` table and the Season↔Venue routes/import (`POST /api/v2/setup/seasons/{id}/venues`, `DELETE …/venues/{venue_id}`, and the sheet section), **plus a durable store for the `no_current_season_access` decision** — a persisted record (e.g. a `venue_access_review` row/flag per venue), not an audit-log entry, so E2 can query it directly. Auto-populate the unambiguous single-Season case from `Venue.league_id`. **`Venue.league_id` stays.** After E1 the new table, the decision store, and the API all exist and operators can add access rows or record the decision.
   - **E2 (decouple):** drop `Venue.league_id` (permanent ownership) with a pre-migration report of any venue whose access coverage is still incomplete/ambiguous; the upgrade aborts until those rows are added via the E1 API. Organization→Venue ownership is unchanged.
 - **F — imports & onboarding:** columns `facility_owner, venue, program, season, league, division, club, team, player`; wizard questions per the epic.
 - **G — scheduler alignment (behaviour only, no schema change):** generate for Season + League (+ optional Division) using the `game.league_id` added in Slice C; resolve teams via `SeasonTeamRegistration`, ice via `SeasonVenueAccess`; blackout/holiday inputs; unschedulable diagnostics.
