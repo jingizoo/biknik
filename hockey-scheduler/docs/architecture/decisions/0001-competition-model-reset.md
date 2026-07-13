@@ -106,20 +106,46 @@ Because "League" is reused, every reference must be disambiguated by layer, neve
 | `Organization` / `organizations` | `id, name, short_name, external_ref?` | **Organization** | unchanged; gains a Program-operator role in addition to Venue ownership |
 | `Venue` / `venues` | `id, name, address, timezone, organization_id?, league_id?(#173 permanent), external_ref?` | **Venue** | **drop `league_id`** (no permanent Program ownership); keep `organization_id` (facility owner) |
 | — | — | **SeasonVenueAccess** (new) | `id, season_id, venue_id, active` (+ optional allocation metadata later); replaces `Venue.league_id`; many-to-many |
-| `Game` / `games` | `…, season_id, division_id, ice_slot_id, …` | **Game** | schedule scope becomes Season + League (+ optional Division); `division_id` stays optional; a `league_id` scope column is added when the scheduler aligns (#206 / Slice G) |
+| `Game` / `games` | `…, season_id, division_id, ice_slot_id, …` | **Game** | add a `league_id` scope column **in Slice C** (alongside the League layer) so a game is scoped to Season + League (+ optional Division); `division_id` stays optional. Slice G only changes scheduler *behaviour* (how games are generated), not this schema. |
 
 `Rink` / `IceSlot` are unchanged (they hang off Venue, which stays owned by Organization).
 
-### Routes / API (families; exact endpoints in `api-contract.md`)
+### Routes / API — exact old → new matrix
 
-| Current route family | Target family | Compatibility |
+Derived from the real dispatcher in `web/server.py::_handle_setup` (the routes are
+path-parsed, not listed in `docs/architecture/api-contract.md`, which is stale and
+carries **no** Setup routes — a doc-refresh is folded into Slice B). All routes are
+`POST /api/setup/<entity>` unless noted; each maps to an `ApiService`/`SetupService`
+method. "→ alias" means the old path keeps working with the new semantics during the
+deprecation window; a **new path** is minted only where reusing the old one would
+silently change a caller's meaning.
+
+**Entity create/CRUD:**
+
+| Method + path (today) | Body today | Path (target) | Body (target) | Compatibility |
+|---|---|---|---|---|
+| `POST /api/setup/league` | `name, country, timezone, organization_id?` | `POST /api/setup/program` | `name, country, timezone, operator_organization_id?` | old `league` path = **alias** for `program`; accept `organization_id` as deprecated key for `operator_organization_id` |
+| `POST /api/setup/season` | `league_id, name, start_date, end_date` | `POST /api/setup/season` | `program_id, name, start_date, end_date` | accept `league_id` as deprecated alias for `program_id` (dual-read) |
+| `POST /api/setup/level` | `season_id, name, sort_order` | `POST /api/setup/league` | `season_id, name, sort_order` | **new-meaning `league` path**; old `level` path deprecated alias → creates a League(new). The pre-reset `league` create is `program` (row above), so the two never collide. |
+| `POST /api/setup/division` | `season_id, name, age_group, level_id?` | `POST /api/setup/division` | `league_id, name, age_group` | parent key `league_id` (was `season_id` + optional `level_id`); accept old keys during dual-read, deriving the League |
+| `POST /api/setup/team` | `club_id?, division_id?, name, league_id?` | `POST /api/setup/team` | `name, program_id, club_id?` | `league_id` → `program_id` (dual-read); `club_id` stays nullable; retire the `division_id`-derives-owner import shortcut |
+| `POST /api/setup/venue` | `name, address, timezone, organization_id?, league_id?` | `POST /api/setup/venue` | `name, address, timezone, organization_id?` | **drop `league_id`**; a rejected/ignored `league_id` is a deprecation warning; access now via the Season↔Venue routes below |
+| `POST /api/setup/game` | `season_id, division_id, home_team_id, away_team_id, ice_slot_id, allow_division_override?` | `POST /api/setup/game` | `season_id, league_id, division_id?, home_team_id, away_team_id, ice_slot_id, allow_division_override?` | add `league_id` (Slice C); `division_id` optional |
+| `POST /api/setup/{organization,club,rink,ice-slot,official,player}` | unchanged | same | unchanged | — |
+
+**Nested, registration, action & delete routes:**
+
+| Method + path (today) | Target | Change |
 |---|---|---|
-| `/api/setup/leagues/…` | `/api/setup/programs/…` | keep `leagues` as a deprecated alias returning the new Program shape until clients migrate |
-| `/api/setup/levels/…` | `/api/setup/leagues/…` | **breaking meaning change** — must be versioned/deprecated explicitly, never silently repointed |
-| `/api/setup/seasons/…` | `/api/setup/seasons/…` | payload gains `program_id` (was `league_id`); keep old key as deprecated read alias |
-| `/api/setup/divisions/…` | `/api/setup/divisions/…` | parent key `league_id` (was `season_id`/`level_id`) |
-| `/api/setup/venues/…` | `/api/setup/venues/…` | drop `league_id`; add Season↔Venue access endpoints |
-| `/api/setup/registrations/…` | `/api/setup/registrations/…` | payload gains `league_id` |
+| `GET /api/setup/hierarchy` | same | payload reshaped to Program→Season→League→Division; keep old keys during dual-read |
+| `GET /api/setup/leagues/{id}/teams` | `GET /api/setup/programs/{id}/teams` (alias `leagues`) | teams resolve by `program_id` |
+| `GET·POST /api/setup/seasons/{id}/team-registrations` | same | POST body gains `league_id` (required once the League layer exists); `division_id` stays optional |
+| `POST /api/setup/season-team-registration/{id}/assign-division` | same + new `…/assign-league` | division reassignment stays; add a league-reassignment action |
+| `POST /api/setup/season-team-registration/{id}/remove` | same | — |
+| `POST /api/setup/seasons/{id}/roll-forward` | same | selections may carry `league_id` + `division_id?` |
+| `POST /api/setup/{league,venue,rink,division,team,player}/{id}/assign-{parent}` | `league`→`program`; `division` parent → `league` | reassign-parent semantics follow the new hierarchy |
+| `POST /api/setup/{organization,league,season,level,division,club,team,venue,rink,ice-slot,game}/{id}/delete` | `league`→`program` delete; `level`→`league` delete | delete dispatch keys track the renames |
+| — (new, Slice E) | `POST /api/setup/seasons/{id}/venues` (`{venue_id, active}`) and `DELETE …/venues/{venue_id}` | Season↔Venue access (`SeasonVenueAccess`), replacing `Venue.league_id` |
 
 ### UI labels (Slice B)
 
@@ -138,10 +164,27 @@ Forward-only, per-dialect (SQLite rebuild + PostgreSQL ALTER), following the #20
 | Division reparent | For a Division with `level_id` set → parent = that level-now-league. For a Division with only `season_id` (no level) → **needs a League**: attach to the season's sole League if exactly one exists; otherwise **abort and report** (operator must pick/create a League). | a season has 0 or >1 Leagues and a level-less Division exists |
 | Team.league_id → program_id | Copy the permanent-owner value. | a Team's `league_id` has no league row |
 | Registration.league_id (new) | Derive from the Team's Division-for-that-season if unambiguous; else from a single League under the season. | the league can't be uniquely derived from existing division/season data |
-| Venue.league_id → SeasonVenueAccess | For each `Venue.league_id`, create `SeasonVenueAccess` rows for the seasons under that league-now-program where the link is unambiguous. | a venue's owning-league maps to 0 or many candidate seasons ambiguously |
+| Venue.league_id → SeasonVenueAccess | If the owning league-now-program has **exactly one** Season, create one `SeasonVenueAccess(season_id, venue_id, active=true)`. Otherwise abort. | the program has **0 or more than one** Season — see below |
 | Club | `NA`, blank, and NULL in any source all map to **no Club** (null `club_id`); never create a Club record. | — |
 
 Every mapping keys on **stable ids** so audit logs, results, rosters, and external_refs continue to resolve.
+
+**Why multi-season venue mappings abort (and how to remediate).** Today a Venue is
+owned by exactly one league (`Venue.league_id`); that edge records *which competition
+owns the building*, not *which seasons actually used it*. The target model replaces
+ownership with per-**Season** access (`SeasonVenueAccess`). When the owning
+program has more than one Season, the old data does not say which of those Seasons
+the venue was actually used for, so auto-creating access for **all** of them would
+grant ice eligibility that may never have existed (over-granting), while creating
+none would strand a real venue (under-granting). Either guess would silently change
+which ice the scheduler treats as eligible — so the migration **aborts** and the
+pre-migration report lists each `(venue, program, candidate seasons)` needing a
+decision. **Remediation:** before re-running the upgrade, the operator assigns the
+venue to the specific Season(s) that use it via the new Season↔Venue route/import
+(`POST /api/setup/seasons/{id}/venues`); the migration then finds those explicit
+access rows already present and leaves them untouched. The zero-Season case (a venue
+owned by a program that has no seasons yet) is reported the same way and simply
+carries no access rows until a Season exists.
 
 ## Migration compatibility & sequencing
 
@@ -149,11 +192,11 @@ Implementation order (from the epic; Slice A is this document):
 
 - **A — ADR + compatibility map** (this doc). Canonical docs updated before code.
 - **B — terminology without data loss:** UI/label/route-alias rename (League→Program, Level→League), explicit API compatibility. No schema change.
-- **C — competition schema:** introduce `programs`, reparent Season→Program, rename Level→League(new), reparent Division→League, move Team ownership to Program, add `registration.league_id`; forward-only SQLite+PostgreSQL migrations with pre-migration integrity reports.
+- **C — competition schema:** introduce `programs`, reparent Season→Program, rename Level→League(new), reparent Division→League, move Team ownership to Program, add `registration.league_id`, **and add `game.league_id`** (the game competition-scope column); forward-only SQLite+PostgreSQL migrations with pre-migration integrity reports.
 - **D — optional Clubs:** `team.club_id` nullable end-to-end; drop any create/import Club requirement; `NA`/blank/null → no Club.
 - **E — venue decoupling:** drop permanent Program/League→Venue ownership; add `SeasonVenueAccess`; keep Organization→Venue ownership; migrate unambiguous venue links.
 - **F — imports & onboarding:** columns `facility_owner, venue, program, season, league, division, club, team, player`; wizard questions per the epic.
-- **G — scheduler alignment:** generate for Season + League (+ optional Division); resolve teams via `SeasonTeamRegistration`, ice via `SeasonVenueAccess`; blackout/holiday inputs; unschedulable diagnostics.
+- **G — scheduler alignment (behaviour only, no schema change):** generate for Season + League (+ optional Division) using the `game.league_id` added in Slice C; resolve teams via `SeasonTeamRegistration`, ice via `SeasonVenueAccess`; blackout/holiday inputs; unschedulable diagnostics.
 
 Cross-cutting requirements (all slices): memory/SQLite/PostgreSQL parity; historical upgrade tests from the current production schema through the final model; restart and backup/restore acceptance on PostgreSQL; concurrency-safe constraints only after the relationship is settled.
 
