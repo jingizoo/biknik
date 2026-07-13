@@ -235,6 +235,9 @@ SPECS = {
 # data; a destructive rebuild is reset_schema(), demo-only and never run in prod.
 _MIGRATIONS_DIR = os.path.join(os.path.dirname(__file__), "migrations")
 
+# A version given per-dialect must supply BOTH engines' files (never just one).
+_DIALECT_PAIR = {"sqlite", "postgres"}
+
 
 def _split_statements(raw):
     # Drop whole-line comments first (a comment may itself contain a ';', so it
@@ -251,13 +254,17 @@ def _load_migrations(backend=None):
     split on ``;`` with line comments and blanks removed, so each can be executed
     individually — portable across drivers that don't run multi-statement strings.
 
-    A version may ship as a single portable ``NNN_name.sql`` (applied to both
-    backends) OR, when the DDL cannot be written portably, as a pair of
-    per-dialect files ``NNN_name.sqlite.sql`` and ``NNN_name.postgres.sql`` that
-    share the version stem ``NNN_name`` (so the ``schema_migrations`` ledger is
-    identical on either engine — a database only ever runs one of the two).
-    ``backend`` ("sqlite"/"postgres") selects which variant's statements to
-    return; when ``None`` (version listing only), any available variant is used.
+    A version must ship as EXACTLY ONE of:
+    - a single portable ``NNN_name.sql`` (applied to both backends), or
+    - a complete per-dialect pair ``NNN_name.sqlite.sql`` +
+      ``NNN_name.postgres.sql`` (for DDL that can't be written portably),
+      sharing the version stem ``NNN_name`` so the ``schema_migrations`` ledger
+      is identical on either engine — a database only ever runs one of the two.
+
+    Any other shape — a lone per-dialect file, or a portable file mixed with a
+    per-dialect one — is a build error and raises, so a missing variant can never
+    silently fall back to the *other* engine's DDL. ``backend``
+    ("sqlite"/"postgres") selects which variant's statements to return.
     """
     # version -> {dialect_or_None: statements}
     by_version = {}
@@ -277,14 +284,21 @@ def _load_migrations(backend=None):
     out = []
     for version in sorted(by_version):
         variants = by_version[version]
-        if backend is not None and backend in variants:
-            statements = variants[backend]
-        elif None in variants:
-            statements = variants[None]  # portable file applies to both
+        shape = set(variants)
+        if shape == {None}:
+            statements = variants[None]  # portable — both backends
+        elif shape == _DIALECT_PAIR:
+            # Complete pair: pick the requested backend. For a version-only
+            # listing (backend is None) the statements are unused, so default to
+            # SQLite deterministically rather than guessing.
+            statements = variants[backend if backend in variants else "sqlite"]
         else:
-            # Only per-dialect files exist; pick the requested backend, or (for a
-            # version-only listing) any variant so the version is still reported.
-            statements = variants.get(backend) or next(iter(variants.values()))
+            raise RuntimeError(
+                f"Migration {version!r} must be a single portable .sql or a "
+                f"complete .sqlite.sql + .postgres.sql pair; found "
+                f"{sorted(d or 'portable' for d in shape)}. A lone per-dialect "
+                f"file (or a portable/per-dialect mix) is rejected so a missing "
+                f"variant can never run the other engine's DDL.")
         out.append((version, statements))
     return out
 

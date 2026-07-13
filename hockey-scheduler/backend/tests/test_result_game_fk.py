@@ -28,6 +28,7 @@ from hockey_scheduler.store.integrity_checks import (
     assert_result_games_exist,
     find_orphan_result_games,
 )
+from hockey_scheduler.store import sql_store as sql_store_mod
 from hockey_scheduler.store.sql_store import migrate
 
 UTC = timezone.utc
@@ -243,6 +244,41 @@ class RebuildPreservesDataTest(unittest.TestCase):
             _add_result_raw(store, "r1", "g1")
             _add_result_raw(store, "r2", None)
         return store
+
+
+class MigrationLoaderShapeTest(unittest.TestCase):
+    """The per-dialect migration loader must fail closed: a version is either one
+    portable .sql or a complete sqlite+postgres pair. A lone per-dialect file (or
+    a portable/per-dialect mix) must raise, so a missing variant can never
+    silently run the other engine's DDL."""
+
+    def _load_from(self, filenames):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            for name in filenames:
+                with open(os.path.join(d, name), "w", encoding="utf-8") as fh:
+                    fh.write("CREATE TABLE t (id TEXT);\n")
+            original = sql_store_mod._MIGRATIONS_DIR
+            sql_store_mod._MIGRATIONS_DIR = d
+            try:
+                return {v: s for v, s
+                        in sql_store_mod._load_migrations("sqlite")}
+            finally:
+                sql_store_mod._MIGRATIONS_DIR = original
+
+    def test_portable_and_complete_pair_load(self):
+        loaded = self._load_from(
+            ["001_a.sql", "002_b.sqlite.sql", "002_b.postgres.sql"])
+        self.assertEqual(sorted(loaded), ["001_a", "002_b"])
+
+    def test_lone_per_dialect_file_is_rejected(self):
+        with self.assertRaises(RuntimeError) as ctx:
+            self._load_from(["003_c.sqlite.sql"])  # no matching .postgres.sql
+        self.assertIn("003_c", str(ctx.exception))
+
+    def test_portable_and_per_dialect_mix_is_rejected(self):
+        with self.assertRaises(RuntimeError):
+            self._load_from(["004_d.sql", "004_d.sqlite.sql"])
 
 
 class MigrationLedgerTest(unittest.TestCase):
