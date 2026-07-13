@@ -502,12 +502,12 @@ const SETUP_ENTITIES = [
   { key: "league", title: "Programs", icon: "🏆", noun: "league", displayNoun: "program",
     perm: "manage_setup",
     list: (ov) => ov.leagues.map((l) => ({
-      title: l.name, sub: nameById(ov.organizations, l.organization_id) || "No owner" })),
+      title: l.name, sub: nameById(ov.organizations, l.organization_id) || "No operating org" })),
     fields: [
       { id: "f-league", label: "Program name", required: true, placeholder: "e.g. Adult Men" },
-      // A league is operated by a facility owner (#173) — required, so create
-      // an owner first if none exists.
-      { id: "f-league-org", label: "Facility owner", type: "select", required: true, ofNoun: "organization",
+      // A program is operated by an organization (#233) — required, so create
+      // an organization first if none exists.
+      { id: "f-league-org", label: "Operating organization", type: "select", required: true, ofNoun: "organization",
         options: (ov) => (ov.organizations || []).map((o) => [o.id, o.name]) }] },
   { key: "season", title: "Seasons", icon: "🗓️", noun: "season", perm: "manage_setup",
     list: (ov) => ov.seasons.map((s) => ({ title: s.name, sub: nameById(ov.leagues, s.league_id) })),
@@ -689,7 +689,7 @@ const REASSIGN = {
     perm: "manage_arena", noun: "venue", nullable: false, risky: false,
     options: (ov) => (ov.venues || []).map((v) => [v.id, v.name]) },
   "division:level": {
-    perm: "manage_setup", noun: "level", nullable: true, risky: false,
+    perm: "manage_setup", noun: "level", displayNoun: "league", nullable: true, risky: false,
     // Only levels in the division's own season — the backend rejects a
     // cross-season link, so never offer one.
     options: (ov, pr) => (ov.levels || [])
@@ -705,14 +705,14 @@ const REASSIGN = {
     perm: "manage_setup", noun: "team", nullable: false, risky: true,
     warn: "Moving a player changes which team's roster they belong to.",
     options: (ov) => (ov.teams || []).map((t) => [t.id, t.name]) },
-  // Cross-domain league↔facility moves (#173) — both MANAGE_SETUP.
+  // Cross-domain program↔facility moves (#173) — both MANAGE_SETUP.
   "league:organization": {
-    perm: "manage_setup", noun: "facility owner", nullable: true, risky: true,
-    warn: "A league's owner can't change while venues are attached — unassign its venues first.",
+    perm: "manage_setup", noun: "facility owner", displayNoun: "operating organization", nullable: true, risky: true,
+    warn: "A program's operating organization can't change while venues are attached — unassign its venues first.",
     options: (ov) => (ov.organizations || []).map((o) => [o.id, o.name]) },
   "venue:league": {
-    perm: "manage_setup", noun: "league", nullable: true, risky: true,
-    warn: "Moving a venue to another league changes which league's games may use its ice; the venue's owner follows the league.",
+    perm: "manage_setup", noun: "league", displayNoun: "program", nullable: true, risky: true,
+    warn: "Moving a venue to another program changes which program's games may use its ice; the venue's owner follows the program.",
     options: (ov) => (ov.leagues || []).map(
       (l) => [l.id, `${nameById(ov.organizations, l.organization_id) || "No owner"} · ${l.name}`]) },
 };
@@ -1021,7 +1021,8 @@ function renderSetupHierarchy(ov) {
     (pByTeam[p.team_id] = pByTeam[p.team_id] || []).push(p);
   });
 
-  // -- Facility: Organization → League → Venue → Rink (#173) --
+  // -- Facility: Organization owns Venue → Rink; venues are grouped by the
+  //    program operating at them (legacy venue.league_id; Season↔Venue in Slice E) --
   const rinksByVenue = groupBy(ov.rinks, "venue_id");
   const venueNode = (v) => {
     const rinks = rinksByVenue[v.id] || [];
@@ -1038,7 +1039,7 @@ function renderSetupHierarchy(ov) {
   };
   const venuesByLeague = groupBy(ov.venues, "league_id");
   const leaguesByOrgF = groupBy(ov.leagues, "organization_id");
-  // A league groups the venues it operates; the owner groups its leagues.
+  // A program groups the venues it operates; the facility owner groups its programs.
   const leagueFacilityNode = (lg) => {
     const vs = venuesByLeague[lg.id] || [];
     const venueRows = vs.map(venueNode).join("")
@@ -1052,11 +1053,11 @@ function renderSetupHierarchy(ov) {
   const orgSections = (ov.organizations || []).map((o) => {
     const lgs = leaguesByOrgF[o.id] || [];
     const leagueRows = lgs.map(leagueFacilityNode).join("")
-      || `<div class="tn-empty">No leagues yet. Add a league operated by ${esc(o.name)}.</div>`;
+      || `<div class="tn-empty">No programs yet. Add a program operated by ${esc(o.name)}.</div>`;
     return `<details class="tn" open><summary class="tn-sum">
         <span class="tn-label">🏢 ${esc(o.name)}</span>
-        <span class="tn-meta">${lgs.length} league${lgs.length === 1 ? "" : "s"}</span>${delBtn("organization", o.id, o.name)}</summary>
-      <div class="tn-children">${leagueRows}${treeAdd("league", "Add league to " + o.name, "f-league-org", o.id)}</div>
+        <span class="tn-meta">${lgs.length} program${lgs.length === 1 ? "" : "s"}</span>${delBtn("organization", o.id, o.name)}</summary>
+      <div class="tn-children">${leagueRows}${treeAdd("league", "Add program operated by " + o.name, "f-league-org", o.id)}</div>
     </details>`;
   }).join("");
   // Buckets for records that can't nest yet: ownerless leagues, leagueless venues.
@@ -1070,22 +1071,22 @@ function renderSetupHierarchy(ov) {
   const orphanVenues = (venuesByLeague[null] || []).concat(venuesByLeague[undefined] || []);
   const orphanVenueSection = orphanVenues.length
     ? `<details class="tn" open><summary class="tn-sum">
-        <span class="tn-label tn-warn-text">🏟️ No league</span>
+        <span class="tn-label tn-warn-text">🏟️ No program</span>
         <span class="tn-meta">${orphanVenues.length} venue${orphanVenues.length === 1 ? "" : "s"}</span></summary>
       <div class="tn-children">${orphanVenues.map(venueNode).join("")}</div>
     </details>` : "";
   const facility = `<section class="tree-panel">
     <div class="tree-head"><span class="tree-title">🏟️ Facility</span>
-      <span class="tree-sub">Owner → Program → Venue → Rink</span></div>
+      <span class="tree-sub">Facility owner → Venue → Rink · grouped by operating program</span></div>
     ${orgSections}${orphanLeagueSection}${orphanVenueSection}
     ${!orgSections && !orphanLeagueSection && !orphanVenueSection ? `<div class="tn-empty">No owners yet. Add a facility owner to start your arena setup.</div>` : ""}
-    <div class="tree-actions">${treeAdd("organization", "Add facility owner")}${treeAdd("league", "Add league")}</div>
+    <div class="tree-actions">${treeAdd("organization", "Add facility owner")}${treeAdd("league", "Add program")}</div>
   </section>`;
 
   // -- Competition: Program → Season → League → Division (#233 display;
   //    internal entities remain league/season/level/division on the v1 API) --
   // Teams are NOT children of a division here: a team belongs permanently to a
-  // league (see the "Permanent league teams" panel), and its per-season
+  // program (see the "Permanent program teams" panel), and its per-season
   // division is shown under "Season participation". So the competition tree is
   // the structure only; each division is a leaf, and the team count is the
   // teams *registered* for that season/division, not division-owned teams.
@@ -1118,7 +1119,7 @@ function renderSetupHierarchy(ov) {
       const levelSections = levels.map((lv) => {
         const lvDivs = divsByLevel[lv.id] || [];
         const inner = lvDivs.map(divisionNode).join("")
-          || `<div class="tn-empty">No divisions in this level yet.</div>`;
+          || `<div class="tn-empty">No divisions in this league yet.</div>`;
         return `<details class="tn" open><summary class="tn-sum">
             <span class="tn-label">🎚️ ${esc(lv.name)}</span>
             <span class="tn-meta">${lvDivs.length} division${lvDivs.length === 1 ? "" : "s"}</span>${delBtn("level", lv.id, lv.name)}</summary>
@@ -1129,7 +1130,7 @@ function renderSetupHierarchy(ov) {
       const orphanDivSection = orphanDivs.length
         ? (levels.length
             ? `<details class="tn" open><summary class="tn-sum">
-                <span class="tn-label tn-warn-text">🏅 No level</span>
+                <span class="tn-label tn-warn-text">🏅 No league</span>
                 <span class="tn-meta">${orphanDivs.length} division${orphanDivs.length === 1 ? "" : "s"}</span></summary>
               <div class="tn-children">${orphanDivs.map(divisionNode).join("")}</div>
             </details>`
@@ -1142,7 +1143,7 @@ function renderSetupHierarchy(ov) {
           <span class="tn-label">🗓️ ${esc(s.name)}</span>
           <span class="tn-meta">${divs.length} division(s) · ${countTeams(divs)} team(s)</span>${delBtn("season", s.id, s.name)}</summary>
         <div class="tn-children">${seasonBody}
-          <div class="tree-actions sub">${treeAdd("level", "Add level to " + s.name, "f-level-season", s.id)}${treeAdd("division", "Add division to " + s.name, "f-div-season", s.id)}</div></div>
+          <div class="tree-actions sub">${treeAdd("level", "Add league to " + s.name, "f-level-season", s.id)}${treeAdd("division", "Add division to " + s.name, "f-div-season", s.id)}</div></div>
       </details>`;
     }).join("") || `<div class="tn-empty">No seasons in this league yet.</div>`;
     return `<details class="tn" open><summary class="tn-sum">
@@ -1155,14 +1156,14 @@ function renderSetupHierarchy(ov) {
     <div class="tree-head"><span class="tree-title">🏆 Competition structure</span>
       <span class="tree-sub">Program → Season → League → Division</span></div>
     ${leagueRows || `<div class="tn-empty">No leagues yet. Add a league to begin.</div>`}
-    <div class="tree-actions">${treeAdd("league", "Add league")}</div>
+    <div class="tree-actions">${treeAdd("league", "Add program")}</div>
   </section>`;
 
-  // -- Permanent league teams (#180): a team belongs permanently to its
+  // -- Permanent program teams (#180): a team belongs permanently to its
   // league, independent of any season. This is the first-class place a team
   // "exists"; season/division is participation, shown separately below. --
   const permanentTeams = `<section class="tree-panel">
-    <div class="tree-head"><span class="tree-title">👥 Permanent league teams</span>
+    <div class="tree-head"><span class="tree-title">👥 Permanent program teams</span>
       <span class="tree-sub">Program → its permanent member teams</span></div>
     ${(ov.leagues || []).map((lg) => {
       const teams = leagueTeams[lg.id] || [];
@@ -1246,7 +1247,7 @@ function renderSetupHierarchy(ov) {
   return `${reassignPanelHtml(ov)}<div class="setup-trees">${facility}${permanentTeams}${competition}${renderSeasonParticipation(ov)}${renderRollover(ov)}${roster}${needsAssignment}</div>`;
 }
 
-// Season participation (#180): permanent league teams and which season/division
+// Season participation (#180): permanent program teams and which season/division
 // each plays. Kept separate from the competition tree above (which still shows
 // teams by their legacy division_id) so the two ideas — a team's permanent
 // league membership vs. its per-season participation — read distinctly. Data
@@ -1310,7 +1311,7 @@ function renderSeasonParticipation(ov) {
 
   return `<section class="tree-panel">
     <div class="tree-head"><span class="tree-title">🗓️ Season participation</span>
-      <span class="tree-sub">Permanent league teams → seasons &amp; divisions they play</span></div>
+      <span class="tree-sub">Permanent program teams → seasons &amp; divisions they play</span></div>
     ${leagueBlocks}</section>`;
 }
 
@@ -1416,7 +1417,7 @@ function renderRollover(ov) {
 
   return `<section class="tree-panel">
     <div class="tree-head"><span class="tree-title">↪ Season rollover</span>
-      <span class="tree-sub">Carry a prior season's teams into a new season of the same league</span></div>
+      <span class="tree-sub">Carry a prior season's teams into a new season of the same program</span></div>
     <div class="ro-controls">${leagueSel}${fromSel}${toSel}</div>
     ${body}</section>`;
 }

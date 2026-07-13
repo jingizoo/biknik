@@ -1,7 +1,7 @@
 // Permanent-teams Setup structure journey (#180 UI correction).
 //
 // Proves the corrected Setup model at desktop and phone widths: a team is a
-// first-class member of its LEAGUE (a "Permanent league teams" panel), created
+// first-class member of its PROGRAM (a "Permanent program teams" panel), created
 // under the league — not a division — and the Competition tree is structure
 // only (its subtitle no longer ends in "Team", and divisions carry no team
 // children). Fails on any browser console/page error.
@@ -85,26 +85,30 @@ async function checkViewport(browser, viewport) {
     await page.click('.tab[data-tab="setup"]');
     await page.waitForFunction(
       () => [...document.querySelectorAll(".tree-title")]
-        .some((x) => x.textContent.includes("Permanent league teams")),
+        .some((x) => x.textContent.includes("Permanent program teams")),
       null, { timeout: 15000 });
 
     const checks = await page.evaluate(() => {
       const titles = [...document.querySelectorAll(".tree-title")].map((x) => x.textContent);
       const subs = [...document.querySelectorAll(".tree-sub")].map((x) => x.textContent);
-      const compSub = subs.find((s) => s.includes("League → Season"));
+      const compSub = subs.find((s) => s.includes("Program → Season"));
       return {
-        hasPermanentPanel: titles.some((t) => t.includes("Permanent league teams")),
+        hasPermanentPanel: titles.some((t) => t.includes("Permanent program teams")),
         hasCompetition: titles.some((t) => t.includes("Competition structure")),
         hasParticipation: titles.some((t) => t.includes("Season participation")),
         competitionSaysTeam: !!compSub && /Team\s*$/.test(compSub.trim()),
+        // #233 Slice B1: competition subtitle uses the new hierarchy nouns.
+        competitionUsesNewNouns: !!compSub && compSub.includes("Program → Season → League → Division"),
         bodyHasTeam: document.body.textContent.includes("Perma Bruins"),
       };
     });
-    if (!checks.hasPermanentPanel) throw new Error(`[${viewport.label}] no "Permanent league teams" panel`);
+    if (!checks.hasPermanentPanel) throw new Error(`[${viewport.label}] no "Permanent program teams" panel`);
     if (!checks.hasCompetition || !checks.hasParticipation)
       throw new Error(`[${viewport.label}] missing Competition/Participation sections`);
     if (checks.competitionSaysTeam)
       throw new Error(`[${viewport.label}] Competition subtitle still ends in "Team"`);
+    if (!checks.competitionUsesNewNouns)
+      throw new Error(`[${viewport.label}] Competition subtitle not "Program → Season → League → Division" (#233)`);
     if (!checks.bodyHasTeam)
       throw new Error(`[${viewport.label}] permanent team not shown on Setup`);
 
