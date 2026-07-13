@@ -122,32 +122,65 @@ async function checkViewport(browser, viewport) {
     await page.waitForSelector('.tab[data-tab="onboarding"].active');
     await page.getByText("Progress is recalculated from saved records", { exact: false }).waitFor();
 
-    // #233 B1: the wizard reads in the canonical vocabulary. The umbrella step is
-    // "Program" (never a bare "League"); its org link is the "operating
-    // organization" (not "owner"/"facility owner"); the optional grouping is a
-    // "League" (never "Level"). Step/drawer keys stay frozen (asserted below by
-    // deep-linking the organization drawer). All steps render regardless of
-    // state, so the whole step list is inspectable on an empty install.
+    // #233 B1: the wizard teaches the target model in the canonical vocabulary.
+    // Step/drawer keys stay frozen (exercised below by deep-linking the
+    // organization drawer). All steps render regardless of completion state, so
+    // the whole step list is inspectable on an empty install. Per-step text and
+    // action labels are captured by the frozen data-onboarding-step key.
     const wiz = await page.evaluate(() => {
+      const steps = {};
+      document.querySelectorAll(".onboarding-step").forEach((el) => {
+        steps[el.getAttribute("data-onboarding-step")] = {
+          title: ((el.querySelector("h3") || {}).textContent || "").trim(),
+          text: el.textContent,
+          actions: [...el.querySelectorAll(".onboarding-step-actions button")]
+            .map((b) => b.textContent.trim()),
+        };
+      });
       const list = document.querySelector(".onboarding-step-list");
       return {
-        text: list ? list.textContent : "",
+        steps,
+        allText: list ? list.textContent : "",
         titles: [...document.querySelectorAll(".onboarding-step h3")].map((h) => h.textContent.trim()),
       };
     });
     const need = (cond, msg) => { if (!cond) throw new Error(`[${viewport.label}] ${msg}`); };
-    need(wiz.titles.includes("Program"), `no "Program" umbrella step (got ${JSON.stringify(wiz.titles)})`);
+    const s = wiz.steps;
+
+    // Umbrella step (frozen key "league") reads "Program" and never a bare
+    // "League"; its action is "Add program", its checks name the program and the
+    // operating organization (never "owner"/"facility owner").
+    need(s.league && s.league.title === "Program", `umbrella step title is not "Program" (got ${JSON.stringify(s.league && s.league.title)})`);
     need(!wiz.titles.includes("League"), `wizard still has a bare "League" step title`);
-    need(/Program created/.test(wiz.text), `step 2 check is not "Program created"`);
-    need(/Operating organization assigned/.test(wiz.text), `step 2 owner check not renamed to "Operating organization assigned"`);
-    need(/Program venue/.test(wiz.text), `step 3 check is not "Program venue"`);
-    need(wiz.text.includes("Add program") && !wiz.text.includes("Add league"),
-      `umbrella action is not "Add program" (or still shows "Add league")`);
-    need(/Leagues remain optional/.test(wiz.text) && !/Levels remain/.test(wiz.text),
-      `optional-grouping copy still says "Levels remain"`);
-    need(/Add optional league/.test(wiz.text) && !/Add optional level/.test(wiz.text),
-      `optional grouping action still says "Add optional level"`);
-    need(!/\bLevel\b/.test(wiz.text), `wizard still exposes the internal "Level" noun`);
+    need(s.league.actions.includes("Add program") && !s.league.actions.includes("Add league"),
+      `umbrella action is not "Add program" (got ${JSON.stringify(s.league.actions)})`);
+    need(/Program created/.test(s.league.text) && /Operating organization assigned/.test(s.league.text),
+      `umbrella checks not renamed to "Program created"/"Operating organization assigned"`);
+
+    // Step 1 keeps facility ownership distinct from program operation.
+    need(/facility owner/i.test(s.organization.text) && /operating organization/i.test(s.organization.text),
+      `step 1 does not separate facility owner from operating organization`);
+
+    // Step 3 marks the Venue→Program link as temporary v1 compatibility.
+    need(/temporary v1/i.test(s.venues.text) && /Program-linked venue/i.test(s.venues.text),
+      `step 3 does not mark the venue→program link as temporary v1`);
+
+    // Step 4 teaches the target model — leagues required, division optional — and
+    // no longer says "Leagues remain optional"; the grouping action is "Add
+    // league" (not "Add optional league"/"Add optional level").
+    need(/leagues \(required\)/i.test(s.season.text) && /optional split of a league/i.test(s.season.text),
+      `step 4 does not teach league-required / division-optional target model`);
+    need(!/Leagues remain optional/i.test(s.season.text) && !/Levels remain/i.test(s.season.text),
+      `step 4 still says "Leagues remain optional"`);
+    need(s.season.actions.includes("Add league") && !s.season.actions.some((a) => /optional (league|level)/i.test(a)),
+      `step 4 grouping action is not a plain "Add league" (got ${JSON.stringify(s.season.actions)})`);
+
+    // Step 5 frames teams as permanent program members placed seasonally.
+    need(/permanently to its program/i.test(s.teams.text) && /optional division/i.test(s.teams.text),
+      `step 5 does not describe permanent program ownership + seasonal placement`);
+
+    // The internal grouping key "level"/"Level" is never shown to the operator.
+    need(!/\bLevel\b/.test(wiz.allText), `wizard still exposes the internal "Level" noun`);
 
     const status = await page.evaluate(async () => {
       const response = await fetch("/api/onboarding/status", {

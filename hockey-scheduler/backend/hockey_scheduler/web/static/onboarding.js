@@ -127,7 +127,7 @@ function buildOnboardingGroups(status) {
   return [
     {
       number: 1, key: "organization", title: "Facility owner",
-      description: "Create the organization that owns your venues and operates your program.",
+      description: "Create the organization that will own your venues as the facility owner. The same organization can separately operate your program — you link it as the program's operating organization in the next step. The two roles are distinct.",
       done: done("organization"),
       checks: [onboardingCheck("Organization", done("organization"), detail("organization"))],
       actions: [{ label: "Add facility owner", attrs: { "onboarding-drawer": "organization" } }],
@@ -147,10 +147,10 @@ function buildOnboardingGroups(status) {
     },
     {
       number: 3, key: "venues", title: "Venues and rinks",
-      description: "Assign a venue to the program, then add the rink surfaces used for scheduling.",
+      description: "Assign a venue to the program — a temporary v1 compatibility link (venues become Season-scoped in Slice E) — then add the rink surfaces used for scheduling.",
       done: done("venue", "rink"),
       checks: [
-        onboardingCheck("Program venue", done("venue"), detail("venue")),
+        onboardingCheck("Program-linked venue (temporary v1)", done("venue"), detail("venue")),
         onboardingCheck("Rink", done("rink"), detail("rink")),
       ],
       actions: [
@@ -160,22 +160,22 @@ function buildOnboardingGroups(status) {
     },
     {
       number: 4, key: "season", title: "Season structure",
-      description: "Create the playing season and at least one division. Leagues remain optional.",
+      description: "Create the playing season, then its leagues. In the target model a season is split into leagues (required) and a division is an optional split of a league. During the v1 transition the check below still requires at least one division; the new required/optional gating lands with the schema in Slice C.",
       done: done("season", "division"),
       checks: [
         onboardingCheck("Season", done("season"), detail("season")),
-        onboardingCheck("Division", done("division"), detail("division")),
+        onboardingCheck("Division (required in v1; optional in the new model)", done("division"), detail("division")),
       ],
       actions: [
+        { label: "Add league", attrs: { "onboarding-drawer": "level" } },
         { label: done("season") ? "Add division" : "Add season", attrs: { "onboarding-drawer": done("season") ? "division" : "season" } },
-        { label: "Add optional league", attrs: { "onboarding-drawer": "level" } },
       ],
     },
     {
       number: 5, key: "teams", title: "Clubs and teams",
-      description: "Create clubs and teams, then place each team in its current division.",
+      description: "Create clubs and teams. Each team belongs permanently to its program; its per-season placement in a league (and an optional division) is set later under Season participation, not fixed here.",
       done: done("team"),
-      checks: [onboardingCheck("At least one team", done("team"), detail("team"))],
+      checks: [onboardingCheck("At least one program team", done("team"), detail("team"))],
       actions: [
         { label: "Add club", attrs: { "onboarding-drawer": "club" } },
         { label: "Add team", attrs: { "onboarding-drawer": "team" } },
