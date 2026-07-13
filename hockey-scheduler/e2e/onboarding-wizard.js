@@ -117,10 +117,37 @@ async function checkViewport(browser, viewport) {
     }
 
     await page.waitForSelector('body[data-view="onboarding"]', { timeout: 10000 });
-    await page.getByRole("heading", { name: "Complete the league foundation" }).waitFor();
+    await page.getByRole("heading", { name: "Complete the program foundation" }).waitFor();
     await page.waitForSelector('[data-onboarding-step="organization"].current');
     await page.waitForSelector('.tab[data-tab="onboarding"].active');
     await page.getByText("Progress is recalculated from saved records", { exact: false }).waitFor();
+
+    // #233 B1: the wizard reads in the canonical vocabulary. The umbrella step is
+    // "Program" (never a bare "League"); its org link is the "operating
+    // organization" (not "owner"/"facility owner"); the optional grouping is a
+    // "League" (never "Level"). Step/drawer keys stay frozen (asserted below by
+    // deep-linking the organization drawer). All steps render regardless of
+    // state, so the whole step list is inspectable on an empty install.
+    const wiz = await page.evaluate(() => {
+      const list = document.querySelector(".onboarding-step-list");
+      return {
+        text: list ? list.textContent : "",
+        titles: [...document.querySelectorAll(".onboarding-step h3")].map((h) => h.textContent.trim()),
+      };
+    });
+    const need = (cond, msg) => { if (!cond) throw new Error(`[${viewport.label}] ${msg}`); };
+    need(wiz.titles.includes("Program"), `no "Program" umbrella step (got ${JSON.stringify(wiz.titles)})`);
+    need(!wiz.titles.includes("League"), `wizard still has a bare "League" step title`);
+    need(/Program created/.test(wiz.text), `step 2 check is not "Program created"`);
+    need(/Operating organization assigned/.test(wiz.text), `step 2 owner check not renamed to "Operating organization assigned"`);
+    need(/Program venue/.test(wiz.text), `step 3 check is not "Program venue"`);
+    need(wiz.text.includes("Add program") && !wiz.text.includes("Add league"),
+      `umbrella action is not "Add program" (or still shows "Add league")`);
+    need(/Leagues remain optional/.test(wiz.text) && !/Levels remain/.test(wiz.text),
+      `optional-grouping copy still says "Levels remain"`);
+    need(/Add optional league/.test(wiz.text) && !/Add optional level/.test(wiz.text),
+      `optional grouping action still says "Add optional level"`);
+    need(!/\bLevel\b/.test(wiz.text), `wizard still exposes the internal "Level" noun`);
 
     const status = await page.evaluate(async () => {
       const response = await fetch("/api/onboarding/status", {

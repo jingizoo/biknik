@@ -127,30 +127,30 @@ function buildOnboardingGroups(status) {
   return [
     {
       number: 1, key: "organization", title: "Facility owner",
-      description: "Create the organization that operates the league and its venues.",
+      description: "Create the organization that owns your venues and operates your program.",
       done: done("organization"),
       checks: [onboardingCheck("Organization", done("organization"), detail("organization"))],
       actions: [{ label: "Add facility owner", attrs: { "onboarding-drawer": "organization" } }],
     },
     {
-      number: 2, key: "league", title: "League",
-      description: "Create the league and link it to the correct facility owner.",
+      number: 2, key: "league", title: "Program",
+      description: "Create the program and link it to its operating organization.",
       done: done("league", "league_ownership"),
       checks: [
-        onboardingCheck("League created", done("league"), detail("league")),
-        onboardingCheck("Owner assigned", done("league_ownership"), detail("league_ownership")),
+        onboardingCheck("Program created", done("league"), detail("league")),
+        onboardingCheck("Operating organization assigned", done("league_ownership"), detail("league_ownership")),
       ],
       actions: [
-        { label: "Add league", attrs: { "onboarding-drawer": "league" } },
+        { label: "Add program", attrs: { "onboarding-drawer": "league" } },
         { label: "Repair assignments", attrs: { "onboarding-goto": "setup" } },
       ],
     },
     {
       number: 3, key: "venues", title: "Venues and rinks",
-      description: "Assign a venue to the league, then add the rink surfaces used for scheduling.",
+      description: "Assign a venue to the program, then add the rink surfaces used for scheduling.",
       done: done("venue", "rink"),
       checks: [
-        onboardingCheck("League venue", done("venue"), detail("venue")),
+        onboardingCheck("Program venue", done("venue"), detail("venue")),
         onboardingCheck("Rink", done("rink"), detail("rink")),
       ],
       actions: [
@@ -160,7 +160,7 @@ function buildOnboardingGroups(status) {
     },
     {
       number: 4, key: "season", title: "Season structure",
-      description: "Create the playing season and at least one division. Levels remain optional.",
+      description: "Create the playing season and at least one division. Leagues remain optional.",
       done: done("season", "division"),
       checks: [
         onboardingCheck("Season", done("season"), detail("season")),
@@ -168,7 +168,7 @@ function buildOnboardingGroups(status) {
       ],
       actions: [
         { label: done("season") ? "Add division" : "Add season", attrs: { "onboarding-drawer": done("season") ? "division" : "season" } },
-        { label: "Add optional level", attrs: { "onboarding-drawer": "level" } },
+        { label: "Add optional league", attrs: { "onboarding-drawer": "level" } },
       ],
     },
     {
@@ -198,7 +198,7 @@ function buildOnboardingGroups(status) {
     },
     {
       number: 7, key: "ice", title: "Game ice inventory",
-      description: "Add at least one available Game ice slot under a league rink.",
+      description: "Add at least one available Game ice slot under a program rink.",
       done: done("ice"),
       checks: [onboardingCheck("Available Game ice", done("ice"), detail("ice"))],
       actions: [
@@ -296,7 +296,7 @@ async function renderInitialSetup() {
 
   if (!hasPerm("manage_setup")) {
     content.innerHTML = `<div class="banner neutral"><h2>League Admin only</h2>
-      <p>Initial Setup contains league-wide configuration and account readiness.</p></div>`;
+      <p>Initial Setup contains the competition and facility configuration and account readiness.</p></div>`;
     return;
   }
 
@@ -331,7 +331,7 @@ async function renderInitialSetup() {
   content.innerHTML = `<div class="onboarding-shell">
     <section class="onboarding-hero">
       <div><span class="onboarding-eyebrow">Resumable client onboarding</span>
-        <h2>${status.ready_to_schedule ? "Ready to schedule" : "Complete the league foundation"}</h2>
+        <h2>${status.ready_to_schedule ? "Ready to schedule" : "Complete the program foundation"}</h2>
         <p>Progress is recalculated from saved records every time this page opens. You can leave and continue later without losing work.</p></div>
       <div class="onboarding-progress-card" aria-label="Required setup progress">
         <strong>${completed}/${required.length}</strong><span>required stages complete</span>
@@ -341,7 +341,7 @@ async function renderInitialSetup() {
 
     <section class="onboarding-foundation-card">
       <div class="onboarding-section-head"><div><span class="onboarding-eyebrow">Deployment foundation</span>
-        <h3>Before league configuration</h3></div>
+        <h3>Before program configuration</h3></div>
         <button type="button" class="act ghost" data-onboarding-goto="readiness">View deployment readiness</button></div>
       <div class="onboarding-foundation-grid">${foundationChecks}</div>
     </section>
