@@ -904,51 +904,56 @@ class ApiService:
         block(mig["current"], "migrations_stale",
               "Database migrations are not up to date.")
 
-        # 2. Facility ownership chain: organization → league → venue → rink → ice.
+        # 2. Facility + program chain: organization → program → venue → rink → ice.
         has_org = len(orgs) > 0
         step("organization", "Add a facility organization", has_org,
              detail=f"{len(orgs)} organization(s)")
         block(has_org, "no_organization",
               "No facility organization has been created yet.")
 
+        # Display noun is "program" (#233): the internal `league` entity is the
+        # umbrella Program. Keys/codes stay frozen; only the shown text changes.
         has_league = len(leagues) > 0
-        step("league", "Create a league", has_league,
-             detail=f"{len(leagues)} league(s)")
-        block(has_league, "no_league", "No league has been created yet.")
+        step("league", "Create a program", has_league,
+             detail=f"{len(leagues)} program(s)")
+        block(has_league, "no_league", "No program has been created yet.")
 
-        # League ownership only becomes an actionable gap once a league exists.
+        # Program-operator link only becomes an actionable gap once one exists.
         ownership_ok = has_league and not leagues_without_org
-        step("league_ownership", "Tie every league to an organization",
+        step("league_ownership", "Tie every program to an operating organization",
              ownership_ok,
-             detail=(f"{len(leagues_without_org)} league(s) without an owner"
-                     if leagues_without_org else "all leagues owned"))
+             detail=(f"{len(leagues_without_org)} program(s) without an "
+                     "operating organization" if leagues_without_org
+                     else "all programs have an operating organization"))
         if has_league:
             block(not leagues_without_org, "league_without_organization",
-                  f"{len(leagues_without_org)} league(s) are not tied to an "
-                  "organization.")
+                  f"{len(leagues_without_org)} program(s) are not tied to an "
+                  "operating organization.")
 
-        # A venue is only schedulable once it's soundly under a league; gate the
-        # gap on a league existing so we don't ask for a venue before its parent.
+        # A venue is only schedulable once it's soundly linked to a program; gate
+        # the gap on a program existing so we don't ask for a venue before its
+        # parent. The venue→program link is a temporary v1 compatibility relation
+        # (Season-to-Venue access replaces it in Slice E); venues stay org-owned.
         venue_ok = bool(sound_league_venue_ids)
-        step("venue", "Assign a venue to a league", venue_ok,
-             detail=(f"{len(sound_league_venue_ids)} venue(s) under a league"
+        step("venue", "Link a venue to a program (temporary v1)", venue_ok,
+             detail=(f"{len(sound_league_venue_ids)} venue(s) linked to a program"
                      if venue_ok else f"{len(venues)} venue(s), "
-                     f"{len(venues_in_league)} assigned"))
+                     f"{len(venues_in_league)} linked"))
         if has_league:
             block(bool(venues_in_league), "no_venue_assigned_to_league",
-                  "No venue is assigned to a league yet.")
-            # Surfaced independently so an operator can reconcile the exact
-            # venues whose owner disagrees with their league's owner.
+                  "No venue is linked to a program yet.")
+            # Surfaced independently so an operator can reconcile the exact venues
+            # whose facility owner disagrees with the program's operating org.
             block(not venue_mismatches, "venue_owner_mismatch",
-                  f"{len(venue_mismatches)} venue(s) have an owner that "
-                  "disagrees with their league's owner.")
+                  f"{len(venue_mismatches)} venue(s) have a facility owner that "
+                  "disagrees with their program's operating organization.")
 
         has_rink = bool(schedulable_rink_ids)
-        step("rink", "Add a rink to a league venue", has_rink,
-             detail=f"{len(schedulable_rink_ids)} rink(s) under a league venue")
+        step("rink", "Add a rink to a configured venue", has_rink,
+             detail=f"{len(schedulable_rink_ids)} rink(s) at a configured venue")
         if venue_ok:
             block(has_rink, "no_rink",
-                  "No rink exists under a venue assigned to a league.")
+                  "No rink exists at a venue linked to a program.")
 
         has_ice = bool(available_game_slots)
         step("ice", "Open an available game ice slot", has_ice,
@@ -966,7 +971,7 @@ class ApiService:
             block(has_season, "no_season", "No season has been created yet.")
         if seasons_dangling:
             block(False, "seasons_without_league",
-                  f"{len(seasons_dangling)} season(s) reference a league that "
+                  f"{len(seasons_dangling)} season(s) reference a program that "
                   "no longer exists.")
 
         has_division = any(d.season_id in season_ids for d in divisions)
@@ -987,7 +992,7 @@ class ApiService:
             block(has_team, "no_team", "No team has been added yet.")
         if teams_dangling:
             block(False, "teams_without_league",
-                  f"{len(teams_dangling)} team(s) are not tied to a valid league.")
+                  f"{len(teams_dangling)} team(s) are not tied to a valid program.")
 
         # 4. Soft gaps — recommended but not required to schedule a first game.
         if not players:

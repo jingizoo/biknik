@@ -142,6 +142,55 @@ class OnboardingStatusServiceTest(unittest.TestCase):
         s = self.api.get_onboarding_status("demo")
         self.assertIn("seasons_without_league", _codes(s))
 
+    # -- #233 B1 display wording -------------------------------------------
+    def test_program_display_wording_is_canonical(self):
+        """Rendered onboarding labels/details/messages use the Program /
+        operating-organization display nouns. The internal `league` umbrella
+        never surfaces as the word "league" (only the frozen "League Admin" role
+        step keeps it); step keys and blocker codes stay unchanged."""
+        self._admin()
+        org = self.api.create_organization("Canlon")
+        self.api.create_league("Over 55", organization_id=org["id"])
+        self.api.create_league("Ownerless")  # ownerless → operating-org gap
+        s = self.api.get_onboarding_status("demo")
+        by_key = {st["key"]: st for st in s["steps"]}
+
+        # No step label/detail exposes the umbrella as "league" — except the
+        # frozen "League Admin" role step.
+        for key, st in by_key.items():
+            if key == "league_admin":
+                continue
+            self.assertNotRegex(st["label"], r"(?i)\bleague\b", f"{key} label")
+            self.assertNotRegex(st["detail"], r"(?i)\bleague\b", f"{key} detail")
+
+        # The umbrella reads "program"; the operator link reads "operating
+        # organization"; keys stay frozen.
+        self.assertEqual(by_key["league"]["key"], "league")
+        self.assertEqual(by_key["league"]["label"], "Create a program")
+        self.assertEqual(by_key["league"]["detail"], "2 program(s)")
+        self.assertIn("operating organization",
+                      by_key["league_ownership"]["detail"])
+
+        # Blocking messages for program-scoped gaps say "program", never "league".
+        prog_msgs = " ".join(b["message"] for b in s["blocking"]
+                             if b["code"] != "no_active_admin")
+        self.assertNotRegex(prog_msgs, r"(?i)\bleague\b")
+        self.assertRegex(prog_msgs, r"(?i)\bprogram\b")
+
+    def test_dangling_parent_message_uses_program_wording(self):
+        """The dangling-parent blocker message uses the Program display noun
+        while its code (`seasons_without_league`) stays frozen."""
+        self._admin()
+        org = self.api.create_organization("Canlon")
+        league = self.api.create_league("Over 55", organization_id=org["id"])
+        season = self.api.create_season(league["id"], "Fall 2026")
+        self.api.store.get_season(season["id"]).league_id = "league_ghost"
+        s = self.api.get_onboarding_status("demo")
+        msg = next(b["message"] for b in s["blocking"]
+                   if b["code"] == "seasons_without_league")
+        self.assertIn("program", msg)
+        self.assertNotRegex(msg, r"(?i)\bleague\b")
+
     # -- warnings don't block ----------------------------------------------
     def _ready_hierarchy(self):
         self._admin()
