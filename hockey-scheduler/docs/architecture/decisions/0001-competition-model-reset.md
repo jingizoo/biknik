@@ -1,6 +1,6 @@
 # ADR 0001 — Competition model reset: Program → Season → League → optional Division; decouple venues
 
-- **Status:** Accepted (design of record for epic #233). Supersedes the competition-hierarchy portions of `docs/architecture/data-model.md` until that doc is rewritten in Slice B.
+- **Status:** Accepted (design of record for epic #233). Supersedes the competition-hierarchy portions of `docs/architecture/data-model.md` until that doc is rewritten in Slice B1.
 - **Date:** 2026-07-13
 - **Epic:** #233 (P0). Related: #180, #159, #201, #204, #205, #206, #209 (canonical docs), #212 (roadmap).
 - **Scope of this ADR (epic Slice A):** define the canonical model, publish the old→new compatibility map, and set the migration-compatibility / API-deprecation rules. **No code or schema changes land in Slice A** — this is the single reference reviewers use for Slices B–G.
@@ -114,7 +114,7 @@ Because "League" is reused, every reference must be disambiguated by layer, neve
 
 Derived from the real dispatcher in `web/server.py::_handle_setup` (the routes are
 path-parsed, not listed in `docs/architecture/api-contract.md`, which is stale and
-carries **no** Setup routes — its refresh is folded into Slice B).
+carries **no** Setup routes — its refresh is folded into Slice B1).
 
 **Versioning resolves the `league` noun collision.** Because "League" is reused one
 level down, no single path can safely mean both concepts. So the Setup surface is
@@ -126,8 +126,9 @@ level down, no single path can safely mean both concepts. So the Setup surface i
   existing clients and is removed at end-of-window. It is **not** repointed.
 - **v2 — `/api/v2/setup/…` (canonical, NEW).** Uses the new vocabulary cleanly:
   `program` = umbrella, `league` = the season grouping (today's `level`), `division`
-  optional under a League. All new UI (Slice B), imports (Slice F) and clients target
-  v2.
+  optional under a League. The v2 **endpoints land in Slice C** (they read/write C's
+  new columns — `registration.league_id`, `game.league_id`, nullable Division); the
+  UI cuts over to them in **Slice B2**, and imports adopt them in **Slice F**.
 
 So `POST /api/setup/league` (v1) creates the umbrella; `POST /api/v2/setup/program`
 creates the same concept under its new name; `POST /api/v2/setup/league` creates the
@@ -183,7 +184,7 @@ Import target column set (epic Slice F): `facility_owner, venue, program, season
 league, division, club, team, player`. A pre-commit dry-run reports ambiguous rows
 (same abort rules as the schema migration) rather than guessing.
 
-### UI labels (Slice B)
+### UI labels (Slice B1 labels/docs; B2 UI cutover)
 
 - Screen/label **"League"** → **"Program"**; **"Level"** → **"League"**; **"Division"** stays, shown as optional.
 - Update: Setup, Records, Hierarchy, onboarding wizard, imports, scheduler labels, validation messages, audit labels, and docs — with explicit route/API compatibility, not a blind text pass.
@@ -200,7 +201,7 @@ Forward-only, per-dialect (SQLite rebuild + PostgreSQL ALTER), following the #20
 | Division reparent | For a Division with `level_id` set → parent = that level-now-league. For a Division with only `season_id` (no level) → **needs a League**: attach to the season's sole League if exactly one exists; otherwise **abort and report** (operator must pick/create a League). | a season has 0 or >1 Leagues and a level-less Division exists |
 | Team.league_id → program_id | Copy the permanent-owner value. | a Team's `league_id` has no league row |
 | Registration.league_id (new) | Derive from the Team's Division-for-that-season if unambiguous; else from a single League under the season. | the league can't be uniquely derived from existing division/season data |
-| Venue.league_id → SeasonVenueAccess | If the owning league-now-program has **exactly one** Season, create one `SeasonVenueAccess(season_id, venue_id, active=true)`. Otherwise abort. | the program has **0 or more than one** Season — see below |
+| Venue.league_id → SeasonVenueAccess | If the owning league-now-program has **exactly one** Season, create one `SeasonVenueAccess(season_id, venue_id, active=true)`. If it has **more than one**, abort until the operator assigns access. If it has **no Season** (or the operator intends no current access), the venue is resolved by an explicit reviewed `no_current_season_access` decision — **no fake access row is created**. | the program has **>1** Season and no explicit assignment/decision exists — see below |
 | Club | `NA`, blank, and NULL in any source all map to **no Club** (null `club_id`); never create a Club record. | — |
 
 Every mapping keys on **stable ids** so audit logs, results, rosters, and external_refs continue to resolve.
@@ -223,19 +224,48 @@ circular (see Slice E1/E2 in the sequencing):
   still exists at this point — E1 adds, it removes nothing.
 - **E2** is the migration that drops `Venue.league_id`. Its pre-migration report lists
   each `(venue, program, candidate seasons)` still lacking access coverage and
-  **aborts**. The operator resolves them by assigning the venue to the specific
-  Season(s) via the E1 route/import; re-running E2 then finds those access rows
-  already present and leaves them untouched. The zero-Season case (a venue owned by a
-  program with no seasons yet) is reported the same way and simply carries no access
-  rows until a Season exists.
+  **aborts**. Each such venue needs **one of two explicit, audited resolutions** —
+  never fabricated data:
+  1. **assign** the venue to the specific Season(s) that use it via the E1
+     route/import (creates real `SeasonVenueAccess` rows); or
+  2. record a reviewed **`no_current_season_access`** decision — the venue is
+     intentionally eligible for **no** current Season. This is a first-class,
+     audited migration decision (stored so the report is satisfied and the choice is
+     traceable), **not** a placeholder access row. It covers both the
+     "program has no Seasons yet" case and the "operator deliberately grants the
+     venue to none this cycle" case, so a real venue is never stranded and E2 is never
+     permanently blocked.
+
+  Re-running E2 then finds every venue either covered by real access rows or carrying
+  an explicit `no_current_season_access` decision, and completes. The venue and its
+  future access are re-enabled the moment the operator adds a `SeasonVenueAccess` row
+  once a Season exists.
 
 ## Migration compatibility & sequencing
 
-Implementation order (from the epic; Slice A is this document):
+Implementation order. **Slice B is split around Slice C** because the canonical v2
+API cannot be *written to* until C's columns exist: v2 writes require
+`registration.league_id`, nullable-Division support, and `game.league_id`, none of
+which are present before C. Ordering the full UI cutover before C would ship a v2
+surface with no backing columns. So the effective order is **B1 → C → B2** (labels
+and docs first, then schema + the v2 API that needs those columns, then the UI
+cutover):
 
 - **A — ADR + compatibility map** (this doc). Canonical docs updated before code.
-- **B — terminology without data loss:** UI/label/route-alias rename (League→Program, Level→League), explicit API compatibility. No schema change.
-- **C — competition schema:** introduce `programs`, reparent Season→Program, rename Level→League(new), reparent Division→League, move Team ownership to Program, add `registration.league_id`, **and add `game.league_id`** (the game competition-scope column); forward-only SQLite+PostgreSQL migrations with pre-migration integrity reports.
+- **B1 — terminology in labels & docs (no schema, no v2 writes):** rename UI labels
+  (League→Program, Level→League; Division stays optional), rewrite `data-model.md` /
+  `api-contract.md` and audit/validation wording. v1 stays the write path; no v2
+  endpoint is wired yet (there are no columns for it to write). Reviewers share the
+  new vocabulary before any data moves.
+- **C — competition schema + v2 API:** introduce `programs`, reparent Season→Program,
+  rename Level→League(new), reparent Division→League, move Team ownership to Program,
+  add `registration.league_id`, nullable Division support, **and add `game.league_id`**
+  (the game competition-scope column); forward-only SQLite+PostgreSQL migrations with
+  pre-migration integrity reports. The **`/api/v2/setup/…` endpoints land here**, since
+  they read/write these new columns.
+- **B2 — UI cutover:** switch the frontend to the v2 API and the new model end-to-end
+  (Setup, Records, Hierarchy, onboarding, scheduler labels). v1 remains for legacy
+  callers through the deprecation window.
 - **D — optional Clubs:** `team.club_id` nullable end-to-end; drop any create/import Club requirement; `NA`/blank/null → no Club.
 - **E — venue decoupling, staged in two migrations** so the remediation target exists before anything is dropped:
   - **E1 (additive):** create the `SeasonVenueAccess` table and the Season↔Venue routes/import (`POST /api/v2/setup/seasons/{id}/venues`, `DELETE …/venues/{venue_id}`, and the sheet section). Auto-populate the unambiguous single-Season case from `Venue.league_id`. **`Venue.league_id` stays.** After E1 the new table and API exist and operators can add access rows.
@@ -256,7 +286,7 @@ Cross-cutting requirements (all slices): memory/SQLite/PostgreSQL parity; histor
    documented dual-read alias, not a new required field on v1.
 3. **Deprecation window:** v1 paths return a deprecation marker (header/field) and are
    removed only after clients migrate; the transition is tracked in the refreshed
-   `api-contract.md` (Slice B).
+   `api-contract.md` (Slice B1).
 4. **No breaking change without the version bump** or an explicit, documented
    deprecation — v1 is never mutated in place.
 
@@ -264,10 +294,10 @@ Cross-cutting requirements (all slices): memory/SQLite/PostgreSQL parity; histor
 
 - **Do not** add new FKs or NOT NULL constraints that permanently encode `Venue → Program`, `Team → old-League`, or **mandatory** Division ownership. (These would cement relationships this epic is deliberately reshaping.)
 - #201 may continue on **orthogonal** transaction/idempotency/invariant work that does not encode competition ownership (e.g. the roster→game/player FKs already landed; a roster NOT-NULL follow-up is fine, but Team/Venue/Division ownership FKs wait for Slice C/E).
-- #232 delete-actions work may continue independently, but must adopt the new terminology once Slice B lands.
+- #232 delete-actions work may continue independently, but must adopt the new terminology once Slice B1 lands.
 
 ## Consequences
 
 - **Positive:** the schema and UI will match the client's real operating model; venues become shareable across programs; teams model permanent-program ownership with per-season league/division placement; later work (#159 multi-program context, #205 seasonal rosters, #206 scheduler v2) builds on correct relationships.
 - **Cost/risk:** a vocabulary collision ("League" reused) demands careful, non-textual migration and dual-read API compatibility; the Division-reparent and Venue-decouple mappings have genuinely ambiguous cases that must **abort with row-level diagnostics** rather than guess.
-- **Reversibility:** each slice is forward-only but bounded and independently reviewed; terminology (B) precedes schema (C) so reviewers share one vocabulary before data moves.
+- **Reversibility:** each slice is forward-only but bounded and independently reviewed; terminology labels/docs (B1) precede schema (C) so reviewers share one vocabulary before data moves, and the UI cutover (B2) follows C so it never writes to columns that don't exist yet.
