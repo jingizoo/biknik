@@ -44,6 +44,22 @@ def _entry(eid, game="g1", player="p1"):
         selected_by="actor")
 
 
+def _ensure_parents(store, games=(), players=()):
+    """Seed the parent games/players a roster entry references (migration 027 adds
+    game_roster_entries.game_id → games and .player_id → players foreign keys, so
+    a concrete reference must name a real row). NULL references need no parent."""
+    cur = store.conn.cursor()
+    for table, ids in (("games", games), ("players", players)):
+        for rid in ids:
+            if rid is None:
+                continue
+            cur.execute(store.dialect.sql(
+                f"SELECT 1 FROM {table} WHERE id = ?"), (rid,))
+            if cur.fetchone() is None:
+                cur.execute(store.dialect.sql(
+                    f"INSERT INTO {table} (id) VALUES (?)"), (rid,))
+
+
 def _sql_backends():
     backends = [("sqlite", ":memory:")]
     url = os.environ.get("TEST_DATABASE_URL")
@@ -124,6 +140,7 @@ class PreMigrationValidationTest(unittest.TestCase):
         for label, url in _sql_backends():
             store = self._pre023(url)
             try:
+                _ensure_parents(store, ["g1"], ["p1", "p2"])
                 with store.transaction():
                     store.add_roster_entry(_entry("e1", "g1", "p1"))
                     store.add_roster_entry(_entry("e2", "g1", "p1"))  # dup
@@ -145,6 +162,7 @@ class PreMigrationValidationTest(unittest.TestCase):
         for label, url in _sql_backends():
             store = self._pre023(url)
             try:
+                _ensure_parents(store, ["g1"], ["p1"])
                 with store.transaction():
                     store.add_roster_entry(_entry("e1", None, "p1"))
                     store.add_roster_entry(_entry("e2", None, "p1"))
@@ -163,6 +181,7 @@ class PreMigrationValidationTest(unittest.TestCase):
         for label, url in _sql_backends():
             store = self._pre023(url)
             try:
+                _ensure_parents(store, ["g1"], ["p1"])
                 with store.transaction():
                     store.add_roster_entry(_entry("e1", None, "p1"))
                     store.add_roster_entry(_entry("e2", "g1", "p1"))
@@ -180,6 +199,7 @@ class ConstraintEnforcementTest(unittest.TestCase):
         for label, url in _sql_backends():
             store = _fresh(url)
             try:
+                _ensure_parents(store, ["g1"], ["p1", "p2"])
                 with store.transaction():
                     store.add_roster_entry(_entry("e1"))
                 with self.assertRaises(IntegrityConflictError, msg=label) as ctx:
@@ -200,6 +220,7 @@ class ConstraintEnforcementTest(unittest.TestCase):
         for label, url in _sql_backends():
             store = _fresh(url)
             try:
+                _ensure_parents(store, ["g1"], ["p1"])
                 with store.transaction():
                     store.add_roster_entry(_entry("e1"))
                 entry = store.roster_entry_for_player("g1", "p1")
@@ -220,6 +241,7 @@ class ConstraintEnforcementTest(unittest.TestCase):
         for label, url in _sql_backends():
             store = _fresh(url)
             try:
+                _ensure_parents(store, ["g1"], ["p1"])
                 with store.transaction():  # none of these raise a conflict
                     store.add_roster_entry(_entry("e1", None, "p1"))
                     store.add_roster_entry(_entry("e2", None, "p1"))
@@ -235,6 +257,7 @@ class ConstraintEnforcementTest(unittest.TestCase):
         for label, url in _sql_backends():
             store = _fresh(url)
             try:
+                _ensure_parents(store, ["g1"], ["p1", "p9"])
                 with store.transaction():
                     store.add_roster_entry(_entry("e1"))
                 with self.assertRaises(IntegrityConflictError, msg=label):
@@ -251,7 +274,10 @@ class RosterRaceTest(unittest.TestCase):
                          "cross-connection race needs PostgreSQL")
     def test_only_one_of_two_racing_inserts_wins(self):
         url = os.environ["TEST_DATABASE_URL"]
-        SqlStore(url).reset_schema()
+        seed = SqlStore(url)
+        seed.reset_schema()
+        _ensure_parents(seed, ["race_g"], ["race_p"])  # FK parents for the race
+        seed.close()
         barrier = threading.Barrier(2)
         results = {}
 
@@ -300,6 +326,7 @@ class IndexShapeTest(unittest.TestCase):
         for label, url in _sql_backends():
             store = _fresh(url)
             try:
+                _ensure_parents(store, ["g1"], ["p1"])
                 # A NULL-player row lives outside the partial unique index; the
                 # non-partial lookup index is what keeps its per-game read fast.
                 with store.transaction():
@@ -329,6 +356,7 @@ class MigrationLedgerTest(unittest.TestCase):
             self.assertIn(_VERSION, first.migration_status()["applied"])
             self.assertTrue(_game_lookup_index_present(first))
             self.assertTrue(_unique_partial_index_present(first))
+            _ensure_parents(first, ["g1"], ["p1"])
             with first.transaction():
                 first.add_roster_entry(_entry("e1"))
                 first.add_roster_entry(_entry("e_null", "g1", None))  # NULL-player
