@@ -94,3 +94,31 @@ def assert_no_duplicate_result_games(conn):
             "Cannot enforce one result per game: "
             f"{len(duplicates)} game(s) already have multiple result rows: "
             f"{shown}{more}. Resolve the duplicates before upgrading.")
+
+
+def find_orphan_result_games(conn):
+    """Non-null game_id values on result rows that reference a missing game.
+
+    These are the rows a game_results.game_id → games(id) foreign key (migration
+    025) would reject. NULL game_ids are excluded: a nullable foreign key permits
+    NULL (a result not yet tied to a game), so only dangling concrete references
+    block the upgrade.
+    """
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT DISTINCT gr.game_id FROM game_results gr "
+        "LEFT JOIN games g ON g.id = gr.game_id "
+        "WHERE gr.game_id IS NOT NULL AND g.id IS NULL")
+    return sorted(row["game_id"] for row in cur.fetchall())
+
+
+def assert_result_games_exist(conn):
+    """Abort the migration if any result references a missing game (#201 3D)."""
+    orphans = find_orphan_result_games(conn)
+    if orphans:
+        shown = ", ".join(orphans[:20])
+        more = "" if len(orphans) <= 20 else f" (+{len(orphans) - 20} more)"
+        raise MigrationDataError(
+            "Cannot add the result → game foreign key: "
+            f"{len(orphans)} result row(s) reference a game that does not "
+            f"exist: {shown}{more}. Reattach or remove them before upgrading.")

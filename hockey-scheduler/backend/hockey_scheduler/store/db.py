@@ -11,8 +11,12 @@ from typing import Optional, Tuple
 
 
 class Dialect:
-    def __init__(self, paramstyle: str):
+    def __init__(self, paramstyle: str, backend: str):
         self.paramstyle = paramstyle
+        # "sqlite" or "postgres" — lets the migration loader pick a per-dialect
+        # migration file when the DDL can't be written portably (e.g. adding a
+        # foreign key needs an ALTER on Postgres but a table rebuild on SQLite).
+        self.backend = backend
 
     def sql(self, query: str) -> str:
         """Author SQL with ``?``; translate to ``%s`` for Postgres."""
@@ -37,7 +41,7 @@ def connect(url: str) -> Tuple[object, Dialect, Optional[str]]:
         from psycopg.rows import dict_row
 
         conn = psycopg.connect(url, autocommit=True, row_factory=dict_row)
-        return conn, Dialect("pyformat"), None
+        return conn, Dialect("pyformat", "postgres"), None
 
     if url.startswith("sqlite:///"):
         path = url[len("sqlite:///"):]
@@ -49,4 +53,9 @@ def connect(url: str) -> Tuple[object, Dialect, Optional[str]]:
     conn = sqlite3.connect(path, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.isolation_level = None  # autocommit; transaction() manages explicit txns
-    return conn, Dialect("qmark"), path
+    # Enforce declared foreign keys (off by default in SQLite). PostgreSQL always
+    # enforces them, so this gives both backends the same observable behavior
+    # (#201). It is a per-connection setting and cannot be changed inside a
+    # transaction, so it is set once here at open time.
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn, Dialect("qmark", "sqlite"), path

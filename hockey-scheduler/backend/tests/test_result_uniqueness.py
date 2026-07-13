@@ -37,6 +37,19 @@ def _result(rid, game="g1", home=3, away=2):
         status=ResultStatus.DRAFT, recorded_by="actor", recorded_at=now)
 
 
+def _ensure_games(store, *game_ids):
+    """Seed the parent games a result references (migration 025 adds a
+    game_results.game_id → games(id) foreign key, so a concrete game_id must
+    name a real game). NULL game_ids need no parent and are skipped."""
+    cur = store.conn.cursor()
+    for gid in game_ids:
+        if gid is None:
+            continue
+        cur.execute(store.dialect.sql("SELECT 1 FROM games WHERE id = ?"), (gid,))
+        if cur.fetchone() is None:
+            cur.execute(store.dialect.sql("INSERT INTO games (id) VALUES (?)"), (gid,))
+
+
 def _sql_backends():
     backends = [("sqlite", ":memory:")]
     url = os.environ.get("TEST_DATABASE_URL")
@@ -117,6 +130,7 @@ class PreMigrationValidationTest(unittest.TestCase):
         for label, url in _sql_backends():
             store = self._pre024(url)
             try:
+                _ensure_games(store, "g1", "g2")
                 with store.transaction():
                     store.add_game_result(_result("r1", "g1"))
                     store.add_game_result(_result("r2", "g1"))  # dup
@@ -154,6 +168,7 @@ class PreMigrationValidationTest(unittest.TestCase):
         for label, url in _sql_backends():
             store = self._pre024(url)
             try:
+                _ensure_games(store, "g1")
                 with store.transaction():
                     store.add_game_result(_result("r1", None))
                     store.add_game_result(_result("r2", "g1"))
@@ -171,6 +186,7 @@ class ConstraintEnforcementTest(unittest.TestCase):
         for label, url in _sql_backends():
             store = _fresh(url)
             try:
+                _ensure_games(store, "g1", "g2")
                 with store.transaction():
                     store.add_game_result(_result("r1", "g1"))
                 with self.assertRaises(IntegrityConflictError, msg=label) as ctx:
@@ -191,6 +207,7 @@ class ConstraintEnforcementTest(unittest.TestCase):
         for label, url in _sql_backends():
             store = _fresh(url)
             try:
+                _ensure_games(store, "g1")
                 with store.transaction():
                     store.add_game_result(_result("r1", "g1", home=1, away=0))
                 result = store.result_for_game("g1")
@@ -226,6 +243,7 @@ class ConstraintEnforcementTest(unittest.TestCase):
         for label, url in _sql_backends():
             store = _fresh(url)
             try:
+                _ensure_games(store, "g1", "g9")
                 with store.transaction():
                     store.add_game_result(_result("r1", "g1"))
                 with self.assertRaises(IntegrityConflictError, msg=label):
@@ -242,7 +260,10 @@ class ResultRaceTest(unittest.TestCase):
                          "cross-connection race needs PostgreSQL")
     def test_only_one_of_two_racing_inserts_wins(self):
         url = os.environ["TEST_DATABASE_URL"]
-        SqlStore(url).reset_schema()
+        seed = SqlStore(url)
+        seed.reset_schema()
+        _ensure_games(seed, "race_g")  # FK parent for the racing results
+        seed.close()
         barrier = threading.Barrier(2)
         results = {}
 
@@ -292,6 +313,7 @@ class IndexShapeTest(unittest.TestCase):
         for label, url in _sql_backends():
             store = _fresh(url)
             try:
+                _ensure_games(store, "g1")
                 with store.transaction():
                     store.add_game_result(_result("r1", "g1"))
                 self.assertTrue(_game_lookup_index_present(store),
@@ -315,6 +337,7 @@ class MigrationLedgerTest(unittest.TestCase):
             self.assertIn(_VERSION, first.migration_status()["applied"])
             self.assertTrue(_game_lookup_index_present(first))
             self.assertTrue(_unique_partial_index_present(first))
+            _ensure_games(first, "g1")
             with first.transaction():
                 first.add_game_result(_result("r1", "g1"))
             first.close()

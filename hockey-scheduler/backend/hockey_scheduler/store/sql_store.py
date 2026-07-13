@@ -77,6 +77,7 @@ from .integrity_checks import (
     assert_no_duplicate_active_ice_slots,
     assert_no_duplicate_result_games,
     assert_no_duplicate_roster_players,
+    assert_result_games_exist,
 )
 
 
@@ -234,27 +235,70 @@ SPECS = {
 # data; a destructive rebuild is reset_schema(), demo-only and never run in prod.
 _MIGRATIONS_DIR = os.path.join(os.path.dirname(__file__), "migrations")
 
+# A version given per-dialect must supply BOTH engines' files (never just one).
+_DIALECT_PAIR = {"sqlite", "postgres"}
 
-def _load_migrations():
+
+def _split_statements(raw):
+    # Drop whole-line comments first (a comment may itself contain a ';', so it
+    # must go before we split statements on ';'), then split.
+    body = "\n".join(ln for ln in raw.splitlines()
+                     if not ln.strip().startswith("--"))
+    return [s.strip() for s in body.split(";") if s.strip()]
+
+
+def _load_migrations(backend=None):
     """Return ``[(version, [statement, ...]), ...]`` in numeric version order.
 
-    Version is the filename stem (e.g. ``001_initial``); statements are the
-    file split on ``;`` with line comments and blanks removed, so each can be
-    executed individually — portable across drivers that don't run multi-
-    statement strings.
+    Version is the filename stem (e.g. ``001_initial``); statements are the file
+    split on ``;`` with line comments and blanks removed, so each can be executed
+    individually — portable across drivers that don't run multi-statement strings.
+
+    A version must ship as EXACTLY ONE of:
+    - a single portable ``NNN_name.sql`` (applied to both backends), or
+    - a complete per-dialect pair ``NNN_name.sqlite.sql`` +
+      ``NNN_name.postgres.sql`` (for DDL that can't be written portably),
+      sharing the version stem ``NNN_name`` so the ``schema_migrations`` ledger
+      is identical on either engine — a database only ever runs one of the two.
+
+    Any other shape — a lone per-dialect file, or a portable file mixed with a
+    per-dialect one — is a build error and raises, so a missing variant can never
+    silently fall back to the *other* engine's DDL. ``backend``
+    ("sqlite"/"postgres") selects which variant's statements to return.
     """
-    out = []
+    # version -> {dialect_or_None: statements}
+    by_version = {}
     for fname in sorted(os.listdir(_MIGRATIONS_DIR)):
         if not fname.endswith(".sql"):
             continue
-        version = fname[:-len(".sql")]
+        stem = fname[:-len(".sql")]
+        dialect = None
+        for suffix in (".sqlite", ".postgres"):
+            if stem.endswith(suffix):
+                dialect, stem = suffix[1:], stem[:-len(suffix)]
+                break
         with open(os.path.join(_MIGRATIONS_DIR, fname), encoding="utf-8") as fh:
-            raw = fh.read()
-        # Drop whole-line comments first (a comment may itself contain a ';',
-        # so it must go before we split statements on ';'), then split.
-        body = "\n".join(ln for ln in raw.splitlines()
-                         if not ln.strip().startswith("--"))
-        statements = [s.strip() for s in body.split(";") if s.strip()]
+            statements = _split_statements(fh.read())
+        by_version.setdefault(stem, {})[dialect] = statements
+
+    out = []
+    for version in sorted(by_version):
+        variants = by_version[version]
+        shape = set(variants)
+        if shape == {None}:
+            statements = variants[None]  # portable — both backends
+        elif shape == _DIALECT_PAIR:
+            # Complete pair: pick the requested backend. For a version-only
+            # listing (backend is None) the statements are unused, so default to
+            # SQLite deterministically rather than guessing.
+            statements = variants[backend if backend in variants else "sqlite"]
+        else:
+            raise RuntimeError(
+                f"Migration {version!r} must be a single portable .sql or a "
+                f"complete .sqlite.sql + .postgres.sql pair; found "
+                f"{sorted(d or 'portable' for d in shape)}. A lone per-dialect "
+                f"file (or a portable/per-dialect mix) is rejected so a missing "
+                f"variant can never run the other engine's DDL.")
         out.append((version, statements))
     return out
 
@@ -267,6 +311,7 @@ _PRE_MIGRATION_CHECKS = {
     "022_one_active_game_per_slot": assert_no_duplicate_active_ice_slots,
     "023_one_roster_row_per_player": assert_no_duplicate_roster_players,
     "024_one_result_per_game": assert_no_duplicate_result_games,
+    "025_result_game_fk": assert_result_games_exist,
 }
 
 
@@ -281,6 +326,10 @@ def migrate(conn, dialect) -> None:
     A version with a registered pre-migration check (``_PRE_MIGRATION_CHECKS``)
     runs that check first; it raises (aborting the upgrade) if existing data
     would violate the constraint the migration adds.
+
+    Each pending version's statements and its ledger row are applied as one
+    atomic unit, so a migration that fails part-way (e.g. a SQLite table rebuild)
+    leaves the database on the previous version rather than half-migrated.
     """
     cur = conn.cursor()
     cur.execute("CREATE TABLE IF NOT EXISTS schema_migrations "
@@ -288,17 +337,44 @@ def migrate(conn, dialect) -> None:
     cur.execute("SELECT version FROM schema_migrations")
     # Both sqlite3.Row and psycopg dict_row support key access (not positional).
     applied = {row["version"] for row in cur.fetchall()}
-    for version, statements in _load_migrations():
+    for version, statements in _load_migrations(dialect.backend):
         if version in applied:
             continue
         check = _PRE_MIGRATION_CHECKS.get(version)
         if check is not None:
-            check(conn)
+            check(conn)  # read-only; safe to run before opening the txn
+        _apply_migration(conn, dialect, version, statements)
+
+
+def _apply_migration(conn, dialect, version, statements) -> None:
+    """Run one migration's statements plus its ledger row in a single txn."""
+    def body():
+        cur = conn.cursor()
         for stmt in statements:
             cur.execute(stmt)
         cur.execute(dialect.sql(
             "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)"),
             (version, _utcnow().isoformat()))
+
+    if dialect.backend == "postgres":
+        # psycopg: group the autocommit statements. Nesting is safe — if migrate()
+        # runs inside an outer transaction (e.g. the demo reset), this opens a
+        # savepoint rather than a second transaction.
+        with conn.transaction():
+            body()
+    elif conn.in_transaction:
+        # Already inside a transaction (e.g. reset_schema called within the demo
+        # reset's store.transaction()) — join it; SQLite can't nest BEGIN, and the
+        # outer transaction already makes this migration all-or-nothing.
+        body()
+    else:  # sqlite (autocommit) — explicit txn so the rebuild is all-or-nothing
+        try:
+            conn.execute("BEGIN")
+            body()
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
 
 
 def _utcnow() -> datetime:
@@ -401,13 +477,35 @@ class SqlStore:
                 "expected": expected, "current": current}
 
     def reset_schema(self) -> None:
-        """Drop all tables and re-migrate — for a clean test database."""
+        """Drop all tables and re-migrate — for a clean test database.
+
+        Foreign keys (#201) make drop order matter: dropping a parent while a
+        child still references it fails. Postgres uses ``DROP ... CASCADE`` to
+        also remove the dependent constraint. SQLite has no such clause, so its
+        FK enforcement is suspended for the drops — but the *how* depends on
+        whether a transaction is already open (the demo reset runs reset_schema
+        inside one for atomicity): ``PRAGMA foreign_keys`` is a no-op mid-
+        transaction, so ``defer_foreign_keys`` (which holds checks until COMMIT,
+        by which point every table is gone, and resets itself there) is used
+        instead; standalone, plain ``foreign_keys = OFF`` around the drops works.
+        """
+        cascade = " CASCADE" if self.backend == "postgres" else ""
         with self._lock:
             cur = self.conn.cursor()
-            for spec in SPECS.values():
-                cur.execute(f"DROP TABLE IF EXISTS {spec.table}")
-            cur.execute("DROP TABLE IF EXISTS counters")
-            cur.execute("DROP TABLE IF EXISTS schema_migrations")
+            deferred = self.backend == "sqlite" and self.conn.in_transaction
+            if self.backend == "sqlite":
+                cur.execute("PRAGMA defer_foreign_keys = ON" if deferred
+                            else "PRAGMA foreign_keys = OFF")
+            try:
+                for spec in SPECS.values():
+                    cur.execute(f"DROP TABLE IF EXISTS {spec.table}{cascade}")
+                cur.execute(f"DROP TABLE IF EXISTS counters{cascade}")
+                cur.execute(f"DROP TABLE IF EXISTS schema_migrations{cascade}")
+            finally:
+                # defer_foreign_keys resets itself at COMMIT; only the standalone
+                # foreign_keys toggle needs restoring here.
+                if self.backend == "sqlite" and not deferred:
+                    cur.execute("PRAGMA foreign_keys = ON")
         migrate(self.conn, self.dialect)
 
     # -- low-level ---------------------------------------------------------
