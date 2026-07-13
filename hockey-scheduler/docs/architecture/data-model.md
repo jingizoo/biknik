@@ -1,5 +1,14 @@
 # Data Model
 
+> **⚠️ Competition hierarchy is being reset (epic #233).** The
+> League → Season → Level → Division and permanent-League→Venue relationships
+> described below for the *competition/venue* layer are **superseded** by
+> [ADR 0001 — Competition model reset](decisions/0001-competition-model-reset.md)
+> (canonical target: Program → Season → League → optional Division; Season↔Venue
+> many-to-many). Use the ADR as the source of truth for those concepts until this
+> document is rewritten in epic #233 Slice B. The roster + substitute entities
+> below are unaffected.
+
 Entities for the roster + substitute slice. `RosterStatus` is **calculated
 dynamically** from the other entities (not stored).
 
