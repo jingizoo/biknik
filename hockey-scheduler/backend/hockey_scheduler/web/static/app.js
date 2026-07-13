@@ -573,7 +573,7 @@ const SETUP_ENTITIES = [
       sub: [v.organization_name, v.league_name].filter(Boolean).join(" · ") || "Unassigned" })),
     fields: [
       { id: "f-venue", label: "Venue name", required: true, placeholder: "e.g. South Arena" },
-      { id: "f-venue-league", label: "Program (optional — sets the owner)", type: "select", ofNoun: "league",
+      { id: "f-venue-league", label: "Operating program (optional)", type: "select", ofNoun: "league",
         options: (ov) => [["", "— none —"]].concat((ov.leagues || []).map(
           (l) => [l.id, `${nameById(ov.organizations, l.organization_id) || "No owner"} · ${l.name}`])) }] },
   { key: "rink", title: "Rinks", icon: "⛸️", noun: "rink", perm: "manage_arena",
@@ -623,6 +623,15 @@ const SETUP_ENTITIES = [
 // linkage token, which stays frozen for the v1 API and ofNoun matching — only
 // the user-visible word changes (e.g. league→Program, level→League).
 const entNoun = (e) => e.displayNoun || e.noun;
+
+// Display noun for a field's parent entity (`ofNoun` holds the parent's internal
+// key). Maps to the parent's display noun so empty-select notes never expose the
+// internal league/level tokens (#233).
+const ofNounLabel = (f) => {
+  if (!f.ofNoun) return "record";
+  const e = SETUP_ENTITIES.find((x) => x.key === f.ofNoun);
+  return e ? entNoun(e) : f.ofNoun;
+};
 
 // Each entity's POST body, built from the drawer inputs (ids match the fields).
 const SETUP_POST = {
@@ -837,7 +846,7 @@ function demoConfirmModalHtml(m) {
   const lead = clear
     ? `<p>This clears all demo data and returns to an empty setup. Everyone
          using this demo will see it emptied. This can't be undone.</p>`
-    : `<p>This clears all demo data and rebuilds the sample league. Everyone
+    : `<p>This clears all demo data and rebuilds the sample competition. Everyone
          using this demo will see it restart. This can't be undone.</p>`;
   return modalShell("danger", title,
     `${lead}
@@ -996,8 +1005,8 @@ function startYourLeagueCard() {
   const load = (hasPerm("manage_setup") && isDemo())
     ? `<button class="act ghost" data-demo-load>Load demo data</button>` : "";
   return `<section class="card start-league">
-    <div class="section-title" style="margin-top:0">Start your league</div>
-    <p class="muted">Create your league structure from scratch, or load the
+    <div class="section-title" style="margin-top:0">Start your competition</div>
+    <p class="muted">Create your competition structure from scratch, or load the
       complete sample dataset to explore the app.</p>
     <div class="actions">
       <button class="act primary" data-drawer="league">Create manually</button>
@@ -1064,7 +1073,7 @@ function renderSetupHierarchy(ov) {
   const orphanLeagues = (leaguesByOrgF[null] || []).concat(leaguesByOrgF[undefined] || []);
   const orphanLeagueSection = orphanLeagues.length
     ? `<details class="tn" open><summary class="tn-sum">
-        <span class="tn-label tn-warn-text">🏆 No facility owner</span>
+        <span class="tn-label tn-warn-text">🏆 No operating organization</span>
         <span class="tn-meta">${orphanLeagues.length} program${orphanLeagues.length === 1 ? "" : "s"}</span></summary>
       <div class="tn-children">${orphanLeagues.map(leagueFacilityNode).join("")}</div>
     </details>` : "";
@@ -1145,7 +1154,7 @@ function renderSetupHierarchy(ov) {
         <div class="tn-children">${seasonBody}
           <div class="tree-actions sub">${treeAdd("level", "Add league to " + s.name, "f-level-season", s.id)}${treeAdd("division", "Add division to " + s.name, "f-div-season", s.id)}</div></div>
       </details>`;
-    }).join("") || `<div class="tn-empty">No seasons in this league yet.</div>`;
+    }).join("") || `<div class="tn-empty">No seasons in this program yet.</div>`;
     return `<details class="tn" open><summary class="tn-sum">
         <span class="tn-label">🏆 ${esc(lg.name)}</span>
         <span class="tn-meta">${seasons.length} season(s) · ${lgTeams} team(s)</span>${delBtn("league", lg.id, lg.name)}</summary>
@@ -1155,7 +1164,7 @@ function renderSetupHierarchy(ov) {
   const competition = `<section class="tree-panel">
     <div class="tree-head"><span class="tree-title">🏆 Competition structure</span>
       <span class="tree-sub">Program → Season → League → Division</span></div>
-    ${leagueRows || `<div class="tn-empty">No leagues yet. Add a league to begin.</div>`}
+    ${leagueRows || `<div class="tn-empty">No programs yet. Add a program to begin.</div>`}
     <div class="tree-actions">${treeAdd("league", "Add program")}</div>
   </section>`;
 
@@ -1176,7 +1185,7 @@ function renderSetupHierarchy(ov) {
           <span class="tn-meta">${teams.length} team${teams.length === 1 ? "" : "s"}</span></summary>
         <div class="tn-children">${rows}${treeAdd("team", "Add team to " + lg.name, "f-team-league", lg.id)}</div>
       </details>`;
-    }).join("") || `<div class="tn-empty">No leagues yet. Add a league, then its teams.</div>`}
+    }).join("") || `<div class="tn-empty">No programs yet. Add a program, then its teams.</div>`}
   </section>`;
 
   // -- Roster: Team → Players (operator-only; player names) --
@@ -1228,11 +1237,11 @@ function renderSetupHierarchy(ov) {
     ? `<div class="na-group"><div class="na-group-label">${esc(label)} (${rows.length})</div>${
         rows.map((r) => `<div class="tn-leaf warn"><span class="tn-label">⚠ ${esc(r.name)}</span>${
           fix ? fix(r) : ""}</div>`).join("")}</div>` : "";
-  const naBody = naRow("Programs without a facility owner", noOwnerLeagues,
+  const naBody = naRow("Programs without an operating organization", noOwnerLeagues,
                        (l) => reassignBtn("league", "organization", l, l.organization_id))
-    + naRow("Venues without a league", noLeagueVenues,
+    + naRow("Venues without a program", noLeagueVenues,
             (v) => reassignBtn("venue", "league", v, v.league_id))
-    + naRow("Venues whose owner ≠ league owner", ownerMismatchVenues,
+    + naRow("Venues whose owner ≠ program owner", ownerMismatchVenues,
             (v) => reassignBtn("venue", "league", v, v.league_id))
     + naRow("Rinks without a venue", orphanRinks,
             (r) => reassignBtn("rink", "venue", r, r.venue_id))
@@ -1283,13 +1292,13 @@ function renderSeasonParticipation(ov) {
       const available = teams.filter((t) => !registered.has(t.id));
       const addCtl = available.length
         ? `<div class="tn-leaf reg-add">
-            <select id="reg-team-${esc(s.id)}"><option value="">Add a league team…</option>${
+            <select id="reg-team-${esc(s.id)}"><option value="">Add a program team…</option>${
               available.map((t) => opt(t.id, t.name)).join("")}</select>
             <select id="reg-div-${esc(s.id)}"><option value="">No division</option>${divOpts(s.id, "")}</select>
             <button class="act primary" data-reg-add="${esc(s.id)}">Register</button></div>`
         : (teams.length
-            ? `<div class="tn-empty">Every league team is registered for this season.</div>`
-            : `<div class="tn-empty">Create a league team first, then register it here.</div>`);
+            ? `<div class="tn-empty">Every program team is registered for this season.</div>`
+            : `<div class="tn-empty">Create a program team first, then register it here.</div>`);
       return `<details class="tn" open><summary class="tn-sum">
           <span class="tn-label">🗓️ ${esc(s.name)}</span>
           <span class="tn-meta">${regs.length} team${regs.length === 1 ? "" : "s"}</span></summary>
@@ -1300,12 +1309,12 @@ function renderSeasonParticipation(ov) {
     const idle = teams.filter((t) => !(seasonsByLeague[lg.id] || [])
       .some((s) => (seasonRegs[s.id] || []).some((r) => r.active && r.team_id === t.id)));
     const idleRows = idle.length
-      ? `<div class="tn-leaf reg-row"><span class="tn-meta">${idle.length} league team${
+      ? `<div class="tn-leaf reg-row"><span class="tn-meta">${idle.length} program team${
           idle.length === 1 ? "" : "s"} not in any current season: ${
           idle.map((t) => esc(t.name)).join(", ")}</span></div>` : "";
     return `<details class="tn" open><summary class="tn-sum">
         <span class="tn-label">🏆 ${esc(lg.name)}</span>
-        <span class="tn-meta">${teams.length} league team${teams.length === 1 ? "" : "s"}</span></summary>
+        <span class="tn-meta">${teams.length} program team${teams.length === 1 ? "" : "s"}</span></summary>
       <div class="tn-children">${seasonBlocks}${idleRows}</div></details>`;
   }).join("");
 
@@ -1411,7 +1420,7 @@ function renderRollover(ov) {
           already.map((t) => esc(t.name)).join(", ")}</span></div>` : "";
     const ineligibleRow = ineligible.length
       ? `<div class="tn-leaf warn"><span class="tn-meta">⚠ ${ineligible.length} source registration${
-          ineligible.length === 1 ? "" : "s"} can't be carried — the team isn't a permanent member of this league (orphaned or cross-league data).</span></div>` : "";
+          ineligible.length === 1 ? "" : "s"} can't be carried — the team isn't a permanent member of this program (orphaned or cross-program data).</span></div>` : "";
     body = `<div class="tn-children">${carry}${alreadyRow}${ineligibleRow}${rolloverResultHtml()}</div>`;
   }
 
@@ -1468,10 +1477,10 @@ function renderSetup(ov) {
   </div>`;
   let body;
   if (setupView === "hierarchy") {
-    body = `${pageIntro("Review and fix how your venues, league, teams, and rosters are connected.")}${renderSetupHierarchy(ov)}`;
+    body = `${pageIntro("Review and fix how your venues, programs, teams, and rosters are connected.")}${renderSetupHierarchy(ov)}`;
   } else {
     const cards = SETUP_ENTITIES.map((ent) => setupCard(ent, ov)).join("");
-    body = `<div class="setup-intro">Create your league structure and arena. Tap
+    body = `<div class="setup-intro">Create your competition structure and arena. Tap
       <strong>＋ New</strong> on any card to open a form.</div>
       <div class="setup-grid">${cards}</div>`;
   }
@@ -1511,7 +1520,7 @@ function drawerField(f, ov) {
     const rows = f.options(ov);
     if (!rows.length) {
       return `<label>${esc(f.label)}${req}</label>
-        <div class="drawer-note">Create a ${esc(f.ofNoun || "record")} first.</div>`;
+        <div class="drawer-note">Create a ${esc(ofNounLabel(f))} first.</div>`;
     }
     const sel = current || rows[0][0];
     const opts = rows.map(([v, label]) =>
