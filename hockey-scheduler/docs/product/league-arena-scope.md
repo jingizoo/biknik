@@ -1,5 +1,12 @@
 # League + Arena Setup — Slice Scope
 
+> **Terminology note (epic #233).** This is the *historical* scope for the original
+> setup slice and uses the old vocabulary (League → Season → Division). The canonical
+> model is now **Program → Season → League → optional Division** — see
+> [ADR 0001](../architecture/decisions/0001-competition-model-reset.md) and
+> [Competition + Facility Setup](../architecture/league-arena-setup.md). "League"
+> below means today's top umbrella (the new **Program**); "Division" is unchanged.
+
 The roster/substitute slice operates on a single seeded game. This slice adds
 the **setup layer** an operator builds before games exist, so games can be
 created against a real league/division and a real rink ice slot.
