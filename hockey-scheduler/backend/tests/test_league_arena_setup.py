@@ -29,7 +29,7 @@ def build():
 
 def full_universe(svc):
     """Create league→season→division, two teams in it, and one ice slot."""
-    league = svc.create_league("EU Premier", country="DE")
+    league = svc.create_program("EU Premier", country="DE")
     season = svc.create_season(league.id, "2026/27")
     division = svc.create_division(season.id, "U16", age_group="U16")
     club_a = svc.create_club("Lions Club")
@@ -95,7 +95,7 @@ class LeagueArenaSetupTest(unittest.TestCase):
         svc, _ = build()
         with self.assertRaises(NotFoundError):
             svc.create_season("league_missing", "X")
-        league = svc.create_league("L")
+        league = svc.create_program("L")
         with self.assertRaises(NotFoundError):
             svc.create_division("season_missing", "D")
         season = svc.create_season(league.id, "S")
@@ -107,7 +107,7 @@ class LeagueArenaSetupTest(unittest.TestCase):
     def test_division_must_belong_to_season(self):
         svc, _ = build()
         u = full_universe(svc)
-        other_league = svc.create_league("Other")
+        other_league = svc.create_program("Other")
         other_season = svc.create_season(other_league.id, "S2")
         with self.assertRaises(ValidationError):
             svc.create_game(other_season.id, u["division"].id,
@@ -122,7 +122,7 @@ class LeagueArenaSetupTest(unittest.TestCase):
 
     def test_ice_slot_requires_tz_aware_times(self):
         svc, _ = build()
-        league = svc.create_league("L")
+        league = svc.create_program("L")
         venue = svc.create_venue("V")
         rink = svc.create_rink(venue.id, "R")
         naive = datetime(2026, 9, 1, 18, 30)  # no tzinfo
@@ -162,13 +162,13 @@ class LeagueArenaSetupTest(unittest.TestCase):
     def test_blank_name_rejected(self):
         svc, _ = build()
         with self.assertRaises(ValidationError):
-            svc.create_league("   ")
+            svc.create_program("   ")
 
     # -- scheduling-rule fixes (review round 3) ---------------------------
     def test_game_in_second_season_division_succeeds(self):
         # The wizard/back end must accept a non-seeded season's division.
         svc, _ = build()
-        lg = svc.create_league("L2")
+        lg = svc.create_program("L2")
         se = svc.create_season(lg.id, "S2")
         dv = svc.create_division(se.id, "U16 B")
         ta = svc.create_team(svc.create_club("CA").id, dv.id, "TA")

@@ -62,7 +62,7 @@ class ImportCommitServiceContract:
         self.store = self._store()
         self.api = ApiService(self.store)
         self.setup = SetupService(self.store)
-        league = self.setup.create_league("Test League", actor_id="admin")
+        league = self.setup.create_program("Test League", actor_id="admin")
         self.season = self.setup.create_season(
             league.id, "2026 Season", actor_id="admin")
 
@@ -120,7 +120,7 @@ class ImportCommitServiceContract:
         season = self.store.get_season(self.season.id)
         t1 = self._team("T1")
         # Permanent league is the imported season's league; NO legacy division.
-        self.assertEqual(t1.league_id, season.league_id)
+        self.assertEqual(t1.program_id, season.program_id)
         self.assertIsNone(t1.division_id)
         # An active registration ties T1 to the season + its imported division,
         # so the imported team is immediately schedulable (not teams_without_league).
@@ -150,7 +150,7 @@ class ImportCommitServiceContract:
         t1 = self._team("T1")
         first = self.store.registration_for_team_in_season(self.season.id, t1.id)
         first_div = first.division_id
-        league_id = self.store.get_season(self.season.id).league_id
+        league_id = self.store.get_season(self.season.id).program_id
         season2 = self.setup.create_season(league_id, "2027", actor_id="admin")
         self.api.commit_teams_players_import(
             season2.id, _valid_sheets_csv(), actor_id="admin")
@@ -169,10 +169,10 @@ class ImportCommitServiceContract:
         self.api.commit_teams_players_import(
             self.season.id, _valid_sheets_csv(), actor_id="admin")
         t1 = self._team("T1")
-        league1 = self.store.get_season(self.season.id).league_id
-        self.assertEqual(t1.league_id, league1)
+        league1 = self.store.get_season(self.season.id).program_id
+        self.assertEqual(t1.program_id, league1)
         # Re-import the SAME team_code into a DIFFERENT league's season.
-        league2 = self.setup.create_league("Other League", actor_id="admin").id
+        league2 = self.setup.create_program("Other League", actor_id="admin").id
         season2 = self.setup.create_season(league2, "2027", actor_id="admin")
         res = self.api.commit_teams_players_import(
             season2.id, _valid_sheets_csv(), actor_id="admin")
@@ -180,12 +180,12 @@ class ImportCommitServiceContract:
         self.assertTrue(any(e["reason"] == "team_league_move_blocked"
                             for e in res["errors"]))
         # Zero writes: T1 keeps its league; no registration was made in season2.
-        self.assertEqual(self._team("T1").league_id, league1)
+        self.assertEqual(self._team("T1").program_id, league1)
         self.assertIsNone(
             self.store.registration_for_team_in_season(season2.id, t1.id))
 
     def test_import_rejects_a_season_without_a_valid_league(self):
-        orphan = Season(id=self.store.next_id("season"), league_id=None,
+        orphan = Season(id=self.store.next_id("season"), program_id=None,
                         name="Orphan")
         self.store.add_season(orphan)
         res = self.api.commit_teams_players_import(
@@ -205,7 +205,7 @@ class ImportCommitServiceContract:
             self.season.id, _valid_sheets_csv(), actor_id="admin")
         t1 = self._team("T1")
         u16 = self._u16()
-        league = self.store.get_season(self.season.id).league_id
+        league = self.store.get_season(self.season.id).program_id
         club2 = self.setup.create_club("C2", actor_id="admin").id
         mate = self.api.create_team(club2, u16.id, "Mate", actor_id="admin")["id"]
         self.api.register_team_for_season(
@@ -462,7 +462,7 @@ class TransactionBoundaryTest(unittest.TestCase):
     def test_commit_opens_exactly_one_transaction_for_multi_team_multi_player(self):
         store = SqlStore(":memory:")
         setup = SetupService(store)
-        league = setup.create_league("Test League", actor_id="admin")
+        league = setup.create_program("Test League", actor_id="admin")
         season = setup.create_season(league.id, "2026 Season", actor_id="admin")
         api = ApiService(store)
 

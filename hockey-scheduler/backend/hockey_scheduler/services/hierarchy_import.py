@@ -11,7 +11,7 @@ from collections import OrderedDict
 from typing import Dict, Iterable, List, Optional, Tuple
 
 from ..domain import (
-    Division, League, Level, Organization, Rink, Season,
+    Division, League, Program, Organization, Rink, Season,
     SeasonTeamRegistration, Team, Venue)
 
 
@@ -200,11 +200,11 @@ def validate_hierarchy_import(sheets: Dict[str, List[dict]], store) -> dict:
 
     existing_orgs = _existing_map(
         report, store.all_organizations(), "organization")
-    existing_leagues = _existing_map(report, store.all_leagues(), "league")
+    existing_leagues = _existing_map(report, store.all_programs(), "league")
     _existing_map(report, store.all_venues(), "venue")
     _existing_map(report, store.all_rinks(), "rink")
     existing_seasons = _existing_map(report, store.all_seasons(), "season")
-    _existing_map(report, store.all_levels(), "level")
+    _existing_map(report, store.all_leagues(), "level")
     existing_divisions = _existing_map(report, store.all_divisions(), "division")
     existing_teams = _existing_map(report, store.all_teams(), "team")
 
@@ -227,7 +227,7 @@ def validate_hierarchy_import(sheets: Dict[str, List[dict]], store) -> dict:
     existing_league_owner = {}
     existing_org_by_id = {obj.id: obj for obj in store.all_organizations()}
     for code, league in existing_leagues.items():
-        owner = existing_org_by_id.get(league.organization_id)
+        owner = existing_org_by_id.get(league.operator_organization_id)
         existing_league_owner[code] = (
             _optional(owner.external_ref) if owner is not None else None)
 
@@ -293,7 +293,7 @@ def validate_hierarchy_import(sheets: Dict[str, List[dict]], store) -> dict:
         if code:
             season_league.setdefault(code, _optional(row.get("league_code")))
     for code, season in existing_seasons.items():
-        season_league.setdefault(code, league_ref_by_id.get(season.league_id))
+        season_league.setdefault(code, league_ref_by_id.get(season.program_id))
 
     division_season = {}
     for row in rows["competition"]:
@@ -309,7 +309,7 @@ def validate_hierarchy_import(sheets: Dict[str, List[dict]], store) -> dict:
         if code:
             team_league.setdefault(code, _optional(row.get("league_code")))
     for code, team in existing_teams.items():
-        team_league.setdefault(code, league_ref_by_id.get(team.league_id))
+        team_league.setdefault(code, league_ref_by_id.get(team.program_id))
 
     known_season_codes = {_clean(r.get("season_code"))
                           for r in rows["competition"]
@@ -426,7 +426,7 @@ def _preflight_reassignment_safety(store, rows) -> List[dict]:
     seasons = {s.external_ref: s for s in store.all_seasons() if s.external_ref}
     divisions = {d.external_ref: d for d in store.all_divisions()
                  if d.external_ref}
-    league_code_by_id = {lg.id: lg.external_ref for lg in store.all_leagues()
+    league_code_by_id = {lg.id: lg.external_ref for lg in store.all_programs()
                          if lg.external_ref}
     season_code_by_id = {s.id: s.external_ref for s in store.all_seasons()
                          if s.external_ref}
@@ -447,14 +447,14 @@ def _preflight_reassignment_safety(store, rows) -> List[dict]:
         if team is None:
             continue  # a new team has no history to strand
         new_league_code = _clean(row.get("league_code"))
-        if new_league_code == league_code_by_id.get(team.league_id):
+        if new_league_code == league_code_by_id.get(team.program_id):
             continue  # league unchanged
         stranded_regs = []
         for reg in all_regs:
             if reg.team_id != team.id:
                 continue
             season = store.get_season(reg.season_id)
-            reg_league = (league_code_by_id.get(season.league_id)
+            reg_league = (league_code_by_id.get(season.program_id)
                           if season is not None else None)
             if reg_league != new_league_code:
                 stranded_regs.append(reg.id)
@@ -513,7 +513,7 @@ def _preflight_reassignment_safety(store, rows) -> List[dict]:
         if season is None:
             continue
         new_league_code = _clean(row.get("league_code"))
-        if new_league_code == league_code_by_id.get(season.league_id):
+        if new_league_code == league_code_by_id.get(season.program_id):
             continue  # league unchanged
         affected_regs = [r.id for r in all_regs if r.season_id == season.id]
         if affected_regs:
@@ -597,7 +597,7 @@ def commit_hierarchy_import(setup, sheets: Dict[str, List[dict]],
 
         orgs = {o.external_ref: o for o in store.all_organizations()
                 if o.external_ref}
-        leagues = {o.external_ref: o for o in store.all_leagues()
+        leagues = {o.external_ref: o for o in store.all_programs()
                    if o.external_ref}
         venues = {o.external_ref: o for o in store.all_venues()
                   if o.external_ref}
@@ -605,7 +605,7 @@ def commit_hierarchy_import(setup, sheets: Dict[str, List[dict]],
                  if o.external_ref}
         seasons = {o.external_ref: o for o in store.all_seasons()
                    if o.external_ref}
-        levels = {o.external_ref: o for o in store.all_levels()
+        levels = {o.external_ref: o for o in store.all_leagues()
                   if o.external_ref}
         divisions = {o.external_ref: o for o in store.all_divisions()
                      if o.external_ref}
@@ -649,13 +649,13 @@ def commit_hierarchy_import(setup, sheets: Dict[str, List[dict]],
                 "name": _clean(row.get("league_name")),
                 "country": _clean(row.get("country")),
                 "timezone": _clean(row.get("timezone"), "UTC") or "UTC",
-                "organization_id": org.id,
+                "operator_organization_id": org.id,
             }
             obj = leagues.get(code)
             if obj is None:
-                obj = League(id=store.next_id("league"), external_ref=code,
-                             **values)
-                store.add_league(obj)
+                obj = Program(id=store.next_id("league"), external_ref=code,
+                              **values)
+                store.add_program(obj)
                 leagues[code] = obj
                 counts["leagues"]["created"] += 1
                 audit("league_created", "league", obj,
@@ -663,7 +663,7 @@ def commit_hierarchy_import(setup, sheets: Dict[str, List[dict]],
             else:
                 changed = _apply_changes(obj, values)
                 if changed:
-                    store.save_league(obj)
+                    store.save_program(obj)
                     counts["leagues"]["updated"] += 1
                     audit("league_updated", "league", obj,
                           {"organization_id": org.id,
@@ -728,7 +728,7 @@ def commit_hierarchy_import(setup, sheets: Dict[str, List[dict]],
         for code, row in _group_first(
                 rows["competition"], "season_code").items():
             league = leagues[_clean(row.get("league_code"))]
-            values = {"league_id": league.id,
+            values = {"program_id": league.id,
                       "name": _clean(row.get("season_name"))}
             obj = seasons.get(code)
             if obj is None:
@@ -762,9 +762,9 @@ def commit_hierarchy_import(setup, sheets: Dict[str, List[dict]],
             }
             obj = levels.get(code)
             if obj is None:
-                obj = Level(id=store.next_id("level"), external_ref=code,
-                            **values)
-                store.add_level(obj)
+                obj = League(id=store.next_id("level"), external_ref=code,
+                             **values)
+                store.add_league(obj)
                 levels[code] = obj
                 counts["levels"]["created"] += 1
                 audit("level_created", "level", obj,
@@ -772,7 +772,7 @@ def commit_hierarchy_import(setup, sheets: Dict[str, List[dict]],
             else:
                 changed = _apply_changes(obj, values)
                 if changed:
-                    store.save_level(obj)
+                    store.save_league(obj)
                     counts["levels"]["updated"] += 1
                     audit("level_updated", "level", obj,
                           {"season_id": season.id, "changed_fields": changed})
@@ -788,7 +788,7 @@ def commit_hierarchy_import(setup, sheets: Dict[str, List[dict]],
                 "season_id": season.id,
                 "name": _clean(row.get("division_name")),
                 "age_group": _clean(row.get("age_group")),
-                "level_id": level.id if level else None,
+                "league_id": level.id if level else None,
             }
             obj = divisions.get(code)
             if obj is None:
@@ -823,7 +823,7 @@ def commit_hierarchy_import(setup, sheets: Dict[str, List[dict]],
                 rows["permanent_teams"], "team_code").items():
             league = leagues[_clean(row.get("league_code"))]
             values = {"name": _clean(row.get("team_name")),
-                      "league_id": league.id}
+                      "program_id": league.id}
             obj = teams.get(code)
             if obj is None:
                 # A genuinely NEW permanent team carries no club and no division
@@ -836,13 +836,13 @@ def commit_hierarchy_import(setup, sheets: Dict[str, List[dict]],
                 counts["permanent_teams"]["created"] += 1
                 audit("team_created", "team", obj, {"league_id": league.id})
             else:
-                old_league_id = obj.league_id
+                old_league_id = obj.program_id
                 changed = _apply_changes(obj, values)
                 if changed:
                     store.save_team(obj)
                     counts["permanent_teams"]["updated"] += 1
                     detail = {"league_id": league.id, "changed_fields": changed}
-                    if "league_id" in changed:  # exact from/to on a league move
+                    if "program_id" in changed:  # exact from/to on a program move
                         detail["from_league_id"] = old_league_id
                         detail["to_league_id"] = league.id
                     audit("team_updated", "team", obj, detail)
@@ -861,7 +861,10 @@ def commit_hierarchy_import(setup, sheets: Dict[str, List[dict]],
             if reg is None:
                 reg = SeasonTeamRegistration(
                     id=store.next_id("streg"), season_id=season.id,
-                    team_id=team.id, division_id=division.id, active=True)
+                    team_id=team.id, division_id=division.id,
+                    league_id=setup._derive_registration_league(
+                        season.id, division.id),
+                    active=True)
                 store.add_season_team_registration(reg)
                 counts["registrations"]["created"] += 1
                 setup._audit(
@@ -874,6 +877,8 @@ def commit_hierarchy_import(setup, sheets: Dict[str, List[dict]],
                 old_division_id = reg.division_id
                 if reg.division_id != division.id:
                     reg.division_id = division.id
+                    reg.league_id = setup._derive_registration_league(
+                        season.id, division.id)
                     changed.append("division_id")
                 if not reg.active:
                     reg.active = True

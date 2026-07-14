@@ -46,7 +46,7 @@ def dt(h, m=0):
 def universe():
     store = InMemoryStore()
     svc = SetupService(store, clock=FakeClock())
-    league = svc.create_league("L")
+    league = svc.create_program("L")
     season = svc.create_season(league.id, "S")
     div = svc.create_division(season.id, "U16")
     home = svc.create_team(svc.create_club("LH").id, div.id, "Lions")

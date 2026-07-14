@@ -25,7 +25,7 @@ class OfficialsServiceTest(unittest.TestCase):
     def setUp(self):
         self.store = InMemoryStore()
         self.svc = SetupService(self.store)
-        league = self.svc.create_league("L")
+        league = self.svc.create_program("L")
         season = self.svc.create_season(league.id, "S")
         self.div = self.svc.create_division(season.id, "U16")
         self.club_a = self.svc.create_club("Aces HC")

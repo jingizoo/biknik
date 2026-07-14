@@ -23,7 +23,7 @@ ADMIN = "setup_admin"
 def _fixture(api, league_name="Over 55"):
     """A league with one season and one division, plus a club — the minimum to
     create a team and register it. Returns ids."""
-    league = api.create_league(league_name, actor_id=ADMIN)
+    league = api.create_program(league_name, actor_id=ADMIN)
     season = api.create_season(league["id"], "Fall 2026", actor_id=ADMIN)
     division = api.create_division(season["id"], "Div A", actor_id=ADMIN)
     club = api.create_club("Club X", actor_id=ADMIN)
@@ -38,23 +38,23 @@ class TeamLeagueMembershipTest(unittest.TestCase):
         league, season, division, club = _fixture(self.api)
         team = self.api.create_team(club["id"], division["id"], "Lions",
                                     actor_id=ADMIN)
-        self.assertEqual(team["league_id"], league["id"])
+        self.assertEqual(team["program_id"], league["id"])
 
     def test_teams_for_league_lists_permanent_members(self):
         league, season, division, club = _fixture(self.api)
         self.api.create_team(club["id"], division["id"], "Lions", actor_id=ADMIN)
         self.api.create_team(club["id"], division["id"], "Falcons", actor_id=ADMIN)
         names = [t["name"]
-                 for t in self.api.list_league_teams(league["id"])["teams"]]
+                 for t in self.api.list_program_teams(league["id"])["teams"]]
         self.assertEqual(sorted(names), ["Falcons", "Lions"])
 
     def test_create_team_under_league_without_a_division(self):
-        # #180 UI correction: a team is created under the LEAGUE directly; its
+        # #180 UI correction: a team is created under the PROGRAM directly; its
         # season/division comes later via registration, not at creation.
         league, season, division, club = _fixture(self.api)
         team = self.api.create_team(club["id"], name="Bears",
-                                    league_id=league["id"], actor_id=ADMIN)
-        self.assertEqual(team["league_id"], league["id"])
+                                    program_id=league["id"], actor_id=ADMIN)
+        self.assertEqual(team["program_id"], league["id"])
         self.assertIsNone(team["division_id"])
 
     def test_create_team_needs_a_league_or_division(self):
@@ -64,9 +64,9 @@ class TeamLeagueMembershipTest(unittest.TestCase):
 
     def test_create_team_rejects_division_from_a_different_league(self):
         league_a, _, div_a, club = _fixture(self.api, "League A")
-        league_b = self.api.create_league("League B", actor_id=ADMIN)
+        league_b = self.api.create_program("League B", actor_id=ADMIN)
         res = self.api.create_team(club["id"], div_a["id"], "Mismatch",
-                                   league_id=league_b["id"], actor_id=ADMIN)
+                                   program_id=league_b["id"], actor_id=ADMIN)
         self.assertEqual(res["error"]["code"], "validation_error")
 
 
@@ -91,7 +91,7 @@ class SeasonRegistrationServiceTest(unittest.TestCase):
         self.assertTrue(reg["active"])
         # The Team was not duplicated by registering it.
         self.assertEqual(
-            len(self.api.list_league_teams(self.league["id"])["teams"]), 1)
+            len(self.api.list_program_teams(self.league["id"])["teams"]), 1)
 
     def test_duplicate_registration_in_same_season_is_rejected(self):
         self._register()
@@ -99,7 +99,7 @@ class SeasonRegistrationServiceTest(unittest.TestCase):
         self.assertEqual(dup["error"]["code"], "validation_error")
 
     def test_cross_league_registration_is_rejected(self):
-        other_league = self.api.create_league("Other", actor_id=ADMIN)
+        other_league = self.api.create_program("Other", actor_id=ADMIN)
         other_season = self.api.create_season(other_league["id"], "S", actor_id=ADMIN)
         reg = self.api.register_team_for_season(
             other_season["id"], self.team["id"], actor_id=ADMIN)
@@ -142,7 +142,7 @@ class SeasonRegistrationServiceTest(unittest.TestCase):
         self.assertFalse(removed["active"])
         # The permanent Team survives removal from the season.
         self.assertEqual(
-            len(self.api.list_league_teams(self.league["id"])["teams"]), 1)
+            len(self.api.list_program_teams(self.league["id"])["teams"]), 1)
         # Re-registering reactivates the same row rather than duplicating it.
         again = self._register()
         self.assertEqual(again["id"], reg["id"])
@@ -180,40 +180,65 @@ class SeasonRegistrationPersistenceTest(unittest.TestCase):
         del api
 
         reopened = SqlStore(path)
-        self.assertEqual(reopened.get_team(team["id"]).league_id, league["id"])
+        self.assertEqual(reopened.get_team(team["id"]).program_id, league["id"])
         persisted = reopened.get_season_team_registration(reg["id"])
         self.assertIsNotNone(persisted)
         self.assertEqual(persisted.team_id, team["id"])
         self.assertEqual(persisted.division_id, division["id"])
         self.assertTrue(persisted.active)
 
-    def test_legacy_team_backfills_league_and_one_registration(self):
-        # A pre-#180 database has a team under a division but no league_id and no
-        # registration. Re-running migration 021 must derive the league and
-        # create exactly one registration, deterministically.
+    def test_legacy_team_backfills_program_and_one_registration(self):
+        # A pre-#180 database has a team under a division but no permanent
+        # program and no registration. Reversing the #233 competition-model
+        # rename back to the pre-028 shape and re-running migrations 021
+        # (permanent teams) then 028 (competition reset) must derive the team's
+        # program and create exactly one registration, deterministically.
         path = self._durable()
         api = ApiService(SqlStore(path))
         league, season, division, club = _fixture(api)
         team = api.create_team(club["id"], division["id"], "Lions", actor_id=ADMIN)
         store = api.store
         cur = store.conn.cursor()
+        # Reverse migration 028 (#233 C1b) to the pre-028 competition-model names
+        # a legacy DB carried, so migration 021's backfill (which reads the old
+        # names) can re-run, followed by 028 performing the rename again.
+        cur.execute("ALTER TABLE games DROP COLUMN league_id")
+        cur.execute("ALTER TABLE season_team_registrations DROP COLUMN league_id")
+        cur.execute("ALTER TABLE divisions RENAME COLUMN league_id TO level_id")
+        cur.execute("DROP INDEX IF EXISTS ix_leagues_external_ref")
+        cur.execute("ALTER TABLE leagues RENAME TO levels")
+        cur.execute("CREATE INDEX ix_levels_external_ref ON levels(external_ref)")
+        cur.execute("DROP INDEX IF EXISTS ix_teams_program")
+        cur.execute("ALTER TABLE teams RENAME COLUMN program_id TO league_id")
+        cur.execute("DROP INDEX IF EXISTS ix_seasons_program")
+        cur.execute("ALTER TABLE seasons RENAME COLUMN program_id TO league_id")
+        cur.execute("DROP INDEX IF EXISTS ix_programs_operator_organization")
+        cur.execute("DROP INDEX IF EXISTS ix_programs_external_ref")
+        cur.execute("ALTER TABLE programs RENAME TO leagues")
+        cur.execute("ALTER TABLE leagues "
+                    "RENAME COLUMN operator_organization_id TO organization_id")
+        cur.execute("CREATE INDEX ix_leagues_external_ref ON leagues(external_ref)")
+        # Give the season a single grouping league (level) so the #233 reset gate
+        # can deterministically reparent the division/registration on re-boot.
+        cur.execute("INSERT INTO levels (id, season_id, name, sort_order) "
+                    "VALUES (?, ?, 'L1', 0)", ("level_legacy", season["id"]))
         # Simulate the legacy shape: a pre-#180 team carried a Team.division_id
         # (create_team no longer writes one). Set it directly so migration 021
-        # has the legacy link to backfill league_id + a registration from.
+        # has the legacy link to backfill the permanent program + a registration.
         cur.execute("UPDATE teams SET division_id = ? WHERE id = ?",
                     (division["id"], team["id"]))
-        # Then drop the #180 additions and their ledger entry, and reopen so
-        # migration 021 re-runs its backfill over the legacy team/division rows.
+        # Then drop the #180 additions and their ledger entry plus the 028 entry,
+        # and reopen so migrations 021 then 028 re-run over the legacy rows.
         cur.execute("DROP INDEX IF EXISTS ix_teams_league")
         cur.execute("ALTER TABLE teams DROP COLUMN league_id")
         cur.execute("DROP TABLE IF EXISTS season_team_registrations")
-        cur.execute("DELETE FROM schema_migrations WHERE version = "
-                    "'021_permanent_teams'")
+        cur.execute("DELETE FROM schema_migrations WHERE version IN "
+                    "('021_permanent_teams', '028_competition_reset')")
         store.conn.commit()
         del api, store
 
         reopened = SqlStore(path)
-        self.assertEqual(reopened.get_team(team["id"]).league_id, league["id"])
+        self.assertEqual(reopened.get_team(team["id"]).program_id, league["id"])
         regs = reopened.registrations_for_season(season["id"])
         self.assertEqual(len(regs), 1)
         self.assertEqual(regs[0].team_id, team["id"])

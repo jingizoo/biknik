@@ -37,12 +37,12 @@ import tempfile
 # configures, so a dropped table or lost relationship shows up as a count gap.
 _CENSUS = [
     ("organizations", "all_organizations"),
-    ("leagues", "all_leagues"),
+    ("leagues", "all_programs"),
     ("venues", "all_venues"),
     ("rinks", "all_rinks"),
     ("ice_slots", "all_ice_slots"),
     ("seasons", "all_seasons"),
-    ("levels", "all_levels"),
+    ("levels", "all_leagues"),
     ("divisions", "all_divisions"),
     ("clubs", "all_clubs"),
     ("teams", "all_teams"),
@@ -72,8 +72,8 @@ def configure_sample(api, actor_id: str = SAMPLE_ADMIN) -> None:
     """
     api.accounts.create_account(SAMPLE_ADMIN, "not-a-real-secret", "league_admin")
     org = api.create_organization("Canlon", short_name="CAN", actor_id=actor_id)
-    league = api.create_league("Over 55", country="US",
-                               organization_id=org["id"], actor_id=actor_id)
+    league = api.create_program("Over 55", country="US",
+                                operator_organization_id=org["id"], actor_id=actor_id)
     venue = api.create_venue("Plainfield", address="1 Rink Rd",
                              league_id=league["id"], actor_id=actor_id)
     rink = api.create_rink(venue["id"], "Rink 1", actor_id=actor_id)

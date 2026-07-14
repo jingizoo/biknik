@@ -19,8 +19,8 @@ from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
 
 from hockey_scheduler.api import ApiService
 from hockey_scheduler.domain import (
-    Division, Game, IceSlot, IceSlotStatus, League, Official, Organization,
-    Rink, Season, SeasonTeamRegistration, Team, Venue)
+    Division, Game, IceSlot, IceSlotStatus, Official, Organization,
+    Program, Rink, Season, SeasonTeamRegistration, Team, Venue)
 from hockey_scheduler.store import InMemoryStore
 from hockey_scheduler.web import server as srv
 
@@ -30,15 +30,15 @@ UTC = timezone.utc
 def _seeded_api():
     s = InMemoryStore()
     s.add_organization(Organization(id="org", name="Owner"))
-    s.add_league(League(id="league", name="League", organization_id="org"))
-    s.add_season(Season(id="se", league_id="league", name="Season"))
+    s.add_program(Program(id="league", name="League", operator_organization_id="org"))
+    s.add_season(Season(id="se", program_id="league", name="Season"))
     s.add_division(Division(id="d", season_id="se", name="D1"))
     s.add_venue(Venue(id="v", name="Arena", organization_id="org",
                       league_id="league"))
     s.add_rink(Rink(id="r1", venue_id="v", name="Main"))
     for i in range(4):
         s.add_team(Team(id=f"t{i}", name=f"T{i}", division="D1", division_id="d",
-                        league_id="league"))
+                        program_id="league"))
         # Participation is per-season (#180): draft scheduling reads the
         # registration, so register each seeded team into the season+division.
         s.add_season_team_registration(SeasonTeamRegistration(

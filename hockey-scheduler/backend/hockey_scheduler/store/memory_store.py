@@ -26,7 +26,7 @@ from ..domain import (
     DeliveryStatus,
     DeviceToken,
     League,
-    Level,
+    Program,
     Notification,
     NotificationDelivery,
     GuardianLink,
@@ -65,9 +65,9 @@ class InMemoryStore:
         self.notifications: List[NotificationEvent] = []
         # Organization & arena setup collections.
         self.organizations: Dict[str, Organization] = {}
-        self.leagues: Dict[str, League] = {}
+        self.programs: Dict[str, Program] = {}
         self.seasons: Dict[str, Season] = {}
-        self.levels: Dict[str, Level] = {}
+        self.leagues: Dict[str, League] = {}
         self.divisions: Dict[str, Division] = {}
         self.season_team_registrations: Dict[str, SeasonTeamRegistration] = {}
         self.clubs: Dict[str, Club] = {}
@@ -295,12 +295,13 @@ class InMemoryStore:
         return [n for n in self.notifications if n.game_id == game_id]
 
     # -- organization & arena setup ---------------------------------------
-    def add_league(self, league: League) -> League:
-        self.leagues[league.id] = league
-        return league
+    # Umbrella competition entity: Program (#233, formerly League).
+    def add_program(self, program: Program) -> Program:
+        self.programs[program.id] = program
+        return program
 
-    def get_league(self, league_id: str) -> Optional[League]:
-        return self.leagues.get(league_id)
+    def get_program(self, program_id: str) -> Optional[Program]:
+        return self.programs.get(program_id)
 
     def add_season(self, season: Season) -> Season:
         self.seasons[season.id] = season
@@ -309,15 +310,16 @@ class InMemoryStore:
     def get_season(self, season_id: str) -> Optional[Season]:
         return self.seasons.get(season_id)
 
-    def seasons_for_league(self, league_id: str) -> List[Season]:
-        return [s for s in self.seasons.values() if s.league_id == league_id]
+    def seasons_for_program(self, program_id: str) -> List[Season]:
+        return [s for s in self.seasons.values() if s.program_id == program_id]
 
-    def add_level(self, level: Level) -> Level:
-        self.levels[level.id] = level
-        return level
+    # Competition grouping: League (#233, formerly Level).
+    def add_league(self, league: League) -> League:
+        self.leagues[league.id] = league
+        return league
 
-    def get_level(self, level_id: str) -> Optional[Level]:
-        return self.levels.get(level_id)
+    def get_league(self, league_id: str) -> Optional[League]:
+        return self.leagues.get(league_id)
 
     def add_division(self, division: Division) -> Division:
         self.divisions[division.id] = division
@@ -339,8 +341,8 @@ class InMemoryStore:
     def get_team(self, team_id: str) -> Optional[Team]:
         return self.teams.get(team_id)
 
-    def teams_for_league(self, league_id: str) -> List[Team]:
-        return [t for t in self.teams.values() if t.league_id == league_id]
+    def teams_for_program(self, program_id: str) -> List[Team]:
+        return [t for t in self.teams.values() if t.program_id == program_id]
 
     # -- season team registrations (#180) ----------------------------------
     def add_season_team_registration(
@@ -760,14 +762,14 @@ class InMemoryStore:
         return entry
 
     # -- listings (interface shared with the SQL store) -------------------
-    def all_leagues(self) -> List[League]:
-        return list(self.leagues.values())
+    def all_programs(self) -> List[Program]:
+        return list(self.programs.values())
 
     def all_seasons(self) -> List[Season]:
         return list(self.seasons.values())
 
-    def all_levels(self) -> List[Level]:
-        return list(self.levels.values())
+    def all_leagues(self) -> List[League]:
+        return list(self.leagues.values())
 
     def all_divisions(self) -> List[Division]:
         return list(self.divisions.values())
@@ -802,14 +804,14 @@ class InMemoryStore:
     def delete_organization(self, org_id: str) -> None:
         self.organizations.pop(org_id, None)
 
-    def delete_league(self, league_id: str) -> None:
-        self.leagues.pop(league_id, None)
+    def delete_program(self, program_id: str) -> None:
+        self.programs.pop(program_id, None)
 
     def delete_season(self, season_id: str) -> None:
         self.seasons.pop(season_id, None)
 
-    def delete_level(self, level_id: str) -> None:
-        self.levels.pop(level_id, None)
+    def delete_league(self, league_id: str) -> None:
+        self.leagues.pop(league_id, None)
 
     def delete_division(self, division_id: str) -> None:
         self.divisions.pop(division_id, None)
@@ -840,6 +842,10 @@ class InMemoryStore:
         self.games[game.id] = game
         return game
 
+    def save_program(self, program: Program) -> Program:
+        self.programs[program.id] = program
+        return program
+
     def save_league(self, league: League) -> League:
         self.leagues[league.id] = league
         return league
@@ -859,10 +865,6 @@ class InMemoryStore:
     def save_season(self, season: Season) -> Season:
         self.seasons[season.id] = season
         return season
-
-    def save_level(self, level: Level) -> Level:
-        self.levels[level.id] = level
-        return level
 
     def save_team(self, team: Team) -> Team:
         self.teams[team.id] = team

@@ -26,16 +26,19 @@ from .roles import Role
 
 
 @dataclass
-class League:
+class Program:
+    """The umbrella competition entity (#233, formerly ``League``). A Program is
+    operated by a facility Organization and holds Seasons."""
     id: str
     name: str
     country: str = ""
     timezone: str = "UTC"
-    # Owning facility organization (#173). Nullable — pre-existing leagues and
-    # leagues created without an owner have none until one is assigned.
-    organization_id: Optional[str] = None
+    # Operating facility organization (#173/#233). Nullable — pre-existing
+    # programs and programs created without an operator have none until one is
+    # assigned.
+    operator_organization_id: Optional[str] = None
     # Stable import-matching key (#174 PR E), mirroring Rink/Team/Player/
-    # Official's external_ref (#93-#95): leagues are matched across repeat
+    # Official's external_ref (#93-#95): programs are matched across repeat
     # hierarchy uploads by this code (the sheet's league_code), not by name.
     external_ref: Optional[str] = None
 
@@ -43,7 +46,7 @@ class League:
 @dataclass
 class Season:
     id: str
-    league_id: str
+    program_id: str
     name: str
     start_date: Optional[datetime] = None
     end_date: Optional[datetime] = None
@@ -53,16 +56,16 @@ class Season:
 
 
 @dataclass
-class Level:
-    """A competitive level/tier between Season and Division (#166). A season
-    like "Over 55" can run several levels ("Level 1", "Level 2"), each holding
-    its own divisions. Divisions link up via a nullable ``level_id`` so existing
-    divisions need no backfill and a level is always optional."""
+class League:
+    """A competitive league/grouping between Season and Division (#233, formerly
+    ``Level``). A season like "Over 55" can run several leagues ("Level 1",
+    "Level 2"), each holding its own divisions. Divisions link up via
+    ``league_id``."""
     id: str
     season_id: str
     name: str
     sort_order: int = 0
-    # Stable import-matching key (#174 PR E) — levels are matched across
+    # Stable import-matching key (#174 PR E) — leagues are matched across
     # repeat hierarchy uploads by this code (the sheet's level_code).
     external_ref: Optional[str] = None
 
@@ -73,9 +76,10 @@ class Division:
     season_id: str
     name: str
     age_group: str = ""
-    # Owning competitive level/tier (#166). Nullable — pre-existing divisions
-    # and divisions created without a level sit directly under their season.
-    level_id: Optional[str] = None
+    # Owning competitive league/grouping (#166/#233). Nullable at the model
+    # level; the reparent migration (#233 Slice C1b) backfills a league for
+    # every division from its season's sole league.
+    league_id: Optional[str] = None
     # Stable import-matching key (#174 PR E) — divisions are matched across
     # repeat hierarchy uploads by this code (the sheet's division_code).
     external_ref: Optional[str] = None
@@ -97,6 +101,10 @@ class SeasonTeamRegistration:
     season_id: str
     team_id: str
     division_id: Optional[str] = None
+    # Owning competition league (#233 Slice C1b). Nullable at the model level;
+    # the reparent migration derives it from the validated same-Season chain
+    # (division's league, else the season's sole league).
+    league_id: Optional[str] = None
     active: bool = True
 
 

@@ -74,6 +74,28 @@ class MigrationApplyTest(unittest.TestCase):
         try:
             store = SqlStore(path)
             cur = store.conn.cursor()
+            # Reverse migration 028 (#233 C1b) first so the DB is back at the
+            # pre-028 competition-model names a legacy adopter would carry. The
+            # legacy-strip below then operates on those original names, and the
+            # re-boot re-applies 001-028 (028 performing the rename again).
+            cur.execute("ALTER TABLE games DROP COLUMN league_id")
+            cur.execute("ALTER TABLE season_team_registrations DROP COLUMN league_id")
+            cur.execute("ALTER TABLE divisions RENAME COLUMN league_id TO level_id")
+            cur.execute("DROP INDEX IF EXISTS ix_leagues_external_ref")
+            cur.execute("ALTER TABLE leagues RENAME TO levels")
+            cur.execute("CREATE INDEX ix_levels_external_ref ON levels(external_ref)")
+            cur.execute("DROP INDEX IF EXISTS ix_teams_program")
+            cur.execute("ALTER TABLE teams RENAME COLUMN program_id TO league_id")
+            cur.execute("CREATE INDEX ix_teams_league ON teams(league_id)")
+            cur.execute("DROP INDEX IF EXISTS ix_seasons_program")
+            cur.execute("ALTER TABLE seasons RENAME COLUMN program_id TO league_id")
+            cur.execute("DROP INDEX IF EXISTS ix_programs_operator_organization")
+            cur.execute("DROP INDEX IF EXISTS ix_programs_external_ref")
+            cur.execute("ALTER TABLE programs RENAME TO leagues")
+            cur.execute("ALTER TABLE leagues "
+                        "RENAME COLUMN operator_organization_id TO organization_id")
+            cur.execute("CREATE INDEX ix_leagues_organization ON leagues(organization_id)")
+            cur.execute("CREATE INDEX ix_leagues_external_ref ON leagues(external_ref)")
             for col in ("last_attempt_at", "next_attempt_at", "dead_lettered_at"):
                 cur.execute(f"ALTER TABLE notification_deliveries DROP COLUMN {col}")
             cur.execute("ALTER TABLE games DROP COLUMN is_draft")  # #86 additive col
@@ -126,16 +148,23 @@ class MigrationApplyTest(unittest.TestCase):
                 {"created_by", "last_used_at", "revoked_by"}
                 <= _table_columns(adopted, "calendar_feed_tokens"))
             self.assertIn("organization_id", _table_columns(adopted, "venues"))
-            self.assertIn("organization_id", _table_columns(adopted, "leagues"))
+            # #233 C1b: the umbrella is now `programs` with operator_organization_id.
+            self.assertIn("operator_organization_id",
+                          _table_columns(adopted, "programs"))
             self.assertIn("league_id", _table_columns(adopted, "venues"))
-            # #174 PR E hierarchy external_ref columns re-landed on every table.
-            for tbl in ("organizations", "leagues", "venues", "seasons",
-                        "levels", "divisions"):
+            # #174 PR E hierarchy external_ref columns re-landed on every table
+            # (post-028 names: `programs` umbrella, `leagues` grouping).
+            for tbl in ("organizations", "programs", "venues", "seasons",
+                        "leagues", "divisions"):
                 self.assertIn("external_ref", _table_columns(adopted, tbl))
-            # #180 permanent-teams column + registrations table re-landed.
-            self.assertIn("league_id", _table_columns(adopted, "teams"))
+            # #180 permanent-teams column (now program_id) + registrations table.
+            self.assertIn("program_id", _table_columns(adopted, "teams"))
             self.assertIn("season_id",
                           _table_columns(adopted, "season_team_registrations"))
+            # #233 C1b reparent columns landed on registrations and games.
+            self.assertIn("league_id",
+                          _table_columns(adopted, "season_team_registrations"))
+            self.assertIn("league_id", _table_columns(adopted, "games"))
         finally:
             os.remove(path)
 

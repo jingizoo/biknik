@@ -79,7 +79,7 @@ class HierarchyImportContract:
         self.assertFalse(result["ok"])
         self.assertTrue(any("Unknown organization_code MISSING" in e["message"]
                             for e in result["errors"]))
-        self.assertEqual(self.store.all_leagues(), [])
+        self.assertEqual(self.store.all_programs(), [])
 
     def test_venue_owner_must_match_league_owner(self):
         organizations = ORGANIZATIONS + "OTHER,Other Owner,Other\n"
@@ -114,18 +114,18 @@ class HierarchyImportContract:
         self.assertEqual(summary["divisions"]["created"], 2)
 
         org = by_ref(self.store.all_organizations(), "CANLON")
-        league = by_ref(self.store.all_leagues(), "OVER55")
+        league = by_ref(self.store.all_programs(), "OVER55")
         venue = by_ref(self.store.all_venues(), "PLAINFIELD")
         season = by_ref(self.store.all_seasons(), "FALL26")
-        level = by_ref(self.store.all_levels(), "L1")
+        level = by_ref(self.store.all_leagues(), "L1")
         division = by_ref(self.store.all_divisions(), "DIVA")
-        self.assertEqual(league.organization_id, org.id)
+        self.assertEqual(league.operator_organization_id, org.id)
         self.assertEqual(venue.organization_id, org.id)
         self.assertEqual(venue.league_id, league.id)
-        self.assertEqual(season.league_id, league.id)
+        self.assertEqual(season.program_id, league.id)
         self.assertEqual(level.season_id, season.id)
         self.assertEqual(division.season_id, season.id)
-        self.assertEqual(division.level_id, level.id)
+        self.assertEqual(division.league_id, level.id)
         self.assertEqual({r.venue_id for r in self.store.all_rinks()}, {venue.id})
 
     def test_identical_repeat_is_skipped_not_duplicated(self):
@@ -143,21 +143,21 @@ class HierarchyImportContract:
                      "seasons", "levels", "divisions"):
             self.assertGreater(result["summary"][name]["skipped"], 0)
         self.assertEqual(len(self.store.all_organizations()), 1)
-        self.assertEqual(len(self.store.all_leagues()), 1)
+        self.assertEqual(len(self.store.all_programs()), 1)
         self.assertEqual(len(self.store.all_venues()), 1)
         self.assertEqual(len(self.store.all_rinks()), 2)
         self.assertEqual(len(self.store.all_seasons()), 1)
-        self.assertEqual(len(self.store.all_levels()), 1)
+        self.assertEqual(len(self.store.all_leagues()), 1)
         self.assertEqual(len(self.store.all_divisions()), 2)
 
     def test_changed_repeat_updates_in_place(self):
         self.api.commit_hierarchy_import(payload(), actor_id="admin")
         ids = {
             "org": by_ref(self.store.all_organizations(), "CANLON").id,
-            "league": by_ref(self.store.all_leagues(), "OVER55").id,
+            "league": by_ref(self.store.all_programs(), "OVER55").id,
             "venue": by_ref(self.store.all_venues(), "PLAINFIELD").id,
             "season": by_ref(self.store.all_seasons(), "FALL26").id,
-            "level": by_ref(self.store.all_levels(), "L1").id,
+            "level": by_ref(self.store.all_leagues(), "L1").id,
             "division": by_ref(self.store.all_divisions(), "DIVA").id,
         }
         changed = payload(
@@ -174,10 +174,10 @@ class HierarchyImportContract:
         self.assertEqual(result["summary"]["seasons"]["updated"], 1)
         self.assertEqual(result["summary"]["divisions"]["updated"], 1)
         self.assertEqual(by_ref(self.store.all_organizations(), "CANLON").id, ids["org"])
-        self.assertEqual(by_ref(self.store.all_leagues(), "OVER55").id, ids["league"])
+        self.assertEqual(by_ref(self.store.all_programs(), "OVER55").id, ids["league"])
         self.assertEqual(by_ref(self.store.all_venues(), "PLAINFIELD").id, ids["venue"])
         self.assertEqual(by_ref(self.store.all_seasons(), "FALL26").id, ids["season"])
-        self.assertEqual(by_ref(self.store.all_levels(), "L1").id, ids["level"])
+        self.assertEqual(by_ref(self.store.all_leagues(), "L1").id, ids["level"])
         self.assertEqual(by_ref(self.store.all_divisions(), "DIVA").id, ids["division"])
 
     def test_incremental_files_can_reference_existing_codes(self):
@@ -194,7 +194,7 @@ class HierarchyImportContract:
         result = self.api.commit_hierarchy_import(payload(
             leagues_csv="", venues_rinks_csv="", competition_csv=""))
         self.assertTrue(result["committed"])
-        self.assertEqual(len(self.store.all_leagues()), 1)
+        self.assertEqual(len(self.store.all_programs()), 1)
         self.assertEqual(len(self.store.all_venues()), 1)
         self.assertEqual(len(self.store.all_divisions()), 2)
 
@@ -203,7 +203,7 @@ class HierarchyImportContract:
         result = self.api.commit_hierarchy_import(bad, actor_id="admin")
         self.assertFalse(result["committed"])
         self.assertEqual(self.store.all_organizations(), [])
-        self.assertEqual(self.store.all_leagues(), [])
+        self.assertEqual(self.store.all_programs(), [])
         self.assertEqual(self.store.all_setup_audit(), [])
 
     def test_batch_and_entity_audits_share_batch_id(self):

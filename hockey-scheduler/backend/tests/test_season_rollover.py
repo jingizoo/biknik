@@ -30,7 +30,7 @@ class SeasonRolloverServiceTest(unittest.TestCase):
     def setUp(self):
         self.api = ApiService(InMemoryStore())
         api = self.api
-        self.league = api.create_league("L", actor_id=ADMIN)
+        self.league = api.create_program("L", actor_id=ADMIN)
         self.s1 = api.create_season(self.league["id"], "2026-27", actor_id=ADMIN)
         self.s2 = api.create_season(self.league["id"], "2027-28", actor_id=ADMIN)
         self.d1 = api.create_division(self.s1["id"], "Div A", actor_id=ADMIN)
@@ -85,13 +85,13 @@ class SeasonRolloverServiceTest(unittest.TestCase):
     def test_cross_league_source_team_is_rejected_with_no_writes(self):
         # A source row whose Team permanently belongs to another league must
         # abort rather than carry a foreign team into this league's season.
-        other = self.api.create_league("Other", actor_id=ADMIN)
+        other = self.api.create_program("Other", actor_id=ADMIN)
         other_season = self.api.create_season(other["id"], "OS", actor_id=ADMIN)
         other_div = self.api.create_division(other_season["id"], "OD", actor_id=ADMIN)
         foreign = self.api.create_team(
             self.api.create_club("FC", actor_id=ADMIN)["id"],
             other_div["id"], "Foreign", actor_id=ADMIN)
-        self.assertEqual(foreign["league_id"], other["id"])
+        self.assertEqual(foreign["program_id"], other["id"])
         self._inject_source_reg(foreign["id"])
         audits_before = self._audit_count()
         res = self.api.roll_forward_registrations(
@@ -103,7 +103,7 @@ class SeasonRolloverServiceTest(unittest.TestCase):
     def test_cross_league_team_via_selection_is_rejected(self):
         # Same defense on the selective path: a hand-picked team whose Team is
         # cross-league is rejected before any write.
-        other = self.api.create_league("Other", actor_id=ADMIN)
+        other = self.api.create_program("Other", actor_id=ADMIN)
         other_season = self.api.create_season(other["id"], "OS", actor_id=ADMIN)
         other_div = self.api.create_division(other_season["id"], "OD", actor_id=ADMIN)
         foreign = self.api.create_team(
@@ -189,9 +189,9 @@ class SeasonRolloverServiceTest(unittest.TestCase):
         self.assertEqual(len(self._active(self.s2["id"])), 1)
 
     def test_reuses_permanent_team_records(self):
-        before = len(self.api.list_league_teams(self.league["id"])["teams"])
+        before = len(self.api.list_program_teams(self.league["id"])["teams"])
         self.api.roll_forward_registrations(self.s1["id"], self.s2["id"], actor_id=ADMIN)
-        after = len(self.api.list_league_teams(self.league["id"])["teams"])
+        after = len(self.api.list_program_teams(self.league["id"])["teams"])
         self.assertEqual(before, after)  # rollover copies participation, not teams
 
     def test_idempotent_skip_when_already_registered(self):
@@ -202,7 +202,7 @@ class SeasonRolloverServiceTest(unittest.TestCase):
         self.assertEqual(len(self._active(self.s2["id"])), 2)
 
     def test_cross_league_rollover_is_rejected(self):
-        other = self.api.create_league("Other", actor_id=ADMIN)
+        other = self.api.create_program("Other", actor_id=ADMIN)
         other_season = self.api.create_season(other["id"], "X", actor_id=ADMIN)
         res = self.api.roll_forward_registrations(self.s1["id"], other_season["id"], actor_id=ADMIN)
         self.assertEqual(res["error"]["code"], "validation_error")

@@ -8,6 +8,12 @@ manual create, move/reschedule, draft generation, and publish from drifting.
 from typing import Optional
 
 from ..domain.errors import DomainError, NotFoundError, ValidationError
+from .scope_bridge import (
+    get_scope_program,
+    program_operator_id,
+    season_scope_id,
+    team_scope_id,
+)
 
 
 def venue_for_slot(store, ice_slot_id):
@@ -60,16 +66,17 @@ def league_id_for_division(store, division_id: str) -> str:
                 "season_id": division.season_id,
             },
         )
-    if not season.league_id or store.get_league(season.league_id) is None:
+    scope_id = season_scope_id(season)
+    if not scope_id or get_scope_program(store, scope_id) is None:
         raise ValidationError(
             "Season is not linked to a valid league.",
             details={
                 "reason": "season_league_missing",
                 "season_id": season.id,
-                "league_id": season.league_id,
+                "league_id": scope_id,
             },
         )
-    return season.league_id
+    return scope_id
 
 
 def league_id_for_game(store, game) -> Optional[str]:
@@ -96,17 +103,18 @@ def league_id_for_game(store, game) -> Optional[str]:
                     "season_id": season_id,
                 },
             )
-        if not season.league_id or store.get_league(season.league_id) is None:
+        season_scope = season_scope_id(season)
+        if not season_scope or get_scope_program(store, season_scope) is None:
             raise ValidationError(
                 "Game season is not linked to a valid league.",
                 details={
                     "reason": "season_league_missing",
                     "game_id": getattr(game, "id", None),
                     "season_id": season.id,
-                    "league_id": season.league_id,
+                    "league_id": season_scope,
                 },
             )
-        resolved.add(season.league_id)
+        resolved.add(season_scope)
 
     division_id = getattr(game, "division_id", None)
     if division_id:
@@ -121,8 +129,8 @@ def league_id_for_game(store, game) -> Optional[str]:
     for team_id in (getattr(game, "home_team_id", None),
                     getattr(game, "away_team_id", None)):
         team = store.get_team(team_id) if team_id else None
-        if team and team.league_id:
-            resolved.add(team.league_id)
+        if team and team_scope_id(team):
+            resolved.add(team_scope_id(team))
 
     if len(resolved) > 1:
         raise ValidationError(
@@ -153,18 +161,19 @@ def team_registration_valid(store, season, team_id, division_id=None,
     division must match too. A registration is valid only when the season has a
     concrete league and the Team has the *same* concrete league — a missing
     league on either side is never treated as a match (#200 review)."""
-    if season is None or not season.league_id:
+    season_scope = season_scope_id(season) if season is not None else None
+    if season is None or not season_scope:
         return None
     # The shared league must actually EXIST (#180 review): a season and team
     # that share a dangling/non-existent league id are not league-consistent —
     # no operational consumer may trust such a row.
-    if store.get_league(season.league_id) is None:
+    if get_scope_program(store, season_scope) is None:
         return None
     reg = store.registration_for_team_in_season(season.id, team_id)
     if reg is None or not reg.active:
         return None
     team = store.get_team(team_id)
-    if team is None or not team.league_id or team.league_id != season.league_id:
+    if team is None or not team_scope_id(team) or team_scope_id(team) != season_scope:
         return None
     if require_division and division_id is not None and reg.division_id != division_id:
         return None
@@ -181,15 +190,15 @@ def registered_team_ids_in_division(store, division_id):
     if division is None:
         return set()
     season = store.get_season(division.season_id)
-    if season is None or not season.league_id:
+    if season is None or not season_scope_id(season):
         return set()  # dangling season, or a season with no league — trust nothing
-    league_id = season.league_id
+    league_id = season_scope_id(season)
     ids = set()
     for reg in store.registrations_for_season(division.season_id):
         if not reg.active or reg.division_id != division_id:
             continue
         team = store.get_team(reg.team_id)
-        if team is None or not team.league_id or team.league_id != league_id:
+        if team is None or not team_scope_id(team) or team_scope_id(team) != league_id:
             continue  # orphaned, null-league, or cross-league row — never trusted
         ids.add(reg.team_id)
     return ids
@@ -215,7 +224,7 @@ def require_slot_belongs_to_league(store, ice_slot_id: str, league_id: str):
     Returns the resolved Venue so callers that need venue context do not repeat
     the traversal. Unassigned and cross-league inventory are both invalid.
     """
-    league = store.get_league(league_id) if league_id else None
+    league = get_scope_program(store, league_id) if league_id else None
     if league is None:
         raise ValidationError(
             "A valid league is required before assigning game ice.",
@@ -243,7 +252,8 @@ def require_slot_belongs_to_league(store, ice_slot_id: str, league_id: str):
                 "actual_league_id": venue.league_id,
             },
         )
-    if (league.organization_id or None) != (venue.organization_id or None):
+    league_organization_id = program_operator_id(league)
+    if (league_organization_id or None) != (venue.organization_id or None):
         raise ValidationError(
             "The venue owner does not match the league owner.",
             details={
@@ -251,7 +261,7 @@ def require_slot_belongs_to_league(store, ice_slot_id: str, league_id: str):
                 "ice_slot_id": ice_slot_id,
                 "venue_id": venue.id,
                 "league_id": league_id,
-                "league_organization_id": league.organization_id,
+                "league_organization_id": league_organization_id,
                 "venue_organization_id": venue.organization_id,
             },
         )

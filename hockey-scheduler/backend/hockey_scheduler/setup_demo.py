@@ -16,7 +16,7 @@ def main() -> None:
     api = ApiService()
     actor = "league_admin"
 
-    league = api.create_league("EU Premier Hockey", country="DE", actor_id=actor)
+    league = api.create_program("EU Premier Hockey", country="DE", actor_id=actor)
     season = api.create_season(league["id"], "2026/27", actor_id=actor)
     division = api.create_division(season["id"], "U16", age_group="U16", actor_id=actor)
 

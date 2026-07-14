@@ -47,7 +47,7 @@ def _seeded_api():
     so substitute enrollment there always hits slot_already_filled."""
     api = ApiService(InMemoryStore())
     api.roster.clock = FakeClock()
-    league = api.setup.create_league("L")
+    league = api.setup.create_program("L")
     season = api.setup.create_season(league.id, "S")
     div = api.setup.create_division(season.id, "U16")
     home = api.setup.create_team(api.setup.create_club("LH").id, div.id, "Lions")

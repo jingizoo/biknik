@@ -34,7 +34,7 @@ class _Base(unittest.TestCase):
     def setUp(self):
         self.store = InMemoryStore()
         self.svc = SetupService(self.store, clock=FakeClock())
-        self.league = self.svc.create_league("L")
+        self.league = self.svc.create_program("L")
         self.season = self.svc.create_season(self.league.id, "S")
         self.div = self.svc.create_division(self.season.id, "U16")
         self.other_div = self.svc.create_division(self.season.id, "U18")
@@ -119,7 +119,7 @@ class CreateGameGuardTest(_Base):
     def test_cross_league_registration_row_is_rejected(self):
         # An injected/legacy registration whose Team belongs to another league
         # must not be trusted (#199/#200): the game is rejected.
-        other_league = self.svc.create_league("Other")
+        other_league = self.svc.create_program("Other")
         other_season = self.svc.create_season(other_league.id, "OS")
         other_div = self.svc.create_division(other_season.id, "OD")
         foreign = self.svc.create_team(
@@ -211,7 +211,7 @@ class StandingsRosterTest(_Base):
         self.store.add_season_team_registration(SeasonTeamRegistration(
             id="streg_orphan", season_id=self.season.id, team_id="ghost",
             division_id=self.div.id, active=True))
-        other = self.svc.create_league("Other")
+        other = self.svc.create_program("Other")
         foreign = self.svc.create_team(
             self.svc.create_club("FC").id,
             self.svc.create_division(
@@ -258,19 +258,19 @@ class LeagueScopedIceGuardTest(unittest.TestCase):
     def setUp(self):
         self.store = InMemoryStore()
         self.svc = LeagueScopedSetupService(self.store, clock=FakeClock())
-        self.la = self.svc.create_league("A")
+        self.la = self.svc.create_program("A")
         self.sa = self.svc.create_season(self.la.id, "SA")
         self.da = self.svc.create_division(self.sa.id, "DA")
         club = self.svc.create_club("C")
         # League-first: no division on the Team, participation via registration.
-        self.home = self.svc.create_team(club.id, name="Home", league_id=self.la.id)
-        self.away = self.svc.create_team(club.id, name="Away", league_id=self.la.id)
+        self.home = self.svc.create_team(club.id, name="Home", program_id=self.la.id)
+        self.away = self.svc.create_team(club.id, name="Away", program_id=self.la.id)
         self.assertIsNone(self.home.division_id)
         self.svc.register_team_for_season(self.sa.id, self.home.id, self.da.id)
         self.svc.register_team_for_season(self.sa.id, self.away.id, self.da.id)
         # League B owns a different rink; League A owns its own.
         rb = self.svc.create_rink(
-            self.svc.create_venue("VB", league_id=self.svc.create_league("B").id).id,
+            self.svc.create_venue("VB", league_id=self.svc.create_program("B").id).id,
             "RB")
         self.foreign_slot = self.svc.create_ice_slot(rb.id, dt(18), dt(20))
         ra = self.svc.create_rink(
@@ -297,7 +297,7 @@ class NullLeagueAndDanglingSeasonTest(_Base):
 
     def _inject_null_league_team(self):
         ghost = Team(id="team_nl", name="NoLeague",
-                     division_id=self.div.id, league_id=None)
+                     division_id=self.div.id, program_id=None)
         self.store.add_team(ghost)
         self.store.add_season_team_registration(SeasonTeamRegistration(
             id="streg_nl", season_id=self.season.id, team_id=ghost.id,
@@ -326,10 +326,10 @@ class NullLeagueAndDanglingSeasonTest(_Base):
     def test_dangling_season_league_yields_empty_roster(self):
         # A season whose league is missing/empty (or a division whose season is
         # dangling) must trust no registration into create, standings, or drafts.
-        self.store.add_season(Season(id="se_nl", league_id="", name="NL"))
+        self.store.add_season(Season(id="se_nl", program_id="", name="NL"))
         self.store.add_division(Division(id="d_nl", season_id="se_nl", name="D"))
         self.store.add_team(Team(id="t_nl", name="T", division_id="d_nl",
-                                 league_id=""))
+                                 program_id=""))
         self.store.add_season_team_registration(SeasonTeamRegistration(
             id="streg_dnl", season_id="se_nl", team_id="t_nl",
             division_id="d_nl", active=True))
