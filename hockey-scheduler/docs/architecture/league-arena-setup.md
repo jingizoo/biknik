@@ -30,11 +30,14 @@ Game   >── Season, League, (optional) Division, home Team, away Team, IceSlo
 ```
 
 - A **Program** is the permanent competition umbrella (e.g. *Adult Men*, *High School*).
-- A **League** is a season-specific grouping within a Program/Season (e.g. *Diamond*,
-  *Platinum*; *Varsity*, *Freshman*). *(Legacy name: **Level**.)*
+- A **League** is a season-specific grouping within a Program/Season (e.g. *Adult
+  League*, *Junior League*; *Varsity League*, *Freshman League*). *(Legacy name:
+  **Level**.)*
 - A **Division** keeps its name — only its parent changes (now a **League**, was
   Season/Level) and it becomes **optional**, an extra split of a League (e.g.
-  *North*/*South*).
+  *Gold*/*Silver*/*Diamond*, or *North*/*South*). *(Issue #245: Gold/Silver/Diamond
+  are Division examples, never League examples — an earlier doc revision had this
+  reversed.)*
 - A **Team** belongs permanently to one **Program**; its per-season placement
   (League + optional Division) is a **SeasonTeamRegistration**, not a field on the Team.
 - **Club** is a team affiliation. It becomes **optional end-to-end in Slice D** (a team
@@ -70,7 +73,7 @@ name (until Slice C) it is noted. See ADR 0001 for the full column map.
 | --- | --- | --- |
 | id | str | season-specific grouping |
 | season_id | str | parent Season |
-| name | str | required, e.g. "Diamond" |
+| name | str | required, e.g. "Adult League" |
 | sort_order | int | display order |
 
 ### Division (optional)
@@ -78,7 +81,7 @@ name (until Slice C) it is noted. See ADR 0001 for the full column map.
 | --- | --- | --- |
 | id | str | `division_…` |
 | league_id | str | parent League *(legacy: `season_id` + optional `level_id`)* |
-| name | str | required, e.g. "North" |
+| name | str | required, e.g. "Gold" or "North" |
 | age_group | str | optional |
 
 ### Team / Club

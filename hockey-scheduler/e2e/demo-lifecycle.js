@@ -144,6 +144,26 @@ async function checkViewport(browser, viewport) {
     await waitDemoTitle("Reset demo data").catch(() => {
       throw new Error(`[${V}] header did not flip to "Reset demo data" after Load`);
     });
+
+    // The sample dataset demonstrates the client's own naming convention
+    // (issue #245): Gold/Silver/Diamond are DIVISIONS within a League
+    // ("Adult League"), never Leagues themselves.
+    const hv = await getJson("/api/v2/setup/hierarchy");
+    const adultLeague = hv.programs.flatMap((p) => p.seasons).flatMap((s) => s.leagues || [])
+      .find((lv) => lv.name === "Adult League");
+    if (!adultLeague) throw new Error(`[${V}] demo data has no "Adult League" League`);
+    const adultDivisionNames = new Set((adultLeague.divisions || []).map((d) => d.name));
+    for (const name of ["Gold", "Silver", "Diamond"]) {
+      if (!adultDivisionNames.has(name)) {
+        throw new Error(`[${V}] "Adult League" is missing its "${name}" Division (got ${
+          JSON.stringify([...adultDivisionNames])})`);
+      }
+    }
+    const leagueNames = hv.programs.flatMap((p) => p.seasons).flatMap((s) => s.leagues || []).map((lv) => lv.name);
+    if (leagueNames.some((n) => ["Gold", "Silver", "Diamond"].includes(n))) {
+      throw new Error(`[${V}] Gold/Silver/Diamond appear as League names, not just Division names (got ${
+        JSON.stringify(leagueNames)})`);
+    }
     // The populated Setup exposes icon row actions with accessible labels — the
     // "Remove from season" control is an icon carrying its intent in title/aria.
     const remove = await page.$("[data-reg-remove]");

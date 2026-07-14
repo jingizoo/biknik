@@ -15,8 +15,12 @@ class FullDemoTest(unittest.TestCase):
     def test_seed_builds_full_universe(self):
         ov = self.api.get_demo_overview()
         self.assertEqual(ov["league"]["name"], "Alpine Ice Hockey League")
+        # Gold/Silver/Diamond (issue #245) are a second, team-less League's
+        # Divisions — a structural example of the client's naming convention,
+        # never part of the pilot-scale team/player/game counts below.
         self.assertEqual({d["name"] for d in ov["divisions"]},
-                         {"U16 Elite", "U18 Development", "Senior A"})
+                         {"U16 Elite", "U18 Development", "Senior A",
+                          "Gold", "Silver", "Diamond"})
         # The pilot data pack (#97) grows this from the original 4-team demo
         # to 12 teams across the 3 divisions.
         self.assertEqual({t["name"] for t in ov["teams"]}, {

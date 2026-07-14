@@ -78,6 +78,19 @@ def build_full_demo_store(store=None) -> Tuple[InMemoryStore, str, dict]:
                                   league_id=junior_tier.id, actor_id=admin)
     d_sen = setup.create_division(season.id, "Senior A", actor_id=admin)
 
+    # A second League purely to demonstrate the client's own naming convention
+    # (issue #245): Gold/Silver/Diamond are DIVISIONS within a League, never
+    # Leagues themselves. No teams are registered here — a structural example
+    # only, so it doesn't affect the pilot-scale team/player/game counts below.
+    adult_league = setup.create_league(season.id, "Adult League", sort_order=2,
+                                       actor_id=admin)
+    setup.create_division(season.id, "Gold", league_id=adult_league.id,
+                          actor_id=admin)
+    setup.create_division(season.id, "Silver", league_id=adult_league.id,
+                          actor_id=admin)
+    setup.create_division(season.id, "Diamond", league_id=adult_league.id,
+                          actor_id=admin)
+
     club_lions = setup.create_club("Lions HC", country="AT", actor_id=admin)
     club_falcons = setup.create_club("Falcons HC", country="AT", actor_id=admin)
     setup.create_club("Bears HC", country="AT", actor_id=admin)

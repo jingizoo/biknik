@@ -27,7 +27,8 @@ Season ↔ allowed Venues     (many-to-many)
 
 Concrete client examples:
 - **Programs:** Adult Men, Juniors, Ladies Hockey, High School.
-- **Leagues in a Program/Season:** Diamond, Platinum, Gold, Silver, Bronze, Leisure (Adult Men); Varsity, Freshman (High School).
+- **Leagues in a Program/Season:** Adult League (Adult Men); Varsity League, Freshman League (High School).
+- **Divisions within a League:** Gold, Silver, Diamond, Bronze, Leisure (within Adult League). *(Correction, issue #245: the client's initial examples above listed these as Leagues; the client later confirmed they are Divisions **within** a League, not Leagues themselves — the shape `Program → Season → League → optional Division` below was always correct, only this worked example was reversed.)*
 - **Teams in a League:** D1–D4, Rangers, …
 - **Club:** optional; many programs use none.
 - **Venue:** Twin Rinks hosts its own programs *and* external ones (e.g. Illinois High School Hockey); a competition may use several venues and a venue may host several independent competitions.

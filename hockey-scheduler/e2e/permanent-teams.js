@@ -84,6 +84,7 @@ async function checkViewport(browser, viewport) {
         title: (d.querySelector(".drawer-title") || {}).textContent || "",
         labels: [...d.querySelectorAll("label")].map((l) => l.textContent.trim()),
         notes: [...d.querySelectorAll(".drawer-note")].map((n) => n.textContent.trim()),
+        placeholders: [...d.querySelectorAll("input[placeholder]")].map((i) => i.placeholder),
       };
     });
   };
@@ -163,6 +164,20 @@ async function checkViewport(browser, viewport) {
       fail(`Program drawer showed a blocking note for an optional field (got ${JSON.stringify(programDrawer.notes)})`);
     if (/facility owner/i.test(programLabels))
       fail(`Program drawer operator field still says "facility owner" (got ${JSON.stringify(programDrawer.labels)})`);
+    await closeDrawer();
+
+    // 2b) League/Division example copy (issue #245): the client confirmed
+    //     Gold/Silver/Diamond are DIVISIONS within a League, never Leagues
+    //     themselves — the League name field must never suggest a division
+    //     example, and the Division name field must use one.
+    const levelDrawer = await openDrawer("level");
+    if (levelDrawer.placeholders.some((p) => /diamond|platinum|gold|silver/i.test(p)))
+      fail(`League name field placeholder suggests a Division example (got ${JSON.stringify(levelDrawer.placeholders)})`);
+    await closeDrawer();
+
+    const divisionDrawer = await openDrawer("division");
+    if (!divisionDrawer.placeholders.some((p) => /gold|silver|diamond/i.test(p)))
+      fail(`Division name field placeholder is not a Gold/Silver/Diamond example (got ${JSON.stringify(divisionDrawer.placeholders)})`);
     await closeDrawer();
 
     // 3) Now build a program → season → league(grouping) → division, plus a
