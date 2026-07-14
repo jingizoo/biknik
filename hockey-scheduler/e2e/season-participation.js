@@ -1,10 +1,12 @@
-// Season participation browser journey (#180 PR D).
+// Season participation browser journey (#180 PR D, cut to v2 canonical #233
+// Slice B2b).
 //
-// At desktop and phone widths, a League Admin builds a permanent league team,
-// registers it for two different seasons in two different divisions through the
-// Setup "Season participation" panel, confirms exactly one permanent Team backs
-// two registrations, then removes it from one season and confirms the other
-// season's registration is untouched. Fails on any browser console/page error.
+// At desktop and phone widths, a League Admin builds a permanent program team,
+// registers it for two different seasons — each under its own grouping League
+// and division — through the Setup "Season participation" panel, confirms
+// exactly one permanent Team backs two registrations, then removes it from one
+// season and confirms the other season's registration is untouched. Fails on
+// any browser console/page error.
 const { chromium } = require("playwright");
 const { spawn } = require("child_process");
 const http = require("http");
@@ -65,54 +67,61 @@ async function checkViewport(browser, viewport) {
     await page.goto(base, { waitUntil: "domcontentloaded" });
     await page.waitForSelector("#content > *", { timeout: 10000 });
 
-    // Build a permanent league team + two seasons/divisions through the API
-    // (demo default is League Admin), the same records an operator would type
-    // in. create_team derives the team's permanent league from its division.
+    // Build a permanent program team + two seasons, each with its own grouping
+    // League and division, through the canonical v2 API (demo default is
+    // League Admin) — the same records an operator would type in. A v2
+    // registration's League is REQUIRED, so each season needs one before the
+    // panel can register anything into it (#233 Slice C2).
     const ids = await page.evaluate(async () => {
       const post = async (p, b) => (await fetch(p, {
         method: "POST", credentials: "same-origin",
         headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
       })).json();
-      const league = await post("/api/setup/league", { name: "Participation League" });
-      const s1 = await post("/api/setup/season", { league_id: league.id, name: "2026-27" });
-      const s2 = await post("/api/setup/season", { league_id: league.id, name: "2027-28" });
-      const dA = await post("/api/setup/division", { season_id: s1.id, name: "Division A" });
-      const dB = await post("/api/setup/division", { season_id: s2.id, name: "Division B" });
-      const club = await post("/api/setup/club", { name: "Participation Club" });
-      const team = await post("/api/setup/team",
-        { club_id: club.id, division_id: dA.id, name: "Perma Lions" });
-      return { league: league.id, s1: s1.id, s2: s2.id, dA: dA.id, dB: dB.id, team: team.id };
+      const program = await post("/api/v2/setup/program", { name: "Participation Program" });
+      const s1 = await post("/api/v2/setup/season", { program_id: program.id, name: "2026-27" });
+      const s2 = await post("/api/v2/setup/season", { program_id: program.id, name: "2027-28" });
+      const lg1 = await post("/api/v2/setup/league", { season_id: s1.id, name: "Diamond" });
+      const lg2 = await post("/api/v2/setup/league", { season_id: s2.id, name: "Diamond" });
+      const dA = await post("/api/v2/setup/division", { league_id: lg1.id, name: "Division A" });
+      const dB = await post("/api/v2/setup/division", { league_id: lg2.id, name: "Division B" });
+      const club = await post("/api/v2/setup/club", { name: "Participation Club" });
+      const team = await post("/api/v2/setup/team",
+        { program_id: program.id, club_id: club.id, name: "Perma Lions" });
+      return { program: program.id, s1: s1.id, s2: s2.id, lg1: lg1.id, lg2: lg2.id,
+        dA: dA.id, dB: dB.id, team: team.id };
     }, );
 
     // Open Setup → Season participation reflects the fresh, empty seasons.
     // (Navigating to the tab re-renders and re-fetches the registration data;
-    // no full reload, which would drop the signed-in session.)
+    // no full reload, which would drop the signed-in session.) The register
+    // control lives per League, keyed by the League's id.
     await page.click('.tab[data-tab="setup"]');
     await page.waitForFunction(
-      (sel) => !!document.querySelector(sel), `#reg-team-${ids.s1}`, { timeout: 15000 });
+      (sel) => !!document.querySelector(sel), `#reg-team-${ids.lg1}`, { timeout: 15000 });
 
-    // Register the permanent team for season 1 / Division A.
-    await page.selectOption(`#reg-team-${ids.s1}`, ids.team);
-    await page.selectOption(`#reg-div-${ids.s1}`, ids.dA);
+    // Register the permanent team for season 1 / League 1 / Division A. The
+    // League select already defaults to lg1 (the section it's under).
+    await page.selectOption(`#reg-team-${ids.lg1}`, ids.team);
+    await page.selectOption(`#reg-div-add-${ids.lg1}`, ids.dA);
     let resp = page.waitForResponse((r) =>
-      r.url() === `${base}/api/setup/seasons/${ids.s1}/team-registrations`
+      r.url() === `${base}/api/v2/setup/seasons/${ids.s1}/team-registrations`
       && r.request().method() === "POST");
-    await page.click(`[data-reg-add="${ids.s1}"]`);
+    await page.click(`[data-reg-add="${ids.lg1}"]`);
     if ((await resp).status() !== 200) throw new Error(`[${viewport.label}] register s1 failed`);
 
-    // Register the SAME team for season 2 / Division B. The team is still
-    // available for s2 (registering it for s1 doesn't touch s2), so its s2
-    // register control is present.
+    // Register the SAME team for season 2 / League 2 / Division B. The team is
+    // still available for s2 (registering it for s1 doesn't touch s2), so its
+    // s2 register control is present.
     await page.waitForFunction(
-      (sel) => !!document.querySelector(sel), `#reg-team-${ids.s2}`, { timeout: 15000 });
-    await page.selectOption(`#reg-team-${ids.s2}`, ids.team);
-    await page.selectOption(`#reg-div-${ids.s2}`, ids.dB);
+      (sel) => !!document.querySelector(sel), `#reg-team-${ids.lg2}`, { timeout: 15000 });
+    await page.selectOption(`#reg-team-${ids.lg2}`, ids.team);
+    await page.selectOption(`#reg-div-add-${ids.lg2}`, ids.dB);
     resp = page.waitForResponse((r) =>
-      r.url() === `${base}/api/setup/seasons/${ids.s2}/team-registrations`
+      r.url() === `${base}/api/v2/setup/seasons/${ids.s2}/team-registrations`
       && r.request().method() === "POST");
-    await page.click(`[data-reg-add="${ids.s2}"]`);
+    await page.click(`[data-reg-add="${ids.lg2}"]`);
     if ((await resp).status() !== 200) throw new Error(`[${viewport.label}] register s2 failed`);
-    // Now the team is registered for BOTH seasons, so each season shows a
+    // Now the team is registered for BOTH seasons, so each league shows a
     // Remove control (and its register select is gone — nothing left to add).
     await page.waitForFunction(
       () => document.querySelectorAll("[data-reg-remove]").length >= 2, null, { timeout: 15000 });
@@ -120,9 +129,9 @@ async function checkViewport(browser, viewport) {
     // Exactly one permanent Team backs two season registrations.
     const state = await page.evaluate(async (i) => {
       const get = async (p) => (await fetch(p, { credentials: "same-origin" })).json();
-      const teams = await get(`/api/setup/leagues/${i.league}/teams`);
-      const r1 = await get(`/api/setup/seasons/${i.s1}/team-registrations`);
-      const r2 = await get(`/api/setup/seasons/${i.s2}/team-registrations`);
+      const teams = await get(`/api/v2/setup/programs/${i.program}/teams`);
+      const r1 = await get(`/api/v2/setup/seasons/${i.s1}/team-registrations`);
+      const r2 = await get(`/api/v2/setup/seasons/${i.s2}/team-registrations`);
       return { teamCount: teams.teams.length,
                r1: r1.registrations.filter((r) => r.active).length,
                r2: r2.registrations.filter((r) => r.active).length };
@@ -131,8 +140,9 @@ async function checkViewport(browser, viewport) {
       throw new Error(`[${viewport.label}] expected 1 team + 2 registrations, got ${JSON.stringify(state)}`);
     }
 
-    // Remove the team from season 2; season 1 must be untouched. Season blocks
-    // render in season order (s1 then s2), so the last Remove button is s2's.
+    // Remove the team from season 2; season 1 must be untouched. Season/league
+    // blocks render in season order (s1 then s2), so the last Remove button is
+    // s2's.
     const removeBtns = await page.$$("[data-reg-remove]");
     resp = page.waitForResponse((r) => r.url().includes("/remove") && r.request().method() === "POST");
     await removeBtns[removeBtns.length - 1].click();
@@ -140,13 +150,13 @@ async function checkViewport(browser, viewport) {
     // Removed from s2 → the team is available for s2 again, so its register
     // control reappears; wait for the panel to settle on that.
     await page.waitForFunction(
-      (sel) => !!document.querySelector(sel), `#reg-team-${ids.s2}`, { timeout: 15000 });
+      (sel) => !!document.querySelector(sel), `#reg-team-${ids.lg2}`, { timeout: 15000 });
 
     const after = await page.evaluate(async (i) => {
       const get = async (p) => (await fetch(p, { credentials: "same-origin" })).json();
-      const r1 = await get(`/api/setup/seasons/${i.s1}/team-registrations`);
-      const r2 = await get(`/api/setup/seasons/${i.s2}/team-registrations`);
-      const teams = await get(`/api/setup/leagues/${i.league}/teams`);
+      const r1 = await get(`/api/v2/setup/seasons/${i.s1}/team-registrations`);
+      const r2 = await get(`/api/v2/setup/seasons/${i.s2}/team-registrations`);
+      const teams = await get(`/api/v2/setup/programs/${i.program}/teams`);
       return { r1: r1.registrations.filter((r) => r.active).length,
                r2: r2.registrations.filter((r) => r.active).length,
                teamCount: teams.teams.length };

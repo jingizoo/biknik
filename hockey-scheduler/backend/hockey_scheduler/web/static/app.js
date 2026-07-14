@@ -54,9 +54,13 @@ let addableSubs = null;             // eligible-but-not-enrolled team players a 
 let dashAvailability = null;        // availability-summary for the coach dashboard's next game (#146)
 let dashSubQueue = null;            // substitute-candidates for the coach dashboard's next game (#146)
 let playersList = [];               // [{id,name,team_id,position,jersey_number,...}] for Setup (#114)
-let leagueTeams = {};               // league_id -> [{id,name,league_id}] permanent members (#180)
-let seasonRegs = {};                // season_id -> [{id,team_id,division_id,active}] registrations (#180)
-let rollover = { leagueId: "", fromSeasonId: "", toSeasonId: "", result: null };  // season rollover picker (#180)
+let leagueTeams = {};               // program_id -> [{id,name,program_id}] permanent members (#180/#233 v2)
+let seasonRegs = {};                // season_id -> [{id,team_id,league_id,division_id,active}] registrations (#180/#233 v2)
+let leagueDivisions = {};           // league_id -> [{id,name,...}] — cascade data for the League→Division
+                                     // selects in Season participation / Rollover (#233 Slice B2b), populated
+                                     // each render from hv and read by the onchange handlers that rescope a
+                                     // Division select after its paired League select changes.
+let rollover = { programId: "", fromSeasonId: "", toSeasonId: "", result: null };  // season rollover picker (#180/#233 v2)
 let modal = null;                   // themed confirm/blocked modal (#215): {type, ...}
 let demoMenuOpen = false;           // header demo (database) dropdown open? (#215)
 let rescheduleRequests = null;      // reschedule request(s) for the current game (#29)
@@ -1325,108 +1329,147 @@ function renderSetupHierarchy(sv, hv, ov) {
     ? `<section class="tree-panel na"><div class="tree-head"><span class="tree-title">⚠ Needs assignment</span></div>
         <div class="tree-note">These records can't be scheduled until they're assigned.</div>${naBody}</section>` : "";
 
-  return `${reassignPanelHtml(ov)}<div class="setup-trees">${facility}${permanentTeams}${competition}${renderSeasonParticipation(ov)}${renderRollover(ov)}${roster}${needsAssignment}</div>`;
+  return `${reassignPanelHtml(ov)}<div class="setup-trees">${facility}${permanentTeams}${competition}${renderSeasonParticipation(hv, ov)}${renderRollover(hv, ov)}${roster}${needsAssignment}</div>`;
 }
 
-// Season participation (#180): permanent program teams and which season/division
-// each plays. Kept separate from the competition tree above (which still shows
-// teams by their legacy division_id) so the two ideas — a team's permanent
-// league membership vs. its per-season participation — read distinctly. Data
-// comes from the dedicated /api/setup endpoints loaded in render() (leagueTeams,
-// seasonRegs), never the legacy Team.division_id.
-function renderSeasonParticipation(ov) {
+// Season participation (#180, cut to v2 canonical #233 Slice B2b): permanent
+// program teams and which season/league/division each plays. Kept separate
+// from the Competition tree above (which reads hv read-only) so the two ideas
+// — a team's permanent program membership vs. its per-season participation —
+// read distinctly. Grouped Program → Season → League (three levels, matching
+// hv.programs[].seasons[].leagues[]), since a v2 registration's League is
+// REQUIRED and its Division is an optional split of that League. leagueTeams
+// (permanent roster) and seasonRegs (registration rows, each carrying a
+// league_id) are the dedicated v2 reads loaded in render(); hv supplies the
+// Program→Season→League→Division shape and each league's current teams.
+function renderSeasonParticipation(hv, ov) {
   if (!hasPerm("manage_setup")) return "";
-  const seasonsByLeague = groupBy(ov.seasons, "league_id");
-  const divsBySeason = groupBy(ov.divisions, "season_id");
-  const divName = (id) => (((ov.divisions || []).find((d) => d.id === id)) || {}).name || "";
-  const leaguesWithSeasons = (ov.leagues || []).filter((lg) => (seasonsByLeague[lg.id] || []).length);
-  if (!leaguesWithSeasons.length) return "";
-  const divOpts = (sid, sel) => (divsBySeason[sid] || []).map((d) => opt(d.id, d.name, d.id === sel)).join("");
+  const programs = (hv.programs || []).filter((p) => (p.seasons || []).length);
+  if (!programs.length) return "";
 
-  const leagueBlocks = leaguesWithSeasons.map((lg) => {
-    const teams = leagueTeams[lg.id] || [];
-    const teamName = (tid) => ((teams.find((t) => t.id === tid)) || {}).name || tid;
-    const seasonBlocks = (seasonsByLeague[lg.id] || []).map((s) => {
+  const programBlocks = programs.map((program) => {
+    const permanentTeams = leagueTeams[program.id] || [];
+    const seasons = program.seasons || [];
+
+    const seasonBlocks = seasons.map((s) => {
       const regs = (seasonRegs[s.id] || []).filter((r) => r.active);
-      const registered = new Set(regs.map((r) => r.team_id));
-      const hasDivs = (divsBySeason[s.id] || []).length > 0;
-      const regRows = regs.map((r) => {
-        const divCtl = hasDivs
-          ? `<select class="reg-div" id="regdiv-${esc(r.id)}"><option value="">No division</option>${divOpts(s.id, r.division_id)}</select>
-             <button class="act" data-reg-assign="${esc(r.id)}">Save</button>` : "";
-        const tag = `${esc(s.name)} · ${r.division_id ? esc(divName(r.division_id)) : "No division"}`;
-        return `<div class="tn-leaf reg-row">
-          <span class="tn-label">👥 ${esc(teamName(r.team_id))}</span>
-          <span class="tn-meta reg-tag">${tag}</span>
-          ${divCtl}<button class="icon-btn danger" data-reg-remove="${esc(r.id)}"
-            title="Remove from season" aria-label="Remove ${esc(teamName(r.team_id))} from ${esc(s.name)}">${ICONS.circleMinus}</button></div>`;
-      }).join("") || `<div class="tn-empty">No teams registered for this season yet.</div>`;
-      const available = teams.filter((t) => !registered.has(t.id));
-      const addCtl = available.length
-        ? `<div class="tn-leaf reg-add">
-            <select id="reg-team-${esc(s.id)}"><option value="">Add a program team…</option>${
-              available.map((t) => opt(t.id, t.name)).join("")}</select>
-            <select id="reg-div-${esc(s.id)}"><option value="">No division</option>${divOpts(s.id, "")}</select>
-            <button class="act primary" data-reg-add="${esc(s.id)}">Register</button></div>`
-        : (teams.length
-            ? `<div class="tn-empty">Every program team is registered for this season.</div>`
-            : `<div class="tn-empty">Create a program team first, then register it here.</div>`);
+      const regByTeam = {};
+      regs.forEach((r) => { regByTeam[r.team_id] = r; });
+      const registeredTeamIds = new Set(regs.map((r) => r.team_id));
+      const leagues = s.leagues || [];
+      // Cache each League's Division options for the cascade handlers wired
+      // later in wireApp — a League select's onchange rescopes its paired
+      // Division select using this map, never guessing a same-named division.
+      leagues.forEach((lv) => { leagueDivisions[lv.id] = lv.divisions || []; });
+      const leagueOptsFor = (selId) => leagues.map((lv) =>
+        opt(lv.id, lv.name, lv.id === selId)).join("");
+
+      const leagueSections = leagues.map((lv) => {
+        const divs = lv.divisions || [];
+        const divOptsFor = (selId) => divs.map((d) => opt(d.id, d.name, d.id === selId)).join("");
+        // A registered team's row: its own League+Division cascade (both
+        // scoped to this season) plus Save/Remove. `reg` is looked up by team
+        // id — structurally guaranteed present since t only appears here
+        // because a valid registration resolved it into this League/Division.
+        const regRow = (t, divId) => {
+          const reg = regByTeam[t.id];
+          if (!reg) return "";
+          return `<div class="tn-leaf reg-row">
+            <span class="tn-label">👥 ${esc(t.name)}</span>
+            <select id="reg-league-${esc(reg.id)}" data-reg-league-for="${esc(reg.id)}">${leagueOptsFor(lv.id)}</select>
+            <select id="reg-div-${esc(reg.id)}" data-reg-div-for="${esc(reg.id)}"><option value="">No division</option>${divOptsFor(divId)}</select>
+            <button class="act" data-reg-save="${esc(reg.id)}" data-reg-orig-league="${esc(lv.id)}" data-reg-orig-div="${esc(divId || "")}">Save</button>
+            <button class="icon-btn danger" data-reg-remove="${esc(reg.id)}"
+              title="Remove from season" aria-label="Remove ${esc(t.name)} from ${esc(s.name)}">${ICONS.circleMinus}</button></div>`;
+        };
+        const divRows = divs.map((d) => (d.teams || []).map((t) => regRow(t, d.id)).join("")).join("");
+        const twdRows = (lv.teams_without_division || []).map((t) => regRow(t, "")).join("");
+        const rows = `${divRows}${twdRows}`
+          || `<div class="tn-empty">No teams registered under this league yet.</div>`;
+        const available = permanentTeams.filter((t) => !registeredTeamIds.has(t.id));
+        const addCtl = available.length
+          ? `<div class="tn-leaf reg-add">
+              <select id="reg-team-${esc(lv.id)}"><option value="">Add a program team…</option>${
+                available.map((t) => opt(t.id, t.name)).join("")}</select>
+              <select id="reg-league-add-${esc(lv.id)}" data-reg-league-add="${esc(lv.id)}">${leagueOptsFor(lv.id)}</select>
+              <select id="reg-div-add-${esc(lv.id)}"><option value="">No division</option>${divOptsFor("")}</select>
+              <button class="act primary" data-reg-add="${esc(lv.id)}" data-reg-add-season="${esc(s.id)}">Register</button></div>`
+          : (permanentTeams.length
+              ? `<div class="tn-empty">Every program team is registered for this season.</div>`
+              : `<div class="tn-empty">Create a program team first, then register it here.</div>`);
+        const teamCount = divs.reduce((n, d) => n + (d.teams || []).length, 0)
+          + (lv.teams_without_division || []).length;
+        return `<details class="tn" open><summary class="tn-sum">
+            <span class="tn-label">🎚️ ${esc(lv.name)}</span>
+            <span class="tn-meta">${teamCount} team${teamCount === 1 ? "" : "s"}</span></summary>
+          <div class="tn-children">${rows}${addCtl}</div></details>`;
+      }).join("");
+      const leagueBlocks = leagueSections
+        || `<div class="tn-empty">No leagues in this season yet. Add a league under
+            Competition structure, then register teams here.</div>`;
+      const teamCount = leagues.reduce((n, lv) =>
+        n + (lv.divisions || []).reduce((m, d) => m + (d.teams || []).length, 0)
+          + (lv.teams_without_division || []).length, 0);
       return `<details class="tn" open><summary class="tn-sum">
           <span class="tn-label">🗓️ ${esc(s.name)}</span>
-          <span class="tn-meta">${regs.length} team${regs.length === 1 ? "" : "s"}</span></summary>
-        <div class="tn-children">${regRows}${addCtl}</div></details>`;
+          <span class="tn-meta">${leagues.length} league${leagues.length === 1 ? "" : "s"} · ${
+            teamCount} team${teamCount === 1 ? "" : "s"}</span></summary>
+        <div class="tn-children">${leagueBlocks}</div></details>`;
     }).join("");
-    // Permanent members not registered for ANY season this league — surfaced so
-    // an operator sees teams that exist but sit out every current season.
-    const idle = teams.filter((t) => !(seasonsByLeague[lg.id] || [])
-      .some((s) => (seasonRegs[s.id] || []).some((r) => r.active && r.team_id === t.id)));
+
+    // Permanent members not registered for ANY season this program — surfaced
+    // so an operator sees teams that exist but sit out every current season.
+    const idle = permanentTeams.filter((t) => !seasons.some(
+      (s) => (seasonRegs[s.id] || []).some((r) => r.active && r.team_id === t.id)));
     const idleRows = idle.length
       ? `<div class="tn-leaf reg-row"><span class="tn-meta">${idle.length} program team${
           idle.length === 1 ? "" : "s"} not in any current season: ${
           idle.map((t) => esc(t.name)).join(", ")}</span></div>` : "";
     return `<details class="tn" open><summary class="tn-sum">
-        <span class="tn-label">🏆 ${esc(lg.name)}</span>
-        <span class="tn-meta">${teams.length} program team${teams.length === 1 ? "" : "s"}</span></summary>
+        <span class="tn-label">🏆 ${esc(program.name)}</span>
+        <span class="tn-meta">${permanentTeams.length} program team${permanentTeams.length === 1 ? "" : "s"}</span></summary>
       <div class="tn-children">${seasonBlocks}${idleRows}</div></details>`;
   }).join("");
 
   return `<section class="tree-panel">
     <div class="tree-head"><span class="tree-title">🗓️ Season participation</span>
-      <span class="tree-sub">Permanent program teams → seasons &amp; divisions they play</span></div>
-    ${leagueBlocks}</section>`;
+      <span class="tree-sub">Permanent program teams → season, league &amp; division they play</span></div>
+    ${programBlocks}</section>`;
 }
 
-// Season rollover (#180): carry a prior season's participation forward into a
-// new season of the SAME league, reusing the permanent teams. A bounded,
-// functional picker — choose a source and a target season, pick which eligible
-// teams to carry and each one's target-season division, then commit through the
-// hardened rollover service (services/setup_service.roll_forward_registrations),
-// which re-checks league membership before any write. Source rows that aren't
-// permanent members of this league (orphaned or cross-league data) and teams
-// already active in the target are shown but never sent. The full Setup and
-// navigation redesign stays out of this slice (#204).
-function renderRollover(ov) {
+// Season rollover (#180, cut to v2 canonical #233 Slice B2b): carry a prior
+// season's participation forward into a new season of the SAME program,
+// reusing the permanent teams. A bounded, functional picker — choose a source
+// and a target season, pick which eligible teams to carry and each one's
+// target-season League (required) and optional Division, then commit through
+// the hardened v2 rollover service (services/setup_service.
+// roll_forward_registrations_v2), which re-checks program membership and
+// League/Division consistency before any write. Unlike the FROZEN v1 route,
+// v2 has no division-only mode — every selection needs an explicit target
+// League. Source rows that aren't permanent members of this program (orphaned
+// or cross-program data) and teams already active in the target are shown but
+// never sent. The full Setup and navigation redesign stays out of this slice
+// (#204).
+function renderRollover(hv, ov) {
   if (!hasPerm("manage_setup")) return "";
-  const seasonsByLeague = groupBy(ov.seasons, "league_id");
-  const divsBySeason = groupBy(ov.divisions, "season_id");
-  // A rollover needs a source and a distinct target, so only leagues with at
+  // A rollover needs a source and a distinct target, so only programs with at
   // least two seasons can be rolled.
-  const eligibleLeagues = (ov.leagues || []).filter(
-    (lg) => (seasonsByLeague[lg.id] || []).length >= 2);
-  if (!eligibleLeagues.length) return "";
-  let leagueId = rollover.leagueId;
-  if (!eligibleLeagues.some((lg) => lg.id === leagueId)) leagueId = eligibleLeagues[0].id;
-  const seasons = seasonsByLeague[leagueId] || [];
+  const eligiblePrograms = (hv.programs || []).filter((p) => (p.seasons || []).length >= 2);
+  if (!eligiblePrograms.length) return "";
+  let programId = rollover.programId;
+  if (!eligiblePrograms.some((p) => p.id === programId)) programId = eligiblePrograms[0].id;
+  const program = eligiblePrograms.find((p) => p.id === programId);
+  const seasons = program.seasons || [];
   const fromId = seasons.some((s) => s.id === rollover.fromSeasonId) ? rollover.fromSeasonId : "";
   const toId = seasons.some((s) => s.id === rollover.toSeasonId) && rollover.toSeasonId !== fromId
     ? rollover.toSeasonId : "";
-  const teams = leagueTeams[leagueId] || [];
-  const teamById = (tid) => teams.find((t) => t.id === tid);
+  const permanentTeams = leagueTeams[programId] || [];
+  const teamById = (tid) => permanentTeams.find((t) => t.id === tid);
 
-  const leagueSel = eligibleLeagues.length > 1
+  const programSel = eligiblePrograms.length > 1
     ? `<label class="ro-field">Program
-        <select data-rollover-league>${eligibleLeagues.map((lg) =>
-          opt(lg.id, lg.name, lg.id === leagueId)).join("")}</select></label>` : "";
+        <select data-rollover-program>${eligiblePrograms.map((p) =>
+          opt(p.id, p.name, p.id === programId)).join("")}</select></label>` : "";
   const fromSel = `<label class="ro-field">Copy from
       <select data-rollover-from><option value="">Choose a season…</option>${
         seasons.map((s) => opt(s.id, s.name, s.id === fromId)).join("")}</select></label>`;
@@ -1439,16 +1482,20 @@ function renderRollover(ov) {
   if (!fromId || !toId) {
     body = `<div class="tn-empty">Choose a source and a target season to preview which teams can be carried forward.</div>`;
   } else {
+    const toSeason = seasons.find((s) => s.id === toId);
+    const toLeagues = (toSeason && toSeason.leagues) || [];
+    // Cache each target League's Division options for the cascade handler
+    // wired in wireApp — a League select's onchange rescopes its paired
+    // Division select using this map.
+    toLeagues.forEach((lv) => { leagueDivisions[lv.id] = lv.divisions || []; });
     // Split the source season's active registrations three ways using the data
     // already loaded for Season participation: teams eligible to carry, teams
     // already registered in the target (the service skips these), and source
-    // rows whose team isn't a permanent member of this league (orphaned or
-    // cross-league — the service rejects these, so they're never offered).
+    // rows whose team isn't a permanent member of this program (orphaned or
+    // cross-program — the service rejects these, so they're never offered).
     const srcRegs = (seasonRegs[fromId] || []).filter((r) => r.active);
     const targetActive = new Set((seasonRegs[toId] || [])
       .filter((r) => r.active).map((r) => r.team_id));
-    const targetDivs = divsBySeason[toId] || [];
-    const divOptions = targetDivs.map((d) => opt(d.id, d.name)).join("");
     const eligible = [], already = [], ineligible = [];
     srcRegs.forEach((r) => {
       const team = teamById(r.team_id);
@@ -1456,30 +1503,35 @@ function renderRollover(ov) {
       else if (targetActive.has(r.team_id)) already.push(team);
       else eligible.push(team);
     });
-    // Every carried team must land in a concrete target-season division —
-    // a null-division registration is unusable by division-scoped scheduling
-    // and standings, so the UI never lets one be created (review #216).
-    // Rows start unchecked (no implicit bulk null assignment); the per-row
-    // division defaults to a "Choose a division…" placeholder unless the
-    // target season has exactly one division, which is preselected. The commit
-    // button stays disabled until every checked team has a division.
-    const single = targetDivs.length === 1;
+    // Every carried team must land under a concrete target-season League — the
+    // v2 rollover has no division-only mode, so a null-league selection can
+    // never be sent (#233 Slice C2). Rows start unchecked (no implicit bulk
+    // assignment); the per-row League defaults to a "Choose a league…"
+    // placeholder unless the target season has exactly one League, which is
+    // preselected. Division stays optional and defaults to "No division",
+    // scoped to whichever League is currently selected. The commit button
+    // stays disabled until every checked team has a League.
+    const single = toLeagues.length === 1;
     const carryRows = eligible.map((team) => {
-      const divOpts = single
-        ? opt(targetDivs[0].id, targetDivs[0].name, true)
-        : `<option value="">Choose a division…</option>${divOptions}`;
+      const leagueOptsHtml = single
+        ? opt(toLeagues[0].id, toLeagues[0].name, true)
+        : `<option value="">Choose a league…</option>${toLeagues.map((lv) => opt(lv.id, lv.name)).join("")}`;
+      const initialDivs = single ? (toLeagues[0].divisions || []) : [];
       return `<div class="tn-leaf reg-row">
         <label class="ro-pick"><input type="checkbox" data-rollover-pick="${esc(team.id)}">
           <span class="tn-label">👥 ${esc(team.name)}</span></label>
-        <select class="reg-div" data-rollover-div="${esc(team.id)}">${divOpts}</select>
-        <span class="ro-row-err" hidden>Pick a target division</span></div>`;
+        <select class="reg-league" data-rollover-league="${esc(team.id)}">${leagueOptsHtml}</select>
+        <select class="reg-div" data-rollover-div="${esc(team.id)}"><option value="">No division</option>${
+          initialDivs.map((d) => opt(d.id, d.name)).join("")}</select>
+        <span class="ro-row-err" hidden>Pick a target league</span></div>`;
     }).join("");
     let carry;
-    if (!targetDivs.length) {
-      // The target season has no divisions — block the rollover outright rather
-      // than offer a path that could only produce null-division registrations.
-      carry = `<div class="tn-empty">The target season has no divisions yet.
-        Create a target division first, then roll teams into it.</div>`;
+    if (!toLeagues.length) {
+      // The target season has no leagues — block the rollover outright rather
+      // than offer a path that could only produce league-less selections,
+      // which the v2 service always rejects.
+      carry = `<div class="tn-empty">The target season has no leagues yet.
+        Create a target league first, then roll teams into it.</div>`;
     } else if (!eligible.length) {
       carry = `<div class="tn-empty">No eligible teams left to carry into the target season.</div>`;
     } else {
@@ -1499,7 +1551,7 @@ function renderRollover(ov) {
   return `<section class="tree-panel">
     <div class="tree-head"><span class="tree-title">↪ Season rollover</span>
       <span class="tree-sub">Carry a prior season's teams into a new season of the same program</span></div>
-    <div class="ro-controls">${leagueSel}${fromSel}${toSel}</div>
+    <div class="ro-controls">${programSel}${fromSel}${toSel}</div>
     ${body}</section>`;
 }
 
@@ -1516,19 +1568,20 @@ function rolloverResultHtml() {
   return `<div class="banner ok"><h2>Rollover complete</h2><p>${esc(parts.join(" · "))}.</p></div>`;
 }
 
-// Rollover commit gate (review #216): reflect the current selection without a
-// full re-render (which would drop the checkbox/division state). A checked team
-// with no target division shows an inline row error, and the commit button is
-// enabled only when at least one team is checked and every checked team has a
-// division — so a rollover request can never be submitted with an unassigned
-// team, matching the backend's per-selection division validation.
+// Rollover commit gate (review #216, re-scoped to League for v2 #233 Slice
+// B2b): reflect the current selection without a full re-render (which would
+// drop the checkbox/league/division state). A checked team with no target
+// League shows an inline row error, and the commit button is enabled only
+// when at least one team is checked and every checked team has a League —
+// Division stays optional — matching the v2 backend's per-selection League
+// requirement (the v2 rollover has no division-only mode).
 function updateRolloverCommitState(c) {
   const commit = c.querySelector("[data-rollover-commit]");
   if (!commit) return;
   let anyChecked = false, allAssigned = true;
   c.querySelectorAll("[data-rollover-pick]").forEach((cb) => {
-    const div = c.querySelector(`[data-rollover-div="${cb.dataset.rolloverPick}"]`);
-    const assigned = !!(div && div.value);
+    const league = c.querySelector(`[data-rollover-league="${cb.dataset.rolloverPick}"]`);
+    const assigned = !!(league && league.value);
     const row = cb.closest(".reg-row");
     const err = row && row.querySelector(".ro-row-err");
     if (cb.checked) {
@@ -4279,19 +4332,22 @@ async function render() {
       // parentage rules exactly instead of a client-side reinterpretation.
       const hvr = await getJSON("/api/v2/setup/hierarchy");
       if (hvr && !hvr.error) hv = hvr;
-      // Season participation (#180): a league's permanent teams and each
-      // season's registrations, each its own authenticated call (like the
-      // player list above), so the Setup page can show which permanent team
-      // plays which season/division — never derived from the legacy
-      // Team.division_id.
-      leagueTeams = {}; seasonRegs = {};
-      for (const lg of (ov.leagues || [])) {
-        const r = await getJSON(`/api/setup/leagues/${lg.id}/teams`);
-        leagueTeams[lg.id] = (r && r.teams) || [];
-      }
-      for (const s of (ov.seasons || [])) {
-        const r = await getJSON(`/api/setup/seasons/${s.id}/team-registrations`);
-        seasonRegs[s.id] = (r && r.registrations) || [];
+      // Season participation (#180, cut to v2 canonical #233 Slice B2b): a
+      // program's permanent teams and each season's registrations, each its
+      // own authenticated call (like the player list above), so the Setup
+      // page can show which permanent team plays which season/league/
+      // division — never derived from the legacy Team.division_id. Iterates
+      // hv (already fetched above) rather than ov.leagues/ov.seasons so the
+      // requested ids are consistently canonical; hv is only populated under
+      // manage_setup, which already gates this whole block.
+      leagueTeams = {}; seasonRegs = {}; leagueDivisions = {};
+      for (const program of (hv.programs || [])) {
+        const r = await getJSON(`/api/v2/setup/programs/${program.id}/teams`);
+        leagueTeams[program.id] = (r && r.teams) || [];
+        for (const s of (program.seasons || [])) {
+          const rr = await getJSON(`/api/v2/setup/seasons/${s.id}/team-registrations`);
+          seasonRegs[s.id] = (rr && rr.registrations) || [];
+        }
       }
     }
     // The game sheet also needs the officials pool for its assign control (#30).
@@ -4569,33 +4625,89 @@ async function render() {
     const sel = c.querySelector("#reassign-target");
     commitReassign(sel ? sel.value : "");
   });
-  // Season participation (#180): register a league team for a season, change
-  // its season division, or remove it. Each posts to the setup registration
-  // routes then re-renders; the toast reflects the server's structured error
-  // (e.g. a team with scheduled games can't be removed).
+  // Season participation (#180, cut to v2 canonical #233 Slice B2b): register
+  // a program team for a season under a chosen League (required) and optional
+  // Division, change an existing registration's League and/or Division, or
+  // remove it. Each posts to the v2 registration routes then re-renders; the
+  // toast reflects the server's structured error (e.g. a team with scheduled
+  // games can't be removed/reassigned).
   c.querySelectorAll("[data-reg-add]").forEach((b) => b.onclick = async () => {
-    const sid = b.dataset.regAdd;
-    const team = c.querySelector(`#reg-team-${sid}`);
-    const div = c.querySelector(`#reg-div-${sid}`);
-    if (!team || !team.value) { toast = "Choose a league team to register."; toastIsError = true; return render(); }
+    const lvId = b.dataset.regAdd;
+    const sid = b.dataset.regAddSeason;
+    const team = c.querySelector(`#reg-team-${lvId}`);
+    const league = c.querySelector(`#reg-league-add-${lvId}`);
+    const div = c.querySelector(`#reg-div-add-${lvId}`);
+    if (!team || !team.value) { toast = "Choose a program team to register."; toastIsError = true; return render(); }
+    if (!league || !league.value) { toast = "Choose a league to register the team under."; toastIsError = true; return render(); }
     toast = "";
-    const res = await post(`/api/setup/seasons/${sid}/team-registrations`,
-      { team_id: team.value, division_id: (div && div.value) || null });
+    const res = await post(`/api/v2/setup/seasons/${sid}/team-registrations`,
+      { team_id: team.value, league_id: league.value, division_id: (div && div.value) || null });
     if (res && !res.error) toast = "Team registered for the season.";
     await render();
   });
-  c.querySelectorAll("[data-reg-assign]").forEach((b) => b.onclick = async () => {
-    const rid = b.dataset.regAssign;
-    const div = c.querySelector(`#regdiv-${rid}`);
+  // A "Register" control's League select rescopes its own Division select to
+  // the newly-chosen League's divisions (never guessing a same-named one).
+  c.querySelectorAll("[data-reg-league-add]").forEach((sel) => sel.onchange = () => {
+    const lvId = sel.dataset.regLeagueAdd;
+    const divSel = c.querySelector(`#reg-div-add-${lvId}`);
+    if (!divSel) return;
+    const divs = leagueDivisions[sel.value] || [];
+    divSel.innerHTML = `<option value="">No division</option>${divs.map((d) => opt(d.id, d.name)).join("")}`;
+  });
+  // A registered team's row: the League select rescopes its paired Division
+  // select the same way, so a League move always forces an explicit
+  // re-pick of the Division rather than carrying over a now-foreign one.
+  c.querySelectorAll("[data-reg-league-for]").forEach((sel) => sel.onchange = () => {
+    const rid = sel.dataset.regLeagueFor;
+    const divSel = c.querySelector(`#reg-div-${rid}`);
+    if (!divSel) return;
+    const divs = leagueDivisions[sel.value] || [];
+    divSel.innerHTML = `<option value="">No division</option>${divs.map((d) => opt(d.id, d.name)).join("")}`;
+  });
+  c.querySelectorAll("[data-reg-save]").forEach((b) => b.onclick = async () => {
+    const rid = b.dataset.regSave;
+    const leagueSel = c.querySelector(`#reg-league-${rid}`);
+    const divSel = c.querySelector(`#reg-div-${rid}`);
+    const newLeague = leagueSel ? leagueSel.value : "";
+    const newDiv = (divSel && divSel.value) || "";
+    const origLeague = b.dataset.regOrigLeague || "";
+    const origDiv = b.dataset.regOrigDiv || "";
+    if (!newLeague) { toast = "Choose a league."; toastIsError = true; return render(); }
+    const leagueChanged = newLeague !== origLeague;
+    const divChanged = newDiv !== origDiv;
+    if (!leagueChanged && !divChanged) { toast = "No changes to save."; return render(); }
     toast = "";
-    const res = await post(`/api/setup/season-team-registration/${rid}/assign-division`,
-      { division_id: (div && div.value) || null });
-    if (res && !res.error) toast = "Division updated for the season.";
+    // A registration's League and Division are cross-validated server-side (a
+    // set Division must belong to the registration's current League) — see
+    // setup_service.assign_season_team_league / assign_season_team_division
+    // (v2). Changing League while an old, now-foreign Division is still
+    // attached would be rejected by assign-league itself. Deviation from a
+    // literal "assign-league then assign-division" order (#233 B2b): clear
+    // the Division FIRST whenever League is changing and one is currently
+    // set, so the League move always lands cleanly, then re-apply the
+    // (already league-rescoped) Division afterward if one was picked.
+    let res;
+    if (leagueChanged && origDiv) {
+      res = await post(`/api/v2/setup/season-team-registration/${rid}/assign-division`, { division_id: null });
+      if (res && res.error) return render();
+    }
+    if (leagueChanged) {
+      res = await post(`/api/v2/setup/season-team-registration/${rid}/assign-league`, { league_id: newLeague });
+      if (res && res.error) return render();
+    }
+    if (newDiv && (leagueChanged || divChanged)) {
+      res = await post(`/api/v2/setup/season-team-registration/${rid}/assign-division`, { division_id: newDiv });
+      if (res && res.error) return render();
+    } else if (!leagueChanged && divChanged) {
+      res = await post(`/api/v2/setup/season-team-registration/${rid}/assign-division`, { division_id: null });
+      if (res && res.error) return render();
+    }
+    if (res && !res.error) toast = "Season registration updated.";
     await render();
   });
   c.querySelectorAll("[data-reg-remove]").forEach((b) => b.onclick = async () => {
     toast = "";
-    const res = await post(`/api/setup/season-team-registration/${b.dataset.regRemove}/remove`, {});
+    const res = await post(`/api/v2/setup/season-team-registration/${b.dataset.regRemove}/remove`, {});
     if (res && !res.error) toast = "Team removed from the season.";
     await render();
   });
@@ -4617,14 +4729,15 @@ async function render() {
               name: b.dataset.gameName };
     render();
   });
-  // Season rollover (#180): the league/season pickers reset the selection and
-  // any stale result so the preview always matches the chosen pair; commit
-  // gathers the checked teams and their target divisions and posts to the
-  // hardened rollover route, then re-renders (which reloads season
+  // Season rollover (#180, cut to v2 canonical #233 Slice B2b): the
+  // program/season pickers reset the selection and any stale result so the
+  // preview always matches the chosen pair; commit gathers the checked teams
+  // with their target League (required) and optional Division and posts to
+  // the hardened v2 rollover route, then re-renders (which reloads season
   // registrations, so carried teams move into "already registered").
-  const roLeague = c.querySelector("[data-rollover-league]");
-  if (roLeague) roLeague.onchange = () => {
-    rollover.leagueId = roLeague.value;
+  const roProgram = c.querySelector("[data-rollover-program]");
+  if (roProgram) roProgram.onchange = () => {
+    rollover.programId = roProgram.value;
     rollover.fromSeasonId = ""; rollover.toSeasonId = ""; rollover.result = null;
     render();
   };
@@ -4643,11 +4756,22 @@ async function render() {
     c.querySelectorAll("[data-rollover-pick]").forEach((cb) => { cb.checked = roAll.checked; });
     updateRolloverCommitState(c);
   };
-  // Every checkbox/division change re-evaluates the commit gate in place, so
-  // inline row errors and the button's enabled state track the selection
-  // without a re-render dropping it (review #216).
+  // Every checkbox/league/division change re-evaluates the commit gate in
+  // place, so inline row errors and the button's enabled state track the
+  // selection without a re-render dropping it (review #216). A row's League
+  // select also rescopes its own Division select's options (never guessing a
+  // same-named division under the newly-picked League).
   c.querySelectorAll("[data-rollover-pick]").forEach((cb) =>
     cb.onchange = () => updateRolloverCommitState(c));
+  c.querySelectorAll("[data-rollover-league]").forEach((sel) => sel.onchange = () => {
+    const teamId = sel.dataset.rolloverLeague;
+    const divSel = c.querySelector(`[data-rollover-div="${teamId}"]`);
+    if (divSel) {
+      const divs = leagueDivisions[sel.value] || [];
+      divSel.innerHTML = `<option value="">No division</option>${divs.map((d) => opt(d.id, d.name)).join("")}`;
+    }
+    updateRolloverCommitState(c);
+  });
   c.querySelectorAll("[data-rollover-div]").forEach((sel) =>
     sel.onchange = () => updateRolloverCommitState(c));
   const roCommit = c.querySelector("[data-rollover-commit]");
@@ -4657,11 +4781,15 @@ async function render() {
       const selections = [];
       c.querySelectorAll("[data-rollover-pick]").forEach((cb) => {
         if (!cb.checked) return;
+        const league = c.querySelector(`[data-rollover-league="${cb.dataset.rolloverPick}"]`);
         const div = c.querySelector(`[data-rollover-div="${cb.dataset.rolloverPick}"]`);
-        if (div && div.value) selections.push({ team_id: cb.dataset.rolloverPick, division_id: div.value });
+        if (league && league.value) {
+          selections.push({ team_id: cb.dataset.rolloverPick, league_id: league.value,
+                             division_id: (div && div.value) || null });
+        }
       });
-      // Defensive: the button is disabled unless every checked team is
-      // assigned, but re-check before sending so an unassigned selection can
+      // Defensive: the button is disabled unless every checked team has a
+      // League, but re-check before sending so an unassigned selection can
       // never reach the server.
       const checked = c.querySelectorAll("[data-rollover-pick]:checked").length;
       if (!selections.length || selections.length !== checked) {
@@ -4669,7 +4797,7 @@ async function render() {
         return;
       }
       toast = "";
-      rollover.result = await post(`/api/setup/seasons/${rollover.toSeasonId}/roll-forward`,
+      rollover.result = await post(`/api/v2/setup/seasons/${rollover.toSeasonId}/roll-forward`,
         { from_season_id: rollover.fromSeasonId, selections });
       if (rollover.result && !rollover.result.error) toast = "Season rollover complete.";
       await render();

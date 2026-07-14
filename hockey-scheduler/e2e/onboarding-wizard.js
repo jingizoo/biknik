@@ -122,11 +122,15 @@ async function checkViewport(browser, viewport) {
     await page.waitForSelector('.tab[data-tab="onboarding"].active');
     await page.getByText("Progress is recalculated from saved records", { exact: false }).waitFor();
 
-    // #233 B1: the wizard teaches the target model in the canonical vocabulary.
-    // Step/drawer keys stay frozen (exercised below by deep-linking the
-    // organization drawer). All steps render regardless of completion state, so
-    // the whole step list is inspectable on an empty install. Per-step text and
-    // action labels are captured by the frozen data-onboarding-step key.
+    // #233 B1/B2b: the wizard teaches the target model in the canonical
+    // vocabulary, now backed by /api/v2/onboarding/status. Step/drawer keys
+    // stay frozen (exercised below by deep-linking the organization drawer).
+    // All steps render regardless of completion state, so the whole step list
+    // is inspectable on an empty install. Per-step text and action labels are
+    // captured by each group's own data-onboarding-step key — note this is a
+    // wizard-internal grouping key, not the backend's onboarding step key; the
+    // Program group's own key was renamed league→program in Slice B2b to
+    // avoid colliding with the new season-scoped "League" concept.
     const wiz = await page.evaluate(() => {
       const steps = {};
       document.querySelectorAll(".onboarding-step").forEach((el) => {
@@ -147,14 +151,14 @@ async function checkViewport(browser, viewport) {
     const need = (cond, msg) => { if (!cond) throw new Error(`[${viewport.label}] ${msg}`); };
     const s = wiz.steps;
 
-    // Umbrella step (frozen key "league") reads "Program" and never a bare
+    // Umbrella group (wizard key "program") reads "Program" and never a bare
     // "League"; its action is "Add program", its checks name the program and the
     // operating organization (never "owner"/"facility owner").
-    need(s.league && s.league.title === "Program", `umbrella step title is not "Program" (got ${JSON.stringify(s.league && s.league.title)})`);
+    need(s.program && s.program.title === "Program", `umbrella step title is not "Program" (got ${JSON.stringify(s.program && s.program.title)})`);
     need(!wiz.titles.includes("League"), `wizard still has a bare "League" step title`);
-    need(s.league.actions.includes("Add program") && !s.league.actions.includes("Add league"),
-      `umbrella action is not "Add program" (got ${JSON.stringify(s.league.actions)})`);
-    need(/Program created/.test(s.league.text) && /Operating organization assigned/.test(s.league.text),
+    need(s.program.actions.includes("Add program") && !s.program.actions.includes("Add league"),
+      `umbrella action is not "Add program" (got ${JSON.stringify(s.program.actions)})`);
+    need(/Program created/.test(s.program.text) && /Operating organization assigned/.test(s.program.text),
       `umbrella checks not renamed to "Program created"/"Operating organization assigned"`);
 
     // Step 1 keeps facility ownership distinct from program operation.
@@ -168,12 +172,16 @@ async function checkViewport(browser, viewport) {
     need(/Season-to-Venue access replaces/i.test(s.venues.text),
       `step 3 does not say Season-to-Venue access replaces the temporary link`);
 
-    // Step 4 teaches the target model — leagues required, division optional — and
-    // no longer says "Leagues remain optional".
-    need(/leagues \(required\)/i.test(s.season.text) && /optional split of a league/i.test(s.season.text),
+    // Step 4 (wizard key "season") teaches the v2 target model, now actually
+    // enforced (not just described): every season requires a grouping League
+    // (blocking), Division is optional (never blocking). No more "will land
+    // with the schema in Slice C" — C2/B2a already shipped it.
+    need(/requires a grouping league/i.test(s.season.text) && /optional split of a league/i.test(s.season.text),
       `step 4 does not teach league-required / division-optional target model`);
-    need(!/Leagues remain optional/i.test(s.season.text) && !/Levels remain/i.test(s.season.text),
-      `step 4 still says "Leagues remain optional"`);
+    need(!/will land with the schema/i.test(s.season.text) && !/Slice C\b/i.test(s.season.text),
+      `step 4 still describes the v2 gating as future work`);
+    need(/Division \(optional\)/i.test(s.season.text),
+      `step 4 does not mark its Division check as optional`);
     // Action order must respect the frozen v1 drawer dependencies: at empty
     // install (no Season) the only action is "Add season" — never a dead-end
     // "Add league" whose drawer requires a Season — and never "Add optional …".
@@ -194,8 +202,11 @@ async function checkViewport(browser, viewport) {
     // The internal grouping key "level"/"Level" is never shown to the operator.
     need(!/\bLevel\b/.test(wiz.allText), `wizard still exposes the internal "Level" noun`);
 
+    // Canonical v2 readiness (#233 Slice B2b): empty install is blocked on
+    // no_organization exactly as v1 was (the code is unchanged between v1 and
+    // v2 for this gap).
     const status = await page.evaluate(async () => {
-      const response = await fetch("/api/onboarding/status", {
+      const response = await fetch("/api/v2/onboarding/status", {
         credentials: "same-origin",
         cache: "no-store",
       });
