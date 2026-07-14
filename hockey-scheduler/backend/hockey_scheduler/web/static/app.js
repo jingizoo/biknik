@@ -254,6 +254,77 @@ async function post(p, b) {
   return d;
 }
 
+// Shared write-order logic for moving a season registration to a new
+// League/Division (#233 B2b review) — used by BOTH Season participation's
+// own Save control (renderSeasonParticipation's regRow) and the Needs-
+// assignment repair row's Save control (renderSetupHierarchy's
+// regIssueRow), so the sequencing lives in exactly one place.
+//
+// A registration's League and Division are cross-validated server-side (a
+// set Division must belong to the registration's current League) — see
+// setup_service.assign_season_team_league / assign_season_team_division
+// (v2). Changing League while an old, now-foreign Division is still
+// attached would be rejected by assign-league itself. Deviation from a
+// literal "assign-league then assign-division" order (#233 B2b): clear the
+// Division FIRST whenever League is changing and one is currently set, so
+// the League move always lands cleanly, then re-apply the (already
+// league-rescoped) Division afterward if one was picked.
+//
+// Each individual POST is server-side transactional (a single write can't
+// half-apply), so the only partial state possible is "an earlier step in
+// this sequence succeeded, then a later one failed" — callers use the
+// returned `partial` flag to tell an operator their Save actually mutated
+// something rather than silently no-op'ing.
+async function saveRegistrationPlacement(registrationId, newLeagueId, newDivisionId,
+                                         origLeagueId, origDivisionId) {
+  const leagueChanged = newLeagueId !== origLeagueId;
+  const divChanged = newDivisionId !== origDivisionId;
+  let appliedAny = false;
+  const fail = (res) => ({
+    ok: false,
+    error: (res && res.error && res.error.message) || "The update could not be completed.",
+    partial: appliedAny,
+  });
+
+  if (leagueChanged && origDivisionId) {
+    const res = await post(
+      `/api/v2/setup/season-team-registration/${registrationId}/assign-division`, { division_id: null });
+    if (res && res.error) return fail(res);
+    appliedAny = true;
+  }
+  if (leagueChanged) {
+    const res = await post(
+      `/api/v2/setup/season-team-registration/${registrationId}/assign-league`, { league_id: newLeagueId });
+    if (res && res.error) return fail(res);
+    appliedAny = true;
+  }
+  if (newDivisionId && (leagueChanged || divChanged)) {
+    const res = await post(
+      `/api/v2/setup/season-team-registration/${registrationId}/assign-division`, { division_id: newDivisionId });
+    if (res && res.error) return fail(res);
+    appliedAny = true;
+  } else if (!leagueChanged && divChanged) {
+    const res = await post(
+      `/api/v2/setup/season-team-registration/${registrationId}/assign-division`, { division_id: null });
+    if (res && res.error) return fail(res);
+    appliedAny = true;
+  }
+  return { ok: true, error: null, partial: false };
+}
+// Sets `toast`/`toastIsError` from a saveRegistrationPlacement() result — the
+// one place that turns its {ok, error, partial} contract into operator-facing
+// text, shared by both Save call sites so "fully applied" / "failed before
+// any write" / "partially applied" always read the same way everywhere.
+function placementSaveToast(result, successMessage) {
+  if (result.ok) { toast = successMessage; toastIsError = false; return; }
+  if (result.partial) {
+    toast = `Partially saved — an earlier change was applied, but a later step failed (${result.error}). Please retry to finish.`;
+  } else {
+    toast = result.error;
+  }
+  toastIsError = true;
+}
+
 /* ---------- shared ---------- */
 const bannerClass = (s) => s === "open_slot" ? "alert" : s === "needs_substitute" ? "warn" : s === "roster_confirmed" ? "ok" : "neutral";
 // Same ok/warn/alert/neutral → green/orange/red/gray mapping the .banner
@@ -1204,7 +1275,12 @@ function renderSetupHierarchy(sv, hv, ov) {
             <span class="tn-meta">${dangling.length} division${dangling.length === 1 ? "" : "s"}</span></summary>
           <div class="tn-children">${dangling.map((d) => divisionNode(d, s.id)).join("")}</div>
         </details>` : "";
-      (s.needs_assignment && s.needs_assignment.registrations || []).forEach((r) => seasonRegIssues.push(r));
+      // Each issue carries its OWN season's id/name/leagues (not just the raw
+      // backend row) so the repair row below can build a League→Division
+      // cascade scoped to the right season, never the whole program (#233
+      // B2b review — repair surface for invalid season registrations).
+      (s.needs_assignment && s.needs_assignment.registrations || []).forEach((r) =>
+        seasonRegIssues.push({ ...r, season_id: s.id, season_name: s.name, season_leagues: s.leagues || [] }));
       const seasonBody = (levelSections || orphanDivSection)
         ? `${levelSections}${orphanDivSection}`
         : `<div class="tn-empty">No divisions in this season yet.</div>`;
@@ -1305,13 +1381,52 @@ function renderSetupHierarchy(sv, hv, ov) {
   // Season registration issues the canonical hierarchy detects (#233 B2a
   // review r1) — a team's League/Division no longer agrees with its
   // registration, or the team/league itself is gone. Fixed in Slice B2b's
-  // registration UI; surfaced here (read-only) so they're never silently
-  // hidden by the tree only showing valid branches.
+  // registration UI. A row's diagnostic reason is always shown; a
+  // registration whose Team still resolves gets a repair control — a
+  // League(required)+Division(optional) cascade for a League/Division
+  // mismatch (mirrors renderSeasonParticipation's own regRow cascade,
+  // scoped to the ISSUE's own season via season_leagues), or a plain Remove
+  // when the Team itself is gone/foreign (not safely repairable here — see
+  // REPAIRABLE_REG_REASONS below). Never hidden manually; a repaired/removed
+  // row simply stops appearing once the backend's needs_assignment no longer
+  // reports it (#233 B2b review — repair surface for invalid registrations).
   const regTeamName = (tid) => (((ov.teams || []).find((t) => t.id === tid)) || {}).name || tid;
+  // Only a League/Division inconsistency is safely repairable inline: the
+  // registration and Team are real, just mis-parented. team_missing (no such
+  // Team) and team_program_mismatch (a cross-Program Team) both need
+  // out-of-scope reparenting decisions, so they only offer Remove.
+  const REPAIRABLE_REG_REASONS = new Set([
+    "registration_league_division_mismatch", "registration_league_not_in_season"]);
+  const repairRemoveBtn = (issue) => `<button class="icon-btn danger" data-repair-remove="${esc(issue.registration_id)}"
+      title="Remove from season" aria-label="Remove ${esc(regTeamName(issue.team_id))} from ${esc(issue.season_name)}">${ICONS.circleMinus}</button>`;
+  const regIssueRow = (issue) => {
+    const diag = `<span class="tn-label">⚠ ${esc(regTeamName(issue.team_id))}</span>
+          <span class="tn-meta">${esc(REG_REASON_LABEL[issue.reason] || issue.reason)}</span>`;
+    if (!REPAIRABLE_REG_REASONS.has(issue.reason)) {
+      return `<div class="tn-leaf warn repair-row">${diag}${repairRemoveBtn(issue)}</div>`;
+    }
+    // The League select is scoped to the issue's OWN season (issue.season_leagues,
+    // attached when seasonRegIssues was built above) — never the whole program.
+    // A registration_league_not_in_season issue's current league_id won't match
+    // any option here, so nothing starts selected; that's expected.
+    const leagues = issue.season_leagues || [];
+    const leagueOpts = leagues.map((lv) => opt(lv.id, lv.name, lv.id === issue.league_id)).join("");
+    const curLeague = leagues.find((lv) => lv.id === issue.league_id);
+    const divOpts = ((curLeague && curLeague.divisions) || [])
+      .map((d) => opt(d.id, d.name, d.id === issue.division_id)).join("");
+    return `<div class="tn-leaf warn repair-row">${diag}
+      <select id="repair-league-${esc(issue.registration_id)}" data-repair-league-for="${esc(issue.registration_id)}">
+        <option value="">Choose a league…</option>${leagueOpts}</select>
+      <select id="repair-div-${esc(issue.registration_id)}" data-repair-div-for="${esc(issue.registration_id)}">
+        <option value="">No division</option>${divOpts}</select>
+      <button class="act" data-repair-save="${esc(issue.registration_id)}"
+        data-repair-orig-league="${esc(issue.league_id || "")}"
+        data-repair-orig-div="${esc(issue.division_id || "")}">Save</button>
+      ${repairRemoveBtn(issue)}</div>`;
+  };
   const regIssueRows = seasonRegIssues.length
     ? `<div class="na-group"><div class="na-group-label">Season registrations needing attention (${seasonRegIssues.length})</div>${
-        seasonRegIssues.map((r) => `<div class="tn-leaf warn"><span class="tn-label">⚠ ${esc(regTeamName(r.team_id))}</span>
-          <span class="tn-meta">${esc(REG_REASON_LABEL[r.reason] || r.reason)}</span></div>`).join("")}</div>` : "";
+        seasonRegIssues.map(regIssueRow).join("")}</div>` : "";
   const naBody = naRow("Programs without an operating organization", noOwnerLeagues,
                        (l) => reassignBtn("league", "organization", l, l.organization_id))
     + naRow("Venues without a legacy program grouping", noLeagueVenues,
@@ -4676,39 +4791,56 @@ async function render() {
     const leagueChanged = newLeague !== origLeague;
     const divChanged = newDiv !== origDiv;
     if (!leagueChanged && !divChanged) { toast = "No changes to save."; return render(); }
-    toast = "";
-    // A registration's League and Division are cross-validated server-side (a
-    // set Division must belong to the registration's current League) — see
-    // setup_service.assign_season_team_league / assign_season_team_division
-    // (v2). Changing League while an old, now-foreign Division is still
-    // attached would be rejected by assign-league itself. Deviation from a
-    // literal "assign-league then assign-division" order (#233 B2b): clear
-    // the Division FIRST whenever League is changing and one is currently
-    // set, so the League move always lands cleanly, then re-apply the
-    // (already league-rescoped) Division afterward if one was picked.
-    let res;
-    if (leagueChanged && origDiv) {
-      res = await post(`/api/v2/setup/season-team-registration/${rid}/assign-division`, { division_id: null });
-      if (res && res.error) return render();
-    }
-    if (leagueChanged) {
-      res = await post(`/api/v2/setup/season-team-registration/${rid}/assign-league`, { league_id: newLeague });
-      if (res && res.error) return render();
-    }
-    if (newDiv && (leagueChanged || divChanged)) {
-      res = await post(`/api/v2/setup/season-team-registration/${rid}/assign-division`, { division_id: newDiv });
-      if (res && res.error) return render();
-    } else if (!leagueChanged && divChanged) {
-      res = await post(`/api/v2/setup/season-team-registration/${rid}/assign-division`, { division_id: null });
-      if (res && res.error) return render();
-    }
-    if (res && !res.error) toast = "Season registration updated.";
+    // Write-order logic (clear Division first when League is changing and one
+    // is set, then assign-league, then assign-division) lives in the shared
+    // saveRegistrationPlacement() helper — see its comment for why — so it's
+    // not duplicated between this control and the repair row's Save below.
+    const result = await saveRegistrationPlacement(rid, newLeague, newDiv, origLeague, origDiv);
+    placementSaveToast(result, "Season registration updated.");
     await render();
   });
   c.querySelectorAll("[data-reg-remove]").forEach((b) => b.onclick = async () => {
     toast = "";
     const res = await post(`/api/v2/setup/season-team-registration/${b.dataset.regRemove}/remove`, {});
     if (res && !res.error) toast = "Team removed from the season.";
+    await render();
+  });
+  // Needs-assignment repair row (#233 B2b review): an invalid season
+  // registration's League→Division cascade and Save/Remove — see
+  // renderSetupHierarchy's regIssueRow for how these controls are built.
+  // Distinct data-repair-* attributes keep this selector space separate from
+  // Season participation's own data-reg-* controls above (no id collision in
+  // practice — an issue registration is by construction excluded from the
+  // valid tree — but kept distinct for clarity).
+  c.querySelectorAll("[data-repair-league-for]").forEach((sel) => sel.onchange = () => {
+    const rid = sel.dataset.repairLeagueFor;
+    const divSel = c.querySelector(`#repair-div-${rid}`);
+    if (!divSel) return;
+    // Only reached with the NEWLY selected league, which is always one of
+    // this issue's real season_leagues options — so leagueDivisions (built
+    // from hv.programs[].seasons[].leagues[] during this same render pass)
+    // is guaranteed to have it, even for a registration_league_not_in_season
+    // issue whose ORIGINAL league_id might not be covered by it.
+    const divs = leagueDivisions[sel.value] || [];
+    divSel.innerHTML = `<option value="">No division</option>${divs.map((d) => opt(d.id, d.name)).join("")}`;
+  });
+  c.querySelectorAll("[data-repair-save]").forEach((b) => b.onclick = async () => {
+    const rid = b.dataset.repairSave;
+    const leagueSel = c.querySelector(`#repair-league-${rid}`);
+    const divSel = c.querySelector(`#repair-div-${rid}`);
+    const newLeague = leagueSel ? leagueSel.value : "";
+    const newDiv = (divSel && divSel.value) || "";
+    const origLeague = b.dataset.repairOrigLeague || "";
+    const origDiv = b.dataset.repairOrigDiv || "";
+    if (!newLeague) { toast = "Choose a league to repair this registration."; toastIsError = true; return render(); }
+    const result = await saveRegistrationPlacement(rid, newLeague, newDiv, origLeague, origDiv);
+    placementSaveToast(result, "Registration repaired — moved into the selected league/division.");
+    await render();
+  });
+  c.querySelectorAll("[data-repair-remove]").forEach((b) => b.onclick = async () => {
+    toast = "";
+    const res = await post(`/api/v2/setup/season-team-registration/${b.dataset.repairRemove}/remove`, {});
+    if (res && !res.error) toast = "Invalid registration removed from the season.";
     await render();
   });
   // Safe destructive delete (#215): a Delete control opens the themed confirm

@@ -70,6 +70,48 @@ class V2OnboardingStatusTest(unittest.TestCase):
         # Division optional — never a blocker in v2.
         self.assertNotIn("no_division", _codes(status))
 
+    def test_program_without_organization_never_blocks_v2(self):
+        """#233 B2b review: operator_organization_id is nullable on the
+        canonical Program (B2a/ADR 0001), so a Program with no operator is a
+        complete, valid Program — v2 readiness must never block on it."""
+        api = self._api()
+        api.create_user_account("admin", "pw", "league_admin")
+        program = api.create_program("Orgless Prog", actor_id="admin")
+        self.assertIsNone(program.get("operator_organization_id"))
+        season = api.create_season(program["id"], "Fall", actor_id="admin")
+        league = api.create_league(season["id"], "Diamond", actor_id="admin")
+        club = api.create_club("C", actor_id="admin")
+        team = api.create_team(club["id"], None, "T", actor_id="admin",
+                               program_id=program["id"])
+        # No venue linked to the program at all here — that's a SEPARATE
+        # blocker (no_venue_assigned_to_program) this test doesn't need to
+        # clear; it only proves the operator gap itself never blocks
+        # readiness (registration is set up so the rest of the chain is
+        # otherwise valid, isolating the assertion to the operator gap).
+        reg = api.register_team_for_season(season["id"], team["id"],
+                                           actor_id="admin",
+                                           league_id=league["id"])
+        self.assertNotIn("error", reg, reg)
+
+        status = api.get_onboarding_status_v2("demo")
+        codes = _codes(status)
+        self.assertNotIn("program_without_organization", codes)
+        warning_codes = {w["code"] for w in status["warnings"]}
+        self.assertIn("program_without_organization", warning_codes)
+        step = {s["key"]: s for s in status["steps"]}["program_ownership"]
+        self.assertFalse(step["blocking"])
+
+    def test_same_program_without_organization_still_blocks_v1(self):
+        """v1 readiness is FROZEN: the exact same orgless Program still blocks
+        v1 on league_without_organization (v1's name for this gap)."""
+        api = self._api()
+        api.create_user_account("admin", "pw", "league_admin")
+        program = api.create_program("Orgless Prog", actor_id="admin")
+        status = api.get_onboarding_status("demo")
+        self.assertFalse(status["ready_to_schedule"], status)
+        self.assertIn("league_without_organization",
+                      {b["code"] for b in status["blocking"]})
+
     def test_same_data_still_blocks_no_division_in_v1(self):
         """The v1 readiness is FROZEN: the exact data that is v2-ready (league,
         no division) still blocks v1 on `no_division`, and v1 never asks for a

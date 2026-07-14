@@ -103,18 +103,25 @@ async function checkViewport(browser, viewport) {
         { program_id: program.id, club_id: club.id, name: "Lions" });
       const bears = await post("/api/v2/setup/team",
         { program_id: program.id, club_id: club.id, name: "Bears" });
-      // Both teams play the source season.
+      // A third team, carried in a SEPARATE second rollover round below with
+      // only a League chosen (Division left at "No division") — covers a
+      // rollover selection whose stored division_id is actually null.
+      const wolves = await post("/api/v2/setup/team",
+        { program_id: program.id, club_id: club.id, name: "Wolves" });
+      // All three teams play the source season.
       await post(`/api/v2/setup/seasons/${src.id}/team-registrations`,
         { team_id: lions.id, league_id: lgSrc.id, division_id: dSrc.id });
       await post(`/api/v2/setup/seasons/${src.id}/team-registrations`,
         { team_id: bears.id, league_id: lgSrc.id, division_id: dSrc.id });
+      await post(`/api/v2/setup/seasons/${src.id}/team-registrations`,
+        { team_id: wolves.id, league_id: lgSrc.id, division_id: dSrc.id });
       // Lions is already in the target season (League A + Target A) — the
       // rollover must skip it, not duplicate it.
       await post(`/api/v2/setup/seasons/${dst.id}/team-registrations`,
         { team_id: lions.id, league_id: lgDstA.id, division_id: dstA.id });
       return { program: program.id, src: src.id, dst: dst.id, empty: empty.id,
         lgSrc: lgSrc.id, lgDstA: lgDstA.id, lgDstB: lgDstB.id,
-        dstA: dstA.id, dstB: dstB.id, lions: lions.id, bears: bears.id };
+        dstA: dstA.id, dstB: dstB.id, lions: lions.id, bears: bears.id, wolves: wolves.id };
     });
 
     // Open Setup and reach the Season rollover panel.
@@ -213,7 +220,8 @@ async function checkViewport(browser, viewport) {
     // Verify the resulting target-season registrations: Bears now active under
     // the target League in Target B, Lions still active in Target A
     // (untouched), and the permanent Team count in the program is unchanged
-    // (no team was copied).
+    // (no team was copied — Wolves is the 3rd permanent team, created above
+    // for the second rollover round below, not carried yet).
     const state = await page.evaluate(async (i) => {
       const get = async (p) => (await fetch(p, { credentials: "same-origin" })).json();
       const regs = (await get(`/api/v2/setup/seasons/${i.dst}/team-registrations`)).registrations;
@@ -229,8 +237,8 @@ async function checkViewport(browser, viewport) {
         activeCount: active.length,
       };
     }, ids);
-    if (state.teamCount !== 2) {
-      throw new Error(`[${viewport.label}] expected 2 permanent teams, got ${state.teamCount}`);
+    if (state.teamCount !== 3) {
+      throw new Error(`[${viewport.label}] expected 3 permanent teams, got ${state.teamCount}`);
     }
     if (state.bearsLeague !== ids.lgDstB) {
       throw new Error(`[${viewport.label}] Bears not carried into League B: ${JSON.stringify(state)}`);
@@ -245,10 +253,49 @@ async function checkViewport(browser, viewport) {
       throw new Error(`[${viewport.label}] expected 2 active target registrations, got ${state.activeCount}`);
     }
 
+    // (4) Rollover with division_id: null — a SEPARATE second round carries
+    // Wolves (still eligible: registered in the source season, not yet in
+    // the target) with only a target League chosen; its Division select is
+    // left at the default "No division". The picker persists alongside the
+    // "Rollover complete" banner from the first commit above, so no reset
+    // step is needed before checking Wolves.
+    await page.waitForFunction(
+      (w) => !!document.querySelector(`[data-rollover-pick="${w}"]`),
+      ids.wolves, { timeout: 15000 });
+    await page.check(`[data-rollover-pick="${ids.wolves}"]`);
+    await page.selectOption(`[data-rollover-league="${ids.wolves}"]`, ids.lgDstA);
+    // Division select is untouched — stays at its "No division" default.
+    await page.waitForFunction(() => {
+      const commit = document.querySelector("[data-rollover-commit]");
+      return commit && !commit.disabled;
+    }, null, { timeout: 10000 });
+    const resp2 = page.waitForResponse((r) =>
+      r.url() === `${base}/api/v2/setup/seasons/${ids.dst}/roll-forward`
+      && r.request().method() === "POST");
+    await page.click("[data-rollover-commit]");
+    const resp2Req = (await resp2).request();
+    if (resp2Req.postDataJSON) {
+      const body2 = resp2Req.postDataJSON();
+      const wolvesSel = (body2.selections || []).find((s) => s.team_id === ids.wolves);
+      if (!wolvesSel || wolvesSel.division_id !== null) {
+        throw new Error(`[${viewport.label}] wolves roll-forward selection division_id: ${JSON.stringify(wolvesSel)}`);
+      }
+    }
+    const wolvesStored = await page.evaluate(async (i) => {
+      const get = async (p) => (await fetch(p, { credentials: "same-origin" })).json();
+      const regs = (await get(`/api/v2/setup/seasons/${i.dst}/team-registrations`)).registrations;
+      return regs.find((r) => r.active && r.team_id === i.wolves);
+    }, ids);
+    if (!wolvesStored || wolvesStored.division_id !== null || !("division_id" in wolvesStored)) {
+      throw new Error(`[${viewport.label}] wolves stored registration division_id wasn't null: ${
+        JSON.stringify(wolvesStored)}`);
+    }
+
     if (errors.length) {
       throw new Error(`[${viewport.label}] console/page errors:\n${errors.join("\n")}`);
     }
-    console.log(`[${viewport.label}] OK — eligible team carried forward, already-registered team skipped.`);
+    console.log(`[${viewport.label}] OK — eligible team carried forward, already-registered team skipped, `
+      + `league-only rollover stored a null division_id.`);
   } catch (error) {
     throw new Error(`${error.message}\n--- demo server output ---\n${serverOutput}`);
   } finally {
