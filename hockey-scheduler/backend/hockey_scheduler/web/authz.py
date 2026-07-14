@@ -15,6 +15,52 @@ from ..domain import Permission, can
 _ARENA_SETUP = {"organization", "venue", "rink", "ice-slot"}
 _LEAGUE_SETUP = {"league", "season", "level", "division", "club", "team", "player"}
 
+# The v2 canonical setup surface (#233 Slice C2). Same operator authz as v1, over
+# canonical entity names: v1 "league"(umbrella)→"program", v1 "level"(grouping)→
+# "league". The required *permission* is unchanged by the rename (both are
+# MANAGE_SETUP), so only the entity-name sets differ.
+_V2_ARENA_SETUP = {"organization", "venue", "rink", "ice-slot"}
+_V2_SETUP_SETUP = {"program", "season", "league", "division", "club", "team",
+                   "player"}
+
+
+def _v2_setup_permission(rest: str):
+    """The Permission a ``/api/v2/setup/<rest>`` POST requires (#233 Slice C2)."""
+    # Reassignment: facility-side moves (venue/rink parents) are arena actions;
+    # competition-structure moves (division/team/player parents) require setup.
+    if re.match(r"^(venue|rink)/[^/]+/assign-\w+$", rest):
+        return Permission.MANAGE_ARENA
+    if re.match(r"^(division|team|player)/[^/]+/assign-\w+$", rest):
+        return Permission.MANAGE_SETUP
+    # Season team-registration operations (register / assign-league /
+    # assign-division / remove / roll-forward) are setup actions.
+    if re.match(r"^season-team-registration/[^/]+/"
+                r"(assign-league|assign-division|remove)$", rest):
+        return Permission.MANAGE_SETUP
+    if re.match(r"^seasons/[^/]+/(team-registrations|roll-forward)$", rest):
+        return Permission.MANAGE_SETUP
+    if re.match(r"^programs/[^/]+/teams$", rest):
+        return Permission.MANAGE_SETUP
+    if rest == "hierarchy":
+        return Permission.MANAGE_SETUP
+    # Delete: /api/v2/setup/<entity>/<id>/delete — per-entity permission.
+    md = re.match(r"^([\w-]+)/[^/]+/delete$", rest)
+    if md:
+        kind = md.group(1)
+        if kind == "game":
+            return Permission.MANAGE_SCHEDULE
+        if kind in _V2_ARENA_SETUP:
+            return Permission.MANAGE_ARENA
+        return Permission.MANAGE_SETUP
+    # Plain entity create.
+    if rest in ("game", "official"):
+        return Permission.MANAGE_SCHEDULE
+    if rest in _V2_ARENA_SETUP:
+        return Permission.MANAGE_ARENA
+    if rest in _V2_SETUP_SETUP:
+        return Permission.MANAGE_SETUP
+    return Permission.MANAGE_SETUP  # unknown v2 setup entity: require setup
+
 # Game sub-actions grouped by the permission they require.
 _SCHEDULE_ACTIONS = {"move", "publish", "result", "result/approve"}
 _ROSTER_ACTIONS = {
@@ -133,6 +179,13 @@ def required_permission(path: str):
     # the "only a League Admin sees full onboarding data" rule (#174).
     if path == "/api/onboarding/status":
         return Permission.MANAGE_SETUP
+
+    # Canonical v2 surface (#233 Slice C2): the v2 readiness read is League-Admin
+    # only like its v1 sibling, and the v2 setup routes mirror v1's authz.
+    if path == "/api/v2/onboarding/status":
+        return Permission.MANAGE_SETUP
+    if path.startswith("/api/v2/setup/"):
+        return _v2_setup_permission(path[len("/api/v2/setup/"):])
 
     # Cross-domain league↔facility moves (#173) — tying a league to an owner or
     # a venue to a league spans both domains, so both require MANAGE_SETUP

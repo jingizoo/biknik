@@ -1024,6 +1024,220 @@ class ApiService:
             "warnings": warnings,
         }
 
+    def get_onboarding_status_v2(self, app_mode: str = "demo") -> dict:
+        """Canonical v2 onboarding readiness (#233 Slice C2).
+
+        Enforces the TARGET competition model: Program → Season → **League** →
+        optional Division → Team. The key difference from the FROZEN v1
+        ``get_onboarding_status``: a Season needs at least one grouping **League**
+        (blocker ``no_league``), and **Division is optional** — there is NO
+        ``no_division`` blocker; the division step is informational only.
+
+        Canonical vocabulary is used for the codes: the umbrella is a *Program*
+        (``no_program`` — v1's ``no_league`` meant the umbrella), and ``no_league``
+        here means the season-scoped grouping League that v1 has no requirement
+        for. Same shape as v1 (``complete``/``ready_to_schedule``/``steps``/
+        ``blocking``/``warnings``) and the same count-only privacy invariant.
+        """
+        production = (app_mode == "production")
+
+        admins = self._active_admin_count()
+        mig = self.store.migration_status()
+        persistent = (not isinstance(self.store, InMemoryStore)
+                      and not getattr(self.store, "is_memory_backed", False))
+
+        orgs = self.store.all_organizations()
+        programs = self.store.all_programs()
+        venues = self.store.all_venues()
+        rinks = self.store.all_rinks()
+        seasons = self.store.all_seasons()
+        leagues = self.store.all_leagues()  # the grouping League (was Level)
+        divisions = self.store.all_divisions()
+        teams = self.store.all_teams()
+        slots = self.store.all_ice_slots()
+        players = self.store.all_players()
+        officials = self.store.all_officials()
+
+        org_ids = {o.id for o in orgs}
+        program_ids = {p.id for p in programs}
+        season_ids = {s.id for s in seasons}
+        team_ids = {t.id for t in teams}
+        program_owner = {p.id: (p.operator_organization_id or None)
+                         for p in programs}
+
+        # Venue/ice soundness — identical rules to v1 (venue↔program is still the
+        # temporary v1 relation until Slice E), just under canonical names.
+        venues_in_program = [v for v in venues if v.league_id in program_ids]
+        venue_mismatches = [
+            v for v in venues_in_program
+            if (v.organization_id or None) != program_owner.get(v.league_id)]
+        mismatch_ids = {v.id for v in venue_mismatches}
+        sound_program_venue_ids = {
+            v.id for v in venues_in_program if v.id not in mismatch_ids}
+        schedulable_rink_ids = {
+            r.id for r in rinks if r.venue_id in sound_program_venue_ids}
+        available_game_slots = [
+            s for s in slots
+            if s.rink_id in schedulable_rink_ids
+            and s.slot_type == IceSlotType.GAME
+            and s.status == IceSlotStatus.AVAILABLE]
+
+        programs_without_org = [
+            p for p in programs
+            if not p.operator_organization_id
+            or p.operator_organization_id not in org_ids]
+
+        seasons_dangling = [s for s in seasons if s.program_id not in program_ids]
+        leagues_dangling = [lg for lg in leagues if lg.season_id not in season_ids]
+        teams_dangling = [t for t in teams
+                          if not t.program_id or t.program_id not in program_ids]
+
+        blocking = []
+        warnings = []
+        steps = []
+
+        def step(key, label, done, *, blocking_step=True, detail=""):
+            steps.append({"key": key, "label": label,
+                          "status": "done" if done else "todo",
+                          "blocking": blocking_step and not done,
+                          "detail": detail})
+
+        def block(done, code, message):
+            if not done:
+                blocking.append({"code": code, "message": message})
+
+        # 1. Deployment foundation.
+        step("league_admin", "Create a League Admin account", admins > 0,
+             detail=f"{admins} active league admin(s)")
+        block(admins > 0, "no_active_admin",
+              "No active League Admin account exists to operate the installation.")
+
+        storage_ok = persistent or not production
+        step("durable_storage", "Run on durable storage", storage_ok,
+             blocking_step=production,
+             detail=("durable store" if storage_ok
+                     else "in-memory or ephemeral (no durable DATABASE_URL)"))
+        if production:
+            block(storage_ok, "non_durable_store",
+                  "Production is running on non-durable storage; data would be "
+                  "lost on restart.")
+
+        step("migrations", "Apply database migrations", mig["current"],
+             detail=f"{len(mig['applied'])}/{len(mig['expected'])} applied")
+        block(mig["current"], "migrations_stale",
+              "Database migrations are not up to date.")
+
+        # 2. Facility + program chain.
+        has_org = len(orgs) > 0
+        step("organization", "Add a facility organization", has_org,
+             detail=f"{len(orgs)} organization(s)")
+        block(has_org, "no_organization",
+              "No facility organization has been created yet.")
+
+        has_program = len(programs) > 0
+        step("program", "Create a program", has_program,
+             detail=f"{len(programs)} program(s)")
+        block(has_program, "no_program", "No program has been created yet.")
+
+        ownership_ok = has_program and not programs_without_org
+        step("program_ownership",
+             "Tie every program to an operating organization", ownership_ok,
+             detail=(f"{len(programs_without_org)} program(s) without an "
+                     "operating organization" if programs_without_org
+                     else "all programs have an operating organization"))
+        if has_program:
+            block(not programs_without_org, "program_without_organization",
+                  f"{len(programs_without_org)} program(s) are not tied to an "
+                  "operating organization.")
+
+        venue_ok = bool(sound_program_venue_ids)
+        step("venue", "Link a venue to a program (temporary v1)", venue_ok,
+             detail=(f"{len(sound_program_venue_ids)} venue(s) linked to a program"
+                     if venue_ok else f"{len(venues)} venue(s), "
+                     f"{len(venues_in_program)} linked"))
+        if has_program:
+            block(bool(venues_in_program), "no_venue_assigned_to_program",
+                  "No venue is linked to a program yet.")
+            block(not venue_mismatches, "venue_owner_mismatch",
+                  f"{len(venue_mismatches)} venue(s) have a facility owner that "
+                  "disagrees with their program's operating organization.")
+
+        has_rink = bool(schedulable_rink_ids)
+        step("rink", "Add a rink to a configured venue", has_rink,
+             detail=f"{len(schedulable_rink_ids)} rink(s) at a configured venue")
+        if venue_ok:
+            block(has_rink, "no_rink",
+                  "No rink exists at a venue linked to a program.")
+
+        has_ice = bool(available_game_slots)
+        step("ice", "Open an available game ice slot", has_ice,
+             detail=f"{len(available_game_slots)} available game slot(s)")
+        if has_rink:
+            block(has_ice, "no_available_ice",
+                  "No available game ice slot exists to schedule on.")
+
+        # 3. Competition structure: season → LEAGUE (required) → team.
+        #    Division is OPTIONAL in v2 — no no_division blocker.
+        has_season = bool(season_ids) and any(
+            s.program_id in program_ids for s in seasons)
+        step("season", "Create a season", has_season,
+             detail=f"{len(seasons)} season(s)")
+        if has_program:
+            block(has_season, "no_season", "No season has been created yet.")
+        if seasons_dangling:
+            block(False, "seasons_without_program",
+                  f"{len(seasons_dangling)} season(s) reference a program that "
+                  "no longer exists.")
+
+        has_league = any(lg.season_id in season_ids for lg in leagues)
+        step("league", "Create a league under a season", has_league,
+             detail=f"{len(leagues)} league(s)")
+        if has_season:
+            block(has_league, "no_league",
+                  "No league has been created under a season yet.")
+        if leagues_dangling:
+            block(False, "leagues_without_season",
+                  f"{len(leagues_dangling)} league(s) reference a season that "
+                  "no longer exists.")
+
+        # Division is optional (#233): show the milestone but never block on it.
+        has_division = any(d.season_id in season_ids for d in divisions)
+        step("division", "Create a division (optional)", has_division,
+             blocking_step=False,
+             detail=f"{len(divisions)} division(s)")
+
+        has_team = any(t.program_id in program_ids for t in teams)
+        step("team", "Add a team", has_team,
+             detail=f"{len(teams)} team(s)")
+        if has_league:
+            block(has_team, "no_team", "No team has been added yet.")
+        if teams_dangling:
+            block(False, "teams_without_program",
+                  f"{len(teams_dangling)} team(s) are not tied to a valid program.")
+
+        # 4. Soft gaps — recommended but not required to schedule.
+        if not players:
+            warnings.append({"code": "no_players",
+                             "message": "No players have been added yet."})
+        if not officials:
+            warnings.append({"code": "no_officials",
+                             "message": "No officials have been added yet."})
+        orphan_players = [p for p in players if p.team_id not in team_ids]
+        if orphan_players:
+            warnings.append({
+                "code": "players_without_team",
+                "message": f"{len(orphan_players)} player(s) are not on any "
+                           "team."})
+
+        ready = not blocking
+        return {
+            "complete": ready and not warnings,
+            "ready_to_schedule": ready,
+            "steps": steps,
+            "blocking": blocking,
+            "warnings": warnings,
+        }
+
     # -- contact registry (#60) --------------------------------------------
     @staticmethod
     def _contact_row(c) -> dict:
@@ -2463,6 +2677,81 @@ class ApiService:
             "missing_assignments": missing,
         }
 
+    @catch
+    def get_setup_hierarchy_v2(self) -> dict:
+        """Canonical Program→Season→League→Division setup tree (#233 Slice C2).
+
+        The v2 counterpart of ``get_setup_hierarchy``: canonical keys throughout
+        (``program_id`` / ``operator_organization_id`` / competition
+        ``league_id``), Program as the umbrella and the grouping League between
+        Season and Division. The v1 ``get_setup_hierarchy`` is untouched. Leaves
+        carry counts only (``player_count``) — never rosters or player names —
+        so this operator-gated read stays name-free like its v1 sibling."""
+        programs = self.store.all_programs()
+        seasons = self.store.all_seasons()
+        leagues = self.store.all_leagues()  # the grouping League (was Level)
+        divisions = self.store.all_divisions()
+        teams = self.store.all_teams()
+
+        player_count = {}
+        for p in self.store.all_players():
+            player_count[p.team_id] = player_count.get(p.team_id, 0) + 1
+
+        seasons_by_program = _group(seasons, "program_id")
+        leagues_by_season = _group(leagues, "season_id")
+        divs_by_season = _group(divisions, "season_id")
+        # Teams nest under a Division via their active SeasonTeamRegistration
+        # (#180), not the legacy scalar — mirrors the v1 tree.
+        teams_by_id = {t.id: t for t in teams}
+        teams_by_div = {}
+        for reg in self.store.all_season_team_registrations():
+            if reg.active and reg.division_id:
+                tm = teams_by_id.get(reg.team_id)
+                if tm is not None:
+                    teams_by_div.setdefault(reg.division_id, []).append(tm)
+
+        def team_node(t):
+            return {"id": t.id, "name": t.name, "club_id": t.club_id,
+                    "program_id": t.program_id,
+                    "player_count": player_count.get(t.id, 0)}
+
+        def division_node(d):
+            return {"id": d.id, "name": d.name, "age_group": d.age_group,
+                    "league_id": d.league_id,
+                    "teams": [team_node(t) for t in teams_by_div.get(d.id, [])]}
+
+        program_tree = []
+        for prog in programs:
+            season_nodes = []
+            for s in seasons_by_program.get(prog.id, []):
+                season_leagues = sorted(
+                    leagues_by_season.get(s.id, []),
+                    key=lambda lv: (lv.sort_order or 0, lv.name))
+                league_ids = {lv.id for lv in season_leagues}
+                divs_by_league = _group(divs_by_season.get(s.id, []), "league_id")
+                league_nodes = [
+                    {"id": lv.id, "name": lv.name, "sort_order": lv.sort_order,
+                     "divisions": [division_node(d)
+                                   for d in divs_by_league.get(lv.id, [])]}
+                    for lv in season_leagues
+                ]
+                # Divisions in this season with no league (or a dangling one) —
+                # allowed, since Division is optional under a League in v2.
+                no_league = [d for d in divs_by_season.get(s.id, [])
+                             if not d.league_id or d.league_id not in league_ids]
+                season_nodes.append({
+                    "id": s.id, "name": s.name, "leagues": league_nodes,
+                    "divisions_without_league": [division_node(d)
+                                                 for d in no_league],
+                })
+            program_tree.append({
+                "id": prog.id, "name": prog.name,
+                "operator_organization_id": prog.operator_organization_id,
+                "seasons": season_nodes,
+            })
+
+        return {"programs": program_tree}
+
     # ====================================================================
     # League + Arena setup
     # ====================================================================
@@ -2498,6 +2787,14 @@ class ApiService:
             season_id, name, age_group, league_id, actor_id))
 
     @catch
+    def create_division_v2(self, league_id: str, name: str, age_group: str = "",
+                           actor_id: Optional[str] = None) -> dict:
+        """Canonical v2 division create (#233 Slice C2): parented by a grouping
+        League (REQUIRED); Season is derived from the league."""
+        return _serialize(self.setup.create_division_under_league(
+            league_id, name, age_group, actor_id))
+
+    @catch
     def create_club(self, name: str, country: str = "",
                     actor_id: Optional[str] = None) -> dict:
         return _serialize(self.setup.create_club(name, country, actor_id))
@@ -2513,9 +2810,12 @@ class ApiService:
     @catch
     def register_team_for_season(self, season_id: str, team_id: str,
                                  division_id: Optional[str] = None,
-                                 actor_id: Optional[str] = None) -> dict:
+                                 actor_id: Optional[str] = None,
+                                 league_id: Optional[str] = None) -> dict:
+        # ``league_id`` is the v2 canonical path (#233 Slice C2): when supplied
+        # it is required-and-validated; when omitted (v1) the C1b derivation runs.
         return _serialize(self.setup.register_team_for_season(
-            season_id, team_id, division_id, actor_id))
+            season_id, team_id, division_id, actor_id, league_id=league_id))
 
     @catch
     def assign_season_team_division(self, registration_id: str,
@@ -2523,6 +2823,14 @@ class ApiService:
                                     actor_id: Optional[str] = None) -> dict:
         return _serialize(self.setup.assign_season_team_division(
             registration_id, division_id, actor_id))
+
+    @catch
+    def assign_season_team_league(self, registration_id: str,
+                                  league_id: Optional[str] = None,
+                                  actor_id: Optional[str] = None) -> dict:
+        """Canonical v2 (#233 Slice C2): reassign a registration's League."""
+        return _serialize(self.setup.assign_season_team_league(
+            registration_id, league_id, actor_id))
 
     @catch
     def unregister_team_from_season(self, registration_id: str,
@@ -2555,6 +2863,13 @@ class ApiService:
         # keys/shape and values.
         rows = [team_to_v1(_serialize(t))
                 for t in self.store.teams_for_program(program_id)]
+        return {"teams": rows}
+
+    @catch
+    def list_program_teams_v2(self, program_id: str) -> dict:
+        """Canonical v2 (#233 Slice C2): a program's permanent teams with
+        canonical keys (program_id, not the legacy league_id)."""
+        rows = [_serialize(t) for t in self.store.teams_for_program(program_id)]
         return {"teams": rows}
 
     # -- safe destructive deletion (#215) ---------------------------------
@@ -2701,11 +3016,15 @@ class ApiService:
                     away_team_id: str, ice_slot_id: str, target_goalies: int = 1,
                     target_skaters: int = 15, max_skaters: int = 18,
                     allow_division_override: bool = False,
-                    actor_id: Optional[str] = None) -> dict:
+                    actor_id: Optional[str] = None,
+                    league_id: Optional[str] = None) -> dict:
+        # ``league_id`` is the v2 canonical scope (#233 Slice C2): when supplied
+        # it is required-and-validated and division_id is optional; when omitted
+        # (v1) division_id stays mandatory and the league is derived from it.
         return _serialize(self.setup.create_game(
             season_id, division_id, home_team_id, away_team_id, ice_slot_id,
             target_goalies, target_skaters, max_skaters,
-            allow_division_override, actor_id))
+            allow_division_override, actor_id, league_id=league_id))
 
     # ====================================================================
     # Pilot onboarding import — dry-run validator (#92)

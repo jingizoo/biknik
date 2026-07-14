@@ -22,7 +22,8 @@ class SetupService(_BaseSetupService):
                     away_team_id: str, ice_slot_id: str,
                     target_goalies: int = 1, target_skaters: int = 15,
                     max_skaters: int = 18, allow_division_override: bool = False,
-                    actor_id: Optional[str] = None):
+                    actor_id: Optional[str] = None,
+                    league_id: Optional[str] = None):
         # The scope check and all writes share one transaction. Call the base
         # method's undecorated body to avoid opening a nested SqlStore
         # transaction (SQLite rejects BEGIN inside BEGIN).
@@ -37,18 +38,23 @@ class SetupService(_BaseSetupService):
             # Participation is resolved through SeasonTeamRegistration (#180),
             # not Team.division_id (#200 review): a league-first team created
             # with division_id=None but correctly registered must still count as
-            # a valid matchup so the cross-league ice guard runs. Both teams must
-            # be co-registered in this division (cross-division override is
-            # deprecated), so allow_division_override does not affect this check.
+            # a valid matchup so the cross-league ice guard runs. When v2 omits a
+            # division (#233 Slice C2), participation relaxes to season-only.
+            require_division = division_id is not None
             teams_match = (
                 season is not None
-                and self._team_participates(season, home_team_id, division_id)
-                and self._team_participates(season, away_team_id, division_id)
+                and self._team_participates(season, home_team_id, division_id,
+                                            require_division)
+                and self._team_participates(season, away_team_id, division_id,
+                                            require_division)
             )
+            # Division is optional in v2 (a supplied league_id scopes the game);
+            # when a division IS given it must belong to the season, as in v1.
+            division_ok = (division is not None and division.season_id == season_id) \
+                if require_division else True
             structure_valid = (
                 season is not None
-                and division is not None
-                and division.season_id == season_id
+                and division_ok
                 and home is not None
                 and away is not None
                 and home_team_id != away_team_id
@@ -62,7 +68,7 @@ class SetupService(_BaseSetupService):
                 ice_slot_id, target_goalies=target_goalies,
                 target_skaters=target_skaters, max_skaters=max_skaters,
                 allow_division_override=allow_division_override,
-                actor_id=actor_id,
+                actor_id=actor_id, league_id=league_id,
             )
 
     def move_game(self, game_id: str, new_ice_slot_id: str, reason: str = "",
