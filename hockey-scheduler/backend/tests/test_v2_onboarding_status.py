@@ -94,6 +94,59 @@ class V2OnboardingStatusTest(unittest.TestCase):
         # Program", which is satisfied here), so it never blocks on no_league.
         self.assertNotIn("no_league", _codes(v1))
 
+    def test_second_season_without_league_blocks_no_league(self):
+        """League is required PER Season: a second Season with no grouping League
+        must fire `no_league` even though the first Season has one — the naming
+        message identifies the offending Season."""
+        api = self._api()
+        org, program, season = self._base(api)
+        # First season gets a league + a valid registration.
+        league = api.create_league(season["id"], "Diamond", actor_id="admin")
+        team = api.create_team(self._club["id"], None, "T", actor_id="admin",
+                               program_id=program["id"])
+        api.register_team_for_season(season["id"], team["id"], actor_id="admin",
+                                     league_id=league["id"])
+        # A SECOND season under the same program with NO league.
+        season2 = api.create_season(program["id"], "Spring", actor_id="admin")
+
+        status = api.get_onboarding_status_v2("demo")
+        self.assertFalse(status["ready_to_schedule"], status)
+        codes = _codes(status)
+        self.assertIn("no_league", codes)
+        # The blocker names the season that lacks a league.
+        msg = next(b["message"] for b in status["blocking"]
+                   if b["code"] == "no_league")
+        self.assertIn(season2["name"], msg, msg)
+
+    def test_invalid_registrations_are_reported(self):
+        """Cross-League (league_id not in the season), cross-Program (team in
+        another program), and cross-League-Division registrations are surfaced as
+        an `invalid_registrations` blocker."""
+        api = self._api()
+        org, program, season = self._base(api)
+        league = api.create_league(season["id"], "Diamond", actor_id="admin")
+        team = api.create_team(self._club["id"], None, "T", actor_id="admin",
+                               program_id=program["id"])
+        # A valid registration keeps the installation otherwise ready...
+        api.register_team_for_season(season["id"], team["id"], actor_id="admin",
+                                     league_id=league["id"])
+        # ...but a league from a DIFFERENT season is invalid participation.
+        other_season = api.create_season(program["id"], "Other", actor_id="admin")
+        other_league = api.create_league(other_season["id"], "OL",
+                                         actor_id="admin")
+        team2 = api.create_team(self._club["id"], None, "T2", actor_id="admin",
+                                program_id=program["id"])
+        # Inject a cross-season-league registration directly (the service would
+        # reject it) to reproduce the invalid data the readiness must report.
+        from hockey_scheduler.domain import SeasonTeamRegistration
+        api.store.add_season_team_registration(SeasonTeamRegistration(
+            id=api.store.next_id("streg"), season_id=season["id"],
+            team_id=team2["id"], division_id=None,
+            league_id=other_league["id"], active=True))
+
+        status = api.get_onboarding_status_v2("demo")
+        self.assertIn("invalid_registrations", _codes(status), status)
+
     def test_v2_uses_canonical_program_code(self):
         """With nothing created, v2 blocks on `no_program` (canonical umbrella
         code), never repurposing v1's `no_league` for the umbrella."""

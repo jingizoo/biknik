@@ -1948,8 +1948,9 @@ class Handler(BaseHTTPRequestHandler):
         b = body
         combo = (entity, target)
         if combo == ("division", "league"):
+            # v2 Division reparent: League REQUIRED + dependent-record integrity.
             return self._send_api(api.assign_division_league(
-                record_id, b.get("league_id") or None, actor_id))
+                record_id, b.get("league_id") or None, actor_id, v2=True))
         if combo == ("team", "club"):
             return self._send_api(api.assign_team_club(
                 record_id, b.get("club_id") or None, actor_id))
@@ -1960,8 +1961,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_api(api.assign_rink_venue(
                 record_id, b.get("venue_id"), actor_id))
         if combo == ("venue", "organization"):
-            return self._send_api(api.assign_venue_organization(
-                record_id, b.get("organization_id") or None, actor_id))
+            # Canonical Venue is org-owned only — strip the legacy league_id.
+            return self._send_api(_v1.venue_to_v2(api.assign_venue_organization(
+                record_id, b.get("organization_id") or None, actor_id)))
         return self._send_json({"error": {
             "code": "not_found",
             "message": f"Unknown reassignment {entity}/assign-{target}."}}, 404)
@@ -2009,16 +2011,19 @@ class Handler(BaseHTTPRequestHandler):
                 ml.group(1), b.get("league_id") or None, actor_id))
         ma = re.match(r"^season-team-registration/([^/]+)/assign-division$", entity)
         if ma:
+            # v2: clearing the Division PRESERVES the required league_id; a set
+            # Division must match the registration's League.
             return self._send_api(api.assign_season_team_division(
-                ma.group(1), b.get("division_id") or None, actor_id))
+                ma.group(1), b.get("division_id") or None, actor_id, v2=True))
         mx = re.match(r"^season-team-registration/([^/]+)/remove$", entity)
         if mx:
             return self._send_api(api.unregister_team_from_season(
                 mx.group(1), actor_id))
-        # Season rollover (canonical): selections may carry league_id + division.
+        # Season rollover (canonical v2): each selection REQUIRES a target
+        # league_id, honored verbatim on the resulting registration.
         mrf = re.match(r"^seasons/([^/]+)/roll-forward$", entity)
         if mrf:
-            return self._send_api(api.roll_forward_registrations(
+            return self._send_api(api.roll_forward_registrations_v2(
                 b.get("from_season_id"), mrf.group(1), b.get("selections"),
                 actor_id))
         # Delete: /api/v2/setup/<entity>/<id>/delete — canonical names
@@ -2036,7 +2041,9 @@ class Handler(BaseHTTPRequestHandler):
                 "venue": api.delete_venue, "rink": api.delete_rink,
                 "ice-slot": api.delete_ice_slot, "game": api.delete_game,
             }[kind]
-            return self._send_api(deleter(md.group(2), actor_id))
+            # Canonical Venue responses drop the legacy league_id (org-owned only).
+            mapper = _v1.venue_to_v2 if kind == "venue" else (lambda r: r)
+            return self._send_api(mapper(deleter(md.group(2), actor_id)))
 
         # Entity create — canonical bodies, canonical responses.
         if entity == "program":
@@ -2074,10 +2081,11 @@ class Handler(BaseHTTPRequestHandler):
                 b.get("name"), b.get("short_name", ""), actor_id))
         if entity == "venue":
             # v2 omits league_id — venue↔program is a legacy v1-only relation
-            # (Slice E decouples it); the v2 route simply never accepts it.
-            return self._send_api(api.create_venue(
+            # (Slice E decouples it); the v2 route never accepts it in the request
+            # and strips it from the response (canonical Venue is org-owned only).
+            return self._send_api(_v1.venue_to_v2(api.create_venue(
                 b.get("name"), b.get("address", ""), b.get("timezone", "UTC"),
-                b.get("organization_id") or None, None, actor_id))
+                b.get("organization_id") or None, None, actor_id)))
         if entity == "rink":
             return self._send_api(api.create_rink(
                 b.get("venue_id"), b.get("name"), actor_id))

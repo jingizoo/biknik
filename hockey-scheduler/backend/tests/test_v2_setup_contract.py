@@ -33,8 +33,10 @@ DIVISION_KEYS = {"id", "season_id", "name", "age_group", "league_id",
                  "external_ref"}
 TEAM_KEYS = {"id", "name", "division", "club_id", "division_id", "external_ref",
              "program_id"}
+# Canonical Venue is Organization-owned only: the legacy league_id is stripped
+# from every v2 Venue response (#233 Slice C2).
 VENUE_KEYS = {"id", "name", "address", "timezone", "organization_id",
-              "league_id", "external_ref"}
+              "external_ref"}
 REGISTRATION_KEYS = {"id", "season_id", "team_id", "division_id", "league_id",
                      "active"}
 GAME_KEYS = {"id", "home_team_id", "start_time", "target_goalies",
@@ -144,13 +146,13 @@ class V2SetupContractTest(unittest.TestCase):
         self.assertEqual(set(team_b), TEAM_KEYS, team_b)
         self.assertEqual(team_b["club_id"], club["id"])
 
-        # venue: v2 never carries league_id in the request; org owner only —
-        # the canonical response still exposes league_id (null here).
+        # venue: v2 never carries league_id in the request OR the response —
+        # canonical Venue is org-owned only; league_id is stripped entirely.
         venue = self._v2(c, "venue",
                         {"name": "Main Arena", "organization_id": org["id"]})
         self.assertEqual(set(venue), VENUE_KEYS, venue)
         self.assertEqual(venue["organization_id"], org["id"])
-        self.assertIsNone(venue["league_id"])
+        self.assertNotIn("league_id", venue)
 
         # For the game's schedulable ice, the venue must be linked to the program
         # (the league-ice isolation guard). That temporary v1 venue↔program link
