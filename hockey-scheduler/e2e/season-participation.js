@@ -8,8 +8,10 @@
 // season and confirms the other season's registration is untouched. Fails on
 // any browser console/page error.
 const { chromium } = require("playwright");
-const { spawn } = require("child_process");
+const { spawn, spawnSync } = require("child_process");
+const fs = require("fs");
 const http = require("http");
+const os = require("os");
 const path = require("path");
 
 const HOST = "127.0.0.1";
@@ -44,12 +46,65 @@ function stopServer(server) {
   });
 }
 
+// #233 B2b review r3: registration_league_not_in_season has no remaining
+// documented v2 mutation path (delete_league now blocks on a live
+// registration referencing it), so the repair UI's browser coverage below
+// manufactures it the same way the backend's direct-injection test does —
+// via the store, bypassing the service layer entirely — but from a SEPARATE
+// process against the SAME durable SQLite file the running server was
+// started against (see the DATABASE_URL passed into spawn() below). The
+// server's own SQLite connection is autocommit/single-statement, and this
+// script only runs between browser actions (never concurrently with a live
+// request), so there is no write contention with the running server.
+function injectCorruptRegistration(databasePath, { seasonId, teamId, leagueId }) {
+  const script = `
+import os
+from hockey_scheduler.store import create_store
+from hockey_scheduler.domain import SeasonTeamRegistration
+
+store = create_store(os.environ["FIXTURE_DB_PATH"])
+try:
+    reg_id = store.next_id("streg")
+    store.add_season_team_registration(SeasonTeamRegistration(
+        id=reg_id, season_id=os.environ["FIXTURE_SEASON_ID"],
+        team_id=os.environ["FIXTURE_TEAM_ID"], division_id=None,
+        league_id=os.environ["FIXTURE_LEAGUE_ID"], active=True))
+    print(reg_id)
+finally:
+    store.close()
+`;
+  const result = spawnSync(process.env.PYTHON || "python3", ["-c", script], {
+    cwd: BACKEND_DIR,
+    env: {
+      ...process.env,
+      FIXTURE_DB_PATH: databasePath,
+      FIXTURE_SEASON_ID: seasonId,
+      FIXTURE_TEAM_ID: teamId,
+      FIXTURE_LEAGUE_ID: leagueId,
+    },
+    encoding: "utf8",
+  });
+  if (result.status !== 0) {
+    throw new Error(`Fixture injection failed (exit ${result.status}): ${result.stderr}`);
+  }
+  return result.stdout.trim();
+}
+
 async function checkViewport(browser, viewport) {
   const base = `http://${HOST}:${viewport.port}`;
+  // A durable SQLite file (not the in-memory demo default) so the repair-UI
+  // coverage below can inject a corrupt row directly into the same file from
+  // a separate process (#233 B2b review r3). Demo mode still boots to a
+  // clean slate against it (DemoState.__init__ calls reset(seed=False)), so
+  // every other scenario in this file behaves identically to the in-memory
+  // store it replaces.
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "hockey-participation-"));
+  const databasePath = path.join(tempDir, `participation-${viewport.label}.sqlite`);
   const server = spawn(
     process.env.PYTHON || "python3",
     ["-u", "-m", "hockey_scheduler.web.server", "--host", HOST, "--port", String(viewport.port)],
-    { cwd: BACKEND_DIR, stdio: ["ignore", "pipe", "pipe"] });
+    { cwd: BACKEND_DIR, env: { ...process.env, DATABASE_URL: databasePath },
+      stdio: ["ignore", "pipe", "pipe"] });
   let serverOutput = "";
   server.stdout.on("data", (d) => { serverOutput += d.toString(); });
   server.stderr.on("data", (d) => { serverOutput += d.toString(); });
@@ -103,6 +158,19 @@ async function checkViewport(browser, viewport) {
     await page.click('.tab[data-tab="setup"]');
     await page.waitForFunction(
       (sel) => !!document.querySelector(sel), `#reg-team-${ids.lg1}`, { timeout: 15000 });
+
+    // #233 B2b review r3: the fixture Program above was created with no
+    // operator_organization_id (optional on the canonical Program, B2a/ADR
+    // 0001) — it must never be listed under Needs assignment as a
+    // scheduling blocker (that panel's own copy says "can't be scheduled
+    // until assigned", which no longer applies to a missing operator).
+    const naText = await page.evaluate(() => {
+      const el = document.querySelector(".tree-panel.na");
+      return el ? el.textContent : "";
+    });
+    if (/operating organization/i.test(naText)) {
+      throw new Error(`[${viewport.label}] orgless Program listed under Needs assignment: ${naText}`);
+    }
 
     // Register the permanent team for season 1 / League 1 / Division A. The
     // League select already defaults to lg1 (the section it's under).
@@ -344,15 +412,13 @@ async function checkViewport(browser, viewport) {
     // which also means registration_league_not_in_season (like
     // registration_league_division_mismatch, already established as
     // unreachable) has no remaining documented-v2-mutation path to produce
-    // it; test_v2_onboarding_status.py's test_invalid_registrations_are_reported
-    // and the new test_repair_via_v2_after_direct_injection in that same
-    // file cover invalid-registration detection and repair at the backend
-    // level via direct store injection (the established pattern for
-    // legacy/corrupt-data coverage — the service itself would reject it).
-    // The repair row's own cascade/Save mechanics are the exact same
-    // saveRegistrationPlacement() code path already driven end-to-end by
-    // the edit-path steps above, so this browser journey's job is just to
-    // prove the delete itself is blocked.
+    // it. test_v2_onboarding_status.py's test_invalid_registrations_are_reported
+    // and test_repair_via_v2_after_direct_injection cover detection and
+    // repair at the backend level via direct store injection; section (7)
+    // below drives the same defect through the actual browser repair UI
+    // (data-repair-* controls), using the same direct-injection technique
+    // against this journey's own durable SQLite-backed server (#233 B2b
+    // review r3).
     const lgGuarded = await page.evaluate(async (i) => {
       const post = async (p, b) => (await fetch(p, {
         method: "POST", credentials: "same-origin",
@@ -393,6 +459,101 @@ async function checkViewport(browser, viewport) {
     }, { lg: lgGuarded.lg });
     if (!stillThere) {
       throw new Error(`[${viewport.label}] a blocked league delete removed the league anyway`);
+    }
+
+    // (7) Repair surface, driven through the actual browser controls (#233
+    // B2b review r3): the prior rounds proved the repair MECHANICS
+    // (saveRegistrationPlacement()) via the edit-path steps above and proved
+    // SERVICE-level detection/repair via a direct-injection backend test —
+    // neither exercises the dedicated data-repair-* rendering/wiring. This
+    // manufactures the same registration_league_not_in_season defect via a
+    // direct write to this journey's own durable SQLite file (see
+    // injectCorruptRegistration above), never through a documented v2
+    // mutation, then drives the row through Needs assignment end to end.
+    const repairFixture = await page.evaluate(async (i) => {
+      const post = async (p, b) => (await fetch(p, {
+        method: "POST", credentials: "same-origin",
+        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
+      })).json();
+      // The CORRECT League (repair target) lives in seasonR; the WRONG
+      // League the corrupt row will reference lives in a DIFFERENT season
+      // under the same program — the same shape as
+      // test_repair_via_v2_after_direct_injection in
+      // test_v2_onboarding_status.py.
+      const seasonR = await post("/api/v2/setup/season", { program_id: i.program, name: "Repair Season" });
+      const leagueR = await post("/api/v2/setup/league", { season_id: seasonR.id, name: "Repair League" });
+      const otherSeasonR = await post("/api/v2/setup/season", { program_id: i.program, name: "Repair Season B" });
+      const otherLeagueR = await post("/api/v2/setup/league", { season_id: otherSeasonR.id, name: "Repair League B" });
+      const clubR = await post("/api/v2/setup/club", { name: "Repair Club" });
+      const teamR = await post("/api/v2/setup/team",
+        { program_id: i.program, club_id: clubR.id, name: "Repair Foxes" });
+      return { seasonR: seasonR.id, leagueR: leagueR.id, otherLeagueR: otherLeagueR.id, teamR: teamR.id };
+    }, { program: ids.program });
+    const repairRegId = injectCorruptRegistration(databasePath, {
+      seasonId: repairFixture.seasonR, teamId: repairFixture.teamR, leagueId: repairFixture.otherLeagueR,
+    });
+
+    await refreshSetup({ selector: `[data-repair-save="${repairRegId}"]` });
+
+    // The invalid row appears with its diagnostic and the offending team's
+    // name; the League select offers only Leagues from its OWN season
+    // (leagueR, never otherLeagueR — a different season's League).
+    const repairRow = await page.evaluate((regId) => {
+      const btn = document.querySelector(`[data-repair-save="${regId}"]`);
+      const row = btn.closest(".repair-row");
+      const leagueSel = document.querySelector(`[data-repair-league-for="${regId}"]`);
+      return {
+        text: row.textContent,
+        leagueOptions: Array.from(leagueSel.options).map((o) => o.value).filter(Boolean),
+      };
+    }, repairRegId);
+    if (!/Repair Foxes/.test(repairRow.text) || !/isn't in this season/.test(repairRow.text)) {
+      throw new Error(`[${viewport.label}] repair row missing team name/diagnostic: ${repairRow.text}`);
+    }
+    if (!repairRow.leagueOptions.includes(repairFixture.leagueR)
+        || repairRow.leagueOptions.includes(repairFixture.otherLeagueR)) {
+      throw new Error(`[${viewport.label}] repair row League options wrong: ${JSON.stringify(repairRow.leagueOptions)}`);
+    }
+
+    // Readiness blocks on the invalid registration before repair.
+    let onboarding = await page.evaluate(async () =>
+      (await fetch("/api/v2/onboarding/status", { credentials: "same-origin" })).json());
+    if (!onboarding.blocking.some((b) => b.code === "invalid_registrations")) {
+      throw new Error(`[${viewport.label}] readiness didn't block on the injected invalid registration`);
+    }
+
+    // Repair through the cascade: choose the correct League, leave Division
+    // at "No division", Save.
+    await page.selectOption(`[data-repair-league-for="${repairRegId}"]`, repairFixture.leagueR);
+    await page.click(`[data-repair-save="${repairRegId}"]`);
+    await waitForToast("Registration repaired — moved into the selected league/division.");
+
+    // The row disappears from Needs assignment...
+    await page.waitForSelector(`[data-repair-save="${repairRegId}"]`, { state: "detached", timeout: 15000 });
+    // ...and the team reappears in the valid League branch (league-only —
+    // no division was chosen).
+    const afterRepair = await page.evaluate(async (i) => {
+      const hv = await (await fetch("/api/v2/setup/hierarchy", { credentials: "same-origin" })).json();
+      const seasonNode = hv.programs.flatMap((p) => p.seasons).find((s) => s.id === i.seasonR);
+      const leagueNode = (seasonNode.leagues || []).find((lv) => lv.id === i.leagueR);
+      return {
+        issuesLeft: (seasonNode.needs_assignment && seasonNode.needs_assignment.registrations) || [],
+        inLeague: !!(leagueNode && (leagueNode.teams_without_division || []).some((t) => t.id === i.teamR)),
+      };
+    }, repairFixture);
+    if (afterRepair.issuesLeft.length) {
+      throw new Error(`[${viewport.label}] needs_assignment still reports the repaired registration: ${
+        JSON.stringify(afterRepair.issuesLeft)}`);
+    }
+    if (!afterRepair.inLeague) {
+      throw new Error(`[${viewport.label}] repaired team didn't land under the chosen League`);
+    }
+
+    // Readiness no longer blocks on it.
+    onboarding = await page.evaluate(async () =>
+      (await fetch("/api/v2/onboarding/status", { credentials: "same-origin" })).json());
+    if (onboarding.blocking.some((b) => b.code === "invalid_registrations")) {
+      throw new Error(`[${viewport.label}] readiness still blocks on invalid_registrations after repair`);
     }
 
     if (errors.length) {

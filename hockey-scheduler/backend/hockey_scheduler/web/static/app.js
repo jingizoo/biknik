@@ -1293,7 +1293,8 @@ function renderSetupHierarchy(sv, hv, ov) {
     }).join("") || `<div class="tn-empty">No seasons in this program yet.</div>`;
     return `<details class="tn" open><summary class="tn-sum">
         <span class="tn-label">🏆 ${esc(program.name)}</span>
-        <span class="tn-meta">${seasons.length} season(s) · ${progTeams} team(s)</span>${delBtn("league", program.id, program.name)}</summary>
+        <span class="tn-meta">${seasons.length} season(s) · ${progTeams} team(s)</span>${
+          reassignBtn("league", "organization", program, program.operator_organization_id)}${delBtn("league", program.id, program.name)}</summary>
       <div class="tn-children">${seasonRows}${treeAdd("season", "Add season to " + program.name, "f-season-league", program.id)}</div>
     </details>`;
   }).join("");
@@ -1364,11 +1365,16 @@ function renderSetupHierarchy(sv, hv, ov) {
   const noClubTeams = (ov.teams || []).filter((t) => !t.club_id && !t.club_name);
   const orphanPlayers = canSeePlayers
     ? playersList.filter((p) => !p.team_id || !teamIds.has(p.team_id)) : [];
-  // League↔facility gaps (#173): leagues without an owner, venues without a
-  // league, and venues whose owner disagrees with their league's owner.
+  // League↔facility gaps (#173): venues without a league, and venues whose
+  // owner disagrees with their league's owner. A Program with no operating
+  // organization is NOT one of these gaps (#233 B2b review r3) — the
+  // operator is optional on the canonical model (B2a/ADR 0001) and never a
+  // scheduling blocker, so it must never appear under this "can't be
+  // scheduled until assigned" panel; the Records subtitle ("No operating
+  // org") and the onboarding wizard's own optional check already surface it
+  // informationally.
   const leagueOwner = {};
   (ov.leagues || []).forEach((l) => { leagueOwner[l.id] = l.organization_id || null; });
-  const noOwnerLeagues = (ov.leagues || []).filter((l) => !l.organization_id);
   const noLeagueVenues = (ov.venues || []).filter((v) => !v.league_id);
   const ownerMismatchVenues = (ov.venues || []).filter(
     (v) => v.league_id && (leagueOwner[v.league_id] || null) !== (v.organization_id || null));
@@ -1427,9 +1433,7 @@ function renderSetupHierarchy(sv, hv, ov) {
   const regIssueRows = seasonRegIssues.length
     ? `<div class="na-group"><div class="na-group-label">Season registrations needing attention (${seasonRegIssues.length})</div>${
         seasonRegIssues.map(regIssueRow).join("")}</div>` : "";
-  const naBody = naRow("Programs without an operating organization", noOwnerLeagues,
-                       (l) => reassignBtn("league", "organization", l, l.organization_id))
-    + naRow("Venues without a legacy program grouping", noLeagueVenues,
+  const naBody = naRow("Venues without a legacy program grouping", noLeagueVenues,
             (v) => reassignBtn("venue", "league", v, v.league_id))
     + naRow("Venue facility owner ≠ program operating organization (legacy v1 link)", ownerMismatchVenues,
             (v) => reassignBtn("venue", "league", v, v.league_id))
