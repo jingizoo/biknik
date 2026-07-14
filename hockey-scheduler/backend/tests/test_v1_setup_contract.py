@@ -139,6 +139,26 @@ class V1SetupContractTest(unittest.TestCase):
         self.assertEqual(reorg["organization_id"], org2["id"])
         self.assertNotIn("operator_organization_id", reorg)
 
+    def test_v1_program_teams_read_route_uses_legacy_key(self):
+        # GET /api/setup/leagues/{id}/teams (permanent program teams) must return
+        # each team under its legacy v1 key league_id, never the canonical
+        # program_id — this read route backs the frontend permanent-team panel.
+        c = self._admin()
+        org = self._create(c, "organization", {"name": "Owner", "short_name": "OWN"})
+        league = self._create(c, "league",
+                              {"name": "Read Program", "organization_id": org["id"]})
+        club = self._create(c, "club", {"name": "Read Club"})
+        self._create(c, "team",
+                     {"club_id": club["id"], "name": "Read Team",
+                      "league_id": league["id"]})
+        status, body = self._req(
+            c, "GET", f"/api/setup/leagues/{league['id']}/teams")
+        self.assertEqual(status, 200, body)
+        rows = body["teams"]
+        self.assertEqual(len(rows), 1, body)
+        self.assertEqual(rows[0]["league_id"], league["id"])
+        self.assertNotIn("program_id", rows[0])
+
 
 if __name__ == "__main__":
     unittest.main()

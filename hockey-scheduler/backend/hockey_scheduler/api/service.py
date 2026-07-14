@@ -58,7 +58,7 @@ from ..services import (
 from ..services.league_scope import team_registration_valid
 from ..services.notifier import push as _push_notification
 from ..store import InMemoryStore
-from .v1_setup_adapter import program_to_v1, season_to_v1
+from .v1_setup_adapter import program_to_v1, season_to_v1, team_to_v1
 
 
 def _jsonify(value):
@@ -2553,7 +2553,12 @@ class ApiService:
 
     @catch
     def list_program_teams(self, program_id: str) -> dict:
-        rows = [_serialize(t) for t in self.store.teams_for_program(program_id)]
+        # v1 boundary (#233 C1b): this backs the v1 read route
+        # GET /api/setup/leagues/{id}/teams (and the frontend's permanent-team
+        # panel), so each team row is mapped back to its legacy key
+        # (program_id → league_id) to keep the v1 contract byte-identical.
+        rows = [team_to_v1(_serialize(t))
+                for t in self.store.teams_for_program(program_id)]
         return {"teams": rows}
 
     # -- safe destructive deletion (#215) ---------------------------------
