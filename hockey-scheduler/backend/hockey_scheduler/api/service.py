@@ -2392,13 +2392,15 @@ class ApiService:
     # ====================================================================
     @catch
     def _registration_is_operational(self, r) -> bool:
-        """True only for a registration safe to act on (#180 review).
+        """True only for a registration safe to act on (#180 review, #233 B2c).
 
         Reuses the shared scheduling guard (season has a league, Team exists and
         its permanent league matches the season) and additionally requires any
-        named division to actually belong to the registration's season — so a
-        wrong-season / cross-league / missing-Team / missing-League row is never
-        exposed to the operational UI.
+        named division to actually belong to the registration's season, and the
+        registration's own (competition) league — when set — to resolve, belong
+        to the season, and agree with a named division's league. A wrong-season
+        / cross-league / missing-Team / missing-League row is never exposed to
+        the operational UI (e.g. the game-scheduling wizard, #233 B2c).
         """
         season = self.store.get_season(r.season_id)
         if team_registration_valid(
@@ -2407,6 +2409,12 @@ class ApiService:
         if r.division_id is not None:
             division = self.store.get_division(r.division_id)
             if division is None or division.season_id != r.season_id:
+                return False
+            if r.league_id is not None and division.league_id != r.league_id:
+                return False
+        if r.league_id is not None:
+            league = self.store.get_league(r.league_id)
+            if league is None or league.season_id != r.season_id:
                 return False
         return True
 
@@ -2582,15 +2590,19 @@ class ApiService:
             "schedule": schedule,
             "public_fixtures": public_fixtures,
             # Active season/division participation (#180): the source of truth
-            # for which Team plays which Division in which Season. Operational UI
-            # (e.g. the scheduling wizard) filters teams through these, never the
-            # legacy Team.division_id. Only OPERATIONALLY-VALID rows are exposed
-            # (review): a corrupt/retained row — wrong season, cross-league or
-            # missing Team/League, or a division that isn't in the row's season —
-            # is filtered out here so it can never be offered in the picker.
+            # for which Team plays which League/Division in which Season.
+            # Operational UI (e.g. the scheduling wizard, #233 B2c) filters
+            # teams through these, never the legacy Team.division_id. Only
+            # OPERATIONALLY-VALID rows are exposed (review): a corrupt/retained
+            # row — wrong season, cross-league or missing Team/League, or a
+            # division that isn't in the row's season or doesn't agree with its
+            # league — is filtered out here so it can never be offered in the
+            # picker. `league_id` is the competition (grouping) League the
+            # wizard's League picker needs — required on the registration since
+            # #233 Slice C2, so always present for an operational row.
             "registrations": [
                 {"team_id": r.team_id, "season_id": r.season_id,
-                 "division_id": r.division_id}
+                 "division_id": r.division_id, "league_id": r.league_id}
                 for r in self.store.all_season_team_registrations()
                 if r.active and self._registration_is_operational(r)
             ],

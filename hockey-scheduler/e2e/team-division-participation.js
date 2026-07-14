@@ -77,9 +77,14 @@ async function checkViewport(browser, viewport) {
       const league = await post("/api/setup/league", { name: "Perm League" });
       const s1 = await post("/api/setup/season", { league_id: league.id, name: "2026" });
       const s2 = await post("/api/setup/season", { league_id: league.id, name: "2027" });
-      const d1 = await post("/api/setup/division", { season_id: s1.id, name: "S1 Div One" });
-      const d1b = await post("/api/setup/division", { season_id: s1.id, name: "S1 Div Two" });
-      const d2 = await post("/api/setup/division", { season_id: s2.id, name: "S2 Div One" });
+      // A grouping League per season (#233 B2c) — the scheduling wizard's
+      // League picker is required, so each season needs one before a game
+      // can be created in it.
+      const lv1 = await post("/api/setup/level", { season_id: s1.id, name: "Level One" });
+      const lv2 = await post("/api/setup/level", { season_id: s2.id, name: "Level Two" });
+      const d1 = await post("/api/setup/division", { season_id: s1.id, level_id: lv1.id, name: "S1 Div One" });
+      const d1b = await post("/api/setup/division", { season_id: s1.id, level_id: lv1.id, name: "S1 Div Two" });
+      const d2 = await post("/api/setup/division", { season_id: s2.id, level_id: lv2.id, name: "S2 Div One" });
       const venue = await post("/api/setup/venue", { name: "V", league_id: league.id });
       const rink = await post("/api/setup/rink", { venue_id: venue.id, name: "R" });
       const club = await post("/api/setup/club", { name: "Club" });
@@ -101,7 +106,7 @@ async function checkViewport(browser, viewport) {
       const slot = await post("/api/setup/ice-slot", {
         rink_id: rink.id, start_time: `${day}T18:00:00+00:00`,
         end_time: `${day}T19:00:00+00:00`, slot_type: "game" });
-      return { league: league.id, s1: s1.id, s2: s2.id,
+      return { league: league.id, s1: s1.id, s2: s2.id, lv1: lv1.id,
         d1: d1.id, d1b: d1b.id, d2: d2.id, perma, slot: slot.id };
     }, CAL_DAY);
 
@@ -127,7 +132,13 @@ async function checkViewport(browser, viewport) {
     await page.click('.tab[data-tab="calendar"]');
     await page.waitForSelector(`[data-slot="${ids.slot}"]`, { timeout: 15000 });
     await page.click(`[data-slot="${ids.slot}"]`);
-    await page.waitForSelector("#w-div", { timeout: 10000 });
+    await page.waitForSelector("#w-league", { timeout: 10000 });
+    // League is required (#233 B2c) — select the season's League so its
+    // Division picker is scoped to d1/d1b.
+    await page.selectOption("#w-league", ids.lv1);
+    await page.waitForFunction(
+      (d) => !!Array.from(document.querySelectorAll("#w-div option")).find((o) => o.value === d),
+      ids.d1, { timeout: 10000 });
 
     const homeOptions = async () => page.$$eval(
       "#w-home option", (opts) => opts.map((o) => o.value));
