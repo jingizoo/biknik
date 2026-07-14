@@ -894,8 +894,11 @@ function blockedModalHtml(m) {
       ? `<span class="dep-item">${esc(it.name)} <code>${esc(it.id)}</code></span>`
       : `<span class="dep-item">${esc(it.name)}</span>`).join(", ");
     const more = g.count > items.length ? ", …" : "";
+    // Prefer the canonical display noun (#233); the structured `type` stays the
+    // frozen code (e.g. league/level) for programmatic consumers.
+    const depNoun = g.display || g.type;
     return `<div class="li"><div class="li-main">
-      <div class="li-title">${esc(g.count)} ${esc(g.type)}${g.count === 1 ? "" : "s"}</div>
+      <div class="li-title">${esc(g.count)} ${esc(depNoun)}${g.count === 1 ? "" : "s"}</div>
       ${shown ? `<div class="li-sub">${shown}${more}</div>` : ""}</div></div>`;
   }).join("");
   return modalShell("blocked", `Can't delete this ${noun}`,
