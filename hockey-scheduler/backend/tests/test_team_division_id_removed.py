@@ -114,7 +114,7 @@ class LegacyFieldIsInertContract:
     def setUp(self):
         self.store = self.make_store()
         self.api = ApiService(self.store)
-        self.league = self.api.create_league("L", actor_id=self.ACTOR)["id"]
+        self.league = self.api.create_program("L", actor_id=self.ACTOR)["id"]
         self.club = self.api.create_club("C", actor_id=self.ACTOR)["id"]
 
     def _season(self, name):
@@ -123,10 +123,10 @@ class LegacyFieldIsInertContract:
     def _division(self, season_id, name):
         return self.api.create_division(season_id, name, actor_id=self.ACTOR)["id"]
 
-    def _team(self, name, division_id=None, league_id="_default"):
-        lid = self.league if league_id == "_default" else league_id
+    def _team(self, name, division_id=None, program_id="_default"):
+        pid = self.league if program_id == "_default" else program_id
         return self.api.create_team(
-            self.club, division_id, name, actor_id=self.ACTOR, league_id=lid)["id"]
+            self.club, division_id, name, actor_id=self.ACTOR, program_id=pid)["id"]
 
     def _slot(self):
         venue = self.api.create_venue("V", league_id=self.league, actor_id=self.ACTOR)["id"]
@@ -205,7 +205,7 @@ class LegacyFieldIsInertContract:
         # create_team derives league_id from a division, so build the invalid
         # league-less shape directly in the store.
         orphan = Team(id=self.store.next_id("team"), name="Orphan",
-                      division_id=dA, league_id=None)
+                      division_id=dA, program_id=None)
         self.store.add_team(orphan)
         self.store.add_season_team_registration(SeasonTeamRegistration(
             id=self.store.next_id("streg"), season_id=season,
@@ -235,14 +235,14 @@ class LegacyFieldIsInertContract:
                 team_id=team_id, division_id=division_id, active=True))
 
         # cross-league team
-        other = self.api.create_league("Other", actor_id=self.ACTOR)["id"]
-        cross = Team(id=self.store.next_id("team"), name="Cross", league_id=other)
+        other = self.api.create_program("Other", actor_id=self.ACTOR)["id"]
+        cross = Team(id=self.store.next_id("team"), name="Cross", program_id=other)
         self.store.add_team(cross)
         bad_reg(cross.id, dA)
         # missing team
         bad_reg("team_missing", dA)
         # league-less team
-        orphan = Team(id=self.store.next_id("team"), name="Orphan", league_id=None)
+        orphan = Team(id=self.store.next_id("team"), name="Orphan", program_id=None)
         self.store.add_team(orphan)
         bad_reg(orphan.id, dA)
         # wrong-season: the division belongs to a different season than the row
@@ -262,9 +262,9 @@ class LegacyFieldIsInertContract:
         # review): the resolver must still reject it, not trust matching-but-
         # dangling ids.
         ghost = "league_ghost"
-        season = Season(id=self.store.next_id("season"), league_id=ghost, name="S")
+        season = Season(id=self.store.next_id("season"), program_id=ghost, name="S")
         self.store.add_season(season)
-        team = Team(id=self.store.next_id("team"), name="Ghost", league_id=ghost)
+        team = Team(id=self.store.next_id("team"), name="Ghost", program_id=ghost)
         self.store.add_team(team)
         self.store.add_season_team_registration(SeasonTeamRegistration(
             id=self.store.next_id("streg"), season_id=season.id,

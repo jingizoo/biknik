@@ -12,9 +12,9 @@ class SetupReassignTest(unittest.TestCase):
 
     def setUp(self):
         self.api = ApiService()
-        self.league = self.api.create_league("Over 55")
+        self.league = self.api.create_program("Over 55")
         self.season = self.api.create_season(self.league["id"], "Fall 2026")
-        self.level = self.api.create_level(self.season["id"], "Level 1")
+        self.level = self.api.create_league(self.season["id"], "Level 1")
         self.div = self.api.create_division(self.season["id"], "Div A")
         self.club = self.api.create_club("Club X")
         self.club2 = self.api.create_club("Club Y")
@@ -51,15 +51,15 @@ class SetupReassignTest(unittest.TestCase):
 
     # -- division → level (nullable, same-season) --------------------------
     def test_assign_and_clear_division_level(self):
-        assigned = self.api.assign_division_level(self.div["id"], self.level["id"])
-        self.assertEqual(assigned["level_id"], self.level["id"])
-        cleared = self.api.assign_division_level(self.div["id"], None)
-        self.assertIsNone(cleared["level_id"])
+        assigned = self.api.assign_division_league(self.div["id"], self.level["id"])
+        self.assertEqual(assigned["league_id"], self.level["id"])
+        cleared = self.api.assign_division_league(self.div["id"], None)
+        self.assertIsNone(cleared["league_id"])
 
     def test_assign_division_level_from_other_season_rejected(self):
         other = self.api.create_season(self.league["id"], "Spring 2027")
         div_other = self.api.create_division(other["id"], "Div B")
-        r = self.api.assign_division_level(div_other["id"], self.level["id"])
+        r = self.api.assign_division_league(div_other["id"], self.level["id"])
         self.assertEqual(r["error"]["code"], "validation_error")
 
     # -- team → club (nullable) --------------------------------------------
@@ -104,13 +104,13 @@ class LeagueVenueReassignTest(unittest.TestCase):
         self.api = ApiService()
         self.org = self.api.create_organization("Canlon")
         self.org2 = self.api.create_organization("Rival Owner")
-        self.league = self.api.create_league("Over 55", organization_id=self.org["id"])
+        self.league = self.api.create_program("Over 55", operator_organization_id=self.org["id"])
         self.venue = self.api.create_venue("Plainfield")
 
     def test_assign_league_organization(self):
-        league = self.api.create_league("New League")  # ownerless
-        r = self.api.assign_league_organization(league["id"], self.org["id"])
-        self.assertEqual(r["organization_id"], self.org["id"])
+        league = self.api.create_program("New League")  # ownerless
+        r = self.api.assign_program_organization(league["id"], self.org["id"])
+        self.assertEqual(r["operator_organization_id"], self.org["id"])
 
     def test_assign_venue_league_derives_owner(self):
         r = self.api.assign_venue_league(self.venue["id"], self.league["id"])
@@ -124,7 +124,7 @@ class LeagueVenueReassignTest(unittest.TestCase):
 
     def test_league_owner_change_with_attached_venue_rejected(self):
         self.api.assign_venue_league(self.venue["id"], self.league["id"])
-        r = self.api.assign_league_organization(self.league["id"], self.org2["id"])
+        r = self.api.assign_program_organization(self.league["id"], self.org2["id"])
         self.assertEqual(r["error"]["code"], "validation_error")
 
     def test_unassign_venue_league(self):
@@ -155,7 +155,7 @@ class LeagueVenueReassignTest(unittest.TestCase):
             rink["id"], "2026-09-01T18:30:00+00:00", "2026-09-01T20:00:00+00:00")
         self.api.assign_venue_league(self.venue["id"], self.league["id"])
         self.api.create_game(season["id"], div["id"], home["id"], away["id"], slot["id"])
-        other = self.api.create_league("Other League", organization_id=self.org["id"])
+        other = self.api.create_program("Other League", operator_organization_id=self.org["id"])
         r = self.api.assign_venue_league(self.venue["id"], other["id"])
         self.assertEqual(r["error"]["code"], "validation_error")
         # The venue stayed put.

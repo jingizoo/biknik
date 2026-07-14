@@ -161,7 +161,7 @@ class TranslatorAtStoreBoundaryTest(unittest.TestCase):
                 with self.assertRaises(IntegrityConflictError, msg=label):
                     with store.transaction():
                         store.add_team(Team(id="team_x", name="Rolled Back",
-                                            league_id=None, club_id=None))
+                                            program_id=None, club_id=None))
                         store.add_user_account(_account("user_2", "dup"))
                 self.assertEqual(len(store.all_teams()), teams_before, label)
                 self.assertIsNone(store.get_team("team_x"), label)
@@ -174,7 +174,7 @@ class TranslatorAtStoreBoundaryTest(unittest.TestCase):
         try:
             with self.assertRaises(RuntimeError):
                 with store.transaction():
-                    store.add_team(Team(id="t1", name="T", league_id=None,
+                    store.add_team(Team(id="t1", name="T", program_id=None,
                                         club_id=None))
                     raise RuntimeError("not a database failure")
             # And it rolled back — no partial write survived.

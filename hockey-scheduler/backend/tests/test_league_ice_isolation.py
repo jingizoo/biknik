@@ -25,10 +25,10 @@ class LeagueIceIsolationTest(unittest.TestCase):
 
         self.owner_a = self.setup.create_organization("Owner A")
         self.owner_b = self.setup.create_organization("Owner B")
-        self.league_a = self.setup.create_league(
-            "League A", organization_id=self.owner_a.id)
-        self.league_b = self.setup.create_league(
-            "League B", organization_id=self.owner_b.id)
+        self.league_a = self.setup.create_program(
+            "League A", operator_organization_id=self.owner_a.id)
+        self.league_b = self.setup.create_program(
+            "League B", operator_organization_id=self.owner_b.id)
         self.season_a = self.setup.create_season(self.league_a.id, "Fall A")
         self.season_b = self.setup.create_season(self.league_b.id, "Fall B")
         self.div_a = self.setup.create_division(self.season_a.id, "A")

@@ -11,7 +11,7 @@ class SetupFacadeTest(unittest.TestCase):
         self.api = ApiService()
 
     def _build(self):
-        league = self.api.create_league("EU Premier", country="DE")
+        league = self.api.create_program("EU Premier", country="DE")
         season = self.api.create_season(league["id"], "2026/27")
         division = self.api.create_division(season["id"], "U16", age_group="U16")
         club_a = self.api.create_club("Lions Club")
@@ -59,21 +59,21 @@ class SetupFacadeTest(unittest.TestCase):
 
     def test_create_league_with_owner(self):
         org = self.api.create_organization("Canlon")
-        league = self.api.create_league("Over 55", organization_id=org["id"])
+        league = self.api.create_program("Over 55", operator_organization_id=org["id"])
         self.assertNotIn("error", league)
-        self.assertEqual(league["organization_id"], org["id"])
+        self.assertEqual(league["operator_organization_id"], org["id"])
 
     def test_create_league_with_missing_owner_returns_not_found(self):
-        result = self.api.create_league("Over 55", organization_id="org_missing")
+        result = self.api.create_program("Over 55", operator_organization_id="org_missing")
         self.assertEqual(result["error"]["code"], "not_found")
 
     def test_create_league_without_owner_is_unassigned(self):
-        league = self.api.create_league("Over 55")
-        self.assertIsNone(league["organization_id"])
+        league = self.api.create_program("Over 55")
+        self.assertIsNone(league["operator_organization_id"])
 
     def test_venue_with_league_derives_owner(self):
         org = self.api.create_organization("Canlon")
-        league = self.api.create_league("Over 55", organization_id=org["id"])
+        league = self.api.create_program("Over 55", operator_organization_id=org["id"])
         venue = self.api.create_venue("Plainfield", league_id=league["id"])
         self.assertEqual(venue["league_id"], league["id"])
         self.assertEqual(venue["organization_id"], org["id"])  # derived
@@ -81,7 +81,7 @@ class SetupFacadeTest(unittest.TestCase):
     def test_venue_owner_mismatch_with_league_rejected(self):
         org = self.api.create_organization("Canlon")
         other = self.api.create_organization("Other Owner")
-        league = self.api.create_league("Over 55", organization_id=org["id"])
+        league = self.api.create_program("Over 55", operator_organization_id=org["id"])
         result = self.api.create_venue(
             "Plainfield", organization_id=other["id"], league_id=league["id"])
         self.assertEqual(result["error"]["code"], "validation_error")
@@ -123,40 +123,40 @@ class SetupFacadeTest(unittest.TestCase):
         self.assertEqual(row["organization_name"], "Summit Ice Facilities")
 
     def test_create_level_and_assign_division(self):
-        league = self.api.create_league("Over 55")
+        league = self.api.create_program("Over 55")
         season = self.api.create_season(league["id"], "Fall 2026")
-        level = self.api.create_level(season["id"], "Level 1", sort_order=1)
+        level = self.api.create_league(season["id"], "Level 1", sort_order=1)
         self.assertNotIn("error", level)
         self.assertEqual(level["name"], "Level 1")
         self.assertEqual(level["sort_order"], 1)
-        div = self.api.create_division(season["id"], "Div A", level_id=level["id"])
-        self.assertEqual(div["level_id"], level["id"])
+        div = self.api.create_division(season["id"], "Div A", league_id=level["id"])
+        self.assertEqual(div["league_id"], level["id"])
 
     def test_create_division_without_level_is_unassigned(self):
-        league = self.api.create_league("Over 55")
+        league = self.api.create_program("Over 55")
         season = self.api.create_season(league["id"], "Fall 2026")
         div = self.api.create_division(season["id"], "Div A")
-        self.assertIsNone(div["level_id"])
+        self.assertIsNone(div["league_id"])
 
     def test_create_division_with_missing_level_returns_not_found(self):
-        league = self.api.create_league("Over 55")
+        league = self.api.create_program("Over 55")
         season = self.api.create_season(league["id"], "Fall 2026")
-        result = self.api.create_division(season["id"], "Div A", level_id="level_missing")
+        result = self.api.create_division(season["id"], "Div A", league_id="level_missing")
         self.assertEqual(result["error"]["code"], "not_found")
 
     def test_division_rejects_level_from_another_season(self):
-        league = self.api.create_league("Over 55")
+        league = self.api.create_program("Over 55")
         season_a = self.api.create_season(league["id"], "Fall 2026")
         season_b = self.api.create_season(league["id"], "Spring 2027")
-        level_a = self.api.create_level(season_a["id"], "Level 1")
-        result = self.api.create_division(season_b["id"], "Div A", level_id=level_a["id"])
+        level_a = self.api.create_league(season_a["id"], "Level 1")
+        result = self.api.create_division(season_b["id"], "Div A", league_id=level_a["id"])
         self.assertEqual(result["error"]["code"], "validation_error")
 
     def test_overview_surfaces_level_on_division_rows(self):
-        league = self.api.create_league("Over 55")
+        league = self.api.create_program("Over 55")
         season = self.api.create_season(league["id"], "Fall 2026")
-        level = self.api.create_level(season["id"], "Level 1")
-        self.api.create_division(season["id"], "Div A", level_id=level["id"])
+        level = self.api.create_league(season["id"], "Level 1")
+        self.api.create_division(season["id"], "Div A", league_id=level["id"])
         overview = self.api.get_demo_overview()
         self.assertIn("levels", overview)
         self.assertEqual(len(overview["levels"]), 1)
@@ -201,15 +201,15 @@ class SetupValidationWordingTest(unittest.TestCase):
         self.assertNotRegex(self._msg(r), r"(?i)\bleague\b")
 
     def test_missing_grouping_parent_says_league(self):
-        league = self.api.create_league("P")
+        league = self.api.create_program("P")
         season = self.api.create_season(league["id"], "S")
-        r = self.api.create_division(season["id"], "D", level_id="nope")
+        r = self.api.create_division(season["id"], "D", league_id="nope")
         self.assertEqual(self._msg(r), "League nope not found.")
 
     def test_venue_program_owner_mismatch_uses_role_nouns_and_v1_qualifier(self):
         org1 = self.api.create_organization("O1")
         org2 = self.api.create_organization("O2")
-        league = self.api.create_league("P", organization_id=org1["id"])
+        league = self.api.create_program("P", operator_organization_id=org1["id"])
         venue = self.api.create_venue("V", organization_id=org2["id"])
         r = self.api.assign_venue_league(venue["id"], league["id"])
         msg = self._msg(r)
@@ -223,7 +223,7 @@ class SetupValidationWordingTest(unittest.TestCase):
     def test_create_venue_owner_mismatch_is_v1_qualified(self):
         org1 = self.api.create_organization("O1")
         org2 = self.api.create_organization("O2")
-        league = self.api.create_league("P", organization_id=org1["id"])
+        league = self.api.create_program("P", operator_organization_id=org1["id"])
         r = self.api.create_venue("V", organization_id=org2["id"],
                                   league_id=league["id"])
         msg = self._msg(r)
@@ -234,17 +234,17 @@ class SetupValidationWordingTest(unittest.TestCase):
     def test_change_operating_org_blocked_while_venue_attached_is_v1_qualified(self):
         org1 = self.api.create_organization("O1")
         org2 = self.api.create_organization("O2")
-        league = self.api.create_league("P", organization_id=org1["id"])
+        league = self.api.create_program("P", operator_organization_id=org1["id"])
         self.api.create_venue("V", league_id=league["id"])  # attaches a venue
-        r = self.api.assign_league_organization(league["id"], org2["id"])
+        r = self.api.assign_program_organization(league["id"], org2["id"])
         msg = self._msg(r)
         self.assertIn("Current v1 compatibility", msg)
         self.assertIn("operating organization", msg)
         self.assertIn("venue", msg)
 
     def test_rollover_across_programs_says_programs(self):
-        p1 = self.api.create_league("P1")
-        p2 = self.api.create_league("P2")
+        p1 = self.api.create_program("P1")
+        p2 = self.api.create_program("P2")
         s1 = self.api.create_season(p1["id"], "S1")
         s2 = self.api.create_season(p2["id"], "S2")
         r = self.api.roll_forward_registrations(s1["id"], s2["id"])
@@ -253,23 +253,23 @@ class SetupValidationWordingTest(unittest.TestCase):
         self.assertNotRegex(msg, r"(?i)\bleague\b")
 
     def test_delete_umbrella_blocked_says_program(self):
-        league = self.api.create_league("P")
+        league = self.api.create_program("P")
         self.api.create_season(league["id"], "S")
-        r = self.api.delete_league(league["id"])
+        r = self.api.delete_program(league["id"])
         self.assertEqual(r["error"]["code"], "has_dependencies")
         self.assertIn("Can't delete this program", self._msg(r))
 
     def test_delete_grouping_blocked_says_league(self):
-        league = self.api.create_league("P")
+        league = self.api.create_program("P")
         season = self.api.create_season(league["id"], "S")
-        level = self.api.create_level(season["id"], "Grp")
-        self.api.create_division(season["id"], "D", level_id=level["id"])
-        r = self.api.delete_level(level["id"])
+        level = self.api.create_league(season["id"], "Grp")
+        self.api.create_division(season["id"], "D", league_id=level["id"])
+        r = self.api.delete_league(level["id"])
         self.assertIn("Can't delete this league", self._msg(r))
 
     def test_delete_facility_owner_dep_renders_program_frozen_type(self):
         org = self.api.create_organization("O")
-        self.api.create_league("P", organization_id=org["id"])
+        self.api.create_program("P", operator_organization_id=org["id"])
         r = self.api.delete_organization(org["id"])
         # Rendered noun is canonical…
         self.assertIn("1 program", self._msg(r))
@@ -280,9 +280,9 @@ class SetupValidationWordingTest(unittest.TestCase):
         self.assertEqual(prog["type"], "league")
 
     def test_delete_season_dep_renders_league_frozen_type(self):
-        league = self.api.create_league("P")
+        league = self.api.create_program("P")
         season = self.api.create_season(league["id"], "S")
-        self.api.create_level(season["id"], "Grp")
+        self.api.create_league(season["id"], "Grp")
         r = self.api.delete_season(season["id"])
         self.assertIn("1 league", self._msg(r))
         deps = r["error"]["details"]["dependencies"]

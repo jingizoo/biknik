@@ -21,8 +21,8 @@ from hockey_scheduler.domain import (
     IceSlot,
     IceSlotStatus,
     IceSlotType,
-    League,
     Organization,
+    Program,
     Rink,
     Season,
     SeasonTeamRegistration,
@@ -67,16 +67,16 @@ class DraftScheduleTest(unittest.TestCase):
     def _store(self, n_teams=4, n_slots=6):
         s = InMemoryStore()
         s.add_organization(Organization(id="org1", name="Owner"))
-        s.add_league(League(id="league1", name="League",
-                            organization_id="org1"))
-        s.add_season(Season(id="se1", league_id="league1", name="Season"))
+        s.add_program(Program(id="league1", name="League",
+                              operator_organization_id="org1"))
+        s.add_season(Season(id="se1", program_id="league1", name="Season"))
         s.add_division(Division(id="div1", season_id="se1", name="D1"))
         s.add_venue(Venue(id="v1", name="Arena", organization_id="org1",
                           league_id="league1"))
         s.add_rink(Rink(id="r1", venue_id="v1", name="Main"))
         for i in range(n_teams):
             s.add_team(Team(id=f"t{i}", name=f"Team {i}", division="D1",
-                            division_id="div1", league_id="league1"))
+                            division_id="div1", program_id="league1"))
             # Draft scheduling reads the season registration, not division_id (#180).
             s.add_season_team_registration(SeasonTeamRegistration(
                 id=f"streg_t{i}", season_id="se1", team_id=f"t{i}",

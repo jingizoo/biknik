@@ -22,7 +22,7 @@ UTC = timezone.utc
 def _seed_scheduleable(store):
     """A league/season/division with two registered teams and a free slot."""
     svc = SetupService(store)
-    league = svc.create_league("L")
+    league = svc.create_program("L")
     season = svc.create_season(league.id, "S")
     div = svc.create_division(season.id, "D")
     home = svc.create_team(svc.create_club("CA").id, div.id, "TA")
@@ -176,7 +176,7 @@ class MemoryStoreTransactionTest(unittest.TestCase):
 
 def _bare_team(store, name):
     from hockey_scheduler.domain import Team
-    return Team(id=store.next_id("team"), name=name, league_id=None, club_id=None)
+    return Team(id=store.next_id("team"), name=name, program_id=None, club_id=None)
 
 
 if __name__ == "__main__":

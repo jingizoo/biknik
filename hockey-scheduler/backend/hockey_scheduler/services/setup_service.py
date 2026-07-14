@@ -18,7 +18,7 @@ from ..domain import (
     IceSlotStatus,
     IceSlotType,
     League,
-    Level,
+    Program,
     GameResult,
     NotificationAudience,
     NotificationChannel,
@@ -169,78 +169,81 @@ class SetupService:
             self._notify(kind, NotificationAudience.PUBLIC, title, message,
                          game_id=game.id)
 
-    # -- league / season / division ---------------------------------------
+    # -- program / season / league / division -----------------------------
     @_transactional
-    def create_league(self, name: str, country: str = "", timezone_name: str = "UTC",
-                      organization_id: Optional[str] = None,
-                      actor_id: Optional[str] = None) -> League:
-        # Optional owning organization (#173) — validated when given so a league
-        # never dangles off a non-existent owner. Nullable for migration/legacy;
-        # null-owner leagues surface in the missing-assignment queue.
-        if organization_id and self.store.get_organization(organization_id) is None:
-            raise NotFoundError(f"Organization {organization_id} not found.")
-        league = League(id=self.store.next_id("league"),
-                        name=self._require_name(name), country=country,
-                        timezone=timezone_name or "UTC",
-                        organization_id=organization_id or None)
-        self.store.add_league(league)
-        self._audit("league_created", "league", league.id, actor_id,
-                    {"organization_id": organization_id} if organization_id else None)
-        return league
+    def create_program(self, name: str, country: str = "", timezone_name: str = "UTC",
+                       operator_organization_id: Optional[str] = None,
+                       actor_id: Optional[str] = None) -> Program:
+        # Optional operating organization (#173) — validated when given so a
+        # program never dangles off a non-existent operator. Nullable for
+        # migration/legacy; null-operator programs surface in the queue.
+        if operator_organization_id and \
+                self.store.get_organization(operator_organization_id) is None:
+            raise NotFoundError(
+                f"Organization {operator_organization_id} not found.")
+        program = Program(id=self.store.next_id("league"),
+                          name=self._require_name(name), country=country,
+                          timezone=timezone_name or "UTC",
+                          operator_organization_id=operator_organization_id or None)
+        self.store.add_program(program)
+        self._audit("league_created", "league", program.id, actor_id,
+                    {"organization_id": operator_organization_id}
+                    if operator_organization_id else None)
+        return program
 
     @_transactional
-    def create_season(self, league_id: str, name: str,
+    def create_season(self, program_id: str, name: str,
                       start_date: Optional[datetime] = None,
                       end_date: Optional[datetime] = None,
                       actor_id: Optional[str] = None) -> Season:
-        if self.store.get_league(league_id) is None:
-            raise NotFoundError(f"Program {league_id} not found.")
+        if self.store.get_program(program_id) is None:
+            raise NotFoundError(f"Program {program_id} not found.")
         start = self._require_utc(start_date, "start_date") if start_date else None
         end = self._require_utc(end_date, "end_date") if end_date else None
         if start and end and end < start:
             raise ValidationError("end_date cannot be before start_date.")
-        season = Season(id=self.store.next_id("season"), league_id=league_id,
+        season = Season(id=self.store.next_id("season"), program_id=program_id,
                         name=self._require_name(name), start_date=start, end_date=end)
         self.store.add_season(season)
         self._audit("season_created", "season", season.id, actor_id,
-                    {"league_id": league_id})
+                    {"league_id": program_id})
         return season
 
     @_transactional
-    def create_level(self, season_id: str, name: str, sort_order: int = 0,
-                     actor_id: Optional[str] = None) -> Level:
+    def create_league(self, season_id: str, name: str, sort_order: int = 0,
+                      actor_id: Optional[str] = None) -> League:
         if self.store.get_season(season_id) is None:
             raise NotFoundError(f"Season {season_id} not found.")
-        level = Level(id=self.store.next_id("level"), season_id=season_id,
-                      name=self._require_name(name), sort_order=sort_order or 0)
-        self.store.add_level(level)
-        self._audit("level_created", "level", level.id, actor_id,
+        league = League(id=self.store.next_id("level"), season_id=season_id,
+                        name=self._require_name(name), sort_order=sort_order or 0)
+        self.store.add_league(league)
+        self._audit("level_created", "level", league.id, actor_id,
                     {"season_id": season_id})
-        return level
+        return league
 
     @_transactional
     def create_division(self, season_id: str, name: str, age_group: str = "",
-                        level_id: Optional[str] = None,
+                        league_id: Optional[str] = None,
                         actor_id: Optional[str] = None) -> Division:
         if self.store.get_season(season_id) is None:
             raise NotFoundError(f"Season {season_id} not found.")
-        # An optional owning level/tier (#166) — validated when given: it must
-        # exist AND belong to this division's season, so a division can never
-        # sit under a level from a different season. Null is fine (unassigned).
-        if level_id:
-            level = self.store.get_level(level_id)
-            if level is None:
-                raise NotFoundError(f"League {level_id} not found.")
-            if level.season_id != season_id:
+        # An optional owning league/grouping (#166/#233) — validated when given:
+        # it must exist AND belong to this division's season, so a division can
+        # never sit under a league from a different season. Null is fine.
+        if league_id:
+            league = self.store.get_league(league_id)
+            if league is None:
+                raise NotFoundError(f"League {league_id} not found.")
+            if league.season_id != season_id:
                 raise ValidationError(
                     "League belongs to a different season than the division.")
         division = Division(id=self.store.next_id("division"), season_id=season_id,
                             name=self._require_name(name), age_group=age_group,
-                            level_id=level_id or None)
+                            league_id=league_id or None)
         self.store.add_division(division)
         self._audit("division_created", "division", division.id, actor_id,
                     {"season_id": season_id,
-                     **({"level_id": level_id} if level_id else {})})
+                     **({"level_id": league_id} if league_id else {})})
         return division
 
     # -- club / team -------------------------------------------------------
@@ -256,7 +259,7 @@ class SetupService:
     @_transactional
     def create_team(self, club_id: str, division_id: Optional[str] = None,
                     name: str = "", actor_id: Optional[str] = None,
-                    league_id: Optional[str] = None) -> Team:
+                    program_id: Optional[str] = None) -> Team:
         """Create a permanent league team (#180).
 
         A team belongs permanently to a *league*, not a division — its
@@ -281,22 +284,22 @@ class SetupService:
             if division is None:
                 raise NotFoundError(f"Division {division_id} not found.")
             season = self.store.get_season(division.season_id)
-            derived_league = season.league_id if season else None
-            if league_id and derived_league and league_id != derived_league:
+            derived_program = season.program_id if season else None
+            if program_id and derived_program and program_id != derived_program:
                 raise ValidationError(
                     "The chosen division belongs to a different program.")
-            league_id = derived_league
-        if not league_id:
+            program_id = derived_program
+        if not program_id:
             raise ValidationError(
                 "A team needs a program (choose a program, or a division to "
                 "derive it from).")
-        if self.store.get_league(league_id) is None:
-            raise NotFoundError(f"Program {league_id} not found.")
+        if self.store.get_program(program_id) is None:
+            raise NotFoundError(f"Program {program_id} not found.")
         team = Team(id=self.store.next_id("team"), name=self._require_name(name),
-                    club_id=club_id, league_id=league_id)
+                    club_id=club_id, program_id=program_id)
         self.store.add_team(team)
         self._audit("team_created", "team", team.id, actor_id,
-                    {"club_id": club_id, "league_id": league_id})
+                    {"club_id": club_id, "league_id": program_id})
         return team
 
     # -- permanent teams + season registrations (#180) ---------------------
@@ -316,9 +319,9 @@ class SetupService:
         team = self.store.get_team(team_id)
         if team is None:
             raise NotFoundError(f"Team {team_id} not found.")
-        # Rule 4 — league consistency: the team's permanent league must match
-        # the season's league. Cross-league registration is rejected.
-        if team.league_id and team.league_id != season.league_id:
+        # Rule 4 — program consistency: the team's permanent program must match
+        # the season's program. Cross-program registration is rejected.
+        if team.program_id and team.program_id != season.program_id:
             raise ValidationError(
                 "Team belongs to a different program than this season.")
         if division_id:
@@ -339,6 +342,8 @@ class SetupService:
                     f"Team {team_id} is already registered for this season.")
             existing.active = True
             existing.division_id = division_id or None
+            existing.league_id = self._derive_registration_league(
+                season_id, existing.division_id)
             self.store.save_season_team_registration(existing)
             self._audit("season_team_registered", "season_team_registration",
                         existing.id, actor_id,
@@ -347,7 +352,10 @@ class SetupService:
             return existing
         reg = SeasonTeamRegistration(
             id=self.store.next_id("streg"), season_id=season_id, team_id=team_id,
-            division_id=division_id or None, active=True)
+            division_id=division_id or None,
+            league_id=self._derive_registration_league(season_id,
+                                                       division_id or None),
+            active=True)
         self.store.add_season_team_registration(reg)
         self._audit("season_team_registered", "season_team_registration",
                     reg.id, actor_id,
@@ -365,9 +373,22 @@ class SetupService:
                 and team_id in (g.home_team_id, g.away_team_id)]
 
     def _registration_league(self, reg):
-        """The league a registration resolves to (via its season), or None."""
+        """The program a registration resolves to (via its season), or None."""
         season = self.store.get_season(reg.season_id)
-        return season.league_id if season else None
+        return season.program_id if season else None
+
+    def _derive_registration_league(self, season_id, division_id):
+        """The competition League (#233) a registration belongs to: its
+        division's league when the division carries one, else the season's sole
+        league. None when neither is determinable (mirrors the migration
+        backfill; the C1a preflight guarantees a single league at upgrade)."""
+        if division_id:
+            division = self.store.get_division(division_id)
+            if division is not None and division.league_id:
+                return division.league_id
+        leagues = [lv for lv in self.store.all_leagues()
+                   if lv.season_id == season_id]
+        return leagues[0].id if len(leagues) == 1 else None
 
     @_transactional
     def assign_season_team_division(self, registration_id: str,
@@ -400,6 +421,8 @@ class SetupService:
                     {"reason": "team_has_scheduled_games",
                      "affected_game_ids": stranded, "count": len(stranded)})
         reg.division_id = division_id or None
+        reg.league_id = self._derive_registration_league(
+            reg.season_id, reg.division_id)
         self.store.save_season_team_registration(reg)
         self._audit("season_team_division_assigned", "season_team_registration",
                     reg.id, actor_id, {"from": old, "to": reg.division_id})
@@ -472,7 +495,7 @@ class SetupService:
         if from_season_id == to_season_id:
             raise ValidationError("Source and target seasons must differ.")
         # Rule 4 — a rollover stays within one program.
-        if (src.league_id or None) != (dst.league_id or None):
+        if (src.program_id or None) != (dst.program_id or None):
             raise ValidationError(
                 "Cannot roll participation between seasons of different programs.")
         source_active = {r.team_id
@@ -528,14 +551,14 @@ class SetupService:
         # tolerates a null team league): manual registration is an operator
         # vouching for one team, whereas rollover blindly trusts a batch of
         # source rows, so a null/other league_id here is treated as bad data.
-        league_id = src.league_id or None
+        program_id = src.program_id or None
         for tid in wanted:
             team = self.store.get_team(tid)
             if team is None:
                 raise ValidationError(
                     f"Team {tid} in the source season no longer exists; "
                     "it cannot be rolled forward.")
-            if (team.league_id or None) != league_id:
+            if (team.program_id or None) != program_id:
                 raise ValidationError(
                     f"Team {tid} belongs to a different program than this "
                     "rollover; it cannot be carried into this season.")
@@ -558,12 +581,16 @@ class SetupService:
             if existing is not None:  # reactivate a prior inactive registration
                 existing.active = True
                 existing.division_id = div_id
+                existing.league_id = self._derive_registration_league(
+                    to_season_id, div_id)
                 self.store.save_season_team_registration(existing)
                 reg = existing
             else:
                 reg = SeasonTeamRegistration(
                     id=self.store.next_id("streg"), season_id=to_season_id,
-                    team_id=tid, division_id=div_id, active=True)
+                    team_id=tid, division_id=div_id,
+                    league_id=self._derive_registration_league(to_season_id, div_id),
+                    active=True)
                 self.store.add_season_team_registration(reg)
             self._audit("season_team_registered", "season_team_registration",
                         reg.id, actor_id,
@@ -616,24 +643,24 @@ class SetupService:
         return rink
 
     @_transactional
-    def assign_division_level(self, division_id: str,
-                              level_id: Optional[str] = None,
-                              actor_id: Optional[str] = None) -> Division:
+    def assign_division_league(self, division_id: str,
+                               league_id: Optional[str] = None,
+                               actor_id: Optional[str] = None) -> Division:
         division = self.store.get_division(division_id)
         if division is None:
             raise NotFoundError(f"Division {division_id} not found.")
-        if level_id:
-            level = self.store.get_level(level_id)
-            if level is None:
-                raise NotFoundError(f"League {level_id} not found.")
-            if level.season_id != division.season_id:
+        if league_id:
+            league = self.store.get_league(league_id)
+            if league is None:
+                raise NotFoundError(f"League {league_id} not found.")
+            if league.season_id != division.season_id:
                 raise ValidationError(
                     "League belongs to a different season than the division.")
-        old = division.level_id
-        division.level_id = level_id or None
+        old = division.league_id
+        division.league_id = league_id or None
         self.store.save_division(division)
         self._audit("division_level_assigned", "division", division.id, actor_id,
-                    {"from": old, "to": division.level_id})
+                    {"from": old, "to": division.league_id})
         return division
 
     @_transactional
@@ -673,32 +700,34 @@ class SetupService:
 
     # -- cross-domain reassignment: league owner + venue league (#173) -----
     @_transactional
-    def assign_league_organization(self, league_id: str,
-                                   organization_id: Optional[str] = None,
-                                   actor_id: Optional[str] = None) -> League:
-        league = self.store.get_league(league_id)
-        if league is None:
-            raise NotFoundError(f"Program {league_id} not found.")
+    def assign_program_organization(self, program_id: str,
+                                    organization_id: Optional[str] = None,
+                                    actor_id: Optional[str] = None) -> Program:
+        program = self.store.get_program(program_id)
+        if program is None:
+            raise NotFoundError(f"Program {program_id} not found.")
         if organization_id and self.store.get_organization(organization_id) is None:
             raise NotFoundError(f"Organization {organization_id} not found.")
-        old = league.organization_id
-        # Invariant #4: changing the owner must not silently cascade to the
-        # league's venues (whose owner is derived from it). Refuse while venues
+        old = program.operator_organization_id
+        # Invariant #4: changing the operator must not silently cascade to the
+        # program's venues (whose owner is derived from it). Refuse while venues
         # are still attached — the operator unassigns/reassigns them first, so
-        # the ownership change is deliberate and each venue is re-audited.
+        # the ownership change is deliberate and each venue is re-audited. Venues
+        # keep their ``league_id`` column this slice (points at the program).
         if (organization_id or None) != (old or None):
-            attached = [v for v in self.store.all_venues() if v.league_id == league_id]
+            attached = [v for v in self.store.all_venues()
+                        if v.league_id == program_id]
             if attached:
                 raise ValidationError(
                     f"Current v1 compatibility: while the temporary Venue→Program "
                     f"link is active (removed in Slice E), this program's operating "
                     f"organization can't change while {len(attached)} venue(s) are "
                     f"attached. Unassign them first.")
-        league.organization_id = organization_id or None
-        self.store.save_league(league)
-        self._audit("league_organization_assigned", "league", league.id, actor_id,
-                    {"from": old, "to": league.organization_id})
-        return league
+        program.operator_organization_id = organization_id or None
+        self.store.save_program(program)
+        self._audit("league_organization_assigned", "league", program.id, actor_id,
+                    {"from": old, "to": program.operator_organization_id})
+        return program
 
     @_transactional
     def assign_venue_league(self, venue_id: str, league_id: Optional[str] = None,
@@ -710,10 +739,10 @@ class SetupService:
         old_org = venue.organization_id
         new_org = venue.organization_id
         if league_id:
-            league = self.store.get_league(league_id)
+            league = self.store.get_program(league_id)
             if league is None:
                 raise NotFoundError(f"Program {league_id} not found.")
-            league_owner = league.organization_id
+            league_owner = league.operator_organization_id
             # Owner agreement (#173 invariant 3): the venue and program must
             # share an owner. Derive the owner from the program when the venue
             # has none; reject a conflicting existing owner rather than silently
@@ -762,7 +791,7 @@ class SetupService:
             if slot is None or slot.rink_id not in rink_ids:
                 continue
             season = self.store.get_season(g.season_id) if g.season_id else None
-            game_league = season.league_id if season else None
+            game_league = season.program_id if season else None
             if (game_league or None) != (new_league_id or None):
                 stranded.append(g.id)
         return stranded
@@ -791,10 +820,10 @@ class SetupService:
         # the league, and reject an explicitly-supplied conflicting owner rather
         # than silently transferring facility ownership.
         if league_id:
-            league = self.store.get_league(league_id)
+            league = self.store.get_program(league_id)
             if league is None:
                 raise NotFoundError(f"Program {league_id} not found.")
-            league_owner = league.organization_id
+            league_owner = league.operator_organization_id
             if organization_id and league_owner and organization_id != league_owner:
                 raise ValidationError(
                     "Current v1 compatibility: while the temporary Venue→Program "
@@ -883,9 +912,9 @@ class SetupService:
                 {"reason": "team_not_registered", "team_id": team_id,
                  "season_id": season_id})
         rteam = self.store.get_team(team_id)
-        season_league = season.league_id if season is not None else None
-        if (rteam is None or not rteam.league_id or not season_league
-                or rteam.league_id != season_league):
+        season_league = season.program_id if season is not None else None
+        if (rteam is None or not rteam.program_id or not season_league
+                or rteam.program_id != season_league):
             raise DivisionMismatchError(
                 f"{label}'s registration does not belong to this program.",
                 {"reason": "registration_cross_league", "team_id": team_id,
@@ -997,6 +1026,7 @@ class SetupService:
             season_id=season_id,
             division_id=division_id,
             ice_slot_id=ice_slot_id,
+            league_id=division.league_id,
         )
         self.store.add_game(game)
         # Mark the slot allocated so it reads as taken across the arena.
@@ -1352,9 +1382,9 @@ class SetupService:
         _season = self.store.get_season(season_id)
         if _season is None:
             raise NotFoundError(f"Season {season_id} not found.")
-        # The permanent league every imported team belongs to (#180): the league
-        # of the season being imported into.
-        season_league_id = _season.league_id
+        # The permanent program every imported team belongs to (#180): the
+        # program of the season being imported into.
+        season_league_id = _season.program_id
 
         result = validate_import(sheets)
         if not result["ok"]:
@@ -1394,7 +1424,7 @@ class SetupService:
             # strand committed games by moving a registration's division. A
             # violation returns a structured error with zero writes.
             if (not season_league_id
-                    or self.store.get_league(season_league_id) is None):
+                    or self.store.get_program(season_league_id) is None):
                 return {"committed": False, "summary": result["summary"],
                         "errors": [{"sheet": "teams",
                             "reason": "season_league_missing",
@@ -1411,9 +1441,9 @@ class SetupService:
                     continue
                 team_regs = [r for r in self.store.all_season_team_registrations()
                              if r.team_id == existing.id]
-                # (1) The import must never move a permanent Team's league.
-                if (existing.league_id or None) != season_league_id:
-                    if existing.league_id is None:
+                # (1) The import must never move a permanent Team's program.
+                if (existing.program_id or None) != season_league_id:
+                    if existing.program_id is None:
                         # A league-less team is repaired to the target league
                         # only if EVERY retained registration already resolves
                         # there; otherwise its history would go cross-league.
@@ -1523,15 +1553,15 @@ class SetupService:
                     team.name = team_name
                     team.club_id = club_id
                     if season_league_id:
-                        team.league_id = season_league_id
+                        team.program_id = season_league_id
                     self.store.save_team(team)
                     self._audit("team_updated", "team", team.id, actor_id,
-                                {"club_id": club_id, "league_id": team.league_id,
+                                {"club_id": club_id, "league_id": team.program_id,
                                  "import_batch_id": batch_id})
                     counts["teams_updated"] += 1
                 else:
                     team = Team(id=self.store.next_id("team"), name=team_name,
-                               club_id=club_id, league_id=season_league_id,
+                               club_id=club_id, program_id=season_league_id,
                                external_ref=team_code)
                     self.store.add_team(team)
                     self._audit("team_created", "team", team.id, actor_id,
@@ -1547,6 +1577,8 @@ class SetupService:
                     if not reg.active or reg.division_id != division_id:
                         reg.active = True
                         reg.division_id = division_id
+                        reg.league_id = self._derive_registration_league(
+                            season_id, division_id)
                         self.store.save_season_team_registration(reg)
                         self._audit("season_team_registration_updated",
                                     "season_team_registration", reg.id, actor_id,
@@ -1556,7 +1588,10 @@ class SetupService:
                 else:
                     reg = SeasonTeamRegistration(
                         id=self.store.next_id("streg"), season_id=season_id,
-                        team_id=team.id, division_id=division_id, active=True)
+                        team_id=team.id, division_id=division_id,
+                        league_id=self._derive_registration_league(
+                            season_id, division_id),
+                        active=True)
                     self.store.add_season_team_registration(reg)
                     self._audit("season_team_registered",
                                 "season_team_registration", reg.id, actor_id,
@@ -2353,11 +2388,11 @@ class SetupService:
         return score
 
     # -- listings ----------------------------------------------------------
-    def list_leagues(self) -> List[League]:
-        return list(self.store.all_leagues())
+    def list_programs(self) -> List[Program]:
+        return list(self.store.all_programs())
 
-    def list_seasons(self, league_id: str) -> List[Season]:
-        return self.store.seasons_for_league(league_id)
+    def list_seasons(self, program_id: str) -> List[Season]:
+        return self.store.seasons_for_program(program_id)
 
     def list_divisions(self, season_id: str) -> List[Division]:
         return self.store.divisions_for_season(season_id)
@@ -2439,8 +2474,8 @@ class SetupService:
         org = self.store.get_organization(org_id)
         if org is None:
             raise NotFoundError(f"Organization {org_id} not found.")
-        leagues = [lg for lg in self.store.all_leagues()
-                   if lg.organization_id == org_id]
+        leagues = [lg for lg in self.store.all_programs()
+                   if lg.operator_organization_id == org_id]
         venues = [v for v in self.store.all_venues()
                   if v.organization_id == org_id]
         self._block_if_dependents("organization", org_id, "facility owner", [
@@ -2453,42 +2488,42 @@ class SetupService:
         return org
 
     @_transactional
-    def delete_level(self, level_id: str, actor_id: Optional[str] = None) -> Level:
-        level = self.store.get_level(level_id)
-        if level is None:
-            raise NotFoundError(f"League {level_id} not found.")
-        divisions = [d for d in self.store.all_divisions()
-                     if d.level_id == level_id]
-        self._block_if_dependents("level", level_id, "league", [
-            self._dep_group("division", divisions, lambda d: d.name)])
-        self.store.delete_level(level_id)
-        self._audit("level_deleted", "level", level_id, actor_id,
-                    {"name": level.name, "season_id": level.season_id})
-        return level
-
-    @_transactional
     def delete_league(self, league_id: str, actor_id: Optional[str] = None) -> League:
         league = self.store.get_league(league_id)
         if league is None:
-            raise NotFoundError(f"Program {league_id} not found.")
-        seasons = self.store.seasons_for_league(league_id)
-        teams = self.store.teams_for_league(league_id)
-        venues = [v for v in self.store.all_venues() if v.league_id == league_id]
-        self._block_if_dependents("league", league_id, "program", [
+            raise NotFoundError(f"League {league_id} not found.")
+        divisions = [d for d in self.store.all_divisions()
+                     if d.league_id == league_id]
+        self._block_if_dependents("level", league_id, "league", [
+            self._dep_group("division", divisions, lambda d: d.name)])
+        self.store.delete_league(league_id)
+        self._audit("level_deleted", "level", league_id, actor_id,
+                    {"name": league.name, "season_id": league.season_id})
+        return league
+
+    @_transactional
+    def delete_program(self, program_id: str, actor_id: Optional[str] = None) -> Program:
+        program = self.store.get_program(program_id)
+        if program is None:
+            raise NotFoundError(f"Program {program_id} not found.")
+        seasons = self.store.seasons_for_program(program_id)
+        teams = self.store.teams_for_program(program_id)
+        venues = [v for v in self.store.all_venues() if v.league_id == program_id]
+        self._block_if_dependents("league", program_id, "program", [
             self._dep_group("season", seasons, lambda s: s.name),
             self._dep_group("team", teams, lambda t: t.name),
             self._dep_group("venue", venues, lambda v: v.name)])
-        self.store.delete_league(league_id)
-        self._audit("league_deleted", "league", league_id, actor_id,
-                    {"name": league.name})
-        return league
+        self.store.delete_program(program_id)
+        self._audit("league_deleted", "league", program_id, actor_id,
+                    {"name": program.name})
+        return program
 
     @_transactional
     def delete_season(self, season_id: str, actor_id: Optional[str] = None) -> Season:
         season = self.store.get_season(season_id)
         if season is None:
             raise NotFoundError(f"Season {season_id} not found.")
-        levels = [lv for lv in self.store.all_levels() if lv.season_id == season_id]
+        levels = [lv for lv in self.store.all_leagues() if lv.season_id == season_id]
         divisions = self.store.divisions_for_season(season_id)
         regs = self.store.registrations_for_season(season_id)
         # Games/results/history reference the season directly (#215): a game
@@ -2504,7 +2539,7 @@ class SetupService:
             self._dep_group("game", games, self._matchup)])
         self.store.delete_season(season_id)
         self._audit("season_deleted", "season", season_id, actor_id,
-                    {"name": season.name, "league_id": season.league_id})
+                    {"name": season.name, "league_id": season.program_id})
         return season
 
     @_transactional
@@ -2584,7 +2619,7 @@ class SetupService:
                             lambda d: d.label or d.provider)])
         self.store.delete_team(team_id)
         self._audit("team_deleted", "team", team_id, actor_id,
-                    {"name": team.name, "league_id": team.league_id})
+                    {"name": team.name, "league_id": team.program_id})
         return team
 
     @_transactional

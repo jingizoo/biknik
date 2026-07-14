@@ -54,8 +54,8 @@ class ProductionRestartTest(unittest.TestCase):
         Returns the ids captured at creation time so a reopened process can be
         checked against them exactly."""
         org = api.create_organization("Canlon", short_name="CAN", actor_id=ADMIN)
-        league = api.create_league("Over 55", country="US",
-                                   organization_id=org["id"], actor_id=ADMIN)
+        league = api.create_program("Over 55", country="US",
+                                    operator_organization_id=org["id"], actor_id=ADMIN)
         venue = api.create_venue("Plainfield", address="1 Rink Rd",
                                  league_id=league["id"], actor_id=ADMIN)
         rink = api.create_rink(venue["id"], "Rink 1", actor_id=ADMIN)
@@ -99,7 +99,7 @@ class ProductionRestartTest(unittest.TestCase):
         api = self._fresh_api()
         store = api.store
         self.assertIsNotNone(store.get_organization(ids["org"]))
-        self.assertIsNotNone(store.get_league(ids["league"]))
+        self.assertIsNotNone(store.get_program(ids["league"]))
         self.assertIsNotNone(store.get_venue(ids["venue"]))
         self.assertIsNotNone(store.get_rink(ids["rink"]))
         self.assertIsNotNone(store.get_ice_slot(ids["slot"]))
@@ -115,20 +115,21 @@ class ProductionRestartTest(unittest.TestCase):
         ids = self._configure(self._fresh_api())
         store = self._fresh_api().store
         # Facility chain: Organization → League → Venue → Rink → IceSlot.
-        self.assertEqual(store.get_league(ids["league"]).organization_id, ids["org"])
+        self.assertEqual(store.get_program(ids["league"]).operator_organization_id,
+                         ids["org"])
         venue = store.get_venue(ids["venue"])
         self.assertEqual(venue.league_id, ids["league"])
         self.assertEqual(venue.organization_id, ids["org"])  # derived + persisted
         self.assertEqual(store.get_rink(ids["rink"]).venue_id, ids["venue"])
         self.assertEqual(store.get_ice_slot(ids["slot"]).rink_id, ids["rink"])
         # Competition chain: League → Season → Division → Team; Club → Team.
-        self.assertEqual(store.get_season(ids["season"]).league_id, ids["league"])
+        self.assertEqual(store.get_season(ids["season"]).program_id, ids["league"])
         self.assertEqual(store.get_division(ids["division"]).season_id, ids["season"])
         team = store.get_team(ids["team_a"])
         self.assertEqual(team.club_id, ids["club"])
         # #180: the surviving competition relationship is the permanent league,
         # not the legacy Team.division_id (which is no longer written).
-        self.assertEqual(team.league_id, ids["league"])
+        self.assertEqual(team.program_id, ids["league"])
         self.assertEqual(store.get_player(ids["player"]).team_id, ids["team_a"])
 
     def test_account_and_login_survive_restart(self):

@@ -27,7 +27,7 @@ class RegistrationSafetyTest(unittest.TestCase):
     def setUp(self):
         self.api = ApiService(InMemoryStore())
         api = self.api
-        self.league = api.create_league("L", actor_id=ADMIN)
+        self.league = api.create_program("L", actor_id=ADMIN)
         self.season = api.create_season(self.league["id"], "S", actor_id=ADMIN)
         self.division = api.create_division(self.season["id"], "D", actor_id=ADMIN)
         club = api.create_club("C", actor_id=ADMIN)

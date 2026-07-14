@@ -63,19 +63,19 @@ def build_full_demo_store(store=None) -> Tuple[InMemoryStore, str, dict]:
     # and its venues link to the league (deriving the same owner).
     org = setup.create_organization("Summit Ice Facilities", short_name="Summit",
                                     actor_id=admin)
-    league = setup.create_league("Alpine Ice Hockey League", country="AT",
-                                 organization_id=org.id, actor_id=admin)
+    league = setup.create_program("Alpine Ice Hockey League", country="AT",
+                                  operator_organization_id=org.id, actor_id=admin)
     season = setup.create_season(league.id, "2026–27 Winter Season",
                                  actor_id=admin)
-    # A competitive level/tier groups divisions inside the season (#166). The
-    # junior divisions sit under it; Senior A is left level-less on purpose so
-    # the Setup hierarchy shows the "No level" bucket.
-    junior_tier = setup.create_level(season.id, "Junior Tier", sort_order=1,
-                                     actor_id=admin)
+    # A competitive league/grouping holds divisions inside the season (#166/#233).
+    # The junior divisions sit under it; Senior A is left league-less on purpose
+    # so the Setup hierarchy shows the "No level" bucket.
+    junior_tier = setup.create_league(season.id, "Junior Tier", sort_order=1,
+                                      actor_id=admin)
     d_u16 = setup.create_division(season.id, "U16 Elite", age_group="U16",
-                                  level_id=junior_tier.id, actor_id=admin)
+                                  league_id=junior_tier.id, actor_id=admin)
     d_u18 = setup.create_division(season.id, "U18 Development", age_group="U18",
-                                  level_id=junior_tier.id, actor_id=admin)
+                                  league_id=junior_tier.id, actor_id=admin)
     d_sen = setup.create_division(season.id, "Senior A", actor_id=admin)
 
     club_lions = setup.create_club("Lions HC", country="AT", actor_id=admin)

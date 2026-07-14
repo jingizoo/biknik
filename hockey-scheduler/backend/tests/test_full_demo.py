@@ -100,7 +100,7 @@ class FullDemoTest(unittest.TestCase):
         # A team with fewer players than target builds a draft (open) roster,
         # never silently "confirmed".
         api = ApiService()
-        lg = api.create_league("L")
+        lg = api.create_program("L")
         se = api.create_season(lg["id"], "S")
         dv = api.create_division(se["id"], "D")
         ta = api.create_team(api.create_club("CA")["id"], dv["id"], "TA")
@@ -142,7 +142,7 @@ class FullDemoTest(unittest.TestCase):
     def test_build_roster_without_players_errors(self):
         # A team with no players cannot be auto-rostered.
         api = ApiService()
-        lg = api.create_league("L")
+        lg = api.create_program("L")
         se = api.create_season(lg["id"], "S")
         dv = api.create_division(se["id"], "D")
         ta = api.create_team(api.create_club("CA")["id"], dv["id"], "TA")

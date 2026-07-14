@@ -29,7 +29,7 @@ from ..domain import (
     IceSlotType,
     GameResult,
     League,
-    Level,
+    Program,
     ContactDestination,
     DeliveryStatus,
     DeviceToken,
@@ -74,6 +74,7 @@ from ..domain.enums import NotificationType
 from .db import connect
 from .db_errors import translate_db_exception
 from .integrity_checks import (
+    assert_competition_reset_ready,
     assert_no_duplicate_active_ice_slots,
     assert_no_duplicate_result_games,
     assert_no_duplicate_roster_players,
@@ -138,9 +139,9 @@ class Spec:
 
 
 SPECS = {
-    League: Spec(League, "leagues"),
+    Program: Spec(Program, "programs"),
     Season: Spec(Season, "seasons", {"start_date": _dt(), "end_date": _dt()}),
-    Level: Spec(Level, "levels"),
+    League: Spec(League, "leagues"),
     Division: Spec(Division, "divisions"),
     SeasonTeamRegistration: Spec(
         SeasonTeamRegistration, "season_team_registrations", {"active": _bool()}),
@@ -316,6 +317,7 @@ _PRE_MIGRATION_CHECKS = {
     "025_result_game_fk": assert_result_games_exist,
     "026_result_game_not_null": assert_results_have_game,
     "027_roster_entry_fks": assert_roster_refs_exist,
+    "028_competition_reset": assert_competition_reset_ready,
 }
 
 
@@ -590,8 +592,8 @@ class SqlStore:
     def add_team(self, team): return self._insert(team)
     def get_team(self, team_id): return self._get(Team, team_id)
     def save_team(self, team): return self._update(team)
-    def teams_for_league(self, league_id):
-        return self._query(Team, "league_id = ?", (league_id,), order="id")
+    def teams_for_program(self, program_id):
+        return self._query(Team, "program_id = ?", (program_id,), order="id")
     def add_player(self, player): return self._insert(player)
     def get_player(self, player_id): return self._get(Player, player_id)
     def save_player(self, player): return self._update(player)
@@ -660,22 +662,24 @@ class SqlStore:
         return self._query(NotificationEvent, "game_id = ?", (game_id,), order="id")
 
     # -- organization & arena setup ---------------------------------------
-    def add_league(self, league): return self._insert(league)
-    def get_league(self, league_id): return self._get(League, league_id)
-    def all_leagues(self): return self._query(League, order="id")
-    def save_league(self, league): return self._update(league)
+    # Umbrella competition entity: Program (#233, formerly League).
+    def add_program(self, program): return self._insert(program)
+    def get_program(self, program_id): return self._get(Program, program_id)
+    def all_programs(self): return self._query(Program, order="id")
+    def save_program(self, program): return self._update(program)
 
     def add_season(self, season): return self._insert(season)
     def get_season(self, season_id): return self._get(Season, season_id)
     def all_seasons(self): return self._query(Season, order="id")
     def save_season(self, season): return self._update(season)
-    def seasons_for_league(self, league_id):
-        return self._query(Season, "league_id = ?", (league_id,), order="id")
+    def seasons_for_program(self, program_id):
+        return self._query(Season, "program_id = ?", (program_id,), order="id")
 
-    def add_level(self, level): return self._insert(level)
-    def get_level(self, level_id): return self._get(Level, level_id)
-    def all_levels(self): return self._query(Level, order="id")
-    def save_level(self, level): return self._update(level)
+    # Competition grouping: League (#233, formerly Level).
+    def add_league(self, league): return self._insert(league)
+    def get_league(self, league_id): return self._get(League, league_id)
+    def all_leagues(self): return self._query(League, order="id")
+    def save_league(self, league): return self._update(league)
 
     def add_division(self, division): return self._insert(division)
     def get_division(self, division_id): return self._get(Division, division_id)
@@ -731,9 +735,9 @@ class SqlStore:
     # Single-record hard deletes; the service runs a pre-write dependency gate
     # before calling these, so they never cascade.
     def delete_organization(self, org_id): self._delete(Organization, org_id)
-    def delete_league(self, league_id): self._delete(League, league_id)
+    def delete_program(self, program_id): self._delete(Program, program_id)
     def delete_season(self, season_id): self._delete(Season, season_id)
-    def delete_level(self, level_id): self._delete(Level, level_id)
+    def delete_league(self, league_id): self._delete(League, league_id)
     def delete_division(self, division_id): self._delete(Division, division_id)
     def delete_club(self, club_id): self._delete(Club, club_id)
     def delete_team(self, team_id): self._delete(Team, team_id)

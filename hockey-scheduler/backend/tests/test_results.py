@@ -20,7 +20,7 @@ class ResultsTest(unittest.TestCase):
         self.store = InMemoryStore()
         self.svc = SetupService(self.store)
         self.api = ApiService(self.store)
-        league = self.svc.create_league("L")
+        league = self.svc.create_program("L")
         self.season = self.svc.create_season(league.id, "S")
         self.div = self.svc.create_division(self.season.id, "U16")
         self.lions = self.svc.create_team(self.svc.create_club("Lions").id, self.div.id, "Lions")

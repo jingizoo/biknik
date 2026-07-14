@@ -76,7 +76,7 @@ class OnboardingStatusServiceTest(unittest.TestCase):
         self.assertEqual(_codes(self.api.get_onboarding_status("demo")),
                          {"no_league"})
 
-        league = self.api.create_league("Over 55", organization_id=org["id"])
+        league = self.api.create_program("Over 55", operator_organization_id=org["id"])
         # A league unlocks its two dependents: a venue and a season.
         self.assertEqual(_codes(self.api.get_onboarding_status("demo")),
                          {"no_venue_assigned_to_league", "no_season"})
@@ -114,7 +114,7 @@ class OnboardingStatusServiceTest(unittest.TestCase):
         self._admin()
         org1 = self.api.create_organization("Owner One")
         org2 = self.api.create_organization("Owner Two")
-        league = self.api.create_league("Over 55", organization_id=org1["id"])
+        league = self.api.create_program("Over 55", operator_organization_id=org1["id"])
         venue = self.api.create_venue("Plainfield", league_id=league["id"])
         # Legacy-style drift: the venue's own owner no longer matches its
         # league's owner. create/assign enforce agreement, so force it directly.
@@ -128,17 +128,17 @@ class OnboardingStatusServiceTest(unittest.TestCase):
 
     def test_league_without_organization_is_a_blocker(self):
         self._admin()
-        self.api.create_league("Ownerless")  # no organization_id
+        self.api.create_program("Ownerless")  # no organization_id
         s = self.api.get_onboarding_status("demo")
         self.assertIn("league_without_organization", _codes(s))
 
     def test_dangling_season_parent_is_a_blocker(self):
         self._admin()
         org = self.api.create_organization("Canlon")
-        league = self.api.create_league("Over 55", organization_id=org["id"])
+        league = self.api.create_program("Over 55", operator_organization_id=org["id"])
         season = self.api.create_season(league["id"], "Fall 2026")
         # Point the season at a league that no longer exists.
-        self.api.store.get_season(season["id"]).league_id = "league_ghost"
+        self.api.store.get_season(season["id"]).program_id = "league_ghost"
         s = self.api.get_onboarding_status("demo")
         self.assertIn("seasons_without_league", _codes(s))
 
@@ -150,8 +150,8 @@ class OnboardingStatusServiceTest(unittest.TestCase):
         step keeps it); step keys and blocker codes stay unchanged."""
         self._admin()
         org = self.api.create_organization("Canlon")
-        self.api.create_league("Over 55", organization_id=org["id"])
-        self.api.create_league("Ownerless")  # ownerless → operating-org gap
+        self.api.create_program("Over 55", operator_organization_id=org["id"])
+        self.api.create_program("Ownerless")  # ownerless → operating-org gap
         s = self.api.get_onboarding_status("demo")
         by_key = {st["key"]: st for st in s["steps"]}
 
@@ -182,9 +182,9 @@ class OnboardingStatusServiceTest(unittest.TestCase):
         while its code (`seasons_without_league`) stays frozen."""
         self._admin()
         org = self.api.create_organization("Canlon")
-        league = self.api.create_league("Over 55", organization_id=org["id"])
+        league = self.api.create_program("Over 55", operator_organization_id=org["id"])
         season = self.api.create_season(league["id"], "Fall 2026")
-        self.api.store.get_season(season["id"]).league_id = "league_ghost"
+        self.api.store.get_season(season["id"]).program_id = "league_ghost"
         s = self.api.get_onboarding_status("demo")
         msg = next(b["message"] for b in s["blocking"]
                    if b["code"] == "seasons_without_league")
@@ -195,7 +195,7 @@ class OnboardingStatusServiceTest(unittest.TestCase):
     def _ready_hierarchy(self):
         self._admin()
         org = self.api.create_organization("Canlon")
-        league = self.api.create_league("Over 55", organization_id=org["id"])
+        league = self.api.create_program("Over 55", operator_organization_id=org["id"])
         venue = self.api.create_venue("Plainfield", league_id=league["id"])
         rink = self.api.create_rink(venue["id"], "Rink 1")
         self.api.create_ice_slot(

@@ -16,18 +16,20 @@ import unittest
 from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
 
 from hockey_scheduler.domain import (
-    Division, League, Level, Organization, Season, Venue,
+    Division, League, Program, Organization, Season, Venue,
 )
 from hockey_scheduler.store import InMemoryStore, SqlStore
 
-# (dataclass, store collection accessor, add method, save method, id prefix)
+# (dataclass, store collection accessor, add method, save method, id prefix).
+# #233 C1b: the umbrella is Program (store all_programs/add_program/...); the
+# grouping formerly named Level is now League (store all_leagues/add_league/...).
 _ENTITIES = [
     ("organization", Organization, "all_organizations", "add_organization",
      "save_organization"),
-    ("league", League, "all_leagues", "add_league", "save_league"),
+    ("league", Program, "all_programs", "add_program", "save_program"),
     ("venue", Venue, "all_venues", "add_venue", "save_venue"),
     ("season", Season, "all_seasons", "add_season", "save_season"),
-    ("level", Level, "all_levels", "add_level", "save_level"),
+    ("level", League, "all_leagues", "add_league", "save_league"),
     ("division", Division, "all_divisions", "add_division", "save_division"),
 ]
 
@@ -39,14 +41,14 @@ def _make(cls, ref):
               "external_ref": ref}
     if cls is Organization:
         return Organization(**common)
-    if cls is League:
-        return League(**common)
+    if cls is Program:
+        return Program(**common)
     if cls is Venue:
         return Venue(**common)
     if cls is Season:
-        return Season(league_id="league_1", **common)
-    if cls is Level:
-        return Level(season_id="season_1", **common)
+        return Season(program_id="program_1", **common)
+    if cls is League:  # competition grouping (formerly Level)
+        return League(season_id="season_1", **common)
     if cls is Division:
         return Division(season_id="season_1", **common)
     raise AssertionError(cls)

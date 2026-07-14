@@ -31,9 +31,6 @@ import unittest
 
 from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
 
-from hockey_scheduler.domain.models import Team
-from hockey_scheduler.domain.setup_models import (
-    Division, League, Level, Season, SeasonTeamRegistration)
 from hockey_scheduler.store import SqlStore
 from hockey_scheduler.store.integrity_checks import (
     MigrationDataError,
@@ -51,31 +48,51 @@ def _sql_backends():
     return backends
 
 
+def _downgrade_to_pre028(store):
+    """Reverse migration 028's competition-model renames so the pre-migration
+    gate queries the exact PRE-028 schema it runs against in production — the
+    ``levels`` grouping table and ``divisions.level_id``. The gate only reads
+    divisions/levels/seasons/season_team_registrations, so those are the only
+    names that must be restored."""
+    cur = store.conn.cursor()
+    cur.execute("ALTER TABLE divisions RENAME COLUMN league_id TO level_id")
+    cur.execute("DROP INDEX IF EXISTS ix_leagues_external_ref")
+    cur.execute("ALTER TABLE leagues RENAME TO levels")
+
+
 def _fresh(url):
     store = SqlStore(url)
     if url != ":memory:":
         store.reset_schema()
-    store.add_league(League(id="prog", name="Program"))  # real umbrella parent
+    _downgrade_to_pre028(store)
     return store
 
 
+def _exec(store, sql, params):
+    store.conn.cursor().execute(store.dialect.sql(sql), params)
+
+
 def _season(store, sid, program="prog"):
-    store.add_season(Season(id=sid, league_id=program, name=sid))
+    _exec(store, "INSERT INTO seasons (id, program_id, name) VALUES (?, ?, ?)",
+          (sid, program, sid))
 
 
 def _level(store, lid, sid):
-    store.add_level(Level(id=lid, season_id=sid, name=lid))
+    _exec(store, "INSERT INTO levels (id, season_id, name) VALUES (?, ?, ?)",
+          (lid, sid, lid))
 
 
 def _division(store, did, sid, level_id=None):
-    store.add_division(Division(id=did, season_id=sid, name=did, level_id=level_id))
+    _exec(store, "INSERT INTO divisions (id, season_id, name, level_id) "
+          "VALUES (?, ?, ?, ?)", (did, sid, did, level_id))
 
 
 def _registration(store, rid, sid, division_id=None):
     tid = "t_" + rid
-    store.add_team(Team(id=tid, name=tid, league_id="prog"))  # real team parent
-    store.add_season_team_registration(SeasonTeamRegistration(
-        id=rid, season_id=sid, team_id=tid, division_id=division_id))
+    _exec(store, "INSERT INTO teams (id, name) VALUES (?, ?)", (tid, tid))
+    _exec(store, "INSERT INTO season_team_registrations "
+          "(id, season_id, team_id, division_id, active) VALUES (?, ?, ?, ?, 1)",
+          (rid, sid, tid, division_id))
 
 
 def _snapshot(store):

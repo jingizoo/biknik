@@ -33,7 +33,7 @@ class DeletionContract:
 
     # -- fixture helpers ---------------------------------------------------
     def _league(self, name="League"):
-        return self.api.create_league(name, actor_id=self.ACTOR)["id"]
+        return self.api.create_program(name, actor_id=self.ACTOR)["id"]
 
     def _season(self, league_id, name="Season"):
         return self.api.create_season(league_id, name, actor_id=self.ACTOR)["id"]
@@ -46,7 +46,7 @@ class DeletionContract:
 
     def _team(self, club_id, league_id, name="Team"):
         return self.api.create_team(
-            club_id, None, name, actor_id=self.ACTOR, league_id=league_id)["id"]
+            club_id, None, name, actor_id=self.ACTOR, program_id=league_id)["id"]
 
     def _register(self, season_id, team_id, division_id):
         return self.api.register_team_for_season(
@@ -108,17 +108,17 @@ class DeletionContract:
         club = self._club()
         team = self._team(club, lg)
         self._venue(league_id=lg)
-        blocked = self.api.delete_league(lg, actor_id=self.ACTOR)
+        blocked = self.api.delete_program(lg, actor_id=self.ACTOR)
         self.assertBlocked(blocked, expect_types={"season", "team", "venue"})
-        self.assertIsNotNone(self.store.get_league(lg))  # zero-write
+        self.assertIsNotNone(self.store.get_program(lg))  # zero-write
         self.assertEqual(self._audits("league_deleted"), [])
         # Clear the dependents, then the league deletes cleanly.
         for v in list(self.store.all_venues()):
             self.api.delete_venue(v.id, actor_id=self.ACTOR)
         self.api.delete_team(team, actor_id=self.ACTOR)
         self.api.delete_season(s, actor_id=self.ACTOR)
-        self.assertDeleted(self.api.delete_league(lg, actor_id=self.ACTOR),
-                           self.store.get_league, lg, "league_deleted")
+        self.assertDeleted(self.api.delete_program(lg, actor_id=self.ACTOR),
+                           self.store.get_program, lg, "league_deleted")
 
     # -- season ------------------------------------------------------------
     def test_season_blocked_by_division_and_registration(self):
@@ -344,7 +344,7 @@ class DeletionContract:
     # -- organization ------------------------------------------------------
     def test_organization_blocked_by_league_and_venue(self):
         org = self.api.create_organization("Org", actor_id=self.ACTOR)["id"]
-        self.api.create_league("Owned", organization_id=org, actor_id=self.ACTOR)
+        self.api.create_program("Owned", operator_organization_id=org, actor_id=self.ACTOR)
         self.api.create_venue("Owned Venue", organization_id=org, actor_id=self.ACTOR)
         blocked = self.api.delete_organization(org, actor_id=self.ACTOR)
         self.assertBlocked(blocked, expect_types={"league", "venue"})
@@ -357,14 +357,14 @@ class DeletionContract:
     def test_level_blocked_by_division(self):
         lg = self._league()
         s = self._season(lg)
-        level = self.api.create_level(s, "Level A", actor_id=self.ACTOR)["id"]
-        self.api.create_division(s, "In Level", level_id=level, actor_id=self.ACTOR)
-        blocked = self.api.delete_level(level, actor_id=self.ACTOR)
+        level = self.api.create_league(s, "Level A", actor_id=self.ACTOR)["id"]
+        self.api.create_division(s, "In Level", league_id=level, actor_id=self.ACTOR)
+        blocked = self.api.delete_league(level, actor_id=self.ACTOR)
         self.assertBlocked(blocked, expect_types={"division"})
-        self.assertIsNotNone(self.store.get_level(level))
-        empty = self.api.create_level(s, "Empty Level", actor_id=self.ACTOR)["id"]
-        self.assertDeleted(self.api.delete_level(empty, actor_id=self.ACTOR),
-                           self.store.get_level, empty, "level_deleted")
+        self.assertIsNotNone(self.store.get_league(level))
+        empty = self.api.create_league(s, "Empty Level", actor_id=self.ACTOR)["id"]
+        self.assertDeleted(self.api.delete_league(empty, actor_id=self.ACTOR),
+                           self.store.get_league, empty, "level_deleted")
 
     # -- season blocked by a game (direct season_id reference) -------------
     def test_season_blocked_by_game(self):
@@ -408,8 +408,8 @@ class DeletionContract:
 
     # -- not found ---------------------------------------------------------
     def test_missing_ids_report_not_found(self):
-        for fn in (self.api.delete_organization, self.api.delete_league,
-                   self.api.delete_season, self.api.delete_level,
+        for fn in (self.api.delete_organization, self.api.delete_program,
+                   self.api.delete_season, self.api.delete_league,
                    self.api.delete_division, self.api.delete_club,
                    self.api.delete_team, self.api.delete_venue,
                    self.api.delete_rink, self.api.delete_ice_slot,
@@ -422,7 +422,7 @@ class DeletionContract:
         lg = self._league()
         self._season(lg)
         before = len(self.store.all_setup_audit())
-        self.api.delete_league(lg, actor_id=self.ACTOR)
+        self.api.delete_program(lg, actor_id=self.ACTOR)
         self.assertEqual(len(self.store.all_setup_audit()), before,
                          "a blocked delete must not append any audit row")
 

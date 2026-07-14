@@ -55,7 +55,7 @@ class SetupService(_BaseSetupService):
             )
             if structure_valid:
                 require_slot_belongs_to_league(
-                    self.store, ice_slot_id, season.league_id)
+                    self.store, ice_slot_id, season.program_id)
             return _BaseSetupService.create_game.__wrapped__(
                 self, season_id, division_id, home_team_id, away_team_id,
                 ice_slot_id, target_goalies=target_goalies,

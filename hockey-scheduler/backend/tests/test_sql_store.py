@@ -166,9 +166,9 @@ class SqlStoreParityTest(unittest.TestCase):
         # League.organization_id and Venue.league_id (#173) must persist through
         # their columns, and the venue must derive the league's owner.
         org = self.api.create_organization("Canlon")
-        league = self.api.create_league("Over 55", organization_id=org["id"])
+        league = self.api.create_program("Over 55", operator_organization_id=org["id"])
         venue = self.api.create_venue("Plainfield", league_id=league["id"])
-        self.assertEqual(self.store.get_league(league["id"]).organization_id, org["id"])
+        self.assertEqual(self.store.get_program(league["id"]).operator_organization_id, org["id"])
         stored_venue = self.store.get_venue(venue["id"])
         self.assertEqual(stored_venue.league_id, league["id"])
         self.assertEqual(stored_venue.organization_id, org["id"])
@@ -190,13 +190,13 @@ class SqlStoreParityTest(unittest.TestCase):
     def test_level_and_division_link_roundtrip_on_sql(self):
         # A level (#166) persists through the levels table, and a division's
         # level_id column roundtrips the level/tier link.
-        league = self.api.create_league("Over 55")
+        league = self.api.create_program("Over 55")
         season = self.api.create_season(league["id"], "Fall 2026")
-        level = self.api.create_level(season["id"], "Level 1", sort_order=1)
-        div = self.api.create_division(season["id"], "Div A", level_id=level["id"])
-        self.assertEqual(div["level_id"], level["id"])
+        level = self.api.create_league(season["id"], "Level 1", sort_order=1)
+        div = self.api.create_division(season["id"], "Div A", league_id=level["id"])
+        self.assertEqual(div["league_id"], level["id"])
         stored = self.store.get_division(div["id"])
-        self.assertEqual(stored.level_id, level["id"])
+        self.assertEqual(stored.league_id, level["id"])
         ov = self.api.get_demo_overview()
         self.assertIn(level["id"], [lv["id"] for lv in ov["levels"]])
         row = next(d for d in ov["divisions"] if d["id"] == div["id"])
@@ -220,17 +220,17 @@ class SqlStoreParityTest(unittest.TestCase):
     def test_reassignment_persists_on_sql(self):
         # Moving a record under a new parent (#166 PR D) must UPDATE the row in
         # the SQL store, not just mutate an in-memory object.
-        league = self.api.create_league("Over 55")
+        league = self.api.create_program("Over 55")
         season = self.api.create_season(league["id"], "Fall 2026")
-        level = self.api.create_level(season["id"], "Level 1")
+        level = self.api.create_league(season["id"], "Level 1")
         div = self.api.create_division(season["id"], "Div A")
-        moved = self.api.assign_division_level(div["id"], level["id"])
-        self.assertEqual(moved["level_id"], level["id"])
+        moved = self.api.assign_division_league(div["id"], level["id"])
+        self.assertEqual(moved["league_id"], level["id"])
         # Re-read straight from the store to prove it persisted.
-        self.assertEqual(self.store.get_division(div["id"]).level_id, level["id"])
-        cleared = self.api.assign_division_level(div["id"], None)
-        self.assertIsNone(cleared["level_id"])
-        self.assertIsNone(self.store.get_division(div["id"]).level_id)
+        self.assertEqual(self.store.get_division(div["id"]).league_id, level["id"])
+        cleared = self.api.assign_division_league(div["id"], None)
+        self.assertIsNone(cleared["league_id"])
+        self.assertIsNone(self.store.get_division(div["id"]).league_id)
 
 
 class SqlStoreTransactionTest(unittest.TestCase):
@@ -239,7 +239,7 @@ class SqlStoreTransactionTest(unittest.TestCase):
     def test_failed_create_game_rolls_back(self):
         store = SqlStore(":memory:")
         svc = SetupService(store)
-        league = svc.create_league("L")
+        league = svc.create_program("L")
         season = svc.create_season(league.id, "S")
         div = svc.create_division(season.id, "D")
         home = svc.create_team(svc.create_club("CA").id, div.id, "TA")
