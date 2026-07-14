@@ -193,10 +193,10 @@ async function checkViewport(browser, viewport) {
       })).json();
       const league = await post("/api/setup/league", { name: "Permanent League" });
       const season = await post("/api/setup/season", { league_id: league.id, name: "2026-27" });
-      const level = await post("/api/setup/level", { season_id: season.id, name: "Diamond" });
+      const level = await post("/api/setup/level", { season_id: season.id, name: "Adult League" });
       // A second grouping League in the same season, so the Division-move
       // dialog (below) has a real target to move to (#233 B2a review r1).
-      const level2 = await post("/api/setup/level", { season_id: season.id, name: "Platinum" });
+      const level2 = await post("/api/setup/level", { season_id: season.id, name: "Junior League" });
       const division = await post("/api/setup/division",
         { season_id: season.id, level_id: level.id, name: "U14" });
       const club = await post("/api/setup/club", { name: "Perma Club" });

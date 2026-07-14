@@ -73,7 +73,8 @@ async function checkViewport(browser, viewport) {
     await page.waitForSelector("#content > *", { timeout: 10000 });
 
     // Build a source season with two registered permanent teams and a target
-    // season with TWO Leagues (Diamond/Platinum), each with its own division;
+    // season with TWO Leagues (Adult League/Junior League), each with its own
+    // division;
     // pre-register one team in the target so the rollover has both an
     // eligible team (Bears) and an already-registered one (Lions). A v2
     // registration's League is REQUIRED (#233 Slice C2), so every season here
@@ -92,12 +93,12 @@ async function checkViewport(browser, viewport) {
       // A third season in the same program with NO leagues — the rollover must
       // refuse it as a target (review #216, point 3 — re-scoped to League).
       const empty = await post("/api/v2/setup/season", { program_id: program.id, name: "2028-29" });
-      const lgSrc = await post("/api/v2/setup/league", { season_id: src.id, name: "Diamond" });
-      const lgDstA = await post("/api/v2/setup/league", { season_id: dst.id, name: "Diamond" });
-      const lgDstB = await post("/api/v2/setup/league", { season_id: dst.id, name: "Platinum" });
+      const lgSrc = await post("/api/v2/setup/league", { season_id: src.id, name: "Adult League" });
+      const lgDstA = await post("/api/v2/setup/league", { season_id: dst.id, name: "Adult League" });
+      const lgDstB = await post("/api/v2/setup/league", { season_id: dst.id, name: "Junior League" });
       const dSrc = await post("/api/v2/setup/division", { league_id: lgSrc.id, name: "Source Div" });
-      const dstA = await post("/api/v2/setup/division", { league_id: lgDstA.id, name: "Target A" });
-      const dstB = await post("/api/v2/setup/division", { league_id: lgDstB.id, name: "Target B" });
+      const dstA = await post("/api/v2/setup/division", { league_id: lgDstA.id, name: "Gold" });
+      const dstB = await post("/api/v2/setup/division", { league_id: lgDstB.id, name: "Silver" });
       const club = await post("/api/v2/setup/club", { name: "Rollover Club" });
       const lions = await post("/api/v2/setup/team",
         { program_id: program.id, club_id: club.id, name: "Lions" });
@@ -192,7 +193,7 @@ async function checkViewport(browser, viewport) {
       throw new Error(`[${viewport.label}] target season was written before a valid commit: ${before} active regs`);
     }
 
-    // Assign Bears to League B (Platinum) — the inline error clears and
+    // Assign Bears to League B (Junior League) — the inline error clears and
     // commit enables even with Division left at its optional "No division"
     // default (the League→Division cascade rescopes the Division select to
     // League B's divisions, but picking one is not required).

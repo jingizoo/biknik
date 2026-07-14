@@ -140,9 +140,9 @@ async function checkViewport(browser, viewport) {
       const program = await post("/api/v2/setup/program", { name: "Participation Program" });
       const s1 = await post("/api/v2/setup/season", { program_id: program.id, name: "2026-27" });
       const s2 = await post("/api/v2/setup/season", { program_id: program.id, name: "2027-28" });
-      const lg1 = await post("/api/v2/setup/league", { season_id: s1.id, name: "Diamond" });
-      const lg2 = await post("/api/v2/setup/league", { season_id: s2.id, name: "Diamond" });
-      const dA = await post("/api/v2/setup/division", { league_id: lg1.id, name: "Division A" });
+      const lg1 = await post("/api/v2/setup/league", { season_id: s1.id, name: "Adult League" });
+      const lg2 = await post("/api/v2/setup/league", { season_id: s2.id, name: "Adult League" });
+      const dA = await post("/api/v2/setup/division", { league_id: lg1.id, name: "Gold" });
       const dB = await post("/api/v2/setup/division", { league_id: lg2.id, name: "Division B" });
       const club = await post("/api/v2/setup/club", { name: "Participation Club" });
       const team = await post("/api/v2/setup/team",
@@ -172,7 +172,7 @@ async function checkViewport(browser, viewport) {
       throw new Error(`[${viewport.label}] orgless Program listed under Needs assignment: ${naText}`);
     }
 
-    // Register the permanent team for season 1 / League 1 / Division A. The
+    // Register the permanent team for season 1 / League 1 / Division Gold. The
     // League select already defaults to lg1 (the section it's under).
     await page.selectOption(`#reg-team-${ids.lg1}`, ids.team);
     await page.selectOption(`#reg-div-add-${ids.lg1}`, ids.dA);
@@ -260,7 +260,7 @@ async function checkViewport(browser, viewport) {
       (t) => (document.querySelector("#toast-root .toast-msg") || {}).textContent === t,
       expected, { timeout: 15000 });
 
-    // Lions (still active in season 1 under League 1 / Division A) is reused
+    // Lions (still active in season 1 under League 1 / Division Gold) is reused
     // for the edit-path steps. A second League ("Sapphire") with its own
     // Division ("Division C") in the SAME season gives Save somewhere real
     // to move it to.
@@ -360,7 +360,7 @@ async function checkViewport(browser, viewport) {
     // (5) Partial-failure toast for Save: intercept the FINAL assign-division
     // request (the one that sets a real Division, not the null-clearing one)
     // and force it to fail. Lions is currently League 2 ("Sapphire") /
-    // no Division; move it to League 1 ("Diamond") / Division A — the
+    // no Division; move it to League 1 ("Adult League") / Division Gold — the
     // League change succeeds, the Division change is intercepted and fails,
     // so the toast must clearly say the update was only partially applied
     // (matches app.js's placementSaveToast() partial-branch text exactly).

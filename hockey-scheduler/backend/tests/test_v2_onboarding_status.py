@@ -44,7 +44,7 @@ class V2OnboardingStatusTest(unittest.TestCase):
     def test_season_with_league_no_division_is_ready_in_v2(self):
         api = self._api()
         org, program, season = self._base(api)
-        league = api.create_league(season["id"], "Diamond", actor_id="admin")
+        league = api.create_league(season["id"], "Adult League", actor_id="admin")
         # A team registered with the league but NO division.
         team = api.create_team(self._club["id"], None, "T", actor_id="admin",
                                program_id=program["id"])
@@ -79,7 +79,7 @@ class V2OnboardingStatusTest(unittest.TestCase):
         program = api.create_program("Orgless Prog", actor_id="admin")
         self.assertIsNone(program.get("operator_organization_id"))
         season = api.create_season(program["id"], "Fall", actor_id="admin")
-        league = api.create_league(season["id"], "Diamond", actor_id="admin")
+        league = api.create_league(season["id"], "Adult League", actor_id="admin")
         club = api.create_club("C", actor_id="admin")
         team = api.create_team(club["id"], None, "T", actor_id="admin",
                                program_id=program["id"])
@@ -118,7 +118,7 @@ class V2OnboardingStatusTest(unittest.TestCase):
         grouping League."""
         api = self._api()
         org, program, season = self._base(api)
-        league = api.create_league(season["id"], "Diamond", actor_id="admin")
+        league = api.create_league(season["id"], "Adult League", actor_id="admin")
         team = api.create_team(self._club["id"], None, "T", actor_id="admin",
                                program_id=program["id"])
         api.register_team_for_season(season["id"], team["id"], actor_id="admin",
@@ -143,7 +143,7 @@ class V2OnboardingStatusTest(unittest.TestCase):
         api = self._api()
         org, program, season = self._base(api)
         # First season gets a league + a valid registration.
-        league = api.create_league(season["id"], "Diamond", actor_id="admin")
+        league = api.create_league(season["id"], "Adult League", actor_id="admin")
         team = api.create_team(self._club["id"], None, "T", actor_id="admin",
                                program_id=program["id"])
         api.register_team_for_season(season["id"], team["id"], actor_id="admin",
@@ -166,7 +166,7 @@ class V2OnboardingStatusTest(unittest.TestCase):
         an `invalid_registrations` blocker."""
         api = self._api()
         org, program, season = self._base(api)
-        league = api.create_league(season["id"], "Diamond", actor_id="admin")
+        league = api.create_league(season["id"], "Adult League", actor_id="admin")
         team = api.create_team(self._club["id"], None, "T", actor_id="admin",
                                program_id=program["id"])
         # A valid registration keeps the installation otherwise ready...
@@ -203,7 +203,7 @@ class V2OnboardingStatusTest(unittest.TestCase):
         bypassing the service layer the real app always goes through."""
         api = self._api()
         org, program, season = self._base(api)
-        league = api.create_league(season["id"], "Diamond", actor_id="admin")
+        league = api.create_league(season["id"], "Adult League", actor_id="admin")
         team = api.create_team(self._club["id"], None, "T", actor_id="admin",
                                program_id=program["id"])
         other_season = api.create_season(program["id"], "Other", actor_id="admin")
