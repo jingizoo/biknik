@@ -818,12 +818,35 @@ class SetupService:
                 raise ValidationError(
                     f"Team {tid} belongs to a different program than this "
                     "rollover; it cannot be carried into this season.")
-            wanted[tid] = (lid, div or None)
+            div_id = div or None
+            # An already-active target registration is an idempotent skip ONLY
+            # when its League AND Division exactly match this selection. A
+            # mismatch means the selection's required League/Division would be
+            # silently ignored (the team left in its current League) — a
+            # contract violation. Catch it in the pre-write gate so the whole
+            # batch aborts with zero writes rather than reporting a false skip.
+            existing = self.store.registration_for_team_in_season(
+                to_season_id, tid)
+            if existing is not None and existing.active and (
+                    (existing.league_id or None) != lid
+                    or (existing.division_id or None) != div_id):
+                raise ValidationError(
+                    f"Team {tid} is already registered in the target season "
+                    "under a different league/division than this selection; "
+                    "resolve the existing registration first.",
+                    {"reason": "rollover_conflicts_active_registration",
+                     "team_id": tid, "registration_id": existing.id,
+                     "expected_league_id": lid, "expected_division_id": div_id,
+                     "actual_league_id": existing.league_id,
+                     "actual_division_id": existing.division_id})
+            wanted[tid] = (lid, div_id)
 
         rolled, skipped, created = 0, 0, []
         for tid, (lid, div_id) in wanted.items():
             existing = self.store.registration_for_team_in_season(to_season_id, tid)
             if existing is not None and existing.active:
+                # Guaranteed an exact League+Division match by the pre-write gate
+                # above — a safe idempotent skip.
                 skipped += 1
                 continue
             if existing is not None:  # reactivate a prior inactive registration
