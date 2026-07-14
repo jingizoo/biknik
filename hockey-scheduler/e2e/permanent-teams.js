@@ -190,14 +190,16 @@ async function checkViewport(browser, viewport) {
     if (!ids.structureOk) fail(`league grouping / division not created`);
 
     // 4) With a program present, the Venue drawer's program field is labelled as
-    //    an explicitly legacy/transitional link (removed in Slice E) — never the
-    //    old "sets the owner" nor a target-model "operating program" phrasing.
+    //    an explicitly temporary/transitional link (removed in Slice E) — never
+    //    the old "sets the owner" nor a target-model "operating program" phrasing.
+    //    (#233 B2a: the temporary game-ice compatibility bridge's exact wording
+    //    is a locked product decision — see the Facility tree's matching label.)
     await page.click('[data-setup-view="records"]');
     await page.waitForSelector(".setup-card", { timeout: 10000 });
     const venueDrawer = await openDrawer("venue");
     const venueLabels = venueDrawer.labels.join(" | ");
-    if (!/Legacy program grouping/i.test(venueLabels) || !/removed in Slice E/i.test(venueLabels))
-      fail(`Venue drawer program field not marked legacy/transitional (got ${JSON.stringify(venueDrawer.labels)})`);
+    if (!/Temporary game-ice compatibility/i.test(venueLabels) || !/removed in Slice E/i.test(venueLabels))
+      fail(`Venue drawer program field not marked temporary/transitional (got ${JSON.stringify(venueDrawer.labels)})`);
     if (/sets the owner/i.test(venueLabels))
       fail(`Venue drawer still says "sets the owner"`);
     await closeDrawer();

@@ -231,6 +231,66 @@ class V2SetupContractTest(unittest.TestCase):
         # meaning-of-program is gone — the season carries program_id.
         self.assertNotIn('"level"', blob)
 
+    # -- canonical flat overview (#233 Slice B2a) ---------------------------
+    def test_v2_overview_canonical_flat_lists(self):
+        c = self._admin()
+        org = self._v2(c, "organization", {"name": "Ov Org", "short_name": "OO"})
+        program = self._v2(c, "program",
+                          {"name": "Ov Program",
+                           "operator_organization_id": org["id"]})
+        season = self._v2(c, "season",
+                        {"program_id": program["id"], "name": "OvS"})
+        league = self._v2(c, "league", {"season_id": season["id"], "name": "OvL"})
+        division = self._v2(c, "division",
+                           {"league_id": league["id"], "name": "OvD"})
+        club = self._v2(c, "club", {"name": "OvC"})
+        team = self._v2(c, "team",
+                       {"program_id": program["id"], "club_id": club["id"],
+                        "name": "OvT"})
+        venue = self._v2(c, "venue",
+                        {"name": "OvV", "organization_id": org["id"]})
+
+        status, ov = self._req(c, "GET", "/api/v2/setup/overview")
+        self.assertEqual(status, 200, ov)
+        # Flat canonical lists exist for every setup entity.
+        for key in ("programs", "seasons", "leagues", "divisions", "teams",
+                    "clubs", "organizations", "venues", "rinks", "ice_slots"):
+            self.assertIn(key, ov, ov)
+
+        prog = next(p for p in ov["programs"] if p["id"] == program["id"])
+        self.assertEqual(prog["operator_organization_id"], org["id"])
+        self.assertNotIn("organization_id", prog)  # canonical, not legacy
+
+        s = next(x for x in ov["seasons"] if x["id"] == season["id"])
+        self.assertEqual(s["program_id"], program["id"])
+        self.assertNotIn("league_id", s)  # season carries program_id, not league_id
+
+        d = next(x for x in ov["divisions"] if x["id"] == division["id"])
+        self.assertEqual(d["league_id"], league["id"])  # canonical grouping League
+        self.assertNotIn("level_id", d)
+
+        t = next(x for x in ov["teams"] if x["id"] == team["id"])
+        self.assertEqual(t["program_id"], program["id"])
+        self.assertNotIn("league_id", t)
+
+        v = next(x for x in ov["venues"] if x["id"] == venue["id"])
+        self.assertEqual(v["organization_id"], org["id"])
+        # Canonical Venue is org-owned only — the temporary program link is NOT
+        # exposed here (managed via the v1 assign-league bridge until Slice E).
+        self.assertNotIn("league_id", v)
+
+        # No legacy vocabulary anywhere in the payload.
+        blob = json.dumps(ov)
+        self.assertNotIn("level_id", blob)
+        self.assertNotIn("level_name", blob)
+
+    def test_v2_overview_requires_operator(self):
+        # Unauthenticated → gated (401 no session / 403 wrong role), never 200:
+        # same MANAGE_SETUP gate as the hierarchy read.
+        c = self._client()
+        status, _ = self._req(c, "GET", "/api/v2/setup/overview")
+        self.assertIn(status, (401, 403))
+
     # -- assign-league + assign-division ------------------------------------
     def test_v2_assign_league_and_division(self):
         c = self._admin()

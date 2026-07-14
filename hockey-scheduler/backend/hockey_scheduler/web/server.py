@@ -772,6 +772,13 @@ class Handler(BaseHTTPRequestHandler):
         # Canonical v2 setup reads (#233 Slice C2). Same MANAGE_SETUP operator
         # gate as their v1 siblings, but canonical keys and shapes — no v1
         # adapter mapping.
+        if path == "/api/v2/setup/overview":
+            # Canonical flat setup-entity lists for the Setup/Records UI (#233
+            # Slice B2a). Same MANAGE_SETUP operator gate as the hierarchy read;
+            # canonical keys, no schedule/games/PII.
+            if self._operator_only("/api/v2/setup/player"):
+                return
+            return self._send_api(api.get_setup_overview_v2())
         if path == "/api/v2/setup/hierarchy":
             if self._operator_only("/api/v2/setup/player"):
                 return

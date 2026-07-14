@@ -37,6 +37,7 @@ const onboardingBasePost = post;
 post = async function postWithOnboardingRefresh(path, body) {
   const result = await onboardingBasePost(path, body);
   const changedSetup = path.startsWith("/api/setup/")
+    || path.startsWith("/api/v2/setup/")
     || path === "/api/accounts"
     || path.startsWith("/api/import/commit/")
     || path.startsWith("/api/guardians/links");
