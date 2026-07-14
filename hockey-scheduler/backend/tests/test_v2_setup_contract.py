@@ -285,11 +285,29 @@ class V2SetupContractTest(unittest.TestCase):
         self.assertNotIn("level_name", blob)
 
     def test_v2_overview_requires_operator(self):
-        # Unauthenticated → gated (401 no session / 403 wrong role), never 200:
-        # same MANAGE_SETUP gate as the hierarchy read.
+        # Unauthenticated → gated (401 no session / 403 wrong role), never 200.
         c = self._client()
         status, _ = self._req(c, "GET", "/api/v2/setup/overview")
         self.assertIn(status, (401, 403))
+
+    def test_v2_overview_allows_arena_manager(self):
+        # #233 B2a review: overview is gated MANAGE_ARENA (not MANAGE_SETUP
+        # like hierarchy) so the Setup UI's facility portion doesn't crash for
+        # an Arena Manager, who holds MANAGE_ARENA but not MANAGE_SETUP.
+        c = self._client()
+        self._req(c, "POST", "/api/auth/login",
+                  {"username": "arena", "password": "demo"})
+        status, resp = self._req(c, "GET", "/api/v2/setup/overview")
+        self.assertEqual(status, 200, resp)
+        self.assertIn("organizations", resp)
+        self.assertIn("venues", resp)
+
+    def test_v2_overview_denies_role_without_arena_or_setup(self):
+        c = self._client()
+        self._req(c, "POST", "/api/auth/login",
+                  {"username": "coach", "password": "demo"})
+        status, _ = self._req(c, "GET", "/api/v2/setup/overview")
+        self.assertEqual(status, 403)
 
     # -- assign-league + assign-division ------------------------------------
     def test_v2_assign_league_and_division(self):

@@ -774,9 +774,11 @@ class Handler(BaseHTTPRequestHandler):
         # adapter mapping.
         if path == "/api/v2/setup/overview":
             # Canonical flat setup-entity lists for the Setup/Records UI (#233
-            # Slice B2a). Same MANAGE_SETUP operator gate as the hierarchy read;
-            # canonical keys, no schedule/games/PII.
-            if self._operator_only("/api/v2/setup/player"):
+            # Slice B2a). Gated MANAGE_ARENA (not MANAGE_SETUP like hierarchy)
+            # — both League Admin and Arena Manager hold it, and Arena
+            # Managers need the facility portion (organizations/venues/rinks)
+            # for their own Setup cards; the payload has no PII/roster counts.
+            if self._operator_only("/api/v2/setup/overview"):
                 return
             return self._send_api(api.get_setup_overview_v2())
         if path == "/api/v2/setup/hierarchy":

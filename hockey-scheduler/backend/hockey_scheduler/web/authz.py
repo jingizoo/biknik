@@ -43,6 +43,14 @@ def _v2_setup_permission(rest: str):
         return Permission.MANAGE_SETUP
     if rest == "hierarchy":
         return Permission.MANAGE_SETUP
+    # The flat overview (#233 B2a review) mixes arena entities (organization/
+    # venue/rink/ice_slot) with competition ones, but carries no PII or
+    # roster-adjacent counts (unlike hierarchy's player_count) — so unlike
+    # hierarchy it's gated to MANAGE_ARENA, the one permission both League
+    # Admin and Arena Manager hold (unauthenticated ov.venues/etc. is no
+    # longer the Setup facility source, so Arena Managers need this read).
+    if rest == "overview":
+        return Permission.MANAGE_ARENA
     # Delete: /api/v2/setup/<entity>/<id>/delete — per-entity permission.
     md = re.match(r"^([\w-]+)/[^/]+/delete$", rest)
     if md:

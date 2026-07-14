@@ -152,15 +152,17 @@ async function checkViewport(browser, viewport) {
       fail(`Program drawer title is not "New program" (got "${programDrawer.title}")`);
     const programLabels = programDrawer.labels.join(" | ");
     if (!/Program name/.test(programLabels)) fail(`Program drawer missing "Program name" field`);
-    if (!/Operating organization/.test(programLabels)) fail(`Program drawer missing "Operating organization" field`);
-    // The empty-operator note must name the parent by the Program-operator role
-    // ("operating organization"), never "facility owner" — that role word is
-    // for Venue ownership, not Program operation (ADR 0001).
-    const programNote = programDrawer.notes.join(" | ");
-    if (!/Create an operating organization first/i.test(programNote))
-      fail(`Program drawer empty operator note is not "Create an operating organization first" (got ${JSON.stringify(programDrawer.notes)})`);
-    if (/facility owner/i.test(programNote))
-      fail(`Program drawer operator note still says "facility owner" (got ${JSON.stringify(programDrawer.notes)})`);
+    // The operating organization is OPTIONAL in the canonical model (#233 B2a
+    // review r1) — operator_organization_id is nullable server-side, so with
+    // zero organizations the field must still offer an explicit "— none —"
+    // choice and never block the drawer with a "create one first" note (that
+    // pattern is reserved for genuinely required parents).
+    if (!/Operating organization \(optional\)/.test(programLabels))
+      fail(`Program drawer's organization field is not marked optional (got ${JSON.stringify(programDrawer.labels)})`);
+    if (programDrawer.notes.length)
+      fail(`Program drawer showed a blocking note for an optional field (got ${JSON.stringify(programDrawer.notes)})`);
+    if (/facility owner/i.test(programLabels))
+      fail(`Program drawer operator field still says "facility owner" (got ${JSON.stringify(programDrawer.labels)})`);
     await closeDrawer();
 
     // 3) Now build a program → season → league(grouping) → division, plus a
@@ -177,29 +179,33 @@ async function checkViewport(browser, viewport) {
       const league = await post("/api/setup/league", { name: "Permanent League" });
       const season = await post("/api/setup/season", { league_id: league.id, name: "2026-27" });
       const level = await post("/api/setup/level", { season_id: season.id, name: "Diamond" });
+      // A second grouping League in the same season, so the Division-move
+      // dialog (below) has a real target to move to (#233 B2a review r1).
+      const level2 = await post("/api/setup/level", { season_id: season.id, name: "Platinum" });
       const division = await post("/api/setup/division",
         { season_id: season.id, level_id: level.id, name: "U14" });
       const club = await post("/api/setup/club", { name: "Perma Club" });
       const team = await post("/api/setup/team",
         { club_id: club.id, league_id: league.id, name: "Perma Bruins" });
-      return { league: league.id, team: team.id,
+      return { league: league.id, team: team.id, division: division.id, level2: level2.id,
                teamOk: !team.error && team.league_id === league.id && !team.division_id,
-               structureOk: !level.error && !division.error };
+               structureOk: !level.error && !level2.error && !division.error };
     });
     if (!ids.teamOk) fail(`team not created under league`);
     if (!ids.structureOk) fail(`league grouping / division not created`);
 
-    // 4) With a program present, the Venue drawer's program field is labelled as
-    //    an explicitly temporary/transitional link (removed in Slice E) — never
-    //    the old "sets the owner" nor a target-model "operating program" phrasing.
-    //    (#233 B2a: the temporary game-ice compatibility bridge's exact wording
-    //    is a locked product decision — see the Facility tree's matching label.)
+    // 4) #233 B2a review r1: canonical Venue create is org-owned only — the
+    //    drawer must NOT offer a Program field at all (a create-time field
+    //    couldn't apply the temporary bridge anyway, since a venue has no id
+    //    yet, and one that silently discarded a selection was misleading).
+    //    The bridge's exact wording lives on the Facility tree's control
+    //    instead (asserted later, once a venue exists to attach it to).
     await page.click('[data-setup-view="records"]');
     await page.waitForSelector(".setup-card", { timeout: 10000 });
     const venueDrawer = await openDrawer("venue");
     const venueLabels = venueDrawer.labels.join(" | ");
-    if (!/Temporary game-ice compatibility/i.test(venueLabels) || !/removed in Slice E/i.test(venueLabels))
-      fail(`Venue drawer program field not marked temporary/transitional (got ${JSON.stringify(venueDrawer.labels)})`);
+    if (/[Pp]rogram/.test(venueLabels))
+      fail(`Venue create drawer still has a Program field (got ${JSON.stringify(venueDrawer.labels)})`);
     if (/sets the owner/i.test(venueLabels))
       fail(`Venue drawer still says "sets the owner"`);
     await closeDrawer();
@@ -276,8 +282,202 @@ async function checkViewport(browser, viewport) {
     if (!laRole || laRole.label !== "League Admin")
       fail(`League Admin role label changed (got ${JSON.stringify(laRole && laRole.label)})`);
 
+    // 10) #233 B2a review r1: a Program's operating organization is OPTIONAL —
+    //     the drawer must let it be created with no organization at all, post
+    //     operator_organization_id: null (never omit/coerce it), and keep
+    //     displaying "No operating org" after a fresh reload (never crash on
+    //     the null field).
+    await page.click('[data-setup-view="records"]');
+    await page.waitForSelector(".setup-card", { timeout: 10000 });
+    const noOrgReq = page.waitForRequest((r) =>
+      r.url().includes("/api/v2/setup/program") && r.method() === "POST");
+    await page.click('.setup-card .sc-new[data-drawer="league"]');
+    await page.waitForSelector("#f-league", { timeout: 5000 });
+    await page.fill("#f-league", "Orgless Program");
+    await page.click('[data-drawer-submit="league"]');
+    const noOrgBody = (await noOrgReq).postDataJSON();
+    if (noOrgBody.operator_organization_id !== null)
+      fail(`Program-create body did not carry a null operator_organization_id (got ${JSON.stringify(noOrgBody)})`);
+    await page.waitForFunction(() => !document.querySelector(".drawer[role=dialog]"), null, { timeout: 5000 });
+    await page.reload({ waitUntil: "domcontentloaded" });
+    await page.click('.tab[data-tab="setup"]');
+    await page.click('[data-setup-view="records"]');
+    await page.waitForSelector(".setup-card", { timeout: 10000 });
+    const orglessRow = await page.evaluate(() => {
+      const card = [...document.querySelectorAll(".setup-card")]
+        .find((c) => c.querySelector(".sc-title").textContent.includes("Programs"));
+      const row = [...card.querySelectorAll(".li-title")]
+        .find((t) => t.textContent.trim() === "Orgless Program");
+      return row ? row.closest(".li").querySelector(".li-sub").textContent.trim() : null;
+    });
+    if (orglessRow !== "No operating org")
+      fail(`Orgless program not shown as "No operating org" after reload (got ${JSON.stringify(orglessRow)})`);
+
+    // 11) #233 B2a review r1: structural Setup writes go to v2 — a Division
+    //     move (division:level) and a Division delete both POST to
+    //     /api/v2/setup/..., never the legacy /api/setup/... route.
+    await page.click('[data-setup-view="hierarchy"]');
+    await page.waitForFunction(
+      () => document.querySelector('[data-reassign="division:level"]'),
+      null, { timeout: 15000 });
+    const divMoveReq = page.waitForRequest((r) =>
+      /\/api\/(v2\/)?setup\/division\/[^/]+\/assign-/.test(r.url()) && r.method() === "POST");
+    await page.click('[data-reassign="division:level"]');
+    await page.waitForSelector(".rz-panel select#reassign-target", { timeout: 5000 });
+    await page.selectOption("#reassign-target", ids.level2);
+    await page.click(".rz-panel [data-reassign-confirm]");
+    const divMoveUrl = (await divMoveReq).url();
+    if (!divMoveUrl.includes("/api/v2/setup/division/"))
+      fail(`Division move did not POST to v2 (got ${divMoveUrl})`);
+    await page.waitForFunction(() => !document.querySelector(".rz-panel"), null, { timeout: 5000 });
+
+    const divDelReq = page.waitForRequest((r) =>
+      /\/api\/(v2\/)?setup\/division\/[^/]+\/delete$/.test(r.url()) && r.method() === "POST");
+    await page.click('[data-del="division"]');
+    await page.waitForSelector(".modal.danger [data-del-confirm]", { timeout: 5000 });
+    await page.click(".modal.danger [data-del-confirm]");
+    const divDelUrl = (await divDelReq).url();
+    if (!divDelUrl.includes("/api/v2/setup/division/"))
+      fail(`Division delete did not POST to v2 (got ${divDelUrl})`);
+    await page.waitForFunction(() => !document.querySelector(".modal[role=dialog]"), null, { timeout: 5000 });
+
+    // 12) #233 B2a review r1: the temporary Venue→Program compatibility bridge
+    //     is set through the v1 assign-league route (the one deliberate v1
+    //     structural holdout) and, unlike before, its current value is
+    //     displayed and preselected — it must not disappear on refresh.
+    const bridgeVenue = await page.evaluate(async (leagueId) => {
+      const r = await fetch("/api/v2/setup/venue", {
+        method: "POST", credentials: "same-origin",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: "Bridge Arena", organization_id: null }),
+      });
+      return (await r.json()).id;
+    }, ids.league);
+    await page.reload({ waitUntil: "domcontentloaded" });
+    await page.click('.tab[data-tab="setup"]');
+    await page.click('[data-setup-view="hierarchy"]');
+    await page.waitForFunction(
+      () => document.body.textContent.includes("Bridge Arena"), null, { timeout: 15000 });
+    const bridgeReq = page.waitForRequest((r) =>
+      r.url().includes("/api/setup/venue/") && r.url().includes("/assign-league")
+      && r.method() === "POST");
+    await page.click('[data-reassign="venue:league"]');
+    await page.waitForSelector(".rz-panel select#reassign-target", { timeout: 5000 });
+    await page.selectOption("#reassign-target", ids.league);
+    await page.click(".rz-panel [data-reassign-confirm]");
+    const bridgeUrl = (await bridgeReq).url();
+    if (bridgeUrl.includes("/api/v2/setup/"))
+      fail(`Venue→Program bridge unexpectedly went to v2 (got ${bridgeUrl})`);
+    await page.waitForFunction(() => !document.querySelector(".rz-panel"), null, { timeout: 5000 });
+    await page.reload({ waitUntil: "domcontentloaded" });
+    await page.click('.tab[data-tab="setup"]');
+    await page.click('[data-setup-view="hierarchy"]');
+    await page.waitForFunction(
+      () => document.body.textContent.includes("Bridged to: Permanent League"),
+      null, { timeout: 15000 });
+    await page.click('[data-reassign="venue:league"]');
+    await page.waitForSelector(".rz-panel select#reassign-target", { timeout: 5000 });
+    const preselected = await page.$eval("#reassign-target", (s) => s.value);
+    if (preselected !== ids.league)
+      fail(`Venue bridge Move panel did not preselect the current Program (got "${preselected}")`);
+    await page.click(".rz-panel [data-reassign-cancel]");
+    await page.waitForFunction(() => !document.querySelector(".rz-panel"), null, { timeout: 5000 });
+
     if (errors.length) fail(`console/page errors:\n${errors.join("\n")}`);
     console.log(`[${tag}] OK — permanent team under league; Setup uses Program/League nouns end to end.`);
+  } catch (error) {
+    throw new Error(`${error.message}\n--- demo server output ---\n${serverOutput}`);
+  } finally {
+    await context.close();
+    await stopServer(server);
+  }
+}
+
+// #233 B2a review r1: an Arena Manager (MANAGE_ARENA, not MANAGE_SETUP) must
+// be able to open both Setup views and manage Organization/Venue/Rink
+// without the page crashing — before this fix, the canonical overview was
+// fetched only under manage_setup, so an Arena Manager's Setup screen
+// dereferenced an undefined `sv`.
+async function checkArenaManager(browser, viewport) {
+  const base = `http://${HOST}:${viewport.port}`;
+  const tag = viewport.label;
+  const server = spawn(
+    process.env.PYTHON || "python3",
+    ["-u", "-m", "hockey_scheduler.web.server", "--host", HOST, "--port", String(viewport.port)],
+    { cwd: BACKEND_DIR, stdio: ["ignore", "pipe", "pipe"] });
+  let serverOutput = "";
+  server.stdout.on("data", (d) => { serverOutput += d.toString(); });
+  server.stderr.on("data", (d) => { serverOutput += d.toString(); });
+
+  const context = await browser.newContext({ viewport: { width: viewport.width, height: viewport.height } });
+  const page = await context.newPage();
+  const errors = [];
+  page.on("pageerror", (e) => errors.push(`[pageerror] ${e.message}`));
+  page.on("console", (m) => { if (m.type() === "error") errors.push(`[console] ${m.text()}`); });
+  const fail = (msg) => { throw new Error(`[arena-manager/${tag}] ${msg}`); };
+
+  try {
+    await waitForServer(`${base}/api/health`, READY_TIMEOUT_MS);
+    await page.goto(base, { waitUntil: "domcontentloaded" });
+    await page.waitForSelector("#content > *", { timeout: 10000 });
+    // A fresh boot only seeds the "admin" account — the other demo personas
+    // (including "arena") are UserAccount rows built by /api/demo/load, so
+    // load the sample dataset first (as the auto-logged-in League Admin)
+    // before switching sessions onto Arena Manager and reloading.
+    const loadStatus = await page.evaluate(() => fetch("/api/demo/load", {
+      method: "POST", credentials: "same-origin",
+      headers: { "Content-Type": "application/json" }, body: "{}",
+    }).then((r) => r.status));
+    if (loadStatus !== 200) fail(`demo load (as admin) failed (status ${loadStatus})`);
+    const loginStatus = await page.evaluate(() => fetch("/api/auth/login", {
+      method: "POST", credentials: "same-origin",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username: "arena", password: "demo" }),
+    }).then((r) => r.status));
+    if (loginStatus !== 200) fail(`arena manager login failed (status ${loginStatus})`);
+    await page.reload({ waitUntil: "domcontentloaded" });
+    await page.waitForSelector("#content > *", { timeout: 10000 });
+
+    await page.click('.tab[data-tab="setup"]');
+    await page.click('[data-setup-view="hierarchy"]');
+    await page.waitForSelector(".setup-trees", { timeout: 10000 });
+    if (!(await page.$$eval(".setup-trees .tree-panel", (els) => els.length)))
+      fail(`Hierarchy view rendered no tree panels for Arena Manager`);
+
+    await page.click('[data-setup-view="records"]');
+    await page.waitForSelector(".setup-card", { timeout: 10000 });
+    const cardTitles = await page.$$eval(".setup-card .sc-title", (els) => els.map((e) => e.textContent.trim()));
+    if (!cardTitles.includes("Venues") || !cardTitles.includes("Rinks"))
+      fail(`Records grid missing Venue/Rink cards for Arena Manager (got ${JSON.stringify(cardTitles)})`);
+
+    // Create an Organization, then a Venue owned by it, then a Rink — the
+    // full arena-side create path an Arena Manager actually uses. Each step
+    // waits for its own record to actually appear (not just for the drawer
+    // to close) before moving on, since the next drawer's "+New" click can
+    // otherwise race the previous submit's full-page re-render under load.
+    await page.click('.setup-card .sc-new[data-drawer="organization"]');
+    await page.waitForSelector("#f-org", { timeout: 5000 });
+    await page.fill("#f-org", "Arena Co");
+    await page.click('[data-drawer-submit="organization"]');
+    await page.waitForFunction(() => !document.querySelector(".drawer[role=dialog]")
+      && document.body.textContent.includes("Arena Co"), null, { timeout: 10000 });
+
+    await page.click('.setup-card .sc-new[data-drawer="venue"]');
+    await page.waitForSelector("#f-venue", { timeout: 5000 });
+    await page.fill("#f-venue", "Arena One");
+    await page.click('[data-drawer-submit="venue"]');
+    await page.waitForFunction(() => !document.querySelector(".drawer[role=dialog]")
+      && document.body.textContent.includes("Arena One"), null, { timeout: 10000 });
+
+    await page.click('.setup-card .sc-new[data-drawer="rink"]');
+    await page.waitForSelector("#f-rink", { timeout: 5000 });
+    await page.fill("#f-rink", "Rink A");
+    await page.click('[data-drawer-submit="rink"]');
+    await page.waitForFunction(() => !document.querySelector(".drawer[role=dialog]")
+      && document.body.textContent.includes("Rink A"), null, { timeout: 10000 });
+
+    if (errors.length) fail(`console/page errors:\n${errors.join("\n")}`);
+    console.log(`[arena-manager/${tag}] OK — Setup Hierarchy + Records usable, Venue/Rink created, no crash.`);
   } catch (error) {
     throw new Error(`${error.message}\n--- demo server output ---\n${serverOutput}`);
   } finally {
@@ -292,6 +492,7 @@ async function main() {
     browser = await chromium.launch(
       process.env.SMOKE_CHROMIUM_PATH ? { executablePath: process.env.SMOKE_CHROMIUM_PATH } : {});
     for (const viewport of VIEWPORTS) await checkViewport(browser, viewport);
+    for (const viewport of VIEWPORTS) await checkArenaManager(browser, viewport);
     console.log("Permanent-teams + competition-terminology browser journey passed.");
   } catch (error) {
     console.error("Permanent-teams + competition-terminology browser journey FAILED.");
