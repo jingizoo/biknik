@@ -177,5 +177,118 @@ class SetupFacadeTest(unittest.TestCase):
         self.assertEqual(status["game_id"], game["id"])
 
 
+class SetupValidationWordingTest(unittest.TestCase):
+    """#233 B1: setup validation/deletion messages use the canonical display
+    nouns — Program for the umbrella (internal ``league``), League for the
+    grouping (internal ``level``), and facility-owner / operating-organization
+    for the venue↔program org roles. Error codes stay frozen."""
+
+    def setUp(self):
+        self.api = ApiService()
+
+    def _msg(self, result):
+        return result["error"]["message"]
+
+    def test_missing_umbrella_parent_says_program(self):
+        r = self.api.create_season("nope", "S")
+        self.assertEqual(r["error"]["code"], "not_found")
+        self.assertEqual(self._msg(r), "Program nope not found.")
+
+    def test_team_without_umbrella_says_program(self):
+        club = self.api.create_club("C")
+        r = self.api.create_team(club["id"], None, "T")  # no league/division
+        self.assertIn("A team needs a program", self._msg(r))
+        self.assertNotRegex(self._msg(r), r"(?i)\bleague\b")
+
+    def test_missing_grouping_parent_says_league(self):
+        league = self.api.create_league("P")
+        season = self.api.create_season(league["id"], "S")
+        r = self.api.create_division(season["id"], "D", level_id="nope")
+        self.assertEqual(self._msg(r), "League nope not found.")
+
+    def test_venue_program_owner_mismatch_uses_role_nouns_and_v1_qualifier(self):
+        org1 = self.api.create_organization("O1")
+        org2 = self.api.create_organization("O2")
+        league = self.api.create_league("P", organization_id=org1["id"])
+        venue = self.api.create_venue("V", organization_id=org2["id"])
+        r = self.api.assign_venue_league(venue["id"], league["id"])
+        msg = self._msg(r)
+        self.assertIn("facility owner", msg)
+        self.assertIn("operating organization", msg)
+        # Presented as a temporary v1 constraint, not the target ownership model.
+        self.assertIn("Current v1 compatibility", msg)
+        self.assertIn("Slice E", msg)
+        self.assertNotRegex(msg, r"(?i)\bleague\b")
+
+    def test_create_venue_owner_mismatch_is_v1_qualified(self):
+        org1 = self.api.create_organization("O1")
+        org2 = self.api.create_organization("O2")
+        league = self.api.create_league("P", organization_id=org1["id"])
+        r = self.api.create_venue("V", organization_id=org2["id"],
+                                  league_id=league["id"])
+        msg = self._msg(r)
+        self.assertIn("Current v1 compatibility", msg)
+        self.assertIn("facility owner", msg)
+        self.assertIn("operating organization", msg)
+
+    def test_change_operating_org_blocked_while_venue_attached_is_v1_qualified(self):
+        org1 = self.api.create_organization("O1")
+        org2 = self.api.create_organization("O2")
+        league = self.api.create_league("P", organization_id=org1["id"])
+        self.api.create_venue("V", league_id=league["id"])  # attaches a venue
+        r = self.api.assign_league_organization(league["id"], org2["id"])
+        msg = self._msg(r)
+        self.assertIn("Current v1 compatibility", msg)
+        self.assertIn("operating organization", msg)
+        self.assertIn("venue", msg)
+
+    def test_rollover_across_programs_says_programs(self):
+        p1 = self.api.create_league("P1")
+        p2 = self.api.create_league("P2")
+        s1 = self.api.create_season(p1["id"], "S1")
+        s2 = self.api.create_season(p2["id"], "S2")
+        r = self.api.roll_forward_registrations(s1["id"], s2["id"])
+        msg = self._msg(r)
+        self.assertIn("different programs", msg)
+        self.assertNotRegex(msg, r"(?i)\bleague\b")
+
+    def test_delete_umbrella_blocked_says_program(self):
+        league = self.api.create_league("P")
+        self.api.create_season(league["id"], "S")
+        r = self.api.delete_league(league["id"])
+        self.assertEqual(r["error"]["code"], "has_dependencies")
+        self.assertIn("Can't delete this program", self._msg(r))
+
+    def test_delete_grouping_blocked_says_league(self):
+        league = self.api.create_league("P")
+        season = self.api.create_season(league["id"], "S")
+        level = self.api.create_level(season["id"], "Grp")
+        self.api.create_division(season["id"], "D", level_id=level["id"])
+        r = self.api.delete_level(level["id"])
+        self.assertIn("Can't delete this league", self._msg(r))
+
+    def test_delete_facility_owner_dep_renders_program_frozen_type(self):
+        org = self.api.create_organization("O")
+        self.api.create_league("P", organization_id=org["id"])
+        r = self.api.delete_organization(org["id"])
+        # Rendered noun is canonical…
+        self.assertIn("1 program", self._msg(r))
+        self.assertNotRegex(self._msg(r), r"(?i)\bleague\b")
+        # …while the structured dependency type stays the frozen v1 code.
+        deps = r["error"]["details"]["dependencies"]
+        prog = next(g for g in deps if g["display"] == "program")
+        self.assertEqual(prog["type"], "league")
+
+    def test_delete_season_dep_renders_league_frozen_type(self):
+        league = self.api.create_league("P")
+        season = self.api.create_season(league["id"], "S")
+        self.api.create_level(season["id"], "Grp")
+        r = self.api.delete_season(season["id"])
+        self.assertIn("1 league", self._msg(r))
+        deps = r["error"]["details"]["dependencies"]
+        grp = next(g for g in deps if g["display"] == "league")
+        self.assertEqual(grp["type"], "level")
+
+
 if __name__ == "__main__":
     unittest.main()
