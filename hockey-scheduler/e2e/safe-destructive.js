@@ -133,7 +133,7 @@ async function checkViewport(browser, viewport) {
     // enables it; the delete then succeeds.
     let deleteRequests = 0;
     const countDelete = (r) => {
-      if (r.url() === `${base}/api/setup/team/${ids.bare}/delete`) deleteRequests += 1;
+      if (r.url() === `${base}/api/v2/setup/team/${ids.bare}/delete`) deleteRequests += 1;
     };
     page.on("request", countDelete);
     // Cancel path: open, then Cancel — no request must fire.
@@ -158,7 +158,7 @@ async function checkViewport(browser, viewport) {
     await page.waitForFunction(
       () => !document.querySelector("[data-del-confirm]").disabled, null, { timeout: 5000 });
     const delResp = page.waitForResponse((r) =>
-      r.url() === `${base}/api/setup/team/${ids.bare}/delete` && r.request().method() === "POST");
+      r.url() === `${base}/api/v2/setup/team/${ids.bare}/delete` && r.request().method() === "POST");
     await page.click("[data-del-confirm]");
     if ((await delResp).status() !== 200) {
       throw new Error(`[${viewport.label}] team delete returned non-200`);

@@ -2592,6 +2592,108 @@ class ApiService:
         }
 
     @catch
+    def get_setup_overview_v2(self) -> dict:
+        """Canonical flat setup-entity lists for the Setup/Records UI (#233 B2a).
+
+        The v1 ``get_demo_overview`` stays the (legacy-shaped) source for the
+        schedule / games / public views; this is the canonical READ the
+        operator's Setup surface renders from. Every field is canonical — a
+        Program's ``operator_organization_id``, a Season/Team's ``program_id``, a
+        Division's grouping ``league_id`` — and the canonical Venue is
+        Organization-owned only, carrying NO ``league_id`` (the temporary
+        Venue→Program game-ice link is set through the v1
+        ``venue/{id}/assign-league`` bridge until Slice E). It exposes only
+        structural records plus resolved parent names — no rosters, schedule,
+        games or PII — so it is gated like the hierarchy read.
+        """
+        programs = self.store.all_programs()
+        seasons = self.store.all_seasons()
+        leagues = self.store.all_leagues()      # grouping League (was Level)
+        divisions = self.store.all_divisions()
+        teams = self.store.all_teams()
+        clubs = self.store.all_clubs()
+        orgs = self.store.all_organizations()
+        venues = self.store.all_venues()
+        rinks = self.store.all_rinks()
+
+        orgs_by_id = {o.id: o for o in orgs}
+        clubs_by_id = {c.id: c for c in clubs}
+        leagues_by_id = {lg.id: lg for lg in leagues}
+        venues_by_id = {v.id: v for v in venues}
+        rinks_by_id = {r.id: r for r in rinks}
+
+        def is_junior(div):
+            tag = (div.age_group or div.name or "").upper()
+            return tag.startswith("U")
+
+        return {
+            "programs": [
+                {"id": p.id, "name": p.name, "country": p.country,
+                 "timezone": p.timezone,
+                 "operator_organization_id": p.operator_organization_id,
+                 "operator_organization_name": (
+                     orgs_by_id[p.operator_organization_id].name
+                     if p.operator_organization_id in orgs_by_id else None)}
+                for p in programs],
+            "seasons": [
+                {"id": s.id, "program_id": s.program_id, "name": s.name,
+                 "start_date": s.start_date.isoformat() if s.start_date else None,
+                 "end_date": s.end_date.isoformat() if s.end_date else None}
+                for s in seasons],
+            "leagues": [
+                {"id": lg.id, "season_id": lg.season_id, "name": lg.name,
+                 "sort_order": lg.sort_order}
+                for lg in leagues],
+            "divisions": [
+                {"id": d.id, "season_id": d.season_id, "name": d.name,
+                 "age_group": d.age_group, "is_junior": is_junior(d),
+                 "league_id": d.league_id,
+                 "league_name": (leagues_by_id[d.league_id].name
+                                 if d.league_id in leagues_by_id else None)}
+                for d in divisions],
+            "teams": [
+                {"id": t.id, "name": t.name, "club_id": t.club_id,
+                 "program_id": t.program_id,
+                 "club_name": (clubs_by_id[t.club_id].name
+                               if t.club_id in clubs_by_id else None)}
+                for t in teams],
+            "clubs": [{"id": c.id, "name": c.name} for c in clubs],
+            "organizations": [
+                {"id": o.id, "name": o.name, "short_name": o.short_name}
+                for o in orgs],
+            # Officials are shown on the Setup surface (no legacy field rename);
+            # sourced here so the whole Setup page reads from this canonical
+            # endpoint rather than the v1 demo overview.
+            "officials": [
+                {"id": o.id, "name": o.name,
+                 "home_club_name": (clubs_by_id[o.home_club_id].name
+                                    if o.home_club_id in clubs_by_id else None)}
+                for o in self.store.all_officials()],
+            "venues": [
+                {"id": v.id, "name": v.name, "address": v.address,
+                 "timezone": v.timezone,
+                 "organization_id": v.organization_id,
+                 "organization_name": (orgs_by_id[v.organization_id].name
+                                       if v.organization_id in orgs_by_id
+                                       else None)}
+                for v in venues],
+            "rinks": [
+                {"id": r.id, "venue_id": r.venue_id, "name": r.name,
+                 "venue_name": (venues_by_id[r.venue_id].name
+                                if r.venue_id in venues_by_id else None)}
+                for r in rinks],
+            "ice_slots": [
+                {"id": ic.id, "rink_id": ic.rink_id,
+                 "start_time": ic.start_time.isoformat(),
+                 "end_time": ic.end_time.isoformat(),
+                 "slot_type": ic.slot_type.value, "status": ic.status.value,
+                 "rink_name": (rinks_by_id[ic.rink_id].name
+                               if ic.rink_id in rinks_by_id else None)}
+                for ic in sorted(self.store.all_ice_slots(),
+                                 key=lambda x: (x.rink_id, x.start_time))],
+        }
+
+    @catch
     def get_setup_hierarchy(self) -> dict:
         """Nested, UI-ready setup tree (#166 PR C, extended in #173 PR B).
 

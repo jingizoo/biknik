@@ -143,7 +143,7 @@ async function checkViewport(browser, viewport) {
     await page.click(`[data-del="club"][data-del-id="${ids.bareClub}"]`);
     await page.waitForSelector(".modal.danger [data-del-confirm]", { timeout: 10000 });
     let resp = page.waitForResponse((r) =>
-      r.url() === `${base}/api/setup/club/${ids.bareClub}/delete` && r.request().method() === "POST");
+      r.url() === `${base}/api/v2/setup/club/${ids.bareClub}/delete` && r.request().method() === "POST");
     await page.click("[data-del-confirm]");
     if ((await resp).status() !== 200) throw new Error(`[${viewport.label}] club delete non-200`);
     await page.waitForSelector(".modal", { state: "detached", timeout: 10000 });
@@ -155,7 +155,7 @@ async function checkViewport(browser, viewport) {
     await page.click(slotDel);
     await page.waitForSelector(".modal.danger [data-del-confirm]", { timeout: 10000 });
     resp = page.waitForResponse((r) =>
-      r.url() === `${base}/api/setup/ice-slot/${ids.slotFree}/delete` && r.request().method() === "POST");
+      r.url() === `${base}/api/v2/setup/ice-slot/${ids.slotFree}/delete` && r.request().method() === "POST");
     await page.click("[data-del-confirm]");
     if ((await resp).status() !== 200) throw new Error(`[${viewport.label}] slot delete non-200`);
     await page.waitForSelector(".modal", { state: "detached", timeout: 10000 });

@@ -501,62 +501,62 @@ const SETUP_ENTITIES = [
   // "league" entity/key/noun (v1 API frozen) — only the display noun changes.
   { key: "league", title: "Programs", icon: "🏆", noun: "league", displayNoun: "program",
     perm: "manage_setup",
-    list: (ov) => ov.leagues.map((l) => ({
-      title: l.name, sub: nameById(ov.organizations, l.organization_id) || "No operating org" })),
+    list: (ov) => (ov.programs || []).map((l) => ({
+      title: l.name, sub: nameById(ov.organizations, l.operator_organization_id) || "No operating org" })),
     fields: [
       { id: "f-league", label: "Program name", required: true, placeholder: "e.g. Adult Men" },
-      // A program is operated by an organization (#233) — required, so create
-      // an organization first if none exists.
-      { id: "f-league-org", label: "Operating organization", type: "select", required: true,
+      // A Program's operating organization is OPTIONAL in the canonical model
+      // (#233 B2a review r1) — operator_organization_id is nullable server-
+      // side, so the field must offer an explicit "none" option rather than
+      // forcing an organization to exist before a Program can be created.
+      { id: "f-league-org", label: "Operating organization (optional)", type: "select",
         ofNoun: "organization", ofNounDisplay: "operating organization",
-        options: (ov) => (ov.organizations || []).map((o) => [o.id, o.name]) }] },
+        options: (ov) => [["", "— none —"]].concat((ov.organizations || []).map((o) => [o.id, o.name])) }] },
   { key: "season", title: "Seasons", icon: "🗓️", noun: "season", perm: "manage_setup",
-    list: (ov) => ov.seasons.map((s) => ({ title: s.name, sub: nameById(ov.leagues, s.league_id) })),
+    list: (ov) => (ov.seasons || []).map((s) => ({ title: s.name, sub: nameById(ov.programs, s.program_id) })),
     fields: [
       { id: "f-season-league", label: "Program", type: "select", required: true, ofNoun: "league",
-        options: (ov) => ov.leagues.map((l) => [l.id, l.name]) },
+        options: (ov) => (ov.programs || []).map((l) => [l.id, l.name]) },
       { id: "f-season", label: "Season name", required: true, placeholder: "e.g. 2027–28" }] },
   // League (#233): the season-specific competitive grouping (e.g. Diamond,
   // Platinum). Internally still the "level" entity/key/noun (v1 API frozen) —
   // only the display noun changes.
   { key: "level", title: "Leagues", icon: "🎚️", noun: "level", displayNoun: "league",
     perm: "manage_setup",
-    list: (ov) => (ov.levels || []).map((lv) => ({
+    list: (ov) => (ov.leagues || []).map((lv) => ({
       title: lv.name, sub: nameById(ov.seasons, lv.season_id) })),
     fields: [
       { id: "f-level-season", label: "Season", type: "select", required: true, ofNoun: "season",
-        options: (ov) => ov.seasons.map((s) => [s.id, s.name]) },
+        options: (ov) => (ov.seasons || []).map((s) => [s.id, s.name]) },
       { id: "f-level", label: "League name", required: true, placeholder: "e.g. Diamond" },
       { id: "f-level-sort", label: "Sort order (optional)", type: "number", placeholder: "e.g. 1" }] },
   { key: "division", title: "Divisions", icon: "🏅", noun: "division", perm: "manage_setup",
-    list: (ov) => ov.divisions.map((d) => ({
+    list: (ov) => (ov.divisions || []).map((d) => ({
       title: d.name,
-      sub: [d.level_name, d.is_junior ? "Junior" : ""].filter(Boolean).join(" · ") })),
+      sub: [d.league_name, d.is_junior ? "Junior" : ""].filter(Boolean).join(" · ") })),
     fields: [
-      { id: "f-div-season", label: "Season", type: "select", required: true, ofNoun: "season",
-        options: (ov) => ov.seasons.map((s) => [s.id, s.name]) },
-      { id: "f-div-level", label: "League (optional)", type: "select", ofNoun: "level",
-        options: (ov) => [["", "— none —"]].concat((ov.levels || []).map(
-          (lv) => [lv.id, `${nameById(ov.seasons, lv.season_id)} · ${lv.name}`])) },
+      // A v2 division is parented by a League (season is derived) — required.
+      { id: "f-div-league", label: "League", type: "select", required: true, ofNoun: "level",
+        options: (ov) => (ov.leagues || []).map((lv) => [lv.id, `${nameById(ov.seasons, lv.season_id)} · ${lv.name}`]) },
       { id: "f-div", label: "Division name", required: true, placeholder: "e.g. U14" },
       { id: "f-div-age", label: "Age group", placeholder: "e.g. U14 (optional)" }] },
   { key: "club", title: "Clubs", icon: "🏒", noun: "club", perm: "manage_setup",
     delKind: "club",  // a club with no team can be deleted from here (#215)
-    list: (ov) => ov.clubs.map((c) => ({ id: c.id, title: c.name })),
+    list: (ov) => (ov.clubs || []).map((c) => ({ id: c.id, title: c.name })),
     fields: [{ id: "f-club", label: "Club name", required: true, placeholder: "e.g. Eagles HC" }] },
   { key: "team", title: "Teams", icon: "👥", noun: "team", perm: "manage_setup",
     // A team is a permanent member of a LEAGUE (#180) — its season/division is
     // set separately via Season participation, so the subtitle shows the club
     // only, not a (now season-specific) division.
-    list: (ov) => ov.teams.map((t) => ({
+    list: (ov) => (ov.teams || []).map((t) => ({
       title: t.name,
       sub: t.club_name || "No club",
     })),
     fields: [
       { id: "f-team-club", label: "Club", type: "select", required: true, ofNoun: "club",
-        options: (ov) => ov.clubs.map((c) => [c.id, c.name]) },
+        options: (ov) => (ov.clubs || []).map((c) => [c.id, c.name]) },
       { id: "f-team-league", label: "Program", type: "select", required: true, ofNoun: "league",
-        options: (ov) => (ov.leagues || []).map((l) => [l.id, l.name]) },
+        options: (ov) => (ov.programs || []).map((l) => [l.id, l.name]) },
       { id: "f-team", label: "Team name", required: true, placeholder: "e.g. U14 Eagles" }] },
   // Organization (#166): the facility owner/operator that owns venues — a rink
   // company, distinct from a hockey Club. Arena-side, like venue/rink.
@@ -566,29 +566,34 @@ const SETUP_ENTITIES = [
       { id: "f-org", label: "Facility owner name", required: true, placeholder: "e.g. Summit Ice Facilities" },
       { id: "f-org-short", label: "Short name (optional)", placeholder: "e.g. Summit" }] },
   { key: "venue", title: "Venues", icon: "🏟️", noun: "venue", perm: "manage_arena",
-    // A venue belongs to a program, deriving that program's owner (#173) — show
-    // "Owner · Program" so the operator sees both at a glance. (Venue↔Program
-    // ownership is replaced by Season↔Venue access in #233 Slice E.)
-    list: (ov) => ov.venues.map((v) => ({
+    // A venue is owned by an organization (#233 canonical) — show its facility
+    // owner. The venue↔program game-ice link is a separate temporary bridge
+    // control on the Facility tree (removed in Slice E).
+    list: (ov) => (ov.venues || []).map((v) => ({
       title: v.name,
-      sub: [v.organization_name, v.league_name].filter(Boolean).join(" · ") || "Unassigned" })),
+      sub: [v.organization_name].filter(Boolean).join(" · ") || "Unassigned" })),
+    // No Program field on this form (#233 B2a review r1): canonical Venue
+    // create is org-owned only. The temporary venue→program game-ice
+    // compatibility bridge is managed exclusively post-creation via the
+    // Facility tree's labelled "⇄ Move" control (POST /api/setup/venue/
+    // {id}/assign-league) — a create-time field couldn't apply it anyway (no
+    // venue id yet), and one that silently discarded a selection was
+    // actively misleading.
     fields: [
       { id: "f-venue", label: "Venue name", required: true, placeholder: "e.g. South Arena" },
-      { id: "f-venue-league", label: "Legacy program grouping (temporary, optional — removed in Slice E)",
-        type: "select", ofNoun: "league",
-        options: (ov) => [["", "— none —"]].concat((ov.leagues || []).map(
-          (l) => [l.id, `${nameById(ov.organizations, l.organization_id) || "No operating org"} · ${l.name}`])) }] },
+      { id: "f-venue-org", label: "Facility owner (organization)", type: "select", ofNoun: "organization", ofNounDisplay: "facility owner",
+        options: (ov) => [["", "— none —"]].concat((ov.organizations || []).map((o) => [o.id, o.name])) }] },
   { key: "rink", title: "Rinks", icon: "⛸️", noun: "rink", perm: "manage_arena",
-    list: (ov) => ov.rinks.map((r) => ({ title: r.name, sub: r.venue_name || "" })),
+    list: (ov) => (ov.rinks || []).map((r) => ({ title: r.name, sub: r.venue_name || "" })),
     fields: [
       { id: "f-rink-venue", label: "Venue", type: "select", required: true, ofNoun: "venue",
-        options: (ov) => ov.venues.map((v) => [v.id, v.name]) },
+        options: (ov) => (ov.venues || []).map((v) => [v.id, v.name]) },
       { id: "f-rink", label: "Rink name", required: true, placeholder: "e.g. Rink 3" }] },
   { key: "ice-slot", title: "Ice slots", icon: "🧊", noun: "ice slot", perm: "manage_arena",
     list: null,  // ice inventory is managed visually on the Arena Calendar
     fields: [
       { id: "f-slot-rink", label: "Rink", type: "select", required: true, ofNoun: "rink",
-        options: (ov) => ov.rinks.map((r) => [r.id, `${r.venue_name ? r.venue_name + " · " : ""}${r.name}`]) },
+        options: (ov) => (ov.rinks || []).map((r) => [r.id, `${r.venue_name ? r.venue_name + " · " : ""}${r.name}`]) },
       { id: "f-slot-date", label: "Date", type: "date", required: true, value: "2026-09-05" },
       { id: "f-slot-start", label: "Start", type: "time", required: true, value: "21:00" },
       { id: "f-slot-end", label: "End", type: "time", required: true, value: "22:30" },
@@ -600,7 +605,7 @@ const SETUP_ENTITIES = [
     fields: [
       { id: "f-official", label: "Official name", required: true, placeholder: "e.g. Riley Whistle" },
       { id: "f-official-club", label: "Home club (optional — for conflict checks)", type: "select",
-        options: (ov) => [["", "— none —"]].concat(ov.clubs.map((c) => [c.id, c.name])) }] },
+        options: (ov) => [["", "— none —"]].concat((ov.clubs || []).map((c) => [c.id, c.name])) }] },
   // Players (#114): a manual-create path so a late-arriving player doesn't
   // force an operator through the CSV Import wizard for one row. Sourced
   // from its own /api/players call (playersList, fetched in render() only
@@ -613,7 +618,7 @@ const SETUP_ENTITIES = [
     })),
     fields: [
       { id: "f-player-team", label: "Team", type: "select", required: true, ofNoun: "team",
-        options: (ov) => ov.teams.map((t) => [t.id, t.name]) },
+        options: (ov) => (ov.teams || []).map((t) => [t.id, t.name]) },
       { id: "f-player-name", label: "Player name", required: true, placeholder: "e.g. Jordan Lee" },
       { id: "f-player-position", label: "Position", type: "select", required: true,
         options: () => [["forward", "Forward"], ["defense", "Defense"], ["goalie", "Goalie"]] },
@@ -641,21 +646,18 @@ const ofNounLabel = (f) => {
 
 // Each entity's POST body, built from the drawer inputs (ids match the fields).
 const SETUP_POST = {
-  league: () => post("/api/setup/league", { name: val("f-league"), organization_id: val("f-league-org") || null }),
-  season: () => post("/api/setup/season", { league_id: val("f-season-league"), name: val("f-season") }),
-  level: () => post("/api/setup/level", { season_id: val("f-level-season"), name: val("f-level"), sort_order: val("f-level-sort") ? Number(val("f-level-sort")) : 0 }),
-  division: () => post("/api/setup/division", { season_id: val("f-div-season"), name: val("f-div"), age_group: val("f-div-age"), level_id: val("f-div-level") || null }),
-  club: () => post("/api/setup/club", { name: val("f-club") }),
-  team: () => post("/api/setup/team", { club_id: val("f-team-club"), league_id: val("f-team-league"), name: val("f-team") }),
+  league: () => post("/api/v2/setup/program", { name: val("f-league"), operator_organization_id: val("f-league-org") || null }),
+  season: () => post("/api/v2/setup/season", { program_id: val("f-season-league"), name: val("f-season") }),
+  level: () => post("/api/v2/setup/league", { season_id: val("f-level-season"), name: val("f-level"), sort_order: val("f-level-sort") ? Number(val("f-level-sort")) : 0 }),
+  division: () => post("/api/v2/setup/division", { league_id: val("f-div-league"), name: val("f-div"), age_group: val("f-div-age") }),
+  club: () => post("/api/v2/setup/club", { name: val("f-club") }),
+  team: () => post("/api/v2/setup/team", { program_id: val("f-team-league"), club_id: val("f-team-club"), name: val("f-team") }),
+  // Organization create stays on v1 in this slice; the canonical body is
+  // identical, and its route cutover lands with the other deferred v1 writes.
   organization: () => post("/api/setup/organization", { name: val("f-org"), short_name: val("f-org-short") }),
-  venue: () => post("/api/setup/venue", { name: val("f-venue"), league_id: val("f-venue-league") || null }),
-  rink: () => post("/api/setup/rink", { venue_id: val("f-rink-venue"), name: val("f-rink") }),
-  "ice-slot": () => post("/api/setup/ice-slot", {
-    rink_id: val("f-slot-rink"),
-    start_time: `${val("f-slot-date")}T${val("f-slot-start")}:00+00:00`,
-    end_time: `${val("f-slot-date")}T${val("f-slot-end")}:00+00:00`,
-    slot_type: val("f-slot-type"),
-  }),
+  venue: () => post("/api/v2/setup/venue", { name: val("f-venue"), organization_id: val("f-venue-org") || null }),
+  rink: () => post("/api/v2/setup/rink", { venue_id: val("f-rink-venue"), name: val("f-rink") }),
+  "ice-slot": () => post("/api/v2/setup/ice-slot", { rink_id: val("f-slot-rink"), start_time: `${val("f-slot-date")}T${val("f-slot-start")}:00+00:00`, end_time: `${val("f-slot-date")}T${val("f-slot-end")}:00+00:00`, slot_type: val("f-slot-type") }),
   official: () => post("/api/setup/official", {
     name: val("f-official"), home_club_id: val("f-official-club") || null,
   }),
@@ -704,13 +706,17 @@ const REASSIGN = {
     perm: "manage_arena", noun: "venue", nullable: false, risky: false,
     options: (ov) => (ov.venues || []).map((v) => [v.id, v.name]) },
   "division:level": {
-    perm: "manage_setup", noun: "level", displayNoun: "league", nullable: true, risky: false,
+    // Not nullable (#233 B2a review r1): v2 division create/reassign REQUIRES
+    // a League, so the panel must never offer "— none —" here — it would
+    // just produce a validation_error the canonical model rejects.
+    perm: "manage_setup", noun: "level", displayNoun: "league", nullable: false, risky: false,
     // Only levels in the division's own season — the backend rejects a
     // cross-season link, so never offer one.
     options: (ov, pr) => (ov.levels || [])
       .filter((lv) => lv.season_id === pr.seasonId).map((lv) => [lv.id, lv.name]) },
   "team:club": {
-    perm: "manage_setup", noun: "club", nullable: true, risky: false,
+    // Not nullable (#233 B2a review r1): v2 keeps Club REQUIRED until Slice D.
+    perm: "manage_setup", noun: "club", nullable: false, risky: false,
     options: (ov) => (ov.clubs || []).map((c) => [c.id, c.name]) },
   "team:division": {
     perm: "manage_setup", noun: "division", nullable: false, risky: true,
@@ -730,6 +736,20 @@ const REASSIGN = {
     warn: "Legacy v1 only: linking a venue to a program derives the venue's facility owner from that program's operating organization. This is a temporary v1 coupling — the venue↔program link is removed when Season↔Venue access lands in Slice E.",
     options: (ov) => (ov.leagues || []).map(
       (l) => [l.id, `${nameById(ov.organizations, l.organization_id) || "No operating org"} · ${l.name}`]) },
+};
+// v2 route + canonical body-key mapping for the reassignments moved to v2
+// (#233 B2a review r1): frontend kind/parent tokens stay frozen (league =
+// Program, level = League), but the v2 request needs canonical route
+// segments and body keys. venue:league (the temporary game-ice
+// compatibility bridge) is the one deliberate v1 holdout — Slice E removes
+// it along with the bridge itself; every other structural entity visible in
+// B2a moves here.
+const REASSIGN_V2 = {
+  "league:organization": { kind: "program", parent: "organization", bodyKey: "operator_organization_id" },
+  "division:level": { kind: "division", parent: "league", bodyKey: "league_id" },
+  "team:club": { kind: "team", parent: "club", bodyKey: "club_id" },
+  "rink:venue": { kind: "rink", parent: "venue", bodyKey: "venue_id" },
+  "venue:organization": { kind: "venue", parent: "organization", bodyKey: "organization_id" },
 };
 // A small "⇄ Move" button that opens the reassignment confirm panel, seeded
 // with the record's current parent so the operator sees where it sits now.
@@ -775,8 +795,11 @@ async function commitReassign(newId) {
   const cfg = REASSIGN[`${pr.kind}:${pr.parent}`];
   toast = "";
   if ((newId || "") === (pr.curId || "")) { pendingReassign = null; return render(); }
-  const res = await post(`/api/setup/${pr.kind}/${pr.id}/assign-${pr.parent}`,
-    { [`${pr.parent}_id`]: newId || null });
+  const v2 = REASSIGN_V2[`${pr.kind}:${pr.parent}`];
+  const res = v2
+    ? await post(`/api/v2/setup/${v2.kind}/${pr.id}/assign-${v2.parent}`, { [v2.bodyKey]: newId || null })
+    : await post(`/api/setup/${pr.kind}/${pr.id}/assign-${pr.parent}`,
+      { [`${pr.parent}_id`]: newId || null });
   if (res && res.error) { toast = res.error.message; pendingReassign = null; return render(); }
   pendingReassign = null;
   toast = newId ? `Moved to a new ${entNoun(cfg)}.` : `Unassigned from its ${entNoun(cfg)}.`;
@@ -811,6 +834,13 @@ const DEL_NOUN = {
 // type the record's name or DELETE before the destructive button enables.
 // Lower-risk entities keep a single-click confirm.
 const HIGH_RISK_DELETE = new Set(["league", "season", "team", "venue", "rink"]);
+// v2 delete route segment for each structural B2a entity (#233 B2a review
+// r1) — frozen frontend kind tokens map to canonical names; organization,
+// official, player, and game are deliberately absent (deferred v1 writes).
+const DEL_ROUTE_V2 = {
+  league: "program", season: "season", level: "league", division: "division",
+  club: "club", team: "team", venue: "venue", rink: "rink", "ice-slot": "ice-slot",
+};
 
 function renderModal() {
   if (!modal) return "";
@@ -976,7 +1006,14 @@ function wireModal(c) {
     delConfirm.onclick = async () => {
       if (!confirmed()) return;  // defense in depth; the button is disabled too
       toast = "";
-      const res = await post(`/api/setup/${m.kind}/${m.id}/delete`, {});
+      // Structural deletes use v2 (#233 B2a review r1); frozen frontend kind
+      // tokens map to canonical v2 route segments (league→program,
+      // level→league), others 1:1. Organization/official/player/game stay
+      // on v1, deferred with their other v1 writes (create, B2c).
+      const v2Kind = DEL_ROUTE_V2[m.kind];
+      const res = v2Kind
+        ? await post(`/api/v2/setup/${v2Kind}/${m.id}/delete`, {})
+        : await post(`/api/setup/${m.kind}/${m.id}/delete`, {});
       if (res && res.error && res.error.code === "has_dependencies") {
         modal = { type: "blocked", kind: m.kind, name: m.name, error: res.error };
         return render();
@@ -1024,11 +1061,11 @@ function startYourLeagueCard() {
   </section>`;
 }
 
-function renderSetupHierarchy(ov) {
+function renderSetupHierarchy(sv, hv, ov) {
   // A brand-new demo (or any empty setup) opens on the "Start your league"
   // card rather than empty trees (#215).
-  if (hasPerm("manage_setup") && !(ov.leagues || []).length
-      && !(ov.teams || []).length && !(ov.organizations || []).length) {
+  if (hasPerm("manage_setup") && !(sv.programs || []).length
+      && !(sv.teams || []).length && !(sv.organizations || []).length) {
     return startYourLeagueCard();
   }
   const canSeePlayers = hasPerm("manage_setup");
@@ -1039,9 +1076,19 @@ function renderSetupHierarchy(ov) {
     (pByTeam[p.team_id] = pByTeam[p.team_id] || []).push(p);
   });
 
-  // -- Facility: Organization owns Venue → Rink; venues are grouped by the
-  //    program operating at them (legacy venue.league_id; Season↔Venue in Slice E) --
-  const rinksByVenue = groupBy(ov.rinks, "venue_id");
+  // -- Facility: Organization owns Venue → Rink (canonical #233 — venues are
+  //    org-owned). The venue→program game-ice link is a separate temporary
+  //    compatibility bridge on each venue, removed in Slice E. --
+  const rinksByVenue = groupBy(sv.rinks, "venue_id");
+  // The canonical sv.venues omits league_id (org-owned only), but the bridge
+  // control still needs the venue's CURRENT legacy Program link so the "⇄
+  // Move" panel preselects it instead of always looking unset (#233 B2a
+  // review r1). ov and sv share the same id values for the same records, so
+  // this lookup by id is safe even though the two payloads' venue shapes
+  // differ.
+  const ovVenueById = {};
+  (ov.venues || []).forEach((v) => { ovVenueById[v.id] = v; });
+  const ovProgramName = (id) => (((ov.leagues || []).find((l) => l.id === id)) || {}).name || "";
   const venueNode = (v) => {
     const rinks = rinksByVenue[v.id] || [];
     const badge = rinks.length
@@ -1049,133 +1096,138 @@ function renderSetupHierarchy(ov) {
     const rinkRows = rinks.map((r) =>
       `<div class="tn-leaf"><span class="tn-label">⛸️ ${esc(r.name)}</span>${reassignBtn("rink", "venue", r, r.venue_id)}${delBtn("rink", r.id, r.name)}</div>`).join("")
       || `<div class="tn-empty">No rinks yet. Add a rink so this venue can host games.</div>`;
+    // venue:organization is the canonical owner move; venue:league is the
+    // temporary game-ice compatibility bridge, preselected from the venue's
+    // current legacy Program link (looked up via ov, never sv).
+    const bridgeLeagueId = (ovVenueById[v.id] || {}).league_id || "";
+    const bridgeState = bridgeLeagueId
+      ? `<span class="tn-meta">Bridged to: ${esc(ovProgramName(bridgeLeagueId))}</span>`
+      : `<span class="tn-meta">No bridge set</span>`;
     return `<details class="tn" open><summary class="tn-sum">
         <span class="tn-label">🏟️ ${esc(v.name)}</span>
-        <span class="tn-meta">${rinks.length} rink${rinks.length === 1 ? "" : "s"}</span>${badge}${reassignBtn("venue", "league", v, v.league_id)}${delBtn("venue", v.id, v.name)}</summary>
+        <span class="tn-meta">${rinks.length} rink${rinks.length === 1 ? "" : "s"}</span>${badge}${reassignBtn("venue", "organization", v, v.organization_id)}${reassignBtn("venue", "league", v, bridgeLeagueId)}${bridgeState}<span class="tn-meta">Temporary game-ice compatibility — removed in Slice E</span>${delBtn("venue", v.id, v.name)}</summary>
       <div class="tn-children">${rinkRows}${treeAdd("rink", "Add rink to " + v.name, "f-rink-venue", v.id)}</div>
     </details>`;
   };
-  const venuesByLeague = groupBy(ov.venues, "league_id");
-  const leaguesByOrgF = groupBy(ov.leagues, "organization_id");
-  // A program groups the venues it operates; the facility owner groups its programs.
-  const leagueFacilityNode = (lg) => {
-    const vs = venuesByLeague[lg.id] || [];
+  // A facility owner (organization) groups the venues it owns.
+  const venuesByOrg = groupBy(sv.venues, "organization_id");
+  const orgSections = (sv.organizations || []).map((o) => {
+    const vs = venuesByOrg[o.id] || [];
     const venueRows = vs.map(venueNode).join("")
-      || `<div class="tn-empty">No venues yet. Add a venue for ${esc(lg.name)}.</div>`;
-    return `<details class="tn" open><summary class="tn-sum">
-        <span class="tn-label">🏆 ${esc(lg.name)}</span>
-        <span class="tn-meta">${vs.length} venue${vs.length === 1 ? "" : "s"}</span>${reassignBtn("league", "organization", lg, lg.organization_id)}</summary>
-      <div class="tn-children">${venueRows}${treeAdd("venue", "Add venue to " + lg.name, "f-venue-league", lg.id)}</div>
-    </details>`;
-  };
-  const orgSections = (ov.organizations || []).map((o) => {
-    const lgs = leaguesByOrgF[o.id] || [];
-    const leagueRows = lgs.map(leagueFacilityNode).join("")
-      || `<div class="tn-empty">No programs yet. Add a program operated by ${esc(o.name)}.</div>`;
+      || `<div class="tn-empty">No venues yet. Add a venue owned by ${esc(o.name)}.</div>`;
     return `<details class="tn" open><summary class="tn-sum">
         <span class="tn-label">🏢 ${esc(o.name)}</span>
-        <span class="tn-meta">${lgs.length} program${lgs.length === 1 ? "" : "s"}</span>${delBtn("organization", o.id, o.name)}</summary>
-      <div class="tn-children">${leagueRows}${treeAdd("league", "Add program operated by " + o.name, "f-league-org", o.id)}</div>
+        <span class="tn-meta">${vs.length} venue${vs.length === 1 ? "" : "s"}</span>${delBtn("organization", o.id, o.name)}</summary>
+      <div class="tn-children">${venueRows}${treeAdd("venue", "Add venue to " + o.name, "f-venue-org", o.id)}</div>
     </details>`;
   }).join("");
-  // Buckets for records that can't nest yet: ownerless leagues, leagueless venues.
-  const orphanLeagues = (leaguesByOrgF[null] || []).concat(leaguesByOrgF[undefined] || []);
-  const orphanLeagueSection = orphanLeagues.length
-    ? `<details class="tn" open><summary class="tn-sum">
-        <span class="tn-label tn-warn-text">🏆 No operating organization</span>
-        <span class="tn-meta">${orphanLeagues.length} program${orphanLeagues.length === 1 ? "" : "s"}</span></summary>
-      <div class="tn-children">${orphanLeagues.map(leagueFacilityNode).join("")}</div>
-    </details>` : "";
-  const orphanVenues = (venuesByLeague[null] || []).concat(venuesByLeague[undefined] || []);
+  // Venues with no facility owner (canonical venue.organization_id is null).
+  const orphanVenues = (venuesByOrg[null] || []).concat(venuesByOrg[undefined] || []);
   const orphanVenueSection = orphanVenues.length
     ? `<details class="tn" open><summary class="tn-sum">
-        <span class="tn-label tn-warn-text">🏟️ No legacy program grouping</span>
+        <span class="tn-label tn-warn-text">🏟️ No facility owner</span>
         <span class="tn-meta">${orphanVenues.length} venue${orphanVenues.length === 1 ? "" : "s"}</span></summary>
       <div class="tn-children">${orphanVenues.map(venueNode).join("")}</div>
     </details>` : "";
   const facility = `<section class="tree-panel">
     <div class="tree-head"><span class="tree-title">🏟️ Facility</span>
-      <span class="tree-sub">Facility owner → Venue → Rink · grouped by legacy program link until Slice E</span></div>
-    ${orgSections}${orphanLeagueSection}${orphanVenueSection}
-    ${!orgSections && !orphanLeagueSection && !orphanVenueSection ? `<div class="tn-empty">No owners yet. Add a facility owner to start your arena setup.</div>` : ""}
-    <div class="tree-actions">${treeAdd("organization", "Add facility owner")}${treeAdd("league", "Add program")}</div>
+      <span class="tree-sub">Facility owner → Venue → Rink</span></div>
+    ${orgSections}${orphanVenueSection}
+    ${!orgSections && !orphanVenueSection ? `<div class="tn-empty">No owners yet. Add a facility owner to start your arena setup.</div>` : ""}
+    <div class="tree-actions">${treeAdd("organization", "Add facility owner")}</div>
   </section>`;
 
   // -- Competition: Program → Season → League → Division (#233 display;
-  //    internal entities remain league/season/level/division on the v1 API) --
-  // Teams are NOT children of a division here: a team belongs permanently to a
-  // program (see the "Permanent program teams" panel), and its per-season
-  // division is shown under "Season participation". So the competition tree is
-  // the structure only; each division is a leaf, and the team count is the
-  // teams *registered* for that season/division, not division-owned teams.
-  const seasonsByLeague = groupBy(ov.seasons, "league_id");
-  const divsBySeason = groupBy(ov.divisions, "season_id");
-  const levelsBySeason = groupBy(ov.levels, "season_id");
-  const regsForDiv = (sid, did) => (seasonRegs[sid] || [])
-    .filter((r) => r.active && r.division_id === did).length;
-  const countTeams = (divs) => divs.reduce(
-    (n, d) => n + regsForDiv(d.season_id, d.id), 0);
-  const divisionNode = (d) => {
-    const n = regsForDiv(d.season_id, d.id);
+  //    internal entities remain league/season/level/division on the v1 API).
+  //    Consumed directly from the canonical hv (/api/v2/setup/hierarchy)
+  //    payload (#233 B2a review r1) rather than reconstructed from flat sv
+  //    lists client-side, so nesting, teams_without_division, and dangling
+  //    divisions match the server's canonical parentage rules exactly. --
+  const REG_REASON_LABEL = {
+    team_missing: "Registered team no longer exists",
+    team_program_mismatch: "Registered team belongs to a different program",
+    registration_league_division_mismatch: "Registration's league doesn't match its division's league",
+    registration_league_not_in_season: "Registration's league isn't in this season",
+  };
+  const seasonRegIssues = [];  // flattened across all seasons, for Needs assignment below
+  const teamLeaf = (t) => `<div class="tn-leaf"><span class="tn-label">👥 ${esc(t.name)}</span>${
+    t.player_count != null ? `<span class="tn-meta">${t.player_count} player${t.player_count === 1 ? "" : "s"}</span>` : ""}</div>`;
+  const divisionNode = (d, seasonId) => {
+    const n = (d.teams || []).length;
+    const teamRows = (d.teams || []).map(teamLeaf).join("")
+      || `<div class="tn-empty">No teams registered. Register teams under
+        <button class="linklike" data-goto="setup">Season participation</button>.</div>`;
     return `<details class="tn"><summary class="tn-sum">
         <span class="tn-label">🏅 ${esc(d.name)}</span>
-        <span class="tn-meta">${n} team${n === 1 ? "" : "s"} registered</span>${reassignBtn("division", "level", d, d.level_id, d.season_id)}${delBtn("division", d.id, d.name)}</summary>
-      <div class="tn-children"><div class="tn-empty">Register teams for this division under
-        <button class="linklike" data-goto="setup">Season participation</button>.</div></div>
+        <span class="tn-meta">${n} team${n === 1 ? "" : "s"} registered</span>${reassignBtn("division", "level", d, d.league_id, seasonId)}${delBtn("division", d.id, d.name)}</summary>
+      <div class="tn-children">${teamRows}</div>
     </details>`;
   };
-  const leagueRows = (ov.leagues || []).map((lg) => {
-    const seasons = seasonsByLeague[lg.id] || [];
-    const lgTeams = seasons.reduce((n, s) => n + countTeams(divsBySeason[s.id] || []), 0);
+  const leagueRows = (hv.programs || []).map((program) => {
+    const seasons = program.seasons || [];
+    const progTeams = seasons.reduce((n, s) => n + (s.leagues || []).reduce(
+      (m, lv) => m + (lv.divisions || []).reduce((k, d) => k + (d.teams || []).length, 0)
+        + (lv.teams_without_division || []).length, 0), 0);
     const seasonRows = seasons.map((s) => {
-      const divs = divsBySeason[s.id] || [];
-      const divsByLevel = groupBy(divs, "level_id");
-      // Levels group their divisions (sorted by sort_order); a "No level"
-      // bucket holds divisions created directly under the season (#166).
-      const levels = (levelsBySeason[s.id] || []).slice()
+      const leagues = (s.leagues || []).slice()
         .sort((a, b) => (a.sort_order || 0) - (b.sort_order || 0) || a.name.localeCompare(b.name));
-      const levelSections = levels.map((lv) => {
-        const lvDivs = divsByLevel[lv.id] || [];
-        const inner = lvDivs.map(divisionNode).join("")
-          || `<div class="tn-empty">No divisions in this league yet.</div>`;
+      const divCount = leagues.reduce((n, lv) => n + (lv.divisions || []).length, 0);
+      const teamCount = leagues.reduce((n, lv) => n + (lv.divisions || []).reduce(
+        (m, d) => m + (d.teams || []).length, 0) + (lv.teams_without_division || []).length, 0);
+      const levelSections = leagues.map((lv) => {
+        const divs = lv.divisions || [];
+        const twd = lv.teams_without_division || [];
+        const divRows = divs.map((d) => divisionNode(d, s.id)).join("");
+        const twdSection = twd.length
+          ? `<div class="tn-empty">Registered directly under this league (no division):</div>${twd.map(teamLeaf).join("")}`
+          : "";
+        const inner = (divRows || twdSection)
+          ? `${divRows}${twdSection}`
+          : `<div class="tn-empty">No divisions in this league yet.</div>`;
         return `<details class="tn" open><summary class="tn-sum">
             <span class="tn-label">🎚️ ${esc(lv.name)}</span>
-            <span class="tn-meta">${lvDivs.length} division${lvDivs.length === 1 ? "" : "s"}</span>${delBtn("level", lv.id, lv.name)}</summary>
-          <div class="tn-children">${inner}${treeAdd("division", "Add division to " + lv.name, "f-div-level", lv.id, "f-div-season", s.id)}</div>
+            <span class="tn-meta">${divs.length} division${divs.length === 1 ? "" : "s"}</span>${delBtn("level", lv.id, lv.name)}</summary>
+          <div class="tn-children">${inner}${treeAdd("division", "Add division to " + lv.name, "f-div-league", lv.id)}</div>
         </details>`;
       }).join("");
-      const orphanDivs = (divsByLevel[null] || []).concat(divsByLevel[undefined] || []);
-      const orphanDivSection = orphanDivs.length
-        ? (levels.length
-            ? `<details class="tn" open><summary class="tn-sum">
-                <span class="tn-label tn-warn-text">🏅 No league</span>
-                <span class="tn-meta">${orphanDivs.length} division${orphanDivs.length === 1 ? "" : "s"}</span></summary>
-              <div class="tn-children">${orphanDivs.map(divisionNode).join("")}</div>
-            </details>`
-            : orphanDivs.map(divisionNode).join(""))
-        : "";
+      // Dangling divisions (no league, or a league that doesn't resolve in
+      // this season) — INVALID structure per the canonical hierarchy, never
+      // shown as a valid branch.
+      const dangling = (s.needs_assignment && s.needs_assignment.divisions_without_league) || [];
+      const orphanDivSection = dangling.length
+        ? `<details class="tn" open><summary class="tn-sum">
+            <span class="tn-label tn-warn-text">🏅 No league</span>
+            <span class="tn-meta">${dangling.length} division${dangling.length === 1 ? "" : "s"}</span></summary>
+          <div class="tn-children">${dangling.map((d) => divisionNode(d, s.id)).join("")}</div>
+        </details>` : "";
+      (s.needs_assignment && s.needs_assignment.registrations || []).forEach((r) => seasonRegIssues.push(r));
       const seasonBody = (levelSections || orphanDivSection)
         ? `${levelSections}${orphanDivSection}`
         : `<div class="tn-empty">No divisions in this season yet.</div>`;
       return `<details class="tn" open><summary class="tn-sum">
           <span class="tn-label">🗓️ ${esc(s.name)}</span>
-          <span class="tn-meta">${divs.length} division(s) · ${countTeams(divs)} team(s)</span>${delBtn("season", s.id, s.name)}</summary>
+          <span class="tn-meta">${divCount} division(s) · ${teamCount} team(s)</span>${delBtn("season", s.id, s.name)}</summary>
         <div class="tn-children">${seasonBody}
-          <div class="tree-actions sub">${treeAdd("level", "Add league to " + s.name, "f-level-season", s.id)}${treeAdd("division", "Add division to " + s.name, "f-div-season", s.id)}</div></div>
+          <div class="tree-actions sub">${treeAdd("level", "Add league to " + s.name, "f-level-season", s.id)}</div></div>
       </details>`;
     }).join("") || `<div class="tn-empty">No seasons in this program yet.</div>`;
     return `<details class="tn" open><summary class="tn-sum">
-        <span class="tn-label">🏆 ${esc(lg.name)}</span>
-        <span class="tn-meta">${seasons.length} season(s) · ${lgTeams} team(s)</span>${delBtn("league", lg.id, lg.name)}</summary>
-      <div class="tn-children">${seasonRows}${treeAdd("season", "Add season to " + lg.name, "f-season-league", lg.id)}</div>
+        <span class="tn-label">🏆 ${esc(program.name)}</span>
+        <span class="tn-meta">${seasons.length} season(s) · ${progTeams} team(s)</span>${delBtn("league", program.id, program.name)}</summary>
+      <div class="tn-children">${seasonRows}${treeAdd("season", "Add season to " + program.name, "f-season-league", program.id)}</div>
     </details>`;
   }).join("");
-  const competition = `<section class="tree-panel">
+  let competition = `<section class="tree-panel">
     <div class="tree-head"><span class="tree-title">🏆 Competition structure</span>
       <span class="tree-sub">Program → Season → League → Division</span></div>
     ${leagueRows || `<div class="tn-empty">No programs yet. Add a program to begin.</div>`}
     <div class="tree-actions">${treeAdd("league", "Add program")}</div>
   </section>`;
+  if (!hasPerm("manage_setup")) {
+    competition = `<section class="tree-panel">
+      <div class="tree-head"><span class="tree-title">🏆 Competition structure</span></div>
+      <div class="tree-note">Programs, seasons, leagues, and divisions are visible to setup operators.</div></section>`;
+  }
 
   // -- Permanent program teams (#180): a team belongs permanently to its
   // league, independent of any season. This is the first-class place a team
@@ -1246,6 +1298,16 @@ function renderSetupHierarchy(ov) {
     ? `<div class="na-group"><div class="na-group-label">${esc(label)} (${rows.length})</div>${
         rows.map((r) => `<div class="tn-leaf warn"><span class="tn-label">⚠ ${esc(r.name)}</span>${
           fix ? fix(r) : ""}</div>`).join("")}</div>` : "";
+  // Season registration issues the canonical hierarchy detects (#233 B2a
+  // review r1) — a team's League/Division no longer agrees with its
+  // registration, or the team/league itself is gone. Fixed in Slice B2b's
+  // registration UI; surfaced here (read-only) so they're never silently
+  // hidden by the tree only showing valid branches.
+  const regTeamName = (tid) => (((ov.teams || []).find((t) => t.id === tid)) || {}).name || tid;
+  const regIssueRows = seasonRegIssues.length
+    ? `<div class="na-group"><div class="na-group-label">Season registrations needing attention (${seasonRegIssues.length})</div>${
+        seasonRegIssues.map((r) => `<div class="tn-leaf warn"><span class="tn-label">⚠ ${esc(regTeamName(r.team_id))}</span>
+          <span class="tn-meta">${esc(REG_REASON_LABEL[r.reason] || r.reason)}</span></div>`).join("")}</div>` : "";
   const naBody = naRow("Programs without an operating organization", noOwnerLeagues,
                        (l) => reassignBtn("league", "organization", l, l.organization_id))
     + naRow("Venues without a legacy program grouping", noLeagueVenues,
@@ -1257,7 +1319,8 @@ function renderSetupHierarchy(ov) {
     + naRow("Teams without a club", noClubTeams,
             (t) => reassignBtn("team", "club", t, t.club_id))
     + naRow("Players without a team", orphanPlayers,
-            (p) => reassignBtn("player", "team", p, p.team_id));
+            (p) => reassignBtn("player", "team", p, p.team_id))
+    + regIssueRows;
   const needsAssignment = naBody
     ? `<section class="tree-panel na"><div class="tree-head"><span class="tree-title">⚠ Needs assignment</span></div>
         <div class="tree-note">These records can't be scheduled until they're assigned.</div>${naBody}</section>` : "";
@@ -1479,25 +1542,25 @@ function updateRolloverCommitState(c) {
   commit.disabled = !(anyChecked && allAssigned);
 }
 
-function renderSetup(ov) {
+function renderSetup(sv, hv, ov) {
   const toggle = `<div class="seg-group setup-viewtoggle">
     <button class="seg ${setupView === "hierarchy" ? "active" : ""}" data-setup-view="hierarchy">Hierarchy</button>
     <button class="seg ${setupView === "records" ? "active" : ""}" data-setup-view="records">Records</button>
   </div>`;
   let body;
   if (setupView === "hierarchy") {
-    body = `${pageIntro("Review and fix how your venues, programs, teams, and rosters are connected.")}${renderSetupHierarchy(ov)}`;
+    body = `${pageIntro("Review and fix how your venues, programs, teams, and rosters are connected.")}${renderSetupHierarchy(sv, hv, ov)}`;
   } else {
-    const cards = SETUP_ENTITIES.map((ent) => setupCard(ent, ov)).join("");
+    const cards = SETUP_ENTITIES.map((ent) => setupCard(ent, sv)).join("");
     body = `<div class="setup-intro">Create your competition structure and arena. Tap
       <strong>＋ New</strong> on any card to open a form.</div>
       <div class="setup-grid">${cards}</div>`;
   }
-  return `${toggle}${body}${renderDrawer(ov)}`;
+  return `${toggle}${body}${renderDrawer(sv)}`;
 }
 
-function setupCard(ent, ov) {
-  const items = ent.list ? ent.list(ov) : null;
+function setupCard(ent, sv) {
+  const items = ent.list ? ent.list(sv) : null;
   let body;
   if (items === null) {
     body = `<div class="setup-hint">Ice inventory lives on the
@@ -1520,13 +1583,13 @@ function setupCard(ent, ov) {
   </section>`;
 }
 
-function drawerField(f, ov) {
+function drawerField(f, sv) {
   const req = f.required ? ` <span class="req">*</span>` : "";
   // Preserve what the user already typed/selected across an error re-render;
   // fall back to the field's default only on first open.
   const current = f.id in drawerValues ? drawerValues[f.id] : (f.value || "");
   if (f.type === "select") {
-    const rows = f.options(ov);
+    const rows = f.options(sv);
     if (!rows.length) {
       const noun = ofNounLabel(f);
       const article = /^[aeiou]/i.test(noun) ? "an" : "a";
@@ -1543,14 +1606,14 @@ function drawerField(f, ov) {
   return `<label>${esc(f.label)}${req}</label><input id="${f.id}" type="${type}"${attrs} />`;
 }
 
-function renderDrawer(ov) {
+function renderDrawer(sv) {
   if (!drawer) return "";
   const ent = SETUP_ENTITIES.find((e) => e.key === drawer.kind);
   if (!ent) return "";
-  const fields = ent.fields.map((f) => drawerField(f, ov)).join("");
+  const fields = ent.fields.map((f) => drawerField(f, sv)).join("");
   const err = drawerError ? `<div class="drawer-err">⚠ ${esc(drawerError)}</div>` : "";
   // A required select with no options can never be satisfied — block submit.
-  const blocked = ent.fields.some((f) => f.type === "select" && f.required && !f.options(ov).length);
+  const blocked = ent.fields.some((f) => f.type === "select" && f.required && !f.options(sv).length);
   return `<div class="drawer-scrim" data-drawer-close></div>
     <aside class="drawer" role="dialog" aria-modal="true" aria-label="New ${esc(entNoun(ent))}">
       <header class="drawer-head"><span class="drawer-ico">${ent.icon}</span>
@@ -4116,7 +4179,7 @@ async function render() {
   updateToast();
   const c = document.getElementById("content");
   document.body.dataset.view = view;
-  let ov, board, lineups, standings, inbox, playerHome;
+  let ov, sv, hv, board, lineups, standings, inbox, playerHome;
   try {
     c.innerHTML = `<div class="skeleton"></div><div class="skeleton"></div><div class="skeleton"></div>`;
     ov = await getJSON("/api/demo/overview");
@@ -4186,11 +4249,36 @@ async function render() {
       const rr = await getJSON(`/api/games/${currentGame}/reschedule`);
       if (rr && !rr.error) rescheduleRequests = rr.requests;
     }
-    // The Setup Player card needs the league-wide player list (#114) — its
-    // own authenticated call, never bundled into the public demo overview.
+    // The Setup view itself isn't permission-hidden (any signed-in role can
+    // land on it; setupCard/renderSetupHierarchy hide actions per-entity), so
+    // `sv`/`hv` always default to an empty shape here — never `undefined` —
+    // regardless of which role reaches view==="setup" (#233 B2a review r1).
+    if (view === "setup") {
+      sv = { programs: [], seasons: [], leagues: [], divisions: [], teams: [], clubs: [], organizations: [], venues: [], rinks: [], ice_slots: [], officials: [] };
+      hv = { programs: [] };
+    }
+    // Canonical Setup structure (#233 B2a). `sv` (the flat overview) is gated
+    // MANAGE_ARENA server-side — both League Admin and Arena Manager hold it
+    // — because Arena Managers need it for their own Organization/Venue/
+    // Rink/Ice-slot cards and the Facility tree (#233 B2a review r1: this
+    // used to crash for them, since it was fetched only under manage_setup).
+    if (view === "setup" && (hasPerm("manage_setup") || hasPerm("manage_arena"))) {
+      const svr = await getJSON("/api/v2/setup/overview");
+      if (svr && !svr.error) sv = svr;
+    }
+    // The Competition tree, Setup Player card, and season participation are
+    // MANAGE_SETUP-only (roster-adjacent / competition-structure data an
+    // Arena Manager doesn't manage) — their own authenticated calls, never
+    // bundled into the public demo overview.
     if (view === "setup" && hasPerm("manage_setup")) {
       const pl = await getJSON("/api/players");
       playersList = Array.isArray(pl) ? pl : [];
+      // The canonical Program→Season→League→Division tree (#233 B2a review
+      // r1): consumed as-is rather than reconstructed from flat `sv` lists,
+      // so needs_assignment/teams_without_division match the canonical
+      // parentage rules exactly instead of a client-side reinterpretation.
+      const hvr = await getJSON("/api/v2/setup/hierarchy");
+      if (hvr && !hvr.error) hv = hvr;
       // Season participation (#180): a league's permanent teams and each
       // season's registrations, each its own authenticated call (like the
       // player list above), so the Setup page can show which permanent team
@@ -4396,7 +4484,7 @@ async function render() {
   }
   c.innerHTML =
     view === "dashboard" ? renderDashboard(ov, standings)
-    : view === "setup" ? renderSetup(ov)
+    : view === "setup" ? renderSetup(sv, hv, ov)
     : view === "import" ? renderImport(ov)
     : view === "calendar" ? renderCalendar(ov)
     : view === "games" ? renderGames(ov)
@@ -5522,6 +5610,11 @@ function gateChrome() {
   // manage_arena is the one permission both League Admin and Arena Manager
   // hold, and it's the entry point for all three import types.
   toggle('.tab[data-tab="import"]', hasPerm("manage_arena"));
+  // Setup (#233 B2a review r2): a role with neither manage_setup nor
+  // manage_arena has nothing to manage there — the tab itself isn't a
+  // dead end (setupCard/renderSetupHierarchy already hide per-entity
+  // actions), but it shouldn't be reachable at all for such a role.
+  toggle('.tab[data-tab="setup"]', hasPerm("manage_setup") || hasPerm("manage_arena"));
   // Reset wipes and reseeds all demo data — shown only in demo mode and only to
   // a League Admin (MANAGE_SETUP), matching the server, which hard-disables the
   // reset route in production (#215).
@@ -5630,6 +5723,10 @@ function setUser(user) {
   // now-invisible screen.
   if (["dashboard", "activity"].includes(view) && !canSeeOpsConsole()) view = "dashboard";
   if (["roster", "sheet"].includes(view) && !canReadAnyPrivateGame()) view = "dashboard";
+  // #233 B2a review r2: a no-reload persona switch off an operator role can
+  // otherwise leave a viewer/coach/player/official staring at a Setup screen
+  // whose tab gateChrome just hid out from under them.
+  if (view === "setup" && !(hasPerm("manage_setup") || hasPerm("manage_arena"))) view = "dashboard";
   if (isPlayerUser && view === "dashboard") view = "player_home";
   else if (isGuardianUser && view === "dashboard") view = "guardian_home";
   else if (isOfficialUser && view === "dashboard") view = "inbox";
