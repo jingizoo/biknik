@@ -30,7 +30,7 @@ def _v2_setup_permission(rest: str):
     # competition-structure moves (division/team/player parents) require setup.
     if re.match(r"^(venue|rink)/[^/]+/assign-\w+$", rest):
         return Permission.MANAGE_ARENA
-    if re.match(r"^(division|team|player)/[^/]+/assign-\w+$", rest):
+    if re.match(r"^(program|division|team|player)/[^/]+/assign-\w+$", rest):
         return Permission.MANAGE_SETUP
     # Season team-registration operations (register / assign-league /
     # assign-division / remove / roll-forward) are setup actions.

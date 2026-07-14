@@ -46,6 +46,7 @@ from .auth import (
 )
 from .authz import authorize, required_permission
 from ..api import v1_setup_adapter as _v1
+from ..api import v2_setup_projection as _v2p
 from .rate_limit import RateLimiter
 from .scope import can_read_private_game_data, scope_violation
 
@@ -1947,13 +1948,24 @@ class Handler(BaseHTTPRequestHandler):
         api = STATE.api
         b = body
         combo = (entity, target)
+        if combo == ("program", "organization"):
+            # v2 Program operator reassignment (#233 Slice C2 review): the
+            # canonical umbrella owner move, using ``operator_organization_id``.
+            # The facade preserves the temporary Venue-link safety rule (the
+            # operator can't change while venues are still attached).
+            return self._send_api(api.assign_program_organization(
+                record_id, b.get("operator_organization_id") or None, actor_id))
         if combo == ("division", "league"):
             # v2 Division reparent: League REQUIRED + dependent-record integrity.
             return self._send_api(api.assign_division_league(
                 record_id, b.get("league_id") or None, actor_id, v2=True))
         if combo == ("team", "club"):
+            # v2 keeps Club REQUIRED until Slice D — a v2 create needs a real
+            # Club, so its reassignment must not be able to null the link and
+            # produce a state the v2 create path rejects (the v2 guard lives in
+            # the facade so it holds regardless of caller). v1 stays nullable.
             return self._send_api(api.assign_team_club(
-                record_id, b.get("club_id") or None, actor_id))
+                record_id, b.get("club_id") or None, actor_id, v2=True))
         if combo == ("player", "team"):
             return self._send_api(api.assign_player_team(
                 record_id, b.get("team_id"), actor_id))
@@ -1962,7 +1974,7 @@ class Handler(BaseHTTPRequestHandler):
                 record_id, b.get("venue_id"), actor_id))
         if combo == ("venue", "organization"):
             # Canonical Venue is org-owned only — strip the legacy league_id.
-            return self._send_api(_v1.venue_to_v2(api.assign_venue_organization(
+            return self._send_api(_v2p.venue_to_v2(api.assign_venue_organization(
                 record_id, b.get("organization_id") or None, actor_id)))
         return self._send_json({"error": {
             "code": "not_found",
@@ -1990,8 +2002,9 @@ class Handler(BaseHTTPRequestHandler):
             return True
 
         # Reassignment: /api/v2/setup/<entity>/<id>/assign-<parent>.
-        m = re.match(r"^(division|team|player|rink|venue)/([^/]+)/assign-(\w+)$",
-                     entity)
+        m = re.match(
+            r"^(program|division|team|player|rink|venue)/([^/]+)/assign-(\w+)$",
+            entity)
         if m:
             return self._handle_reassign_v2(
                 m.group(1), m.group(2), m.group(3), b, actor_id)
@@ -2042,7 +2055,7 @@ class Handler(BaseHTTPRequestHandler):
                 "ice-slot": api.delete_ice_slot, "game": api.delete_game,
             }[kind]
             # Canonical Venue responses drop the legacy league_id (org-owned only).
-            mapper = _v1.venue_to_v2 if kind == "venue" else (lambda r: r)
+            mapper = _v2p.venue_to_v2 if kind == "venue" else (lambda r: r)
             return self._send_api(mapper(deleter(md.group(2), actor_id)))
 
         # Entity create — canonical bodies, canonical responses.
@@ -2083,7 +2096,7 @@ class Handler(BaseHTTPRequestHandler):
             # v2 omits league_id — venue↔program is a legacy v1-only relation
             # (Slice E decouples it); the v2 route never accepts it in the request
             # and strips it from the response (canonical Venue is org-owned only).
-            return self._send_api(_v1.venue_to_v2(api.create_venue(
+            return self._send_api(_v2p.venue_to_v2(api.create_venue(
                 b.get("name"), b.get("address", ""), b.get("timezone", "UTC"),
                 b.get("organization_id") or None, None, actor_id)))
         if entity == "rink":

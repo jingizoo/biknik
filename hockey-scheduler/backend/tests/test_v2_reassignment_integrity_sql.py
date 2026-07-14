@@ -19,7 +19,7 @@ import unittest
 from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
 
 from hockey_scheduler.api import ApiService
-from hockey_scheduler.domain import IceSlotStatus
+from hockey_scheduler.domain import IceSlotStatus, Team
 from hockey_scheduler.store import SqlStore
 
 ADMIN = "admin"
@@ -232,6 +232,59 @@ class GameRegistrationLeagueSqlTest(_SqlIntegrityBase):
             self.assertEqual(store.all_games(), [])
             self.assertEqual(store.get_ice_slot(slot["id"]).status,
                              IceSlotStatus.AVAILABLE)
+            self.assertEqual(len(store.all_setup_audit()), audits_before)
+
+        self._run(case)
+
+
+class AssignClubRequiredSqlTest(_SqlIntegrityBase):
+    def test_v2_assign_club_null_rejected_zero_mutation(self):
+        def case(api, store):
+            org, program = self._org_program(api)
+            club = api.create_club("C", actor_id=ADMIN)
+            team = api.create_team(club["id"], None, "T", actor_id=ADMIN,
+                                   program_id=program["id"])
+            audits_before = len(store.all_setup_audit())
+            # v2 reassignment may not null the Club (deferred to Slice D).
+            res = api.assign_team_club(team["id"], None, actor_id=ADMIN, v2=True)
+            self.assertEqual(res["error"]["code"], "validation_error", res)
+            # Club link and audit log unchanged.
+            self.assertEqual(store.get_team(team["id"]).club_id, club["id"])
+            self.assertEqual(len(store.all_setup_audit()), audits_before)
+
+        self._run(case)
+
+    def test_v1_assign_club_null_still_allowed(self):
+        """v1 stays nullable — the guard is v2-only."""
+        def case(api, store):
+            org, program = self._org_program(api)
+            club = api.create_club("C", actor_id=ADMIN)
+            team = api.create_team(club["id"], None, "T", actor_id=ADMIN,
+                                   program_id=program["id"])
+            res = api.assign_team_club(team["id"], None, actor_id=ADMIN)
+            self.assertNotIn("error", res, res)
+            self.assertIsNone(res["club_id"])
+
+        self._run(case)
+
+
+class RegisterProgramMatchSqlTest(_SqlIntegrityBase):
+    def test_v2_register_program_less_team_rejected_zero_mutation(self):
+        def case(api, store):
+            org, program = self._org_program(api)
+            season = api.create_season(program["id"], "Fall", actor_id=ADMIN)
+            league = api.create_league(season["id"], "L", actor_id=ADMIN)
+            club = api.create_club("C", actor_id=ADMIN)
+            # A legacy Team with no program (create_team requires one → inject).
+            team = Team(id=store.next_id("team"), name="Legacy",
+                        club_id=club["id"], program_id=None)
+            store.add_team(team)
+
+            audits_before = len(store.all_setup_audit())
+            res = api.register_team_for_season(
+                season["id"], team.id, actor_id=ADMIN, league_id=league["id"])
+            self.assertEqual(res["error"]["code"], "validation_error", res)
+            self.assertEqual(store.registrations_for_season(season["id"]), [])
             self.assertEqual(len(store.all_setup_audit()), audits_before)
 
         self._run(case)

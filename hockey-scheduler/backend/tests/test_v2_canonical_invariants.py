@@ -24,7 +24,8 @@ import unittest
 from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
 
 from hockey_scheduler.api import ApiService
-from hockey_scheduler.domain import IceSlotStatus
+from hockey_scheduler.domain import (
+    IceSlotStatus, SeasonTeamRegistration, Team)
 from hockey_scheduler.store import InMemoryStore
 
 ADMIN = "admin"
@@ -290,6 +291,113 @@ class AssignLeagueGameStrandTest(_Base):
                                                    actor_id=ADMIN)
         self.assertNotIn("error", moved, moved)
         self.assertEqual(moved["league_id"], l2["id"])
+
+
+class V2RegisterProgramMatchTest(_Base):
+    """The v2 registration path requires an EXACT, non-null Team→Program match —
+    a legacy Team with no Program (or one owned by another Program) must not be
+    able to enter the canonical tree (#233 Slice C2 review)."""
+
+    def _season_league(self):
+        org, program = self._org_program()
+        season = self.api.create_season(program["id"], "Fall", actor_id=ADMIN)
+        league = self.api.create_league(season["id"], "L", actor_id=ADMIN)
+        club = self.api.create_club("C", actor_id=ADMIN)
+        return org, program, season, league, club
+
+    def test_v2_register_rejects_program_less_team_zero_mutation(self):
+        org, program, season, league, club = self._season_league()
+        # A legacy Team with NO program (create_team requires one, so inject).
+        team = Team(id=self.api.store.next_id("team"), name="Legacy",
+                    club_id=club["id"], program_id=None)
+        self.api.store.add_team(team)
+
+        audits_before = self._audit_count()
+        res = self.api.register_team_for_season(
+            season["id"], team.id, actor_id=ADMIN, league_id=league["id"])
+        self.assertEqual(res["error"]["code"], "validation_error", res)
+        # No registration was written and no audit grew.
+        self.assertEqual(
+            self.api.store.registrations_for_season(season["id"]), [])
+        self.assertEqual(self._audit_count(), audits_before)
+
+    def test_v2_register_rejects_cross_program_team(self):
+        org, program, season, league, club = self._season_league()
+        # A team owned by a DIFFERENT program.
+        other = self.api.create_program(
+            "Other", operator_organization_id=org["id"], actor_id=ADMIN)
+        team = self.api.create_team(club["id"], None, "X", actor_id=ADMIN,
+                                    program_id=other["id"])
+        res = self.api.register_team_for_season(
+            season["id"], team["id"], actor_id=ADMIN, league_id=league["id"])
+        self.assertEqual(res["error"]["code"], "validation_error", res)
+
+
+class HierarchyV2ProgramMismatchTest(_Base):
+    """A cross-Program registration (a Team owned by another Program) is INVALID
+    structure — the v2 hierarchy routes it to `needs_assignment` with reason
+    `team_program_mismatch`, never presenting it as a valid branch."""
+
+    def _cross_program_reg(self, division_id=None):
+        org, program = self._org_program()
+        season = self.api.create_season(program["id"], "Fall", actor_id=ADMIN)
+        league = self.api.create_league(season["id"], "L", actor_id=ADMIN)
+        club = self.api.create_club("C", actor_id=ADMIN)
+        # A team that belongs to ANOTHER program.
+        other = self.api.create_program(
+            "Other", operator_organization_id=org["id"], actor_id=ADMIN)
+        team = self.api.create_team(club["id"], None, "Foreign", actor_id=ADMIN,
+                                    program_id=other["id"])
+        # Inject the registration directly (register_team_for_season would now
+        # reject it) to reproduce a directly-loaded cross-Program row.
+        self.api.store.add_season_team_registration(SeasonTeamRegistration(
+            id=self.api.store.next_id("streg"), season_id=season["id"],
+            team_id=team["id"], division_id=division_id, league_id=league["id"],
+            active=True))
+        return program, season, league, team
+
+    def _season_node(self, program, season):
+        tree = self.api.get_setup_hierarchy_v2()
+        prog = next(p for p in tree["programs"] if p["id"] == program["id"])
+        return next(x for x in prog["seasons"] if x["id"] == season["id"])
+
+    def test_direct_cross_program_registration_needs_assignment(self):
+        program, season, league, team = self._cross_program_reg()
+        s = self._season_node(program, season)
+        na = {r["team_id"]: r for r in s["needs_assignment"]["registrations"]}
+        self.assertIn(team["id"], na)
+        self.assertEqual(na[team["id"]]["reason"], "team_program_mismatch")
+        # It is NOT presented as a valid League-direct team.
+        lg = next(x for x in s["leagues"] if x["id"] == league["id"])
+        self.assertNotIn(team["id"],
+                         [t["id"] for t in lg["teams_without_division"]])
+
+    def test_division_backed_cross_program_registration_needs_assignment(self):
+        # Build the season first, then a division under its league, then inject.
+        org, program = self._org_program()
+        season = self.api.create_season(program["id"], "Fall", actor_id=ADMIN)
+        league = self.api.create_league(season["id"], "L", actor_id=ADMIN)
+        div = self.api.create_division_v2(league["id"], "D", actor_id=ADMIN)
+        club = self.api.create_club("C", actor_id=ADMIN)
+        other = self.api.create_program(
+            "Other", operator_organization_id=org["id"], actor_id=ADMIN)
+        team = self.api.create_team(club["id"], None, "Foreign", actor_id=ADMIN,
+                                    program_id=other["id"])
+        self.api.store.add_season_team_registration(SeasonTeamRegistration(
+            id=self.api.store.next_id("streg"), season_id=season["id"],
+            team_id=team["id"], division_id=div["id"], league_id=league["id"],
+            active=True))
+
+        tree = self.api.get_setup_hierarchy_v2()
+        prog = next(p for p in tree["programs"] if p["id"] == program["id"])
+        s = next(x for x in prog["seasons"] if x["id"] == season["id"])
+        na = {r["team_id"]: r for r in s["needs_assignment"]["registrations"]}
+        self.assertEqual(na.get(team["id"], {}).get("reason"),
+                         "team_program_mismatch")
+        # Not nested under the Division either.
+        lg = next(x for x in s["leagues"] if x["id"] == league["id"])
+        dnode = next(d for d in lg["divisions"] if d["id"] == div["id"])
+        self.assertNotIn(team["id"], [t["id"] for t in dnode["teams"]])
 
 
 if __name__ == "__main__":

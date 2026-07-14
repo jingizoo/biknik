@@ -87,15 +87,3 @@ def game_to_v1(result):
     Drops the internal competition ``league_id`` the v1 API never exposed.
     """
     return _drop(result, {"league_id"})
-
-
-def venue_to_v2(result):
-    """A Venue result → the canonical v2 shape (#233 Slice C2).
-
-    The canonical Venue is Organization-owned only; the ``league_id`` column is
-    legacy v1 data (the temporary Venue→Program link removed in Slice E) and the
-    v2 surface never exposes it. Drop it from every v2 Venue response (create,
-    reassign, delete) so no v2 payload leaks the legacy field. v1 Venue responses
-    keep ``league_id`` unchanged.
-    """
-    return _drop(result, {"league_id"})

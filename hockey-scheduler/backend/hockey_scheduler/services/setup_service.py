@@ -359,6 +359,19 @@ class SetupService:
         # v1 C1b derivation). When omitted (v1), keep the derivation below.
         explicit_league_id = league_id or None
         if explicit_league_id:
+            # v2 (#233 Slice C2 review): a canonical registration must resolve to
+            # the same Program as the Team — require an EXACT, non-null Team→
+            # Program match. The permissive Rule-4 check above only rejects a
+            # non-null *different* program, so a legacy Team with no program would
+            # otherwise slip into the canonical tree. v1 (no explicit league)
+            # keeps that permissive behavior.
+            if not team.program_id or team.program_id != season.program_id:
+                raise ValidationError(
+                    "Team must belong to this season's program.",
+                    {"reason": "team_program_mismatch",
+                     "team_id": team.id,
+                     "team_program_id": team.program_id,
+                     "season_program_id": season.program_id})
             league = self.store.get_league(explicit_league_id)
             if league is None:
                 raise NotFoundError(f"League {explicit_league_id} not found.")
@@ -930,10 +943,17 @@ class SetupService:
 
     @_transactional
     def assign_team_club(self, team_id: str, club_id: Optional[str] = None,
-                         actor_id: Optional[str] = None) -> Team:
+                         actor_id: Optional[str] = None,
+                         v2: bool = False) -> Team:
         team = self.store.get_team(team_id)
         if team is None:
             raise NotFoundError(f"Team {team_id} not found.")
+        # v2 (#233 Slice C2 review): nullable Club is deferred to Slice D and the
+        # v2 Team create path requires a real Club — so the v2 reassignment must
+        # not be able to null the link and produce a state v2 create rejects.
+        # Require a non-null existing Club here. v1 keeps its nullable behavior.
+        if v2 and not club_id:
+            raise ValidationError("A club_id is required.")
         if club_id and self.store.get_club(club_id) is None:
             raise NotFoundError(f"Club {club_id} not found.")
         old = team.club_id

@@ -286,6 +286,41 @@ class V2SetupContractTest(unittest.TestCase):
         self.assertEqual(set(dmoved), DIVISION_KEYS, dmoved)
         self.assertNotIn("level_id", dmoved)
 
+    # -- program operator reassignment (#233 Slice C2 review) ---------------
+    def test_v2_program_assign_organization(self):
+        c = self._admin()
+        org1 = self._v2(c, "organization", {"name": "Org1", "short_name": "O1"})
+        org2 = self._v2(c, "organization", {"name": "Org2", "short_name": "O2"})
+        program = self._v2(c, "program",
+                          {"name": "P", "operator_organization_id": org1["id"]})
+        self.assertEqual(program["operator_organization_id"], org1["id"])
+
+        # Canonical operator move via the new v2 route → canonical Program back.
+        status, moved = self._req(
+            c, "POST",
+            f"/api/v2/setup/program/{program['id']}/assign-organization",
+            {"operator_organization_id": org2["id"]})
+        self.assertEqual(status, 200, moved)
+        self.assertEqual(set(moved), PROGRAM_KEYS, moved)
+        self.assertEqual(moved["operator_organization_id"], org2["id"])
+        self.assertNotIn("organization_id", moved)  # canonical, not legacy v1
+
+        # The temporary Venue-link safety rule is preserved: attach a venue to
+        # the program (v1-only link) and the operator can no longer change.
+        status, _venue = self._req(c, "POST", "/api/setup/venue",
+                                   {"name": "Arena", "league_id": program["id"],
+                                    "organization_id": org2["id"]})
+        self.assertEqual(status, 200, _venue)
+        status, blocked = self._req(
+            c, "POST",
+            f"/api/v2/setup/program/{program['id']}/assign-organization",
+            {"operator_organization_id": org1["id"]})
+        self.assertEqual(blocked["error"]["code"], "validation_error", blocked)
+        # Zero mutation — the operator is still org2.
+        status, prog2 = self._req(c, "GET", "/api/v2/setup/hierarchy")
+        p = next(x for x in prog2["programs"] if x["id"] == program["id"])
+        self.assertEqual(p["operator_organization_id"], org2["id"])
+
     # -- deletes ------------------------------------------------------------
     def test_v2_deletes_canonical(self):
         c = self._admin()

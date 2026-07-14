@@ -2813,6 +2813,17 @@ class ApiService:
                              "division_id": reg.division_id,
                              "reason": "team_missing"})
                         continue
+                    # A registration's Team must belong to THIS Program — a
+                    # cross-Program (or program-less legacy) Team is invalid
+                    # structure and is surfaced for reassignment, never shown as a
+                    # valid branch under this Program's tree (#233 Slice C2 review).
+                    if tm.program_id != prog.id:
+                        needs_assignment_regs.append(
+                            {"registration_id": reg.id, "team_id": reg.team_id,
+                             "league_id": reg.league_id,
+                             "division_id": reg.division_id,
+                             "reason": "team_program_mismatch"})
+                        continue
                     if reg.division_id:
                         div = divisions_by_id.get(reg.division_id)
                         # A Team nests under its Division only when the Division is
@@ -3088,8 +3099,9 @@ class ApiService:
 
     @catch
     def assign_team_club(self, team_id: str, club_id: Optional[str] = None,
-                         actor_id: Optional[str] = None) -> dict:
-        return _serialize(self.setup.assign_team_club(team_id, club_id, actor_id))
+                         actor_id: Optional[str] = None, v2: bool = False) -> dict:
+        return _serialize(self.setup.assign_team_club(
+            team_id, club_id, actor_id, v2=v2))
 
     # assign_team_division removed (#180) — see SetupService; a Team's seasonal
     # division lives in SeasonTeamRegistration (assign_season_team_division).
