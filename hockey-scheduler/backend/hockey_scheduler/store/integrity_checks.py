@@ -171,3 +171,95 @@ def assert_roster_refs_exist(conn):
             "Cannot add the roster → game/player foreign keys: "
             f"{len(orphans)} roster row(s) reference a game or player that does "
             f"not exist: {shown}{more}. Reattach or remove them before upgrading.")
+
+
+# -- #233 Slice C — competition-model reset reparent preflight -------------
+#
+# Slice C reparents each Division onto a League (today's `levels`) and adds a
+# derived `league_id` to every SeasonTeamRegistration. Both mappings are
+# deterministic for the common shape but genuinely ambiguous for some legacy
+# data, and ADR 0001 requires the upgrade to *abort and report* those rows
+# rather than guess (no silent reassignment). These read-only checks find the
+# ambiguous rows; the actual reparent migration (Slice C1b) registers
+# ``assert_competition_reset_ready`` as its pre-migration gate. They are pure
+# SELECTs — nothing is changed — so a fresh install and any deterministic
+# dataset pass cleanly, and they are safe to re-run.
+
+
+def find_undeterminable_division_leagues(conn):
+    """Level-less Divisions whose target League can't be derived deterministically.
+
+    A Division with a ``level_id`` maps onto that level-now-League. A Division
+    with no ``level_id`` must attach to its Season's *sole* League — deterministic
+    only when the Season has exactly one level. Returns ``(division_id, season_id,
+    level_count)`` for each level-less Division whose Season has 0 or >1 levels.
+    """
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT d.id AS id, d.season_id AS season_id, "
+        "(SELECT COUNT(*) FROM levels lv WHERE lv.season_id = d.season_id) "
+        "AS level_count "
+        "FROM divisions d WHERE d.level_id IS NULL")
+    return sorted(
+        ((row["id"], row["season_id"], row["level_count"])
+         for row in cur.fetchall() if row["level_count"] != 1),
+        key=lambda r: r[0])
+
+
+def find_underivable_registration_leagues(conn):
+    """Registrations whose new ``league_id`` can't be uniquely derived.
+
+    The registration's League comes from its Division's level when the Division
+    has one; otherwise from the Season's sole League. It is ambiguous when the
+    registration has no resolvable Division-level AND its Season does not have
+    exactly one level. Returns ``(registration_id, season_id, division_id,
+    level_count)`` for each such row.
+    """
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT r.id AS id, r.season_id AS season_id, r.division_id AS division_id, "
+        "(SELECT COUNT(*) FROM levels lv WHERE lv.season_id = r.season_id) "
+        "AS level_count, "
+        "(SELECT d.level_id FROM divisions d WHERE d.id = r.division_id) "
+        "AS division_level_id "
+        "FROM season_team_registrations r")
+    blocking = []
+    for row in cur.fetchall():
+        derivable = row["division_level_id"] is not None or row["level_count"] == 1
+        if not derivable:
+            blocking.append(
+                (row["id"], row["season_id"], row["division_id"], row["level_count"]))
+    return sorted(blocking, key=lambda r: r[0])
+
+
+def assert_competition_reset_ready(conn):
+    """Abort the competition-model reset (#233 Slice C) if any Division or
+    registration can't be deterministically reparented onto a League.
+
+    Read-only: raises :class:`MigrationDataError` naming the offending rows and
+    leaves all data unchanged, so an operator resolves the ambiguity (add/pick a
+    League) before the reparent migration runs.
+    """
+    div_issues = find_undeterminable_division_leagues(conn)
+    reg_issues = find_underivable_registration_leagues(conn)
+    if not div_issues and not reg_issues:
+        return
+    parts = []
+    if div_issues:
+        ids = [d[0] for d in div_issues]
+        shown = ", ".join(ids[:20])
+        more = "" if len(ids) <= 20 else f" (+{len(ids) - 20} more)"
+        parts.append(
+            f"{len(ids)} level-less division(s) whose season has no single league "
+            f"to attach to: {shown}{more}")
+    if reg_issues:
+        ids = [r[0] for r in reg_issues]
+        shown = ", ".join(ids[:20])
+        more = "" if len(ids) <= 20 else f" (+{len(ids) - 20} more)"
+        parts.append(
+            f"{len(ids)} registration(s) whose league can't be uniquely derived: "
+            f"{shown}{more}")
+    raise MigrationDataError(
+        "Cannot reset the competition model (#233 Slice C): " + "; ".join(parts)
+        + ". Attach each division to a league and give each ambiguous season a "
+        "single league (or set each registration's division) before upgrading.")
