@@ -1139,16 +1139,23 @@ class ApiService:
              detail=f"{len(programs)} program(s)")
         block(has_program, "no_program", "No program has been created yet.")
 
+        # An operating organization is OPTIONAL on the canonical Program
+        # (#233 B2a/ADR 0001 — operator_organization_id is nullable): a
+        # Program with no operator is a complete, valid Program, so this
+        # step never blocks readiness (mirrors the "division" step below).
+        # v1's get_onboarding_status is untouched and keeps this blocking.
         ownership_ok = has_program and not programs_without_org
         step("program_ownership",
-             "Tie every program to an operating organization", ownership_ok,
+             "Tie every program to an operating organization (optional)",
+             ownership_ok, blocking_step=False,
              detail=(f"{len(programs_without_org)} program(s) without an "
                      "operating organization" if programs_without_org
                      else "all programs have an operating organization"))
-        if has_program:
-            block(not programs_without_org, "program_without_organization",
-                  f"{len(programs_without_org)} program(s) are not tied to an "
-                  "operating organization.")
+        if has_program and programs_without_org:
+            warnings.append({
+                "code": "program_without_organization",
+                "message": f"{len(programs_without_org)} program(s) are not "
+                           "tied to an operating organization."})
 
         venue_ok = bool(sound_program_venue_ids)
         step("venue", "Link a venue to a program (temporary v1)", venue_ok,

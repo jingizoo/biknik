@@ -89,7 +89,14 @@ async function checkViewport(browser, viewport) {
       })).json();
       const league = await post("/api/setup/league", { name: "Del League" });
       const season = await post("/api/setup/season", { league_id: league.id, name: "Del Season" });
-      const div = await post("/api/setup/division", { season_id: season.id, name: "Del Div" });
+      // A grouping League (v1 "level") under the season, with the division
+      // parented to it (#233 Slice B2b): the v2 Setup Season participation
+      // panel only shows a registration whose League resolves — without a
+      // level_id here the division/registration would be structurally
+      // dangling and never render a Remove control below.
+      const level = await post("/api/setup/level", { season_id: season.id, name: "Del Level" });
+      const div = await post("/api/setup/division",
+        { season_id: season.id, name: "Del Div", level_id: level.id });
       const club = await post("/api/setup/club", { name: "Del Club" });
       const team = await post("/api/setup/team", { club_id: club.id, league_id: league.id, name: "Del Team" });
       await post(`/api/setup/seasons/${season.id}/team-registrations`,

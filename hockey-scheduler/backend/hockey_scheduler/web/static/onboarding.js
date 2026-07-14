@@ -1,9 +1,11 @@
 /* Guided Initial Setup UI (#174 PR D).
 
    This is a thin extension over the existing operator console. Progress is
-   always fetched from /api/onboarding/status; the browser stores no completed
-   step number and creates no parallel onboarding records. Actions deep-link to
-   the existing Setup drawers, Users screen, Import wizard, and Calendar. */
+   always fetched from /api/v2/onboarding/status (#233 Slice B2b — the
+   canonical Program→Season→League→optional Division readiness check); the
+   browser stores no completed step number and creates no parallel onboarding
+   records. Actions deep-link to the existing Setup drawers, Users screen,
+   Import wizard, and Calendar. */
 
 NAV.onboarding = "Initial Setup";
 
@@ -70,7 +72,10 @@ function updateOnboardingBadge(status) {
 
 async function loadOnboardingStatus(force) {
   if (!force && onboardingStatus && !onboardingStatusDirty) return onboardingStatus;
-  const status = await getJSON("/api/onboarding/status");
+  // Canonical v2 readiness (#233 Slice B2b): same shape as v1
+  // (complete/ready_to_schedule/steps/blocking/warnings) but v2 vocabulary —
+  // see buildOnboardingGroups/nextOnboardingFix below for the key/code map.
+  const status = await getJSON("/api/v2/onboarding/status");
   if (!status || status.error) {
     throw new Error((status && status.error && status.error.message)
       || "Could not load initial setup status.");
@@ -134,12 +139,26 @@ function buildOnboardingGroups(status) {
       actions: [{ label: "Add facility owner", attrs: { "onboarding-drawer": "organization" } }],
     },
     {
-      number: 2, key: "league", title: "Program",
-      description: "Create the program and link it to its operating organization.",
-      done: done("league", "league_ownership"),
+      // Group key renamed league→program (#233 Slice B2b) to match the v2
+      // backend step keys this group now reads (program/program_ownership) —
+      // v1's umbrella step key was "league"; v2's is "program". The internal
+      // onboarding-drawer token stays the frozen SETUP_ENTITIES kind
+      // ("league" = the Program entity), unrelated to this group key.
+      number: 2, key: "program", title: "Program",
+      // #233 B2b review r2: the operator is optional and, when set, is simply
+      // the organization that operates the Program — it may be the SAME
+      // organization as a facility owner or a DIFFERENT one entirely (an
+      // externally-operated program using another owner's venue is a valid
+      // v2 configuration). Never imply the operator must match a facility
+      // owner — that's exactly the coupling ADR 0001/#233 breaks.
+      description: "Create the program. An operating organization is optional — when set, it's the organization that operates the program, which may be a different organization than any facility owner.",
+      // #233 B2b review: operator_organization_id is nullable (B2a/ADR 0001)
+      // — a Program with no operator is already complete, so group
+      // completion depends only on "program", never "program_ownership".
+      done: done("program"),
       checks: [
-        onboardingCheck("Program created", done("league"), detail("league")),
-        onboardingCheck("Operating organization assigned", done("league_ownership"), detail("league_ownership")),
+        onboardingCheck("Program created", done("program"), detail("program")),
+        onboardingCheck("Operating organization assigned (optional)", done("program_ownership"), detail("program_ownership")),
       ],
       actions: [
         { label: "Add program", attrs: { "onboarding-drawer": "league" } },
@@ -161,16 +180,17 @@ function buildOnboardingGroups(status) {
     },
     {
       number: 4, key: "season", title: "Season structure",
-      description: "Create the playing season, then its leagues. In the target model a season is split into leagues (required) and a division is an optional split of a league. During the v1 transition the check below still requires at least one division; the new required/optional gating lands with the schema in Slice C.",
-      done: done("season", "division"),
+      description: "Create the playing season, then give it at least one league. Every season requires a grouping league; a division is an optional split of a league.",
+      done: done("season", "league"),
       checks: [
         onboardingCheck("Season", done("season"), detail("season")),
-        onboardingCheck("Division (required in v1; optional in the new model)", done("division"), detail("division")),
+        onboardingCheck("League", done("league"), detail("league")),
+        onboardingCheck("Division (optional)", done("division"), detail("division")),
       ],
       // Action order follows the frozen v1 drawer dependencies: the league and
       // division drawers both require a Season, so before one exists the only
       // offered action is "Add season". Once a Season exists, lead with the
-      // (target-required) league, then the v1-required division.
+      // required league, then the optional division.
       actions: done("season")
         ? [
             { label: "Add league", attrs: { "onboarding-drawer": "level" } },
@@ -235,22 +255,42 @@ function buildOnboardingGroups(status) {
   ];
 }
 
+// Blocking-code → drawer map, v2 vocabulary (#233 Slice B2b). v1's umbrella
+// code was no_league (→ the "league" drawer token, the frozen Program
+// entity); v2's umbrella code is no_program, same drawer. v2 adds no_league
+// for the season-scoped grouping League (→ the "level" drawer token, the
+// frozen League entity) — a concept v1 has no requirement for. v2 drops
+// no_division entirely (Division is never blocking in v2).
+//
+// no_venue_assigned_to_program deliberately has NO drawer entry (#233 B2b
+// review r1): canonical Venue creation is org-owned only (B2a) — the
+// venue→program game-ice bridge can only be assigned post-creation, from the
+// Setup hierarchy's allowlisted "⇄ Move" control, never from the create
+// drawer. Opening the Venue drawer here would let an operator create another
+// venue without ever clearing this blocker, so it falls through to the
+// setup-view fallback below instead.
 function nextOnboardingFix(status) {
   const code = status.blocking && status.blocking[0] && status.blocking[0].code;
   const drawers = {
     no_organization: "organization",
-    no_league: "league",
-    no_venue_assigned_to_league: "venue",
+    no_program: "league",
     no_rink: "rink",
     no_available_ice: "ice-slot",
     no_season: "season",
-    no_division: "division",
+    no_league: "level",
   };
   if (drawers[code]) return { type: "drawer", value: drawers[code] };
   if (code === "no_team") return { type: "drawer", value: "club" };
   if (["non_durable_store", "migrations_stale", "no_active_admin"].includes(code)) {
     return { type: "view", value: "readiness" };
   }
+  // Fallback for codes with no dedicated drawer — no_venue_assigned_to_program
+  // (see above), venue_owner_mismatch, seasons_without_program,
+  // leagues_without_season, teams_without_program, no_participation,
+  // invalid_registrations — the Setup hierarchy surfaces every one of these
+  // under "Needs assignment" or Season participation (with the Venue→Program
+  // bridge control specifically living on the Facility tree there), so
+  // routing to setup/hierarchy is always a safe, capable landing spot.
   return { type: "view", value: "setup" };
 }
 

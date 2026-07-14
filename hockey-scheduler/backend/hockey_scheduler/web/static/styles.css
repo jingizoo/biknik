@@ -740,10 +740,12 @@ details.tn > .tn-sum:hover { background: #f6f7fb; }
 .tn-leaf .tn-reassign-btn:first-of-type,
 .tn-sum .tn-reassign-btn:first-of-type { margin-left: auto; }
 /* Season participation rows (#180): let the team/division controls wrap under
-   the label on a narrow (390px) phone instead of overflowing the row. */
-.reg-row, .reg-add { flex-wrap: wrap; }
+   the label on a narrow (390px) phone instead of overflowing the row.
+   .repair-row (#233 B2b review) is the Needs-assignment repair control for
+   an invalid registration — same League/Division cascade layout. */
+.reg-row, .reg-add, .repair-row { flex-wrap: wrap; }
 .reg-row .reg-tag { margin-right: auto; }
-.reg-add select, .reg-row select { max-width: 100%; }
+.reg-add select, .reg-row select, .repair-row select { max-width: 100%; }
 /* Season rollover picker (#180): season selectors wrap on a narrow phone; each
    team row's checkbox label and division select share the row and wrap. */
 .ro-controls { display: flex; flex-wrap: wrap; gap: 10px; margin: 4px 0 8px; }
