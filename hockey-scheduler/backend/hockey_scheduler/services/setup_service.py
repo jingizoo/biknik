@@ -2854,8 +2854,17 @@ class SetupService:
             raise NotFoundError(f"League {league_id} not found.")
         divisions = [d for d in self.store.all_divisions()
                      if d.league_id == league_id]
+        # #233 B2b review r2: a registration's league_id is REQUIRED in v2 and
+        # can point directly at this League with no Division (division-less
+        # participation) — checking only Divisions as dependents let a League
+        # delete silently orphan such a registration's required league_id.
+        # Mirrors delete_division's own registration check just below.
+        regs = [r for r in self.store.all_season_team_registrations()
+                if r.league_id == league_id]
         self._block_if_dependents("level", league_id, "league", [
-            self._dep_group("division", divisions, lambda d: d.name)])
+            self._dep_group("division", divisions, lambda d: d.name),
+            self._dep_group("team registration", regs,
+                            lambda r: self._team_name(r.team_id))])
         self.store.delete_league(league_id)
         self._audit("level_deleted", "level", league_id, actor_id,
                     {"name": league.name, "season_id": league.season_id})

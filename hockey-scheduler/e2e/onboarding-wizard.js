@@ -161,6 +161,19 @@ async function checkViewport(browser, viewport) {
     need(/Program created/.test(s.program.text) && /Operating organization assigned/.test(s.program.text),
       `umbrella checks not renamed to "Program created"/"Operating organization assigned"`);
 
+    // #233 B2b review r2: the Program step must teach operator/facility-owner
+    // role independence — the operator is optional and, when set, may be a
+    // DIFFERENT organization than any facility owner (an externally-operated
+    // program is valid) — never conditioned on or derived from facility
+    // ownership.
+    need(/organization is optional/i.test(s.program.text),
+      `Program step does not describe the operator as optional (got ${JSON.stringify(s.program.text)})`);
+    need(/may be a different organization than any facility owner/i.test(s.program.text),
+      `Program step does not state the operator may differ from a facility owner`);
+    need(!/if this program's facility owner also operates it/i.test(s.program.text)
+        && !/facility owner also operates/i.test(s.program.text),
+      `Program step still conditions the operator on facility ownership`);
+
     // Step 1 keeps facility ownership distinct from program operation.
     need(/facility owner/i.test(s.organization.text) && /operating organization/i.test(s.organization.text),
       `step 1 does not separate facility owner from operating organization`);

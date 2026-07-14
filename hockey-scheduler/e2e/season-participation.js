@@ -335,78 +335,64 @@ async function checkViewport(browser, viewport) {
       throw new Error(`[${viewport.label}] partial-failure left unexpected state: ${JSON.stringify(stored)}`);
     }
 
-    // (6) Repair surface: manufacture an invalid registration and use the
-    // Needs-assignment repair row to fix it in place.
-    //
-    // registration_league_division_mismatch is NOT reachable through the
-    // documented v2 write surface — every mutation path
-    // (register_team_for_season, assign_season_team_league,
-    // assign_season_team_division, assign_division_league,
-    // roll_forward_registrations_v2) explicitly cross-validates League vs.
-    // Division and rejects a mismatch before any write. So this fixture
-    // manufactures registration_league_not_in_season instead: a League can
-    // be deleted while it still owns a division-less registration —
-    // delete_league's dependent check only blocks on live Divisions, never
-    // on a registration parked directly under the League with no Division —
-    // leaving that registration's league_id pointing at nothing. Verified
-    // directly against the running service before writing this assertion.
-    const orphan = await page.evaluate(async (i) => {
+    // (6) Blocked delete: a League still holding a live, division-less
+    // registration cannot be deleted (#233 B2b review r2 — delete_league now
+    // checks registrations, not just Divisions, as a dependent; see
+    // setup_service.py). This used to be reachable and was exactly how an
+    // earlier version of this journey manufactured an orphaned registration
+    // for the repair-surface UI below — that path is now correctly blocked,
+    // which also means registration_league_not_in_season (like
+    // registration_league_division_mismatch, already established as
+    // unreachable) has no remaining documented-v2-mutation path to produce
+    // it; test_v2_onboarding_status.py's test_invalid_registrations_are_reported
+    // and the new test_repair_via_v2_after_direct_injection in that same
+    // file cover invalid-registration detection and repair at the backend
+    // level via direct store injection (the established pattern for
+    // legacy/corrupt-data coverage — the service itself would reject it).
+    // The repair row's own cascade/Save mechanics are the exact same
+    // saveRegistrationPlacement() code path already driven end-to-end by
+    // the edit-path steps above, so this browser journey's job is just to
+    // prove the delete itself is blocked.
+    const lgGuarded = await page.evaluate(async (i) => {
       const post = async (p, b) => (await fetch(p, {
         method: "POST", credentials: "same-origin",
         headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
       })).json();
-      const lgOrphan = await post("/api/v2/setup/league", { season_id: i.s1, name: "Bronze" });
+      const lg = await post("/api/v2/setup/league", { season_id: i.s1, name: "Bronze" });
       const foxes = await post("/api/v2/setup/team",
         { program_id: i.program, club_id: i.club, name: "Perma Foxes" });
       const reg = await post(`/api/v2/setup/seasons/${i.s1}/team-registrations`,
-        { team_id: foxes.id, league_id: lgOrphan.id, division_id: null });
-      const del = await fetch(`/api/v2/setup/league/${lgOrphan.id}/delete`, {
-        method: "POST", credentials: "same-origin",
-        headers: { "Content-Type": "application/json" }, body: "{}",
-      });
-      const statusBefore = await (await fetch("/api/v2/onboarding/status",
-        { credentials: "same-origin" })).json();
-      return { foxes: foxes.id, reg: reg.id, deleteStatus: del.status,
-        hadInvalidRegBlocker: (statusBefore.blocking || []).some((b) => b.code === "invalid_registrations") };
+        { team_id: foxes.id, league_id: lg.id, division_id: null });
+      return { lg: lg.id, reg: reg.id };
     }, { s1: ids.s1, program: ids.program, club: edit.club });
-    if (orphan.deleteStatus !== 200) {
-      throw new Error(`[${viewport.label}] could not manufacture registration_league_not_in_season — `
-        + `deleting a league with a division-less registration under it returned ${orphan.deleteStatus} `
-        + `(expected 200); the repair-surface fixture needs a different reachable invalid state`);
+    await refreshSetup({ selector: `[data-del="level"][data-del-id="${lgGuarded.lg}"]` });
+    await page.click(`[data-del="level"][data-del-id="${lgGuarded.lg}"]`);
+    // Level (grouping League) isn't a high-risk kind, so its confirm button
+    // is enabled immediately — no typed DELETE needed (unlike the umbrella
+    // Program/"league" kind exercised in safe-destructive.js).
+    await page.waitForSelector(".modal.danger [data-del-confirm]", { timeout: 10000 });
+    // Detach the console-error listener only for this deliberately-blocked
+    // delete: the server's 409 response logs a benign "Failed to load
+    // resource" Chromium console entry, not a real page bug (same pattern
+    // as the simulated partial-failure request above).
+    page.off("console", consoleErrorHandler);
+    await page.click("[data-del-confirm]");
+    await page.waitForSelector(".modal.blocked", { timeout: 10000 });
+    page.on("console", consoleErrorHandler);
+    const blockedText = await page.textContent(".modal.blocked .modal-body");
+    if (!/team registration/i.test(blockedText)) {
+      throw new Error(`[${viewport.label}] blocked-league-delete modal missing the registration dependency: ${blockedText}`);
     }
-    if (!orphan.hadInvalidRegBlocker) {
-      throw new Error(`[${viewport.label}] manufactured invalid registration didn't trip the `
-        + `invalid_registrations onboarding blocker`);
-    }
-    await refreshSetup({ selector: `[data-repair-league-for="${orphan.reg}"]` });
-    const repairRowText = await page.evaluate((rid) => {
-      const btn = document.querySelector(`[data-repair-save="${rid}"]`);
-      const row = btn && btn.closest(".repair-row");
-      return row ? row.textContent : "";
-    }, orphan.reg);
-    if (!/isn't in this season/i.test(repairRowText)) {
-      throw new Error(`[${viewport.label}] repair row missing its diagnostic reason: ${repairRowText}`);
-    }
-    await page.selectOption(`#repair-league-${orphan.reg}`, ids.lg1);
-    await page.selectOption(`#repair-div-${orphan.reg}`, ids.dA);
-    await page.click(`[data-repair-save="${orphan.reg}"]`);
-    await waitForToast("Registration repaired — moved into the selected league/division.");
-    if (await page.$(`[data-repair-save="${orphan.reg}"]`)) {
-      throw new Error(`[${viewport.label}] repaired registration still shows a Needs-assignment row`);
-    }
-    const repaired = await page.evaluate(async (i) => {
+    await page.click(".modal.blocked [data-modal-close]");
+    await page.waitForSelector(".modal", { state: "detached", timeout: 10000 });
+    const stillThere = await page.evaluate(async (i) => {
       const get = async (p) => (await fetch(p, { credentials: "same-origin" })).json();
-      const regs = (await get(`/api/v2/setup/seasons/${i.s1}/team-registrations`)).registrations;
-      const reg = regs.find((r) => r.id === i.reg);
-      const status = await (await fetch("/api/v2/onboarding/status", { credentials: "same-origin" })).json();
-      return { league_id: reg && reg.league_id, division_id: reg && reg.division_id,
-        hasInvalidRegBlocker: (status.blocking || []).some((b) => b.code === "invalid_registrations") };
-    }, { s1: ids.s1, reg: orphan.reg });
-    if (repaired.league_id !== ids.lg1 || repaired.division_id !== ids.dA) {
-      throw new Error(`[${viewport.label}] repair didn't land in League 1 / Division A: ${JSON.stringify(repaired)}`);
-    }
-    if (repaired.hasInvalidRegBlocker) {
-      throw new Error(`[${viewport.label}] invalid_registrations onboarding blocker didn't clear after repair`);
+      return !!(await get("/api/v2/setup/hierarchy")).programs
+        .flatMap((p) => p.seasons).flatMap((s) => s.leagues || [])
+        .some((lv) => lv.id === i.lg);
+    }, { lg: lgGuarded.lg });
+    if (!stillThere) {
+      throw new Error(`[${viewport.label}] a blocked league delete removed the league anyway`);
     }
 
     if (errors.length) {

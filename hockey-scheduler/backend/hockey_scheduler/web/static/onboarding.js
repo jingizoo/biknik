@@ -145,7 +145,13 @@ function buildOnboardingGroups(status) {
       // onboarding-drawer token stays the frozen SETUP_ENTITIES kind
       // ("league" = the Program entity), unrelated to this group key.
       number: 2, key: "program", title: "Program",
-      description: "Create the program. An operating organization is optional — link one if this program's facility owner also operates it.",
+      // #233 B2b review r2: the operator is optional and, when set, is simply
+      // the organization that operates the Program — it may be the SAME
+      // organization as a facility owner or a DIFFERENT one entirely (an
+      // externally-operated program using another owner's venue is a valid
+      // v2 configuration). Never imply the operator must match a facility
+      // owner — that's exactly the coupling ADR 0001/#233 breaks.
+      description: "Create the program. An operating organization is optional — when set, it's the organization that operates the program, which may be a different organization than any facility owner.",
       // #233 B2b review: operator_organization_id is nullable (B2a/ADR 0001)
       // — a Program with no operator is already complete, so group
       // completion depends only on "program", never "program_ownership".

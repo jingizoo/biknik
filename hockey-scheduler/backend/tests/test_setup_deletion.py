@@ -366,6 +366,57 @@ class DeletionContract:
         self.assertDeleted(self.api.delete_league(empty, actor_id=self.ACTOR),
                            self.store.get_league, empty, "level_deleted")
 
+    def test_level_blocked_by_registration(self):
+        """#233 B2b review r2: a v2 registration's REQUIRED league_id can
+        point directly at a grouping League with no Division (division-less
+        participation) — deleting that League must not silently orphan a
+        required field. Covers both a division-less registration and one
+        with a Division under the same League, and proves zero mutation
+        (record, division, and registration all survive; no audit written)
+        on every blocked attempt."""
+        lg = self._league()
+        s = self._season(lg)
+        level = self.api.create_league(s, "Level A", actor_id=self.ACTOR)["id"]
+        club = self._club()
+
+        # Division-less registration parked directly under the League.
+        bare_team = self._team(club, lg, "Bare Team")
+        reg = self.api.register_team_for_season(
+            s, bare_team, None, actor_id=self.ACTOR, league_id=level)
+        self.assertNotIn("error", reg, reg)
+        regs_before = len(self.store.all_season_team_registrations())
+        audits_before = len(self.store.all_setup_audit())
+        blocked = self.api.delete_league(level, actor_id=self.ACTOR)
+        self.assertBlocked(blocked, expect_types={"team registration"})
+        self.assertIsNotNone(self.store.get_league(level))
+        self.assertIsNotNone(
+            self.store.get_season_team_registration(reg["id"]))
+        self.assertEqual(len(self.store.all_season_team_registrations()),
+                         regs_before, "blocked delete must not mutate registrations")
+        self.assertEqual(len(self.store.all_setup_audit()), audits_before,
+                         "blocked delete must not write an audit row")
+
+        # A registration WITH a Division under the same League also blocks —
+        # both the division and the registration are reported, so neither
+        # can be missed if an operator clears one dependent but not the other.
+        # (A registration keeps blocking its League even once "removed" —
+        # unregister_team_from_season deactivates rather than deletes the
+        # row, and this dependency check counts every registration
+        # referencing the League regardless of active state, mirroring
+        # delete_division's identical, unfiltered convention just above —
+        # so this test proves the blocked path only, like its sibling
+        # test_level_blocked_by_division, which proves the empty-deletes-
+        # cleanly path on a SEPARATE League rather than this one.)
+        div = self.api.create_division_v2(level, "In Level", actor_id=self.ACTOR)["id"]
+        div_team = self._team(club, lg, "Div Team")
+        reg2 = self.api.register_team_for_season(
+            s, div_team, div, actor_id=self.ACTOR, league_id=level)
+        self.assertNotIn("error", reg2, reg2)
+        blocked2 = self.api.delete_league(level, actor_id=self.ACTOR)
+        self.assertBlocked(blocked2,
+                           expect_types={"division", "team registration"})
+        self.assertIsNotNone(self.store.get_league(level))
+
     # -- season blocked by a game (direct season_id reference) -------------
     def test_season_blocked_by_game(self):
         lg = self._league()

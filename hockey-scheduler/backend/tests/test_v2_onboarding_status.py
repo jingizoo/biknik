@@ -189,6 +189,59 @@ class V2OnboardingStatusTest(unittest.TestCase):
         status = api.get_onboarding_status_v2("demo")
         self.assertIn("invalid_registrations", _codes(status), status)
 
+    def test_repair_via_v2_after_direct_injection(self):
+        """#233 B2b review r2: the same defect a direct-injection test proves
+        the readiness detects (test_invalid_registrations_are_reported) must
+        also be fixable through the documented v2 write surface — the exact
+        assign-league call the frontend's Needs-assignment repair row makes.
+
+        registration_league_not_in_season is otherwise unreachable through
+        any documented v2 mutation as of this review round: delete_league now
+        blocks on a live registration referencing it (setup_service.py), so
+        the injected row here is deliberately manufactured the same way
+        test_invalid_registrations_are_reported does — direct store access,
+        bypassing the service layer the real app always goes through."""
+        api = self._api()
+        org, program, season = self._base(api)
+        league = api.create_league(season["id"], "Diamond", actor_id="admin")
+        team = api.create_team(self._club["id"], None, "T", actor_id="admin",
+                               program_id=program["id"])
+        other_season = api.create_season(program["id"], "Other", actor_id="admin")
+        other_league = api.create_league(other_season["id"], "OL", actor_id="admin")
+
+        from hockey_scheduler.domain import SeasonTeamRegistration
+        reg_id = api.store.next_id("streg")
+        api.store.add_season_team_registration(SeasonTeamRegistration(
+            id=reg_id, season_id=season["id"], team_id=team["id"],
+            division_id=None, league_id=other_league["id"], active=True))
+
+        before = api.get_setup_hierarchy_v2()
+        season_node = next(s for p in before["programs"] for s in p["seasons"]
+                           if s["id"] == season["id"])
+        issues = season_node["needs_assignment"]["registrations"]
+        self.assertEqual(len(issues), 1, issues)
+        self.assertEqual(issues[0]["reason"], "registration_league_not_in_season")
+        self.assertEqual(issues[0]["registration_id"], reg_id)
+        status_before = api.get_onboarding_status_v2("demo")
+        self.assertIn("invalid_registrations", _codes(status_before))
+
+        # Repair through the exact v2 route the frontend's repair row Save
+        # button calls.
+        repaired = api.assign_season_team_league(reg_id, league["id"],
+                                                  actor_id="admin")
+        self.assertNotIn("error", repaired, repaired)
+
+        after = api.get_setup_hierarchy_v2()
+        season_node_after = next(s for p in after["programs"] for s in p["seasons"]
+                                 if s["id"] == season["id"])
+        self.assertEqual(season_node_after["needs_assignment"]["registrations"], [])
+        league_node = next(lv for lv in season_node_after["leagues"]
+                           if lv["id"] == league["id"])
+        self.assertIn(team["id"],
+                      {t["id"] for t in league_node["teams_without_division"]})
+        status_after = api.get_onboarding_status_v2("demo")
+        self.assertNotIn("invalid_registrations", _codes(status_after), status_after)
+
     def test_v2_uses_canonical_program_code(self):
         """With nothing created, v2 blocks on `no_program` (canonical umbrella
         code), never repurposing v1's `no_league` for the umbrella."""
