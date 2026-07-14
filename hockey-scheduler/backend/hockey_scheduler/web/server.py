@@ -46,6 +46,7 @@ from .auth import (
 )
 from .authz import authorize, required_permission
 from ..api import v1_setup_adapter as _v1
+from ..api import v2_setup_projection as _v2p
 from .rate_limit import RateLimiter
 from .scope import can_read_private_game_data, scope_violation
 
@@ -768,6 +769,29 @@ class Handler(BaseHTTPRequestHandler):
             if self._operator_only("/api/onboarding/status"):
                 return
             return self._send_api(api.get_onboarding_status(_app_mode()))
+        # Canonical v2 setup reads (#233 Slice C2). Same MANAGE_SETUP operator
+        # gate as their v1 siblings, but canonical keys and shapes — no v1
+        # adapter mapping.
+        if path == "/api/v2/setup/hierarchy":
+            if self._operator_only("/api/v2/setup/player"):
+                return
+            return self._send_api(api.get_setup_hierarchy_v2())
+        mpt = re.match(r"^/api/v2/setup/programs/([^/]+)/teams$", path)
+        if mpt:
+            if self._operator_only("/api/v2/setup/player"):
+                return
+            return self._send_api(api.list_program_teams_v2(mpt.group(1)))
+        mv2tr = re.match(r"^/api/v2/setup/seasons/([^/]+)/team-registrations$", path)
+        if mv2tr:
+            if self._operator_only("/api/v2/setup/player"):
+                return
+            # Canonical: each registration row keeps its competition league_id.
+            return self._send_api(
+                api.list_season_team_registrations(mv2tr.group(1)))
+        if path == "/api/v2/onboarding/status":
+            if self._operator_only("/api/v2/onboarding/status"):
+                return
+            return self._send_api(api.get_onboarding_status_v2(_app_mode()))
         if path == "/api/bootstrap/status":
             # Public-safe one-time claim posture (#174). No account count,
             # database details, usernames, or configuration values.
@@ -1478,6 +1502,13 @@ class Handler(BaseHTTPRequestHandler):
                 rink_id, start.isoformat(), end.isoformat(),
                 body.get("slot_type", "game"), actor_id="arena_mgr"))
 
+        # Canonical v2 setup writes (#233 Slice C2). Same operator authz as v1
+        # (enforced above), but canonical request bodies and canonical
+        # (_serialize) responses — NO v1 adapter mapping. Checked before the v1
+        # prefix so /api/v2/setup/ never falls through to /api/setup/.
+        if path.startswith("/api/v2/setup/"):
+            return self._handle_setup_v2(path[len("/api/v2/setup/"):], body, user_id)
+
         # Setup create endpoints — operator creates real records via the API.
         if path.startswith("/api/setup/"):
             return self._handle_setup(path[len("/api/setup/"):], body, user_id)
@@ -1892,6 +1923,199 @@ class Handler(BaseHTTPRequestHandler):
                 b.get("away_team_id"), b.get("ice_slot_id"),
                 allow_division_override=bool(b.get("allow_division_override")),
                 actor_id=actor_id)))
+        if entity == "official":
+            return self._send_api(api.create_official(
+                b.get("name"), b.get("home_club_id"), actor_id))
+        if entity == "player":
+            return self._send_api(api.create_player(
+                b.get("team_id"), b.get("name"), b.get("position"),
+                jersey_number=b.get("jersey_number"), email=b.get("email"),
+                actor_id=actor_id))
+        return self._send_json({"error": {"code": "not_found",
+                                          "message": "Unknown setup entity."}}, 404)
+
+    def _handle_reassign_v2(self, entity: str, record_id: str, target: str,
+                            body: dict, actor_id: str):
+        """Dispatch /api/v2/setup/<entity>/<id>/assign-<target> (#233 Slice C2).
+
+        Canonical reassign per the ADR 0001 new tree: division→league (the
+        grouping League), team→club, player→team, rink→venue, venue→organization.
+        There is NO team→program (a Team is program-permanent) and NO
+        division→level (division's parent is now a League). Canonical request
+        keys and canonical (_serialize) responses — no v1 mapping. ``actor_id``
+        is the server-resolved session user (#136), never client-supplied.
+        """
+        api = STATE.api
+        b = body
+        combo = (entity, target)
+        if combo == ("program", "organization"):
+            # v2 Program operator reassignment (#233 Slice C2 review): the
+            # canonical umbrella owner move, using ``operator_organization_id``.
+            # The facade preserves the temporary Venue-link safety rule (the
+            # operator can't change while venues are still attached).
+            return self._send_api(api.assign_program_organization(
+                record_id, b.get("operator_organization_id") or None, actor_id))
+        if combo == ("division", "league"):
+            # v2 Division reparent: League REQUIRED + dependent-record integrity.
+            return self._send_api(api.assign_division_league(
+                record_id, b.get("league_id") or None, actor_id, v2=True))
+        if combo == ("team", "club"):
+            # v2 keeps Club REQUIRED until Slice D — a v2 create needs a real
+            # Club, so its reassignment must not be able to null the link and
+            # produce a state the v2 create path rejects (the v2 guard lives in
+            # the facade so it holds regardless of caller). v1 stays nullable.
+            return self._send_api(api.assign_team_club(
+                record_id, b.get("club_id") or None, actor_id, v2=True))
+        if combo == ("player", "team"):
+            return self._send_api(api.assign_player_team(
+                record_id, b.get("team_id"), actor_id))
+        if combo == ("rink", "venue"):
+            return self._send_api(api.assign_rink_venue(
+                record_id, b.get("venue_id"), actor_id))
+        if combo == ("venue", "organization"):
+            # Canonical Venue is org-owned only — strip the legacy league_id.
+            return self._send_api(_v2p.venue_to_v2(api.assign_venue_organization(
+                record_id, b.get("organization_id") or None, actor_id)))
+        return self._send_json({"error": {
+            "code": "not_found",
+            "message": f"Unknown reassignment {entity}/assign-{target}."}}, 404)
+
+    def _handle_setup_v2(self, entity: str, body: dict, actor_id: str):
+        """Dispatch /api/v2/setup/<entity> to the canonical facade (#233 Slice C2).
+
+        The canonical write surface: canonical body keys (program_id /
+        operator_organization_id / competition league_id) in, canonical
+        ``_serialize`` output out — no ``v1_setup_adapter`` mapping. Canonical
+        validation is REQUIRED on the v2 routes where the target model demands it
+        (League on division / registration / game); a missing one is a
+        validation_error rather than a silent v1-style derivation. ``actor_id`` is
+        always the server-resolved session user (#136).
+        """
+        api = STATE.api
+        b = body
+
+        def _required_error(message):
+            """Send a structured validation_error and return True (so the caller
+            returns immediately). Returns False when nothing is sent."""
+            self._send_api({"error": {
+                "code": "validation_error", "message": message}})
+            return True
+
+        # Reassignment: /api/v2/setup/<entity>/<id>/assign-<parent>.
+        m = re.match(
+            r"^(program|division|team|player|rink|venue)/([^/]+)/assign-(\w+)$",
+            entity)
+        if m:
+            return self._handle_reassign_v2(
+                m.group(1), m.group(2), m.group(3), b, actor_id)
+        # Season team registrations (canonical): league_id REQUIRED, division
+        # optional. The result keeps its competition league_id (canonical).
+        mr = re.match(r"^seasons/([^/]+)/team-registrations$", entity)
+        if mr:
+            if not (b.get("league_id") or None):
+                return self._send_api({"error": {"code": "validation_error",
+                    "message": "A league_id is required."}})
+            return self._send_api(api.register_team_for_season(
+                mr.group(1), b.get("team_id"), b.get("division_id") or None,
+                actor_id, league_id=b.get("league_id") or None))
+        ml = re.match(r"^season-team-registration/([^/]+)/assign-league$", entity)
+        if ml:
+            return self._send_api(api.assign_season_team_league(
+                ml.group(1), b.get("league_id") or None, actor_id))
+        ma = re.match(r"^season-team-registration/([^/]+)/assign-division$", entity)
+        if ma:
+            # v2: clearing the Division PRESERVES the required league_id; a set
+            # Division must match the registration's League.
+            return self._send_api(api.assign_season_team_division(
+                ma.group(1), b.get("division_id") or None, actor_id, v2=True))
+        mx = re.match(r"^season-team-registration/([^/]+)/remove$", entity)
+        if mx:
+            return self._send_api(api.unregister_team_from_season(
+                mx.group(1), actor_id))
+        # Season rollover (canonical v2): each selection REQUIRES a target
+        # league_id, honored verbatim on the resulting registration.
+        mrf = re.match(r"^seasons/([^/]+)/roll-forward$", entity)
+        if mrf:
+            return self._send_api(api.roll_forward_registrations_v2(
+                b.get("from_season_id"), mrf.group(1), b.get("selections"),
+                actor_id))
+        # Delete: /api/v2/setup/<entity>/<id>/delete — canonical names
+        # (program-delete = umbrella, league-delete = the grouping League).
+        md = re.match(
+            r"^(organization|program|season|league|division|club|team|venue|rink"
+            r"|ice-slot|game)/([^/]+)/delete$", entity)
+        if md:
+            kind = md.group(1)
+            deleter = {
+                "organization": api.delete_organization,
+                "program": api.delete_program, "season": api.delete_season,
+                "league": api.delete_league, "division": api.delete_division,
+                "club": api.delete_club, "team": api.delete_team,
+                "venue": api.delete_venue, "rink": api.delete_rink,
+                "ice-slot": api.delete_ice_slot, "game": api.delete_game,
+            }[kind]
+            # Canonical Venue responses drop the legacy league_id (org-owned only).
+            mapper = _v2p.venue_to_v2 if kind == "venue" else (lambda r: r)
+            return self._send_api(mapper(deleter(md.group(2), actor_id)))
+
+        # Entity create — canonical bodies, canonical responses.
+        if entity == "program":
+            return self._send_api(api.create_program(
+                b.get("name"), b.get("country", ""), b.get("timezone", "UTC"),
+                b.get("operator_organization_id") or None, actor_id))
+        if entity == "season":
+            return self._send_api(api.create_season(
+                b.get("program_id"), b.get("name"),
+                b.get("start_date"), b.get("end_date"), actor_id))
+        if entity == "league":
+            try:
+                sort_order = int(b.get("sort_order") or 0)
+            except (TypeError, ValueError):
+                sort_order = 0
+            return self._send_api(api.create_league(
+                b.get("season_id"), b.get("name"), sort_order, actor_id))
+        if entity == "division":
+            # v2: parented by a League (REQUIRED); season derived from it.
+            if not (b.get("league_id") or None):
+                return _required_error("A league_id is required.")
+            return self._send_api(api.create_division_v2(
+                b.get("league_id"), b.get("name"), b.get("age_group", ""),
+                actor_id))
+        if entity == "club":
+            return self._send_api(api.create_club(
+                b.get("name"), b.get("country", ""), actor_id))
+        if entity == "team":
+            # v2: program-owned; club optional; no division_id-derives-owner.
+            return self._send_api(api.create_team(
+                b.get("club_id") or None, None, b.get("name"),
+                actor_id, program_id=b.get("program_id") or None))
+        if entity == "organization":
+            return self._send_api(api.create_organization(
+                b.get("name"), b.get("short_name", ""), actor_id))
+        if entity == "venue":
+            # v2 omits league_id — venue↔program is a legacy v1-only relation
+            # (Slice E decouples it); the v2 route never accepts it in the request
+            # and strips it from the response (canonical Venue is org-owned only).
+            return self._send_api(_v2p.venue_to_v2(api.create_venue(
+                b.get("name"), b.get("address", ""), b.get("timezone", "UTC"),
+                b.get("organization_id") or None, None, actor_id)))
+        if entity == "rink":
+            return self._send_api(api.create_rink(
+                b.get("venue_id"), b.get("name"), actor_id))
+        if entity == "ice-slot":
+            return self._send_api(api.create_ice_slot(
+                b.get("rink_id"), b.get("start_time"), b.get("end_time"),
+                b.get("slot_type", "game"), actor_id))
+        if entity == "game":
+            # v2: league_id REQUIRED (game scope); division_id optional.
+            if not (b.get("league_id") or None):
+                return _required_error("A league_id is required.")
+            return self._send_api(api.create_game(
+                b.get("season_id"), b.get("division_id") or None,
+                b.get("home_team_id"), b.get("away_team_id"),
+                b.get("ice_slot_id"),
+                allow_division_override=bool(b.get("allow_division_override")),
+                actor_id=actor_id, league_id=b.get("league_id") or None))
         if entity == "official":
             return self._send_api(api.create_official(
                 b.get("name"), b.get("home_club_id"), actor_id))
