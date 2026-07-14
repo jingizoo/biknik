@@ -5610,6 +5610,11 @@ function gateChrome() {
   // manage_arena is the one permission both League Admin and Arena Manager
   // hold, and it's the entry point for all three import types.
   toggle('.tab[data-tab="import"]', hasPerm("manage_arena"));
+  // Setup (#233 B2a review r2): a role with neither manage_setup nor
+  // manage_arena has nothing to manage there — the tab itself isn't a
+  // dead end (setupCard/renderSetupHierarchy already hide per-entity
+  // actions), but it shouldn't be reachable at all for such a role.
+  toggle('.tab[data-tab="setup"]', hasPerm("manage_setup") || hasPerm("manage_arena"));
   // Reset wipes and reseeds all demo data — shown only in demo mode and only to
   // a League Admin (MANAGE_SETUP), matching the server, which hard-disables the
   // reset route in production (#215).
@@ -5718,6 +5723,10 @@ function setUser(user) {
   // now-invisible screen.
   if (["dashboard", "activity"].includes(view) && !canSeeOpsConsole()) view = "dashboard";
   if (["roster", "sheet"].includes(view) && !canReadAnyPrivateGame()) view = "dashboard";
+  // #233 B2a review r2: a no-reload persona switch off an operator role can
+  // otherwise leave a viewer/coach/player/official staring at a Setup screen
+  // whose tab gateChrome just hid out from under them.
+  if (view === "setup" && !(hasPerm("manage_setup") || hasPerm("manage_arena"))) view = "dashboard";
   if (isPlayerUser && view === "dashboard") view = "player_home";
   else if (isGuardianUser && view === "dashboard") view = "guardian_home";
   else if (isOfficialUser && view === "dashboard") view = "inbox";

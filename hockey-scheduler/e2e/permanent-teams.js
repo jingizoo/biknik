@@ -486,6 +486,96 @@ async function checkArenaManager(browser, viewport) {
   }
 }
 
+// #233 B2a review r2: a role with neither manage_setup nor manage_arena (a
+// Coach, here) must never be able to see or open the Setup tab — not from a
+// fresh sign-in, and not by a no-reload persona switch off an operator
+// identity that was already sitting on the Setup screen. Neither path may
+// request /api/v2/setup/overview or /api/v2/setup/hierarchy.
+async function checkNoSetupAccess(browser, viewport) {
+  const base = `http://${HOST}:${viewport.port}`;
+  const tag = viewport.label;
+  const server = spawn(
+    process.env.PYTHON || "python3",
+    ["-u", "-m", "hockey_scheduler.web.server", "--host", HOST, "--port", String(viewport.port)],
+    { cwd: BACKEND_DIR, stdio: ["ignore", "pipe", "pipe"] });
+  let serverOutput = "";
+  server.stdout.on("data", (d) => { serverOutput += d.toString(); });
+  server.stderr.on("data", (d) => { serverOutput += d.toString(); });
+
+  const context = await browser.newContext({ viewport: { width: viewport.width, height: viewport.height } });
+  const page = await context.newPage();
+  const errors = [];
+  page.on("pageerror", (e) => errors.push(`[pageerror] ${e.message}`));
+  page.on("console", (m) => { if (m.type() === "error") errors.push(`[console] ${m.text()}`); });
+  const setupRequests = [];
+  page.on("request", (r) => {
+    if (/\/api\/v2\/setup\/(overview|hierarchy)(\?|$)/.test(r.url())) setupRequests.push(r.url());
+  });
+  const fail = (msg) => { throw new Error(`[no-setup-access/${tag}] ${msg}`); };
+
+  try {
+    await waitForServer(`${base}/api/health`, READY_TIMEOUT_MS);
+    await page.goto(base, { waitUntil: "domcontentloaded" });
+    await page.waitForSelector("#content > *", { timeout: 10000 });
+    // Seed the "coach" persona (a fresh boot only has "admin" — see
+    // checkArenaManager above) while still the auto-logged-in League Admin.
+    const loadStatus = await page.evaluate(() => fetch("/api/demo/load", {
+      method: "POST", credentials: "same-origin",
+      headers: { "Content-Type": "application/json" }, body: "{}",
+    }).then((r) => r.status));
+    if (loadStatus !== 200) fail(`demo load (as admin) failed (status ${loadStatus})`);
+
+    // 1) A fresh sign-in as Coach never sees the Setup tab at all.
+    await page.reload({ waitUntil: "domcontentloaded" });
+    await page.waitForSelector("#content > *", { timeout: 10000 });
+    const loginStatus = await page.evaluate(() => fetch("/api/auth/login", {
+      method: "POST", credentials: "same-origin",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username: "coach", password: "demo" }),
+    }).then((r) => r.status));
+    if (loginStatus !== 200) fail(`coach login failed (status ${loginStatus})`);
+    await page.reload({ waitUntil: "domcontentloaded" });
+    await page.waitForSelector("#content > *", { timeout: 10000 });
+    if (await page.isVisible('.tab[data-tab="setup"]'))
+      fail(`Setup tab is visible for a fresh Coach sign-in`);
+
+    // 2) An operator switches (no reload) to Coach while already on Setup —
+    // the view must bounce off, the tab must hide, and no further v2 setup
+    // read may fire.
+    const adminLoginStatus = await page.evaluate(() => fetch("/api/auth/login", {
+      method: "POST", credentials: "same-origin",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username: "admin", password: "demo" }),
+    }).then((r) => r.status));
+    if (adminLoginStatus !== 200) fail(`admin re-login failed (status ${adminLoginStatus})`);
+    await page.reload({ waitUntil: "domcontentloaded" });
+    await page.waitForSelector("#content > *", { timeout: 10000 });
+    await page.click('.tab[data-tab="setup"]');
+    await page.waitForSelector(".setup-trees, .setup-card", { timeout: 10000 });
+    if ((await page.evaluate(() => document.body.dataset.view)) !== "setup")
+      fail(`did not actually land on the Setup view as League Admin`);
+
+    setupRequests.length = 0;  // only count requests fired AFTER the switch below
+    const sel = page.locator("#role-switch");
+    await sel.selectOption({ label: "Coach" });
+    await page.waitForFunction(() => document.body.dataset.view !== "setup", null, { timeout: 10000 });
+    // Give any in-flight fetch a moment to land before checking the log.
+    await page.waitForTimeout(500);
+    if (await page.isVisible('.tab[data-tab="setup"]'))
+      fail(`Setup tab still visible after switching to Coach`);
+    if (setupRequests.length)
+      fail(`v2 setup read(s) fired after switching to a non-operator role: ${JSON.stringify(setupRequests)}`);
+
+    if (errors.length) fail(`console/page errors:\n${errors.join("\n")}`);
+    console.log(`[no-setup-access/${tag}] OK — Coach never sees/keeps the Setup tab, no v2 setup reads.`);
+  } catch (error) {
+    throw new Error(`${error.message}\n--- demo server output ---\n${serverOutput}`);
+  } finally {
+    await context.close();
+    await stopServer(server);
+  }
+}
+
 async function main() {
   let browser;
   try {
@@ -493,6 +583,7 @@ async function main() {
       process.env.SMOKE_CHROMIUM_PATH ? { executablePath: process.env.SMOKE_CHROMIUM_PATH } : {});
     for (const viewport of VIEWPORTS) await checkViewport(browser, viewport);
     for (const viewport of VIEWPORTS) await checkArenaManager(browser, viewport);
+    for (const viewport of VIEWPORTS) await checkNoSetupAccess(browser, viewport);
     console.log("Permanent-teams + competition-terminology browser journey passed.");
   } catch (error) {
     console.error("Permanent-teams + competition-terminology browser journey FAILED.");
