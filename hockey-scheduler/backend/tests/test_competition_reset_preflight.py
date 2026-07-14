@@ -233,9 +233,53 @@ class CompetitionResetPreflightTest(unittest.TestCase):
                 found = find_underivable_registration_leagues(store.conn)
                 self.assertEqual([r["registration_id"] for r in found], ["r_x"])
                 self.assertEqual(found[0]["reason"], "cross_season_division")
+                # The diagnostic carries the division's actual Level id, not None.
+                self.assertEqual(found[0]["level_id"], "l_b")
                 with self.assertRaises(MigrationDataError) as ctx:
                     assert_competition_reset_ready(store.conn)
-                self.assertIn("r_x", str(ctx.exception))
+                msg = str(ctx.exception)
+                self.assertIn("r_x", msg)
+                self.assertIn("level=l_b", msg)
+                self.assertIn("leagues_in_season=1", msg)  # s_a has the sole level l_a
+
+    def test_registration_via_division_with_dangling_level_is_reported(self):
+        for label, url in _sql_backends():
+            with self.subTest(backend=label):
+                store = _fresh(url)
+                _season(store, "s1")
+                _level(store, "l1", "s1")  # season has a sole league…
+                _division(store, "d_dl", "s1", level_id="ghost")  # …div's level dangles
+                _registration(store, "r_dl", "s1", division_id="d_dl")
+                found = find_underivable_registration_leagues(store.conn)
+                self.assertEqual([r["registration_id"] for r in found], ["r_dl"])
+                self.assertEqual(found[0]["reason"], "dangling_level")
+                self.assertEqual(found[0]["level_id"], "ghost")
+                with self.assertRaises(MigrationDataError) as ctx:
+                    assert_competition_reset_ready(store.conn)
+                msg = str(ctx.exception)
+                self.assertIn("r_dl", msg)
+                self.assertIn("reason=dangling_level", msg)
+
+    def test_registration_via_division_with_cross_season_level_is_reported(self):
+        for label, url in _sql_backends():
+            with self.subTest(backend=label):
+                store = _fresh(url)
+                _season(store, "s1")
+                _level(store, "l1", "s1")   # s1's sole league
+                _season(store, "s2")
+                _level(store, "l2", "s2")   # a level belonging to another season
+                _division(store, "d_cl", "s1", level_id="l2")  # same-season div, cross-season level
+                _registration(store, "r_cl", "s1", division_id="d_cl")
+                found = find_underivable_registration_leagues(store.conn)
+                self.assertEqual([r["registration_id"] for r in found], ["r_cl"])
+                self.assertEqual(found[0]["reason"], "cross_season_level")
+                self.assertEqual(found[0]["level_id"], "l2")
+                with self.assertRaises(MigrationDataError) as ctx:
+                    assert_competition_reset_ready(store.conn)
+                msg = str(ctx.exception)
+                self.assertIn("r_cl", msg)
+                self.assertIn("level=l2", msg)
+                self.assertIn("cross_season_level", msg)
 
     # -- diagnostics + read-only guarantee ----------------------------------
     def test_abort_text_includes_reason_and_parent_ids(self):

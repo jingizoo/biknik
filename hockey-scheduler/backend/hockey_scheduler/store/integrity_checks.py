@@ -269,7 +269,10 @@ def find_underivable_registration_leagues(conn):
     for row in cur.fetchall():
         did = row["division_id"]
         div_level_id = row["div_level_id"]
-        level_id = None
+        # Report the Division's actual Level id in every diagnostic (None only
+        # when there is no Division or the Division carries no Level), regardless
+        # of which reason branch fires.
+        level_id = div_level_id
         if not row["season_exists"]:
             reason = "missing_season"
         elif did is not None and row["div_season"] is None:
@@ -279,7 +282,6 @@ def find_underivable_registration_leagues(conn):
         elif did is not None and div_level_id is not None:
             # The (same-Season) Division carries a Level — that Level must itself
             # exist and belong to this Season for a deterministic derivation.
-            level_id = div_level_id
             if row["div_level_season"] is None:
                 reason = "dangling_level"
             elif row["div_level_season"] != row["season_id"]:
