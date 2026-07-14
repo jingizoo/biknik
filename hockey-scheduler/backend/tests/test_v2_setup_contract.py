@@ -112,7 +112,7 @@ class V2SetupContractTest(unittest.TestCase):
 
         # league (the grouping): season_id.
         league = self._v2(c, "league",
-                         {"season_id": season["id"], "name": "Diamond",
+                         {"season_id": season["id"], "name": "Adult League",
                           "sort_order": 1})
         self.assertEqual(set(league), LEAGUE_KEYS, league)
         self.assertEqual(league["season_id"], season["id"])
@@ -121,7 +121,7 @@ class V2SetupContractTest(unittest.TestCase):
         # division: parented by league_id (canonical), NOT level_id; season
         # derived from the league.
         division = self._v2(c, "division",
-                           {"league_id": league["id"], "name": "Div A",
+                           {"league_id": league["id"], "name": "Gold",
                             "age_group": "adult"})
         self.assertEqual(set(division), DIVISION_KEYS, division)
         self.assertEqual(division["league_id"], league["id"])

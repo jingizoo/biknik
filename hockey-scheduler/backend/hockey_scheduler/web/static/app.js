@@ -593,9 +593,11 @@ const SETUP_ENTITIES = [
       { id: "f-season-league", label: "Program", type: "select", required: true, ofNoun: "league",
         options: (ov) => (ov.programs || []).map((l) => [l.id, l.name]) },
       { id: "f-season", label: "Season name", required: true, placeholder: "e.g. 2027–28" }] },
-  // League (#233): the season-specific competitive grouping (e.g. Diamond,
-  // Platinum). Internally still the "level" entity/key/noun (v1 API frozen) —
-  // only the display noun changes.
+  // League (#233): the season-specific competitive grouping (e.g. Adult
+  // League, Junior League). Internally still the "level" entity/key/noun (v1
+  // API frozen) — only the display noun changes. Gold/Silver/Diamond etc. are
+  // DIVISIONS *within* a League, never Leagues themselves (issue #245 — the
+  // client confirmed this after B2b, correcting an earlier reversed example).
   { key: "level", title: "Leagues", icon: "🎚️", noun: "level", displayNoun: "league",
     perm: "manage_setup",
     list: (ov) => (ov.leagues || []).map((lv) => ({
@@ -603,8 +605,10 @@ const SETUP_ENTITIES = [
     fields: [
       { id: "f-level-season", label: "Season", type: "select", required: true, ofNoun: "season",
         options: (ov) => (ov.seasons || []).map((s) => [s.id, s.name]) },
-      { id: "f-level", label: "League name", required: true, placeholder: "e.g. Diamond" },
+      { id: "f-level", label: "League name", required: true, placeholder: "e.g. Adult League" },
       { id: "f-level-sort", label: "Sort order (optional)", type: "number", placeholder: "e.g. 1" }] },
+  // Division (#245): the optional split WITHIN a League (e.g. Gold, Silver,
+  // Diamond) — never a League example itself.
   { key: "division", title: "Divisions", icon: "🏅", noun: "division", perm: "manage_setup",
     list: (ov) => (ov.divisions || []).map((d) => ({
       title: d.name,
@@ -613,7 +617,7 @@ const SETUP_ENTITIES = [
       // A v2 division is parented by a League (season is derived) — required.
       { id: "f-div-league", label: "League", type: "select", required: true, ofNoun: "level",
         options: (ov) => (ov.leagues || []).map((lv) => [lv.id, `${nameById(ov.seasons, lv.season_id)} · ${lv.name}`]) },
-      { id: "f-div", label: "Division name", required: true, placeholder: "e.g. U14" },
+      { id: "f-div", label: "Division name", required: true, placeholder: "e.g. Gold" },
       { id: "f-div-age", label: "Age group", placeholder: "e.g. U14 (optional)" }] },
   { key: "club", title: "Clubs", icon: "🏒", noun: "club", perm: "manage_setup",
     delKind: "club",  // a club with no team can be deleted from here (#215)

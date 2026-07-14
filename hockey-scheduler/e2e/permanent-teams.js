@@ -84,6 +84,7 @@ async function checkViewport(browser, viewport) {
         title: (d.querySelector(".drawer-title") || {}).textContent || "",
         labels: [...d.querySelectorAll("label")].map((l) => l.textContent.trim()),
         notes: [...d.querySelectorAll(".drawer-note")].map((n) => n.textContent.trim()),
+        placeholders: [...d.querySelectorAll("input[placeholder]")].map((i) => i.placeholder),
       };
     });
   };
@@ -165,6 +166,20 @@ async function checkViewport(browser, viewport) {
       fail(`Program drawer operator field still says "facility owner" (got ${JSON.stringify(programDrawer.labels)})`);
     await closeDrawer();
 
+    // 2b) League/Division example copy (issue #245): the client confirmed
+    //     Gold/Silver/Diamond are DIVISIONS within a League, never Leagues
+    //     themselves — the League name field must never suggest a division
+    //     example, and the Division name field must use one.
+    const levelDrawer = await openDrawer("level");
+    if (levelDrawer.placeholders.some((p) => /diamond|platinum|gold|silver/i.test(p)))
+      fail(`League name field placeholder suggests a Division example (got ${JSON.stringify(levelDrawer.placeholders)})`);
+    await closeDrawer();
+
+    const divisionDrawer = await openDrawer("division");
+    if (!divisionDrawer.placeholders.some((p) => /gold|silver|diamond/i.test(p)))
+      fail(`Division name field placeholder is not a Gold/Silver/Diamond example (got ${JSON.stringify(divisionDrawer.placeholders)})`);
+    await closeDrawer();
+
     // 3) Now build a program → season → league(grouping) → division, plus a
     //    club → permanent team, through the v1 API (still POST
     //    /api/setup/{league,season,level,division,club,team}). The team is
@@ -178,10 +193,10 @@ async function checkViewport(browser, viewport) {
       })).json();
       const league = await post("/api/setup/league", { name: "Permanent League" });
       const season = await post("/api/setup/season", { league_id: league.id, name: "2026-27" });
-      const level = await post("/api/setup/level", { season_id: season.id, name: "Diamond" });
+      const level = await post("/api/setup/level", { season_id: season.id, name: "Adult League" });
       // A second grouping League in the same season, so the Division-move
       // dialog (below) has a real target to move to (#233 B2a review r1).
-      const level2 = await post("/api/setup/level", { season_id: season.id, name: "Platinum" });
+      const level2 = await post("/api/setup/level", { season_id: season.id, name: "Junior League" });
       const division = await post("/api/setup/division",
         { season_id: season.id, level_id: level.id, name: "U14" });
       const club = await post("/api/setup/club", { name: "Perma Club" });
