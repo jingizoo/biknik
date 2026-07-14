@@ -43,6 +43,22 @@ def _fresh(url):
     return store
 
 
+def _teardown(store):
+    """Unconditionally return the (possibly SHARED, e.g. Postgres) database to a
+    clean canonical baseline before closing (#233 C1b item 8).
+
+    A downgrade/abort test leaves the pre-028 shape behind — ``levels`` present,
+    no ``programs`` — and on a shared database that legacy collision would persist
+    into the next test. ``reset_schema()`` drops every canonical table AND the
+    legacy ``levels`` table, then re-migrates to canonical, so file/CI ordering
+    can never leave the database dirty. Runs in a ``finally``, so it happens even
+    when the test body raised."""
+    try:
+        store.reset_schema()
+    finally:
+        store.close()
+
+
 def _cols(store, table):
     cur = store.conn.cursor()
     if store.backend == "sqlite":
@@ -130,8 +146,10 @@ def _seed_pre028_clean(store):
               ("r_nodiv", "s1", "tm2", None))
         _exec(store, "INSERT INTO games (id, division_id) VALUES (?, ?)",
               ("g_div", "d_lv"))
-        _exec(store, "INSERT INTO games (id, division_id) VALUES (?, ?)",
-              ("g_nodiv", None))
+        # A division-less game derives its league from its Season's sole league
+        # (#233 C1b item 6): give it a season so the backfill is deterministic.
+        _exec(store, "INSERT INTO games (id, season_id, division_id) "
+              "VALUES (?, ?, ?)", ("g_nodiv", "s1", None))
 
 
 class FreshInstallSchemaTest(unittest.TestCase):
@@ -152,7 +170,7 @@ class FreshInstallSchemaTest(unittest.TestCase):
                     self.assertIn("league_id", _cols(store, "games"), label)
                     self.assertIn(_VERSION, store.migration_status()["applied"], label)
                 finally:
-                    store.close()
+                    _teardown(store)
 
 
 class HistoricalUpgradeTest(unittest.TestCase):
@@ -208,13 +226,14 @@ class HistoricalUpgradeTest(unittest.TestCase):
                              ("r_nodiv",))["league_id"], "lg1", label)
 
                     # Game league_id backfilled from its division; a division-less
-                    # game stays NULL.
+                    # game is backfilled from its Season's sole league (#233 C1b
+                    # item 6), never left unscoped.
                     self.assertEqual(
                         _one(store, "SELECT league_id FROM games WHERE id = ?",
                              ("g_div",))["league_id"], "lg1", label)
-                    self.assertIsNone(
+                    self.assertEqual(
                         _one(store, "SELECT league_id FROM games WHERE id = ?",
-                             ("g_nodiv",))["league_id"], label)
+                             ("g_nodiv",))["league_id"], "lg1", label)
 
                     # No rows lost.
                     for table, n in (("programs", 1), ("seasons", 1), ("leagues", 1),
@@ -224,7 +243,162 @@ class HistoricalUpgradeTest(unittest.TestCase):
                             _one(store, f"SELECT COUNT(*) AS n FROM {table}")["n"], n,
                             f"{label}:{table}")
                 finally:
-                    store.close()
+                    _teardown(store)
+
+
+_GATE_TABLES = ("seasons", "teams", "levels", "divisions",
+                "season_team_registrations", "games")
+
+
+def _count(store, table):
+    return _one(store, f"SELECT COUNT(*) AS n FROM {table}")["n"]
+
+
+# Each case seeds ONE offending pre-028 row (on an otherwise C1a-clean dataset)
+# that the C1b gate — the rest of migration 028's rename/reparent/backfill —
+# must catch. (label, seed(store), [expected substrings in the abort message]).
+def _seed_season_missing_program(store):
+    _exec(store, "INSERT INTO seasons (id, league_id, name) VALUES (?, ?, ?)",
+          ("s_bad", "ghost_umbrella", "Orphan Season"))
+
+
+def _seed_team_missing_program(store):
+    _exec(store, "INSERT INTO teams (id, name, league_id) VALUES (?, ?, ?)",
+          ("t_bad", "Orphan Team", "ghost_umbrella"))
+
+
+def _seed_promoted_league_missing_season(store):
+    _exec(store, "INSERT INTO levels (id, season_id, name) VALUES (?, ?, ?)",
+          ("lv_bad", "ghost_season", "Orphan League"))
+
+
+def _seed_game_dangling_division(store):
+    _exec(store, "INSERT INTO games (id, division_id) VALUES (?, ?)",
+          ("g_bad", "ghost_division"))
+
+
+def _seed_game_cross_season_division(store):
+    _exec(store, "INSERT INTO leagues (id, name) VALUES (?, ?)", ("prog1", "P1"))
+    _exec(store, "INSERT INTO seasons (id, league_id, name) VALUES (?, ?, ?)",
+          ("s1", "prog1", "S1"))
+    _exec(store, "INSERT INTO seasons (id, league_id, name) VALUES (?, ?, ?)",
+          ("s2", "prog1", "S2"))
+    _exec(store, "INSERT INTO levels (id, season_id, name) VALUES (?, ?, ?)",
+          ("l1", "s1", "L1"))
+    _exec(store, "INSERT INTO divisions (id, season_id, name, level_id) "
+          "VALUES (?, ?, ?, ?)", ("d1", "s1", "D1", "l1"))
+    _exec(store, "INSERT INTO games (id, season_id, division_id) "
+          "VALUES (?, ?, ?)", ("g_x", "s2", "d1"))  # division from another season
+
+
+def _seed_game_missing_season(store):
+    _exec(store, "INSERT INTO games (id, season_id, division_id) "
+          "VALUES (?, ?, ?)", ("g_ns", "ghost_season", None))
+
+
+def _seed_game_ambiguous_season(store):
+    _exec(store, "INSERT INTO leagues (id, name) VALUES (?, ?)", ("prog1", "P1"))
+    _exec(store, "INSERT INTO seasons (id, league_id, name) VALUES (?, ?, ?)",
+          ("s1", "prog1", "S1"))
+    _exec(store, "INSERT INTO levels (id, season_id, name) VALUES (?, ?, ?)",
+          ("la", "s1", "La"))
+    _exec(store, "INSERT INTO levels (id, season_id, name) VALUES (?, ?, ?)",
+          ("lb", "s1", "Lb"))
+    _exec(store, "INSERT INTO games (id, season_id, division_id) "
+          "VALUES (?, ?, ?)", ("g_amb", "s1", None))  # season has 2 leagues
+
+
+_C1B_GATE_CASES = [
+    ("season_missing_program", _seed_season_missing_program,
+     ["season s_bad", "missing_program"]),
+    ("team_missing_program", _seed_team_missing_program,
+     ["team t_bad", "missing_program"]),
+    ("promoted_league_missing_season", _seed_promoted_league_missing_season,
+     ["league lv_bad", "missing_season"]),
+    ("game_dangling_division", _seed_game_dangling_division,
+     ["game g_bad", "dangling_division"]),
+    ("game_cross_season_division", _seed_game_cross_season_division,
+     ["game g_x", "cross_season_division"]),
+    ("game_missing_season", _seed_game_missing_season,
+     ["game g_ns", "missing_season"]),
+    ("game_ambiguous_season", _seed_game_ambiguous_season,
+     ["game g_amb", "no_single_league"]),
+]
+
+
+class C1bGateAbortTest(unittest.TestCase):
+    """The combined C1b gate (assert_competition_reset_ready_c1b) — registered as
+    028's pre-migration check — aborts every rename/reparent/backfill case C1a
+    doesn't cover, naming the offending row, and leaves the pre-028 data and
+    schema byte-for-byte unchanged (dual-backend, no mutation)."""
+
+    def test_each_c1b_case_aborts_without_mutation(self):
+        for case, seed, expected in _C1B_GATE_CASES:
+            for label, url in _sql_backends():
+                with self.subTest(case=case, backend=label):
+                    store = _fresh(url)
+                    try:
+                        _downgrade_028(store)
+                        with store.transaction():
+                            seed(store)
+                        counts = {t: _count(store, t) for t in _GATE_TABLES}
+
+                        with self.assertRaises(MigrationDataError) as ctx:
+                            migrate(store.conn, store.dialect)  # runs the gate
+                        msg = str(ctx.exception)
+                        for token in expected:
+                            self.assertIn(token, msg, f"{case}/{label}: {msg}")
+
+                        # No mutation: schema still pre-028, 028 not recorded,
+                        # every row count unchanged.
+                        self.assertTrue(_table_exists(store, "levels"), case)
+                        self.assertFalse(_table_exists(store, "programs"), case)
+                        self.assertNotIn(
+                            _VERSION, store.migration_status()["applied"], case)
+                        self.assertEqual(
+                            {t: _count(store, t) for t in _GATE_TABLES}, counts,
+                            case)
+                    finally:
+                        _teardown(store)
+
+
+class GameLeagueBackfillTest(unittest.TestCase):
+    """Migration 028 backfills every Game's competition league_id: from its
+    Division→League when it has a division, else from its Season's sole League
+    (#233 C1b item 6). Dual-backend."""
+
+    def test_division_backed_and_division_less_games_are_scoped(self):
+        for label, url in _sql_backends():
+            with self.subTest(backend=label):
+                store = _fresh(url)
+                try:
+                    _downgrade_028(store)
+                    with store.transaction():
+                        _exec(store, "INSERT INTO leagues (id, name) VALUES (?, ?)",
+                              ("prog1", "P1"))
+                        _exec(store, "INSERT INTO seasons (id, league_id, name) "
+                              "VALUES (?, ?, ?)", ("s1", "prog1", "S1"))
+                        _exec(store, "INSERT INTO levels (id, season_id, name) "
+                              "VALUES (?, ?, ?)", ("lg1", "s1", "Lg1"))
+                        _exec(store, "INSERT INTO divisions "
+                              "(id, season_id, name, level_id) VALUES (?, ?, ?, ?)",
+                              ("d1", "s1", "D1", "lg1"))
+                        # division-backed: league via Division→League.
+                        _exec(store, "INSERT INTO games (id, season_id, division_id) "
+                              "VALUES (?, ?, ?)", ("g_div", "s1", "d1"))
+                        # division-less, single-league season: league via Season.
+                        _exec(store, "INSERT INTO games (id, season_id, division_id) "
+                              "VALUES (?, ?, ?)", ("g_nodiv", "s1", None))
+                    migrate(store.conn, store.dialect)  # gate passes; 028 applies
+                    self.assertIn(_VERSION, store.migration_status()["applied"], label)
+                    self.assertEqual(
+                        _one(store, "SELECT league_id FROM games WHERE id = ?",
+                             ("g_div",))["league_id"], "lg1", label)
+                    self.assertEqual(
+                        _one(store, "SELECT league_id FROM games WHERE id = ?",
+                             ("g_nodiv",))["league_id"], "lg1", label)
+                finally:
+                    _teardown(store)
 
 
 class AmbiguityGateTest(unittest.TestCase):
@@ -264,7 +438,7 @@ class AmbiguityGateTest(unittest.TestCase):
                         _one(store, "SELECT COUNT(*) AS n FROM divisions")["n"], 1,
                         label)
                 finally:
-                    store.close()
+                    _teardown(store)
 
 
 if __name__ == "__main__":

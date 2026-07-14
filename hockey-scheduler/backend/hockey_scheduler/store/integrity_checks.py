@@ -333,3 +333,183 @@ def assert_competition_reset_ready(conn):
         f"division(s) and {len(reg_issues)} registration(s) cannot be "
         "deterministically reparented onto a same-Season League. Resolve these "
         "before upgrading — " + "; ".join(lines))
+
+
+# -- #233 Slice C1b — the rest of migration 028's rename/reparent/backfill -----
+#
+# C1a (above) validates only the Division and Registration reparent chain. C1b
+# also renames seasons.league_id -> program_id and teams.league_id -> program_id
+# (both pointing at the umbrella `leagues` row that becomes a `programs` row),
+# promotes `levels` -> `leagues`, and backfills every Game's competition
+# league_id. These checks validate the rest so migration 028 never leaves an
+# unscoped canonical row.
+#
+# They run against the PRE-028 schema: `leagues` is still the umbrella,
+# `seasons.league_id`/`teams.league_id` reference it, `levels` is the grouping
+# (promoted to `leagues` by 028), `divisions.level_id` references `levels`, and
+# neither games nor registrations carry a league_id yet. A non-null id is not
+# proof of a valid parent — these setup relationships have no DB foreign keys, so
+# a legacy row can carry a dangling reference. Pure SELECTs, portable across
+# SQLite/PostgreSQL, safe to re-run.
+
+
+def find_seasons_missing_program(conn):
+    """Seasons whose umbrella parent is gone (pre-028 ``seasons.league_id``).
+
+    A season carries a non-null ``league_id`` that references no ``leagues``
+    (umbrella) row — after the rename it would be a Program-less Season. Returns
+    ``[{season_id, program_id, reason: 'missing_program'}]`` (``program_id`` is
+    the offending pre-028 ``league_id`` value).
+    """
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT s.id AS season_id, s.league_id AS program_id "
+        "FROM seasons s "
+        "WHERE s.league_id IS NOT NULL "
+        "  AND NOT EXISTS (SELECT 1 FROM leagues lg WHERE lg.id = s.league_id)")
+    return sorted(
+        ({"season_id": r["season_id"], "program_id": r["program_id"],
+          "reason": "missing_program"} for r in cur.fetchall()),
+        key=lambda x: x["season_id"])
+
+
+def find_teams_missing_program(conn):
+    """Teams whose umbrella owner is gone (pre-028 ``teams.league_id``).
+
+    A team carries a non-null ``league_id`` that references no ``leagues``
+    (umbrella) row — after the rename it would be a Program-less Team. Returns
+    ``[{team_id, program_id, reason: 'missing_program'}]``.
+    """
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT t.id AS team_id, t.league_id AS program_id "
+        "FROM teams t "
+        "WHERE t.league_id IS NOT NULL "
+        "  AND NOT EXISTS (SELECT 1 FROM leagues lg WHERE lg.id = t.league_id)")
+    return sorted(
+        ({"team_id": r["team_id"], "program_id": r["program_id"],
+          "reason": "missing_program"} for r in cur.fetchall()),
+        key=lambda x: x["team_id"])
+
+
+def find_promoted_leagues_missing_season(conn):
+    """Promoted Leagues (pre-028 ``levels``) whose Season parent is gone.
+
+    A ``levels`` row carries a non-null ``season_id`` that references no
+    ``seasons`` row — after promotion it would be a Season-less League. Returns
+    ``[{league_id, season_id, reason: 'missing_season'}]`` (``league_id`` is the
+    pre-028 ``levels.id``).
+    """
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT lv.id AS league_id, lv.season_id AS season_id "
+        "FROM levels lv "
+        "WHERE lv.season_id IS NOT NULL "
+        "  AND NOT EXISTS (SELECT 1 FROM seasons s WHERE s.id = lv.season_id)")
+    return sorted(
+        ({"league_id": r["league_id"], "season_id": r["season_id"],
+          "reason": "missing_season"} for r in cur.fetchall()),
+        key=lambda x: x["league_id"])
+
+
+def find_underivable_game_leagues(conn):
+    """Games whose competition League can't be derived for migration 028's backfill.
+
+    Migration 028 derives a game's ``league_id`` from its Division→League when the
+    game has a division, else from the game's Season sole League. This reports a
+    game where that derivation is invalid or ambiguous, with a ``reason``:
+      - ``dangling_division``     — its non-null ``division_id`` references no Division;
+      - ``cross_season_division`` — it has a Season and its Division belongs to a
+        different Season;
+      - ``missing_season``        — it is division-less and its ``season_id`` is
+        null or references no Season (no League to derive from);
+      - ``no_single_league``      — it is division-less and its Season has 0 or >1
+        Leagues (``levels``), so there is no sole League to attach it to.
+    A division-backed game whose Division resolves in the game's Season (or which
+    has no Season to cross-check) derives via that Division — the Division's own
+    reparent is validated by the C1a division check. Returns a list of dicts:
+    ``{game_id, season_id, division_id, level_count, reason}``.
+    """
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT g.id AS game_id, g.season_id AS season_id, "
+        "g.division_id AS division_id, "
+        "(SELECT COUNT(*) FROM seasons s WHERE s.id = g.season_id) AS season_exists, "
+        "(SELECT COUNT(*) FROM levels lv WHERE lv.season_id = g.season_id) "
+        "AS level_count, "
+        "(SELECT d.season_id FROM divisions d WHERE d.id = g.division_id) "
+        "AS div_season "
+        "FROM games g")
+    issues = []
+    for row in cur.fetchall():
+        did = row["division_id"]
+        sid = row["season_id"]
+        if did is not None:
+            if row["div_season"] is None:
+                reason = "dangling_division"
+            elif sid is not None and row["div_season"] != sid:
+                reason = "cross_season_division"
+            else:
+                continue  # derives via a same-Season (or Season-less) Division
+        elif sid is None or not row["season_exists"]:
+            reason = "missing_season"
+        elif row["level_count"] != 1:
+            reason = "no_single_league"
+        else:
+            continue  # derives via the Season's sole League
+        issues.append({"game_id": row["game_id"], "season_id": sid,
+                       "division_id": did, "level_count": row["level_count"],
+                       "reason": reason})
+    return sorted(issues, key=lambda x: x["game_id"])
+
+
+def assert_competition_reset_ready_c1b(conn):
+    """Abort migration 028 (#233 Slice C1b) if ANY row it renames/reparents/
+    backfills cannot be mapped deterministically onto the canonical model.
+
+    A superset of :func:`assert_competition_reset_ready` (C1a's Division +
+    Registration reparent): it additionally validates the Season/Team umbrella
+    parents, the promoted-League Season parent, and every Game's derived League.
+    Read-only — raises :class:`MigrationDataError` with bounded, row-level
+    diagnostics (id + parent id + reason) and leaves all data unchanged.
+    """
+    # C1a first (Division + Registration reparent), so its detailed diagnostics
+    # surface exactly as before when they are the problem.
+    assert_competition_reset_ready(conn)
+
+    season_issues = find_seasons_missing_program(conn)
+    team_issues = find_teams_missing_program(conn)
+    league_issues = find_promoted_leagues_missing_season(conn)
+    game_issues = find_underivable_game_leagues(conn)
+    if not (season_issues or team_issues or league_issues or game_issues):
+        return
+
+    lines = []
+    for s in season_issues[:20]:
+        lines.append(f"season {s['season_id']} (program={s['program_id']}, "
+                     f"reason={s['reason']})")
+    if len(season_issues) > 20:
+        lines.append(f"(+{len(season_issues) - 20} more season(s))")
+    for t in team_issues[:20]:
+        lines.append(f"team {t['team_id']} (program={t['program_id']}, "
+                     f"reason={t['reason']})")
+    if len(team_issues) > 20:
+        lines.append(f"(+{len(team_issues) - 20} more team(s))")
+    for lg in league_issues[:20]:
+        lines.append(f"league {lg['league_id']} (season={lg['season_id']}, "
+                     f"reason={lg['reason']})")
+    if len(league_issues) > 20:
+        lines.append(f"(+{len(league_issues) - 20} more league(s))")
+    for g in game_issues[:20]:
+        lines.append(f"game {g['game_id']} (season={g['season_id']}, "
+                     f"division={g['division_id']}, "
+                     f"leagues_in_season={g['level_count']}, "
+                     f"reason={g['reason']})")
+    if len(game_issues) > 20:
+        lines.append(f"(+{len(game_issues) - 20} more game(s))")
+    raise MigrationDataError(
+        f"Cannot reset the competition model (#233 Slice C1b): "
+        f"{len(season_issues)} season(s), {len(team_issues)} team(s), "
+        f"{len(league_issues)} league(s), and {len(game_issues)} game(s) "
+        "reference a missing parent or cannot be deterministically scoped onto a "
+        "same-Season League. Resolve these before upgrading — " + "; ".join(lines))

@@ -80,19 +80,14 @@ def _jsonify(value):
     return value
 
 
-# Domain types that gained an internal competition ``league_id`` in #233 Slice
-# C1b which the v1 API never exposed — it is stripped from the boundary payload
-# so v1 game/registration responses stay byte-identical.
-_V1_HIDDEN_LEAGUE_ID = frozenset({"Game", "SeasonTeamRegistration"})
-
-
 def _serialize(obj) -> dict:
-    """Convert a domain dataclass to a fully JSON-safe dict."""
-    d = _jsonify(obj)
-    if is_dataclass(obj) and isinstance(d, dict) \
-            and type(obj).__name__ in _V1_HIDDEN_LEAGUE_ID:
-        d.pop("league_id", None)
-    return d
+    """Convert a domain dataclass to a fully JSON-safe canonical dict.
+
+    Purely canonical (#233 Slice C1b): a direct facade call returns registration
+    and game dicts WITH the competition ``league_id``. The v1 HTTP boundary drops
+    it via ``v1_setup_adapter.registration_to_v1`` / ``game_to_v1`` so the legacy
+    contract is unchanged, while non-v1 consumers see the canonical field."""
+    return _jsonify(obj)
 
 
 def _group(rows, attr):
@@ -2556,7 +2551,8 @@ class ApiService:
         # v1 boundary (#233 C1b): this backs the v1 read route
         # GET /api/setup/leagues/{id}/teams (and the frontend's permanent-team
         # panel), so each team row is mapped back to its legacy key
-        # (program_id → league_id) to keep the v1 contract byte-identical.
+        # (program_id → league_id) to keep the v1 contract's same JSON
+        # keys/shape and values.
         rows = [team_to_v1(_serialize(t))
                 for t in self.store.teams_for_program(program_id)]
         return {"teams": rows}

@@ -8,8 +8,8 @@ invariants the refinement calls out:
   * An existing scoped user still resolves to (and sees) exactly the same
     records — the tenancy layer keeps its own ``league_id`` vocabulary while the
     canonical id value flowing in is the Program id.
-  * Session/scope payload shapes are byte-identical (the rename adds no scope
-    keys and renames none).
+  * Session/scope payload shapes keep the same keys/shape and values (the rename
+    adds no scope keys and renames none).
   * Canonical domain dataclasses expose the renamed field (``program_id``) and
     no longer carry the legacy name.
 """
@@ -27,7 +27,13 @@ from hockey_scheduler.domain import (
 from hockey_scheduler.domain.roles import (
     Permission, ROLE_LABELS, ROLE_PERMISSIONS, Role, permissions_for,
 )
+from hockey_scheduler.domain.errors import ValidationError
 from hockey_scheduler.services import SetupService
+from hockey_scheduler.services.league_scope import (
+    registered_team_ids_in_division,
+    require_slot_belongs_to_league,
+    slot_belongs_to_league,
+)
 from hockey_scheduler.store import InMemoryStore
 
 
@@ -123,11 +129,72 @@ class ScopedUserSeesSameRecordsTest(unittest.TestCase):
             {self.t1.id, self.t2.id})
 
 
+class TenancySeamUnchangedTest(unittest.TestCase):
+    """The tenancy/scheduling layer resolves scope through the ONE canonical
+    bridge (services/scope_bridge.py) after the rename, but keeps its own frozen
+    vocabulary. These exercise the ACTUAL scoped authorization decision and
+    record-visibility paths — not just a scheduler return key — proving the
+    behaviour and the ``league_id`` / ``league_organization_id`` result keys are
+    unchanged."""
+
+    def setUp(self):
+        self.store = InMemoryStore()
+        self.setup = SetupService(self.store, clock=FakeClock())
+        # Two programs under two owners, each with its own ice.
+        self.orgA = self.setup.create_organization("Owner A")
+        self.orgB = self.setup.create_organization("Owner B")
+        self.progA = self.setup.create_program(
+            "Program A", operator_organization_id=self.orgA.id)
+        self.progB = self.setup.create_program(
+            "Program B", operator_organization_id=self.orgB.id)
+        self.seasonA = self.setup.create_season(self.progA.id, "Fall A")
+        self.divA = self.setup.create_division(self.seasonA.id, "A")
+        club = self.setup.create_club("Club")
+        self.tA1 = self.setup.create_team(club.id, self.divA.id, "A1")
+        self.tA2 = self.setup.create_team(club.id, self.divA.id, "A2")
+        self.setup.register_team_for_season(self.seasonA.id, self.tA1.id, self.divA.id)
+        self.setup.register_team_for_season(self.seasonA.id, self.tA2.id, self.divA.id)
+        venueA = self.setup.create_venue("Arena A", league_id=self.progA.id)
+        rinkA = self.setup.create_rink(venueA.id, "Rink A")
+        self.slotA = self.setup.create_ice_slot(rinkA.id, _at(19), _at(20))
+        venueB = self.setup.create_venue("Arena B", league_id=self.progB.id)
+        rinkB = self.setup.create_rink(venueB.id, "Rink B")
+        self.slotB = self.setup.create_ice_slot(rinkB.id, _at(19), _at(20))
+
+    def test_authorization_decision_and_error_keys_unchanged(self):
+        # A same-scope slot is accepted; a cross-scope slot is rejected — the
+        # authorization decision flows through the bridge unchanged.
+        self.assertIsNotNone(
+            require_slot_belongs_to_league(self.store, self.slotA.id, self.progA.id))
+        self.assertTrue(
+            slot_belongs_to_league(self.store, self.slotA.id, self.progA.id))
+        self.assertFalse(
+            slot_belongs_to_league(self.store, self.slotB.id, self.progA.id))
+        # The rejection's machine-readable details keep the tenancy vocabulary:
+        # the result keys are still ``league_id`` (the scope id flowing in is the
+        # Program id) and ``league_organization_id`` — never program_id /
+        # operator_organization_id.
+        with self.assertRaises(ValidationError) as ctx:
+            require_slot_belongs_to_league(self.store, self.slotB.id, self.progA.id)
+        details = ctx.exception.details
+        self.assertEqual(details["reason"], "cross_league_slot")
+        self.assertEqual(details["expected_league_id"], self.progA.id)
+        self.assertNotIn("program_id", details)
+        self.assertNotIn("operator_organization_id", details)
+
+    def test_record_visibility_through_scope_is_unchanged(self):
+        # A league-scoped read still resolves the scope from the (now Program) id
+        # and returns exactly the division's registered teams — no more, no less.
+        self.assertEqual(
+            registered_team_ids_in_division(self.store, self.divA.id),
+            {self.tA1.id, self.tA2.id})
+
+
 class SessionScopePayloadUnchangedTest(unittest.TestCase):
     """Creating and reading back a scoped account must preserve the exact
     scope-dict shape the rename must not touch."""
 
-    def test_coach_scope_shape_is_byte_identical(self):
+    def test_coach_scope_shape_is_unchanged(self):
         api = ApiService(self.store if hasattr(self, "store") else InMemoryStore())
         # A coach account bound to a team — the canonical scoped-user example.
         created = api.create_user_account(

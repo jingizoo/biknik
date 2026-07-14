@@ -74,7 +74,7 @@ from ..domain.enums import NotificationType
 from .db import connect
 from .db_errors import translate_db_exception
 from .integrity_checks import (
-    assert_competition_reset_ready,
+    assert_competition_reset_ready_c1b,
     assert_no_duplicate_active_ice_slots,
     assert_no_duplicate_result_games,
     assert_no_duplicate_roster_players,
@@ -317,7 +317,7 @@ _PRE_MIGRATION_CHECKS = {
     "025_result_game_fk": assert_result_games_exist,
     "026_result_game_not_null": assert_results_have_game,
     "027_roster_entry_fks": assert_roster_refs_exist,
-    "028_competition_reset": assert_competition_reset_ready,
+    "028_competition_reset": assert_competition_reset_ready_c1b,
 }
 
 
@@ -505,6 +505,15 @@ class SqlStore:
             try:
                 for spec in SPECS.values():
                     cur.execute(f"DROP TABLE IF EXISTS {spec.table}{cascade}")
+                # Legacy competition tables from a PRE-028 shape (#233 C1b): a
+                # historical/abort/downgrade test can reverse migration 028 on a
+                # SHARED database, leaving the umbrella `leagues`/grouping `levels`
+                # collision behind. SPECS already drops the canonical `programs`
+                # AND `leagues` (so the umbrella↔grouping name collision is
+                # covered), but `levels` is no longer a canonical table — drop it
+                # explicitly so a re-migrate rebuilds the canonical baseline
+                # cleanly and no stale legacy rows persist into the next test.
+                cur.execute(f"DROP TABLE IF EXISTS levels{cascade}")
                 cur.execute(f"DROP TABLE IF EXISTS counters{cascade}")
                 cur.execute(f"DROP TABLE IF EXISTS schema_migrations{cascade}")
             finally:

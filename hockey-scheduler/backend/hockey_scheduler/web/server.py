@@ -751,8 +751,14 @@ class Handler(BaseHTTPRequestHandler):
             # this season and in which division.
             if self._operator_only("/api/setup/player"):
                 return
-            return self._send_api(
-                api.list_season_team_registrations(mtr.group(1)))
+            # v1 boundary (#233 C1b): each registration carries the canonical
+            # competition league_id — drop it from every row so this read route's
+            # v1 shape is unchanged.
+            listed = api.list_season_team_registrations(mtr.group(1))
+            if isinstance(listed, dict) and "registrations" in listed:
+                listed = {**listed, "registrations": [
+                    _v1.registration_to_v1(r) for r in listed["registrations"]]}
+            return self._send_api(listed)
         if path == "/api/onboarding/status":
             # Guided onboarding progress for the Setup wizard (#174 PR C). It
             # aggregates the full setup hierarchy plus account/player onboarding
@@ -1772,19 +1778,24 @@ class Handler(BaseHTTPRequestHandler):
         # a season, reassign its division for that season, or remove it from the
         # season. All League-Admin (MANAGE_SETUP) via the /api/setup/ authz
         # catch-all; the actor is the server-resolved session user.
+        # v1 boundary (#233 C1b): a registration result carries the canonical
+        # competition league_id, which the v1 API never exposed — drop it here
+        # via _v1.registration_to_v1 so the v1 registration shape is unchanged.
         mr = re.match(r"^seasons/([^/]+)/team-registrations$", entity)
         if mr:
-            return self._send_api(api.register_team_for_season(
-                mr.group(1), b.get("team_id"), b.get("division_id") or None,
-                actor_id))
+            return self._send_api(_v1.registration_to_v1(
+                api.register_team_for_season(
+                    mr.group(1), b.get("team_id"), b.get("division_id") or None,
+                    actor_id)))
         ma = re.match(r"^season-team-registration/([^/]+)/assign-division$", entity)
         if ma:
-            return self._send_api(api.assign_season_team_division(
-                ma.group(1), b.get("division_id") or None, actor_id))
+            return self._send_api(_v1.registration_to_v1(
+                api.assign_season_team_division(
+                    ma.group(1), b.get("division_id") or None, actor_id)))
         mx = re.match(r"^season-team-registration/([^/]+)/remove$", entity)
         if mx:
-            return self._send_api(api.unregister_team_from_season(
-                mx.group(1), actor_id))
+            return self._send_api(_v1.registration_to_v1(
+                api.unregister_team_from_season(mx.group(1), actor_id)))
         # Safe destructive deletion (#215): /api/setup/<entity>/<id>/delete.
         # League-Admin only via the /api/setup MANAGE_SETUP catch-all; the actor
         # is the server-resolved session user. Each facade method runs a
@@ -1806,7 +1817,8 @@ class Handler(BaseHTTPRequestHandler):
             # v1 boundary (#233 C1b): the deleted record is returned serialized,
             # so canonical entities are mapped back to their legacy v1 shape.
             _to_v1 = {"league": _v1.program_to_v1, "season": _v1.season_to_v1,
-                      "division": _v1.division_to_v1, "team": _v1.team_to_v1}
+                      "division": _v1.division_to_v1, "team": _v1.team_to_v1,
+                      "game": _v1.game_to_v1}
             mapper = _to_v1.get(kind, lambda r: r)
             return self._send_api(mapper(deleter(md.group(2), actor_id)))
         # Season rollover (#180): copy a prior season's participation forward
@@ -1814,13 +1826,21 @@ class Handler(BaseHTTPRequestHandler):
         # season and an optional per-team target-division selection.
         mrf = re.match(r"^seasons/([^/]+)/roll-forward$", entity)
         if mrf:
-            return self._send_api(api.roll_forward_registrations(
+            rolled = api.roll_forward_registrations(
                 b.get("from_season_id"), mrf.group(1), b.get("selections"),
-                actor_id))
+                actor_id)
+            # v1 boundary (#233 C1b): each rolled-forward registration carries the
+            # canonical competition league_id — drop it from every one so the v1
+            # registration shape is unchanged. An error envelope passes through.
+            if isinstance(rolled, dict) and "registrations" in rolled:
+                rolled = {**rolled, "registrations": [
+                    _v1.registration_to_v1(r) for r in rolled["registrations"]]}
+            return self._send_api(rolled)
         # v1 boundary (#233 C1b): legacy request keys (organization_id, season
         # league_id, division level_id, team league_id) are read here and passed
         # to the canonical facade; canonical results are mapped back to legacy v1
-        # response keys via _v1 so the v1 contract stays byte-identical.
+        # response keys via _v1 so the v1 contract keeps the same JSON
+        # keys/shape and values.
         if entity == "league":
             return self._send_api(_v1.program_to_v1(api.create_program(
                 b.get("name"), b.get("country", ""), b.get("timezone", "UTC"),
@@ -1864,11 +1884,14 @@ class Handler(BaseHTTPRequestHandler):
                 b.get("rink_id"), b.get("start_time"), b.get("end_time"),
                 b.get("slot_type", "game"), actor_id))
         if entity == "game":
-            return self._send_api(api.create_game(
+            # v1 boundary (#233 C1b): a game result carries the canonical
+            # competition league_id, which the v1 API never exposed — drop it via
+            # _v1.game_to_v1 so the v1 game shape is unchanged.
+            return self._send_api(_v1.game_to_v1(api.create_game(
                 b.get("season_id"), b.get("division_id"), b.get("home_team_id"),
                 b.get("away_team_id"), b.get("ice_slot_id"),
                 allow_division_override=bool(b.get("allow_division_override")),
-                actor_id=actor_id))
+                actor_id=actor_id)))
         if entity == "official":
             return self._send_api(api.create_official(
                 b.get("name"), b.get("home_club_id"), actor_id))

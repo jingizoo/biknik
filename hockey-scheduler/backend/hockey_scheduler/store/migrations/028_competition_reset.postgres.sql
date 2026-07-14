@@ -11,11 +11,12 @@
 -- BEFORE the old `levels` becomes `leagues`, or the second rename would collide.
 --
 -- PostgreSQL expresses every step with ALTER TABLE RENAME TO / RENAME COLUMN /
--- ADD COLUMN + UPDATE. A pre-migration gate (assert_competition_reset_ready)
--- proves every division and registration maps deterministically onto a single
--- same-Season League before these run, so each backfill subquery below resolves
--- to exactly one row (PostgreSQL errors on a multi-row scalar subquery, so the
--- registration backfill is split into two single-row passes).
+-- ADD COLUMN + UPDATE. A pre-migration gate (assert_competition_reset_ready_c1b)
+-- proves every season/team umbrella parent, promoted-League season, division,
+-- registration, and game maps deterministically onto the canonical model before
+-- these run, so each backfill subquery below resolves to exactly one row
+-- (PostgreSQL errors on a multi-row scalar subquery, so the registration backfill
+-- is split into two single-row passes).
 
 -- 1. leagues -> programs; organization_id -> operator_organization_id.
 DROP INDEX IF EXISTS ix_leagues_organization;
@@ -62,8 +63,16 @@ UPDATE season_team_registrations SET league_id = (
   WHERE lv.season_id = season_team_registrations.season_id)
   WHERE league_id IS NULL;
 
--- 7. games: add league_id, backfill from the game's division league.
+-- 7. games: add league_id, backfill from the game's Division league when it has
+--    a division (divisions carry league_id after step 5), else from the game's
+--    Season sole league. The gate (assert_competition_reset_ready_c1b) proves a
+--    division-less game's season has exactly one league, so each scalar subquery
+--    resolves to exactly one row (PostgreSQL errors on a multi-row scalar
+--    subquery) and no game is left unscoped.
 ALTER TABLE games ADD COLUMN league_id TEXT;
 UPDATE games SET league_id = (
   SELECT d.league_id FROM divisions d WHERE d.id = games.division_id)
   WHERE division_id IS NOT NULL;
+UPDATE games SET league_id = (
+  SELECT lv.id FROM leagues lv WHERE lv.season_id = games.season_id)
+  WHERE league_id IS NULL AND division_id IS NULL;
