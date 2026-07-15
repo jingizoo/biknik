@@ -130,6 +130,8 @@ jobs:
         run: npm run team-division-participation
       - name: Run Allowed Venues journey
         run: npm run allowed-venues
+      - name: Run venue-access cleanup journey
+        run: npm run venue-access-cleanup
       - name: Run permanent-teams structure journey
         run: npm run permanent-teams
       - name: Run safe destructive actions journey

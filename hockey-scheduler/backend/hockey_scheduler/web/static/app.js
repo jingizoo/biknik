@@ -903,6 +903,7 @@ const DEL_NOUN = {
   level: "league", division: "division", club: "club", team: "team",
   venue: "venue", rink: "rink", "ice-slot": "ice slot", game: "game",
   "season-team-registration": "registration",
+  "season-venue-access": "venue access",
 };
 // Higher-level records (#215) demand a typed confirmation — the operator must
 // type the record's name or DELETE before the destructive button enables.
@@ -919,6 +920,7 @@ const DEL_ROUTE_V2 = {
   club: "club", team: "team", venue: "venue", rink: "rink", "ice-slot": "ice-slot",
   organization: "organization", game: "game",
   "season-team-registration": "season-team-registration",
+  "season-venue-access": "season-venue-access",
 };
 
 function renderModal() {
@@ -1208,7 +1210,7 @@ function renderSetupHierarchy(sv, hv, ov) {
         <span class="tn-meta">${orphanVenues.length} venue${orphanVenues.length === 1 ? "" : "s"}</span></summary>
       <div class="tn-children">${orphanVenues.map(venueNode).join("")}</div>
     </details>` : "";
-  const facility = `<section class="tree-panel">
+  const facility = `<section class="tree-panel" id="facility-tree">
     <div class="tree-head"><span class="tree-title">🏟️ Facility</span>
       <span class="tree-sub">Facility owner → Venue → Rink</span></div>
     ${orgSections}${orphanVenueSection}
@@ -1534,6 +1536,28 @@ function renderSeasonParticipation(hv, ov, sv) {
           <span class="tn-meta">${grantedAccess.length} venue${grantedAccess.length === 1 ? "" : "s"}</span></summary>
         <div class="tn-children">${venueAccessRows}${venueAddCtl}</div></details>`;
 
+      // Revoked venue access (#233 Slice E, mirrors #251's inactive
+      // registrations exactly): revoke only deactivates a row, preserving
+      // history — but delete_season()/delete_venue() block on a matching
+      // access row REGARDLESS of active status, so a revoked row still needs
+      // this explicit, audited permanent-cleanup path before the Season or
+      // Venue it references can ever be deleted.
+      const revokedAccess = (seasonVenueAccess[s.id] || []).filter((a) => !a.active);
+      const revokedAccessRows = revokedAccess.map((a) => {
+        const venueName = venueNameById[a.venue_id] || a.venue_id;
+        return `<div class="tn-leaf reg-row inactive-reg">
+          <span class="tn-label">🏟️ ${esc(venueName)}</span>
+          <span class="tn-meta">revoked · <code>${esc(a.id)}</code></span>
+          ${delBtn("season-venue-access", a.id, `${venueName} access`,
+            "Permanently remove this revoked venue access")}</div>`;
+      }).join("");
+      const revokedAccessSection = revokedAccess.length
+        ? `<details class="tn" open><summary class="tn-sum">
+            <span class="tn-label">🗑️ Revoked venue access</span>
+            <span class="tn-meta">${revokedAccess.length} row${revokedAccess.length === 1 ? "" : "s"}</span></summary>
+          <div class="tn-children">${revokedAccessRows}</div></details>`
+        : "";
+
       const leagueSections = leagues.map((lv) => {
         const divs = lv.divisions || [];
         const divOptsFor = (selId) => divs.map((d) => opt(d.id, d.name, d.id === selId)).join("");
@@ -1586,7 +1610,7 @@ function renderSeasonParticipation(hv, ov, sv) {
           <span class="tn-meta">${leagues.length} league${leagues.length === 1 ? "" : "s"} · ${
             teamCount} team${teamCount === 1 ? "" : "s"}</span>
           ${delBtn("season", s.id, s.name)}</summary>
-        <div class="tn-children">${leagueBlocks}${venueAccessSection}${inactiveSection}</div></details>`;
+        <div class="tn-children">${leagueBlocks}${venueAccessSection}${revokedAccessSection}${inactiveSection}</div></details>`;
     }).join("");
 
     // Permanent members not registered for ANY season this program — surfaced

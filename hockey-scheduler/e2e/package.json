@@ -11,6 +11,7 @@
     "season-rollover": "node season-rollover.js",
     "team-division-participation": "node team-division-participation.js",
     "allowed-venues": "node allowed-venues.js",
+    "venue-access-cleanup": "node venue-access-cleanup.js",
     "permanent-teams": "node permanent-teams.js",
     "safe-destructive": "node safe-destructive.js",
     "destructive-surfaces": "node destructive-surfaces.js",
