@@ -162,6 +162,39 @@ async function checkViewport(browser, viewport) {
       "f-player-position": "forward",
     }, "/api/v2/setup/player");
 
+    // The common real-world shape (#232 review): an emailed Player also
+    // picks up a login account and a push device token — an account/token
+    // scoped to it, prerequisites for the full blocked->cleared->succeeds
+    // lifecycle proof below, so built via raw fetch like every other
+    // journey's non-target prerequisites.
+    const playerAccount = await page.evaluate(async (i) => {
+      const post = async (p, b) => (await fetch(p, {
+        method: "POST", credentials: "same-origin",
+        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
+      })).json();
+      return post("/api/accounts", {
+        username: "records_delete_player", password: "a-real-password",
+        role: "player", scope: { team_id: i.team, player_id: i.player },
+      });
+    }, { team: team.id, player: playerBlocked.id });
+    if (playerAccount.error) {
+      throw new Error(`[${viewport.label}] player account create failed: ` +
+        `${JSON.stringify(playerAccount.error)}`);
+    }
+    const playerDevice = await page.evaluate(async (i) => {
+      const post = async (p, b) => (await fetch(p, {
+        method: "POST", credentials: "same-origin",
+        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
+      })).json();
+      return post("/api/notifications/device-tokens", {
+        recipient_ref: `player:${i.player}`, provider: "fcm", token: "records-delete-tok",
+      });
+    }, { player: playerBlocked.id });
+    if (playerDevice.error) {
+      throw new Error(`[${viewport.label}] player device token create failed: ` +
+        `${JSON.stringify(playerDevice.error)}`);
+    }
+
     // Every one of the 10 delete-capable Records kinds shows a delete
     // control on the row this journey just created for it.
     const expectPresent = [
@@ -251,9 +284,13 @@ async function checkViewport(browser, viewport) {
       (id) => !document.querySelector(`[data-del="official"][data-del-id="${id}"]`),
       official.id, { timeout: 10000 });
 
-    // (5) Player's new delete contract: blocked by a live contact
-    // destination (the real "email on manual create" path), and a bare
-    // Player deletes successfully.
+    // (5) Player's new delete contract, proven for the COMMON real-world
+    // shape (#232 review) — not sidestepped by deleting a separate bare
+    // Player instead: the emailed Player, with a scoped account and device
+    // token too, is blocked by all three; each is cleared through its own
+    // supported route (account/device-token deactivation, the new explicit
+    // contact-destination cleanup); the delete then succeeds on the SAME
+    // Player. A separate bare Player also deletes cleanly on the first try.
     await clickDelete("player", playerBlocked.id);
     result = await confirmDelete("player", playerBlocked.id, { expectBlocked: true });
     if (!result.error || result.error.code !== "has_dependencies") {
@@ -262,12 +299,49 @@ async function checkViewport(browser, viewport) {
     }
     await page.waitForSelector(".modal.blocked", { timeout: 10000 });
     const playerBlockedText = (await page.textContent(".modal.blocked")) || "";
-    if (!playerBlockedText.toLowerCase().includes("contact")) {
-      throw new Error(`[${viewport.label}] blocked-Player modal doesn't mention the blocking ` +
-        `contact destination: ${playerBlockedText}`);
+    for (const term of ["contact", "account", "device"]) {
+      if (!playerBlockedText.toLowerCase().includes(term)) {
+        throw new Error(`[${viewport.label}] blocked-Player modal doesn't mention the blocking ` +
+          `${term} dependency: ${playerBlockedText}`);
+      }
     }
     await page.click("button.act[data-modal-close]");
     await page.waitForSelector(".modal", { state: "detached", timeout: 10000 });
+
+    // Clear every dependency through its own supported route — never a
+    // silent cascade from the Player delete itself.
+    const cleared = await page.evaluate(async (i) => {
+      const post = async (p, b) => (await fetch(p, {
+        method: "POST", credentials: "same-origin",
+        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
+      })).json();
+      const ov = await (await fetch("/api/v2/setup/overview", { credentials: "same-origin" })).json();
+      const acc = await post(`/api/accounts/${i.account}/active`, { active: false });
+      const dev = await post(`/api/notifications/device-tokens/${i.device}/active`, { active: false });
+      const contactsResp = await fetch("/api/notifications/contacts", { credentials: "same-origin" });
+      const contactsBody = await contactsResp.json();
+      const contact = (contactsBody.contacts || [])
+        .find((c) => c.recipient_ref === `player:${i.player}`);
+      const con = contact
+        ? await post(`/api/notifications/contacts/${contact.id}/delete`, {})
+        : { error: { message: "no matching contact destination found" } };
+      return { acc, dev, con, ov: !!ov };
+    }, { account: playerAccount.id, device: playerDevice.id, player: playerBlocked.id });
+    if (cleared.acc.error || cleared.dev.error || cleared.con.error) {
+      throw new Error(`[${viewport.label}] clearing the Player's dependencies failed: ` +
+        JSON.stringify(cleared));
+    }
+
+    await clickDelete("player", playerBlocked.id);
+    result = await confirmDelete("player", playerBlocked.id);
+    if (result.error) {
+      throw new Error(`[${viewport.label}] the emailed Player delete still failed after clearing ` +
+        `every dependency: ${JSON.stringify(result)}`);
+    }
+    await page.waitForSelector(".modal", { state: "detached", timeout: 10000 });
+    await page.waitForFunction(
+      (id) => !document.querySelector(`[data-del="player"][data-del-id="${id}"]`),
+      playerBlocked.id, { timeout: 10000 });
 
     await clickDelete("player", playerBare.id);
     result = await confirmDelete("player", playerBare.id);
@@ -283,7 +357,8 @@ async function checkViewport(browser, viewport) {
       throw new Error(`[${viewport.label}] console/page errors:\n${errors.join("\n")}`);
     }
     console.log(`[${viewport.label}] OK — every Records card offers delete, cancel/blocked/success ` +
-      `flows verified, Official and Player's new delete contract proven end to end.`);
+      `flows verified, Official and Player's new delete contract proven end to end for the common ` +
+      `real-world (account + device token + contact) case.`);
   } catch (error) {
     throw new Error(`${error.message}\n--- demo server output ---\n${serverOutput}`);
   } finally {

@@ -3179,8 +3179,13 @@ class SetupService:
             raise NotFoundError(f"Official {official_id} not found.")
         assignments = self.store.assignments_for_official(official_id)
         availability = self.store.availability_for_official(official_id)
+        # Only an ACTIVE account/device token is a live pointer (#232 review):
+        # both already have a supported deactivation route
+        # (set_user_account_active / set_device_token_active) that resolves
+        # this dependency without needing a new one. An inactive row is inert
+        # history, exactly like a revoked calendar feed below.
         accounts = [a for a in self.store.all_user_accounts()
-                    if (a.scope or {}).get("official_id") == official_id]
+                    if a.active and (a.scope or {}).get("official_id") == official_id]
         feeds = [t for t in self.store.all_calendar_feed_tokens()
                  if t.actor_type == "official" and t.actor_ref == official_id
                  and t.revoked_at is None]
@@ -3190,7 +3195,7 @@ class SetupService:
         prefs = [p for p in self.store.all_notification_preferences()
                  if p.recipient_ref == ref]
         devices = [d for d in self.store.all_device_tokens()
-                   if d.recipient_ref == ref]
+                   if d.active and d.recipient_ref == ref]
         self._block_if_dependents("official", official_id, "official", [
             self._dep_group("assignment", assignments, self._matchup_for_game_ref),
             self._dep_group("availability window", availability,
@@ -3223,8 +3228,13 @@ class SetupService:
         availability = self.store.availability_entries_for_player(player_id)
         subs = self.store.substitute_enrollments_for_player(player_id)
         guardian_links = self.store.guardian_links_for_player(player_id)
+        # Only an ACTIVE account/device token is a live pointer (#232 review):
+        # both already have a supported deactivation route
+        # (set_user_account_active / set_device_token_active) that resolves
+        # this dependency without needing a new one. An inactive row is inert
+        # history, exactly like a revoked calendar feed below.
         accounts = [a for a in self.store.all_user_accounts()
-                    if (a.scope or {}).get("player_id") == player_id]
+                    if a.active and (a.scope or {}).get("player_id") == player_id]
         feeds = [t for t in self.store.all_calendar_feed_tokens()
                  if t.actor_type == "player" and t.actor_ref == player_id
                  and t.revoked_at is None]
@@ -3234,7 +3244,7 @@ class SetupService:
         prefs = [p for p in self.store.all_notification_preferences()
                  if p.recipient_ref == ref]
         devices = [d for d in self.store.all_device_tokens()
-                   if d.recipient_ref == ref]
+                   if d.active and d.recipient_ref == ref]
         self._block_if_dependents("player", player_id, "player", [
             self._dep_group("roster entry", rosters, self._matchup_for_game_ref),
             self._dep_group("availability response", availability,

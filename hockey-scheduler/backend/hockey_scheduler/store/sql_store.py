@@ -865,6 +865,8 @@ class SqlStore:
         return rows[0] if rows else None
     def all_contact_destinations(self):
         return self._query(ContactDestination, order="id")
+    def delete_contact_destination(self, contact_id):
+        self._delete(ContactDestination, contact_id)
 
     # -- device token registry (#65) ---------------------------------------
     def add_device_token(self, t): return self._insert(t)
@@ -920,6 +922,8 @@ class SqlStore:
     # -- notification preferences (#81) ------------------------------------
     def save_notification_preference(self, p):
         return self._upsert(p)
+    def delete_notification_preference(self, pref_id):
+        self._delete(NotificationPreference, pref_id)
     def get_notification_preference(self, recipient_ref, channel):
         rows = self._query(
             NotificationPreference, "recipient_ref = ? AND channel = ?",

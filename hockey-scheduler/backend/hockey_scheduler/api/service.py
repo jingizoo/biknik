@@ -1346,6 +1346,25 @@ class ApiService:
         self.store.add_contact_destination(c)
         return self._contact_row(c)
 
+    @catch
+    def delete_contact_destination(self, contact_id: str,
+                                   actor_id: Optional[str] = None) -> dict:
+        """Explicit, audited removal of a stored contact destination (#232
+        review): Player/Official deletion never silently cascades this row,
+        but a genuinely dead identity's contact destination would otherwise
+        block that delete forever with no supported resolution — this is
+        that resolution, a narrowly scoped identity/integration cleanup
+        action, not a general contacts-management surface."""
+        c = next((row for row in self.store.all_contact_destinations()
+                  if row.id == contact_id), None)
+        if c is None:
+            raise NotFoundError(f"Contact destination {contact_id} not found.")
+        self.store.delete_contact_destination(contact_id)
+        self.setup._audit(
+            "contact_destination_deleted", "contact_destination", contact_id,
+            actor_id, {"recipient_ref": c.recipient_ref, "channel": c.channel.value})
+        return {"id": contact_id, "recipient_ref": c.recipient_ref}
+
     # -- notification preferences (#81) ------------------------------------
     # The delivery channels a recipient can opt out of (in-app feed is always on).
     PREF_CHANNELS = (NotificationChannel.EMAIL, NotificationChannel.PUSH)
@@ -1403,6 +1422,25 @@ class ApiService:
              "digest": pref.digest})
         return {"recipient_ref": recipient_ref, "channel": ch.value,
                 "enabled": pref.enabled, "digest": pref.digest}
+
+    @catch
+    def delete_notification_preference(self, pref_id: str,
+                                       actor_id: Optional[str] = None) -> dict:
+        """Explicit, audited removal of a stored notification preference
+        (#232 review): the same narrowly scoped identity/integration
+        cleanup action as `delete_contact_destination`, for the one other
+        recipient-scoped row type Player/Official deletion can never
+        silently cascade but had no supported way to clear."""
+        p = next((row for row in self.store.all_notification_preferences()
+                  if row.id == pref_id), None)
+        if p is None:
+            raise NotFoundError(f"Notification preference {pref_id} not found.")
+        self.store.delete_notification_preference(pref_id)
+        self.setup._audit(
+            "notification_preference_deleted", "notification_preference",
+            pref_id, actor_id,
+            {"recipient_ref": p.recipient_ref, "channel": p.channel.value})
+        return {"id": pref_id, "recipient_ref": p.recipient_ref}
 
     # -- calendar feed tokens (#82) ----------------------------------------
     @staticmethod

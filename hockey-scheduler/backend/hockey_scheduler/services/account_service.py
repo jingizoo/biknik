@@ -144,6 +144,28 @@ class AccountService:
         account = self.store.get_user_account(account_id)
         if account is None:
             raise NotFoundError("User account not found.")
+        if active:
+            # Reactivating an account whose scoped subject was deleted while
+            # the account sat deactivated (#232 review) would resurrect a
+            # login pointing at a nonexistent Official/Player — the exact
+            # dangling-identity hole scoping delete_official/delete_player's
+            # account blocker to active-only accounts opened up. Refuse
+            # until the account is rebound to a valid subject.
+            scope = account.scope or {}
+            official_id = scope.get("official_id")
+            if official_id and self.store.get_official(official_id) is None:
+                raise ValidationError(
+                    "This account's official no longer exists; rebind it to "
+                    "a valid official before reactivating.",
+                    {"reason": "scope_subject_missing", "account_id": account_id,
+                     "official_id": official_id})
+            player_id = scope.get("player_id")
+            if player_id and self.store.get_player(player_id) is None:
+                raise ValidationError(
+                    "This account's player no longer exists; rebind it to "
+                    "a valid player before reactivating.",
+                    {"reason": "scope_subject_missing", "account_id": account_id,
+                     "player_id": player_id})
         account.active = bool(active)
         self.store.save_user_account(account)
         self._audit(
