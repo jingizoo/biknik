@@ -3104,6 +3104,12 @@ class ApiService:
             registration_id, actor_id))
 
     @catch
+    def delete_season_team_registration(self, registration_id: str,
+                                        actor_id: Optional[str] = None) -> dict:
+        return _serialize(self.setup.delete_season_team_registration(
+            registration_id, actor_id))
+
+    @catch
     def roll_forward_registrations(self, from_season_id: str, to_season_id: str,
                                    selections: Optional[list] = None,
                                    actor_id: Optional[str] = None) -> dict:

@@ -822,6 +822,9 @@ class InMemoryStore:
     def delete_team(self, team_id: str) -> None:
         self.teams.pop(team_id, None)
 
+    def delete_season_team_registration(self, registration_id: str) -> None:
+        self.season_team_registrations.pop(registration_id, None)
+
     def delete_venue(self, venue_id: str) -> None:
         self.venues.pop(venue_id, None)
 

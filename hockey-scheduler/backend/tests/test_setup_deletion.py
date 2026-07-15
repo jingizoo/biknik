@@ -285,6 +285,187 @@ class DeletionContract:
         self.assertFalse(stored2.active)
         self.assertEqual(len(self.store.all_setup_audit()), audits_before)
 
+    # -- explicit inactive-registration cleanup (#251) ---------------------
+    # unregister_team_from_season only deactivates a row (Season/Team/League/
+    # Division identity is retained for history) — delete_season_team_
+    # registration is the separate, explicit operation that permanently
+    # removes that row once it's inactive AND no Game (draft, scheduled,
+    # cancelled, or historical) still references it.
+    def test_registration_delete_succeeds_when_inactive_and_game_free(self):
+        lg = self._league()
+        s = self._season(lg)
+        d = self._division(s)
+        club = self._club()
+        team = self._team(club, lg)
+        reg = self._register(s, team, d)
+        expected_league_id = self.store.get_season_team_registration(reg).league_id
+        self.api.unregister_team_from_season(reg, actor_id=self.ACTOR)
+
+        audits_before = len(self.store.all_setup_audit())
+        result = self.api.delete_season_team_registration(reg, actor_id=self.ACTOR)
+        self.assertNotIn("error", result, result)
+        self.assertEqual(result["id"], reg)
+        self.assertEqual(result["season_id"], s)
+        self.assertEqual(result["team_id"], team)
+        self.assertEqual(result["league_id"], expected_league_id)
+        self.assertIsNone(self.store.get_season_team_registration(reg))
+
+        deleted = self._audits("season_team_registration_deleted")
+        self.assertEqual(len(deleted), 1)
+        self.assertEqual(deleted[0].entity_id, reg)
+        self.assertEqual(deleted[0].actor_id, self.ACTOR)
+        self.assertEqual(deleted[0].detail["season_id"], s)
+        self.assertEqual(deleted[0].detail["team_id"], team)
+        self.assertEqual(deleted[0].detail["division_id"], d)
+        self.assertEqual(len(self.store.all_setup_audit()), audits_before + 1)
+
+    def test_registration_delete_blocked_when_active(self):
+        lg = self._league()
+        s = self._season(lg)
+        d = self._division(s)
+        club = self._club()
+        team = self._team(club, lg)
+        reg = self._register(s, team, d)
+
+        result = self.api.delete_season_team_registration(reg, actor_id=self.ACTOR)
+        self.assertEqual(result["error"]["code"], "validation_error")
+        self.assertEqual(result["error"]["details"]["reason"], "registration_active")
+        self.assertIsNotNone(self.store.get_season_team_registration(reg))
+        self.assertEqual(self._audits("season_team_registration_deleted"), [])
+
+    def test_registration_delete_blocked_by_draft_game(self):
+        lg = self._league()
+        s = self._season(lg)
+        d = self._division(s)
+        club = self._club()
+        home = self._team(club, lg, "Home")
+        away = self._team(club, lg, "Away")
+        home_reg = self._register(s, home, d)
+        away_reg = self._register(s, away, d)
+        slot = self._slot(self._rink(self._venue(league_id=lg)))
+        game = self._game(s, d, home, away, slot)
+        self._make_draft(game)
+        # A draft game holds neither team's registration off "scheduled", so
+        # both can be deactivated even while the draft still references them.
+        self.api.unregister_team_from_season(home_reg, actor_id=self.ACTOR)
+        self.api.unregister_team_from_season(away_reg, actor_id=self.ACTOR)
+
+        blocked = self.api.delete_season_team_registration(
+            home_reg, actor_id=self.ACTOR)
+        self.assertBlocked(blocked, expect_types={"game"})
+        self.assertIsNotNone(self.store.get_season_team_registration(home_reg))
+
+    def test_registration_delete_blocked_by_cancelled_game(self):
+        lg = self._league()
+        s = self._season(lg)
+        d = self._division(s)
+        club = self._club()
+        home = self._team(club, lg, "Home")
+        away = self._team(club, lg, "Away")
+        home_reg = self._register(s, home, d)
+        away_reg = self._register(s, away, d)
+        slot = self._slot(self._rink(self._venue(league_id=lg)))
+        game = self._game(s, d, home, away, slot)
+        self.api.cancel_game(game, actor_id=self.ACTOR)
+        self.api.unregister_team_from_season(home_reg, actor_id=self.ACTOR)
+        self.api.unregister_team_from_season(away_reg, actor_id=self.ACTOR)
+
+        blocked = self.api.delete_season_team_registration(
+            home_reg, actor_id=self.ACTOR)
+        self.assertBlocked(blocked, expect_types={"game"})
+        self.assertIsNotNone(self.store.get_season_team_registration(home_reg))
+        self.assertEqual(self._audits("season_team_registration_deleted"), [])
+
+    def test_registration_delete_blocked_by_published_game_history(self):
+        # A game that was actually played (published, then later cancelled —
+        # the only way a committed game stops blocking unregister) is
+        # permanent history and must keep blocking the registration cleanup
+        # too, just like a plain cancelled game.
+        lg = self._league()
+        s = self._season(lg)
+        d = self._division(s)
+        club = self._club()
+        home = self._team(club, lg, "Home")
+        away = self._team(club, lg, "Away")
+        home_reg = self._register(s, home, d)
+        away_reg = self._register(s, away, d)
+        slot = self._slot(self._rink(self._venue(league_id=lg)))
+        game = self._game(s, d, home, away, slot)
+        stored_game = self.store.get_game(game)
+        stored_game.published = True
+        self.store.save_game(stored_game)
+        self.api.cancel_game(game, actor_id=self.ACTOR)
+        self.api.unregister_team_from_season(home_reg, actor_id=self.ACTOR)
+        self.api.unregister_team_from_season(away_reg, actor_id=self.ACTOR)
+
+        blocked = self.api.delete_season_team_registration(
+            away_reg, actor_id=self.ACTOR)
+        self.assertBlocked(blocked, expect_types={"game"})
+        self.assertIsNotNone(self.store.get_season_team_registration(away_reg))
+
+    def test_registration_delete_rolls_back_on_forced_mid_operation_failure(self):
+        lg = self._league()
+        s = self._season(lg)
+        d = self._division(s)
+        club = self._club()
+        team = self._team(club, lg)
+        reg = self._register(s, team, d)
+        self.api.unregister_team_from_season(reg, actor_id=self.ACTOR)
+
+        audits_before = len(self.store.all_setup_audit())
+        original = self.store.add_setup_audit
+
+        def boom(entry):
+            raise RuntimeError("forced mid-operation failure")
+
+        self.store.add_setup_audit = boom
+        try:
+            with self.assertRaises(RuntimeError):
+                self.api.delete_season_team_registration(reg, actor_id=self.ACTOR)
+        finally:
+            self.store.add_setup_audit = original
+
+        # The store-level delete already ran before the forced failure; the
+        # transaction must still roll it back so nothing is lost.
+        self.assertIsNotNone(self.store.get_season_team_registration(reg))
+        self.assertEqual(len(self.store.all_setup_audit()), audits_before)
+
+    def test_league_season_team_deletable_after_cleaning_inactive_registration(self):
+        # #251 item 8: the three parent deletes are unchanged — they still
+        # block on ANY registration, active or not — but once the new
+        # cleanup op removes the inactive row, the existing block naturally
+        # resolves and the previously-stuck parent deletes succeed.
+        lg = self._league()
+        s = self._season(lg)
+        d = self._division(s)
+        club = self._club()
+        team = self._team(club, lg)
+        reg = self._register(s, team, d)
+        self.api.unregister_team_from_season(reg, actor_id=self.ACTOR)
+        self.api.delete_division(d, actor_id=self.ACTOR)
+
+        self.assertBlocked(
+            self.api.delete_program(lg, actor_id=self.ACTOR),
+            expect_types={"season", "team"})
+        self.assertBlocked(
+            self.api.delete_season(s, actor_id=self.ACTOR),
+            expect_types={"team registration"})
+        self.assertBlocked(
+            self.api.delete_team(team, actor_id=self.ACTOR),
+            expect_types={"season registration"})
+
+        self.assertDeleted(
+            self.api.delete_season_team_registration(reg, actor_id=self.ACTOR),
+            self.store.get_season_team_registration, reg,
+            "season_team_registration_deleted")
+
+        self.assertDeleted(self.api.delete_season(s, actor_id=self.ACTOR),
+                           self.store.get_season, s, "season_deleted")
+        self.assertDeleted(self.api.delete_team(team, actor_id=self.ACTOR),
+                           self.store.get_team, team, "team_deleted")
+        self.assertDeleted(self.api.delete_program(lg, actor_id=self.ACTOR),
+                           self.store.get_program, lg, "league_deleted")
+
     # -- club --------------------------------------------------------------
     def test_club_blocked_by_team(self):
         lg = self._league()
@@ -597,7 +778,8 @@ class DeletionContract:
                    self.api.delete_division, self.api.delete_club,
                    self.api.delete_team, self.api.delete_venue,
                    self.api.delete_rink, self.api.delete_ice_slot,
-                   self.api.delete_game):
+                   self.api.delete_game,
+                   self.api.delete_season_team_registration):
             result = fn("nope_1", actor_id=self.ACTOR)
             self.assertEqual(result["error"]["code"], "not_found")
 
