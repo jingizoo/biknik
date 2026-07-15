@@ -431,8 +431,13 @@ async function checkViewport(browser, viewport) {
         { team_id: foxes.id, league_id: lg.id, division_id: null });
       return { lg: lg.id, reg: reg.id };
     }, { s1: ids.s1, program: ids.program, club: edit.club });
-    await refreshSetup({ selector: `[data-del="level"][data-del-id="${lgGuarded.lg}"]` });
-    await page.click(`[data-del="level"][data-del-id="${lgGuarded.lg}"]`);
+    // Scoped to the Competition structure tree (#251): the Season
+    // participation panel below it now renders its own delBtn for the same
+    // League id, so an unscoped selector would match twice.
+    await refreshSetup({
+      selector: `#competition-structure [data-del="level"][data-del-id="${lgGuarded.lg}"]` });
+    await page.click(
+      `#competition-structure [data-del="level"][data-del-id="${lgGuarded.lg}"]`);
     // Level (grouping League) isn't a high-risk kind, so its confirm button
     // is enabled immediately — no typed DELETE needed (unlike the umbrella
     // Program/"league" kind exercised in safe-destructive.js).
