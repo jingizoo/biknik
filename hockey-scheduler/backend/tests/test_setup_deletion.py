@@ -969,6 +969,45 @@ class DeletionContract:
         self.assertDeleted(self.api.delete_official(official, actor_id=self.ACTOR),
                            self.store.get_official, official, "official_deleted")
 
+    # -- official dangling-recipient guard (#232 review 2) -------------------
+    # Scoping the delete blocker to active tokens/accounts must not reopen a
+    # dangling-identity hole via deactivate -> delete -> reactivate/
+    # re-register — the same class of hole the account reactivation guard
+    # closes, for every other recipient-scoped route.
+    def test_reactivating_device_token_after_official_deleted_is_blocked(self):
+        official = self._official()
+        ref = f"official:{official}"
+        tok = self.api.register_device_token(ref, "fcm", "tok_o_react")
+        self.api.set_device_token_active(tok["id"], False)
+        self.assertDeleted(self.api.delete_official(official, actor_id=self.ACTOR),
+                           self.store.get_official, official, "official_deleted")
+        result = self.api.set_device_token_active(tok["id"], True)
+        self.assertEqual(result["error"]["code"], "validation_error", result)
+        self.assertFalse(self.store.get_device_token(tok["id"]).active)
+
+    def test_reregistering_device_token_after_official_deleted_is_blocked(self):
+        official = self._official()
+        ref = f"official:{official}"
+        tok = self.api.register_device_token(ref, "fcm", "tok_o_reg")
+        self.api.set_device_token_active(tok["id"], False)
+        self.assertDeleted(self.api.delete_official(official, actor_id=self.ACTOR),
+                           self.store.get_official, official, "official_deleted")
+        result = self.api.register_device_token(ref, "fcm", "tok_o_reg")
+        self.assertEqual(result["error"]["code"], "validation_error", result)
+        self.assertFalse(self.store.get_device_token(tok["id"]).active)
+        result = self.api.register_device_token(ref, "fcm", "tok_o_brand_new")
+        self.assertEqual(result["error"]["code"], "validation_error", result)
+
+    def test_device_token_lifecycle_allowed_for_existing_official(self):
+        official = self._official()
+        ref = f"official:{official}"
+        tok = self.api.register_device_token(ref, "fcm", "tok_o_live")
+        self.assertNotIn("error", tok)
+        self.assertTrue(self.api.set_device_token_active(tok["id"], False)["active"] is False)
+        reactivated = self.api.set_device_token_active(tok["id"], True)
+        self.assertNotIn("error", reactivated)
+        self.assertTrue(reactivated["active"])
+
     # -- player (#232) --------------------------------------------------------
     def test_player_blocked_by_roster_entry(self):
         lg = self._league()
@@ -1206,6 +1245,50 @@ class DeletionContract:
 
         self.assertDeleted(self.api.delete_player(player, actor_id=self.ACTOR),
                            self.store.get_player, player, "player_deleted")
+
+    # -- player dangling-recipient guard (#232 review 2) ---------------------
+    def test_reactivating_device_token_after_player_deleted_is_blocked(self):
+        lg = self._league()
+        club = self._club()
+        team = self._team(club, lg)
+        player = self._player(team)
+        ref = f"player:{player}"
+        tok = self.api.register_device_token(ref, "fcm", "tok_p_react")
+        self.api.set_device_token_active(tok["id"], False)
+        self.assertDeleted(self.api.delete_player(player, actor_id=self.ACTOR),
+                           self.store.get_player, player, "player_deleted")
+        result = self.api.set_device_token_active(tok["id"], True)
+        self.assertEqual(result["error"]["code"], "validation_error", result)
+        self.assertFalse(self.store.get_device_token(tok["id"]).active)
+
+    def test_reregistering_device_token_after_player_deleted_is_blocked(self):
+        lg = self._league()
+        club = self._club()
+        team = self._team(club, lg)
+        player = self._player(team)
+        ref = f"player:{player}"
+        tok = self.api.register_device_token(ref, "fcm", "tok_p_reg")
+        self.api.set_device_token_active(tok["id"], False)
+        self.assertDeleted(self.api.delete_player(player, actor_id=self.ACTOR),
+                           self.store.get_player, player, "player_deleted")
+        result = self.api.register_device_token(ref, "fcm", "tok_p_reg")
+        self.assertEqual(result["error"]["code"], "validation_error", result)
+        self.assertFalse(self.store.get_device_token(tok["id"]).active)
+        result = self.api.register_device_token(ref, "fcm", "tok_p_brand_new")
+        self.assertEqual(result["error"]["code"], "validation_error", result)
+
+    def test_device_token_lifecycle_allowed_for_existing_player(self):
+        lg = self._league()
+        club = self._club()
+        team = self._team(club, lg)
+        player = self._player(team)
+        ref = f"player:{player}"
+        tok = self.api.register_device_token(ref, "fcm", "tok_p_live")
+        self.assertNotIn("error", tok)
+        self.assertFalse(self.api.set_device_token_active(tok["id"], False)["active"])
+        reactivated = self.api.set_device_token_active(tok["id"], True)
+        self.assertNotIn("error", reactivated)
+        self.assertTrue(reactivated["active"])
 
     # -- not found ---------------------------------------------------------
     def test_missing_ids_report_not_found(self):

@@ -1305,6 +1305,36 @@ class ApiService:
             "warnings": warnings,
         }
 
+    def _reject_dangling_recipient(self, recipient_ref: str) -> None:
+        """Reject a structured ``player:<id>``/``official:<id>``
+        ``recipient_ref`` whose subject no longer exists (#232 review 2).
+
+        Closes the same dangling-identity hole the account reactivation
+        guard closes (``AccountService.set_active``): scoping
+        delete_official/delete_player's device-token blocker to active
+        tokens only means a token deactivated, then left behind after the
+        subject is deleted, must not be re-registered or reactivated onto
+        a now-nonexistent record. Deliberately scoped to device tokens
+        only (register_device_token / set_device_token_active) — contact
+        destinations and notification preferences have no
+        active/inactive concept and their own tests rely on synthetic
+        recipient_refs with no backing store row, so this guard does not
+        apply there. Any other ``recipient_ref`` shape (``team:<id>``,
+        ``guardian:<user_id>``, …) is untouched.
+        """
+        if recipient_ref.startswith("player:"):
+            player_id = recipient_ref[len("player:"):]
+            if self.store.get_player(player_id) is None:
+                raise ValidationError(
+                    "This player no longer exists.",
+                    {"reason": "scope_subject_missing", "player_id": player_id})
+        elif recipient_ref.startswith("official:"):
+            official_id = recipient_ref[len("official:"):]
+            if self.store.get_official(official_id) is None:
+                raise ValidationError(
+                    "This official no longer exists.",
+                    {"reason": "scope_subject_missing", "official_id": official_id})
+
     # -- contact registry (#60) --------------------------------------------
     @staticmethod
     def _contact_row(c) -> dict:
@@ -1571,6 +1601,7 @@ class ApiService:
         """Register (or reactivate) a real push device token for a recipient."""
         if not recipient_ref:
             raise ValidationError("A recipient_ref is required.")
+        self._reject_dangling_recipient(recipient_ref)
         provider = (provider or "").strip()
         if not provider:
             raise ValidationError("A provider is required.")
@@ -1600,6 +1631,8 @@ class ApiService:
         t = self.store.get_device_token(token_id)
         if t is None:
             raise NotFoundError("Device token not found.")
+        if active:
+            self._reject_dangling_recipient(t.recipient_ref)
         t.active = bool(active)
         self.store.save_device_token(t)
         return self._device_token_row(t)

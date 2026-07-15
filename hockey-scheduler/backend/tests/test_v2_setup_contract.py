@@ -980,6 +980,84 @@ class V2SetupContractTest(unittest.TestCase):
                 "league": league, "division": division, "team_a": team_a,
                 "team_b": team_b, "slot": slot}
 
+    def test_device_token_dangling_recipient_rejected_after_delete(self):
+        """#232 review: a device token deactivated before its Player/Official
+        is deleted must not be reactivatable or re-registerable afterward —
+        the same dangling-identity hole the account reactivation guard
+        closes. A still-existing subject's token lifecycle is untouched."""
+        c = self._admin()
+        env = self._playable(c)
+
+        player = self._v2(c, "player",
+                          {"team_id": env["team_a"]["id"], "name": "HTTP Player",
+                           "position": "forward"})
+        official = self._v2(c, "official", {"name": "HTTP Official"})
+
+        for kind, entity, ref in (
+                ("player", player, f"player:{player['id']}"),
+                ("official", official, f"official:{official['id']}")):
+            status, tok = self._req(
+                c, "POST", "/api/notifications/device-tokens",
+                {"recipient_ref": ref, "provider": "fcm", "token": f"http-tok-{kind}"})
+            self.assertEqual(status, 200, tok)
+            self.assertTrue(tok["active"], tok)
+
+            # Deactivate — the supported resolution path — then delete succeeds.
+            status, _ = self._req(
+                c, "POST", f"/api/notifications/device-tokens/{tok['id']}/active",
+                {"active": False})
+            self.assertEqual(status, 200)
+            status, deleted = self._req(
+                c, "POST", f"/api/v2/setup/{kind}/{entity['id']}/delete", {})
+            self.assertEqual(status, 200, deleted)
+
+            # Reactivation is rejected — zero mutation.
+            status, react = self._req(
+                c, "POST", f"/api/notifications/device-tokens/{tok['id']}/active",
+                {"active": True})
+            self.assertEqual(status, 400, react)
+            self.assertEqual(react["error"]["code"], "validation_error", react)
+            self.assertEqual(react["error"]["details"]["reason"],
+                             "scope_subject_missing", react)
+
+            status, listing = self._req(c, "GET", "/api/notifications/device-tokens")
+            self.assertEqual(status, 200)
+            row = next(t for t in listing["device_tokens"] if t["id"] == tok["id"])
+            self.assertFalse(row["active"], "reactivation must not have mutated the token")
+
+            # Re-registering the same recipient/token pair (the
+            # reactivate-via-value-match path in register_device_token) is
+            # rejected too, as is a brand-new token for the same dead recipient.
+            status, reregister = self._req(
+                c, "POST", "/api/notifications/device-tokens",
+                {"recipient_ref": ref, "provider": "fcm", "token": f"http-tok-{kind}"})
+            self.assertEqual(status, 400, reregister)
+            self.assertEqual(reregister["error"]["code"], "validation_error", reregister)
+            status, newtok = self._req(
+                c, "POST", "/api/notifications/device-tokens",
+                {"recipient_ref": ref, "provider": "fcm", "token": f"http-tok-{kind}-new"})
+            self.assertEqual(status, 400, newtok)
+
+        # A valid, still-existing subject can register/deactivate/reactivate
+        # normally — the guard is narrowly scoped to dead subjects only.
+        player2 = self._v2(c, "player",
+                           {"team_id": env["team_a"]["id"], "name": "HTTP Player 2",
+                            "position": "forward"})
+        status, tok2 = self._req(
+            c, "POST", "/api/notifications/device-tokens",
+            {"recipient_ref": f"player:{player2['id']}", "provider": "fcm",
+             "token": "http-tok-live"})
+        self.assertEqual(status, 200, tok2)
+        status, _ = self._req(
+            c, "POST", f"/api/notifications/device-tokens/{tok2['id']}/active",
+            {"active": False})
+        self.assertEqual(status, 200)
+        status, reactivated = self._req(
+            c, "POST", f"/api/notifications/device-tokens/{tok2['id']}/active",
+            {"active": True})
+        self.assertEqual(status, 200, reactivated)
+        self.assertTrue(reactivated["active"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -343,6 +343,31 @@ async function checkViewport(browser, viewport) {
       (id) => !document.querySelector(`[data-del="player"][data-del-id="${id}"]`),
       playerBlocked.id, { timeout: 10000 });
 
+    // Post-delete reactivation rejection (#232 review 2): the device token
+    // deactivated above to clear the way for the delete must not be
+    // reactivatable now that its Player is gone — a dangling-identity hole
+    // scoping the delete blocker to active-only tokens would otherwise
+    // reopen.
+    page.off("console", consoleErrorHandler);
+    const reactivation = await page.evaluate(async (deviceId) => {
+      const resp = await fetch(`/api/notifications/device-tokens/${deviceId}/active`, {
+        method: "POST", credentials: "same-origin",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ active: true }),
+      });
+      const body = await resp.json();
+      return { status: resp.status, body };
+    }, playerDevice.id);
+    page.on("console", consoleErrorHandler);
+    if (reactivation.status === 200 || !reactivation.body.error) {
+      throw new Error(`[${viewport.label}] reactivating the deleted Player's device token ` +
+        `unexpectedly succeeded: ${JSON.stringify(reactivation)}`);
+    }
+    if ((reactivation.body.error.details || {}).reason !== "scope_subject_missing") {
+      throw new Error(`[${viewport.label}] reactivation was rejected for the wrong reason: ` +
+        `${JSON.stringify(reactivation)}`);
+    }
+
     await clickDelete("player", playerBare.id);
     result = await confirmDelete("player", playerBare.id);
     if (result.error) {
