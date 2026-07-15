@@ -56,6 +56,7 @@ def _seeded_api():
     api.setup.register_team_for_season(season.id, home.id, div.id)
     api.setup.register_team_for_season(season.id, away.id, div.id)
     venue = api.setup.create_venue("Arena", league_id=league.id)
+    api.setup.grant_season_venue_access(season.id, venue.id)
     rink = api.setup.create_rink(venue.id, "Rink 1")
     base = datetime(2026, 9, 1, 18, 30, tzinfo=UTC)
     slot = api.setup.create_ice_slot(rink.id, base, base + timedelta(hours=1, minutes=30))

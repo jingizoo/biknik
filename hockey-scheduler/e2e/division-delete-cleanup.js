@@ -103,10 +103,10 @@ async function checkViewport(browser, viewport) {
       // its teams then removed from the season (a Game still blocks even
       // with zero active registrations left).
       const venue = await post("/api/v2/setup/venue", { name: "V", organization_id: org.id });
-      // The temporary Venue→Program compatibility bridge (#233, deferred to
-      // Slice E) — create_game requires the ice slot's venue to already
-      // carry a league_id. Out of this journey's scope (proven elsewhere).
-      await post(`/api/setup/venue/${venue.id}/assign-league`, { league_id: program.id });
+      // Game ice eligibility (#233 Slice E) requires the ice slot's venue to
+      // hold an active SeasonVenueAccess grant for this Season. Out of this
+      // journey's scope (proven elsewhere).
+      await post(`/api/v2/setup/seasons/${season.id}/venue-access`, { venue_id: venue.id });
       const rink = await post("/api/v2/setup/rink", { venue_id: venue.id, name: "R" });
       const slot = await post("/api/v2/setup/ice-slot", {
         rink_id: rink.id, start_time: `${d}T18:00:00+00:00`, end_time: `${d}T19:00:00+00:00`,

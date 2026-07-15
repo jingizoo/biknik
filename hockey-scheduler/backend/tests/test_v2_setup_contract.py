@@ -158,14 +158,12 @@ class V2SetupContractTest(unittest.TestCase):
         self.assertEqual(venue["organization_id"], org["id"])
         self.assertNotIn("league_id", venue)
 
-        # For the game's schedulable ice, the venue must be linked to the program
-        # (the league-ice isolation guard). That temporary v1 venue↔program link
-        # is v1-only (removed in Slice E), so use the v1 venue route for it.
-        status, game_venue = self._req(c, "POST", "/api/setup/venue",
-                                       {"name": "Game Arena",
-                                        "league_id": program["id"],
-                                        "organization_id": org["id"]})
-        self.assertEqual(status, 200, game_venue)
+        # For the game's schedulable ice, the venue needs active
+        # SeasonVenueAccess for this Season (#233 Slice E).
+        game_venue = self._v2(c, "venue",
+                              {"name": "Game Arena", "organization_id": org["id"]})
+        self._req(c, "POST", f"/api/v2/setup/seasons/{season['id']}/venue-access",
+                  {"venue_id": game_venue["id"]})
         rink = self._v2(c, "rink", {"venue_id": game_venue["id"], "name": "Rink 1"})
         slot = self._v2(c, "ice-slot",
                        {"rink_id": rink["id"],
@@ -387,21 +385,19 @@ class V2SetupContractTest(unittest.TestCase):
         self.assertEqual(moved["operator_organization_id"], org2["id"])
         self.assertNotIn("organization_id", moved)  # canonical, not legacy v1
 
-        # The temporary Venue-link safety rule is preserved: attach a venue to
-        # the program (v1-only link) and the operator can no longer change.
+        # #233 Slice E: physical (facility) and competition (Program) structure
+        # are independent trees — attaching a venue to the program (the legacy
+        # v1-only link) no longer constrains an operator-organization change.
         status, _venue = self._req(c, "POST", "/api/setup/venue",
                                    {"name": "Arena", "league_id": program["id"],
                                     "organization_id": org2["id"]})
         self.assertEqual(status, 200, _venue)
-        status, blocked = self._req(
+        status, unblocked = self._req(
             c, "POST",
             f"/api/v2/setup/program/{program['id']}/assign-organization",
             {"operator_organization_id": org1["id"]})
-        self.assertEqual(blocked["error"]["code"], "validation_error", blocked)
-        # Zero mutation — the operator is still org2.
-        status, prog2 = self._req(c, "GET", "/api/v2/setup/hierarchy")
-        p = next(x for x in prog2["programs"] if x["id"] == program["id"])
-        self.assertEqual(p["operator_organization_id"], org2["id"])
+        self.assertEqual(status, 200, unblocked)
+        self.assertEqual(unblocked["operator_organization_id"], org1["id"])
 
     # -- deletes ------------------------------------------------------------
     def test_v2_deletes_canonical(self):
@@ -530,6 +526,8 @@ class V2SetupContractTest(unittest.TestCase):
             {"name": "R Arena", "league_id": program["id"],
              "organization_id": org["id"]})
         self.assertEqual(status, 200, game_venue)
+        self._req(c, "POST", f"/api/v2/setup/seasons/{season['id']}/venue-access",
+                  {"venue_id": game_venue["id"]})
         rink = self._v2(c, "rink", {"venue_id": game_venue["id"], "name": "Rink 1"})
         slot = self._v2(c, "ice-slot",
                        {"rink_id": rink["id"],
@@ -863,13 +861,11 @@ class V2SetupContractTest(unittest.TestCase):
         team_b = self._v2(c, "team",
                         {"program_id": program["id"], "club_id": club["id"],
                          "name": "B"})
-        # Venue must be linked to the program for the game ice to be schedulable
-        # (the league-ice isolation guard). The v2 venue route omits league_id,
-        # so use the v1 venue create for the owner+program link this test needs.
-        status, venue = self._req(c, "POST", "/api/setup/venue",
-                                  {"name": "V", "league_id": program["id"],
-                                   "organization_id": org["id"]})
-        self.assertEqual(status, 200, venue)
+        # The venue needs active SeasonVenueAccess for this Season for the
+        # game ice to be schedulable (#233 Slice E).
+        venue = self._v2(c, "venue", {"name": "V", "organization_id": org["id"]})
+        self._req(c, "POST", f"/api/v2/setup/seasons/{season['id']}/venue-access",
+                  {"venue_id": venue["id"]})
         rink = self._v2(c, "rink", {"venue_id": venue["id"], "name": "R"})
         slot = self._v2(c, "ice-slot",
                        {"rink_id": rink["id"],

@@ -1,23 +1,23 @@
-// v1-dependency proof (#233 B2c): every application UI workflow talks to the
-// canonical /api/v2/setup/... surface. The ONLY frontend call still on
-// /api/setup/... is the temporary Venue→Program compatibility bridge
-// (POST /api/setup/venue/{id}/assign-league) — deliberately deferred to
-// Slice E, when the Venue.league_id coupling itself is removed.
+// v1-dependency proof (#233 B2c, bridge removed in Slice E): every
+// application UI workflow talks to the canonical /api/v2/setup/... surface.
+// The temporary Venue→Program compatibility bridge
+// (POST /api/setup/venue/{id}/assign-league) has been removed entirely
+// (#233 Slice E) — there is no longer any documented v1 exception.
 //
 // This journey drives EVERY structural create through its real Records-view
 // drawer — Organization (x2), Program, Season, League, Division, Club, Team
 // (x2), Venue, Rink, Ice-slot (x2), Official, Player — plus a Player→Team
-// reassign, the one documented v1 bridge, scheduling a game through the
-// Calendar wizard (League required, Division optional), and deleting both a
-// spare Organization and a draft game, while recording every request the
-// page makes. Driving creates through the real drawers (not a raw-fetch
-// fixture) means reverting any SETUP_POST entry back to v1 would be caught
-// here, not just by the separate check-v1-route-contract.js static check.
-// It then asserts the ONLY /api/setup/... calls observed are the documented
-// bridge call — any other stray v1 call fails the journey outright.
+// reassign, scheduling a game through the Calendar wizard (League required,
+// Division optional), and deleting both a spare Organization and a draft
+// game, while recording every request the page makes. Driving creates
+// through the real drawers (not a raw-fetch fixture) means reverting any
+// SETUP_POST entry back to v1 would be caught here, not just by the separate
+// check-v1-route-contract.js static check. It then asserts ZERO
+// /api/setup/... calls were observed — any v1 call fails the journey.
 //
 // It also asserts the removed legacy Team→Division reassignment control
-// (superseded by SeasonTeamRegistration) is never rendered anywhere.
+// (superseded by SeasonTeamRegistration) and the removed Venue→Program
+// bridge control are never rendered anywhere.
 //
 // Fails on any browser console/page error.
 const { chromium } = require("playwright");
@@ -33,9 +33,6 @@ const VIEWPORTS = [
   { label: "desktop", width: 1440, height: 900, port: 8171 },
   { label: "phone", width: 390, height: 844, port: 8172 },
 ];
-
-// The one documented, deliberately-deferred v1 call (removed in Slice E).
-const ALLOWED_V1 = /^\/api\/setup\/venue\/[^/]+\/assign-league$/;
 
 function waitForServer(url, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
@@ -152,8 +149,9 @@ async function checkViewport(browser, viewport) {
       "f-slot-start": "18:00", "f-slot-end": "19:00",
     }, "/api/v2/setup/ice-slot");
     // A second slot for the scheduler-committed draft built AFTER the venue
-    // bridge is applied below (the round-robin generator requires the
-    // slot's venue to already carry the legacy league_id).
+    // is granted season access below (the round-robin generator requires the
+    // slot's venue to hold active SeasonVenueAccess for the season, #233
+    // Slice E).
     const draftSlot = await createViaDrawer("ice-slot", {
       "f-slot-rink": rink.id, "f-slot-date": CAL_DAY,
       "f-slot-start": "20:00", "f-slot-end": "21:00",
@@ -172,7 +170,15 @@ async function checkViewport(browser, viewport) {
         { team_id: i.team1, league_id: i.league, division_id: i.division });
       await post(`/api/v2/setup/seasons/${i.season}/team-registrations`,
         { team_id: i.team2, league_id: i.league, division_id: i.division });
-    }, { season: season.id, league: league.id, division: division.id, team1: team1.id, team2: team2.id });
+      // Season venue access (#233 Slice E) — a new v2-only feature with no
+      // dedicated Records/Hierarchy UI yet, so built via raw fetch, matching
+      // the established fixture-building pattern for prerequisites this
+      // journey isn't itself proving.
+      await post(`/api/v2/setup/seasons/${i.season}/venue-access`, { venue_id: i.venue });
+    }, {
+      season: season.id, league: league.id, division: division.id,
+      team1: team1.id, team2: team2.id, venue: venue.id,
+    });
 
     // (1) Official create — drawer submit must hit v2.
     await createViaDrawer("official", { "f-official": "Proof Official" }, "/api/v2/setup/official");
@@ -207,6 +213,14 @@ async function checkViewport(browser, viewport) {
     // League→Division cascade, never a structural Team reassignment.
     if (await page.$('[data-reassign="team:division"]')) {
       throw new Error(`[${viewport.label}] a legacy team:division reassign control is still rendered`);
+    }
+    // The removed Venue→Program bridge control (#233 Slice E) must never
+    // render anywhere either — the Facility tree's venue rows no longer
+    // offer a "⇄ Move" to a program.
+    await page.click('.tab[data-tab="setup"]');
+    await page.click('[data-setup-view="hierarchy"]');
+    if (await page.$('[data-reassign="venue:league"]')) {
+      throw new Error(`[${viewport.label}] a removed venue:league bridge reassign control is still rendered`);
     }
 
     // (5) The one documented, deliberately-deferred v1 call: the temporary
@@ -286,21 +300,16 @@ async function checkViewport(browser, viewport) {
     await page.click("[data-del-confirm]");
     await page.waitForSelector(".modal", { state: "detached", timeout: 10000 });
 
-    // The proof: every /api/setup/... call this page made is the one
-    // documented bridge — anything else is a stray v1 dependency.
-    const stray = v1Calls.filter((c) => !ALLOWED_V1.test(c.split(" ")[1]));
-    if (stray.length) {
-      throw new Error(`[${viewport.label}] stray /api/setup/... calls found: ${JSON.stringify(stray)}`);
-    }
-    const bridgeCalls = v1Calls.filter((c) => ALLOWED_V1.test(c.split(" ")[1]));
-    if (!bridgeCalls.length) {
-      throw new Error(`[${viewport.label}] the documented venue-bridge call never fired — the allowlist regex may be untested`);
+    // The proof: NO /api/setup/... call was made anywhere in this journey —
+    // the Venue→Program bridge (the last documented v1 exception) is gone.
+    if (v1Calls.length) {
+      throw new Error(`[${viewport.label}] stray /api/setup/... calls found: ${JSON.stringify(v1Calls)}`);
     }
 
     if (errors.length) {
       throw new Error(`[${viewport.label}] console/page errors:\n${errors.join("\n")}`);
     }
-    console.log(`[${viewport.label}] OK — every /api/setup/... call was the documented venue-bridge exception (${bridgeCalls.length}), zero stray v1 calls.`);
+    console.log(`[${viewport.label}] OK — zero /api/setup/... calls, the app is fully on the v2 surface.`);
   } catch (error) {
     throw new Error(`${error.message}\n--- demo server output ---\n${serverOutput}`);
   } finally {

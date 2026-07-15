@@ -10,7 +10,6 @@ from typing import Optional
 from ..domain.errors import DomainError, NotFoundError, ValidationError
 from .scope_bridge import (
     get_scope_program,
-    program_operator_id,
     season_scope_id,
     team_scope_id,
 )
@@ -218,60 +217,40 @@ def require_game_league_id(store, game) -> str:
     return league_id
 
 
-def require_slot_belongs_to_league(store, ice_slot_id: str, league_id: str):
-    """Require an IceSlot's Venue to be assigned to ``league_id``.
+def require_slot_belongs_to_season(store, ice_slot_id: str, season_id: str):
+    """Require an IceSlot's Venue to hold active SeasonVenueAccess for ``season_id``.
 
     Returns the resolved Venue so callers that need venue context do not repeat
-    the traversal. Unassigned and cross-league inventory are both invalid.
+    the traversal. Replaces the legacy one-Venue-one-Program bridge (#233 Slice
+    E): a Venue may legitimately host many Seasons/Programs, and a facility
+    owner and Program operator may be different organizations, so no
+    owner-match check is imposed here.
     """
-    league = get_scope_program(store, league_id) if league_id else None
-    if league is None:
+    season = store.get_season(season_id) if season_id else None
+    if season is None:
         raise ValidationError(
-            "A valid league is required before assigning game ice.",
-            details={"reason": "league_missing", "league_id": league_id},
+            "A valid season is required before assigning game ice.",
+            details={"reason": "season_missing", "season_id": season_id},
         )
     venue = venue_for_slot(store, ice_slot_id)
-    if not venue.league_id:
+    access = store.season_venue_access_for_pair(season_id, venue.id)
+    if access is None or not access.active:
         raise ValidationError(
-            "The selected ice slot's venue is not assigned to a league.",
+            "The selected ice slot's venue is not allowed for this season.",
             details={
-                "reason": "venue_league_unassigned",
+                "reason": "venue_access_missing",
                 "ice_slot_id": ice_slot_id,
                 "venue_id": venue.id,
-                "league_id": league_id,
-            },
-        )
-    if venue.league_id != league_id:
-        raise ValidationError(
-            "The selected ice slot belongs to a different league.",
-            details={
-                "reason": "cross_league_slot",
-                "ice_slot_id": ice_slot_id,
-                "venue_id": venue.id,
-                "expected_league_id": league_id,
-                "actual_league_id": venue.league_id,
-            },
-        )
-    league_organization_id = program_operator_id(league)
-    if (league_organization_id or None) != (venue.organization_id or None):
-        raise ValidationError(
-            "The venue owner does not match the league owner.",
-            details={
-                "reason": "venue_owner_mismatch",
-                "ice_slot_id": ice_slot_id,
-                "venue_id": venue.id,
-                "league_id": league_id,
-                "league_organization_id": league_organization_id,
-                "venue_organization_id": venue.organization_id,
+                "season_id": season_id,
             },
         )
     return venue
 
 
-def slot_belongs_to_league(store, ice_slot_id: str, league_id: str) -> bool:
+def slot_belongs_to_season(store, ice_slot_id: str, season_id: str) -> bool:
     """Boolean filtering form used when scanning all inventory for a draft."""
     try:
-        require_slot_belongs_to_league(store, ice_slot_id, league_id)
+        require_slot_belongs_to_season(store, ice_slot_id, season_id)
         return True
     except DomainError:
         return False

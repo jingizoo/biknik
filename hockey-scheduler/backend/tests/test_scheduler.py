@@ -26,6 +26,7 @@ from hockey_scheduler.domain import (
     Rink,
     Season,
     SeasonTeamRegistration,
+    SeasonVenueAccess,
     Team,
     Venue,
 )
@@ -73,6 +74,8 @@ class DraftScheduleTest(unittest.TestCase):
         s.add_division(Division(id="div1", season_id="se1", name="D1"))
         s.add_venue(Venue(id="v1", name="Arena", organization_id="org1",
                           league_id="league1"))
+        s.add_season_venue_access(SeasonVenueAccess(
+            id="sva1", season_id="se1", venue_id="v1", active=True))
         s.add_rink(Rink(id="r1", venue_id="v1", name="Main"))
         for i in range(n_teams):
             s.add_team(Team(id=f"t{i}", name=f"Team {i}", division="D1",

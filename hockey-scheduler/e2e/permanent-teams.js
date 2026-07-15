@@ -356,48 +356,6 @@ async function checkViewport(browser, viewport) {
       fail(`Division delete did not POST to v2 (got ${divDelUrl})`);
     await page.waitForFunction(() => !document.querySelector(".modal[role=dialog]"), null, { timeout: 5000 });
 
-    // 12) #233 B2a review r1: the temporary Venue→Program compatibility bridge
-    //     is set through the v1 assign-league route (the one deliberate v1
-    //     structural holdout) and, unlike before, its current value is
-    //     displayed and preselected — it must not disappear on refresh.
-    const bridgeVenue = await page.evaluate(async (leagueId) => {
-      const r = await fetch("/api/v2/setup/venue", {
-        method: "POST", credentials: "same-origin",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name: "Bridge Arena", organization_id: null }),
-      });
-      return (await r.json()).id;
-    }, ids.league);
-    await page.reload({ waitUntil: "domcontentloaded" });
-    await page.click('.tab[data-tab="setup"]');
-    await page.click('[data-setup-view="hierarchy"]');
-    await page.waitForFunction(
-      () => document.body.textContent.includes("Bridge Arena"), null, { timeout: 15000 });
-    const bridgeReq = page.waitForRequest((r) =>
-      r.url().includes("/api/setup/venue/") && r.url().includes("/assign-league")
-      && r.method() === "POST");
-    await page.click('[data-reassign="venue:league"]');
-    await page.waitForSelector(".rz-panel select#reassign-target", { timeout: 5000 });
-    await page.selectOption("#reassign-target", ids.league);
-    await page.click(".rz-panel [data-reassign-confirm]");
-    const bridgeUrl = (await bridgeReq).url();
-    if (bridgeUrl.includes("/api/v2/setup/"))
-      fail(`Venue→Program bridge unexpectedly went to v2 (got ${bridgeUrl})`);
-    await page.waitForFunction(() => !document.querySelector(".rz-panel"), null, { timeout: 5000 });
-    await page.reload({ waitUntil: "domcontentloaded" });
-    await page.click('.tab[data-tab="setup"]');
-    await page.click('[data-setup-view="hierarchy"]');
-    await page.waitForFunction(
-      () => document.body.textContent.includes("Bridged to: Permanent League"),
-      null, { timeout: 15000 });
-    await page.click('[data-reassign="venue:league"]');
-    await page.waitForSelector(".rz-panel select#reassign-target", { timeout: 5000 });
-    const preselected = await page.$eval("#reassign-target", (s) => s.value);
-    if (preselected !== ids.league)
-      fail(`Venue bridge Move panel did not preselect the current Program (got "${preselected}")`);
-    await page.click(".rz-panel [data-reassign-cancel]");
-    await page.waitForFunction(() => !document.querySelector(".rz-panel"), null, { timeout: 5000 });
-
     if (errors.length) fail(`console/page errors:\n${errors.join("\n")}`);
     console.log(`[${tag}] OK — permanent team under league; Setup uses Program/League nouns end to end.`);
   } catch (error) {

@@ -203,13 +203,11 @@ def required_permission(path: str):
     if path.startswith("/api/v2/setup/"):
         return _v2_setup_permission(path[len("/api/v2/setup/"):])
 
-    # Cross-domain league↔facility moves (#173) — tying a league to an owner or
-    # a venue to a league spans both domains, so both require MANAGE_SETUP
-    # (League-Admin-only), even though a venue's own arena-side moves don't.
-    # These must precede the arena-side venue rule below.
+    # Cross-domain league→owner move (#173) — tying a league to an owner spans
+    # both domains, so it requires MANAGE_SETUP (League-Admin-only), even
+    # though a venue's own arena-side moves don't. Must precede the arena-side
+    # venue rule below.
     if re.match(r"^/api/setup/league/[^/]+/assign-organization$", path):
-        return Permission.MANAGE_SETUP
-    if re.match(r"^/api/setup/venue/[^/]+/assign-league$", path):
         return Permission.MANAGE_SETUP
 
     # Reassignment routes (#166 PR D): /api/setup/<entity>/<id>/assign-<parent>.

@@ -75,9 +75,10 @@ class _SqlIntegrityBase(unittest.TestCase):
         return org, program
 
     @staticmethod
-    def _game_slot(api, org, program):
+    def _game_slot(api, org, program, season_id):
         venue = api.create_venue("V", organization_id=org["id"],
                                  league_id=program["id"], actor_id=ADMIN)
+        api.grant_season_venue_access(season_id, venue["id"], actor_id=ADMIN)
         rink = api.create_rink(venue["id"], "R", actor_id=ADMIN)
         return api.create_ice_slot(
             rink["id"], "2026-09-01T18:30:00+00:00",
@@ -188,7 +189,7 @@ class AssignLeagueGameStrandSqlTest(_SqlIntegrityBase):
                                                  actor_id=ADMIN, league_id=l1["id"])
             api.register_team_for_season(season["id"], team_b["id"],
                                          actor_id=ADMIN, league_id=l1["id"])
-            slot = self._game_slot(api, org, program)
+            slot = self._game_slot(api, org, program, season["id"])
             game = api.create_game(season["id"], None, team_a["id"], team_b["id"],
                                    slot["id"], actor_id=ADMIN, league_id=l1["id"])
             self.assertNotIn("error", game, game)
@@ -221,7 +222,7 @@ class GameRegistrationLeagueSqlTest(_SqlIntegrityBase):
                                          actor_id=ADMIN, league_id=l1["id"])
             api.register_team_for_season(season["id"], team_b["id"],
                                          actor_id=ADMIN, league_id=l1["id"])
-            slot = self._game_slot(api, org, program)
+            slot = self._game_slot(api, org, program, season["id"])
 
             audits_before = len(store.all_setup_audit())
             # Game scoped to L2 while both teams are registered in L1 → rejected.

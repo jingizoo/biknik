@@ -9,9 +9,8 @@ from typing import Optional
 
 from .league_scope import (
     require_game_league_id,
-    require_slot_belongs_to_league,
+    require_slot_belongs_to_season,
 )
-from .scope_bridge import season_scope_id
 from .setup_service import SetupService as _BaseSetupService
 
 
@@ -61,8 +60,8 @@ class SetupService(_BaseSetupService):
                 and teams_match
             )
             if structure_valid:
-                require_slot_belongs_to_league(
-                    self.store, ice_slot_id, season_scope_id(season))
+                require_slot_belongs_to_season(
+                    self.store, ice_slot_id, season_id)
             return _BaseSetupService.create_game.__wrapped__(
                 self, season_id, division_id, home_team_id, away_team_id,
                 ice_slot_id, target_goalies=target_goalies,
@@ -78,9 +77,9 @@ class SetupService(_BaseSetupService):
             # Preserve the base service's established same-slot error/reason
             # before running the new scope check.
             if game is not None and new_ice_slot_id != game.ice_slot_id:
-                league_id = require_game_league_id(self.store, game)
-                require_slot_belongs_to_league(
-                    self.store, new_ice_slot_id, league_id)
+                require_game_league_id(self.store, game)
+                require_slot_belongs_to_season(
+                    self.store, new_ice_slot_id, game.season_id)
             return _BaseSetupService.move_game.__wrapped__(
                 self, game_id, new_ice_slot_id, reason=reason,
                 actor_id=actor_id)
@@ -90,8 +89,8 @@ class SetupService(_BaseSetupService):
         with self.store.transaction():
             game = self.store.get_game(game_id)
             if published and game is not None:
-                league_id = require_game_league_id(self.store, game)
-                require_slot_belongs_to_league(
-                    self.store, game.ice_slot_id, league_id)
+                require_game_league_id(self.store, game)
+                require_slot_belongs_to_season(
+                    self.store, game.ice_slot_id, game.season_id)
             return _BaseSetupService.publish_game.__wrapped__(
                 self, game_id, published, actor_id)

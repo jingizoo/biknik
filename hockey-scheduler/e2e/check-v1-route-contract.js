@@ -1,16 +1,16 @@
-// Static v1-route contract check (#233 B2c review): rather than scanning for
-// the literal substring "/api/setup/" (which also matches the two
-// *parameterized* v1-fallback templates in commitReassign()/wireModal() —
-// `/api/setup/${pr.kind}/.../assign-${pr.parent}` and
-// `/api/setup/${m.kind}/${m.id}/delete` — neither of which spells out a
+// Static v1-route contract check (#233 B2c review, bridge removed in Slice
+// E): rather than scanning for the literal substring "/api/setup/" (which
+// also matches the two *parameterized* v1-fallback templates in
+// commitReassign()/wireModal() — `/api/setup/${pr.kind}/.../assign-${pr.parent}`
+// and `/api/setup/${m.kind}/${m.id}/delete` — neither of which spells out a
 // concrete path in source), this inspects the DATA STRUCTURES that gate
 // those fallbacks:
 //
-//   - REASSIGN_V2 must cover every REASSIGN entry except the one documented,
-//     deliberately-deferred exception (venue:league, the temporary
-//     Venue→Program compatibility bridge — removed in Slice E). Any other
-//     REASSIGN entry with no REASSIGN_V2 counterpart falls through
-//     commitReassign()'s v1 POST — a stray v1 write.
+//   - REASSIGN_V2 must cover EVERY REASSIGN entry — there is no longer any
+//     documented v1 exception (the temporary Venue→Program compatibility
+//     bridge, venue:league, was removed in #233 Slice E). Any REASSIGN entry
+//     with no REASSIGN_V2 counterpart falls through commitReassign()'s v1
+//     POST — a stray v1 write.
 //   - SETUP_POST's create dispatch must target /api/v2/setup/... for every
 //     entity — a literal v1 URL there is a stray v1 write.
 //
@@ -28,7 +28,6 @@ const path = require("path");
 
 const APP_JS = path.resolve(__dirname, "..", "backend", "hockey_scheduler",
   "web", "static", "app.js");
-const ALLOWED_V1_FALLBACK_REASSIGN = new Set(["venue:league"]);
 
 // Extract the `{...}` body of `const NAME = { ... };`, balancing braces (a
 // naive `indexOf("};")` would stop at the first entry's own closing brace).
@@ -77,15 +76,9 @@ function checkSource(source) {
   const reassignKeys = extractQuotedKeys(extractObjectBody(source, "REASSIGN"));
   const reassignV2Keys = extractQuotedKeys(extractObjectBody(source, "REASSIGN_V2"));
   for (const key of reassignKeys) {
-    if (!reassignV2Keys.has(key) && !ALLOWED_V1_FALLBACK_REASSIGN.has(key)) {
-      violations.push(`REASSIGN["${key}"] has no REASSIGN_V2 entry and is not the ` +
-        `documented venue:league bridge exception — it falls through to a v1 POST.`);
-    }
-  }
-  for (const allowed of ALLOWED_V1_FALLBACK_REASSIGN) {
-    if (!reassignKeys.has(allowed)) {
-      violations.push(`Expected REASSIGN["${allowed}"] (the documented v1 bridge) ` +
-        `to exist, but it's missing — the allowlist is stale.`);
+    if (!reassignV2Keys.has(key)) {
+      violations.push(`REASSIGN["${key}"] has no REASSIGN_V2 entry — ` +
+        `it falls through to a v1 POST.`);
     }
   }
   const setupPostPaths = extractSetupPostPaths(extractObjectBody(source, "SETUP_POST"));
@@ -108,15 +101,14 @@ const SETUP_POST = {
 };
 const REASSIGN = {
   "team:club": { perm: "manage_setup" },
-  "venue:league": { perm: "manage_setup" },
 };
 const REASSIGN_V2 = {
   "team:club": { kind: "team", parent: "club", bodyKey: "club_id" },
 };
 `;
   const strayReassign = clean.replace(
-    '"venue:league": { perm: "manage_setup" },',
-    '"venue:league": { perm: "manage_setup" },\n  "player:team": { perm: "manage_setup" },');
+    '"team:club": { perm: "manage_setup" },\n};',
+    '"team:club": { perm: "manage_setup" },\n  "player:team": { perm: "manage_setup" },\n};');
   const strayCreate = clean.replace(
     'post("/api/v2/setup/team"', 'post("/api/setup/team"');
 
@@ -149,9 +141,8 @@ function main() {
     process.exitCode = 1;
     return;
   }
-  console.log("v1 route contract OK — every REASSIGN entry without a REASSIGN_V2 " +
-    "counterpart is exactly the documented venue:league bridge, and every " +
-    "SETUP_POST entry targets /api/v2/setup/...");
+  console.log("v1 route contract OK — every REASSIGN entry has a REASSIGN_V2 " +
+    "counterpart, and every SETUP_POST entry targets /api/v2/setup/...");
 }
 
 main();

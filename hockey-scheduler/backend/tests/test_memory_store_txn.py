@@ -29,7 +29,9 @@ def _seed_scheduleable(store):
     away = svc.create_team(svc.create_club("CB").id, div.id, "TB")
     svc.register_team_for_season(season.id, home.id, div.id)
     svc.register_team_for_season(season.id, away.id, div.id)
-    rink = svc.create_rink(svc.create_venue("V", league_id=league.id).id, "R")
+    venue = svc.create_venue("V", league_id=league.id)
+    svc.grant_season_venue_access(season.id, venue.id)
+    rink = svc.create_rink(venue.id, "R")
     slot = svc.create_ice_slot(rink.id, datetime(2026, 9, 1, 18, 30, tzinfo=UTC),
                                datetime(2026, 9, 1, 20, 0, tzinfo=UTC))
     return svc, season, div, home, away, slot

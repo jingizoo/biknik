@@ -1062,18 +1062,17 @@ class ApiService:
         program_ids = {p.id for p in programs}
         season_ids = {s.id for s in seasons}
         team_ids = {t.id for t in teams}
-        program_owner = {p.id: (p.operator_organization_id or None)
-                         for p in programs}
 
-        # Venue/ice soundness — identical rules to v1 (venue↔program is still the
-        # temporary v1 relation until Slice E), just under canonical names.
-        venues_in_program = [v for v in venues if v.league_id in program_ids]
-        venue_mismatches = [
-            v for v in venues_in_program
-            if (v.organization_id or None) != program_owner.get(v.league_id)]
-        mismatch_ids = {v.id for v in venue_mismatches}
-        sound_program_venue_ids = {
-            v.id for v in venues_in_program if v.id not in mismatch_ids}
+        # Venue/ice soundness (#233 Slice E): a venue is schedulable once ANY of
+        # this program's seasons has granted it active SeasonVenueAccess — the
+        # legacy venue<->program bridge no longer gates readiness. There is no
+        # owner-match concept here: a facility owner and a program operator are
+        # deliberately independent.
+        program_season_ids = {s.id for s in seasons if s.program_id in program_ids}
+        venue_access_venue_ids = {
+            a.venue_id for a in self.store.all_season_venue_access()
+            if a.active and a.season_id in program_season_ids}
+        sound_program_venue_ids = venue_access_venue_ids & {v.id for v in venues}
         schedulable_rink_ids = {
             r.id for r in rinks if r.venue_id in sound_program_venue_ids}
         available_game_slots = [
@@ -1158,16 +1157,13 @@ class ApiService:
                            "tied to an operating organization."})
 
         venue_ok = bool(sound_program_venue_ids)
-        step("venue", "Link a venue to a program (temporary v1)", venue_ok,
-             detail=(f"{len(sound_program_venue_ids)} venue(s) linked to a program"
-                     if venue_ok else f"{len(venues)} venue(s), "
-                     f"{len(venues_in_program)} linked"))
+        step("venue", "Grant a season venue access", venue_ok,
+             detail=(f"{len(sound_program_venue_ids)} venue(s) with active "
+                     "season access" if venue_ok
+                     else f"{len(venues)} venue(s), 0 with active season access"))
         if has_program:
-            block(bool(venues_in_program), "no_venue_assigned_to_program",
-                  "No venue is linked to a program yet.")
-            block(not venue_mismatches, "venue_owner_mismatch",
-                  f"{len(venue_mismatches)} venue(s) have a facility owner that "
-                  "disagrees with their program's operating organization.")
+            block(venue_ok, "no_venue_access_granted",
+                  "No venue has been granted access to a season yet.")
 
         has_rink = bool(schedulable_rink_ids)
         step("rink", "Add a rink to a configured venue", has_rink,
@@ -2622,11 +2618,11 @@ class ApiService:
         operator's Setup surface renders from. Every field is canonical — a
         Program's ``operator_organization_id``, a Season/Team's ``program_id``, a
         Division's grouping ``league_id`` — and the canonical Venue is
-        Organization-owned only, carrying NO ``league_id`` (the temporary
-        Venue→Program game-ice link is set through the v1
-        ``venue/{id}/assign-league`` bridge until Slice E). It exposes only
-        structural records plus resolved parent names — no rosters, schedule,
-        games or PII — so it is gated like the hierarchy read.
+        Organization-owned only, carrying NO ``league_id``. Which Seasons may
+        use a Venue's ice is a separate SeasonVenueAccess grant (#233 Slice
+        E), not part of this structural read. It exposes only structural
+        records plus resolved parent names — no rosters, schedule, games or
+        PII — so it is gated like the hierarchy read.
         """
         programs = self.store.all_programs()
         seasons = self.store.all_seasons()
@@ -3273,11 +3269,6 @@ class ApiService:
                                     actor_id: Optional[str] = None) -> dict:
         return _serialize(self.setup.assign_program_organization(
             program_id, organization_id, actor_id))
-
-    @catch
-    def assign_venue_league(self, venue_id: str, league_id: Optional[str] = None,
-                            actor_id: Optional[str] = None) -> dict:
-        return _serialize(self.setup.assign_venue_league(venue_id, league_id, actor_id))
 
     @catch
     def create_organization(self, name: str, short_name: str = "",

@@ -646,18 +646,13 @@ const SETUP_ENTITIES = [
       { id: "f-org-short", label: "Short name (optional)", placeholder: "e.g. Summit" }] },
   { key: "venue", title: "Venues", icon: "🏟️", noun: "venue", perm: "manage_arena",
     // A venue is owned by an organization (#233 canonical) — show its facility
-    // owner. The venue↔program game-ice link is a separate temporary bridge
-    // control on the Facility tree (removed in Slice E).
+    // owner. Which Seasons may use a venue's ice is a separate, independent
+    // grant (SeasonVenueAccess, #233 Slice E) managed under each Season.
     list: (ov) => (ov.venues || []).map((v) => ({
       title: v.name,
       sub: [v.organization_name].filter(Boolean).join(" · ") || "Unassigned" })),
     // No Program field on this form (#233 B2a review r1): canonical Venue
-    // create is org-owned only. The temporary venue→program game-ice
-    // compatibility bridge is managed exclusively post-creation via the
-    // Facility tree's labelled "⇄ Move" control (POST /api/setup/venue/
-    // {id}/assign-league) — a create-time field couldn't apply it anyway (no
-    // venue id yet), and one that silently discarded a selection was
-    // actively misleading.
+    // create is org-owned only.
     fields: [
       { id: "f-venue", label: "Venue name", required: true, placeholder: "e.g. South Arena" },
       { id: "f-venue-org", label: "Facility owner (organization)", type: "select", ofNoun: "organization", ofNounDisplay: "facility owner",
@@ -807,24 +802,19 @@ const REASSIGN = {
     perm: "manage_setup", noun: "team", nullable: false, risky: true,
     warn: "Moving a player changes which team's roster they belong to.",
     options: (ov) => (ov.teams || []).map((t) => [t.id, t.name]) },
-  // Cross-domain program↔facility moves (#173) — both MANAGE_SETUP.
+  // Program↔facility owner move (#173) — MANAGE_SETUP. Independent of any
+  // Venue (#233 Slice E): a program's operating organization is free to
+  // change regardless of Venue state.
   "league:organization": {
-    perm: "manage_setup", noun: "facility owner", displayNoun: "operating organization", nullable: true, risky: true,
-    warn: "Legacy v1 blocks changing a program's operating organization while venues are still attached to it — unassign its venues first. This coupling is a temporary v1 rule, not the target model; it goes away when Season↔Venue access lands in Slice E.",
+    perm: "manage_setup", noun: "facility owner", displayNoun: "operating organization", nullable: true, risky: false,
     options: (ov) => (ov.organizations || []).map((o) => [o.id, o.name]) },
-  "venue:league": {
-    perm: "manage_setup", noun: "league", displayNoun: "program", nullable: true, risky: true,
-    warn: "Legacy v1 only: linking a venue to a program derives the venue's facility owner from that program's operating organization. This is a temporary v1 coupling — the venue↔program link is removed when Season↔Venue access lands in Slice E.",
-    options: (ov) => (ov.leagues || []).map(
-      (l) => [l.id, `${nameById(ov.organizations, l.organization_id) || "No operating org"} · ${l.name}`]) },
 };
 // v2 route + canonical body-key mapping for the reassignments moved to v2
 // (#233 B2a review r1): frontend kind/parent tokens stay frozen (league =
 // Program, level = League), but the v2 request needs canonical route
-// segments and body keys. venue:league (the temporary game-ice
-// compatibility bridge) is the one deliberate v1 holdout — Slice E removes
-// it along with the bridge itself; every other structural entity visible in
-// B2a moves here.
+// segments and body keys. The venue:league temporary game-ice compatibility
+// bridge (the one deliberate v1 holdout) was removed in #233 Slice E along
+// with its backend route; every remaining structural entity here moves to v2.
 const REASSIGN_V2 = {
   "league:organization": { kind: "program", parent: "organization", bodyKey: "operator_organization_id" },
   "division:level": { kind: "division", parent: "league", bodyKey: "league_id" },
@@ -1180,18 +1170,10 @@ function renderSetupHierarchy(sv, hv, ov) {
   });
 
   // -- Facility: Organization owns Venue → Rink (canonical #233 — venues are
-  //    org-owned). The venue→program game-ice link is a separate temporary
-  //    compatibility bridge on each venue, removed in Slice E. --
+  //    org-owned, independent of any competition Program). Which Seasons may
+  //    use a Venue's ice is managed under each Season (SeasonVenueAccess,
+  //    #233 Slice E), not here on the facility tree. --
   const rinksByVenue = groupBy(sv.rinks, "venue_id");
-  // The canonical sv.venues omits league_id (org-owned only), but the bridge
-  // control still needs the venue's CURRENT legacy Program link so the "⇄
-  // Move" panel preselects it instead of always looking unset (#233 B2a
-  // review r1). ov and sv share the same id values for the same records, so
-  // this lookup by id is safe even though the two payloads' venue shapes
-  // differ.
-  const ovVenueById = {};
-  (ov.venues || []).forEach((v) => { ovVenueById[v.id] = v; });
-  const ovProgramName = (id) => (((ov.leagues || []).find((l) => l.id === id)) || {}).name || "";
   const venueNode = (v) => {
     const rinks = rinksByVenue[v.id] || [];
     const badge = rinks.length
@@ -1199,16 +1181,9 @@ function renderSetupHierarchy(sv, hv, ov) {
     const rinkRows = rinks.map((r) =>
       `<div class="tn-leaf"><span class="tn-label">⛸️ ${esc(r.name)}</span>${reassignBtn("rink", "venue", r, r.venue_id)}${delBtn("rink", r.id, r.name)}</div>`).join("")
       || `<div class="tn-empty">No rinks yet. Add a rink so this venue can host games.</div>`;
-    // venue:organization is the canonical owner move; venue:league is the
-    // temporary game-ice compatibility bridge, preselected from the venue's
-    // current legacy Program link (looked up via ov, never sv).
-    const bridgeLeagueId = (ovVenueById[v.id] || {}).league_id || "";
-    const bridgeState = bridgeLeagueId
-      ? `<span class="tn-meta">Bridged to: ${esc(ovProgramName(bridgeLeagueId))}</span>`
-      : `<span class="tn-meta">No bridge set</span>`;
     return `<details class="tn" open><summary class="tn-sum">
         <span class="tn-label">🏟️ ${esc(v.name)}</span>
-        <span class="tn-meta">${rinks.length} rink${rinks.length === 1 ? "" : "s"}</span>${badge}${reassignBtn("venue", "organization", v, v.organization_id)}${reassignBtn("venue", "league", v, bridgeLeagueId)}${bridgeState}<span class="tn-meta">Temporary game-ice compatibility — removed in Slice E</span>${delBtn("venue", v.id, v.name)}</summary>
+        <span class="tn-meta">${rinks.length} rink${rinks.length === 1 ? "" : "s"}</span>${badge}${reassignBtn("venue", "organization", v, v.organization_id)}${delBtn("venue", v.id, v.name)}</summary>
       <div class="tn-children">${rinkRows}${treeAdd("rink", "Add rink to " + v.name, "f-rink-venue", v.id)}</div>
     </details>`;
   };
@@ -1393,19 +1368,6 @@ function renderSetupHierarchy(sv, hv, ov) {
   const noClubTeams = (ov.teams || []).filter((t) => !t.club_id && !t.club_name);
   const orphanPlayers = canSeePlayers
     ? playersList.filter((p) => !p.team_id || !teamIds.has(p.team_id)) : [];
-  // League↔facility gaps (#173): venues without a league, and venues whose
-  // owner disagrees with their league's owner. A Program with no operating
-  // organization is NOT one of these gaps (#233 B2b review r3) — the
-  // operator is optional on the canonical model (B2a/ADR 0001) and never a
-  // scheduling blocker, so it must never appear under this "can't be
-  // scheduled until assigned" panel; the Records subtitle ("No operating
-  // org") and the onboarding wizard's own optional check already surface it
-  // informationally.
-  const leagueOwner = {};
-  (ov.leagues || []).forEach((l) => { leagueOwner[l.id] = l.organization_id || null; });
-  const noLeagueVenues = (ov.venues || []).filter((v) => !v.league_id);
-  const ownerMismatchVenues = (ov.venues || []).filter(
-    (v) => v.league_id && (leagueOwner[v.league_id] || null) !== (v.organization_id || null));
   // Each orphan row carries the same "⇄ Move" control (labelled by its fix)
   // so an operator can assign a parent inline — the primary fix surface (#166).
   const naRow = (label, rows, fix) => rows.length
@@ -1461,11 +1423,7 @@ function renderSetupHierarchy(sv, hv, ov) {
   const regIssueRows = seasonRegIssues.length
     ? `<div class="na-group"><div class="na-group-label">Season registrations needing attention (${seasonRegIssues.length})</div>${
         seasonRegIssues.map(regIssueRow).join("")}</div>` : "";
-  const naBody = naRow("Venues without a legacy program grouping", noLeagueVenues,
-            (v) => reassignBtn("venue", "league", v, v.league_id))
-    + naRow("Venue facility owner ≠ program operating organization (legacy v1 link)", ownerMismatchVenues,
-            (v) => reassignBtn("venue", "league", v, v.league_id))
-    + naRow("Rinks without a venue", orphanRinks,
+  const naBody = naRow("Rinks without a venue", orphanRinks,
             (r) => reassignBtn("rink", "venue", r, r.venue_id))
     + naRow("Teams without a club", noClubTeams,
             (t) => reassignBtn("team", "club", t, t.club_id))

@@ -149,12 +149,11 @@ class ServerAuthzTest(unittest.TestCase):
         self.assertEqual(body["error"]["details"]["required"], "manage_setup")
 
     def test_cross_domain_league_venue_moves_are_setup_only(self):
-        # Tying a league to an owner or a venue to a league spans both domains
-        # (#173): MANAGE_SETUP only. An Arena Manager (MANAGE_ARENA) is
-        # forbidden even though its plain venue moves are allowed.
+        # Tying a league to an owner spans both domains (#173): MANAGE_SETUP
+        # only. An Arena Manager (MANAGE_ARENA) is forbidden even though its
+        # plain venue moves are allowed.
         for path, body in (
             ("/api/setup/league/league_x/assign-organization", {"organization_id": None}),
-            ("/api/setup/venue/venue_x/assign-league", {"league_id": None}),
         ):
             status, resp = self._post(path, body, role="arena_manager")
             self.assertEqual(status, 403, path)

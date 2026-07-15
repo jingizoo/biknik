@@ -128,8 +128,9 @@ class LegacyFieldIsInertContract:
         return self.api.create_team(
             self.club, division_id, name, actor_id=self.ACTOR, program_id=pid)["id"]
 
-    def _slot(self):
+    def _slot(self, season_id):
         venue = self.api.create_venue("V", league_id=self.league, actor_id=self.ACTOR)["id"]
+        self.api.grant_season_venue_access(season_id, venue, actor_id=self.ACTOR)
         rink = self.api.create_rink(venue, "R", actor_id=self.ACTOR)["id"]
         return self.api.create_ice_slot(
             rink, "2027-05-01T18:00:00+00:00", "2027-05-01T19:00:00+00:00",
@@ -149,12 +150,12 @@ class LegacyFieldIsInertContract:
         away = self._team("Away", division_id=dB)
         self._register(season, home, dA)             # truth: both play dA
         self._register(season, away, dA)
-        slot = self._slot()
+        slot = self._slot(season)
         # Scheduling in the REGISTERED division succeeds despite the legacy dB.
         game = self.api.create_game(season, dA, home, away, slot, actor_id=self.ACTOR)
         self.assertNotIn("error", game)
         # Scheduling in the LEGACY division is rejected — the field is inert.
-        bad = self.api.create_game(season, dB, home, away, self._slot(),
+        bad = self.api.create_game(season, dB, home, away, self._slot(season),
                                    actor_id=self.ACTOR)
         self.assertIn("error", bad)
 
@@ -216,7 +217,7 @@ class LegacyFieldIsInertContract:
         # division sits in this season's league.
         self.assertIsNone(team_registration_valid(
             self.store, self.store.get_season(season), orphan.id, dA))
-        bad = self.api.create_game(season, dA, orphan.id, other, self._slot(),
+        bad = self.api.create_game(season, dA, orphan.id, other, self._slot(season),
                                    actor_id=self.ACTOR)
         self.assertIn("error", bad)
 

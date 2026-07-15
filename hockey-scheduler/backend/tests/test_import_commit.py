@@ -219,6 +219,7 @@ class ImportCommitServiceContract:
         self.api.register_team_for_season(
             self.season.id, mate, u16.id, actor_id="admin")
         venue = self.setup.create_venue("V", league_id=league, actor_id="admin").id
+        self.setup.grant_season_venue_access(self.season.id, venue, actor_id="admin")
         rink = self.setup.create_rink(venue, "R", actor_id="admin").id
         slot = self.api.create_ice_slot(
             rink, "2027-06-01T18:00:00+00:00", "2027-06-01T19:00:00+00:00",
