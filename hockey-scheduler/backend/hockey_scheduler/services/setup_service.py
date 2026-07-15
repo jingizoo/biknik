@@ -619,6 +619,34 @@ class SetupService:
                 "Cannot permanently delete an active registration; remove "
                 "it from the season first.",
                 {"reason": "registration_active", "registration_id": reg.id})
+        # Resolve every parent this row claims to belong to BEFORE any write —
+        # an inactive row whose Season/Team/League has since vanished, or
+        # whose Division no longer resolves, is not safe to purge blindly,
+        # and the caller needs real labels (not bare ids) to confirm what it
+        # just removed. Division alone is genuinely optional on the model.
+        season = self.store.get_season(reg.season_id)
+        if season is None:
+            raise ValidationError(
+                "This registration's Season no longer exists.",
+                {"reason": "invalid_season", "season_id": reg.season_id})
+        team = self.store.get_team(reg.team_id)
+        if team is None:
+            raise ValidationError(
+                "This registration's Team no longer exists.",
+                {"reason": "invalid_team", "team_id": reg.team_id})
+        league = self.store.get_league(reg.league_id) if reg.league_id else None
+        if league is None:
+            raise ValidationError(
+                "This registration's League no longer resolves.",
+                {"reason": "invalid_league", "league_id": reg.league_id})
+        division = None
+        if reg.division_id:
+            division = self.store.get_division(reg.division_id)
+            if division is None:
+                raise ValidationError(
+                    "This registration's Division no longer resolves.",
+                    {"reason": "invalid_division",
+                     "division_id": reg.division_id})
         games = [g for g in self.store.all_games()
                 if g.season_id == reg.season_id
                 and reg.team_id in (g.home_team_id, g.away_team_id)]
@@ -632,7 +660,10 @@ class SetupService:
         self._audit("season_team_registration_deleted",
                     "season_team_registration", registration_id, actor_id,
                     detail)
-        return {"id": reg.id, **detail}
+        return {"id": reg.id, **detail,
+                "season_name": season.name, "team_name": team.name,
+                "league_name": league.name,
+                "division_name": division.name if division else None}
 
     @_transactional
     def roll_forward_registrations(self, from_season_id: str, to_season_id: str,

@@ -52,6 +52,14 @@ class DeletionContract:
         return self.api.register_team_for_season(
             season_id, team_id, division_id, actor_id=self.ACTOR)["id"]
 
+    def _level(self, season_id, name="Level"):
+        return self.api.create_league(season_id, name, actor_id=self.ACTOR)["id"]
+
+    def _register_v2(self, season_id, team_id, division_id, league_id):
+        return self.api.register_team_for_season(
+            season_id, team_id, division_id, actor_id=self.ACTOR,
+            league_id=league_id)["id"]
+
     def _venue(self, league_id=None, name="Venue"):
         return self.api.create_venue(
             name, league_id=league_id, actor_id=self.ACTOR)["id"]
@@ -294,11 +302,12 @@ class DeletionContract:
     def test_registration_delete_succeeds_when_inactive_and_game_free(self):
         lg = self._league()
         s = self._season(lg)
-        d = self._division(s)
+        level = self._level(s)
+        d = self.api.create_division(
+            s, "Division", league_id=level, actor_id=self.ACTOR)["id"]
         club = self._club()
         team = self._team(club, lg)
-        reg = self._register(s, team, d)
-        expected_league_id = self.store.get_season_team_registration(reg).league_id
+        reg = self._register_v2(s, team, d, level)
         self.api.unregister_team_from_season(reg, actor_id=self.ACTOR)
 
         audits_before = len(self.store.all_setup_audit())
@@ -307,7 +316,12 @@ class DeletionContract:
         self.assertEqual(result["id"], reg)
         self.assertEqual(result["season_id"], s)
         self.assertEqual(result["team_id"], team)
-        self.assertEqual(result["league_id"], expected_league_id)
+        self.assertEqual(result["league_id"], level)
+        self.assertEqual(result["division_id"], d)
+        self.assertEqual(result["season_name"], "Season")
+        self.assertEqual(result["team_name"], "Team")
+        self.assertEqual(result["league_name"], "Level")
+        self.assertEqual(result["division_name"], "Division")
         self.assertIsNone(self.store.get_season_team_registration(reg))
 
         deleted = self._audits("season_team_registration_deleted")
@@ -322,10 +336,12 @@ class DeletionContract:
     def test_registration_delete_blocked_when_active(self):
         lg = self._league()
         s = self._season(lg)
-        d = self._division(s)
+        level = self._level(s)
+        d = self.api.create_division(
+            s, "Division", league_id=level, actor_id=self.ACTOR)["id"]
         club = self._club()
         team = self._team(club, lg)
-        reg = self._register(s, team, d)
+        reg = self._register_v2(s, team, d, level)
 
         result = self.api.delete_season_team_registration(reg, actor_id=self.ACTOR)
         self.assertEqual(result["error"]["code"], "validation_error")
@@ -333,15 +349,36 @@ class DeletionContract:
         self.assertIsNotNone(self.store.get_season_team_registration(reg))
         self.assertEqual(self._audits("season_team_registration_deleted"), [])
 
-    def test_registration_delete_blocked_by_draft_game(self):
+    def test_registration_delete_blocked_by_invalid_league(self):
+        # A v1-derived (or otherwise legacy) registration with no resolvable
+        # League can't be safely purged through this v2-only cleanup op —
+        # it must be reported, not silently ignored or deleted.
         lg = self._league()
         s = self._season(lg)
         d = self._division(s)
         club = self._club()
+        team = self._team(club, lg)
+        reg = self._register(s, team, d)  # no explicit league_id
+        self.assertIsNone(self.store.get_season_team_registration(reg).league_id)
+        self.api.unregister_team_from_season(reg, actor_id=self.ACTOR)
+
+        result = self.api.delete_season_team_registration(reg, actor_id=self.ACTOR)
+        self.assertEqual(result["error"]["code"], "validation_error")
+        self.assertEqual(result["error"]["details"]["reason"], "invalid_league")
+        self.assertIsNotNone(self.store.get_season_team_registration(reg))
+        self.assertEqual(self._audits("season_team_registration_deleted"), [])
+
+    def test_registration_delete_blocked_by_draft_game(self):
+        lg = self._league()
+        s = self._season(lg)
+        level = self._level(s)
+        d = self.api.create_division(
+            s, "Division", league_id=level, actor_id=self.ACTOR)["id"]
+        club = self._club()
         home = self._team(club, lg, "Home")
         away = self._team(club, lg, "Away")
-        home_reg = self._register(s, home, d)
-        away_reg = self._register(s, away, d)
+        home_reg = self._register_v2(s, home, d, level)
+        away_reg = self._register_v2(s, away, d, level)
         slot = self._slot(self._rink(self._venue(league_id=lg)))
         game = self._game(s, d, home, away, slot)
         self._make_draft(game)
@@ -358,12 +395,14 @@ class DeletionContract:
     def test_registration_delete_blocked_by_cancelled_game(self):
         lg = self._league()
         s = self._season(lg)
-        d = self._division(s)
+        level = self._level(s)
+        d = self.api.create_division(
+            s, "Division", league_id=level, actor_id=self.ACTOR)["id"]
         club = self._club()
         home = self._team(club, lg, "Home")
         away = self._team(club, lg, "Away")
-        home_reg = self._register(s, home, d)
-        away_reg = self._register(s, away, d)
+        home_reg = self._register_v2(s, home, d, level)
+        away_reg = self._register_v2(s, away, d, level)
         slot = self._slot(self._rink(self._venue(league_id=lg)))
         game = self._game(s, d, home, away, slot)
         self.api.cancel_game(game, actor_id=self.ACTOR)
@@ -383,12 +422,14 @@ class DeletionContract:
         # too, just like a plain cancelled game.
         lg = self._league()
         s = self._season(lg)
-        d = self._division(s)
+        level = self._level(s)
+        d = self.api.create_division(
+            s, "Division", league_id=level, actor_id=self.ACTOR)["id"]
         club = self._club()
         home = self._team(club, lg, "Home")
         away = self._team(club, lg, "Away")
-        home_reg = self._register(s, home, d)
-        away_reg = self._register(s, away, d)
+        home_reg = self._register_v2(s, home, d, level)
+        away_reg = self._register_v2(s, away, d, level)
         slot = self._slot(self._rink(self._venue(league_id=lg)))
         game = self._game(s, d, home, away, slot)
         stored_game = self.store.get_game(game)
@@ -406,10 +447,12 @@ class DeletionContract:
     def test_registration_delete_rolls_back_on_forced_mid_operation_failure(self):
         lg = self._league()
         s = self._season(lg)
-        d = self._division(s)
+        level = self._level(s)
+        d = self.api.create_division(
+            s, "Division", league_id=level, actor_id=self.ACTOR)["id"]
         club = self._club()
         team = self._team(club, lg)
-        reg = self._register(s, team, d)
+        reg = self._register_v2(s, team, d, level)
         self.api.unregister_team_from_season(reg, actor_id=self.ACTOR)
 
         audits_before = len(self.store.all_setup_audit())
@@ -431,25 +474,30 @@ class DeletionContract:
         self.assertEqual(len(self.store.all_setup_audit()), audits_before)
 
     def test_league_season_team_deletable_after_cleaning_inactive_registration(self):
-        # #251 item 8: the three parent deletes are unchanged — they still
-        # block on ANY registration, active or not — but once the new
-        # cleanup op removes the inactive row, the existing block naturally
-        # resolves and the previously-stuck parent deletes succeed.
+        # #251 item 8: League (formerly Level)/Season/Team delete are
+        # unchanged — they still block on ANY registration, active or not —
+        # but once the new cleanup op removes the inactive row, the existing
+        # block naturally resolves and the previously-stuck parent deletes
+        # succeed. Program is proven too, for the full chain.
         lg = self._league()
         s = self._season(lg)
-        d = self._division(s)
+        level = self._level(s)
+        d = self.api.create_division(
+            s, "Division", league_id=level, actor_id=self.ACTOR)["id"]
         club = self._club()
         team = self._team(club, lg)
-        reg = self._register(s, team, d)
+        reg = self._register_v2(s, team, d, level)
         self.api.unregister_team_from_season(reg, actor_id=self.ACTOR)
+        # Clear the Division dependency first (#249) so League/Season/Team
+        # blocking is isolated to the hidden inactive registration itself.
         self.api.delete_division(d, actor_id=self.ACTOR)
 
         self.assertBlocked(
-            self.api.delete_program(lg, actor_id=self.ACTOR),
-            expect_types={"season", "team"})
+            self.api.delete_league(level, actor_id=self.ACTOR),
+            expect_types={"team registration"})
         self.assertBlocked(
             self.api.delete_season(s, actor_id=self.ACTOR),
-            expect_types={"team registration"})
+            expect_types={"level", "team registration"})
         self.assertBlocked(
             self.api.delete_team(team, actor_id=self.ACTOR),
             expect_types={"season registration"})
@@ -459,10 +507,12 @@ class DeletionContract:
             self.store.get_season_team_registration, reg,
             "season_team_registration_deleted")
 
-        self.assertDeleted(self.api.delete_season(s, actor_id=self.ACTOR),
-                           self.store.get_season, s, "season_deleted")
+        self.assertDeleted(self.api.delete_league(level, actor_id=self.ACTOR),
+                           self.store.get_league, level, "level_deleted")
         self.assertDeleted(self.api.delete_team(team, actor_id=self.ACTOR),
                            self.store.get_team, team, "team_deleted")
+        self.assertDeleted(self.api.delete_season(s, actor_id=self.ACTOR),
+                           self.store.get_season, s, "season_deleted")
         self.assertDeleted(self.api.delete_program(lg, actor_id=self.ACTOR),
                            self.store.get_program, lg, "league_deleted")
 
