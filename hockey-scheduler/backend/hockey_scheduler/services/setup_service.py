@@ -742,8 +742,8 @@ class SetupService:
     @_transactional
     def delete_season_venue_access(self, access_id: str,
                                    actor_id: Optional[str] = None) -> dict:
-        """Permanently remove an already-revoked Season-Venue access row
-        (#233 Slice E, #255 review).
+        """Permanently remove an already-revoked, game-free Season-Venue
+        access row (#233 Slice E, #255 review, #257 review).
 
         revoke_season_venue_access only deactivates a row, preserving it as a
         blocker for delete_season/delete_venue (both check every row
@@ -751,7 +751,11 @@ class SetupService:
         auditable by default. This is the explicit, separate cleanup action
         that actually removes an inactive row once an operator has confirmed
         it no longer needs to block a parent delete — mirrors
-        delete_season_team_registration (#251) exactly. Never an active row.
+        delete_season_team_registration (#251) exactly, including its
+        game-history guard: a revoked row can still be the ONLY explicit
+        record of why a draft/committed/cancelled/published Game's ice was
+        allowed at this Venue for this Season, so it is never purged out from
+        under live Game history. Never an active row.
         """
         access = self.store.get_season_venue_access(access_id)
         if access is None:
@@ -761,12 +765,37 @@ class SetupService:
                 "Cannot permanently delete an active access; revoke it "
                 "first.",
                 {"reason": "access_active", "access_id": access.id})
+        # Resolve both parents before any write — an inactive row whose
+        # Season or Venue has since vanished is not safe to purge blindly,
+        # and the caller needs real labels (not bare ids) to confirm what it
+        # just removed (mirrors delete_season_team_registration exactly).
+        season = self.store.get_season(access.season_id)
+        if season is None:
+            raise ValidationError(
+                "This access's Season no longer exists.",
+                {"reason": "invalid_season", "season_id": access.season_id})
+        venue = self.store.get_venue(access.venue_id)
+        if venue is None:
+            raise ValidationError(
+                "This access's Venue no longer exists.",
+                {"reason": "invalid_venue", "venue_id": access.venue_id})
+        rink_ids = {r.id for r in self.store.all_rinks()
+                    if r.venue_id == access.venue_id}
+        games = [
+            g for g in self.store.all_games()
+            if g.season_id == access.season_id and g.ice_slot_id
+            and (slot := self.store.get_ice_slot(g.ice_slot_id)) is not None
+            and slot.rink_id in rink_ids]
+        self._block_if_dependents(
+            "season_venue_access", access_id, "venue access", [
+                self._dep_group("game", games, self._matchup)])
         detail = {"season_id": access.season_id, "venue_id": access.venue_id,
                   "reason": "explicit_revoked_cleanup"}
         self.store.delete_season_venue_access(access_id)
         self._audit("season_venue_access_deleted", "season_venue_access",
                     access_id, actor_id, detail)
-        return {"id": access_id, **detail}
+        return {"id": access_id, **detail,
+                "season_name": season.name, "venue_name": venue.name}
 
     @_transactional
     def roll_forward_registrations(self, from_season_id: str, to_season_id: str,

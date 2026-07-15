@@ -281,6 +281,124 @@ class SeasonVenueAccessContract:
         self.assertEqual(audits[0].detail["season_id"], season)
         self.assertEqual(audits[0].detail["venue_id"], venue)
 
+    def test_delete_season_venue_access_returns_resolved_labels(self):
+        org = self.api.create_organization("LabelOrg", actor_id=ACTOR)["id"]
+        program = self.api.create_program(
+            "LabelProg", operator_organization_id=org, actor_id=ACTOR)["id"]
+        season = self.api.create_season(program, "Labelled Season", actor_id=ACTOR)["id"]
+        venue = self.api.create_venue(
+            "Labelled Venue", organization_id=org, actor_id=ACTOR)["id"]
+        granted = self.api.grant_season_venue_access(season, venue, actor_id=ACTOR)
+        self.api.revoke_season_venue_access(granted["id"], actor_id=ACTOR)
+        cleaned = self.api.delete_season_venue_access(granted["id"], actor_id=ACTOR)
+        self.assertNotIn("error", cleaned, cleaned)
+        self.assertEqual(cleaned["season_name"], "Labelled Season")
+        self.assertEqual(cleaned["venue_name"], "Labelled Venue")
+
+    # -- Permanent cleanup never erases live Game history (#257 review) -----
+    # A revoked access row can be the ONLY explicit record of why a Game's
+    # ice was allowed at this Venue for this Season. delete_season_venue_access
+    # must never purge it out from under a draft, committed, cancelled, or
+    # published Game — mirrors delete_season_team_registration's own
+    # game-history guard (#251) exactly.
+    def _playable_game(self, season, venue, home_name="Home", away_name="Away"):
+        """A full scheduling chain on ``venue``'s ice: League, Division, two
+        registered Teams, and a free ice slot. Returns
+        (division_id, home_id, away_id, slot_id)."""
+        league = self.api.create_league(season, "L", actor_id=ACTOR)["id"]
+        division = self.api.create_division(
+            season, "D", league_id=league, actor_id=ACTOR)["id"]
+        club = self.api.create_club("Club", actor_id=ACTOR)["id"]
+        home = self.api.create_team(club, division, home_name, actor_id=ACTOR)["id"]
+        away = self.api.create_team(club, division, away_name, actor_id=ACTOR)["id"]
+        self.api.register_team_for_season(season, home, division, actor_id=ACTOR)
+        self.api.register_team_for_season(season, away, division, actor_id=ACTOR)
+        rink = self.api.create_rink(venue, "R", actor_id=ACTOR)["id"]
+        slot = self.api.create_ice_slot(
+            rink, "2027-01-15T18:00:00+00:00", "2027-01-15T19:30:00+00:00",
+            actor_id=ACTOR)["id"]
+        return division, home, away, slot
+
+    def test_cleanup_blocked_by_committed_game(self):
+        _, _, season, venue = self._fixture()
+        granted = self.api.grant_season_venue_access(season, venue, actor_id=ACTOR)
+        division, home, away, slot = self._playable_game(season, venue)
+        game = self.api.create_game(season, division, home, away, slot, actor_id=ACTOR)
+        self.assertNotIn("error", game, game)
+        self.api.revoke_season_venue_access(granted["id"], actor_id=ACTOR)
+        audits_before = len(self.store.all_setup_audit())
+        blocked = self.api.delete_season_venue_access(granted["id"], actor_id=ACTOR)
+        self.assertEqual(blocked["error"]["code"], "has_dependencies")
+        deps = {g["type"] for g in blocked["error"]["details"]["dependencies"]}
+        self.assertIn("game", deps)
+        self.assertIsNotNone(self.store.get_season_venue_access(granted["id"]))
+        self.assertEqual(len(self.store.all_setup_audit()), audits_before)
+
+    def test_cleanup_blocked_by_published_game(self):
+        _, _, season, venue = self._fixture()
+        granted = self.api.grant_season_venue_access(season, venue, actor_id=ACTOR)
+        division, home, away, slot = self._playable_game(season, venue)
+        game = self.api.create_game(season, division, home, away, slot, actor_id=ACTOR)
+        self.api.publish_game(game["id"], actor_id=ACTOR)
+        self.api.revoke_season_venue_access(granted["id"], actor_id=ACTOR)
+        blocked = self.api.delete_season_venue_access(granted["id"], actor_id=ACTOR)
+        self.assertEqual(blocked["error"]["code"], "has_dependencies")
+        self.assertIsNotNone(self.store.get_season_venue_access(granted["id"]))
+
+    def test_cleanup_blocked_by_cancelled_game(self):
+        _, _, season, venue = self._fixture()
+        granted = self.api.grant_season_venue_access(season, venue, actor_id=ACTOR)
+        division, home, away, slot = self._playable_game(season, venue)
+        game = self.api.create_game(season, division, home, away, slot, actor_id=ACTOR)
+        self.api.cancel_game(game["id"], actor_id=ACTOR)
+        self.api.revoke_season_venue_access(granted["id"], actor_id=ACTOR)
+        blocked = self.api.delete_season_venue_access(granted["id"], actor_id=ACTOR)
+        self.assertEqual(blocked["error"]["code"], "has_dependencies")
+        self.assertIsNotNone(self.store.get_season_venue_access(granted["id"]))
+
+    def _make_draft_game(self, season, division, home, away, slot):
+        """A draft game on ``slot`` — created through the normal (committed)
+        path, then flipped to draft directly at the store, matching this
+        file's established direct-store-manipulation pattern for shaping
+        state a facade call alone can't reach (season_id is a required,
+        explicit create_game argument, so this keeps it set correctly,
+        unlike a raw scheduler-commit call)."""
+        game = self.api.create_game(season, division, home, away, slot, actor_id=ACTOR)
+        self.assertNotIn("error", game, game)
+        row = self.store.get_game(game["id"])
+        row.is_draft = True
+        self.store.save_game(row)
+        return game["id"]
+
+    def test_cleanup_blocked_by_draft_game(self):
+        _, _, season, venue = self._fixture()
+        granted = self.api.grant_season_venue_access(season, venue, actor_id=ACTOR)
+        division, home, away, slot = self._playable_game(season, venue)
+        self._make_draft_game(season, division, home, away, slot)
+        self.api.revoke_season_venue_access(granted["id"], actor_id=ACTOR)
+        blocked = self.api.delete_season_venue_access(granted["id"], actor_id=ACTOR)
+        self.assertEqual(blocked["error"]["code"], "has_dependencies")
+        self.assertIsNotNone(self.store.get_season_venue_access(granted["id"]))
+
+    def test_cleanup_succeeds_once_the_game_is_gone(self):
+        # A DRAFT game's own delete control removes it outright (unlike a
+        # committed/published game, which only cancels) — proves the block
+        # really does key off live Game rows, not just "any game ever
+        # touched this venue+season", by clearing the dependency and
+        # re-checking that the cleanup then succeeds.
+        _, _, season, venue = self._fixture()
+        granted = self.api.grant_season_venue_access(season, venue, actor_id=ACTOR)
+        division, home, away, slot = self._playable_game(season, venue)
+        game_id = self._make_draft_game(season, division, home, away, slot)
+        self.api.revoke_season_venue_access(granted["id"], actor_id=ACTOR)
+        still_blocked = self.api.delete_season_venue_access(granted["id"], actor_id=ACTOR)
+        self.assertEqual(still_blocked["error"]["code"], "has_dependencies")
+        deleted_game = self.api.delete_game(game_id, actor_id=ACTOR)
+        self.assertNotIn("error", deleted_game, deleted_game)
+        cleaned = self.api.delete_season_venue_access(granted["id"], actor_id=ACTOR)
+        self.assertNotIn("error", cleaned, cleaned)
+        self.assertIsNone(self.store.get_season_venue_access(granted["id"]))
+
 
 class MemoryAccessTest(SeasonVenueAccessContract, unittest.TestCase):
     def make_store(self):
