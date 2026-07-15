@@ -16,15 +16,27 @@
 //   2. Creates two independent Programs, each operated by its OWN
 //      organization (distinct from the facility owner and from each other) —
 //      Program A modelling "Twin Rinks' own program", Program B modelling
-//      an external, unrelated operator (Illinois High School Hockey).
+//      an external, unrelated operator (Illinois High School Hockey) — and
+//      re-reads the PERSISTED Venue-owner and Program-operator links (not
+//      just the ids submitted on the forms) to confirm all three
+//      organizations are actually distinct.
 //   3. Grants Program A's Season access to BOTH venues (multi-venue Season).
 //   4. Grants Program B's Season access to the SAME shared venue Program A
 //      already uses (multi-program Venue) — confirming the shared venue is
 //      still offered in Program B's Allow picker despite Program A's grant,
-//      and that neither Season's Allowed-venues list leaks the other's rows.
-//   5. Successfully creates a Game for each Program on the shared venue, and
+//      then reads EACH Season's own "Allowed venues" subsection (scoped to
+//      that Season's own hierarchy node, not a page-wide count) and asserts
+//      its exact venue-name set: Season A = {shared, second}, Season B =
+//      {shared} — neither list leaking the other's rows.
+//   5. Attempts, through the real Calendar wizard, to create a Game for
+//      Program B on the second Venue — which Season B was never granted —
+//      and asserts it is rejected (venue_access_missing), the wizard stays
+//      open rather than silently closing, and afterward no Game exists on
+//      that slot and the slot itself is still available.
+//   6. Successfully creates a Game for each Program on the shared venue, and
 //      a further Game for Program A on the second venue, through the
-//      Calendar wizard — proving eligibility and isolation both hold.
+//      Calendar wizard — proving eligibility and isolation both hold for the
+//      allowed combinations while the ungranted one stays blocked.
 //
 // Fails on any browser console/page error.
 const { chromium } = require("playwright");
@@ -81,7 +93,8 @@ async function checkViewport(browser, viewport) {
   const page = await context.newPage();
   const errors = [];
   page.on("pageerror", (e) => errors.push(`[pageerror] ${e.message}`));
-  page.on("console", (m) => { if (m.type() === "error") errors.push(`[console] ${m.text()}`); });
+  const consoleErrorHandler = (m) => { if (m.type() === "error") errors.push(`[console] ${m.text()}`); };
+  page.on("console", consoleErrorHandler);
 
   const createViaDrawer = async (key, fields, expectedUrl) => {
     await page.click(`.setup-card .sc-new[data-drawer="${key}"]`);
@@ -156,6 +169,68 @@ async function checkViewport(browser, viewport) {
     return body;
   };
 
+  // Attempts a Game create through the real Calendar wizard on a slot whose
+  // Venue has NOT been granted to this League's Season, and asserts it is
+  // rejected end to end: the create POST fails with venue_access_missing,
+  // the wizard stays open (no silent success path), and — after closing it —
+  // no Game exists on the slot and the slot itself is still available.
+  const assertGameDenied = async (slotId, leagueId, homeId, awayId) => {
+    await page.click('.tab[data-tab="calendar"]');
+    await page.waitForSelector(`[data-slot="${slotId}"]`, { timeout: 15000 });
+    await page.click(`[data-slot="${slotId}"]`);
+    await page.waitForSelector("#w-league", { timeout: 10000 });
+    await page.selectOption("#w-league", leagueId);
+    await page.waitForFunction(
+      (t) => !!Array.from(document.querySelectorAll("#w-home option")).find((o) => o.value === t),
+      homeId, { timeout: 10000 });
+    await page.selectOption("#w-home", homeId);
+    await page.selectOption("#w-away", awayId);
+    const createReq = page.waitForResponse((r) =>
+      r.url() === `${base}/api/v2/setup/game` && r.request().method() === "POST");
+    // A deliberately-rejected create's 400 response logs a benign "Failed to
+    // load resource" Chromium console entry, not a page bug (same pattern as
+    // venue-access-cleanup.js's blocked-delete checks).
+    page.off("console", consoleErrorHandler);
+    await page.click("[data-wizcreate]");
+    const body = await (await createReq).json();
+    page.on("console", consoleErrorHandler);
+    const reason = body.error && body.error.details && body.error.details.reason;
+    if (reason !== "venue_access_missing") {
+      throw new Error(`[${viewport.label}] expected the ungranted-Venue create to be rejected ` +
+        `with venue_access_missing, got: ${JSON.stringify(body)}`);
+    }
+    // render() briefly shows a loading skeleton (re-fetching state) before
+    // redrawing — the wizard element itself is absent during that window
+    // even though `wizard` was never nulled — so wait for the full re-render
+    // to settle rather than checking .wizard the instant the response lands.
+    try {
+      await page.waitForSelector(".wizard", { timeout: 5000 });
+    } catch (_) {
+      throw new Error(`[${viewport.label}] wizard closed despite a rejected, blocked game create`);
+    }
+    // The error toast doesn't auto-dismiss and, at 390px, overlaps the
+    // wizard's Cancel button — dismiss it first via its own close control.
+    const toastClose = await page.$("[data-toast-close]");
+    if (toastClose) await toastClose.click();
+    await page.click("[data-wizcancel]");
+    await page.waitForFunction(() => !document.querySelector(".wizard"), null, { timeout: 10000 });
+    const outcome = await page.evaluate(async (sid) => {
+      const ov = await (await fetch("/api/demo/overview", { credentials: "same-origin" })).json();
+      const slot = (ov.ice_slots || []).find((s) => s.id === sid);
+      return {
+        status: slot && slot.status,
+        gameOnSlot: (ov.schedule || []).some((g) => g.ice_slot_id === sid),
+      };
+    }, slotId);
+    if (outcome.gameOnSlot) {
+      throw new Error(`[${viewport.label}] a Game exists on the denied slot despite the block`);
+    }
+    if (outcome.status !== "available") {
+      throw new Error(`[${viewport.label}] the denied slot's status is "${outcome.status}", ` +
+        `expected it to remain "available"`);
+    }
+  };
+
   try {
     await waitForServer(`${base}/api/health`, READY_TIMEOUT_MS);
     await page.goto(base, { waitUntil: "domcontentloaded" });
@@ -225,6 +300,31 @@ async function checkViewport(browser, viewport) {
     const teamB2 = await createViaDrawer("team",
       { "f-team-club": "", "f-team-league": programB.id, "f-team": "Varsity Away" },
       "/api/v2/setup/team");
+    // A THIRD ice slot on the second Venue, deliberately never granted to
+    // Season B — the ungranted-Venue negative case below (#258 review).
+    const slotSecondDenied = await createViaDrawer("ice-slot", {
+      "f-slot-rink": rinkSecond.id, "f-slot-date": CAL_DAY,
+      "f-slot-start": "10:00", "f-slot-end": "11:00",
+    }, "/api/v2/setup/ice-slot");
+
+    // (#258 review) Confirm the persisted owner/operator links, not just the
+    // ids submitted on the drawer forms: the Venue owner and both Program
+    // operators must be the three DISTINCT organizations just created.
+    if (venueShared.organization_id !== orgFacility.id
+      || venueSecond.organization_id !== orgFacility.id) {
+      throw new Error(`[${viewport.label}] a Venue's persisted organization_id does not match ` +
+        `the facility owner it was created under`);
+    }
+    if (programA.operator_organization_id !== orgProgramA.id
+      || programB.operator_organization_id !== orgProgramB.id) {
+      throw new Error(`[${viewport.label}] a Program's persisted operator_organization_id does ` +
+        `not match the organization it was created under`);
+    }
+    const distinctOrgIds = new Set([orgFacility.id, orgProgramA.id, orgProgramB.id]);
+    if (distinctOrgIds.size !== 3) {
+      throw new Error(`[${viewport.label}] the facility owner and the two Program operators are ` +
+        `not three distinct organizations`);
+    }
 
     // Team-registration creation is Season participation's own already-proven
     // UI (Slice B2b) — out of THIS regression's scope, so built via raw fetch
@@ -258,15 +358,50 @@ async function checkViewport(browser, viewport) {
     // still offers it despite Program A's grant.
     await grantViaUi(seasonB.id, venueShared.id);
 
-    // Neither Season's Allowed-venues list leaks the other's rows: together
-    // they add up to exactly 3 active grants (2 for Season A + 1 for B).
-    const totalActiveGrants = await page.$$eval("[data-va-revoke]", (els) => els.length);
-    if (totalActiveGrants !== 3) {
-      throw new Error(`[${viewport.label}] expected 3 total active venue-access rows across ` +
-        `both seasons (2 for A + 1 for B), found ${totalActiveGrants}`);
+    // Neither Season's Allowed-venues list leaks the other's rows: read each
+    // Season's OWN "Allowed venues" subsection (scoped from its delete button
+    // in the Season's own <details> node, not a page-wide count) and check
+    // the exact venue-name set it lists (#258 review).
+    const allowedVenueNamesFor = async (seasonId) => page.evaluate((sid) => {
+      // Season nodes are duplicated across trees (Competition structure AND
+      // Season participation); only the latter — scoped by its own
+      // #season-participation container — carries the venueAccessSection
+      // this journey needs (#258 review fix: an unscoped querySelector can
+      // silently grab the wrong copy).
+      const panel = document.getElementById("season-participation");
+      const del = panel && panel.querySelector(`[data-del="season"][data-del-id="${sid}"]`);
+      if (!del) return null;
+      const seasonDetails = del.closest("details.tn");
+      const child = Array.from(seasonDetails.querySelectorAll(
+        ":scope > div.tn-children > details.tn"))
+        .find((d) => (d.querySelector("summary")?.textContent || "").includes("Allowed venues"));
+      if (!child) return null;
+      return Array.from(child.querySelectorAll("[data-va-revoke]")).map((btn) =>
+        btn.closest(".tn-leaf").querySelector(".tn-label").textContent.trim()
+          .replace(/^\S+\s*/, ""));  // drop the leading emoji glyph
+    }, seasonId);
+
+    const namesA = await allowedVenueNamesFor(seasonA.id);
+    const namesB = await allowedVenueNamesFor(seasonB.id);
+    const sameSet = (actual, expected) =>
+      actual && actual.length === expected.length
+      && expected.every((n) => actual.includes(n));
+    if (!sameSet(namesA, [venueShared.name, venueSecond.name])) {
+      throw new Error(`[${viewport.label}] Season A's Allowed-venues list should be exactly ` +
+        `{${venueShared.name}, ${venueSecond.name}}, found ${JSON.stringify(namesA)}`);
+    }
+    if (!sameSet(namesB, [venueShared.name])) {
+      throw new Error(`[${viewport.label}] Season B's Allowed-venues list should be exactly ` +
+        `{${venueShared.name}}, found ${JSON.stringify(namesB)}`);
     }
 
-    // (5) Program A schedules a Game on the shared venue AND on its second
+    // (5) Program B's Season was never granted the second Venue — attempting
+    // a Game there through the real Calendar UI must be rejected, with zero
+    // mutation (no Game created, slot stays available), not merely "some
+    // positive path happens to succeed elsewhere" (#258 review).
+    await assertGameDenied(slotSecondDenied.id, leagueB.id, teamB1.id, teamB2.id);
+
+    // (6) Program A schedules a Game on the shared venue AND on its second
     // venue; Program B independently schedules a Game on the same shared
     // venue — proving eligibility and isolation both hold end to end.
     const gameA1 = await createGameViaWizard(
