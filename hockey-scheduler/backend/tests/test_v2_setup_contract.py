@@ -436,6 +436,165 @@ class V2SetupContractTest(unittest.TestCase):
         self.assertEqual(set(dprogram), PROGRAM_KEYS, dprogram)
         self.assertNotIn("organization_id", dprogram)
 
+    # -- explicit inactive-registration cleanup (#251) -----------------------
+    def test_v2_registration_delete_contract(self):
+        """POST /api/v2/setup/season-team-registration/{id}/delete: League
+        Admin success + resolved labels, unauthorized-role rejection,
+        active/game-backed blocking, and invalid-parent zero-mutation."""
+        c = self._admin()
+        org = self._v2(c, "organization", {"name": "R Org", "short_name": "RO"})
+        program = self._v2(c, "program",
+                          {"name": "R Prog", "operator_organization_id": org["id"]})
+        season = self._v2(c, "season",
+                         {"program_id": program["id"], "name": "R Season"})
+        league = self._v2(c, "league",
+                         {"season_id": season["id"], "name": "R League"})
+        division = self._v2(c, "division",
+                           {"league_id": league["id"], "name": "R Division"})
+        club = self._v2(c, "club", {"name": "R Club"})
+
+        # -- League Admin success + resolved labels for UI confirmation -----
+        team = self._v2(c, "team",
+                       {"program_id": program["id"], "club_id": club["id"],
+                        "name": "R Team"})
+        status, reg = self._req(
+            c, "POST", f"/api/v2/setup/seasons/{season['id']}/team-registrations",
+            {"team_id": team["id"], "league_id": league["id"],
+             "division_id": division["id"]})
+        self.assertEqual(status, 200, reg)
+        status, removed = self._req(
+            c, "POST",
+            f"/api/v2/setup/season-team-registration/{reg['id']}/remove", {})
+        self.assertEqual(status, 200, removed)
+        self.assertFalse(removed["active"])
+
+        status, deleted = self._req(
+            c, "POST",
+            f"/api/v2/setup/season-team-registration/{reg['id']}/delete", {})
+        self.assertEqual(status, 200, deleted)
+        self.assertEqual(
+            set(deleted),
+            {"id", "season_id", "team_id", "league_id", "division_id",
+             "reason", "season_name", "team_name", "league_name",
+             "division_name"}, deleted)
+        self.assertEqual(deleted["id"], reg["id"])
+        self.assertEqual(deleted["season_name"], "R Season")
+        self.assertEqual(deleted["team_name"], "R Team")
+        self.assertEqual(deleted["league_name"], "R League")
+        self.assertEqual(deleted["division_name"], "R Division")
+
+        # -- unauthorized role is rejected, before any entity-specific check -
+        coach = self._client()
+        self._req(coach, "POST", "/api/auth/login",
+                 {"username": "coach", "password": "demo"})
+        status, denied = self._req(
+            coach, "POST",
+            f"/api/v2/setup/season-team-registration/{reg['id']}/delete", {})
+        self.assertEqual(status, 403, denied)
+        self.assertEqual(denied["error"]["details"]["required"], "manage_setup")
+
+        # -- an active registration blocks the permanent cleanup delete -----
+        team_active = self._v2(c, "team",
+                              {"program_id": program["id"], "club_id": club["id"],
+                               "name": "R Active"})
+        status, reg_active = self._req(
+            c, "POST", f"/api/v2/setup/seasons/{season['id']}/team-registrations",
+            {"team_id": team_active["id"], "league_id": league["id"],
+             "division_id": division["id"]})
+        self.assertEqual(status, 200, reg_active)
+        status, blocked_active = self._req(
+            c, "POST",
+            f"/api/v2/setup/season-team-registration/{reg_active['id']}/delete",
+            {})
+        self.assertEqual(status, 400, blocked_active)
+        self.assertEqual(blocked_active["error"]["code"], "validation_error")
+        self.assertEqual(
+            blocked_active["error"]["details"]["reason"], "registration_active")
+
+        # -- a Game (even cancelled) still blocks the cleanup ---------------
+        team_home = self._v2(c, "team",
+                            {"program_id": program["id"], "club_id": club["id"],
+                             "name": "R Home"})
+        team_away = self._v2(c, "team",
+                            {"program_id": program["id"], "club_id": club["id"],
+                             "name": "R Away"})
+        for tm in (team_home, team_away):
+            status, r = self._req(
+                c, "POST",
+                f"/api/v2/setup/seasons/{season['id']}/team-registrations",
+                {"team_id": tm["id"], "league_id": league["id"],
+                 "division_id": division["id"]})
+            self.assertEqual(status, 200, r)
+        status, game_venue = self._req(
+            c, "POST", "/api/setup/venue",
+            {"name": "R Arena", "league_id": program["id"],
+             "organization_id": org["id"]})
+        self.assertEqual(status, 200, game_venue)
+        rink = self._v2(c, "rink", {"venue_id": game_venue["id"], "name": "Rink 1"})
+        slot = self._v2(c, "ice-slot",
+                       {"rink_id": rink["id"],
+                        "start_time": "2027-01-01T10:00:00+00:00",
+                        "end_time": "2027-01-01T11:00:00+00:00",
+                        "slot_type": "game"})
+        status, game = self._req(
+            c, "POST", "/api/v2/setup/game",
+            {"season_id": season["id"], "league_id": league["id"],
+             "division_id": division["id"], "home_team_id": team_home["id"],
+             "away_team_id": team_away["id"], "ice_slot_id": slot["id"]})
+        self.assertEqual(status, 200, game)
+        status, cancelled = self._req(
+            c, "POST", f"/api/games/{game['id']}/cancel", {})
+        self.assertEqual(status, 200, cancelled)
+        status, listing = self._req(
+            c, "GET", f"/api/v2/setup/seasons/{season['id']}/team-registrations")
+        home_reg_id = next(
+            r["id"] for r in listing["registrations"]
+            if r["team_id"] == team_home["id"])
+        status, _ = self._req(
+            c, "POST",
+            f"/api/v2/setup/season-team-registration/{home_reg_id}/remove", {})
+        self.assertEqual(status, 200)
+        status, blocked_game = self._req(
+            c, "POST",
+            f"/api/v2/setup/season-team-registration/{home_reg_id}/delete", {})
+        self.assertEqual(status, 409, blocked_game)
+        self.assertEqual(blocked_game["error"]["code"], "has_dependencies")
+        dep_types = {g["type"] for g in
+                    blocked_game["error"]["details"]["dependencies"]}
+        self.assertIn("game", dep_types)
+
+        # -- an inconsistent parent (no resolvable League) is reported, not -
+        # -- silently deleted or ignored — zero mutation on the block -------
+        season2 = self._v2(c, "season",
+                          {"program_id": program["id"], "name": "R Season 2"})
+        team_legacy = self._v2(c, "team",
+                              {"program_id": program["id"], "club_id": club["id"],
+                               "name": "R Legacy"})
+        # v1 registration route: no league_id, and season2 has no League row
+        # at all, so the derived league_id is None (#233 C1b derivation).
+        status, reg_legacy = self._req(
+            c, "POST", f"/api/setup/seasons/{season2['id']}/team-registrations",
+            {"team_id": team_legacy["id"]})
+        self.assertEqual(status, 200, reg_legacy)
+        status, removed_legacy = self._req(
+            c, "POST",
+            f"/api/v2/setup/season-team-registration/{reg_legacy['id']}/remove",
+            {})
+        self.assertEqual(status, 200, removed_legacy)
+        status, blocked_legacy = self._req(
+            c, "POST",
+            f"/api/v2/setup/season-team-registration/{reg_legacy['id']}/delete",
+            {})
+        self.assertEqual(status, 400, blocked_legacy)
+        self.assertEqual(blocked_legacy["error"]["code"], "validation_error")
+        self.assertEqual(
+            blocked_legacy["error"]["details"]["reason"], "invalid_league")
+        status, still_there = self._req(
+            c, "GET", f"/api/v2/setup/seasons/{season2['id']}/team-registrations")
+        self.assertEqual(status, 200, still_there)
+        self.assertIn(reg_legacy["id"],
+                      [r["id"] for r in still_there["registrations"]])
+
     # -- canonical validation: League required, Division optional -----------
     def test_v2_division_requires_league(self):
         c = self._admin()

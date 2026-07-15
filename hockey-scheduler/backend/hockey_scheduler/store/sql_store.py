@@ -750,6 +750,8 @@ class SqlStore:
     def delete_division(self, division_id): self._delete(Division, division_id)
     def delete_club(self, club_id): self._delete(Club, club_id)
     def delete_team(self, team_id): self._delete(Team, team_id)
+    def delete_season_team_registration(self, registration_id):
+        self._delete(SeasonTeamRegistration, registration_id)
     def delete_venue(self, venue_id): self._delete(Venue, venue_id)
     def delete_rink(self, rink_id): self._delete(Rink, rink_id)
     def delete_ice_slot(self, slot_id): self._delete(IceSlot, slot_id)

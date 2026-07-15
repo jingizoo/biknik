@@ -2039,6 +2039,14 @@ class Handler(BaseHTTPRequestHandler):
         if mx:
             return self._send_api(api.unregister_team_from_season(
                 mx.group(1), actor_id))
+        # Explicit permanent cleanup of an already-inactive, game-free
+        # registration (#251). Distinct from "remove" above, which only
+        # deactivates and preserves the row for history.
+        mdr = re.match(
+            r"^season-team-registration/([^/]+)/delete$", entity)
+        if mdr:
+            return self._send_api(api.delete_season_team_registration(
+                mdr.group(1), actor_id))
         # Season rollover (canonical v2): each selection REQUIRES a target
         # league_id, honored verbatim on the resulting registration.
         mrf = re.match(r"^seasons/([^/]+)/roll-forward$", entity)

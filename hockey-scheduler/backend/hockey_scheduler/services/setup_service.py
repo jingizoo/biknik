@@ -594,6 +594,78 @@ class SetupService:
         return reg
 
     @_transactional
+    def delete_season_team_registration(self, registration_id: str,
+                                        actor_id: Optional[str] = None
+                                        ) -> dict:
+        """Permanently remove an INACTIVE, game-free registration (#251).
+
+        unregister_team_from_season() deliberately only deactivates a row —
+        it retains the registration's Season/Team/League/Division identity
+        for history, which is correct, but leaves no way to resolve the
+        hidden blocker it creates for delete_league/delete_season/
+        delete_team (each of which still — correctly — blocks on ANY
+        registration row, active or not, since League/Season/Team are
+        required identifiers on a registration and can't simply be cleared
+        the way delete_division clears an optional division_id). This is
+        the explicit, safe cleanup operation for that hidden row: never an
+        active registration, never one any Game still references (draft,
+        scheduled, cancelled, or historical all count as history).
+        """
+        reg = self.store.get_season_team_registration(registration_id)
+        if reg is None:
+            raise NotFoundError(f"Registration {registration_id} not found.")
+        if reg.active:
+            raise ValidationError(
+                "Cannot permanently delete an active registration; remove "
+                "it from the season first.",
+                {"reason": "registration_active", "registration_id": reg.id})
+        # Resolve every parent this row claims to belong to BEFORE any write —
+        # an inactive row whose Season/Team/League has since vanished, or
+        # whose Division no longer resolves, is not safe to purge blindly,
+        # and the caller needs real labels (not bare ids) to confirm what it
+        # just removed. Division alone is genuinely optional on the model.
+        season = self.store.get_season(reg.season_id)
+        if season is None:
+            raise ValidationError(
+                "This registration's Season no longer exists.",
+                {"reason": "invalid_season", "season_id": reg.season_id})
+        team = self.store.get_team(reg.team_id)
+        if team is None:
+            raise ValidationError(
+                "This registration's Team no longer exists.",
+                {"reason": "invalid_team", "team_id": reg.team_id})
+        league = self.store.get_league(reg.league_id) if reg.league_id else None
+        if league is None:
+            raise ValidationError(
+                "This registration's League no longer resolves.",
+                {"reason": "invalid_league", "league_id": reg.league_id})
+        division = None
+        if reg.division_id:
+            division = self.store.get_division(reg.division_id)
+            if division is None:
+                raise ValidationError(
+                    "This registration's Division no longer resolves.",
+                    {"reason": "invalid_division",
+                     "division_id": reg.division_id})
+        games = [g for g in self.store.all_games()
+                if g.season_id == reg.season_id
+                and reg.team_id in (g.home_team_id, g.away_team_id)]
+        self._block_if_dependents(
+            "season_team_registration", registration_id, "registration", [
+                self._dep_group("game", games, self._matchup)])
+        detail = {"season_id": reg.season_id, "team_id": reg.team_id,
+                  "league_id": reg.league_id, "division_id": reg.division_id,
+                  "reason": "explicit_inactive_cleanup"}
+        self.store.delete_season_team_registration(registration_id)
+        self._audit("season_team_registration_deleted",
+                    "season_team_registration", registration_id, actor_id,
+                    detail)
+        return {"id": reg.id, **detail,
+                "season_name": season.name, "team_name": team.name,
+                "league_name": league.name,
+                "division_name": division.name if division else None}
+
+    @_transactional
     def roll_forward_registrations(self, from_season_id: str, to_season_id: str,
                                    selections: Optional[list] = None,
                                    actor_id: Optional[str] = None) -> dict:
