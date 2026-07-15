@@ -39,6 +39,14 @@ def _v2_setup_permission(rest: str):
         return Permission.MANAGE_SETUP
     if re.match(r"^seasons/[^/]+/(team-registrations|roll-forward)$", rest):
         return Permission.MANAGE_SETUP
+    # Season-venue access (#233 Slice E): granting/revoking which Venues a
+    # Season may use is a competition-side setup action, same permission as
+    # season team registrations above (not MANAGE_ARENA — the Venue itself is
+    # untouched, only the join to a Season is created/removed).
+    if re.match(r"^season-venue-access/[^/]+/remove$", rest):
+        return Permission.MANAGE_SETUP
+    if re.match(r"^seasons/[^/]+/venue-access$", rest):
+        return Permission.MANAGE_SETUP
     if re.match(r"^programs/[^/]+/teams$", rest):
         return Permission.MANAGE_SETUP
     if rest == "hierarchy":

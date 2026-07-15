@@ -109,6 +109,26 @@ class SeasonTeamRegistration:
 
 
 @dataclass
+class SeasonVenueAccess:
+    """A Season's access to a Venue for scheduling ice (#233 Slice E).
+
+    Physical structure (facility Organization -> Venue -> Rink -> Ice Slot) and
+    competition structure (Program -> Season -> League -> optional Division) are
+    independent trees — this is the explicit many-to-many join between them,
+    replacing the permanent, one-to-one ``Venue.league_id`` bridge. One Season
+    may use several Venues; one Venue may host several Seasons, even across
+    different Programs/operators. Uniqueness is one ACTIVE row per
+    ``(season_id, venue_id)`` pair: revoking access deactivates the row rather
+    than deleting it (history preserved), and re-granting reactivates the
+    existing row rather than duplicating it.
+    """
+    id: str
+    season_id: str
+    venue_id: str
+    active: bool = True
+
+
+@dataclass
 class Club:
     id: str
     name: str

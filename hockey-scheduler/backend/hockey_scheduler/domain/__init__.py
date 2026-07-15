@@ -88,6 +88,7 @@ from .setup_models import (
     Rink,
     Season,
     SeasonTeamRegistration,
+    SeasonVenueAccess,
     SetupAuditLog,
     Venue,
 )

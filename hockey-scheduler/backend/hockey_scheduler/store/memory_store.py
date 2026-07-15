@@ -41,6 +41,7 @@ from ..domain import (
     Rink,
     Season,
     SeasonTeamRegistration,
+    SeasonVenueAccess,
     Session,
     SetupAuditLog,
     SubstituteEnrollment,
@@ -70,6 +71,7 @@ class InMemoryStore:
         self.leagues: Dict[str, League] = {}
         self.divisions: Dict[str, Division] = {}
         self.season_team_registrations: Dict[str, SeasonTeamRegistration] = {}
+        self.season_venue_access: Dict[str, SeasonVenueAccess] = {}
         self.clubs: Dict[str, Club] = {}
         self.venues: Dict[str, Venue] = {}
         self.rinks: Dict[str, Rink] = {}
@@ -371,6 +373,39 @@ class InMemoryStore:
             self, season_id: str, team_id: str) -> Optional[SeasonTeamRegistration]:
         return next((r for r in self.season_team_registrations.values()
                      if r.season_id == season_id and r.team_id == team_id), None)
+
+    # -- season venue access (#233 Slice E) ---------------------------------
+    def add_season_venue_access(
+            self, sva: SeasonVenueAccess) -> SeasonVenueAccess:
+        self.season_venue_access[sva.id] = sva
+        return sva
+
+    def get_season_venue_access(
+            self, sva_id: str) -> Optional[SeasonVenueAccess]:
+        return self.season_venue_access.get(sva_id)
+
+    def save_season_venue_access(
+            self, sva: SeasonVenueAccess) -> SeasonVenueAccess:
+        self.season_venue_access[sva.id] = sva
+        return sva
+
+    def all_season_venue_access(self) -> List[SeasonVenueAccess]:
+        return list(self.season_venue_access.values())
+
+    def season_venue_access_for_season(
+            self, season_id: str) -> List[SeasonVenueAccess]:
+        return [a for a in self.season_venue_access.values()
+                if a.season_id == season_id]
+
+    def season_venue_access_for_venue(
+            self, venue_id: str) -> List[SeasonVenueAccess]:
+        return [a for a in self.season_venue_access.values()
+                if a.venue_id == venue_id]
+
+    def season_venue_access_for_pair(
+            self, season_id: str, venue_id: str) -> Optional[SeasonVenueAccess]:
+        return next((a for a in self.season_venue_access.values()
+                     if a.season_id == season_id and a.venue_id == venue_id), None)
 
     def add_organization(self, org: Organization) -> Organization:
         self.organizations[org.id] = org
@@ -827,6 +862,9 @@ class InMemoryStore:
 
     def delete_venue(self, venue_id: str) -> None:
         self.venues.pop(venue_id, None)
+
+    def delete_season_venue_access(self, sva_id: str) -> None:
+        self.season_venue_access.pop(sva_id, None)
 
     def delete_rink(self, rink_id: str) -> None:
         self.rinks.pop(rink_id, None)

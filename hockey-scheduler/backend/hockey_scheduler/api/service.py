@@ -3109,6 +3109,25 @@ class ApiService:
         return _serialize(self.setup.delete_season_team_registration(
             registration_id, actor_id))
 
+    # -- season venue access (#233 Slice E) ---------------------------------
+    @catch
+    def grant_season_venue_access(self, season_id: str, venue_id: str,
+                                  actor_id: Optional[str] = None) -> dict:
+        return _serialize(self.setup.grant_season_venue_access(
+            season_id, venue_id, actor_id))
+
+    @catch
+    def revoke_season_venue_access(self, access_id: str,
+                                   actor_id: Optional[str] = None) -> dict:
+        return _serialize(self.setup.revoke_season_venue_access(
+            access_id, actor_id))
+
+    @catch
+    def list_season_venue_access(self, season_id: str) -> dict:
+        rows = [_serialize(a)
+                for a in self.store.season_venue_access_for_season(season_id)]
+        return {"venue_access": rows}
+
     @catch
     def roll_forward_registrations(self, from_season_id: str, to_season_id: str,
                                    selections: Optional[list] = None,
