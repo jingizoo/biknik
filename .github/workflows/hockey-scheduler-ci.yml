@@ -128,6 +128,8 @@ jobs:
         run: npm run season-rollover
       - name: Run team/division participation journey
         run: npm run team-division-participation
+      - name: Run Allowed Venues journey
+        run: npm run allowed-venues
       - name: Run permanent-teams structure journey
         run: npm run permanent-teams
       - name: Run safe destructive actions journey

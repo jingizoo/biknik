@@ -56,6 +56,7 @@ let dashSubQueue = null;            // substitute-candidates for the coach dashb
 let playersList = [];               // [{id,name,team_id,position,jersey_number,...}] for Setup (#114)
 let leagueTeams = {};               // program_id -> [{id,name,program_id}] permanent members (#180/#233 v2)
 let seasonRegs = {};                // season_id -> [{id,team_id,league_id,division_id,active}] registrations (#180/#233 v2)
+let seasonVenueAccess = {};         // season_id -> [{id,season_id,venue_id,active}] (#233 Slice E)
 let leagueDivisions = {};           // league_id -> [{id,name,...}] — cascade data for the League→Division
                                      // selects in Season participation / Rollover (#233 Slice B2b), populated
                                      // each render from hv and read by the onchange handlers that rescope a
@@ -1434,7 +1435,7 @@ function renderSetupHierarchy(sv, hv, ov) {
     ? `<section class="tree-panel na"><div class="tree-head"><span class="tree-title">⚠ Needs assignment</span></div>
         <div class="tree-note">These records can't be scheduled until they're assigned.</div>${naBody}</section>` : "";
 
-  return `${reassignPanelHtml(ov)}<div class="setup-trees">${facility}${permanentTeams}${competition}${renderSeasonParticipation(hv, ov)}${renderRollover(hv, ov)}${roster}${needsAssignment}</div>`;
+  return `${reassignPanelHtml(ov)}<div class="setup-trees">${facility}${permanentTeams}${competition}${renderSeasonParticipation(hv, ov, sv)}${renderRollover(hv, ov)}${roster}${needsAssignment}</div>`;
 }
 
 // Season participation (#180, cut to v2 canonical #233 Slice B2b): permanent
@@ -1447,10 +1448,11 @@ function renderSetupHierarchy(sv, hv, ov) {
 // (permanent roster) and seasonRegs (registration rows, each carrying a
 // league_id) are the dedicated v2 reads loaded in render(); hv supplies the
 // Program→Season→League→Division shape and each league's current teams.
-function renderSeasonParticipation(hv, ov) {
+function renderSeasonParticipation(hv, ov, sv) {
   if (!hasPerm("manage_setup")) return "";
   const programs = (hv.programs || []).filter((p) => (p.seasons || []).length);
   if (!programs.length) return "";
+  const allVenues = (sv && sv.venues) || [];
 
   const programBlocks = programs.map((program) => {
     const permanentTeams = leagueTeams[program.id] || [];
@@ -1505,6 +1507,33 @@ function renderSeasonParticipation(hv, ov) {
           <div class="tn-children">${inactiveRows}</div></details>`
         : "";
 
+      // Allowed venues (#233 Slice E): which Venues this Season may schedule
+      // game ice on, via SeasonVenueAccess — independent of any Venue-Program
+      // ownership. A Venue may be granted to several Seasons/Programs at
+      // once, and a Season may use several Venues.
+      const venueNameById = {};
+      allVenues.forEach((v) => { venueNameById[v.id] = v.name; });
+      const grantedAccess = (seasonVenueAccess[s.id] || []).filter((a) => a.active);
+      const grantedVenueIds = new Set(grantedAccess.map((a) => a.venue_id));
+      const venueAccessRows = grantedAccess.map((a) => `<div class="tn-leaf reg-row">
+          <span class="tn-label">🏟️ ${esc(venueNameById[a.venue_id] || a.venue_id)}</span>
+          <button class="icon-btn danger" data-va-revoke="${esc(a.id)}"
+            title="Revoke venue access" aria-label="Revoke ${esc(venueNameById[a.venue_id] || a.venue_id)} from ${esc(s.name)}">${ICONS.circleMinus}</button></div>`).join("")
+        || `<div class="tn-empty">No venues allowed for this season yet — games can't be scheduled until one is added.</div>`;
+      const availableVenues = allVenues.filter((v) => !grantedVenueIds.has(v.id));
+      const venueAddCtl = availableVenues.length
+        ? `<div class="tn-leaf reg-add">
+            <select id="va-add-${esc(s.id)}"><option value="">Add a venue…</option>${
+              availableVenues.map((v) => opt(v.id, v.name)).join("")}</select>
+            <button class="act primary" data-va-add="${esc(s.id)}">Allow</button></div>`
+        : (allVenues.length
+            ? `<div class="tn-empty">Every venue is already allowed for this season.</div>`
+            : `<div class="tn-empty">Create a venue on the Facility tree first, then allow it here.</div>`);
+      const venueAccessSection = `<details class="tn" open><summary class="tn-sum">
+          <span class="tn-label">🏟️ Allowed venues</span>
+          <span class="tn-meta">${grantedAccess.length} venue${grantedAccess.length === 1 ? "" : "s"}</span></summary>
+        <div class="tn-children">${venueAccessRows}${venueAddCtl}</div></details>`;
+
       const leagueSections = leagues.map((lv) => {
         const divs = lv.divisions || [];
         const divOptsFor = (selId) => divs.map((d) => opt(d.id, d.name, d.id === selId)).join("");
@@ -1557,7 +1586,7 @@ function renderSeasonParticipation(hv, ov) {
           <span class="tn-meta">${leagues.length} league${leagues.length === 1 ? "" : "s"} · ${
             teamCount} team${teamCount === 1 ? "" : "s"}</span>
           ${delBtn("season", s.id, s.name)}</summary>
-        <div class="tn-children">${leagueBlocks}${inactiveSection}</div></details>`;
+        <div class="tn-children">${leagueBlocks}${venueAccessSection}${inactiveSection}</div></details>`;
     }).join("");
 
     // Permanent members not registered for ANY season this program — surfaced
@@ -4512,13 +4541,17 @@ async function render() {
       // hv (already fetched above) rather than ov.leagues/ov.seasons so the
       // requested ids are consistently canonical; hv is only populated under
       // manage_setup, which already gates this whole block.
-      leagueTeams = {}; seasonRegs = {}; leagueDivisions = {};
+      leagueTeams = {}; seasonRegs = {}; leagueDivisions = {}; seasonVenueAccess = {};
       for (const program of (hv.programs || [])) {
         const r = await getJSON(`/api/v2/setup/programs/${program.id}/teams`);
         leagueTeams[program.id] = (r && r.teams) || [];
         for (const s of (program.seasons || [])) {
           const rr = await getJSON(`/api/v2/setup/seasons/${s.id}/team-registrations`);
           seasonRegs[s.id] = (rr && rr.registrations) || [];
+          // Allowed venues (#233 Slice E): which Venues this Season may use
+          // for game ice, independent of any Venue-Program ownership.
+          const va = await getJSON(`/api/v2/setup/seasons/${s.id}/venue-access`);
+          seasonVenueAccess[s.id] = (va && va.venue_access) || [];
         }
       }
     }
@@ -4860,6 +4893,23 @@ async function render() {
     toast = "";
     const res = await post(`/api/v2/setup/season-team-registration/${b.dataset.regRemove}/remove`, {});
     if (res && !res.error) toast = "Team removed from the season.";
+    await render();
+  });
+  // Allowed venues (#233 Slice E): grant/revoke a Venue's SeasonVenueAccess
+  // for a Season, independent of any Venue-Program ownership.
+  c.querySelectorAll("[data-va-add]").forEach((b) => b.onclick = async () => {
+    const sid = b.dataset.vaAdd;
+    const sel = c.querySelector(`#va-add-${sid}`);
+    if (!sel || !sel.value) { toast = "Choose a venue to allow."; toastIsError = true; return render(); }
+    toast = "";
+    const res = await post(`/api/v2/setup/seasons/${sid}/venue-access`, { venue_id: sel.value });
+    if (res && !res.error) toast = "Venue allowed for this season.";
+    await render();
+  });
+  c.querySelectorAll("[data-va-revoke]").forEach((b) => b.onclick = async () => {
+    toast = "";
+    const res = await post(`/api/v2/setup/season-venue-access/${b.dataset.vaRevoke}/remove`, {});
+    if (res && !res.error) toast = "Venue access revoked.";
     await render();
   });
   // Needs-assignment repair row (#233 B2b review): an invalid season

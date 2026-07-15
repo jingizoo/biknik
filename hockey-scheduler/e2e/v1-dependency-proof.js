@@ -170,14 +170,9 @@ async function checkViewport(browser, viewport) {
         { team_id: i.team1, league_id: i.league, division_id: i.division });
       await post(`/api/v2/setup/seasons/${i.season}/team-registrations`,
         { team_id: i.team2, league_id: i.league, division_id: i.division });
-      // Season venue access (#233 Slice E) — a new v2-only feature with no
-      // dedicated Records/Hierarchy UI yet, so built via raw fetch, matching
-      // the established fixture-building pattern for prerequisites this
-      // journey isn't itself proving.
-      await post(`/api/v2/setup/seasons/${i.season}/venue-access`, { venue_id: i.venue });
     }, {
       season: season.id, league: league.id, division: division.id,
-      team1: team1.id, team2: team2.id, venue: venue.id,
+      team1: team1.id, team2: team2.id,
     });
 
     // (1) Official create — drawer submit must hit v2.
@@ -195,6 +190,23 @@ async function checkViewport(browser, viewport) {
     // never a structural reassignment on the Team or the Player). The
     // reassign control lives on the Hierarchy tree view, not Records.
     await page.click('[data-setup-view="hierarchy"]');
+
+    // (2b) Season venue access (#233 Slice E) — grant the venue to the season
+    // through the real "Allowed venues" control in Season participation, the
+    // supported UI path a League Admin uses (no raw-fetch fixture).
+    const vaSelId = `#va-add-${season.id}`;
+    await page.waitForSelector(vaSelId, { timeout: 10000 });
+    await page.selectOption(vaSelId, venue.id);
+    const vaReq = page.waitForResponse((r) =>
+      r.url() === `${base}/api/v2/setup/seasons/${season.id}/venue-access`
+      && r.request().method() === "POST");
+    await page.click(`[data-va-add="${season.id}"]`);
+    const vaBody = await (await vaReq).json();
+    if (vaBody.error) {
+      throw new Error(`[${viewport.label}] season venue-access grant failed: ${JSON.stringify(vaBody.error)}`);
+    }
+    await page.waitForSelector(`[data-va-revoke="${vaBody.id}"]`, { timeout: 10000 });
+
     // The Rosters tree's team rows start collapsed — expand Team One's to
     // reveal the player row and its reassign control.
     await page.waitForSelector('[data-reassign="player:team"]', { state: "attached", timeout: 10000 });
