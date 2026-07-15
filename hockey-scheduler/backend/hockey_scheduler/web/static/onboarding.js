@@ -280,7 +280,9 @@ function nextOnboardingFix(status) {
     no_league: "level",
   };
   if (drawers[code]) return { type: "drawer", value: drawers[code] };
-  if (code === "no_team") return { type: "drawer", value: "club" };
+  // Club is optional on a Team (#233 Slice D): the fix routes straight to the
+  // Team drawer rather than requiring a Club to exist first.
+  if (code === "no_team") return { type: "drawer", value: "team" };
   if (["non_durable_store", "migrations_stale", "no_active_admin"].includes(code)) {
     return { type: "view", value: "readiness" };
   }

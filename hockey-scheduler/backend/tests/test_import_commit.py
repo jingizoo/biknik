@@ -47,6 +47,14 @@ DUPLICATE_TEAM_CODE_CSV = (
     "T1,Team Two\n"
 )
 
+NO_CLUB_TEAMS_CSV = (
+    "team_code,team_name,club_name,division_name\n"
+    "N1,No Club Blank,,U16\n"
+    "N2,No Club NA,NA,U16\n"
+    "N3,No Club na lower,na,U16\n"
+    "N4,Has Club,Real Club,U16\n"
+)
+
 
 def _valid_sheets_csv():
     return {"teams_csv": TEAMS_CSV, "players_csv": PLAYERS_CSV}
@@ -293,6 +301,22 @@ class ImportCommitServiceContract:
         self.assertEqual(res["summary"]["clubs_created"], 1)
         self.assertEqual(res["summary"]["divisions_created"], 2)
         self.assertEqual(len(self.store.all_clubs()), 1)
+
+    # -- 3b. blank/NA club_name means no Club, never a placeholder (#233 D) --
+    def test_blank_and_na_club_name_creates_no_club(self):
+        res = self.api.commit_teams_players_import(
+            self.season.id, {"teams_csv": NO_CLUB_TEAMS_CSV}, actor_id="admin")
+        self.assertNotIn("error", res)
+        self.assertTrue(res["committed"])
+        # Only "Real Club" is created — blank/NA/na never become a Club row.
+        self.assertEqual(res["summary"]["clubs_created"], 1)
+        clubs = self.store.all_clubs()
+        self.assertEqual(len(clubs), 1)
+        self.assertEqual(clubs[0].name, "Real Club")
+        self.assertIsNone(self._team("N1").club_id)
+        self.assertIsNone(self._team("N2").club_id)
+        self.assertIsNone(self._team("N3").club_id)
+        self.assertEqual(self._team("N4").club_id, clubs[0].id)
 
     # -- 4. validation reuse blocks the whole commit -------------------------
     def test_invalid_row_blocks_whole_commit(self):

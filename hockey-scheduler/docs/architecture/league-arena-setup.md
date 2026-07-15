@@ -40,9 +40,9 @@ Game   >── Season, League, (optional) Division, home Team, away Team, IceSlo
   reversed.)*
 - A **Team** belongs permanently to one **Program**; its per-season placement
   (League + optional Division) is a **SeasonTeamRegistration**, not a field on the Team.
-- **Club** is a team affiliation. It becomes **optional end-to-end in Slice D** (a team
-  may then have none, with no placeholder Club); **today the v1 `create_team` still
-  requires a valid `club_id`**.
+- **Club** is a team affiliation. It is **optional end-to-end (Slice D)** — a Team may
+  have no Club, with no placeholder Club ever created — in both v1 and v2, and across
+  create and reassignment.
 - A **Venue** is owned by an **Organization** (facility owner) and made available to a
   Season via **SeasonVenueAccess** — one Season may use several Venues and one Venue
   may host several independent Programs/Seasons.
@@ -87,8 +87,9 @@ name (until Slice C) it is noted. See ADR 0001 for the full column map.
 ### Team / Club
 - `Club { id, name, country }` — affiliation.
 - `Team` belongs permanently to a **Program** *(legacy column: `league_id` → `program_id`)*.
-  Its `club_id` is **required in v1 today** and becomes **nullable in Slice D**. Season
-  placement is a SeasonTeamRegistration.
+  Its `club_id` is **optional** (Slice D) in both v1 and v2 — no Club is required to
+  create a Team, and an existing Club assignment may be cleared. Season placement is a
+  SeasonTeamRegistration.
 
 ### SeasonTeamRegistration
 | Field | Type | Notes |
@@ -146,7 +147,7 @@ POST /api/setup/league        create_league   (the umbrella; = Program)
 POST /api/setup/season        create_season   (body: league_id, …)
 POST /api/setup/level         create_level    (the grouping; = League)
 POST /api/setup/division      create_division (body: season_id, level_id?)
-POST /api/setup/team          create_team     (body: league_id, club_id, …)   # club_id required in v1
+POST /api/setup/team          create_team     (body: league_id, club_id?, …)   # club_id optional
 POST /api/setup/venue         create_venue    (body: organization_id?, league_id?)
 POST /api/setup/game          create_game     (body: season_id, division_id, …)
 
@@ -155,7 +156,7 @@ POST /api/v2/setup/program     (body: operator_organization_id?, …)
 POST /api/v2/setup/season      (body: program_id, …)
 POST /api/v2/setup/league      (body: season_id, …)          # the new League
 POST /api/v2/setup/division    (body: league_id, …)
-POST /api/v2/setup/team        (body: program_id, club_id, …)   # club_id nullable in Slice D
+POST /api/v2/setup/team        (body: program_id, club_id?, …)   # club_id optional
 POST /api/v2/setup/venue       (body: organization_id?)       # no league ownership
 POST /api/v2/setup/game        (body: season_id, league_id, division_id?, …)
 

@@ -632,8 +632,8 @@ const SETUP_ENTITIES = [
       sub: t.club_name || "No club",
     })),
     fields: [
-      { id: "f-team-club", label: "Club", type: "select", required: true, ofNoun: "club",
-        options: (ov) => (ov.clubs || []).map((c) => [c.id, c.name]) },
+      { id: "f-team-club", label: "Club (optional)", type: "select", ofNoun: "club",
+        options: (ov) => [["", "— none —"]].concat((ov.clubs || []).map((c) => [c.id, c.name])) },
       { id: "f-team-league", label: "Program", type: "select", required: true, ofNoun: "league",
         options: (ov) => (ov.programs || []).map((l) => [l.id, l.name]) },
       { id: "f-team", label: "Team name", required: true, placeholder: "e.g. U14 Eagles" }] },
@@ -730,7 +730,7 @@ const SETUP_POST = {
   level: () => post("/api/v2/setup/league", { season_id: val("f-level-season"), name: val("f-level"), sort_order: val("f-level-sort") ? Number(val("f-level-sort")) : 0 }),
   division: () => post("/api/v2/setup/division", { league_id: val("f-div-league"), name: val("f-div"), age_group: val("f-div-age") }),
   club: () => post("/api/v2/setup/club", { name: val("f-club") }),
-  team: () => post("/api/v2/setup/team", { program_id: val("f-team-league"), club_id: val("f-team-club"), name: val("f-team") }),
+  team: () => post("/api/v2/setup/team", { program_id: val("f-team-league"), club_id: val("f-team-club") || null, name: val("f-team") }),
   organization: () => post("/api/v2/setup/organization", { name: val("f-org"), short_name: val("f-org-short") }),
   venue: () => post("/api/v2/setup/venue", { name: val("f-venue"), organization_id: val("f-venue-org") || null }),
   rink: () => post("/api/v2/setup/rink", { venue_id: val("f-rink-venue"), name: val("f-rink") }),
@@ -792,8 +792,9 @@ const REASSIGN = {
     options: (ov, pr) => (ov.levels || [])
       .filter((lv) => lv.season_id === pr.seasonId).map((lv) => [lv.id, lv.name]) },
   "team:club": {
-    // Not nullable (#233 B2a review r1): v2 keeps Club REQUIRED until Slice D.
-    perm: "manage_setup", noun: "club", nullable: false, risky: false,
+    // Club is optional on a Team (#233 Slice D): nullable lets the operator
+    // unassign a Team's Club from the reassign panel.
+    perm: "manage_setup", noun: "club", nullable: true, risky: false,
     options: (ov) => (ov.clubs || []).map((c) => [c.id, c.name]) },
   // team:division removed (#233 B2c): a Team has no seasonal Division of its
   // own — participation is a SeasonTeamRegistration (League required,
