@@ -53,6 +53,14 @@ OVERLAP_AVAIL_CSV = (
     "O1,2026-08-01T19:00:00+00:00,2026-08-01T21:00:00+00:00,available\n"
 )
 
+NO_CLUB_OFFICIALS_CSV = (
+    "official_code,name,home_club_name\n"
+    "N1,No Club Blank,\n"
+    "N2,No Club NA,NA\n"
+    "N3,No Club na lower,na\n"
+    "N4,Has Club,Real Club\n"
+)
+
 
 def _valid_sheets_csv():
     return {"officials_csv": OFFICIALS_CSV, "official_availability_csv": AVAILABILITY_CSV}
@@ -149,6 +157,21 @@ class ImportOfficialsAvailabilityCommitServiceContract:
         o1 = self._official("O1")
         o2 = self._official("O2")
         self.assertEqual(o1.home_club_id, o2.home_club_id)
+
+    # -- 4a. blank/NA home_club_name means no Club (#233 Slice D) -------------
+    def test_blank_and_na_home_club_name_creates_no_club(self):
+        res = self.api.commit_officials_availability_import(
+            {"officials_csv": NO_CLUB_OFFICIALS_CSV}, actor_id="admin")
+        self.assertNotIn("error", res)
+        self.assertTrue(res["committed"])
+        self.assertEqual(res["summary"]["clubs_created"], 1)
+        clubs = self.store.all_clubs()
+        self.assertEqual(len(clubs), 1)
+        self.assertEqual(clubs[0].name, "Real Club")
+        self.assertIsNone(self._official("N1").home_club_id)
+        self.assertIsNone(self._official("N2").home_club_id)
+        self.assertIsNone(self._official("N3").home_club_id)
+        self.assertEqual(self._official("N4").home_club_id, clubs[0].id)
 
     # -- 4b. official email contact destination -------------------------------
     def test_email_contact_destination(self):

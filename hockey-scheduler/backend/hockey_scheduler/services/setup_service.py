@@ -73,6 +73,13 @@ def _clean(value) -> str:
     return str(value).strip()
 
 
+def _no_club(value) -> bool:
+    """Blank, null, and the literal spreadsheet placeholder "NA" (any case)
+    all mean "no Club" on import (#233 Slice D) — never a Club literally
+    named "NA"."""
+    return _blank(value) or _clean(value).upper() == "NA"
+
+
 def _parse_iso_utc(value) -> Optional[datetime]:
     """Parse a timezone-aware ISO-8601 timestamp, else None.
 
@@ -1872,7 +1879,7 @@ class SetupService:
 
                 club_id = None
                 club_name_raw = row.get("club_name")
-                if not _blank(club_name_raw):
+                if not _no_club(club_name_raw):
                     club_name = _clean(club_name_raw)
                     club = next((c for c in self.store.all_clubs()
                                 if c.name == club_name), None)
@@ -2127,7 +2134,7 @@ class SetupService:
 
                 club_id = None
                 club_name_raw = row.get("home_club_name")
-                if not _blank(club_name_raw):
+                if not _no_club(club_name_raw):
                     club_name = _clean(club_name_raw)
                     club = next((c for c in self.store.all_clubs()
                                 if c.name == club_name), None)
