@@ -225,9 +225,12 @@ class LegacyFieldIsInertContract:
         # retained row must never appear there (#180 review) so it can't be
         # offered in the picker or reach a create request.
         season = self._season("S")
+        league = self.api.create_league(season, "Adult League", actor_id=self.ACTOR)["id"]
         dA = self._division(season, "A")
+        self.api.assign_division_league(dA, league, actor_id=self.ACTOR)
         good = self._team("Good")
-        self._register(season, good, dA)
+        self.api.register_team_for_season(
+            season, good, dA, actor_id=self.ACTOR, league_id=league)
 
         def bad_reg(team_id, division_id):
             self.store.add_season_team_registration(SeasonTeamRegistration(
@@ -274,6 +277,20 @@ class LegacyFieldIsInertContract:
         exposed = {r["team_id"]
                    for r in self.api.get_demo_overview()["registrations"]}
         self.assertNotIn(team.id, exposed)
+
+    def test_overview_excludes_registration_with_no_league_id(self):
+        # #233 B2c review r1: every registration is required to carry a
+        # League — a row with league_id=None (e.g. a stale pre-#233 v1 row,
+        # or a derivation that couldn't determine one) must be excluded from
+        # the overview, never silently passed through as league-less.
+        season = self._season("S")
+        team = self._team("NoLeague")
+        self.store.add_season_team_registration(SeasonTeamRegistration(
+            id=self.store.next_id("streg"), season_id=season,
+            team_id=team, division_id=None, league_id=None, active=True))
+        exposed = {r["team_id"]
+                  for r in self.api.get_demo_overview()["registrations"]}
+        self.assertNotIn(team, exposed)
 
     def test_overview_registration_exposes_league_id_for_wizard(self):
         # #233 B2c: the scheduling wizard's League picker needs the

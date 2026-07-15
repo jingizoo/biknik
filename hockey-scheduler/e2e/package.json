@@ -15,7 +15,9 @@
     "destructive-surfaces": "node destructive-surfaces.js",
     "reset-visibility": "node reset-visibility.js",
     "demo-lifecycle": "node demo-lifecycle.js",
-    "api-error-resilience": "node api-error-resilience.js"
+    "api-error-resilience": "node api-error-resilience.js",
+    "v1-dependency-proof": "node v1-dependency-proof.js",
+    "check-v1-route-contract": "node check-v1-route-contract.js"
   },
   "devDependencies": {
     "playwright": "^1.48.0"

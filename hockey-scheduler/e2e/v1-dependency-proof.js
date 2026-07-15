@@ -4,14 +4,16 @@
 // (POST /api/setup/venue/{id}/assign-league) — deliberately deferred to
 // Slice E, when the Venue.league_id coupling itself is removed.
 //
-// This journey drives a broad sweep of Setup/Records/Calendar workflows —
-// creating a Program/Season/League/Division/Club/Team/Venue/Rink/Ice-slot,
-// creating an Organization, an Official and a Player through their drawers,
-// reassigning a Player to a different Team, applying the one documented v1
-// bridge, scheduling a game through the Calendar wizard (League required,
-// Division optional), and deleting both a spare Organization and the draft
-// game just created — while recording every request the page makes. It then
-// asserts the ONLY /api/setup/... calls observed are that one documented
+// This journey drives EVERY structural create through its real Records-view
+// drawer — Organization (x2), Program, Season, League, Division, Club, Team
+// (x2), Venue, Rink, Ice-slot (x2), Official, Player — plus a Player→Team
+// reassign, the one documented v1 bridge, scheduling a game through the
+// Calendar wizard (League required, Division optional), and deleting both a
+// spare Organization and a draft game, while recording every request the
+// page makes. Driving creates through the real drawers (not a raw-fetch
+// fixture) means reverting any SETUP_POST entry back to v1 would be caught
+// here, not just by the separate check-v1-route-contract.js static check.
+// It then asserts the ONLY /api/setup/... calls observed are the documented
 // bridge call — any other stray v1 call fails the journey outright.
 //
 // It also asserts the removed legacy Team→Division reassignment control
@@ -86,86 +88,102 @@ async function checkViewport(browser, viewport) {
     if (p.startsWith("/api/setup/")) v1Calls.push(`${req.method()} ${p}`);
   });
 
+  // Open a create drawer, fill its fields (select vs. fill by tag), submit,
+  // and return the parsed response body — asserting it POSTed to exactly the
+  // expected canonical v2 URL. Filling every entity through its real drawer
+  // (rather than a raw fetch) means a SETUP_POST entry reverted to v1 fails
+  // this journey directly.
+  const createViaDrawer = async (key, fields, expectedUrl) => {
+    await page.click(`.setup-card .sc-new[data-drawer="${key}"]`);
+    await page.waitForSelector(".drawer[role=dialog]", { timeout: 10000 });
+    for (const [id, value] of Object.entries(fields)) {
+      const tag = await page.$eval(`#${id}`, (el) => el.tagName);
+      if (tag === "SELECT") await page.selectOption(`#${id}`, value);
+      else await page.fill(`#${id}`, value);
+    }
+    const resp = page.waitForResponse((r) =>
+      r.url() === `${base}${expectedUrl}` && r.request().method() === "POST");
+    await page.click(`[data-drawer-submit="${key}"]`);
+    const body = await (await resp).json();
+    if (body.error) {
+      throw new Error(`[${viewport.label}] ${key} create failed: ${JSON.stringify(body.error)}`);
+    }
+    await page.waitForFunction(
+      () => !document.querySelector(".drawer[role=dialog]"), null, { timeout: 10000 });
+    return body;
+  };
+
   try {
     await waitForServer(`${base}/api/health`, READY_TIMEOUT_MS);
     await page.goto(base, { waitUntil: "domcontentloaded" });
     await page.waitForSelector("#content > *", { timeout: 10000 });
-
-    // Build the structural fixtures the drawer/wizard/reassign/delete steps
-    // below need, entirely through the canonical v2 API (never through the
-    // page's own click-driven creates — those are what this journey proves).
-    const fx = await page.evaluate(async (day) => {
-      const post = async (p, b) => (await fetch(p, {
-        method: "POST", credentials: "same-origin",
-        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
-      })).json();
-      const org = await post("/api/v2/setup/organization", { name: "Fixture Facilities" });
-      const program = await post("/api/v2/setup/program",
-        { name: "V1 Proof Program", operator_organization_id: org.id });
-      const season = await post("/api/v2/setup/season", { program_id: program.id, name: "2026-27" });
-      const league = await post("/api/v2/setup/league", { season_id: season.id, name: "Adult League" });
-      const division = await post("/api/v2/setup/division", { league_id: league.id, name: "Gold" });
-      const club = await post("/api/v2/setup/club", { name: "Fixture Club" });
-      const team1 = await post("/api/v2/setup/team",
-        { program_id: program.id, club_id: club.id, name: "Team One" });
-      const team2 = await post("/api/v2/setup/team",
-        { program_id: program.id, club_id: club.id, name: "Team Two" });
-      await post(`/api/v2/setup/seasons/${season.id}/team-registrations`,
-        { team_id: team1.id, league_id: league.id, division_id: division.id });
-      await post(`/api/v2/setup/seasons/${season.id}/team-registrations`,
-        { team_id: team2.id, league_id: league.id, division_id: division.id });
-      const venue = await post("/api/v2/setup/venue", { name: "Fixture Venue", organization_id: org.id });
-      const rink = await post("/api/v2/setup/rink", { venue_id: venue.id, name: "Fixture Rink" });
-      const slot = await post("/api/v2/setup/ice-slot", {
-        rink_id: rink.id, start_time: `${day}T18:00:00+00:00`,
-        end_time: `${day}T19:00:00+00:00`, slot_type: "game" });
-      // A spare, dependency-free Organization for the delete step below.
-      const spareOrg = await post("/api/v2/setup/organization", { name: "Spare Facilities" });
-      // A second slot for the scheduler-committed draft built AFTER the venue
-      // bridge is applied below (the round-robin generator requires the
-      // slot's venue to already carry the legacy league_id).
-      const draftSlot = await post("/api/v2/setup/ice-slot", {
-        rink_id: rink.id, start_time: `${day}T20:00:00+00:00`,
-        end_time: `${day}T21:00:00+00:00`, slot_type: "game" });
-      return {
-        org: org.id, program: program.id, season: season.id, league: league.id,
-        division: division.id, club: club.id, team1: team1.id, team2: team2.id,
-        venue: venue.id, rink: rink.id, slot: slot.id, spareOrg: spareOrg.id,
-        draftSlot: draftSlot.id,
-      };
-    }, CAL_DAY);
-
     await page.click('.tab[data-tab="setup"]');
     await page.click('[data-setup-view="records"]');
     await page.waitForSelector(".setup-card", { timeout: 10000 });
 
+    // Every structural create driven through its real drawer, in dependency
+    // order — the actual subject of this journey's SETUP_POST proof.
+    const org = await createViaDrawer("organization",
+      { "f-org": "Fixture Facilities" }, "/api/v2/setup/organization");
+    const spareOrg = await createViaDrawer("organization",
+      { "f-org": "Spare Facilities" }, "/api/v2/setup/organization");
+    const program = await createViaDrawer("league",
+      { "f-league": "V1 Proof Program", "f-league-org": org.id }, "/api/v2/setup/program");
+    const season = await createViaDrawer("season",
+      { "f-season-league": program.id, "f-season": "2026-27" }, "/api/v2/setup/season");
+    const league = await createViaDrawer("level",
+      { "f-level-season": season.id, "f-level": "Adult League" }, "/api/v2/setup/league");
+    const division = await createViaDrawer("division",
+      { "f-div-league": league.id, "f-div": "Gold" }, "/api/v2/setup/division");
+    const club = await createViaDrawer("club",
+      { "f-club": "Fixture Club" }, "/api/v2/setup/club");
+    const team1 = await createViaDrawer("team",
+      { "f-team-club": club.id, "f-team-league": program.id, "f-team": "Team One" },
+      "/api/v2/setup/team");
+    const team2 = await createViaDrawer("team",
+      { "f-team-club": club.id, "f-team-league": program.id, "f-team": "Team Two" },
+      "/api/v2/setup/team");
+    const venue = await createViaDrawer("venue",
+      { "f-venue": "Fixture Venue", "f-venue-org": org.id }, "/api/v2/setup/venue");
+    const rink = await createViaDrawer("rink",
+      { "f-rink-venue": venue.id, "f-rink": "Fixture Rink" }, "/api/v2/setup/rink");
+    const slot = await createViaDrawer("ice-slot", {
+      "f-slot-rink": rink.id, "f-slot-date": CAL_DAY,
+      "f-slot-start": "18:00", "f-slot-end": "19:00",
+    }, "/api/v2/setup/ice-slot");
+    // A second slot for the scheduler-committed draft built AFTER the venue
+    // bridge is applied below (the round-robin generator requires the
+    // slot's venue to already carry the legacy league_id).
+    const draftSlot = await createViaDrawer("ice-slot", {
+      "f-slot-rink": rink.id, "f-slot-date": CAL_DAY,
+      "f-slot-start": "20:00", "f-slot-end": "21:00",
+    }, "/api/v2/setup/ice-slot");
+
+    // Team-registration creation is Season participation's own UI (already
+    // proven v2 in Slice B2b) — out of this journey's explicit scope, so
+    // built via raw fetch, matching the established fixture-building pattern
+    // used elsewhere for prerequisites this journey isn't itself proving.
+    await page.evaluate(async (i) => {
+      const post = async (p, b) => (await fetch(p, {
+        method: "POST", credentials: "same-origin",
+        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
+      })).json();
+      await post(`/api/v2/setup/seasons/${i.season}/team-registrations`,
+        { team_id: i.team1, league_id: i.league, division_id: i.division });
+      await post(`/api/v2/setup/seasons/${i.season}/team-registrations`,
+        { team_id: i.team2, league_id: i.league, division_id: i.division });
+    }, { season: season.id, league: league.id, division: division.id, team1: team1.id, team2: team2.id });
+
     // (1) Official create — drawer submit must hit v2.
-    await page.click('.setup-card .sc-new[data-drawer="official"]');
-    await page.waitForSelector("#f-official", { timeout: 10000 });
-    await page.fill("#f-official", "Proof Official");
-    await page.click('[data-drawer-submit="official"]');
-    await page.waitForFunction(
-      () => !document.querySelector(".drawer[role=dialog]"), null, { timeout: 10000 });
+    await createViaDrawer("official", { "f-official": "Proof Official" }, "/api/v2/setup/official");
 
     // (2) Player create — drawer submit must hit v2.
-    await page.click('.setup-card .sc-new[data-drawer="player"]');
-    await page.waitForSelector("#f-player-team", { timeout: 10000 });
-    await page.selectOption("#f-player-team", fx.team1);
-    await page.fill("#f-player-name", "Proof Player");
-    await page.selectOption("#f-player-position", "forward");
-    await page.click('[data-drawer-submit="player"]');
-    await page.waitForFunction(
-      () => !document.querySelector(".drawer[role=dialog]"), null, { timeout: 10000 });
+    await createViaDrawer("player", {
+      "f-player-team": team1.id, "f-player-name": "Proof Player",
+      "f-player-position": "forward",
+    }, "/api/v2/setup/player");
 
-    // (3) Organization create — drawer submit must hit v2.
-    await page.click('.setup-card .sc-new[data-drawer="organization"]');
-    await page.waitForSelector("#f-org", { timeout: 10000 });
-    await page.fill("#f-org", "Proof Facilities");
-    await page.click('[data-drawer-submit="organization"]');
-    await page.waitForFunction(
-      () => !document.querySelector(".drawer[role=dialog]"), null, { timeout: 10000 });
-
-    // (4) Player→Team reassign — move the just-created player to Team Two.
+    // (3) Player→Team reassign — move the just-created player to Team Two.
     // Must hit v2 (assign_player_team), the successor to the removed
     // Team→Division control (seasonal placement is a SeasonTeamRegistration,
     // never a structural reassignment on the Team or the Player). The
@@ -178,12 +196,12 @@ async function checkViewport(browser, viewport) {
     await page.waitForSelector('[data-reassign="player:team"]', { timeout: 10000 });
     await page.click('[data-reassign="player:team"]');
     await page.waitForSelector(".rz-panel", { timeout: 10000 });
-    await page.selectOption("#reassign-target", fx.team2);
+    await page.selectOption("#reassign-target", team2.id);
     await page.click("[data-reassign-confirm]");
     await page.waitForFunction(
       () => !document.querySelector(".rz-panel"), null, { timeout: 10000 });
 
-    // (5) The removed legacy Team→Division reassignment control must never
+    // (4) The removed legacy Team→Division reassignment control must never
     // render anywhere on the page (#233 B2c) — seasonal placement is a
     // SeasonTeamRegistration, moved via Season participation's own
     // League→Division cascade, never a structural Team reassignment.
@@ -191,21 +209,21 @@ async function checkViewport(browser, viewport) {
       throw new Error(`[${viewport.label}] a legacy team:division reassign control is still rendered`);
     }
 
-    // (6) The one documented, deliberately-deferred v1 call: the temporary
+    // (5) The one documented, deliberately-deferred v1 call: the temporary
     // Venue→Program compatibility bridge (Slice E removes it).
     await page.waitForSelector('[data-reassign="venue:league"]', { timeout: 10000 });
     await page.click('[data-reassign="venue:league"]');
     await page.waitForSelector(".rz-panel", { timeout: 10000 });
-    await page.selectOption("#reassign-target", fx.program);
+    await page.selectOption("#reassign-target", program.id);
     await page.click("[data-reassign-confirm]");
     await page.waitForFunction(
       () => !document.querySelector(".rz-panel"), null, { timeout: 10000 });
 
     // A genuine scheduler draft (is_draft=True — a manually wizard-created
-    // game defaults to committed, not draft, per (7) below), built now that
+    // game defaults to committed, not draft, per (6) below), built now that
     // the venue carries its legacy league_id (the round-robin generator
     // requires it), purely to exercise the Scheduler view's draft-delete
-    // control at (9). Neither /api/scheduler/... route is part of the
+    // control at (8). Neither /api/scheduler/... route is part of the
     // /api/setup/... v1 surface this journey is proving.
     const draftGame = await page.evaluate(async (i) => {
       const post = async (p, b) => (await fetch(p, {
@@ -219,46 +237,46 @@ async function checkViewport(browser, viewport) {
         { credentials: "same-origin" })).json();
       const draft = (drafts.draft_games || []).find((g) => g.division_id === i.division);
       return { id: draft && draft.game_id };
-    }, fx);
+    }, { division: division.id, draftSlot: draftSlot.id });
     if (draftGame.error || !draftGame.id) {
       throw new Error(`[${viewport.label}] scheduler commit produced no draft game: ${JSON.stringify(draftGame)}`);
     }
 
-    // (7) Schedule a game through the Calendar wizard — League required,
+    // (6) Schedule a game through the Calendar wizard — League required,
     // Division optional (#233 B2c) — must hit v2.
     await page.click('.tab[data-tab="calendar"]');
-    await page.waitForSelector(`[data-slot="${fx.slot}"]`, { timeout: 15000 });
-    await page.click(`[data-slot="${fx.slot}"]`);
+    await page.waitForSelector(`[data-slot="${slot.id}"]`, { timeout: 15000 });
+    await page.click(`[data-slot="${slot.id}"]`);
     await page.waitForSelector("#w-league", { timeout: 10000 });
-    await page.selectOption("#w-league", fx.league);
+    await page.selectOption("#w-league", league.id);
     await page.waitForFunction(
       (d) => !!Array.from(document.querySelectorAll("#w-div option")).find((o) => o.value === d),
-      fx.division, { timeout: 10000 });
-    await page.selectOption("#w-div", fx.division);
+      division.id, { timeout: 10000 });
+    await page.selectOption("#w-div", division.id);
     await page.waitForFunction(
       (t) => !!Array.from(document.querySelectorAll("#w-home option")).find((o) => o.value === t),
-      fx.team1, { timeout: 10000 });
-    await page.selectOption("#w-home", fx.team1);
-    await page.selectOption("#w-away", fx.team2);
+      team1.id, { timeout: 10000 });
+    await page.selectOption("#w-home", team1.id);
+    await page.selectOption("#w-away", team2.id);
     const createResp = page.waitForResponse((r) =>
       r.url() === `${base}/api/v2/setup/game` && r.request().method() === "POST");
     await page.click("[data-wizcreate]");
     const created = await (await createResp).json();
     if (created.error) throw new Error(`[${viewport.label}] wizard game create failed: ${JSON.stringify(created.error)}`);
 
-    // (8) Delete the spare Organization from the Facility tree (its only
+    // (7) Delete the spare Organization from the Facility tree (its only
     // delete control — Records has no delBtn for organizations) — must hit v2.
     await page.click('.tab[data-tab="setup"]');
     await page.click('[data-setup-view="hierarchy"]');
-    await page.waitForSelector(`[data-del="organization"][data-del-id="${fx.spareOrg}"]`, { timeout: 15000 });
-    await page.click(`[data-del="organization"][data-del-id="${fx.spareOrg}"]`);
+    await page.waitForSelector(`[data-del="organization"][data-del-id="${spareOrg.id}"]`, { timeout: 15000 });
+    await page.click(`[data-del="organization"][data-del-id="${spareOrg.id}"]`);
     await page.waitForSelector(".modal.danger [data-del-confirm]", { timeout: 10000 });
     await page.click("[data-del-confirm]");
     await page.waitForSelector(".modal", { state: "detached", timeout: 10000 });
 
-    // (9) Delete the scheduler-committed draft game (a manually wizard-created
+    // (8) Delete the scheduler-committed draft game (a manually wizard-created
     // game defaults to committed, not draft — its only actions are Publish/
-    // Cancel, per (7) above). A draft's only delete control is on the
+    // Cancel, per (6) above). A draft's only delete control is on the
     // Scheduler view's list (the Games tab offers Cancel for a committed/
     // published game, never Delete) — must hit v2.
     await page.click('.tab[data-tab="scheduler"]');

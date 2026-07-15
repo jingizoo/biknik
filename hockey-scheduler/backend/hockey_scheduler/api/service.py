@@ -2392,15 +2392,17 @@ class ApiService:
     # ====================================================================
     @catch
     def _registration_is_operational(self, r) -> bool:
-        """True only for a registration safe to act on (#180 review, #233 B2c).
+        """True only for a registration safe to act on (#180 review, #233 B2c
+        review r1).
 
         Reuses the shared scheduling guard (season has a league, Team exists and
         its permanent league matches the season) and additionally requires any
-        named division to actually belong to the registration's season, and the
-        registration's own (competition) league — when set — to resolve, belong
-        to the season, and agree with a named division's league. A wrong-season
-        / cross-league / missing-Team / missing-League row is never exposed to
-        the operational UI (e.g. the game-scheduling wizard, #233 B2c).
+        named division to actually belong to the registration's season. The
+        registration's own (competition) league_id is REQUIRED (#233 — every
+        registration carries a League) and must resolve, belong to the season,
+        and agree with a named division's league — a wrong-season / cross-league
+        / missing-Team / missing-League / **league-less** row is never exposed
+        to the operational UI (e.g. the game-scheduling wizard, #233 B2c).
         """
         season = self.store.get_season(r.season_id)
         if team_registration_valid(
@@ -2410,12 +2412,13 @@ class ApiService:
             division = self.store.get_division(r.division_id)
             if division is None or division.season_id != r.season_id:
                 return False
-            if r.league_id is not None and division.league_id != r.league_id:
+            if division.league_id != r.league_id:
                 return False
-        if r.league_id is not None:
-            league = self.store.get_league(r.league_id)
-            if league is None or league.season_id != r.season_id:
-                return False
+        if not r.league_id:
+            return False
+        league = self.store.get_league(r.league_id)
+        if league is None or league.season_id != r.season_id:
+            return False
         return True
 
     def get_demo_overview(self) -> dict:
