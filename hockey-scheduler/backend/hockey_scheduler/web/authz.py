@@ -154,19 +154,22 @@ def required_permission(path: str):
     # Managing contact destinations is an operator action (#60).
     if path == "/api/notifications/contacts":
         return Permission.MANAGE_SCHEDULE
-    # Explicit, audited removal of a dead contact destination (#232 review) —
-    # the same operator action as managing one, above.
+    # Explicit, audited removal of a dead contact destination (#232 review 3):
+    # a Player/Official-scoped hard delete, so it takes the League-Admin-only
+    # MANAGE_SETUP permission that gates Player/Official deletion itself, not
+    # the wider MANAGE_SCHEDULE an Arena Manager also holds.
     if re.match(r"^/api/notifications/contacts/[^/]+/delete$", path):
-        return Permission.MANAGE_SCHEDULE
+        return Permission.MANAGE_SETUP
     # Managing push device tokens is an operator action (#65).
     if path == "/api/notifications/device-tokens":
         return Permission.MANAGE_SCHEDULE
     if re.match(r"^/api/notifications/device-tokens/[^/]+/active$", path):
         return Permission.MANAGE_SCHEDULE
     # Explicit, audited removal of a dead notification preference (#232
-    # review) — the same operator action as setting one.
+    # review 3): same League-Admin-only MANAGE_SETUP rationale as the
+    # contact-destination delete above.
     if re.match(r"^/api/notifications/preferences/[^/]+/delete$", path):
-        return Permission.MANAGE_SCHEDULE
+        return Permission.MANAGE_SETUP
     # Creating/activating login accounts is a distinct, narrower operator
     # action than scheduling — only a league admin holds it (#67).
     if path == "/api/accounts":
