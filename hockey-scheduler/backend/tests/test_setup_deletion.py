@@ -152,6 +152,139 @@ class DeletionContract:
         self.assertDeleted(self.api.delete_division(empty, actor_id=self.ACTOR),
                            self.store.get_division, empty, "division_deleted")
 
+    # -- division: inactive registrations never block, active ones do (#233
+    # D1 bundled fix) — the UI can show 0 active teams under a Division while
+    # a hidden inactive SeasonTeamRegistration row still points at it; that
+    # row must not silently block deletion forever.
+    def test_division_with_only_inactive_registration_deletes_and_clears_it(self):
+        lg = self._league()
+        s = self._season(lg)
+        d = self._division(s)
+        club = self._club()
+        team = self._team(club, lg)
+        reg = self._register(s, team, d)
+        self.api.unregister_team_from_season(reg, actor_id=self.ACTOR)
+        stored = self.store.get_season_team_registration(reg)
+        self.assertFalse(stored.active)
+        self.assertEqual(stored.division_id, d)  # retained until now (the bug)
+
+        audits_before = len(self.store.all_setup_audit())
+        result = self.api.delete_division(d, actor_id=self.ACTOR)
+        self.assertNotIn("error", result, result)
+        self.assertEqual(result["inactive_registrations_cleaned"], 1)
+        self.assertIsNone(self.store.get_division(d))
+
+        # The registration row itself survives — inactive, division cleared.
+        stored = self.store.get_season_team_registration(reg)
+        self.assertIsNotNone(stored)
+        self.assertFalse(stored.active)
+        self.assertIsNone(stored.division_id)
+        self.assertEqual(stored.season_id, s)
+        self.assertEqual(stored.team_id, team)
+
+        cleared = self._audits("season_team_division_cleared")
+        self.assertEqual(len(cleared), 1)
+        self.assertEqual(cleared[0].entity_id, reg)
+        self.assertEqual(cleared[0].detail["from"], d)
+        self.assertIsNone(cleared[0].detail["to"])
+        deleted = self._audits("division_deleted")
+        self.assertEqual(len(deleted), 1)
+        self.assertEqual(deleted[0].detail["inactive_registrations_cleaned"], 1)
+        # Exactly two new audit rows: the per-registration cleanup, then the
+        # division deletion itself.
+        self.assertEqual(len(self.store.all_setup_audit()), audits_before + 2)
+
+    def test_division_with_active_registration_still_blocks_even_with_inactive(self):
+        lg = self._league()
+        s = self._season(lg)
+        d = self._division(s)
+        club = self._club()
+        gone_team = self._team(club, lg, "Gone")
+        gone_reg = self._register(s, gone_team, d)
+        self.api.unregister_team_from_season(gone_reg, actor_id=self.ACTOR)
+        stay_team = self._team(club, lg, "Stays")
+        self._register(s, stay_team, d)
+
+        blocked = self.api.delete_division(d, actor_id=self.ACTOR)
+        self.assertBlocked(blocked, expect_types={"team registration"})
+        # Zero-write on block: even the inactive row is untouched.
+        self.assertIsNotNone(self.store.get_division(d))
+        stored = self.store.get_season_team_registration(gone_reg)
+        self.assertEqual(stored.division_id, d)
+        self.assertEqual(self._audits("season_team_division_cleared"), [])
+
+    def test_division_with_game_history_still_blocks_even_with_inactive_reg(self):
+        lg = self._league()
+        s = self._season(lg)
+        d = self._division(s)
+        club = self._club()
+        home = self._team(club, lg, "Home")
+        away = self._team(club, lg, "Away")
+        home_reg = self._register(s, home, d)
+        away_reg = self._register(s, away, d)
+        slot = self._slot(self._rink(self._venue(league_id=lg)))
+        game = self._game(s, d, home, away, slot)
+        # unregister_team_from_season refuses to strand a team with a
+        # scheduled game, so the only realistic path to "inactive
+        # registration + Game history, zero active registrations" is: cancel
+        # the game first (a cancelled game no longer counts as "scheduled"
+        # and stops blocking unregister), THEN remove both teams from the
+        # season. The cancelled Game itself is permanent history and must
+        # still block deletion even though no ACTIVE registration remains.
+        self.api.cancel_game(game, actor_id=self.ACTOR)
+        self.api.unregister_team_from_season(home_reg, actor_id=self.ACTOR)
+        self.api.unregister_team_from_season(away_reg, actor_id=self.ACTOR)
+
+        blocked = self.api.delete_division(d, actor_id=self.ACTOR)
+        self.assertBlocked(blocked, expect_types={"game"})
+        self.assertIsNotNone(self.store.get_division(d))
+        self.assertEqual(self._audits("season_team_division_cleared"), [])
+
+    def test_division_delete_rolls_back_on_forced_mid_operation_failure(self):
+        # Two inactive registrations to clear — force the SECOND save to
+        # raise, so the operation fails after partial progress. The store's
+        # transaction must roll back everything: the first registration's
+        # clear, the audits, and the division itself.
+        lg = self._league()
+        s = self._season(lg)
+        d = self._division(s)
+        club = self._club()
+        team1 = self._team(club, lg, "T1")
+        team2 = self._team(club, lg, "T2")
+        reg1 = self._register(s, team1, d)
+        reg2 = self._register(s, team2, d)
+        self.api.unregister_team_from_season(reg1, actor_id=self.ACTOR)
+        self.api.unregister_team_from_season(reg2, actor_id=self.ACTOR)
+
+        audits_before = len(self.store.all_setup_audit())
+        original = self.store.save_season_team_registration
+        calls = {"n": 0}
+
+        def boom(reg):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                raise RuntimeError("forced mid-operation failure")
+            return original(reg)
+
+        self.store.save_season_team_registration = boom
+        try:
+            with self.assertRaises(RuntimeError):
+                self.api.delete_division(d, actor_id=self.ACTOR)
+        finally:
+            self.store.save_season_team_registration = original
+
+        # Nothing persisted: the division, both registrations, and the audit
+        # log are exactly as they were before the call — including the FIRST
+        # registration's clear, which must not survive as a partial write.
+        self.assertIsNotNone(self.store.get_division(d))
+        stored1 = self.store.get_season_team_registration(reg1)
+        stored2 = self.store.get_season_team_registration(reg2)
+        self.assertEqual(stored1.division_id, d)
+        self.assertEqual(stored2.division_id, d)
+        self.assertFalse(stored1.active)
+        self.assertFalse(stored2.active)
+        self.assertEqual(len(self.store.all_setup_audit()), audits_before)
+
     # -- club --------------------------------------------------------------
     def test_club_blocked_by_team(self):
         lg = self._league()

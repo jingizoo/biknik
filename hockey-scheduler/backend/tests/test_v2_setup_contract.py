@@ -31,6 +31,10 @@ SEASON_KEYS = {"id", "program_id", "name", "start_date", "end_date",
 LEAGUE_KEYS = {"id", "season_id", "name", "sort_order", "external_ref"}
 DIVISION_KEYS = {"id", "season_id", "name", "age_group", "league_id",
                  "external_ref"}
+# delete_division's response also reports how many inactive, game-free
+# registrations it cleared (#233 D1 bundled fix, #248) — a delete-only field,
+# not part of the general Division shape used by create/read/reassign.
+DIVISION_DELETE_KEYS = DIVISION_KEYS | {"inactive_registrations_cleaned"}
 TEAM_KEYS = {"id", "name", "division", "club_id", "division_id", "external_ref",
              "program_id"}
 # Canonical Venue is Organization-owned only: the legacy league_id is stripped
@@ -415,7 +419,7 @@ class V2SetupContractTest(unittest.TestCase):
         status, deleted = self._req(
             c, "POST", f"/api/v2/setup/division/{division['id']}/delete", {})
         self.assertEqual(status, 200, deleted)
-        self.assertEqual(set(deleted), DIVISION_KEYS, deleted)
+        self.assertEqual(set(deleted), DIVISION_DELETE_KEYS, deleted)
 
         status, dleague = self._req(
             c, "POST", f"/api/v2/setup/league/{league['id']}/delete", {})

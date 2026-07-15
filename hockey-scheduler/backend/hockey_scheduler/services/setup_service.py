@@ -277,7 +277,8 @@ class SetupService:
         return club
 
     @_transactional
-    def create_team(self, club_id: str, division_id: Optional[str] = None,
+    def create_team(self, club_id: Optional[str] = None,
+                    division_id: Optional[str] = None,
                     name: str = "", actor_id: Optional[str] = None,
                     program_id: Optional[str] = None) -> Team:
         """Create a permanent league team (#180).
@@ -296,8 +297,13 @@ class SetupService:
 
         Exactly one is required. When both are given, the division's league
         wins (and must not contradict a supplied league_id).
+
+        ``club_id`` is optional (#233 Slice D): a team's Club is just an
+        affiliation, not a structural requirement, and many programs use no
+        club at all. Only validate it when a non-null id is actually supplied
+        — never invent or require a placeholder Club.
         """
-        if self.store.get_club(club_id) is None:
+        if club_id and self.store.get_club(club_id) is None:
             raise NotFoundError(f"Club {club_id} not found.")
         if division_id:
             division = self.store.get_division(division_id)
@@ -316,10 +322,10 @@ class SetupService:
         if self.store.get_program(program_id) is None:
             raise NotFoundError(f"Program {program_id} not found.")
         team = Team(id=self.store.next_id("team"), name=self._require_name(name),
-                    club_id=club_id, program_id=program_id)
+                    club_id=club_id or None, program_id=program_id)
         self.store.add_team(team)
         self._audit("team_created", "team", team.id, actor_id,
-                    {"club_id": club_id, "league_id": program_id})
+                    {"club_id": team.club_id, "league_id": program_id})
         return team
 
     # -- permanent teams + season registrations (#180) ---------------------
@@ -966,17 +972,12 @@ class SetupService:
 
     @_transactional
     def assign_team_club(self, team_id: str, club_id: Optional[str] = None,
-                         actor_id: Optional[str] = None,
-                         v2: bool = False) -> Team:
+                         actor_id: Optional[str] = None) -> Team:
         team = self.store.get_team(team_id)
         if team is None:
             raise NotFoundError(f"Team {team_id} not found.")
-        # v2 (#233 Slice C2 review): nullable Club is deferred to Slice D and the
-        # v2 Team create path requires a real Club — so the v2 reassignment must
-        # not be able to null the link and produce a state v2 create rejects.
-        # Require a non-null existing Club here. v1 keeps its nullable behavior.
-        if v2 and not club_id:
-            raise ValidationError("A club_id is required.")
+        # Club is optional on a Team in both v1 and v2 (#233 Slice D): null
+        # unassigns it. Only validate the id when one is actually supplied.
         if club_id and self.store.get_club(club_id) is None:
             raise NotFoundError(f"Club {club_id} not found.")
         old = team.club_id
@@ -2913,24 +2914,51 @@ class SetupService:
 
     @_transactional
     def delete_division(self, division_id: str,
-                        actor_id: Optional[str] = None) -> Division:
+                        actor_id: Optional[str] = None) -> dict:
         division = self.store.get_division(division_id)
         if division is None:
             raise NotFoundError(f"Division {division_id} not found.")
         regs = [r for r in self.store.all_season_team_registrations()
                 if r.division_id == division_id]
         games = [g for g in self.store.all_games() if g.division_id == division_id]
-        # Deletion keys off real operational dependents only (#180): season
-        # registrations and games. A stale legacy Team.division_id pointer is no
-        # longer read operationally, so it never blocks a division delete.
+        # Deletion keys off real operational dependents only (#180, #233 D1
+        # bundled fix): an ACTIVE registration or any Game blocks deletion. An
+        # INACTIVE registration (the team was removed from the season via
+        # unregister_team_from_season, which deliberately retains division_id
+        # for history) is not a live dependent — the Setup UI can show 0 teams
+        # under a Division while these hidden rows still exist, so they must
+        # not silently block deletion forever. A stale legacy
+        # Team.division_id pointer is no longer read operationally, so it
+        # never blocks a division delete either.
+        active_regs = [r for r in regs if r.active]
+        inactive_regs = [r for r in regs if not r.active]
         self._block_if_dependents("division", division_id, "division", [
-            self._dep_group("team registration", regs,
+            self._dep_group("team registration", active_regs,
                             lambda r: self._team_name(r.team_id)),
             self._dep_group("game", games, self._matchup)])
+        # Clear the inactive registrations' division_id (never a hard delete —
+        # the row, its Season/Team/League identity, and its active=False
+        # status are all retained) before removing the Division itself. Each
+        # cleanup is audited individually against its own registration (the
+        # old→new convention used elsewhere, e.g. season_team_league_assigned)
+        # so every affected row has its own traceable audit entry.
+        for reg in inactive_regs:
+            old_division_id = reg.division_id
+            reg.division_id = None
+            self.store.save_season_team_registration(reg)
+            self._audit("season_team_division_cleared",
+                        "season_team_registration", reg.id, actor_id,
+                        {"from": old_division_id, "to": None,
+                         "reason": "division_deleted"})
         self.store.delete_division(division_id)
         self._audit("division_deleted", "division", division_id, actor_id,
-                    {"name": division.name, "season_id": division.season_id})
-        return division
+                    {"name": division.name, "season_id": division.season_id,
+                     "inactive_registrations_cleaned": len(inactive_regs)})
+        return {"id": division.id, "season_id": division.season_id,
+                "name": division.name, "age_group": division.age_group,
+                "league_id": division.league_id,
+                "external_ref": division.external_ref,
+                "inactive_registrations_cleaned": len(inactive_regs)}
 
     @_transactional
     def delete_club(self, club_id: str, actor_id: Optional[str] = None) -> Club:
