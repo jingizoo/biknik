@@ -93,6 +93,7 @@ jobs:
           node --check hockey-scheduler/e2e/team-club-optional.js
           node --check hockey-scheduler/e2e/division-delete-cleanup.js
           node --check hockey-scheduler/e2e/registration-cleanup.js
+          node --check hockey-scheduler/e2e/venue-sharing.js
       - name: Check v1 route contract (#233 B2c)
         run: node hockey-scheduler/e2e/check-v1-route-contract.js
 
@@ -132,6 +133,8 @@ jobs:
         run: npm run allowed-venues
       - name: Run venue-access cleanup journey
         run: npm run venue-access-cleanup
+      - name: Run venue-sharing journey
+        run: npm run venue-sharing
       - name: Run permanent-teams structure journey
         run: npm run permanent-teams
       - name: Run safe destructive actions journey
