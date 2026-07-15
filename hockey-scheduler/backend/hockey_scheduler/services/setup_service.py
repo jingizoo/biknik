@@ -2914,24 +2914,51 @@ class SetupService:
 
     @_transactional
     def delete_division(self, division_id: str,
-                        actor_id: Optional[str] = None) -> Division:
+                        actor_id: Optional[str] = None) -> dict:
         division = self.store.get_division(division_id)
         if division is None:
             raise NotFoundError(f"Division {division_id} not found.")
         regs = [r for r in self.store.all_season_team_registrations()
                 if r.division_id == division_id]
         games = [g for g in self.store.all_games() if g.division_id == division_id]
-        # Deletion keys off real operational dependents only (#180): season
-        # registrations and games. A stale legacy Team.division_id pointer is no
-        # longer read operationally, so it never blocks a division delete.
+        # Deletion keys off real operational dependents only (#180, #233 D1
+        # bundled fix): an ACTIVE registration or any Game blocks deletion. An
+        # INACTIVE registration (the team was removed from the season via
+        # unregister_team_from_season, which deliberately retains division_id
+        # for history) is not a live dependent — the Setup UI can show 0 teams
+        # under a Division while these hidden rows still exist, so they must
+        # not silently block deletion forever. A stale legacy
+        # Team.division_id pointer is no longer read operationally, so it
+        # never blocks a division delete either.
+        active_regs = [r for r in regs if r.active]
+        inactive_regs = [r for r in regs if not r.active]
         self._block_if_dependents("division", division_id, "division", [
-            self._dep_group("team registration", regs,
+            self._dep_group("team registration", active_regs,
                             lambda r: self._team_name(r.team_id)),
             self._dep_group("game", games, self._matchup)])
+        # Clear the inactive registrations' division_id (never a hard delete —
+        # the row, its Season/Team/League identity, and its active=False
+        # status are all retained) before removing the Division itself. Each
+        # cleanup is audited individually against its own registration (the
+        # old→new convention used elsewhere, e.g. season_team_league_assigned)
+        # so every affected row has its own traceable audit entry.
+        for reg in inactive_regs:
+            old_division_id = reg.division_id
+            reg.division_id = None
+            self.store.save_season_team_registration(reg)
+            self._audit("season_team_division_cleared",
+                        "season_team_registration", reg.id, actor_id,
+                        {"from": old_division_id, "to": None,
+                         "reason": "division_deleted"})
         self.store.delete_division(division_id)
         self._audit("division_deleted", "division", division_id, actor_id,
-                    {"name": division.name, "season_id": division.season_id})
-        return division
+                    {"name": division.name, "season_id": division.season_id,
+                     "inactive_registrations_cleaned": len(inactive_regs)})
+        return {"id": division.id, "season_id": division.season_id,
+                "name": division.name, "age_group": division.age_group,
+                "league_id": division.league_id,
+                "external_ref": division.external_ref,
+                "inactive_registrations_cleaned": len(inactive_regs)}
 
     @_transactional
     def delete_club(self, club_id: str, actor_id: Optional[str] = None) -> Club:
