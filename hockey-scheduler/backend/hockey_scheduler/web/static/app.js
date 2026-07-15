@@ -7,7 +7,7 @@ let rosterSide = "home";    // home | away — which lineup the roster tab shows
 let rosterTeamId = null;    // team_id of the currently shown lineup (for copy)
 let currentGame = null;     // game id whose roster we're viewing
 let pickedPlayer = null;
-let wizard = null;          // {slot_id, division_id, home_id, away_id} when scheduling
+let wizard = null;          // {slot_id, league_id, division_id, home_id, away_id} when scheduling
 let calendarDate = "2026-09-05";  // YYYY-MM-DD shown on the arena calendar
 let calendarMode = "day";   // day | week
 let calFilters = { venueId: "all", rinkId: "all", divisionId: "all", teamId: "all" };
@@ -731,16 +731,14 @@ const SETUP_POST = {
   division: () => post("/api/v2/setup/division", { league_id: val("f-div-league"), name: val("f-div"), age_group: val("f-div-age") }),
   club: () => post("/api/v2/setup/club", { name: val("f-club") }),
   team: () => post("/api/v2/setup/team", { program_id: val("f-team-league"), club_id: val("f-team-club"), name: val("f-team") }),
-  // Organization create stays on v1 in this slice; the canonical body is
-  // identical, and its route cutover lands with the other deferred v1 writes.
-  organization: () => post("/api/setup/organization", { name: val("f-org"), short_name: val("f-org-short") }),
+  organization: () => post("/api/v2/setup/organization", { name: val("f-org"), short_name: val("f-org-short") }),
   venue: () => post("/api/v2/setup/venue", { name: val("f-venue"), organization_id: val("f-venue-org") || null }),
   rink: () => post("/api/v2/setup/rink", { venue_id: val("f-rink-venue"), name: val("f-rink") }),
   "ice-slot": () => post("/api/v2/setup/ice-slot", { rink_id: val("f-slot-rink"), start_time: `${val("f-slot-date")}T${val("f-slot-start")}:00+00:00`, end_time: `${val("f-slot-date")}T${val("f-slot-end")}:00+00:00`, slot_type: val("f-slot-type") }),
-  official: () => post("/api/setup/official", {
+  official: () => post("/api/v2/setup/official", {
     name: val("f-official"), home_club_id: val("f-official-club") || null,
   }),
-  player: () => post("/api/setup/player", {
+  player: () => post("/api/v2/setup/player", {
     team_id: val("f-player-team"), name: val("f-player-name"),
     position: val("f-player-position"),
     jersey_number: val("f-player-jersey") ? Number(val("f-player-jersey")) : null,
@@ -797,10 +795,13 @@ const REASSIGN = {
     // Not nullable (#233 B2a review r1): v2 keeps Club REQUIRED until Slice D.
     perm: "manage_setup", noun: "club", nullable: false, risky: false,
     options: (ov) => (ov.clubs || []).map((c) => [c.id, c.name]) },
-  "team:division": {
-    perm: "manage_setup", noun: "division", nullable: false, risky: true,
-    warn: "Moving a team to a new division changes where it competes and can affect its scheduled games.",
-    options: (ov) => (ov.divisions || []).map((d) => [d.id, d.name]) },
+  // team:division removed (#233 B2c): a Team has no seasonal Division of its
+  // own — participation is a SeasonTeamRegistration (League required,
+  // Division optional), moved via the registration's own League→Division
+  // cascade (Season participation / Needs-assignment repair row), never a
+  // structural reassignment on the Team itself. assign_team_division was
+  // already removed server-side (#180); this control was dead UI config with
+  // no reachable backend route.
   "player:team": {
     perm: "manage_setup", noun: "team", nullable: false, risky: true,
     warn: "Moving a player changes which team's roster they belong to.",
@@ -827,6 +828,7 @@ const REASSIGN_V2 = {
   "league:organization": { kind: "program", parent: "organization", bodyKey: "operator_organization_id" },
   "division:level": { kind: "division", parent: "league", bodyKey: "league_id" },
   "team:club": { kind: "team", parent: "club", bodyKey: "club_id" },
+  "player:team": { kind: "player", parent: "team", bodyKey: "team_id" },
   "rink:venue": { kind: "rink", parent: "venue", bodyKey: "venue_id" },
   "venue:organization": { kind: "venue", parent: "organization", bodyKey: "organization_id" },
 };
@@ -913,12 +915,14 @@ const DEL_NOUN = {
 // type the record's name or DELETE before the destructive button enables.
 // Lower-risk entities keep a single-click confirm.
 const HIGH_RISK_DELETE = new Set(["league", "season", "team", "venue", "rink"]);
-// v2 delete route segment for each structural B2a entity (#233 B2a review
-// r1) — frozen frontend kind tokens map to canonical names; organization,
-// official, player, and game are deliberately absent (deferred v1 writes).
+// v2 delete route segment for each structural entity (#233 B2a review r1,
+// extended to organization/game in B2c) — frozen frontend kind tokens map to
+// canonical names, 1:1 except league→program/level→league. official/player
+// have no delete UI wired (no delBtn call site), so they're absent here.
 const DEL_ROUTE_V2 = {
   league: "program", season: "season", level: "league", division: "division",
   club: "club", team: "team", venue: "venue", rink: "rink", "ice-slot": "ice-slot",
+  organization: "organization", game: "game",
 };
 
 function renderModal() {
@@ -1085,10 +1089,9 @@ function wireModal(c) {
     delConfirm.onclick = async () => {
       if (!confirmed()) return;  // defense in depth; the button is disabled too
       toast = "";
-      // Structural deletes use v2 (#233 B2a review r1); frozen frontend kind
-      // tokens map to canonical v2 route segments (league→program,
-      // level→league), others 1:1. Organization/official/player/game stay
-      // on v1, deferred with their other v1 writes (create, B2c).
+      // Structural deletes use v2 (#233 B2a review r1, extended B2c); frozen
+      // frontend kind tokens map to canonical v2 route segments
+      // (league→program, level→league), others 1:1.
       const v2Kind = DEL_ROUTE_V2[m.kind];
       const res = v2Kind
         ? await post(`/api/v2/setup/${v2Kind}/${m.id}/delete`, {})
@@ -2098,45 +2101,73 @@ function slotVenueName(ov, slot) {
 function renderWizard(ov) {
   const slot = ov.ice_slots.find((s) => s.id === wizard.slot_id);
   if (!slot) { wizard = null; return renderCalendar(ov); }
-  const divs = ov.divisions;
-  if (!wizard.division_id && divs[0]) wizard.division_id = divs[0].id;
+  // League (required) + Division (optional) — v2 canonical game scope (#233
+  // B2c): `ov.levels` is the grouping League list (frozen internal key
+  // "level" = canonical League); `ov.divisions[].level_id` is each
+  // division's owning League. The Division picker offers "No division" and
+  // is scoped to the chosen League — never a flat cross-league list.
+  //
+  // The League is NEVER implicitly picked when more than one exists (#233
+  // B2c review): silently defaulting to the first risks writing the game to
+  // the wrong competitive grouping (#212). Auto-selecting is safe only when
+  // there is exactly ONE unambiguous League to choose from — with zero or
+  // several, the select starts on a disabled "Select league…" placeholder
+  // and every downstream control (Division/Home/Away/Create) stays disabled
+  // until the operator picks one explicitly.
+  const leagues = ov.levels || [];
+  if (!wizard.league_id && leagues.length === 1) wizard.league_id = leagues[0].id;
+  const leagueChosen = !!wizard.league_id;
+  const divs = leagueChosen ? ov.divisions.filter((d) => d.level_id === wizard.league_id) : [];
+  if (wizard.division_id && !divs.find((d) => d.id === wizard.division_id)) wizard.division_id = "";
   // Teams eligible for this game are those with an ACTIVE SeasonTeamRegistration
-  // in the chosen division (#180) — never the legacy Team.division_id. This
-  // mirrors the server's registration-based game-creation guard, so the picker
-  // only offers teams the server will accept.
-  const registeredIds = new Set((ov.registrations || [])
-    .filter((r) => r.division_id === wizard.division_id)
-    .map((r) => r.team_id));
+  // in the chosen League (#180, #233 B2c) — and, when a Division is also
+  // chosen, in that exact Division too (the server requires an exact match
+  // once a Division is given). Never the legacy Team.division_id. This
+  // mirrors the server's registration-based game-creation guard, so the
+  // picker only offers teams the server will accept. Empty until a League is
+  // explicitly chosen.
+  const registeredIds = leagueChosen ? new Set((ov.registrations || [])
+    .filter((r) => r.league_id === wizard.league_id
+      && (!wizard.division_id || r.division_id === wizard.division_id))
+    .map((r) => r.team_id)) : new Set();
   const teams = ov.teams.filter((t) => registeredIds.has(t.id));
   if (!teams.find((t) => t.id === wizard.home_id)) wizard.home_id = teams[0] ? teams[0].id : "";
   const awayTeams = teams.filter((t) => t.id !== wizard.home_id);
   if (!awayTeams.find((t) => t.id === wizard.away_id)) wizard.away_id = awayTeams[0] ? awayTeams[0].id : "";
 
-  const sameDiv = wizard.home_id && wizard.away_id;
+  const sameLeague = wizard.home_id && wizard.away_id;
   const distinct = wizard.home_id && wizard.away_id && wizard.home_id !== wizard.away_id;
-  const ok = sameDiv && distinct && slot.status === "available";
+  const ok = leagueChosen && sameLeague && distinct && slot.status === "available";
   const v = (good, t) => `<div class="valid ${good ? "ok" : "bad"}">${good ? "✓" : "✕"} ${t}</div>`;
+  const dis = leagueChosen ? "" : "disabled";
   return `
     <div class="wizard">
       <h3>Schedule Game</h3>
       <div class="step">1 · Competition</div>
-      <select id="w-div">${divs.map((d) => opt(d.id, d.name, d.id === wizard.division_id)).join("")}</select>
-      <div class="step">2 · Teams</div>
-      <select id="w-home">${teams.map((t) => opt(t.id, t.name, t.id === wizard.home_id)).join("")}</select>
+      <select id="w-league" aria-label="League">${
+        leagueChosen ? "" : `<option value="" disabled selected>Select league…</option>`}${
+        leagues.map((lv) => opt(lv.id, lv.name, lv.id === wizard.league_id)).join("")}</select>
       <div style="height:8px"></div>
-      <select id="w-away">${awayTeams.map((t) => opt(t.id, t.name, t.id === wizard.away_id)).join("") || opt("", "—")}</select>
+      <select id="w-div" aria-label="Division" ${dis}><option value="">No division</option>${
+        divs.map((d) => opt(d.id, d.name, d.id === wizard.division_id)).join("")}</select>
+      <div class="step">2 · Teams</div>
+      <select id="w-home" aria-label="Home team" ${dis}>${teams.map((t) => opt(t.id, t.name, t.id === wizard.home_id)).join("")}</select>
+      <div style="height:8px"></div>
+      <select id="w-away" aria-label="Away team" ${dis}>${awayTeams.map((t) => opt(t.id, t.name, t.id === wizard.away_id)).join("") || opt("", "—")}</select>
       <div class="step">3 · Ice</div>
       <div class="li"><span class="li-time">${fmt(slot.start_time)}–${fmt(slot.end_time)}</span>
         <div class="li-main"><div class="li-title">${esc(slot.rink_name)}</div>
           <div class="li-sub">${esc(slotVenueName(ov, slot))}</div></div></div>
       <div class="step">4 · Validation</div>
-      ${v(!!teams.length, "Same division")}
+      ${v(leagueChosen, "League selected")}
+      ${v(!!teams.length, "Same league")}
       ${v(distinct, "Home and away are different teams")}
       ${v(slot.status === "available", "Ice slot is available")}
       ${v(true, "Public-safe junior fixture (no PII)")}
       <div class="step">5 · Review</div>
       <div class="review">
-        <div class="kv"><span class="k">Division</span><span class="v">${esc((divs.find((d) => d.id === wizard.division_id) || {}).name || "")}</span></div>
+        <div class="kv"><span class="k">League</span><span class="v">${esc((leagues.find((lv) => lv.id === wizard.league_id) || {}).name || "")}</span></div>
+        <div class="kv"><span class="k">Division</span><span class="v">${esc((divs.find((d) => d.id === wizard.division_id) || {}).name || "No division")}</span></div>
         <div class="kv"><span class="k">Home</span><span class="v">${esc((teams.find((t) => t.id === wizard.home_id) || {}).name || "—")}</span></div>
         <div class="kv"><span class="k">Away</span><span class="v">${esc((awayTeams.find((t) => t.id === wizard.away_id) || {}).name || "—")}</span></div>
         <div class="kv"><span class="k">Venue · Rink</span><span class="v">${esc(slotVenueName(ov, slot))} · ${esc(slot.rink_name)}</span></div>
@@ -5686,7 +5717,9 @@ async function render() {
   c.querySelectorAll("[data-openroster]").forEach((b) => b.onclick = () => { currentGame = b.dataset.openroster; switchTab("roster"); });
   const picker = document.getElementById("player-picker");
   if (picker) picker.onchange = (e) => { pickedPlayer = e.target.value; toast = ""; render(); };
-  // wizard wiring
+  // wizard wiring (#233 B2c: League required, Division optional)
+  const wl = document.getElementById("w-league");
+  if (wl) wl.onchange = (e) => { wizard.league_id = e.target.value; wizard.division_id = ""; wizard.home_id = null; wizard.away_id = null; render(); };
   const wd = document.getElementById("w-div");
   if (wd) wd.onchange = (e) => { wizard.division_id = e.target.value; wizard.home_id = null; wizard.away_id = null; render(); };
   const wh = document.getElementById("w-home");
@@ -5696,11 +5729,13 @@ async function render() {
   const wc = c.querySelector("[data-wizcancel]"); if (wc) wc.onclick = () => { wizard = null; render(); };
   const wcr = c.querySelector("[data-wizcreate]");
   if (wcr) wcr.onclick = async () => {
-    // Use the SELECTED division's season, not the first seeded season.
-    const div = ov.divisions.find((d) => d.id === wizard.division_id);
-    const res = await post("/api/setup/game", {
-      season_id: div ? div.season_id : (ov.seasons[0] || {}).id,
-      division_id: wizard.division_id,
+    // v2: League is REQUIRED (game scope); Division is optional (#233 B2c).
+    // season_id comes from the selected League, not a Division (which may be
+    // unset when the game is league-only).
+    const league = (ov.levels || []).find((lv) => lv.id === wizard.league_id);
+    const res = await post("/api/v2/setup/game", {
+      season_id: league ? league.season_id : (ov.seasons[0] || {}).id,
+      league_id: wizard.league_id, division_id: wizard.division_id || null,
       home_team_id: wizard.home_id, away_team_id: wizard.away_id, ice_slot_id: wizard.slot_id,
     });
     if (res && !res.error) { toast = "Game scheduled."; currentGame = res.id; wizard = null; view = "games"; }

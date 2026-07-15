@@ -225,9 +225,12 @@ class LegacyFieldIsInertContract:
         # retained row must never appear there (#180 review) so it can't be
         # offered in the picker or reach a create request.
         season = self._season("S")
+        league = self.api.create_league(season, "Adult League", actor_id=self.ACTOR)["id"]
         dA = self._division(season, "A")
+        self.api.assign_division_league(dA, league, actor_id=self.ACTOR)
         good = self._team("Good")
-        self._register(season, good, dA)
+        self.api.register_team_for_season(
+            season, good, dA, actor_id=self.ACTOR, league_id=league)
 
         def bad_reg(team_id, division_id):
             self.store.add_season_team_registration(SeasonTeamRegistration(
@@ -274,6 +277,83 @@ class LegacyFieldIsInertContract:
         exposed = {r["team_id"]
                    for r in self.api.get_demo_overview()["registrations"]}
         self.assertNotIn(team.id, exposed)
+
+    def test_overview_excludes_registration_with_no_league_id(self):
+        # #233 B2c review r1: every registration is required to carry a
+        # League — a row with league_id=None (e.g. a stale pre-#233 v1 row,
+        # or a derivation that couldn't determine one) must be excluded from
+        # the overview, never silently passed through as league-less.
+        season = self._season("S")
+        team = self._team("NoLeague")
+        self.store.add_season_team_registration(SeasonTeamRegistration(
+            id=self.store.next_id("streg"), season_id=season,
+            team_id=team, division_id=None, league_id=None, active=True))
+        exposed = {r["team_id"]
+                  for r in self.api.get_demo_overview()["registrations"]}
+        self.assertNotIn(team, exposed)
+
+    def test_overview_registration_exposes_league_id_for_wizard(self):
+        # #233 B2c: the scheduling wizard's League picker needs the
+        # registration's competition league_id — a v2 (league-required)
+        # registration must expose it verbatim in the overview.
+        season = self._season("S")
+        league = self.api.create_league(season, "Adult League", actor_id=self.ACTOR)["id"]
+        dA = self._division(season, "A")
+        self.api.assign_division_league(dA, league, actor_id=self.ACTOR)
+        team = self._team("Reg")
+        reg = self.api.register_team_for_season(
+            season, team, dA, actor_id=self.ACTOR, league_id=league)["id"]
+        row = next(r for r in self.api.get_demo_overview()["registrations"]
+                  if r["team_id"] == team)
+        self.assertEqual(row["league_id"], league)
+        self.assertEqual(row["division_id"], dA)
+
+        # A league-only registration (no Division) exposes league_id with a
+        # null division_id — never silently dropped from the picker's data.
+        team2 = self._team("LeagueOnly")
+        reg2 = self.api.register_team_for_season(
+            season, team2, None, actor_id=self.ACTOR, league_id=league)["id"]
+        row2 = next(r for r in self.api.get_demo_overview()["registrations"]
+                   if r["team_id"] == team2)
+        self.assertEqual(row2["league_id"], league)
+        self.assertIsNone(row2["division_id"])
+
+    def test_overview_excludes_registration_with_dangling_league_id(self):
+        # A registration whose league_id points at a League from a DIFFERENT
+        # season (or no League at all) must never reach the wizard — the same
+        # "cross-league/missing-League" corruption class the division check
+        # already guards against (#233 B2c).
+        season = self._season("S")
+        other_season = self._season("Other")
+        other_league = self.api.create_league(
+            other_season, "Other League", actor_id=self.ACTOR)["id"]
+        team = self._team("Dangling")
+        self.store.add_season_team_registration(SeasonTeamRegistration(
+            id=self.store.next_id("streg"), season_id=season,
+            team_id=team, division_id=None, league_id=other_league,
+            active=True))
+        exposed = {r["team_id"]
+                  for r in self.api.get_demo_overview()["registrations"]}
+        self.assertNotIn(team, exposed)
+
+    def test_overview_excludes_registration_with_division_league_mismatch(self):
+        # A registration whose Division belongs to a DIFFERENT League than the
+        # registration's own league_id is corrupt and must never be exposed
+        # (#233 B2c) — the wizard's division picker is scoped by league, so a
+        # mismatched row would otherwise silently offer the wrong division.
+        season = self._season("S")
+        league = self.api.create_league(season, "Adult League", actor_id=self.ACTOR)["id"]
+        other_league = self.api.create_league(
+            season, "Other League", actor_id=self.ACTOR)["id"]
+        dA = self._division(season, "A")
+        self.api.assign_division_league(dA, other_league, actor_id=self.ACTOR)
+        team = self._team("Mismatch")
+        self.store.add_season_team_registration(SeasonTeamRegistration(
+            id=self.store.next_id("streg"), season_id=season,
+            team_id=team, division_id=dA, league_id=league, active=True))
+        exposed = {r["team_id"]
+                  for r in self.api.get_demo_overview()["registrations"]}
+        self.assertNotIn(team, exposed)
 
     def test_delete_division_ignores_stale_legacy_team_pointer(self):
         # A division with no registrations/games deletes cleanly even if a team's

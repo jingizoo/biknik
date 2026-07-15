@@ -65,7 +65,7 @@ async function checkPostError(browser) {
     await page.reload({ waitUntil: "domcontentloaded" });
     await page.waitForSelector("#content > *", { timeout: 10000 });
     await page.waitForTimeout(600);
-    await page.route("**/api/setup/organization", (r) => r.fulfill(BAD_GATEWAY));
+    await page.route("**/api/v2/setup/organization", (r) => r.fulfill(BAD_GATEWAY));
     await page.locator('[data-onboarding-drawer="organization"]').first().click();
     await page.waitForSelector("#f-org", { timeout: 10000 });
     await page.fill("#f-org", "Sophia");

@@ -183,7 +183,7 @@ async function checkViewport(browser, viewport) {
     await page.click(draftDel);
     await page.waitForSelector(".modal.danger [data-del-confirm]", { timeout: 10000 });
     resp = page.waitForResponse((r) =>
-      r.url() === `${base}/api/setup/game/${ids.draft}/delete` && r.request().method() === "POST");
+      r.url() === `${base}/api/v2/setup/game/${ids.draft}/delete` && r.request().method() === "POST");
     await page.click("[data-del-confirm]");
     if ((await resp).status() !== 200) throw new Error(`[${viewport.label}] draft delete non-200`);
     await page.waitForSelector(".modal", { state: "detached", timeout: 10000 });
