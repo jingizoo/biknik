@@ -2066,6 +2066,12 @@ class Handler(BaseHTTPRequestHandler):
         if mvr:
             return self._send_api(api.revoke_season_venue_access(
                 mvr.group(1), actor_id))
+        # Explicit permanent cleanup of an already-revoked access row (#255
+        # review), mirroring #251's season-team-registration .../delete.
+        mvd = re.match(r"^season-venue-access/([^/]+)/delete$", entity)
+        if mvd:
+            return self._send_api(api.delete_season_venue_access(
+                mvd.group(1), actor_id))
         # Season rollover (canonical v2): each selection REQUIRES a target
         # league_id, honored verbatim on the resulting registration.
         mrf = re.match(r"^seasons/([^/]+)/roll-forward$", entity)

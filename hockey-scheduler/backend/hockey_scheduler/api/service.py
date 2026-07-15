@@ -3123,6 +3123,12 @@ class ApiService:
             access_id, actor_id))
 
     @catch
+    def delete_season_venue_access(self, access_id: str,
+                                   actor_id: Optional[str] = None) -> dict:
+        return _serialize(self.setup.delete_season_venue_access(
+            access_id, actor_id))
+
+    @catch
     def list_season_venue_access(self, season_id: str) -> dict:
         rows = [_serialize(a)
                 for a in self.store.season_venue_access_for_season(season_id)]

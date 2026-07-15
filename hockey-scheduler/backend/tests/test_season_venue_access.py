@@ -185,6 +185,102 @@ class SeasonVenueAccessContract:
         self.assertNotIn("error", r2, r2)
         self.assertNotEqual(r1["id"], r2["id"])
 
+    # -- Season/Venue delete dependency gate (#255 review) ------------------
+    # SeasonVenueAccess must never be an orphan: delete_season/delete_venue
+    # both treat a matching access row as a live dependent, active or not
+    # (revoke_season_venue_access only deactivates — the grant/revoke
+    # history is preserved by default), with zero mutation/audit on a
+    # blocked attempt. delete_season_venue_access is the explicit,
+    # separate, audited cleanup action for an already-revoked row.
+    def test_delete_season_blocked_by_active_venue_access(self):
+        _, _, season, venue = self._fixture()
+        granted = self.api.grant_season_venue_access(season, venue, actor_id=ACTOR)
+        audits_before = len(self.store.all_setup_audit())
+        blocked = self.api.delete_season(season, actor_id=ACTOR)
+        self.assertEqual(blocked["error"]["code"], "has_dependencies")
+        deps = {g["type"] for g in blocked["error"]["details"]["dependencies"]}
+        self.assertIn("venue access", deps)
+        self.assertIsNotNone(self.store.get_season(season))
+        self.assertTrue(self.store.get_season_venue_access(granted["id"]).active)
+        self.assertEqual(len(self.store.all_setup_audit()), audits_before)
+
+    def test_delete_venue_blocked_by_active_venue_access(self):
+        _, _, season, venue = self._fixture()
+        self.api.grant_season_venue_access(season, venue, actor_id=ACTOR)
+        audits_before = len(self.store.all_setup_audit())
+        blocked = self.api.delete_venue(venue, actor_id=ACTOR)
+        self.assertEqual(blocked["error"]["code"], "has_dependencies")
+        deps = {g["type"] for g in blocked["error"]["details"]["dependencies"]}
+        self.assertIn("venue access", deps)
+        self.assertIsNotNone(self.store.get_venue(venue))
+        self.assertEqual(len(self.store.all_setup_audit()), audits_before)
+
+    def test_delete_season_still_blocked_by_revoked_venue_access(self):
+        # Revoking is not enough — history is preserved by design, so the
+        # inactive row must still block until explicitly cleaned up.
+        _, _, season, venue = self._fixture()
+        granted = self.api.grant_season_venue_access(season, venue, actor_id=ACTOR)
+        self.api.revoke_season_venue_access(granted["id"], actor_id=ACTOR)
+        blocked = self.api.delete_season(season, actor_id=ACTOR)
+        self.assertEqual(blocked["error"]["code"], "has_dependencies")
+        self.assertIsNotNone(self.store.get_season(season))
+        self.assertIsNotNone(self.store.get_season_venue_access(granted["id"]))
+
+    def test_delete_venue_still_blocked_by_revoked_venue_access(self):
+        _, _, season, venue = self._fixture()
+        granted = self.api.grant_season_venue_access(season, venue, actor_id=ACTOR)
+        self.api.revoke_season_venue_access(granted["id"], actor_id=ACTOR)
+        blocked = self.api.delete_venue(venue, actor_id=ACTOR)
+        self.assertEqual(blocked["error"]["code"], "has_dependencies")
+        self.assertIsNotNone(self.store.get_venue(venue))
+
+    def test_delete_season_succeeds_after_explicit_cleanup(self):
+        _, _, season, venue = self._fixture()
+        granted = self.api.grant_season_venue_access(season, venue, actor_id=ACTOR)
+        self.api.revoke_season_venue_access(granted["id"], actor_id=ACTOR)
+        cleaned = self.api.delete_season_venue_access(
+            granted["id"], actor_id=ACTOR)
+        self.assertNotIn("error", cleaned, cleaned)
+        self.assertEqual(cleaned["id"], granted["id"])
+        self.assertIsNone(self.store.get_season_venue_access(granted["id"]))
+        deleted = self.api.delete_season(season, actor_id=ACTOR)
+        self.assertNotIn("error", deleted, deleted)
+        self.assertIsNone(self.store.get_season(season))
+
+    def test_delete_venue_succeeds_after_explicit_cleanup(self):
+        _, _, season, venue = self._fixture()
+        granted = self.api.grant_season_venue_access(season, venue, actor_id=ACTOR)
+        self.api.revoke_season_venue_access(granted["id"], actor_id=ACTOR)
+        self.api.delete_season_venue_access(granted["id"], actor_id=ACTOR)
+        deleted = self.api.delete_venue(venue, actor_id=ACTOR)
+        self.assertNotIn("error", deleted, deleted)
+        self.assertIsNone(self.store.get_venue(venue))
+
+    def test_delete_season_venue_access_rejects_active_row(self):
+        _, _, season, venue = self._fixture()
+        granted = self.api.grant_season_venue_access(season, venue, actor_id=ACTOR)
+        result = self.api.delete_season_venue_access(
+            granted["id"], actor_id=ACTOR)
+        self.assertEqual(result["error"]["code"], "validation_error")
+        self.assertEqual(result["error"]["details"]["reason"], "access_active")
+        self.assertIsNotNone(self.store.get_season_venue_access(granted["id"]))
+
+    def test_delete_season_venue_access_missing_id_not_found(self):
+        result = self.api.delete_season_venue_access("nope", actor_id=ACTOR)
+        self.assertEqual(result["error"]["code"], "not_found")
+
+    def test_delete_season_venue_access_audits(self):
+        _, _, season, venue = self._fixture()
+        granted = self.api.grant_season_venue_access(season, venue, actor_id=ACTOR)
+        self.api.revoke_season_venue_access(granted["id"], actor_id=ACTOR)
+        self.api.delete_season_venue_access(granted["id"], actor_id=ACTOR)
+        audits = [a for a in self.store.all_setup_audit()
+                  if a.action == "season_venue_access_deleted"]
+        self.assertEqual(len(audits), 1)
+        self.assertEqual(audits[0].entity_id, granted["id"])
+        self.assertEqual(audits[0].detail["season_id"], season)
+        self.assertEqual(audits[0].detail["venue_id"], venue)
+
 
 class MemoryAccessTest(SeasonVenueAccessContract, unittest.TestCase):
     def make_store(self):

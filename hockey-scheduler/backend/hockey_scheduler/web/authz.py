@@ -43,7 +43,7 @@ def _v2_setup_permission(rest: str):
     # Season may use is a competition-side setup action, same permission as
     # season team registrations above (not MANAGE_ARENA — the Venue itself is
     # untouched, only the join to a Season is created/removed).
-    if re.match(r"^season-venue-access/[^/]+/remove$", rest):
+    if re.match(r"^season-venue-access/[^/]+/(remove|delete)$", rest):
         return Permission.MANAGE_SETUP
     if re.match(r"^seasons/[^/]+/venue-access$", rest):
         return Permission.MANAGE_SETUP
