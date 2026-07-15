@@ -576,9 +576,10 @@ const SETUP_ENTITIES = [
   // Program (#233) is the permanent competition umbrella. Internally still the
   // "league" entity/key/noun (v1 API frozen) — only the display noun changes.
   { key: "league", title: "Programs", icon: "🏆", noun: "league", displayNoun: "program",
-    perm: "manage_setup",
+    perm: "manage_setup", delKind: "league",
     list: (ov) => (ov.programs || []).map((l) => ({
-      title: l.name, sub: nameById(ov.organizations, l.operator_organization_id) || "No operating org" })),
+      id: l.id, title: l.name,
+      sub: nameById(ov.organizations, l.operator_organization_id) || "No operating org" })),
     fields: [
       { id: "f-league", label: "Program name", required: true, placeholder: "e.g. Adult Men" },
       // A Program's operating organization is OPTIONAL in the canonical model
@@ -589,7 +590,9 @@ const SETUP_ENTITIES = [
         ofNoun: "organization", ofNounDisplay: "operating organization",
         options: (ov) => [["", "— none —"]].concat((ov.organizations || []).map((o) => [o.id, o.name])) }] },
   { key: "season", title: "Seasons", icon: "🗓️", noun: "season", perm: "manage_setup",
-    list: (ov) => (ov.seasons || []).map((s) => ({ title: s.name, sub: nameById(ov.programs, s.program_id) })),
+    delKind: "season",
+    list: (ov) => (ov.seasons || []).map((s) => ({
+      id: s.id, title: s.name, sub: nameById(ov.programs, s.program_id) })),
     fields: [
       { id: "f-season-league", label: "Program", type: "select", required: true, ofNoun: "league",
         options: (ov) => (ov.programs || []).map((l) => [l.id, l.name]) },
@@ -600,9 +603,9 @@ const SETUP_ENTITIES = [
   // DIVISIONS *within* a League, never Leagues themselves (issue #245 — the
   // client confirmed this after B2b, correcting an earlier reversed example).
   { key: "level", title: "Leagues", icon: "🎚️", noun: "level", displayNoun: "league",
-    perm: "manage_setup",
+    perm: "manage_setup", delKind: "level",
     list: (ov) => (ov.leagues || []).map((lv) => ({
-      title: lv.name, sub: nameById(ov.seasons, lv.season_id) })),
+      id: lv.id, title: lv.name, sub: nameById(ov.seasons, lv.season_id) })),
     fields: [
       { id: "f-level-season", label: "Season", type: "select", required: true, ofNoun: "season",
         options: (ov) => (ov.seasons || []).map((s) => [s.id, s.name]) },
@@ -611,8 +614,9 @@ const SETUP_ENTITIES = [
   // Division (#245): the optional split WITHIN a League (e.g. Gold, Silver,
   // Diamond) — never a League example itself.
   { key: "division", title: "Divisions", icon: "🏅", noun: "division", perm: "manage_setup",
+    delKind: "division",
     list: (ov) => (ov.divisions || []).map((d) => ({
-      title: d.name,
+      id: d.id, title: d.name,
       sub: [d.league_name, d.is_junior ? "Junior" : ""].filter(Boolean).join(" · ") })),
     fields: [
       // A v2 division is parented by a League (season is derived) — required.
@@ -625,11 +629,12 @@ const SETUP_ENTITIES = [
     list: (ov) => (ov.clubs || []).map((c) => ({ id: c.id, title: c.name })),
     fields: [{ id: "f-club", label: "Club name", required: true, placeholder: "e.g. Eagles HC" }] },
   { key: "team", title: "Teams", icon: "👥", noun: "team", perm: "manage_setup",
+    delKind: "team",
     // A team is a permanent member of a LEAGUE (#180) — its season/division is
     // set separately via Season participation, so the subtitle shows the club
     // only, not a (now season-specific) division.
     list: (ov) => (ov.teams || []).map((t) => ({
-      title: t.name,
+      id: t.id, title: t.name,
       sub: t.club_name || "No club",
     })),
     fields: [
@@ -641,16 +646,19 @@ const SETUP_ENTITIES = [
   // Organization (#166): the facility owner/operator that owns venues — a rink
   // company, distinct from a hockey Club. Arena-side, like venue/rink.
   { key: "organization", title: "Facility owners", icon: "🏢", noun: "facility owner", perm: "manage_arena",
-    list: (ov) => (ov.organizations || []).map((o) => ({ title: o.name, sub: o.short_name || "" })),
+    delKind: "organization",
+    list: (ov) => (ov.organizations || []).map((o) => ({
+      id: o.id, title: o.name, sub: o.short_name || "" })),
     fields: [
       { id: "f-org", label: "Facility owner name", required: true, placeholder: "e.g. Summit Ice Facilities" },
       { id: "f-org-short", label: "Short name (optional)", placeholder: "e.g. Summit" }] },
   { key: "venue", title: "Venues", icon: "🏟️", noun: "venue", perm: "manage_arena",
+    delKind: "venue",
     // A venue is owned by an organization (#233 canonical) — show its facility
     // owner. Which Seasons may use a venue's ice is a separate, independent
     // grant (SeasonVenueAccess, #233 Slice E) managed under each Season.
     list: (ov) => (ov.venues || []).map((v) => ({
-      title: v.name,
+      id: v.id, title: v.name,
       sub: [v.organization_name].filter(Boolean).join(" · ") || "Unassigned" })),
     // No Program field on this form (#233 B2a review r1): canonical Venue
     // create is org-owned only.
@@ -659,7 +667,9 @@ const SETUP_ENTITIES = [
       { id: "f-venue-org", label: "Facility owner (organization)", type: "select", ofNoun: "organization", ofNounDisplay: "facility owner",
         options: (ov) => [["", "— none —"]].concat((ov.organizations || []).map((o) => [o.id, o.name])) }] },
   { key: "rink", title: "Rinks", icon: "⛸️", noun: "rink", perm: "manage_arena",
-    list: (ov) => (ov.rinks || []).map((r) => ({ title: r.name, sub: r.venue_name || "" })),
+    delKind: "rink",
+    list: (ov) => (ov.rinks || []).map((r) => ({
+      id: r.id, title: r.name, sub: r.venue_name || "" })),
     fields: [
       { id: "f-rink-venue", label: "Venue", type: "select", required: true, ofNoun: "venue",
         options: (ov) => (ov.venues || []).map((v) => [v.id, v.name]) },
@@ -676,7 +686,9 @@ const SETUP_ENTITIES = [
         options: () => [["game", "Game"], ["practice", "Practice"], ["public_skate", "Public skate"],
                         ["maintenance", "Maintenance"], ["tournament", "Tournament"]] }] },
   { key: "official", title: "Officials", icon: "🧑‍⚖️", noun: "official", perm: "manage_schedule",
-    list: (ov) => (ov.officials || []).map((o) => ({ title: o.name, sub: o.home_club_name || "" })),
+    delKind: "official",
+    list: (ov) => (ov.officials || []).map((o) => ({
+      id: o.id, title: o.name, sub: o.home_club_name || "" })),
     fields: [
       { id: "f-official", label: "Official name", required: true, placeholder: "e.g. Riley Whistle" },
       { id: "f-official-club", label: "Home club (optional — for conflict checks)", type: "select",
@@ -687,8 +699,9 @@ const SETUP_ENTITIES = [
   // while this view is open) — never from /api/demo/overview, which is
   // unauthenticated and this app's own convention keeps player names out of.
   { key: "player", title: "Players", icon: "🧑", noun: "player", perm: "manage_setup",
+    delKind: "player",
     list: (ov) => playersList.map((p) => ({
-      title: p.name,
+      id: p.id, title: p.name,
       sub: `${nameById(ov.teams, p.team_id) || ""}${p.jersey_number != null ? " · #" + p.jersey_number : ""}`,
     })),
     fields: [
@@ -904,6 +917,7 @@ const DEL_NOUN = {
   venue: "venue", rink: "rink", "ice-slot": "ice slot", game: "game",
   "season-team-registration": "registration",
   "season-venue-access": "venue access",
+  official: "official", player: "player",
 };
 // Higher-level records (#215) demand a typed confirmation — the operator must
 // type the record's name or DELETE before the destructive button enables.
@@ -912,15 +926,16 @@ const DEL_NOUN = {
 // reaches this modal, so it stays single-click like division/club/game.
 const HIGH_RISK_DELETE = new Set(["league", "season", "team", "venue", "rink"]);
 // v2 delete route segment for each structural entity (#233 B2a review r1,
-// extended to organization/game in B2c) — frozen frontend kind tokens map to
-// canonical names, 1:1 except league→program/level→league. official/player
-// have no delete UI wired (no delBtn call site), so they're absent here.
+// extended to organization/game in B2c; official/player added in #232) —
+// frozen frontend kind tokens map to canonical names, 1:1 except
+// league→program/level→league.
 const DEL_ROUTE_V2 = {
   league: "program", season: "season", level: "league", division: "division",
   club: "club", team: "team", venue: "venue", rink: "rink", "ice-slot": "ice-slot",
   organization: "organization", game: "game",
   "season-team-registration": "season-team-registration",
   "season-venue-access": "season-venue-access",
+  official: "official", player: "player",
 };
 
 function renderModal() {

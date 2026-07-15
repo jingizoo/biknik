@@ -3169,6 +3169,99 @@ class SetupService:
         return team
 
     @_transactional
+    def delete_official(self, official_id: str,
+                        actor_id: Optional[str] = None) -> Official:
+        """Permanently remove an Official (#232), gated on any live
+        assignment, availability window, account, or integration state —
+        the same pre-write, no-cascade contract as `delete_team`."""
+        official = self.store.get_official(official_id)
+        if official is None:
+            raise NotFoundError(f"Official {official_id} not found.")
+        assignments = self.store.assignments_for_official(official_id)
+        availability = self.store.availability_for_official(official_id)
+        accounts = [a for a in self.store.all_user_accounts()
+                    if (a.scope or {}).get("official_id") == official_id]
+        feeds = [t for t in self.store.all_calendar_feed_tokens()
+                 if t.actor_type == "official" and t.actor_ref == official_id
+                 and t.revoked_at is None]
+        ref = f"official:{official_id}"
+        contacts = [c for c in self.store.all_contact_destinations()
+                    if c.recipient_ref == ref]
+        prefs = [p for p in self.store.all_notification_preferences()
+                 if p.recipient_ref == ref]
+        devices = [d for d in self.store.all_device_tokens()
+                   if d.recipient_ref == ref]
+        self._block_if_dependents("official", official_id, "official", [
+            self._dep_group("assignment", assignments, self._matchup_for_game_ref),
+            self._dep_group("availability window", availability,
+                            lambda a: a.status.value if a.status else a.id),
+            self._dep_group("account", accounts, lambda a: a.username),
+            self._dep_group("calendar feed", feeds,
+                            lambda t: t.label or t.actor_ref),
+            self._dep_group("contact destination", contacts,
+                            lambda c: c.label or c.destination),
+            self._dep_group("notification preference", prefs,
+                            lambda p: p.channel.value),
+            self._dep_group("device token", devices,
+                            lambda d: d.label or d.provider)])
+        self.store.delete_official(official_id)
+        self._audit("official_deleted", "official", official_id, actor_id,
+                    {"name": official.name})
+        return official
+
+    @_transactional
+    def delete_player(self, player_id: str,
+                      actor_id: Optional[str] = None) -> Player:
+        """Permanently remove a Player (#232), gated on any live roster
+        entry, availability response, substitute enrolment, guardian link,
+        account, or integration state — the same pre-write, no-cascade
+        contract as `delete_team`."""
+        player = self.store.get_player(player_id)
+        if player is None:
+            raise NotFoundError(f"Player {player_id} not found.")
+        rosters = self.store.roster_entries_for_player(player_id)
+        availability = self.store.availability_entries_for_player(player_id)
+        subs = self.store.substitute_enrollments_for_player(player_id)
+        guardian_links = self.store.guardian_links_for_player(player_id)
+        accounts = [a for a in self.store.all_user_accounts()
+                    if (a.scope or {}).get("player_id") == player_id]
+        feeds = [t for t in self.store.all_calendar_feed_tokens()
+                 if t.actor_type == "player" and t.actor_ref == player_id
+                 and t.revoked_at is None]
+        ref = f"player:{player_id}"
+        contacts = [c for c in self.store.all_contact_destinations()
+                    if c.recipient_ref == ref]
+        prefs = [p for p in self.store.all_notification_preferences()
+                 if p.recipient_ref == ref]
+        devices = [d for d in self.store.all_device_tokens()
+                   if d.recipient_ref == ref]
+        self._block_if_dependents("player", player_id, "player", [
+            self._dep_group("roster entry", rosters, self._matchup_for_game_ref),
+            self._dep_group("availability response", availability,
+                            self._matchup_for_game_ref),
+            self._dep_group("substitute enrolment", subs,
+                            self._matchup_for_game_ref),
+            self._dep_group("guardian link", guardian_links,
+                            lambda g: g.guardian_user_id),
+            self._dep_group("account", accounts, lambda a: a.username),
+            self._dep_group("calendar feed", feeds,
+                            lambda t: t.label or t.actor_ref),
+            self._dep_group("contact destination", contacts,
+                            lambda c: c.label or c.destination),
+            self._dep_group("notification preference", prefs,
+                            lambda p: p.channel.value),
+            self._dep_group("device token", devices,
+                            lambda d: d.label or d.provider)])
+        self.store.delete_player(player_id)
+        self._audit("player_deleted", "player", player_id, actor_id,
+                    {"name": player.name, "team_id": player.team_id})
+        return player
+
+    def _matchup_for_game_ref(self, entry) -> str:
+        game = self.store.get_game(entry.game_id)
+        return self._matchup(game) if game else entry.game_id
+
+    @_transactional
     def delete_venue(self, venue_id: str, actor_id: Optional[str] = None) -> Venue:
         venue = self.store.get_venue(venue_id)
         if venue is None:

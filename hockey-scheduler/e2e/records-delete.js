@@ -1,0 +1,311 @@
+// Setup Records delete-action coverage (#232): before this issue only the
+// Clubs card in Setup > Records showed a trash button. Every other record
+// card — Facility owners, Programs, Seasons, Leagues, Divisions, Teams,
+// Venues, Rinks, Officials, Players — now wires the same delBtn()/confirm/
+// blocked-modal machinery Clubs already had, and Officials/Players gained a
+// brand-new backend delete contract (previously they had none at all).
+//
+// At desktop and 390px, a League Admin:
+//   1. Builds one full chain (Organization -> Venue -> Rink, Program ->
+//      Season -> League -> Division -> Club -> Team, plus an Official and
+//      two Players) entirely through the real Setup > Records drawers, then
+//      confirms every one of those 10 record kinds shows a delete control on
+//      its row — and that Ice slots (intentionally managed only from the
+//      Arena Calendar) shows none.
+//   2. Cancels one confirmation (the Program) and confirms nothing changed.
+//   3. Triggers one dependency-blocked delete (the Club, blocked by its
+//      Team) and confirms zero mutation.
+//   4. Proves the Official's new delete contract end to end: blocked by a
+//      live availability window, then succeeds once that dependency is
+//      cleared through the official's own supported cleanup route.
+//   5. Proves the Player's new delete contract: a Player with a contact
+//      destination (the real "email on manual create" path) is blocked, and
+//      a bare Player deletes successfully.
+//
+// Fails on any browser console/page error.
+const { chromium } = require("playwright");
+const { spawn } = require("child_process");
+const http = require("http");
+const path = require("path");
+
+const HOST = "127.0.0.1";
+const BACKEND_DIR = path.resolve(__dirname, "..", "backend");
+const READY_TIMEOUT_MS = 15000;
+const VIEWPORTS = [
+  { label: "desktop", width: 1440, height: 900, port: 8195 },
+  { label: "phone", width: 390, height: 844, port: 8196 },
+];
+
+function waitForServer(url, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  return new Promise((resolve, reject) => {
+    const attempt = () => {
+      const request = http.get(url, (r) => { r.resume(); resolve(); });
+      request.setTimeout(2000, () => request.destroy(new Error("request timed out")));
+      request.on("error", () => {
+        if (Date.now() > deadline) reject(new Error(`Server never came up at ${url}`));
+        else setTimeout(attempt, 250);
+      });
+    };
+    attempt();
+  });
+}
+
+function stopServer(server) {
+  return new Promise((resolve) => {
+    if (server.exitCode !== null || server.signalCode !== null) return resolve();
+    const escalate = setTimeout(() => server.kill("SIGKILL"), 3000);
+    server.once("exit", () => { clearTimeout(escalate); resolve(); });
+    server.kill("SIGTERM");
+  });
+}
+
+async function checkViewport(browser, viewport) {
+  const base = `http://${HOST}:${viewport.port}`;
+  const server = spawn(
+    process.env.PYTHON || "python3",
+    ["-u", "-m", "hockey_scheduler.web.server", "--host", HOST, "--port", String(viewport.port)],
+    { cwd: BACKEND_DIR, stdio: ["ignore", "pipe", "pipe"] });
+  let serverOutput = "";
+  server.stdout.on("data", (d) => { serverOutput += d.toString(); });
+  server.stderr.on("data", (d) => { serverOutput += d.toString(); });
+
+  const context = await browser.newContext({
+    viewport: { width: viewport.width, height: viewport.height },
+  });
+  const page = await context.newPage();
+  const errors = [];
+  const consoleErrorHandler = (m) => { if (m.type() === "error") errors.push(`[console] ${m.text()}`); };
+  page.on("pageerror", (e) => errors.push(`[pageerror] ${e.message}`));
+  page.on("console", consoleErrorHandler);
+
+  const createViaDrawer = async (key, fields, expectedUrl) => {
+    await page.click(`.setup-card .sc-new[data-drawer="${key}"]`);
+    await page.waitForSelector(".drawer[role=dialog]", { timeout: 10000 });
+    for (const [id, value] of Object.entries(fields)) {
+      const tag = await page.$eval(`#${id}`, (el) => el.tagName);
+      if (tag === "SELECT") await page.selectOption(`#${id}`, value);
+      else await page.fill(`#${id}`, value);
+    }
+    const resp = page.waitForResponse((r) =>
+      r.url() === `${base}${expectedUrl}` && r.request().method() === "POST");
+    await page.click(`[data-drawer-submit="${key}"]`);
+    const body = await (await resp).json();
+    if (body.error) {
+      throw new Error(`[${viewport.label}] ${key} create failed: ${JSON.stringify(body.error)}`);
+    }
+    await page.waitForFunction(
+      () => !document.querySelector(".drawer[role=dialog]"), null, { timeout: 10000 });
+    return body;
+  };
+
+  // Clicks a row's delete control and, if `expectBlocked`, treats the
+  // resulting 4xx as expected (deliberate) rather than a page bug.
+  const clickDelete = async (kind, id) => {
+    await page.click(`[data-del="${kind}"][data-del-id="${id}"]`);
+    await page.waitForSelector(".modal.danger", { timeout: 10000 });
+  };
+
+  const confirmDelete = async (kind, id, { expectBlocked } = {}) => {
+    const highRisk = await page.$("#del-confirm");
+    if (highRisk) await page.fill("#del-confirm", "DELETE");
+    const resp = page.waitForResponse((r) =>
+      r.url() === `${base}/api/v2/setup/${kind}/${id}/delete` && r.request().method() === "POST");
+    if (expectBlocked) page.off("console", consoleErrorHandler);
+    await page.click("[data-del-confirm]");
+    const body = await (await resp).json();
+    if (expectBlocked) page.on("console", consoleErrorHandler);
+    return body;
+  };
+
+  try {
+    await waitForServer(`${base}/api/health`, READY_TIMEOUT_MS);
+    await page.goto(base, { waitUntil: "domcontentloaded" });
+    await page.waitForSelector("#content > *", { timeout: 10000 });
+    await page.click('.tab[data-tab="setup"]');
+    await page.click('[data-setup-view="records"]');
+    await page.waitForSelector(".setup-card", { timeout: 10000 });
+
+    // (1) One full chain, entirely through the real Records drawers.
+    const org = await createViaDrawer("organization",
+      { "f-org": "Records Delete Org" }, "/api/v2/setup/organization");
+    const program = await createViaDrawer("league",
+      { "f-league": "Records Delete Program", "f-league-org": org.id }, "/api/v2/setup/program");
+    const season = await createViaDrawer("season",
+      { "f-season-league": program.id, "f-season": "2026-27" }, "/api/v2/setup/season");
+    const league = await createViaDrawer("level",
+      { "f-level-season": season.id, "f-level": "Adult League" }, "/api/v2/setup/league");
+    const division = await createViaDrawer("division",
+      { "f-div-league": league.id, "f-div": "Gold" }, "/api/v2/setup/division");
+    const club = await createViaDrawer("club",
+      { "f-club": "Records Delete Club" }, "/api/v2/setup/club");
+    const team = await createViaDrawer("team",
+      { "f-team-club": club.id, "f-team-league": program.id, "f-team": "Records Delete Team" },
+      "/api/v2/setup/team");
+    const venue = await createViaDrawer("venue",
+      { "f-venue": "Records Delete Venue", "f-venue-org": org.id }, "/api/v2/setup/venue");
+    const rink = await createViaDrawer("rink",
+      { "f-rink-venue": venue.id, "f-rink": "Records Delete Rink" }, "/api/v2/setup/rink");
+    const slot = await createViaDrawer("ice-slot", {
+      "f-slot-rink": rink.id, "f-slot-date": "2026-09-05",
+      "f-slot-start": "18:00", "f-slot-end": "19:00",
+    }, "/api/v2/setup/ice-slot");
+    const official = await createViaDrawer("official",
+      { "f-official": "Records Delete Official", "f-official-club": club.id },
+      "/api/v2/setup/official");
+    const playerBlocked = await createViaDrawer("player", {
+      "f-player-team": team.id, "f-player-name": "Blocked Player",
+      "f-player-position": "forward", "f-player-email": "blocked-player@example.com",
+    }, "/api/v2/setup/player");
+    const playerBare = await createViaDrawer("player", {
+      "f-player-team": team.id, "f-player-name": "Bare Player",
+      "f-player-position": "forward",
+    }, "/api/v2/setup/player");
+
+    // Every one of the 10 delete-capable Records kinds shows a delete
+    // control on the row this journey just created for it.
+    const expectPresent = [
+      ["organization", org.id], ["league", program.id], ["season", season.id],
+      ["level", league.id], ["division", division.id], ["club", club.id],
+      ["team", team.id], ["venue", venue.id], ["rink", rink.id],
+      ["official", official.id], ["player", playerBare.id],
+    ];
+    for (const [kind, id] of expectPresent) {
+      await page.waitForSelector(`[data-del="${kind}"][data-del-id="${id}"]`, { timeout: 10000 });
+    }
+    // Ice slots are intentionally NOT duplicated in Records (managed only
+    // from the Arena Calendar) — the freshly-created slot must not appear
+    // as a deletable row here.
+    if (await page.$('[data-del="ice-slot"]')) {
+      throw new Error(`[${viewport.label}] Ice slots unexpectedly offers a Records delete control ` +
+        `(slot ${slot.id})`);
+    }
+
+    // (2) Cancel one confirmation — nothing changes.
+    await clickDelete("league", program.id);
+    await page.click("button.act[data-modal-close]");
+    await page.waitForSelector(".modal", { state: "detached", timeout: 10000 });
+    await page.waitForSelector(`[data-del="league"][data-del-id="${program.id}"]`, { timeout: 10000 });
+
+    // (3) One dependency-blocked delete — the Club is blocked by its Team.
+    await clickDelete("club", club.id);
+    let result = await confirmDelete("club", club.id, { expectBlocked: true });
+    if (!result.error || result.error.code !== "has_dependencies") {
+      throw new Error(`[${viewport.label}] expected the Club delete to be blocked, got ${JSON.stringify(result)}`);
+    }
+    await page.waitForSelector(".modal.blocked", { timeout: 10000 });
+    const blockedText = (await page.textContent(".modal.blocked")) || "";
+    if (!blockedText.toLowerCase().includes("team")) {
+      throw new Error(`[${viewport.label}] blocked-Club modal doesn't mention the blocking team: ${blockedText}`);
+    }
+    await page.click("button.act[data-modal-close]");
+    await page.waitForSelector(".modal", { state: "detached", timeout: 10000 });
+    await page.waitForSelector(`[data-del="club"][data-del-id="${club.id}"]`, { timeout: 10000 });
+
+    // (4) Official's new delete contract: blocked by a live availability
+    // window (an official's own self-service action, out of THIS
+    // regression's scope, so set up via a direct call to its own supported
+    // route), then succeeds once that window is cleared through the
+    // official's own supported cleanup route.
+    const availId = await page.evaluate(async (officialId) => {
+      const post = async (p, b) => (await fetch(p, {
+        method: "POST", credentials: "same-origin",
+        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
+      })).json();
+      const av = await post(`/api/officials/${officialId}/availability`, {
+        start_time: "2027-01-01T00:00:00+00:00", end_time: "2027-01-02T00:00:00+00:00",
+        status: "unavailable",
+      });
+      return av.id;
+    }, official.id);
+
+    await clickDelete("official", official.id);
+    result = await confirmDelete("official", official.id, { expectBlocked: true });
+    if (!result.error || result.error.code !== "has_dependencies") {
+      throw new Error(`[${viewport.label}] expected the Official delete to be blocked, got ${JSON.stringify(result)}`);
+    }
+    await page.waitForSelector(".modal.blocked", { timeout: 10000 });
+    const officialBlockedText = (await page.textContent(".modal.blocked")) || "";
+    if (!officialBlockedText.toLowerCase().includes("availability")) {
+      throw new Error(`[${viewport.label}] blocked-Official modal doesn't mention the ` +
+        `blocking availability window: ${officialBlockedText}`);
+    }
+    await page.click("button.act[data-modal-close]");
+    await page.waitForSelector(".modal", { state: "detached", timeout: 10000 });
+
+    await page.evaluate(async (id) => {
+      await fetch(`/api/officials/availability/${id}/delete`, {
+        method: "POST", credentials: "same-origin",
+        headers: { "Content-Type": "application/json" }, body: "{}",
+      });
+    }, availId);
+
+    await clickDelete("official", official.id);
+    result = await confirmDelete("official", official.id);
+    if (result.error) {
+      throw new Error(`[${viewport.label}] Official delete still blocked after clearing its ` +
+        `availability window: ${JSON.stringify(result)}`);
+    }
+    await page.waitForSelector(".modal", { state: "detached", timeout: 10000 });
+    await page.waitForFunction(
+      (id) => !document.querySelector(`[data-del="official"][data-del-id="${id}"]`),
+      official.id, { timeout: 10000 });
+
+    // (5) Player's new delete contract: blocked by a live contact
+    // destination (the real "email on manual create" path), and a bare
+    // Player deletes successfully.
+    await clickDelete("player", playerBlocked.id);
+    result = await confirmDelete("player", playerBlocked.id, { expectBlocked: true });
+    if (!result.error || result.error.code !== "has_dependencies") {
+      throw new Error(`[${viewport.label}] expected the emailed Player delete to be blocked, ` +
+        `got ${JSON.stringify(result)}`);
+    }
+    await page.waitForSelector(".modal.blocked", { timeout: 10000 });
+    const playerBlockedText = (await page.textContent(".modal.blocked")) || "";
+    if (!playerBlockedText.toLowerCase().includes("contact")) {
+      throw new Error(`[${viewport.label}] blocked-Player modal doesn't mention the blocking ` +
+        `contact destination: ${playerBlockedText}`);
+    }
+    await page.click("button.act[data-modal-close]");
+    await page.waitForSelector(".modal", { state: "detached", timeout: 10000 });
+
+    await clickDelete("player", playerBare.id);
+    result = await confirmDelete("player", playerBare.id);
+    if (result.error) {
+      throw new Error(`[${viewport.label}] bare Player delete failed: ${JSON.stringify(result)}`);
+    }
+    await page.waitForSelector(".modal", { state: "detached", timeout: 10000 });
+    await page.waitForFunction(
+      (id) => !document.querySelector(`[data-del="player"][data-del-id="${id}"]`),
+      playerBare.id, { timeout: 10000 });
+
+    if (errors.length) {
+      throw new Error(`[${viewport.label}] console/page errors:\n${errors.join("\n")}`);
+    }
+    console.log(`[${viewport.label}] OK — every Records card offers delete, cancel/blocked/success ` +
+      `flows verified, Official and Player's new delete contract proven end to end.`);
+  } catch (error) {
+    throw new Error(`${error.message}\n--- demo server output ---\n${serverOutput}`);
+  } finally {
+    await context.close();
+    await stopServer(server);
+  }
+}
+
+async function main() {
+  let browser;
+  try {
+    browser = await chromium.launch(
+      process.env.SMOKE_CHROMIUM_PATH ? { executablePath: process.env.SMOKE_CHROMIUM_PATH } : {});
+    for (const viewport of VIEWPORTS) await checkViewport(browser, viewport);
+    console.log("Records-delete browser journey passed.");
+  } catch (error) {
+    console.error("Records-delete browser journey FAILED.");
+    console.error(error && error.message ? error.message : error);
+    process.exitCode = 1;
+  } finally {
+    if (browser) await browser.close();
+  }
+}
+
+main();

@@ -644,6 +644,9 @@ class SqlStore:
         return self._first(GameRosterEntry, "game_id = ? AND player_id = ?",
                            (game_id, player_id))
 
+    def roster_entries_for_player(self, player_id):
+        return self._query(GameRosterEntry, "player_id = ?", (player_id,), order="id")
+
     # -- availability ------------------------------------------------------
     def upsert_availability(self, av): return self._upsert(av)
     def save_availability(self, av): return self._upsert(av)
@@ -655,6 +658,9 @@ class SqlStore:
         return self._first(GameAvailability, "game_id = ? AND player_id = ?",
                            (game_id, player_id))
 
+    def availability_entries_for_player(self, player_id):
+        return self._query(GameAvailability, "player_id = ?", (player_id,), order="id")
+
     # -- substitutes -------------------------------------------------------
     def add_substitute(self, sub): return self._insert(sub)
     def save_substitute(self, sub): return self._update(sub)
@@ -665,6 +671,9 @@ class SqlStore:
     def substitute_for_player(self, game_id, player_id):
         return self._first(SubstituteEnrollment, "game_id = ? AND player_id = ?",
                            (game_id, player_id))
+
+    def substitute_enrollments_for_player(self, player_id):
+        return self._query(SubstituteEnrollment, "player_id = ?", (player_id,), order="id")
 
     # -- audit / notifications --------------------------------------------
     def add_audit(self, entry): return self._insert(entry)
@@ -780,6 +789,8 @@ class SqlStore:
         self._delete(SeasonVenueAccess, sva_id)
     def delete_rink(self, rink_id): self._delete(Rink, rink_id)
     def delete_ice_slot(self, slot_id): self._delete(IceSlot, slot_id)
+    def delete_official(self, official_id): self._delete(Official, official_id)
+    def delete_player(self, player_id): self._delete(Player, player_id)
 
     # -- officials (#30) ---------------------------------------------------
     def add_official(self, official): return self._insert(official)

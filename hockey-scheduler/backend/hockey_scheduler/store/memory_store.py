@@ -249,6 +249,9 @@ class InMemoryStore:
                 return e
         return None
 
+    def roster_entries_for_player(self, player_id: str) -> List[GameRosterEntry]:
+        return [e for e in self.roster_entries.values() if e.player_id == player_id]
+
     # -- availability ------------------------------------------------------
     def upsert_availability(self, av: GameAvailability) -> GameAvailability:
         self.availability[av.id] = av
@@ -265,6 +268,9 @@ class InMemoryStore:
                 return a
         return None
 
+    def availability_entries_for_player(self, player_id: str) -> List[GameAvailability]:
+        return [a for a in self.availability.values() if a.player_id == player_id]
+
     # -- substitutes -------------------------------------------------------
     def add_substitute(self, sub: SubstituteEnrollment) -> SubstituteEnrollment:
         self.substitutes[sub.id] = sub
@@ -280,6 +286,9 @@ class InMemoryStore:
             if s.game_id == game_id and s.player_id == player_id:
                 return s
         return None
+
+    def substitute_enrollments_for_player(self, player_id: str) -> List[SubstituteEnrollment]:
+        return [s for s in self.substitutes.values() if s.player_id == player_id]
 
     # -- audit / notifications --------------------------------------------
     def add_audit(self, entry: AuditLog) -> AuditLog:
@@ -871,6 +880,12 @@ class InMemoryStore:
 
     def delete_ice_slot(self, slot_id: str) -> None:
         self.ice_slots.pop(slot_id, None)
+
+    def delete_official(self, official_id: str) -> None:
+        self.officials.pop(official_id, None)
+
+    def delete_player(self, player_id: str) -> None:
+        self.players.pop(player_id, None)
 
     def all_setup_audit(self) -> List[SetupAuditLog]:
         return list(self.setup_audit)

@@ -3228,6 +3228,16 @@ class ApiService:
     def delete_game(self, game_id: str, actor_id: Optional[str] = None) -> dict:
         return _serialize(self.setup.delete_game(game_id, actor_id))
 
+    @catch
+    def delete_official(self, official_id: str,
+                        actor_id: Optional[str] = None) -> dict:
+        return _serialize(self.setup.delete_official(official_id, actor_id))
+
+    @catch
+    def delete_player(self, player_id: str,
+                      actor_id: Optional[str] = None) -> dict:
+        return _serialize(self.setup.delete_player(player_id, actor_id))
+
     # -- reassignment: move a record under a new parent (#166 PR D) --------
     @catch
     def assign_venue_organization(self, venue_id: str,

@@ -23,7 +23,8 @@
     "check-v1-route-contract": "node check-v1-route-contract.js",
     "team-club-optional": "node team-club-optional.js",
     "division-delete-cleanup": "node division-delete-cleanup.js",
-    "registration-cleanup": "node registration-cleanup.js"
+    "registration-cleanup": "node registration-cleanup.js",
+    "records-delete": "node records-delete.js"
   },
   "devDependencies": {
     "playwright": "^1.48.0"

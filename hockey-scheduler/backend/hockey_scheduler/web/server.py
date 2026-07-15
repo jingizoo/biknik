@@ -2080,7 +2080,7 @@ class Handler(BaseHTTPRequestHandler):
         # (program-delete = umbrella, league-delete = the grouping League).
         md = re.match(
             r"^(organization|program|season|league|division|club|team|venue|rink"
-            r"|ice-slot|game)/([^/]+)/delete$", entity)
+            r"|ice-slot|game|official|player)/([^/]+)/delete$", entity)
         if md:
             kind = md.group(1)
             deleter = {
@@ -2090,6 +2090,7 @@ class Handler(BaseHTTPRequestHandler):
                 "club": api.delete_club, "team": api.delete_team,
                 "venue": api.delete_venue, "rink": api.delete_rink,
                 "ice-slot": api.delete_ice_slot, "game": api.delete_game,
+                "official": api.delete_official, "player": api.delete_player,
             }[kind]
             # Canonical Venue responses drop the legacy league_id (org-owned only).
             mapper = _v2p.venue_to_v2 if kind == "venue" else (lambda r: r)

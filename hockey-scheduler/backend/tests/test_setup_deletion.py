@@ -18,7 +18,14 @@ import unittest
 from datetime import datetime, timezone
 
 from hockey_scheduler.api.service import ApiService
-from hockey_scheduler.domain import CalendarFeedToken, IceSlotStatus, Role
+from hockey_scheduler.domain import (
+    AvailabilityStatus, CalendarFeedToken, ContactDestination, DeviceToken,
+    GameAvailability, GameRosterEntry, GuardianLink, IceSlotStatus,
+    NotificationChannel, NotificationPreference, OfficialAssignment,
+    OfficialAssignmentStatus, OfficialAvailability, OfficialAvailabilityStatus,
+    OfficialRole, Position, Role, RosterEntryStatus, RosterRole,
+    SelectionSource, SubstituteEnrollment, SubstituteStatus,
+)
 from hockey_scheduler.store import InMemoryStore, SqlStore
 
 
@@ -80,6 +87,13 @@ class DeletionContract:
         return self.api.create_game(
             season_id, division_id, home_id, away_id, slot_id,
             actor_id=self.ACTOR)["id"]
+
+    def _official(self, name="Official"):
+        return self.api.create_official(name, actor_id=self.ACTOR)["id"]
+
+    def _player(self, team_id, name="Player"):
+        return self.api.create_player(
+            team_id, name, "skater", actor_id=self.ACTOR)["id"]
 
     # -- assertions --------------------------------------------------------
     def _audits(self, action):
@@ -825,6 +839,186 @@ class DeletionContract:
         self.assertEqual(blocked["error"]["code"], "validation_error")
         self.assertIsNotNone(self.store.get_ice_slot(slot))
 
+    # -- official (#232) -----------------------------------------------------
+    def test_official_blocked_by_assignment(self):
+        official = self._official()
+        gid = self._built_game()
+        self.store.add_official_assignment(OfficialAssignment(
+            id=self.store.next_id("official_assignment"), game_id=gid,
+            official_id=official, role=OfficialRole.REFEREE,
+            status=OfficialAssignmentStatus.PROPOSED))
+        blocked = self.api.delete_official(official, actor_id=self.ACTOR)
+        self.assertBlocked(blocked, expect_types={"assignment"})
+        self.assertIsNotNone(self.store.get_official(official))
+
+    def test_official_blocked_by_availability_window(self):
+        official = self._official()
+        self.store.add_official_availability(OfficialAvailability(
+            id=self.store.next_id("official_availability"),
+            official_id=official,
+            start_time=datetime(2027, 1, 1, tzinfo=timezone.utc),
+            end_time=datetime(2027, 1, 2, tzinfo=timezone.utc),
+            status=OfficialAvailabilityStatus.UNAVAILABLE))
+        blocked = self.api.delete_official(official, actor_id=self.ACTOR)
+        self.assertBlocked(blocked, expect_types={"availability window"})
+        self.assertIsNotNone(self.store.get_official(official))
+
+    def test_official_blocked_by_account(self):
+        official = self._official()
+        self.api.accounts.create_account(
+            "official_x", "a-real-password", Role.OFFICIAL,
+            scope={"official_id": official}, actor_id=self.ACTOR)
+        blocked = self.api.delete_official(official, actor_id=self.ACTOR)
+        self.assertBlocked(blocked, expect_types={"account"})
+        self.assertIsNotNone(self.store.get_official(official))
+
+    def test_official_blocked_by_live_calendar_feed(self):
+        official = self._official()
+        self.store.add_calendar_feed_token(CalendarFeedToken(
+            id=self.store.next_id("cft"), token_hash="hash_o",
+            actor_type="official", actor_ref=official,
+            created_at=datetime(2026, 1, 1, tzinfo=timezone.utc)))
+        blocked = self.api.delete_official(official, actor_id=self.ACTOR)
+        self.assertBlocked(blocked, expect_types={"calendar feed"})
+        self.assertIsNotNone(self.store.get_official(official))
+
+    def test_official_blocked_by_contact_destination(self):
+        official = self._official()
+        self.store.add_contact_destination(ContactDestination(
+            id=self.store.next_id("contact"), recipient_ref=f"official:{official}",
+            channel=NotificationChannel.EMAIL, destination="ref@example.com"))
+        blocked = self.api.delete_official(official, actor_id=self.ACTOR)
+        self.assertBlocked(blocked, expect_types={"contact destination"})
+        self.assertIsNotNone(self.store.get_official(official))
+
+    def test_official_blocked_by_notification_preference(self):
+        official = self._official()
+        self.store.save_notification_preference(NotificationPreference(
+            id=self.store.next_id("notif_pref"), recipient_ref=f"official:{official}",
+            channel=NotificationChannel.PUSH, enabled=False))
+        blocked = self.api.delete_official(official, actor_id=self.ACTOR)
+        self.assertBlocked(blocked, expect_types={"notification preference"})
+        self.assertIsNotNone(self.store.get_official(official))
+
+    def test_official_blocked_by_device_token(self):
+        official = self._official()
+        self.store.add_device_token(DeviceToken(
+            id=self.store.next_id("device"), recipient_ref=f"official:{official}",
+            provider="fcm", token="tok_o"))
+        blocked = self.api.delete_official(official, actor_id=self.ACTOR)
+        self.assertBlocked(blocked, expect_types={"device token"})
+        self.assertIsNotNone(self.store.get_official(official))
+
+    def test_official_deletable_when_bare(self):
+        official = self._official()
+        self.assertDeleted(self.api.delete_official(official, actor_id=self.ACTOR),
+                           self.store.get_official, official, "official_deleted")
+
+    # -- player (#232) --------------------------------------------------------
+    def test_player_blocked_by_roster_entry(self):
+        lg = self._league()
+        club = self._club()
+        team = self._team(club, lg)
+        player = self._player(team)
+        gid = self._built_game()
+        self.store.add_roster_entry(GameRosterEntry(
+            id=self.store.next_id("roster_entry"), game_id=gid, player_id=player,
+            roster_role=RosterRole.SELECTED,
+            selection_source=SelectionSource.COACH_SELECTED,
+            status=RosterEntryStatus.SELECTED,
+            selected_at=datetime(2027, 1, 1, tzinfo=timezone.utc),
+            updated_at=datetime(2027, 1, 1, tzinfo=timezone.utc)))
+        blocked = self.api.delete_player(player, actor_id=self.ACTOR)
+        self.assertBlocked(blocked, expect_types={"roster entry"})
+        self.assertIsNotNone(self.store.get_player(player))
+
+    def test_player_blocked_by_availability_response(self):
+        lg = self._league()
+        club = self._club()
+        team = self._team(club, lg)
+        player = self._player(team)
+        gid = self._built_game()
+        self.store.upsert_availability(GameAvailability(
+            id=self.store.next_id("availability"), game_id=gid, player_id=player,
+            availability_status=AvailabilityStatus.AVAILABLE))
+        blocked = self.api.delete_player(player, actor_id=self.ACTOR)
+        self.assertBlocked(blocked, expect_types={"availability response"})
+        self.assertIsNotNone(self.store.get_player(player))
+
+    def test_player_blocked_by_substitute_enrollment(self):
+        lg = self._league()
+        club = self._club()
+        team = self._team(club, lg)
+        player = self._player(team)
+        gid = self._built_game()
+        self.store.add_substitute(SubstituteEnrollment(
+            id=self.store.next_id("substitute"), game_id=gid, player_id=player,
+            position=Position.SKATER, status=SubstituteStatus.ENROLLED,
+            enrolled_at=datetime(2027, 1, 1, tzinfo=timezone.utc)))
+        blocked = self.api.delete_player(player, actor_id=self.ACTOR)
+        self.assertBlocked(blocked, expect_types={"substitute enrolment"})
+        self.assertIsNotNone(self.store.get_player(player))
+
+    def test_player_blocked_by_guardian_link(self):
+        lg = self._league()
+        club = self._club()
+        team = self._team(club, lg)
+        player = self._player(team)
+        self.store.add_guardian_link(GuardianLink(
+            id=self.store.next_id("guardian_link"), guardian_user_id="user_guardian",
+            player_id=player, created_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            verified=True))
+        blocked = self.api.delete_player(player, actor_id=self.ACTOR)
+        self.assertBlocked(blocked, expect_types={"guardian link"})
+        self.assertIsNotNone(self.store.get_player(player))
+
+    def test_player_blocked_by_account(self):
+        lg = self._league()
+        club = self._club()
+        team = self._team(club, lg)
+        player = self._player(team)
+        self.api.accounts.create_account(
+            "player_x", "a-real-password", Role.PLAYER,
+            scope={"team_id": team, "player_id": player}, actor_id=self.ACTOR)
+        blocked = self.api.delete_player(player, actor_id=self.ACTOR)
+        self.assertBlocked(blocked, expect_types={"account"})
+        self.assertIsNotNone(self.store.get_player(player))
+
+    def test_player_blocked_by_live_calendar_feed(self):
+        lg = self._league()
+        club = self._club()
+        team = self._team(club, lg)
+        player = self._player(team)
+        self.store.add_calendar_feed_token(CalendarFeedToken(
+            id=self.store.next_id("cft"), token_hash="hash_p",
+            actor_type="player", actor_ref=player,
+            created_at=datetime(2026, 1, 1, tzinfo=timezone.utc)))
+        blocked = self.api.delete_player(player, actor_id=self.ACTOR)
+        self.assertBlocked(blocked, expect_types={"calendar feed"})
+        self.assertIsNotNone(self.store.get_player(player))
+
+    def test_player_blocked_by_contact_destination(self):
+        # The real production path: an optional email on manual player create
+        # writes a "player:<id>"-scoped ContactDestination (#232 review of
+        # #215's recipient_ref convention).
+        lg = self._league()
+        club = self._club()
+        team = self._team(club, lg)
+        player = self.api.create_player(
+            team, "Emailed Player", "skater", email="p@example.com",
+            actor_id=self.ACTOR)["id"]
+        blocked = self.api.delete_player(player, actor_id=self.ACTOR)
+        self.assertBlocked(blocked, expect_types={"contact destination"})
+        self.assertIsNotNone(self.store.get_player(player))
+
+    def test_player_deletable_when_bare(self):
+        lg = self._league()
+        club = self._club()
+        team = self._team(club, lg)
+        player = self._player(team)
+        self.assertDeleted(self.api.delete_player(player, actor_id=self.ACTOR),
+                           self.store.get_player, player, "player_deleted")
+
     # -- not found ---------------------------------------------------------
     def test_missing_ids_report_not_found(self):
         for fn in (self.api.delete_organization, self.api.delete_program,
@@ -833,7 +1027,8 @@ class DeletionContract:
                    self.api.delete_team, self.api.delete_venue,
                    self.api.delete_rink, self.api.delete_ice_slot,
                    self.api.delete_game,
-                   self.api.delete_season_team_registration):
+                   self.api.delete_season_team_registration,
+                   self.api.delete_official, self.api.delete_player):
             result = fn("nope_1", actor_id=self.ACTOR)
             self.assertEqual(result["error"]["code"], "not_found")
 
