@@ -3063,7 +3063,8 @@ class ApiService:
         return _serialize(self.setup.create_club(name, country, actor_id))
 
     @catch
-    def create_team(self, club_id: str, division_id: Optional[str] = None,
+    def create_team(self, club_id: Optional[str] = None,
+                    division_id: Optional[str] = None,
                     name: str = "", actor_id: Optional[str] = None,
                     program_id: Optional[str] = None) -> dict:
         return _serialize(self.setup.create_team(
@@ -3223,9 +3224,9 @@ class ApiService:
 
     @catch
     def assign_team_club(self, team_id: str, club_id: Optional[str] = None,
-                         actor_id: Optional[str] = None, v2: bool = False) -> dict:
+                         actor_id: Optional[str] = None) -> dict:
         return _serialize(self.setup.assign_team_club(
-            team_id, club_id, actor_id, v2=v2))
+            team_id, club_id, actor_id))
 
     # assign_team_division removed (#180) — see SetupService; a Team's seasonal
     # division lives in SeasonTeamRegistration (assign_season_team_division).

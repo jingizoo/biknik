@@ -277,7 +277,8 @@ class SetupService:
         return club
 
     @_transactional
-    def create_team(self, club_id: str, division_id: Optional[str] = None,
+    def create_team(self, club_id: Optional[str] = None,
+                    division_id: Optional[str] = None,
                     name: str = "", actor_id: Optional[str] = None,
                     program_id: Optional[str] = None) -> Team:
         """Create a permanent league team (#180).
@@ -296,8 +297,13 @@ class SetupService:
 
         Exactly one is required. When both are given, the division's league
         wins (and must not contradict a supplied league_id).
+
+        ``club_id`` is optional (#233 Slice D): a team's Club is just an
+        affiliation, not a structural requirement, and many programs use no
+        club at all. Only validate it when a non-null id is actually supplied
+        — never invent or require a placeholder Club.
         """
-        if self.store.get_club(club_id) is None:
+        if club_id and self.store.get_club(club_id) is None:
             raise NotFoundError(f"Club {club_id} not found.")
         if division_id:
             division = self.store.get_division(division_id)
@@ -316,10 +322,10 @@ class SetupService:
         if self.store.get_program(program_id) is None:
             raise NotFoundError(f"Program {program_id} not found.")
         team = Team(id=self.store.next_id("team"), name=self._require_name(name),
-                    club_id=club_id, program_id=program_id)
+                    club_id=club_id or None, program_id=program_id)
         self.store.add_team(team)
         self._audit("team_created", "team", team.id, actor_id,
-                    {"club_id": club_id, "league_id": program_id})
+                    {"club_id": team.club_id, "league_id": program_id})
         return team
 
     # -- permanent teams + season registrations (#180) ---------------------
@@ -966,17 +972,12 @@ class SetupService:
 
     @_transactional
     def assign_team_club(self, team_id: str, club_id: Optional[str] = None,
-                         actor_id: Optional[str] = None,
-                         v2: bool = False) -> Team:
+                         actor_id: Optional[str] = None) -> Team:
         team = self.store.get_team(team_id)
         if team is None:
             raise NotFoundError(f"Team {team_id} not found.")
-        # v2 (#233 Slice C2 review): nullable Club is deferred to Slice D and the
-        # v2 Team create path requires a real Club — so the v2 reassignment must
-        # not be able to null the link and produce a state v2 create rejects.
-        # Require a non-null existing Club here. v1 keeps its nullable behavior.
-        if v2 and not club_id:
-            raise ValidationError("A club_id is required.")
+        # Club is optional on a Team in both v1 and v2 (#233 Slice D): null
+        # unassigns it. Only validate the id when one is actually supplied.
         if club_id and self.store.get_club(club_id) is None:
             raise NotFoundError(f"Club {club_id} not found.")
         old = team.club_id

@@ -237,33 +237,42 @@ class GameRegistrationLeagueSqlTest(_SqlIntegrityBase):
         self._run(case)
 
 
-class AssignClubRequiredSqlTest(_SqlIntegrityBase):
-    def test_v2_assign_club_null_rejected_zero_mutation(self):
+class AssignClubOptionalSqlTest(_SqlIntegrityBase):
+    """Club is optional on a Team in both v1 and v2 (#233 Slice D)."""
+
+    def test_assign_club_null_unassigns_with_audit(self):
         def case(api, store):
             org, program = self._org_program(api)
             club = api.create_club("C", actor_id=ADMIN)
             team = api.create_team(club["id"], None, "T", actor_id=ADMIN,
                                    program_id=program["id"])
             audits_before = len(store.all_setup_audit())
-            # v2 reassignment may not null the Club (deferred to Slice D).
-            res = api.assign_team_club(team["id"], None, actor_id=ADMIN, v2=True)
-            self.assertEqual(res["error"]["code"], "validation_error", res)
-            # Club link and audit log unchanged.
-            self.assertEqual(store.get_team(team["id"]).club_id, club["id"])
-            self.assertEqual(len(store.all_setup_audit()), audits_before)
+            res = api.assign_team_club(team["id"], None, actor_id=ADMIN)
+            self.assertNotIn("error", res, res)
+            self.assertIsNone(res["club_id"])
+            self.assertIsNone(store.get_team(team["id"]).club_id)
+            audits = store.all_setup_audit()
+            self.assertEqual(len(audits), audits_before + 1)
+            last = audits[-1]
+            self.assertEqual(last.action, "team_club_assigned")
+            self.assertEqual(last.detail["from"], club["id"])
+            self.assertIsNone(last.detail["to"])
+            # No placeholder Club created as a side effect.
+            self.assertEqual(len(store.all_clubs()), 1)
 
         self._run(case)
 
-    def test_v1_assign_club_null_still_allowed(self):
-        """v1 stays nullable — the guard is v2-only."""
+    def test_assign_unknown_club_rejected_zero_mutation(self):
         def case(api, store):
             org, program = self._org_program(api)
             club = api.create_club("C", actor_id=ADMIN)
             team = api.create_team(club["id"], None, "T", actor_id=ADMIN,
                                    program_id=program["id"])
-            res = api.assign_team_club(team["id"], None, actor_id=ADMIN)
-            self.assertNotIn("error", res, res)
-            self.assertIsNone(res["club_id"])
+            audits_before = len(store.all_setup_audit())
+            res = api.assign_team_club(team["id"], "club_missing", actor_id=ADMIN)
+            self.assertEqual(res["error"]["code"], "not_found", res)
+            self.assertEqual(store.get_team(team["id"]).club_id, club["id"])
+            self.assertEqual(len(store.all_setup_audit()), audits_before)
 
         self._run(case)
 

@@ -1969,12 +1969,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_api(api.assign_division_league(
                 record_id, b.get("league_id") or None, actor_id, v2=True))
         if combo == ("team", "club"):
-            # v2 keeps Club REQUIRED until Slice D — a v2 create needs a real
-            # Club, so its reassignment must not be able to null the link and
-            # produce a state the v2 create path rejects (the v2 guard lives in
-            # the facade so it holds regardless of caller). v1 stays nullable.
+            # Club is optional in both v1 and v2 (#233 Slice D): a null
+            # club_id unassigns the team's Club.
             return self._send_api(api.assign_team_club(
-                record_id, b.get("club_id") or None, actor_id, v2=True))
+                record_id, b.get("club_id") or None, actor_id))
         if combo == ("player", "team"):
             return self._send_api(api.assign_player_team(
                 record_id, b.get("team_id"), actor_id))
