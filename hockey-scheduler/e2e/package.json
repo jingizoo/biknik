@@ -18,7 +18,8 @@
     "api-error-resilience": "node api-error-resilience.js",
     "v1-dependency-proof": "node v1-dependency-proof.js",
     "check-v1-route-contract": "node check-v1-route-contract.js",
-    "team-club-optional": "node team-club-optional.js"
+    "team-club-optional": "node team-club-optional.js",
+    "division-delete-cleanup": "node division-delete-cleanup.js"
   },
   "devDependencies": {
     "playwright": "^1.48.0"

@@ -1103,7 +1103,14 @@ function wireModal(c) {
       }
       if (res && res.error) { modal = null; return render(); }  // post() set the toast
       modal = null;
-      toast = `Deleted ${DEL_NOUN[m.kind] || "record"} “${m.name}”.`;
+      // A Division delete may have cleared inactive, game-free registrations
+      // pointing at it (#233 D1 bundled fix, #248) — surface that count so
+      // the operator knows those rows survived (division_id cleared, not
+      // deleted), not just that the Division itself is gone.
+      const cleaned = res && res.inactive_registrations_cleaned;
+      toast = `Deleted ${DEL_NOUN[m.kind] || "record"} “${m.name}”.` + (cleaned
+        ? ` Cleared ${cleaned} inactive registration${cleaned === 1 ? "" : "s"}.`
+        : "");
       await render();
     };
   }
