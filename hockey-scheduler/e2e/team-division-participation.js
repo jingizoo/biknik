@@ -103,11 +103,17 @@ async function checkViewport(browser, viewport) {
       await post(`/api/setup/seasons/${s2.id}/team-registrations`, { team_id: perma, division_id: d2.id });
       await post(`/api/setup/seasons/${s2.id}/team-registrations`, { team_id: mateB, division_id: d2.id });
       await post(`/api/setup/seasons/${s1.id}/team-registrations`, { team_id: otherD, division_id: d1b.id });
+      // A league-only registration (no Division) under lv1 — #233 B2c
+      // review: proves the wizard's no-Division path still creates a valid
+      // league-only game.
+      const leagueOnly = await team("League Only");
+      await post(`/api/setup/seasons/${s1.id}/team-registrations`,
+        { team_id: leagueOnly, division_id: null });
       const slot = await post("/api/setup/ice-slot", {
         rink_id: rink.id, start_time: `${day}T18:00:00+00:00`,
         end_time: `${day}T19:00:00+00:00`, slot_type: "game" });
       return { league: league.id, s1: s1.id, s2: s2.id, lv1: lv1.id,
-        d1: d1.id, d1b: d1b.id, d2: d2.id, perma, slot: slot.id };
+        d1: d1.id, d1b: d1b.id, d2: d2.id, perma, leagueOnly, slot: slot.id };
     }, CAL_DAY);
 
     // (A) Season participation: one permanent Team, two seasons, two divisions.
@@ -133,12 +139,57 @@ async function checkViewport(browser, viewport) {
     await page.waitForSelector(`[data-slot="${ids.slot}"]`, { timeout: 15000 });
     await page.click(`[data-slot="${ids.slot}"]`);
     await page.waitForSelector("#w-league", { timeout: 10000 });
+
+    // (B0) #233 B2c review: with TWO Leagues in the store (lv1, lv2), the
+    // League select must NEVER implicitly pre-select one — an operator must
+    // choose explicitly, or a game could silently write to the wrong
+    // competitive grouping. It starts on a disabled placeholder, and every
+    // downstream control (Division/Home/Away/Create) stays disabled until a
+    // League is chosen. League and Division also carry accessible names.
+    const preSelect = await page.evaluate(() => {
+      const lg = document.querySelector("#w-league");
+      const div = document.querySelector("#w-div");
+      return {
+        leagueValue: lg.value, leagueLabel: lg.getAttribute("aria-label"),
+        divLabel: div.getAttribute("aria-label"),
+        divDisabled: div.disabled,
+        homeDisabled: document.querySelector("#w-home").disabled,
+        awayDisabled: document.querySelector("#w-away").disabled,
+        createDisabled: document.querySelector("[data-wizcreate]").disabled,
+      };
+    });
+    if (preSelect.leagueValue !== "") {
+      throw new Error(`[${viewport.label}] League was implicitly pre-selected: ${JSON.stringify(preSelect)}`);
+    }
+    if (preSelect.leagueLabel !== "League" || preSelect.divLabel !== "Division") {
+      throw new Error(`[${viewport.label}] League/Division controls lack accessible names: ${JSON.stringify(preSelect)}`);
+    }
+    if (!preSelect.divDisabled || !preSelect.homeDisabled || !preSelect.awayDisabled || !preSelect.createDisabled) {
+      throw new Error(`[${viewport.label}] downstream controls were not disabled before a League was chosen: ${JSON.stringify(preSelect)}`);
+    }
+
     // League is required (#233 B2c) — select the season's League so its
     // Division picker is scoped to d1/d1b.
     await page.selectOption("#w-league", ids.lv1);
     await page.waitForFunction(
       (d) => !!Array.from(document.querySelectorAll("#w-div option")).find((o) => o.value === d),
       ids.d1, { timeout: 10000 });
+
+    // (B1) Choosing a League enables the downstream controls, and scopes the
+    // Division picker to it — d2 (League 2's own division) must never leak
+    // into League 1's picker.
+    const postSelect = await page.evaluate(() => ({
+      divDisabled: document.querySelector("#w-div").disabled,
+      homeDisabled: document.querySelector("#w-home").disabled,
+      awayDisabled: document.querySelector("#w-away").disabled,
+      divOptions: Array.from(document.querySelectorAll("#w-div option")).map((o) => o.value),
+    }));
+    if (postSelect.divDisabled || postSelect.homeDisabled || postSelect.awayDisabled) {
+      throw new Error(`[${viewport.label}] downstream controls stayed disabled after choosing a League: ${JSON.stringify(postSelect)}`);
+    }
+    if (postSelect.divOptions.includes(ids.d2)) {
+      throw new Error(`[${viewport.label}] League 1's Division picker leaked League 2's own division: ${JSON.stringify(postSelect.divOptions)}`);
+    }
 
     const homeOptions = async () => page.$$eval(
       "#w-home option", (opts) => opts.map((o) => o.value));
@@ -160,10 +211,34 @@ async function checkViewport(browser, viewport) {
       throw new Error(`[${viewport.label}] Perma was offered in a division it isn't registered in`);
     }
 
+    // (C) #233 B2c review: the no-Division path still creates a valid
+    // league-only game, and the v2 create payload carries exactly the
+    // League chosen with a null division_id (never omitted, never a stray
+    // legacy field). Reopen the wizard on the same (still-available) slot.
+    await page.click("[data-wizcancel]");
+    await page.waitForFunction(() => !document.querySelector(".wizard"), null, { timeout: 10000 });
+    await page.click(`[data-slot="${ids.slot}"]`);
+    await page.waitForSelector("#w-league", { timeout: 10000 });
+    await page.selectOption("#w-league", ids.lv1);
+    await page.waitForFunction(
+      (t) => !!Array.from(document.querySelectorAll("#w-home option")).find((o) => o.value === t),
+      ids.leagueOnly, { timeout: 10000 });
+    // Division stays at its default "No division" — a league-only game.
+    await page.selectOption("#w-home", ids.leagueOnly);
+    await page.selectOption("#w-away", ids.perma);
+    const createReq = page.waitForRequest((r) =>
+      r.url() === `${base}/api/v2/setup/game` && r.method() === "POST");
+    await page.click("[data-wizcreate]");
+    const createBody = (await createReq).postDataJSON();
+    if (createBody.league_id !== ids.lv1 || createBody.division_id !== null) {
+      throw new Error(`[${viewport.label}] league-only wizard create sent an unexpected payload: ${JSON.stringify(createBody)}`);
+    }
+    await page.waitForFunction(() => !document.querySelector(".wizard"), null, { timeout: 10000 });
+
     if (errors.length) {
       throw new Error(`[${viewport.label}] console/page errors:\n${errors.join("\n")}`);
     }
-    console.log(`[${viewport.label}] OK — one team across two seasons; wizard filters by registration.`);
+    console.log(`[${viewport.label}] OK — one team across two seasons; wizard filters by registration; no implicit League selection.`);
   } catch (error) {
     throw new Error(`${error.message}\n--- demo server output ---\n${serverOutput}`);
   } finally {

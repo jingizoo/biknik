@@ -2106,20 +2106,30 @@ function renderWizard(ov) {
   // "level" = canonical League); `ov.divisions[].level_id` is each
   // division's owning League. The Division picker offers "No division" and
   // is scoped to the chosen League — never a flat cross-league list.
+  //
+  // The League is NEVER implicitly picked when more than one exists (#233
+  // B2c review): silently defaulting to the first risks writing the game to
+  // the wrong competitive grouping (#212). Auto-selecting is safe only when
+  // there is exactly ONE unambiguous League to choose from — with zero or
+  // several, the select starts on a disabled "Select league…" placeholder
+  // and every downstream control (Division/Home/Away/Create) stays disabled
+  // until the operator picks one explicitly.
   const leagues = ov.levels || [];
-  if (!wizard.league_id && leagues[0]) wizard.league_id = leagues[0].id;
-  const divs = ov.divisions.filter((d) => d.level_id === wizard.league_id);
+  if (!wizard.league_id && leagues.length === 1) wizard.league_id = leagues[0].id;
+  const leagueChosen = !!wizard.league_id;
+  const divs = leagueChosen ? ov.divisions.filter((d) => d.level_id === wizard.league_id) : [];
   if (wizard.division_id && !divs.find((d) => d.id === wizard.division_id)) wizard.division_id = "";
   // Teams eligible for this game are those with an ACTIVE SeasonTeamRegistration
   // in the chosen League (#180, #233 B2c) — and, when a Division is also
   // chosen, in that exact Division too (the server requires an exact match
   // once a Division is given). Never the legacy Team.division_id. This
   // mirrors the server's registration-based game-creation guard, so the
-  // picker only offers teams the server will accept.
-  const registeredIds = new Set((ov.registrations || [])
+  // picker only offers teams the server will accept. Empty until a League is
+  // explicitly chosen.
+  const registeredIds = leagueChosen ? new Set((ov.registrations || [])
     .filter((r) => r.league_id === wizard.league_id
       && (!wizard.division_id || r.division_id === wizard.division_id))
-    .map((r) => r.team_id));
+    .map((r) => r.team_id)) : new Set();
   const teams = ov.teams.filter((t) => registeredIds.has(t.id));
   if (!teams.find((t) => t.id === wizard.home_id)) wizard.home_id = teams[0] ? teams[0].id : "";
   const awayTeams = teams.filter((t) => t.id !== wizard.home_id);
@@ -2127,25 +2137,29 @@ function renderWizard(ov) {
 
   const sameLeague = wizard.home_id && wizard.away_id;
   const distinct = wizard.home_id && wizard.away_id && wizard.home_id !== wizard.away_id;
-  const ok = sameLeague && distinct && slot.status === "available";
+  const ok = leagueChosen && sameLeague && distinct && slot.status === "available";
   const v = (good, t) => `<div class="valid ${good ? "ok" : "bad"}">${good ? "✓" : "✕"} ${t}</div>`;
+  const dis = leagueChosen ? "" : "disabled";
   return `
     <div class="wizard">
       <h3>Schedule Game</h3>
       <div class="step">1 · Competition</div>
-      <select id="w-league">${leagues.map((lv) => opt(lv.id, lv.name, lv.id === wizard.league_id)).join("")}</select>
+      <select id="w-league" aria-label="League">${
+        leagueChosen ? "" : `<option value="" disabled selected>Select league…</option>`}${
+        leagues.map((lv) => opt(lv.id, lv.name, lv.id === wizard.league_id)).join("")}</select>
       <div style="height:8px"></div>
-      <select id="w-div"><option value="">No division</option>${
+      <select id="w-div" aria-label="Division" ${dis}><option value="">No division</option>${
         divs.map((d) => opt(d.id, d.name, d.id === wizard.division_id)).join("")}</select>
       <div class="step">2 · Teams</div>
-      <select id="w-home">${teams.map((t) => opt(t.id, t.name, t.id === wizard.home_id)).join("")}</select>
+      <select id="w-home" aria-label="Home team" ${dis}>${teams.map((t) => opt(t.id, t.name, t.id === wizard.home_id)).join("")}</select>
       <div style="height:8px"></div>
-      <select id="w-away">${awayTeams.map((t) => opt(t.id, t.name, t.id === wizard.away_id)).join("") || opt("", "—")}</select>
+      <select id="w-away" aria-label="Away team" ${dis}>${awayTeams.map((t) => opt(t.id, t.name, t.id === wizard.away_id)).join("") || opt("", "—")}</select>
       <div class="step">3 · Ice</div>
       <div class="li"><span class="li-time">${fmt(slot.start_time)}–${fmt(slot.end_time)}</span>
         <div class="li-main"><div class="li-title">${esc(slot.rink_name)}</div>
           <div class="li-sub">${esc(slotVenueName(ov, slot))}</div></div></div>
       <div class="step">4 · Validation</div>
+      ${v(leagueChosen, "League selected")}
       ${v(!!teams.length, "Same league")}
       ${v(distinct, "Home and away are different teams")}
       ${v(slot.status === "available", "Ice slot is available")}
