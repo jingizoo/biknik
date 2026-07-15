@@ -92,6 +92,7 @@ jobs:
           node --check hockey-scheduler/e2e/check-v1-route-contract.js
           node --check hockey-scheduler/e2e/team-club-optional.js
           node --check hockey-scheduler/e2e/division-delete-cleanup.js
+          node --check hockey-scheduler/e2e/registration-cleanup.js
       - name: Check v1 route contract (#233 B2c)
         run: node hockey-scheduler/e2e/check-v1-route-contract.js
 
@@ -145,3 +146,5 @@ jobs:
         run: npm run team-club-optional
       - name: Run Division-deletion cleanup journey
         run: npm run division-delete-cleanup
+      - name: Run inactive-registration cleanup journey
+        run: npm run registration-cleanup

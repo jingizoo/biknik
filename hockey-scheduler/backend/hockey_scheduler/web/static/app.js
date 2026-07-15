@@ -911,10 +911,13 @@ const DEL_NOUN = {
   organization: "facility owner", league: "program", season: "season",
   level: "league", division: "division", club: "club", team: "team",
   venue: "venue", rink: "rink", "ice-slot": "ice slot", game: "game",
+  "season-team-registration": "registration",
 };
 // Higher-level records (#215) demand a typed confirmation — the operator must
 // type the record's name or DELETE before the destructive button enables.
-// Lower-risk entities keep a single-click confirm.
+// Lower-risk entities keep a single-click confirm. A registration cleanup
+// (#251) is already scoped to an inactive, game-free row before it ever
+// reaches this modal, so it stays single-click like division/club/game.
 const HIGH_RISK_DELETE = new Set(["league", "season", "team", "venue", "rink"]);
 // v2 delete route segment for each structural entity (#233 B2a review r1,
 // extended to organization/game in B2c) — frozen frontend kind tokens map to
@@ -924,6 +927,7 @@ const DEL_ROUTE_V2 = {
   league: "program", season: "season", level: "league", division: "division",
   club: "club", team: "team", venue: "venue", rink: "rink", "ice-slot": "ice-slot",
   organization: "organization", game: "game",
+  "season-team-registration": "season-team-registration",
 };
 
 function renderModal() {
@@ -1015,10 +1019,19 @@ function blockedModalHtml(m) {
       <div class="li-title">${esc(g.count)} ${esc(depNoun)}${g.count === 1 ? "" : "s"}</div>
       ${shown ? `<div class="li-sub">${shown}${more}</div>` : ""}</div></div>`;
   }).join("");
+  // A registration cleanup (#251) blocked by Game history has no "remove or
+  // reassign" action available — a draft/scheduled/cancelled Game is kept as
+  // permanent record on purpose, so the generic call-to-action below would be
+  // pointing at a step the operator can't actually take.
+  const footer = m.kind === "season-team-registration"
+    ? `<p class="muted">This registration is tied to permanent Game history and
+         can't be purged while any game — including cancelled ones — still
+         references it in this season.</p>`
+    : `<p class="muted">Remove or reassign these first, then delete the ${esc(noun)}.</p>`;
   return modalShell("blocked", `Can't delete this ${noun}`,
     `<p>${esc((m.error && m.error.message) || "This record still has dependents.")}</p>
      <div class="card">${rows || `<div class="li"><div class="li-sub">Dependent records exist.</div></div>`}</div>
-     <p class="muted">Remove or reassign these first, then delete the ${esc(noun)}.</p>`,
+     ${footer}`,
     `<button class="act primary" data-modal-close>Close</button>`);
 }
 
@@ -1313,14 +1326,14 @@ function renderSetupHierarchy(sv, hv, ov) {
       <div class="tn-children">${seasonRows}${treeAdd("season", "Add season to " + program.name, "f-season-league", program.id)}</div>
     </details>`;
   }).join("");
-  let competition = `<section class="tree-panel">
+  let competition = `<section class="tree-panel" id="competition-structure">
     <div class="tree-head"><span class="tree-title">🏆 Competition structure</span>
       <span class="tree-sub">Program → Season → League → Division</span></div>
     ${leagueRows || `<div class="tn-empty">No programs yet. Add a program to begin.</div>`}
     <div class="tree-actions">${treeAdd("league", "Add program")}</div>
   </section>`;
   if (!hasPerm("manage_setup")) {
-    competition = `<section class="tree-panel">
+    competition = `<section class="tree-panel" id="competition-structure">
       <div class="tree-head"><span class="tree-title">🏆 Competition structure</span></div>
       <div class="tree-note">Programs, seasons, leagues, and divisions are visible to setup operators.</div></section>`;
   }
@@ -1498,6 +1511,42 @@ function renderSeasonParticipation(hv, ov) {
       const leagueOptsFor = (selId) => leagues.map((lv) =>
         opt(lv.id, lv.name, lv.id === selId)).join("");
 
+      // Inactive registrations (#251): unregister_team_from_season only
+      // deactivates a row — Season/Team/League identity (and Division, if it
+      // had one) is retained for history, which is correct, but that history
+      // is otherwise invisible and silently blocks League/Season/Team
+      // deletes. Surface every inactive row here with a permanent-cleanup
+      // trash action; a row is only actually removable once no Game (draft,
+      // scheduled, cancelled, or historical) still references it — the
+      // has_dependencies path is handled generically by the confirm/blocked
+      // modal flow (delBtn → confirmDeleteModalHtml/blockedModalHtml).
+      const teamNameById = {};
+      permanentTeams.forEach((t) => { teamNameById[t.id] = t.name; });
+      const leagueNameById = {};
+      const divisionNameById = {};
+      leagues.forEach((lv) => {
+        leagueNameById[lv.id] = lv.name;
+        (lv.divisions || []).forEach((d) => { divisionNameById[d.id] = d.name; });
+      });
+      const inactiveRegs = (seasonRegs[s.id] || []).filter((r) => !r.active);
+      const inactiveRows = inactiveRegs.map((r) => {
+        const teamName = teamNameById[r.team_id] || r.team_id;
+        const leagueName = r.league_id ? (leagueNameById[r.league_id] || r.league_id) : "";
+        const divisionName = r.division_id ? (divisionNameById[r.division_id] || r.division_id) : "";
+        const where = [leagueName, divisionName].filter(Boolean).join(" / ") || "no league";
+        return `<div class="tn-leaf reg-row inactive-reg">
+          <span class="tn-label">👥 ${esc(teamName)}</span>
+          <span class="tn-meta">${esc(where)} · inactive · <code>${esc(r.id)}</code></span>
+          ${delBtn("season-team-registration", r.id, `${teamName} registration`,
+            "Permanently remove this inactive registration")}</div>`;
+      }).join("");
+      const inactiveSection = inactiveRegs.length
+        ? `<details class="tn" open><summary class="tn-sum">
+            <span class="tn-label">🗑️ Inactive registrations</span>
+            <span class="tn-meta">${inactiveRegs.length} row${inactiveRegs.length === 1 ? "" : "s"}</span></summary>
+          <div class="tn-children">${inactiveRows}</div></details>`
+        : "";
+
       const leagueSections = leagues.map((lv) => {
         const divs = lv.divisions || [];
         const divOptsFor = (selId) => divs.map((d) => opt(d.id, d.name, d.id === selId)).join("");
@@ -1535,7 +1584,8 @@ function renderSeasonParticipation(hv, ov) {
           + (lv.teams_without_division || []).length;
         return `<details class="tn" open><summary class="tn-sum">
             <span class="tn-label">🎚️ ${esc(lv.name)}</span>
-            <span class="tn-meta">${teamCount} team${teamCount === 1 ? "" : "s"}</span></summary>
+            <span class="tn-meta">${teamCount} team${teamCount === 1 ? "" : "s"}</span>
+            ${delBtn("level", lv.id, lv.name)}</summary>
           <div class="tn-children">${rows}${addCtl}</div></details>`;
       }).join("");
       const leagueBlocks = leagueSections
@@ -1547,8 +1597,9 @@ function renderSeasonParticipation(hv, ov) {
       return `<details class="tn" open><summary class="tn-sum">
           <span class="tn-label">🗓️ ${esc(s.name)}</span>
           <span class="tn-meta">${leagues.length} league${leagues.length === 1 ? "" : "s"} · ${
-            teamCount} team${teamCount === 1 ? "" : "s"}</span></summary>
-        <div class="tn-children">${leagueBlocks}</div></details>`;
+            teamCount} team${teamCount === 1 ? "" : "s"}</span>
+          ${delBtn("season", s.id, s.name)}</summary>
+        <div class="tn-children">${leagueBlocks}${inactiveSection}</div></details>`;
     }).join("");
 
     // Permanent members not registered for ANY season this program — surfaced
@@ -1561,11 +1612,12 @@ function renderSeasonParticipation(hv, ov) {
           idle.map((t) => esc(t.name)).join(", ")}</span></div>` : "";
     return `<details class="tn" open><summary class="tn-sum">
         <span class="tn-label">🏆 ${esc(program.name)}</span>
-        <span class="tn-meta">${permanentTeams.length} program team${permanentTeams.length === 1 ? "" : "s"}</span></summary>
+        <span class="tn-meta">${permanentTeams.length} program team${permanentTeams.length === 1 ? "" : "s"}</span>
+        ${delBtn("league", program.id, program.name)}</summary>
       <div class="tn-children">${seasonBlocks}${idleRows}</div></details>`;
   }).join("");
 
-  return `<section class="tree-panel">
+  return `<section class="tree-panel" id="season-participation">
     <div class="tree-head"><span class="tree-title">🗓️ Season participation</span>
       <span class="tree-sub">Permanent program teams → season, league &amp; division they play</span></div>
     ${programBlocks}</section>`;

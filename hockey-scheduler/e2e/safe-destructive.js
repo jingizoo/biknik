@@ -110,12 +110,17 @@ async function checkViewport(browser, viewport) {
       (u) => fetch(u, { credentials: "same-origin" }).then((r) => r.json()), p);
 
     await page.click('.tab[data-tab="setup"]');
-    await page.waitForSelector(`[data-del="league"][data-del-id="${ids.league}"]`, { timeout: 15000 });
+    // Scoped to the Competition structure tree (#251): the Season
+    // participation panel below it now renders its own delBtn for the same
+    // Program/Season/League ids, so an unscoped selector would match twice.
+    await page.waitForSelector(
+      `#competition-structure [data-del="league"][data-del-id="${ids.league}"]`,
+      { timeout: 15000 });
 
     // (1) Blocked deletion: league is a high-risk record, so its Delete button
     // stays disabled until DELETE is typed (#215); then the server refuses and
     // the blocked modal lists the dependents; the league survives.
-    await page.click(`[data-del="league"][data-del-id="${ids.league}"]`);
+    await page.click(`#competition-structure [data-del="league"][data-del-id="${ids.league}"]`);
     await page.waitForSelector(".modal.danger [data-del-confirm]", { timeout: 10000 });
     if (!(await page.$eval("[data-del-confirm]", (b) => b.disabled))) {
       throw new Error(`[${viewport.label}] high-risk delete was enabled before typing DELETE`);

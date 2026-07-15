@@ -745,6 +745,9 @@ details.tn > .tn-sum:hover { background: #f6f7fb; }
    an invalid registration — same League/Division cascade layout. */
 .reg-row, .reg-add, .repair-row { flex-wrap: wrap; }
 .reg-row .reg-tag { margin-right: auto; }
+/* Inactive registrations (#251): a deactivated-but-not-yet-purged row reads
+   as muted history, not a normal active participant. */
+.reg-row.inactive-reg .tn-label { color: var(--muted); font-weight: 500; }
 .reg-add select, .reg-row select, .repair-row select { max-width: 100%; }
 /* Season rollover picker (#180): season selectors wrap on a narrow phone; each
    team row's checkbox label and division select share the row and wrap. */
