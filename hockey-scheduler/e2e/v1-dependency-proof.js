@@ -223,22 +223,11 @@ async function checkViewport(browser, viewport) {
       throw new Error(`[${viewport.label}] a removed venue:league bridge reassign control is still rendered`);
     }
 
-    // (5) The one documented, deliberately-deferred v1 call: the temporary
-    // Venue→Program compatibility bridge (Slice E removes it).
-    await page.waitForSelector('[data-reassign="venue:league"]', { timeout: 10000 });
-    await page.click('[data-reassign="venue:league"]');
-    await page.waitForSelector(".rz-panel", { timeout: 10000 });
-    await page.selectOption("#reassign-target", program.id);
-    await page.click("[data-reassign-confirm]");
-    await page.waitForFunction(
-      () => !document.querySelector(".rz-panel"), null, { timeout: 10000 });
-
     // A genuine scheduler draft (is_draft=True — a manually wizard-created
-    // game defaults to committed, not draft, per (6) below), built now that
-    // the venue carries its legacy league_id (the round-robin generator
-    // requires it), purely to exercise the Scheduler view's draft-delete
-    // control at (8). Neither /api/scheduler/... route is part of the
-    // /api/setup/... v1 surface this journey is proving.
+    // game defaults to committed, not draft, per (6) below), purely to
+    // exercise the Scheduler view's draft-delete control at (8). Neither
+    // /api/scheduler/... route is part of the /api/setup/... v1 surface
+    // this journey is proving.
     const draftGame = await page.evaluate(async (i) => {
       const post = async (p, b) => (await fetch(p, {
         method: "POST", credentials: "same-origin",

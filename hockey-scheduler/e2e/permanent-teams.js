@@ -9,11 +9,11 @@
 //    (Program / League) everywhere the operator reads them — Records-view card
 //    titles, create-drawer field labels and titles, empty-select notes (which
 //    must show the display noun, never the internal league/level key), the
-//    Season-participation add control, the move/reassign dialog nouns + legacy
-//    warnings, and the delete-modal nouns. The Venue→Program link and the
-//    Program→org coupling are labelled as temporary legacy v1 relationships, and
-//    the Program operator is an "operating organization" (never "facility
-//    owner"). The visible trees never expose the internal "level" grouping word,
+//    Season-participation add control, the move/reassign dialog nouns, and the
+//    delete-modal nouns. The Program operator is an "operating organization"
+//    (never "facility owner"), and moving it carries no legacy-coupling
+//    warning (#233 Slice E removed the Venue->Program bridge). The visible
+//    trees never expose the internal "level" grouping word,
 //    and the unrelated "League Admin" policy role is left untouched. The internal
 //    entity keys and the v1 API (POST /api/setup/{league,level}) are unchanged.
 // Fails on any browser console/page error.
@@ -266,17 +266,18 @@ async function checkViewport(browser, viewport) {
     const treeText = await page.$eval(".setup-trees", (el) => el.textContent);
     if (/\blevel\b/i.test(treeText)) fail(`Setup trees still show the internal "level" grouping noun`);
 
-    // 7) Move/reassign dialog nouns + legacy warnings. The Program's operator
-    //    move says "operating organization" (not "facility owner") and warns
-    //    that the venue coupling is a temporary legacy v1 rule; moving a Division
-    //    targets a "league" (the grouping), never a "level".
+    // 7) Move/reassign dialog nouns. The Program's operator move says
+    //    "operating organization" (not "facility owner") and, since #233
+    //    Slice E removed the Venue->Program bridge, carries no legacy-coupling
+    //    warning anymore — the move is unconstrained by any Venue. Moving a
+    //    Division targets a "league" (the grouping), never a "level".
     const progMove = await reassignPanel("league:organization");
     if (!/operating organization/i.test(progMove.title))
       fail(`Program move dialog title is not "…operating organization" (got "${progMove.title}")`);
     if (/facility owner/i.test(progMove.title))
       fail(`Program move dialog still says "facility owner"`);
-    if (!/legacy v1/i.test(progMove.warn) || !/Slice E/i.test(progMove.warn))
-      fail(`Program move warning does not flag the legacy v1 coupling (got "${progMove.warn}")`);
+    if (progMove.warn)
+      fail(`Program move dialog unexpectedly shows a warning (got "${progMove.warn}")`);
     const divMove = await reassignPanel("division:level");
     if (!/\bleague\b/i.test(divMove.title) || /\blevel\b/i.test(divMove.title))
       fail(`Division move dialog does not target a "league" (got "${divMove.title}")`);
