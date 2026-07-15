@@ -61,6 +61,7 @@ from ..domain import (
     RosterRole,
     Season,
     SeasonTeamRegistration,
+    SeasonVenueAccess,
     SelectionSource,
     Session,
     SetupAuditLog,
@@ -81,6 +82,7 @@ from .integrity_checks import (
     assert_result_games_exist,
     assert_results_have_game,
     assert_roster_refs_exist,
+    assert_venue_season_access_backfill_ready,
 )
 
 
@@ -145,6 +147,8 @@ SPECS = {
     Division: Spec(Division, "divisions"),
     SeasonTeamRegistration: Spec(
         SeasonTeamRegistration, "season_team_registrations", {"active": _bool()}),
+    SeasonVenueAccess: Spec(
+        SeasonVenueAccess, "season_venue_access", {"active": _bool()}),
     Club: Spec(Club, "clubs"),
     Team: Spec(Team, "teams"),
     Player: Spec(Player, "players",
@@ -318,6 +322,7 @@ _PRE_MIGRATION_CHECKS = {
     "026_result_game_not_null": assert_results_have_game,
     "027_roster_entry_fks": assert_roster_refs_exist,
     "028_competition_reset": assert_competition_reset_ready_c1b,
+    "029_season_venue_access": assert_venue_season_access_backfill_ready,
 }
 
 
@@ -712,6 +717,24 @@ class SqlStore:
                            "season_id = ? AND team_id = ?", (season_id, team_id))
         return rows[0] if rows else None
 
+    # -- season venue access (#233 Slice E) ---------------------------------
+    def add_season_venue_access(self, sva): return self._insert(sva)
+    def get_season_venue_access(self, sva_id):
+        return self._get(SeasonVenueAccess, sva_id)
+    def save_season_venue_access(self, sva): return self._update(sva)
+    def all_season_venue_access(self):
+        return self._query(SeasonVenueAccess, order="id")
+    def season_venue_access_for_season(self, season_id):
+        return self._query(SeasonVenueAccess, "season_id = ?",
+                           (season_id,), order="id")
+    def season_venue_access_for_venue(self, venue_id):
+        return self._query(SeasonVenueAccess, "venue_id = ?",
+                           (venue_id,), order="id")
+    def season_venue_access_for_pair(self, season_id, venue_id):
+        rows = self._query(SeasonVenueAccess,
+                           "season_id = ? AND venue_id = ?", (season_id, venue_id))
+        return rows[0] if rows else None
+
     def add_club(self, club): return self._insert(club)
     def get_club(self, club_id): return self._get(Club, club_id)
     def all_clubs(self): return self._query(Club, order="id")
@@ -753,6 +776,8 @@ class SqlStore:
     def delete_season_team_registration(self, registration_id):
         self._delete(SeasonTeamRegistration, registration_id)
     def delete_venue(self, venue_id): self._delete(Venue, venue_id)
+    def delete_season_venue_access(self, sva_id):
+        self._delete(SeasonVenueAccess, sva_id)
     def delete_rink(self, rink_id): self._delete(Rink, rink_id)
     def delete_ice_slot(self, slot_id): self._delete(IceSlot, slot_id)
 

@@ -513,3 +513,62 @@ def assert_competition_reset_ready_c1b(conn):
         f"{len(league_issues)} league(s), and {len(game_issues)} game(s) "
         "reference a missing parent or cannot be deterministically scoped onto a "
         "same-Season League. Resolve these before upgrading — " + "; ".join(lines))
+
+
+# -- #233 Slice E — Venue/Program legacy-link backfill preflight -----------
+#
+# Migration 029 backfills a SeasonVenueAccess row from the legacy
+# ``venues.league_id`` (Program) link only when that Program has EXACTLY ONE
+# Season — the sole Season a venue-wide link could unambiguously have meant.
+# A Program with two or more Seasons is ambiguous and must never be guessed
+# (ADR 0001 / epic #233: no silent reassignment). This read-only check finds
+# every such Venue and aborts the whole migration with per-row diagnostics,
+# leaving both ``venues.league_id`` and the new table untouched.
+
+
+def find_venues_with_ambiguous_program_seasons(conn):
+    """Venues whose legacy Program link resolves to more than one Season.
+
+    A non-null ``venues.league_id`` (a Program id) with two or more Season
+    rows sharing that ``program_id`` has no single Season the legacy link
+    could unambiguously mean, so migration 029's backfill can't pick one
+    without guessing. Returns ``[{venue_id, program_id, season_count}, ...]``.
+    """
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT v.id AS venue_id, v.league_id AS program_id, "
+        "COUNT(s.id) AS season_count "
+        "FROM venues v JOIN seasons s ON s.program_id = v.league_id "
+        "WHERE v.league_id IS NOT NULL "
+        "GROUP BY v.id, v.league_id HAVING COUNT(s.id) > 1")
+    return sorted(
+        ({"venue_id": r["venue_id"], "program_id": r["program_id"],
+          "season_count": r["season_count"]} for r in cur.fetchall()),
+        key=lambda x: x["venue_id"])
+
+
+def assert_venue_season_access_backfill_ready(conn):
+    """Abort migration 029 (#233 Slice E) if any Venue's legacy Program link
+    resolves to more than one Season.
+
+    Read-only: raises :class:`MigrationDataError` with bounded, row-level
+    diagnostics (venue id + program id + season count) and leaves all data
+    unchanged, so an operator resolves each ambiguous venue (or waits for the
+    Slice E2 UI to grant SeasonVenueAccess explicitly) before the backfill
+    runs. A Venue whose Program has zero or exactly one Season is unaffected
+    and is not reported.
+    """
+    issues = find_venues_with_ambiguous_program_seasons(conn)
+    if not issues:
+        return
+    shown = ", ".join(
+        f"venue {i['venue_id']} (program={i['program_id']}, "
+        f"seasons={i['season_count']})" for i in issues[:20])
+    more = "" if len(issues) <= 20 else f" (+{len(issues) - 20} more)"
+    raise MigrationDataError(
+        "Cannot backfill Season-Venue access (#233 Slice E): "
+        f"{len(issues)} venue(s) have a legacy Program link that resolves to "
+        "more than one Season, so a single backfill target can't be chosen "
+        f"deterministically: {shown}{more}. Grant SeasonVenueAccess "
+        "explicitly for these venues instead of relying on the legacy link, "
+        "or resolve the ambiguity before upgrading.")

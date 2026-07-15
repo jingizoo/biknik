@@ -595,6 +595,181 @@ class V2SetupContractTest(unittest.TestCase):
         self.assertIn(reg_legacy["id"],
                       [r["id"] for r in still_there["registrations"]])
 
+    # -- season venue access (#233 Slice E) ----------------------------------
+    def test_v2_season_venue_access_contract(self):
+        """List/grant/remove for POST /api/v2/setup/seasons/{id}/venue-access
+        and POST /api/v2/setup/season-venue-access/{id}/remove: League Admin
+        success + response shape, unauthorized-role rejection, one Season
+        using multiple Venues, one Venue hosting multiple Programs/Seasons,
+        and duplicate-grant / not-found error shapes."""
+        c = self._admin()
+        org = self._v2(c, "organization", {"name": "SVA Org", "short_name": "SO"})
+        program = self._v2(c, "program",
+                          {"name": "SVA Prog", "operator_organization_id": org["id"]})
+        season = self._v2(c, "season",
+                         {"program_id": program["id"], "name": "SVA Season"})
+        venue = self._v2(c, "venue",
+                        {"name": "SVA Venue", "organization_id": org["id"]})
+
+        # -- League Admin success + exact response shape ---------------------
+        status, granted = self._req(
+            c, "POST", f"/api/v2/setup/seasons/{season['id']}/venue-access",
+            {"venue_id": venue["id"]})
+        self.assertEqual(status, 200, granted)
+        self.assertEqual(set(granted), {"id", "season_id", "venue_id", "active"},
+                         granted)
+        self.assertEqual(granted["season_id"], season["id"])
+        self.assertEqual(granted["venue_id"], venue["id"])
+        self.assertTrue(granted["active"])
+
+        status, listing = self._req(
+            c, "GET", f"/api/v2/setup/seasons/{season['id']}/venue-access")
+        self.assertEqual(status, 200, listing)
+        self.assertEqual(set(listing), {"venue_access"}, listing)
+        self.assertEqual([a["id"] for a in listing["venue_access"]],
+                         [granted["id"]])
+
+        # -- unauthorized role is rejected ------------------------------------
+        coach = self._client()
+        self._req(coach, "POST", "/api/auth/login",
+                 {"username": "coach", "password": "demo"})
+        status, denied = self._req(
+            coach, "POST", f"/api/v2/setup/seasons/{season['id']}/venue-access",
+            {"venue_id": venue["id"]})
+        self.assertEqual(status, 403, denied)
+        self.assertEqual(denied["error"]["details"]["required"], "manage_setup")
+        status, denied_get = self._req(
+            coach, "GET", f"/api/v2/setup/seasons/{season['id']}/venue-access")
+        self.assertEqual(status, 403, denied_get)
+
+        # -- duplicate active grant is rejected, zero mutation ----------------
+        status, dup = self._req(
+            c, "POST", f"/api/v2/setup/seasons/{season['id']}/venue-access",
+            {"venue_id": venue["id"]})
+        self.assertEqual(status, 400, dup)
+        self.assertEqual(dup["error"]["code"], "validation_error")
+        self.assertEqual(dup["error"]["details"]["reason"], "already_active")
+
+        # -- one Season can use multiple Venues -------------------------------
+        venue2 = self._v2(c, "venue",
+                         {"name": "SVA Venue 2", "organization_id": org["id"]})
+        status, granted2 = self._req(
+            c, "POST", f"/api/v2/setup/seasons/{season['id']}/venue-access",
+            {"venue_id": venue2["id"]})
+        self.assertEqual(status, 200, granted2)
+        status, listing2 = self._req(
+            c, "GET", f"/api/v2/setup/seasons/{season['id']}/venue-access")
+        self.assertEqual({a["venue_id"] for a in listing2["venue_access"]},
+                         {venue["id"], venue2["id"]})
+
+        # -- one Venue can host multiple Programs/Seasons ---------------------
+        program2 = self._v2(c, "program",
+                           {"name": "SVA Prog 2",
+                            "operator_organization_id": org["id"]})
+        season2 = self._v2(c, "season",
+                          {"program_id": program2["id"], "name": "SVA Season 2"})
+        status, granted3 = self._req(
+            c, "POST", f"/api/v2/setup/seasons/{season2['id']}/venue-access",
+            {"venue_id": venue["id"]})
+        self.assertEqual(status, 200, granted3)
+        self.assertNotEqual(granted3["id"], granted["id"])
+
+        # -- remove deactivates; not-found and missing-venue_id are reported --
+        status, removed = self._req(
+            c, "POST",
+            f"/api/v2/setup/season-venue-access/{granted['id']}/remove", {})
+        self.assertEqual(status, 200, removed)
+        self.assertFalse(removed["active"])
+        status, missing = self._req(
+            c, "POST", "/api/v2/setup/season-venue-access/nope/remove", {})
+        self.assertEqual(status, 404, missing)
+        self.assertEqual(missing["error"]["code"], "not_found")
+        status, no_venue = self._req(
+            c, "POST", f"/api/v2/setup/seasons/{season['id']}/venue-access", {})
+        self.assertEqual(status, 400, no_venue)
+        self.assertEqual(no_venue["error"]["code"], "validation_error")
+
+    def test_v2_season_venue_delete_blocked_until_access_explicitly_cleaned(self):
+        """#255 review: SeasonVenueAccess must never be an orphan.
+        delete_season/delete_venue block on a matching access row — active
+        OR revoked, zero mutation/audit — until it's explicitly cleaned up
+        via POST /api/v2/setup/season-venue-access/{id}/delete."""
+        c = self._admin()
+        org = self._v2(c, "organization", {"name": "SVD Org", "short_name": "SO"})
+        program = self._v2(c, "program",
+                          {"name": "SVD Prog", "operator_organization_id": org["id"]})
+        season = self._v2(c, "season",
+                         {"program_id": program["id"], "name": "SVD Season"})
+        venue = self._v2(c, "venue",
+                        {"name": "SVD Venue", "organization_id": org["id"]})
+        status, granted = self._req(
+            c, "POST", f"/api/v2/setup/seasons/{season['id']}/venue-access",
+            {"venue_id": venue["id"]})
+        self.assertEqual(status, 200, granted)
+
+        # -- blocked while active: zero mutation on both parents ------------
+        status, blocked_season = self._req(
+            c, "POST", f"/api/v2/setup/season/{season['id']}/delete", {})
+        self.assertEqual(status, 409, blocked_season)
+        self.assertEqual(blocked_season["error"]["code"], "has_dependencies")
+        deps = {g["type"] for g in
+               blocked_season["error"]["details"]["dependencies"]}
+        self.assertIn("venue access", deps)
+        status, blocked_venue = self._req(
+            c, "POST", f"/api/v2/setup/venue/{venue['id']}/delete", {})
+        self.assertEqual(status, 409, blocked_venue)
+        self.assertEqual(blocked_venue["error"]["code"], "has_dependencies")
+        status, still_there = self._req(
+            c, "GET", f"/api/v2/setup/seasons/{season['id']}/venue-access")
+        self.assertEqual([a["id"] for a in still_there["venue_access"]],
+                         [granted["id"]])
+        self.assertTrue(still_there["venue_access"][0]["active"])
+
+        # -- revoking is not enough: still blocked (history preserved) ------
+        status, revoked = self._req(
+            c, "POST",
+            f"/api/v2/setup/season-venue-access/{granted['id']}/remove", {})
+        self.assertEqual(status, 200, revoked)
+        status, still_blocked = self._req(
+            c, "POST", f"/api/v2/setup/season/{season['id']}/delete", {})
+        self.assertEqual(status, 409, still_blocked)
+        self.assertEqual(still_blocked["error"]["code"], "has_dependencies")
+
+        # -- explicit permanent cleanup unblocks both parents ----------------
+        status, cleaned = self._req(
+            c, "POST",
+            f"/api/v2/setup/season-venue-access/{granted['id']}/delete", {})
+        self.assertEqual(status, 200, cleaned)
+        self.assertEqual(cleaned["season_id"], season["id"])
+        self.assertEqual(cleaned["venue_id"], venue["id"])
+        # Cleaning up an already-active row is rejected, not silently ignored.
+        status, active_reg = self._req(
+            c, "POST", f"/api/v2/setup/seasons/{season['id']}/venue-access",
+            {"venue_id": venue["id"]})
+        self.assertEqual(status, 200, active_reg)
+        status, reject_active = self._req(
+            c, "POST",
+            f"/api/v2/setup/season-venue-access/{active_reg['id']}/delete", {})
+        self.assertEqual(status, 400, reject_active)
+        self.assertEqual(reject_active["error"]["code"], "validation_error")
+        self.assertEqual(
+            reject_active["error"]["details"]["reason"], "access_active")
+        status, revoke2 = self._req(
+            c, "POST",
+            f"/api/v2/setup/season-venue-access/{active_reg['id']}/remove", {})
+        self.assertEqual(status, 200, revoke2)
+        status, cleaned2 = self._req(
+            c, "POST",
+            f"/api/v2/setup/season-venue-access/{active_reg['id']}/delete", {})
+        self.assertEqual(status, 200, cleaned2)
+
+        status, venue_deleted = self._req(
+            c, "POST", f"/api/v2/setup/venue/{venue['id']}/delete", {})
+        self.assertEqual(status, 200, venue_deleted)
+        status, season_deleted = self._req(
+            c, "POST", f"/api/v2/setup/season/{season['id']}/delete", {})
+        self.assertEqual(status, 200, season_deleted)
+
     # -- canonical validation: League required, Division optional -----------
     def test_v2_division_requires_league(self):
         c = self._admin()

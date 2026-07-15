@@ -797,6 +797,11 @@ class Handler(BaseHTTPRequestHandler):
             # Canonical: each registration row keeps its competition league_id.
             return self._send_api(
                 api.list_season_team_registrations(mv2tr.group(1)))
+        mv2va = re.match(r"^/api/v2/setup/seasons/([^/]+)/venue-access$", path)
+        if mv2va:
+            if self._operator_only("/api/v2/setup/player"):
+                return
+            return self._send_api(api.list_season_venue_access(mv2va.group(1)))
         if path == "/api/v2/onboarding/status":
             if self._operator_only("/api/v2/onboarding/status"):
                 return
@@ -2047,6 +2052,26 @@ class Handler(BaseHTTPRequestHandler):
         if mdr:
             return self._send_api(api.delete_season_team_registration(
                 mdr.group(1), actor_id))
+        # Season-venue access (#233 Slice E, E1): grant/revoke which Venues a
+        # Season may use, independent of any Venue-Program ownership. Not a
+        # v1 route — this is a new v2-only feature, no legacy shape to adapt.
+        mva = re.match(r"^seasons/([^/]+)/venue-access$", entity)
+        if mva:
+            if not (b.get("venue_id") or None):
+                return self._send_api({"error": {"code": "validation_error",
+                    "message": "A venue_id is required."}})
+            return self._send_api(api.grant_season_venue_access(
+                mva.group(1), b.get("venue_id"), actor_id))
+        mvr = re.match(r"^season-venue-access/([^/]+)/remove$", entity)
+        if mvr:
+            return self._send_api(api.revoke_season_venue_access(
+                mvr.group(1), actor_id))
+        # Explicit permanent cleanup of an already-revoked access row (#255
+        # review), mirroring #251's season-team-registration .../delete.
+        mvd = re.match(r"^season-venue-access/([^/]+)/delete$", entity)
+        if mvd:
+            return self._send_api(api.delete_season_venue_access(
+                mvd.group(1), actor_id))
         # Season rollover (canonical v2): each selection REQUIRES a target
         # league_id, honored verbatim on the resulting registration.
         mrf = re.match(r"^seasons/([^/]+)/roll-forward$", entity)

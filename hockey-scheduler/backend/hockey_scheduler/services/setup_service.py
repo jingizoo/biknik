@@ -38,6 +38,7 @@ from ..domain import (
     Rink,
     Season,
     SeasonTeamRegistration,
+    SeasonVenueAccess,
     SetupAuditLog,
     Team,
     Venue,
@@ -664,6 +665,108 @@ class SetupService:
                 "season_name": season.name, "team_name": team.name,
                 "league_name": league.name,
                 "division_name": division.name if division else None}
+
+    @_transactional
+    def grant_season_venue_access(self, season_id: str, venue_id: str,
+                                  actor_id: Optional[str] = None
+                                  ) -> SeasonVenueAccess:
+        """Give a Season access to a Venue's ice (#233 Slice E).
+
+        Physical structure (Venue) and competition structure (Season) are
+        independent — unlike the legacy Venue.league_id bridge, this never
+        constrains a Venue to one Program, and a Season may hold access to any
+        number of Venues regardless of operator. Rule mirrors
+        register_team_for_season's Rule 5: a prior *inactive* access row (once
+        revoked, now regranted) is reactivated in place rather than
+        duplicated, honoring the (season_id, venue_id) one-active-row
+        invariant enforced by the partial unique index (migration 029).
+        """
+        season = self.store.get_season(season_id)
+        if season is None:
+            raise NotFoundError(f"Season {season_id} not found.")
+        venue = self.store.get_venue(venue_id)
+        if venue is None:
+            raise NotFoundError(f"Venue {venue_id} not found.")
+        existing = self.store.season_venue_access_for_pair(season_id, venue_id)
+        if existing is not None:
+            if existing.active:
+                raise ValidationError(
+                    f"Season {season_id} already has access to venue "
+                    f"{venue_id}.",
+                    {"reason": "already_active", "access_id": existing.id})
+            existing.active = True
+            self.store.save_season_venue_access(existing)
+            self._audit("season_venue_access_granted", "season_venue_access",
+                        existing.id, actor_id,
+                        {"season_id": season_id, "venue_id": venue_id,
+                         "reactivated": True})
+            return existing
+        access = SeasonVenueAccess(
+            id=self.store.next_id("sva"), season_id=season_id,
+            venue_id=venue_id, active=True)
+        self.store.add_season_venue_access(access)
+        self._audit("season_venue_access_granted", "season_venue_access",
+                    access.id, actor_id,
+                    {"season_id": season_id, "venue_id": venue_id})
+        return access
+
+    @_transactional
+    def revoke_season_venue_access(self, access_id: str,
+                                   actor_id: Optional[str] = None
+                                   ) -> SeasonVenueAccess:
+        """Deactivate a Season's access to a Venue (#233 Slice E).
+
+        Deactivates only — history is preserved (mirrors
+        unregister_team_from_season) so any Game already scheduled against
+        this Venue for this Season remains intact and auditable. A revoked
+        row still blocks a Season/Venue delete (delete_season/delete_venue
+        check every access row regardless of active status, mirroring
+        delete_league/delete_season/delete_team's identical registration
+        check) — delete_season_venue_access below is the explicit,
+        separate cleanup action for an already-revoked row.
+        """
+        access = self.store.get_season_venue_access(access_id)
+        if access is None:
+            raise NotFoundError(f"Season-venue access {access_id} not found.")
+        if not access.active:
+            raise ValidationError(
+                "This access is already revoked.",
+                {"reason": "already_revoked", "access_id": access.id})
+        access.active = False
+        self.store.save_season_venue_access(access)
+        self._audit("season_venue_access_revoked", "season_venue_access",
+                    access.id, actor_id,
+                    {"season_id": access.season_id, "venue_id": access.venue_id})
+        return access
+
+    @_transactional
+    def delete_season_venue_access(self, access_id: str,
+                                   actor_id: Optional[str] = None) -> dict:
+        """Permanently remove an already-revoked Season-Venue access row
+        (#233 Slice E, #255 review).
+
+        revoke_season_venue_access only deactivates a row, preserving it as a
+        blocker for delete_season/delete_venue (both check every row
+        regardless of active status) so the grant/revoke history stays
+        auditable by default. This is the explicit, separate cleanup action
+        that actually removes an inactive row once an operator has confirmed
+        it no longer needs to block a parent delete — mirrors
+        delete_season_team_registration (#251) exactly. Never an active row.
+        """
+        access = self.store.get_season_venue_access(access_id)
+        if access is None:
+            raise NotFoundError(f"Season-venue access {access_id} not found.")
+        if access.active:
+            raise ValidationError(
+                "Cannot permanently delete an active access; revoke it "
+                "first.",
+                {"reason": "access_active", "access_id": access.id})
+        detail = {"season_id": access.season_id, "venue_id": access.venue_id,
+                  "reason": "explicit_revoked_cleanup"}
+        self.store.delete_season_venue_access(access_id)
+        self._audit("season_venue_access_deleted", "season_venue_access",
+                    access_id, actor_id, detail)
+        return {"id": access_id, **detail}
 
     @_transactional
     def roll_forward_registrations(self, from_season_id: str, to_season_id: str,
@@ -2903,6 +3006,10 @@ class SetupService:
         season = self.store.get_season(season_id) if season_id else None
         return season.name if season else (season_id or "—")
 
+    def _venue_name(self, venue_id) -> str:
+        venue = self.store.get_venue(venue_id) if venue_id else None
+        return venue.name if venue else (venue_id or "—")
+
     def _slot_label(self, slot) -> str:
         rink = self.store.get_rink(slot.rink_id) if slot.rink_id else None
         when = slot.start_time.isoformat() if slot.start_time else ""
@@ -2979,13 +3086,23 @@ class SetupService:
         # whose division is legacy/null/mismatched still carries season_id, so
         # check by season_id rather than trusting the division tree above.
         games = [g for g in self.store.all_games() if g.season_id == season_id]
+        # SeasonVenueAccess (#233 Slice E, reviewer blocker on #255): checked
+        # regardless of active status, mirroring team registrations above —
+        # revoke_season_venue_access deliberately only deactivates a row (the
+        # grant/revoke history is preserved), so an inactive row is not proof
+        # the Season is free of it. delete_season_venue_access (mirroring
+        # #251's delete_season_team_registration) is the explicit cleanup an
+        # operator runs on each revoked row before this delete can succeed.
+        venue_access = self.store.season_venue_access_for_season(season_id)
         self._block_if_dependents("season", season_id, "season", [
             self._dep_group("level", levels, lambda lv: lv.name,
                             display="league"),
             self._dep_group("division", divisions, lambda d: d.name),
             self._dep_group("team registration", regs,
                             lambda r: self._team_name(r.team_id)),
-            self._dep_group("game", games, self._matchup)])
+            self._dep_group("game", games, self._matchup),
+            self._dep_group("venue access", venue_access,
+                            lambda a: self._venue_name(a.venue_id))])
         self.store.delete_season(season_id)
         self._audit("season_deleted", "season", season_id, actor_id,
                     {"name": season.name, "league_id": season.program_id})
@@ -3104,8 +3221,14 @@ class SetupService:
         if venue is None:
             raise NotFoundError(f"Venue {venue_id} not found.")
         rinks = [r for r in self.store.all_rinks() if r.venue_id == venue_id]
+        # SeasonVenueAccess (#233 Slice E, reviewer blocker on #255): checked
+        # regardless of active status — see delete_season's identical
+        # comment; delete_season_venue_access is the matching cleanup op.
+        venue_access = self.store.season_venue_access_for_venue(venue_id)
         self._block_if_dependents("venue", venue_id, "venue", [
-            self._dep_group("rink", rinks, lambda r: r.name)])
+            self._dep_group("rink", rinks, lambda r: r.name),
+            self._dep_group("venue access", venue_access,
+                            lambda a: self._season_name(a.season_id))])
         self.store.delete_venue(venue_id)
         self._audit("venue_deleted", "venue", venue_id, actor_id,
                     {"name": venue.name})
