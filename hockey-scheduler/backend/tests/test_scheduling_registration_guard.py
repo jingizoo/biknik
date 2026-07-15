@@ -42,6 +42,7 @@ class _Base(unittest.TestCase):
         self.home = self.svc.create_team(club.id, self.div.id, "Home")
         self.away = self.svc.create_team(club.id, self.div.id, "Away")
         self.venue = self.svc.create_venue("V", league_id=self.league.id)
+        self.svc.grant_season_venue_access(self.season.id, self.venue.id)
         self.rink = self.svc.create_rink(self.venue.id, "R")
 
     def _slot(self, h=18):
@@ -273,8 +274,9 @@ class LeagueScopedIceGuardTest(unittest.TestCase):
             self.svc.create_venue("VB", league_id=self.svc.create_program("B").id).id,
             "RB")
         self.foreign_slot = self.svc.create_ice_slot(rb.id, dt(18), dt(20))
-        ra = self.svc.create_rink(
-            self.svc.create_venue("VA", league_id=self.la.id).id, "RA")
+        va = self.svc.create_venue("VA", league_id=self.la.id)
+        self.svc.grant_season_venue_access(self.sa.id, va.id)
+        ra = self.svc.create_rink(va.id, "RA")
         self.home_slot = self.svc.create_ice_slot(ra.id, dt(18), dt(20))
 
     def test_cross_league_ice_rejected_for_league_first_team(self):

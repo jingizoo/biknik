@@ -742,8 +742,8 @@ class SetupService:
     @_transactional
     def delete_season_venue_access(self, access_id: str,
                                    actor_id: Optional[str] = None) -> dict:
-        """Permanently remove an already-revoked Season-Venue access row
-        (#233 Slice E, #255 review).
+        """Permanently remove an already-revoked, game-free Season-Venue
+        access row (#233 Slice E, #255 review, #257 review).
 
         revoke_season_venue_access only deactivates a row, preserving it as a
         blocker for delete_season/delete_venue (both check every row
@@ -751,7 +751,11 @@ class SetupService:
         auditable by default. This is the explicit, separate cleanup action
         that actually removes an inactive row once an operator has confirmed
         it no longer needs to block a parent delete — mirrors
-        delete_season_team_registration (#251) exactly. Never an active row.
+        delete_season_team_registration (#251) exactly, including its
+        game-history guard: a revoked row can still be the ONLY explicit
+        record of why a draft/committed/cancelled/published Game's ice was
+        allowed at this Venue for this Season, so it is never purged out from
+        under live Game history. Never an active row.
         """
         access = self.store.get_season_venue_access(access_id)
         if access is None:
@@ -761,12 +765,37 @@ class SetupService:
                 "Cannot permanently delete an active access; revoke it "
                 "first.",
                 {"reason": "access_active", "access_id": access.id})
+        # Resolve both parents before any write — an inactive row whose
+        # Season or Venue has since vanished is not safe to purge blindly,
+        # and the caller needs real labels (not bare ids) to confirm what it
+        # just removed (mirrors delete_season_team_registration exactly).
+        season = self.store.get_season(access.season_id)
+        if season is None:
+            raise ValidationError(
+                "This access's Season no longer exists.",
+                {"reason": "invalid_season", "season_id": access.season_id})
+        venue = self.store.get_venue(access.venue_id)
+        if venue is None:
+            raise ValidationError(
+                "This access's Venue no longer exists.",
+                {"reason": "invalid_venue", "venue_id": access.venue_id})
+        rink_ids = {r.id for r in self.store.all_rinks()
+                    if r.venue_id == access.venue_id}
+        games = [
+            g for g in self.store.all_games()
+            if g.season_id == access.season_id and g.ice_slot_id
+            and (slot := self.store.get_ice_slot(g.ice_slot_id)) is not None
+            and slot.rink_id in rink_ids]
+        self._block_if_dependents(
+            "season_venue_access", access_id, "venue access", [
+                self._dep_group("game", games, self._matchup)])
         detail = {"season_id": access.season_id, "venue_id": access.venue_id,
                   "reason": "explicit_revoked_cleanup"}
         self.store.delete_season_venue_access(access_id)
         self._audit("season_venue_access_deleted", "season_venue_access",
                     access_id, actor_id, detail)
-        return {"id": access_id, **detail}
+        return {"id": access_id, **detail,
+                "season_name": season.name, "venue_name": venue.name}
 
     @_transactional
     def roll_forward_registrations(self, from_season_id: str, to_season_id: str,
@@ -1189,7 +1218,7 @@ class SetupService:
                     {"from": old, "to": team_id})
         return player
 
-    # -- cross-domain reassignment: league owner + venue league (#173) -----
+    # -- cross-domain reassignment: league owner (#173) --------------------
     @_transactional
     def assign_program_organization(self, program_id: str,
                                     organization_id: Optional[str] = None,
@@ -1200,92 +1229,16 @@ class SetupService:
         if organization_id and self.store.get_organization(organization_id) is None:
             raise NotFoundError(f"Organization {organization_id} not found.")
         old = program.operator_organization_id
-        # Invariant #4: changing the operator must not silently cascade to the
-        # program's venues (whose owner is derived from it). Refuse while venues
-        # are still attached — the operator unassigns/reassigns them first, so
-        # the ownership change is deliberate and each venue is re-audited. Venues
-        # keep their ``league_id`` column this slice (points at the program).
-        if (organization_id or None) != (old or None):
-            attached = [v for v in self.store.all_venues()
-                        if v.league_id == program_id]
-            if attached:
-                raise ValidationError(
-                    f"Current v1 compatibility: while the temporary Venue→Program "
-                    f"link is active (removed in Slice E), this program's operating "
-                    f"organization can't change while {len(attached)} venue(s) are "
-                    f"attached. Unassign them first.")
+        # #233 Slice E: physical (facility owner) and competition (Program
+        # operator) structure are independent trees — a Program's operating
+        # organization is free to change without regard to any Venue, since
+        # Venue<->Program access is now a decoupled SeasonVenueAccess grant,
+        # not a shared-owner bridge.
         program.operator_organization_id = organization_id or None
         self.store.save_program(program)
         self._audit("league_organization_assigned", "league", program.id, actor_id,
                     {"from": old, "to": program.operator_organization_id})
         return program
-
-    @_transactional
-    def assign_venue_league(self, venue_id: str, league_id: Optional[str] = None,
-                            actor_id: Optional[str] = None) -> Venue:
-        venue = self.store.get_venue(venue_id)
-        if venue is None:
-            raise NotFoundError(f"Venue {venue_id} not found.")
-        old_league = venue.league_id
-        old_org = venue.organization_id
-        new_org = venue.organization_id
-        if league_id:
-            league = self.store.get_program(league_id)
-            if league is None:
-                raise NotFoundError(f"Program {league_id} not found.")
-            league_owner = league.operator_organization_id
-            # Owner agreement (#173 invariant 3): the venue and program must
-            # share an owner. Derive the owner from the program when the venue
-            # has none; reject a conflicting existing owner rather than silently
-            # transferring facility ownership.
-            if venue.organization_id and league_owner \
-                    and venue.organization_id != league_owner:
-                raise ValidationError(
-                    "Current v1 compatibility: while the temporary Venue→Program "
-                    "link is active (removed in Slice E), a venue's facility owner "
-                    "must match the program's operating organization. Reassign the "
-                    "venue's facility owner first, or pick a program with the same "
-                    "operating organization.")
-            new_org = league_owner or venue.organization_id
-        # Reassignment safety (#173): refuse if the move would strand non-
-        # cancelled scheduled games on ice that no longer belongs to their
-        # league — surface the offending game ids so the operator resolves them.
-        stranded = self._games_stranded_by_venue_league(venue_id, league_id)
-        if stranded:
-            raise ValidationError(
-                f"{len(stranded)} scheduled game(s) use this venue's ice and "
-                f"belong to a different program. Move or cancel them first: "
-                f"{', '.join(stranded[:10])}.")
-        venue.league_id = league_id or None
-        venue.organization_id = new_org or None
-        self.store.save_venue(venue)
-        detail = {"from": old_league, "to": venue.league_id}
-        if (new_org or None) != (old_org or None):
-            detail["organization_from"] = old_org
-            detail["organization_to"] = venue.organization_id
-        self._audit("venue_league_assigned", "venue", venue.id, actor_id, detail)
-        return venue
-
-    def _games_stranded_by_venue_league(self, venue_id, new_league_id):
-        """Ids of non-cancelled games whose ice is on ``venue_id`` but whose
-        own league (via Season) would not match the venue's new league — i.e.
-        games the reassignment would leave on ice outside their league (#173).
-        """
-        rink_ids = {r.id for r in self.store.all_rinks() if r.venue_id == venue_id}
-        if not rink_ids:
-            return []
-        stranded = []
-        for g in self.store.all_games():
-            if g.cancelled or not g.ice_slot_id:
-                continue
-            slot = self.store.get_ice_slot(g.ice_slot_id)
-            if slot is None or slot.rink_id not in rink_ids:
-                continue
-            season = self.store.get_season(g.season_id) if g.season_id else None
-            game_league = season.program_id if season else None
-            if (game_league or None) != (new_league_id or None):
-                stranded.append(g.id)
-        return stranded
 
     # -- organization / venue / rink / ice slot ---------------------------
     @_transactional

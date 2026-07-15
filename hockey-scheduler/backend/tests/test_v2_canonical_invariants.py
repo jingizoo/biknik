@@ -44,12 +44,13 @@ class _Base(unittest.TestCase):
             "Prog", operator_organization_id=org["id"], actor_id=ADMIN)
         return org, program
 
-    def _playable_slot(self, org, program):
-        """A GAME ice slot whose venue is soundly linked to the program, so the
-        league-ice isolation guard passes and game creation reaches the
-        registration-league check."""
+    def _playable_slot(self, org, program, season_id):
+        """A GAME ice slot whose venue has active SeasonVenueAccess for
+        ``season_id`` (#233 Slice E), so the ice eligibility guard passes and
+        game creation reaches the registration-league check."""
         venue = self.api.create_venue("V", organization_id=org["id"],
                                       league_id=program["id"], actor_id=ADMIN)
+        self.api.grant_season_venue_access(season_id, venue["id"], actor_id=ADMIN)
         rink = self.api.create_rink(venue["id"], "R", actor_id=ADMIN)
         slot = self.api.create_ice_slot(
             rink["id"], "2026-09-01T18:30:00+00:00",
@@ -73,7 +74,7 @@ class GameRegistrationLeagueTest(_Base):
                                           actor_id=ADMIN, league_id=l1["id"])
         self.api.register_team_for_season(season["id"], team_b["id"],
                                           actor_id=ADMIN, league_id=l1["id"])
-        slot = self._playable_slot(org, program)
+        slot = self._playable_slot(org, program, season["id"])
 
         audits_before = self._audit_count()
         # v2 game scoped to L2 while both teams are registered in L1 → rejected.
@@ -300,6 +301,7 @@ class AssignLeagueGameStrandTest(_Base):
                                           actor_id=ADMIN, league_id=l1["id"])
         venue = self.api.create_venue("V", organization_id=org["id"],
                                       league_id=program["id"], actor_id=ADMIN)
+        self.api.grant_season_venue_access(season["id"], venue["id"], actor_id=ADMIN)
         rink = self.api.create_rink(venue["id"], "R", actor_id=ADMIN)
         slot = self.api.create_ice_slot(
             rink["id"], "2026-09-01T18:30:00+00:00",

@@ -38,6 +38,7 @@ class RegistrationSafetyTest(unittest.TestCase):
         # A venue tied to the same league so the #173 ice-isolation guard is
         # satisfied when the game is scheduled onto its ice.
         venue = api.create_venue("V", league_id=self.league["id"], actor_id=ADMIN)
+        api.grant_season_venue_access(self.season["id"], venue["id"], actor_id=ADMIN)
         rink = api.create_rink(venue["id"], "R", actor_id=ADMIN)
         self.slot = api.create_ice_slot(
             rink["id"], "2026-09-01T18:30:00+00:00",

@@ -11,7 +11,7 @@ from ..domain import Game
 from ..domain.errors import DomainError
 from ..services.league_scope import (
     require_game_league_id,
-    require_slot_belongs_to_league,
+    require_slot_belongs_to_season,
 )
 from .service import ApiService as _BaseApiService
 from .service import catch
@@ -33,18 +33,14 @@ class ApiService(_BaseApiService):
                           double_booked: bool) -> dict:
         row = super()._draft_review_row(game, slot_games, double_booked)
         try:
-            league_id = require_game_league_id(self.store, game)
-            require_slot_belongs_to_league(
-                self.store, game.ice_slot_id, league_id)
+            require_game_league_id(self.store, game)
+            require_slot_belongs_to_season(
+                self.store, game.ice_slot_id, game.season_id)
         except DomainError as exc:
             reason = getattr(exc, "details", {}).get("reason")
             issue = (
                 "wrong_league_ice"
-                if reason in {
-                    "cross_league_slot",
-                    "venue_league_unassigned",
-                    "venue_owner_mismatch",
-                }
+                if reason == "venue_access_missing"
                 else "league_scope_missing"
             )
             if issue not in row["issues"]:
@@ -61,10 +57,10 @@ class ApiService(_BaseApiService):
 
         # Revalidate every proposed slot before the first write. This closes the
         # commit boundary even if inventory changed after an earlier preview.
-        league_id = proposal["league_id"]
+        season_id = proposal["season_id"]
         for row in proposal["draft_games"]:
-            require_slot_belongs_to_league(
-                self.store, row["ice_slot_id"], league_id)
+            require_slot_belongs_to_season(
+                self.store, row["ice_slot_id"], season_id)
 
         created = []
         with self.store.transaction():
@@ -110,8 +106,8 @@ class ApiService(_BaseApiService):
         # Validate the whole batch before the first slot allocation or publish;
         # one bad legacy draft must not partially publish the selection.
         for game in targets:
-            league_id = require_game_league_id(self.store, game)
-            require_slot_belongs_to_league(
-                self.store, game.ice_slot_id, league_id)
+            require_game_league_id(self.store, game)
+            require_slot_belongs_to_season(
+                self.store, game.ice_slot_id, game.season_id)
         return super().publish_draft_games(
             game_ids=game_ids, all_drafts=all_drafts, actor_id=actor_id)

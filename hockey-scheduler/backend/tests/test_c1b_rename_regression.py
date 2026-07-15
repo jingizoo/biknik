@@ -31,8 +31,8 @@ from hockey_scheduler.domain.errors import ValidationError
 from hockey_scheduler.services import SetupService
 from hockey_scheduler.services.league_scope import (
     registered_team_ids_in_division,
-    require_slot_belongs_to_league,
-    slot_belongs_to_league,
+    require_slot_belongs_to_season,
+    slot_belongs_to_season,
 )
 from hockey_scheduler.store import InMemoryStore
 
@@ -111,6 +111,7 @@ class ScopedUserSeesSameRecordsTest(unittest.TestCase):
         self.setup.register_team_for_season(self.season.id, self.t1.id, self.div.id)
         self.setup.register_team_for_season(self.season.id, self.t2.id, self.div.id)
         venue = self.setup.create_venue("Arena", league_id=self.program.id)
+        self.setup.grant_season_venue_access(self.season.id, venue.id)
         rink = self.setup.create_rink(venue.id, "Rink")
         self.setup.create_ice_slot(rink.id, _at(19), _at(20))
         self.setup.create_ice_slot(rink.id, _at(21), _at(22))
@@ -133,8 +134,9 @@ class TenancySeamUnchangedTest(unittest.TestCase):
     """The tenancy/scheduling layer resolves scope through the ONE canonical
     bridge (services/scope_bridge.py) after the rename, but keeps its own frozen
     vocabulary. These exercise the ACTUAL scoped authorization decision and
-    record-visibility paths — not just a scheduler return key — proving the
-    behaviour and the ``league_id`` / ``league_organization_id`` result keys are
+    record-visibility paths — not just a scheduler return key. Ice eligibility
+    itself is season-based (#233 Slice E, SeasonVenueAccess) rather than
+    Program-based, but the record-visibility seam it sits alongside is
     unchanged."""
 
     def setUp(self):
@@ -155,32 +157,30 @@ class TenancySeamUnchangedTest(unittest.TestCase):
         self.setup.register_team_for_season(self.seasonA.id, self.tA1.id, self.divA.id)
         self.setup.register_team_for_season(self.seasonA.id, self.tA2.id, self.divA.id)
         venueA = self.setup.create_venue("Arena A", league_id=self.progA.id)
+        self.setup.grant_season_venue_access(self.seasonA.id, venueA.id)
         rinkA = self.setup.create_rink(venueA.id, "Rink A")
         self.slotA = self.setup.create_ice_slot(rinkA.id, _at(19), _at(20))
+        # Arena B is never granted access to Season A — it is a different
+        # Program's venue with no SeasonVenueAccess grant at all.
         venueB = self.setup.create_venue("Arena B", league_id=self.progB.id)
         rinkB = self.setup.create_rink(venueB.id, "Rink B")
         self.slotB = self.setup.create_ice_slot(rinkB.id, _at(19), _at(20))
 
     def test_authorization_decision_and_error_keys_unchanged(self):
-        # A same-scope slot is accepted; a cross-scope slot is rejected — the
-        # authorization decision flows through the bridge unchanged.
+        # A slot whose venue has been granted access is accepted; one that
+        # hasn't is rejected.
         self.assertIsNotNone(
-            require_slot_belongs_to_league(self.store, self.slotA.id, self.progA.id))
+            require_slot_belongs_to_season(self.store, self.slotA.id, self.seasonA.id))
         self.assertTrue(
-            slot_belongs_to_league(self.store, self.slotA.id, self.progA.id))
+            slot_belongs_to_season(self.store, self.slotA.id, self.seasonA.id))
         self.assertFalse(
-            slot_belongs_to_league(self.store, self.slotB.id, self.progA.id))
-        # The rejection's machine-readable details keep the tenancy vocabulary:
-        # the result keys are still ``league_id`` (the scope id flowing in is the
-        # Program id) and ``league_organization_id`` — never program_id /
-        # operator_organization_id.
+            slot_belongs_to_season(self.store, self.slotB.id, self.seasonA.id))
+        # The rejection's machine-readable details identify the season/venue.
         with self.assertRaises(ValidationError) as ctx:
-            require_slot_belongs_to_league(self.store, self.slotB.id, self.progA.id)
+            require_slot_belongs_to_season(self.store, self.slotB.id, self.seasonA.id)
         details = ctx.exception.details
-        self.assertEqual(details["reason"], "cross_league_slot")
-        self.assertEqual(details["expected_league_id"], self.progA.id)
-        self.assertNotIn("program_id", details)
-        self.assertNotIn("operator_organization_id", details)
+        self.assertEqual(details["reason"], "venue_access_missing")
+        self.assertEqual(details["season_id"], self.seasonA.id)
 
     def test_record_visibility_through_scope_is_unchanged(self):
         # A league-scoped read still resolves the scope from the (now Program) id

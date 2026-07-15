@@ -158,14 +158,12 @@ class V2SetupContractTest(unittest.TestCase):
         self.assertEqual(venue["organization_id"], org["id"])
         self.assertNotIn("league_id", venue)
 
-        # For the game's schedulable ice, the venue must be linked to the program
-        # (the league-ice isolation guard). That temporary v1 venue↔program link
-        # is v1-only (removed in Slice E), so use the v1 venue route for it.
-        status, game_venue = self._req(c, "POST", "/api/setup/venue",
-                                       {"name": "Game Arena",
-                                        "league_id": program["id"],
-                                        "organization_id": org["id"]})
-        self.assertEqual(status, 200, game_venue)
+        # For the game's schedulable ice, the venue needs active
+        # SeasonVenueAccess for this Season (#233 Slice E).
+        game_venue = self._v2(c, "venue",
+                              {"name": "Game Arena", "organization_id": org["id"]})
+        self._req(c, "POST", f"/api/v2/setup/seasons/{season['id']}/venue-access",
+                  {"venue_id": game_venue["id"]})
         rink = self._v2(c, "rink", {"venue_id": game_venue["id"], "name": "Rink 1"})
         slot = self._v2(c, "ice-slot",
                        {"rink_id": rink["id"],
@@ -387,21 +385,19 @@ class V2SetupContractTest(unittest.TestCase):
         self.assertEqual(moved["operator_organization_id"], org2["id"])
         self.assertNotIn("organization_id", moved)  # canonical, not legacy v1
 
-        # The temporary Venue-link safety rule is preserved: attach a venue to
-        # the program (v1-only link) and the operator can no longer change.
+        # #233 Slice E: physical (facility) and competition (Program) structure
+        # are independent trees — attaching a venue to the program (the legacy
+        # v1-only link) no longer constrains an operator-organization change.
         status, _venue = self._req(c, "POST", "/api/setup/venue",
                                    {"name": "Arena", "league_id": program["id"],
                                     "organization_id": org2["id"]})
         self.assertEqual(status, 200, _venue)
-        status, blocked = self._req(
+        status, unblocked = self._req(
             c, "POST",
             f"/api/v2/setup/program/{program['id']}/assign-organization",
             {"operator_organization_id": org1["id"]})
-        self.assertEqual(blocked["error"]["code"], "validation_error", blocked)
-        # Zero mutation — the operator is still org2.
-        status, prog2 = self._req(c, "GET", "/api/v2/setup/hierarchy")
-        p = next(x for x in prog2["programs"] if x["id"] == program["id"])
-        self.assertEqual(p["operator_organization_id"], org2["id"])
+        self.assertEqual(status, 200, unblocked)
+        self.assertEqual(unblocked["operator_organization_id"], org1["id"])
 
     # -- deletes ------------------------------------------------------------
     def test_v2_deletes_canonical(self):
@@ -530,6 +526,8 @@ class V2SetupContractTest(unittest.TestCase):
             {"name": "R Arena", "league_id": program["id"],
              "organization_id": org["id"]})
         self.assertEqual(status, 200, game_venue)
+        self._req(c, "POST", f"/api/v2/setup/seasons/{season['id']}/venue-access",
+                  {"venue_id": game_venue["id"]})
         rink = self._v2(c, "rink", {"venue_id": game_venue["id"], "name": "Rink 1"})
         slot = self._v2(c, "ice-slot",
                        {"rink_id": rink["id"],
@@ -770,6 +768,110 @@ class V2SetupContractTest(unittest.TestCase):
             c, "POST", f"/api/v2/setup/season/{season['id']}/delete", {})
         self.assertEqual(status, 200, season_deleted)
 
+    def test_v2_season_venue_access_cleanup_blocked_by_game_history(self):
+        """#257 review: a revoked access row can be the ONLY explicit record
+        of why a Game's ice was allowed at this Venue for this Season, so
+        POST .../season-venue-access/{id}/delete must never purge it out
+        from under a draft, committed, cancelled, or published Game — real
+        HTTP end to end, mirroring #251's own game-history guard on
+        delete_season_team_registration."""
+        c = self._admin()
+        org = self._v2(c, "organization", {"name": "SVGH Org", "short_name": "SO"})
+        program = self._v2(c, "program",
+                          {"name": "SVGH Prog", "operator_organization_id": org["id"]})
+        season = self._v2(c, "season",
+                         {"program_id": program["id"], "name": "SVGH Season"})
+        league = self._v2(c, "league",
+                         {"season_id": season["id"], "name": "SVGH League"})
+        division = self._v2(c, "division",
+                           {"league_id": league["id"], "name": "SVGH Division"})
+        venue = self._v2(c, "venue",
+                        {"name": "SVGH Venue", "organization_id": org["id"]})
+        rink = self._v2(c, "rink", {"venue_id": venue["id"], "name": "R"})
+        club = self._v2(c, "club", {"name": "SVGH Club"})
+        home = self._v2(c, "team",
+                       {"program_id": program["id"], "club_id": club["id"], "name": "Home"})
+        away = self._v2(c, "team",
+                       {"program_id": program["id"], "club_id": club["id"], "name": "Away"})
+        for team in (home, away):
+            status, reg = self._req(
+                c, "POST", f"/api/v2/setup/seasons/{season['id']}/team-registrations",
+                {"team_id": team["id"], "league_id": league["id"], "division_id": division["id"]})
+            self.assertEqual(status, 200, reg)
+        slot = self._v2(c, "ice-slot", {
+            "rink_id": rink["id"], "start_time": "2027-03-01T18:00:00+00:00",
+            "end_time": "2027-03-01T19:30:00+00:00", "slot_type": "game"})
+
+        slot2 = self._v2(c, "ice-slot", {
+            "rink_id": rink["id"], "start_time": "2027-03-08T18:00:00+00:00",
+            "end_time": "2027-03-08T19:30:00+00:00", "slot_type": "game"})
+
+        status, granted = self._req(
+            c, "POST", f"/api/v2/setup/seasons/{season['id']}/venue-access",
+            {"venue_id": venue["id"]})
+        self.assertEqual(status, 200, granted)
+        status, game = self._req(c, "POST", "/api/v2/setup/game", {
+            "season_id": season["id"], "division_id": division["id"],
+            "league_id": league["id"], "home_team_id": home["id"],
+            "away_team_id": away["id"], "ice_slot_id": slot["id"]})
+        self.assertEqual(status, 200, game)
+        # The DRAFT game is created while access is still active — creating
+        # one AFTER revoke is correctly rejected by the same eligibility gate
+        # this whole PR added, so it must exist before revoke to exercise the
+        # cleanup-blocking behavior below.
+        status, draft = self._req(
+            c, "POST", "/api/scheduler/commit",
+            {"division_id": division["id"], "slot_ids": [slot2["id"]]})
+        self.assertEqual(status, 200, draft)
+        self.assertTrue(draft["created"], draft)
+        draft_game_id = draft["created"][0]["game_id"]
+        status, revoked = self._req(
+            c, "POST",
+            f"/api/v2/setup/season-venue-access/{granted['id']}/remove", {})
+        self.assertEqual(status, 200, revoked)
+
+        # -- blocked by the committed game: zero mutation ----------------
+        status, blocked = self._req(
+            c, "POST",
+            f"/api/v2/setup/season-venue-access/{granted['id']}/delete", {})
+        self.assertEqual(status, 409, blocked)
+        self.assertEqual(blocked["error"]["code"], "has_dependencies")
+        deps = {g["type"] for g in blocked["error"]["details"]["dependencies"]}
+        self.assertIn("game", deps)
+        status, still_there = self._req(
+            c, "GET", f"/api/v2/setup/seasons/{season['id']}/venue-access")
+        self.assertEqual([a["id"] for a in still_there["venue_access"]],
+                         [granted["id"]])
+        self.assertTrue(still_there["venue_access"][0]["active"] is False)
+
+        # -- cancelling the game does NOT clear the block: cancelled games
+        #    remain permanent record, same as #251's own registration guard.
+        status, cancelled = self._req(
+            c, "POST", f"/api/games/{game['id']}/cancel", {})
+        self.assertEqual(status, 200, cancelled)
+        status, still_blocked = self._req(
+            c, "POST",
+            f"/api/v2/setup/season-venue-access/{granted['id']}/delete", {})
+        self.assertEqual(status, 409, still_blocked)
+        self.assertEqual(still_blocked["error"]["code"], "has_dependencies")
+
+        # -- the DRAFT game still blocks cleanup too, and deleting it (its
+        #    own supported removal path) is what finally clears the way.
+        status, still_blocked2 = self._req(
+            c, "POST",
+            f"/api/v2/setup/season-venue-access/{granted['id']}/delete", {})
+        self.assertEqual(status, 409, still_blocked2)
+        status, draft_deleted = self._req(
+            c, "POST", f"/api/v2/setup/game/{draft_game_id}/delete", {})
+        self.assertEqual(status, 200, draft_deleted)
+
+        # The cancelled (but permanent) game still blocks — cleanup only
+        # succeeds once every Game referencing this Venue/Season is gone.
+        status, still_blocked3 = self._req(
+            c, "POST",
+            f"/api/v2/setup/season-venue-access/{granted['id']}/delete", {})
+        self.assertEqual(status, 409, still_blocked3)
+
     # -- canonical validation: League required, Division optional -----------
     def test_v2_division_requires_league(self):
         c = self._admin()
@@ -863,13 +965,11 @@ class V2SetupContractTest(unittest.TestCase):
         team_b = self._v2(c, "team",
                         {"program_id": program["id"], "club_id": club["id"],
                          "name": "B"})
-        # Venue must be linked to the program for the game ice to be schedulable
-        # (the league-ice isolation guard). The v2 venue route omits league_id,
-        # so use the v1 venue create for the owner+program link this test needs.
-        status, venue = self._req(c, "POST", "/api/setup/venue",
-                                  {"name": "V", "league_id": program["id"],
-                                   "organization_id": org["id"]})
-        self.assertEqual(status, 200, venue)
+        # The venue needs active SeasonVenueAccess for this Season for the
+        # game ice to be schedulable (#233 Slice E).
+        venue = self._v2(c, "venue", {"name": "V", "organization_id": org["id"]})
+        self._req(c, "POST", f"/api/v2/setup/seasons/{season['id']}/venue-access",
+                  {"venue_id": venue["id"]})
         rink = self._v2(c, "rink", {"venue_id": venue["id"], "name": "R"})
         slot = self._v2(c, "ice-slot",
                        {"rink_id": rink["id"],

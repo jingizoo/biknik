@@ -31,6 +31,7 @@ class ResultsTest(unittest.TestCase):
         for _t in (self.lions, self.falcons, self.bears):
             self.svc.register_team_for_season(self.season.id, _t.id, self.div.id)
         venue = self.svc.create_venue("Arena", league_id=league.id)
+        self.svc.grant_season_venue_access(self.season.id, venue.id)
         self.rink = self.svc.create_rink(venue.id, "Rink 1")
 
     def _game(self, home, away, h=18):

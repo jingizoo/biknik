@@ -30,6 +30,7 @@ def main() -> None:
     api.register_team_for_season(season["id"], away["id"], division["id"], actor_id=actor)
 
     venue = api.create_venue("Ice Palace", actor_id=actor)
+    api.grant_season_venue_access(season["id"], venue["id"], actor_id=actor)
     rink = api.create_rink(venue["id"], "Rink 2", actor_id=actor)
     slot = api.create_ice_slot(
         rink["id"], "2026-09-05T18:30:00+00:00", "2026-09-05T20:00:00+00:00",

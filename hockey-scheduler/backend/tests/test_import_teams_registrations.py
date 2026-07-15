@@ -148,6 +148,7 @@ class ImportConvergenceContract:
         season = self._by_ref(self.store.all_seasons(), "FALL26")
         diva = self._by_ref(self.store.all_divisions(), "DIVA")
         venue = self.api.create_venue("Ice", league_id=league.id)
+        self.api.grant_season_venue_access(season.id, venue["id"])
         rink = self.api.create_rink(venue["id"], "R1")
         slot = self.api.create_ice_slot(
             rink["id"], "2026-11-01T18:00:00+00:00", "2026-11-01T20:00:00+00:00")
@@ -164,8 +165,9 @@ class ImportConvergenceContract:
         league = self._by_ref(self.store.all_programs(), "OVER55")
         season = self._by_ref(self.store.all_seasons(), "FALL26")
         diva = self._by_ref(self.store.all_divisions(), "DIVA")
-        rink = self.api.create_rink(
-            self.api.create_venue("Ice", league_id=league.id)["id"], "R1")
+        venue = self.api.create_venue("Ice", league_id=league.id)
+        self.api.grant_season_venue_access(season.id, venue["id"])
+        rink = self.api.create_rink(venue["id"], "R1")
         slot = self.api.create_ice_slot(
             rink["id"], "2026-11-01T18:00:00+00:00", "2026-11-01T20:00:00+00:00")
         game = self.api.create_game(

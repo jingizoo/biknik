@@ -240,9 +240,9 @@ class ImportRinksIceSlotsCommitServiceContract:
 
         league = self.setup.create_program("Test League", actor_id="admin")
         venue = self.store.get_venue(self._rink("R1").venue_id)
-        self.setup.assign_venue_league(venue.id, league.id, actor_id="admin")
         season = self.setup.create_season(
             league.id, "2026 Season", actor_id="admin")
+        self.setup.grant_season_venue_access(season.id, venue.id, actor_id="admin")
         division = self.setup.create_division(
             season.id, "U16", actor_id="admin")
         club = self.setup.create_club("Test Club", actor_id="admin")
@@ -282,9 +282,9 @@ class ImportRinksIceSlotsCommitServiceContract:
 
         league = self.setup.create_program("Test League", actor_id="admin")
         venue = self.store.get_venue(self._rink("R1").venue_id)
-        self.setup.assign_venue_league(venue.id, league.id, actor_id="admin")
         season = self.setup.create_season(
             league.id, "2026 Season", actor_id="admin")
+        self.setup.grant_season_venue_access(season.id, venue.id, actor_id="admin")
         division = self.setup.create_division(
             season.id, "U16", actor_id="admin")
         club = self.setup.create_club("Test Club", actor_id="admin")

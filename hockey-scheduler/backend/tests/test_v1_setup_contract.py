@@ -213,6 +213,10 @@ class V1SetupContractTest(unittest.TestCase):
                              "start_time": "2026-09-01T18:30:00+00:00",
                              "end_time": "2026-09-01T20:00:00+00:00",
                              "slot_type": "game"})
+        # Game ice eligibility (#233 Slice E) is season-based; grant the
+        # venue access via the v2-only route (no v1 equivalent exists).
+        self._req(c, "POST", f"/api/v2/setup/seasons/{season['id']}/venue-access",
+                  {"venue_id": venue["id"]})
         return league, season, division, team_a, team_b, slot
 
     def test_v1_registration_response_omits_league_id(self):
@@ -349,6 +353,7 @@ class V1FacadeIsCanonicalTest(unittest.TestCase):
         team_b = api.create_team(club["id"], division["id"], "B", actor_id="admin",
                                  program_id=prog["id"])
         venue = api.create_venue("V", league_id=prog["id"], actor_id="admin")
+        api.grant_season_venue_access(season["id"], venue["id"], actor_id="admin")
         rink = api.create_rink(venue["id"], "R", actor_id="admin")
         slot = api.create_ice_slot(rink["id"], "2026-09-01T18:30:00+00:00",
                                    "2026-09-01T20:00:00+00:00", actor_id="admin")

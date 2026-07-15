@@ -56,6 +56,7 @@ let dashSubQueue = null;            // substitute-candidates for the coach dashb
 let playersList = [];               // [{id,name,team_id,position,jersey_number,...}] for Setup (#114)
 let leagueTeams = {};               // program_id -> [{id,name,program_id}] permanent members (#180/#233 v2)
 let seasonRegs = {};                // season_id -> [{id,team_id,league_id,division_id,active}] registrations (#180/#233 v2)
+let seasonVenueAccess = {};         // season_id -> [{id,season_id,venue_id,active}] (#233 Slice E)
 let leagueDivisions = {};           // league_id -> [{id,name,...}] — cascade data for the League→Division
                                      // selects in Season participation / Rollover (#233 Slice B2b), populated
                                      // each render from hv and read by the onchange handlers that rescope a
@@ -646,18 +647,13 @@ const SETUP_ENTITIES = [
       { id: "f-org-short", label: "Short name (optional)", placeholder: "e.g. Summit" }] },
   { key: "venue", title: "Venues", icon: "🏟️", noun: "venue", perm: "manage_arena",
     // A venue is owned by an organization (#233 canonical) — show its facility
-    // owner. The venue↔program game-ice link is a separate temporary bridge
-    // control on the Facility tree (removed in Slice E).
+    // owner. Which Seasons may use a venue's ice is a separate, independent
+    // grant (SeasonVenueAccess, #233 Slice E) managed under each Season.
     list: (ov) => (ov.venues || []).map((v) => ({
       title: v.name,
       sub: [v.organization_name].filter(Boolean).join(" · ") || "Unassigned" })),
     // No Program field on this form (#233 B2a review r1): canonical Venue
-    // create is org-owned only. The temporary venue→program game-ice
-    // compatibility bridge is managed exclusively post-creation via the
-    // Facility tree's labelled "⇄ Move" control (POST /api/setup/venue/
-    // {id}/assign-league) — a create-time field couldn't apply it anyway (no
-    // venue id yet), and one that silently discarded a selection was
-    // actively misleading.
+    // create is org-owned only.
     fields: [
       { id: "f-venue", label: "Venue name", required: true, placeholder: "e.g. South Arena" },
       { id: "f-venue-org", label: "Facility owner (organization)", type: "select", ofNoun: "organization", ofNounDisplay: "facility owner",
@@ -807,24 +803,19 @@ const REASSIGN = {
     perm: "manage_setup", noun: "team", nullable: false, risky: true,
     warn: "Moving a player changes which team's roster they belong to.",
     options: (ov) => (ov.teams || []).map((t) => [t.id, t.name]) },
-  // Cross-domain program↔facility moves (#173) — both MANAGE_SETUP.
+  // Program↔facility owner move (#173) — MANAGE_SETUP. Independent of any
+  // Venue (#233 Slice E): a program's operating organization is free to
+  // change regardless of Venue state.
   "league:organization": {
-    perm: "manage_setup", noun: "facility owner", displayNoun: "operating organization", nullable: true, risky: true,
-    warn: "Legacy v1 blocks changing a program's operating organization while venues are still attached to it — unassign its venues first. This coupling is a temporary v1 rule, not the target model; it goes away when Season↔Venue access lands in Slice E.",
+    perm: "manage_setup", noun: "facility owner", displayNoun: "operating organization", nullable: true, risky: false,
     options: (ov) => (ov.organizations || []).map((o) => [o.id, o.name]) },
-  "venue:league": {
-    perm: "manage_setup", noun: "league", displayNoun: "program", nullable: true, risky: true,
-    warn: "Legacy v1 only: linking a venue to a program derives the venue's facility owner from that program's operating organization. This is a temporary v1 coupling — the venue↔program link is removed when Season↔Venue access lands in Slice E.",
-    options: (ov) => (ov.leagues || []).map(
-      (l) => [l.id, `${nameById(ov.organizations, l.organization_id) || "No operating org"} · ${l.name}`]) },
 };
 // v2 route + canonical body-key mapping for the reassignments moved to v2
 // (#233 B2a review r1): frontend kind/parent tokens stay frozen (league =
 // Program, level = League), but the v2 request needs canonical route
-// segments and body keys. venue:league (the temporary game-ice
-// compatibility bridge) is the one deliberate v1 holdout — Slice E removes
-// it along with the bridge itself; every other structural entity visible in
-// B2a moves here.
+// segments and body keys. The venue:league temporary game-ice compatibility
+// bridge (the one deliberate v1 holdout) was removed in #233 Slice E along
+// with its backend route; every remaining structural entity here moves to v2.
 const REASSIGN_V2 = {
   "league:organization": { kind: "program", parent: "organization", bodyKey: "operator_organization_id" },
   "division:level": { kind: "division", parent: "league", bodyKey: "league_id" },
@@ -912,6 +903,7 @@ const DEL_NOUN = {
   level: "league", division: "division", club: "club", team: "team",
   venue: "venue", rink: "rink", "ice-slot": "ice slot", game: "game",
   "season-team-registration": "registration",
+  "season-venue-access": "venue access",
 };
 // Higher-level records (#215) demand a typed confirmation — the operator must
 // type the record's name or DELETE before the destructive button enables.
@@ -928,6 +920,7 @@ const DEL_ROUTE_V2 = {
   club: "club", team: "team", venue: "venue", rink: "rink", "ice-slot": "ice-slot",
   organization: "organization", game: "game",
   "season-team-registration": "season-team-registration",
+  "season-venue-access": "season-venue-access",
 };
 
 function renderModal() {
@@ -1180,18 +1173,10 @@ function renderSetupHierarchy(sv, hv, ov) {
   });
 
   // -- Facility: Organization owns Venue → Rink (canonical #233 — venues are
-  //    org-owned). The venue→program game-ice link is a separate temporary
-  //    compatibility bridge on each venue, removed in Slice E. --
+  //    org-owned, independent of any competition Program). Which Seasons may
+  //    use a Venue's ice is managed under each Season (SeasonVenueAccess,
+  //    #233 Slice E), not here on the facility tree. --
   const rinksByVenue = groupBy(sv.rinks, "venue_id");
-  // The canonical sv.venues omits league_id (org-owned only), but the bridge
-  // control still needs the venue's CURRENT legacy Program link so the "⇄
-  // Move" panel preselects it instead of always looking unset (#233 B2a
-  // review r1). ov and sv share the same id values for the same records, so
-  // this lookup by id is safe even though the two payloads' venue shapes
-  // differ.
-  const ovVenueById = {};
-  (ov.venues || []).forEach((v) => { ovVenueById[v.id] = v; });
-  const ovProgramName = (id) => (((ov.leagues || []).find((l) => l.id === id)) || {}).name || "";
   const venueNode = (v) => {
     const rinks = rinksByVenue[v.id] || [];
     const badge = rinks.length
@@ -1199,16 +1184,9 @@ function renderSetupHierarchy(sv, hv, ov) {
     const rinkRows = rinks.map((r) =>
       `<div class="tn-leaf"><span class="tn-label">⛸️ ${esc(r.name)}</span>${reassignBtn("rink", "venue", r, r.venue_id)}${delBtn("rink", r.id, r.name)}</div>`).join("")
       || `<div class="tn-empty">No rinks yet. Add a rink so this venue can host games.</div>`;
-    // venue:organization is the canonical owner move; venue:league is the
-    // temporary game-ice compatibility bridge, preselected from the venue's
-    // current legacy Program link (looked up via ov, never sv).
-    const bridgeLeagueId = (ovVenueById[v.id] || {}).league_id || "";
-    const bridgeState = bridgeLeagueId
-      ? `<span class="tn-meta">Bridged to: ${esc(ovProgramName(bridgeLeagueId))}</span>`
-      : `<span class="tn-meta">No bridge set</span>`;
     return `<details class="tn" open><summary class="tn-sum">
         <span class="tn-label">🏟️ ${esc(v.name)}</span>
-        <span class="tn-meta">${rinks.length} rink${rinks.length === 1 ? "" : "s"}</span>${badge}${reassignBtn("venue", "organization", v, v.organization_id)}${reassignBtn("venue", "league", v, bridgeLeagueId)}${bridgeState}<span class="tn-meta">Temporary game-ice compatibility — removed in Slice E</span>${delBtn("venue", v.id, v.name)}</summary>
+        <span class="tn-meta">${rinks.length} rink${rinks.length === 1 ? "" : "s"}</span>${badge}${reassignBtn("venue", "organization", v, v.organization_id)}${delBtn("venue", v.id, v.name)}</summary>
       <div class="tn-children">${rinkRows}${treeAdd("rink", "Add rink to " + v.name, "f-rink-venue", v.id)}</div>
     </details>`;
   };
@@ -1232,7 +1210,7 @@ function renderSetupHierarchy(sv, hv, ov) {
         <span class="tn-meta">${orphanVenues.length} venue${orphanVenues.length === 1 ? "" : "s"}</span></summary>
       <div class="tn-children">${orphanVenues.map(venueNode).join("")}</div>
     </details>` : "";
-  const facility = `<section class="tree-panel">
+  const facility = `<section class="tree-panel" id="facility-tree">
     <div class="tree-head"><span class="tree-title">🏟️ Facility</span>
       <span class="tree-sub">Facility owner → Venue → Rink</span></div>
     ${orgSections}${orphanVenueSection}
@@ -1393,19 +1371,6 @@ function renderSetupHierarchy(sv, hv, ov) {
   const noClubTeams = (ov.teams || []).filter((t) => !t.club_id && !t.club_name);
   const orphanPlayers = canSeePlayers
     ? playersList.filter((p) => !p.team_id || !teamIds.has(p.team_id)) : [];
-  // League↔facility gaps (#173): venues without a league, and venues whose
-  // owner disagrees with their league's owner. A Program with no operating
-  // organization is NOT one of these gaps (#233 B2b review r3) — the
-  // operator is optional on the canonical model (B2a/ADR 0001) and never a
-  // scheduling blocker, so it must never appear under this "can't be
-  // scheduled until assigned" panel; the Records subtitle ("No operating
-  // org") and the onboarding wizard's own optional check already surface it
-  // informationally.
-  const leagueOwner = {};
-  (ov.leagues || []).forEach((l) => { leagueOwner[l.id] = l.organization_id || null; });
-  const noLeagueVenues = (ov.venues || []).filter((v) => !v.league_id);
-  const ownerMismatchVenues = (ov.venues || []).filter(
-    (v) => v.league_id && (leagueOwner[v.league_id] || null) !== (v.organization_id || null));
   // Each orphan row carries the same "⇄ Move" control (labelled by its fix)
   // so an operator can assign a parent inline — the primary fix surface (#166).
   const naRow = (label, rows, fix) => rows.length
@@ -1461,11 +1426,7 @@ function renderSetupHierarchy(sv, hv, ov) {
   const regIssueRows = seasonRegIssues.length
     ? `<div class="na-group"><div class="na-group-label">Season registrations needing attention (${seasonRegIssues.length})</div>${
         seasonRegIssues.map(regIssueRow).join("")}</div>` : "";
-  const naBody = naRow("Venues without a legacy program grouping", noLeagueVenues,
-            (v) => reassignBtn("venue", "league", v, v.league_id))
-    + naRow("Venue facility owner ≠ program operating organization (legacy v1 link)", ownerMismatchVenues,
-            (v) => reassignBtn("venue", "league", v, v.league_id))
-    + naRow("Rinks without a venue", orphanRinks,
+  const naBody = naRow("Rinks without a venue", orphanRinks,
             (r) => reassignBtn("rink", "venue", r, r.venue_id))
     + naRow("Teams without a club", noClubTeams,
             (t) => reassignBtn("team", "club", t, t.club_id))
@@ -1476,7 +1437,7 @@ function renderSetupHierarchy(sv, hv, ov) {
     ? `<section class="tree-panel na"><div class="tree-head"><span class="tree-title">⚠ Needs assignment</span></div>
         <div class="tree-note">These records can't be scheduled until they're assigned.</div>${naBody}</section>` : "";
 
-  return `${reassignPanelHtml(ov)}<div class="setup-trees">${facility}${permanentTeams}${competition}${renderSeasonParticipation(hv, ov)}${renderRollover(hv, ov)}${roster}${needsAssignment}</div>`;
+  return `${reassignPanelHtml(ov)}<div class="setup-trees">${facility}${permanentTeams}${competition}${renderSeasonParticipation(hv, ov, sv)}${renderRollover(hv, ov)}${roster}${needsAssignment}</div>`;
 }
 
 // Season participation (#180, cut to v2 canonical #233 Slice B2b): permanent
@@ -1489,10 +1450,11 @@ function renderSetupHierarchy(sv, hv, ov) {
 // (permanent roster) and seasonRegs (registration rows, each carrying a
 // league_id) are the dedicated v2 reads loaded in render(); hv supplies the
 // Program→Season→League→Division shape and each league's current teams.
-function renderSeasonParticipation(hv, ov) {
+function renderSeasonParticipation(hv, ov, sv) {
   if (!hasPerm("manage_setup")) return "";
   const programs = (hv.programs || []).filter((p) => (p.seasons || []).length);
   if (!programs.length) return "";
+  const allVenues = (sv && sv.venues) || [];
 
   const programBlocks = programs.map((program) => {
     const permanentTeams = leagueTeams[program.id] || [];
@@ -1547,6 +1509,55 @@ function renderSeasonParticipation(hv, ov) {
           <div class="tn-children">${inactiveRows}</div></details>`
         : "";
 
+      // Allowed venues (#233 Slice E): which Venues this Season may schedule
+      // game ice on, via SeasonVenueAccess — independent of any Venue-Program
+      // ownership. A Venue may be granted to several Seasons/Programs at
+      // once, and a Season may use several Venues.
+      const venueNameById = {};
+      allVenues.forEach((v) => { venueNameById[v.id] = v.name; });
+      const grantedAccess = (seasonVenueAccess[s.id] || []).filter((a) => a.active);
+      const grantedVenueIds = new Set(grantedAccess.map((a) => a.venue_id));
+      const venueAccessRows = grantedAccess.map((a) => `<div class="tn-leaf reg-row">
+          <span class="tn-label">🏟️ ${esc(venueNameById[a.venue_id] || a.venue_id)}</span>
+          <button class="icon-btn danger" data-va-revoke="${esc(a.id)}"
+            title="Revoke venue access" aria-label="Revoke ${esc(venueNameById[a.venue_id] || a.venue_id)} from ${esc(s.name)}">${ICONS.circleMinus}</button></div>`).join("")
+        || `<div class="tn-empty">No venues allowed for this season yet — games can't be scheduled until one is added.</div>`;
+      const availableVenues = allVenues.filter((v) => !grantedVenueIds.has(v.id));
+      const venueAddCtl = availableVenues.length
+        ? `<div class="tn-leaf reg-add">
+            <select id="va-add-${esc(s.id)}"><option value="">Add a venue…</option>${
+              availableVenues.map((v) => opt(v.id, v.name)).join("")}</select>
+            <button class="act primary" data-va-add="${esc(s.id)}">Allow</button></div>`
+        : (allVenues.length
+            ? `<div class="tn-empty">Every venue is already allowed for this season.</div>`
+            : `<div class="tn-empty">Create a venue on the Facility tree first, then allow it here.</div>`);
+      const venueAccessSection = `<details class="tn" open><summary class="tn-sum">
+          <span class="tn-label">🏟️ Allowed venues</span>
+          <span class="tn-meta">${grantedAccess.length} venue${grantedAccess.length === 1 ? "" : "s"}</span></summary>
+        <div class="tn-children">${venueAccessRows}${venueAddCtl}</div></details>`;
+
+      // Revoked venue access (#233 Slice E, mirrors #251's inactive
+      // registrations exactly): revoke only deactivates a row, preserving
+      // history — but delete_season()/delete_venue() block on a matching
+      // access row REGARDLESS of active status, so a revoked row still needs
+      // this explicit, audited permanent-cleanup path before the Season or
+      // Venue it references can ever be deleted.
+      const revokedAccess = (seasonVenueAccess[s.id] || []).filter((a) => !a.active);
+      const revokedAccessRows = revokedAccess.map((a) => {
+        const venueName = venueNameById[a.venue_id] || a.venue_id;
+        return `<div class="tn-leaf reg-row inactive-reg">
+          <span class="tn-label">🏟️ ${esc(venueName)}</span>
+          <span class="tn-meta">revoked · <code>${esc(a.id)}</code></span>
+          ${delBtn("season-venue-access", a.id, `${venueName} access`,
+            "Permanently remove this revoked venue access")}</div>`;
+      }).join("");
+      const revokedAccessSection = revokedAccess.length
+        ? `<details class="tn" open><summary class="tn-sum">
+            <span class="tn-label">🗑️ Revoked venue access</span>
+            <span class="tn-meta">${revokedAccess.length} row${revokedAccess.length === 1 ? "" : "s"}</span></summary>
+          <div class="tn-children">${revokedAccessRows}</div></details>`
+        : "";
+
       const leagueSections = leagues.map((lv) => {
         const divs = lv.divisions || [];
         const divOptsFor = (selId) => divs.map((d) => opt(d.id, d.name, d.id === selId)).join("");
@@ -1599,7 +1610,7 @@ function renderSeasonParticipation(hv, ov) {
           <span class="tn-meta">${leagues.length} league${leagues.length === 1 ? "" : "s"} · ${
             teamCount} team${teamCount === 1 ? "" : "s"}</span>
           ${delBtn("season", s.id, s.name)}</summary>
-        <div class="tn-children">${leagueBlocks}${inactiveSection}</div></details>`;
+        <div class="tn-children">${leagueBlocks}${venueAccessSection}${revokedAccessSection}${inactiveSection}</div></details>`;
     }).join("");
 
     // Permanent members not registered for ANY season this program — surfaced
@@ -4554,13 +4565,17 @@ async function render() {
       // hv (already fetched above) rather than ov.leagues/ov.seasons so the
       // requested ids are consistently canonical; hv is only populated under
       // manage_setup, which already gates this whole block.
-      leagueTeams = {}; seasonRegs = {}; leagueDivisions = {};
+      leagueTeams = {}; seasonRegs = {}; leagueDivisions = {}; seasonVenueAccess = {};
       for (const program of (hv.programs || [])) {
         const r = await getJSON(`/api/v2/setup/programs/${program.id}/teams`);
         leagueTeams[program.id] = (r && r.teams) || [];
         for (const s of (program.seasons || [])) {
           const rr = await getJSON(`/api/v2/setup/seasons/${s.id}/team-registrations`);
           seasonRegs[s.id] = (rr && rr.registrations) || [];
+          // Allowed venues (#233 Slice E): which Venues this Season may use
+          // for game ice, independent of any Venue-Program ownership.
+          const va = await getJSON(`/api/v2/setup/seasons/${s.id}/venue-access`);
+          seasonVenueAccess[s.id] = (va && va.venue_access) || [];
         }
       }
     }
@@ -4902,6 +4917,23 @@ async function render() {
     toast = "";
     const res = await post(`/api/v2/setup/season-team-registration/${b.dataset.regRemove}/remove`, {});
     if (res && !res.error) toast = "Team removed from the season.";
+    await render();
+  });
+  // Allowed venues (#233 Slice E): grant/revoke a Venue's SeasonVenueAccess
+  // for a Season, independent of any Venue-Program ownership.
+  c.querySelectorAll("[data-va-add]").forEach((b) => b.onclick = async () => {
+    const sid = b.dataset.vaAdd;
+    const sel = c.querySelector(`#va-add-${sid}`);
+    if (!sel || !sel.value) { toast = "Choose a venue to allow."; toastIsError = true; return render(); }
+    toast = "";
+    const res = await post(`/api/v2/setup/seasons/${sid}/venue-access`, { venue_id: sel.value });
+    if (res && !res.error) toast = "Venue allowed for this season.";
+    await render();
+  });
+  c.querySelectorAll("[data-va-revoke]").forEach((b) => b.onclick = async () => {
+    toast = "";
+    const res = await post(`/api/v2/setup/season-venue-access/${b.dataset.vaRevoke}/remove`, {});
+    if (res && !res.error) toast = "Venue access revoked.";
     await render();
   });
   // Needs-assignment repair row (#233 B2b review): an invalid season

@@ -38,6 +38,7 @@ class V2OnboardingStatusTest(unittest.TestCase):
         api.create_ice_slot(rink["id"], "2026-09-01T18:30:00+00:00",
                             "2026-09-01T20:00:00+00:00", actor_id="admin")
         season = api.create_season(program["id"], "Fall", actor_id="admin")
+        api.grant_season_venue_access(season["id"], venue["id"], actor_id="admin")
         self._club = api.create_club("C", actor_id="admin")
         return org, program, season
 
@@ -83,8 +84,8 @@ class V2OnboardingStatusTest(unittest.TestCase):
         club = api.create_club("C", actor_id="admin")
         team = api.create_team(club["id"], None, "T", actor_id="admin",
                                program_id=program["id"])
-        # No venue linked to the program at all here — that's a SEPARATE
-        # blocker (no_venue_assigned_to_program) this test doesn't need to
+        # No venue granted season access at all here — that's a SEPARATE
+        # blocker (no_venue_access_granted) this test doesn't need to
         # clear; it only proves the operator gap itself never blocks
         # readiness (registration is set up so the rest of the chain is
         # otherwise valid, isolating the assertion to the operator gap).

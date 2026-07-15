@@ -22,6 +22,7 @@ class SetupFacadeTest(unittest.TestCase):
         self.api.register_team_for_season(season["id"], home["id"], division["id"])
         self.api.register_team_for_season(season["id"], away["id"], division["id"])
         venue = self.api.create_venue("Ice Palace", league_id=league["id"])
+        self.api.grant_season_venue_access(season["id"], venue["id"])
         rink = self.api.create_rink(venue["id"], "Rink 2")
         slot = self.api.create_ice_slot(
             rink["id"], "2026-09-01T18:30:00+00:00", "2026-09-01T20:00:00+00:00"
@@ -206,20 +207,6 @@ class SetupValidationWordingTest(unittest.TestCase):
         r = self.api.create_division(season["id"], "D", league_id="nope")
         self.assertEqual(self._msg(r), "League nope not found.")
 
-    def test_venue_program_owner_mismatch_uses_role_nouns_and_v1_qualifier(self):
-        org1 = self.api.create_organization("O1")
-        org2 = self.api.create_organization("O2")
-        league = self.api.create_program("P", operator_organization_id=org1["id"])
-        venue = self.api.create_venue("V", organization_id=org2["id"])
-        r = self.api.assign_venue_league(venue["id"], league["id"])
-        msg = self._msg(r)
-        self.assertIn("facility owner", msg)
-        self.assertIn("operating organization", msg)
-        # Presented as a temporary v1 constraint, not the target ownership model.
-        self.assertIn("Current v1 compatibility", msg)
-        self.assertIn("Slice E", msg)
-        self.assertNotRegex(msg, r"(?i)\bleague\b")
-
     def test_create_venue_owner_mismatch_is_v1_qualified(self):
         org1 = self.api.create_organization("O1")
         org2 = self.api.create_organization("O2")
@@ -231,16 +218,15 @@ class SetupValidationWordingTest(unittest.TestCase):
         self.assertIn("facility owner", msg)
         self.assertIn("operating organization", msg)
 
-    def test_change_operating_org_blocked_while_venue_attached_is_v1_qualified(self):
+    def test_change_operating_org_unconstrained_by_venue(self):
+        # #233 Slice E: an operator organization change is independent of any
+        # attached Venue — the legacy assign_venue_league bridge guard is gone.
         org1 = self.api.create_organization("O1")
         org2 = self.api.create_organization("O2")
         league = self.api.create_program("P", operator_organization_id=org1["id"])
-        self.api.create_venue("V", league_id=league["id"])  # attaches a venue
+        self.api.create_venue("V", league_id=league["id"])
         r = self.api.assign_program_organization(league["id"], org2["id"])
-        msg = self._msg(r)
-        self.assertIn("Current v1 compatibility", msg)
-        self.assertIn("operating organization", msg)
-        self.assertIn("venue", msg)
+        self.assertEqual(r["operator_organization_id"], org2["id"])
 
     def test_rollover_across_programs_says_programs(self):
         p1 = self.api.create_program("P1")

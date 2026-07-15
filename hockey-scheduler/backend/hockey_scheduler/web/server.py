@@ -1780,9 +1780,6 @@ class Handler(BaseHTTPRequestHandler):
         if combo == ("league", "organization"):
             return self._send_api(_v1.program_to_v1(api.assign_program_organization(
                 record_id, b.get("organization_id") or None, actor_id)))
-        if combo == ("venue", "league"):
-            return self._send_api(api.assign_venue_league(
-                record_id, b.get("league_id") or None, actor_id))
         if combo == ("venue", "organization"):
             return self._send_api(api.assign_venue_organization(
                 record_id, b.get("organization_id") or None, actor_id))

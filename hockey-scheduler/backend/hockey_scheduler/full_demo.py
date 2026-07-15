@@ -118,6 +118,9 @@ def build_full_demo_store(store=None) -> Tuple[InMemoryStore, str, dict]:
     # Both demo venues belong to the league (and, through it, the owner above).
     venue = setup.create_venue("Nord Arena", address="Alpine Way 1",
                                league_id=league.id, actor_id=admin)
+    # #233 Slice E: game/ice eligibility is granted per Season via
+    # SeasonVenueAccess, independent of the legacy Venue->Program bridge above.
+    setup.grant_season_venue_access(season.id, venue.id, actor_id=admin)
     main_rink = setup.create_rink(venue.id, "Main Rink", actor_id=admin)
     setup.create_rink(venue.id, "Training Rink", actor_id=admin)
 
@@ -308,6 +311,7 @@ def _seed_pilot_scale(setup, roster, admin, season, d_u16, d_u18, d_sen,
     # 3 rinks total across 2 venues.
     venue2 = setup.create_venue("Lakeside Ice Center", address="2 Harbor Rd",
                                 league_id=league.id, actor_id=admin)
+    setup.grant_season_venue_access(season.id, venue2.id, actor_id=admin)
     lakeside_rink = setup.create_rink(venue2.id, "Lakeside Rink", actor_id=admin)
     training_rink = next(r for r in store.all_rinks() if r.name == "Training Rink")
     rinks = [main_rink, training_rink, lakeside_rink]

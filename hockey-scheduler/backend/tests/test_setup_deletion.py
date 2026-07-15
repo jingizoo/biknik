@@ -60,9 +60,13 @@ class DeletionContract:
             season_id, team_id, division_id, actor_id=self.ACTOR,
             league_id=league_id)["id"]
 
-    def _venue(self, league_id=None, name="Venue"):
-        return self.api.create_venue(
+    def _venue(self, league_id=None, name="Venue", season_id=None):
+        vid = self.api.create_venue(
             name, league_id=league_id, actor_id=self.ACTOR)["id"]
+        if season_id:
+            self.api.grant_season_venue_access(
+                season_id, vid, actor_id=self.ACTOR)
+        return vid
 
     def _rink(self, venue_id, name="Rink"):
         return self.api.create_rink(venue_id, name, actor_id=self.ACTOR)["id"]
@@ -230,7 +234,7 @@ class DeletionContract:
         away = self._team(club, lg, "Away")
         home_reg = self._register(s, home, d)
         away_reg = self._register(s, away, d)
-        slot = self._slot(self._rink(self._venue(league_id=lg)))
+        slot = self._slot(self._rink(self._venue(league_id=lg, season_id=s)))
         game = self._game(s, d, home, away, slot)
         # unregister_team_from_season refuses to strand a team with a
         # scheduled game, so the only realistic path to "inactive
@@ -379,7 +383,7 @@ class DeletionContract:
         away = self._team(club, lg, "Away")
         home_reg = self._register_v2(s, home, d, level)
         away_reg = self._register_v2(s, away, d, level)
-        slot = self._slot(self._rink(self._venue(league_id=lg)))
+        slot = self._slot(self._rink(self._venue(league_id=lg, season_id=s)))
         game = self._game(s, d, home, away, slot)
         self._make_draft(game)
         # A draft game holds neither team's registration off "scheduled", so
@@ -403,7 +407,7 @@ class DeletionContract:
         away = self._team(club, lg, "Away")
         home_reg = self._register_v2(s, home, d, level)
         away_reg = self._register_v2(s, away, d, level)
-        slot = self._slot(self._rink(self._venue(league_id=lg)))
+        slot = self._slot(self._rink(self._venue(league_id=lg, season_id=s)))
         game = self._game(s, d, home, away, slot)
         self.api.cancel_game(game, actor_id=self.ACTOR)
         self.api.unregister_team_from_season(home_reg, actor_id=self.ACTOR)
@@ -430,7 +434,7 @@ class DeletionContract:
         away = self._team(club, lg, "Away")
         home_reg = self._register_v2(s, home, d, level)
         away_reg = self._register_v2(s, away, d, level)
-        slot = self._slot(self._rink(self._venue(league_id=lg)))
+        slot = self._slot(self._rink(self._venue(league_id=lg, season_id=s)))
         game = self._game(s, d, home, away, slot)
         stored_game = self.store.get_game(game)
         stored_game.published = True
@@ -622,7 +626,7 @@ class DeletionContract:
         away = self._team(club, lg, "Away")
         self._register(s, home, d)
         self._register(s, away, d)
-        v = self._venue(league_id=lg)
+        v = self._venue(league_id=lg, season_id=s)
         r = self._rink(v)
         slot = self._slot(r)
         self._game(s, d, home, away, slot)
@@ -640,7 +644,7 @@ class DeletionContract:
         away = self._team(club, lg, "Away")
         self._register(s, home, d)
         self._register(s, away, d)
-        slot = self._slot(self._rink(self._venue(league_id=lg)))
+        slot = self._slot(self._rink(self._venue(league_id=lg, season_id=s)))
         return self._game(s, d, home, away, slot)
 
     def _make_draft(self, gid):
@@ -791,7 +795,7 @@ class DeletionContract:
         away = self._team(club, lg, "Away")
         self._register(s, home, d)
         self._register(s, away, d)
-        slot = self._slot(self._rink(self._venue(league_id=lg)))
+        slot = self._slot(self._rink(self._venue(league_id=lg, season_id=s)))
         self._game(s, d, home, away, slot)
         blocked = self.api.delete_season(s, actor_id=self.ACTOR)
         deps = {g["type"] for g in blocked["error"]["details"]["dependencies"]}

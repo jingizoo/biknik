@@ -57,6 +57,7 @@ def universe():
     for _t in (home, away, other):
         svc.register_team_for_season(season.id, _t.id, div.id)
     venue = svc.create_venue("Arena", league_id=league.id)
+    svc.grant_season_venue_access(season.id, venue.id)
     rink = svc.create_rink(venue.id, "Rink 1")
     slot_a = svc.create_ice_slot(rink.id, dt(18, 30), dt(20))       # game lives here
     slot_b = svc.create_ice_slot(rink.id, dt(20, 30), dt(22))       # free target

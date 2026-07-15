@@ -86,6 +86,9 @@ async function checkViewport(browser, viewport) {
       const d1b = await post("/api/setup/division", { season_id: s1.id, level_id: lv1.id, name: "S1 Div Two" });
       const d2 = await post("/api/setup/division", { season_id: s2.id, level_id: lv2.id, name: "S2 Div One" });
       const venue = await post("/api/setup/venue", { name: "V", league_id: league.id });
+      // Game ice eligibility (#233 Slice E) requires the venue to hold active
+      // SeasonVenueAccess for the season the game is scheduled in.
+      await post(`/api/v2/setup/seasons/${s1.id}/venue-access`, { venue_id: venue.id });
       const rink = await post("/api/setup/rink", { venue_id: venue.id, name: "R" });
       const club = await post("/api/setup/club", { name: "Club" });
       // #180: create the permanent Team under its LEAGUE (no division); its

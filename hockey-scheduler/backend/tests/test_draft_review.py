@@ -20,7 +20,8 @@ from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
 from hockey_scheduler.api import ApiService
 from hockey_scheduler.domain import (
     Division, Game, IceSlot, IceSlotStatus, Official, Organization,
-    Program, Rink, Season, SeasonTeamRegistration, Team, Venue)
+    Program, Rink, Season, SeasonTeamRegistration, SeasonVenueAccess, Team,
+    Venue)
 from hockey_scheduler.store import InMemoryStore
 from hockey_scheduler.web import server as srv
 
@@ -35,6 +36,8 @@ def _seeded_api():
     s.add_division(Division(id="d", season_id="se", name="D1"))
     s.add_venue(Venue(id="v", name="Arena", organization_id="org",
                       league_id="league"))
+    s.add_season_venue_access(SeasonVenueAccess(
+        id="sva1", season_id="se", venue_id="v", active=True))
     s.add_rink(Rink(id="r1", venue_id="v", name="Main"))
     for i in range(4):
         s.add_team(Team(id=f"t{i}", name=f"T{i}", division="D1", division_id="d",

@@ -87,6 +87,9 @@ async function checkViewport(browser, viewport) {
       const dA = await post("/api/setup/division", { season_id: season.id, name: "Div A" });
       const dB = await post("/api/setup/division", { season_id: season.id, name: "Div B" });
       const venue = await post("/api/setup/venue", { name: "V", league_id: league.id });
+      // Game ice eligibility (#233 Slice E) requires the venue to hold active
+      // SeasonVenueAccess for the season the game is scheduled in.
+      await post(`/api/v2/setup/seasons/${season.id}/venue-access`, { venue_id: venue.id });
       const rink = await post("/api/setup/rink", { venue_id: venue.id, name: "R" });
       const club = await post("/api/setup/club", { name: "Roster Club" });
       // A bare club to delete from the Records view.
