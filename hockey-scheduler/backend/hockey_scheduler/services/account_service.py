@@ -8,6 +8,7 @@ official), so signing in as that account produces exactly the session the
 role/scope model already enforces.
 """
 
+import functools
 from datetime import datetime, timezone
 from typing import Callable, Optional
 
@@ -27,6 +28,15 @@ _INSTALLATION_STATE_ID = "primary"
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _transactional(fn):
+    """Wrap a mutating service method in a single store transaction."""
+    @functools.wraps(fn)
+    def wrapper(self, *args, **kwargs):
+        with self.store.transaction():
+            return fn(self, *args, **kwargs)
+    return wrapper
 
 
 class AccountService:
@@ -51,6 +61,7 @@ class AccountService:
         except ValueError:
             raise ValidationError(f"Unknown role '{role}'.")
 
+    @_transactional
     def create_account(self, username: str, password: str, role,
                        scope: Optional[dict] = None,
                        actor_id: Optional[str] = None,
@@ -66,13 +77,31 @@ class AccountService:
         if not password:
             raise ValidationError("A password is required.")
         role = self._parse_role(role)
+        scope = dict(scope or {})
+        # A role-scoped Player/Official reference must resolve to a real
+        # subject *at creation*, not only at reactivation (#232 review 7):
+        # without this, deleting a Player/Official and then creating a fresh
+        # account with the old id recreates the exact dangling live identity
+        # this issue set out to prevent. Checked — and the whole method
+        # transactional (#232 review 7) — before any store write, so a
+        # rejected creation writes neither an account nor an audit row.
+        official_id = scope.get("official_id")
+        if official_id and self.store.get_official(official_id) is None:
+            raise ValidationError(
+                "That official does not exist.",
+                {"reason": "scope_subject_missing", "official_id": official_id})
+        player_id = scope.get("player_id")
+        if player_id and self.store.get_player(player_id) is None:
+            raise ValidationError(
+                "That player does not exist.",
+                {"reason": "scope_subject_missing", "player_id": player_id})
         account = UserAccount(
             id=account_id or self.store.next_id("user"),
             username=username,
             password_hash=hash_password(password),
             role=role,
             created_at=self.clock(),
-            scope=dict(scope or {}),
+            scope=scope,
             active=True,
         )
         self.store.add_user_account(account)
@@ -144,6 +173,28 @@ class AccountService:
         account = self.store.get_user_account(account_id)
         if account is None:
             raise NotFoundError("User account not found.")
+        if active:
+            # Reactivating an account whose scoped subject was deleted while
+            # the account sat deactivated (#232 review) would resurrect a
+            # login pointing at a nonexistent Official/Player — the exact
+            # dangling-identity hole scoping delete_official/delete_player's
+            # account blocker to active-only accounts opened up. Refuse
+            # until the account is rebound to a valid subject.
+            scope = account.scope or {}
+            official_id = scope.get("official_id")
+            if official_id and self.store.get_official(official_id) is None:
+                raise ValidationError(
+                    "This account's official no longer exists; rebind it to "
+                    "a valid official before reactivating.",
+                    {"reason": "scope_subject_missing", "account_id": account_id,
+                     "official_id": official_id})
+            player_id = scope.get("player_id")
+            if player_id and self.store.get_player(player_id) is None:
+                raise ValidationError(
+                    "This account's player no longer exists; rebind it to "
+                    "a valid player before reactivating.",
+                    {"reason": "scope_subject_missing", "account_id": account_id,
+                     "player_id": player_id})
         account.active = bool(active)
         self.store.save_user_account(account)
         self._audit(

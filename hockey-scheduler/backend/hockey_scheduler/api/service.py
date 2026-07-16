@@ -1305,12 +1305,39 @@ class ApiService:
             "warnings": warnings,
         }
 
+    def _reject_dangling_recipient(self, recipient_ref: str) -> None:
+        """Reject a structured ``player:<id>``/``official:<id>``
+        ``recipient_ref`` whose subject no longer exists (#232 review 2 & 3).
+
+        Closes the same dangling-identity hole the account reactivation
+        guard closes (``AccountService.set_active``): once a Player/Official
+        is deleted, nothing should be able to (re)point a live integration
+        row — a device token, a contact destination, or a notification
+        preference — at that now-nonexistent record. Applied to
+        register_device_token / set_device_token_active(active=True) and to
+        set_contact_destination / set_notification_preference. Any other
+        ``recipient_ref`` shape (``team:<id>``, ``guardian:<user_id>``, …)
+        is untouched.
+        """
+        if recipient_ref.startswith("player:"):
+            player_id = recipient_ref[len("player:"):]
+            if self.store.get_player(player_id) is None:
+                raise ValidationError(
+                    "This player no longer exists.",
+                    {"reason": "scope_subject_missing", "player_id": player_id})
+        elif recipient_ref.startswith("official:"):
+            official_id = recipient_ref[len("official:"):]
+            if self.store.get_official(official_id) is None:
+                raise ValidationError(
+                    "This official no longer exists.",
+                    {"reason": "scope_subject_missing", "official_id": official_id})
+
     # -- contact registry (#60) --------------------------------------------
     @staticmethod
     def _contact_row(c) -> dict:
         return {"id": c.id, "recipient_ref": c.recipient_ref,
                 "channel": c.channel.value, "destination": c.destination,
-                "label": c.label}
+                "label": c.label, "active": c.active}
 
     @catch
     def list_contact_destinations(self) -> dict:
@@ -1322,9 +1349,11 @@ class ApiService:
     @catch
     def set_contact_destination(self, recipient_ref: str, channel: str,
                                 destination: str, label=None) -> dict:
-        """Register (or update) the real destination for a recipient/channel."""
+        """Register (or update the value of) a recipient/channel's real
+        destination."""
         if not recipient_ref:
             raise ValidationError("A recipient_ref is required.")
+        self._reject_dangling_recipient(recipient_ref)
         try:
             ch = NotificationChannel(channel)
         except ValueError:
@@ -1336,6 +1365,11 @@ class ApiService:
             raise ValidationError("An email destination must contain '@'.")
         existing = self.store.get_contact_destination(recipient_ref, ch)
         if existing is not None:
+            # Deliberately does NOT touch `active` (#232 review 6): a
+            # retired row must stay retired through an ordinary value edit —
+            # only the MANAGE_SETUP-gated set_contact_destination_active can
+            # reactivate one. Without this, a wider-permissioned caller
+            # could silently undo a retirement by editing the destination.
             existing.destination = destination
             existing.label = label
             self.store.save_contact_destination(existing)
@@ -1344,6 +1378,49 @@ class ApiService:
             id=self.store.next_id("contact"), recipient_ref=recipient_ref,
             channel=ch, destination=destination, label=label)
         self.store.add_contact_destination(c)
+        return self._contact_row(c)
+
+    @catch
+    def set_contact_destination_active(self, contact_id: str, active: bool,
+                                       actor_id: Optional[str] = None) -> dict:
+        """Retire (or reactivate) a contact destination (#232 review 4).
+
+        A durable, audited lifecycle toggle — never a delete. Retiring a row
+        (``active=False``) is the supported way to clear a Player/Official
+        delete's contact-destination dependency: the stored destination and
+        its history are preserved, just no longer counted as live. Mirrors
+        `set_device_token_active`; reactivating one whose Player/Official no
+        longer exists is rejected the same way re-registering a device token
+        is. Restricted to Player/Official-scoped rows, same as the delete
+        lifecycle it serves — not a general contact-management surface for
+        other recipient kinds (team, guardian, …).
+        """
+        c = next((row for row in self.store.all_contact_destinations()
+                  if row.id == contact_id), None)
+        if c is None:
+            raise NotFoundError(f"Contact destination {contact_id} not found.")
+        if not (c.recipient_ref.startswith("player:")
+                or c.recipient_ref.startswith("official:")):
+            raise ValidationError(
+                "Only Player/Official-scoped contact destinations can be "
+                "retired through this action.",
+                {"reason": "recipient_not_cleanup_eligible",
+                 "recipient_ref": c.recipient_ref})
+        if active:
+            self._reject_dangling_recipient(c.recipient_ref)
+        # The mutation itself must happen INSIDE the transaction (#232 review
+        # 6): the in-memory store snapshots state at entry, so mutating `c`
+        # beforehand would already be reflected in that snapshot — a forced
+        # audit failure would then roll back to the already-mutated state
+        # instead of the true pre-image.
+        with self.store.transaction():
+            c.active = bool(active)
+            self.store.save_contact_destination(c)
+            self.setup._audit(
+                "contact_destination_activated" if c.active
+                else "contact_destination_retired",
+                "contact_destination", contact_id, actor_id,
+                {"recipient_ref": c.recipient_ref, "channel": c.channel.value})
         return self._contact_row(c)
 
     # -- notification preferences (#81) ------------------------------------
@@ -1361,18 +1438,25 @@ class ApiService:
         prefs = []
         for ch in self.PREF_CHANNELS:
             p = stored.get(ch)
-            prefs.append({"channel": ch.value,
+            # id is required (#232 review 4): retiring a row via
+            # set_notification_preference_active needs its id, and this read
+            # is the only supported way a client can discover it — there is
+            # no other route that exposes it.
+            prefs.append({"id": p.id if p else None, "channel": ch.value,
                           "enabled": p.enabled if p else True,
-                          "digest": p.digest if p else None})
+                          "digest": p.digest if p else None,
+                          "active": p.active if p else True})
         return {"recipient_ref": recipient_ref, "preferences": prefs}
 
     @catch
     def set_notification_preference(self, recipient_ref: str, channel: str,
                                     enabled: bool, digest=None,
                                     actor_id=None) -> dict:
-        """Enable/disable a delivery channel for a recipient (#81)."""
+        """Enable/disable (or update) a delivery channel for a
+        recipient (#81)."""
         if not recipient_ref:
             raise ValidationError("A recipient_ref is required.")
+        self._reject_dangling_recipient(recipient_ref)
         try:
             ch = NotificationChannel(channel)
         except ValueError:
@@ -1382,6 +1466,10 @@ class ApiService:
         existing = self.store.get_notification_preference(recipient_ref, ch)
         prior_enabled = existing.enabled if existing is not None else None
         if existing is not None:
+            # Deliberately does NOT touch `active` (#232 review 6): see
+            # set_contact_destination's identical comment — only the
+            # MANAGE_SETUP-gated set_notification_preference_active can
+            # reactivate a retired row.
             existing.enabled = bool(enabled)
             if digest is not None:
                 existing.digest = digest
@@ -1401,8 +1489,49 @@ class ApiService:
             {"recipient_ref": recipient_ref, "channel": ch.value,
              "enabled": pref.enabled, "prior_enabled": prior_enabled,
              "digest": pref.digest})
-        return {"recipient_ref": recipient_ref, "channel": ch.value,
+        return {"id": pref.id, "recipient_ref": recipient_ref, "channel": ch.value,
                 "enabled": pref.enabled, "digest": pref.digest}
+
+    @catch
+    def set_notification_preference_active(self, pref_id: str, active: bool,
+                                           actor_id: Optional[str] = None) -> dict:
+        """Retire (or reactivate) a notification preference (#232 review 4).
+
+        A durable, audited lifecycle toggle — never a delete. Retiring a row
+        (``active=False``) is the supported way to clear a Player/Official
+        delete's notification-preference dependency: the stored ``enabled``
+        opt-out and its history are preserved — and still govern delivery
+        exactly as before, via `services/delivery.channel_enabled` — just no
+        longer counted as a live blocker. Mirrors
+        `set_contact_destination_active`, including the Player/Official-only
+        scope restriction.
+        """
+        p = next((row for row in self.store.all_notification_preferences()
+                  if row.id == pref_id), None)
+        if p is None:
+            raise NotFoundError(f"Notification preference {pref_id} not found.")
+        if not (p.recipient_ref.startswith("player:")
+                or p.recipient_ref.startswith("official:")):
+            raise ValidationError(
+                "Only Player/Official-scoped notification preferences can "
+                "be retired through this action.",
+                {"reason": "recipient_not_cleanup_eligible",
+                 "recipient_ref": p.recipient_ref})
+        if active:
+            self._reject_dangling_recipient(p.recipient_ref)
+        # See set_contact_destination_active: the mutation must happen
+        # INSIDE the transaction so a forced audit failure rolls back to the
+        # true pre-image, not an already-mutated snapshot (#232 review 6).
+        with self.store.transaction():
+            p.active = bool(active)
+            self.store.save_notification_preference(p)
+            self.setup._audit(
+                "notification_preference_activated" if p.active
+                else "notification_preference_retired",
+                "notification_preference", pref_id, actor_id,
+                {"recipient_ref": p.recipient_ref, "channel": p.channel.value})
+        return {"recipient_ref": p.recipient_ref, "channel": p.channel.value,
+                "enabled": p.enabled, "active": p.active}
 
     # -- calendar feed tokens (#82) ----------------------------------------
     @staticmethod
@@ -1533,6 +1662,7 @@ class ApiService:
         """Register (or reactivate) a real push device token for a recipient."""
         if not recipient_ref:
             raise ValidationError("A recipient_ref is required.")
+        self._reject_dangling_recipient(recipient_ref)
         provider = (provider or "").strip()
         if not provider:
             raise ValidationError("A provider is required.")
@@ -1562,6 +1692,8 @@ class ApiService:
         t = self.store.get_device_token(token_id)
         if t is None:
             raise NotFoundError("Device token not found.")
+        if active:
+            self._reject_dangling_recipient(t.recipient_ref)
         t.active = bool(active)
         self.store.save_device_token(t)
         return self._device_token_row(t)
@@ -3227,6 +3359,16 @@ class ApiService:
     @catch
     def delete_game(self, game_id: str, actor_id: Optional[str] = None) -> dict:
         return _serialize(self.setup.delete_game(game_id, actor_id))
+
+    @catch
+    def delete_official(self, official_id: str,
+                        actor_id: Optional[str] = None) -> dict:
+        return _serialize(self.setup.delete_official(official_id, actor_id))
+
+    @catch
+    def delete_player(self, player_id: str,
+                      actor_id: Optional[str] = None) -> dict:
+        return _serialize(self.setup.delete_player(player_id, actor_id))
 
     # -- reassignment: move a record under a new parent (#166 PR D) --------
     @catch

@@ -1599,11 +1599,25 @@ class Handler(BaseHTTPRequestHandler):
         if di:
             return self._send_api(api.ignore_notification_delivery(di.group(1)))
 
-        # Contact registry: register/update a real destination (#60).
+        # Contact registry: register/update a real destination (#60). No
+        # delete route — a contact destination is never erased, only
+        # retired (#232 review 4): deleting one outright would erase the
+        # integration history #232 requires be preserved, and a MISSING row
+        # would fall back to the resolver's default-enabled placeholder,
+        # which could silently redirect a still-pending delivery.
         if path == "/api/notifications/contacts":
             return self._send_api(api.set_contact_destination(
                 body.get("recipient_ref"), body.get("channel"),
                 body.get("destination"), body.get("label")))
+        # Retire/reactivate (#232 review 4): the audited, non-destructive way
+        # to clear a Player/Official delete's contact-destination
+        # dependency — the row and its history are preserved, just no
+        # longer counted as live.
+        cda = re.match(r"^/api/notifications/contacts/([^/]+)/active$", path)
+        if cda:
+            _role, _scope, actor_uid, _err = self._resolve_role()
+            return self._send_api(api.set_contact_destination_active(
+                cda.group(1), bool(body.get("active")), actor_id=actor_uid))
 
         # Device token registry: register / activate-deactivate (#65).
         if path == "/api/notifications/device-tokens":
@@ -1614,6 +1628,15 @@ class Handler(BaseHTTPRequestHandler):
         if dt:
             return self._send_api(api.set_device_token_active(
                 dt.group(1), bool(body.get("active"))))
+
+        # Retire/reactivate a notification preference (#232 review 4) — the
+        # audited, non-destructive counterpart to the contact-destination
+        # route above, for the same Player/Official delete lifecycle.
+        npa = re.match(r"^/api/notifications/preferences/([^/]+)/active$", path)
+        if npa:
+            _role, _scope, actor_uid, _err = self._resolve_role()
+            return self._send_api(api.set_notification_preference_active(
+                npa.group(1), bool(body.get("active")), actor_id=actor_uid))
 
         # User accounts: operator creates a login, or activates/deactivates
         # one (#67). No self-service signup — this is the only way an
@@ -2080,7 +2103,7 @@ class Handler(BaseHTTPRequestHandler):
         # (program-delete = umbrella, league-delete = the grouping League).
         md = re.match(
             r"^(organization|program|season|league|division|club|team|venue|rink"
-            r"|ice-slot|game)/([^/]+)/delete$", entity)
+            r"|ice-slot|game|official|player)/([^/]+)/delete$", entity)
         if md:
             kind = md.group(1)
             deleter = {
@@ -2090,6 +2113,7 @@ class Handler(BaseHTTPRequestHandler):
                 "club": api.delete_club, "team": api.delete_team,
                 "venue": api.delete_venue, "rink": api.delete_rink,
                 "ice-slot": api.delete_ice_slot, "game": api.delete_game,
+                "official": api.delete_official, "player": api.delete_player,
             }[kind]
             # Canonical Venue responses drop the legacy league_id (org-owned only).
             mapper = _v2p.venue_to_v2 if kind == "venue" else (lambda r: r)

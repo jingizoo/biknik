@@ -18,7 +18,15 @@ import unittest
 from datetime import datetime, timezone
 
 from hockey_scheduler.api.service import ApiService
-from hockey_scheduler.domain import CalendarFeedToken, IceSlotStatus, Role
+from hockey_scheduler.domain import (
+    AvailabilityStatus, CalendarFeedToken, ContactDestination, DeviceToken,
+    GameAvailability, GameRosterEntry, GuardianLink, IceSlotStatus,
+    Notification, NotificationAudience, NotificationChannel, NotificationKind,
+    NotificationPreference, OfficialAssignment, OfficialAssignmentStatus,
+    OfficialAvailability, OfficialAvailabilityStatus, OfficialRole, Position,
+    Role, RosterEntryStatus, RosterRole, SelectionSource,
+    SubstituteEnrollment, SubstituteStatus,
+)
 from hockey_scheduler.store import InMemoryStore, SqlStore
 
 
@@ -80,6 +88,13 @@ class DeletionContract:
         return self.api.create_game(
             season_id, division_id, home_id, away_id, slot_id,
             actor_id=self.ACTOR)["id"]
+
+    def _official(self, name="Official"):
+        return self.api.create_official(name, actor_id=self.ACTOR)["id"]
+
+    def _player(self, team_id, name="Player"):
+        return self.api.create_player(
+            team_id, name, "skater", actor_id=self.ACTOR)["id"]
 
     # -- assertions --------------------------------------------------------
     def _audits(self, action):
@@ -825,6 +840,1070 @@ class DeletionContract:
         self.assertEqual(blocked["error"]["code"], "validation_error")
         self.assertIsNotNone(self.store.get_ice_slot(slot))
 
+    # -- official (#232) -----------------------------------------------------
+    def test_official_blocked_by_assignment(self):
+        official = self._official()
+        gid = self._built_game()
+        self.store.add_official_assignment(OfficialAssignment(
+            id=self.store.next_id("official_assignment"), game_id=gid,
+            official_id=official, role=OfficialRole.REFEREE,
+            status=OfficialAssignmentStatus.PROPOSED))
+        blocked = self.api.delete_official(official, actor_id=self.ACTOR)
+        self.assertBlocked(blocked, expect_types={"assignment"})
+        self.assertIsNotNone(self.store.get_official(official))
+
+    def test_official_blocked_by_availability_window(self):
+        official = self._official()
+        self.store.add_official_availability(OfficialAvailability(
+            id=self.store.next_id("official_availability"),
+            official_id=official,
+            start_time=datetime(2027, 1, 1, tzinfo=timezone.utc),
+            end_time=datetime(2027, 1, 2, tzinfo=timezone.utc),
+            status=OfficialAvailabilityStatus.UNAVAILABLE))
+        blocked = self.api.delete_official(official, actor_id=self.ACTOR)
+        self.assertBlocked(blocked, expect_types={"availability window"})
+        self.assertIsNotNone(self.store.get_official(official))
+
+    def test_official_blocked_by_account(self):
+        official = self._official()
+        self.api.accounts.create_account(
+            "official_x", "a-real-password", Role.OFFICIAL,
+            scope={"official_id": official}, actor_id=self.ACTOR)
+        blocked = self.api.delete_official(official, actor_id=self.ACTOR)
+        self.assertBlocked(blocked, expect_types={"account"})
+        self.assertIsNotNone(self.store.get_official(official))
+
+    def test_official_blocked_by_live_calendar_feed(self):
+        official = self._official()
+        self.store.add_calendar_feed_token(CalendarFeedToken(
+            id=self.store.next_id("cft"), token_hash="hash_o",
+            actor_type="official", actor_ref=official,
+            created_at=datetime(2026, 1, 1, tzinfo=timezone.utc)))
+        blocked = self.api.delete_official(official, actor_id=self.ACTOR)
+        self.assertBlocked(blocked, expect_types={"calendar feed"})
+        self.assertIsNotNone(self.store.get_official(official))
+
+    def test_official_blocked_by_device_token(self):
+        official = self._official()
+        self.store.add_device_token(DeviceToken(
+            id=self.store.next_id("device"), recipient_ref=f"official:{official}",
+            provider="fcm", token="tok_o"))
+        blocked = self.api.delete_official(official, actor_id=self.ACTOR)
+        self.assertBlocked(blocked, expect_types={"device token"})
+        self.assertIsNotNone(self.store.get_official(official))
+
+    def test_official_deletable_when_bare(self):
+        official = self._official()
+        self.assertDeleted(self.api.delete_official(official, actor_id=self.ACTOR),
+                           self.store.get_official, official, "official_deleted")
+
+    # -- official dependency lifecycle (#232 review) ------------------------
+    # An account/device token has an existing supported deactivation route
+    # (#67/#65); an inactive one is inert history, not a live pointer, so it
+    # must not block — mirroring #251's own "revoked ≠ live" precedent.
+    def test_official_inactive_account_does_not_block(self):
+        official = self._official()
+        acc = self.api.accounts.create_account(
+            "official_inactive", "a-real-password", Role.OFFICIAL,
+            scope={"official_id": official}, actor_id=self.ACTOR)
+        self.api.accounts.set_active(acc.id, False, actor_id=self.ACTOR)
+        self.assertDeleted(self.api.delete_official(official, actor_id=self.ACTOR),
+                           self.store.get_official, official, "official_deleted")
+
+    def test_official_inactive_device_token_does_not_block(self):
+        official = self._official()
+        self.store.add_device_token(DeviceToken(
+            id=self.store.next_id("device"), recipient_ref=f"official:{official}",
+            provider="fcm", token="tok_o_inactive", active=False))
+        self.assertDeleted(self.api.delete_official(official, actor_id=self.ACTOR),
+                           self.store.get_official, official, "official_deleted")
+
+    def test_reactivating_account_after_official_deleted_is_blocked(self):
+        # Scoping the delete blocker to active accounts only (above) must not
+        # reopen a dangling-identity hole: once the official is gone, the
+        # inactive account can never come back without being rebound.
+        official = self._official()
+        acc = self.api.accounts.create_account(
+            "official_rebind", "a-real-password", Role.OFFICIAL,
+            scope={"official_id": official}, actor_id=self.ACTOR)
+        self.api.accounts.set_active(acc.id, False, actor_id=self.ACTOR)
+        self.assertDeleted(self.api.delete_official(official, actor_id=self.ACTOR),
+                           self.store.get_official, official, "official_deleted")
+        result = self.api.set_user_account_active(acc.id, True, actor_id=self.ACTOR)
+        self.assertEqual(result["error"]["code"], "validation_error")
+        self.assertFalse(self.store.get_user_account(acc.id).active)
+
+    def test_creating_account_for_deleted_official_is_rejected(self):
+        # #232 review 7: the reactivation guard above only protects an
+        # account that already existed before the official was deleted — a
+        # brand-new account scoped to the (now-gone) official id must be
+        # refused just as firmly, or delete-then-create recreates the exact
+        # dangling live identity #232 exists to prevent. Zero account/audit
+        # mutation on rejection.
+        official = self._official()
+        self.assertDeleted(self.api.delete_official(official, actor_id=self.ACTOR),
+                           self.store.get_official, official, "official_deleted")
+        accounts_before = len(self.store.all_user_accounts())
+        audits_before = len(self.store.all_setup_audit())
+        result = self.api.create_user_account(
+            "official_ghost", "a-real-password", "official",
+            scope={"official_id": official}, actor_id=self.ACTOR)
+        self.assertEqual(result["error"]["code"], "validation_error")
+        self.assertEqual(result["error"]["details"]["reason"], "scope_subject_missing")
+        self.assertEqual(len(self.store.all_user_accounts()), accounts_before)
+        self.assertEqual(len(self.store.all_setup_audit()), audits_before)
+        self.assertIsNone(self.store.get_user_account_by_username("official_ghost"))
+
+    def test_creating_account_for_existing_official_still_works(self):
+        official = self._official()
+        result = self.api.create_user_account(
+            "official_live", "a-real-password", "official",
+            scope={"official_id": official}, actor_id=self.ACTOR)
+        self.assertNotIn("error", result, result)
+        self.assertTrue(result["active"])
+
+    def test_official_blocked_by_contact_destination(self):
+        official = self._official()
+        self.store.add_contact_destination(ContactDestination(
+            id=self.store.next_id("contact"), recipient_ref=f"official:{official}",
+            channel=NotificationChannel.EMAIL, destination="ref@example.com"))
+        blocked = self.api.delete_official(official, actor_id=self.ACTOR)
+        self.assertBlocked(blocked, expect_types={"contact destination"})
+        self.assertIsNotNone(self.store.get_official(official))
+
+    def test_official_blocked_by_notification_preference(self):
+        official = self._official()
+        self.store.save_notification_preference(NotificationPreference(
+            id=self.store.next_id("notif_pref"), recipient_ref=f"official:{official}",
+            channel=NotificationChannel.PUSH, enabled=False))
+        blocked = self.api.delete_official(official, actor_id=self.ACTOR)
+        self.assertBlocked(blocked, expect_types={"notification preference"})
+        self.assertIsNotNone(self.store.get_official(official))
+
+    # -- official contact/preference retirement (#232 review 4) --------------
+    # #232 requires Player/Official deletion never silently cascade or erase
+    # a dependent record. A contact destination/notification preference is
+    # therefore never deleted at all — it is retired (active=False) through
+    # its own explicit, audited action, exactly like an account/device token
+    # is deactivated, preserving the stored destination/opt-out and its
+    # history. Only an ACTIVE row blocks the delete.
+    def test_official_inactive_contact_destination_does_not_block(self):
+        official = self._official()
+        self.store.add_contact_destination(ContactDestination(
+            id=self.store.next_id("contact"), recipient_ref=f"official:{official}",
+            channel=NotificationChannel.EMAIL, destination="inactive@example.com",
+            active=False))
+        self.assertDeleted(self.api.delete_official(official, actor_id=self.ACTOR),
+                           self.store.get_official, official, "official_deleted")
+
+    def test_official_inactive_notification_preference_does_not_block(self):
+        official = self._official()
+        self.store.save_notification_preference(NotificationPreference(
+            id=self.store.next_id("notif_pref"), recipient_ref=f"official:{official}",
+            channel=NotificationChannel.PUSH, enabled=False, active=False))
+        self.assertDeleted(self.api.delete_official(official, actor_id=self.ACTOR),
+                           self.store.get_official, official, "official_deleted")
+
+    def test_official_blocked_by_contact_destination_then_retired_then_deletes(self):
+        official = self._official()
+        contact = self.store.add_contact_destination(ContactDestination(
+            id=self.store.next_id("contact"), recipient_ref=f"official:{official}",
+            channel=NotificationChannel.EMAIL, destination="retire-me@example.com"))
+        audits_before = len(self.store.all_setup_audit())
+        blocked = self.api.delete_official(official, actor_id=self.ACTOR)
+        self.assertBlocked(blocked, expect_types={"contact destination"})
+        self.assertIsNotNone(self.store.get_official(official))
+        self.assertEqual(len(self.store.all_setup_audit()), audits_before)
+
+        retired = self.api.set_contact_destination_active(
+            contact.id, False, actor_id=self.ACTOR)
+        self.assertNotIn("error", retired, retired)
+        self.assertFalse(retired["active"])
+        self.assertEqual(retired["destination"], "retire-me@example.com",
+                         "retiring must not touch the stored destination")
+
+        before_delete_audits = len(self.store.all_setup_audit())
+        self.assertDeleted(self.api.delete_official(official, actor_id=self.ACTOR),
+                           self.store.get_official, official, "official_deleted")
+        self.assertEqual(len(self.store.all_setup_audit()), before_delete_audits + 1,
+                         "a successful delete writes exactly one audit entry")
+
+        # History preserved, queryable, unchanged (#232's no-erase contract):
+        still_there = next(
+            (c for c in self.store.all_contact_destinations() if c.id == contact.id),
+            None)
+        self.assertIsNotNone(still_there)
+        self.assertFalse(still_there.active)
+        self.assertEqual(still_there.destination, "retire-me@example.com")
+
+    def test_official_blocked_by_notification_preference_then_retired_then_deletes(self):
+        official = self._official()
+        pref = self.store.save_notification_preference(NotificationPreference(
+            id=self.store.next_id("notif_pref"), recipient_ref=f"official:{official}",
+            channel=NotificationChannel.PUSH, enabled=False))
+        blocked = self.api.delete_official(official, actor_id=self.ACTOR)
+        self.assertBlocked(blocked, expect_types={"notification preference"})
+
+        retired = self.api.set_notification_preference_active(
+            pref.id, False, actor_id=self.ACTOR)
+        self.assertNotIn("error", retired, retired)
+        self.assertFalse(retired["active"])
+        self.assertFalse(retired["enabled"], "retiring must not touch the opt-out")
+
+        self.assertDeleted(self.api.delete_official(official, actor_id=self.ACTOR),
+                           self.store.get_official, official, "official_deleted")
+
+        still_there = next(
+            (p for p in self.store.all_notification_preferences() if p.id == pref.id),
+            None)
+        self.assertIsNotNone(still_there, "retired history must remain queryable")
+        self.assertFalse(still_there.active)
+        self.assertFalse(still_there.enabled)
+
+    def test_official_blocked_delete_preserves_contact_and_preference(self):
+        # The scenario the reviewer flagged directly: a delete blocked by
+        # something else entirely (here, an active device token) must leave
+        # the recipient's opt-out state completely untouched — no silent
+        # re-enable, zero mutation, zero audit.
+        official = self._official()
+        ref = f"official:{official}"
+        self.store.add_device_token(DeviceToken(
+            id=self.store.next_id("device"), recipient_ref=ref,
+            provider="fcm", token="tok_o_block"))
+        pref = self.store.save_notification_preference(NotificationPreference(
+            id=self.store.next_id("notif_pref"), recipient_ref=ref,
+            channel=NotificationChannel.EMAIL, enabled=False))
+        audits_before = len(self.store.all_setup_audit())
+        blocked = self.api.delete_official(official, actor_id=self.ACTOR)
+        self.assertBlocked(blocked, expect_types={"device token", "notification preference"})
+        self.assertIsNotNone(self.store.get_official(official))
+        self.assertEqual(len(self.store.all_setup_audit()), audits_before)
+        stored = self.store.get_notification_preference(
+            ref, NotificationChannel.EMAIL)
+        self.assertIsNotNone(stored, "a blocked delete must not touch the "
+                             "recipient's stored opt-out")
+        self.assertFalse(stored.enabled)
+        self.assertTrue(stored.active)
+        self.assertEqual(stored.id, pref.id)
+
+    def test_official_delete_rolls_back_on_forced_audit_failure(self):
+        # #232's "exactly one audit on success" contract implies the delete
+        # itself is still a single atomic write: a forced failure on that
+        # one audit call must roll back the identity delete too.
+        official = self._official()
+        audits_before = len(self.store.all_setup_audit())
+        original = self.store.add_setup_audit
+
+        def boom(entry):
+            raise RuntimeError("forced audit failure")
+
+        self.store.add_setup_audit = boom
+        try:
+            with self.assertRaises(RuntimeError):
+                self.api.delete_official(official, actor_id=self.ACTOR)
+        finally:
+            self.store.add_setup_audit = original
+
+        self.assertIsNotNone(self.store.get_official(official))
+        self.assertEqual(len(self.store.all_setup_audit()), audits_before)
+
+    # -- official dangling-recipient guard (#232 review 2) -------------------
+    # Scoping the delete blocker to active tokens/accounts must not reopen a
+    # dangling-identity hole via deactivate -> delete -> reactivate/
+    # re-register — the same class of hole the account reactivation guard
+    # closes, for every other recipient-scoped route.
+    def test_reactivating_device_token_after_official_deleted_is_blocked(self):
+        official = self._official()
+        ref = f"official:{official}"
+        tok = self.api.register_device_token(ref, "fcm", "tok_o_react")
+        self.api.set_device_token_active(tok["id"], False)
+        self.assertDeleted(self.api.delete_official(official, actor_id=self.ACTOR),
+                           self.store.get_official, official, "official_deleted")
+        result = self.api.set_device_token_active(tok["id"], True)
+        self.assertEqual(result["error"]["code"], "validation_error", result)
+        self.assertFalse(self.store.get_device_token(tok["id"]).active)
+
+    def test_reregistering_device_token_after_official_deleted_is_blocked(self):
+        official = self._official()
+        ref = f"official:{official}"
+        tok = self.api.register_device_token(ref, "fcm", "tok_o_reg")
+        self.api.set_device_token_active(tok["id"], False)
+        self.assertDeleted(self.api.delete_official(official, actor_id=self.ACTOR),
+                           self.store.get_official, official, "official_deleted")
+        result = self.api.register_device_token(ref, "fcm", "tok_o_reg")
+        self.assertEqual(result["error"]["code"], "validation_error", result)
+        self.assertFalse(self.store.get_device_token(tok["id"]).active)
+        result = self.api.register_device_token(ref, "fcm", "tok_o_brand_new")
+        self.assertEqual(result["error"]["code"], "validation_error", result)
+
+    def test_device_token_lifecycle_allowed_for_existing_official(self):
+        official = self._official()
+        ref = f"official:{official}"
+        tok = self.api.register_device_token(ref, "fcm", "tok_o_live")
+        self.assertNotIn("error", tok)
+        self.assertTrue(self.api.set_device_token_active(tok["id"], False)["active"] is False)
+        reactivated = self.api.set_device_token_active(tok["id"], True)
+        self.assertNotIn("error", reactivated)
+        self.assertTrue(reactivated["active"])
+
+    # -- official contact/preference re-creation guard (#232 review 3) ------
+    # The dangling-recipient guard extends to the setters themselves: once an
+    # official is deleted, nothing may re-point a contact destination or a
+    # notification preference at the now-dead recipient_ref, closing the same
+    # hole the device-token guard closes for register/reactivate.
+    def test_contact_destination_rejects_recreation_after_official_deleted(self):
+        official = self._official()
+        ref = f"official:{official}"
+        self.assertDeleted(self.api.delete_official(official, actor_id=self.ACTOR),
+                           self.store.get_official, official, "official_deleted")
+        before = len(self.store.all_contact_destinations())
+        result = self.api.set_contact_destination(ref, "email", "dead@example.com")
+        self.assertEqual(result["error"]["code"], "validation_error", result)
+        self.assertEqual(result["error"]["details"]["reason"], "scope_subject_missing")
+        self.assertEqual(len(self.store.all_contact_destinations()), before)
+
+    def test_notification_preference_rejects_recreation_after_official_deleted(self):
+        official = self._official()
+        ref = f"official:{official}"
+        self.assertDeleted(self.api.delete_official(official, actor_id=self.ACTOR),
+                           self.store.get_official, official, "official_deleted")
+        before = len(self.store.all_notification_preferences())
+        result = self.api.set_notification_preference(ref, "email", False)
+        self.assertEqual(result["error"]["code"], "validation_error", result)
+        self.assertEqual(result["error"]["details"]["reason"], "scope_subject_missing")
+        self.assertEqual(len(self.store.all_notification_preferences()), before)
+
+    def test_contact_destination_still_settable_for_existing_official(self):
+        official = self._official()
+        ref = f"official:{official}"
+        result = self.api.set_contact_destination(ref, "email", "live@example.com")
+        self.assertNotIn("error", result, result)
+        self.assertEqual(result["destination"], "live@example.com")
+
+    def test_notification_preference_still_settable_for_existing_official(self):
+        official = self._official()
+        ref = f"official:{official}"
+        result = self.api.set_notification_preference(ref, "email", False)
+        self.assertNotIn("error", result, result)
+        self.assertFalse(result["enabled"])
+
+    def test_ordinary_setters_do_not_silently_reactivate_a_retired_row(self):
+        # #232 review 6: only the MANAGE_SETUP-gated set_..._active can
+        # reactivate a retired row — an ordinary value edit (a wider
+        # permission than retire/reactivate) must not be a back door around
+        # that gate.
+        official = self._official()
+        ref = f"official:{official}"
+        contact = self.store.add_contact_destination(ContactDestination(
+            id=self.store.next_id("contact"), recipient_ref=ref,
+            channel=NotificationChannel.EMAIL, destination="original@example.com"))
+        pref = self.store.save_notification_preference(NotificationPreference(
+            id=self.store.next_id("notif_pref"), recipient_ref=ref,
+            channel=NotificationChannel.PUSH, enabled=False))
+        self.api.set_contact_destination_active(contact.id, False, actor_id=self.ACTOR)
+        self.api.set_notification_preference_active(pref.id, False, actor_id=self.ACTOR)
+
+        edited_contact = self.api.set_contact_destination(
+            ref, "email", "edited@example.com")
+        self.assertNotIn("error", edited_contact, edited_contact)
+        self.assertEqual(edited_contact["destination"], "edited@example.com")
+        self.assertFalse(edited_contact["active"],
+                         "editing the value must not reactivate a retired contact")
+
+        edited_pref = self.api.set_notification_preference(ref, "push", True)
+        self.assertNotIn("error", edited_pref, edited_pref)
+        self.assertTrue(edited_pref["enabled"])
+        stored_pref = next(p for p in self.store.all_notification_preferences()
+                          if p.id == pref.id)
+        self.assertFalse(stored_pref.active,
+                         "editing the value must not reactivate a retired preference")
+
+    # -- official contact/preference retire-reactivate guard (#232 review 4) -
+    # The same deactivate -> delete subject -> reactivate hole the device-
+    # token guard closes applies identically to retiring a contact/
+    # preference ahead of deletion: reactivating one whose Official is gone
+    # must be rejected, exactly like set_device_token_active/
+    # register_device_token.
+    def test_reactivating_retired_contact_after_official_deleted_is_blocked(self):
+        official = self._official()
+        ref = f"official:{official}"
+        contact = self.store.add_contact_destination(ContactDestination(
+            id=self.store.next_id("contact"), recipient_ref=ref,
+            channel=NotificationChannel.EMAIL, destination="react@example.com"))
+        self.api.set_contact_destination_active(contact.id, False, actor_id=self.ACTOR)
+        self.assertDeleted(self.api.delete_official(official, actor_id=self.ACTOR),
+                           self.store.get_official, official, "official_deleted")
+        result = self.api.set_contact_destination_active(
+            contact.id, True, actor_id=self.ACTOR)
+        self.assertEqual(result["error"]["code"], "validation_error", result)
+        self.assertEqual(result["error"]["details"]["reason"], "scope_subject_missing")
+        self.assertFalse(next(c for c in self.store.all_contact_destinations()
+                              if c.id == contact.id).active)
+
+    def test_reactivating_retired_preference_after_official_deleted_is_blocked(self):
+        official = self._official()
+        ref = f"official:{official}"
+        pref = self.store.save_notification_preference(NotificationPreference(
+            id=self.store.next_id("notif_pref"), recipient_ref=ref,
+            channel=NotificationChannel.PUSH, enabled=False))
+        self.api.set_notification_preference_active(pref.id, False, actor_id=self.ACTOR)
+        self.assertDeleted(self.api.delete_official(official, actor_id=self.ACTOR),
+                           self.store.get_official, official, "official_deleted")
+        result = self.api.set_notification_preference_active(
+            pref.id, True, actor_id=self.ACTOR)
+        self.assertEqual(result["error"]["code"], "validation_error", result)
+        self.assertEqual(result["error"]["details"]["reason"], "scope_subject_missing")
+        self.assertFalse(next(p for p in self.store.all_notification_preferences()
+                              if p.id == pref.id).active)
+
+    def test_contact_retire_reactivate_lifecycle_allowed_for_existing_official(self):
+        official = self._official()
+        ref = f"official:{official}"
+        c = self.api.set_contact_destination(ref, "email", "lifecycle@example.com")
+        self.assertNotIn("error", c, c)
+        contact_id = self.store.get_contact_destination(
+            ref, NotificationChannel.EMAIL).id
+        retired = self.api.set_contact_destination_active(contact_id, False)
+        self.assertFalse(retired["active"])
+        reactivated = self.api.set_contact_destination_active(contact_id, True)
+        self.assertNotIn("error", reactivated, reactivated)
+        self.assertTrue(reactivated["active"])
+
+    def test_preference_retire_reactivate_lifecycle_allowed_for_existing_official(self):
+        official = self._official()
+        ref = f"official:{official}"
+        self.api.set_notification_preference(ref, "email", False)
+        pref_id = self.store.get_notification_preference(
+            ref, NotificationChannel.EMAIL).id
+        retired = self.api.set_notification_preference_active(pref_id, False)
+        self.assertFalse(retired["active"])
+        reactivated = self.api.set_notification_preference_active(pref_id, True)
+        self.assertNotIn("error", reactivated, reactivated)
+        self.assertTrue(reactivated["active"])
+
+    def test_retire_contact_rolls_back_on_forced_audit_failure(self):
+        # #232 review 6: retire/reactivate + its audit must be one atomic
+        # unit — a forced audit failure must leave the lifecycle flag
+        # exactly as it was, not silently changed with no audit record.
+        official = self._official()
+        ref = f"official:{official}"
+        contact = self.store.add_contact_destination(ContactDestination(
+            id=self.store.next_id("contact"), recipient_ref=ref,
+            channel=NotificationChannel.EMAIL, destination="atomic@example.com"))
+        audits_before = len(self.store.all_setup_audit())
+        original = self.store.add_setup_audit
+
+        def boom(entry):
+            raise RuntimeError("forced audit failure")
+
+        self.store.add_setup_audit = boom
+        try:
+            with self.assertRaises(RuntimeError):
+                self.api.set_contact_destination_active(
+                    contact.id, False, actor_id=self.ACTOR)
+        finally:
+            self.store.add_setup_audit = original
+
+        self.assertEqual(len(self.store.all_setup_audit()), audits_before)
+        stored = next(c for c in self.store.all_contact_destinations()
+                     if c.id == contact.id)
+        self.assertTrue(stored.active, "the forced failure must roll back "
+                        "the active flag, not just skip the audit")
+
+    def test_retire_preference_rolls_back_on_forced_audit_failure(self):
+        official = self._official()
+        ref = f"official:{official}"
+        pref = self.store.save_notification_preference(NotificationPreference(
+            id=self.store.next_id("notif_pref"), recipient_ref=ref,
+            channel=NotificationChannel.PUSH, enabled=False))
+        audits_before = len(self.store.all_setup_audit())
+        original = self.store.add_setup_audit
+
+        def boom(entry):
+            raise RuntimeError("forced audit failure")
+
+        self.store.add_setup_audit = boom
+        try:
+            with self.assertRaises(RuntimeError):
+                self.api.set_notification_preference_active(
+                    pref.id, False, actor_id=self.ACTOR)
+        finally:
+            self.store.add_setup_audit = original
+
+        self.assertEqual(len(self.store.all_setup_audit()), audits_before)
+        stored = next(p for p in self.store.all_notification_preferences()
+                     if p.id == pref.id)
+        self.assertTrue(stored.active, "the forced failure must roll back "
+                        "the active flag, not just skip the audit")
+
+    def test_retired_contact_is_never_resolved_even_while_subject_still_exists(self):
+        # #232 review 6: retirement must make a contact genuinely non-live —
+        # not merely stop it from blocking the delete — independent of
+        # whether the subject has been deleted yet.
+        from hockey_scheduler.services.delivery import resolve_destination
+
+        official = self._official()
+        ref = f"official:{official}"
+        contact = self.store.add_contact_destination(ContactDestination(
+            id=self.store.next_id("contact"), recipient_ref=ref,
+            channel=NotificationChannel.EMAIL, destination="live@example.com"))
+        self.assertEqual(
+            resolve_destination(self.store, ref, NotificationChannel.EMAIL),
+            "live@example.com")
+        self.api.set_contact_destination_active(contact.id, False, actor_id=self.ACTOR)
+        resolved = resolve_destination(self.store, ref, NotificationChannel.EMAIL)
+        self.assertNotEqual(resolved, "live@example.com")
+        self.assertTrue(resolved.endswith("@notify.invalid"))
+
+    def test_pending_delivery_cannot_be_redirected_after_subject_deleted(self):
+        """#232 review 6: a queued delivery re-resolves its destination on
+        every send attempt (services/delivery.py). A retired contact
+        (active=False) is never resolved to — retiring one to clear a
+        Player/Official delete's dependency must make it actually
+        non-live, not just stop it from blocking the delete — so the
+        sequence enqueue -> retire contact -> delete subject ->
+        process/retry delivery must fall back to the synthesized
+        placeholder, never the retired real address and never a NEW,
+        attacker-controlled one."""
+        from hockey_scheduler.services.delivery import enqueue
+
+        official = self._official()
+        ref = f"official:{official}"
+        contact = self.store.add_contact_destination(ContactDestination(
+            id=self.store.next_id("contact"), recipient_ref=ref,
+            channel=NotificationChannel.EMAIL, destination="original@example.com"))
+        notification = Notification(
+            id=self.store.next_id("notif"), kind=NotificationKind.ASSIGNMENT_OFFERED,
+            audience=NotificationAudience.OFFICIAL, audience_ref=official,
+            title="Offer", message="You have an assignment offer",
+            at=datetime(2027, 1, 1, tzinfo=timezone.utc))
+        self.store.add_notification_feed(notification)
+        deliveries = enqueue(self.store, notification)
+        email_delivery = next(d for d in deliveries
+                              if d.channel == NotificationChannel.EMAIL)
+        self.assertEqual(email_delivery.destination, "original@example.com")
+
+        # Retire (never delete) the contact to clear the way, then delete.
+        self.api.set_contact_destination_active(contact.id, False, actor_id=self.ACTOR)
+        self.assertDeleted(self.api.delete_official(official, actor_id=self.ACTOR),
+                           self.store.get_official, official, "official_deleted")
+
+        # The hijack attempt: point a fresh contact at the now-dead ref.
+        before = len(self.store.all_contact_destinations())
+        hijack = self.api.set_contact_destination(
+            ref, "email", "attacker@example.com")
+        self.assertEqual(hijack["error"]["code"], "validation_error", hijack)
+        self.assertEqual(len(self.store.all_contact_destinations()), before)
+
+        # Draining the queue re-resolves the destination (delivery.py's
+        # retry-time re-resolution): the retired contact is skipped entirely
+        # now, so this falls back to the placeholder — never the retired
+        # real address and never the attacker's.
+        self.api.delivery.process_pending()
+        redelivered = self.store.get_notification_delivery(email_delivery.id)
+        self.assertNotEqual(redelivered.destination, "original@example.com")
+        self.assertNotEqual(redelivered.destination, "attacker@example.com")
+        self.assertTrue(redelivered.destination.endswith("@notify.invalid"))
+
+    # -- player (#232) --------------------------------------------------------
+    def test_player_blocked_by_roster_entry(self):
+        lg = self._league()
+        club = self._club()
+        team = self._team(club, lg)
+        player = self._player(team)
+        gid = self._built_game()
+        self.store.add_roster_entry(GameRosterEntry(
+            id=self.store.next_id("roster_entry"), game_id=gid, player_id=player,
+            roster_role=RosterRole.SELECTED,
+            selection_source=SelectionSource.COACH_SELECTED,
+            status=RosterEntryStatus.SELECTED,
+            selected_at=datetime(2027, 1, 1, tzinfo=timezone.utc),
+            updated_at=datetime(2027, 1, 1, tzinfo=timezone.utc)))
+        blocked = self.api.delete_player(player, actor_id=self.ACTOR)
+        self.assertBlocked(blocked, expect_types={"roster entry"})
+        self.assertIsNotNone(self.store.get_player(player))
+
+    def test_player_blocked_by_availability_response(self):
+        lg = self._league()
+        club = self._club()
+        team = self._team(club, lg)
+        player = self._player(team)
+        gid = self._built_game()
+        self.store.upsert_availability(GameAvailability(
+            id=self.store.next_id("availability"), game_id=gid, player_id=player,
+            availability_status=AvailabilityStatus.AVAILABLE))
+        blocked = self.api.delete_player(player, actor_id=self.ACTOR)
+        self.assertBlocked(blocked, expect_types={"availability response"})
+        self.assertIsNotNone(self.store.get_player(player))
+
+    def test_player_blocked_by_substitute_enrollment(self):
+        lg = self._league()
+        club = self._club()
+        team = self._team(club, lg)
+        player = self._player(team)
+        gid = self._built_game()
+        self.store.add_substitute(SubstituteEnrollment(
+            id=self.store.next_id("substitute"), game_id=gid, player_id=player,
+            position=Position.SKATER, status=SubstituteStatus.ENROLLED,
+            enrolled_at=datetime(2027, 1, 1, tzinfo=timezone.utc)))
+        blocked = self.api.delete_player(player, actor_id=self.ACTOR)
+        self.assertBlocked(blocked, expect_types={"substitute enrolment"})
+        self.assertIsNotNone(self.store.get_player(player))
+
+    def test_player_blocked_by_guardian_link(self):
+        lg = self._league()
+        club = self._club()
+        team = self._team(club, lg)
+        player = self._player(team)
+        self.store.add_guardian_link(GuardianLink(
+            id=self.store.next_id("guardian_link"), guardian_user_id="user_guardian",
+            player_id=player, created_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            verified=True))
+        blocked = self.api.delete_player(player, actor_id=self.ACTOR)
+        self.assertBlocked(blocked, expect_types={"guardian link"})
+        self.assertIsNotNone(self.store.get_player(player))
+
+    def test_player_blocked_by_account(self):
+        lg = self._league()
+        club = self._club()
+        team = self._team(club, lg)
+        player = self._player(team)
+        self.api.accounts.create_account(
+            "player_x", "a-real-password", Role.PLAYER,
+            scope={"team_id": team, "player_id": player}, actor_id=self.ACTOR)
+        blocked = self.api.delete_player(player, actor_id=self.ACTOR)
+        self.assertBlocked(blocked, expect_types={"account"})
+        self.assertIsNotNone(self.store.get_player(player))
+
+    def test_player_blocked_by_live_calendar_feed(self):
+        lg = self._league()
+        club = self._club()
+        team = self._team(club, lg)
+        player = self._player(team)
+        self.store.add_calendar_feed_token(CalendarFeedToken(
+            id=self.store.next_id("cft"), token_hash="hash_p",
+            actor_type="player", actor_ref=player,
+            created_at=datetime(2026, 1, 1, tzinfo=timezone.utc)))
+        blocked = self.api.delete_player(player, actor_id=self.ACTOR)
+        self.assertBlocked(blocked, expect_types={"calendar feed"})
+        self.assertIsNotNone(self.store.get_player(player))
+
+    def test_player_blocked_by_contact_destination(self):
+        # The real production path: an optional email on manual player create
+        # writes a "player:<id>"-scoped ContactDestination (#232 review of
+        # #215's recipient_ref convention).
+        lg = self._league()
+        club = self._club()
+        team = self._team(club, lg)
+        player = self.api.create_player(
+            team, "Emailed Player", "skater", email="p@example.com",
+            actor_id=self.ACTOR)["id"]
+        blocked = self.api.delete_player(player, actor_id=self.ACTOR)
+        self.assertBlocked(blocked, expect_types={"contact destination"})
+        self.assertIsNotNone(self.store.get_player(player))
+
+    def test_player_blocked_by_notification_preference(self):
+        lg = self._league()
+        club = self._club()
+        team = self._team(club, lg)
+        player = self._player(team)
+        self.store.save_notification_preference(NotificationPreference(
+            id=self.store.next_id("notif_pref"), recipient_ref=f"player:{player}",
+            channel=NotificationChannel.PUSH, enabled=False))
+        blocked = self.api.delete_player(player, actor_id=self.ACTOR)
+        self.assertBlocked(blocked, expect_types={"notification preference"})
+        self.assertIsNotNone(self.store.get_player(player))
+
+    def test_player_emailed_contact_retired_then_deletes(self):
+        # The common real-world shape (#232 review): the emailed Player's
+        # contact is retired — never deleted — to clear the way; the delete
+        # then succeeds and the retired row remains queryable history.
+        lg = self._league()
+        club = self._club()
+        team = self._team(club, lg)
+        player = self.api.create_player(
+            team, "Emailed Player", "skater", email="p@example.com",
+            actor_id=self.ACTOR)["id"]
+        ref = f"player:{player}"
+        contact = self.store.get_contact_destination(ref, NotificationChannel.EMAIL)
+        self.assertIsNotNone(contact)
+        self.api.set_contact_destination_active(contact.id, False, actor_id=self.ACTOR)
+        result = self.api.delete_player(player, actor_id=self.ACTOR)
+        self.assertNotIn("error", result, result)
+        self.assertIsNone(self.store.get_player(player))
+        still_there = next(
+            (c for c in self.store.all_contact_destinations() if c.id == contact.id),
+            None)
+        self.assertIsNotNone(still_there, "retired history must remain queryable")
+        self.assertFalse(still_there.active)
+        self.assertEqual(still_there.destination, "p@example.com")
+
+    def test_player_inactive_contact_destination_does_not_block(self):
+        lg = self._league()
+        club = self._club()
+        team = self._team(club, lg)
+        player = self._player(team)
+        self.store.add_contact_destination(ContactDestination(
+            id=self.store.next_id("contact"), recipient_ref=f"player:{player}",
+            channel=NotificationChannel.EMAIL, destination="inactive@example.com",
+            active=False))
+        self.assertDeleted(self.api.delete_player(player, actor_id=self.ACTOR),
+                           self.store.get_player, player, "player_deleted")
+
+    def test_player_inactive_notification_preference_does_not_block(self):
+        lg = self._league()
+        club = self._club()
+        team = self._team(club, lg)
+        player = self._player(team)
+        self.store.save_notification_preference(NotificationPreference(
+            id=self.store.next_id("notif_pref"), recipient_ref=f"player:{player}",
+            channel=NotificationChannel.PUSH, enabled=False, active=False))
+        self.assertDeleted(self.api.delete_player(player, actor_id=self.ACTOR),
+                           self.store.get_player, player, "player_deleted")
+
+    def test_player_blocked_by_device_token(self):
+        lg = self._league()
+        club = self._club()
+        team = self._team(club, lg)
+        player = self._player(team)
+        self.store.add_device_token(DeviceToken(
+            id=self.store.next_id("device"), recipient_ref=f"player:{player}",
+            provider="fcm", token="tok_p"))
+        blocked = self.api.delete_player(player, actor_id=self.ACTOR)
+        self.assertBlocked(blocked, expect_types={"device token"})
+        self.assertIsNotNone(self.store.get_player(player))
+
+    def test_player_deletable_when_bare(self):
+        lg = self._league()
+        club = self._club()
+        team = self._team(club, lg)
+        player = self._player(team)
+        self.assertDeleted(self.api.delete_player(player, actor_id=self.ACTOR),
+                           self.store.get_player, player, "player_deleted")
+
+    # -- player dependency lifecycle (#232 review) ---------------------------
+    def test_player_inactive_account_does_not_block(self):
+        lg = self._league()
+        club = self._club()
+        team = self._team(club, lg)
+        player = self._player(team)
+        acc = self.api.accounts.create_account(
+            "player_inactive", "a-real-password", Role.PLAYER,
+            scope={"team_id": team, "player_id": player}, actor_id=self.ACTOR)
+        self.api.accounts.set_active(acc.id, False, actor_id=self.ACTOR)
+        self.assertDeleted(self.api.delete_player(player, actor_id=self.ACTOR),
+                           self.store.get_player, player, "player_deleted")
+
+    def test_player_inactive_device_token_does_not_block(self):
+        lg = self._league()
+        club = self._club()
+        team = self._team(club, lg)
+        player = self._player(team)
+        self.store.add_device_token(DeviceToken(
+            id=self.store.next_id("device"), recipient_ref=f"player:{player}",
+            provider="fcm", token="tok_p_inactive", active=False))
+        self.assertDeleted(self.api.delete_player(player, actor_id=self.ACTOR),
+                           self.store.get_player, player, "player_deleted")
+
+    def test_reactivating_account_after_player_deleted_is_blocked(self):
+        lg = self._league()
+        club = self._club()
+        team = self._team(club, lg)
+        player = self._player(team)
+        acc = self.api.accounts.create_account(
+            "player_rebind", "a-real-password", Role.PLAYER,
+            scope={"team_id": team, "player_id": player}, actor_id=self.ACTOR)
+        self.api.accounts.set_active(acc.id, False, actor_id=self.ACTOR)
+        self.assertDeleted(self.api.delete_player(player, actor_id=self.ACTOR),
+                           self.store.get_player, player, "player_deleted")
+        result = self.api.set_user_account_active(acc.id, True, actor_id=self.ACTOR)
+        self.assertEqual(result["error"]["code"], "validation_error")
+        self.assertFalse(self.store.get_user_account(acc.id).active)
+
+    def test_creating_account_for_deleted_player_is_rejected(self):
+        # Mirrors test_creating_account_for_deleted_official_is_rejected
+        # (#232 review 7) for the Player side of the same hole.
+        lg = self._league()
+        club = self._club()
+        team = self._team(club, lg)
+        player = self._player(team)
+        self.assertDeleted(self.api.delete_player(player, actor_id=self.ACTOR),
+                           self.store.get_player, player, "player_deleted")
+        accounts_before = len(self.store.all_user_accounts())
+        audits_before = len(self.store.all_setup_audit())
+        result = self.api.create_user_account(
+            "player_ghost", "a-real-password", "player",
+            scope={"team_id": team, "player_id": player}, actor_id=self.ACTOR)
+        self.assertEqual(result["error"]["code"], "validation_error")
+        self.assertEqual(result["error"]["details"]["reason"], "scope_subject_missing")
+        self.assertEqual(len(self.store.all_user_accounts()), accounts_before)
+        self.assertEqual(len(self.store.all_setup_audit()), audits_before)
+        self.assertIsNone(self.store.get_user_account_by_username("player_ghost"))
+
+    def test_creating_account_for_existing_player_still_works(self):
+        lg = self._league()
+        club = self._club()
+        team = self._team(club, lg)
+        player = self._player(team)
+        result = self.api.create_user_account(
+            "player_live", "a-real-password", "player",
+            scope={"team_id": team, "player_id": player}, actor_id=self.ACTOR)
+        self.assertNotIn("error", result, result)
+        self.assertTrue(result["active"])
+
+    def test_player_notification_preference_retired_then_deletes(self):
+        lg = self._league()
+        club = self._club()
+        team = self._team(club, lg)
+        player = self._player(team)
+        ref = f"player:{player}"
+        pref = self.store.save_notification_preference(NotificationPreference(
+            id=self.store.next_id("notif_pref"), recipient_ref=ref,
+            channel=NotificationChannel.PUSH, enabled=False))
+        blocked = self.api.delete_player(player, actor_id=self.ACTOR)
+        self.assertBlocked(blocked, expect_types={"notification preference"})
+
+        self.api.set_notification_preference_active(pref.id, False, actor_id=self.ACTOR)
+        before_delete_audits = len(self.store.all_setup_audit())
+        result = self.api.delete_player(player, actor_id=self.ACTOR)
+        self.assertNotIn("error", result, result)
+        self.assertEqual(len(self.store.all_setup_audit()), before_delete_audits + 1,
+                         "a successful delete writes exactly one audit entry")
+        self.assertIsNone(self.store.get_player(player))
+        still_there = next(
+            (p for p in self.store.all_notification_preferences() if p.id == pref.id),
+            None)
+        self.assertIsNotNone(still_there, "retired history must remain queryable")
+        self.assertFalse(still_there.active)
+        self.assertFalse(still_there.enabled)
+
+    def test_player_blocked_delete_preserves_notification_preference(self):
+        lg = self._league()
+        club = self._club()
+        team = self._team(club, lg)
+        player = self._player(team)
+        ref = f"player:{player}"
+        self.store.add_device_token(DeviceToken(
+            id=self.store.next_id("device"), recipient_ref=ref,
+            provider="fcm", token="tok_p_block"))
+        pref = self.store.save_notification_preference(NotificationPreference(
+            id=self.store.next_id("notif_pref"), recipient_ref=ref,
+            channel=NotificationChannel.PUSH, enabled=False))
+        audits_before = len(self.store.all_setup_audit())
+        blocked = self.api.delete_player(player, actor_id=self.ACTOR)
+        self.assertBlocked(blocked, expect_types={"device token", "notification preference"})
+        self.assertIsNotNone(self.store.get_player(player))
+        self.assertEqual(len(self.store.all_setup_audit()), audits_before)
+        stored = self.store.get_notification_preference(
+            ref, NotificationChannel.PUSH)
+        self.assertIsNotNone(stored, "a blocked delete must not touch the "
+                             "recipient's stored opt-out")
+        self.assertFalse(stored.enabled)
+        self.assertTrue(stored.active)
+        self.assertEqual(stored.id, pref.id)
+
+    def test_player_full_dependency_lifecycle_then_succeeds(self):
+        """#232 review: the real emailed-Player path — the common case a
+        League Admin actually hits — has a genuine supported resolution for
+        EVERY dependency type it can accumulate simultaneously, not just a
+        separate bare Player deleted instead. #232 review 4: contact/
+        preference dependencies are cleared by retiring them, never by
+        deleting them."""
+        lg = self._league()
+        club = self._club()
+        team = self._team(club, lg)
+        player = self.api.create_player(
+            team, "Lifecycle Player", "skater", email="lifecycle@example.com",
+            actor_id=self.ACTOR)["id"]
+        ref = f"player:{player}"
+        acc = self.api.accounts.create_account(
+            "player_lifecycle", "a-real-password", Role.PLAYER,
+            scope={"team_id": team, "player_id": player}, actor_id=self.ACTOR)
+        tok = self.store.add_device_token(DeviceToken(
+            id=self.store.next_id("device"), recipient_ref=ref,
+            provider="fcm", token="tok_lifecycle"))
+        pref = self.store.save_notification_preference(NotificationPreference(
+            id=self.store.next_id("notif_pref"), recipient_ref=ref,
+            channel=NotificationChannel.PUSH, enabled=False))
+
+        audits_before = len(self.store.all_setup_audit())
+        blocked = self.api.delete_player(player, actor_id=self.ACTOR)
+        self.assertBlocked(blocked, expect_types={
+            "account", "device token", "contact destination",
+            "notification preference"})
+        self.assertIsNotNone(self.store.get_player(player))
+        self.assertEqual(len(self.store.all_setup_audit()), audits_before,
+                         "a blocked delete must not append any audit row")
+
+        # Clear each dependency through its own supported route — never a
+        # silent cascade or erasure from delete_player itself.
+        self.api.accounts.set_active(acc.id, False, actor_id=self.ACTOR)
+        self.api.set_device_token_active(tok.id, False)
+        contact = next(c for c in self.store.all_contact_destinations()
+                      if c.recipient_ref == ref)
+        self.api.set_contact_destination_active(contact.id, False, actor_id=self.ACTOR)
+        self.api.set_notification_preference_active(pref.id, False, actor_id=self.ACTOR)
+
+        self.assertDeleted(self.api.delete_player(player, actor_id=self.ACTOR),
+                           self.store.get_player, player, "player_deleted")
+        # Nothing erased — every dependent row survives as retired history.
+        self.assertIsNotNone(next(
+            (c for c in self.store.all_contact_destinations() if c.id == contact.id),
+            None))
+        self.assertIsNotNone(next(
+            (p for p in self.store.all_notification_preferences() if p.id == pref.id),
+            None))
+
+    # -- player dangling-recipient guard (#232 review 2) ---------------------
+    def test_reactivating_device_token_after_player_deleted_is_blocked(self):
+        lg = self._league()
+        club = self._club()
+        team = self._team(club, lg)
+        player = self._player(team)
+        ref = f"player:{player}"
+        tok = self.api.register_device_token(ref, "fcm", "tok_p_react")
+        self.api.set_device_token_active(tok["id"], False)
+        self.assertDeleted(self.api.delete_player(player, actor_id=self.ACTOR),
+                           self.store.get_player, player, "player_deleted")
+        result = self.api.set_device_token_active(tok["id"], True)
+        self.assertEqual(result["error"]["code"], "validation_error", result)
+        self.assertFalse(self.store.get_device_token(tok["id"]).active)
+
+    def test_reregistering_device_token_after_player_deleted_is_blocked(self):
+        lg = self._league()
+        club = self._club()
+        team = self._team(club, lg)
+        player = self._player(team)
+        ref = f"player:{player}"
+        tok = self.api.register_device_token(ref, "fcm", "tok_p_reg")
+        self.api.set_device_token_active(tok["id"], False)
+        self.assertDeleted(self.api.delete_player(player, actor_id=self.ACTOR),
+                           self.store.get_player, player, "player_deleted")
+        result = self.api.register_device_token(ref, "fcm", "tok_p_reg")
+        self.assertEqual(result["error"]["code"], "validation_error", result)
+        self.assertFalse(self.store.get_device_token(tok["id"]).active)
+        result = self.api.register_device_token(ref, "fcm", "tok_p_brand_new")
+        self.assertEqual(result["error"]["code"], "validation_error", result)
+
+    def test_device_token_lifecycle_allowed_for_existing_player(self):
+        lg = self._league()
+        club = self._club()
+        team = self._team(club, lg)
+        player = self._player(team)
+        ref = f"player:{player}"
+        tok = self.api.register_device_token(ref, "fcm", "tok_p_live")
+        self.assertNotIn("error", tok)
+        self.assertFalse(self.api.set_device_token_active(tok["id"], False)["active"])
+        reactivated = self.api.set_device_token_active(tok["id"], True)
+        self.assertNotIn("error", reactivated)
+        self.assertTrue(reactivated["active"])
+
+    # -- player contact/preference re-creation guard (#232 review 3) --------
+    def test_contact_destination_rejects_recreation_after_player_deleted(self):
+        lg = self._league()
+        club = self._club()
+        team = self._team(club, lg)
+        player = self._player(team)
+        ref = f"player:{player}"
+        self.assertDeleted(self.api.delete_player(player, actor_id=self.ACTOR),
+                           self.store.get_player, player, "player_deleted")
+        before = len(self.store.all_contact_destinations())
+        result = self.api.set_contact_destination(ref, "email", "dead@example.com")
+        self.assertEqual(result["error"]["code"], "validation_error", result)
+        self.assertEqual(result["error"]["details"]["reason"], "scope_subject_missing")
+        self.assertEqual(len(self.store.all_contact_destinations()), before)
+
+    def test_notification_preference_rejects_recreation_after_player_deleted(self):
+        lg = self._league()
+        club = self._club()
+        team = self._team(club, lg)
+        player = self._player(team)
+        ref = f"player:{player}"
+        self.assertDeleted(self.api.delete_player(player, actor_id=self.ACTOR),
+                           self.store.get_player, player, "player_deleted")
+        before = len(self.store.all_notification_preferences())
+        result = self.api.set_notification_preference(ref, "email", False)
+        self.assertEqual(result["error"]["code"], "validation_error", result)
+        self.assertEqual(result["error"]["details"]["reason"], "scope_subject_missing")
+        self.assertEqual(len(self.store.all_notification_preferences()), before)
+
+    def test_contact_destination_still_settable_for_existing_player(self):
+        lg = self._league()
+        club = self._club()
+        team = self._team(club, lg)
+        player = self._player(team)
+        ref = f"player:{player}"
+        result = self.api.set_contact_destination(ref, "email", "live@example.com")
+        self.assertNotIn("error", result, result)
+        self.assertEqual(result["destination"], "live@example.com")
+
+    def test_other_recipient_shapes_unaffected_by_dangling_guard(self):
+        # team:/guardian:-scoped refs never pass through the Player/Official
+        # existence check at all (#232 review 3) — only structured
+        # player:<id>/official:<id> refs are validated.
+        result = self.api.set_contact_destination("team:no-such-team", "email",
+                                                   "team@example.com")
+        self.assertNotIn("error", result, result)
+        result2 = self.api.set_notification_preference("guardian:no-such-user",
+                                                        "email", False)
+        self.assertNotIn("error", result2, result2)
+
+    # -- player contact/preference retire-reactivate guard (#232 review 4) ---
+    def test_reactivating_retired_contact_after_player_deleted_is_blocked(self):
+        lg = self._league()
+        club = self._club()
+        team = self._team(club, lg)
+        player = self._player(team)
+        ref = f"player:{player}"
+        contact = self.store.add_contact_destination(ContactDestination(
+            id=self.store.next_id("contact"), recipient_ref=ref,
+            channel=NotificationChannel.EMAIL, destination="react@example.com"))
+        self.api.set_contact_destination_active(contact.id, False, actor_id=self.ACTOR)
+        self.assertDeleted(self.api.delete_player(player, actor_id=self.ACTOR),
+                           self.store.get_player, player, "player_deleted")
+        result = self.api.set_contact_destination_active(
+            contact.id, True, actor_id=self.ACTOR)
+        self.assertEqual(result["error"]["code"], "validation_error", result)
+        self.assertEqual(result["error"]["details"]["reason"], "scope_subject_missing")
+
+    def test_reactivating_retired_preference_after_player_deleted_is_blocked(self):
+        lg = self._league()
+        club = self._club()
+        team = self._team(club, lg)
+        player = self._player(team)
+        ref = f"player:{player}"
+        pref = self.store.save_notification_preference(NotificationPreference(
+            id=self.store.next_id("notif_pref"), recipient_ref=ref,
+            channel=NotificationChannel.PUSH, enabled=False))
+        self.api.set_notification_preference_active(pref.id, False, actor_id=self.ACTOR)
+        self.assertDeleted(self.api.delete_player(player, actor_id=self.ACTOR),
+                           self.store.get_player, player, "player_deleted")
+        result = self.api.set_notification_preference_active(
+            pref.id, True, actor_id=self.ACTOR)
+        self.assertEqual(result["error"]["code"], "validation_error", result)
+        self.assertEqual(result["error"]["details"]["reason"], "scope_subject_missing")
+
+    def test_player_delete_rolls_back_on_forced_audit_failure(self):
+        lg = self._league()
+        club = self._club()
+        team = self._team(club, lg)
+        player = self._player(team)
+        audits_before = len(self.store.all_setup_audit())
+        original = self.store.add_setup_audit
+
+        def boom(entry):
+            raise RuntimeError("forced audit failure")
+
+        self.store.add_setup_audit = boom
+        try:
+            with self.assertRaises(RuntimeError):
+                self.api.delete_player(player, actor_id=self.ACTOR)
+        finally:
+            self.store.add_setup_audit = original
+
+        self.assertIsNotNone(self.store.get_player(player))
+        self.assertEqual(len(self.store.all_setup_audit()), audits_before)
+
     # -- not found ---------------------------------------------------------
     def test_missing_ids_report_not_found(self):
         for fn in (self.api.delete_organization, self.api.delete_program,
@@ -833,7 +1912,8 @@ class DeletionContract:
                    self.api.delete_team, self.api.delete_venue,
                    self.api.delete_rink, self.api.delete_ice_slot,
                    self.api.delete_game,
-                   self.api.delete_season_team_registration):
+                   self.api.delete_season_team_registration,
+                   self.api.delete_official, self.api.delete_player):
             result = fn("nope_1", actor_id=self.ACTOR)
             self.assertEqual(result["error"]["code"], "not_found")
 

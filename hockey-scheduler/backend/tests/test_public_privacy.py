@@ -152,7 +152,11 @@ class ProductionPublicPrivacyTest(_HttpBase):
         ok, _ = self._get_as("u_o1", Role.OFFICIAL, {"official_id": oid},
                              f"/api/games/{self.game_id}/officials")
         self.assertEqual(ok, 200)
-        no, _ = self._get_as("u_o2", Role.OFFICIAL, {"official_id": "official_other"},
+        # A real, but unassigned-to-this-game, official (#232 review 7: a
+        # scoped official_id must resolve to an existing Official even to
+        # create the account, so this can no longer be a bare literal).
+        other = srv.STATE.api.create_official("Unassigned Official")["id"]
+        no, _ = self._get_as("u_o2", Role.OFFICIAL, {"official_id": other},
                              f"/api/games/{self.game_id}/officials")
         self.assertEqual(no, 403)
 

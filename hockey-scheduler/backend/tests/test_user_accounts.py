@@ -95,6 +95,41 @@ class AccountServiceTest(unittest.TestCase):
         acct = self.accounts.create_account("user4", "pw", Role.VIEWER)
         self.assertEqual(acct.scope, {})
 
+    def test_create_account_for_missing_official_is_rejected(self):
+        with self.assertRaises(Exception):
+            self.accounts.create_account(
+                "no_such_official", "pw", Role.OFFICIAL,
+                scope={"official_id": "official_missing"})
+        self.assertIsNone(
+            self.store.get_user_account_by_username("no_such_official"))
+
+    def test_create_account_for_missing_player_is_rejected(self):
+        with self.assertRaises(Exception):
+            self.accounts.create_account(
+                "no_such_player", "pw", Role.PLAYER,
+                scope={"player_id": "player_missing"})
+        self.assertIsNone(
+            self.store.get_user_account_by_username("no_such_player"))
+
+    def test_create_account_rolls_back_on_forced_audit_failure(self):
+        # #232 review 7: create_account's account insert + audit write must
+        # be one transaction — an audit failure must leave zero account row,
+        # not a live account with no audit trail.
+        accounts_before = len(self.store.all_user_accounts())
+        audits_before = len(self.store.all_setup_audit())
+        original = self.store.add_setup_audit
+        def boom(entry):
+            raise RuntimeError("forced audit failure")
+        self.store.add_setup_audit = boom
+        try:
+            with self.assertRaises(RuntimeError):
+                self.accounts.create_account("atomic_user", "pw", Role.VIEWER)
+        finally:
+            self.store.add_setup_audit = original
+        self.assertEqual(len(self.store.all_user_accounts()), accounts_before)
+        self.assertEqual(len(self.store.all_setup_audit()), audits_before)
+        self.assertIsNone(self.store.get_user_account_by_username("atomic_user"))
+
     # -- login verification ---------------------------------------------------
     def test_wrong_password_returns_none(self):
         self.accounts.create_account("user5", "right-pw", Role.VIEWER)
@@ -181,13 +216,17 @@ class ApiServiceAccountFacadeTest(unittest.TestCase):
         self.assertEqual(res["error"]["code"], "not_found")
 
     def test_verify_login_end_to_end(self):
+        # #232 review 7: a scoped official_id must resolve to a real Official
+        # to be accepted at all, so this exercises a genuinely created one
+        # rather than an arbitrary literal id.
+        official = self.api.create_official("Login Official")["id"]
         self.api.create_user_account("op5", "correct", "official",
-                                     scope={"official_id": "official_9"})
+                                     scope={"official_id": official})
         self.assertIsNone(self.api.verify_login("op5", "wrong"))
         row = self.api.verify_login("op5", "correct")
         self.assertIsNotNone(row)
         self.assertEqual(row["role"], "official")
-        self.assertEqual(row["scope"], {"official_id": "official_9"})
+        self.assertEqual(row["scope"], {"official_id": official})
         self.assertNotIn("password_hash", row)
 
 
@@ -295,6 +334,58 @@ class AccountCreationHttpTest(unittest.TestCase):
             {"username": "blank_pw_http", "password": "", "role": "viewer"})
         self.assertEqual(status, 400)
         self.assertEqual(body["error"]["code"], "validation_error")
+
+    def test_creating_account_for_deleted_official_over_http_is_rejected(self):
+        # #232 review 7: deleting an Official and then POSTing a fresh
+        # account scoped to its old id over the real HTTP path a League
+        # Admin actually uses must be refused, not just the service-level
+        # call — with zero account/audit mutation.
+        admin = self._login("admin")
+        official = srv.STATE.api.create_official("HTTP Ghost Official")
+        srv.STATE.api.delete_official(official["id"])
+        accounts_before = len(srv.STATE.api.store.all_user_accounts())
+        audits_before = len(srv.STATE.api.store.all_setup_audit())
+        status, body = self._req(
+            admin, "POST", "/api/accounts",
+            {"username": "official_ghost_http", "password": "pw", "role": "official",
+             "scope": {"official_id": official["id"]}})
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"]["code"], "validation_error")
+        self.assertEqual(body["error"]["details"]["reason"], "scope_subject_missing")
+        self.assertEqual(len(srv.STATE.api.store.all_user_accounts()), accounts_before)
+        self.assertEqual(len(srv.STATE.api.store.all_setup_audit()), audits_before)
+        self.assertIsNone(
+            srv.STATE.api.store.get_user_account_by_username("official_ghost_http"))
+
+    def test_creating_account_for_deleted_player_over_http_is_rejected(self):
+        admin = self._login("admin")
+        home_team = srv.STATE.ids["home_team_id"]
+        player = srv.STATE.api.create_player(
+            home_team, "HTTP Ghost Player", "forward")
+        srv.STATE.api.delete_player(player["id"])
+        accounts_before = len(srv.STATE.api.store.all_user_accounts())
+        audits_before = len(srv.STATE.api.store.all_setup_audit())
+        status, body = self._req(
+            admin, "POST", "/api/accounts",
+            {"username": "player_ghost_http", "password": "pw", "role": "player",
+             "scope": {"team_id": home_team, "player_id": player["id"]}})
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"]["code"], "validation_error")
+        self.assertEqual(body["error"]["details"]["reason"], "scope_subject_missing")
+        self.assertEqual(len(srv.STATE.api.store.all_user_accounts()), accounts_before)
+        self.assertEqual(len(srv.STATE.api.store.all_setup_audit()), audits_before)
+        self.assertIsNone(
+            srv.STATE.api.store.get_user_account_by_username("player_ghost_http"))
+
+    def test_creating_account_for_existing_official_over_http_still_works(self):
+        admin = self._login("admin")
+        official = srv.STATE.api.create_official("HTTP Live Official")
+        status, body = self._req(
+            admin, "POST", "/api/accounts",
+            {"username": "official_live_http", "password": "pw", "role": "official",
+             "scope": {"official_id": official["id"]}})
+        self.assertEqual(status, 200)
+        self.assertEqual(body["scope"], {"official_id": official["id"]})
 
 
 if __name__ == "__main__":
