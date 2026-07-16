@@ -933,6 +933,35 @@ class DeletionContract:
         self.assertEqual(result["error"]["code"], "validation_error")
         self.assertFalse(self.store.get_user_account(acc.id).active)
 
+    def test_creating_account_for_deleted_official_is_rejected(self):
+        # #232 review 7: the reactivation guard above only protects an
+        # account that already existed before the official was deleted — a
+        # brand-new account scoped to the (now-gone) official id must be
+        # refused just as firmly, or delete-then-create recreates the exact
+        # dangling live identity #232 exists to prevent. Zero account/audit
+        # mutation on rejection.
+        official = self._official()
+        self.assertDeleted(self.api.delete_official(official, actor_id=self.ACTOR),
+                           self.store.get_official, official, "official_deleted")
+        accounts_before = len(self.store.all_user_accounts())
+        audits_before = len(self.store.all_setup_audit())
+        result = self.api.create_user_account(
+            "official_ghost", "a-real-password", "official",
+            scope={"official_id": official}, actor_id=self.ACTOR)
+        self.assertEqual(result["error"]["code"], "validation_error")
+        self.assertEqual(result["error"]["details"]["reason"], "scope_subject_missing")
+        self.assertEqual(len(self.store.all_user_accounts()), accounts_before)
+        self.assertEqual(len(self.store.all_setup_audit()), audits_before)
+        self.assertIsNone(self.store.get_user_account_by_username("official_ghost"))
+
+    def test_creating_account_for_existing_official_still_works(self):
+        official = self._official()
+        result = self.api.create_user_account(
+            "official_live", "a-real-password", "official",
+            scope={"official_id": official}, actor_id=self.ACTOR)
+        self.assertNotIn("error", result, result)
+        self.assertTrue(result["active"])
+
     def test_official_blocked_by_contact_destination(self):
         official = self._official()
         self.store.add_contact_destination(ContactDestination(
@@ -1590,6 +1619,37 @@ class DeletionContract:
         result = self.api.set_user_account_active(acc.id, True, actor_id=self.ACTOR)
         self.assertEqual(result["error"]["code"], "validation_error")
         self.assertFalse(self.store.get_user_account(acc.id).active)
+
+    def test_creating_account_for_deleted_player_is_rejected(self):
+        # Mirrors test_creating_account_for_deleted_official_is_rejected
+        # (#232 review 7) for the Player side of the same hole.
+        lg = self._league()
+        club = self._club()
+        team = self._team(club, lg)
+        player = self._player(team)
+        self.assertDeleted(self.api.delete_player(player, actor_id=self.ACTOR),
+                           self.store.get_player, player, "player_deleted")
+        accounts_before = len(self.store.all_user_accounts())
+        audits_before = len(self.store.all_setup_audit())
+        result = self.api.create_user_account(
+            "player_ghost", "a-real-password", "player",
+            scope={"team_id": team, "player_id": player}, actor_id=self.ACTOR)
+        self.assertEqual(result["error"]["code"], "validation_error")
+        self.assertEqual(result["error"]["details"]["reason"], "scope_subject_missing")
+        self.assertEqual(len(self.store.all_user_accounts()), accounts_before)
+        self.assertEqual(len(self.store.all_setup_audit()), audits_before)
+        self.assertIsNone(self.store.get_user_account_by_username("player_ghost"))
+
+    def test_creating_account_for_existing_player_still_works(self):
+        lg = self._league()
+        club = self._club()
+        team = self._team(club, lg)
+        player = self._player(team)
+        result = self.api.create_user_account(
+            "player_live", "a-real-password", "player",
+            scope={"team_id": team, "player_id": player}, actor_id=self.ACTOR)
+        self.assertNotIn("error", result, result)
+        self.assertTrue(result["active"])
 
     def test_player_notification_preference_retired_then_deletes(self):
         lg = self._league()

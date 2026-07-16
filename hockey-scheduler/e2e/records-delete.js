@@ -17,15 +17,22 @@
 //      Team) and confirms zero mutation.
 //   4. Proves the Official's new delete contract end to end: blocked by a
 //      live availability window, then succeeds once that dependency is
-//      cleared through the official's own supported cleanup route.
+//      cleared through the official's own supported cleanup route. After
+//      the delete, creating a brand-new account scoped to the deleted
+//      Official's id is rejected (#232 review 7 — a fresh account never
+//      validated its scope subject at all, so delete-then-create recreated
+//      the exact dangling live identity this issue exists to prevent).
 //   5. Proves the Player's new delete contract: an emailed Player with a
 //      scoped account, device token, AND a disabled notification preference
 //      is blocked by all four; each is cleared through its own supported
 //      route — account/device-token deactivation, contact/preference
 //      RETIREMENT (#232 review 4: never a delete, so nothing is erased);
 //      the delete then succeeds, and the retired contact/preference are
-//      proven to remain queryable history, not gone. A bare Player also
-//      deletes successfully.
+//      proven to remain queryable history, not gone. After the delete, both
+//      reactivating the deactivated device token AND creating a brand-new
+//      account scoped to the deleted Player's id are rejected (#232 review
+//      7, same gap as the Official case above). A bare Player also deletes
+//      successfully.
 //
 // Fails on any browser console/page error.
 const { chromium } = require("playwright");
@@ -305,6 +312,33 @@ async function checkViewport(browser, viewport) {
       (id) => !document.querySelector(`[data-del="official"][data-del-id="${id}"]`),
       official.id, { timeout: 10000 });
 
+    // Post-delete account-CREATION rejection (#232 review 7): a fresh
+    // account scoped to the now-deleted Official's id must be refused, not
+    // just a reactivation of one that already existed — create_account
+    // never validated its scope subject at all until this fix, so deleting
+    // the Official and then creating a new account recreated the exact
+    // dangling live identity #232 exists to prevent.
+    page.off("console", consoleErrorHandler);
+    const officialGhostAccount = await page.evaluate(async (officialId) => {
+      const resp = await fetch("/api/accounts", {
+        method: "POST", credentials: "same-origin",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          username: `ghost_official_${officialId}`, password: "a-real-password",
+          role: "official", scope: { official_id: officialId } }),
+      });
+      return { status: resp.status, body: await resp.json() };
+    }, official.id);
+    page.on("console", consoleErrorHandler);
+    if (officialGhostAccount.status === 200 || !officialGhostAccount.body.error) {
+      throw new Error(`[${viewport.label}] creating an account for the deleted Official ` +
+        `unexpectedly succeeded: ${JSON.stringify(officialGhostAccount)}`);
+    }
+    if ((officialGhostAccount.body.error.details || {}).reason !== "scope_subject_missing") {
+      throw new Error(`[${viewport.label}] post-delete Official account creation was rejected ` +
+        `for the wrong reason: ${JSON.stringify(officialGhostAccount)}`);
+    }
+
     // (5) Player's new delete contract, proven for the COMMON real-world
     // shape (#232 review) — not sidestepped by deleting a separate bare
     // Player instead: the emailed Player, with a scoped account, device
@@ -477,6 +511,31 @@ async function checkViewport(browser, viewport) {
     if ((reactivation.body.error.details || {}).reason !== "scope_subject_missing") {
       throw new Error(`[${viewport.label}] reactivation was rejected for the wrong reason: ` +
         `${JSON.stringify(reactivation)}`);
+    }
+
+    // Post-delete account-CREATION rejection (#232 review 7) — the actual
+    // gap the review found: reactivation above only protects an account
+    // that already existed. A brand-NEW account scoped to the deleted
+    // Player's id must be refused too.
+    page.off("console", consoleErrorHandler);
+    const playerGhostAccount = await page.evaluate(async (i) => {
+      const resp = await fetch("/api/accounts", {
+        method: "POST", credentials: "same-origin",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          username: `ghost_player_${i.player}`, password: "a-real-password",
+          role: "player", scope: { team_id: i.team, player_id: i.player } }),
+      });
+      return { status: resp.status, body: await resp.json() };
+    }, { team: team.id, player: playerBlocked.id });
+    page.on("console", consoleErrorHandler);
+    if (playerGhostAccount.status === 200 || !playerGhostAccount.body.error) {
+      throw new Error(`[${viewport.label}] creating an account for the deleted Player ` +
+        `unexpectedly succeeded: ${JSON.stringify(playerGhostAccount)}`);
+    }
+    if ((playerGhostAccount.body.error.details || {}).reason !== "scope_subject_missing") {
+      throw new Error(`[${viewport.label}] post-delete Player account creation was rejected ` +
+        `for the wrong reason: ${JSON.stringify(playerGhostAccount)}`);
     }
 
     await clickDelete("player", playerBare.id);
