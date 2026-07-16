@@ -177,16 +177,17 @@ class FactoryResetContract:
         from hockey_scheduler.domain.errors import ValidationError
         from hockey_scheduler.domain import FactoryResetLock
         self._add_some_data()
+        now = self.api.roster.clock()
         self.store.acquire_factory_reset_lock(FactoryResetLock(
-            id="singleton", actor_id="someone-else",
-            acquired_at=self.api.roster.clock()))
+            id="singleton", actor_id="someone-else", token="other-token",
+            acquired_at=now, expires_at=now + timedelta(seconds=300)))
         try:
             token = self._preview()["challenge_token"]
             with self.assertRaises(ValidationError) as cm:
                 self._execute(token=token)
             self.assertEqual(cm.exception.details["reason"], "reset_in_progress")
         finally:
-            self.store.release_factory_reset_lock()
+            self.store.release_factory_reset_lock("other-token")
 
     def test_execute_lock_is_store_backed_across_two_service_instances(self):
         # #256 review blocker 5: the single-in-flight guard must hold across
@@ -200,9 +201,10 @@ class FactoryResetContract:
                                             self.api.roster.clock)
         token = other_service.preview(self.admin.id)["challenge_token"]
         from hockey_scheduler.domain import FactoryResetLock
+        now = self.api.roster.clock()
         held = self.store.acquire_factory_reset_lock(FactoryResetLock(
-            id="singleton", actor_id=self.admin.id,
-            acquired_at=self.api.roster.clock()))
+            id="singleton", actor_id=self.admin.id, token="held-token",
+            acquired_at=now, expires_at=now + timedelta(seconds=300)))
         self.assertTrue(held)
         try:
             with self.assertRaises(ValidationError) as cm:
@@ -210,7 +212,7 @@ class FactoryResetContract:
                     self.admin.id, "hunter22", CONFIRMATION_PHRASE, token, True)
             self.assertEqual(cm.exception.details["reason"], "reset_in_progress")
         finally:
-            self.store.release_factory_reset_lock()
+            self.store.release_factory_reset_lock("held-token")
 
     def test_preview_and_execute_across_two_service_instances(self):
         # Same cross-process-equivalence concern as above, for the
@@ -226,6 +228,73 @@ class FactoryResetContract:
         result = service_b.execute(
             self.admin.id, "hunter22", CONFIRMATION_PHRASE, token, True)
         self.assertEqual(result["result"], "success")
+
+    def test_stale_lock_reclaimed_allows_new_reset(self):
+        # #256 review round 2 blocker 3: a crashed process's lock (acquired,
+        # never released, lease already expired) must not disable factory
+        # reset forever — a new attempt reclaims it automatically.
+        from hockey_scheduler.domain import FactoryResetLock
+        self._add_some_data()
+        now = self.api.roster.clock()
+        self.store.acquire_factory_reset_lock(FactoryResetLock(
+            id="singleton", actor_id="crashed-process", token="dead-token",
+            acquired_at=now - timedelta(seconds=1000),
+            expires_at=now - timedelta(seconds=700)))
+        token = self._preview()["challenge_token"]
+        result = self._execute(token=token)
+        self.assertEqual(result["result"], "success")
+
+    def test_wrong_owner_release_does_not_clear_active_lock(self):
+        # #256 review round 2 blocker 3: release must be compare-and-delete
+        # on the owner's token — a release call carrying some other token
+        # must never clear a different, still-active lock.
+        from hockey_scheduler.domain import FactoryResetLock
+        now = self.api.roster.clock()
+        self.store.acquire_factory_reset_lock(FactoryResetLock(
+            id="singleton", actor_id=self.admin.id, token="real-token",
+            acquired_at=now, expires_at=now + timedelta(seconds=300)))
+        try:
+            self.store.release_factory_reset_lock("someone-elses-token")
+            held_again = self.store.acquire_factory_reset_lock(FactoryResetLock(
+                id="singleton", actor_id="another", token="another-token",
+                acquired_at=now, expires_at=now + timedelta(seconds=300)))
+            self.assertFalse(held_again, "wrong-token release must not clear the lock")
+        finally:
+            self.store.release_factory_reset_lock("real-token")
+
+    def test_forced_failure_then_recovery_produces_distinct_event_ids(self):
+        # #256 review round 2 blocker 2: an id allocated inside a rolled-
+        # back wipe transaction must never be reused by the next attempt's
+        # success event, which would collide with the already-persisted
+        # failed event and break every reset that follows one failure.
+        self._add_some_data()
+        token1 = self._preview()["challenge_token"]
+        orig = self.store.clear_all_data
+
+        def boom():
+            orig()
+            raise RuntimeError("forced failure")
+
+        self.store.clear_all_data = boom
+        try:
+            with self.assertRaises(RuntimeError):
+                self._execute(token=token1)
+        finally:
+            self.store.clear_all_data = orig
+        events = self.store.all_factory_reset_events()
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].result, "failed")
+        failed_event_id = events[0].id
+
+        token2 = self._preview()["challenge_token"]
+        result = self._execute(token=token2)
+        self.assertEqual(result["result"], "success")
+        events = self.store.all_factory_reset_events()
+        self.assertEqual(len(events), 2)
+        ids = {e.id for e in events}
+        self.assertEqual(len(ids), 2, "event ids must be distinct")
+        self.assertIn(failed_event_id, ids)
+        self.assertNotEqual(result["event_id"], failed_event_id)
 
     # -- successful reset -------------------------------------------------
     def test_execute_success_wipes_domains_preserves_one_admin(self):
@@ -421,6 +490,141 @@ class DurableFactoryResetTest(FactoryResetContract, unittest.TestCase):
         store = SqlStore(url)
         store.reset_schema()
         return store
+
+
+class FactoryResetPostgresRaceTest(unittest.TestCase):
+    """Real two-connection PostgreSQL regression for #256 review round 2
+    blocker 1: a concurrent ordinary write must never land silently between
+    the preview recount and the wipe."""
+
+    @unittest.skipUnless(os.environ.get("TEST_DATABASE_URL"),
+                         "cross-connection race needs PostgreSQL")
+    def test_concurrent_insert_never_silently_wiped(self):
+        url = os.environ["TEST_DATABASE_URL"]
+        seed = SqlStore(url)
+        seed.reset_schema()
+        try:
+            api = ApiService(seed)
+            admin = api.accounts.create_account(
+                "boss", "hunter22", Role.LEAGUE_ADMIN)
+            seed.add_organization(Organization(id="org_seed", name="Seed Org"))
+            token = api.factory_reset.preview(admin.id)["challenge_token"]
+
+            barrier = threading.Barrier(2)
+            writer_result = {}
+
+            def concurrent_writer():
+                store = SqlStore(url)
+                try:
+                    barrier.wait(timeout=5)
+                    # lock_clearable_tables_for_wipe() holds an ACCESS
+                    # EXCLUSIVE lock on this table for the wipe's whole
+                    # transaction — if this write is issued while that lock
+                    # is held, PostgreSQL blocks it at the database level
+                    # until the wipe transaction commits or rolls back.
+                    store.add_organization(Organization(
+                        id="concurrent_org", name="Snuck In"))
+                    writer_result["status"] = "written"
+                except Exception as exc:  # pragma: no cover
+                    writer_result["status"] = f"error:{exc!r}"
+                finally:
+                    store.close()
+
+            t = threading.Thread(target=concurrent_writer)
+            t.start()
+            barrier.wait(timeout=5)
+            # Both accepted outcomes per the reviewed contract: either the
+            # writer's insert is blocked by the exclusive lock until after
+            # the wipe commits (reset succeeds, row survives), or the
+            # writer's insert lands and commits BEFORE the wipe's recount
+            # observes it, correctly failing the snapshot comparison as a
+            # safe rejection. Either way the row must exist afterward and
+            # the reset must never silently absorb it into the wipe.
+            from hockey_scheduler.domain.errors import ValidationError
+            outcome = {}
+            try:
+                outcome["result"] = api.factory_reset.execute(
+                    admin.id, "hunter22", CONFIRMATION_PHRASE, token, True)
+            except ValidationError as exc:
+                outcome["error"] = exc
+            t.join(timeout=10)
+
+            self.assertEqual(writer_result.get("status"), "written",
+                             writer_result)
+            if "error" in outcome:
+                self.assertEqual(
+                    outcome["error"].details.get("reason"), "preview_stale",
+                    outcome["error"])
+            else:
+                self.assertEqual(outcome["result"]["result"], "success")
+            # The concurrently-inserted row must never be silently swept up
+            # by the wipe without ever being seen, whichever side of the
+            # wipe's exclusive lock it actually landed on.
+            checker = SqlStore(url)
+            try:
+                self.assertIsNotNone(checker.get_organization("concurrent_org"))
+            finally:
+                checker.close()
+        finally:
+            seed.close()
+
+    @unittest.skipUnless(os.environ.get("TEST_DATABASE_URL"),
+                         "cross-connection lock test needs PostgreSQL")
+    def test_lock_clearable_tables_for_wipe_blocks_concurrent_write(self):
+        # Directly proves the ACCESS EXCLUSIVE lock itself blocks a
+        # concurrent writer (the full execute() flow above reliably hits
+        # the "safe rejection" branch instead, since password verification
+        # is deliberately slow enough that a concurrent single-statement
+        # insert always completes first) — this isolates just the locking
+        # primitive to prove it genuinely serializes, not merely that the
+        # end-to-end outcome happens to be safe either way.
+        url = os.environ["TEST_DATABASE_URL"]
+        holder = SqlStore(url)
+        holder.reset_schema()
+        try:
+            holder.add_organization(Organization(id="org1", name="Org"))
+            release_lock = threading.Event()
+            entered_transaction = threading.Event()
+
+            def hold_lock():
+                with holder.transaction():
+                    holder.lock_clearable_tables_for_wipe()
+                    entered_transaction.set()
+                    release_lock.wait(timeout=5)
+
+            holder_thread = threading.Thread(target=hold_lock)
+            holder_thread.start()
+            self.assertTrue(entered_transaction.wait(timeout=5))
+
+            writer_done = threading.Event()
+
+            def blocked_writer():
+                store = SqlStore(url)
+                try:
+                    store.add_organization(Organization(id="org2", name="Blocked"))
+                finally:
+                    store.close()
+                    writer_done.set()
+
+            writer_thread = threading.Thread(target=blocked_writer)
+            writer_thread.start()
+            # The writer must still be blocked shortly after starting —
+            # this is the actual claim under test.
+            self.assertFalse(writer_done.wait(timeout=1),
+                             "concurrent write completed while the "
+                             "ACCESS EXCLUSIVE lock was held")
+            release_lock.set()
+            holder_thread.join(timeout=5)
+            self.assertTrue(writer_done.wait(timeout=5),
+                            "concurrent write never completed after release")
+            writer_thread.join(timeout=5)
+        finally:
+            holder.close()
+            checker = SqlStore(url)
+            try:
+                self.assertIsNotNone(checker.get_organization("org2"))
+            finally:
+                checker.close()
 
 
 class FactoryResetHttpTest(unittest.TestCase):

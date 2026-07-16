@@ -18,15 +18,20 @@ acknowledgement, and the single-in-flight guard).
 
 The challenge and the "one reset in progress" lock both live in the store
 (``FactoryResetChallenge``/``FactoryResetLock``), not in this Python
-object's memory (#256 review blocker 5) — a preview() and a later execute()
-reaching different ``FactoryResetService`` instances, processes, or server
-workers that share the same store still see the same outstanding challenge
-and correctly serialize against each other.
+object's memory (#256 review round 1 blocker 5) — a preview() and a later
+execute() reaching different ``FactoryResetService`` instances, processes,
+or server workers that share the same store still see the same outstanding
+challenge and correctly serialize against each other. The lock additionally
+carries a lease (``expires_at``) and an owner ``token`` (round 2 blocker 3):
+a crashed process's lock can be reclaimed after it expires, and release is
+compare-and-delete so a delayed release can never remove a different
+process's active lock.
 """
 
 import hashlib
 import hmac
 import secrets
+import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Optional
 
@@ -48,6 +53,7 @@ from .account_service import AccountService
 CONFIRMATION_PHRASE = "DELETE ALL PRODUCTION DATA"
 
 DEFAULT_CHALLENGE_TTL_SECONDS = 5 * 60
+DEFAULT_LOCK_LEASE_SECONDS = 5 * 60
 
 _CHALLENGE_ID = "singleton"
 _LOCK_ID = "singleton"
@@ -71,11 +77,13 @@ def _sanitize_failure(exc: Exception) -> str:
 class FactoryResetService:
     def __init__(self, store, accounts: AccountService,
                  clock: Callable[[], datetime] = _utcnow,
-                 challenge_ttl_seconds: int = DEFAULT_CHALLENGE_TTL_SECONDS):
+                 challenge_ttl_seconds: int = DEFAULT_CHALLENGE_TTL_SECONDS,
+                 lock_lease_seconds: int = DEFAULT_LOCK_LEASE_SECONDS):
         self.store = store
         self.accounts = accounts
         self.clock = clock
         self._challenge_ttl = challenge_ttl_seconds
+        self._lock_lease = lock_lease_seconds
 
     def _require_admin(self, actor_id: Optional[str]) -> UserAccount:
         """Require an authenticated, active League Admin holding both
@@ -144,14 +152,22 @@ class FactoryResetService:
         Any rejection performs zero writes — not even the durable event row,
         since nothing worth auditing happened yet. Only once every guard has
         passed does the atomic wipe run, and the durable success event is
-        written inside that same transaction (#256 review blocker 2) so an
-        event-write failure rolls the whole wipe back rather than leaving
-        production data gone with no surviving record. A failure past that
-        point gets its own durable "failed" event, written in a fresh
-        operation after the rollback completes.
+        written inside that same transaction (#256 review round 1 blocker
+        2) so an event-write failure rolls the whole wipe back rather than
+        leaving production data gone with no surviving record. A failure
+        past that point gets its own durable "failed" event, written in a
+        fresh operation after the rollback completes.
         """
+        # A crashed process's lock is reclaimable once its lease expires
+        # (#256 review round 2 blocker 3) — try this before acquiring so a
+        # stale lock never blocks forever.
+        self.store.release_stale_factory_reset_lock(self.clock())
+        lock_token = secrets.token_urlsafe(24)
+        now = self.clock()
         acquired = self.store.acquire_factory_reset_lock(FactoryResetLock(
-            id=_LOCK_ID, actor_id=actor_id or "", acquired_at=self.clock()))
+            id=_LOCK_ID, actor_id=actor_id or "", token=lock_token,
+            acquired_at=now,
+            expires_at=now + timedelta(seconds=self._lock_lease)))
         if not acquired:
             raise ValidationError(
                 "A factory reset is already in progress.",
@@ -168,32 +184,38 @@ class FactoryResetService:
                     "Typed confirmation phrase did not match.",
                     {"reason": "phrase_mismatch"})
             # Require the JSON value to be exactly `true` (#256 review
-            # blocker 3) — a truthiness check would accept the strings
-            # "false"/"no" or the number 1, silently treating an unset or
-            # malformed acknowledgement as given.
+            # round 1 blocker 3) — a truthiness check would accept the
+            # strings "false"/"no" or the number 1, silently treating an
+            # unset or malformed acknowledgement as given.
             if backup_acknowledged is not True:
                 raise ValidationError(
                     "Backup acknowledgement is required.",
                     {"reason": "backup_not_acknowledged"})
             challenge = self._consume_challenge(challenge_token, actor_id)
 
-            event_id = None
-            started_at = None
+            # A random id, not store.next_id() (#256 review round 2 blocker
+            # 2): next_id()'s counter increment is a write inside the wipe
+            # transaction below, so it would roll back on failure while the
+            # separately-written "failed" event keeps the id it names — the
+            # next successful reset would then reissue and collide with
+            # that same counter value. A random id has no such dependency
+            # on the transaction that might roll back.
+            event_id = f"factoryreset_{uuid.uuid4().hex}"
+            started_at = self.clock()
             try:
                 with self.store.transaction():
-                    # Re-validate the preview snapshot atomically with the
-                    # wipe itself (#256 review blocker 1): data created
-                    # after preview but before this exact moment must never
-                    # be silently swept up in a wipe the operator never saw
-                    # or confirmed.
+                    # Block ordinary concurrent writes on every clearable
+                    # table BEFORE re-checking counts (#256 review round 2
+                    # blocker 1) — otherwise a write that lands between the
+                    # count and clear_all_data() would be silently wiped
+                    # without ever appearing in the confirmed preview.
+                    self.store.lock_clearable_tables_for_wipe()
                     current_counts = self.store.row_counts()
                     if current_counts != challenge.counts:
                         raise ValidationError(
                             "The data has changed since the preview was "
                             "generated. Request a new preview and try "
                             "again.", {"reason": "preview_stale"})
-                    event_id = self.store.next_id("factoryreset")
-                    started_at = self.clock()
                     self.store.clear_all_data()
                     preserved = self._reinsert_admin(account)
                     self.store.add_factory_reset_event(FactoryResetEvent(
@@ -207,11 +229,6 @@ class FactoryResetService:
                 # there is no failure to record.
                 raise
             except Exception as exc:
-                if event_id is None:
-                    # Failed before an id/counter was ever allocated (e.g. a
-                    # transient error reading row_counts()) — nothing was
-                    # ever staged for this attempt.
-                    raise
                 self.store.add_factory_reset_event(FactoryResetEvent(
                     id=event_id, actor_id=actor_id, environment=environment,
                     started_at=started_at, result="failed",
@@ -222,7 +239,7 @@ class FactoryResetService:
             return {"result": "success", "event_id": event_id,
                     "preserved_account_id": preserved.id}
         finally:
-            self.store.release_factory_reset_lock()
+            self.store.release_factory_reset_lock(lock_token)
 
     def _reinsert_admin(self, account: UserAccount) -> UserAccount:
         """Re-create exactly the acting admin's account (preferred default

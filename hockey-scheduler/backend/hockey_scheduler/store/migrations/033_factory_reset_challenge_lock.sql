@@ -15,6 +15,14 @@
 -- IntegrityConflictError (#201 Slice 2) the same way
 -- create_first_admin_if_unclaimed's installation-claim race already is.
 --
+-- The lock's expires_at is a lease (#256 review round 2 blocker 3): a
+-- crashed process that never releases its lock would otherwise disable
+-- factory reset permanently, so an expired lock may be reclaimed without
+-- manual database intervention. token is a random, unguessable value known
+-- only to the current acquirer — release is compare-and-delete on this
+-- token, never an unconditional delete, so a delayed release from a stale
+-- process can never remove a different process's active lock.
+--
 -- Neither table is ever touched by clear_all_data() (#256): the lock row is
 -- held for the duration of the wipe it guards, and the challenge row is
 -- always consumed (deleted) before the wipe begins.
@@ -33,5 +41,7 @@ CREATE TABLE IF NOT EXISTS factory_reset_challenges (
 CREATE TABLE IF NOT EXISTS factory_reset_locks (
   id TEXT PRIMARY KEY,
   actor_id TEXT NOT NULL,
-  acquired_at TEXT NOT NULL
+  token TEXT NOT NULL,
+  acquired_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL
 );

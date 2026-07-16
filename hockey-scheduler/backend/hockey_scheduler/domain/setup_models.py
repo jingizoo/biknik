@@ -572,12 +572,26 @@ class FactoryResetChallenge:
 @dataclass
 class FactoryResetLock:
     """Installation-wide mutual-exclusion marker for an in-progress factory
-    reset (#256 review blocker 5). A fixed singleton ``id`` makes
-    acquisition a single unique-constraint insert — the same cross-process
-    race-safe pattern ``InstallationState`` already uses for the first-admin
-    claim — so "one reset in progress at a time" holds across every process
-    sharing this store, not only within one Python object.
+    reset (#256 review round 1 blocker 5, hardened in round 2 blocker 3). A
+    fixed singleton ``id`` makes acquisition a single unique-constraint
+    insert — the same cross-process race-safe pattern ``InstallationState``
+    already uses for the first-admin claim — so "one reset in progress at a
+    time" holds across every process sharing this store, not only within
+    one Python object.
+
+    ``token`` is a random, unguessable value generated at acquisition and
+    held only by the acquirer — release is compare-and-delete on this
+    token (never an unconditional delete of "whatever singleton row is
+    there"), so a delayed release from a process that no longer holds the
+    current lock can never delete a different process's active one.
+
+    ``expires_at`` is a lease: if a process crashes after acquiring the
+    lock and never releases it, the lock would otherwise disable factory
+    reset permanently. A caller may reclaim an expired lock without manual
+    database intervention (see ``release_stale_factory_reset_lock``).
     """
     id: str
     actor_id: str
+    token: str
     acquired_at: datetime
+    expires_at: datetime

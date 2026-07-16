@@ -885,19 +885,46 @@ class InMemoryStore:
 
     def acquire_factory_reset_lock(self, lock: FactoryResetLock) -> bool:
         """Try to become the sole in-progress factory reset (#256 review
-        blocker 5). Check-then-set under this store's own lock so two
-        concurrent callers against the same in-memory store (the
+        round 1 blocker 5). Check-then-set under this store's own lock so
+        two concurrent callers against the same in-memory store (the
         process-equivalent of two instances sharing one durable database)
-        can never both win."""
+        can never both win. Call ``release_stale_factory_reset_lock`` first
+        so a lock an owner never released doesn't block forever (#256
+        review round 2 blocker 3)."""
         with self._lock:
             if self._factory_reset_lock is not None:
                 return False
             self._factory_reset_lock = lock
             return True
 
-    def release_factory_reset_lock(self) -> None:
+    def release_stale_factory_reset_lock(self, now) -> bool:
+        """Reclaim the lock if its lease has expired (#256 review round 2
+        blocker 3). Returns True if a stale lock was cleared."""
         with self._lock:
+            existing = self._factory_reset_lock
+            if existing is None or existing.expires_at >= now:
+                return False
             self._factory_reset_lock = None
+            return True
+
+    def release_factory_reset_lock(self, token: str) -> None:
+        """Compare-and-delete: only clear the lock if ``token`` matches the
+        one currently held (#256 review round 2 blocker 3) — an
+        unconditional clear would let a delayed release from a caller that
+        no longer holds the current lock destroy a different caller's
+        active one."""
+        with self._lock:
+            existing = self._factory_reset_lock
+            if existing is not None and existing.token == token:
+                self._factory_reset_lock = None
+
+    def lock_clearable_tables_for_wipe(self) -> None:
+        """No-op for the in-memory store (#256 review round 2 blocker 1):
+        ``transaction()`` already holds ``self._lock`` for its ENTIRE body
+        (see its docstring), so every mutating call this codebase makes
+        through ``store.transaction()`` is already fully serialized against
+        the recount-then-wipe sequence below — there is no separate
+        per-table lock to take."""
 
     # -- listings (interface shared with the SQL store) -------------------
     def all_programs(self) -> List[Program]:
