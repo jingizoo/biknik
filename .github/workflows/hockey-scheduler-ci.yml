@@ -90,6 +90,7 @@ jobs:
           node --check hockey-scheduler/e2e/safe-destructive.js
           node --check hockey-scheduler/e2e/destructive-surfaces.js
           node --check hockey-scheduler/e2e/reset-visibility.js
+          node --check hockey-scheduler/e2e/factory-reset.js
           node --check hockey-scheduler/e2e/demo-lifecycle.js
           node --check hockey-scheduler/e2e/api-error-resilience.js
           node --check hockey-scheduler/e2e/v1-dependency-proof.js
@@ -126,7 +127,7 @@ jobs:
           - shard: 2
             scripts: "team-division-participation allowed-venues venue-access-cleanup venue-sharing permanent-teams"
           - shard: 3
-            scripts: "safe-destructive destructive-surfaces reset-visibility demo-lifecycle api-error-resilience"
+            scripts: "safe-destructive destructive-surfaces reset-visibility factory-reset demo-lifecycle api-error-resilience"
           - shard: 4
             scripts: "v1-dependency-proof team-club-optional division-delete-cleanup registration-cleanup records-delete"
     steps:

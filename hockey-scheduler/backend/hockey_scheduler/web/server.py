@@ -844,6 +844,14 @@ class Handler(BaseHTTPRequestHandler):
             status["demo_empty"] = (_app_mode() != "production"
                                     and not api.store.all_programs()
                                     and not api.store.all_teams())
+            # Whether the guarded production factory-reset workflow is actually
+            # reachable (#256): the UI only surfaces the Administration → Danger
+            # zone when BOTH conditions hold — the same gate the /execute route
+            # enforces — so the control is never shown where it couldn't run.
+            # Non-sensitive: it exposes only a deployment posture bit, never any
+            # data or secret, exactly like app_mode above.
+            status["factory_reset_enabled"] = (
+                _app_mode() == "production" and _allow_production_factory_reset())
             return self._send_json(status)
         if path == "/api/health":
             # Liveness + dependency snapshot (#90). Public, non-sensitive.

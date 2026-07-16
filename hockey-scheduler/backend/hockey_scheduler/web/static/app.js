@@ -151,6 +151,16 @@ const isDemo = () => !envStatus || envStatus.app_mode !== "production";
 // the "Start your league" empty state. Server-computed; defaults to false so a
 // missing status never hides Reset on a populated demo.
 const isDemoEmpty = () => !!(envStatus && envStatus.demo_empty);
+// Whether to surface the Administration → Danger zone factory-reset control
+// (#256). The server already computes `factory_reset_enabled` as production-mode
+// AND the deployment opt-in flag — the exact gate the /execute route enforces —
+// so the UI never has to re-derive it; we only add the client-side permission
+// check (League Admin needs BOTH manage_setup and manage_users). The service
+// re-verifies role and both permissions on every call, so this gate is purely
+// presentational, never the security boundary.
+const canFactoryReset = () =>
+  !!(envStatus && envStatus.factory_reset_enabled)
+  && hasPerm("manage_setup") && hasPerm("manage_users");
 
 // Theme-aligned inline SVG icons (#215): 20×20, stroke=currentColor so a button
 // class controls colour (neutral at rest, red on destructive hover/focus). Kept
@@ -955,6 +965,7 @@ function renderModal() {
   if (modal.type === "confirm-delete") return confirmDeleteModalHtml(modal);
   if (modal.type === "cancel-game") return cancelGameModalHtml(modal);
   if (modal.type === "blocked") return blockedModalHtml(modal);
+  if (modal.type === "factory-reset") return factoryResetModalHtml(modal);
   return "";
 }
 
@@ -998,6 +1009,82 @@ function demoConfirmModalHtml(m) {
        spellcheck="false" placeholder="${word}">`,
     `<button class="act ghost" data-modal-close>Cancel</button>
      <button class="act danger" data-demo-confirm disabled>${esc(title)}</button>`);
+}
+
+// Production factory-reset confirmation (#256). One themed modal that walks the
+// operator through every safety control the issue requires, in order:
+//   loading  — the preview POST is in flight (read-only, zero writes);
+//   confirm  — row-count preview + irreversible warning + backup acknowledgement
+//              + password re-entry + the exact typed phrase, with the execute
+//              button locked until all of them are satisfied;
+//   success  — the wipe completed; the caller is being signed out;
+//   error    — the preview or execute call failed (permission, stale challenge,
+//              server error) — the message is shown with a way to start over.
+// The CONFIRMATION_PHRASE mirrors the server constant exactly.
+const FACTORY_RESET_PHRASE = "DELETE ALL PRODUCTION DATA";
+function factoryResetCountRows(counts) {
+  // Show only the domains that actually hold rows, largest first, plus a total,
+  // so the operator sees the concrete blast radius rather than a wall of zeros.
+  const entries = Object.entries(counts || {})
+    .filter(([, n]) => n > 0)
+    .sort((a, b) => b[1] - a[1]);
+  const total = entries.reduce((sum, [, n]) => sum + n, 0);
+  if (!total) {
+    return `<p class="muted">This installation currently holds no business or
+      operational data. A reset will only re-assert the clean baseline.</p>`;
+  }
+  const rows = entries.map(([table, n]) =>
+    `<div class="fr-count-row"><span class="fr-count-name">${esc(table)}</span>
+       <span class="fr-count-n">${esc(String(n))}</span></div>`).join("");
+  return `<div class="fr-counts" data-fr-counts>
+      <div class="fr-count-row fr-count-total"><span class="fr-count-name">Total rows</span>
+        <span class="fr-count-n">${esc(String(total))}</span></div>
+      ${rows}
+    </div>`;
+}
+function factoryResetModalHtml(m) {
+  const title = "Factory reset production data";
+  if (m.step === "loading") {
+    return modalShell("danger", title,
+      `<p class="muted">Counting the data that would be erased…</p>`,
+      `<button class="act ghost" data-modal-close>Cancel</button>`);
+  }
+  if (m.step === "success") {
+    return modalShell("danger", title,
+      `<p><strong>Production data has been reset.</strong></p>
+       <p class="muted">Every session was signed out. You'll be returned to the
+         sign-in screen to set the installation up again.</p>`,
+      `<button class="act primary" data-fr-done>Return to sign-in</button>`);
+  }
+  if (m.step === "error") {
+    return modalShell("danger", title,
+      `<p>${esc(m.error || "The factory reset could not be started.")}</p>
+       <p class="muted">Nothing was changed.</p>`,
+      `<button class="act ghost" data-modal-close>Close</button>
+       <button class="act danger" data-fr-restart>Start over</button>`);
+  }
+  // step === "confirm"
+  const inlineError = m.error
+    ? `<p class="fr-inline-error" role="alert">${esc(m.error)}</p>` : "";
+  return modalShell("danger", title,
+    `<p>You're about to <strong>permanently erase all production data</strong>
+       for this installation. This cannot be undone. Make sure a database backup
+       has been taken first.</p>
+     <div class="section-title" style="margin-top:0">What will be erased</div>
+     ${factoryResetCountRows(m.counts)}
+     <label class="fr-check"><input type="checkbox" id="fr-backup"
+        ${m.backup ? "checked" : ""}> I have taken a full database backup and
+        understand this permanently erases all production data.</label>
+     <label class="modal-confirm-label" for="fr-password">Re-enter your password</label>
+     <input id="fr-password" class="modal-confirm-input fr-input" type="password"
+       autocomplete="current-password" spellcheck="false" placeholder="Password">
+     <label class="modal-confirm-label" for="fr-phrase">Type
+       <code>${FACTORY_RESET_PHRASE}</code> to confirm (exactly, in capitals)</label>
+     <input id="fr-phrase" class="modal-confirm-input fr-input" autocomplete="off"
+       spellcheck="false" placeholder="${FACTORY_RESET_PHRASE}">
+     ${inlineError}`,
+    `<button class="act ghost" data-modal-close>Cancel</button>
+     <button class="act danger" data-fr-confirm disabled>Reset production data</button>`);
 }
 
 function confirmDeleteModalHtml(m) {
@@ -1196,6 +1283,98 @@ function wireModal(c) {
       await render();
     };
   }
+  // Production factory reset (#256). The confirm step gates the execute button
+  // behind three live conditions — backup acknowledged, a non-empty password,
+  // and the exact typed phrase — toggled by input handlers WITHOUT a re-render
+  // (a re-render would drop focus mid-type, exactly as the demo-confirm flow
+  // avoids). "Start over" re-runs a fresh preview; "Return to sign-in" completes
+  // the post-reset sign-out.
+  if (modal && modal.type === "factory-reset") {
+    const restartBtn = c.querySelector("[data-fr-restart]");
+    if (restartBtn) restartBtn.onclick = () => startFactoryReset();
+    const doneBtn = c.querySelector("[data-fr-done]");
+    if (doneBtn) doneBtn.onclick = () => finishFactoryResetSignOut();
+    const backup = c.querySelector("#fr-backup");
+    const password = c.querySelector("#fr-password");
+    const phrase = c.querySelector("#fr-phrase");
+    const confirm = c.querySelector("[data-fr-confirm]");
+    if (confirm && backup && password && phrase && modal.step === "confirm") {
+      const m = modal;
+      const ready = () => backup.checked
+        && password.value.length > 0
+        && phrase.value === FACTORY_RESET_PHRASE;
+      const sync = () => {
+        // Mirror the checkbox into modal state so a re-render (e.g. after an
+        // inline execute error) preserves the operator's acknowledgement.
+        m.backup = backup.checked;
+        confirm.disabled = !ready();
+      };
+      backup.onchange = sync;
+      password.oninput = sync;
+      phrase.oninput = sync;
+      sync();
+      confirm.onclick = async () => {
+        if (!ready()) return;
+        // Progress lock (#256): disable every control so a double-submit can't
+        // fire a second wipe while the first is in flight.
+        confirm.disabled = true; confirm.textContent = "Resetting…";
+        backup.disabled = password.disabled = phrase.disabled = true;
+        const res = await post("/api/admin/factory-reset/execute", {
+          password: password.value,
+          typed_phrase: phrase.value,
+          challenge_token: m.token,
+          backup_acknowledged: true,
+        });
+        if (res && res.error) {
+          // The challenge is single-use: a stale/expired/consumed one can't be
+          // retried in place, so send the operator back to a fresh preview.
+          // Everything else (wrong password, etc.) is retryable on this screen.
+          const code = res.error.code || "";
+          if (code === "invalid_challenge" || res.error.message &&
+              /preview|challenge/i.test(res.error.message)) {
+            modal = { type: "factory-reset", step: "error", error: res.error.message };
+          } else {
+            modal.step = "confirm"; modal.error = res.error.message;
+          }
+          toast = "";  // the modal owns the error surface, not the toast
+          return render();
+        }
+        modal.step = "success";
+        await render();
+      };
+    }
+  }
+}
+
+// Open the Danger-zone factory-reset modal and immediately fetch the preview
+// (#256): a read-only, zero-write row-count snapshot plus a single-use challenge
+// token bound to it. Kept as a standalone function so both the initial button
+// and the modal's "Start over" reuse the same entry point.
+async function startFactoryReset() {
+  modal = { type: "factory-reset", step: "loading" };
+  render();
+  const res = await post("/api/admin/factory-reset/preview", {});
+  if (!modal || modal.type !== "factory-reset") return;  // closed while loading
+  if (res && res.error) {
+    modal = { type: "factory-reset", step: "error", error: res.error.message };
+  } else {
+    modal = { type: "factory-reset", step: "confirm", counts: res.counts,
+              token: res.challenge_token, backup: false, error: "" };
+  }
+  toast = "";
+  render();
+}
+
+// Complete the post-reset sign-out (#256): the server already revoked every
+// session and expired this caller's cookie, so this just drops client auth
+// state and returns to the sign-in screen, mirroring the header Sign-out.
+function finishFactoryResetSignOut() {
+  modal = null;
+  try { localStorage.setItem("hs_signed_out", "1"); } catch (_) {}
+  setUser(null);
+  toast = "";
+  renderRoleSwitch();
+  showLogin("Production data was reset. Sign in to set up the installation.");
 }
 
 // Setup → Hierarchy (#165): a functional tree of the league's structure built
@@ -3489,7 +3668,33 @@ function renderReadiness(ov) {
     "CSV-only import (no native app or PWA yet); scheduler optimizer not built."));
   return `${pageIntro("A pre-flight checklist for running this league in production: data, delivery, and deployment posture.")}
     <div class="card"><div class="section-title" style="margin-top:0">Pilot Readiness</div>
-    ${rows.join("")}</div>`;
+    ${rows.join("")}</div>
+    ${renderDangerZone()}`;
+}
+
+// Administration → Danger zone (#256): the single, guarded entry point to the
+// production factory reset. Shown only when the deployment has opted in
+// (`factory_reset_enabled`, i.e. production mode AND the ALLOW_PRODUCTION_
+// FACTORY_RESET flag) and the signed-in user is a League Admin with both
+// manage_setup and manage_users — the same conditions the backend enforces.
+// The button opens a multi-step confirmation modal (preview → acknowledge →
+// re-authenticate → typed phrase → execute); it never wipes on a single click.
+function renderDangerZone() {
+  if (!canFactoryReset()) return "";
+  return `<div class="card danger-zone">
+    <div class="section-title" style="margin-top:0">Danger zone</div>
+    <div class="dz-body">
+      <div class="dz-copy">
+        <div class="dz-title">Factory reset production data</div>
+        <p class="muted">Permanently erase all business and operational data —
+          setup hierarchy, teams, players, registrations, games, rosters,
+          officials, notifications, imports and more. The database schema and
+          this installation stay intact; your admin account is preserved and
+          every session is signed out. <strong>This cannot be undone.</strong></p>
+      </div>
+      <button class="act danger" data-factory-reset>Factory reset production data…</button>
+    </div>
+  </div>`;
 }
 
 /* ---------- Draft scheduler review + publish (#86/#106) ---------- */
@@ -4857,6 +5062,9 @@ async function render() {
 
   wireModal(c);
   c.querySelectorAll("[data-goto]").forEach((b) => b.onclick = () => switchTab(b.dataset.goto));
+  // Administration → Danger zone (#256): opens the guarded factory-reset modal.
+  const frBtn = c.querySelector("[data-factory-reset]");
+  if (frBtn) frBtn.onclick = () => { if (canFactoryReset()) startFactoryReset(); };
   // Public surface (#83): tab switch, division select, game detail, back.
   c.querySelectorAll("[data-public-tab]").forEach((b) => b.onclick = () => {
     publicTab = b.dataset.publicTab; publicState.game = null;
