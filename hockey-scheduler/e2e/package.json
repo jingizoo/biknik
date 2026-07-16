@@ -18,6 +18,7 @@
     "destructive-surfaces": "node destructive-surfaces.js",
     "reset-visibility": "node reset-visibility.js",
     "factory-reset": "node factory-reset.js",
+    "coach-scope": "node coach-scope.js",
     "demo-lifecycle": "node demo-lifecycle.js",
     "api-error-resilience": "node api-error-resilience.js",
     "v1-dependency-proof": "node v1-dependency-proof.js",

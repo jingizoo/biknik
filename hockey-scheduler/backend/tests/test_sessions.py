@@ -14,6 +14,7 @@ from datetime import datetime, timedelta, timezone
 
 from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
 
+from hockey_scheduler.domain import Team
 from hockey_scheduler.services import AccountService
 from hockey_scheduler.store import InMemoryStore, SqlStore
 from hockey_scheduler.web.auth import SessionManager, hash_token
@@ -33,7 +34,13 @@ class _Clock:
 
 def _make_account(store, username="coach", role="coach", scope=None):
     accounts = AccountService(store, lambda: datetime(2026, 1, 1, tzinfo=UTC))
-    return accounts.create_account(username, "pw", role, scope=scope or {})
+    scope = scope or {}
+    # A coach account now requires a real team (#266) — seed the referenced
+    # team so these auth/session fixtures don't depend on a pre-existing one.
+    tid = scope.get("team_id")
+    if tid and store.get_team(tid) is None:
+        store.add_team(Team(id=tid, name="Fixture Team"))
+    return accounts.create_account(username, "pw", role, scope=scope)
 
 
 class SessionManagerTest(unittest.TestCase):

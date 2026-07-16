@@ -37,17 +37,31 @@ def _player_ids(path: str, body: dict):
     return ids
 
 
-def scope_violation(role, scope, path, body, store):
+def scope_violation(role, scope, path, body, store, *,
+                    allow_unscoped_dev_fallback=False):
     """Return a human message if the action is outside the user's scope, else None.
 
     ``scope`` is the session binding (``team_id`` for a coach, ``player_id`` for
-    a player). An unbound session (e.g. the dev header fallback) is not scoped.
+    a player).
+
+    Coach scope fails **closed** (#266): a Coach whose session carries no
+    ``team_id`` — an account created/left without a valid team — has NO roster
+    authority and is refused, rather than being silently treated as unscoped and
+    allowed to mutate any team's roster. The ONE exception is the demo-only
+    ``X-Demo-Role`` header fallback, which produces an identity-less
+    (``user_id is None``) coach session for scripts/curl; the caller passes
+    ``allow_unscoped_dev_fallback=True`` only for that path, and only outside
+    production (the header is never even read in production), so the fallback is
+    explicit and impossible to activate in a production deployment.
     """
     scope = scope or {}
     if role == Role.COACH:
         team = scope.get("team_id")
         if not team:
-            return None  # unbound coach (dev fallback) — not resource-scoped
+            if allow_unscoped_dev_fallback:
+                return None  # demo-only X-Demo-Role fallback; unreachable in prod
+            return ("This coach account has no assigned team, so it can't "
+                    "manage any roster — ask a league admin to assign a team.")
         m = _GAME_ACTION.match(path)
         if m and m.group(1) in _GAME_WIDE_COACH_ACTIONS:
             return ("A coach can't lock, unlock, or cancel the whole game "

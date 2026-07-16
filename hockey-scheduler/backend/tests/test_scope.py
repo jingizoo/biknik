@@ -59,11 +59,24 @@ class ScopeUnitTest(unittest.TestCase):
                                      "/api/games/g/roster/remove",
                                      {"player_id": self.away_player}))
 
-    def test_unbound_coach_not_scoped(self):
-        # Dev header fallback: no binding → not resource-scoped.
-        self.assertIsNone(self._v(Role.COACH, {},
-                                  "/api/games/g/roster/select",
-                                  {"player_ids": [self.away_player]}))
+    def test_unbound_coach_fails_closed(self):
+        # #266: a Coach with no team binding — an account created/left without a
+        # valid team — has NO roster authority and is refused, rather than being
+        # silently treated as unscoped and allowed to touch any team's roster.
+        self.assertIsNotNone(self._v(Role.COACH, {},
+                                     "/api/games/g/roster/select",
+                                     {"player_ids": [self.away_player]}))
+
+    def test_unbound_coach_dev_fallback_allowed_only_when_opted_in(self):
+        # The demo-only X-Demo-Role fallback (an identity-less coach session)
+        # stays permitted, but ONLY when the caller opts in explicitly. The
+        # server sets that flag solely for the header path and never in
+        # production, so the fallback is impossible to activate in a real
+        # deployment (#266).
+        self.assertIsNone(scope_violation(
+            Role.COACH, {}, "/api/games/g/roster/select",
+            {"player_ids": [self.away_player]}, self.store,
+            allow_unscoped_dev_fallback=True))
 
     def test_scoped_coach_cannot_lock_unlock_or_cancel(self):
         scope = {"team_id": self.home}

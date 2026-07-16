@@ -1468,7 +1468,13 @@ class Handler(BaseHTTPRequestHandler):
                             "required": perm.value if perm else None},
             }}, 403)
         # Resource scoping (#51): a coach only their team, a player only self.
-        violation = scope_violation(role, scope, path, body, api.store)
+        # An unbound Coach fails closed (#266) — the ONLY permitted unscoped
+        # coach is the demo-only X-Demo-Role dev fallback, which carries no
+        # backing account (user_id is None) and is never read in production, so
+        # the fallback stays explicit and impossible to activate there.
+        allow_dev_fallback = user_id is None and _app_mode() != "production"
+        violation = scope_violation(role, scope, path, body, api.store,
+                                    allow_unscoped_dev_fallback=allow_dev_fallback)
         if violation is not None:
             return self._send_json({"error": {
                 "code": "forbidden", "message": violation,
@@ -1719,6 +1725,21 @@ class Handler(BaseHTTPRequestHandler):
         # one (#67). No self-service signup — this is the only way an
         # account comes into existence besides the demo seed.
         if path == "/api/accounts":
+            # Reject unknown top-level fields (#266): the scope binding must
+            # travel inside `scope` (e.g. {"scope": {"team_id": …}}). A misplaced
+            # top-level `team_id` (or any stray key) would otherwise be silently
+            # dropped, creating an unscoped Coach that looks assigned to the
+            # operator — so fail loudly instead of quietly ignoring it.
+            _ACCOUNT_FIELDS = {"username", "password", "role", "scope"}
+            unknown = sorted(k for k in (body or {}) if k not in _ACCOUNT_FIELDS)
+            if unknown:
+                return self._send_json({"error": {
+                    "code": "validation_error",
+                    "message": ("Unknown field(s): " + ", ".join(unknown)
+                                + ". The scope binding (e.g. team_id) must be "
+                                "sent inside \"scope\"."),
+                    "details": {"reason": "unknown_field", "fields": unknown},
+                }}, 400)
             # Attribute the mint to the signed-in league admin (server-
             # resolved), never a client-supplied actor_id, so the audit
             # trail (#67) cannot be forged (#135).

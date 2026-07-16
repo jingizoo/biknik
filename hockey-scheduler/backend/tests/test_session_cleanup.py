@@ -29,7 +29,8 @@ class _Clock:
 
 
 def _account(store):
-    return AccountService(store, lambda: T0).create_account("c", "pw", "coach")
+    # Role is irrelevant to session cleanup; a viewer needs no team scope (#266).
+    return AccountService(store, lambda: T0).create_account("c", "pw", "viewer")
 
 
 class _CleanupContract:

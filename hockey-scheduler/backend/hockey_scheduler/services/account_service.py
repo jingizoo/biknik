@@ -95,6 +95,23 @@ class AccountService:
             raise ValidationError(
                 "That player does not exist.",
                 {"reason": "scope_subject_missing", "player_id": player_id})
+        # A Coach's authority is entirely its team scope (#266): an account with
+        # no ``team_id`` is refused at the scope gate and can manage no roster,
+        # so creating one is a silent dead end at best and a fail-open hole if
+        # the gate ever regressed. Require the team AND prove it resolves to a
+        # real (non-deleted) Team before any write, mirroring the official/player
+        # subject checks above — a rejected creation writes neither account nor
+        # audit row (the method is transactional).
+        if role == Role.COACH:
+            team_id = scope.get("team_id")
+            if not team_id:
+                raise ValidationError(
+                    "A coach account must be assigned a team.",
+                    {"reason": "scope_required", "field": "team_id"})
+            if self.store.get_team(team_id) is None:
+                raise ValidationError(
+                    "That team does not exist.",
+                    {"reason": "scope_subject_missing", "team_id": team_id})
         account = UserAccount(
             id=account_id or self.store.next_id("user"),
             username=username,
@@ -195,6 +212,25 @@ class AccountService:
                     "a valid player before reactivating.",
                     {"reason": "scope_subject_missing", "account_id": account_id,
                      "player_id": player_id})
+            # A Coach account must still carry a valid team scope to be
+            # reactivated (#266) — reactivating an unscoped or dangling-team
+            # coach would resurrect a login the scope gate now refuses, or (if
+            # the team was deleted meanwhile) a coach bound to a nonexistent
+            # team. Refuse until it is rebound to a real team.
+            if account.role == Role.COACH:
+                team_id = scope.get("team_id")
+                if not team_id:
+                    raise ValidationError(
+                        "This coach account has no assigned team; assign a "
+                        "team before reactivating.",
+                        {"reason": "scope_required", "account_id": account_id,
+                         "field": "team_id"})
+                if self.store.get_team(team_id) is None:
+                    raise ValidationError(
+                        "This account's team no longer exists; rebind it to "
+                        "a valid team before reactivating.",
+                        {"reason": "scope_subject_missing",
+                         "account_id": account_id, "team_id": team_id})
         account.active = bool(active)
         self.store.save_user_account(account)
         self._audit(

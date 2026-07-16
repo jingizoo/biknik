@@ -35,8 +35,11 @@ class FactoryResetContract:
         self.api = ApiService(self.store)
         self.admin = self.api.accounts.create_account(
             "boss", "hunter22", Role.LEAGUE_ADMIN)
-        self.coach = self.api.accounts.create_account(
-            "coach1", "coachpass", Role.COACH)
+        # A non-admin account used only to prove the League-Admin gate rejects
+        # non-admins. A viewer needs no scope subject (a coach would now require
+        # a real team, #266) and keeps the baseline row counts unchanged.
+        self.non_admin = self.api.accounts.create_account(
+            "viewer1", "viewerpass", Role.VIEWER)
 
     def tearDown(self):
         conn = getattr(self.store, "conn", None)
@@ -68,7 +71,7 @@ class FactoryResetContract:
     def test_preview_requires_admin_role(self):
         from hockey_scheduler.domain.errors import NotAuthorizedError
         with self.assertRaises(NotAuthorizedError):
-            self.api.factory_reset.preview(self.coach.id)
+            self.api.factory_reset.preview(self.non_admin.id)
 
     def test_preview_rejects_unknown_actor(self):
         from hockey_scheduler.domain.errors import NotAuthorizedError
@@ -690,8 +693,9 @@ class FactoryResetHttpTest(unittest.TestCase):
         self.assertEqual(status, 401)
 
     def test_non_admin_role_is_403(self):
-        srv.STATE.api.accounts.create_account("coach1", "coachpass", "coach")
-        cookie = self._login("coach1", "coachpass")
+        # A non-admin (viewer needs no team scope, #266) is rejected by the gate.
+        srv.STATE.api.accounts.create_account("viewer1", "viewerpass", "viewer")
+        cookie = self._login("viewer1", "viewerpass")
         status, body, _ = self._req(
             "POST", "/api/admin/factory-reset/preview", {}, cookie=cookie)
         self.assertEqual(status, 403)

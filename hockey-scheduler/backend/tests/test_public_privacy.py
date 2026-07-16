@@ -106,7 +106,14 @@ class ProductionPublicPrivacyTest(_HttpBase):
     def _get_as(self, account_id, role, scope, path):
         # Create a real account with this role/scope, then issue a store-backed
         # session for it (#74 — role/scope are resolved from the account).
+        from hockey_scheduler.domain import Team
         store = srv.STATE.api.store
+        # A coach scope now needs a real team (#266) — seed the referenced team
+        # (including the deliberately-unrelated "team_elsewhere") so the account
+        # can be created to prove it still can't read another team's game.
+        tid = (scope or {}).get("team_id")
+        if tid and store.get_team(tid) is None:
+            store.add_team(Team(id=tid, name="Scope Team"))
         acct = srv.STATE.api.accounts.create_account(
             username=account_id, password="pw", role=role, scope=scope)
         token = srv.SESSIONS.login(store, acct.id)

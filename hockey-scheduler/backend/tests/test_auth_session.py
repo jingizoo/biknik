@@ -140,6 +140,8 @@ class AuthSessionTest(unittest.TestCase):
         admin = self._client()
         self._req(admin, "POST", "/api/auth/login",
                  {"username": "admin", "password": "demo"})
+        from hockey_scheduler.domain import Team
+        srv.STATE.api.store.add_team(Team(id="team_z", name="Team Z"))  # #266
         status, created = self._req(
             admin, "POST", "/api/accounts",
             {"username": "new_coach", "password": "real-pw", "role": "coach",

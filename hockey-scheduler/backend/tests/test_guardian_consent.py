@@ -61,7 +61,8 @@ class LinkGuardianAccountValidationTest(unittest.TestCase):
             self.api.guardians.link_guardian("no_such_account", "junior")
 
     def test_requires_the_guardian_role(self):
-        self.api.accounts.create_account("coach1", "pw", "coach", account_id="acct1")
+        # Any non-guardian role is rejected; a viewer needs no team scope (#266).
+        self.api.accounts.create_account("viewer1", "pw", "viewer", account_id="acct1")
         with self.assertRaises(ValidationError):
             self.api.guardians.link_guardian("acct1", "junior")
 

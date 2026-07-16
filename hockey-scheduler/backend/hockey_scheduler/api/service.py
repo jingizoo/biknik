@@ -765,6 +765,16 @@ class ApiService:
         # (review finding) — also exclude that via is_memory_backed.
         persistent = (not isinstance(self.store, InMemoryStore)
                       and not getattr(self.store, "is_memory_backed", False))
+        # Active Coach accounts with no valid team scope (#266): after the
+        # fail-closed scope gate these accounts can do nothing (every roster
+        # mutation and private read is refused), so they are a rollout defect to
+        # remediate — an operator must rebind them to a real team or deactivate
+        # them. Surfaced here rather than silently grandfathered.
+        unscoped_coaches = sum(
+            1 for a in self.accounts.list_accounts()
+            if a.active and a.role == Role.COACH
+            and (not (a.scope or {}).get("team_id")
+                 or self.store.get_team((a.scope or {}).get("team_id")) is None))
         checks = [
             {"name": "database_reachable", "ok": self.store.db_reachable(),
              "detail": f"store={getattr(self.store, 'backend', 'memory')}"},
@@ -780,6 +790,11 @@ class ApiService:
              "ok": persistent if production else True,
              "detail": (f"store={getattr(self.store, 'backend', 'memory')}"
                         if persistent else "in-memory or ephemeral (no durable DATABASE_URL)")},
+            {"name": "coach_scope_bound",
+             "ok": (unscoped_coaches == 0) if production else True,
+             "detail": (f"{unscoped_coaches} active coach account(s) without a "
+                        "valid team — rebind or deactivate them"
+                        if unscoped_coaches else "all active coaches bound to a team")},
         ]
         return {"ready": all(c["ok"] for c in checks),
                 "app_mode": app_mode, "checks": checks}

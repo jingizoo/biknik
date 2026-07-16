@@ -395,7 +395,7 @@ class ImportCommitServiceContract:
     def test_overview_omits_detail_for_non_import_audit_entries(self):
         from hockey_scheduler.services.account_service import AccountService
         AccountService(self.store).create_account(
-            "sidefx", "hunter2", "coach", actor_id="admin")
+            "sidefx", "hunter2", "viewer", actor_id="admin")
         self.api.commit_teams_players_import(
             self.season.id, _valid_sheets_csv(), actor_id="admin")
         ov = self.api.get_demo_overview()

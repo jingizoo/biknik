@@ -3634,6 +3634,7 @@ const READINESS_CHECK_LABEL = {
   active_admin: "Active league admin",
   cookie_hardening: "Secure cookie hardening",
   persistent_store: "Persistent store",
+  coach_scope_bound: "Coach team scoping",
 };
 const RD_BADGE_CLASS = { pass: "green", warn: "orange", fail: "red", info: "gray" };
 const RD_BADGE_TEXT = { pass: "PASS", warn: "WARN", fail: "FAIL", info: "INFO" };
