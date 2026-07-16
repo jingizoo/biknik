@@ -51,6 +51,8 @@ arrays for the in-memory demo store instead):
 | `DELIVERY_WORKER_ENABLED` / `_INTERVAL` / `_BATCH` | Opt-in background delivery worker (#79). | disabled / 30s / 50 |
 | Email/push transport vars | Configure real SMTP / push; default is dry-run (nothing sent). | dry-run |
 | `TRUST_PROXY_HEADERS` | `1` trusts `X-Forwarded-For` for anonymous-route rate limiting (#131). **Only set this if a real reverse proxy sits in front of the app and is configured to strip/overwrite any client-supplied `X-Forwarded-For` before appending its own** — otherwise any caller can spoof a new value per request and defeat rate limiting entirely. Unset when serving direct HTTP with no proxy. | unset (raw connecting IP) |
+| `ALLOW_PRODUCTION_FACTORY_RESET` | `1`/`true`/`yes` makes the guarded production factory-reset workflow reachable (#256). Leave **unset** except during a deliberate, supervised wipe — see [Factory reset (Danger zone)](#factory-reset-danger-zone). Has no effect outside `APP_MODE=production`. | unset (disabled) |
+| `DEPLOYMENT_ENV` | Free-form environment label recorded on the durable factory-reset audit event (e.g. `prod-eu`). Falls back to `APP_MODE` when unset. | `APP_MODE` |
 
 Secrets are read from the environment only — they are never returned by any
 API, logged, or persisted in plaintext (passwords are PBKDF2-hashed).
@@ -250,6 +252,72 @@ exits non-zero on any divergence. The file-copy backup path is SQLite-only
 acceptance — compare `GET /api/onboarding/status` and record counts on the
 restored database against the source. `test_backup_restore_acceptance.py`
 runs this check (and proves it *fails* on a divergent restore) in CI.
+
+## Factory reset (Danger zone)
+
+The **factory reset** (#256) is the supported way to return a production
+installation to a clean, freshly-configured state — it deletes every business
+and operational row (setup hierarchy, teams, players, registrations, venue
+access, games, rosters, availability, officials, notifications, contacts,
+feeds, imports) while **keeping the schema, migration ledger, and this
+installation intact**. It is a row-level wipe, not `reset_schema`'s demo/test
+DDL rebuild, and it is deliberately **not** `/api/demo/clear` (blocked in
+production) nor ordinary per-record deletion.
+
+It is disabled by default. To make it reachable at all, the deployment must
+run in `APP_MODE=production` **and** set `ALLOW_PRODUCTION_FACTORY_RESET=true`
+— the flag alone, in a non-production process, does nothing. Even then, every
+one of these must hold before a single row is deleted:
+
+- the caller is a League Admin with **both** `manage_setup` and `manage_users`
+  (re-checked in the service, not just at the HTTP gate);
+- a fresh **password re-authentication** succeeds;
+- the operator has typed the exact phrase `DELETE ALL PRODUCTION DATA`;
+- the operator has **acknowledged that a backup was taken** (the request must
+  carry the JSON boolean `true`, not a truthy string);
+- a short-lived, single-use **challenge token** from the preview call is
+  present and still matches the actor and the previewed row counts;
+- no other reset is in progress (an installation-wide lease-backed lock).
+
+The wipe itself runs as **one transaction**: it locks the clearable tables,
+re-validates the preview snapshot (rejecting as `preview_stale` if the data
+changed since preview), deletes, re-inserts exactly the acting admin's account
+plus a fresh installation-claim marker, and writes a durable **success** event
+— so a failure at any point rolls the whole thing back with no partial
+deletion. A separate append-only `factory_reset_events` row (actor, timestamp,
+environment, pre-reset counts, result — no secrets or PII) survives the wipe as
+the audit record. Every session and token is revoked; the operator is signed
+out and must log back in as the preserved admin.
+
+### Operator procedure
+
+1. **Take a fresh backup first** and confirm it restores (the [Backup &
+   restore](#backup--restore) round trip above). The reset is irreversible from
+   inside the app — a backup is the only recovery path.
+2. Set `ALLOW_PRODUCTION_FACTORY_RESET=true` on the production deployment and
+   restart (the flag is read fresh per request, but restarting is the simplest
+   way to set it deliberately). Optionally set `DEPLOYMENT_ENV` for the audit
+   label.
+3. Sign in as a League Admin, open **Pilot Readiness → Danger zone → Factory
+   reset production data**, and follow the modal: review the row-count preview,
+   acknowledge the backup, re-enter your password, type the confirmation
+   phrase, and confirm. The button stays locked until all three inputs are
+   satisfied, and a double-submit cannot fire a second wipe.
+4. You are signed out on success. Sign back in as the same admin and
+   reconfigure the installation (or run the one-time client-owned admin claim
+   below if you preserved a fresh-install posture).
+5. **Unset `ALLOW_PRODUCTION_FACTORY_RESET`** again and restart, so the Danger
+   zone is not left reachable.
+
+For an immediate, lower-risk production reset you can instead stand up a
+**new, empty database**, validate it in staging, cut `DATABASE_URL` over to it,
+and retain the original database until validation is complete — the factory
+reset is the in-place equivalent for when a new database is not practical.
+
+The reset engine (including a forced mid-transaction failure proving full
+PostgreSQL rollback, and two two-connection concurrency regressions) is covered
+by `tests/test_factory_reset.py`; the Danger-zone UI and its safety gating are
+covered by the `factory-reset` browser journey.
 
 ## Migration verification
 

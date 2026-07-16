@@ -856,6 +856,35 @@ details.tn > .tn-sum:hover { background: #f6f7fb; }
 .modal .act.danger:hover:not(:disabled) { filter: brightness(.94); }
 .modal .act.danger:disabled { opacity: .5; cursor: not-allowed; }
 
+/* ----- Administration → Danger zone factory reset (#256) ----- */
+/* The card is deliberately visually distinct from every other admin card so the
+   operator can never mistake it for an ordinary control. */
+.card.danger-zone { border: 1px solid var(--red); }
+.card.danger-zone .section-title { color: var(--red); }
+.dz-body { display: flex; align-items: flex-start; justify-content: space-between;
+  gap: 16px; padding: 4px 4px 8px; flex-wrap: wrap; }
+.dz-copy { flex: 1 1 260px; min-width: 0; }
+.dz-title { font-weight: 700; margin-bottom: 4px; }
+.dz-body .act.danger { flex: 0 0 auto; white-space: nowrap; }
+/* The factory-reset confirm inputs must show exactly what will be compared
+   (the phrase match is case-sensitive), so unlike the shared confirm input they
+   are NOT visually upper-cased or letter-spaced. */
+.modal-confirm-input.fr-input { text-transform: none; letter-spacing: normal; }
+.fr-check { display: flex; gap: 8px; align-items: flex-start; font-size: 13px;
+  margin: 14px 0 4px; cursor: pointer; line-height: 1.4; }
+.fr-check input { margin-top: 2px; flex: 0 0 auto; }
+.fr-counts { border: 1px solid var(--sep); border-radius: 9px; overflow: hidden;
+  margin: 8px 0 4px; max-height: 220px; overflow-y: auto; }
+.fr-count-row { display: flex; justify-content: space-between; gap: 12px;
+  padding: 7px 12px; font-size: 13px; border-bottom: 1px solid var(--sep); }
+.fr-count-row:last-child { border-bottom: none; }
+.fr-count-row .fr-count-name { color: var(--muted); }
+.fr-count-row .fr-count-n { font-weight: 600; font-variant-numeric: tabular-nums; }
+.fr-count-total { background: var(--bg); }
+.fr-count-total .fr-count-name { color: var(--ink); font-weight: 600; }
+.fr-inline-error { color: var(--red); font-size: 13px; font-weight: 600;
+  margin: 12px 0 0; }
+
 /* ----- Pilot onboarding import wizard (#96/#99) ----- */
 .import-form { padding: 0 16px 16px; }
 .import-form label { display: block; font-size: 12px; font-weight: 600; color: var(--muted); margin: 12px 0 4px; }
