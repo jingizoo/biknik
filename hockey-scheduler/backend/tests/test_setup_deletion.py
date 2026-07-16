@@ -1158,6 +1158,37 @@ class DeletionContract:
         self.assertNotIn("error", result, result)
         self.assertFalse(result["enabled"])
 
+    def test_ordinary_setters_do_not_silently_reactivate_a_retired_row(self):
+        # #232 review 6: only the MANAGE_SETUP-gated set_..._active can
+        # reactivate a retired row — an ordinary value edit (a wider
+        # permission than retire/reactivate) must not be a back door around
+        # that gate.
+        official = self._official()
+        ref = f"official:{official}"
+        contact = self.store.add_contact_destination(ContactDestination(
+            id=self.store.next_id("contact"), recipient_ref=ref,
+            channel=NotificationChannel.EMAIL, destination="original@example.com"))
+        pref = self.store.save_notification_preference(NotificationPreference(
+            id=self.store.next_id("notif_pref"), recipient_ref=ref,
+            channel=NotificationChannel.PUSH, enabled=False))
+        self.api.set_contact_destination_active(contact.id, False, actor_id=self.ACTOR)
+        self.api.set_notification_preference_active(pref.id, False, actor_id=self.ACTOR)
+
+        edited_contact = self.api.set_contact_destination(
+            ref, "email", "edited@example.com")
+        self.assertNotIn("error", edited_contact, edited_contact)
+        self.assertEqual(edited_contact["destination"], "edited@example.com")
+        self.assertFalse(edited_contact["active"],
+                         "editing the value must not reactivate a retired contact")
+
+        edited_pref = self.api.set_notification_preference(ref, "push", True)
+        self.assertNotIn("error", edited_pref, edited_pref)
+        self.assertTrue(edited_pref["enabled"])
+        stored_pref = next(p for p in self.store.all_notification_preferences()
+                          if p.id == pref.id)
+        self.assertFalse(stored_pref.active,
+                         "editing the value must not reactivate a retired preference")
+
     # -- official contact/preference retire-reactivate guard (#232 review 4) -
     # The same deactivate -> delete subject -> reactivate hole the device-
     # token guard closes applies identically to retiring a contact/
@@ -1221,15 +1252,90 @@ class DeletionContract:
         self.assertNotIn("error", reactivated, reactivated)
         self.assertTrue(reactivated["active"])
 
+    def test_retire_contact_rolls_back_on_forced_audit_failure(self):
+        # #232 review 6: retire/reactivate + its audit must be one atomic
+        # unit — a forced audit failure must leave the lifecycle flag
+        # exactly as it was, not silently changed with no audit record.
+        official = self._official()
+        ref = f"official:{official}"
+        contact = self.store.add_contact_destination(ContactDestination(
+            id=self.store.next_id("contact"), recipient_ref=ref,
+            channel=NotificationChannel.EMAIL, destination="atomic@example.com"))
+        audits_before = len(self.store.all_setup_audit())
+        original = self.store.add_setup_audit
+
+        def boom(entry):
+            raise RuntimeError("forced audit failure")
+
+        self.store.add_setup_audit = boom
+        try:
+            with self.assertRaises(RuntimeError):
+                self.api.set_contact_destination_active(
+                    contact.id, False, actor_id=self.ACTOR)
+        finally:
+            self.store.add_setup_audit = original
+
+        self.assertEqual(len(self.store.all_setup_audit()), audits_before)
+        stored = next(c for c in self.store.all_contact_destinations()
+                     if c.id == contact.id)
+        self.assertTrue(stored.active, "the forced failure must roll back "
+                        "the active flag, not just skip the audit")
+
+    def test_retire_preference_rolls_back_on_forced_audit_failure(self):
+        official = self._official()
+        ref = f"official:{official}"
+        pref = self.store.save_notification_preference(NotificationPreference(
+            id=self.store.next_id("notif_pref"), recipient_ref=ref,
+            channel=NotificationChannel.PUSH, enabled=False))
+        audits_before = len(self.store.all_setup_audit())
+        original = self.store.add_setup_audit
+
+        def boom(entry):
+            raise RuntimeError("forced audit failure")
+
+        self.store.add_setup_audit = boom
+        try:
+            with self.assertRaises(RuntimeError):
+                self.api.set_notification_preference_active(
+                    pref.id, False, actor_id=self.ACTOR)
+        finally:
+            self.store.add_setup_audit = original
+
+        self.assertEqual(len(self.store.all_setup_audit()), audits_before)
+        stored = next(p for p in self.store.all_notification_preferences()
+                     if p.id == pref.id)
+        self.assertTrue(stored.active, "the forced failure must roll back "
+                        "the active flag, not just skip the audit")
+
+    def test_retired_contact_is_never_resolved_even_while_subject_still_exists(self):
+        # #232 review 6: retirement must make a contact genuinely non-live —
+        # not merely stop it from blocking the delete — independent of
+        # whether the subject has been deleted yet.
+        from hockey_scheduler.services.delivery import resolve_destination
+
+        official = self._official()
+        ref = f"official:{official}"
+        contact = self.store.add_contact_destination(ContactDestination(
+            id=self.store.next_id("contact"), recipient_ref=ref,
+            channel=NotificationChannel.EMAIL, destination="live@example.com"))
+        self.assertEqual(
+            resolve_destination(self.store, ref, NotificationChannel.EMAIL),
+            "live@example.com")
+        self.api.set_contact_destination_active(contact.id, False, actor_id=self.ACTOR)
+        resolved = resolve_destination(self.store, ref, NotificationChannel.EMAIL)
+        self.assertNotEqual(resolved, "live@example.com")
+        self.assertTrue(resolved.endswith("@notify.invalid"))
+
     def test_pending_delivery_cannot_be_redirected_after_subject_deleted(self):
-        """#232 review 3/4: a queued delivery re-resolves its destination on
-        every send attempt (services/delivery.py). The contact destination is
-        retired (never deleted) to clear the way for the Official's delete —
-        it keeps resolving pending deliveries to its ORIGINAL destination
-        exactly as before, so a delivery already queued still completes
-        normally. What must be rejected is a hijack: nothing may point a NEW
-        contact at the now-dead recipient_ref and redirect that pending
-        delivery to a different, attacker-controlled address."""
+        """#232 review 6: a queued delivery re-resolves its destination on
+        every send attempt (services/delivery.py). A retired contact
+        (active=False) is never resolved to — retiring one to clear a
+        Player/Official delete's dependency must make it actually
+        non-live, not just stop it from blocking the delete — so the
+        sequence enqueue -> retire contact -> delete subject ->
+        process/retry delivery must fall back to the synthesized
+        placeholder, never the retired real address and never a NEW,
+        attacker-controlled one."""
         from hockey_scheduler.services.delivery import enqueue
 
         official = self._official()
@@ -1261,11 +1367,14 @@ class DeletionContract:
         self.assertEqual(len(self.store.all_contact_destinations()), before)
 
         # Draining the queue re-resolves the destination (delivery.py's
-        # retry-time re-resolution): the retired contact's ORIGINAL
-        # destination is preserved and still used — never the attacker's.
+        # retry-time re-resolution): the retired contact is skipped entirely
+        # now, so this falls back to the placeholder — never the retired
+        # real address and never the attacker's.
         self.api.delivery.process_pending()
         redelivered = self.store.get_notification_delivery(email_delivery.id)
-        self.assertEqual(redelivered.destination, "original@example.com")
+        self.assertNotEqual(redelivered.destination, "original@example.com")
+        self.assertNotEqual(redelivered.destination, "attacker@example.com")
+        self.assertTrue(redelivered.destination.endswith("@notify.invalid"))
 
     # -- player (#232) --------------------------------------------------------
     def test_player_blocked_by_roster_entry(self):

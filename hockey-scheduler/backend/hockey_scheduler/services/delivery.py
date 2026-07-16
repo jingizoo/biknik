@@ -84,16 +84,23 @@ def resolve_destination(store, recipient: str, channel) -> str:
 
     Resolution order:
       1. push only — the recipient's first *active* device token (#65);
-      2. a registered contact destination (#60);
+      2. an *active* registered contact destination (#60);
       3. the synthesized ``.invalid`` / ``push-token:`` placeholder (#59),
          so a delivery always has somewhere (fictional) to go.
+
+    A retired contact (``active=False``, #232 review 6) is never resolved
+    to — retiring one to clear a Player/Official delete's dependency must
+    actually stop it from being live, not just stop it from blocking the
+    delete. Every retry/re-resolution (below) re-checks this, so a delivery
+    enqueued before retirement falls back to the placeholder on its very
+    next attempt rather than continuing to reach the retired address.
     """
     if channel == NotificationChannel.PUSH:
         token = store.active_device_token_for(recipient)
         if token is not None and token.token:
             return token.token
     stored = store.get_contact_destination(recipient, channel)
-    if stored is not None and stored.destination:
+    if stored is not None and stored.destination and stored.active:
         return stored.destination
     return destination_for(recipient, channel)
 

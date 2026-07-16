@@ -1349,8 +1349,8 @@ class ApiService:
     @catch
     def set_contact_destination(self, recipient_ref: str, channel: str,
                                 destination: str, label=None) -> dict:
-        """Register (or update/reactivate) the real destination for a
-        recipient/channel."""
+        """Register (or update the value of) a recipient/channel's real
+        destination."""
         if not recipient_ref:
             raise ValidationError("A recipient_ref is required.")
         self._reject_dangling_recipient(recipient_ref)
@@ -1365,9 +1365,13 @@ class ApiService:
             raise ValidationError("An email destination must contain '@'.")
         existing = self.store.get_contact_destination(recipient_ref, ch)
         if existing is not None:
+            # Deliberately does NOT touch `active` (#232 review 6): a
+            # retired row must stay retired through an ordinary value edit —
+            # only the MANAGE_SETUP-gated set_contact_destination_active can
+            # reactivate one. Without this, a wider-permissioned caller
+            # could silently undo a retirement by editing the destination.
             existing.destination = destination
             existing.label = label
-            existing.active = True
             self.store.save_contact_destination(existing)
             return self._contact_row(existing)
         c = ContactDestination(
@@ -1404,13 +1408,19 @@ class ApiService:
                  "recipient_ref": c.recipient_ref})
         if active:
             self._reject_dangling_recipient(c.recipient_ref)
-        c.active = bool(active)
-        self.store.save_contact_destination(c)
-        self.setup._audit(
-            "contact_destination_activated" if c.active
-            else "contact_destination_retired",
-            "contact_destination", contact_id, actor_id,
-            {"recipient_ref": c.recipient_ref, "channel": c.channel.value})
+        # The mutation itself must happen INSIDE the transaction (#232 review
+        # 6): the in-memory store snapshots state at entry, so mutating `c`
+        # beforehand would already be reflected in that snapshot — a forced
+        # audit failure would then roll back to the already-mutated state
+        # instead of the true pre-image.
+        with self.store.transaction():
+            c.active = bool(active)
+            self.store.save_contact_destination(c)
+            self.setup._audit(
+                "contact_destination_activated" if c.active
+                else "contact_destination_retired",
+                "contact_destination", contact_id, actor_id,
+                {"recipient_ref": c.recipient_ref, "channel": c.channel.value})
         return self._contact_row(c)
 
     # -- notification preferences (#81) ------------------------------------
@@ -1442,7 +1452,7 @@ class ApiService:
     def set_notification_preference(self, recipient_ref: str, channel: str,
                                     enabled: bool, digest=None,
                                     actor_id=None) -> dict:
-        """Enable/disable (or reactivate) a delivery channel for a
+        """Enable/disable (or update) a delivery channel for a
         recipient (#81)."""
         if not recipient_ref:
             raise ValidationError("A recipient_ref is required.")
@@ -1456,10 +1466,13 @@ class ApiService:
         existing = self.store.get_notification_preference(recipient_ref, ch)
         prior_enabled = existing.enabled if existing is not None else None
         if existing is not None:
+            # Deliberately does NOT touch `active` (#232 review 6): see
+            # set_contact_destination's identical comment — only the
+            # MANAGE_SETUP-gated set_notification_preference_active can
+            # reactivate a retired row.
             existing.enabled = bool(enabled)
             if digest is not None:
                 existing.digest = digest
-            existing.active = True
             self.store.save_notification_preference(existing)
             pref = existing
         else:
@@ -1506,13 +1519,17 @@ class ApiService:
                  "recipient_ref": p.recipient_ref})
         if active:
             self._reject_dangling_recipient(p.recipient_ref)
-        p.active = bool(active)
-        self.store.save_notification_preference(p)
-        self.setup._audit(
-            "notification_preference_activated" if p.active
-            else "notification_preference_retired",
-            "notification_preference", pref_id, actor_id,
-            {"recipient_ref": p.recipient_ref, "channel": p.channel.value})
+        # See set_contact_destination_active: the mutation must happen
+        # INSIDE the transaction so a forced audit failure rolls back to the
+        # true pre-image, not an already-mutated snapshot (#232 review 6).
+        with self.store.transaction():
+            p.active = bool(active)
+            self.store.save_notification_preference(p)
+            self.setup._audit(
+                "notification_preference_activated" if p.active
+                else "notification_preference_retired",
+                "notification_preference", pref_id, actor_id,
+                {"recipient_ref": p.recipient_ref, "channel": p.channel.value})
         return {"recipient_ref": p.recipient_ref, "channel": p.channel.value,
                 "enabled": p.enabled, "active": p.active}
 

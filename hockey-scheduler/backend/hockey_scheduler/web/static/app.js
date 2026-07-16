@@ -938,6 +938,17 @@ const DEL_ROUTE_V2 = {
   official: "official", player: "player",
 };
 
+// Structural deletes use v2 (#233 B2a review r1, extended B2c); frozen
+// frontend kind tokens map to canonical v2 route segments (league→program,
+// level→league), others 1:1. Shared by the initial confirm and the blocked
+// modal's retry-after-retiring-a-dependency flow (#232 review 6).
+async function attemptDelete(kind, id) {
+  const v2Kind = DEL_ROUTE_V2[kind];
+  return v2Kind
+    ? await post(`/api/v2/setup/${v2Kind}/${id}/delete`, {})
+    : await post(`/api/setup/${kind}/${id}/delete`, {});
+}
+
 function renderModal() {
   if (!modal) return "";
   if (modal.type === "demo-confirm") return demoConfirmModalHtml(modal);
@@ -1009,6 +1020,15 @@ function confirmDeleteModalHtml(m) {
      <button class="act danger" data-del-confirm ${highRisk ? "disabled" : ""}>Delete ${esc(noun)}</button>`);
 }
 
+// Dependency group types (#232 review 6) an operator can resolve inline from
+// the blocked-delete modal itself, rather than navigating elsewhere: the
+// retire action (never a delete) that clears each. Maps the group's `type`
+// to the recipient-scoped `/active` route segment.
+const RETIRABLE_DEP_ROUTE = {
+  "contact destination": "contacts",
+  "notification preference": "preferences",
+};
+
 function blockedModalHtml(m) {
   const noun = DEL_NOUN[m.kind] || "record";
   const deps = (m.error && m.error.details && m.error.details.dependencies) || [];
@@ -1016,9 +1036,19 @@ function blockedModalHtml(m) {
     // Prefer id+name pairs so a specific blocker is identifiable even when
     // names collide (#215 review 4); fall back to bare names for older shapes.
     const items = g.items || (g.names || []).map((n) => ({ name: n }));
-    const shown = items.map((it) => it.id
-      ? `<span class="dep-item">${esc(it.name)} <code>${esc(it.id)}</code></span>`
-      : `<span class="dep-item">${esc(it.name)}</span>`).join(", ");
+    const retireRoute = hasPerm("manage_setup") ? RETIRABLE_DEP_ROUTE[g.type] : null;
+    const shown = items.map((it) => {
+      const label = it.id
+        ? `${esc(it.name)} <code>${esc(it.id)}</code>`
+        : esc(it.name);
+      // Retirement (#232 review 6): a contact destination/notification
+      // preference blocker is resolved right here — never a delete, and
+      // never requiring the operator to find a separate admin screen.
+      const retireBtn = retireRoute && it.id
+        ? `<button class="act ghost retire-btn" data-retire-route="${esc(retireRoute)}"
+             data-retire-id="${esc(it.id)}">Retire</button>` : "";
+      return `<span class="dep-item">${label}${retireBtn}</span>`;
+    }).join(", ");
     const more = g.count > items.length ? ", …" : "";
     // Prefer the canonical display noun (#233); the structured `type` stays the
     // frozen code (e.g. league/level) for programmatic consumers.
@@ -1111,15 +1141,9 @@ function wireModal(c) {
     delConfirm.onclick = async () => {
       if (!confirmed()) return;  // defense in depth; the button is disabled too
       toast = "";
-      // Structural deletes use v2 (#233 B2a review r1, extended B2c); frozen
-      // frontend kind tokens map to canonical v2 route segments
-      // (league→program, level→league), others 1:1.
-      const v2Kind = DEL_ROUTE_V2[m.kind];
-      const res = v2Kind
-        ? await post(`/api/v2/setup/${v2Kind}/${m.id}/delete`, {})
-        : await post(`/api/setup/${m.kind}/${m.id}/delete`, {});
+      const res = await attemptDelete(m.kind, m.id);
       if (res && res.error && res.error.code === "has_dependencies") {
-        modal = { type: "blocked", kind: m.kind, name: m.name, error: res.error };
+        modal = { type: "blocked", kind: m.kind, id: m.id, name: m.name, error: res.error };
         return render();
       }
       if (res && res.error) { modal = null; return render(); }  // post() set the toast
@@ -1134,6 +1158,31 @@ function wireModal(c) {
         : "");
       await render();
     };
+  }
+  // Retire a contact destination / notification preference from the blocked
+  // modal itself (#232 review 6): the row is never deleted (its stored value
+  // and history survive), it just stops counting as a live dependency. On
+  // success, retry the same delete so the modal reflects fresh state — either
+  // it now succeeds, or the (shorter) remaining blocker list.
+  if (modal && modal.type === "blocked") {
+    const m = modal;
+    c.querySelectorAll("[data-retire-route]").forEach((b) => b.onclick = async () => {
+      toast = "";
+      b.disabled = true;
+      const res = await post(
+        `/api/notifications/${b.dataset.retireRoute}/${b.dataset.retireId}/active`,
+        { active: false });
+      if (res && res.error) { b.disabled = false; return render(); }  // post() set the toast
+      const retry = await attemptDelete(m.kind, m.id);
+      if (retry && retry.error && retry.error.code === "has_dependencies") {
+        modal = { type: "blocked", kind: m.kind, id: m.id, name: m.name, error: retry.error };
+        return render();
+      }
+      if (retry && retry.error) { modal = null; return render(); }
+      modal = null;
+      toast = `Deleted ${DEL_NOUN[m.kind] || "record"} “${m.name}”.`;
+      await render();
+    });
   }
   // Cancel-game confirm: posts to the roster cancel route (history preserved).
   const cancelGameBtn = c.querySelector("[data-cancel-game-confirm]");

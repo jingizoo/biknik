@@ -254,10 +254,11 @@ class PreferenceHttpAccessTest(unittest.TestCase):
         self.assertEqual(status, 400)
         self.assertEqual(resettle["error"]["code"], "validation_error")
 
-    def test_arena_manager_cannot_retire_cleanup_rows(self):
+    def test_arena_manager_cannot_retire_or_reactivate_cleanup_rows(self):
         # Arena Manager holds MANAGE_SCHEDULE but not the League-Admin-only
-        # MANAGE_SETUP the retire routes require — same rationale as the
-        # Player/Official delete they serve. Refused with zero mutation.
+        # MANAGE_SETUP the retire/reactivate routes require — same rationale
+        # as the Player/Official delete they serve. Refused with zero
+        # mutation in EITHER direction (#232 review 6).
         admin = self._client()
         self._req(admin, "POST", "/api/auth/login", {"username": "admin", "password": "demo"})
         status, official = self._req(admin, "POST", "/api/v2/setup/official",
@@ -290,6 +291,31 @@ class PreferenceHttpAccessTest(unittest.TestCase):
         email_pref = next(p for p in got["preferences"] if p["channel"] == "email")
         self.assertTrue(email_pref["active"], "the Arena Manager's refused "
                         "attempt must not have retired the row")
+
+        # Now the admin genuinely retires both — the Arena Manager must also
+        # be refused REACTIVATING them.
+        status, _ = self._req(
+            admin, "POST", f"/api/notifications/contacts/{contact['id']}/active",
+            {"active": False})
+        self.assertEqual(status, 200)
+        status, _ = self._req(
+            admin, "POST", f"/api/notifications/preferences/{pref['id']}/active",
+            {"active": False})
+        self.assertEqual(status, 200)
+        status, _ = self._req(
+            arena, "POST", f"/api/notifications/contacts/{contact['id']}/active",
+            {"active": True})
+        self.assertEqual(status, 403)
+        status, _ = self._req(
+            arena, "POST", f"/api/notifications/preferences/{pref['id']}/active",
+            {"active": True})
+        self.assertEqual(status, 403)
+        status, got = self._req(
+            admin, "GET", f"/api/notifications/preferences?recipient_ref={ref}")
+        self.assertEqual(status, 200)
+        email_pref = next(p for p in got["preferences"] if p["channel"] == "email")
+        self.assertFalse(email_pref["active"], "the Arena Manager's refused "
+                         "reactivation attempt must not have reactivated the row")
 
     def test_blocked_official_delete_over_http_preserves_preference(self):
         # The scenario the reviewer flagged directly, exercised over real

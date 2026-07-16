@@ -312,7 +312,9 @@ async function checkViewport(browser, viewport) {
     // four; each is cleared through its own supported route (account/
     // device-token deactivation, contact/preference RETIREMENT — #232
     // review 4: never a delete, so nothing is erased and the delete itself
-    // never silently cascades).
+    // never silently cascades). The contact and preference are retired
+    // through the real UI (#232 review 6) — a "Retire" control right in the
+    // blocked-delete modal, not a raw fetch.
     await clickDelete("player", playerBlocked.id);
     result = await confirmDelete("player", playerBlocked.id, { expectBlocked: true });
     if (!result.error || result.error.code !== "has_dependencies") {
@@ -327,12 +329,68 @@ async function checkViewport(browser, viewport) {
           `${term} dependency: ${playerBlockedText}`);
       }
     }
+
+    // Retire the contact destination through the modal's own "Retire"
+    // button; capture its backend id from the button itself (the only
+    // place the UI exposes it) for the later no-erase proof. Retiring one
+    // dependency auto-retries the delete internally (still blocked by the
+    // rest — an EXPECTED 409, so console-error capture is suspended around
+    // the click exactly like confirmDelete's own expectBlocked path).
+    // waitForSelector (not a single-shot page.$) for the button itself:
+    // the retry's own re-render can still be in flight the instant the
+    // ".modal.blocked" wrapper reappears, so polling for the actual
+    // control avoids a race against that re-render.
+    const contactRetireBtn = await page.waitForSelector(
+      '.modal.blocked [data-retire-route="contacts"]', { timeout: 10000 })
+      .catch(() => { throw new Error(`[${viewport.label}] blocked-Player modal has no Retire ` +
+        `control for its contact destination`); });
+    const contactId = await contactRetireBtn.getAttribute("data-retire-id");
+    const retireContactResp = page.waitForResponse((r) =>
+      r.url() === `${base}/api/notifications/contacts/${contactId}/active` &&
+      r.request().method() === "POST");
+    page.off("console", consoleErrorHandler);
+    await contactRetireBtn.click();
+    if ((await (await retireContactResp).json()).error) {
+      page.on("console", consoleErrorHandler);
+      throw new Error(`[${viewport.label}] retiring the Player's contact destination via the ` +
+        `blocked modal failed`);
+    }
+    // The modal auto-retries the delete and refreshes with the remaining
+    // blockers (account, device, preference) — still blocked.
+    await page.waitForSelector(".modal.blocked", { timeout: 10000 });
+    page.on("console", consoleErrorHandler);
+
+    // Same for the notification preference.
+    const prefRetireBtn = await page.waitForSelector(
+      '.modal.blocked [data-retire-route="preferences"]', { timeout: 10000 })
+      .catch(() => { throw new Error(`[${viewport.label}] blocked-Player modal has no Retire ` +
+        `control for its notification preference`); });
+    const prefId = await prefRetireBtn.getAttribute("data-retire-id");
+    const retirePrefResp = page.waitForResponse((r) =>
+      r.url() === `${base}/api/notifications/preferences/${prefId}/active` &&
+      r.request().method() === "POST");
+    page.off("console", consoleErrorHandler);
+    await prefRetireBtn.click();
+    if ((await (await retirePrefResp).json()).error) {
+      page.on("console", consoleErrorHandler);
+      throw new Error(`[${viewport.label}] retiring the Player's notification preference via the ` +
+        `blocked modal failed`);
+    }
+    await page.waitForSelector(".modal.blocked", { timeout: 10000 });
+    page.on("console", consoleErrorHandler);
+    const stillBlockedText = (await page.textContent(".modal.blocked")) || "";
+    if (stillBlockedText.toLowerCase().includes("contact") ||
+        stillBlockedText.toLowerCase().includes("preference")) {
+      throw new Error(`[${viewport.label}] blocked-Player modal still lists a retired dependency: ` +
+        stillBlockedText);
+    }
     await page.click("button.act[data-modal-close]");
     await page.waitForSelector(".modal", { state: "detached", timeout: 10000 });
 
-    // Clear every dependency through its own supported route — never a
-    // silent cascade or erasure from delete_player itself. The contact and
-    // preference are RETIRED (active: false), not deleted.
+    // Clear the two remaining dependencies (account/device-token
+    // deactivation already has its own established UI elsewhere in the app;
+    // this journey exercises it via its supported route directly, matching
+    // every earlier round's convention).
     const cleared = await page.evaluate(async (i) => {
       const post = async (p, b) => (await fetch(p, {
         method: "POST", credentials: "same-origin",
@@ -340,25 +398,10 @@ async function checkViewport(browser, viewport) {
       })).json();
       const acc = await post(`/api/accounts/${i.account}/active`, { active: false });
       const dev = await post(`/api/notifications/device-tokens/${i.device}/active`, { active: false });
-      const contactsResp = await fetch("/api/notifications/contacts", { credentials: "same-origin" });
-      const contactsBody = await contactsResp.json();
-      const contact = (contactsBody.contacts || [])
-        .find((c) => c.recipient_ref === `player:${i.player}`);
-      const con = contact
-        ? await post(`/api/notifications/contacts/${contact.id}/active`, { active: false })
-        : { error: { message: "no matching contact destination found" } };
-      const prefsResp = await fetch(
-        `/api/notifications/preferences?recipient_ref=player:${i.player}`,
-        { credentials: "same-origin" });
-      const prefsBody = await prefsResp.json();
-      const emailPref = (prefsBody.preferences || []).find((p) => p.channel === "email");
-      const pref = emailPref && emailPref.id
-        ? await post(`/api/notifications/preferences/${emailPref.id}/active`, { active: false })
-        : { error: { message: "no matching notification preference found" } };
-      return { acc, dev, con, pref, contactId: contact && contact.id };
-    }, { account: playerAccount.id, device: playerDevice.id, player: playerBlocked.id });
-    if (cleared.acc.error || cleared.dev.error || cleared.con.error || cleared.pref.error) {
-      throw new Error(`[${viewport.label}] clearing the Player's dependencies failed: ` +
+      return { acc, dev };
+    }, { account: playerAccount.id, device: playerDevice.id });
+    if (cleared.acc.error || cleared.dev.error) {
+      throw new Error(`[${viewport.label}] clearing the Player's remaining dependencies failed: ` +
         JSON.stringify(cleared));
     }
 
@@ -395,7 +438,7 @@ async function checkViewport(browser, viewport) {
       const retry = await post("/api/notifications/preferences",
         { recipient_ref: `player:${i.player}`, channel: "email", enabled: false });
       return { contact, emailPref, retry };
-    }, { player: playerBlocked.id, contactId: cleared.contactId });
+    }, { player: playerBlocked.id, contactId });
     page.on("console", consoleErrorHandler);
     if (!historyProof.contact || historyProof.contact.active) {
       throw new Error(`[${viewport.label}] the deleted Player's contact destination is not ` +
