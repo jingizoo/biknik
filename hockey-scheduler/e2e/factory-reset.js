@@ -244,11 +244,32 @@ async function checkFlagFlow(browser, viewport) {
     await page.waitForSelector("[data-fr-done]", { timeout: 15000 });
     await page.click("[data-fr-done]");
     await page.waitForSelector("#login-screen:not([hidden])", { timeout: 10000 });
+    // The whole authenticated shell is hidden behind body.signed-out while the
+    // operator is logged out — proving the sign-out actually took effect, not
+    // just that a success card was shown.
+    await page.waitForFunction(() => document.body.classList.contains("signed-out"),
+                               null, { timeout: 10000 });
 
-    // The preserved admin can sign back in — the installation is recoverable.
-    if ((await login(page, ADMIN, PW)) !== 200) {
-      throw new Error(`[${L}] preserved admin could not sign in after reset`);
-    }
+    // Re-login through the REAL sign-in UI (not a raw fetch): filling the login
+    // form and submitting drives signIn(), which clears hs_signed_out, restores
+    // client identity/permissions, hides the login screen, and re-renders the
+    // authenticated console. A raw /api/auth/login would prove the credentials
+    // are accepted but not that the app returns to a usable signed-in state.
+    await page.fill("#login-user", ADMIN);
+    await page.fill("#login-pass", PW);
+    await page.click("#login-form button[type=submit]");
+    await page.waitForFunction(
+      () => { const s = document.getElementById("login-screen"); return s && s.hidden; },
+      null, { timeout: 10000 });
+    await page.waitForFunction(() => !document.body.classList.contains("signed-out"),
+                               null, { timeout: 10000 });
+    // A genuinely authenticated affordance is back — the League-Admin-only
+    // Readiness (Administration) tab — so the console re-rendered, not just the
+    // login card vanished.
+    await page.waitForFunction(
+      () => { const t = document.querySelector('.tab[data-tab="readiness"]');
+              return t && t.offsetParent !== null; },
+      null, { timeout: 10000 });
 
     if (errors.length) {
       throw new Error(`[${L}] flag-flow console/page errors:\n${errors.join("\n")}`);

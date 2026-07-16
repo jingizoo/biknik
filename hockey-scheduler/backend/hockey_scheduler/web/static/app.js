@@ -154,12 +154,16 @@ const isDemoEmpty = () => !!(envStatus && envStatus.demo_empty);
 // Whether to surface the Administration → Danger zone factory-reset control
 // (#256). The server already computes `factory_reset_enabled` as production-mode
 // AND the deployment opt-in flag — the exact gate the /execute route enforces —
-// so the UI never has to re-derive it; we only add the client-side permission
-// check (League Admin needs BOTH manage_setup and manage_users). The service
-// re-verifies role and both permissions on every call, so this gate is purely
-// presentational, never the security boundary.
+// so the UI never has to re-derive it; we add the client-side identity check to
+// mirror the backend exactly: the exact `league_admin` role AND both
+// manage_setup and manage_users. Checking the role explicitly (not just the two
+// permissions) matches FactoryResetService, so a future permission-matrix change
+// that granted both permissions to some other role could never surface this
+// control there. The service re-verifies role and both permissions on every
+// call, so this gate is presentational only, never the security boundary.
 const canFactoryReset = () =>
   !!(envStatus && envStatus.factory_reset_enabled)
+  && currentRole === "league_admin"
   && hasPerm("manage_setup") && hasPerm("manage_users");
 
 // Theme-aligned inline SVG icons (#215): 20×20, stroke=currentColor so a button
@@ -1292,8 +1296,16 @@ function wireModal(c) {
   if (modal && modal.type === "factory-reset") {
     const restartBtn = c.querySelector("[data-fr-restart]");
     if (restartBtn) restartBtn.onclick = () => startFactoryReset();
-    const doneBtn = c.querySelector("[data-fr-done]");
-    if (doneBtn) doneBtn.onclick = () => finishFactoryResetSignOut();
+    // After a successful reset the server session is already destroyed, so EVERY
+    // exit from the success view — the footer button, the × and the backdrop
+    // scrim — must complete the sign-out. The generic `[data-modal-close]`
+    // handler wired at the top of wireModal only clears the modal, which would
+    // leave a stale authenticated console over a dead session; override all of
+    // them (plus the explicit "Return to sign-in" button) here.
+    if (modal.step === "success") {
+      c.querySelectorAll("[data-modal-close], [data-fr-done]").forEach((b) =>
+        b.onclick = () => finishFactoryResetSignOut());
+    }
     const backup = c.querySelector("#fr-backup");
     const password = c.querySelector("#fr-password");
     const phrase = c.querySelector("#fr-phrase");
