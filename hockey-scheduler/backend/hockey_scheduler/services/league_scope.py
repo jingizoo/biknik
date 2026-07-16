@@ -203,6 +203,71 @@ def registered_team_ids_in_division(store, division_id):
     return ids
 
 
+def require_league_belongs_to_season(store, league_id: str, season_id: str):
+    """Resolve and validate a canonical League belongs to ``season_id`` (#233
+    Slice G). This ``league_id`` is the competition grouping League between
+    Season and Division (``store.get_league`` / ``Division.league_id`` /
+    ``SeasonTeamRegistration.league_id``) — distinct from this module's own
+    ``league_id`` vocabulary elsewhere, which names the Program-level
+    scheduling *scope* (see ``scope_bridge.py``'s docstring). Mirrors
+    ``SetupService.create_game``'s own League validation so a league-wide
+    draft rejects a dangling/cross-season League the same way manual game
+    creation already does."""
+    league = store.get_league(league_id) if league_id else None
+    if league is None:
+        raise NotFoundError(
+            f"League {league_id} not found.",
+            details={"reason": "league_missing", "league_id": league_id},
+        )
+    if league.season_id != season_id:
+        raise ValidationError(
+            "League belongs to a different season.",
+            details={
+                "reason": "league_season_mismatch",
+                "league_id": league_id, "season_id": season_id,
+            },
+        )
+    return league
+
+
+def registered_teams_by_division_in_league(store, season_id, league_id,
+                                           division_id=None):
+    """Active, league-consistent registrations for a canonical League this
+    Season (#233 Slice G), grouped by Division — ``None`` keys the teams
+    registered directly at the League level with no Division. Mirrors
+    ``registered_team_ids_in_division``'s trust rules (active row, Team
+    exists, Team's permanent Program matches the Season's) but scopes by the
+    League directly via ``SeasonTeamRegistration.league_id`` rather than
+    requiring one Division. When ``division_id`` is given, only that
+    Division's bucket is returned (possibly empty) — this lets a league-wide
+    draft be narrowed to one Division without switching to the division-only
+    entry point.
+
+    Grouping by Division here (rather than flattening every registered team
+    into one pool) is deliberate: a League's Divisions are genuine competitive
+    splits (Gold/Silver/Diamond), so a league-wide draft must never pair a
+    Gold team against a Silver team just because they share a League.
+    """
+    season = store.get_season(season_id) if season_id else None
+    if season is None or not season_scope_id(season):
+        return {}
+    program_scope = season_scope_id(season)
+    league = store.get_league(league_id) if league_id else None
+    if league is None or league.season_id != season_id:
+        return {}
+    groups = {}
+    for reg in store.registrations_for_season(season_id):
+        if not reg.active or reg.league_id != league_id:
+            continue
+        if division_id is not None and reg.division_id != division_id:
+            continue
+        team = store.get_team(reg.team_id)
+        if team is None or not team_scope_id(team) or team_scope_id(team) != program_scope:
+            continue  # orphaned, null-league, or cross-Program row — never trusted
+        groups.setdefault(reg.division_id, set()).add(reg.team_id)
+    return groups
+
+
 def require_game_league_id(store, game) -> str:
     """Return a game's league or reject a row with no usable league context."""
     league_id = league_id_for_game(store, game)

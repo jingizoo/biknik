@@ -48,19 +48,47 @@ class ApiService(_BaseApiService):
         return row
 
     @catch
-    def commit_draft_schedule(self, division_id: str, slot_ids=None,
-                              constraints=None, actor_id=None) -> dict:
+    def commit_draft_schedule(self, division_id: str = None,
+                              season_id: str = None, league_id: str = None,
+                              slot_ids=None, constraints=None,
+                              actor_id=None) -> dict:
+        """Accepts the same Division-only or Season+League(+optional
+        Division) scope as ``draft_season_schedule`` (#233 Slice G). Every
+        created Game's ``season_id``/``league_id`` (the canonical grouping
+        League, ``store.get_league``) are stamped from the regenerated
+        proposal, and ``division_id`` is read per-row — a League-wide draft's
+        rows can span several Divisions (or none). Previously ``league_id``
+        was never set on a committed draft game at all, silently defeating
+        the stranding guards in ``assign_season_team_league``/
+        ``move_division_to_league`` (#233 Slice G review) for every
+        scheduler-created game.
+        """
         proposal = self.draft_season_schedule(
-            division_id, slot_ids=slot_ids, constraints=constraints)
+            division_id=division_id, season_id=season_id, league_id=league_id,
+            slot_ids=slot_ids, constraints=constraints)
         if isinstance(proposal, dict) and proposal.get("error"):
             return proposal
 
         # Revalidate every proposed slot before the first write. This closes the
         # commit boundary even if inventory changed after an earlier preview.
-        season_id = proposal["season_id"]
+        resolved_season_id = proposal["season_id"]
         for row in proposal["draft_games"]:
             require_slot_belongs_to_season(
-                self.store, row["ice_slot_id"], season_id)
+                self.store, row["ice_slot_id"], resolved_season_id)
+
+        # The Division-only proposal's own "league_id" is this tenancy
+        # layer's frozen Program-scoped vocabulary (league_scope.py's
+        # league_id_for_division -> season.program_id, see scope_bridge.py's
+        # docstring) — NOT the canonical grouping League Game.league_id
+        # actually stores. Resolve the CANONICAL league straight from the
+        # Division for that path; the League-wide path already received the
+        # canonical league_id as an explicit param, so its own proposal
+        # value is correct as-is.
+        if season_id and league_id:
+            canonical_league_id = proposal["league_id"]
+        else:
+            division = self.store.get_division(division_id) if division_id else None
+            canonical_league_id = division.league_id if division else None
 
         created = []
         with self.store.transaction():
@@ -73,27 +101,32 @@ class ApiService(_BaseApiService):
                     end_time=(datetime.fromisoformat(row["end_time"])
                               if row.get("end_time") else None),
                     rink=row.get("rink_name"),
-                    season_id=proposal["season_id"],
-                    division_id=division_id,
+                    season_id=resolved_season_id,
+                    league_id=canonical_league_id,
+                    division_id=row.get("division_id"),
                     ice_slot_id=row.get("ice_slot_id"),
                     published=False,
                     is_draft=True,
                 )
                 self.store.add_game(game)
                 created.append(self._draft_game_dto(game))
+            if season_id and league_id:
+                scope_type, scope_id = "league", league_id
+            else:
+                scope_type, scope_id = "division", division_id
             self.setup._audit(
-                "draft_schedule_committed", "division", division_id, actor_id,
+                "draft_schedule_committed", scope_type, scope_id, actor_id,
                 {
                     "created_count": len(created),
                     "game_ids": [row["game_id"] for row in created],
                     "unscheduled_count": len(proposal["unscheduled"]),
-                    "season_id": proposal["season_id"],
+                    "season_id": resolved_season_id,
                     "league_id": proposal["league_id"],
                 },
             )
         return {
             "division_id": division_id,
-            "season_id": proposal["season_id"],
+            "season_id": resolved_season_id,
             "league_id": proposal["league_id"],
             "created": created,
             "unscheduled": proposal["unscheduled"],
