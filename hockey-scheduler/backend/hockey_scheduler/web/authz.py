@@ -196,6 +196,14 @@ def required_permission(path: str):
         return Permission.MANAGE_USERS
     if re.match(r"^/api/guardians/links/[^/]+/verify$", path):
         return Permission.MANAGE_USERS
+    # Production factory reset (#256): the coarse HTTP gate maps to a single
+    # permission like every other route, but only a League Admin holds both
+    # MANAGE_SETUP and MANAGE_USERS today — FactoryResetService itself
+    # re-checks both explicitly (defense in depth) so the stricter
+    # requirement holds even if the permission matrix changes later.
+    if path in ("/api/admin/factory-reset/preview",
+                "/api/admin/factory-reset/execute"):
+        return Permission.MANAGE_USERS
     # Officials: an official accepts/declines their own assignment (#54);
     # unassigning is an operator/scheduling action (#30).
     m = re.match(r"^/api/officials/assignments/[^/]+/(accept|decline|unassign)$", path)

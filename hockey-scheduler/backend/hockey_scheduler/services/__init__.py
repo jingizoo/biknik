@@ -1,4 +1,5 @@
 from .account_service import AccountService
+from .factory_reset_service import CONFIRMATION_PHRASE, FactoryResetService
 from .guardian_service import GuardianService
 from .calendar import (
     ACTOR_TYPES,
@@ -62,4 +63,5 @@ __all__ = ["RosterService", "SetupService", "DeliveryWorker", "DeliveryLoop",
            "push_config_from_env", "push_transport_from_env",
            "AccountService", "GuardianService", "IMPORT_SHEET_NAMES",
            "parse_csv_text",
-           "validate_import", "validate_official_availability"]
+           "validate_import", "validate_official_availability",
+           "FactoryResetService", "CONFIRMATION_PHRASE"]

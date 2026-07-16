@@ -25,6 +25,9 @@ from ..domain import (
     ContactDestination,
     DeliveryStatus,
     DeviceToken,
+    FactoryResetChallenge,
+    FactoryResetEvent,
+    FactoryResetLock,
     League,
     Program,
     Notification,
@@ -93,6 +96,16 @@ class InMemoryStore:
         self.guardian_links: Dict[str, GuardianLink] = {}
         self.reschedule_requests: Dict[str, RescheduleRequest] = {}
         self.setup_audit: List[SetupAuditLog] = []
+        # Never cleared by clear_all_data() (#256) — the durable record of a
+        # production factory-reset attempt must survive the wipe it describes.
+        self.factory_reset_events: List[FactoryResetEvent] = []
+        # Durable, cross-process-equivalent challenge/lock (#256 review
+        # blocker 5) — see acquire_factory_reset_lock()/
+        # set_factory_reset_challenge() below. Also never cleared by
+        # clear_all_data(): the challenge is always consumed before a wipe
+        # begins, and the lock is held for the wipe's whole duration.
+        self._factory_reset_challenge: Optional[FactoryResetChallenge] = None
+        self._factory_reset_lock: Optional[FactoryResetLock] = None
         # Plain int counters (not itertools.count): a count object is not
         # copyable on Python 3.14 (copy.copy raises "cannot pickle
         # 'itertools.count'"), which would break the transaction snapshot; an
@@ -148,6 +161,44 @@ class InMemoryStore:
                 current[:] = value
             else:
                 setattr(self, key, value)
+
+    # Attributes clear_all_data()/row_counts() never touch (#256): the lock
+    # and depth counter aren't data, ``_counters`` preserves id uniqueness
+    # across a reset, ``factory_reset_events`` is the durable record of the
+    # reset attempt itself, and the challenge/lock are the reset's own
+    # in-flight orchestration state (not application data). The latter two
+    # are single objects, not dict/list, so row_counts()/clear_all_data()'s
+    # isinstance check already skips them — listed here anyway for clarity.
+    _UNCLEARABLE = frozenset({"_lock", "_txn_depth", "_counters",
+                              "factory_reset_events",
+                              "_factory_reset_challenge", "_factory_reset_lock"})
+
+    def row_counts(self) -> dict:
+        """Row count per collection that ``clear_all_data()`` would empty
+        (#256 preview) — same attribute set, so a preview count can never
+        overstate or understate what an execute() would actually wipe."""
+        return {key: len(value) for key, value in self.__dict__.items()
+               if key not in self._UNCLEARABLE and isinstance(value, (dict, list))}
+
+    def clear_all_data(self) -> None:
+        """Delete every row from every collection (#256 production factory
+        reset). There is no schema to preserve for this store, but the id
+        counters are left untouched for the same reason as
+        ``SqlStore.clear_all_data()``: reusing an id after a reset could
+        collide with anything a durable ``factory_reset_events`` row, or an
+        external system, still references. ``factory_reset_events`` itself
+        is the one collection deliberately excluded — it is the durable
+        record of the reset attempt and must survive the wipe it describes.
+        Generic over every dict/list attribute rather than a hardcoded list,
+        so a future new entity collection is wiped automatically instead of
+        silently surviving a reset. Call within ``transaction()`` for
+        atomicity, exactly like ``SqlStore.clear_all_data()``.
+        """
+        for key, value in self.__dict__.items():
+            if key in self._UNCLEARABLE:
+                continue
+            if isinstance(value, (dict, list)):
+                value.clear()
 
     @contextmanager
     def transaction(self):
@@ -808,6 +859,72 @@ class InMemoryStore:
     def add_setup_audit(self, entry: SetupAuditLog) -> SetupAuditLog:
         self.setup_audit.append(entry)
         return entry
+
+    def add_factory_reset_event(self, event: FactoryResetEvent) -> FactoryResetEvent:
+        self.factory_reset_events.append(event)
+        return event
+
+    def all_factory_reset_events(self) -> List[FactoryResetEvent]:
+        return sorted(self.factory_reset_events, key=lambda e: e.started_at)
+
+    def get_factory_reset_challenge(self) -> Optional[FactoryResetChallenge]:
+        with self._lock:
+            return self._factory_reset_challenge
+
+    def set_factory_reset_challenge(
+            self, challenge: FactoryResetChallenge) -> FactoryResetChallenge:
+        """Replace the single outstanding challenge (#256 review blocker
+        5) — a new preview always supersedes any prior, unconsumed one."""
+        with self._lock:
+            self._factory_reset_challenge = challenge
+        return challenge
+
+    def clear_factory_reset_challenge(self) -> None:
+        with self._lock:
+            self._factory_reset_challenge = None
+
+    def acquire_factory_reset_lock(self, lock: FactoryResetLock) -> bool:
+        """Try to become the sole in-progress factory reset (#256 review
+        round 1 blocker 5). Check-then-set under this store's own lock so
+        two concurrent callers against the same in-memory store (the
+        process-equivalent of two instances sharing one durable database)
+        can never both win. Call ``release_stale_factory_reset_lock`` first
+        so a lock an owner never released doesn't block forever (#256
+        review round 2 blocker 3)."""
+        with self._lock:
+            if self._factory_reset_lock is not None:
+                return False
+            self._factory_reset_lock = lock
+            return True
+
+    def release_stale_factory_reset_lock(self, now) -> bool:
+        """Reclaim the lock if its lease has expired (#256 review round 2
+        blocker 3). Returns True if a stale lock was cleared."""
+        with self._lock:
+            existing = self._factory_reset_lock
+            if existing is None or existing.expires_at >= now:
+                return False
+            self._factory_reset_lock = None
+            return True
+
+    def release_factory_reset_lock(self, token: str) -> None:
+        """Compare-and-delete: only clear the lock if ``token`` matches the
+        one currently held (#256 review round 2 blocker 3) — an
+        unconditional clear would let a delayed release from a caller that
+        no longer holds the current lock destroy a different caller's
+        active one."""
+        with self._lock:
+            existing = self._factory_reset_lock
+            if existing is not None and existing.token == token:
+                self._factory_reset_lock = None
+
+    def lock_clearable_tables_for_wipe(self) -> None:
+        """No-op for the in-memory store (#256 review round 2 blocker 1):
+        ``transaction()`` already holds ``self._lock`` for its ENTIRE body
+        (see its docstring), so every mutating call this codebase makes
+        through ``store.transaction()`` is already fully serialized against
+        the recount-then-wipe sequence below — there is no separate
+        per-table lock to take."""
 
     # -- listings (interface shared with the SQL store) -------------------
     def all_programs(self) -> List[Program]:

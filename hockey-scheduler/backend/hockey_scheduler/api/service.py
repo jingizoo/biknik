@@ -43,6 +43,7 @@ from ..domain.errors import (
 from ..services import (
     ACTOR_TYPES,
     AccountService,
+    FactoryResetService,
     GuardianService,
     DeliveryLoop,
     DeliveryWorker,
@@ -162,6 +163,8 @@ class ApiService:
         # from env at boot. Always available for run-once drains and status.
         self.delivery_loop = DeliveryLoop(self.delivery)
         self.accounts = AccountService(self.store, self.roster.clock)
+        self.factory_reset = FactoryResetService(
+            self.store, self.accounts, self.roster.clock)
         self.guardians = GuardianService(self.store, self.roster.clock)
 
     # -- games -------------------------------------------------------------
@@ -1725,6 +1728,24 @@ class ApiService:
     def list_user_accounts(self) -> dict:
         return {"user_accounts":
                 [self._account_row(a) for a in self.accounts.list_accounts()]}
+
+    # -- production factory reset (#256) ------------------------------------
+    @catch
+    def factory_reset_preview(self, actor_id: str = None) -> dict:
+        return self.factory_reset.preview(actor_id)
+
+    @catch
+    def factory_reset_execute(self, actor_id: str = None, password: str = None,
+                              typed_phrase: str = None,
+                              challenge_token: str = None,
+                              backup_acknowledged=False,
+                              environment: str = "production") -> dict:
+        # backup_acknowledged is passed through UNCOERCED (#256 review
+        # blocker 3) — FactoryResetService requires the exact JSON boolean
+        # `true`, so a bool(...) here would wrongly accept "false"/"no"/1.
+        return self.factory_reset.execute(
+            actor_id, password, typed_phrase, challenge_token,
+            backup_acknowledged, environment=environment)
 
     # -- account sessions (#78) --------------------------------------------
     @staticmethod

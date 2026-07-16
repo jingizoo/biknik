@@ -33,6 +33,9 @@ from ..domain import (
     ContactDestination,
     DeliveryStatus,
     DeviceToken,
+    FactoryResetChallenge,
+    FactoryResetEvent,
+    FactoryResetLock,
     Notification,
     NotificationAudience,
     NotificationChannel,
@@ -72,6 +75,7 @@ from ..domain import (
     Venue,
 )
 from ..domain.enums import NotificationType
+from ..domain.errors import IntegrityConflictError
 from .db import connect
 from .db_errors import translate_db_exception
 from .integrity_checks import (
@@ -183,6 +187,16 @@ SPECS = {
                             {"type": _enum(NotificationType), "at": _dt()}),
     SetupAuditLog: Spec(SetupAuditLog, "setup_audit_logs",
                         {"at": _dt(), "detail": _jsonc()}),
+    FactoryResetEvent: Spec(
+        FactoryResetEvent, "factory_reset_events",
+        {"started_at": _dt(), "completed_at": _dt(),
+         "pre_reset_counts": _jsonc()}),
+    FactoryResetChallenge: Spec(
+        FactoryResetChallenge, "factory_reset_challenges",
+        {"counts": _jsonc(), "expires_at": _dt(), "created_at": _dt()}),
+    FactoryResetLock: Spec(
+        FactoryResetLock, "factory_reset_locks",
+        {"acquired_at": _dt(), "expires_at": _dt()}),
     Official: Spec(Official, "officials", {"is_active": _bool()}),
     OfficialAssignment: Spec(OfficialAssignment, "official_assignments",
                              {"role": _enum(OfficialRole),
@@ -530,6 +544,72 @@ class SqlStore:
                     cur.execute("PRAGMA foreign_keys = ON")
         migrate(self.conn, self.dialect)
 
+    # Tables clear_all_data()/row_counts() never touch (#256): the durable
+    # event log must survive the wipe it describes, and the challenge/lock
+    # rows are orchestration state for the reset in progress, not wipeable
+    # application data — the challenge is always consumed before a wipe
+    # begins, and the lock is actively held for the wipe's whole duration.
+    _FACTORY_RESET_SURVIVING_TABLES = frozenset({
+        "factory_reset_events", "factory_reset_challenges",
+        "factory_reset_locks"})
+
+    @classmethod
+    def _clearable_tables(cls):
+        """Every table ``clear_all_data()``/``row_counts()`` touch — a single
+        list so the two can never drift apart (#256)."""
+        return [spec.table for spec in SPECS.values()
+               if spec.table not in cls._FACTORY_RESET_SURVIVING_TABLES]
+
+    def row_counts(self) -> dict:
+        """Row count per table that ``clear_all_data()`` would delete (#256
+        preview) — built from the exact same table list, so a preview count
+        can never overstate or understate what an execute() would actually
+        wipe."""
+        counts = {}
+        with self._lock:
+            cur = self.conn.cursor()
+            for table in self._clearable_tables():
+                cur.execute(f"SELECT COUNT(*) AS n FROM {table}")
+                row = cur.fetchone()
+                counts[table] = row["n"] if row else 0
+        return counts
+
+    def clear_all_data(self) -> None:
+        """Delete every row from every table, but never drop or recreate the
+        schema (#256 production factory reset) — unlike ``reset_schema()``,
+        which is a demo/test-only DDL drop-and-rebuild, this preserves the
+        schema and the migration ledger exactly, touching only rows.
+
+        ``factory_reset_events`` is deliberately excluded: it is the durable
+        record of the reset attempt itself and must survive the wipe it
+        describes (the caller writes the outcome row after this returns).
+        ``schema_migrations`` and ``counters`` are outside ``SPECS`` and so
+        are never touched either — leaving ``counters`` alone means IDs
+        issued after a reset are never reused, which avoids colliding with
+        any pre-reset id a durable ``factory_reset_events`` row, an external
+        system, or a support ticket might still reference.
+
+        Call within ``store.transaction()`` for atomicity — same FK-ordering
+        technique as ``reset_schema()`` (see its docstring), applied to
+        row-level ``DELETE``/``TRUNCATE`` instead of ``DROP TABLE``.
+        """
+        tables = self._clearable_tables()
+        with self._lock:
+            cur = self.conn.cursor()
+            if self.backend == "postgres":
+                if tables:
+                    cur.execute(f"TRUNCATE TABLE {', '.join(tables)} CASCADE")
+                return
+            deferred = self.conn.in_transaction
+            cur.execute("PRAGMA defer_foreign_keys = ON" if deferred
+                        else "PRAGMA foreign_keys = OFF")
+            try:
+                for table in tables:
+                    cur.execute(f"DELETE FROM {table}")
+            finally:
+                if not deferred:
+                    cur.execute("PRAGMA foreign_keys = ON")
+
     # -- low-level ---------------------------------------------------------
     def _exec(self, query, params=()):
         cur = self.conn.cursor()
@@ -774,6 +854,96 @@ class SqlStore:
 
     def add_setup_audit(self, entry): return self._insert(entry)
     def all_setup_audit(self): return self._query(SetupAuditLog, order="id")
+
+    def add_factory_reset_event(self, event): return self._insert(event)
+    def all_factory_reset_events(self):
+        return self._query(FactoryResetEvent, order="started_at")
+
+    _FACTORY_RESET_CHALLENGE_ID = "singleton"
+    _FACTORY_RESET_LOCK_ID = "singleton"
+
+    def get_factory_reset_challenge(self):
+        return self._get(FactoryResetChallenge, self._FACTORY_RESET_CHALLENGE_ID)
+
+    def set_factory_reset_challenge(self, challenge):
+        """Replace the single outstanding challenge (#256 review blocker
+        5) — a new preview always supersedes any prior, unconsumed one."""
+        with self.transaction():
+            self._upsert(challenge)
+        return challenge
+
+    def clear_factory_reset_challenge(self) -> None:
+        with self.transaction():
+            self._delete(FactoryResetChallenge, self._FACTORY_RESET_CHALLENGE_ID)
+
+    def acquire_factory_reset_lock(self, lock) -> bool:
+        """Try to become the sole in-progress factory reset installation-
+        wide (#256 review round 1 blocker 5). A concurrent acquire attempt
+        collides on the same singleton primary key; that unique-constraint
+        violation is translated to IntegrityConflictError by transaction()
+        (#201 Slice 2), which this catches and reports as a normal loss of
+        the race rather than an unexpected error. Call
+        ``release_stale_factory_reset_lock`` first so a crashed process's
+        expired lock doesn't block acquisition forever (#256 review round 2
+        blocker 3)."""
+        try:
+            with self.transaction():
+                self._insert(lock)
+            return True
+        except IntegrityConflictError:
+            return False
+
+    def release_stale_factory_reset_lock(self, now) -> bool:
+        """Reclaim the singleton lock if its lease has expired — a crashed
+        process that acquired the lock and never released it would
+        otherwise disable factory reset permanently (#256 review round 2
+        blocker 3). Returns True if a stale lock was cleared."""
+        with self.transaction():
+            existing = self._get(FactoryResetLock, self._FACTORY_RESET_LOCK_ID)
+            if existing is None or existing.expires_at >= now:
+                return False
+            self._delete(FactoryResetLock, self._FACTORY_RESET_LOCK_ID)
+            return True
+
+    def release_factory_reset_lock(self, token: str) -> None:
+        """Compare-and-delete: only remove the lock if ``token`` matches the
+        row currently held (#256 review round 2 blocker 3) — an unconditional
+        delete would let a delayed release from a process that no longer
+        holds the current lock destroy a different process's active one
+        (e.g. after a stale lock was reclaimed by a new acquirer)."""
+        with self.transaction():
+            existing = self._get(FactoryResetLock, self._FACTORY_RESET_LOCK_ID)
+            if existing is not None and existing.token == token:
+                self._delete(FactoryResetLock, self._FACTORY_RESET_LOCK_ID)
+
+    def lock_clearable_tables_for_wipe(self) -> None:
+        """Acquire write-blocking locks on every table clear_all_data()
+        would touch, BEFORE re-checking row_counts() against the preview
+        (#256 review round 2 blocker 1) — otherwise an ordinary concurrent
+        write can land on one of these tables between the recount and the
+        wipe and be silently swept in without ever appearing in the
+        confirmed preview. Must be called as the first statement inside the
+        SAME transaction as the recount and the wipe itself, so the lock is
+        held continuously from before the count until the wipe commits.
+
+        PostgreSQL: ACCESS EXCLUSIVE table locks block every other
+        transaction (including plain reads) on exactly these tables until
+        this transaction ends. SQLite has no per-table locking; issuing any
+        write statement inside a transaction immediately escalates SQLite's
+        own connection-wide lock, which blocks every other connection from
+        starting its own write until this transaction ends — a genuine
+        no-op UPDATE on the lock row we already hold achieves the same
+        write-blocking effect portably.
+        """
+        tables = self._clearable_tables()
+        with self._lock:
+            if self.backend == "postgres":
+                if tables:
+                    self._exec(f"LOCK TABLE {', '.join(tables)} IN ACCESS EXCLUSIVE MODE")
+            else:
+                self._exec(
+                    "UPDATE factory_reset_locks SET acquired_at = acquired_at "
+                    "WHERE id = ?", (self._FACTORY_RESET_LOCK_ID,))
 
     # -- setup-entity deletion (#215 safe destructive actions) -------------
     # Single-record hard deletes; the service runs a pre-write dependency gate
