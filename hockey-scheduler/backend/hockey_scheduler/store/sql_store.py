@@ -204,11 +204,13 @@ SPECS = {
                                 "next_attempt_at": _dt(),
                                 "dead_lettered_at": _dt()}),
     ContactDestination: Spec(ContactDestination, "contact_destinations",
-                             {"channel": _enum(NotificationChannel)}),
+                             {"channel": _enum(NotificationChannel),
+                              "active": _bool()}),
     DeviceToken: Spec(DeviceToken, "device_tokens", {"active": _bool()}),
     NotificationPreference: Spec(
         NotificationPreference, "notification_preferences",
-        {"channel": _enum(NotificationChannel), "enabled": _bool()}),
+        {"channel": _enum(NotificationChannel), "enabled": _bool(),
+         "active": _bool()}),
     InstallationState: Spec(
         InstallationState, "installation_state",
         {"claimed_at": _dt()}),
@@ -865,8 +867,6 @@ class SqlStore:
         return rows[0] if rows else None
     def all_contact_destinations(self):
         return self._query(ContactDestination, order="id")
-    def delete_contact_destination(self, contact_id):
-        self._delete(ContactDestination, contact_id)
 
     # -- device token registry (#65) ---------------------------------------
     def add_device_token(self, t): return self._insert(t)
@@ -922,8 +922,6 @@ class SqlStore:
     # -- notification preferences (#81) ------------------------------------
     def save_notification_preference(self, p):
         return self._upsert(p)
-    def delete_notification_preference(self, pref_id):
-        self._delete(NotificationPreference, pref_id)
     def get_notification_preference(self, recipient_ref, channel):
         rows = self._query(
             NotificationPreference, "recipient_ref = ? AND channel = ?",

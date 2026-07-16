@@ -1337,7 +1337,7 @@ class ApiService:
     def _contact_row(c) -> dict:
         return {"id": c.id, "recipient_ref": c.recipient_ref,
                 "channel": c.channel.value, "destination": c.destination,
-                "label": c.label}
+                "label": c.label, "active": c.active}
 
     @catch
     def list_contact_destinations(self) -> dict:
@@ -1349,7 +1349,8 @@ class ApiService:
     @catch
     def set_contact_destination(self, recipient_ref: str, channel: str,
                                 destination: str, label=None) -> dict:
-        """Register (or update) the real destination for a recipient/channel."""
+        """Register (or update/reactivate) the real destination for a
+        recipient/channel."""
         if not recipient_ref:
             raise ValidationError("A recipient_ref is required.")
         self._reject_dangling_recipient(recipient_ref)
@@ -1366,6 +1367,7 @@ class ApiService:
         if existing is not None:
             existing.destination = destination
             existing.label = label
+            existing.active = True
             self.store.save_contact_destination(existing)
             return self._contact_row(existing)
         c = ContactDestination(
@@ -1374,15 +1376,42 @@ class ApiService:
         self.store.add_contact_destination(c)
         return self._contact_row(c)
 
-    # A standalone delete_contact_destination facade method/route existed
-    # briefly (#232 review 3) and was removed (#232 review 4): deleting a
-    # contact/preference row independently of a confirmed Player/Official
-    # delete is unsafe on its own — the resolver treats a MISSING row as
-    # enabled, so clearing one ahead of (or instead of) the actual identity
-    # deletion silently re-enables delivery for a subject that is still
-    # alive. `delete_official`/`delete_player` now cascade this cleanup
-    # atomically, in the same transaction as the confirmed delete, so it is
-    # never a reachable standalone action. See their docstrings.
+    @catch
+    def set_contact_destination_active(self, contact_id: str, active: bool,
+                                       actor_id: Optional[str] = None) -> dict:
+        """Retire (or reactivate) a contact destination (#232 review 4).
+
+        A durable, audited lifecycle toggle — never a delete. Retiring a row
+        (``active=False``) is the supported way to clear a Player/Official
+        delete's contact-destination dependency: the stored destination and
+        its history are preserved, just no longer counted as live. Mirrors
+        `set_device_token_active`; reactivating one whose Player/Official no
+        longer exists is rejected the same way re-registering a device token
+        is. Restricted to Player/Official-scoped rows, same as the delete
+        lifecycle it serves — not a general contact-management surface for
+        other recipient kinds (team, guardian, …).
+        """
+        c = next((row for row in self.store.all_contact_destinations()
+                  if row.id == contact_id), None)
+        if c is None:
+            raise NotFoundError(f"Contact destination {contact_id} not found.")
+        if not (c.recipient_ref.startswith("player:")
+                or c.recipient_ref.startswith("official:")):
+            raise ValidationError(
+                "Only Player/Official-scoped contact destinations can be "
+                "retired through this action.",
+                {"reason": "recipient_not_cleanup_eligible",
+                 "recipient_ref": c.recipient_ref})
+        if active:
+            self._reject_dangling_recipient(c.recipient_ref)
+        c.active = bool(active)
+        self.store.save_contact_destination(c)
+        self.setup._audit(
+            "contact_destination_activated" if c.active
+            else "contact_destination_retired",
+            "contact_destination", contact_id, actor_id,
+            {"recipient_ref": c.recipient_ref, "channel": c.channel.value})
+        return self._contact_row(c)
 
     # -- notification preferences (#81) ------------------------------------
     # The delivery channels a recipient can opt out of (in-app feed is always on).
@@ -1399,16 +1428,22 @@ class ApiService:
         prefs = []
         for ch in self.PREF_CHANNELS:
             p = stored.get(ch)
-            prefs.append({"channel": ch.value,
+            # id is required (#232 review 4): retiring a row via
+            # set_notification_preference_active needs its id, and this read
+            # is the only supported way a client can discover it — there is
+            # no other route that exposes it.
+            prefs.append({"id": p.id if p else None, "channel": ch.value,
                           "enabled": p.enabled if p else True,
-                          "digest": p.digest if p else None})
+                          "digest": p.digest if p else None,
+                          "active": p.active if p else True})
         return {"recipient_ref": recipient_ref, "preferences": prefs}
 
     @catch
     def set_notification_preference(self, recipient_ref: str, channel: str,
                                     enabled: bool, digest=None,
                                     actor_id=None) -> dict:
-        """Enable/disable a delivery channel for a recipient (#81)."""
+        """Enable/disable (or reactivate) a delivery channel for a
+        recipient (#81)."""
         if not recipient_ref:
             raise ValidationError("A recipient_ref is required.")
         self._reject_dangling_recipient(recipient_ref)
@@ -1424,6 +1459,7 @@ class ApiService:
             existing.enabled = bool(enabled)
             if digest is not None:
                 existing.digest = digest
+            existing.active = True
             self.store.save_notification_preference(existing)
             pref = existing
         else:
@@ -1440,12 +1476,45 @@ class ApiService:
             {"recipient_ref": recipient_ref, "channel": ch.value,
              "enabled": pref.enabled, "prior_enabled": prior_enabled,
              "digest": pref.digest})
-        return {"recipient_ref": recipient_ref, "channel": ch.value,
+        return {"id": pref.id, "recipient_ref": recipient_ref, "channel": ch.value,
                 "enabled": pref.enabled, "digest": pref.digest}
 
-    # A standalone delete_notification_preference facade method/route existed
-    # briefly (#232 review 3) and was removed (#232 review 4) for the same
-    # reason as delete_contact_destination above.
+    @catch
+    def set_notification_preference_active(self, pref_id: str, active: bool,
+                                           actor_id: Optional[str] = None) -> dict:
+        """Retire (or reactivate) a notification preference (#232 review 4).
+
+        A durable, audited lifecycle toggle — never a delete. Retiring a row
+        (``active=False``) is the supported way to clear a Player/Official
+        delete's notification-preference dependency: the stored ``enabled``
+        opt-out and its history are preserved — and still govern delivery
+        exactly as before, via `services/delivery.channel_enabled` — just no
+        longer counted as a live blocker. Mirrors
+        `set_contact_destination_active`, including the Player/Official-only
+        scope restriction.
+        """
+        p = next((row for row in self.store.all_notification_preferences()
+                  if row.id == pref_id), None)
+        if p is None:
+            raise NotFoundError(f"Notification preference {pref_id} not found.")
+        if not (p.recipient_ref.startswith("player:")
+                or p.recipient_ref.startswith("official:")):
+            raise ValidationError(
+                "Only Player/Official-scoped notification preferences can "
+                "be retired through this action.",
+                {"reason": "recipient_not_cleanup_eligible",
+                 "recipient_ref": p.recipient_ref})
+        if active:
+            self._reject_dangling_recipient(p.recipient_ref)
+        p.active = bool(active)
+        self.store.save_notification_preference(p)
+        self.setup._audit(
+            "notification_preference_activated" if p.active
+            else "notification_preference_retired",
+            "notification_preference", pref_id, actor_id,
+            {"recipient_ref": p.recipient_ref, "channel": p.channel.value})
+        return {"recipient_ref": p.recipient_ref, "channel": p.channel.value,
+                "enabled": p.enabled, "active": p.active}
 
     # -- calendar feed tokens (#82) ----------------------------------------
     @staticmethod

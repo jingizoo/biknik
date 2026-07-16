@@ -933,40 +933,103 @@ class DeletionContract:
         self.assertEqual(result["error"]["code"], "validation_error")
         self.assertFalse(self.store.get_user_account(acc.id).active)
 
-    # -- official contact/preference cleanup (#232 review 4) -----------------
-    # Contact destinations and notification preferences no longer block
-    # delete_official — they cascade with the confirmed delete, atomically,
-    # in the same transaction. Deleting either row standalone was unsafe:
-    # the resolver treats a MISSING preference row as enabled, so clearing
-    # one ahead of (or instead of) the actual identity deletion could
-    # silently re-enable delivery for a subject that never actually got
-    # deleted (e.g. because another dependency still blocked).
-    def test_official_delete_cascades_contact_and_preference_cleanup(self):
+    def test_official_blocked_by_contact_destination(self):
         official = self._official()
-        ref = f"official:{official}"
+        self.store.add_contact_destination(ContactDestination(
+            id=self.store.next_id("contact"), recipient_ref=f"official:{official}",
+            channel=NotificationChannel.EMAIL, destination="ref@example.com"))
+        blocked = self.api.delete_official(official, actor_id=self.ACTOR)
+        self.assertBlocked(blocked, expect_types={"contact destination"})
+        self.assertIsNotNone(self.store.get_official(official))
+
+    def test_official_blocked_by_notification_preference(self):
+        official = self._official()
+        self.store.save_notification_preference(NotificationPreference(
+            id=self.store.next_id("notif_pref"), recipient_ref=f"official:{official}",
+            channel=NotificationChannel.PUSH, enabled=False))
+        blocked = self.api.delete_official(official, actor_id=self.ACTOR)
+        self.assertBlocked(blocked, expect_types={"notification preference"})
+        self.assertIsNotNone(self.store.get_official(official))
+
+    # -- official contact/preference retirement (#232 review 4) --------------
+    # #232 requires Player/Official deletion never silently cascade or erase
+    # a dependent record. A contact destination/notification preference is
+    # therefore never deleted at all — it is retired (active=False) through
+    # its own explicit, audited action, exactly like an account/device token
+    # is deactivated, preserving the stored destination/opt-out and its
+    # history. Only an ACTIVE row blocks the delete.
+    def test_official_inactive_contact_destination_does_not_block(self):
+        official = self._official()
+        self.store.add_contact_destination(ContactDestination(
+            id=self.store.next_id("contact"), recipient_ref=f"official:{official}",
+            channel=NotificationChannel.EMAIL, destination="inactive@example.com",
+            active=False))
+        self.assertDeleted(self.api.delete_official(official, actor_id=self.ACTOR),
+                           self.store.get_official, official, "official_deleted")
+
+    def test_official_inactive_notification_preference_does_not_block(self):
+        official = self._official()
+        self.store.save_notification_preference(NotificationPreference(
+            id=self.store.next_id("notif_pref"), recipient_ref=f"official:{official}",
+            channel=NotificationChannel.PUSH, enabled=False, active=False))
+        self.assertDeleted(self.api.delete_official(official, actor_id=self.ACTOR),
+                           self.store.get_official, official, "official_deleted")
+
+    def test_official_blocked_by_contact_destination_then_retired_then_deletes(self):
+        official = self._official()
         contact = self.store.add_contact_destination(ContactDestination(
-            id=self.store.next_id("contact"), recipient_ref=ref,
-            channel=NotificationChannel.EMAIL, destination="cleaned@example.com"))
-        pref = self.store.save_notification_preference(NotificationPreference(
-            id=self.store.next_id("notif_pref"), recipient_ref=ref,
-            channel=NotificationChannel.EMAIL, enabled=False))
-        result = self.api.delete_official(official, actor_id=self.ACTOR)
-        self.assertNotIn("error", result, result)
-        self.assertIsNone(self.store.get_official(official))
-        self.assertIsNone(next(
+            id=self.store.next_id("contact"), recipient_ref=f"official:{official}",
+            channel=NotificationChannel.EMAIL, destination="retire-me@example.com"))
+        audits_before = len(self.store.all_setup_audit())
+        blocked = self.api.delete_official(official, actor_id=self.ACTOR)
+        self.assertBlocked(blocked, expect_types={"contact destination"})
+        self.assertIsNotNone(self.store.get_official(official))
+        self.assertEqual(len(self.store.all_setup_audit()), audits_before)
+
+        retired = self.api.set_contact_destination_active(
+            contact.id, False, actor_id=self.ACTOR)
+        self.assertNotIn("error", retired, retired)
+        self.assertFalse(retired["active"])
+        self.assertEqual(retired["destination"], "retire-me@example.com",
+                         "retiring must not touch the stored destination")
+
+        before_delete_audits = len(self.store.all_setup_audit())
+        self.assertDeleted(self.api.delete_official(official, actor_id=self.ACTOR),
+                           self.store.get_official, official, "official_deleted")
+        self.assertEqual(len(self.store.all_setup_audit()), before_delete_audits + 1,
+                         "a successful delete writes exactly one audit entry")
+
+        # History preserved, queryable, unchanged (#232's no-erase contract):
+        still_there = next(
             (c for c in self.store.all_contact_destinations() if c.id == contact.id),
-            None), "the contact destination must be gone with the official")
-        self.assertIsNone(next(
+            None)
+        self.assertIsNotNone(still_there)
+        self.assertFalse(still_there.active)
+        self.assertEqual(still_there.destination, "retire-me@example.com")
+
+    def test_official_blocked_by_notification_preference_then_retired_then_deletes(self):
+        official = self._official()
+        pref = self.store.save_notification_preference(NotificationPreference(
+            id=self.store.next_id("notif_pref"), recipient_ref=f"official:{official}",
+            channel=NotificationChannel.PUSH, enabled=False))
+        blocked = self.api.delete_official(official, actor_id=self.ACTOR)
+        self.assertBlocked(blocked, expect_types={"notification preference"})
+
+        retired = self.api.set_notification_preference_active(
+            pref.id, False, actor_id=self.ACTOR)
+        self.assertNotIn("error", retired, retired)
+        self.assertFalse(retired["active"])
+        self.assertFalse(retired["enabled"], "retiring must not touch the opt-out")
+
+        self.assertDeleted(self.api.delete_official(official, actor_id=self.ACTOR),
+                           self.store.get_official, official, "official_deleted")
+
+        still_there = next(
             (p for p in self.store.all_notification_preferences() if p.id == pref.id),
-            None), "the notification preference must be gone with the official")
-        cd_audits = self._audits("contact_destination_deleted")
-        np_audits = self._audits("notification_preference_deleted")
-        self.assertEqual([a.entity_id for a in cd_audits], [contact.id])
-        self.assertEqual([a.entity_id for a in np_audits], [pref.id])
-        self.assertEqual(cd_audits[0].detail["reason"], "official_deleted")
-        official_audit = self._audits("official_deleted")[-1]
-        self.assertEqual(official_audit.detail["contacts_cleaned"], 1)
-        self.assertEqual(official_audit.detail["preferences_cleaned"], 1)
+            None)
+        self.assertIsNotNone(still_there, "retired history must remain queryable")
+        self.assertFalse(still_there.active)
+        self.assertFalse(still_there.enabled)
 
     def test_official_blocked_delete_preserves_contact_and_preference(self):
         # The scenario the reviewer flagged directly: a delete blocked by
@@ -983,7 +1046,7 @@ class DeletionContract:
             channel=NotificationChannel.EMAIL, enabled=False))
         audits_before = len(self.store.all_setup_audit())
         blocked = self.api.delete_official(official, actor_id=self.ACTOR)
-        self.assertBlocked(blocked, expect_types={"device token"})
+        self.assertBlocked(blocked, expect_types={"device token", "notification preference"})
         self.assertIsNotNone(self.store.get_official(official))
         self.assertEqual(len(self.store.all_setup_audit()), audits_before)
         stored = self.store.get_notification_preference(
@@ -991,26 +1054,19 @@ class DeletionContract:
         self.assertIsNotNone(stored, "a blocked delete must not touch the "
                              "recipient's stored opt-out")
         self.assertFalse(stored.enabled)
+        self.assertTrue(stored.active)
         self.assertEqual(stored.id, pref.id)
 
-    def test_official_delete_rolls_back_cascade_on_forced_audit_failure(self):
+    def test_official_delete_rolls_back_on_forced_audit_failure(self):
+        # #232's "exactly one audit on success" contract implies the delete
+        # itself is still a single atomic write: a forced failure on that
+        # one audit call must roll back the identity delete too.
         official = self._official()
-        ref = f"official:{official}"
-        contact = self.store.add_contact_destination(ContactDestination(
-            id=self.store.next_id("contact"), recipient_ref=ref,
-            channel=NotificationChannel.EMAIL, destination="rollback@example.com"))
-        pref = self.store.save_notification_preference(NotificationPreference(
-            id=self.store.next_id("notif_pref"), recipient_ref=ref,
-            channel=NotificationChannel.EMAIL, enabled=False))
         audits_before = len(self.store.all_setup_audit())
         original = self.store.add_setup_audit
-        calls = {"n": 0}
 
         def boom(entry):
-            calls["n"] += 1
-            if calls["n"] == 2:  # after the contact audit, before the pref audit
-                raise RuntimeError("forced audit failure")
-            return original(entry)
+            raise RuntimeError("forced audit failure")
 
         self.store.add_setup_audit = boom
         try:
@@ -1019,16 +1075,7 @@ class DeletionContract:
         finally:
             self.store.add_setup_audit = original
 
-        # Nothing persisted: the official, the contact, the preference, and
-        # the audit log are exactly as they were — including the FIRST
-        # cascade row's cleanup, which must not survive as a partial write.
         self.assertIsNotNone(self.store.get_official(official))
-        self.assertIsNotNone(next(
-            (c for c in self.store.all_contact_destinations() if c.id == contact.id),
-            None))
-        self.assertIsNotNone(next(
-            (p for p in self.store.all_notification_preferences() if p.id == pref.id),
-            None))
         self.assertEqual(len(self.store.all_setup_audit()), audits_before)
 
     # -- official dangling-recipient guard (#232 review 2) -------------------
@@ -1111,20 +1158,83 @@ class DeletionContract:
         self.assertNotIn("error", result, result)
         self.assertFalse(result["enabled"])
 
+    # -- official contact/preference retire-reactivate guard (#232 review 4) -
+    # The same deactivate -> delete subject -> reactivate hole the device-
+    # token guard closes applies identically to retiring a contact/
+    # preference ahead of deletion: reactivating one whose Official is gone
+    # must be rejected, exactly like set_device_token_active/
+    # register_device_token.
+    def test_reactivating_retired_contact_after_official_deleted_is_blocked(self):
+        official = self._official()
+        ref = f"official:{official}"
+        contact = self.store.add_contact_destination(ContactDestination(
+            id=self.store.next_id("contact"), recipient_ref=ref,
+            channel=NotificationChannel.EMAIL, destination="react@example.com"))
+        self.api.set_contact_destination_active(contact.id, False, actor_id=self.ACTOR)
+        self.assertDeleted(self.api.delete_official(official, actor_id=self.ACTOR),
+                           self.store.get_official, official, "official_deleted")
+        result = self.api.set_contact_destination_active(
+            contact.id, True, actor_id=self.ACTOR)
+        self.assertEqual(result["error"]["code"], "validation_error", result)
+        self.assertEqual(result["error"]["details"]["reason"], "scope_subject_missing")
+        self.assertFalse(next(c for c in self.store.all_contact_destinations()
+                              if c.id == contact.id).active)
+
+    def test_reactivating_retired_preference_after_official_deleted_is_blocked(self):
+        official = self._official()
+        ref = f"official:{official}"
+        pref = self.store.save_notification_preference(NotificationPreference(
+            id=self.store.next_id("notif_pref"), recipient_ref=ref,
+            channel=NotificationChannel.PUSH, enabled=False))
+        self.api.set_notification_preference_active(pref.id, False, actor_id=self.ACTOR)
+        self.assertDeleted(self.api.delete_official(official, actor_id=self.ACTOR),
+                           self.store.get_official, official, "official_deleted")
+        result = self.api.set_notification_preference_active(
+            pref.id, True, actor_id=self.ACTOR)
+        self.assertEqual(result["error"]["code"], "validation_error", result)
+        self.assertEqual(result["error"]["details"]["reason"], "scope_subject_missing")
+        self.assertFalse(next(p for p in self.store.all_notification_preferences()
+                              if p.id == pref.id).active)
+
+    def test_contact_retire_reactivate_lifecycle_allowed_for_existing_official(self):
+        official = self._official()
+        ref = f"official:{official}"
+        c = self.api.set_contact_destination(ref, "email", "lifecycle@example.com")
+        self.assertNotIn("error", c, c)
+        contact_id = self.store.get_contact_destination(
+            ref, NotificationChannel.EMAIL).id
+        retired = self.api.set_contact_destination_active(contact_id, False)
+        self.assertFalse(retired["active"])
+        reactivated = self.api.set_contact_destination_active(contact_id, True)
+        self.assertNotIn("error", reactivated, reactivated)
+        self.assertTrue(reactivated["active"])
+
+    def test_preference_retire_reactivate_lifecycle_allowed_for_existing_official(self):
+        official = self._official()
+        ref = f"official:{official}"
+        self.api.set_notification_preference(ref, "email", False)
+        pref_id = self.store.get_notification_preference(
+            ref, NotificationChannel.EMAIL).id
+        retired = self.api.set_notification_preference_active(pref_id, False)
+        self.assertFalse(retired["active"])
+        reactivated = self.api.set_notification_preference_active(pref_id, True)
+        self.assertNotIn("error", reactivated, reactivated)
+        self.assertTrue(reactivated["active"])
+
     def test_pending_delivery_cannot_be_redirected_after_subject_deleted(self):
         """#232 review 3/4: a queued delivery re-resolves its destination on
-        every send attempt (services/delivery.py), so once the subject is
-        deleted (cascading its contact destination with it), nothing may add
-        a NEW contact destination for that dead recipient_ref and hijack the
-        still-pending delivery to a different, attacker-controlled address.
-        The setter guard closes this at the source: the recreation attempt
-        itself is rejected, so the delivery can only ever resolve to the
-        placeholder — never to a post-deletion contact."""
+        every send attempt (services/delivery.py). The contact destination is
+        retired (never deleted) to clear the way for the Official's delete —
+        it keeps resolving pending deliveries to its ORIGINAL destination
+        exactly as before, so a delivery already queued still completes
+        normally. What must be rejected is a hijack: nothing may point a NEW
+        contact at the now-dead recipient_ref and redirect that pending
+        delivery to a different, attacker-controlled address."""
         from hockey_scheduler.services.delivery import enqueue
 
         official = self._official()
         ref = f"official:{official}"
-        self.store.add_contact_destination(ContactDestination(
+        contact = self.store.add_contact_destination(ContactDestination(
             id=self.store.next_id("contact"), recipient_ref=ref,
             channel=NotificationChannel.EMAIL, destination="original@example.com"))
         notification = Notification(
@@ -1138,8 +1248,8 @@ class DeletionContract:
                               if d.channel == NotificationChannel.EMAIL)
         self.assertEqual(email_delivery.destination, "original@example.com")
 
-        # Delete the subject — the contact cascades with it in the same
-        # transaction, never as a separate prior step.
+        # Retire (never delete) the contact to clear the way, then delete.
+        self.api.set_contact_destination_active(contact.id, False, actor_id=self.ACTOR)
         self.assertDeleted(self.api.delete_official(official, actor_id=self.ACTOR),
                            self.store.get_official, official, "official_deleted")
 
@@ -1151,14 +1261,11 @@ class DeletionContract:
         self.assertEqual(len(self.store.all_contact_destinations()), before)
 
         # Draining the queue re-resolves the destination (delivery.py's
-        # retry-time re-resolution) — it must fall back to the synthesized
-        # placeholder, never the attacker's address and never the (now
-        # gone) original.
+        # retry-time re-resolution): the retired contact's ORIGINAL
+        # destination is preserved and still used — never the attacker's.
         self.api.delivery.process_pending()
         redelivered = self.store.get_notification_delivery(email_delivery.id)
-        self.assertNotEqual(redelivered.destination, "attacker@example.com")
-        self.assertNotEqual(redelivered.destination, "original@example.com")
-        self.assertTrue(redelivered.destination.endswith("@notify.invalid"))
+        self.assertEqual(redelivered.destination, "original@example.com")
 
     # -- player (#232) --------------------------------------------------------
     def test_player_blocked_by_roster_entry(self):
@@ -1243,11 +1350,36 @@ class DeletionContract:
         self.assertBlocked(blocked, expect_types={"calendar feed"})
         self.assertIsNotNone(self.store.get_player(player))
 
-    def test_player_delete_cascades_emailed_players_contact_destination(self):
+    def test_player_blocked_by_contact_destination(self):
         # The real production path: an optional email on manual player create
         # writes a "player:<id>"-scoped ContactDestination (#232 review of
-        # #215's recipient_ref convention). It no longer blocks the delete
-        # (#232 review 4) — it cascades with it.
+        # #215's recipient_ref convention).
+        lg = self._league()
+        club = self._club()
+        team = self._team(club, lg)
+        player = self.api.create_player(
+            team, "Emailed Player", "skater", email="p@example.com",
+            actor_id=self.ACTOR)["id"]
+        blocked = self.api.delete_player(player, actor_id=self.ACTOR)
+        self.assertBlocked(blocked, expect_types={"contact destination"})
+        self.assertIsNotNone(self.store.get_player(player))
+
+    def test_player_blocked_by_notification_preference(self):
+        lg = self._league()
+        club = self._club()
+        team = self._team(club, lg)
+        player = self._player(team)
+        self.store.save_notification_preference(NotificationPreference(
+            id=self.store.next_id("notif_pref"), recipient_ref=f"player:{player}",
+            channel=NotificationChannel.PUSH, enabled=False))
+        blocked = self.api.delete_player(player, actor_id=self.ACTOR)
+        self.assertBlocked(blocked, expect_types={"notification preference"})
+        self.assertIsNotNone(self.store.get_player(player))
+
+    def test_player_emailed_contact_retired_then_deletes(self):
+        # The common real-world shape (#232 review): the emailed Player's
+        # contact is retired — never deleted — to clear the way; the delete
+        # then succeeds and the retired row remains queryable history.
         lg = self._league()
         club = self._club()
         team = self._team(club, lg)
@@ -1257,12 +1389,39 @@ class DeletionContract:
         ref = f"player:{player}"
         contact = self.store.get_contact_destination(ref, NotificationChannel.EMAIL)
         self.assertIsNotNone(contact)
+        self.api.set_contact_destination_active(contact.id, False, actor_id=self.ACTOR)
         result = self.api.delete_player(player, actor_id=self.ACTOR)
         self.assertNotIn("error", result, result)
         self.assertIsNone(self.store.get_player(player))
-        self.assertIsNone(next(
+        still_there = next(
             (c for c in self.store.all_contact_destinations() if c.id == contact.id),
-            None))
+            None)
+        self.assertIsNotNone(still_there, "retired history must remain queryable")
+        self.assertFalse(still_there.active)
+        self.assertEqual(still_there.destination, "p@example.com")
+
+    def test_player_inactive_contact_destination_does_not_block(self):
+        lg = self._league()
+        club = self._club()
+        team = self._team(club, lg)
+        player = self._player(team)
+        self.store.add_contact_destination(ContactDestination(
+            id=self.store.next_id("contact"), recipient_ref=f"player:{player}",
+            channel=NotificationChannel.EMAIL, destination="inactive@example.com",
+            active=False))
+        self.assertDeleted(self.api.delete_player(player, actor_id=self.ACTOR),
+                           self.store.get_player, player, "player_deleted")
+
+    def test_player_inactive_notification_preference_does_not_block(self):
+        lg = self._league()
+        club = self._club()
+        team = self._team(club, lg)
+        player = self._player(team)
+        self.store.save_notification_preference(NotificationPreference(
+            id=self.store.next_id("notif_pref"), recipient_ref=f"player:{player}",
+            channel=NotificationChannel.PUSH, enabled=False, active=False))
+        self.assertDeleted(self.api.delete_player(player, actor_id=self.ACTOR),
+                           self.store.get_player, player, "player_deleted")
 
     def test_player_blocked_by_device_token(self):
         lg = self._league()
@@ -1323,7 +1482,7 @@ class DeletionContract:
         self.assertEqual(result["error"]["code"], "validation_error")
         self.assertFalse(self.store.get_user_account(acc.id).active)
 
-    def test_player_delete_cascades_notification_preference_cleanup(self):
+    def test_player_notification_preference_retired_then_deletes(self):
         lg = self._league()
         club = self._club()
         team = self._team(club, lg)
@@ -1332,15 +1491,22 @@ class DeletionContract:
         pref = self.store.save_notification_preference(NotificationPreference(
             id=self.store.next_id("notif_pref"), recipient_ref=ref,
             channel=NotificationChannel.PUSH, enabled=False))
+        blocked = self.api.delete_player(player, actor_id=self.ACTOR)
+        self.assertBlocked(blocked, expect_types={"notification preference"})
+
+        self.api.set_notification_preference_active(pref.id, False, actor_id=self.ACTOR)
+        before_delete_audits = len(self.store.all_setup_audit())
         result = self.api.delete_player(player, actor_id=self.ACTOR)
         self.assertNotIn("error", result, result)
+        self.assertEqual(len(self.store.all_setup_audit()), before_delete_audits + 1,
+                         "a successful delete writes exactly one audit entry")
         self.assertIsNone(self.store.get_player(player))
-        self.assertIsNone(next(
+        still_there = next(
             (p for p in self.store.all_notification_preferences() if p.id == pref.id),
-            None))
-        np_audits = self._audits("notification_preference_deleted")
-        self.assertEqual([a.entity_id for a in np_audits], [pref.id])
-        self.assertEqual(np_audits[0].detail["reason"], "player_deleted")
+            None)
+        self.assertIsNotNone(still_there, "retired history must remain queryable")
+        self.assertFalse(still_there.active)
+        self.assertFalse(still_there.enabled)
 
     def test_player_blocked_delete_preserves_notification_preference(self):
         lg = self._league()
@@ -1356,7 +1522,7 @@ class DeletionContract:
             channel=NotificationChannel.PUSH, enabled=False))
         audits_before = len(self.store.all_setup_audit())
         blocked = self.api.delete_player(player, actor_id=self.ACTOR)
-        self.assertBlocked(blocked, expect_types={"device token"})
+        self.assertBlocked(blocked, expect_types={"device token", "notification preference"})
         self.assertIsNotNone(self.store.get_player(player))
         self.assertEqual(len(self.store.all_setup_audit()), audits_before)
         stored = self.store.get_notification_preference(
@@ -1364,15 +1530,16 @@ class DeletionContract:
         self.assertIsNotNone(stored, "a blocked delete must not touch the "
                              "recipient's stored opt-out")
         self.assertFalse(stored.enabled)
+        self.assertTrue(stored.active)
         self.assertEqual(stored.id, pref.id)
 
     def test_player_full_dependency_lifecycle_then_succeeds(self):
         """#232 review: the real emailed-Player path — the common case a
         League Admin actually hits — has a genuine supported resolution for
-        every OTHER dependency it can accumulate simultaneously (account,
-        device token); contact destination and notification preference are
-        no longer separate blockers to resolve (#232 review 4) — they
-        cascade with this same confirmed delete."""
+        EVERY dependency type it can accumulate simultaneously, not just a
+        separate bare Player deleted instead. #232 review 4: contact/
+        preference dependencies are cleared by retiring them, never by
+        deleting them."""
         lg = self._league()
         club = self._club()
         team = self._team(club, lg)
@@ -1386,35 +1553,37 @@ class DeletionContract:
         tok = self.store.add_device_token(DeviceToken(
             id=self.store.next_id("device"), recipient_ref=ref,
             provider="fcm", token="tok_lifecycle"))
-        self.store.save_notification_preference(NotificationPreference(
+        pref = self.store.save_notification_preference(NotificationPreference(
             id=self.store.next_id("notif_pref"), recipient_ref=ref,
             channel=NotificationChannel.PUSH, enabled=False))
 
         audits_before = len(self.store.all_setup_audit())
         blocked = self.api.delete_player(player, actor_id=self.ACTOR)
-        self.assertBlocked(blocked, expect_types={"account", "device token"})
+        self.assertBlocked(blocked, expect_types={
+            "account", "device token", "contact destination",
+            "notification preference"})
         self.assertIsNotNone(self.store.get_player(player))
         self.assertEqual(len(self.store.all_setup_audit()), audits_before,
                          "a blocked delete must not append any audit row")
-        self.assertIsNotNone(next(
-            (c for c in self.store.all_contact_destinations()
-             if c.recipient_ref == ref), None),
-            "the contact/preference cascade must not run while another "
-            "dependency still blocks the delete")
 
-        # Clear every OTHER dependency through its own supported route —
-        # never a silent cascade from delete_player itself.
+        # Clear each dependency through its own supported route — never a
+        # silent cascade or erasure from delete_player itself.
         self.api.accounts.set_active(acc.id, False, actor_id=self.ACTOR)
         self.api.set_device_token_active(tok.id, False)
+        contact = next(c for c in self.store.all_contact_destinations()
+                      if c.recipient_ref == ref)
+        self.api.set_contact_destination_active(contact.id, False, actor_id=self.ACTOR)
+        self.api.set_notification_preference_active(pref.id, False, actor_id=self.ACTOR)
 
         self.assertDeleted(self.api.delete_player(player, actor_id=self.ACTOR),
                            self.store.get_player, player, "player_deleted")
-        self.assertIsNone(next(
-            (c for c in self.store.all_contact_destinations()
-             if c.recipient_ref == ref), None))
-        self.assertIsNone(next(
-            (p for p in self.store.all_notification_preferences()
-             if p.recipient_ref == ref), None))
+        # Nothing erased — every dependent row survives as retired history.
+        self.assertIsNotNone(next(
+            (c for c in self.store.all_contact_destinations() if c.id == contact.id),
+            None))
+        self.assertIsNotNone(next(
+            (p for p in self.store.all_notification_preferences() if p.id == pref.id),
+            None))
 
     # -- player dangling-recipient guard (#232 review 2) ---------------------
     def test_reactivating_device_token_after_player_deleted_is_blocked(self):
@@ -1510,7 +1679,8 @@ class DeletionContract:
                                                         "email", False)
         self.assertNotIn("error", result2, result2)
 
-    def test_player_delete_rolls_back_cascade_on_forced_audit_failure(self):
+    # -- player contact/preference retire-reactivate guard (#232 review 4) ---
+    def test_reactivating_retired_contact_after_player_deleted_is_blocked(self):
         lg = self._league()
         club = self._club()
         team = self._team(club, lg)
@@ -1518,19 +1688,42 @@ class DeletionContract:
         ref = f"player:{player}"
         contact = self.store.add_contact_destination(ContactDestination(
             id=self.store.next_id("contact"), recipient_ref=ref,
-            channel=NotificationChannel.EMAIL, destination="rollback@example.com"))
+            channel=NotificationChannel.EMAIL, destination="react@example.com"))
+        self.api.set_contact_destination_active(contact.id, False, actor_id=self.ACTOR)
+        self.assertDeleted(self.api.delete_player(player, actor_id=self.ACTOR),
+                           self.store.get_player, player, "player_deleted")
+        result = self.api.set_contact_destination_active(
+            contact.id, True, actor_id=self.ACTOR)
+        self.assertEqual(result["error"]["code"], "validation_error", result)
+        self.assertEqual(result["error"]["details"]["reason"], "scope_subject_missing")
+
+    def test_reactivating_retired_preference_after_player_deleted_is_blocked(self):
+        lg = self._league()
+        club = self._club()
+        team = self._team(club, lg)
+        player = self._player(team)
+        ref = f"player:{player}"
         pref = self.store.save_notification_preference(NotificationPreference(
             id=self.store.next_id("notif_pref"), recipient_ref=ref,
-            channel=NotificationChannel.EMAIL, enabled=False))
+            channel=NotificationChannel.PUSH, enabled=False))
+        self.api.set_notification_preference_active(pref.id, False, actor_id=self.ACTOR)
+        self.assertDeleted(self.api.delete_player(player, actor_id=self.ACTOR),
+                           self.store.get_player, player, "player_deleted")
+        result = self.api.set_notification_preference_active(
+            pref.id, True, actor_id=self.ACTOR)
+        self.assertEqual(result["error"]["code"], "validation_error", result)
+        self.assertEqual(result["error"]["details"]["reason"], "scope_subject_missing")
+
+    def test_player_delete_rolls_back_on_forced_audit_failure(self):
+        lg = self._league()
+        club = self._club()
+        team = self._team(club, lg)
+        player = self._player(team)
         audits_before = len(self.store.all_setup_audit())
         original = self.store.add_setup_audit
-        calls = {"n": 0}
 
         def boom(entry):
-            calls["n"] += 1
-            if calls["n"] == 2:
-                raise RuntimeError("forced audit failure")
-            return original(entry)
+            raise RuntimeError("forced audit failure")
 
         self.store.add_setup_audit = boom
         try:
@@ -1540,12 +1733,6 @@ class DeletionContract:
             self.store.add_setup_audit = original
 
         self.assertIsNotNone(self.store.get_player(player))
-        self.assertIsNotNone(next(
-            (c for c in self.store.all_contact_destinations() if c.id == contact.id),
-            None))
-        self.assertIsNotNone(next(
-            (p for p in self.store.all_notification_preferences() if p.id == pref.id),
-            None))
         self.assertEqual(len(self.store.all_setup_audit()), audits_before)
 
     # -- not found ---------------------------------------------------------

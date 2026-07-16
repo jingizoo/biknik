@@ -326,12 +326,18 @@ class ContactDestination:
     real transport in this slice — this just lets operators register where a
     notification *would* be sent (an official's email, a team contact, the
     scheduler group inbox, a push-token placeholder).
+
+    ``active`` (#232 review 4) is a reactivatable lifecycle flag, not a
+    delivery-resolution one: an inactive row is retired history that no
+    longer blocks Player/Official deletion, but its stored destination is
+    never erased. Mirrors ``DeviceToken.active``.
     """
     id: str
     recipient_ref: str
     channel: NotificationChannel
     destination: str
     label: Optional[str] = None
+    active: bool = True
 
 
 @dataclass
@@ -388,12 +394,20 @@ class NotificationPreference:
     channel. Absent rows mean the channel is on by default (existing behavior).
     The in-app feed is always delivered and is not represented here. ``digest``
     is a placeholder for a future batching preference — unused this slice.
+
+    ``active`` (#232 review 4) is a separate, reactivatable lifecycle flag —
+    NOT the opt-out itself. An inactive row no longer blocks Player/Official
+    deletion, but ``enabled`` and every other stored value is untouched and
+    still governs delivery exactly as before: retiring a row preserves the
+    recipient's opt-out history rather than erasing it. Mirrors
+    ``DeviceToken.active``.
     """
     id: str
     recipient_ref: str
     channel: NotificationChannel
     enabled: bool = True
     digest: Optional[str] = None
+    active: bool = True
 
 
 @dataclass

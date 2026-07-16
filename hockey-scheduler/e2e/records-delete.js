@@ -19,12 +19,13 @@
 //      live availability window, then succeeds once that dependency is
 //      cleared through the official's own supported cleanup route.
 //   5. Proves the Player's new delete contract: an emailed Player with a
-//      scoped account and device token is blocked by those two (NOT by its
-//      contact destination or a disabled notification preference — #232
-//      review 4 made cleaning those up an atomic part of the confirmed
-//      delete itself, not a separate blocker); once account/device are
-//      cleared, the delete succeeds and the contact/preference are proven
-//      gone with it. A bare Player also deletes successfully.
+//      scoped account, device token, AND a disabled notification preference
+//      is blocked by all four; each is cleared through its own supported
+//      route — account/device-token deactivation, contact/preference
+//      RETIREMENT (#232 review 4: never a delete, so nothing is erased);
+//      the delete then succeeds, and the retired contact/preference are
+//      proven to remain queryable history, not gone. A bare Player also
+//      deletes successfully.
 //
 // Fails on any browser console/page error.
 const { chromium } = require("playwright");
@@ -198,10 +199,9 @@ async function checkViewport(browser, viewport) {
       throw new Error(`[${viewport.label}] player device token create failed: ` +
         `${JSON.stringify(playerDevice.error)}`);
     }
-    // An explicit opt-out (#232 review 4): the emailed Player's contact
-    // destination (created automatically above) AND this disabled
-    // notification preference must both cascade with the confirmed delete
-    // below, atomically — neither is a separate blocker to clear first.
+    // An explicit opt-out (#232 review 4): a disabled notification
+    // preference on the emailed Player, alongside its automatically-created
+    // contact destination — both block the delete until explicitly retired.
     const playerPref = await page.evaluate(async (i) => {
       const post = async (p, b) => (await fetch(p, {
         method: "POST", credentials: "same-origin",
@@ -307,12 +307,12 @@ async function checkViewport(browser, viewport) {
 
     // (5) Player's new delete contract, proven for the COMMON real-world
     // shape (#232 review) — not sidestepped by deleting a separate bare
-    // Player instead: the emailed Player, with a scoped account and device
-    // token too, is blocked by both; each is cleared through its own
-    // supported route (account/device-token deactivation). The contact
-    // destination and disabled notification preference are NOT separate
-    // blockers (#232 review 4) — they cascade atomically with the confirmed
-    // delete below, so the blocked modal must not mention them.
+    // Player instead: the emailed Player, with a scoped account, device
+    // token, AND a disabled notification preference, is blocked by all
+    // four; each is cleared through its own supported route (account/
+    // device-token deactivation, contact/preference RETIREMENT — #232
+    // review 4: never a delete, so nothing is erased and the delete itself
+    // never silently cascades).
     await clickDelete("player", playerBlocked.id);
     result = await confirmDelete("player", playerBlocked.id, { expectBlocked: true });
     if (!result.error || result.error.code !== "has_dependencies") {
@@ -321,22 +321,18 @@ async function checkViewport(browser, viewport) {
     }
     await page.waitForSelector(".modal.blocked", { timeout: 10000 });
     const playerBlockedText = (await page.textContent(".modal.blocked")) || "";
-    for (const term of ["account", "device"]) {
+    for (const term of ["contact", "account", "device", "preference"]) {
       if (!playerBlockedText.toLowerCase().includes(term)) {
         throw new Error(`[${viewport.label}] blocked-Player modal doesn't mention the blocking ` +
           `${term} dependency: ${playerBlockedText}`);
       }
     }
-    if (playerBlockedText.toLowerCase().includes("contact")) {
-      throw new Error(`[${viewport.label}] blocked-Player modal unexpectedly lists the contact ` +
-        `destination as a blocker (#232 review 4 made it a cascade, not a blocker): ` +
-        `${playerBlockedText}`);
-    }
     await page.click("button.act[data-modal-close]");
     await page.waitForSelector(".modal", { state: "detached", timeout: 10000 });
 
-    // Clear every OTHER dependency through its own supported route — never
-    // a silent cascade from the Player delete itself.
+    // Clear every dependency through its own supported route — never a
+    // silent cascade or erasure from delete_player itself. The contact and
+    // preference are RETIRED (active: false), not deleted.
     const cleared = await page.evaluate(async (i) => {
       const post = async (p, b) => (await fetch(p, {
         method: "POST", credentials: "same-origin",
@@ -344,9 +340,24 @@ async function checkViewport(browser, viewport) {
       })).json();
       const acc = await post(`/api/accounts/${i.account}/active`, { active: false });
       const dev = await post(`/api/notifications/device-tokens/${i.device}/active`, { active: false });
-      return { acc, dev };
-    }, { account: playerAccount.id, device: playerDevice.id });
-    if (cleared.acc.error || cleared.dev.error) {
+      const contactsResp = await fetch("/api/notifications/contacts", { credentials: "same-origin" });
+      const contactsBody = await contactsResp.json();
+      const contact = (contactsBody.contacts || [])
+        .find((c) => c.recipient_ref === `player:${i.player}`);
+      const con = contact
+        ? await post(`/api/notifications/contacts/${contact.id}/active`, { active: false })
+        : { error: { message: "no matching contact destination found" } };
+      const prefsResp = await fetch(
+        `/api/notifications/preferences?recipient_ref=player:${i.player}`,
+        { credentials: "same-origin" });
+      const prefsBody = await prefsResp.json();
+      const emailPref = (prefsBody.preferences || []).find((p) => p.channel === "email");
+      const pref = emailPref && emailPref.id
+        ? await post(`/api/notifications/preferences/${emailPref.id}/active`, { active: false })
+        : { error: { message: "no matching notification preference found" } };
+      return { acc, dev, con, pref, contactId: contact && contact.id };
+    }, { account: playerAccount.id, device: playerDevice.id, player: playerBlocked.id });
+    if (cleared.acc.error || cleared.dev.error || cleared.con.error || cleared.pref.error) {
       throw new Error(`[${viewport.label}] clearing the Player's dependencies failed: ` +
         JSON.stringify(cleared));
     }
@@ -362,34 +373,42 @@ async function checkViewport(browser, viewport) {
       (id) => !document.querySelector(`[data-del="player"][data-del-id="${id}"]`),
       playerBlocked.id, { timeout: 10000 });
 
-    // Cascade proof (#232 review 4): the contact destination and
-    // notification preference the emailed Player carried are gone WITH the
-    // Player — never left behind as dangling state, and never requiring a
-    // separate cleanup call the UI never exposed. Re-pointing either at the
-    // now-dead ref is rejected.
+    // No-erase proof (#232 review 4): the retired contact destination and
+    // notification preference remain queryable history after the Player is
+    // gone — never erased, never left as a dangling live row. Re-pointing
+    // either at the now-dead ref is rejected.
     page.off("console", consoleErrorHandler);
-    const cascadeProof = await page.evaluate(async (i) => {
+    const historyProof = await page.evaluate(async (i) => {
       const post = async (p, b) => (await fetch(p, {
         method: "POST", credentials: "same-origin",
         headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
       })).json();
       const contactsResp = await fetch("/api/notifications/contacts", { credentials: "same-origin" });
       const contactsBody = await contactsResp.json();
-      const stillThere = (contactsBody.contacts || [])
-        .find((c) => c.recipient_ref === `player:${i.player}`);
+      const contact = (contactsBody.contacts || [])
+        .find((c) => c.id === i.contactId);
+      const prefsResp = await fetch(
+        `/api/notifications/preferences?recipient_ref=player:${i.player}`,
+        { credentials: "same-origin" });
+      const prefsBody = await prefsResp.json();
+      const emailPref = (prefsBody.preferences || []).find((p) => p.channel === "email");
       const retry = await post("/api/notifications/preferences",
         { recipient_ref: `player:${i.player}`, channel: "email", enabled: false });
-      return { stillThere: !!stillThere, retry };
-    }, { player: playerBlocked.id });
+      return { contact, emailPref, retry };
+    }, { player: playerBlocked.id, contactId: cleared.contactId });
     page.on("console", consoleErrorHandler);
-    if (cascadeProof.stillThere) {
-      throw new Error(`[${viewport.label}] the deleted Player's contact destination is still ` +
-        `present after delete: ${JSON.stringify(cascadeProof)}`);
+    if (!historyProof.contact || historyProof.contact.active) {
+      throw new Error(`[${viewport.label}] the deleted Player's contact destination is not ` +
+        `queryable retired history: ${JSON.stringify(historyProof)}`);
     }
-    if (!cascadeProof.retry.error ||
-        (cascadeProof.retry.error.details || {}).reason !== "scope_subject_missing") {
+    if (!historyProof.emailPref || historyProof.emailPref.active) {
+      throw new Error(`[${viewport.label}] the deleted Player's notification preference is not ` +
+        `queryable retired history: ${JSON.stringify(historyProof)}`);
+    }
+    if (!historyProof.retry.error ||
+        (historyProof.retry.error.details || {}).reason !== "scope_subject_missing") {
       throw new Error(`[${viewport.label}] re-setting a notification preference for the deleted ` +
-        `Player was not rejected as expected: ${JSON.stringify(cascadeProof)}`);
+        `Player was not rejected as expected: ${JSON.stringify(historyProof)}`);
     }
 
     // Post-delete reactivation rejection (#232 review 2): the device token
@@ -432,8 +451,8 @@ async function checkViewport(browser, viewport) {
     }
     console.log(`[${viewport.label}] OK — every Records card offers delete, cancel/blocked/success ` +
       `flows verified, Official and Player's new delete contract proven end to end for the common ` +
-      `real-world (account + device token) case, and the contact/notification-preference cascade ` +
-      `cleanup confirmed.`);
+      `real-world (account + device token + contact + preference) case, and the retired rows ` +
+      `confirmed as queryable, unerased history.`);
   } catch (error) {
     throw new Error(`${error.message}\n--- demo server output ---\n${serverOutput}`);
   } finally {

@@ -111,12 +111,15 @@ class PreferenceResolverContract:
         self.assertTrue(e.detail["enabled"])          # now enabled
 
     def test_deleted_subject_rejects_recreated_preference(self):
-        # (#232 review 3/4) Deleting the Official cascades its preference row
-        # in the same transaction (delete_official no longer requires it be
-        # cleared first) — and must not leave a back door that lets a later
-        # set_notification_preference call re-point a channel at the now-dead
-        # recipient_ref.
+        # (#232 review 3/4) The preference row is retired — never deleted —
+        # to clear the way for the Official's delete; the row survives as
+        # retired history. Deletion must not leave a back door that lets a
+        # later set_notification_preference call re-point a channel at the
+        # now-dead recipient_ref.
         self.api.set_notification_preference(self.official_ref, "email", False)
+        pref = self.store.get_notification_preference(
+            self.official_ref, NotificationChannel.EMAIL)
+        self.api.set_notification_preference_active(pref.id, False)
         self.api.delete_official(self.official_id)
         before = len(self.store.all_notification_preferences())
         res = self.api.set_notification_preference(self.official_ref, "email", False)
@@ -187,39 +190,106 @@ class PreferenceHttpAccessTest(unittest.TestCase):
         self.assertEqual({p["channel"]: p["enabled"] for p in got["preferences"]},
                          {"email": False, "push": True})
 
-    def test_deleting_official_over_http_atomically_clears_contact_and_preference(self):
-        # #232 review 4: no standalone delete-preference/-contact route
-        # exists (or is needed) — the already-authorized, already-supported
-        # Official delete route is the only action a League Admin ever calls,
-        # and it cascades this cleanup atomically in the same transaction.
+    def test_retiring_contact_and_preference_over_http_unblocks_official_delete(self):
+        # #232 review 4: retiring (never deleting) a contact/preference is
+        # the supported, audited way to clear a Player/Official delete's
+        # dependency over the real HTTP contract — no internal-store access
+        # needed anywhere in this test.
         c = self._client()
         self._req(c, "POST", "/api/auth/login", {"username": "admin", "password": "demo"})
         status, official = self._req(c, "POST", "/api/v2/setup/official",
-                                     {"name": "Cleanup Official"})
+                                     {"name": "Retire Official"})
         self.assertEqual(status, 200, official)
         ref = f"official:{official['id']}"
         status, contact = self._req(c, "POST", "/api/notifications/contacts",
                                     {"recipient_ref": ref, "channel": "email",
-                                     "destination": "cleanup@example.com"})
+                                     "destination": "retire@example.com"})
         self.assertEqual(status, 200, contact)
         status, pref = self._req(c, "POST", "/api/notifications/preferences",
                                  {"recipient_ref": ref, "channel": "email",
                                   "enabled": False})
         self.assertEqual(status, 200, pref)
 
+        status, blocked = self._req(
+            c, "POST", f"/api/v2/setup/official/{official['id']}/delete", {})
+        self.assertEqual(status, 409, blocked)
+        self.assertEqual(blocked["error"]["code"], "has_dependencies")
+
+        # Retire both dependencies through the real HTTP actions.
+        status, retired_contact = self._req(
+            c, "POST", f"/api/notifications/contacts/{contact['id']}/active",
+            {"active": False})
+        self.assertEqual(status, 200, retired_contact)
+        self.assertFalse(retired_contact["active"])
+        # The set-preference response carries the row id directly (#232
+        # review 4 fixed this gap) — no internal-store access needed to
+        # discover it.
+        status, retired_pref = self._req(
+            c, "POST", f"/api/notifications/preferences/{pref['id']}/active",
+            {"active": False})
+        self.assertEqual(status, 200, retired_pref)
+        self.assertFalse(retired_pref["active"])
+
         status, deleted = self._req(
             c, "POST", f"/api/v2/setup/official/{official['id']}/delete", {})
         self.assertEqual(status, 200, deleted)
         self.assertNotIn("error", deleted)
 
-        # The cascade actually ran: re-setting the preference against the
-        # now-dead ref is rejected, proving the row (and the subject it
-        # described) is genuinely gone — not merely hidden.
+        # The retired preference remains queryable, unchanged history after
+        # the identity itself is gone (#232's no-erase contract) — reading
+        # it never required internal-store access either.
+        status, got = self._req(
+            c, "GET", f"/api/notifications/preferences?recipient_ref={ref}")
+        self.assertEqual(status, 200)
+        email_pref = next(p for p in got["preferences"] if p["channel"] == "email")
+        self.assertEqual(email_pref["id"], pref["id"])
+        self.assertFalse(email_pref["active"])
+        self.assertFalse(email_pref["enabled"])
+
+        # Re-setting the preference against the now-dead ref is rejected —
+        # the identity is genuinely gone, not merely hidden.
         status, resettle = self._req(c, "POST", "/api/notifications/preferences",
                                      {"recipient_ref": ref, "channel": "email",
                                       "enabled": False})
         self.assertEqual(status, 400)
         self.assertEqual(resettle["error"]["code"], "validation_error")
+
+    def test_arena_manager_cannot_retire_cleanup_rows(self):
+        # Arena Manager holds MANAGE_SCHEDULE but not the League-Admin-only
+        # MANAGE_SETUP the retire routes require — same rationale as the
+        # Player/Official delete they serve. Refused with zero mutation.
+        admin = self._client()
+        self._req(admin, "POST", "/api/auth/login", {"username": "admin", "password": "demo"})
+        status, official = self._req(admin, "POST", "/api/v2/setup/official",
+                                     {"name": "Guarded Official"})
+        self.assertEqual(status, 200, official)
+        ref = f"official:{official['id']}"
+        status, contact = self._req(admin, "POST", "/api/notifications/contacts",
+                                    {"recipient_ref": ref, "channel": "email",
+                                     "destination": "guarded@example.com"})
+        self.assertEqual(status, 200, contact)
+        status, pref = self._req(admin, "POST", "/api/notifications/preferences",
+                                 {"recipient_ref": ref, "channel": "email",
+                                  "enabled": False})
+        self.assertEqual(status, 200, pref)
+
+        arena = self._client()
+        self._req(arena, "POST", "/api/auth/login", {"username": "arena", "password": "demo"})
+        status, _ = self._req(
+            arena, "POST", f"/api/notifications/contacts/{contact['id']}/active",
+            {"active": False})
+        self.assertEqual(status, 403)
+        status, _ = self._req(
+            arena, "POST", f"/api/notifications/preferences/{pref['id']}/active",
+            {"active": False})
+        self.assertEqual(status, 403)
+
+        status, got = self._req(
+            admin, "GET", f"/api/notifications/preferences?recipient_ref={ref}")
+        self.assertEqual(status, 200)
+        email_pref = next(p for p in got["preferences"] if p["channel"] == "email")
+        self.assertTrue(email_pref["active"], "the Arena Manager's refused "
+                        "attempt must not have retired the row")
 
     def test_blocked_official_delete_over_http_preserves_preference(self):
         # The scenario the reviewer flagged directly, exercised over real

@@ -589,9 +589,6 @@ class InMemoryStore:
     def all_contact_destinations(self) -> List[ContactDestination]:
         return list(self.contact_destinations.values())
 
-    def delete_contact_destination(self, contact_id: str) -> None:
-        self.contact_destinations.pop(contact_id, None)
-
     # -- device token registry (#65) ---------------------------------------
     def add_device_token(self, t: DeviceToken) -> DeviceToken:
         self.device_tokens[t.id] = t
@@ -687,9 +684,6 @@ class InMemoryStore:
             if p.recipient_ref == recipient_ref and p.channel == channel:
                 return p
         return None
-
-    def delete_notification_preference(self, pref_id: str) -> None:
-        self.notification_preferences.pop(pref_id, None)
 
     def preferences_for_recipient(
             self, recipient_ref: str) -> List[NotificationPreference]:
