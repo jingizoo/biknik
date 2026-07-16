@@ -175,15 +175,57 @@ class FactoryResetContract:
 
     def test_execute_second_reset_while_in_progress_rejected(self):
         from hockey_scheduler.domain.errors import ValidationError
+        from hockey_scheduler.domain import FactoryResetLock
         self._add_some_data()
-        self.api.factory_reset._execute_lock.acquire()
+        self.store.acquire_factory_reset_lock(FactoryResetLock(
+            id="singleton", actor_id="someone-else",
+            acquired_at=self.api.roster.clock()))
         try:
             token = self._preview()["challenge_token"]
             with self.assertRaises(ValidationError) as cm:
                 self._execute(token=token)
             self.assertEqual(cm.exception.details["reason"], "reset_in_progress")
         finally:
-            self.api.factory_reset._execute_lock.release()
+            self.store.release_factory_reset_lock()
+
+    def test_execute_lock_is_store_backed_across_two_service_instances(self):
+        # #256 review blocker 5: the single-in-flight guard must hold across
+        # two separate FactoryResetService instances sharing one store — the
+        # process-equivalent of two server workers, not just one Python
+        # object's own threading.Lock.
+        from hockey_scheduler.domain.errors import ValidationError
+        from hockey_scheduler.services.factory_reset_service import FactoryResetService
+        self._add_some_data()
+        other_service = FactoryResetService(self.store, self.api.accounts,
+                                            self.api.roster.clock)
+        token = other_service.preview(self.admin.id)["challenge_token"]
+        from hockey_scheduler.domain import FactoryResetLock
+        held = self.store.acquire_factory_reset_lock(FactoryResetLock(
+            id="singleton", actor_id=self.admin.id,
+            acquired_at=self.api.roster.clock()))
+        self.assertTrue(held)
+        try:
+            with self.assertRaises(ValidationError) as cm:
+                self.api.factory_reset.execute(
+                    self.admin.id, "hunter22", CONFIRMATION_PHRASE, token, True)
+            self.assertEqual(cm.exception.details["reason"], "reset_in_progress")
+        finally:
+            self.store.release_factory_reset_lock()
+
+    def test_preview_and_execute_across_two_service_instances(self):
+        # Same cross-process-equivalence concern as above, for the
+        # challenge: preview() on one instance, execute() on another,
+        # sharing only the store.
+        from hockey_scheduler.services.factory_reset_service import FactoryResetService
+        self._add_some_data()
+        service_a = FactoryResetService(self.store, self.api.accounts,
+                                        self.api.roster.clock)
+        service_b = FactoryResetService(self.store, self.api.accounts,
+                                        self.api.roster.clock)
+        token = service_a.preview(self.admin.id)["challenge_token"]
+        result = service_b.execute(
+            self.admin.id, "hunter22", CONFIRMATION_PHRASE, token, True)
+        self.assertEqual(result["result"], "success")
 
     # -- successful reset -------------------------------------------------
     def test_execute_success_wipes_domains_preserves_one_admin(self):
@@ -272,6 +314,100 @@ class FactoryResetContract:
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0].result, "failed")
         self.assertEqual(events[0].failure_reason, "RuntimeError")
+
+    # -- PR #264 review fixes --------------------------------------------
+    def test_execute_rejects_stale_preview_snapshot(self):
+        # #256 review blocker 1: data created after preview but before
+        # execute must never be silently swept into the wipe the operator
+        # never saw or confirmed.
+        from hockey_scheduler.domain.errors import ValidationError
+        self._add_some_data()
+        token = self._preview()["challenge_token"]
+        self.store.add_organization(Organization(id="org2", name="Sneaked In"))
+        with self.assertRaises(ValidationError) as cm:
+            self._execute(token=token)
+        self.assertEqual(cm.exception.details["reason"], "preview_stale")
+        # Zero writes from the rejection itself — both orgs still present,
+        # nothing wiped, no event logged for a pre-flight rejection.
+        self.assertEqual(len(self.store.all_organizations()), 2)
+        self.assertEqual(len(self.store.all_factory_reset_events()), 0)
+
+    def test_execute_succeeds_when_snapshot_unchanged(self):
+        self._add_some_data()
+        token = self._preview()["challenge_token"]
+        result = self._execute(token=token)
+        self.assertEqual(result["result"], "success")
+
+    def test_event_insert_failure_rolls_back_wipe_and_records_failed_event(self):
+        # #256 review blocker 2: the durable success event is written
+        # inside the same transaction as the wipe. If that insert itself
+        # fails, the whole wipe must roll back — not leave production data
+        # gone with no surviving record.
+        self._add_some_data()
+        token = self._preview()["challenge_token"]
+        orig = self.store.add_factory_reset_event
+        calls = {"n": 0}
+
+        def flaky(event):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("event insert failed")
+            return orig(event)
+
+        self.store.add_factory_reset_event = flaky
+        try:
+            with self.assertRaises(RuntimeError):
+                self._execute(token=token)
+        finally:
+            self.store.add_factory_reset_event = orig
+        # The wipe rolled back completely, including the admin re-insert
+        # attempted inside the same transaction.
+        self.assertEqual(len(self.store.all_organizations()), 1)
+        self.assertEqual(len(self.store.all_teams()), 1)
+        self.assertEqual(len(self.store.all_user_accounts()), 2)
+        # Exactly one durable event survives: the "failed" record written
+        # in a fresh operation after the rollback completed.
+        events = self.store.all_factory_reset_events()
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].result, "failed")
+
+    def test_execute_rejects_non_boolean_backup_acknowledgement(self):
+        # #256 review blocker 3: a truthy-but-not-`True` JSON value must
+        # never count as acknowledgement. A rejection here happens before
+        # challenge consumption (same as wrong password/phrase), so the same
+        # preview/token is reused across every value in the loop.
+        from hockey_scheduler.domain.errors import ValidationError
+        self._add_some_data()
+        token = self._preview()["challenge_token"]
+        for bad_value in ("false", "no", "0", 1, 0, None, "true"):
+            with self.subTest(bad_value=bad_value):
+                with self.assertRaises(ValidationError) as cm:
+                    self._execute(token=token, backup=bad_value)
+                self.assertEqual(
+                    cm.exception.details["reason"], "backup_not_acknowledged")
+                self.assertEqual(len(self.store.all_organizations()), 1)
+
+    def test_execute_requires_exact_league_admin_role(self):
+        # #256 review blocker 4: the role itself is checked explicitly, not
+        # only the two permissions — even if a future permission-matrix
+        # change granted both to a different role, that role must still be
+        # refused. Simulated here by temporarily granting Arena Manager
+        # both permissions and confirming the explicit role check still
+        # blocks it.
+        from hockey_scheduler.domain.errors import NotAuthorizedError
+        from hockey_scheduler.domain.roles import Permission, ROLE_PERMISSIONS, Role
+        arena = self.api.accounts.create_account(
+            "arena1", "arenapass", Role.ARENA_MANAGER)
+        original = ROLE_PERMISSIONS[Role.ARENA_MANAGER]
+        ROLE_PERMISSIONS[Role.ARENA_MANAGER] = original | {
+            Permission.MANAGE_SETUP, Permission.MANAGE_USERS}
+        try:
+            with self.assertRaises(NotAuthorizedError) as cm:
+                self.api.factory_reset.preview(arena.id)
+            self.assertEqual(
+                cm.exception.details["reason"], "insufficient_permission")
+        finally:
+            ROLE_PERMISSIONS[Role.ARENA_MANAGER] = original
 
 
 class MemoryFactoryResetTest(FactoryResetContract, unittest.TestCase):
@@ -411,6 +547,29 @@ class FactoryResetHttpTest(unittest.TestCase):
             cookie=cookie)
         self.assertEqual(status, 400)
         self.assertEqual(body["error"]["details"]["reason"], "phrase_mismatch")
+
+    def test_non_boolean_backup_acknowledged_rejected_over_http(self):
+        # #256 review blocker 3: JSON string/number values must not coerce
+        # to acknowledged, and rejecting them performs zero writes. A single
+        # preview/token is reused for both values (a rejection here happens
+        # before challenge consumption) to stay well under the route's rate
+        # limit (5 requests / 300s) within one test.
+        cookie = self._login()
+        before = srv.STATE.api.store.row_counts()
+        status, body, _ = self._req(
+            "POST", "/api/admin/factory-reset/preview", {}, cookie=cookie)
+        token = body["challenge_token"]
+        for bad_value in ("false", 1):
+            with self.subTest(bad_value=bad_value):
+                status, body, _ = self._req(
+                    "POST", "/api/admin/factory-reset/execute",
+                    {"password": "hunter22", "typed_phrase": CONFIRMATION_PHRASE,
+                     "challenge_token": token, "backup_acknowledged": bad_value},
+                    cookie=cookie)
+                self.assertEqual(status, 400, (bad_value, body))
+                self.assertEqual(
+                    body["error"]["details"]["reason"], "backup_not_acknowledged")
+        self.assertEqual(srv.STATE.api.store.row_counts(), before)
 
 
 if __name__ == "__main__":

@@ -33,7 +33,9 @@ from ..domain import (
     ContactDestination,
     DeliveryStatus,
     DeviceToken,
+    FactoryResetChallenge,
     FactoryResetEvent,
+    FactoryResetLock,
     Notification,
     NotificationAudience,
     NotificationChannel,
@@ -73,6 +75,7 @@ from ..domain import (
     Venue,
 )
 from ..domain.enums import NotificationType
+from ..domain.errors import IntegrityConflictError
 from .db import connect
 from .db_errors import translate_db_exception
 from .integrity_checks import (
@@ -188,6 +191,11 @@ SPECS = {
         FactoryResetEvent, "factory_reset_events",
         {"started_at": _dt(), "completed_at": _dt(),
          "pre_reset_counts": _jsonc()}),
+    FactoryResetChallenge: Spec(
+        FactoryResetChallenge, "factory_reset_challenges",
+        {"counts": _jsonc(), "expires_at": _dt(), "created_at": _dt()}),
+    FactoryResetLock: Spec(
+        FactoryResetLock, "factory_reset_locks", {"acquired_at": _dt()}),
     Official: Spec(Official, "officials", {"is_active": _bool()}),
     OfficialAssignment: Spec(OfficialAssignment, "official_assignments",
                              {"role": _enum(OfficialRole),
@@ -535,12 +543,21 @@ class SqlStore:
                     cur.execute("PRAGMA foreign_keys = ON")
         migrate(self.conn, self.dialect)
 
-    @staticmethod
-    def _clearable_tables():
+    # Tables clear_all_data()/row_counts() never touch (#256): the durable
+    # event log must survive the wipe it describes, and the challenge/lock
+    # rows are orchestration state for the reset in progress, not wipeable
+    # application data — the challenge is always consumed before a wipe
+    # begins, and the lock is actively held for the wipe's whole duration.
+    _FACTORY_RESET_SURVIVING_TABLES = frozenset({
+        "factory_reset_events", "factory_reset_challenges",
+        "factory_reset_locks"})
+
+    @classmethod
+    def _clearable_tables(cls):
         """Every table ``clear_all_data()``/``row_counts()`` touch — a single
         list so the two can never drift apart (#256)."""
         return [spec.table for spec in SPECS.values()
-               if spec.table != "factory_reset_events"]
+               if spec.table not in cls._FACTORY_RESET_SURVIVING_TABLES]
 
     def row_counts(self) -> dict:
         """Row count per table that ``clear_all_data()`` would delete (#256
@@ -840,6 +857,41 @@ class SqlStore:
     def add_factory_reset_event(self, event): return self._insert(event)
     def all_factory_reset_events(self):
         return self._query(FactoryResetEvent, order="started_at")
+
+    _FACTORY_RESET_CHALLENGE_ID = "singleton"
+    _FACTORY_RESET_LOCK_ID = "singleton"
+
+    def get_factory_reset_challenge(self):
+        return self._get(FactoryResetChallenge, self._FACTORY_RESET_CHALLENGE_ID)
+
+    def set_factory_reset_challenge(self, challenge):
+        """Replace the single outstanding challenge (#256 review blocker
+        5) — a new preview always supersedes any prior, unconsumed one."""
+        with self.transaction():
+            self._upsert(challenge)
+        return challenge
+
+    def clear_factory_reset_challenge(self) -> None:
+        with self.transaction():
+            self._delete(FactoryResetChallenge, self._FACTORY_RESET_CHALLENGE_ID)
+
+    def acquire_factory_reset_lock(self, lock) -> bool:
+        """Try to become the sole in-progress factory reset installation-
+        wide (#256 review blocker 5). A concurrent acquire attempt collides
+        on the same singleton primary key; that unique-constraint violation
+        is translated to IntegrityConflictError by transaction() (#201
+        Slice 2), which this catches and reports as a normal loss of the
+        race rather than an unexpected error."""
+        try:
+            with self.transaction():
+                self._insert(lock)
+            return True
+        except IntegrityConflictError:
+            return False
+
+    def release_factory_reset_lock(self) -> None:
+        with self.transaction():
+            self._delete(FactoryResetLock, self._FACTORY_RESET_LOCK_ID)
 
     # -- setup-entity deletion (#215 safe destructive actions) -------------
     # Single-record hard deletes; the service runs a pre-write dependency gate

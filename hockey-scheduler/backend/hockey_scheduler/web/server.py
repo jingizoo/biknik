@@ -1542,7 +1542,10 @@ class Handler(BaseHTTPRequestHandler):
                 password=body.get("password"),
                 typed_phrase=body.get("typed_phrase"),
                 challenge_token=body.get("challenge_token"),
-                backup_acknowledged=bool(body.get("backup_acknowledged")),
+                # Passed through UNCOERCED (#256 review blocker 3): the
+                # service requires the exact JSON boolean `true`, so
+                # bool(...) here would wrongly accept "false"/"no"/1.
+                backup_acknowledged=body.get("backup_acknowledged"),
                 environment=environment)
             if isinstance(result, dict) and result.get("error"):
                 return self._send_api(result)

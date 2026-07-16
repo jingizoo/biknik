@@ -25,7 +25,9 @@ from ..domain import (
     ContactDestination,
     DeliveryStatus,
     DeviceToken,
+    FactoryResetChallenge,
     FactoryResetEvent,
+    FactoryResetLock,
     League,
     Program,
     Notification,
@@ -97,6 +99,13 @@ class InMemoryStore:
         # Never cleared by clear_all_data() (#256) — the durable record of a
         # production factory-reset attempt must survive the wipe it describes.
         self.factory_reset_events: List[FactoryResetEvent] = []
+        # Durable, cross-process-equivalent challenge/lock (#256 review
+        # blocker 5) — see acquire_factory_reset_lock()/
+        # set_factory_reset_challenge() below. Also never cleared by
+        # clear_all_data(): the challenge is always consumed before a wipe
+        # begins, and the lock is held for the wipe's whole duration.
+        self._factory_reset_challenge: Optional[FactoryResetChallenge] = None
+        self._factory_reset_lock: Optional[FactoryResetLock] = None
         # Plain int counters (not itertools.count): a count object is not
         # copyable on Python 3.14 (copy.copy raises "cannot pickle
         # 'itertools.count'"), which would break the transaction snapshot; an
@@ -155,10 +164,14 @@ class InMemoryStore:
 
     # Attributes clear_all_data()/row_counts() never touch (#256): the lock
     # and depth counter aren't data, ``_counters`` preserves id uniqueness
-    # across a reset, and ``factory_reset_events`` is the durable record of
-    # the reset attempt itself, which must survive the wipe it describes.
+    # across a reset, ``factory_reset_events`` is the durable record of the
+    # reset attempt itself, and the challenge/lock are the reset's own
+    # in-flight orchestration state (not application data). The latter two
+    # are single objects, not dict/list, so row_counts()/clear_all_data()'s
+    # isinstance check already skips them — listed here anyway for clarity.
     _UNCLEARABLE = frozenset({"_lock", "_txn_depth", "_counters",
-                              "factory_reset_events"})
+                              "factory_reset_events",
+                              "_factory_reset_challenge", "_factory_reset_lock"})
 
     def row_counts(self) -> dict:
         """Row count per collection that ``clear_all_data()`` would empty
@@ -853,6 +866,38 @@ class InMemoryStore:
 
     def all_factory_reset_events(self) -> List[FactoryResetEvent]:
         return sorted(self.factory_reset_events, key=lambda e: e.started_at)
+
+    def get_factory_reset_challenge(self) -> Optional[FactoryResetChallenge]:
+        with self._lock:
+            return self._factory_reset_challenge
+
+    def set_factory_reset_challenge(
+            self, challenge: FactoryResetChallenge) -> FactoryResetChallenge:
+        """Replace the single outstanding challenge (#256 review blocker
+        5) — a new preview always supersedes any prior, unconsumed one."""
+        with self._lock:
+            self._factory_reset_challenge = challenge
+        return challenge
+
+    def clear_factory_reset_challenge(self) -> None:
+        with self._lock:
+            self._factory_reset_challenge = None
+
+    def acquire_factory_reset_lock(self, lock: FactoryResetLock) -> bool:
+        """Try to become the sole in-progress factory reset (#256 review
+        blocker 5). Check-then-set under this store's own lock so two
+        concurrent callers against the same in-memory store (the
+        process-equivalent of two instances sharing one durable database)
+        can never both win."""
+        with self._lock:
+            if self._factory_reset_lock is not None:
+                return False
+            self._factory_reset_lock = lock
+            return True
+
+    def release_factory_reset_lock(self) -> None:
+        with self._lock:
+            self._factory_reset_lock = None
 
     # -- listings (interface shared with the SQL store) -------------------
     def all_programs(self) -> List[Program]:

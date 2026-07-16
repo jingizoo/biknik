@@ -1738,11 +1738,14 @@ class ApiService:
     def factory_reset_execute(self, actor_id: str = None, password: str = None,
                               typed_phrase: str = None,
                               challenge_token: str = None,
-                              backup_acknowledged: bool = False,
+                              backup_acknowledged=False,
                               environment: str = "production") -> dict:
+        # backup_acknowledged is passed through UNCOERCED (#256 review
+        # blocker 3) — FactoryResetService requires the exact JSON boolean
+        # `true`, so a bool(...) here would wrongly accept "false"/"no"/1.
         return self.factory_reset.execute(
             actor_id, password, typed_phrase, challenge_token,
-            bool(backup_acknowledged), environment=environment)
+            backup_acknowledged, environment=environment)
 
     # -- account sessions (#78) --------------------------------------------
     @staticmethod

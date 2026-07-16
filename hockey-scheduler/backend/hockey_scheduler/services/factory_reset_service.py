@@ -15,16 +15,29 @@ limiting, and request parsing; this service enforces the checks that must
 hold even for a direct, non-HTTP caller (role/permission, password
 reauthentication, typed confirmation, challenge validity, backup
 acknowledgement, and the single-in-flight guard).
+
+The challenge and the "one reset in progress" lock both live in the store
+(``FactoryResetChallenge``/``FactoryResetLock``), not in this Python
+object's memory (#256 review blocker 5) — a preview() and a later execute()
+reaching different ``FactoryResetService`` instances, processes, or server
+workers that share the same store still see the same outstanding challenge
+and correctly serialize against each other.
 """
 
 import hashlib
 import hmac
 import secrets
-import threading
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Optional
 
-from ..domain import FactoryResetEvent, InstallationState, Role, UserAccount
+from ..domain import (
+    FactoryResetChallenge,
+    FactoryResetEvent,
+    FactoryResetLock,
+    InstallationState,
+    Role,
+    UserAccount,
+)
 from ..domain.errors import NotAuthorizedError, ValidationError
 from ..domain.roles import Permission, can
 from .account_service import AccountService
@@ -35,6 +48,9 @@ from .account_service import AccountService
 CONFIRMATION_PHRASE = "DELETE ALL PRODUCTION DATA"
 
 DEFAULT_CHALLENGE_TTL_SECONDS = 5 * 60
+
+_CHALLENGE_ID = "singleton"
+_LOCK_ID = "singleton"
 
 
 def _utcnow() -> datetime:
@@ -60,77 +76,83 @@ class FactoryResetService:
         self.accounts = accounts
         self.clock = clock
         self._challenge_ttl = challenge_ttl_seconds
-        self._challenge: Optional[dict] = None
-        self._challenge_lock = threading.Lock()
-        self._execute_lock = threading.Lock()
 
     def _require_admin(self, actor_id: Optional[str]) -> UserAccount:
+        """Require an authenticated, active League Admin holding both
+        manage_setup and manage_users (#256 review blocker 4) — the exact
+        role is checked explicitly, not just the two permissions, so a
+        future change to the permission matrix can never silently grant
+        wipe authority to some other role that happens to gain both."""
         account = self.store.get_user_account(actor_id) if actor_id else None
         if account is None or not account.active:
             raise NotAuthorizedError(
                 "Not authorized.", {"reason": "not_authorized"})
-        if not (can(account.role, Permission.MANAGE_SETUP)
+        if account.role != Role.LEAGUE_ADMIN or not (
+                can(account.role, Permission.MANAGE_SETUP)
                 and can(account.role, Permission.MANAGE_USERS)):
             raise NotAuthorizedError(
-                "Factory reset requires manage_setup and manage_users.",
-                {"reason": "insufficient_permission"})
+                "Factory reset requires a League Admin with manage_setup "
+                "and manage_users.", {"reason": "insufficient_permission"})
         return account
 
     def preview(self, actor_id: str) -> dict:
         """Row-count snapshot plus a short-lived, single-use challenge token
         bound to this actor and this exact snapshot. Generating a preview is
-        read-only — it writes nothing to the store."""
+        read-only — it writes nothing but the durable challenge row itself,
+        which always replaces any prior, unconsumed one."""
         self._require_admin(actor_id)
         counts = self.store.row_counts()
         token = secrets.token_urlsafe(24)
-        expires_at = self.clock() + timedelta(seconds=self._challenge_ttl)
-        with self._challenge_lock:
-            self._challenge = {
-                "token_hash": _hash_token(token),
-                "actor_id": actor_id,
-                "counts": counts,
-                "expires_at": expires_at,
-            }
+        now = self.clock()
+        expires_at = now + timedelta(seconds=self._challenge_ttl)
+        self.store.set_factory_reset_challenge(FactoryResetChallenge(
+            id=_CHALLENGE_ID, token_hash=_hash_token(token), actor_id=actor_id,
+            counts=counts, expires_at=expires_at, created_at=now))
         return {"counts": counts, "challenge_token": token,
                 "expires_at": expires_at.isoformat()}
 
     def _consume_challenge(self, challenge_token: Optional[str],
-                           actor_id: str) -> dict:
+                           actor_id: str) -> FactoryResetChallenge:
         """Validate and immediately invalidate the outstanding challenge —
         single-use regardless of whether it turns out to be valid, so a
         replayed token (stale or reused) is always rejected."""
-        with self._challenge_lock:
-            challenge = self._challenge
-            self._challenge = None
+        challenge = self.store.get_factory_reset_challenge()
+        self.store.clear_factory_reset_challenge()
         if challenge is None:
             raise ValidationError(
                 "No active factory-reset challenge. Request a new preview.",
                 {"reason": "invalid_challenge"})
-        if challenge["expires_at"] < self.clock():
+        if challenge.expires_at < self.clock():
             raise ValidationError(
                 "The factory-reset challenge has expired. Request a new "
                 "preview.", {"reason": "invalid_challenge"})
-        if challenge["actor_id"] != actor_id:
+        if challenge.actor_id != actor_id:
             raise ValidationError(
                 "This challenge does not belong to the current actor.",
                 {"reason": "invalid_challenge"})
         if not hmac.compare_digest(
-                challenge["token_hash"], _hash_token(challenge_token or "")):
+                challenge.token_hash, _hash_token(challenge_token or "")):
             raise ValidationError(
                 "Invalid factory-reset challenge token.",
                 {"reason": "invalid_challenge"})
         return challenge
 
     def execute(self, actor_id: str, password: str, typed_phrase: str,
-               challenge_token: str, backup_acknowledged: bool,
+               challenge_token: str, backup_acknowledged,
                environment: str = "production") -> dict:
         """Every check below must pass, in order, before the first write.
         Any rejection performs zero writes — not even the durable event row,
         since nothing worth auditing happened yet. Only once every guard has
-        passed does the atomic wipe run, followed unconditionally by exactly
-        one durable ``FactoryResetEvent`` recording success or failure.
+        passed does the atomic wipe run, and the durable success event is
+        written inside that same transaction (#256 review blocker 2) so an
+        event-write failure rolls the whole wipe back rather than leaving
+        production data gone with no surviving record. A failure past that
+        point gets its own durable "failed" event, written in a fresh
+        operation after the rollback completes.
         """
-        if not self._execute_lock.acquire(blocking=False):
+        acquired = self.store.acquire_factory_reset_lock(FactoryResetLock(
+            id=_LOCK_ID, actor_id=actor_id or "", acquired_at=self.clock()))
+        if not acquired:
             raise ValidationError(
                 "A factory reset is already in progress.",
                 {"reason": "reset_in_progress"})
@@ -145,33 +167,62 @@ class FactoryResetService:
                 raise ValidationError(
                     "Typed confirmation phrase did not match.",
                     {"reason": "phrase_mismatch"})
-            if not backup_acknowledged:
+            # Require the JSON value to be exactly `true` (#256 review
+            # blocker 3) — a truthiness check would accept the strings
+            # "false"/"no" or the number 1, silently treating an unset or
+            # malformed acknowledgement as given.
+            if backup_acknowledged is not True:
                 raise ValidationError(
                     "Backup acknowledgement is required.",
                     {"reason": "backup_not_acknowledged"})
             challenge = self._consume_challenge(challenge_token, actor_id)
 
-            # Every guard passed — this is the first point any write happens.
-            event_id = self.store.next_id("factoryreset")
-            started_at = self.clock()
-            result, failure_reason = "success", None
+            event_id = None
+            started_at = None
             try:
                 with self.store.transaction():
+                    # Re-validate the preview snapshot atomically with the
+                    # wipe itself (#256 review blocker 1): data created
+                    # after preview but before this exact moment must never
+                    # be silently swept up in a wipe the operator never saw
+                    # or confirmed.
+                    current_counts = self.store.row_counts()
+                    if current_counts != challenge.counts:
+                        raise ValidationError(
+                            "The data has changed since the preview was "
+                            "generated. Request a new preview and try "
+                            "again.", {"reason": "preview_stale"})
+                    event_id = self.store.next_id("factoryreset")
+                    started_at = self.clock()
                     self.store.clear_all_data()
                     preserved = self._reinsert_admin(account)
-            except Exception as exc:
-                result, failure_reason = "failed", _sanitize_failure(exc)
+                    self.store.add_factory_reset_event(FactoryResetEvent(
+                        id=event_id, actor_id=actor_id, environment=environment,
+                        started_at=started_at, result="success",
+                        pre_reset_counts=challenge.counts,
+                        completed_at=self.clock(), failure_reason=None))
+            except ValidationError:
+                # Rejected before (or as part of) the atomic re-check — the
+                # transaction rolled back with nothing durable staged, so
+                # there is no failure to record.
                 raise
-            finally:
+            except Exception as exc:
+                if event_id is None:
+                    # Failed before an id/counter was ever allocated (e.g. a
+                    # transient error reading row_counts()) — nothing was
+                    # ever staged for this attempt.
+                    raise
                 self.store.add_factory_reset_event(FactoryResetEvent(
                     id=event_id, actor_id=actor_id, environment=environment,
-                    started_at=started_at, result=result,
-                    pre_reset_counts=challenge["counts"],
-                    completed_at=self.clock(), failure_reason=failure_reason))
+                    started_at=started_at, result="failed",
+                    pre_reset_counts=challenge.counts,
+                    completed_at=self.clock(),
+                    failure_reason=_sanitize_failure(exc)))
+                raise
             return {"result": "success", "event_id": event_id,
                     "preserved_account_id": preserved.id}
         finally:
-            self._execute_lock.release()
+            self.store.release_factory_reset_lock()
 
     def _reinsert_admin(self, account: UserAccount) -> UserAccount:
         """Re-create exactly the acting admin's account (preferred default

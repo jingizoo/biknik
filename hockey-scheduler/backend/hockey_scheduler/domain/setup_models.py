@@ -549,3 +549,35 @@ class FactoryResetEvent:
     pre_reset_counts: dict = field(default_factory=dict)
     completed_at: Optional[datetime] = None
     failure_reason: Optional[str] = None
+
+
+@dataclass
+class FactoryResetChallenge:
+    """The single outstanding factory-reset preview challenge (#256 review
+    blocker 5) — durable in the store rather than held in one Python
+    process's memory, so a preview() and a later execute() reaching
+    different server instances/processes still see the same challenge. Uses
+    a fixed singleton ``id`` so creating a new challenge always REPLACES any
+    prior one: only the latest preview's challenge is ever valid, and a
+    fresh preview implicitly invalidates an older, unused one.
+    """
+    id: str
+    token_hash: str
+    actor_id: str
+    counts: dict
+    expires_at: datetime
+    created_at: datetime
+
+
+@dataclass
+class FactoryResetLock:
+    """Installation-wide mutual-exclusion marker for an in-progress factory
+    reset (#256 review blocker 5). A fixed singleton ``id`` makes
+    acquisition a single unique-constraint insert — the same cross-process
+    race-safe pattern ``InstallationState`` already uses for the first-admin
+    claim — so "one reset in progress at a time" holds across every process
+    sharing this store, not only within one Python object.
+    """
+    id: str
+    actor_id: str
+    acquired_at: datetime
