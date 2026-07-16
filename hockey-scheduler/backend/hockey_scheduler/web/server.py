@@ -1571,11 +1571,15 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_api(api.commit_rinks_ice_slots_import(
                 body, actor_id=user_id))
 
-        # Season scheduler v1 (#84): generate a draft round-robin proposal for a
-        # division. Returns a preview only — nothing is created or published.
+        # Season scheduler v1 (#84, extended #233 Slice G): generate a draft
+        # round-robin proposal for a Division, or for a whole League within a
+        # Season optionally narrowed to one Division. Returns a preview only —
+        # nothing is created or published.
         if path == "/api/scheduler/draft":
             return self._send_api(api.draft_season_schedule(
-                body.get("division_id"), slot_ids=body.get("slot_ids"),
+                division_id=body.get("division_id"),
+                season_id=body.get("season_id"), league_id=body.get("league_id"),
+                slot_ids=body.get("slot_ids"),
                 constraints=body.get("constraints")))
         # Draft review + publish (#86): commit a proposal to draft games, then
         # publish or discard them. All operator-only (MANAGE_SCHEDULE gate).
@@ -1583,7 +1587,9 @@ class Handler(BaseHTTPRequestHandler):
         # server-side (#86 audit trail), never a client-supplied actor_id.
         if path == "/api/scheduler/commit":
             return self._send_api(api.commit_draft_schedule(
-                body.get("division_id"), slot_ids=body.get("slot_ids"),
+                division_id=body.get("division_id"),
+                season_id=body.get("season_id"), league_id=body.get("league_id"),
+                slot_ids=body.get("slot_ids"),
                 constraints=body.get("constraints"), actor_id=user_id))
         if path == "/api/scheduler/drafts/publish":
             return self._send_api(api.publish_draft_games(

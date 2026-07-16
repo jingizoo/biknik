@@ -32,7 +32,11 @@ from .import_validator import (
     validate_import,
     validate_official_availability,
 )
-from .league_scoped_scheduler import draft_schedule, round_robin_pairings
+from .league_scoped_scheduler import (
+    draft_schedule,
+    draft_schedule_for_league,
+    round_robin_pairings,
+)
 from .league_scoped_setup_service import SetupService
 from .push_transport import (
     DryRunPushTransport,
@@ -47,7 +51,8 @@ from .roster_service import RosterService
 __all__ = ["RosterService", "SetupService", "DeliveryWorker", "DeliveryLoop",
            "delivery_loop_from_env", "enqueue",
            "ACTOR_TYPES", "build_ics", "games_for_actor", "hash_feed_token",
-           "new_feed_token", "draft_schedule", "round_robin_pairings",
+           "new_feed_token", "draft_schedule", "draft_schedule_for_league",
+           "round_robin_pairings",
            "mock_sender", "make_delivery_sender", "recipient_ref",
            "destination_for", "resolve_destination", "EmailTransport",
            "DryRunEmailTransport", "SmtpEmailTransport",
