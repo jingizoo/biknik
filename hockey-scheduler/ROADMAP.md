@@ -164,7 +164,7 @@ A release is not production-ready until its migrations, rollback behavior, autho
 
 ### Rewritten to represent only remaining work
 
-#27, #31, #34, #124, #156, #157, #159, #190, #202, #205, #206, and #211.
+#27, #31, #34, #124, #156, #157, #159, #187, #190, #202, #205, #206, and #211.
 
 ### New issues created from the review
 
@@ -172,7 +172,7 @@ A release is not production-ready until its migrations, rollback behavior, autho
 
 ### Retained as still relevant
 
-#146, #155, #158, #160, #185–#189, #201, #203, #204, #207–#210, and #256.
+#146, #155, #158, #160, #185, #186, #188, #189, #201, #203, #204, #207–#210, and #256.
 
 ## Delivery rules
 
