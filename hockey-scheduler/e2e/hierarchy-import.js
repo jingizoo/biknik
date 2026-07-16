@@ -1,13 +1,15 @@
 // Complete hierarchy import browser journey (#174 PR E2, #260 Slice F).
 //
-// At desktop and phone widths, a League Admin opens the existing Import screen,
-// answers the "Setup profile" wizard (pure UI-routing — every answer combo
-// still submits through the one canonical import engine), downloads every
-// visible template, validates every hierarchy CSV across all nine sheets,
-// commits the batch, verifies the resulting club/team/player/registration/
-// venue-access appear via the canonical v2 setup reads, and checks that no
-// pasted hierarchy data was written to browser storage. Fails on browser
-// console/page errors.
+// At desktop and phone widths, a League Admin opens the existing Import
+// screen and drives the real "Setup profile" wizard — the locked Q1-Q7 from
+// issue #260, pure UI-routing state with no backend field of its own — to
+// prove: (1) the exact question order/content; (2) answer-driven sheet
+// visibility; (3) a fresh commit; (4) an idempotent repeat commit with no
+// duplicates; and (5) an invalid row blocking the whole batch with zero
+// persisted changes. Every step goes through the real DOM (typing into
+// textareas, clicking wizard/validate/commit buttons) and the canonical v2
+// setup reads for verification — never a raw API call for the behavior being
+// accepted. Fails on browser console/page errors.
 const { chromium } = require("playwright");
 const { spawn } = require("child_process");
 const http = require("http");
@@ -20,6 +22,24 @@ const VIEWPORTS = [
   { label: "desktop", width: 1440, height: 900, port: 8135 },
   { label: "phone", width: 390, height: 844, port: 8136 },
 ];
+
+// The locked Q1-Q7 order/content (#260 review) — asserted verbatim below.
+const WIZARD_QUESTIONS = [
+  "Q1. What are you setting up today?",
+  "Q2. Which Programs do you run?",
+  "Q3. Which Leagues exist in this Season?",
+  "Q4. Do your teams belong to clubs?",
+  "Q5. Do your leagues use divisions?",
+  "Q6. Which Venues may this Season use?",
+  "Q7. Does this Season use one Venue or multiple?",
+];
+
+const ALWAYS_VISIBLE_SHEETS = ["organizations_csv"];
+const COMPETITION_TRACK_SHEETS = [
+  "programs_csv", "competition_csv", "permanent_teams_csv",
+  "registrations_csv", "clubs_csv",
+];
+const VENUE_TRACK_SHEETS = ["venues_rinks_csv", "season_venue_access_csv"];
 
 const SHEETS = {
   organizations_csv:
@@ -50,6 +70,11 @@ const SHEETS = {
     "season_code,venue_code,active\n" +
     "BROWSERSEASON,BROWSERVENUE,true\n",
 };
+
+const INVALID_REGISTRATIONS_CSV =
+  "season_code,team_code,league_code,division_code\n" +
+  "BROWSERSEASON,BROWSERTEAM,BROWSERLEAGUE,BROWSERDIV\n" +
+  "BROWSERSEASON,BROWSERTEAM,BOGUSLEAGUE,BROWSERDIV\n";
 
 const FILENAMES = {
   organizations_csv: "organizations.csv",
@@ -93,6 +118,46 @@ function stopServer(server) {
   });
 }
 
+async function waitForSheetVisibility(page, key, visible) {
+  await page.waitForFunction(
+    ({ key, visible }) =>
+      !!document.querySelector(`[data-hierarchy-sheet="${key}"]`) === visible,
+    { key, visible },
+    { timeout: 5000 },
+  );
+}
+
+async function assertSheetsVisible(page, label, visibleKeys, hiddenKeys) {
+  for (const key of visibleKeys) await waitForSheetVisibility(page, key, true);
+  for (const key of hiddenKeys) await waitForSheetVisibility(page, key, false);
+}
+
+async function readOverview(page) {
+  return page.evaluate(async () => {
+    const r = await fetch("/api/v2/setup/overview", { credentials: "same-origin" });
+    return r.json();
+  });
+}
+
+async function readRecordCounts(page) {
+  const overview = await readOverview(page);
+  const teams = (overview.teams || []).filter((t) => t.name === "Browser Team");
+  const team = teams[0];
+  const playersResp = team
+    ? await page.evaluate(async (teamId) => {
+        const r = await fetch(`/api/players?team_id=${teamId}`, { credentials: "same-origin" });
+        return r.json();
+      }, team.id)
+    : [];
+  return {
+    organizations: (overview.organizations || []).filter((o) => o.name === "Browser Ice Facilities").length,
+    programs: (overview.programs || []).filter((p) => p.name === "Browser Program").length,
+    clubs: (overview.clubs || []).filter((c) => c.name === "Browser Club").length,
+    teams: teams.length,
+    players: (Array.isArray(playersResp) ? playersResp : []).filter((p) => p.name === "Browser Player").length,
+  };
+}
+
 async function checkViewport(browser, viewport) {
   const base = `http://${HOST}:${viewport.port}`;
   const server = spawn(
@@ -122,20 +187,37 @@ async function checkViewport(browser, viewport) {
     await page.waitForSelector("#content > *", { timeout: 10000 });
     await page.click('.tab[data-tab="import"]');
     await page.waitForSelector("#hierarchy-import-panel", { timeout: 10000 });
-
-    // The Setup profile wizard is pure UI-routing (#260): its default
-    // answers already show all nine sheets, but this journey drives it
-    // explicitly (rather than relying on defaults) to prove the real wizard
-    // — not raw API calls — is what's being exercised. "Both" + "Yes" to
-    // every question keeps every sheet card visible.
     await page.waitForSelector("#hierarchy-wizard", { timeout: 10000 });
+
+    // (1) Exact Q1-Q7 order/content (#260 review, locked).
+    const titles = await page.locator("#hierarchy-wizard .li-title").allTextContents();
+    if (JSON.stringify(titles) !== JSON.stringify(WIZARD_QUESTIONS)) {
+      throw new Error(`[${viewport.label}] wizard question order/content mismatch.\n`
+        + `expected: ${JSON.stringify(WIZARD_QUESTIONS)}\n`
+        + `actual:   ${JSON.stringify(titles)}`);
+    }
+
+    // (2) Answer-driven sheet visibility (Q1 operatorType).
+    await page.click('[data-hierarchy-wizard="operatorType"][data-hierarchy-wizard-value="venues"]');
+    await assertSheetsVisible(page, "venues-only",
+      [...ALWAYS_VISIBLE_SHEETS, ...VENUE_TRACK_SHEETS], COMPETITION_TRACK_SHEETS);
+
+    await page.click('[data-hierarchy-wizard="operatorType"][data-hierarchy-wizard-value="competitions"]');
+    await assertSheetsVisible(page, "competitions-only",
+      [...ALWAYS_VISIBLE_SHEETS, ...COMPETITION_TRACK_SHEETS], VENUE_TRACK_SHEETS);
+
     await page.click('[data-hierarchy-wizard="operatorType"][data-hierarchy-wizard-value="both"]');
+    await assertSheetsVisible(page, "both",
+      [...ALWAYS_VISIBLE_SHEETS, ...COMPETITION_TRACK_SHEETS, ...VENUE_TRACK_SHEETS], []);
+
+    // Q4 hasClubs="no" hides clubs.csv and hints permanent_teams.csv.
+    await page.click('[data-hierarchy-wizard="hasClubs"][data-hierarchy-wizard-value="no"]');
+    await waitForSheetVisibility(page, "clubs_csv", false);
+    await page.locator('[data-hierarchy-sheet="permanent_teams_csv"]')
+      .locator("xpath=../p").getByText("leave club_code blank", { exact: false }).waitFor();
+    // Restore Q1/Q4 defaults for the real import below.
     await page.click('[data-hierarchy-wizard="hasClubs"][data-hierarchy-wizard-value="yes"]');
-    await page.click('[data-hierarchy-wizard="usesDivisions"][data-hierarchy-wizard-value="yes"]');
-    await page.click('[data-hierarchy-wizard="importPlayers"][data-hierarchy-wizard-value="yes"]');
-    await page.click('[data-hierarchy-wizard="venueCount"][data-hierarchy-wizard-value="one"]');
-    await page.click('[data-hierarchy-wizard="grantVenueAccess"][data-hierarchy-wizard-value="yes"]');
-    await page.click('[data-hierarchy-wizard="importMode"][data-hierarchy-wizard-value="first-time"]');
+    await waitForSheetVisibility(page, "clubs_csv", true);
 
     for (const [key, filename] of Object.entries(FILENAMES)) {
       await page.waitForSelector(`[data-hierarchy-template="${key}"]`, { timeout: 5000 });
@@ -150,7 +232,21 @@ async function checkViewport(browser, viewport) {
     for (const [key, csv] of Object.entries(SHEETS)) {
       await page.fill(`[data-hierarchy-sheet="${key}"]`, csv);
     }
+    // Typing into a sheet doesn't itself re-render the wizard's Q2/Q3/Q6
+    // pickers (only their answer state does) — re-select Q1's current
+    // answer to force one, the same way any other wizard click would, so
+    // the pickers pick up the codes just typed above.
+    await page.click('[data-hierarchy-wizard="operatorType"][data-hierarchy-wizard-value="both"]');
 
+    // Q2/Q3/Q6 pickers pick up codes typed into the draft above.
+    await page.click('[data-hierarchy-wizard-multi="programCodes"][data-hierarchy-wizard-code="BROWSERPROGRAM"]');
+    await page.click('[data-hierarchy-wizard-multi="leagueCodes"][data-hierarchy-wizard-code="BROWSERLEAGUE"]');
+    await page.click('[data-hierarchy-wizard-multi="venueCodes"][data-hierarchy-wizard-code="BROWSERVENUE"]');
+    // Selecting a league surfaces its code as a hint on registrations.csv.
+    await page.locator('[data-hierarchy-sheet="registrations_csv"]')
+      .locator("xpath=../p").getByText("BROWSERLEAGUE", { exact: false }).waitFor();
+
+    // (3) Fresh commit.
     const validateResponse = page.waitForResponse((response) =>
       response.url() === `${base}/api/import/commit/teams-players`
       && response.request().method() === "POST"
@@ -199,8 +295,6 @@ async function checkViewport(browser, viewport) {
       const teams = (overview.teams || []).filter((t) => t.name === "Browser Team"
         && program && t.program_id === program.id);
       const team = teams[0];
-      // /api/players?team_id=... returns a raw array (ApiService.list_players
-      // is not wrapped in a {players: [...]} envelope).
       const playersResp = team ? await getJson(`/api/players?team_id=${team.id}`) : [];
       const players = (Array.isArray(playersResp) ? playersResp : [])
         .filter((p) => p.name === "Browser Player");
@@ -219,7 +313,7 @@ async function checkViewport(browser, viewport) {
         divisionId: division && division.id, clubId: club && club.id,
         venueId: venue && venue.id, venueLeagueId: venue ? venue.league_id : "no-venue",
         teamCount: teams.length, teamClubId: team && team.club_id,
-        playerCount: players.length, playerTeamId: players[0] && players[0].team_id,
+        playerCount: players.length,
         regCount: regs.length, regDivisionId: regs[0] && regs[0].division_id,
         regActive: regs[0] && regs[0].active,
         grantCount: grants.length, grantActive: grants[0] && grants[0].active,
@@ -247,6 +341,56 @@ async function checkViewport(browser, viewport) {
       throw new Error(`[${viewport.label}] expected one active season venue access grant: ${JSON.stringify(verify)}`);
     }
 
+    // (4) Idempotent repeat commit: same draft, same wizard answers — must
+    // update/skip in place, never duplicate.
+    const revalidateResponse = page.waitForResponse((response) =>
+      response.url() === `${base}/api/import/commit/teams-players`
+      && response.request().method() === "POST"
+      && response.request().postData().includes('"dry_run":true'));
+    await page.click("[data-hierarchy-validate]");
+    await revalidateResponse;
+    await page.getByRole("heading", { name: "Hierarchy validation passed" }).waitFor();
+    await page.waitForSelector("[data-hierarchy-commit]:not([disabled])");
+    const recommitResponse = page.waitForResponse((response) =>
+      response.url() === `${base}/api/import/commit/teams-players`
+      && response.request().method() === "POST"
+      && response.request().postData().includes('"dry_run":false'));
+    await page.click("[data-hierarchy-commit]");
+    const recommitBody = await (await recommitResponse).json();
+    if (!recommitBody.committed) {
+      throw new Error(`[${viewport.label}] repeat commit failed: ${JSON.stringify(recommitBody)}`);
+    }
+    for (const [name, counts] of Object.entries(recommitBody.summary || {})) {
+      if (counts.created !== 0) {
+        throw new Error(`[${viewport.label}] repeat commit created new ${name} (${counts.created}) — not idempotent`);
+      }
+    }
+    const afterRepeat = await readRecordCounts(page);
+    if (afterRepeat.teams !== 1 || afterRepeat.players !== 1 || afterRepeat.clubs !== 1
+        || afterRepeat.programs !== 1 || afterRepeat.organizations !== 1) {
+      throw new Error(`[${viewport.label}] repeat commit duplicated records: ${JSON.stringify(afterRepeat)}`);
+    }
+
+    // (5) Invalid row blocks the whole batch, zero persisted changes.
+    const beforeInvalid = await readRecordCounts(page);
+    await page.fill('[data-hierarchy-sheet="registrations_csv"]', INVALID_REGISTRATIONS_CSV);
+    const invalidValidateResponse = page.waitForResponse((response) =>
+      response.url() === `${base}/api/import/commit/teams-players`
+      && response.request().method() === "POST"
+      && response.request().postData().includes('"dry_run":true'));
+    await page.click("[data-hierarchy-validate]");
+    await invalidValidateResponse;
+    await page.getByRole("heading", { name: "Validation blocked the batch" }).waitFor();
+    const commitDisabled = await page.getAttribute("[data-hierarchy-commit]", "disabled");
+    if (commitDisabled === null) {
+      throw new Error(`[${viewport.label}] commit must stay disabled after a failed validation`);
+    }
+    const afterInvalid = await readRecordCounts(page);
+    if (JSON.stringify(afterInvalid) !== JSON.stringify(beforeInvalid)) {
+      throw new Error(`[${viewport.label}] invalid row changed persisted records: `
+        + `before=${JSON.stringify(beforeInvalid)} after=${JSON.stringify(afterInvalid)}`);
+    }
+
     const browserStorage = await page.evaluate(() => JSON.stringify({
       local: { ...localStorage },
       session: { ...sessionStorage },
@@ -260,7 +404,8 @@ async function checkViewport(browser, viewport) {
     if (errors.length) {
       throw new Error(`[${viewport.label}] console/page errors:\n${errors.join("\n")}`);
     }
-    console.log(`[${viewport.label}] OK — wizard-routed, downloaded, validated, and committed hierarchy.`);
+    console.log(`[${viewport.label}] OK — wizard order/visibility, fresh commit, `
+      + "idempotent repeat, and invalid-row rollback all verified.");
   } catch (error) {
     throw new Error(`${error.message}\n--- demo server output ---\n${serverOutput}`);
   } finally {

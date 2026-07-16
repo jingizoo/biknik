@@ -7,11 +7,20 @@
 
    The nine-sheet CSV vocabulary here matches ADR 0001 / issue #260 exactly:
    organizations, programs, venues_rinks, competition, clubs, permanent_teams,
-   players, registrations, season_venue_access. The "Setup profile" wizard below
-   is pure UI-routing state (#260 review) — it only decides which sheet cards
-   are shown and which hints appear; it has no backend representation, is never
-   persisted, and every answer combination still submits through this one
-   canonical import engine. */
+   players, registrations, season_venue_access.
+
+   The "Setup profile" wizard (Q1-Q7, #260 review, locked) is pure UI-routing
+   state: it only decides which sheet cards, sections, and rows are shown or
+   required. It has no backend representation, is never persisted, creates no
+   records, and never becomes a second source of truth — every answer
+   combination still submits through this one canonical import engine, and the
+   canonical import rows plus backend validation remain authoritative. Q2/Q3/Q6
+   pickers offer codes already typed into the current draft AND (for an
+   incremental import) already-persisted codes fetched read-only from
+   /api/import/hierarchy-codes. A handful of narrower, non-locked toggles
+   (importing players now, updating vs. first-time data) exist only as
+   subordinate controls inside their relevant sheet section — never as
+   additional top-level wizard questions. */
 
 const hierarchyImportTemplates = {
   organizations_csv:
@@ -54,19 +63,40 @@ let hierarchyImportState = {
   validatedKey: null,
 };
 
-// Pure UI-routing state (#260 review decision — question 1 has no backend
-// field, and neither does any other answer here): filters which sheet cards
-// render and which contextual hints appear. Never sent to the server, never
-// persisted across a reload.
+// Q1-Q7 (#260 review, locked) — pure UI-routing state, never persisted, no
+// backend field. programCodes/leagueCodes/venueCodes are transient
+// multi-selects: an empty array means "no filter yet", never "none".
 let hierarchyWizardAnswers = {
-  operatorType: "both",       // "competitions" | "venues" | "both"
-  hasClubs: "yes",             // "yes" | "no"
-  usesDivisions: "yes",        // "yes" | "no"
-  importPlayers: "yes",        // "yes" | "no"
-  venueCount: "one",           // "one" | "multiple"
-  grantVenueAccess: "yes",     // "yes" | "no"
-  importMode: "first-time",    // "first-time" | "repeat"
+  operatorType: "both",   // Q1: "competitions" | "venues" | "both"
+  programCodes: [],        // Q2: selected program_code values
+  leagueCodes: [],         // Q3: selected league_code values (filtered by Q2)
+  hasClubs: "yes",          // Q4: "yes" | "no"
+  usesDivisions: "yes",     // Q5: "yes" | "no"
+  venueCodes: [],           // Q6: selected venue_code values
+  venueMode: "one",         // Q7: "one" | "multiple"
 };
+
+// Subordinate, non-locked controls (#260 review) — not part of Q1-Q7; they
+// live inside the specific sheet section they affect.
+let hierarchySubordinate = {
+  importPlayersNow: true,
+  updatingExisting: false,
+};
+
+// Existing persisted Program/League/Venue codes for Q2/Q3/Q6 (#260 review),
+// fetched once, read-only. null = not loaded yet.
+let hierarchyExistingCodes = null;
+let hierarchyExistingCodesLoading = false;
+
+async function ensureHierarchyExistingCodes() {
+  if (hierarchyExistingCodes !== null || hierarchyExistingCodesLoading) return;
+  hierarchyExistingCodesLoading = true;
+  const result = await getJSON("/api/import/hierarchy-codes");
+  hierarchyExistingCodes = (result && !result.error)
+    ? result : { programs: [], leagues: [], venues: [] };
+  hierarchyExistingCodesLoading = false;
+  await render();
+}
 
 const hierarchySheetMeta = [
   ["organizations_csv", "organizations.csv", "Facility owners"],
@@ -80,6 +110,83 @@ const hierarchySheetMeta = [
   ["season_venue_access_csv", "season_venue_access.csv", "Season venue access"],
 ];
 
+// -- draft CSV parsing (for Q2/Q3/Q6 picker options) -----------------------
+
+function hierarchyDraftRows(sheetKey) {
+  const text = hierarchyImportState.sheets[sheetKey] || "";
+  const lines = text.split("\n").map((l) => l.trim()).filter(Boolean);
+  if (lines.length < 2) return [];
+  const header = lines[0].split(",").map((h) => h.trim());
+  return lines.slice(1).map((line) => {
+    const cells = line.split(",");
+    const row = {};
+    header.forEach((h, i) => { row[h] = (cells[i] || "").trim(); });
+    return row;
+  });
+}
+
+function hierarchyDraftCodes(sheetKey, columnName) {
+  const codes = [];
+  const seen = new Set();
+  for (const row of hierarchyDraftRows(sheetKey)) {
+    const code = row[columnName];
+    if (code && !seen.has(code)) { seen.add(code); codes.push(code); }
+  }
+  return codes;
+}
+
+function hierarchyProgramOptions() {
+  const seen = new Set();
+  const options = [];
+  for (const code of hierarchyDraftCodes("programs_csv", "program_code")) {
+    seen.add(code);
+    options.push({ code, label: code });
+  }
+  for (const p of (hierarchyExistingCodes && hierarchyExistingCodes.programs) || []) {
+    if (seen.has(p.code)) continue;
+    seen.add(p.code);
+    options.push({ code: p.code, label: `${p.code} (existing)` });
+  }
+  return options;
+}
+
+function hierarchyLeagueOptions() {
+  const wantedPrograms = hierarchyWizardAnswers.programCodes;
+  const seen = new Set();
+  const options = [];
+  for (const row of hierarchyDraftRows("competition_csv")) {
+    const code = row.league_code;
+    if (!code || seen.has(code)) continue;
+    if (wantedPrograms.length && !wantedPrograms.includes(row.program_code)) continue;
+    seen.add(code);
+    options.push({ code, label: code });
+  }
+  for (const lg of (hierarchyExistingCodes && hierarchyExistingCodes.leagues) || []) {
+    if (seen.has(lg.code)) continue;
+    if (wantedPrograms.length && !wantedPrograms.includes(lg.program_code)) continue;
+    seen.add(lg.code);
+    options.push({ code: lg.code, label: `${lg.code} (existing)` });
+  }
+  return options;
+}
+
+function hierarchyVenueOptions() {
+  const seen = new Set();
+  const options = [];
+  for (const code of hierarchyDraftCodes("venues_rinks_csv", "venue_code")) {
+    seen.add(code);
+    options.push({ code, label: code });
+  }
+  for (const v of (hierarchyExistingCodes && hierarchyExistingCodes.venues) || []) {
+    if (seen.has(v.code)) continue;
+    seen.add(v.code);
+    options.push({ code: v.code, label: `${v.code} (existing)` });
+  }
+  return options;
+}
+
+// -- visibility + hints, driven by Q1-Q7 -----------------------------------
+
 function hierarchySheetVisible(key) {
   const a = hierarchyWizardAnswers;
   switch (key) {
@@ -89,13 +196,12 @@ function hierarchySheetVisible(key) {
     case "registrations_csv":
       return a.operatorType !== "venues";
     case "venues_rinks_csv":
+    case "season_venue_access_csv":
       return a.operatorType !== "competitions";
     case "clubs_csv":
       return a.operatorType !== "venues" && a.hasClubs === "yes";
     case "players_csv":
-      return a.operatorType !== "venues" && a.importPlayers === "yes";
-    case "season_venue_access_csv":
-      return a.grantVenueAccess === "yes";
+      return a.operatorType !== "venues" && hierarchySubordinate.importPlayersNow;
     default:
       return true; // organizations_csv is always foundational
   }
@@ -107,19 +213,34 @@ function hierarchySheetHints(key) {
   if (key === "permanent_teams_csv" && a.hasClubs === "no") {
     hints.push("No clubs: leave club_code blank for every team.");
   }
-  if (key === "competition_csv" && a.usesDivisions === "no") {
-    hints.push("No divisions: leave division_code, division_name, and age_group blank on every row — teams register at the league level only.");
+  if (key === "competition_csv") {
+    if (a.usesDivisions === "no") {
+      hints.push("No divisions: leave division_code, division_name, and age_group blank on every row — teams register at the league level only.");
+    }
+    if (a.programCodes.length) {
+      hints.push(`Only add rows under these programs: ${a.programCodes.join(", ")}.`);
+    }
   }
-  if (key === "registrations_csv" && a.usesDivisions === "no") {
-    hints.push("No divisions: leave division_code blank on every row.");
+  if (key === "registrations_csv") {
+    if (a.usesDivisions === "no") {
+      hints.push("No divisions: leave division_code blank on every row.");
+    }
+    if (a.leagueCodes.length) {
+      hints.push(`Expected league_code values: ${a.leagueCodes.join(", ")}.`);
+    }
   }
-  if (key === "venues_rinks_csv" && a.venueCount === "multiple") {
+  if (key === "venues_rinks_csv" && a.venueMode === "multiple") {
     hints.push("Multiple venues: repeat a venue's venue_code once per rink row it owns, and use a distinct venue_code for each venue.");
   }
-  if (key === "season_venue_access_csv" && a.venueCount === "multiple") {
-    hints.push("Grant each season access to every venue it may use — one row per (season_code, venue_code) pair; a venue with no explicit row for a season stays unavailable to it.");
+  if (key === "season_venue_access_csv") {
+    if (a.venueMode === "multiple") {
+      hints.push("Grant each season access to every venue it may use — one row per (season_code, venue_code) pair; a venue with no explicit row for a season stays unavailable to it.");
+    }
+    if (a.venueCodes.length) {
+      hints.push(`Selected venues: ${a.venueCodes.join(", ")}.`);
+    }
   }
-  if (a.importMode === "repeat") {
+  if (hierarchySubordinate.updatingExisting) {
     hints.push("Updating existing data: rows match by their stable code and update in place — a blank cell on a matched row clears that field (e.g. a blank club_code unassigns a team's club).");
   }
   return hints;
@@ -158,24 +279,46 @@ function hierarchyResultHtml() {
     ${cautions ? `<div class="card"><div class="section-title">Warnings</div><ul>${cautions}</ul></div>` : ""}`;
 }
 
-function renderHierarchyWizard() {
+// -- the seven locked questions (#260 review) -------------------------------
+
+function hierarchySingleQuestion(number, key, label, options) {
   const a = hierarchyWizardAnswers;
-  const question = (key, label, options) => `<div class="li" style="display:block" data-hierarchy-wizard-question="${key}">
-      <div class="li-title">${esc(label)}</div>
+  return `<div class="li" style="display:block" data-hierarchy-wizard-question="${key}">
+      <div class="li-title">Q${number}. ${esc(label)}</div>
       <div class="actions">${options.map(([value, text]) =>
-        `<button type="button" class="act ${a[key] === value ? "primary" : "ghost"}" data-hierarchy-wizard="${key}" data-hierarchy-wizard-value="${value}">${esc(text)}</button>`).join("")}</div>
+        `<button type="button" class="act ${a[key] === value ? "primary" : "ghost"}" data-hierarchy-wizard="${key}" data-hierarchy-wizard-value="${esc(value)}">${esc(text)}</button>`).join("")}</div>
     </div>`;
+}
+
+function hierarchyMultiQuestion(number, key, label, options, emptyHint) {
+  const selected = hierarchyWizardAnswers[key];
+  const chips = options.length
+    ? options.map((opt) => `<button type="button"
+        class="act ${selected.includes(opt.code) ? "primary" : "ghost"}"
+        data-hierarchy-wizard-multi="${key}" data-hierarchy-wizard-code="${esc(opt.code)}">${esc(opt.label)}</button>`).join("")
+    : `<span class="muted">${esc(emptyHint)}</span>`;
+  return `<div class="li" style="display:block" data-hierarchy-wizard-question="${key}">
+      <div class="li-title">Q${number}. ${esc(label)}</div>
+      <div class="actions">${chips}</div>
+    </div>`;
+}
+
+function renderHierarchyWizard() {
   return `<section class="card" id="hierarchy-wizard">
       <div class="section-title" style="margin-top:0">Setup profile</div>
-      <p class="muted">Answer these to show only the sheets you need below. They only control what's shown here — every combination still validates and commits through the same import.</p>
-      ${question("operatorType", "What are you setting up today?", [
+      <p class="muted">Seven questions to show only the sheets, sections, and rows you need below. They only control what's shown here — every answer combination still validates and commits through the same import.</p>
+      ${hierarchySingleQuestion(1, "operatorType", "What are you setting up today?", [
         ["both", "Competitions & venues"], ["competitions", "Competitions only"], ["venues", "Venues only"]])}
-      ${question("hasClubs", "Do your teams belong to clubs?", [["yes", "Yes"], ["no", "No"]])}
-      ${question("usesDivisions", "Do your leagues use divisions?", [["yes", "Yes"], ["no", "No"]])}
-      ${question("importPlayers", "Import player rosters now?", [["yes", "Yes"], ["no", "Not yet"]])}
-      ${question("venueCount", "How many venues host your ice?", [["one", "One"], ["multiple", "Multiple"]])}
-      ${question("grantVenueAccess", "Grant seasons access to venue ice in this import?", [["yes", "Yes"], ["no", "Not yet"]])}
-      ${question("importMode", "Is this a first-time import or an update?", [["first-time", "First-time"], ["repeat", "Updating existing data"]])}
+      ${hierarchyMultiQuestion(2, "programCodes", "Which Programs do you run?", hierarchyProgramOptions(),
+        "No program codes yet — enter them in programs.csv below, or leave blank to include every program.")}
+      ${hierarchyMultiQuestion(3, "leagueCodes", "Which Leagues exist in this Season?", hierarchyLeagueOptions(),
+        "No league codes yet — enter them in competition.csv below, or leave blank to include every league.")}
+      ${hierarchySingleQuestion(4, "hasClubs", "Do your teams belong to clubs?", [["yes", "Yes"], ["no", "No"]])}
+      ${hierarchySingleQuestion(5, "usesDivisions", "Do your leagues use divisions?", [["yes", "Yes"], ["no", "No"]])}
+      ${hierarchyMultiQuestion(6, "venueCodes", "Which Venues may this Season use?", hierarchyVenueOptions(),
+        "No venue codes yet — enter them in venues_rinks.csv below, or leave blank to include every venue.")}
+      ${hierarchySingleQuestion(7, "venueMode", "Does this Season use one Venue or multiple?", [
+        ["one", "One"], ["multiple", "Multiple"]])}
     </section>`;
 }
 
@@ -186,8 +329,14 @@ function renderHierarchyImportPanel() {
     const hints = hierarchySheetHints(key);
     const hintHtml = hints.length
       ? `<p class="muted" style="margin:4px 0">${hints.map((h) => esc(h)).join(" ")}</p>` : "";
+    const playersToggle = key === "players_csv"
+      ? `<div class="actions" style="margin-bottom:4px">
+          <button type="button" class="act ${hierarchySubordinate.importPlayersNow ? "primary" : "ghost"}" data-hierarchy-players-toggle="true">Import players now</button>
+          <button type="button" class="act ${!hierarchySubordinate.importPlayersNow ? "primary" : "ghost"}" data-hierarchy-players-toggle="false">Skip for now</button>
+        </div>` : "";
     return `<section class="card" style="margin:0">
       <div class="section-title" style="margin-top:0">${esc(label)}</div>
+      ${playersToggle}
       <div class="actions"><button type="button" class="act ghost" data-hierarchy-template="${key}">Download ${esc(filename)}</button></div>
       ${hintHtml}
       <textarea data-hierarchy-sheet="${key}" rows="6" style="width:100%;box-sizing:border-box" placeholder="Paste ${esc(filename)} here">${esc(hierarchyImportState.sheets[key])}</textarea>
@@ -198,6 +347,10 @@ function renderHierarchyImportPanel() {
   return `<section class="card" id="hierarchy-import-panel">
       <div class="section-title" style="margin-top:0">Complete client hierarchy</div>
       <p class="muted">Import owners, programs, venues/rinks, seasons, leagues, divisions, clubs, permanent teams, player rosters, season registrations, and season venue access using stable codes. Validate checks every sheet and existing records before any write.</p>
+      <div class="actions">
+        <button type="button" class="act ${hierarchySubordinate.updatingExisting ? "primary" : "ghost"}" data-hierarchy-updating-toggle="true">Updating existing data</button>
+        <button type="button" class="act ${!hierarchySubordinate.updatingExisting ? "primary" : "ghost"}" data-hierarchy-updating-toggle="false">First-time import</button>
+      </div>
       ${renderHierarchyWizard()}
       <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px">${fields}</div>
       <div class="actions">
@@ -219,11 +372,38 @@ function captureHierarchySheets(container) {
   });
 }
 
+function toggleHierarchyMultiCode(key, code) {
+  const list = hierarchyWizardAnswers[key];
+  const idx = list.indexOf(code);
+  if (idx === -1) list.push(code); else list.splice(idx, 1);
+}
+
 function wireHierarchyImport(container) {
   container.querySelectorAll("[data-hierarchy-wizard]").forEach((button) => {
     button.onclick = async () => {
       captureHierarchySheets(container);
       hierarchyWizardAnswers[button.dataset.hierarchyWizard] = button.dataset.hierarchyWizardValue;
+      await render();
+    };
+  });
+  container.querySelectorAll("[data-hierarchy-wizard-multi]").forEach((button) => {
+    button.onclick = async () => {
+      captureHierarchySheets(container);
+      toggleHierarchyMultiCode(button.dataset.hierarchyWizardMulti, button.dataset.hierarchyWizardCode);
+      await render();
+    };
+  });
+  container.querySelectorAll("[data-hierarchy-players-toggle]").forEach((button) => {
+    button.onclick = async () => {
+      captureHierarchySheets(container);
+      hierarchySubordinate.importPlayersNow = button.dataset.hierarchyPlayersToggle === "true";
+      await render();
+    };
+  });
+  container.querySelectorAll("[data-hierarchy-updating-toggle]").forEach((button) => {
+    button.onclick = async () => {
+      captureHierarchySheets(container);
+      hierarchySubordinate.updatingExisting = button.dataset.hierarchyUpdatingToggle === "true";
       await render();
     };
   });
@@ -271,6 +451,7 @@ render = async function renderWithHierarchyImport() {
   if (view === "import" && hasPerm("manage_setup")) {
     const content = document.getElementById("content");
     if (content) wireHierarchyImport(content);
+    ensureHierarchyExistingCodes();
   }
   return result;
 };

@@ -26,6 +26,43 @@ class ApiService(_BaseApiService):
     def hierarchy_import_templates() -> dict:
         return dict(HIERARCHY_TEMPLATES)
 
+    @catch
+    def get_hierarchy_import_codes(self) -> dict:
+        """Existing persisted external codes for the import wizard's
+        Program/League/Venue pickers (#260 review — Q2/Q3/Q6).
+
+        Read-only: an incremental import's wizard can offer already-set-up
+        entities alongside whatever codes are in the current upload draft.
+        This is never a second source of truth — the wizard only uses these
+        codes to decide which sheets/rows to show; every actual write still
+        goes through the one canonical dry-run/commit path.
+        """
+        programs = [p for p in self.store.all_programs() if p.external_ref]
+        programs_by_id = {p.id: p for p in self.store.all_programs()}
+        seasons_by_id = {s.id: s for s in self.store.all_seasons()}
+        leagues = [lg for lg in self.store.all_leagues() if lg.external_ref]
+        venues = [v for v in self.store.all_venues() if v.external_ref]
+
+        league_rows = []
+        for lg in leagues:
+            season = seasons_by_id.get(lg.season_id)
+            program = (programs_by_id.get(season.program_id)
+                      if season is not None else None)
+            league_rows.append({
+                "code": lg.external_ref, "name": lg.name,
+                "season_code": season.external_ref if season else None,
+                "program_code": (program.external_ref
+                                 if program is not None else None),
+            })
+
+        return {
+            "programs": [{"code": p.external_ref, "name": p.name}
+                        for p in programs],
+            "leagues": league_rows,
+            "venues": [{"code": v.external_ref, "name": v.name}
+                      for v in venues],
+        }
+
     @staticmethod
     def _has_hierarchy_payload(sheets_csv: dict) -> bool:
         body = sheets_csv or {}

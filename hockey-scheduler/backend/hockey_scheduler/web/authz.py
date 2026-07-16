@@ -134,6 +134,12 @@ def required_permission(path: str):
     # like their single-entity creation routes.
     if path == "/api/import/commit/rinks-ice-slots":
         return Permission.MANAGE_ARENA
+    # Existing Program/League/Venue codes for the hierarchy import wizard's
+    # pickers (#260 review Q2/Q3/Q6) — same League-Admin-only MANAGE_SETUP
+    # gate as the hierarchy import commit itself, since it's read from the
+    # same setup surface.
+    if path == "/api/import/hierarchy-codes":
+        return Permission.MANAGE_SETUP
     # Generating a draft season schedule is a scheduling action (#84).
     if path == "/api/scheduler/draft":
         return Permission.MANAGE_SCHEDULE

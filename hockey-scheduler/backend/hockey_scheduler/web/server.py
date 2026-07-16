@@ -738,6 +738,13 @@ class Handler(BaseHTTPRequestHandler):
             if self._operator_only("/api/setup/player"):
                 return
             return self._send_api(api.get_setup_hierarchy())
+        if path == "/api/import/hierarchy-codes":
+            # Existing Program/League/Venue codes for the hierarchy import
+            # wizard's pickers (#260 review Q2/Q3/Q6) — same gate as the rest
+            # of the hierarchy import surface.
+            if self._operator_only("/api/import/hierarchy-codes"):
+                return
+            return self._send_api(api.get_hierarchy_import_codes())
         mlt = re.match(r"^/api/setup/leagues/([^/]+)/teams$", path)
         if mlt:
             # A league's permanent teams (#180). Operator-gated (MANAGE_SETUP)
