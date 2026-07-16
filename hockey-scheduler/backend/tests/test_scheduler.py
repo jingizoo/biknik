@@ -153,6 +153,25 @@ class SchedulerContract:
                 league_id="lg1", division_id="silver", active=True))
         self._slots(n_slots)
 
+    def _two_leagues_fixture(self, n_slots=8):
+        """Two Leagues in the same Season, each with its own Division — for
+        asserting a league-wide draft rejects/excludes any Division reference
+        that crosses League boundaries (#233 Slice G review)."""
+        self._base()
+        self.store.add_league(League(id="lg1", season_id="se1", name="League One"))
+        self.store.add_league(League(id="lg2", season_id="se1", name="League Two"))
+        self.store.add_division(Division(
+            id="div1", season_id="se1", name="D1", league_id="lg1"))
+        self.store.add_division(Division(
+            id="div2", season_id="se1", name="D2", league_id="lg2"))
+        for i in range(2):
+            self.store.add_team(Team(id=f"t{i}", name=f"Team {i}",
+                                     program_id="prog1"))
+            self.store.add_season_team_registration(SeasonTeamRegistration(
+                id=f"streg_t{i}", season_id="se1", team_id=f"t{i}",
+                league_id="lg1", division_id="div1", active=True))
+        self._slots(n_slots)
+
     # -- division-only entry point (#84/#85, unchanged behavior) -----------
     def test_assigns_earliest_slots_without_reuse(self):
         self._division_fixture(4, 6)
@@ -344,6 +363,50 @@ class SchedulerContract:
         result = self.api.draft_season_schedule()
         self.assertEqual(result.get("error", {}).get("code"), "validation_error")
 
+    # -- Division/League consistency (#233 Slice G review) ------------------
+    def test_league_wide_draft_rejects_division_from_different_league(self):
+        self._two_leagues_fixture()
+        with self.assertRaises(Exception):
+            draft_schedule_for_league(self.store, "se1", "lg1", division_id="div2")
+
+    def test_league_wide_commit_rejects_cross_league_division_zero_mutation(self):
+        self._two_leagues_fixture()
+        result = self.api.commit_draft_schedule(
+            season_id="se1", league_id="lg1", division_id="div2", actor_id="admin")
+        self.assertEqual(result.get("error", {}).get("code"), "not_found")
+        self.assertEqual(self.store.all_games(), [])
+        self.assertEqual(self.store.all_setup_audit(), [])
+
+    def test_league_wide_draft_excludes_malformed_cross_league_registration(self):
+        self._two_leagues_fixture()
+        # league_id correctly names lg1, but division_id points to lg2's
+        # Division — a corrupt/cross-League row that must never be trusted.
+        self.store.add_team(Team(id="bad", name="Bad Team", program_id="prog1"))
+        self.store.add_season_team_registration(SeasonTeamRegistration(
+            id="streg_bad", season_id="se1", team_id="bad",
+            league_id="lg1", division_id="div2", active=True))
+        res = draft_schedule_for_league(self.store, "se1", "lg1")
+        self.assertEqual(res["team_count"], 2)  # t0/t1 only; "bad" excluded
+        played = {tid for g in res["draft_games"]
+                 for tid in (g["home_team_id"], g["away_team_id"])}
+        self.assertNotIn("bad", played)
+
+    def test_league_wide_commit_never_creates_cross_league_division_game(self):
+        self._two_leagues_fixture()
+        self.store.add_team(Team(id="bad", name="Bad Team", program_id="prog1"))
+        self.store.add_season_team_registration(SeasonTeamRegistration(
+            id="streg_bad", season_id="se1", team_id="bad",
+            league_id="lg1", division_id="div2", active=True))
+        result = self.api.commit_draft_schedule(
+            season_id="se1", league_id="lg1", actor_id="admin")
+        self.assertNotIn("error", result)
+        games = self.store.all_games()
+        self.assertEqual(len(games), 1)  # only t0 vs t1
+        for g in games:
+            self.assertEqual(g.league_id, "lg1")
+            self.assertIn(g.division_id, (None, "div1"))
+            self.assertNotIn("bad", (g.home_team_id, g.away_team_id))
+
 
 class MemorySchedulerTest(SchedulerContract, unittest.TestCase):
     def make_store(self):
@@ -436,6 +499,27 @@ class SchedulerHttpTest(unittest.TestCase):
         self._req(c, "POST", "/api/auth/login", {"username": "admin", "password": "demo"})
         status, body = self._req(c, "POST", "/api/scheduler/draft", {})
         self.assertEqual(body["error"]["code"], "validation_error")
+
+    def test_league_wide_draft_rejects_cross_league_division_via_http(self):
+        div = srv.STATE.api.store.all_divisions()[0].id
+        season_id = srv.STATE.api.store.get_division(div).season_id
+        league_id = None
+        for lg in srv.STATE.api.store.all_leagues():
+            if lg.season_id == season_id:
+                league_id = lg.id
+                break
+        other_league = League(id="lg_http_other", season_id=season_id,
+                              name="Other League")
+        srv.STATE.api.store.add_league(other_league)
+        other_division = Division(id="div_http_other", season_id=season_id,
+                                  name="Other Division", league_id="lg_http_other")
+        srv.STATE.api.store.add_division(other_division)
+        c = self._client()
+        self._req(c, "POST", "/api/auth/login", {"username": "admin", "password": "demo"})
+        status, body = self._req(c, "POST", "/api/scheduler/draft",
+                                 {"season_id": season_id, "league_id": league_id,
+                                  "division_id": "div_http_other"})
+        self.assertEqual(body["error"]["code"], "not_found")
 
 
 if __name__ == "__main__":

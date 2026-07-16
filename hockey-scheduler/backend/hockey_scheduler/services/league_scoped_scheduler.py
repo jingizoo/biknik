@@ -71,7 +71,8 @@ def draft_schedule_for_league(store, season_id, league_id, division_id=None,
     require_league_belongs_to_season(store, league_id, season_id)
     if division_id is not None:
         division = store.get_division(division_id)
-        if division is None or division.season_id != season_id:
+        if (division is None or division.season_id != season_id
+                or division.league_id != league_id):
             raise NotFoundError(
                 f"Division {division_id} not found.",
                 details={"reason": "division_missing", "division_id": division_id})

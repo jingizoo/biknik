@@ -261,6 +261,11 @@ def registered_teams_by_division_in_league(store, season_id, league_id,
             continue
         if division_id is not None and reg.division_id != division_id:
             continue
+        if reg.division_id is not None:
+            division = store.get_division(reg.division_id)
+            if (division is None or division.season_id != season_id
+                    or division.league_id != league_id):
+                continue  # missing/cross-Season/cross-League Division — never trusted
         team = store.get_team(reg.team_id)
         if team is None or not team_scope_id(team) or team_scope_id(team) != program_scope:
             continue  # orphaned, null-league, or cross-Program row — never trusted
