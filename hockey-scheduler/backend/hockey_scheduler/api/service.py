@@ -1374,35 +1374,15 @@ class ApiService:
         self.store.add_contact_destination(c)
         return self._contact_row(c)
 
-    @catch
-    def delete_contact_destination(self, contact_id: str,
-                                   actor_id: Optional[str] = None) -> dict:
-        """Explicit, audited removal of a stored contact destination (#232
-        review): Player/Official deletion never silently cascades this row,
-        but a genuinely dead identity's contact destination would otherwise
-        block that delete forever with no supported resolution — this is
-        that resolution, a narrowly scoped identity/integration cleanup
-        action, not a general contacts-management surface. Restricted to
-        Player/Official-scoped rows (#232 review 3) so this stays a
-        deletion-lifecycle helper, not a general hard-delete surface for
-        other recipient kinds (team, guardian, …)."""
-        c = next((row for row in self.store.all_contact_destinations()
-                  if row.id == contact_id), None)
-        if c is None:
-            raise NotFoundError(f"Contact destination {contact_id} not found.")
-        if not (c.recipient_ref.startswith("player:")
-                or c.recipient_ref.startswith("official:")):
-            raise ValidationError(
-                "Only Player/Official-scoped contact destinations can be "
-                "removed through this cleanup action.",
-                {"reason": "recipient_not_cleanup_eligible",
-                 "recipient_ref": c.recipient_ref})
-        with self.store.transaction():
-            self.store.delete_contact_destination(contact_id)
-            self.setup._audit(
-                "contact_destination_deleted", "contact_destination", contact_id,
-                actor_id, {"recipient_ref": c.recipient_ref, "channel": c.channel.value})
-        return {"id": contact_id, "recipient_ref": c.recipient_ref}
+    # A standalone delete_contact_destination facade method/route existed
+    # briefly (#232 review 3) and was removed (#232 review 4): deleting a
+    # contact/preference row independently of a confirmed Player/Official
+    # delete is unsafe on its own — the resolver treats a MISSING row as
+    # enabled, so clearing one ahead of (or instead of) the actual identity
+    # deletion silently re-enables delivery for a subject that is still
+    # alive. `delete_official`/`delete_player` now cascade this cleanup
+    # atomically, in the same transaction as the confirmed delete, so it is
+    # never a reachable standalone action. See their docstrings.
 
     # -- notification preferences (#81) ------------------------------------
     # The delivery channels a recipient can opt out of (in-app feed is always on).
@@ -1463,33 +1443,9 @@ class ApiService:
         return {"recipient_ref": recipient_ref, "channel": ch.value,
                 "enabled": pref.enabled, "digest": pref.digest}
 
-    @catch
-    def delete_notification_preference(self, pref_id: str,
-                                       actor_id: Optional[str] = None) -> dict:
-        """Explicit, audited removal of a stored notification preference
-        (#232 review): the same narrowly scoped identity/integration
-        cleanup action as `delete_contact_destination`, for the one other
-        recipient-scoped row type Player/Official deletion can never
-        silently cascade but had no supported way to clear. Restricted to
-        Player/Official-scoped rows (#232 review 3) for the same reason."""
-        p = next((row for row in self.store.all_notification_preferences()
-                  if row.id == pref_id), None)
-        if p is None:
-            raise NotFoundError(f"Notification preference {pref_id} not found.")
-        if not (p.recipient_ref.startswith("player:")
-                or p.recipient_ref.startswith("official:")):
-            raise ValidationError(
-                "Only Player/Official-scoped notification preferences can "
-                "be removed through this cleanup action.",
-                {"reason": "recipient_not_cleanup_eligible",
-                 "recipient_ref": p.recipient_ref})
-        with self.store.transaction():
-            self.store.delete_notification_preference(pref_id)
-            self.setup._audit(
-                "notification_preference_deleted", "notification_preference",
-                pref_id, actor_id,
-                {"recipient_ref": p.recipient_ref, "channel": p.channel.value})
-        return {"id": pref_id, "recipient_ref": p.recipient_ref}
+    # A standalone delete_notification_preference facade method/route existed
+    # briefly (#232 review 3) and was removed (#232 review 4) for the same
+    # reason as delete_contact_destination above.
 
     # -- calendar feed tokens (#82) ----------------------------------------
     @staticmethod

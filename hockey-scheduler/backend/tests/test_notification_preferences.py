@@ -111,13 +111,12 @@ class PreferenceResolverContract:
         self.assertTrue(e.detail["enabled"])          # now enabled
 
     def test_deleted_subject_rejects_recreated_preference(self):
-        # (#232 review 3) Deleting the Official must not leave a back door
-        # that lets a later set_notification_preference call re-point a
-        # channel at the now-dead recipient_ref.
+        # (#232 review 3/4) Deleting the Official cascades its preference row
+        # in the same transaction (delete_official no longer requires it be
+        # cleared first) — and must not leave a back door that lets a later
+        # set_notification_preference call re-point a channel at the now-dead
+        # recipient_ref.
         self.api.set_notification_preference(self.official_ref, "email", False)
-        self.api.delete_notification_preference(
-            self.store.get_notification_preference(
-                self.official_ref, NotificationChannel.EMAIL).id)
         self.api.delete_official(self.official_id)
         before = len(self.store.all_notification_preferences())
         res = self.api.set_notification_preference(self.official_ref, "email", False)
@@ -188,9 +187,11 @@ class PreferenceHttpAccessTest(unittest.TestCase):
         self.assertEqual({p["channel"]: p["enabled"] for p in got["preferences"]},
                          {"email": False, "push": True})
 
-    def test_admin_deletes_contact_and_preference_cleanup_rows(self):
-        # League Admin holds MANAGE_SETUP (#232 review 3): the cleanup delete
-        # routes succeed for them, same as any other setup-delete action.
+    def test_deleting_official_over_http_atomically_clears_contact_and_preference(self):
+        # #232 review 4: no standalone delete-preference/-contact route
+        # exists (or is needed) — the already-authorized, already-supported
+        # Official delete route is the only action a League Admin ever calls,
+        # and it cascades this cleanup atomically in the same transaction.
         c = self._client()
         self._req(c, "POST", "/api/auth/login", {"username": "admin", "password": "demo"})
         status, official = self._req(c, "POST", "/api/v2/setup/official",
@@ -205,63 +206,52 @@ class PreferenceHttpAccessTest(unittest.TestCase):
                                  {"recipient_ref": ref, "channel": "email",
                                   "enabled": False})
         self.assertEqual(status, 200, pref)
-        # The set-preference response carries no id (#81's shape) — the
-        # delete route needs the row id, so fetch it directly from the
-        # running demo's store the way the HTTP layer would resolve it.
-        pref_row = srv.STATE.api.store.get_notification_preference(
-            ref, NotificationChannel.EMAIL)
 
-        status, _ = self._req(
-            c, "POST", f"/api/notifications/contacts/{contact['id']}/delete", {})
-        self.assertEqual(status, 200)
-        status, _ = self._req(
-            c, "POST", f"/api/notifications/preferences/{pref_row.id}/delete", {})
-        self.assertEqual(status, 200)
+        status, deleted = self._req(
+            c, "POST", f"/api/v2/setup/official/{official['id']}/delete", {})
+        self.assertEqual(status, 200, deleted)
+        self.assertNotIn("error", deleted)
 
-        status, got = self._req(
-            c, "GET", f"/api/notifications/preferences?recipient_ref={ref}")
-        self.assertEqual(status, 200)
-        # Deleting the preference row reverts the recipient to the default
-        # (enabled) rather than leaving a "disabled" row behind.
-        self.assertTrue(
-            next(p["enabled"] for p in got["preferences"] if p["channel"] == "email"))
+        # The cascade actually ran: re-setting the preference against the
+        # now-dead ref is rejected, proving the row (and the subject it
+        # described) is genuinely gone — not merely hidden.
+        status, resettle = self._req(c, "POST", "/api/notifications/preferences",
+                                     {"recipient_ref": ref, "channel": "email",
+                                      "enabled": False})
+        self.assertEqual(status, 400)
+        self.assertEqual(resettle["error"]["code"], "validation_error")
 
-    def test_arena_manager_cannot_delete_cleanup_rows(self):
-        # Arena Manager holds MANAGE_SCHEDULE but not the League-Admin-only
-        # MANAGE_SETUP the cleanup routes now require (#232 review 3): they
-        # must be refused with zero mutation, not silently allowed through
-        # the old MANAGE_SCHEDULE gate.
-        admin = self._client()
-        self._req(admin, "POST", "/api/auth/login", {"username": "admin", "password": "demo"})
-        status, official = self._req(admin, "POST", "/api/v2/setup/official",
-                                     {"name": "Guarded Official"})
+    def test_blocked_official_delete_over_http_preserves_preference(self):
+        # The scenario the reviewer flagged directly, exercised over real
+        # HTTP: a delete blocked by something else (an active device token)
+        # must leave the recipient's stored opt-out completely untouched —
+        # not silently reverted to the resolver's enabled default.
+        c = self._client()
+        self._req(c, "POST", "/api/auth/login", {"username": "admin", "password": "demo"})
+        status, official = self._req(c, "POST", "/api/v2/setup/official",
+                                     {"name": "Blocked Official"})
         self.assertEqual(status, 200, official)
         ref = f"official:{official['id']}"
-        status, contact = self._req(admin, "POST", "/api/notifications/contacts",
-                                    {"recipient_ref": ref, "channel": "email",
-                                     "destination": "guarded@example.com"})
-        self.assertEqual(status, 200, contact)
-        status, pref = self._req(admin, "POST", "/api/notifications/preferences",
+        status, _ = self._req(c, "POST", "/api/notifications/device-tokens",
+                              {"recipient_ref": ref, "provider": "fcm",
+                               "token": "blocked-tok"})
+        self.assertEqual(status, 200)
+        status, pref = self._req(c, "POST", "/api/notifications/preferences",
                                  {"recipient_ref": ref, "channel": "email",
                                   "enabled": False})
         self.assertEqual(status, 200, pref)
 
-        arena = self._client()
-        self._req(arena, "POST", "/api/auth/login", {"username": "arena", "password": "demo"})
-        status, _ = self._req(
-            arena, "POST", f"/api/notifications/contacts/{contact['id']}/delete", {})
-        self.assertEqual(status, 403)
-        status, _ = self._req(
-            arena, "POST", "/api/notifications/preferences/some-pref-id/delete", {})
-        self.assertEqual(status, 403)
+        status, blocked = self._req(
+            c, "POST", f"/api/v2/setup/official/{official['id']}/delete", {})
+        self.assertEqual(status, 409)
+        self.assertEqual(blocked["error"]["code"], "has_dependencies")
 
-        # Zero mutation: the contact destination the Arena Manager was
-        # refused against is still there for the admin to read back.
         status, got = self._req(
-            admin, "GET", f"/api/notifications/preferences?recipient_ref={ref}")
+            c, "GET", f"/api/notifications/preferences?recipient_ref={ref}")
         self.assertEqual(status, 200)
         self.assertFalse(
-            next(p["enabled"] for p in got["preferences"] if p["channel"] == "email"))
+            next(p["enabled"] for p in got["preferences"] if p["channel"] == "email"),
+            "a blocked delete must not revert the recipient's stored opt-out")
 
     def test_user_manages_own_recipient(self):
         c = self._client()

@@ -3173,7 +3173,20 @@ class SetupService:
                         actor_id: Optional[str] = None) -> Official:
         """Permanently remove an Official (#232), gated on any live
         assignment, availability window, account, or integration state —
-        the same pre-write, no-cascade contract as `delete_team`."""
+        the same pre-write, no-cascade contract as `delete_team`.
+
+        Contact destinations and notification preferences are the one
+        exception (#232 review 4): they cascade with the confirmed delete
+        below, in this same transaction, each with its own audit entry —
+        never as a standalone action. A stored preference row is the only
+        record of an explicit opt-out; the resolver treats a MISSING row as
+        enabled, so deleting one ahead of (or independent from) the actual
+        identity deletion would silently re-enable delivery for a subject
+        that is still alive whenever another dependency blocks the delete
+        or the operator simply stops partway. Folding the cleanup into the
+        confirmed delete itself closes that window: the row is only ever
+        gone together with the subject it describes.
+        """
         official = self.store.get_official(official_id)
         if official is None:
             raise NotFoundError(f"Official {official_id} not found.")
@@ -3190,10 +3203,6 @@ class SetupService:
                  if t.actor_type == "official" and t.actor_ref == official_id
                  and t.revoked_at is None]
         ref = f"official:{official_id}"
-        contacts = [c for c in self.store.all_contact_destinations()
-                    if c.recipient_ref == ref]
-        prefs = [p for p in self.store.all_notification_preferences()
-                 if p.recipient_ref == ref]
         devices = [d for d in self.store.all_device_tokens()
                    if d.active and d.recipient_ref == ref]
         self._block_if_dependents("official", official_id, "official", [
@@ -3203,15 +3212,28 @@ class SetupService:
             self._dep_group("account", accounts, lambda a: a.username),
             self._dep_group("calendar feed", feeds,
                             lambda t: t.label or t.actor_ref),
-            self._dep_group("contact destination", contacts,
-                            lambda c: c.label or c.destination),
-            self._dep_group("notification preference", prefs,
-                            lambda p: p.channel.value),
             self._dep_group("device token", devices,
                             lambda d: d.label or d.provider)])
+        contacts = [c for c in self.store.all_contact_destinations()
+                    if c.recipient_ref == ref]
+        prefs = [p for p in self.store.all_notification_preferences()
+                 if p.recipient_ref == ref]
+        for c in contacts:
+            self.store.delete_contact_destination(c.id)
+            self._audit("contact_destination_deleted", "contact_destination",
+                        c.id, actor_id,
+                        {"recipient_ref": ref, "channel": c.channel.value,
+                         "reason": "official_deleted"})
+        for p in prefs:
+            self.store.delete_notification_preference(p.id)
+            self._audit("notification_preference_deleted",
+                        "notification_preference", p.id, actor_id,
+                        {"recipient_ref": ref, "channel": p.channel.value,
+                         "reason": "official_deleted"})
         self.store.delete_official(official_id)
         self._audit("official_deleted", "official", official_id, actor_id,
-                    {"name": official.name})
+                    {"name": official.name, "contacts_cleaned": len(contacts),
+                     "preferences_cleaned": len(prefs)})
         return official
 
     @_transactional
@@ -3220,7 +3242,15 @@ class SetupService:
         """Permanently remove a Player (#232), gated on any live roster
         entry, availability response, substitute enrolment, guardian link,
         account, or integration state — the same pre-write, no-cascade
-        contract as `delete_team`."""
+        contract as `delete_team`.
+
+        Contact destinations and notification preferences cascade with the
+        confirmed delete instead of blocking it (#232 review 4) — see
+        `delete_official`'s docstring for why a standalone delete of either
+        row is unsafe (it can silently re-enable delivery for a subject
+        that is still alive) and why folding the cleanup into this same
+        transaction closes that window.
+        """
         player = self.store.get_player(player_id)
         if player is None:
             raise NotFoundError(f"Player {player_id} not found.")
@@ -3239,10 +3269,6 @@ class SetupService:
                  if t.actor_type == "player" and t.actor_ref == player_id
                  and t.revoked_at is None]
         ref = f"player:{player_id}"
-        contacts = [c for c in self.store.all_contact_destinations()
-                    if c.recipient_ref == ref]
-        prefs = [p for p in self.store.all_notification_preferences()
-                 if p.recipient_ref == ref]
         devices = [d for d in self.store.all_device_tokens()
                    if d.active and d.recipient_ref == ref]
         self._block_if_dependents("player", player_id, "player", [
@@ -3256,15 +3282,29 @@ class SetupService:
             self._dep_group("account", accounts, lambda a: a.username),
             self._dep_group("calendar feed", feeds,
                             lambda t: t.label or t.actor_ref),
-            self._dep_group("contact destination", contacts,
-                            lambda c: c.label or c.destination),
-            self._dep_group("notification preference", prefs,
-                            lambda p: p.channel.value),
             self._dep_group("device token", devices,
                             lambda d: d.label or d.provider)])
+        contacts = [c for c in self.store.all_contact_destinations()
+                    if c.recipient_ref == ref]
+        prefs = [p for p in self.store.all_notification_preferences()
+                 if p.recipient_ref == ref]
+        for c in contacts:
+            self.store.delete_contact_destination(c.id)
+            self._audit("contact_destination_deleted", "contact_destination",
+                        c.id, actor_id,
+                        {"recipient_ref": ref, "channel": c.channel.value,
+                         "reason": "player_deleted"})
+        for p in prefs:
+            self.store.delete_notification_preference(p.id)
+            self._audit("notification_preference_deleted",
+                        "notification_preference", p.id, actor_id,
+                        {"recipient_ref": ref, "channel": p.channel.value,
+                         "reason": "player_deleted"})
         self.store.delete_player(player_id)
         self._audit("player_deleted", "player", player_id, actor_id,
-                    {"name": player.name, "team_id": player.team_id})
+                    {"name": player.name, "team_id": player.team_id,
+                     "contacts_cleaned": len(contacts),
+                     "preferences_cleaned": len(prefs)})
         return player
 
     def _matchup_for_game_ref(self, entry) -> str:

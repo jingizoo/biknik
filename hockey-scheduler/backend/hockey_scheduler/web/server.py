@@ -1599,20 +1599,17 @@ class Handler(BaseHTTPRequestHandler):
         if di:
             return self._send_api(api.ignore_notification_delivery(di.group(1)))
 
-        # Contact registry: register/update a real destination (#60).
+        # Contact registry: register/update a real destination (#60). No
+        # standalone delete route (#232 review 4) — a contact/preference row
+        # is the only record of an explicit opt-out, and the resolver treats
+        # a MISSING row as enabled, so deleting one independently of a
+        # confirmed Player/Official delete could silently re-enable delivery
+        # for a subject that is still alive. delete_official/delete_player
+        # cascade this cleanup atomically instead; see their docstrings.
         if path == "/api/notifications/contacts":
             return self._send_api(api.set_contact_destination(
                 body.get("recipient_ref"), body.get("channel"),
                 body.get("destination"), body.get("label")))
-        # Explicit, audited removal (#232 review) — the narrowly scoped
-        # identity/integration cleanup a Player/Official delete blocked on a
-        # dead contact destination needs, since this registry is otherwise
-        # upsert-only.
-        cd = re.match(r"^/api/notifications/contacts/([^/]+)/delete$", path)
-        if cd:
-            _role, _scope, actor_uid, _err = self._resolve_role()
-            return self._send_api(api.delete_contact_destination(
-                cd.group(1), actor_id=actor_uid))
 
         # Device token registry: register / activate-deactivate (#65).
         if path == "/api/notifications/device-tokens":
@@ -1623,15 +1620,6 @@ class Handler(BaseHTTPRequestHandler):
         if dt:
             return self._send_api(api.set_device_token_active(
                 dt.group(1), bool(body.get("active"))))
-
-        # Explicit, audited removal (#232 review) — the narrowly scoped
-        # cleanup a Player/Official delete blocked on a dead notification
-        # preference needs, since this registry is otherwise update-only.
-        npd = re.match(r"^/api/notifications/preferences/([^/]+)/delete$", path)
-        if npd:
-            _role, _scope, actor_uid, _err = self._resolve_role()
-            return self._send_api(api.delete_notification_preference(
-                npd.group(1), actor_id=actor_uid))
 
         # User accounts: operator creates a login, or activates/deactivates
         # one (#67). No self-service signup — this is the only way an
