@@ -1802,6 +1802,378 @@ class SetupService:
                else self.store.all_reschedule_requests())
         return sorted(rows, key=lambda r: r.created_at, reverse=True)
 
+    # -- hierarchy import upsert helpers (#260 Slice F) ---------------------
+    # Narrow, purpose-built upsert methods the hierarchy CSV importer
+    # (hierarchy_import.py) calls instead of duplicating create/update
+    # invariants inline (#260 review decision 3). The importer resolves each
+    # row's external_ref against a `{code: obj}` dict it pre-builds once per
+    # sheet (a read-only lookup, not a write) and passes the resolved
+    # `existing` object (or None) in; every actual store write and audit
+    # entry happens here. None of these carry their own @_transactional —
+    # they run inside the importer's single outer `with store.transaction():`
+    # block (store.transaction() is reentrant, so nesting is safe), which is
+    # what makes the whole nine-sheet batch one atomic commit/rollback unit.
+    #
+    # Every helper returns (obj, created, changed_fields) so the caller can
+    # track created/updated/skipped counts without re-deriving them.
+
+    @staticmethod
+    def _apply_changes(obj, values: dict) -> List[str]:
+        changed = []
+        for field, value in values.items():
+            if getattr(obj, field) != value:
+                setattr(obj, field, value)
+                changed.append(field)
+        return changed
+
+    def upsert_imported_organization(self, code: str, name: str, short_name: str,
+                                     existing=None, actor_id: Optional[str] = None,
+                                     import_batch_id: Optional[str] = None):
+        values = {"name": name, "short_name": short_name}
+        if existing is None:
+            obj = Organization(id=self.store.next_id("org"), external_ref=code,
+                               **values)
+            self.store.add_organization(obj)
+            self._audit("organization_created", "organization", obj.id, actor_id,
+                       {"import_batch_id": import_batch_id, "external_ref": code})
+            return obj, True, []
+        changed = self._apply_changes(existing, values)
+        if changed:
+            self.store.save_organization(existing)
+            self._audit("organization_updated", "organization", existing.id,
+                       actor_id, {"import_batch_id": import_batch_id,
+                                  "external_ref": code, "changed_fields": changed})
+        return existing, False, changed
+
+    def upsert_imported_program(self, code: str, name: str, country: str,
+                                timezone_name: str,
+                                operator_organization_id: Optional[str],
+                                existing=None, actor_id: Optional[str] = None,
+                                import_batch_id: Optional[str] = None):
+        values = {"name": name, "country": country,
+                  "timezone": timezone_name or "UTC",
+                  "operator_organization_id": operator_organization_id}
+        if existing is None:
+            obj = Program(id=self.store.next_id("program"), external_ref=code,
+                          **values)
+            self.store.add_program(obj)
+            self._audit("program_created", "program", obj.id, actor_id,
+                       {"import_batch_id": import_batch_id, "external_ref": code,
+                        "operator_organization_id": operator_organization_id})
+            return obj, True, []
+        changed = self._apply_changes(existing, values)
+        if changed:
+            self.store.save_program(existing)
+            self._audit("program_updated", "program", existing.id, actor_id,
+                       {"import_batch_id": import_batch_id, "external_ref": code,
+                        "operator_organization_id": operator_organization_id,
+                        "changed_fields": changed})
+        return existing, False, changed
+
+    def upsert_imported_venue(self, code: str, name: str, address: str,
+                              timezone_name: str, organization_id: str,
+                              existing=None, actor_id: Optional[str] = None,
+                              import_batch_id: Optional[str] = None):
+        # Never sets league_id (#233 Slice E, #260 review decision) — the
+        # legacy one-Venue-one-Program bridge is retired; a Venue's
+        # schedulability comes only from SeasonVenueAccess.
+        values = {"name": name, "address": address,
+                  "timezone": timezone_name or "UTC",
+                  "organization_id": organization_id}
+        if existing is None:
+            obj = Venue(id=self.store.next_id("venue"), external_ref=code,
+                       **values)
+            self.store.add_venue(obj)
+            self._audit("venue_created", "venue", obj.id, actor_id,
+                       {"import_batch_id": import_batch_id, "external_ref": code,
+                        "organization_id": organization_id})
+            return obj, True, []
+        changed = self._apply_changes(existing, values)
+        if changed:
+            self.store.save_venue(existing)
+            self._audit("venue_updated", "venue", existing.id, actor_id,
+                       {"import_batch_id": import_batch_id, "external_ref": code,
+                        "organization_id": organization_id,
+                        "changed_fields": changed})
+        return existing, False, changed
+
+    def upsert_imported_rink(self, code: str, name: str, venue_id: str,
+                             existing=None, actor_id: Optional[str] = None,
+                             import_batch_id: Optional[str] = None):
+        values = {"name": name, "venue_id": venue_id}
+        if existing is None:
+            obj = Rink(id=self.store.next_id("rink"), external_ref=code, **values)
+            self.store.add_rink(obj)
+            self._audit("rink_created", "rink", obj.id, actor_id,
+                       {"import_batch_id": import_batch_id, "external_ref": code,
+                        "venue_id": venue_id})
+            return obj, True, []
+        changed = self._apply_changes(existing, values)
+        if changed:
+            self.store.save_rink(existing)
+            self._audit("rink_updated", "rink", existing.id, actor_id,
+                       {"import_batch_id": import_batch_id, "external_ref": code,
+                        "venue_id": venue_id, "changed_fields": changed})
+        return existing, False, changed
+
+    def upsert_imported_season(self, code: str, name: str, program_id: str,
+                               existing=None, actor_id: Optional[str] = None,
+                               import_batch_id: Optional[str] = None):
+        values = {"name": name, "program_id": program_id}
+        if existing is None:
+            obj = Season(id=self.store.next_id("season"), external_ref=code,
+                        **values)
+            self.store.add_season(obj)
+            self._audit("season_created", "season", obj.id, actor_id,
+                       {"import_batch_id": import_batch_id, "external_ref": code,
+                        "program_id": program_id})
+            return obj, True, []
+        changed = self._apply_changes(existing, values)
+        if changed:
+            self.store.save_season(existing)
+            self._audit("season_updated", "season", existing.id, actor_id,
+                       {"import_batch_id": import_batch_id, "external_ref": code,
+                        "program_id": program_id, "changed_fields": changed})
+        return existing, False, changed
+
+    def upsert_imported_league(self, code: str, name: str, sort_order: int,
+                               season_id: str, existing=None,
+                               actor_id: Optional[str] = None,
+                               import_batch_id: Optional[str] = None):
+        # League is REQUIRED on every canonical competition row (#260 review
+        # decision 2), unlike the old optional level_code/level_name.
+        values = {"name": name, "sort_order": sort_order, "season_id": season_id}
+        if existing is None:
+            obj = League(id=self.store.next_id("league"), external_ref=code,
+                        **values)
+            self.store.add_league(obj)
+            self._audit("league_created", "league", obj.id, actor_id,
+                       {"import_batch_id": import_batch_id, "external_ref": code,
+                        "season_id": season_id})
+            return obj, True, []
+        changed = self._apply_changes(existing, values)
+        if changed:
+            self.store.save_league(existing)
+            self._audit("league_updated", "league", existing.id, actor_id,
+                       {"import_batch_id": import_batch_id, "external_ref": code,
+                        "season_id": season_id, "changed_fields": changed})
+        return existing, False, changed
+
+    def upsert_imported_division(self, code: str, name: str, age_group: str,
+                                 season_id: str, league_id: str, existing=None,
+                                 actor_id: Optional[str] = None,
+                                 import_batch_id: Optional[str] = None):
+        # Optional per row (#260) — the importer only calls this when a row
+        # actually carries a division_code.
+        values = {"name": name, "age_group": age_group,
+                  "season_id": season_id, "league_id": league_id}
+        if existing is None:
+            obj = Division(id=self.store.next_id("division"), external_ref=code,
+                          **values)
+            self.store.add_division(obj)
+            self._audit("division_created", "division", obj.id, actor_id,
+                       {"import_batch_id": import_batch_id, "external_ref": code,
+                        "season_id": season_id, "league_id": league_id})
+            return obj, True, []
+        changed = self._apply_changes(existing, values)
+        if changed:
+            self.store.save_division(existing)
+            self._audit("division_updated", "division", existing.id, actor_id,
+                       {"import_batch_id": import_batch_id, "external_ref": code,
+                        "season_id": season_id, "league_id": league_id,
+                        "changed_fields": changed})
+        return existing, False, changed
+
+    def upsert_imported_club(self, code: str, name: str, country: str,
+                             existing=None, actor_id: Optional[str] = None,
+                             import_batch_id: Optional[str] = None):
+        # Matched by club_code, never by name (#260 review decision 1) — a
+        # renamed Club (same code, new club_name) updates the existing
+        # record in place rather than creating a second one.
+        values = {"name": name, "country": country}
+        if existing is None:
+            obj = Club(id=self.store.next_id("club"), external_ref=code, **values)
+            self.store.add_club(obj)
+            self._audit("club_created", "club", obj.id, actor_id,
+                       {"import_batch_id": import_batch_id, "external_ref": code})
+            return obj, True, []
+        changed = self._apply_changes(existing, values)
+        if changed:
+            self.store.save_club(existing)
+            self._audit("club_updated", "club", existing.id, actor_id,
+                       {"import_batch_id": import_batch_id, "external_ref": code,
+                        "changed_fields": changed})
+        return existing, False, changed
+
+    def upsert_imported_team(self, code: str, name: str, program_id: str,
+                             club_id: Optional[str], existing=None,
+                             actor_id: Optional[str] = None,
+                             import_batch_id: Optional[str] = None):
+        # club_id is always set from the row's resolved club (#260 review
+        # decision 1): a blank/NA club_code means club_id=None on BOTH a
+        # create and a repeat row — never a placeholder Club, but a genuine
+        # unassign on re-import is allowed, mirroring the interactive
+        # "— none —" option exactly.
+        values = {"name": name, "program_id": program_id, "club_id": club_id}
+        if existing is None:
+            obj = Team(id=self.store.next_id("team"), external_ref=code, **values)
+            self.store.add_team(obj)
+            self._audit("team_created", "team", obj.id, actor_id,
+                       {"import_batch_id": import_batch_id, "external_ref": code,
+                        "program_id": program_id, "club_id": club_id})
+            return obj, True, []
+        old_program_id = existing.program_id
+        changed = self._apply_changes(existing, values)
+        if changed:
+            self.store.save_team(existing)
+            detail = {"import_batch_id": import_batch_id, "external_ref": code,
+                      "program_id": program_id, "changed_fields": changed}
+            if "program_id" in changed:  # exact from/to on a program move
+                detail["from_program_id"] = old_program_id
+                detail["to_program_id"] = program_id
+            self._audit("team_updated", "team", existing.id, actor_id, detail)
+        return existing, False, changed
+
+    def upsert_imported_player(self, code: str, name: str, team_id: str,
+                               position: Position, jersey_number: Optional[int],
+                               email: Optional[str], existing=None,
+                               actor_id: Optional[str] = None,
+                               import_batch_id: Optional[str] = None):
+        """Upsert a Player by its stable player_code (#260), syncing an
+        optional email the same way ``add_player`` does: an existing
+        ``player:<id>`` ContactDestination's value is updated in place,
+        never duplicated. Omitting the email on a repeat row leaves a
+        previously-set contact untouched — clearing/retiring a contact is
+        #232's own explicit, audited action, never an import side effect.
+        """
+        values = {"name": name, "team_id": team_id, "position": position,
+                  "jersey_number": jersey_number}
+        if existing is None:
+            obj = Player(id=self.store.next_id("player"), external_ref=code,
+                        **values)
+            self.store.add_player(obj)
+            self._audit("player_created", "player", obj.id, actor_id,
+                       {"import_batch_id": import_batch_id, "external_ref": code,
+                        "team_id": team_id})
+            created, changed = True, []
+        else:
+            obj = existing
+            changed = self._apply_changes(obj, values)
+            if changed:
+                self.store.save_player(obj)
+                self._audit("player_updated", "player", obj.id, actor_id,
+                           {"import_batch_id": import_batch_id,
+                            "external_ref": code, "team_id": team_id,
+                            "changed_fields": changed})
+            created = False
+        if email:
+            recipient_ref = f"player:{obj.id}"
+            existing_contact = self.store.get_contact_destination(
+                recipient_ref, NotificationChannel.EMAIL)
+            if existing_contact is not None:
+                if existing_contact.destination != email:
+                    existing_contact.destination = email
+                    self.store.save_contact_destination(existing_contact)
+            else:
+                self.store.add_contact_destination(ContactDestination(
+                    id=self.store.next_id("contact"),
+                    recipient_ref=recipient_ref,
+                    channel=NotificationChannel.EMAIL,
+                    destination=email))
+        return obj, created, changed
+
+    def upsert_imported_registration(self, season_id: str, team_id: str,
+                                     league_id: str, division_id: Optional[str],
+                                     actor_id: Optional[str] = None,
+                                     import_batch_id: Optional[str] = None):
+        """Upsert a SeasonTeamRegistration by its (season_id, team_id)
+        identity (#260) — it has no external_ref of its own. Mirrors
+        ``register_team_for_season``'s Rule 5 reactivation (an inactive
+        prior row is reactivated in place, never duplicated), but unlike
+        that interactive method — which rejects an already-active row as a
+        duplicate — an ACTIVE existing row is simply updated in place:
+        re-importing the same or corrected registration data must never
+        error.
+        """
+        reg = self.store.registration_for_team_in_season(season_id, team_id)
+        if reg is None:
+            reg = SeasonTeamRegistration(
+                id=self.store.next_id("streg"), season_id=season_id,
+                team_id=team_id, division_id=division_id, league_id=league_id,
+                active=True)
+            self.store.add_season_team_registration(reg)
+            self._audit(
+                "season_team_registered", "season_team_registration", reg.id,
+                actor_id, {"season_id": season_id, "team_id": team_id,
+                          "league_id": league_id, "division_id": division_id,
+                          "import_batch_id": import_batch_id})
+            return reg, True, []
+        changed = []
+        old_league_id = reg.league_id
+        old_division_id = reg.division_id
+        if reg.league_id != league_id:
+            reg.league_id = league_id
+            changed.append("league_id")
+        if reg.division_id != division_id:
+            reg.division_id = division_id
+            changed.append("division_id")
+        if not reg.active:
+            reg.active = True
+            changed.append("active")
+        if changed:
+            self.store.save_season_team_registration(reg)
+            detail = {"season_id": season_id, "team_id": team_id,
+                      "league_id": league_id, "division_id": division_id,
+                      "changed_fields": changed,
+                      "import_batch_id": import_batch_id}
+            if "league_id" in changed:  # exact from/to on a move
+                detail["from_league_id"] = old_league_id
+                detail["to_league_id"] = league_id
+            if "division_id" in changed:
+                detail["from_division_id"] = old_division_id
+                detail["to_division_id"] = division_id
+            self._audit("season_team_registration_updated",
+                       "season_team_registration", reg.id, actor_id, detail)
+        return reg, False, changed
+
+    def upsert_imported_venue_access(self, season_id: str, venue_id: str,
+                                     active: bool, actor_id: Optional[str] = None,
+                                     import_batch_id: Optional[str] = None):
+        """Grant, reactivate, or revoke a Season's access to a Venue's ice
+        by its (season_id, venue_id) identity (#260) — mirrors
+        ``grant_season_venue_access``/``revoke_season_venue_access``'s own
+        reactivate-vs-create branch, but never raises on an already-active
+        or already-revoked row: re-importing identical data is a no-op.
+        Revoking a pair that never existed writes nothing at all — it is a
+        no-op flagged as a warning at dry-run time, never a fabricated
+        inactive record.
+        """
+        access = self.store.season_venue_access_for_pair(season_id, venue_id)
+        if access is None:
+            if not active:
+                return None, False, []  # nothing to revoke — a true no-op
+            access = SeasonVenueAccess(
+                id=self.store.next_id("sva"), season_id=season_id,
+                venue_id=venue_id, active=True)
+            self.store.add_season_venue_access(access)
+            self._audit(
+                "season_venue_access_granted", "season_venue_access",
+                access.id, actor_id,
+                {"season_id": season_id, "venue_id": venue_id,
+                 "import_batch_id": import_batch_id})
+            return access, True, []
+        if access.active != active:
+            access.active = active
+            self.store.save_season_venue_access(access)
+            self._audit(
+                "season_venue_access_granted" if active
+                else "season_venue_access_revoked", "season_venue_access",
+                access.id, actor_id,
+                {"season_id": season_id, "venue_id": venue_id,
+                 "import_batch_id": import_batch_id})
+            return access, False, ["active"]
+        return access, False, []
+
     # -- convenience: add a player to a team ------------------------------
     @_transactional
     def add_player(self, team_id: str, name: str, position: Position,

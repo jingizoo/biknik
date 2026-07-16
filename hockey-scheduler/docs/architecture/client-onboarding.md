@@ -12,8 +12,8 @@ which this guide references rather than repeats.
 Fresh production deployment (durable DB, no demo data)
   → client claims the installation with a one-time setup code
   → client creates their own first League Admin and signs in
-  → guided Initial Setup walks the hierarchy: owner → league → venues/rinks
-    → season/divisions → clubs/teams → players/officials → game ice → staff
+  → guided Initial Setup walks the hierarchy: owner → program → venues/rinks
+    → season/league/divisions → clubs/teams → players/officials → game ice → staff
   → each step is entered manually or bulk-imported from templates
   → onboarding status reports what still blocks scheduling
   → back up / restore is proven to reproduce the configured client
@@ -63,23 +63,39 @@ existing Setup drawers, the Users screen, the Import screen, and the Calendar.
 
 Both paths write the same domain entities through the same services — the wizard
 creates no parallel data store. Small configurations can be typed in; a full
-client hierarchy is imported from templates on the Import screen. Imports are
-matched by stable external codes (not names), validate every cross-file
-reference before any write, commit each batch in one transaction, are idempotent
-on repeat upload, and never delete rows that are absent from a later file. Every
-commit reports created/updated/skipped counts and writes a batch audit plus
-entity audits attributed to the signed-in admin.
+client hierarchy is imported from nine CSV sheets on the Import screen:
+`organizations`, `programs`, `venues_rinks`, `competition` (season/league/
+optional division), `clubs`, `permanent_teams`, `players`, `registrations`, and
+`season_venue_access` (issue #260's locked design). Imports are matched by
+stable external codes (never names — a Club's `club_code` closed the last gap),
+validate every cross-file reference before any write (every error in one pass,
+never fail-fast), commit each batch in one transaction, are idempotent on
+repeat upload, and never delete rows that are absent from a later file. A
+`registrations` row's `league_code` is always explicit and validated against the
+season's chain — never derived from a division or "the season's only league".
+Every commit reports created/updated/skipped counts per entity and writes a
+batch audit plus entity audits attributed to the signed-in admin.
+
+The Import screen's "Setup profile" — seven quick questions (what you're
+setting up, whether you use clubs/divisions, importing players now, one venue
+or several, granting venue access now, first-time vs. updating) — is pure
+UI-routing state: it only decides which of the nine sheet cards are shown and
+which contextual hints appear, has no backend field of its own, and is never
+persisted. Every answer combination still submits through this one canonical
+import engine.
 
 ## 5. Onboarding status: what still blocks scheduling
 
-`GET /api/onboarding/status` (League-Admin only) derives progress from persisted
-records and the owner/league/venue rules — never a browser step counter. It
-returns ordered `steps`, a flat `blocking` list (each individually actionable —
-missing organization, league, owner tie, venue, rink, game ice, season,
-division, team, or a dangling parent), and non-blocking `warnings` (no players
-or officials yet, orphaned records). `ready_to_schedule` is true when nothing
-blocks; `complete` additionally requires the warnings clear. The wizard's
-**Start scheduling** action unlocks only when `ready_to_schedule` is true.
+`GET /api/v2/onboarding/status` (League-Admin only, canonical vocabulary —
+same shape as the legacy `GET /api/onboarding/status`) derives progress from
+persisted records and the owner/program/venue rules — never a browser step
+counter. It returns ordered `steps`, a flat `blocking` list (each individually
+actionable — missing organization, program, owner tie, venue, rink, game ice,
+season, league, division, team, or a dangling parent), and non-blocking
+`warnings` (no players or officials yet, orphaned records). `ready_to_schedule`
+is true when nothing blocks; `complete` additionally requires the warnings
+clear. The wizard's **Start scheduling** action unlocks only when
+`ready_to_schedule` is true.
 
 ## 6. Recovery: backup and restore
 

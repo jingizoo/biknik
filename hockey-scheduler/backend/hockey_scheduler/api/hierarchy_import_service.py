@@ -29,14 +29,22 @@ class ApiService(_BaseApiService):
     @staticmethod
     def _has_hierarchy_payload(sheets_csv: dict) -> bool:
         body = sheets_csv or {}
-        return body.get("import_type") == "hierarchy" or any(
-            body.get(key) for key in HIERARCHY_CSV_KEYS)
+        # #260 Slice F added a hierarchy `players` sheet whose CSV key
+        # (`players_csv`) collides with the legacy teams+players importer's
+        # own `players_csv` — the mere presence of that key can no longer
+        # disambiguate which importer a submission means. `import_type:
+        # "hierarchy"` is the only unambiguous signal now; every hierarchy
+        # caller (frontend, e2e, tests) already sends it explicitly.
+        return body.get("import_type") == "hierarchy"
 
     @staticmethod
     def _parse_hierarchy_payload(sheets_csv: dict) -> dict:
         body = sheets_csv or {}
+        # `players_csv` is deliberately excluded: it's a legitimate sheet in
+        # BOTH importers now (#260), so its presence alone is never a
+        # collision — only genuinely hierarchy-exclusive legacy keys are.
         legacy_keys = (
-            "teams_csv", "players_csv", "officials_csv",
+            "teams_csv", "officials_csv",
             "official_availability_csv", "rinks_csv", "ice_slots_csv")
         mixed = [key for key in legacy_keys if body.get(key)]
         if mixed:

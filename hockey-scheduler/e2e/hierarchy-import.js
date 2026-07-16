@@ -1,11 +1,13 @@
-// Complete hierarchy import browser journey (#174 PR E2).
+// Complete hierarchy import browser journey (#174 PR E2, #260 Slice F).
 //
 // At desktop and phone widths, a League Admin opens the existing Import screen,
-// downloads every explicit template, validates every hierarchy CSV (including
-// the permanent-teams and season-registrations sheets), commits the batch,
-// verifies the resulting team + registration appear in the commit summary, and
-// checks that no pasted hierarchy data was written to browser storage. Fails on
-// browser console/page errors.
+// answers the "Setup profile" wizard (pure UI-routing — every answer combo
+// still submits through the one canonical import engine), downloads every
+// visible template, validates every hierarchy CSV across all nine sheets,
+// commits the batch, verifies the resulting club/team/player/registration/
+// venue-access appear via the canonical v2 setup reads, and checks that no
+// pasted hierarchy data was written to browser storage. Fails on browser
+// console/page errors.
 const { chromium } = require("playwright");
 const { spawn } = require("child_process");
 const http = require("http");
@@ -23,30 +25,42 @@ const SHEETS = {
   organizations_csv:
     "organization_code,organization_name,short_name\n" +
     "BROWSERORG,Browser Ice Facilities,Browser Ice\n",
-  leagues_csv:
-    "league_code,organization_code,league_name,country,timezone\n" +
-    "BROWSERLEAGUE,BROWSERORG,Browser League,US,America/Chicago\n",
+  programs_csv:
+    "program_code,operator_organization_code,program_name,country,timezone\n" +
+    "BROWSERPROGRAM,BROWSERORG,Browser Program,US,America/Chicago\n",
   venues_rinks_csv:
-    "venue_code,organization_code,league_code,venue_name,address,timezone,rink_code,rink_name\n" +
-    "BROWSERVENUE,BROWSERORG,BROWSERLEAGUE,Browser Arena,1 Test Way,America/Chicago,BROWSERRINK,Browser Rink\n",
+    "venue_code,organization_code,venue_name,address,timezone,rink_code,rink_name\n" +
+    "BROWSERVENUE,BROWSERORG,Browser Arena,1 Test Way,America/Chicago,BROWSERRINK,Browser Rink\n",
   competition_csv:
-    "league_code,season_code,season_name,level_code,level_name,level_sort_order,division_code,division_name,age_group\n" +
-    "BROWSERLEAGUE,BROWSERSEASON,Browser Season,BROWSERLEVEL,Browser Level,1,BROWSERDIV,Browser Division,Adult\n",
+    "program_code,season_code,season_name,league_code,league_name,league_sort_order,division_code,division_name,age_group\n" +
+    "BROWSERPROGRAM,BROWSERSEASON,Browser Season,BROWSERLEAGUE,Browser League,1,BROWSERDIV,Browser Division,Adult\n",
+  clubs_csv:
+    "club_code,club_name,country\n" +
+    "BROWSERCLUB,Browser Club,US\n",
   permanent_teams_csv:
-    "league_code,team_code,team_name\n" +
-    "BROWSERLEAGUE,BROWSERTEAM,Browser Team\n",
+    "program_code,team_code,team_name,club_code\n" +
+    "BROWSERPROGRAM,BROWSERTEAM,Browser Team,BROWSERCLUB\n",
+  players_csv:
+    "player_code,team_code,first_name,last_name,jersey_number,position,email\n" +
+    "BROWSERPLAYER,BROWSERTEAM,Browser,Player,9,forward,browser.player@example.com\n",
   registrations_csv:
-    "season_code,team_code,division_code\n" +
-    "BROWSERSEASON,BROWSERTEAM,BROWSERDIV\n",
+    "season_code,team_code,league_code,division_code\n" +
+    "BROWSERSEASON,BROWSERTEAM,BROWSERLEAGUE,BROWSERDIV\n",
+  season_venue_access_csv:
+    "season_code,venue_code,active\n" +
+    "BROWSERSEASON,BROWSERVENUE,true\n",
 };
 
 const FILENAMES = {
   organizations_csv: "organizations.csv",
-  leagues_csv: "leagues.csv",
+  programs_csv: "programs.csv",
   venues_rinks_csv: "venues_rinks.csv",
   competition_csv: "competition.csv",
+  clubs_csv: "clubs.csv",
   permanent_teams_csv: "permanent_teams.csv",
+  players_csv: "players.csv",
   registrations_csv: "registrations.csv",
+  season_venue_access_csv: "season_venue_access.csv",
 };
 
 function waitForServer(url, timeoutMs) {
@@ -109,7 +123,22 @@ async function checkViewport(browser, viewport) {
     await page.click('.tab[data-tab="import"]');
     await page.waitForSelector("#hierarchy-import-panel", { timeout: 10000 });
 
+    // The Setup profile wizard is pure UI-routing (#260): its default
+    // answers already show all nine sheets, but this journey drives it
+    // explicitly (rather than relying on defaults) to prove the real wizard
+    // — not raw API calls — is what's being exercised. "Both" + "Yes" to
+    // every question keeps every sheet card visible.
+    await page.waitForSelector("#hierarchy-wizard", { timeout: 10000 });
+    await page.click('[data-hierarchy-wizard="operatorType"][data-hierarchy-wizard-value="both"]');
+    await page.click('[data-hierarchy-wizard="hasClubs"][data-hierarchy-wizard-value="yes"]');
+    await page.click('[data-hierarchy-wizard="usesDivisions"][data-hierarchy-wizard-value="yes"]');
+    await page.click('[data-hierarchy-wizard="importPlayers"][data-hierarchy-wizard-value="yes"]');
+    await page.click('[data-hierarchy-wizard="venueCount"][data-hierarchy-wizard-value="one"]');
+    await page.click('[data-hierarchy-wizard="grantVenueAccess"][data-hierarchy-wizard-value="yes"]');
+    await page.click('[data-hierarchy-wizard="importMode"][data-hierarchy-wizard-value="first-time"]');
+
     for (const [key, filename] of Object.entries(FILENAMES)) {
+      await page.waitForSelector(`[data-hierarchy-template="${key}"]`, { timeout: 5000 });
       const downloadPromise = page.waitForEvent("download");
       await page.click(`[data-hierarchy-template="${key}"]`);
       const download = await downloadPromise;
@@ -145,61 +174,85 @@ async function checkViewport(browser, viewport) {
     }
     await page.getByRole("heading", { name: "Hierarchy committed" }).waitFor();
     await page.getByText("organizations", { exact: true }).waitFor();
-    await page.getByText("rinks", { exact: true }).waitFor();
-    // The permanent team and its season registration were created (#180 import
-    // convergence): the commit summary lists both entities.
+    await page.getByText("clubs", { exact: true }).waitFor();
     await page.getByText("permanent_teams", { exact: true }).waitFor();
+    await page.getByText("players", { exact: true }).waitFor();
     await page.getByText("registrations", { exact: true }).waitFor();
+    await page.getByText("season_venue_access", { exact: true }).waitFor();
 
-    // Verify the ACTUAL resulting records via the setup APIs (#214 review),
-    // not just the summary labels: the imported permanent Team exists exactly
-    // once in its league (no division), with one active Season/Division
-    // registration.
+    // Verify the ACTUAL resulting records via the canonical v2 setup reads
+    // (#214/#260 review), not just the summary labels: the imported Club,
+    // permanent Team, Player, and active Season/Division registration all
+    // exist exactly once, the Team resolves its Club, and Venue.league_id
+    // is never written (#233 Slice E / #260).
     const verify = await page.evaluate(async () => {
       const getJson = async (url) =>
         (await fetch(url, { credentials: "same-origin" })).json();
-      const hierarchy = await getJson("/api/setup/hierarchy");
-      const league = (hierarchy.leagues || []).find((l) => l.name === "Browser League");
-      const season = league && (league.seasons || []).find((s) => s.name === "Browser Season");
-      const divisions = season
-        ? [...(season.levels || []).flatMap((lv) => lv.divisions || []),
-          ...(season.divisions_without_level || [])]
-        : [];
-      const division = divisions.find((d) => d.name === "Browser Division");
-      const teams = league ? await getJson(`/api/setup/leagues/${league.id}/teams`) : { teams: [] };
-      const imported = (teams.teams || []).filter((t) => t.name === "Browser Team");
-      const team = imported[0];
+      const overview = await getJson("/api/v2/setup/overview");
+      const program = (overview.programs || []).find((p) => p.name === "Browser Program");
+      const season = (overview.seasons || []).find((s) => s.name === "Browser Season"
+        && program && s.program_id === program.id);
+      const division = (overview.divisions || []).find((d) => d.name === "Browser Division"
+        && season && d.season_id === season.id);
+      const club = (overview.clubs || []).find((c) => c.name === "Browser Club");
+      const venue = (overview.venues || []).find((v) => v.name === "Browser Arena");
+      const teams = (overview.teams || []).filter((t) => t.name === "Browser Team"
+        && program && t.program_id === program.id);
+      const team = teams[0];
+      // /api/players?team_id=... returns a raw array (ApiService.list_players
+      // is not wrapped in a {players: [...]} envelope).
+      const playersResp = team ? await getJson(`/api/players?team_id=${team.id}`) : [];
+      const players = (Array.isArray(playersResp) ? playersResp : [])
+        .filter((p) => p.name === "Browser Player");
       const regsResp = season
-        ? await getJson(`/api/setup/seasons/${season.id}/team-registrations`)
+        ? await getJson(`/api/v2/setup/seasons/${season.id}/team-registrations`)
         : { registrations: [] };
       const regs = team ? (regsResp.registrations || []).filter((r) => r.team_id === team.id) : [];
+      const vaResp = season
+        ? await getJson(`/api/v2/setup/seasons/${season.id}/venue-access`)
+        : { venue_access: [] };
+      const grants = venue
+        ? (vaResp.venue_access || vaResp.grants || []).filter((g) => g.venue_id === venue.id)
+        : [];
       return {
-        leagueId: league && league.id, divisionId: division && division.id,
-        teamCount: imported.length, teamLeagueId: team && team.league_id,
-        teamDivisionId: team ? team.division_id : "no-team",
+        programId: program && program.id, seasonId: season && season.id,
+        divisionId: division && division.id, clubId: club && club.id,
+        venueId: venue && venue.id, venueLeagueId: venue ? venue.league_id : "no-venue",
+        teamCount: teams.length, teamClubId: team && team.club_id,
+        playerCount: players.length, playerTeamId: players[0] && players[0].team_id,
         regCount: regs.length, regDivisionId: regs[0] && regs[0].division_id,
         regActive: regs[0] && regs[0].active,
+        grantCount: grants.length, grantActive: grants[0] && grants[0].active,
       };
     });
     if (verify.teamCount !== 1) {
       throw new Error(`[${viewport.label}] expected exactly one imported Browser Team, got ${verify.teamCount}`);
     }
-    if (verify.teamLeagueId !== verify.leagueId) {
-      throw new Error(`[${viewport.label}] imported team is not owned by Browser League`);
+    if (verify.teamClubId !== verify.clubId) {
+      throw new Error(`[${viewport.label}] imported team did not resolve Browser Club`);
     }
-    if (verify.teamDivisionId !== null) {
-      throw new Error(`[${viewport.label}] a permanent team must carry no division, got ${verify.teamDivisionId}`);
+    // The canonical v2 overview omits Venue.league_id entirely (#233 Slice E)
+    // rather than exposing a field that's always null — its absence from the
+    // v2 API surface is itself the proof this importer never writes it.
+    if (verify.venueLeagueId !== undefined && verify.venueLeagueId !== null) {
+      throw new Error(`[${viewport.label}] imported venue must carry no league_id, got ${verify.venueLeagueId}`);
+    }
+    if (verify.playerCount !== 1) {
+      throw new Error(`[${viewport.label}] expected exactly one imported Browser Player, got ${verify.playerCount}`);
     }
     if (verify.regCount !== 1 || verify.regDivisionId !== verify.divisionId || !verify.regActive) {
       throw new Error(`[${viewport.label}] expected one active registration in Browser Division: ${JSON.stringify(verify)}`);
+    }
+    if (verify.grantCount !== 1 || !verify.grantActive) {
+      throw new Error(`[${viewport.label}] expected one active season venue access grant: ${JSON.stringify(verify)}`);
     }
 
     const browserStorage = await page.evaluate(() => JSON.stringify({
       local: { ...localStorage },
       session: { ...sessionStorage },
     }));
-    for (const marker of ["BROWSERORG", "BROWSERLEAGUE", "BROWSERVENUE",
-      "BROWSERDIV", "BROWSERTEAM"]) {
+    for (const marker of ["BROWSERORG", "BROWSERPROGRAM", "BROWSERVENUE",
+      "BROWSERDIV", "BROWSERTEAM", "BROWSERCLUB", "BROWSERPLAYER"]) {
       if (browserStorage.includes(marker)) {
         throw new Error(`[${viewport.label}] hierarchy data appeared in browser storage`);
       }
@@ -207,7 +260,7 @@ async function checkViewport(browser, viewport) {
     if (errors.length) {
       throw new Error(`[${viewport.label}] console/page errors:\n${errors.join("\n")}`);
     }
-    console.log(`[${viewport.label}] OK — downloaded, validated, and committed hierarchy.`);
+    console.log(`[${viewport.label}] OK — wizard-routed, downloaded, validated, and committed hierarchy.`);
   } catch (error) {
     throw new Error(`${error.message}\n--- demo server output ---\n${serverOutput}`);
   } finally {
