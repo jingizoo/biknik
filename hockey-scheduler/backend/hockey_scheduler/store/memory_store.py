@@ -25,6 +25,7 @@ from ..domain import (
     ContactDestination,
     DeliveryStatus,
     DeviceToken,
+    FactoryResetEvent,
     League,
     Program,
     Notification,
@@ -93,6 +94,9 @@ class InMemoryStore:
         self.guardian_links: Dict[str, GuardianLink] = {}
         self.reschedule_requests: Dict[str, RescheduleRequest] = {}
         self.setup_audit: List[SetupAuditLog] = []
+        # Never cleared by clear_all_data() (#256) — the durable record of a
+        # production factory-reset attempt must survive the wipe it describes.
+        self.factory_reset_events: List[FactoryResetEvent] = []
         # Plain int counters (not itertools.count): a count object is not
         # copyable on Python 3.14 (copy.copy raises "cannot pickle
         # 'itertools.count'"), which would break the transaction snapshot; an
@@ -148,6 +152,40 @@ class InMemoryStore:
                 current[:] = value
             else:
                 setattr(self, key, value)
+
+    # Attributes clear_all_data()/row_counts() never touch (#256): the lock
+    # and depth counter aren't data, ``_counters`` preserves id uniqueness
+    # across a reset, and ``factory_reset_events`` is the durable record of
+    # the reset attempt itself, which must survive the wipe it describes.
+    _UNCLEARABLE = frozenset({"_lock", "_txn_depth", "_counters",
+                              "factory_reset_events"})
+
+    def row_counts(self) -> dict:
+        """Row count per collection that ``clear_all_data()`` would empty
+        (#256 preview) — same attribute set, so a preview count can never
+        overstate or understate what an execute() would actually wipe."""
+        return {key: len(value) for key, value in self.__dict__.items()
+               if key not in self._UNCLEARABLE and isinstance(value, (dict, list))}
+
+    def clear_all_data(self) -> None:
+        """Delete every row from every collection (#256 production factory
+        reset). There is no schema to preserve for this store, but the id
+        counters are left untouched for the same reason as
+        ``SqlStore.clear_all_data()``: reusing an id after a reset could
+        collide with anything a durable ``factory_reset_events`` row, or an
+        external system, still references. ``factory_reset_events`` itself
+        is the one collection deliberately excluded — it is the durable
+        record of the reset attempt and must survive the wipe it describes.
+        Generic over every dict/list attribute rather than a hardcoded list,
+        so a future new entity collection is wiped automatically instead of
+        silently surviving a reset. Call within ``transaction()`` for
+        atomicity, exactly like ``SqlStore.clear_all_data()``.
+        """
+        for key, value in self.__dict__.items():
+            if key in self._UNCLEARABLE:
+                continue
+            if isinstance(value, (dict, list)):
+                value.clear()
 
     @contextmanager
     def transaction(self):
@@ -808,6 +846,13 @@ class InMemoryStore:
     def add_setup_audit(self, entry: SetupAuditLog) -> SetupAuditLog:
         self.setup_audit.append(entry)
         return entry
+
+    def add_factory_reset_event(self, event: FactoryResetEvent) -> FactoryResetEvent:
+        self.factory_reset_events.append(event)
+        return event
+
+    def all_factory_reset_events(self) -> List[FactoryResetEvent]:
+        return sorted(self.factory_reset_events, key=lambda e: e.started_at)
 
     # -- listings (interface shared with the SQL store) -------------------
     def all_programs(self) -> List[Program]:

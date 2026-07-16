@@ -527,3 +527,25 @@ class SetupAuditLog:
     at: datetime
     actor_id: Optional[str] = None
     detail: dict = field(default_factory=dict)
+
+
+@dataclass
+class FactoryResetEvent:
+    """Append-only record of a production factory-reset attempt (#256).
+
+    Deliberately outside the application audit trail (``SetupAuditLog``):
+    ``clear_all_data()`` wipes every ordinary table, including
+    ``setup_audit_logs`` itself, so this is the only record that survives a
+    completed reset. Never contains secrets or player PII — only operational
+    metadata (actor id, environment, pre-reset row counts by table, and the
+    outcome). ``environment`` is the deployment identifier (``APP_MODE`` plus
+    an optional operator-supplied label), not a secret.
+    """
+    id: str
+    actor_id: str
+    environment: str
+    started_at: datetime
+    result: str  # "success" | "failed"
+    pre_reset_counts: dict = field(default_factory=dict)
+    completed_at: Optional[datetime] = None
+    failure_reason: Optional[str] = None

@@ -33,6 +33,7 @@ from ..domain import (
     ContactDestination,
     DeliveryStatus,
     DeviceToken,
+    FactoryResetEvent,
     Notification,
     NotificationAudience,
     NotificationChannel,
@@ -183,6 +184,10 @@ SPECS = {
                             {"type": _enum(NotificationType), "at": _dt()}),
     SetupAuditLog: Spec(SetupAuditLog, "setup_audit_logs",
                         {"at": _dt(), "detail": _jsonc()}),
+    FactoryResetEvent: Spec(
+        FactoryResetEvent, "factory_reset_events",
+        {"started_at": _dt(), "completed_at": _dt(),
+         "pre_reset_counts": _jsonc()}),
     Official: Spec(Official, "officials", {"is_active": _bool()}),
     OfficialAssignment: Spec(OfficialAssignment, "official_assignments",
                              {"role": _enum(OfficialRole),
@@ -530,6 +535,63 @@ class SqlStore:
                     cur.execute("PRAGMA foreign_keys = ON")
         migrate(self.conn, self.dialect)
 
+    @staticmethod
+    def _clearable_tables():
+        """Every table ``clear_all_data()``/``row_counts()`` touch — a single
+        list so the two can never drift apart (#256)."""
+        return [spec.table for spec in SPECS.values()
+               if spec.table != "factory_reset_events"]
+
+    def row_counts(self) -> dict:
+        """Row count per table that ``clear_all_data()`` would delete (#256
+        preview) — built from the exact same table list, so a preview count
+        can never overstate or understate what an execute() would actually
+        wipe."""
+        counts = {}
+        with self._lock:
+            cur = self.conn.cursor()
+            for table in self._clearable_tables():
+                cur.execute(f"SELECT COUNT(*) AS n FROM {table}")
+                row = cur.fetchone()
+                counts[table] = row["n"] if row else 0
+        return counts
+
+    def clear_all_data(self) -> None:
+        """Delete every row from every table, but never drop or recreate the
+        schema (#256 production factory reset) — unlike ``reset_schema()``,
+        which is a demo/test-only DDL drop-and-rebuild, this preserves the
+        schema and the migration ledger exactly, touching only rows.
+
+        ``factory_reset_events`` is deliberately excluded: it is the durable
+        record of the reset attempt itself and must survive the wipe it
+        describes (the caller writes the outcome row after this returns).
+        ``schema_migrations`` and ``counters`` are outside ``SPECS`` and so
+        are never touched either — leaving ``counters`` alone means IDs
+        issued after a reset are never reused, which avoids colliding with
+        any pre-reset id a durable ``factory_reset_events`` row, an external
+        system, or a support ticket might still reference.
+
+        Call within ``store.transaction()`` for atomicity — same FK-ordering
+        technique as ``reset_schema()`` (see its docstring), applied to
+        row-level ``DELETE``/``TRUNCATE`` instead of ``DROP TABLE``.
+        """
+        tables = self._clearable_tables()
+        with self._lock:
+            cur = self.conn.cursor()
+            if self.backend == "postgres":
+                if tables:
+                    cur.execute(f"TRUNCATE TABLE {', '.join(tables)} CASCADE")
+                return
+            deferred = self.conn.in_transaction
+            cur.execute("PRAGMA defer_foreign_keys = ON" if deferred
+                        else "PRAGMA foreign_keys = OFF")
+            try:
+                for table in tables:
+                    cur.execute(f"DELETE FROM {table}")
+            finally:
+                if not deferred:
+                    cur.execute("PRAGMA foreign_keys = ON")
+
     # -- low-level ---------------------------------------------------------
     def _exec(self, query, params=()):
         cur = self.conn.cursor()
@@ -774,6 +836,10 @@ class SqlStore:
 
     def add_setup_audit(self, entry): return self._insert(entry)
     def all_setup_audit(self): return self._query(SetupAuditLog, order="id")
+
+    def add_factory_reset_event(self, event): return self._insert(event)
+    def all_factory_reset_events(self):
+        return self._query(FactoryResetEvent, order="started_at")
 
     # -- setup-entity deletion (#215 safe destructive actions) -------------
     # Single-record hard deletes; the service runs a pre-write dependency gate

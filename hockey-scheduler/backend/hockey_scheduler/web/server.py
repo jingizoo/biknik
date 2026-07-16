@@ -84,6 +84,18 @@ def _trust_proxy_headers() -> bool:
     """
     return (os.environ.get("TRUST_PROXY_HEADERS") or "").strip().lower() in ("1", "true", "yes")
 
+
+def _allow_production_factory_reset() -> bool:
+    """Whether the guarded production factory-reset workflow is reachable at
+    all (#256). Read fresh on every call, same idiom as ``_app_mode()``/
+    ``_trust_proxy_headers()``, so ops can flip it without a restart.
+    Defaults to False: this is a whole-installation data-destroying action
+    and must be an explicit, deliberate deployment opt-in, never an
+    accidental default.
+    """
+    return (os.environ.get("ALLOW_PRODUCTION_FACTORY_RESET") or "").strip().lower() in (
+        "1", "true", "yes")
+
 # Sessions live outside DemoState so signing in survives a demo-data reset.
 SESSIONS = SessionManager()
 
@@ -1499,6 +1511,47 @@ class Handler(BaseHTTPRequestHandler):
                 extra = [("Set-Cookie",
                           self._session_cookie(token, SESSION_MAX_AGE))]
             return self._send_json({"ok": True}, extra_headers=extra)
+
+        if path in ("/api/admin/factory-reset/preview",
+                    "/api/admin/factory-reset/execute"):
+            # Guarded production factory reset (#256): a whole-installation
+            # wipe, deliberately separate from the demo lifecycle above (which
+            # is itself unavailable in production) and from ordinary
+            # per-record deletion. Unreachable unless BOTH this process is
+            # actually running in production AND the deployment has opted in
+            # via ALLOW_PRODUCTION_FACTORY_RESET — the flag alone is not
+            # enough, since a demo deployment misconfigured with the flag set
+            # should still never expose this. Every remaining safety control
+            # (role/permission, password reauth, typed phrase, backup
+            # acknowledgement, challenge validity, single-in-flight) is
+            # enforced inside FactoryResetService itself, not here — the HTTP
+            # layer only owns the flag gate, rate limiting, and request
+            # parsing.
+            if not (_app_mode() == "production" and _allow_production_factory_reset()):
+                return self._send_json({"error": {
+                    "code": "factory_reset_not_available",
+                    "message": ("The production factory reset workflow is "
+                               "not enabled for this deployment.")}}, 403)
+            if self._rate_limited("factory_reset", limit=5, window_seconds=300):
+                return
+            if path == "/api/admin/factory-reset/preview":
+                return self._send_api(api.factory_reset_preview(actor_id=user_id))
+            environment = os.environ.get("DEPLOYMENT_ENV") or _app_mode()
+            result = api.factory_reset_execute(
+                actor_id=user_id,
+                password=body.get("password"),
+                typed_phrase=body.get("typed_phrase"),
+                challenge_token=body.get("challenge_token"),
+                backup_acknowledged=bool(body.get("backup_acknowledged")),
+                environment=environment)
+            if isinstance(result, dict) and result.get("error"):
+                return self._send_api(result)
+            # Success (#256): the wipe already dropped every session server
+            # side; also expire the caller's own cookie so the browser stops
+            # sending a token for an account it can no longer resolve, and
+            # require a fresh sign-in.
+            expire = self._session_cookie("", 0)
+            return self._send_json(result, extra_headers=[("Set-Cookie", expire)])
 
         # Quick action: add an available 90-min game slot on a rink for the
         # given date, after the latest existing slot on that rink that day.
