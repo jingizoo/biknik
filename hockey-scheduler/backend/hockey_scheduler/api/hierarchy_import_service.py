@@ -26,17 +26,62 @@ class ApiService(_BaseApiService):
     def hierarchy_import_templates() -> dict:
         return dict(HIERARCHY_TEMPLATES)
 
+    @catch
+    def get_hierarchy_import_codes(self) -> dict:
+        """Existing persisted external codes for the import wizard's
+        Program/League/Venue pickers (#260 review — Q2/Q3/Q6).
+
+        Read-only: an incremental import's wizard can offer already-set-up
+        entities alongside whatever codes are in the current upload draft.
+        This is never a second source of truth — the wizard only uses these
+        codes to decide which sheets/rows to show; every actual write still
+        goes through the one canonical dry-run/commit path.
+        """
+        programs = [p for p in self.store.all_programs() if p.external_ref]
+        programs_by_id = {p.id: p for p in self.store.all_programs()}
+        seasons_by_id = {s.id: s for s in self.store.all_seasons()}
+        leagues = [lg for lg in self.store.all_leagues() if lg.external_ref]
+        venues = [v for v in self.store.all_venues() if v.external_ref]
+
+        league_rows = []
+        for lg in leagues:
+            season = seasons_by_id.get(lg.season_id)
+            program = (programs_by_id.get(season.program_id)
+                      if season is not None else None)
+            league_rows.append({
+                "code": lg.external_ref, "name": lg.name,
+                "season_code": season.external_ref if season else None,
+                "program_code": (program.external_ref
+                                 if program is not None else None),
+            })
+
+        return {
+            "programs": [{"code": p.external_ref, "name": p.name}
+                        for p in programs],
+            "leagues": league_rows,
+            "venues": [{"code": v.external_ref, "name": v.name}
+                      for v in venues],
+        }
+
     @staticmethod
     def _has_hierarchy_payload(sheets_csv: dict) -> bool:
         body = sheets_csv or {}
-        return body.get("import_type") == "hierarchy" or any(
-            body.get(key) for key in HIERARCHY_CSV_KEYS)
+        # #260 Slice F added a hierarchy `players` sheet whose CSV key
+        # (`players_csv`) collides with the legacy teams+players importer's
+        # own `players_csv` — the mere presence of that key can no longer
+        # disambiguate which importer a submission means. `import_type:
+        # "hierarchy"` is the only unambiguous signal now; every hierarchy
+        # caller (frontend, e2e, tests) already sends it explicitly.
+        return body.get("import_type") == "hierarchy"
 
     @staticmethod
     def _parse_hierarchy_payload(sheets_csv: dict) -> dict:
         body = sheets_csv or {}
+        # `players_csv` is deliberately excluded: it's a legitimate sheet in
+        # BOTH importers now (#260), so its presence alone is never a
+        # collision — only genuinely hierarchy-exclusive legacy keys are.
         legacy_keys = (
-            "teams_csv", "players_csv", "officials_csv",
+            "teams_csv", "officials_csv",
             "official_availability_csv", "rinks_csv", "ice_slots_csv")
         mixed = [key for key in legacy_keys if body.get(key)]
         if mixed:

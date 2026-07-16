@@ -1,5 +1,9 @@
 name: Hockey Scheduler Backend CI
 
+concurrency:
+  group: hockey-ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 on:
   pull_request:
     paths:
@@ -104,6 +108,27 @@ jobs:
     defaults:
       run:
         working-directory: hockey-scheduler/e2e
+    strategy:
+      fail-fast: false
+      matrix:
+        # Four isolated runners (#260 Slice F): each shard runs its own
+        # journeys sequentially via one runner/server-per-journey lifecycle,
+        # same as before — only the grouping into parallel jobs is new.
+        # Journey pairs that hardcode the SAME desktop/phone ports
+        # (season-rollover/permanent-teams: 8143/8144, demo-lifecycle/
+        # team-club-optional: 8181/8182, allowed-venues/division-delete-
+        # cleanup: 8191/8192) are deliberately split across different
+        # shards so they never risk running concurrently on the same
+        # runner.
+        include:
+          - shard: 1
+            scripts: "smoke setup-claim onboarding-wizard hierarchy-import season-participation season-rollover"
+          - shard: 2
+            scripts: "team-division-participation allowed-venues venue-access-cleanup venue-sharing permanent-teams"
+          - shard: 3
+            scripts: "safe-destructive destructive-surfaces reset-visibility demo-lifecycle api-error-resilience"
+          - shard: 4
+            scripts: "v1-dependency-proof team-club-optional division-delete-cleanup registration-cleanup records-delete"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -116,45 +141,11 @@ jobs:
         run: |
           npm ci
           npx playwright install --with-deps chromium
-      - name: Run existing application smoke
-        run: npm run smoke
-      - name: Run production first-admin claim journey
-        run: npm run setup-claim
-      - name: Run guided Initial Setup journey
-        run: npm run onboarding-wizard
-      - name: Run complete hierarchy import journey
-        run: npm run hierarchy-import
-      - name: Run season participation journey
-        run: npm run season-participation
-      - name: Run season rollover journey
-        run: npm run season-rollover
-      - name: Run team/division participation journey
-        run: npm run team-division-participation
-      - name: Run Allowed Venues journey
-        run: npm run allowed-venues
-      - name: Run venue-access cleanup journey
-        run: npm run venue-access-cleanup
-      - name: Run venue-sharing journey
-        run: npm run venue-sharing
-      - name: Run permanent-teams structure journey
-        run: npm run permanent-teams
-      - name: Run safe destructive actions journey
-        run: npm run safe-destructive
-      - name: Run destructive-action surfaces journey
-        run: npm run destructive-surfaces
-      - name: Run reset-demo visibility journey
-        run: npm run reset-visibility
-      - name: Run demo lifecycle journey
-        run: npm run demo-lifecycle
-      - name: Run API error-resilience journey
-        run: npm run api-error-resilience
-      - name: Run v1-dependency proof journey
-        run: npm run v1-dependency-proof
-      - name: Run club-optional Team lifecycle journey
-        run: npm run team-club-optional
-      - name: Run Division-deletion cleanup journey
-        run: npm run division-delete-cleanup
-      - name: Run inactive-registration cleanup journey
-        run: npm run registration-cleanup
-      - name: Run Records delete-action journey
-        run: npm run records-delete
+      - name: Run shard ${{ matrix.shard }} journeys
+        run: |
+          set -e
+          for script in ${{ matrix.scripts }}; do
+            echo "::group::npm run $script"
+            npm run "$script"
+            echo "::endgroup::"
+          done

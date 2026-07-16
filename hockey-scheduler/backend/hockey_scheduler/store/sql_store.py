@@ -748,6 +748,7 @@ class SqlStore:
 
     def add_club(self, club): return self._insert(club)
     def get_club(self, club_id): return self._get(Club, club_id)
+    def save_club(self, club): return self._update(club)
     def all_clubs(self): return self._query(Club, order="id")
     def all_teams(self): return self._query(Team, order="id")
 

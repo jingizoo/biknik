@@ -133,6 +133,12 @@ class Club:
     id: str
     name: str
     country: str = ""
+    # Stable CSV-import matching key (#260 Slice F), mirroring every other
+    # setup entity's external_ref (migrations 009-011, 020). Club was the one
+    # entity still matched by name only — see migration 031's comment for why
+    # that was deferred and why it's closed here. Nullable: manually-created
+    # Clubs simply have no code.
+    external_ref: Optional[str] = None
 
 
 @dataclass

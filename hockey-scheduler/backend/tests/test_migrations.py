@@ -130,6 +130,8 @@ class MigrationApplyTest(unittest.TestCase):
             cur.execute("ALTER TABLE calendar_feed_tokens DROP COLUMN revoked_by")  # #131
             cur.execute("ALTER TABLE contact_destinations DROP COLUMN active")  # #232 review 4
             cur.execute("ALTER TABLE notification_preferences DROP COLUMN active")  # #232 review 4
+            cur.execute("DROP INDEX IF EXISTS ix_clubs_external_ref")  # #260 Slice F
+            cur.execute("ALTER TABLE clubs DROP COLUMN external_ref")  # #260 Slice F additive col
             cur.execute("DELETE FROM schema_migrations")
             cur.execute("INSERT INTO schema_migrations(version, applied_at) "
                         "VALUES ('0001_initial', '2026-01-01')")
@@ -151,6 +153,7 @@ class MigrationApplyTest(unittest.TestCase):
                 <= _table_columns(adopted, "calendar_feed_tokens"))
             self.assertIn("active", _table_columns(adopted, "contact_destinations"))
             self.assertIn("active", _table_columns(adopted, "notification_preferences"))
+            self.assertIn("external_ref", _table_columns(adopted, "clubs"))  # #260
             self.assertIn("organization_id", _table_columns(adopted, "venues"))
             # #233 C1b: the umbrella is now `programs` with operator_organization_id.
             self.assertIn("operator_organization_id",

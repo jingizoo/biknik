@@ -38,7 +38,7 @@ PROGRAM_KEYS = {"id", "name", "country", "timezone", "organization_id",
 SEASON_KEYS = {"id", "league_id", "name", "start_date", "end_date", "external_ref"}
 LEVEL_KEYS = {"id", "season_id", "name", "sort_order", "external_ref"}
 DIVISION_KEYS = {"id", "season_id", "name", "age_group", "level_id", "external_ref"}
-CLUB_KEYS = {"id", "name", "country"}
+CLUB_KEYS = {"id", "name", "country", "external_ref"}  # #260 Slice F
 TEAM_KEYS = {"id", "name", "division", "club_id", "division_id", "external_ref",
              "league_id"}
 VENUE_KEYS = {"id", "name", "address", "timezone", "organization_id", "league_id",

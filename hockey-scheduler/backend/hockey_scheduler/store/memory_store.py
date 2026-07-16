@@ -349,6 +349,10 @@ class InMemoryStore:
     def get_club(self, club_id: str) -> Optional[Club]:
         return self.clubs.get(club_id)
 
+    def save_club(self, club: Club) -> Club:
+        self.clubs[club.id] = club
+        return club
+
     def get_team(self, team_id: str) -> Optional[Team]:
         return self.teams.get(team_id)
 
