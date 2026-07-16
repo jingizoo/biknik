@@ -25,13 +25,13 @@ const VIEWPORTS = [
 
 // The locked Q1-Q7 order/content (#260 review) — asserted verbatim below.
 const WIZARD_QUESTIONS = [
-  "Q1. What are you setting up today?",
+  "Q1. Are you operating competitions, providing venues, or both?",
   "Q2. Which Programs do you run?",
   "Q3. Which Leagues exist in this Season?",
-  "Q4. Do your teams belong to clubs?",
-  "Q5. Do your leagues use divisions?",
+  "Q4. Does a League use Divisions?",
+  "Q5. Do Teams use Clubs?",
   "Q6. Which Venues may this Season use?",
-  "Q7. Does this Season use one Venue or multiple?",
+  "Q7. Can the Season use multiple Venues?",
 ];
 
 const ALWAYS_VISIBLE_SHEETS = ["organizations_csv"];
@@ -210,12 +210,12 @@ async function checkViewport(browser, viewport) {
     await assertSheetsVisible(page, "both",
       [...ALWAYS_VISIBLE_SHEETS, ...COMPETITION_TRACK_SHEETS, ...VENUE_TRACK_SHEETS], []);
 
-    // Q4 hasClubs="no" hides clubs.csv and hints permanent_teams.csv.
+    // Q5 (Do Teams use Clubs?) "no" hides clubs.csv and hints permanent_teams.csv.
     await page.click('[data-hierarchy-wizard="hasClubs"][data-hierarchy-wizard-value="no"]');
     await waitForSheetVisibility(page, "clubs_csv", false);
     await page.locator('[data-hierarchy-sheet="permanent_teams_csv"]')
       .locator("xpath=../p").getByText("leave club_code blank", { exact: false }).waitFor();
-    // Restore Q1/Q4 defaults for the real import below.
+    // Restore Q1/Q5 defaults for the real import below.
     await page.click('[data-hierarchy-wizard="hasClubs"][data-hierarchy-wizard-value="yes"]');
     await waitForSheetVisibility(page, "clubs_csv", true);
 

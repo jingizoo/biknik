@@ -307,18 +307,18 @@ function renderHierarchyWizard() {
   return `<section class="card" id="hierarchy-wizard">
       <div class="section-title" style="margin-top:0">Setup profile</div>
       <p class="muted">Seven questions to show only the sheets, sections, and rows you need below. They only control what's shown here — every answer combination still validates and commits through the same import.</p>
-      ${hierarchySingleQuestion(1, "operatorType", "What are you setting up today?", [
-        ["both", "Competitions & venues"], ["competitions", "Competitions only"], ["venues", "Venues only"]])}
+      ${hierarchySingleQuestion(1, "operatorType", "Are you operating competitions, providing venues, or both?", [
+        ["both", "Both"], ["competitions", "Competitions"], ["venues", "Venues"]])}
       ${hierarchyMultiQuestion(2, "programCodes", "Which Programs do you run?", hierarchyProgramOptions(),
         "No program codes yet — enter them in programs.csv below, or leave blank to include every program.")}
       ${hierarchyMultiQuestion(3, "leagueCodes", "Which Leagues exist in this Season?", hierarchyLeagueOptions(),
         "No league codes yet — enter them in competition.csv below, or leave blank to include every league.")}
-      ${hierarchySingleQuestion(4, "hasClubs", "Do your teams belong to clubs?", [["yes", "Yes"], ["no", "No"]])}
-      ${hierarchySingleQuestion(5, "usesDivisions", "Do your leagues use divisions?", [["yes", "Yes"], ["no", "No"]])}
+      ${hierarchySingleQuestion(4, "usesDivisions", "Does a League use Divisions?", [["yes", "Yes"], ["no", "No"]])}
+      ${hierarchySingleQuestion(5, "hasClubs", "Do Teams use Clubs?", [["yes", "Yes"], ["no", "No"]])}
       ${hierarchyMultiQuestion(6, "venueCodes", "Which Venues may this Season use?", hierarchyVenueOptions(),
         "No venue codes yet — enter them in venues_rinks.csv below, or leave blank to include every venue.")}
-      ${hierarchySingleQuestion(7, "venueMode", "Does this Season use one Venue or multiple?", [
-        ["one", "One"], ["multiple", "Multiple"]])}
+      ${hierarchySingleQuestion(7, "venueMode", "Can the Season use multiple Venues?", [
+        ["multiple", "Yes"], ["one", "No"]])}
     </section>`;
 }
 
