@@ -3495,7 +3495,13 @@ class SetupService:
 
     @_transactional
     def delete_team(self, team_id: str, actor_id: Optional[str] = None) -> Team:
-        team = self.store.get_team(team_id)
+        # Row-lock the team before scanning its dependents (#266 review): a
+        # concurrent coach-account creation locks the same row first, so the two
+        # serialize — either the coach is already inserted and blocks this
+        # delete, or this delete commits first and the create then sees the team
+        # gone. Without the lock, both could pass their checks and orphan a coach
+        # against a deleted team under READ COMMITTED.
+        team = self.store.get_team_for_update(team_id)
         if team is None:
             raise NotFoundError(f"Team {team_id} not found.")
         regs = [r for r in self.store.all_season_team_registrations()
@@ -3555,7 +3561,12 @@ class SetupService:
         rather than deleting it. Only an ACTIVE row counts as a live
         dependency, exactly like an active account/device token.
         """
-        official = self.store.get_official(official_id)
+        # Row-lock the Official before the account scan (#282 review): account
+        # create/rebind/reactivation take the same lock while resolving the
+        # official subject, so the two serialize. Without it, on PostgreSQL a
+        # concurrent bind could commit an active account between this scan and
+        # the delete and strand a live login against a deleted official.
+        official = self.store.get_official_for_update(official_id)
         if official is None:
             raise NotFoundError(f"Official {official_id} not found.")
         assignments = self.store.assignments_for_official(official_id)
@@ -3606,7 +3617,12 @@ class SetupService:
         by retiring it (``active=False``), never by deleting it (#232
         review 4).
         """
-        player = self.store.get_player(player_id)
+        # Row-lock the Player before the account scan (#282 review): account
+        # create/rebind/reactivation take the same lock while resolving the
+        # player subject, so the two serialize. Without it, on PostgreSQL a
+        # concurrent bind could commit an active account between this scan and
+        # the delete and strand a live login against a deleted player.
+        player = self.store.get_player_for_update(player_id)
         if player is None:
             raise NotFoundError(f"Player {player_id} not found.")
         rosters = self.store.roster_entries_for_player(player_id)

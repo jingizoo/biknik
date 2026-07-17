@@ -276,7 +276,7 @@ class OnboardingStatusServiceTest(unittest.TestCase):
         team = self._ready_hierarchy()
         self.api.create_player(team["id"], "Top Secret Kid", "forward")
         self.api.accounts.create_account("secret_user", "sup3r-secret-pw",
-                                         "coach")
+                                         "viewer")
         blob = json.dumps(self.api.get_onboarding_status("demo"))
         self.assertNotIn("Top Secret Kid", blob)
         self.assertNotIn("secret_user", blob)

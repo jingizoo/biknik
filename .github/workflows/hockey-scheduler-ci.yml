@@ -100,6 +100,7 @@ jobs:
           node --check hockey-scheduler/e2e/registration-cleanup.js
           node --check hockey-scheduler/e2e/venue-sharing.js
           node --check hockey-scheduler/e2e/records-delete.js
+          node --check hockey-scheduler/e2e/coach-scope.js
       - name: Check v1 route contract (#233 B2c)
         run: node hockey-scheduler/e2e/check-v1-route-contract.js
 
@@ -129,7 +130,7 @@ jobs:
           - shard: 3
             scripts: "safe-destructive destructive-surfaces reset-visibility factory-reset demo-lifecycle api-error-resilience"
           - shard: 4
-            scripts: "v1-dependency-proof team-club-optional division-delete-cleanup registration-cleanup records-delete"
+            scripts: "v1-dependency-proof team-club-optional division-delete-cleanup registration-cleanup records-delete coach-scope"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

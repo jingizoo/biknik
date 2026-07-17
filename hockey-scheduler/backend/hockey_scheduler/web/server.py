@@ -1468,7 +1468,13 @@ class Handler(BaseHTTPRequestHandler):
                             "required": perm.value if perm else None},
             }}, 403)
         # Resource scoping (#51): a coach only their team, a player only self.
-        violation = scope_violation(role, scope, path, body, api.store)
+        # An unbound Coach fails closed (#266) — the ONLY permitted unscoped
+        # coach is the demo-only X-Demo-Role dev fallback, which carries no
+        # backing account (user_id is None) and is never read in production, so
+        # the fallback stays explicit and impossible to activate there.
+        allow_dev_fallback = user_id is None and _app_mode() != "production"
+        violation = scope_violation(role, scope, path, body, api.store,
+                                    allow_unscoped_dev_fallback=allow_dev_fallback)
         if violation is not None:
             return self._send_json({"error": {
                 "code": "forbidden", "message": violation,
@@ -1719,6 +1725,21 @@ class Handler(BaseHTTPRequestHandler):
         # one (#67). No self-service signup — this is the only way an
         # account comes into existence besides the demo seed.
         if path == "/api/accounts":
+            # Reject unknown top-level fields (#266): the scope binding must
+            # travel inside `scope` (e.g. {"scope": {"team_id": …}}). A misplaced
+            # top-level `team_id` (or any stray key) would otherwise be silently
+            # dropped, creating an unscoped Coach that looks assigned to the
+            # operator — so fail loudly instead of quietly ignoring it.
+            _ACCOUNT_FIELDS = {"username", "password", "role", "scope"}
+            unknown = sorted(k for k in (body or {}) if k not in _ACCOUNT_FIELDS)
+            if unknown:
+                return self._send_json({"error": {
+                    "code": "validation_error",
+                    "message": ("Unknown field(s): " + ", ".join(unknown)
+                                + ". The scope binding (e.g. team_id) must be "
+                                "sent inside \"scope\"."),
+                    "details": {"reason": "unknown_field", "fields": unknown},
+                }}, 400)
             # Attribute the mint to the signed-in league admin (server-
             # resolved), never a client-supplied actor_id, so the audit
             # trail (#67) cannot be forged (#135).
@@ -1734,6 +1755,14 @@ class Handler(BaseHTTPRequestHandler):
                 # not just block future logins.
                 SESSIONS.revoke_for_user(api.store, acc.group(1))
             return self._send_api(res)
+        scp = re.match(r"^/api/accounts/([^/]+)/scope$", path)
+        if scp:
+            # Rebind an account's scope (#266 remediation): the audited actor is
+            # the server-resolved signed-in admin, never a client body value.
+            # The raw `scope` value is passed through UNCOERCED so the service
+            # can reject a non-object shape as a stable 400.
+            return self._send_api(api.rebind_user_account_scope(
+                scp.group(1), body.get("scope"), actor_id=user_id))
         rv = re.match(r"^/api/accounts/([^/]+)/sessions/([^/]+)/revoke$", path)
         if rv:
             # Revoke one session (#78). Auto-guarded by the POST authorize()

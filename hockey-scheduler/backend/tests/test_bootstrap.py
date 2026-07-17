@@ -166,8 +166,10 @@ class ProductionResetPreservesSqlStoreTest(unittest.TestCase):
         self.assertIn("firstadmin", self._accounts())
 
         # Add a second, non-admin account directly to the persistent store.
+        # A non-admin account that must survive a reboot; a viewer needs no
+        # team scope (#266).
         ApiService(SqlStore(self.db_path)).create_user_account(
-            "returning_coach", "pw2", "coach")
+            "returning_viewer", "pw2", "viewer")
 
         # Reboot with a DIFFERENT bootstrap user set.
         os.environ["BOOTSTRAP_ADMIN_USER"] = "shouldnotexist"
@@ -177,7 +179,7 @@ class ProductionResetPreservesSqlStoreTest(unittest.TestCase):
         names = self._accounts()
         # Nothing was wiped: both prior accounts survive the reboot.
         self.assertIn("firstadmin", names)
-        self.assertIn("returning_coach", names)
+        self.assertIn("returning_viewer", names)
         # And bootstrap did NOT clobber/add a new admin (accounts already exist).
         self.assertNotIn("shouldnotexist", names)
 

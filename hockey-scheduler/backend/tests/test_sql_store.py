@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
 
 from hockey_scheduler.api import ApiService
+from hockey_scheduler.domain import Team
 from hockey_scheduler.domain.errors import NotFoundError
 from hockey_scheduler.full_demo import build_full_demo_store
 from hockey_scheduler.services import SetupService
@@ -150,6 +151,7 @@ class SqlStoreParityTest(unittest.TestCase):
     def test_user_account_roundtrips_on_sql(self):
         # A created account (#67) persists — hashed password, role, scope,
         # active flag — and login verification works through the SQL store.
+        self.api.store.add_team(Team(id="team_sql", name="SQL Team"))  # #266
         row = self.api.create_user_account(
             "sql_coach", "sql-pw", "coach", scope={"team_id": "team_sql"})
         self.assertNotIn("password_hash", row)

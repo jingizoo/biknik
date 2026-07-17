@@ -197,6 +197,8 @@ class SessionScopePayloadUnchangedTest(unittest.TestCase):
     def test_coach_scope_shape_is_unchanged(self):
         api = ApiService(self.store if hasattr(self, "store") else InMemoryStore())
         # A coach account bound to a team — the canonical scoped-user example.
+        # The team must exist for the coach to be created (#266).
+        api.store.add_team(Team(id="team_9", name="Team 9"))
         created = api.create_user_account(
             "coach1", "not-a-real-secret", "coach", scope={"team_id": "team_9"})
         self.assertEqual(created["scope"], {"team_id": "team_9"})

@@ -270,6 +270,11 @@ class InMemoryStore:
     def get_player(self, player_id: str) -> Optional[Player]:
         return self.players.get(player_id)
 
+    def get_player_for_update(self, player_id: str) -> Optional[Player]:
+        # See get_team_for_update: transaction() holds self._lock for its whole
+        # body, so a plain read already serializes with a concurrent delete.
+        return self.players.get(player_id)
+
     def players_for_team(self, team_id: str) -> List[Player]:
         return [p for p in self.players.values() if p.team_id == team_id]
 
@@ -407,6 +412,12 @@ class InMemoryStore:
     def get_team(self, team_id: str) -> Optional[Team]:
         return self.teams.get(team_id)
 
+    def get_team_for_update(self, team_id: str) -> Optional[Team]:
+        # No row locking needed (#266): transaction() holds self._lock for its
+        # entire body, so a concurrent delete can't interleave with the caller's
+        # check-then-write. Provided for interface parity with SqlStore.
+        return self.teams.get(team_id)
+
     def teams_for_program(self, program_id: str) -> List[Team]:
         return [t for t in self.teams.values() if t.program_id == program_id]
 
@@ -511,6 +522,11 @@ class InMemoryStore:
         return official
 
     def get_official(self, official_id: str) -> Optional[Official]:
+        return self.officials.get(official_id)
+
+    def get_official_for_update(self, official_id: str) -> Optional[Official]:
+        # See get_team_for_update: transaction() holds self._lock for its whole
+        # body, so a plain read already serializes with a concurrent delete.
         return self.officials.get(official_id)
 
     def all_officials(self) -> List[Official]:
@@ -765,6 +781,12 @@ class InMemoryStore:
         return a
 
     def get_user_account(self, account_id: str) -> Optional[UserAccount]:
+        return self.user_accounts.get(account_id)
+
+    def get_user_account_for_update(self, account_id: str) -> Optional[UserAccount]:
+        # No row lock needed (#266 review): transaction() holds self._lock for
+        # its whole body, so set_active/rebind can't interleave. Interface parity
+        # with SqlStore.
         return self.user_accounts.get(account_id)
 
     def get_user_account_by_username(self, username: str) -> Optional[UserAccount]:

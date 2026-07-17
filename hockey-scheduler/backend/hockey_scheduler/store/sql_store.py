@@ -657,6 +657,21 @@ class SqlStore:
             row = cur.fetchone()
         return self._row_to_obj(model, row) if row else None
 
+    def _get_for_update(self, model, pk):
+        """Like ``_get`` but takes a row lock so a concurrent delete of the same
+        row is serialized (#266). On PostgreSQL this is ``SELECT ... FOR
+        UPDATE``, held until the surrounding ``transaction()`` commits; on
+        SQLite the connection-level write lock already serializes writers, so a
+        plain read suffices. Must be called inside ``transaction()`` for the
+        lock to persist across the subsequent write."""
+        spec = SPECS[model]
+        suffix = " FOR UPDATE" if self.backend == "postgres" else ""
+        with self._lock:
+            cur = self._exec(f"SELECT {', '.join(spec.names)} FROM {spec.table} "
+                             f"WHERE id = ?{suffix}", (pk,))
+            row = cur.fetchone()
+        return self._row_to_obj(model, row) if row else None
+
     def _query(self, model, where=None, params=(), order=None):
         spec = SPECS[model]
         q = f"SELECT {', '.join(spec.names)} FROM {spec.table}"
@@ -687,11 +702,14 @@ class SqlStore:
     # -- teams / players ---------------------------------------------------
     def add_team(self, team): return self._insert(team)
     def get_team(self, team_id): return self._get(Team, team_id)
+    def get_team_for_update(self, team_id): return self._get_for_update(Team, team_id)
     def save_team(self, team): return self._update(team)
     def teams_for_program(self, program_id):
         return self._query(Team, "program_id = ?", (program_id,), order="id")
     def add_player(self, player): return self._insert(player)
     def get_player(self, player_id): return self._get(Player, player_id)
+    def get_player_for_update(self, player_id):
+        return self._get_for_update(Player, player_id)
     def save_player(self, player): return self._update(player)
 
     def players_for_team(self, team_id):
@@ -968,6 +986,8 @@ class SqlStore:
     # -- officials (#30) ---------------------------------------------------
     def add_official(self, official): return self._insert(official)
     def get_official(self, official_id): return self._get(Official, official_id)
+    def get_official_for_update(self, official_id):
+        return self._get_for_update(Official, official_id)
     def all_officials(self): return self._query(Official, order="id")
     def save_official(self, official): return self._update(official)
 
@@ -1112,6 +1132,12 @@ class SqlStore:
     def save_user_account(self, a): return self._update(a)
     def get_user_account(self, account_id):
         return self._get(UserAccount, account_id)
+    def get_user_account_for_update(self, account_id):
+        # Row-locked read (#266 review): set_active/rebind read-modify-write the
+        # whole row, so a concurrent mutation of the same account would otherwise
+        # lost-update (e.g. a rebind clobbering a deactivation). Locking here
+        # serializes them on the account row within each transaction().
+        return self._get_for_update(UserAccount, account_id)
     def get_user_account_by_username(self, username):
         rows = self._query(UserAccount, "username = ?", (username,), order="id")
         return rows[0] if rows else None

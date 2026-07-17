@@ -232,10 +232,12 @@ class ServerAuthzTest(unittest.TestCase):
         self.assertEqual(status, 403)
 
     def test_league_admin_can_create_and_deactivate_accounts(self):
+        # A coach account now requires a real team scope (#266).
+        home_team = STATE.ids["home_team_id"]
         status, body = self._post(
             "/api/accounts",
             {"username": "http_created", "password": "pw", "role": "coach",
-             "scope": {"team_id": "team_x"}}, role="league_admin")
+             "scope": {"team_id": home_team}}, role="league_admin")
         self.assertEqual(status, 200)
         self.assertEqual(body["role"], "coach")
         self.assertNotIn("password_hash", body)

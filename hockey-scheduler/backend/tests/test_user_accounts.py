@@ -10,7 +10,7 @@ from http.server import ThreadingHTTPServer
 from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
 
 from hockey_scheduler.api import ApiService
-from hockey_scheduler.domain import Role
+from hockey_scheduler.domain import Role, Team
 from hockey_scheduler.services import AccountService
 from hockey_scheduler.services.passwords import (
     DUMMY_PASSWORD_HASH,
@@ -48,16 +48,45 @@ class PasswordHashingTest(unittest.TestCase):
         self.assertFalse(verify_password("demo", ""))
 
     def test_dummy_hash_uses_current_iteration_count(self):
-        # The unknown-username login path relies on this being real-cost,
-        # not a fast placeholder that would leak account existence via timing.
-        self.assertIn("pbkdf2_sha256$260000$", DUMMY_PASSWORD_HASH)
+        # The unknown-username login path relies on the DUMMY placeholder paying
+        # the SAME cost as a real hash (whatever the configured iteration count),
+        # so it can't leak account existence via timing.
+        from hockey_scheduler.services import passwords as _pw
+        self.assertIn(f"pbkdf2_sha256${_pw._ITERATIONS}$", DUMMY_PASSWORD_HASH)
         self.assertFalse(verify_password("anything", DUMMY_PASSWORD_HASH))
+
+    def test_production_default_iteration_count_is_strong(self):
+        # Guard the strong production default independently of the test-only
+        # override — nobody should weaken it.
+        from hockey_scheduler.services import passwords as _pw
+        self.assertEqual(_pw._DEFAULT_ITERATIONS, 260_000)
+
+    def test_production_ignores_weak_iteration_override(self):
+        # A stray HS_PBKDF2_ITERATIONS in a PRODUCTION process must NOT weaken
+        # hashing — the override is test-only (#266 review). Run in a fresh
+        # subprocess so the import-time resolution is exercised under
+        # APP_MODE=production with the override set to 1.
+        import os
+        import subprocess
+        import sys
+        env = dict(os.environ)
+        env["APP_MODE"] = "production"
+        env["HS_PBKDF2_ITERATIONS"] = "1"
+        code = (
+            "from hockey_scheduler.services.passwords import hash_password, _ITERATIONS;"
+            "assert _ITERATIONS == 260000, _ITERATIONS;"
+            "assert '$260000$' in hash_password('x'), 'weak production hash!'")
+        result = subprocess.run([sys.executable, "-c", code], env=env,
+                                cwd=str(BACKEND), capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
 
 class AccountServiceTest(unittest.TestCase):
     def setUp(self):
         self.store = InMemoryStore()
         self.accounts = AccountService(self.store, _clock)
+        # A real team so a coach account has a valid scope subject (#266).
+        self.store.add_team(Team(id="team_1", name="Test Team"))
 
     # -- create --------------------------------------------------------------
     def test_create_and_login(self):
@@ -159,7 +188,8 @@ class AccountServiceTest(unittest.TestCase):
         finally:
             account_mod.verify_password = original
 
-        self.assertIn("pbkdf2_sha256$260000$", seen["stored"])
+        from hockey_scheduler.services import passwords as _pw
+        self.assertIn(f"pbkdf2_sha256${_pw._ITERATIONS}$", seen["stored"])
 
     def test_deactivated_account_cannot_login(self):
         acct = self.accounts.create_account("user6", "pw", Role.VIEWER)
@@ -206,7 +236,9 @@ class ApiServiceAccountFacadeTest(unittest.TestCase):
         self.assertEqual(res["error"]["code"], "validation_error")
 
     def test_list_never_includes_password_hash(self):
-        self.api.create_user_account("op4", "pw", "coach", scope={"team_id": "t1"})
+        # A viewer needs no scope subject — this test is about the serialized
+        # row shape, not scoping (#266 requires a real team for a coach).
+        self.api.create_user_account("op4", "pw", "viewer")
         rows = self.api.list_user_accounts()["user_accounts"]
         self.assertTrue(rows)
         self.assertTrue(all("password_hash" not in r for r in rows))
@@ -269,22 +301,35 @@ class AccountCreationHttpTest(unittest.TestCase):
         except urllib.error.HTTPError as e:
             return e.code, json.loads(e.read() or b"{}")
 
-    def test_actor_attribution_is_server_resolved_not_client_supplied(self):
-        # The critical regression this issue's backend review item calls
-        # out: a forged body actor_id must never reach the audit trail —
-        # only the real, session-resolved league admin's own account id.
+    def test_body_actor_id_is_rejected_as_unknown_field(self):
+        # A forged body actor_id must never reach the audit trail. #266 makes
+        # this fail loudly: unknown top-level fields (actor_id included) are
+        # rejected outright rather than silently ignored, so no account or audit
+        # row is written at all.
         admin = self._login("admin")
-        admin_id = srv.STATE.api.store.get_user_account_by_username("admin").id
         status, body = self._req(
             admin, "POST", "/api/accounts",
             {"username": "spoof_test", "password": "pw", "role": "viewer",
              "actor_id": "spoofed_someone_else"})
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"]["code"], "validation_error")
+        self.assertIn("actor_id", body["error"]["details"]["fields"])
+        self.assertIsNone(
+            srv.STATE.api.store.get_user_account_by_username("spoof_test"))
+
+    def test_actor_attribution_is_server_resolved(self):
+        # A clean create is attributed to the real, session-resolved league
+        # admin's own account id — never a client-supplied value.
+        admin = self._login("admin")
+        admin_id = srv.STATE.api.store.get_user_account_by_username("admin").id
+        status, body = self._req(
+            admin, "POST", "/api/accounts",
+            {"username": "attributed_ok", "password": "pw", "role": "viewer"})
         self.assertEqual(status, 200)
         entries = srv.STATE.api.store.all_setup_audit()
         mint = next(e for e in reversed(entries)
                    if e.action == "user_account_created" and e.entity_id == body["id"])
         self.assertEqual(mint.actor_id, admin_id)
-        self.assertNotEqual(mint.actor_id, "spoofed_someone_else")
 
     def test_league_admin_can_create_a_coach_account_with_team_scope(self):
         admin = self._login("admin")

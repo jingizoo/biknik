@@ -1,9 +1,18 @@
 """Shared test helpers: a deterministic clock and a small game builder."""
 
+import os
 import sys
 from datetime import datetime, timedelta, timezone
 from http.cookies import SimpleCookie
 from pathlib import Path
+
+# Speed up the suite: PBKDF2 password hashing is deliberately expensive
+# (~80 ms/call in production), and the suite makes hundreds of hash/verify
+# calls. Lower the iteration count for tests ONLY — set here, before any
+# hockey_scheduler import so passwords.py reads it at module load. Production
+# never sets this var, so it keeps the strong default. setdefault so an
+# explicit override still wins.
+os.environ.setdefault("HS_PBKDF2_ITERATIONS", "1000")
 
 # Make ``hockey_scheduler`` importable when tests run from any directory.
 BACKEND = Path(__file__).resolve().parents[1]
