@@ -48,10 +48,18 @@ class PasswordHashingTest(unittest.TestCase):
         self.assertFalse(verify_password("demo", ""))
 
     def test_dummy_hash_uses_current_iteration_count(self):
-        # The unknown-username login path relies on this being real-cost,
-        # not a fast placeholder that would leak account existence via timing.
-        self.assertIn("pbkdf2_sha256$260000$", DUMMY_PASSWORD_HASH)
+        # The unknown-username login path relies on the DUMMY placeholder paying
+        # the SAME cost as a real hash (whatever the configured iteration count),
+        # so it can't leak account existence via timing.
+        from hockey_scheduler.services import passwords as _pw
+        self.assertIn(f"pbkdf2_sha256${_pw._ITERATIONS}$", DUMMY_PASSWORD_HASH)
         self.assertFalse(verify_password("anything", DUMMY_PASSWORD_HASH))
+
+    def test_production_default_iteration_count_is_strong(self):
+        # Guard the strong production default independently of the test-only
+        # override — nobody should weaken it.
+        from hockey_scheduler.services import passwords as _pw
+        self.assertEqual(_pw._DEFAULT_ITERATIONS, 260_000)
 
 
 class AccountServiceTest(unittest.TestCase):
@@ -161,7 +169,8 @@ class AccountServiceTest(unittest.TestCase):
         finally:
             account_mod.verify_password = original
 
-        self.assertIn("pbkdf2_sha256$260000$", seen["stored"])
+        from hockey_scheduler.services import passwords as _pw
+        self.assertIn(f"pbkdf2_sha256${_pw._ITERATIONS}$", seen["stored"])
 
     def test_deactivated_account_cannot_login(self):
         acct = self.accounts.create_account("user6", "pw", Role.VIEWER)

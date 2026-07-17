@@ -8,10 +8,18 @@ raised later without invalidating existing hashes.
 
 import hashlib
 import hmac
+import os
 import secrets
 
 _ALGORITHM = "pbkdf2_sha256"
-_ITERATIONS = 260_000
+# The strong production default. Never lowered in production — the override
+# below is set only by the test bootstrap (tests/helpers.py) so the suite's
+# hundreds of hash/verify calls don't dominate runtime. Safe because the
+# iteration count is embedded in every stored hash, so a low-cost test hash and
+# a strong production hash both verify correctly, and the DUMMY placeholder pays
+# the same (whatever) cost as a real hash, preserving the timing-oracle defence.
+_DEFAULT_ITERATIONS = 260_000
+_ITERATIONS = max(1, int(os.environ.get("HS_PBKDF2_ITERATIONS") or _DEFAULT_ITERATIONS))
 _SALT_BYTES = 16
 
 
