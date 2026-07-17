@@ -631,5 +631,52 @@ class CoachTeamDeleteRaceTest(unittest.TestCase):
                 team, "a coach was left bound to a concurrently-deleted team")
 
 
+@unittest.skipUnless(os.environ.get("TEST_DATABASE_URL"),
+                     "PostgreSQL required (set TEST_DATABASE_URL)")
+class AccountRebindDeactivateRaceTest(unittest.TestCase):
+    """Two-connection race: a scope rebind vs a deactivation of the SAME account
+    (#266 review). Both read-modify-write the whole row, so without the account
+    row lock one would lost-update the other — e.g. a rebind silently restoring
+    active=True over a committed deactivation. With the lock they serialize, and
+    the deterministic final state is BOTH applied: active=False AND the new
+    scope, regardless of which wins the lock."""
+
+    def setUp(self):
+        self.url = os.environ["TEST_DATABASE_URL"]
+        SqlStore(self.url).clear_all_data()
+
+    def test_rebind_and_deactivate_never_lost_update(self):
+        import threading
+        seed = SqlStore(self.url)
+        seed.add_team(Team(id="tA", name="A"))
+        seed.add_team(Team(id="tB", name="B"))
+        seed.add_user_account(UserAccount(
+            id="acct", username="coachx", password_hash=hash_password("pw"),
+            role=Role.COACH, created_at=_clock(),
+            scope={"team_id": "tA"}, active=True))
+
+        rebind_svc = AccountService(SqlStore(self.url), _clock)
+        deact_svc = AccountService(SqlStore(self.url), _clock)
+        barrier = threading.Barrier(2)
+
+        def rebind():
+            barrier.wait()
+            rebind_svc.rebind_account_scope("acct", {"team_id": "tB"})
+
+        def deactivate():
+            barrier.wait()
+            deact_svc.set_active("acct", False)
+
+        t1 = threading.Thread(target=rebind)
+        t2 = threading.Thread(target=deactivate)
+        t1.start(); t2.start(); t1.join(15); t2.join(15)
+
+        final = SqlStore(self.url).get_user_account("acct")
+        self.assertFalse(final.active,
+                         "deactivation was lost-updated by the concurrent rebind")
+        self.assertEqual(final.scope, {"team_id": "tB"},
+                         "rebind was lost-updated by the concurrent deactivation")
+
+
 if __name__ == "__main__":
     unittest.main()

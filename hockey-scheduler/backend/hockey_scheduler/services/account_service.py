@@ -254,8 +254,12 @@ class AccountService:
                    actor_id: Optional[str] = None) -> UserAccount:
         # Transactional (#266 review): the account save and its audit row must
         # commit together — an audit failure after the save would otherwise
-        # leave an unaudited activation/deactivation.
-        account = self.store.get_user_account(account_id)
+        # leave an unaudited activation/deactivation. Row-lock the account so a
+        # concurrent rebind can't lost-update this activation change (#266
+        # review): both read-modify-write the whole row, so without the lock one
+        # would silently clobber the other (e.g. a rebind restoring active=True
+        # over a deactivation, with no activation audit).
+        account = self.store.get_user_account_for_update(account_id)
         if account is None:
             raise NotFoundError("User account not found.")
         if active:
@@ -321,7 +325,10 @@ class AccountService:
         active or inactive accounts, so a deactivated legacy coach can be rebound
         and then reactivated.
         """
-        account = self.store.get_user_account(account_id)
+        # Row-lock the account (#266 review): rebind and set_active both
+        # read-modify-write the whole row, so locking serializes them and a
+        # concurrent deactivation can't be clobbered by this scope change.
+        account = self.store.get_user_account_for_update(account_id)
         if account is None:
             raise NotFoundError("User account not found.")
         if scope is not None and not isinstance(scope, dict):

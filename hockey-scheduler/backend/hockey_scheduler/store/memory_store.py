@@ -773,6 +773,12 @@ class InMemoryStore:
     def get_user_account(self, account_id: str) -> Optional[UserAccount]:
         return self.user_accounts.get(account_id)
 
+    def get_user_account_for_update(self, account_id: str) -> Optional[UserAccount]:
+        # No row lock needed (#266 review): transaction() holds self._lock for
+        # its whole body, so set_active/rebind can't interleave. Interface parity
+        # with SqlStore.
+        return self.user_accounts.get(account_id)
+
     def get_user_account_by_username(self, username: str) -> Optional[UserAccount]:
         for a in self.user_accounts.values():
             if a.username == username:

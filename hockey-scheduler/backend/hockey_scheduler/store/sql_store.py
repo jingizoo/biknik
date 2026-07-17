@@ -1128,6 +1128,12 @@ class SqlStore:
     def save_user_account(self, a): return self._update(a)
     def get_user_account(self, account_id):
         return self._get(UserAccount, account_id)
+    def get_user_account_for_update(self, account_id):
+        # Row-locked read (#266 review): set_active/rebind read-modify-write the
+        # whole row, so a concurrent mutation of the same account would otherwise
+        # lost-update (e.g. a rebind clobbering a deactivation). Locking here
+        # serializes them on the account row within each transaction().
+        return self._get_for_update(UserAccount, account_id)
     def get_user_account_by_username(self, username):
         rows = self._query(UserAccount, "username = ?", (username,), order="id")
         return rows[0] if rows else None
