@@ -154,6 +154,36 @@ class CoachScopeContract:
             scope={"player_id": "p_ok", "team_id": "team_home"})
         self.assertEqual(acct.scope, {"player_id": "p_ok", "team_id": "team_home"})
 
+    # -- player team scope must be the player's OWN team (#266 review) --------
+    def test_create_player_with_foreign_team_rejected(self):
+        self.store.add_team(Team(id="team_other", name="Bears"))
+        self.store.add_player(Player(id="pA", team_id="team_home", name="A",
+                                     position=Position.FORWARD))
+        with self.assertRaises(ValidationError) as cm:
+            self.accounts.create_account(
+                "p", "pw", Role.PLAYER,
+                scope={"player_id": "pA", "team_id": "team_other"})
+        self.assertEqual(cm.exception.details.get("reason"), "scope_team_mismatch")
+        self.assertEqual(self.store.all_user_accounts(), [])
+
+    def test_rebind_player_to_foreign_team_rejected_zero_audit(self):
+        self.store.add_team(Team(id="team_other", name="Bears"))
+        self.store.add_player(Player(id="pB", team_id="team_home", name="B",
+                                     position=Position.FORWARD))
+        acct = UserAccount(
+            id="user_pB", username="playerb", password_hash=hash_password("pw"),
+            role=Role.PLAYER, created_at=_clock(),
+            scope={"player_id": "pB", "team_id": "team_home"}, active=True)
+        self.store.add_user_account(acct)
+        with self.assertRaises(ValidationError) as cm:
+            self.accounts.rebind_account_scope(
+                acct.id, {"player_id": "pB", "team_id": "team_other"})
+        self.assertEqual(cm.exception.details.get("reason"), "scope_team_mismatch")
+        # Unchanged scope and no audit row.
+        self.assertEqual(self.store.get_user_account(acct.id).scope,
+                         {"player_id": "pB", "team_id": "team_home"})
+        self.assertEqual(self._scope_change_audits(), [])
+
     # -- audit detail is sanitized (#266 review) -----------------------------
     def _created_audits(self):
         return [a for a in self.store.all_setup_audit()
@@ -287,6 +317,7 @@ class CoachScopeHttpTest(unittest.TestCase):
         cls.thread.start()
         cls.gid = srv.STATE.game_id
         cls.home = srv.STATE.ids["home_team_id"]
+        cls.away = srv.STATE.ids["away_team_id"]
 
     @classmethod
     def tearDownClass(cls):
@@ -406,6 +437,37 @@ class CoachScopeHttpTest(unittest.TestCase):
                   {"username": "legacy_coach_rebind", "password": "pw"})
         status, _ = self._req(c, "GET", f"/api/games/{self.gid}/board")
         self.assertEqual(status, 200)
+
+    def test_player_cannot_be_rebound_to_foreign_team_over_http(self):
+        # Privacy: a player bound to their own team can read that team's game;
+        # an admin cannot rebind them onto another team (which would grant a
+        # private read of that team's game). Zero writes/audits on rejection,
+        # and the live session stays scoped to the player's own team.
+        store = srv.STATE.api.store
+        home_player = store.players_for_team(self.home)[0].id
+        store.add_user_account(UserAccount(
+            id="user_player_priv", username="player_priv",
+            password_hash=hash_password("pw"), role=Role.PLAYER,
+            created_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            scope={"player_id": home_player, "team_id": self.home}, active=True))
+        # The player can read their own team's game.
+        c = self._client()
+        self._req(c, "POST", "/api/auth/login",
+                  {"username": "player_priv", "password": "pw"})
+        status, _ = self._req(c, "GET", f"/api/games/{self.gid}/board")
+        self.assertEqual(status, 200)
+        # An admin rebind onto the AWAY team is refused with zero writes/audits.
+        admin = self._admin()
+        audits_before = len(store.all_setup_audit())
+        status, body = self._req(
+            admin, "POST", "/api/accounts/user_player_priv/scope",
+            {"scope": {"player_id": home_player, "team_id": self.away}})
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"]["details"].get("reason"), "scope_team_mismatch")
+        self.assertEqual(len(store.all_setup_audit()), audits_before)
+        # The live session is unchanged — still scoped to the home team only.
+        self.assertEqual(store.get_user_account("user_player_priv").scope,
+                         {"player_id": home_player, "team_id": self.home})
 
     def test_rebind_non_object_scope_is_400(self):
         self._insert_unscoped_coach("legacy_coach_badscope")
