@@ -78,6 +78,7 @@ from .setup_models import (
     GameResult,
     IceSlot,
     League,
+    LeagueSeason,
     Program,
     Notification,
     NotificationDelivery,
@@ -93,6 +94,7 @@ from .setup_models import (
     SeasonTeamRegistration,
     SeasonVenueAccess,
     SetupAuditLog,
+    TeamLeagueMigrationDecision,
     Venue,
 )
 from .time_utils import intervals_overlap
@@ -157,6 +159,7 @@ __all__ = [
     "InstallationState",
     "IceSlot",
     "League",
+    "LeagueSeason",
     "Program",
     "Official",
     "OfficialAssignment",
@@ -179,6 +182,7 @@ __all__ = [
     "Rink",
     "Season",
     "SetupAuditLog",
+    "TeamLeagueMigrationDecision",
     "FactoryResetEvent",
     "FactoryResetChallenge",
     "FactoryResetLock",

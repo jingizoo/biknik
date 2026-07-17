@@ -29,6 +29,7 @@ from ..domain import (
     FactoryResetEvent,
     FactoryResetLock,
     League,
+    LeagueSeason,
     Program,
     Notification,
     NotificationDelivery,
@@ -45,6 +46,7 @@ from ..domain import (
     Season,
     SeasonTeamRegistration,
     SeasonVenueAccess,
+    TeamLeagueMigrationDecision,
     Session,
     SetupAuditLog,
     SubstituteEnrollment,
@@ -72,8 +74,11 @@ class InMemoryStore:
         self.programs: Dict[str, Program] = {}
         self.seasons: Dict[str, Season] = {}
         self.leagues: Dict[str, League] = {}
+        self.league_seasons: Dict[str, LeagueSeason] = {}
         self.divisions: Dict[str, Division] = {}
         self.season_team_registrations: Dict[str, SeasonTeamRegistration] = {}
+        self.team_league_migration_decisions: Dict[
+            str, TeamLeagueMigrationDecision] = {}
         self.season_venue_access: Dict[str, SeasonVenueAccess] = {}
         self.clubs: Dict[str, Club] = {}
         self.venues: Dict[str, Venue] = {}
@@ -380,13 +385,47 @@ class InMemoryStore:
     def seasons_for_program(self, program_id: str) -> List[Season]:
         return [s for s in self.seasons.values() if s.program_id == program_id]
 
-    # Competition grouping: League (#233, formerly Level).
+    # Permanent competition grouping: League (#233/#283). Now a permanent
+    # child of a Program (``program_id``), not of a Season.
     def add_league(self, league: League) -> League:
         self.leagues[league.id] = league
         return league
 
     def get_league(self, league_id: str) -> Optional[League]:
         return self.leagues.get(league_id)
+
+    def leagues_for_program(self, program_id: str) -> List[League]:
+        return [lg for lg in self.leagues.values()
+                if lg.program_id == program_id]
+
+    # LeagueSeason (#283): a permanent League's participation in one Season.
+    def add_league_season(self, ls: LeagueSeason) -> LeagueSeason:
+        self.league_seasons[ls.id] = ls
+        return ls
+
+    def get_league_season(self, ls_id: str) -> Optional[LeagueSeason]:
+        return self.league_seasons.get(ls_id)
+
+    def all_league_seasons(self) -> List[LeagueSeason]:
+        return list(self.league_seasons.values())
+
+    def save_league_season(self, ls: LeagueSeason) -> LeagueSeason:
+        self.league_seasons[ls.id] = ls
+        return ls
+
+    def league_seasons_for_season(self, season_id: str) -> List[LeagueSeason]:
+        return [ls for ls in self.league_seasons.values()
+                if ls.season_id == season_id]
+
+    def league_seasons_for_league(self, league_id: str) -> List[LeagueSeason]:
+        return [ls for ls in self.league_seasons.values()
+                if ls.league_id == league_id]
+
+    def league_season_for(self, league_id: str,
+                          season_id: str) -> Optional[LeagueSeason]:
+        return next((ls for ls in self.league_seasons.values()
+                     if ls.league_id == league_id
+                     and ls.season_id == season_id), None)
 
     def add_division(self, division: Division) -> Division:
         self.divisions[division.id] = division
@@ -395,8 +434,17 @@ class InMemoryStore:
     def get_division(self, division_id: str) -> Optional[Division]:
         return self.divisions.get(division_id)
 
+    def divisions_for_league_season(
+            self, league_season_id: str) -> List[Division]:
+        return [d for d in self.divisions.values()
+                if d.league_season_id == league_season_id]
+
     def divisions_for_season(self, season_id: str) -> List[Division]:
-        return [d for d in self.divisions.values() if d.season_id == season_id]
+        """Every Division in a Season, across all its LeagueSeasons (#283)."""
+        ls_ids = {ls.id for ls in self.league_seasons.values()
+                  if ls.season_id == season_id}
+        return [d for d in self.divisions.values()
+                if d.league_season_id in ls_ids]
 
     def add_club(self, club: Club) -> Club:
         self.clubs[club.id] = club
@@ -439,15 +487,44 @@ class InMemoryStore:
     def all_season_team_registrations(self) -> List[SeasonTeamRegistration]:
         return list(self.season_team_registrations.values())
 
+    def registrations_for_league_season(
+            self, league_season_id: str) -> List[SeasonTeamRegistration]:
+        return [r for r in self.season_team_registrations.values()
+                if r.league_season_id == league_season_id]
+
+    def registration_for_team_in_league_season(
+            self, league_season_id: str,
+            team_id: str) -> Optional[SeasonTeamRegistration]:
+        return next((r for r in self.season_team_registrations.values()
+                     if r.league_season_id == league_season_id
+                     and r.team_id == team_id), None)
+
     def registrations_for_season(
             self, season_id: str) -> List[SeasonTeamRegistration]:
+        """Every registration in a Season, across all its LeagueSeasons (#283)."""
+        ls_ids = {ls.id for ls in self.league_seasons.values()
+                  if ls.season_id == season_id}
         return [r for r in self.season_team_registrations.values()
-                if r.season_id == season_id]
+                if r.league_season_id in ls_ids]
 
-    def registration_for_team_in_season(
-            self, season_id: str, team_id: str) -> Optional[SeasonTeamRegistration]:
-        return next((r for r in self.season_team_registrations.values()
-                     if r.season_id == season_id and r.team_id == team_id), None)
+    # -- team → permanent League migration decisions (#283 migration 035) ---
+    def add_team_league_migration_decision(
+            self, decision: TeamLeagueMigrationDecision
+    ) -> TeamLeagueMigrationDecision:
+        self.team_league_migration_decisions[decision.id] = decision
+        return decision
+
+    def all_team_league_migration_decisions(
+            self) -> List[TeamLeagueMigrationDecision]:
+        return list(self.team_league_migration_decisions.values())
+
+    def team_league_migration_decision_for(
+            self, team_id: str) -> Optional[TeamLeagueMigrationDecision]:
+        return next((d for d in self.team_league_migration_decisions.values()
+                     if d.team_id == team_id), None)
+
+    def delete_team_league_migration_decision(self, decision_id: str) -> None:
+        self.team_league_migration_decisions.pop(decision_id, None)
 
     # -- season venue access (#233 Slice E) ---------------------------------
     def add_season_venue_access(

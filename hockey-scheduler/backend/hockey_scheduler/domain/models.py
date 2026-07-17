@@ -40,6 +40,14 @@ class Team:
     # are backfilled from their division's season program by migration 021, and a
     # team created without a division has none until one is derived/assigned.
     program_id: Optional[str] = None
+    # Permanent owning League — the hard competition boundary (#283). A Team
+    # belongs to exactly one League and may only register (per Season) into that
+    # League. Nullable at the model level; migration 034 assigns a permanent
+    # league_id to every existing Team (unambiguous mappings automatically; an
+    # operator decision for Teams historically registered across multiple
+    # Leagues). The invariant ``league.program_id == team.program_id`` (a Team's
+    # League and Program agree) is enforced in the service layer.
+    league_id: Optional[str] = None
 
 
 @dataclass
