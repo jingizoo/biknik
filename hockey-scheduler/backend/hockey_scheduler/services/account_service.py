@@ -61,6 +61,18 @@ class AccountService:
         except ValueError:
             raise ValidationError(f"Unknown role '{role}'.")
 
+    # The ONLY scope keys each role may carry (#266 review). Any other key is
+    # rejected so a scope can never smuggle in an authority binding the role's
+    # session resolution/gate doesn't honor (e.g. a coach carrying a stray
+    # player_id, or an admin/guardian carrying any scope at all). A player may
+    # carry team_id in addition to player_id — it gates their private game reads
+    # (web/scope.py). Roles absent from this map allow NO scope keys.
+    _ALLOWED_SCOPE_KEYS = {
+        Role.COACH: frozenset({"team_id"}),
+        Role.PLAYER: frozenset({"player_id", "team_id"}),
+        Role.OFFICIAL: frozenset({"official_id"}),
+    }
+
     def _validate_scope_subjects(self, role, scope) -> None:
         """Resolve every role-scoped subject in ``scope`` to a real record, or
         raise a stable ``ValidationError``. Shared by account creation and the
@@ -73,6 +85,16 @@ class AccountService:
         deleting a Player/Official then binding the old id would recreate the
         exact dangling live identity that issue set out to prevent.
         """
+        # Reject any scope key the role does not explicitly support (#266
+        # review) — an unexpected key is a misconfiguration, not silently kept.
+        allowed = self._ALLOWED_SCOPE_KEYS.get(role, frozenset())
+        unexpected = sorted(k for k in scope if k not in allowed)
+        if unexpected:
+            raise ValidationError(
+                f"Scope key(s) not allowed for role {role.value}: "
+                + ", ".join(unexpected) + ".",
+                {"reason": "unknown_scope_key", "role": role.value,
+                 "keys": unexpected})
         official_id = scope.get("official_id")
         if official_id and self.store.get_official(official_id) is None:
             raise ValidationError(

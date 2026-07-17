@@ -28,7 +28,8 @@ from http.server import ThreadingHTTPServer
 from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
 
 from hockey_scheduler.api import ApiService
-from hockey_scheduler.domain import Role, Team, UserAccount
+from hockey_scheduler.domain import (
+    Official, Player, Position, Role, Team, UserAccount)
 from hockey_scheduler.domain.errors import ValidationError
 from hockey_scheduler.services.account_service import AccountService
 from hockey_scheduler.services.passwords import hash_password
@@ -120,6 +121,38 @@ class CoachScopeContract:
             self.accounts.create_account("c", "pw", Role.COACH, scope="team_home")
         self.assertEqual(cm.exception.details.get("reason"), "invalid_scope")
         self.assertEqual(self.store.all_user_accounts(), [])
+
+    # -- per-role scope-key allowlist (#266 review) --------------------------
+    def test_coach_scope_rejects_extra_key(self):
+        with self.assertRaises(ValidationError) as cm:
+            self.accounts.create_account(
+                "c", "pw", Role.COACH,
+                scope={"team_id": "team_home", "player_id": "p1"})
+        self.assertEqual(cm.exception.details.get("reason"), "unknown_scope_key")
+        self.assertEqual(cm.exception.details.get("keys"), ["player_id"])
+        self.assertEqual(self.store.all_user_accounts(), [])
+
+    def test_official_scope_rejects_team_id(self):
+        self.store.add_official(Official(id="off1", name="Ref One"))
+        with self.assertRaises(ValidationError) as cm:
+            self.accounts.create_account(
+                "o", "pw", Role.OFFICIAL,
+                scope={"official_id": "off1", "team_id": "team_home"})
+        self.assertEqual(cm.exception.details.get("reason"), "unknown_scope_key")
+
+    def test_admin_rejects_any_scope_key(self):
+        with self.assertRaises(ValidationError) as cm:
+            self.accounts.create_account(
+                "a", "pw", Role.LEAGUE_ADMIN, scope={"team_id": "team_home"})
+        self.assertEqual(cm.exception.details.get("reason"), "unknown_scope_key")
+
+    def test_player_scope_allows_player_id_and_team_id(self):
+        self.store.add_player(Player(id="p_ok", team_id="team_home", name="P",
+                                     position=Position.FORWARD))
+        acct = self.accounts.create_account(
+            "p", "pw", Role.PLAYER,
+            scope={"player_id": "p_ok", "team_id": "team_home"})
+        self.assertEqual(acct.scope, {"player_id": "p_ok", "team_id": "team_home"})
 
     # -- audited scope rebind remediation (#266 review blocker 4) ------------
     def _scope_change_audits(self):
