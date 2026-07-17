@@ -61,6 +61,25 @@ class PasswordHashingTest(unittest.TestCase):
         from hockey_scheduler.services import passwords as _pw
         self.assertEqual(_pw._DEFAULT_ITERATIONS, 260_000)
 
+    def test_production_ignores_weak_iteration_override(self):
+        # A stray HS_PBKDF2_ITERATIONS in a PRODUCTION process must NOT weaken
+        # hashing — the override is test-only (#266 review). Run in a fresh
+        # subprocess so the import-time resolution is exercised under
+        # APP_MODE=production with the override set to 1.
+        import os
+        import subprocess
+        import sys
+        env = dict(os.environ)
+        env["APP_MODE"] = "production"
+        env["HS_PBKDF2_ITERATIONS"] = "1"
+        code = (
+            "from hockey_scheduler.services.passwords import hash_password, _ITERATIONS;"
+            "assert _ITERATIONS == 260000, _ITERATIONS;"
+            "assert '$260000$' in hash_password('x'), 'weak production hash!'")
+        result = subprocess.run([sys.executable, "-c", code], env=env,
+                                cwd=str(BACKEND), capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
 
 class AccountServiceTest(unittest.TestCase):
     def setUp(self):

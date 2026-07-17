@@ -12,15 +12,34 @@ import os
 import secrets
 
 _ALGORITHM = "pbkdf2_sha256"
-# The strong production default. Never lowered in production — the override
-# below is set only by the test bootstrap (tests/helpers.py) so the suite's
-# hundreds of hash/verify calls don't dominate runtime. Safe because the
-# iteration count is embedded in every stored hash, so a low-cost test hash and
-# a strong production hash both verify correctly, and the DUMMY placeholder pays
-# the same (whatever) cost as a real hash, preserving the timing-oracle defence.
 _DEFAULT_ITERATIONS = 260_000
-_ITERATIONS = max(1, int(os.environ.get("HS_PBKDF2_ITERATIONS") or _DEFAULT_ITERATIONS))
 _SALT_BYTES = 16
+
+
+def _resolve_iterations() -> int:
+    """Resolve the PBKDF2 cost once, at import.
+
+    ``HS_PBKDF2_ITERATIONS`` is a TEST-only knob: the test bootstrap
+    (tests/helpers.py) lowers it so the suite's hundreds of ~80 ms hash/verify
+    calls don't dominate runtime. It is **ignored whenever APP_MODE=production**,
+    so a stray or accidental override in a production environment can NEVER
+    weaken hashing below the strong default (#266 review) — production always
+    gets ``_DEFAULT_ITERATIONS``. Safe to lower elsewhere because the iteration
+    count is embedded in every stored hash (so low-cost test hashes and strong
+    production hashes both verify), and the DUMMY placeholder pays the same cost
+    as a real hash either way, preserving the timing-oracle defence.
+    """
+    production = (os.environ.get("APP_MODE") or "demo").strip().lower() == "production"
+    override = os.environ.get("HS_PBKDF2_ITERATIONS")
+    if override and not production:
+        try:
+            return max(1, int(override))
+        except ValueError:
+            return _DEFAULT_ITERATIONS
+    return _DEFAULT_ITERATIONS
+
+
+_ITERATIONS = _resolve_iterations()
 
 
 def hash_password(password: str) -> str:
