@@ -123,24 +123,25 @@ class AccountService:
             raise ValidationError(
                 "That player does not exist.",
                 {"reason": "scope_subject_missing", "player_id": player_id})
-        # A Player's team scope is only ever valid as that player's OWN team
-        # (#266 review). team_id gates the player's private game reads
-        # (web/scope.py), so a team_id must never be trusted on its own: without
-        # a player_id there is no ownership to check, which would let an admin
-        # grant a login read access to any team's rosters/availability. Require
-        # the player_id AND derive/verify the team from that Player's record.
+        # A Player account MUST carry its own player_id (#266/#282 review): a
+        # Player holds RESPOND_AVAILABILITY and substitute self-service, and the
+        # scope gate fails closed for an unscoped Player, so an account with no
+        # player_id has no identity to act as and would be refused at every
+        # turn — reject it at creation/rebind rather than mint a dead login.
+        # The team_id, when present, is only ever valid as that player's OWN
+        # team (team_id gates private game reads in web/scope.py), so it is
+        # verified against the resolved Player and never trusted on its own.
         if role == Role.PLAYER:
+            if not player_id:
+                raise ValidationError(
+                    "A player account must be assigned a player.",
+                    {"reason": "scope_required", "field": "player_id"})
             team_id = scope.get("team_id")
-            if team_id:
-                if player is None:
-                    raise ValidationError(
-                        "A player's team scope requires the player's own id.",
-                        {"reason": "scope_required", "field": "player_id"})
-                if team_id != player.team_id:
-                    raise ValidationError(
-                        "A player's team scope must be the player's own team.",
-                        {"reason": "scope_team_mismatch",
-                         "player_id": player_id, "team_id": team_id})
+            if team_id and team_id != player.team_id:
+                raise ValidationError(
+                    "A player's team scope must be the player's own team.",
+                    {"reason": "scope_team_mismatch",
+                     "player_id": player_id, "team_id": team_id})
         # A Coach's authority is entirely its team scope (#266): an account with
         # no team is refused at the scope gate and can manage no roster, so it
         # must be bound to a real, non-deleted Team.
@@ -289,6 +290,16 @@ class AccountService:
                     {"reason": "scope_subject_missing", "account_id": account_id,
                      "official_id": official_id})
             player_id = scope.get("player_id")
+            # A Player account must carry a valid player_id to be reactivated
+            # (#282 review): the scope gate fails closed for an unscoped Player,
+            # so reactivating one would resurrect a login that can act for no
+            # one — refuse until it is rebound to a real player.
+            if account.role == Role.PLAYER and not player_id:
+                raise ValidationError(
+                    "This player account has no assigned player; assign a "
+                    "player before reactivating.",
+                    {"reason": "scope_required", "account_id": account_id,
+                     "field": "player_id"})
             if player_id and self.store.get_player_for_update(player_id) is None:
                 raise ValidationError(
                     "This account's player no longer exists; rebind it to "

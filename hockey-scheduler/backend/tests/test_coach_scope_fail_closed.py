@@ -208,6 +208,57 @@ class CoachScopeContract:
                          {"player_id": "pB", "team_id": "team_home"})
         self.assertEqual(self._scope_change_audits(), [])
 
+    # -- player scope fails closed with no player_id (#282 review) -----------
+    def test_create_player_empty_scope_rejected(self):
+        # An empty Player scope has no self-service identity (#282): a Player
+        # holds RESPOND_AVAILABILITY, so an unscoped one could act for any
+        # player id — rejected outright, zero writes/audits.
+        with self.assertRaises(ValidationError) as cm:
+            self.accounts.create_account("p", "pw", Role.PLAYER, scope={})
+        self.assertEqual(cm.exception.details.get("reason"), "scope_required")
+        self.assertEqual(cm.exception.details.get("field"), "player_id")
+        self.assertEqual(self.store.all_user_accounts(), [])
+        self.assertEqual(
+            [a for a in self.store.all_setup_audit()
+             if a.action == "user_account_created"], [])
+
+    def test_create_player_no_scope_rejected(self):
+        # scope=None (the field omitted entirely) is the same fail-closed case.
+        with self.assertRaises(ValidationError) as cm:
+            self.accounts.create_account("p", "pw", Role.PLAYER)
+        self.assertEqual(cm.exception.details.get("reason"), "scope_required")
+        self.assertEqual(self.store.all_user_accounts(), [])
+
+    def test_rebind_player_to_empty_scope_rejected_zero_audit(self):
+        self.store.add_player(Player(id="pE", team_id="team_home", name="E",
+                                     position=Position.FORWARD))
+        acct = UserAccount(
+            id="user_pE", username="playere", password_hash=hash_password("pw"),
+            role=Role.PLAYER, created_at=_clock(),
+            scope={"player_id": "pE", "team_id": "team_home"}, active=True)
+        self.store.add_user_account(acct)
+        with self.assertRaises(ValidationError) as cm:
+            self.accounts.rebind_account_scope(acct.id, {})
+        self.assertEqual(cm.exception.details.get("reason"), "scope_required")
+        self.assertEqual(cm.exception.details.get("field"), "player_id")
+        self.assertEqual(self.store.get_user_account(acct.id).scope,
+                         {"player_id": "pE", "team_id": "team_home"})
+        self.assertEqual(self._scope_change_audits(), [])
+
+    def test_reactivate_player_with_empty_scope_rejected(self):
+        # A legacy inactive Player with no player_id must not be reactivated
+        # into a login the scope gate now refuses (#282).
+        acct = UserAccount(
+            id="user_legacyp", username="legacyp",
+            password_hash=hash_password("pw"), role=Role.PLAYER,
+            created_at=_clock(), scope={}, active=False)
+        self.store.add_user_account(acct)
+        with self.assertRaises(ValidationError) as cm:
+            self.accounts.set_active(acct.id, True)
+        self.assertEqual(cm.exception.details.get("reason"), "scope_required")
+        self.assertEqual(cm.exception.details.get("field"), "player_id")
+        self.assertFalse(self.store.get_user_account(acct.id).active)
+
     # -- audit detail is sanitized (#266 review) -----------------------------
     def _created_audits(self):
         return [a for a in self.store.all_setup_audit()
@@ -513,6 +564,61 @@ class CoachScopeHttpTest(unittest.TestCase):
         self.assertEqual(len(store.all_setup_audit()), before)
         self.assertEqual(store.get_user_account("user_player_toonly").scope,
                          {"player_id": home_player, "team_id": self.home})
+
+    # -- player fail-closed with no player_id, over HTTP (#282 review) -------
+    def test_create_player_with_empty_scope_is_400_zero_writes(self):
+        admin = self._admin()
+        store = srv.STATE.api.store
+        audits_before = len(store.all_setup_audit())
+        status, body = self._req(admin, "POST", "/api/accounts",
+                                 {"username": "player_noid", "password": "pw",
+                                  "role": "player", "scope": {}})
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"]["code"], "validation_error")
+        self.assertEqual(body["error"]["details"].get("reason"), "scope_required")
+        self.assertEqual(body["error"]["details"].get("field"), "player_id")
+        self.assertIsNone(store.get_user_account_by_username("player_noid"))
+        self.assertEqual(len(store.all_setup_audit()), audits_before)
+
+    def test_rebind_player_to_empty_scope_is_400_zero_writes(self):
+        store = srv.STATE.api.store
+        home_player = store.players_for_team(self.home)[0].id
+        store.add_user_account(UserAccount(
+            id="user_player_empty", username="player_empty",
+            password_hash=hash_password("pw"), role=Role.PLAYER,
+            created_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            scope={"player_id": home_player, "team_id": self.home}, active=True))
+        admin = self._admin()
+        before = len(store.all_setup_audit())
+        status, body = self._req(
+            admin, "POST", "/api/accounts/user_player_empty/scope", {"scope": {}})
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"]["details"].get("reason"), "scope_required")
+        self.assertEqual(body["error"]["details"].get("field"), "player_id")
+        self.assertEqual(len(store.all_setup_audit()), before)
+        self.assertEqual(store.get_user_account("user_player_empty").scope,
+                         {"player_id": home_player, "team_id": self.home})
+
+    def test_existing_unscoped_player_forbidden_on_self_service(self):
+        # A pre-fix legacy ACTIVE player with no player_id (inserted directly,
+        # since the service now refuses to create one) must NOT be able to run
+        # a self-service action for an arbitrary player id — the live scope gate
+        # fails closed (#282), so the availability response is 403.
+        store = srv.STATE.api.store
+        target = store.players_for_team(self.home)[0].id
+        store.add_user_account(UserAccount(
+            id="user_player_legacy", username="player_legacy",
+            password_hash=hash_password("pw"), role=Role.PLAYER,
+            created_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            scope={}, active=True))
+        c = self._client()
+        self._req(c, "POST", "/api/auth/login",
+                  {"username": "player_legacy", "password": "pw"})
+        status, body = self._req(
+            c, "POST", f"/api/games/{self.gid}/availability",
+            {"player_id": target, "status": "available"})
+        self.assertEqual(status, 403)
+        self.assertEqual(body["error"]["code"], "forbidden")
 
     def test_rebind_non_object_scope_is_400(self):
         self._insert_unscoped_coach("legacy_coach_badscope")

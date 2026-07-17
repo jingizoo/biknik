@@ -44,10 +44,12 @@ def scope_violation(role, scope, path, body, store, *,
     ``scope`` is the session binding (``team_id`` for a coach, ``player_id`` for
     a player).
 
-    Coach scope fails **closed** (#266): a Coach whose session carries no
-    ``team_id`` — an account created/left without a valid team — has NO roster
+    Coach and Player scope both fail **closed** (#266/#282): a Coach whose
+    session carries no ``team_id``, or a Player whose session carries no
+    ``player_id`` — an account created/left without a valid subject — has NO
     authority and is refused, rather than being silently treated as unscoped and
-    allowed to mutate any team's roster. The ONE exception is the demo-only
+    allowed to mutate any team's roster / respond for any player. The ONE
+    exception is the demo-only
     ``X-Demo-Role`` header fallback, which produces an identity-less
     (``user_id is None``) coach session for scripts/curl; the caller passes
     ``allow_unscoped_dev_fallback=True`` only for that path, and only outside
@@ -75,8 +77,17 @@ def scope_violation(role, scope, path, body, store, *,
             return "A coach can only manage their own team's roster."
     elif role == Role.PLAYER:
         own = scope.get("player_id")
+        # Player scope fails **closed** (#266/#282), exactly like Coach above: a
+        # Player whose session carries no ``player_id`` has NO self-service
+        # identity and is refused, rather than being silently treated as
+        # unscoped and allowed to RESPOND_AVAILABILITY / self-service for ANY
+        # player id. The only permitted unscoped player is the demo-only
+        # X-Demo-Role fallback (identity-less, never read in production).
         if not own:
-            return None
+            if allow_unscoped_dev_fallback:
+                return None  # demo-only X-Demo-Role fallback; unreachable in prod
+            return ("This player account has no assigned player, so it can't "
+                    "respond for anyone — ask a league admin to assign a player.")
         for pid in _player_ids(path, body):
             if pid != own:
                 return "Players can only respond for themselves."

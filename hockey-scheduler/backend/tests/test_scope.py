@@ -105,6 +105,24 @@ class ScopeUnitTest(unittest.TestCase):
         self.assertIsNotNone(self._v(Role.PLAYER, scope, other, {}))
         self.assertIsNone(self._v(Role.PLAYER, scope, mine, {}))
 
+    def test_unbound_player_fails_closed(self):
+        # #282: a Player with no player_id binding has no self-service identity
+        # and is refused, rather than being silently treated as unscoped and
+        # allowed to respond for any player id.
+        self.assertIsNotNone(self._v(Role.PLAYER, {},
+                                     "/api/games/g/availability",
+                                     {"player_id": self.away_player}))
+
+    def test_unbound_player_dev_fallback_allowed_only_when_opted_in(self):
+        # The demo-only X-Demo-Role fallback (an identity-less player session)
+        # stays permitted, but ONLY when the caller opts in explicitly — the
+        # server sets that flag solely for the header path and never in
+        # production (#282), mirroring the unbound-coach fallback.
+        self.assertIsNone(scope_violation(
+            Role.PLAYER, {}, "/api/games/g/availability",
+            {"player_id": self.away_player}, self.store,
+            allow_unscoped_dev_fallback=True))
+
 
 class ScopeHttpTest(unittest.TestCase):
     """End-to-end: a bound session is scoped to its team / self (#51)."""
