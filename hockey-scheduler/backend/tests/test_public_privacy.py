@@ -142,13 +142,25 @@ class ProductionPublicPrivacyTest(_HttpBase):
         self.assertEqual(no, 403)
 
     def test_player_scope_controls_roster_status_access(self):
-        from hockey_scheduler.domain import Role
+        from hockey_scheduler.domain import Player, Position, Role, Team
         g = self._game()
-        ok, _ = self._get_as("u_p1", Role.PLAYER, {"team_id": g.away_team_id},
-                             f"/api/games/{self.game_id}/roster-status")
+        store = srv.STATE.api.store
+        # A player ON the away team (#266: a player's team scope must be their
+        # own team) can read the away team's game.
+        away_player = store.players_for_team(g.away_team_id)[0].id
+        ok, _ = self._get_as(
+            "u_p1", Role.PLAYER,
+            {"player_id": away_player, "team_id": g.away_team_id},
+            f"/api/games/{self.game_id}/roster-status")
         self.assertEqual(ok, 200)
-        no, _ = self._get_as("u_p2", Role.PLAYER, {"team_id": "team_elsewhere"},
-                             f"/api/games/{self.game_id}/roster-status")
+        # A player on an unrelated team cannot.
+        store.add_team(Team(id="team_elsewhere", name="Elsewhere"))
+        store.add_player(Player(id="p_elsewhere", team_id="team_elsewhere",
+                                name="Outsider", position=Position.FORWARD))
+        no, _ = self._get_as(
+            "u_p2", Role.PLAYER,
+            {"player_id": "p_elsewhere", "team_id": "team_elsewhere"},
+            f"/api/games/{self.game_id}/roster-status")
         self.assertEqual(no, 403)
 
     def test_official_assignment_controls_officials_access(self):

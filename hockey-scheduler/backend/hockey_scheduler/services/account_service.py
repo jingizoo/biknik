@@ -115,19 +115,24 @@ class AccountService:
             raise ValidationError(
                 "That player does not exist.",
                 {"reason": "scope_subject_missing", "player_id": player_id})
-        # When a Player scope names BOTH a player and a team, the team MUST be
-        # that player's own team (#266 review). team_id gates the player's
-        # private game reads (web/scope.py), so binding player A to team B would
-        # grant A read access to B's rosters/availability. Validate the pairing
-        # against the selected Player's record rather than trusting the supplied
-        # team_id.
-        if role == Role.PLAYER and player is not None:
+        # A Player's team scope is only ever valid as that player's OWN team
+        # (#266 review). team_id gates the player's private game reads
+        # (web/scope.py), so a team_id must never be trusted on its own: without
+        # a player_id there is no ownership to check, which would let an admin
+        # grant a login read access to any team's rosters/availability. Require
+        # the player_id AND derive/verify the team from that Player's record.
+        if role == Role.PLAYER:
             team_id = scope.get("team_id")
-            if team_id and team_id != player.team_id:
-                raise ValidationError(
-                    "A player's team scope must be the player's own team.",
-                    {"reason": "scope_team_mismatch",
-                     "player_id": player_id, "team_id": team_id})
+            if team_id:
+                if player is None:
+                    raise ValidationError(
+                        "A player's team scope requires the player's own id.",
+                        {"reason": "scope_required", "field": "player_id"})
+                if team_id != player.team_id:
+                    raise ValidationError(
+                        "A player's team scope must be the player's own team.",
+                        {"reason": "scope_team_mismatch",
+                         "player_id": player_id, "team_id": team_id})
         # A Coach's authority is entirely its team scope (#266): an account with
         # no team is refused at the scope gate and can manage no roster, so it
         # must be bound to a real, non-deleted Team.

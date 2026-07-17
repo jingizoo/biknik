@@ -166,6 +166,30 @@ class CoachScopeContract:
         self.assertEqual(cm.exception.details.get("reason"), "scope_team_mismatch")
         self.assertEqual(self.store.all_user_accounts(), [])
 
+    def test_create_player_team_only_scope_rejected(self):
+        # A team_id with no player_id has no ownership to check (#266 review),
+        # so it can't be trusted — rejected, zero writes.
+        with self.assertRaises(ValidationError) as cm:
+            self.accounts.create_account(
+                "p", "pw", Role.PLAYER, scope={"team_id": "team_home"})
+        self.assertEqual(cm.exception.details.get("reason"), "scope_required")
+        self.assertEqual(self.store.all_user_accounts(), [])
+
+    def test_rebind_player_to_team_only_scope_rejected_zero_audit(self):
+        self.store.add_player(Player(id="pC", team_id="team_home", name="C",
+                                     position=Position.FORWARD))
+        acct = UserAccount(
+            id="user_pC", username="playerc", password_hash=hash_password("pw"),
+            role=Role.PLAYER, created_at=_clock(),
+            scope={"player_id": "pC", "team_id": "team_home"}, active=True)
+        self.store.add_user_account(acct)
+        with self.assertRaises(ValidationError) as cm:
+            self.accounts.rebind_account_scope(acct.id, {"team_id": "team_home"})
+        self.assertEqual(cm.exception.details.get("reason"), "scope_required")
+        self.assertEqual(self.store.get_user_account(acct.id).scope,
+                         {"player_id": "pC", "team_id": "team_home"})
+        self.assertEqual(self._scope_change_audits(), [])
+
     def test_rebind_player_to_foreign_team_rejected_zero_audit(self):
         self.store.add_team(Team(id="team_other", name="Bears"))
         self.store.add_player(Player(id="pB", team_id="team_home", name="B",
@@ -467,6 +491,27 @@ class CoachScopeHttpTest(unittest.TestCase):
         self.assertEqual(len(store.all_setup_audit()), audits_before)
         # The live session is unchanged — still scoped to the home team only.
         self.assertEqual(store.get_user_account("user_player_priv").scope,
+                         {"player_id": home_player, "team_id": self.home})
+
+    def test_rebind_player_to_team_only_scope_is_400_zero_writes(self):
+        # A player rebind to a team_id-only scope (no player_id) is refused —
+        # no ownership to validate the team against.
+        store = srv.STATE.api.store
+        home_player = store.players_for_team(self.home)[0].id
+        store.add_user_account(UserAccount(
+            id="user_player_toonly", username="player_toonly",
+            password_hash=hash_password("pw"), role=Role.PLAYER,
+            created_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            scope={"player_id": home_player, "team_id": self.home}, active=True))
+        admin = self._admin()
+        before = len(store.all_setup_audit())
+        status, body = self._req(
+            admin, "POST", "/api/accounts/user_player_toonly/scope",
+            {"scope": {"team_id": self.home}})
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"]["details"].get("reason"), "scope_required")
+        self.assertEqual(len(store.all_setup_audit()), before)
+        self.assertEqual(store.get_user_account("user_player_toonly").scope,
                          {"player_id": home_player, "team_id": self.home})
 
     def test_rebind_non_object_scope_is_400(self):
