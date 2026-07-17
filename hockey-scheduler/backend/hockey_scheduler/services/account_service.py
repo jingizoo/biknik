@@ -73,6 +73,15 @@ class AccountService:
         Role.OFFICIAL: frozenset({"official_id"}),
     }
 
+    def _sanitized_scope(self, role, scope) -> dict:
+        """The role's supported scope keys with non-empty values only (#266
+        review). Used for audit details so a legacy/malformed scope — a
+        pre-existing account whose ``scope`` carries unsupported keys — can never
+        leak that stray data into an audit row, and so the creation audit records
+        exactly the binding that took effect."""
+        allowed = self._ALLOWED_SCOPE_KEYS.get(role, frozenset())
+        return {key: scope[key] for key in allowed if scope.get(key)}
+
     def _validate_scope_subjects(self, role, scope) -> None:
         """Resolve every role-scoped subject in ``scope`` to a real record, or
         raise a stable ``ValidationError``. Shared by account creation and the
@@ -158,7 +167,8 @@ class AccountService:
         )
         self.store.add_user_account(account)
         self._audit("user_account_created", account.id, actor_id=actor_id,
-                    detail={"username": username, "role": role.value})
+                    detail={"username": username, "role": role.value,
+                            "scope": self._sanitized_scope(role, scope)})
         return account
 
     def create_first_admin_if_unclaimed(
@@ -304,8 +314,12 @@ class AccountService:
         old_scope = dict(account.scope or {})
         account.scope = scope
         self.store.save_user_account(account)
+        # Sanitize BOTH sides (#266 review): a pre-existing legacy account's
+        # old_scope may carry unsupported keys, which must not leak into the
+        # audit's `from`.
         self._audit("user_account_scope_changed", account.id, actor_id=actor_id,
-                    detail={"from": old_scope, "to": scope})
+                    detail={"from": self._sanitized_scope(account.role, old_scope),
+                            "to": self._sanitized_scope(account.role, scope)})
         return account
 
     def verify_login(self, username: str, password: str) -> Optional[UserAccount]:

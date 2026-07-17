@@ -154,6 +154,46 @@ class CoachScopeContract:
             scope={"player_id": "p_ok", "team_id": "team_home"})
         self.assertEqual(acct.scope, {"player_id": "p_ok", "team_id": "team_home"})
 
+    # -- audit detail is sanitized (#266 review) -----------------------------
+    def _created_audits(self):
+        return [a for a in self.store.all_setup_audit()
+                if a.action == "user_account_created"]
+
+    def test_creation_audit_records_only_sanitized_scope(self):
+        self.accounts.create_account("c", "pw", Role.COACH,
+                                     scope={"team_id": "team_home"})
+        audits = self._created_audits()
+        self.assertEqual(len(audits), 1)
+        self.assertEqual(audits[0].detail["scope"], {"team_id": "team_home"})
+
+    def test_rebind_audit_sanitizes_legacy_from_scope(self):
+        # A pre-fix account whose stored scope carries unsupported keys (a
+        # coach with a stray key) must not leak that data into the audit's
+        # `from` — only the role's supported keys are recorded.
+        acct = self._insert_inactive_coach(
+            "legacy_dirty", {"team_id": "team_home", "roster_secret": "leak"})
+        self.accounts.rebind_account_scope(acct.id, {"team_id": "team_home"})
+        audits = self._scope_change_audits()
+        self.assertEqual(len(audits), 1)
+        self.assertEqual(audits[0].detail["from"], {"team_id": "team_home"})
+        self.assertNotIn("roster_secret", audits[0].detail["from"])
+
+    def test_rebind_rolls_back_when_audit_fails(self):
+        acct = self._insert_inactive_coach("legacy_rbatomic", {})
+        original = self.store.add_setup_audit
+
+        def boom(_entry):
+            raise RuntimeError("audit sink down")
+
+        self.store.add_setup_audit = boom
+        try:
+            with self.assertRaises(RuntimeError):
+                self.accounts.rebind_account_scope(acct.id, {"team_id": "team_home"})
+        finally:
+            self.store.add_setup_audit = original
+        # The scope update did NOT persist — the transaction rolled back.
+        self.assertEqual(self.store.get_user_account(acct.id).scope, {})
+
     # -- audited scope rebind remediation (#266 review blocker 4) ------------
     def _scope_change_audits(self):
         return [a for a in self.store.all_setup_audit()
@@ -304,6 +344,22 @@ class CoachScopeHttpTest(unittest.TestCase):
                                   "role": "coach", "scope": {"team_id": self.home}})
         self.assertEqual(status, 200)
         self.assertEqual(body["scope"], {"team_id": self.home})
+
+    def test_create_coach_with_unknown_scope_key_is_400_zero_writes(self):
+        # A disallowed nested scope key is rejected with a stable 400 and writes
+        # nothing — not the account, not an audit row.
+        admin = self._admin()
+        store = srv.STATE.api.store
+        audits_before = len(store.all_setup_audit())
+        status, body = self._req(
+            admin, "POST", "/api/accounts",
+            {"username": "coach_badscope", "password": "pw", "role": "coach",
+             "scope": {"team_id": self.home, "roster_secret": "leak"}})
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"]["code"], "validation_error")
+        self.assertEqual(body["error"]["details"].get("reason"), "unknown_scope_key")
+        self.assertIsNone(store.get_user_account_by_username("coach_badscope"))
+        self.assertEqual(len(store.all_setup_audit()), audits_before)
 
     def _insert_unscoped_coach(self, username):
         # Simulate a pre-fix legacy account: an ACTIVE coach with no team scope,
