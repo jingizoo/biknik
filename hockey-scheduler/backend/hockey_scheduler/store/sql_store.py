@@ -708,6 +708,8 @@ class SqlStore:
         return self._query(Team, "program_id = ?", (program_id,), order="id")
     def add_player(self, player): return self._insert(player)
     def get_player(self, player_id): return self._get(Player, player_id)
+    def get_player_for_update(self, player_id):
+        return self._get_for_update(Player, player_id)
     def save_player(self, player): return self._update(player)
 
     def players_for_team(self, team_id):
@@ -984,6 +986,8 @@ class SqlStore:
     # -- officials (#30) ---------------------------------------------------
     def add_official(self, official): return self._insert(official)
     def get_official(self, official_id): return self._get(Official, official_id)
+    def get_official_for_update(self, official_id):
+        return self._get_for_update(Official, official_id)
     def all_officials(self): return self._query(Official, order="id")
     def save_official(self, official): return self._update(official)
 

@@ -678,5 +678,101 @@ class AccountRebindDeactivateRaceTest(unittest.TestCase):
                          "rebind was lost-updated by the concurrent deactivation")
 
 
+@unittest.skipUnless(os.environ.get("TEST_DATABASE_URL"),
+                     "PostgreSQL required (set TEST_DATABASE_URL)")
+class PlayerBindDeleteRaceTest(unittest.TestCase):
+    """Two-connection race: binding a Player-scoped account vs deleting that
+    same Player (#282 review). Account creation resolved the player subject and
+    delete_player scanned for referencing accounts, both with unlocked reads —
+    so on PostgreSQL the create could commit an active account in the window
+    after the delete's account scan, stranding a live login against a deleted
+    Player. Both paths now row-lock the Player, so they serialize: whichever
+    wins the lock, the invariant holds — an account that exists is never bound
+    to a deleted player."""
+
+    def setUp(self):
+        self.url = os.environ["TEST_DATABASE_URL"]
+        SqlStore(self.url).clear_all_data()
+
+    def test_bind_racing_player_delete_never_orphans(self):
+        seed = SqlStore(self.url)
+        seed.add_team(Team(id="race_team", name="Race Team"))
+        seed.add_player(Player(id="race_player", team_id="race_team",
+                               name="Racer", position=Position.FORWARD))
+
+        api_create = ApiService(SqlStore(self.url))
+        api_delete = ApiService(SqlStore(self.url))
+        barrier = threading.Barrier(2)
+
+        def create():
+            barrier.wait()
+            try:
+                api_create.accounts.create_account(
+                    "raceplayer", "pw", Role.PLAYER,
+                    scope={"player_id": "race_player", "team_id": "race_team"})
+            except Exception:  # a rejected create (player already gone) is fine
+                pass
+
+        def delete():
+            barrier.wait()
+            # Facade swallows HasDependenciesError into an error dict; either
+            # way the player is only removed when no account is bound to it.
+            api_delete.delete_player("race_player", actor_id="admin")
+
+        ta, tb = threading.Thread(target=create), threading.Thread(target=delete)
+        ta.start(); tb.start(); ta.join(15); tb.join(15)
+
+        check = SqlStore(self.url)
+        acct = check.get_user_account_by_username("raceplayer")
+        player = check.get_player("race_player")
+        if acct is not None and (acct.scope or {}).get("player_id") == "race_player":
+            self.assertIsNotNone(
+                player, "an account was left bound to a concurrently-deleted player")
+
+
+@unittest.skipUnless(os.environ.get("TEST_DATABASE_URL"),
+                     "PostgreSQL required (set TEST_DATABASE_URL)")
+class OfficialBindDeleteRaceTest(unittest.TestCase):
+    """Two-connection race: binding an Official-scoped account vs deleting that
+    same Official (#282 review). Symmetric to PlayerBindDeleteRaceTest — both
+    paths row-lock the Official, so an account that exists is never bound to a
+    deleted official."""
+
+    def setUp(self):
+        self.url = os.environ["TEST_DATABASE_URL"]
+        SqlStore(self.url).clear_all_data()
+
+    def test_bind_racing_official_delete_never_orphans(self):
+        seed = SqlStore(self.url)
+        seed.add_official(Official(id="race_official", name="Ref Racer"))
+
+        api_create = ApiService(SqlStore(self.url))
+        api_delete = ApiService(SqlStore(self.url))
+        barrier = threading.Barrier(2)
+
+        def create():
+            barrier.wait()
+            try:
+                api_create.accounts.create_account(
+                    "raceofficial", "pw", Role.OFFICIAL,
+                    scope={"official_id": "race_official"})
+            except Exception:  # a rejected create (official already gone) is fine
+                pass
+
+        def delete():
+            barrier.wait()
+            api_delete.delete_official("race_official", actor_id="admin")
+
+        ta, tb = threading.Thread(target=create), threading.Thread(target=delete)
+        ta.start(); tb.start(); ta.join(15); tb.join(15)
+
+        check = SqlStore(self.url)
+        acct = check.get_user_account_by_username("raceofficial")
+        official = check.get_official("race_official")
+        if acct is not None and (acct.scope or {}).get("official_id") == "race_official":
+            self.assertIsNotNone(
+                official, "an account was left bound to a concurrently-deleted official")
+
+
 if __name__ == "__main__":
     unittest.main()

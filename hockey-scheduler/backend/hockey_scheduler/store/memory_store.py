@@ -270,6 +270,11 @@ class InMemoryStore:
     def get_player(self, player_id: str) -> Optional[Player]:
         return self.players.get(player_id)
 
+    def get_player_for_update(self, player_id: str) -> Optional[Player]:
+        # See get_team_for_update: transaction() holds self._lock for its whole
+        # body, so a plain read already serializes with a concurrent delete.
+        return self.players.get(player_id)
+
     def players_for_team(self, team_id: str) -> List[Player]:
         return [p for p in self.players.values() if p.team_id == team_id]
 
@@ -517,6 +522,11 @@ class InMemoryStore:
         return official
 
     def get_official(self, official_id: str) -> Optional[Official]:
+        return self.officials.get(official_id)
+
+    def get_official_for_update(self, official_id: str) -> Optional[Official]:
+        # See get_team_for_update: transaction() holds self._lock for its whole
+        # body, so a plain read already serializes with a concurrent delete.
         return self.officials.get(official_id)
 
     def all_officials(self) -> List[Official]:

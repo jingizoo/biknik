@@ -104,13 +104,21 @@ class AccountService:
                 + ", ".join(unexpected) + ".",
                 {"reason": "unknown_scope_key", "role": role.value,
                  "keys": unexpected})
+        # Row-lock the Player/Official subject (#282 review), exactly as the
+        # Coach team is locked below: bind and delete_player/delete_official
+        # otherwise resolve the subject with unlocked reads, so on PostgreSQL a
+        # concurrent delete could commit between this check and the account
+        # write and strand an active login against a deleted Player/Official.
+        # delete_* takes the same lock before its account scan, so the two
+        # serialize either way (bind-then-delete blocks on the live account
+        # reference; delete-then-bind sees the subject gone here).
         official_id = scope.get("official_id")
-        if official_id and self.store.get_official(official_id) is None:
+        if official_id and self.store.get_official_for_update(official_id) is None:
             raise ValidationError(
                 "That official does not exist.",
                 {"reason": "scope_subject_missing", "official_id": official_id})
         player_id = scope.get("player_id")
-        player = self.store.get_player(player_id) if player_id else None
+        player = self.store.get_player_for_update(player_id) if player_id else None
         if player_id and player is None:
             raise ValidationError(
                 "That player does not exist.",
@@ -269,16 +277,19 @@ class AccountService:
             # dangling-identity hole scoping delete_official/delete_player's
             # account blocker to active-only accounts opened up. Refuse
             # until the account is rebound to a valid subject.
+            # Row-lock the Player/Official subject (#282 review) so a concurrent
+            # delete can't strand this reactivated login against a deleted
+            # subject — same lock delete_player/delete_official take.
             scope = account.scope or {}
             official_id = scope.get("official_id")
-            if official_id and self.store.get_official(official_id) is None:
+            if official_id and self.store.get_official_for_update(official_id) is None:
                 raise ValidationError(
                     "This account's official no longer exists; rebind it to "
                     "a valid official before reactivating.",
                     {"reason": "scope_subject_missing", "account_id": account_id,
                      "official_id": official_id})
             player_id = scope.get("player_id")
-            if player_id and self.store.get_player(player_id) is None:
+            if player_id and self.store.get_player_for_update(player_id) is None:
                 raise ValidationError(
                     "This account's player no longer exists; rebind it to "
                     "a valid player before reactivating.",
