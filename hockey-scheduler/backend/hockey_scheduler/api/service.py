@@ -1740,6 +1740,15 @@ class ApiService:
         return self._account_row(account)
 
     @catch
+    def rebind_user_account_scope(self, account_id: str, scope,
+                                  actor_id: Optional[str] = None) -> dict:
+        """Repair/change an account's scope binding (#266) — e.g. rebind an
+        unscoped or dangling-team Coach to a real team. Audited."""
+        account = self.accounts.rebind_account_scope(
+            account_id, scope, actor_id=actor_id)
+        return self._account_row(account)
+
+    @catch
     def list_user_accounts(self) -> dict:
         return {"user_accounts":
                 [self._account_row(a) for a in self.accounts.list_accounts()]}

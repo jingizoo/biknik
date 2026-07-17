@@ -3495,7 +3495,13 @@ class SetupService:
 
     @_transactional
     def delete_team(self, team_id: str, actor_id: Optional[str] = None) -> Team:
-        team = self.store.get_team(team_id)
+        # Row-lock the team before scanning its dependents (#266 review): a
+        # concurrent coach-account creation locks the same row first, so the two
+        # serialize — either the coach is already inserted and blocks this
+        # delete, or this delete commits first and the create then sees the team
+        # gone. Without the lock, both could pass their checks and orphan a coach
+        # against a deleted team under READ COMMITTED.
+        team = self.store.get_team_for_update(team_id)
         if team is None:
             raise NotFoundError(f"Team {team_id} not found.")
         regs = [r for r in self.store.all_season_team_registrations()

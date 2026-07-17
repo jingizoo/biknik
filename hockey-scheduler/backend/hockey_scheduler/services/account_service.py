@@ -61,6 +61,42 @@ class AccountService:
         except ValueError:
             raise ValidationError(f"Unknown role '{role}'.")
 
+    def _validate_scope_subjects(self, role, scope) -> None:
+        """Resolve every role-scoped subject in ``scope`` to a real record, or
+        raise a stable ``ValidationError``. Shared by account creation and the
+        scope-rebind remediation path (#266) so both enforce the identical rule.
+        Must run inside a ``transaction()``: the Coach team is row-locked
+        (``get_team_for_update``) so a concurrent Team deletion can't strand a
+        coach against a deleted team.
+
+        A role-scoped Player/Official reference (#232 review 7) must resolve too:
+        deleting a Player/Official then binding the old id would recreate the
+        exact dangling live identity that issue set out to prevent.
+        """
+        official_id = scope.get("official_id")
+        if official_id and self.store.get_official(official_id) is None:
+            raise ValidationError(
+                "That official does not exist.",
+                {"reason": "scope_subject_missing", "official_id": official_id})
+        player_id = scope.get("player_id")
+        if player_id and self.store.get_player(player_id) is None:
+            raise ValidationError(
+                "That player does not exist.",
+                {"reason": "scope_subject_missing", "player_id": player_id})
+        # A Coach's authority is entirely its team scope (#266): an account with
+        # no team is refused at the scope gate and can manage no roster, so it
+        # must be bound to a real, non-deleted Team.
+        if role == Role.COACH:
+            team_id = scope.get("team_id")
+            if not team_id:
+                raise ValidationError(
+                    "A coach account must be assigned a team.",
+                    {"reason": "scope_required", "field": "team_id"})
+            if self.store.get_team_for_update(team_id) is None:
+                raise ValidationError(
+                    "That team does not exist.",
+                    {"reason": "scope_subject_missing", "team_id": team_id})
+
     @_transactional
     def create_account(self, username: str, password: str, role,
                        scope: Optional[dict] = None,
@@ -77,41 +113,18 @@ class AccountService:
         if not password:
             raise ValidationError("A password is required.")
         role = self._parse_role(role)
+        # Scope must be a JSON object (#266 review): a string or array would let
+        # ``dict(scope)`` raise a raw ValueError/TypeError — a 500 rather than a
+        # stable 400 — so reject a non-object shape as a domain ValidationError.
+        if scope is not None and not isinstance(scope, dict):
+            raise ValidationError(
+                "Account scope must be a JSON object.",
+                {"reason": "invalid_scope"})
         scope = dict(scope or {})
-        # A role-scoped Player/Official reference must resolve to a real
-        # subject *at creation*, not only at reactivation (#232 review 7):
-        # without this, deleting a Player/Official and then creating a fresh
-        # account with the old id recreates the exact dangling live identity
-        # this issue set out to prevent. Checked — and the whole method
-        # transactional (#232 review 7) — before any store write, so a
-        # rejected creation writes neither an account nor an audit row.
-        official_id = scope.get("official_id")
-        if official_id and self.store.get_official(official_id) is None:
-            raise ValidationError(
-                "That official does not exist.",
-                {"reason": "scope_subject_missing", "official_id": official_id})
-        player_id = scope.get("player_id")
-        if player_id and self.store.get_player(player_id) is None:
-            raise ValidationError(
-                "That player does not exist.",
-                {"reason": "scope_subject_missing", "player_id": player_id})
-        # A Coach's authority is entirely its team scope (#266): an account with
-        # no ``team_id`` is refused at the scope gate and can manage no roster,
-        # so creating one is a silent dead end at best and a fail-open hole if
-        # the gate ever regressed. Require the team AND prove it resolves to a
-        # real (non-deleted) Team before any write, mirroring the official/player
-        # subject checks above — a rejected creation writes neither account nor
-        # audit row (the method is transactional).
-        if role == Role.COACH:
-            team_id = scope.get("team_id")
-            if not team_id:
-                raise ValidationError(
-                    "A coach account must be assigned a team.",
-                    {"reason": "scope_required", "field": "team_id"})
-            if self.store.get_team(team_id) is None:
-                raise ValidationError(
-                    "That team does not exist.",
-                    {"reason": "scope_subject_missing", "team_id": team_id})
+        # A role-scoped subject must resolve to a real record before any write
+        # (checked inside this transaction), so a rejected creation writes
+        # neither an account nor an audit row.
+        self._validate_scope_subjects(role, scope)
         account = UserAccount(
             id=account_id or self.store.next_id("user"),
             username=username,
@@ -185,8 +198,12 @@ class AccountService:
                     "This installation has already been claimed.") from None
             raise
 
+    @_transactional
     def set_active(self, account_id: str, active: bool,
                    actor_id: Optional[str] = None) -> UserAccount:
+        # Transactional (#266 review): the account save and its audit row must
+        # commit together — an audit failure after the save would otherwise
+        # leave an unaudited activation/deactivation.
         account = self.store.get_user_account(account_id)
         if account is None:
             raise NotFoundError("User account not found.")
@@ -225,7 +242,7 @@ class AccountService:
                         "team before reactivating.",
                         {"reason": "scope_required", "account_id": account_id,
                          "field": "team_id"})
-                if self.store.get_team(team_id) is None:
+                if self.store.get_team_for_update(team_id) is None:
                     raise ValidationError(
                         "This account's team no longer exists; rebind it to "
                         "a valid team before reactivating.",
@@ -236,6 +253,37 @@ class AccountService:
         self._audit(
             "user_account_activated" if account.active else "user_account_deactivated",
             account.id, actor_id=actor_id)
+        return account
+
+    @_transactional
+    def rebind_account_scope(self, account_id: str, scope,
+                             actor_id: Optional[str] = None) -> UserAccount:
+        """Change an account's ``scope`` binding (#266 remediation path).
+
+        The supported admin action to *repair* a legacy or misconfigured
+        account — e.g. rebind an unscoped Coach (which readiness flags and the
+        scope gate refuses) to a real team, or move a coach to a different team —
+        without deleting and recreating the login. The new scope is validated by
+        the same rule as creation (a Coach needs a real, row-locked team; a
+        Player/Official subject must resolve), and the change is audited
+        (``user_account_scope_changed``) with the before/after scope. Works on
+        active or inactive accounts, so a deactivated legacy coach can be rebound
+        and then reactivated.
+        """
+        account = self.store.get_user_account(account_id)
+        if account is None:
+            raise NotFoundError("User account not found.")
+        if scope is not None and not isinstance(scope, dict):
+            raise ValidationError(
+                "Account scope must be a JSON object.",
+                {"reason": "invalid_scope"})
+        scope = dict(scope or {})
+        self._validate_scope_subjects(account.role, scope)
+        old_scope = dict(account.scope or {})
+        account.scope = scope
+        self.store.save_user_account(account)
+        self._audit("user_account_scope_changed", account.id, actor_id=actor_id,
+                    detail={"from": old_scope, "to": scope})
         return account
 
     def verify_login(self, username: str, password: str) -> Optional[UserAccount]:

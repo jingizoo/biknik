@@ -146,10 +146,25 @@ async function checkViewport(browser, viewport) {
         .some((el) => el.textContent.trim() === name),
       username, { timeout: 10000 });
 
+    // --- Rebind an existing coach's team (the #266 remediation path) --------
+    // The just-created coach is auto-selected, so its Coach-team-scope panel is
+    // showing. Rebind it to a DIFFERENT team and confirm the change persists.
+    await page.waitForSelector("[data-rebind-scope]", { timeout: 10000 });
+    const rebindValues = await page.locator("#rebind-team option")
+      .evaluateAll((os) => os.map((o) => o.value).filter(Boolean));
+    const otherTeam = rebindValues.find((v) => v !== teamId);
+    if (!otherTeam) throw new Error(`[${L}] need a second team to test rebind`);
+    await page.selectOption("#rebind-team", otherTeam);
+    await page.click("[data-rebind-scope]");
+    // After the audited rebind + re-render, the panel reflects the new team.
+    await page.waitForFunction(
+      (t) => { const s = document.querySelector("#rebind-team"); return s && s.value === t; },
+      otherTeam, { timeout: 10000 });
+
     if (errors.length) {
       throw new Error(`[${L}] console/page errors:\n${errors.join("\n")}`);
     }
-    console.log(`[${L}] OK — Team selector gated to Coach; coach created with team scope.`);
+    console.log(`[${L}] OK — Team selector gated to Coach; coach created with team scope, then rebound to another team.`);
   } catch (error) {
     throw new Error(`${error.message}\n--- server output ---\n${out}`);
   } finally {

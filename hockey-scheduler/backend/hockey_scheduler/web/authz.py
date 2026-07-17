@@ -182,6 +182,10 @@ def required_permission(path: str):
         return Permission.MANAGE_USERS
     if re.match(r"^/api/accounts/[^/]+/active$", path):
         return Permission.MANAGE_USERS
+    # Rebinding an account's scope (#266 remediation) — same league-admin-only
+    # user-management permission as creating/activating the account.
+    if re.match(r"^/api/accounts/[^/]+/scope$", path):
+        return Permission.MANAGE_USERS
     # Viewing/revoking an account's login sessions is a user-management action
     # held only by a league admin (#78).
     if re.match(r"^/api/accounts/[^/]+/sessions$", path):

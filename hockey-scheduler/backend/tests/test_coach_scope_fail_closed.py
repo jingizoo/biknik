@@ -112,6 +112,75 @@ class CoachScopeContract:
         reactivated = self.accounts.set_active(acct.id, True)
         self.assertTrue(reactivated.active)
 
+    # -- malformed scope shape (#266 review blocker 3) -----------------------
+    def test_create_coach_with_non_dict_scope_is_stable_validation_error(self):
+        # A string/array scope must surface as a domain ValidationError (stable
+        # 400), never a raw ValueError/TypeError from dict(scope) (a 500).
+        with self.assertRaises(ValidationError) as cm:
+            self.accounts.create_account("c", "pw", Role.COACH, scope="team_home")
+        self.assertEqual(cm.exception.details.get("reason"), "invalid_scope")
+        self.assertEqual(self.store.all_user_accounts(), [])
+
+    # -- audited scope rebind remediation (#266 review blocker 4) ------------
+    def _scope_change_audits(self):
+        return [a for a in self.store.all_setup_audit()
+                if a.action == "user_account_scope_changed"]
+
+    def test_rebind_unscoped_coach_to_team_is_audited(self):
+        acct = self._insert_inactive_coach("legacy_rb", {})
+        rebound = self.accounts.rebind_account_scope(
+            acct.id, {"team_id": "team_home"}, actor_id="admin")
+        self.assertEqual(rebound.scope, {"team_id": "team_home"})
+        audits = self._scope_change_audits()
+        self.assertEqual(len(audits), 1)
+        self.assertEqual(audits[0].detail["to"], {"team_id": "team_home"})
+        self.assertEqual(audits[0].actor_id, "admin")
+
+    def test_rebind_to_nonexistent_team_rejected(self):
+        acct = self._insert_inactive_coach("legacy_rb2", {})
+        with self.assertRaises(ValidationError) as cm:
+            self.accounts.rebind_account_scope(acct.id, {"team_id": "team_ghost"})
+        self.assertEqual(cm.exception.details.get("reason"),
+                         "scope_subject_missing")
+        self.assertEqual(self._scope_change_audits(), [])
+
+    def test_rebind_non_dict_scope_rejected(self):
+        acct = self._insert_inactive_coach("legacy_rb3", {})
+        with self.assertRaises(ValidationError) as cm:
+            self.accounts.rebind_account_scope(acct.id, "team_home")
+        self.assertEqual(cm.exception.details.get("reason"), "invalid_scope")
+
+    def test_rebind_then_reactivate_repairs_legacy_coach(self):
+        # The end-to-end remediation the readiness check points at: a legacy
+        # unscoped coach can't be reactivated, but after a rebind to a real team
+        # it can.
+        acct = self._insert_inactive_coach("legacy_rb4", {})
+        with self.assertRaises(ValidationError):
+            self.accounts.set_active(acct.id, True)
+        self.accounts.rebind_account_scope(acct.id, {"team_id": "team_home"})
+        reactivated = self.accounts.set_active(acct.id, True)
+        self.assertTrue(reactivated.active)
+
+    # -- set_active atomicity (#266 review blocker 2) ------------------------
+    def test_set_active_rolls_back_when_audit_fails(self):
+        # The account save and its audit row must commit together: if the audit
+        # write fails, the activation must roll back rather than persist
+        # unaudited.
+        acct = self._insert_inactive_coach("legacy_atomic", {"team_id": "team_home"})
+        original = self.store.add_setup_audit
+
+        def boom(_entry):
+            raise RuntimeError("audit sink down")
+
+        self.store.add_setup_audit = boom
+        try:
+            with self.assertRaises(RuntimeError):
+                self.accounts.set_active(acct.id, True)
+        finally:
+            self.store.add_setup_audit = original
+        # The activation did NOT persist — the transaction rolled back.
+        self.assertFalse(self.store.get_user_account(acct.id).active)
+
 
 class MemoryCoachScopeTest(CoachScopeContract, unittest.TestCase):
     def make_store(self):
@@ -232,6 +301,43 @@ class CoachScopeHttpTest(unittest.TestCase):
         status, _ = self._req(c, "GET", f"/api/games/{self.gid}/board")
         self.assertEqual(status, 403)
 
+    def test_rebind_scope_repairs_unscoped_coach_over_http(self):
+        # The remediation route: an admin rebinds a legacy unscoped coach to a
+        # real team, and it can then read/act.
+        self._insert_unscoped_coach("legacy_coach_rebind")
+        acct_id = "user_legacy_coach_rebind"
+        admin = self._admin()
+        status, body = self._req(admin, "POST", f"/api/accounts/{acct_id}/scope",
+                                 {"scope": {"team_id": self.home}})
+        self.assertEqual(status, 200)
+        self.assertEqual(body["scope"], {"team_id": self.home})
+        # The rebound (now home-scoped) coach can read its own team's game.
+        c = self._client()
+        self._req(c, "POST", "/api/auth/login",
+                  {"username": "legacy_coach_rebind", "password": "pw"})
+        status, _ = self._req(c, "GET", f"/api/games/{self.gid}/board")
+        self.assertEqual(status, 200)
+
+    def test_rebind_non_object_scope_is_400(self):
+        self._insert_unscoped_coach("legacy_coach_badscope")
+        admin = self._admin()
+        status, body = self._req(
+            admin, "POST", "/api/accounts/user_legacy_coach_badscope/scope",
+            {"scope": "team_home"})
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"]["code"], "validation_error")
+        self.assertEqual(body["error"]["details"].get("reason"), "invalid_scope")
+
+    def test_rebind_requires_authenticated_admin(self):
+        # The rebind route is gated on MANAGE_USERS — an unauthenticated request
+        # (no session) is refused before it can touch any scope.
+        self._insert_unscoped_coach("legacy_coach_authz")
+        anon = self._client()  # never logs in
+        status, _ = self._req(
+            anon, "POST", "/api/accounts/user_legacy_coach_authz/scope",
+            {"scope": {"team_id": self.home}})
+        self.assertEqual(status, 401)
+
 
 # --------------------------------------------------------------------------- #
 # Readiness remediation path (criterion: no silent grandfathering).           #
@@ -280,6 +386,53 @@ class CoachScopeReadinessTest(unittest.TestCase):
         checks = api.get_readiness("demo", cookie_hardened=False)["checks"]
         check = next(c for c in checks if c["name"] == "coach_scope_bound")
         self.assertTrue(check["ok"])
+
+
+# --------------------------------------------------------------------------- #
+# Two-connection PostgreSQL race: coach creation vs Team deletion (#266        #
+# review blocker 1). Without the FOR UPDATE row lock, both could pass their    #
+# checks under READ COMMITTED and orphan a coach against a deleted team.       #
+# --------------------------------------------------------------------------- #
+@unittest.skipUnless(os.environ.get("TEST_DATABASE_URL"),
+                     "PostgreSQL required (set TEST_DATABASE_URL)")
+class CoachTeamDeleteRaceTest(unittest.TestCase):
+    def setUp(self):
+        self.url = os.environ["TEST_DATABASE_URL"]
+        SqlStore(self.url).clear_all_data()
+
+    def test_create_coach_racing_team_delete_never_orphans(self):
+        import threading
+        seed = SqlStore(self.url)
+        seed.add_team(Team(id="race_team", name="Race Team"))
+
+        api_create = ApiService(SqlStore(self.url))
+        api_delete = ApiService(SqlStore(self.url))
+        barrier = threading.Barrier(2)
+
+        def create():
+            barrier.wait()
+            try:
+                api_create.accounts.create_account(
+                    "racecoach", "pw", Role.COACH, scope={"team_id": "race_team"})
+            except Exception:  # a rejected create (team already gone) is fine
+                pass
+
+        def delete():
+            barrier.wait()
+            # Facade swallows a HasDependenciesError into an error dict; either
+            # way the team is only removed when no coach is bound.
+            api_delete.delete_team("race_team", actor_id="admin")
+
+        ta, tb = threading.Thread(target=create), threading.Thread(target=delete)
+        ta.start(); tb.start(); ta.join(15); tb.join(15)
+
+        check = SqlStore(self.url)
+        coach = check.get_user_account_by_username("racecoach")
+        team = check.get_team("race_team")
+        # The invariant: a coach that exists is never bound to a deleted team.
+        if coach is not None and (coach.scope or {}).get("team_id") == "race_team":
+            self.assertIsNotNone(
+                team, "a coach was left bound to a concurrently-deleted team")
 
 
 if __name__ == "__main__":

@@ -1755,6 +1755,14 @@ class Handler(BaseHTTPRequestHandler):
                 # not just block future logins.
                 SESSIONS.revoke_for_user(api.store, acc.group(1))
             return self._send_api(res)
+        scp = re.match(r"^/api/accounts/([^/]+)/scope$", path)
+        if scp:
+            # Rebind an account's scope (#266 remediation): the audited actor is
+            # the server-resolved signed-in admin, never a client body value.
+            # The raw `scope` value is passed through UNCOERCED so the service
+            # can reject a non-object shape as a stable 400.
+            return self._send_api(api.rebind_user_account_scope(
+                scp.group(1), body.get("scope"), actor_id=user_id))
         rv = re.match(r"^/api/accounts/([^/]+)/sessions/([^/]+)/revoke$", path)
         if rv:
             # Revoke one session (#78). Auto-guarded by the POST authorize()

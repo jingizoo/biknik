@@ -3551,11 +3551,42 @@ function renderUsers(ov) {
       <div class="section-title">Accounts</div>
       <div class="row-list">${accountList}</div>
     </div>
+    ${renderCoachScopePanel(ov)}
     <div class="card">
       <div class="section-title">Sessions</div>
       ${sessionPanel}
     </div>
     ${renderGuardianLinks()}`;
+}
+
+// Coach scope remediation (#266): the supported admin action to rebind a
+// selected Coach account to a valid team — the repair path readiness points at
+// for a legacy/misconfigured coach with a missing or dangling team scope (which
+// the scope gate refuses and which can't be reactivated until rebound). Shown
+// only for a selected Coach; a coach whose current team is missing/invalid is
+// flagged so the operator knows it needs repair before it can do anything.
+function renderCoachScopePanel(ov) {
+  if (!usersSelected) return "";
+  const acct = (usersState.accounts || []).find((a) => a.id === usersSelected);
+  if (!acct || acct.role !== "coach") return "";
+  const teams = ov.teams || [];
+  const currentTeam = (acct.scope || {}).team_id || "";
+  const valid = currentTeam && teams.some((t) => t.id === currentTeam);
+  const opts = teams.length
+    ? teams.map((t) => opt(t.id, t.name, t.id === currentTeam)).join("")
+    : `<option value="">No teams available</option>`;
+  const warn = valid ? "" : `<div class="banner alert"><p>This coach account has
+      no valid team assigned, so it can't manage any roster until it's rebound.</p></div>`;
+  return `<div class="card cd-form">
+    <div class="section-title">Coach team scope — ${esc(acct.username)}</div>
+    ${warn}
+    <div class="cd-grid">
+      <label class="cd-field"><span>Team</span>
+        <select id="rebind-team" class="cd-input">${opts}</select></label>
+      <div class="cd-submit"><button class="act primary" data-rebind-scope="${esc(acct.id)}"
+        ${teams.length ? "" : "disabled"}>Save team</button></div>
+    </div>
+  </div>`;
 }
 
 // Guardian↔junior links (#35): create an (unverified) link, then verify it
@@ -5920,6 +5951,21 @@ async function render() {
     await post(`/api/accounts/${usersSelected}/sessions/${b.dataset.revokeSession}/revoke`, {});
     await render();
   });
+  // Coach scope rebind (#266 remediation): send the picked team inside `scope`
+  // to the audited rebind route; the server validates the team and records the
+  // change. A re-render refetches the accounts list so the panel reflects the
+  // new (now-valid) scope.
+  const rebindBtn = c.querySelector("[data-rebind-scope]");
+  if (rebindBtn) rebindBtn.onclick = async () => {
+    const teamSel = c.querySelector("#rebind-team");
+    const teamId = teamSel ? teamSel.value : "";
+    if (!teamId) return;
+    toast = "";
+    const res = await post(`/api/accounts/${rebindBtn.dataset.rebindScope}/scope`,
+                           { scope: { team_id: teamId } });
+    if (res && !res.error) toast = "Coach team updated.";
+    await render();
+  };
   // Create-account form (#135): the Users tab re-renders on plenty of
   // OTHER actions too (viewing an account's sessions, revoking a session,
   // guardian-link create/verify) — every render() call replaces #content's

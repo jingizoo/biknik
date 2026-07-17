@@ -407,6 +407,12 @@ class InMemoryStore:
     def get_team(self, team_id: str) -> Optional[Team]:
         return self.teams.get(team_id)
 
+    def get_team_for_update(self, team_id: str) -> Optional[Team]:
+        # No row locking needed (#266): transaction() holds self._lock for its
+        # entire body, so a concurrent delete can't interleave with the caller's
+        # check-then-write. Provided for interface parity with SqlStore.
+        return self.teams.get(team_id)
+
     def teams_for_program(self, program_id: str) -> List[Team]:
         return [t for t in self.teams.values() if t.program_id == program_id]
 
