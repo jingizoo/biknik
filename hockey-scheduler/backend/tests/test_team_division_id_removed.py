@@ -15,8 +15,11 @@ import os
 import unittest
 from pathlib import Path
 
+from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
+
 from hockey_scheduler.api.service import ApiService
-from hockey_scheduler.domain import Season, SeasonTeamRegistration, Team
+from hockey_scheduler.domain import (
+    LeagueSeason, Season, SeasonTeamRegistration, Team)
 from hockey_scheduler.services.league_scope import (
     league_id_for_game, team_registration_valid)
 from hockey_scheduler.store import InMemoryStore, SqlStore
@@ -208,8 +211,10 @@ class LegacyFieldIsInertContract:
         orphan = Team(id=self.store.next_id("team"), name="Orphan",
                       division_id=dA, program_id=None)
         self.store.add_team(orphan)
+        # #283: a registration hangs off the division's LeagueSeason.
+        dA_ls = self.store.get_division(dA).league_season_id
         self.store.add_season_team_registration(SeasonTeamRegistration(
-            id=self.store.next_id("streg"), season_id=season,
+            id=self.store.next_id("streg"), league_season_id=dA_ls,
             team_id=orphan.id, division_id=dA, active=True))
         other = self._team("Other")
         self._register(season, other, dA)
@@ -233,9 +238,13 @@ class LegacyFieldIsInertContract:
         self.api.register_team_for_season(
             season, good, dA, actor_id=self.ACTOR, league_id=league)
 
+        # #283: every injected row hangs off this season's LeagueSeason (for the
+        # created league); operational validity is judged from there.
+        season_ls = self.store.league_season_for(league, season).id
+
         def bad_reg(team_id, division_id):
             self.store.add_season_team_registration(SeasonTeamRegistration(
-                id=self.store.next_id("streg"), season_id=season,
+                id=self.store.next_id("streg"), league_season_id=season_ls,
                 team_id=team_id, division_id=division_id, active=True))
 
         # cross-league team
@@ -270,8 +279,13 @@ class LegacyFieldIsInertContract:
         self.store.add_season(season)
         team = Team(id=self.store.next_id("team"), name="Ghost", program_id=ghost)
         self.store.add_team(team)
+        # #283: the row resolves its Season/League via a LeagueSeason; bind one to
+        # this dangling program so the row is found yet still trusts nothing.
+        ghost_ls = self.store.add_league_season(LeagueSeason(
+            id=self.store.next_id("leagueseason"), league_id=ghost,
+            season_id=season.id))
         self.store.add_season_team_registration(SeasonTeamRegistration(
-            id=self.store.next_id("streg"), season_id=season.id,
+            id=self.store.next_id("streg"), league_season_id=ghost_ls.id,
             team_id=team.id, division_id=None, active=True))
         self.assertIsNone(
             team_registration_valid(self.store, season, team.id, None))
@@ -286,9 +300,15 @@ class LegacyFieldIsInertContract:
         # the overview, never silently passed through as league-less.
         season = self._season("S")
         team = self._team("NoLeague")
+        # #283: a registration always references a LeagueSeason; a row whose
+        # League doesn't resolve (bound to a non-existent League) is the
+        # league-less corruption that must be excluded.
+        ghost_ls = self.store.add_league_season(LeagueSeason(
+            id=self.store.next_id("leagueseason"), league_id="league_ghost",
+            season_id=season))
         self.store.add_season_team_registration(SeasonTeamRegistration(
-            id=self.store.next_id("streg"), season_id=season,
-            team_id=team, division_id=None, league_id=None, active=True))
+            id=self.store.next_id("streg"), league_season_id=ghost_ls.id,
+            team_id=team, division_id=None, active=True))
         exposed = {r["team_id"]
                   for r in self.api.get_demo_overview()["registrations"]}
         self.assertNotIn(team, exposed)
@@ -319,20 +339,19 @@ class LegacyFieldIsInertContract:
         self.assertEqual(row2["league_id"], league)
         self.assertIsNone(row2["division_id"])
 
-    def test_overview_excludes_registration_with_dangling_league_id(self):
-        # A registration whose league_id points at a League from a DIFFERENT
-        # season (or no League at all) must never reach the wizard — the same
-        # "cross-league/missing-League" corruption class the division check
-        # already guards against (#233 B2c).
+    def test_overview_excludes_registration_with_dangling_league_season(self):
+        # A registration whose LeagueSeason link is dangling (points at no
+        # LeagueSeason row at all) must never reach the wizard — the same
+        # "missing-League" corruption class the division check already guards
+        # against (#233 B2c). #283: a League may legitimately span Seasons, so
+        # the corruption is an unresolvable LeagueSeason, not a "cross-season"
+        # league.
         season = self._season("S")
-        other_season = self._season("Other")
-        other_league = self.api.create_league(
-            other_season, "Other League", actor_id=self.ACTOR)["id"]
         team = self._team("Dangling")
         self.store.add_season_team_registration(SeasonTeamRegistration(
-            id=self.store.next_id("streg"), season_id=season,
-            team_id=team, division_id=None, league_id=other_league,
-            active=True))
+            id=self.store.next_id("streg"),
+            league_season_id="leagueseason_missing",
+            team_id=team, division_id=None, active=True))
         exposed = {r["team_id"]
                   for r in self.api.get_demo_overview()["registrations"]}
         self.assertNotIn(team, exposed)
@@ -346,12 +365,15 @@ class LegacyFieldIsInertContract:
         league = self.api.create_league(season, "Adult League", actor_id=self.ACTOR)["id"]
         other_league = self.api.create_league(
             season, "Other League", actor_id=self.ACTOR)["id"]
-        dA = self._division(season, "A")
-        self.api.assign_division_league(dA, other_league, actor_id=self.ACTOR)
+        # The division belongs to other_league; the registration below claims
+        # `league`, so its LeagueSeason and the division's disagree.
+        dA = self.api.create_division(
+            season, "A", league_id=other_league, actor_id=self.ACTOR)["id"]
         team = self._team("Mismatch")
+        league_ls = self.store.league_season_for(league, season).id
         self.store.add_season_team_registration(SeasonTeamRegistration(
-            id=self.store.next_id("streg"), season_id=season,
-            team_id=team, division_id=dA, league_id=league, active=True))
+            id=self.store.next_id("streg"), league_season_id=league_ls,
+            team_id=team, division_id=dA, active=True))
         exposed = {r["team_id"]
                   for r in self.api.get_demo_overview()["registrations"]}
         self.assertNotIn(team, exposed)

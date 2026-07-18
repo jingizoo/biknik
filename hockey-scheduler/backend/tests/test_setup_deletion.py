@@ -17,6 +17,8 @@ import unittest
 
 from datetime import datetime, timezone
 
+from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
+
 from hockey_scheduler.api.service import ApiService
 from hockey_scheduler.domain import (
     AvailabilityStatus, CalendarFeedToken, ContactDestination, DeviceToken,
@@ -156,8 +158,12 @@ class DeletionContract:
         team = self._team(club, lg)
         self._register(s, team, d)
         blocked = self.api.delete_season(s, actor_id=self.ACTOR)
-        self.assertBlocked(blocked,
-                           expect_types={"division", "team registration"})
+        # The division auto-provisions a League (#283), whose LeagueSeason
+        # also references this Season, so the season delete now additionally
+        # blocks on that level alongside the division and registration.
+        self.assertBlocked(
+            blocked,
+            expect_types={"division", "team registration", "level"})
         self.assertIsNotNone(self.store.get_season(s))
         # Empty season is deletable.
         empty = self._season(lg, "Empty")
@@ -206,7 +212,8 @@ class DeletionContract:
         self.assertIsNotNone(stored)
         self.assertFalse(stored.active)
         self.assertIsNone(stored.division_id)
-        self.assertEqual(stored.season_id, s)
+        self.assertEqual(
+            self.store.get_league_season(stored.league_season_id).season_id, s)
         self.assertEqual(stored.team_id, team)
 
         cleared = self._audits("season_team_division_cleared")
@@ -378,8 +385,15 @@ class DeletionContract:
         club = self._club()
         team = self._team(club, lg)
         reg = self._register(s, team, d)  # no explicit league_id
-        self.assertIsNone(self.store.get_season_team_registration(reg).league_id)
         self.api.unregister_team_from_season(reg, actor_id=self.ACTOR)
+        # Break the League this registration resolves to (#283): its
+        # LeagueSeason now points at a League that no longer exists — the
+        # legacy "no resolvable League" case — so the v2-only cleanup op must
+        # report it rather than purge the row blindly.
+        stored = self.store.get_season_team_registration(reg)
+        ls = self.store.get_league_season(stored.league_season_id)
+        ls.league_id = "league_missing"
+        self.store.save_league_season(ls)
 
         result = self.api.delete_season_team_registration(reg, actor_id=self.ACTOR)
         self.assertEqual(result["error"]["code"], "validation_error")

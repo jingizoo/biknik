@@ -25,6 +25,19 @@ from hockey_scheduler.store import SqlStore
 ADMIN = "admin"
 
 
+# #283: a registration/Division no longer carries its own league_id — it is
+# fixed by the LeagueSeason. Resolve the League from a raw store row.
+def _reg_league(store, reg):
+    ls = store.get_league_season(reg.league_season_id)
+    return ls.league_id if ls else None
+
+
+def _div_league(store, division_id):
+    d = store.get_division(division_id)
+    ls = store.get_league_season(d.league_season_id) if d else None
+    return ls.league_id if ls else None
+
+
 def _sql_backends():
     backends = [("sqlite", ":memory:")]
     url = os.environ.get("TEST_DATABASE_URL")
@@ -104,7 +117,7 @@ class DivisionReparentStrandSqlTest(_SqlIntegrityBase):
                                              v2=True)
             self.assertEqual(res["error"]["code"], "validation_error", res)
             # The division row is unchanged and NO audit row was written.
-            self.assertEqual(store.get_division(div["id"]).league_id, l1["id"])
+            self.assertEqual(_div_league(store, div["id"]), l1["id"])
             self.assertEqual(len(store.all_setup_audit()), audits_before)
 
         self._run(case)
@@ -119,7 +132,7 @@ class DivisionReparentStrandSqlTest(_SqlIntegrityBase):
             res = api.assign_division_league(div["id"], None, actor_id=ADMIN,
                                              v2=True)
             self.assertEqual(res["error"]["code"], "validation_error", res)
-            self.assertEqual(store.get_division(div["id"]).league_id, l1["id"])
+            self.assertEqual(_div_league(store, div["id"]), l1["id"])
             self.assertEqual(len(store.all_setup_audit()), audits_before)
 
         self._run(case)
@@ -144,7 +157,9 @@ class AssignDivisionLeagueSqlTest(_SqlIntegrityBase):
             # Required League preserved through the SQL round-trip.
             self.assertEqual(cleared["league_id"], l1["id"])
             self.assertEqual(
-                store.get_season_team_registration(reg["id"]).league_id, l1["id"])
+                _reg_league(store,
+                            store.get_season_team_registration(reg["id"])),
+                l1["id"])
 
         self._run(case)
 
@@ -167,7 +182,7 @@ class AssignDivisionLeagueSqlTest(_SqlIntegrityBase):
             self.assertEqual(res["error"]["code"], "validation_error", res)
             stored = store.get_season_team_registration(reg["id"])
             self.assertEqual(stored.division_id, d1["id"])
-            self.assertEqual(stored.league_id, l1["id"])
+            self.assertEqual(_reg_league(store, stored), l1["id"])
             self.assertEqual(len(store.all_setup_audit()), audits_before)
 
         self._run(case)
@@ -199,7 +214,8 @@ class AssignLeagueGameStrandSqlTest(_SqlIntegrityBase):
                                                 actor_id=ADMIN)
             self.assertEqual(res["error"]["code"], "validation_error", res)
             self.assertEqual(
-                store.get_season_team_registration(reg_a["id"]).league_id,
+                _reg_league(store,
+                            store.get_season_team_registration(reg_a["id"])),
                 l1["id"])
             self.assertEqual(len(store.all_setup_audit()), audits_before)
 
@@ -337,7 +353,7 @@ class RollForwardConflictSqlTest(_SqlIntegrityBase):
                              "rollover_conflicts_active_registration", res)
             active = {r.team_id: r for r in
                       store.registrations_for_season(s2["id"]) if r.active}
-            self.assertEqual(active[team_a["id"]].league_id, l1t["id"])
+            self.assertEqual(_reg_league(store, active[team_a["id"]]), l1t["id"])
             self.assertNotIn(team_b["id"], active)
             self.assertEqual(len(store.all_setup_audit()), audits_before)
 

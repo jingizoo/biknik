@@ -117,7 +117,13 @@ class SeasonRegistrationServiceTest(unittest.TestCase):
     def test_same_team_different_division_across_seasons(self):
         season2 = self.api.create_season(self.league["id"], "Fall 2027",
                                          actor_id=ADMIN)
-        div_b = self.api.create_division(season2["id"], "Div B", actor_id=ADMIN)
+        # #283: a Team belongs to one permanent League, so its Division in
+        # another season must live under that SAME League's participation
+        # there (an auto-provisioned league would be a different League and
+        # the team could not register into it — rule 7).
+        team_league = self.api.store.get_team(self.team["id"]).league_id
+        div_b = self.api.create_division(season2["id"], "Div B",
+                                         league_id=team_league, actor_id=ADMIN)
         reg1 = self._register()
         reg2 = self.api.register_team_for_season(
             season2["id"], self.team["id"], div_b["id"], actor_id=ADMIN)
@@ -199,6 +205,38 @@ class SeasonRegistrationPersistenceTest(unittest.TestCase):
         team = api.create_team(club["id"], division["id"], "Lions", actor_id=ADMIN)
         store = api.store
         cur = store.conn.cursor()
+        # First reverse migration 035 (#283) back to the post-028 competition
+        # shape (per-Season leagues; season_id + league_id on divisions and
+        # registrations; no permanent Team.league_id), so the pre-028 reversal
+        # below — written against that shape — still applies. 035 re-runs on
+        # reopen alongside 021 and 028.
+        cur.execute("DROP INDEX IF EXISTS ix_leagues_program")
+        cur.execute("ALTER TABLE leagues ADD COLUMN season_id TEXT")
+        cur.execute("UPDATE leagues SET season_id = (SELECT MIN(ls.season_id) "
+                    "FROM league_seasons ls WHERE ls.league_id = leagues.id)")
+        cur.execute("ALTER TABLE leagues DROP COLUMN program_id")
+        cur.execute("DROP INDEX IF EXISTS ix_divisions_league_season")
+        cur.execute("ALTER TABLE divisions ADD COLUMN season_id TEXT")
+        cur.execute("ALTER TABLE divisions ADD COLUMN league_id TEXT")
+        cur.execute("UPDATE divisions SET "
+                    "league_id = (SELECT ls.league_id FROM league_seasons ls "
+                    "WHERE ls.id = divisions.league_season_id), "
+                    "season_id = (SELECT ls.season_id FROM league_seasons ls "
+                    "WHERE ls.id = divisions.league_season_id)")
+        cur.execute("ALTER TABLE divisions DROP COLUMN league_season_id")
+        cur.execute("DROP INDEX IF EXISTS ux_team_league_season")
+        cur.execute("DROP INDEX IF EXISTS ix_reg_league_season_division")
+        cur.execute("ALTER TABLE season_team_registrations ADD COLUMN season_id TEXT")
+        cur.execute("ALTER TABLE season_team_registrations ADD COLUMN league_id TEXT")
+        cur.execute("UPDATE season_team_registrations SET "
+                    "league_id = (SELECT ls.league_id FROM league_seasons ls "
+                    "WHERE ls.id = season_team_registrations.league_season_id), "
+                    "season_id = (SELECT ls.season_id FROM league_seasons ls "
+                    "WHERE ls.id = season_team_registrations.league_season_id)")
+        cur.execute("ALTER TABLE season_team_registrations DROP COLUMN league_season_id")
+        cur.execute("DROP INDEX IF EXISTS ix_teams_league")
+        cur.execute("ALTER TABLE teams DROP COLUMN league_id")
+        cur.execute("DROP TABLE IF EXISTS league_seasons")
         # Reverse migration 028 (#233 C1b) to the pre-028 competition-model names
         # a legacy DB carried, so migration 021's backfill (which reads the old
         # names) can re-run, followed by 028 performing the rename again.
@@ -233,7 +271,8 @@ class SeasonRegistrationPersistenceTest(unittest.TestCase):
         cur.execute("ALTER TABLE teams DROP COLUMN league_id")
         cur.execute("DROP TABLE IF EXISTS season_team_registrations")
         cur.execute("DELETE FROM schema_migrations WHERE version IN "
-                    "('021_permanent_teams', '028_competition_reset')")
+                    "('021_permanent_teams', '028_competition_reset', "
+                    "'035_competition_hierarchy_reset')")
         store.conn.commit()
         del api, store
 

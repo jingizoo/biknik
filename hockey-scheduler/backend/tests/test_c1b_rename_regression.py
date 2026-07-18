@@ -73,22 +73,32 @@ class CanonicalDomainFieldsTest(unittest.TestCase):
         self.assertIn("program_id", season)
         self.assertNotIn("league_id", season)
 
+        # #283: a Team now carries a permanent League (league_id) in addition
+        # to its Program.
         team = self._field_names(Team)
         self.assertIn("program_id", team)
-        self.assertNotIn("league_id", team)
+        self.assertIn("league_id", team)
 
+        # #283: a Division belongs to a LeagueSeason (its Season/League are
+        # resolved through that), not directly to a Season or League.
         division = self._field_names(Division)
-        self.assertIn("league_id", division)
+        self.assertIn("league_season_id", division)
+        self.assertNotIn("league_id", division)
+        self.assertNotIn("season_id", division)
         self.assertNotIn("level_id", division)
 
-        # New competition-league fields land on registration + game.
-        self.assertIn("league_id", self._field_names(SeasonTeamRegistration))
+        # #283: a registration belongs to a LeagueSeason; the Game keeps its
+        # own league_id (repointed to the permanent League by migration 035).
+        self.assertIn("league_season_id",
+                      self._field_names(SeasonTeamRegistration))
+        self.assertNotIn("season_id", self._field_names(SeasonTeamRegistration))
         self.assertIn("league_id", self._field_names(Game))
 
     def test_grouping_league_is_the_competition_entity(self):
-        # The class named League is now the Season-scoped grouping (formerly
-        # Level), not the umbrella.
-        self.assertIn("season_id", self._field_names(League))
+        # #283: League is now a PERMANENT child of a Program (program_id), not a
+        # Season-scoped grouping; its Season participation is a LeagueSeason.
+        self.assertIn("program_id", self._field_names(League))
+        self.assertNotIn("season_id", self._field_names(League))
         self.assertIn("sort_order", self._field_names(League))
 
 

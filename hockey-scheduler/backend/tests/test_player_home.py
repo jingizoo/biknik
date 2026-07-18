@@ -20,8 +20,8 @@ from helpers import BACKEND, FakeClock  # noqa: F401  (BACKEND sets up sys.path)
 
 from hockey_scheduler.api import ApiService
 from hockey_scheduler.domain import (
-    Division, Game, IceSlot, NotificationAudience, NotificationKind,
-    Player, Position, Rink, Team, Venue)
+    Division, Game, IceSlot, LeagueSeason, NotificationAudience,
+    NotificationKind, Player, Position, Rink, Team, Venue)
 from hockey_scheduler.services.notifier import push as push_notification
 from hockey_scheduler.store import InMemoryStore
 from hockey_scheduler.web import server as srv
@@ -35,7 +35,8 @@ def _seeded_api():
     deterministic rather than wall-clock dependent (#107 is the first
     feature in this codebase to filter on real elapsed time)."""
     s = InMemoryStore()
-    s.add_division(Division(id="d", season_id="se", name="D1"))
+    s.add_league_season(LeagueSeason(id="ls", league_id="l", season_id="se"))
+    s.add_division(Division(id="d", league_season_id="ls", name="D1"))
     s.add_rink(Rink(id="r1", venue_id="v", name="Main"))
     s.add_team(Team(id="home", name="Home", division="D1", division_id="d"))
     s.add_team(Team(id="away", name="Away", division="D1", division_id="d"))
@@ -187,7 +188,7 @@ class PlayerHomeAttendanceTest(unittest.TestCase):
 class PlayerHomeSubstituteOpportunitiesTest(unittest.TestCase):
     def setUp(self):
         self.api, self.store, self.base = _seeded_api()
-        self.store.add_division(Division(id="d2", season_id="se", name="D2"))
+        self.store.add_division(Division(id="d2", league_season_id="ls", name="D2"))
         self.store.add_team(Team(id="other", name="Other", division="D2",
                                  division_id="d2"))
         self.store.add_player(Player(id="goalie_rostered", team_id="home",

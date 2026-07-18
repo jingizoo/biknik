@@ -25,7 +25,7 @@ from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
 
 from hockey_scheduler.api import ApiService
 from hockey_scheduler.domain import (
-    IceSlotStatus, SeasonTeamRegistration, Team)
+    IceSlotStatus, LeagueSeason, SeasonTeamRegistration, Team)
 from hockey_scheduler.store import InMemoryStore
 
 ADMIN = "admin"
@@ -37,6 +37,22 @@ class _Base(unittest.TestCase):
 
     def _audit_count(self):
         return len(self.api.store.all_setup_audit())
+
+    # #283: a registration/Division no longer stores its own league_id — it is
+    # fixed by the LeagueSeason. These resolve the League from a raw store row.
+    def _reg_league(self, reg):
+        ls = self.api.store.get_league_season(reg.league_season_id)
+        return ls.league_id if ls else None
+
+    def _div_league(self, division_id):
+        d = self.api.store.get_division(division_id)
+        ls = self.api.store.get_league_season(d.league_season_id) if d else None
+        return ls.league_id if ls else None
+
+    def _ls_id(self, league_id, season_id):
+        """The id of the LeagueSeason binding ``league_id`` to ``season_id``
+        (created by ``create_league``), for building registrations directly."""
+        return self.api.store.league_season_for(league_id, season_id).id
 
     def _org_program(self):
         org = self.api.create_organization("Org", "O", actor_id=ADMIN)
@@ -167,7 +183,7 @@ class RollForwardV2Test(_Base):
         # valid earlier selection; no audit grew.
         active = {r.team_id: r for r in
                   self.api.store.registrations_for_season(s2["id"]) if r.active}
-        self.assertEqual(active[team_a["id"]].league_id, l1t["id"])
+        self.assertEqual(self._reg_league(active[team_a["id"]]), l1t["id"])
         self.assertNotIn(team_b["id"], active)
         self.assertEqual(self._audit_count(), audits_before)
 
@@ -235,8 +251,7 @@ class DivisionReparentIntegrityTest(_Base):
                                               v2=True)
         self.assertEqual(res["error"]["code"], "validation_error", res)
         # Zero mutation: division still under L1, no audit written.
-        self.assertEqual(self.api.store.get_division(div["id"]).league_id,
-                         l1["id"])
+        self.assertEqual(self._div_league(div["id"]), l1["id"])
         self.assertEqual(self._audit_count(), audits_before)
 
     def test_reparent_with_no_dependents_succeeds(self):
@@ -280,7 +295,7 @@ class AssignDivisionPreservesLeagueTest(_Base):
         # Zero mutation: still on d1, league unchanged, no audit.
         stored = self.api.store.get_season_team_registration(reg["id"])
         self.assertEqual(stored.division_id, d1["id"])
-        self.assertEqual(stored.league_id, l1["id"])
+        self.assertEqual(self._reg_league(stored), l1["id"])
         self.assertEqual(self._audit_count(), audits_before)
 
 
@@ -317,7 +332,8 @@ class AssignLeagueGameStrandTest(_Base):
         self.assertEqual(res["error"]["code"], "validation_error", res)
         # Zero mutation: registration still in L1, no audit written.
         self.assertEqual(
-            self.api.store.get_season_team_registration(reg_a["id"]).league_id,
+            self._reg_league(
+                self.api.store.get_season_team_registration(reg_a["id"])),
             l1["id"])
         self.assertEqual(self._audit_count(), audits_before)
 
@@ -393,11 +409,13 @@ class HierarchyV2ProgramMismatchTest(_Base):
         team = self.api.create_team(club["id"], None, "Foreign", actor_id=ADMIN,
                                     program_id=other["id"])
         # Inject the registration directly (register_team_for_season would now
-        # reject it) to reproduce a directly-loaded cross-Program row.
+        # reject it) to reproduce a directly-loaded cross-Program row. #283: the
+        # row hangs off the (league, season) LeagueSeason created by
+        # create_league.
         self.api.store.add_season_team_registration(SeasonTeamRegistration(
-            id=self.api.store.next_id("streg"), season_id=season["id"],
-            team_id=team["id"], division_id=division_id, league_id=league["id"],
-            active=True))
+            id=self.api.store.next_id("streg"),
+            league_season_id=self._ls_id(league["id"], season["id"]),
+            team_id=team["id"], division_id=division_id, active=True))
         return program, season, league, team
 
     def _season_node(self, program, season):
@@ -428,9 +446,9 @@ class HierarchyV2ProgramMismatchTest(_Base):
         team = self.api.create_team(club["id"], None, "Foreign", actor_id=ADMIN,
                                     program_id=other["id"])
         self.api.store.add_season_team_registration(SeasonTeamRegistration(
-            id=self.api.store.next_id("streg"), season_id=season["id"],
-            team_id=team["id"], division_id=div["id"], league_id=league["id"],
-            active=True))
+            id=self.api.store.next_id("streg"),
+            league_season_id=self._ls_id(league["id"], season["id"]),
+            team_id=team["id"], division_id=div["id"], active=True))
 
         tree = self.api.get_setup_hierarchy_v2()
         prog = next(p for p in tree["programs"] if p["id"] == program["id"])

@@ -69,8 +69,13 @@ def division_to_v1(result):
 
 
 def team_to_v1(result):
-    """A Team result → the legacy v1 shape (``program_id`` → ``league_id``)."""
-    return _rename(result, {"program_id": "league_id"})
+    """A Team result → the legacy v1 shape (``program_id`` → ``league_id``).
+
+    #283: ``Team`` gained a competition ``league_id`` field. Drop it BEFORE the
+    rename so the program-derived value isn't clobbered by the (usually None)
+    competition league id — the v1 API's ``league_id`` has always meant the
+    Program."""
+    return _rename(_drop(result, {"league_id"}), {"program_id": "league_id"})
 
 
 def registration_to_v1(result):

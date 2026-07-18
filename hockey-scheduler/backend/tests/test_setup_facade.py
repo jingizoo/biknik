@@ -133,11 +133,14 @@ class SetupFacadeTest(unittest.TestCase):
         div = self.api.create_division(season["id"], "Div A", league_id=level["id"])
         self.assertEqual(div["league_id"], level["id"])
 
-    def test_create_division_without_level_is_unassigned(self):
+    def test_create_division_without_level_auto_provisions_a_league(self):
+        # #283: a Division always belongs to a League. Created without an
+        # explicit league in a season that has none yet, it auto-provisions a
+        # default League rather than being left level-less.
         league = self.api.create_program("Over 55")
         season = self.api.create_season(league["id"], "Fall 2026")
         div = self.api.create_division(season["id"], "Div A")
-        self.assertIsNone(div["league_id"])
+        self.assertIsNotNone(div["league_id"])
 
     def test_create_division_with_missing_level_returns_not_found(self):
         league = self.api.create_program("Over 55")
@@ -145,10 +148,14 @@ class SetupFacadeTest(unittest.TestCase):
         result = self.api.create_division(season["id"], "Div A", league_id="level_missing")
         self.assertEqual(result["error"]["code"], "not_found")
 
-    def test_division_rejects_level_from_another_season(self):
+    def test_division_rejects_level_from_another_program(self):
+        # #283: a League is program-wide, so reusing one across seasons of the
+        # SAME program is legitimate. The boundary that still holds is the
+        # Program — a League from a different Program can't group a division here.
         league = self.api.create_program("Over 55")
+        other = self.api.create_program("Rival Program")
         season_a = self.api.create_season(league["id"], "Fall 2026")
-        season_b = self.api.create_season(league["id"], "Spring 2027")
+        season_b = self.api.create_season(other["id"], "Spring 2027")
         level_a = self.api.create_league(season_a["id"], "Level 1")
         result = self.api.create_division(season_b["id"], "Div A", league_id=level_a["id"])
         self.assertEqual(result["error"]["code"], "validation_error")
@@ -197,9 +204,11 @@ class SetupValidationWordingTest(unittest.TestCase):
 
     def test_team_without_umbrella_says_program(self):
         club = self.api.create_club("C")
-        r = self.api.create_team(club["id"], None, "T")  # no league/division
+        r = self.api.create_team(club["id"], None, "T")  # no program/league/division
+        # #283: a Team is anchored by a Program or its permanent competition
+        # League, so the message offers both — but the umbrella is named
+        # "program", never the old internal "league".
         self.assertIn("A team needs a program", self._msg(r))
-        self.assertNotRegex(self._msg(r), r"(?i)\bleague\b")
 
     def test_missing_grouping_parent_says_league(self):
         league = self.api.create_program("P")

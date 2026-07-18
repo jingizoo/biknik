@@ -124,7 +124,10 @@ class ProductionRestartTest(unittest.TestCase):
         self.assertEqual(store.get_ice_slot(ids["slot"]).rink_id, ids["rink"])
         # Competition chain: League → Season → Division → Team; Club → Team.
         self.assertEqual(store.get_season(ids["season"]).program_id, ids["league"])
-        self.assertEqual(store.get_division(ids["division"]).season_id, ids["season"])
+        division = store.get_division(ids["division"])
+        self.assertEqual(
+            store.get_league_season(division.league_season_id).season_id,
+            ids["season"])
         team = store.get_team(ids["team_a"])
         self.assertEqual(team.club_id, ids["club"])
         # #180: the surviving competition relationship is the permanent league,

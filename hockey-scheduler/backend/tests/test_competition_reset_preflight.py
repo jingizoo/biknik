@@ -49,13 +49,35 @@ def _sql_backends():
 
 
 def _downgrade_to_pre028(store):
-    """Reverse migration 028's competition-model renames so the pre-migration
-    gate queries the exact PRE-028 schema it runs against in production — the
-    ``levels`` grouping table and ``divisions.level_id``. The gate only reads
+    """Reverse the competition-model migrations so the pre-migration gate queries
+    the exact PRE-028 schema it runs against in production — the ``levels``
+    grouping table (with ``season_id``), ``divisions.level_id``, and
+    ``season_team_registrations.season_id``. The gate only reads
     divisions/levels/seasons/season_team_registrations, so those are the only
-    names that must be restored."""
+    names that must be restored.
+
+    035 (#283) now runs at the end of the chain: it folded the divisions and
+    registration ``season_id``/``league_id`` into ``league_season_id`` and made
+    ``leagues`` a permanent Program child (``program_id``, no ``season_id``).
+    Reverse those first, then finish reversing 028's rename of the promoted
+    grouping back to ``levels``. This runs on a freshly-migrated (empty)
+    database, so only the SCHEMA is reversed."""
     cur = store.conn.cursor()
-    cur.execute("ALTER TABLE divisions RENAME COLUMN league_id TO level_id")
+    # -- reverse 035 (#283) back to the post-028 competition shape --
+    cur.execute("DROP INDEX IF EXISTS ux_team_league_season")
+    cur.execute("DROP INDEX IF EXISTS ix_reg_league_season_division")
+    cur.execute("ALTER TABLE season_team_registrations DROP COLUMN league_season_id")
+    cur.execute("ALTER TABLE season_team_registrations ADD COLUMN season_id TEXT")
+    cur.execute("DROP INDEX IF EXISTS ix_divisions_league_season")
+    cur.execute("ALTER TABLE divisions DROP COLUMN league_season_id")
+    cur.execute("ALTER TABLE divisions ADD COLUMN season_id TEXT")
+    cur.execute("ALTER TABLE divisions ADD COLUMN level_id TEXT")
+    cur.execute("DROP INDEX IF EXISTS ix_leagues_program")
+    cur.execute("ALTER TABLE leagues DROP COLUMN program_id")
+    cur.execute("ALTER TABLE leagues ADD COLUMN season_id TEXT")
+    cur.execute("DROP INDEX IF EXISTS ux_league_season")
+    cur.execute("DROP TABLE IF EXISTS league_seasons")
+    # -- finish reversing 028: the promoted grouping is `levels` pre-028 --
     cur.execute("DROP INDEX IF EXISTS ix_leagues_external_ref")
     cur.execute("ALTER TABLE leagues RENAME TO levels")
 

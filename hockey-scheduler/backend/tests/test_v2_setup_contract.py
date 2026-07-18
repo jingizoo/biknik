@@ -568,17 +568,20 @@ class V2SetupContractTest(unittest.TestCase):
         team_legacy = self._v2(c, "team",
                               {"program_id": program["id"], "club_id": club["id"],
                                "name": "R Legacy"})
-        # v1 registration route: no league_id, and season2 has no League row
-        # at all, so the derived league_id is None (#233 C1b derivation).
-        status, reg_legacy = self._req(
-            c, "POST", f"/api/setup/seasons/{season2['id']}/team-registrations",
-            {"team_id": team_legacy["id"]})
-        self.assertEqual(status, 200, reg_legacy)
-        status, removed_legacy = self._req(
-            c, "POST",
-            f"/api/v2/setup/season-team-registration/{reg_legacy['id']}/remove",
-            {})
-        self.assertEqual(status, 200, removed_legacy)
+        # #283: a registration always hangs off a LeagueSeason, so the service
+        # now refuses to create a league-less row. Reproduce the inconsistent
+        # parent (a registration whose League no longer resolves) by injecting an
+        # inactive row against a LeagueSeason bound to a non-existent League —
+        # the same direct-store technique the invalid-data guards elsewhere use.
+        from hockey_scheduler.domain import LeagueSeason, SeasonTeamRegistration
+        store = self.srv.STATE.api.store
+        ghost_ls = store.add_league_season(LeagueSeason(
+            id=store.next_id("leagueseason"), league_id="league_ghost",
+            season_id=season2["id"]))
+        reg_legacy = {"id": store.next_id("streg")}
+        store.add_season_team_registration(SeasonTeamRegistration(
+            id=reg_legacy["id"], league_season_id=ghost_ls.id,
+            team_id=team_legacy["id"], division_id=None, active=False))
         status, blocked_legacy = self._req(
             c, "POST",
             f"/api/v2/setup/season-team-registration/{reg_legacy['id']}/delete",
@@ -933,12 +936,20 @@ class V2SetupContractTest(unittest.TestCase):
         self.assertIsNone(game["division_id"])
         self.assertEqual(game["league_id"], env["league"]["id"])
 
-    def test_v2_cross_season_league_rejected(self):
+    def test_v2_cross_program_league_rejected(self):
+        # #283: a League is permanent and MAY participate in several Seasons of
+        # its own Program, so a League from a different Season of the SAME program
+        # is now valid participation. The rejected case is a League belonging to a
+        # DIFFERENT Program entirely (its LeagueSeason invariant fails).
         c = self._admin()
         env = self._playable(c)
-        # A league under a DIFFERENT season of the same program.
+        other_org = self._v2(c, "organization",
+                            {"name": "XProg Org", "short_name": "XO"})
+        other_program = self._v2(c, "program",
+                               {"name": "X Prog",
+                                "operator_organization_id": other_org["id"]})
         other_season = self._v2(c, "season",
-                               {"program_id": env["program"]["id"], "name": "S2"})
+                              {"program_id": other_program["id"], "name": "S2"})
         other_league = self._v2(c, "league",
                               {"season_id": other_season["id"], "name": "OL"})
         status, resp = self._req(

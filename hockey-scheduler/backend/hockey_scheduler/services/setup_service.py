@@ -330,6 +330,22 @@ class SetupService:
             "belongs to.",
             {"reason": "ambiguous_league_for_season", "season_id": season_id})
 
+    def _import_default_league_season(self, season_id: str) -> LeagueSeason:
+        """The LeagueSeason the simple (two-sheet) team import registers into
+        (#283): the Season's existing LeagueSeason (first if several — this
+        onboarding import carries no per-division League), auto-provisioning a
+        default League when the Season has none, so imported divisions and
+        registrations are never orphaned with a null league_season_id."""
+        candidates = self.store.league_seasons_for_season(season_id)
+        if candidates:
+            return candidates[0]
+        season = self.store.get_season(season_id)
+        league = League(id=self.store.next_id("league"),
+                        program_id=season.program_id if season else None,
+                        name="League", sort_order=0)
+        self.store.add_league(league)
+        return self._link_league_season(league.id, season_id)
+
     @_transactional
     def create_division_under_league(self, league_id: str, name: str,
                                      age_group: str = "",
@@ -520,6 +536,17 @@ class SetupService:
         if team.program_id and team.program_id != season.program_id:
             raise ValidationError(
                 "Team belongs to a different program than this season.")
+        # When an explicit league is supplied (the v2 canonical path), the
+        # Team→Program match is EXACT (#283/#233 C2): a program-less team can't
+        # slip into the canonical tree the way the legacy-permissive check above
+        # would allow it to.
+        if league_id and (not team.program_id
+                          or team.program_id != season.program_id):
+            raise ValidationError(
+                "Team must belong to this season's program.",
+                {"reason": "team_program_mismatch", "team_id": team.id,
+                 "team_program_id": team.program_id,
+                 "season_program_id": season.program_id})
         ls = self._resolve_registration_league_season(
             season, team, division_id, league_id)
         # Rule 7 — a Team with a permanent League registers only in that League.
@@ -2610,12 +2637,13 @@ class SetupService:
                     if division is None:
                         # #283: a Division belongs to a LeagueSeason. This simple
                         # onboarding import carries no per-division League, so use
-                        # the Season's sole LeagueSeason (None if ambiguous —
-                        # mirrors the old "no determinable league" backfill).
-                        _cands = self.store.league_seasons_for_season(season_id)
-                        _ls_id = _cands[0].id if len(_cands) == 1 else None
+                        # the Season's LeagueSeason, auto-provisioning a default
+                        # League when the Season has none yet (mirrors
+                        # create_division so imported rows are never orphaned with
+                        # a null league_season_id).
+                        _ls = self._import_default_league_season(season_id)
                         division = Division(id=self.store.next_id("division"),
-                                            league_season_id=_ls_id,
+                                            league_season_id=_ls.id,
                                             name=division_name)
                         self.store.add_division(division)
                         self._audit("division_created", "division", division.id,
@@ -2625,11 +2653,15 @@ class SetupService:
 
                 division_id = division.id if division else None
 
-                # #180: a team's participation is converged onto the permanent
-                # league_id + a SeasonTeamRegistration, never the legacy
+                # #180/#283: a team's participation is converged onto its
+                # permanent League + a SeasonTeamRegistration, never the legacy
                 # Team.division_id. The team is a permanent member of THIS
-                # import's season league; the imported division lives on the
-                # registration for (season_id, team), not on the Team.
+                # import season's League (auto-provisioned if the Season had
+                # none); the imported division lives on the registration.
+                _import_ls = (self.store.get_league_season(division.league_season_id)
+                              if division is not None
+                              else self._import_default_league_season(season_id))
+                _import_league_id = _import_ls.league_id if _import_ls else None
                 team = next((t for t in self.store.all_teams()
                             if t.external_ref == team_code), None)
                 if team is not None:
@@ -2637,6 +2669,8 @@ class SetupService:
                     team.club_id = club_id
                     if season_league_id:
                         team.program_id = season_league_id
+                    if _import_league_id and not team.league_id:
+                        team.league_id = _import_league_id
                     self.store.save_team(team)
                     self._audit("team_updated", "team", team.id, actor_id,
                                 {"club_id": club_id, "league_id": team.program_id,
@@ -2645,6 +2679,7 @@ class SetupService:
                 else:
                     team = Team(id=self.store.next_id("team"), name=team_name,
                                club_id=club_id, program_id=season_league_id,
+                               league_id=_import_league_id,
                                external_ref=team_code)
                     self.store.add_team(team)
                     self._audit("team_created", "team", team.id, actor_id,
@@ -2660,8 +2695,7 @@ class SetupService:
                 if division is not None:
                     reg_ls_id = division.league_season_id
                 else:
-                    _rcands = self.store.league_seasons_for_season(season_id)
-                    reg_ls_id = _rcands[0].id if len(_rcands) == 1 else None
+                    reg_ls_id = _import_ls.id if _import_ls else None
                 reg = next(
                     (r for r in self.store.registrations_for_season(season_id)
                      if r.team_id == team.id), None)

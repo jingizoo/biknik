@@ -53,11 +53,19 @@ class SetupReassignTest(unittest.TestCase):
     def test_assign_and_clear_division_level(self):
         assigned = self.api.assign_division_league(self.div["id"], self.level["id"])
         self.assertEqual(assigned["league_id"], self.level["id"])
+        # #283: a Division can no longer be league-less — a v1 "clear" is a
+        # no-op that keeps it on its current League rather than nulling a field
+        # that no longer exists.
         cleared = self.api.assign_division_league(self.div["id"], None)
-        self.assertIsNone(cleared["league_id"])
+        self.assertEqual(cleared["league_id"], self.level["id"])
 
     def test_assign_division_level_from_other_season_rejected(self):
-        other = self.api.create_season(self.league["id"], "Spring 2027")
+        # #283: a League is program-wide, so moving a division onto a League of
+        # another Season in the SAME program is legitimate. The boundary that
+        # still holds is the Program — a League from a different Program can't
+        # take a division from this one.
+        other_program = self.api.create_program("Rival Program")
+        other = self.api.create_season(other_program["id"], "Spring 2027")
         div_other = self.api.create_division(other["id"], "Div B")
         r = self.api.assign_division_league(div_other["id"], self.level["id"])
         self.assertEqual(r["error"]["code"], "validation_error")

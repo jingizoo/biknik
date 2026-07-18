@@ -17,7 +17,7 @@ from helpers import BACKEND  # noqa: F401
 
 import hierarchy_fixtures as fx
 from hockey_scheduler.api import ApiService
-from hockey_scheduler.domain import Division, League, Season
+from hockey_scheduler.domain import Division, League, LeagueSeason, Season
 from hockey_scheduler.store import InMemoryStore, SqlStore
 
 by_ref = fx.by_ref
@@ -85,7 +85,9 @@ class ImportConvergenceContract:
         diva = by_ref(self.store.all_divisions(), "DIVA")
         reg = self.store.registration_for_team_in_season(season.id, lions.id)
         self.assertIsNotNone(reg)
-        self.assertEqual(reg.league_id, league.id)
+        self.assertEqual(
+            self.store.get_league_season(reg.league_season_id).league_id,
+            league.id)
         self.assertEqual(reg.division_id, diva.id)
         self.assertTrue(reg.active)
 
@@ -127,7 +129,8 @@ class ImportConvergenceContract:
         l2 = by_ref(self.store.all_leagues(), "L2")
         reg = self.store.registration_for_team_in_season(
             season.id, self._team("LIONS").id)
-        self.assertEqual(reg.league_id, l2.id)
+        self.assertEqual(
+            self.store.get_league_season(reg.league_season_id).league_id, l2.id)
         self.assertIsNone(reg.division_id)
 
     def test_incremental_team_import_against_existing_program(self):
@@ -219,9 +222,10 @@ class ImportConvergenceContract:
         err = next(e for e in result["errors"]
                   if e["code"] == "registration_league_move_strands_games")
         self.assertIn(game_id, err["affected_game_ids"])
+        moved_reg = self.store.registration_for_team_in_season(season.id, lions.id)
         self.assertEqual(
-            self.store.registration_for_team_in_season(season.id, lions.id)
-            .league_id, league.id)
+            self.store.get_league_season(moved_reg.league_season_id).league_id,
+            league.id)
         self.assertEqual(len(self.store.all_setup_audit()), audits_before)
 
     def test_import_cannot_move_team_program_while_registrations_remain(self):
@@ -381,7 +385,9 @@ class ImportConvergenceContract:
                   if e["code"] == "division_season_move_strands_dependents")
         self.assertIn(game_id, err["affected_game_ids"])
         self.assertTrue(err["affected_registration_ids"])
-        self.assertEqual(self.store.get_division(diva.id).season_id, fall.id)
+        diva_ls = self.store.get_league_season(
+            self.store.get_division(diva.id).league_season_id)
+        self.assertEqual(diva_ls.season_id, fall.id)
         self.assertEqual(len(self.store.all_setup_audit()), audits_before)
 
     def test_inactive_registration_with_committed_game_cannot_move_division(self):
@@ -620,10 +626,12 @@ class ImportConvergenceValidationTest(unittest.TestCase):
         # mismatch rather than an unrelated league/season mismatch.
         self.store.add_season(Season(id="se_nl", program_id="", name="NL",
                                      external_ref="SNL"))
-        self.store.add_league(League(id="lg_nl", season_id="se_nl",
+        self.store.add_league(League(id="lg_nl", program_id="",
                                      name="NL League", external_ref="LNL"))
-        self.store.add_division(Division(id="d_nl", season_id="se_nl", name="D",
-                                         league_id="lg_nl", external_ref="DNL"))
+        self.store.add_league_season(LeagueSeason(
+            id="ls_nl", league_id="lg_nl", season_id="se_nl"))
+        self.store.add_division(Division(id="d_nl", league_season_id="ls_nl",
+                                         name="D", external_ref="DNL"))
         reg = {"import_type": "hierarchy", "registrations_csv":
                "season_code,team_code,league_code,division_code\n"
                "SNL,LIONS,LNL,DNL\n"}
@@ -635,7 +643,7 @@ class ImportConvergenceValidationTest(unittest.TestCase):
         self.api.commit_hierarchy_import(base_payload(
             permanent_teams_csv=fx.permanent_teams_csv(rows=(
                 "OVER55,LIONS,Lions,",))), actor_id="admin")
-        self.store.add_division(Division(id="d_dangle", season_id="missing",
+        self.store.add_division(Division(id="d_dangle", league_season_id="missing",
                                          name="D", external_ref="DDG"))
         reg = {"import_type": "hierarchy", "registrations_csv":
                "season_code,team_code,league_code,division_code\n"

@@ -33,8 +33,15 @@ class SeasonRolloverServiceTest(unittest.TestCase):
         self.league = api.create_program("L", actor_id=ADMIN)
         self.s1 = api.create_season(self.league["id"], "2026-27", actor_id=ADMIN)
         self.s2 = api.create_season(self.league["id"], "2027-28", actor_id=ADMIN)
-        self.d1 = api.create_division(self.s1["id"], "Div A", actor_id=ADMIN)
-        self.d2 = api.create_division(self.s2["id"], "Div A", actor_id=ADMIN)
+        # #283: one permanent competition League spanning both seasons, so a
+        # permanent team (which belongs to that League) can roll forward within
+        # its own League from s1 into s2 rather than hitting the cross-league
+        # guard that a per-season auto-provisioned league would trip.
+        self.comp = api.create_league(self.s1["id"], "Comp", actor_id=ADMIN)
+        self.d1 = api.create_division(self.s1["id"], "Div A",
+                                      league_id=self.comp["id"], actor_id=ADMIN)
+        self.d2 = api.create_division(self.s2["id"], "Div A",
+                                      league_id=self.comp["id"], actor_id=ADMIN)
         club = api.create_club("C", actor_id=ADMIN)
         self.lions = api.create_team(club["id"], self.d1["id"], "Lions", actor_id=ADMIN)
         self.bears = api.create_team(club["id"], self.d1["id"], "Bears", actor_id=ADMIN)
@@ -56,8 +63,9 @@ class SeasonRolloverServiceTest(unittest.TestCase):
         through the service (it would reject them), so the tests inject them
         directly to reproduce the data the gate must defend against.
         """
+        ls = self.api.store.league_season_for(self.comp["id"], self.s1["id"])
         reg = SeasonTeamRegistration(
-            id=self.api.store.next_id("streg"), season_id=self.s1["id"],
+            id=self.api.store.next_id("streg"), league_season_id=ls.id,
             team_id=team_id, division_id=division_id, active=True)
         self.api.store.add_season_team_registration(reg)
         return reg

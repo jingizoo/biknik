@@ -18,8 +18,8 @@ from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
 
 from hockey_scheduler.api import ApiService
 from hockey_scheduler.domain import (
-    Division, IceSlot, Organization, Program, Rink, Season,
-    SeasonTeamRegistration, SeasonVenueAccess, Team, Venue)
+    Division, IceSlot, League, LeagueSeason, Organization, Program, Rink,
+    Season, SeasonTeamRegistration, SeasonVenueAccess, Team, Venue)
 from hockey_scheduler.domain.errors import ValidationError
 from hockey_scheduler.store import InMemoryStore
 from hockey_scheduler.services import draft_schedule
@@ -35,7 +35,9 @@ def _store(n_teams, slot_times):
     s.add_organization(Organization(id="org", name="Owner"))
     s.add_program(Program(id="league", name="League", operator_organization_id="org"))
     s.add_season(Season(id="se", program_id="league", name="Season"))
-    s.add_division(Division(id="d", season_id="se", name="D"))
+    s.add_league(League(id="lg", program_id="league", name="Div League"))
+    s.add_league_season(LeagueSeason(id="ls", league_id="lg", season_id="se"))
+    s.add_division(Division(id="d", league_season_id="ls", name="D"))
     s.add_venue(Venue(id="v", name="Arena", organization_id="org",
                       league_id="league"))
     s.add_season_venue_access(SeasonVenueAccess(
@@ -43,10 +45,10 @@ def _store(n_teams, slot_times):
     s.add_rink(Rink(id="r1", venue_id="v", name="Main"))
     for i in range(n_teams):
         s.add_team(Team(id=f"t{i}", name=f"T{i}", division="D", division_id="d",
-                        program_id="league"))
+                        program_id="league", league_id="lg"))
         # Draft scheduling reads the season registration, not division_id (#180).
         s.add_season_team_registration(SeasonTeamRegistration(
-            id=f"streg_t{i}", season_id="se", team_id=f"t{i}",
+            id=f"streg_t{i}", league_season_id="ls", team_id=f"t{i}",
             division_id="d", active=True))
     for i, t in enumerate(slot_times):
         s.add_ice_slot(IceSlot(id=f"s{i}", rink_id="r1", start_time=t,

@@ -3443,8 +3443,13 @@ class ApiService:
                     division_id: Optional[str] = None,
                     name: str = "", actor_id: Optional[str] = None,
                     program_id: Optional[str] = None) -> dict:
-        return _serialize(self.setup.create_team(
+        team = _serialize(self.setup.create_team(
             club_id, division_id, name, actor_id, program_id=program_id))
+        # #283: drop the new competition Team.league_id from this shared shape —
+        # the canonical v2 team excludes it, and the v1 adapter derives its
+        # league_id from program_id (team_to_v1). Neither exposes the raw field.
+        team.pop("league_id", None)
+        return team
 
     # -- permanent teams + season registrations (#180) ---------------------
     @catch
