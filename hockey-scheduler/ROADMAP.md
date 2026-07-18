@@ -63,6 +63,11 @@ See `docs/architecture/data-model.md` and ADR
 - **#256 / PR #264 + #265** — guarded production factory-reset Danger Zone
   (preview, challenge token, typed phrase, atomic wipe + durable event,
   PostgreSQL rollback). **Complete.**
+- **#267 / PR #286** — login throttling by source IP and normalized username
+  (atomic reserve-slot; fixed-size hashed keys; amortized sweep + hard
+  cardinality cap with sweep-then-fail-closed admission; clamped, non-finite-safe
+  config), production minimum-password policy, generic 429/`Retry-After` with no
+  username oracle, and a safe aggregate lockout audit. **Complete on `main`.**
 
 Completed issues are removed from the pending tracks below.
 
@@ -88,16 +93,15 @@ Completed issues are removed from the pending tracks below.
 
 ## Release 0 — production security gate
 
-**Do not add more production users until this gate passes.** (#266 is done.)
+**Do not add more production users until this gate passes.** (#266 and #267 are
+done.)
 
-1. **#267** — login throttling by IP and normalized username, safe backoff,
-   generic errors, and a minimum password policy.
-2. **#160** — canonical Player account scope: private-Game reads work from
+1. **#160** — canonical Player account scope: private-Game reads work from
    `player_id`, with `team_id` derived or guaranteed (they still depend on an
    optional `scope.team_id`).
-3. **#271** — strict write schemas: unknown-field rejection, malformed-JSON
+2. **#271** — strict write schemas: unknown-field rejection, malformed-JSON
    handling, and JSON `405` responses with `Allow`.
-4. **Bounded #201/#202** — only the transaction, concurrency, authorization, and
+3. **Bounded #201/#202** — only the transaction, concurrency, authorization, and
    route-contract work required to close the paths above.
 
 **Exit gate:** credential guessing is throttled without a username oracle; weak
@@ -137,19 +141,33 @@ Ship as ordered slices; **do not** land #205 as one large migration PR.
    membership hangs off the Team's `LeagueSeason`, not a re-created League).
 5. Cut roster, substitutes, imports, accounts and notifications over to seasonal
    membership.
-6. **#276** — privacy-minimized Coach Team directory.
-7. **#275** — Guardian invite-by-email, activation and consent acceptance.
-8. **#278** — C/LW/RW/D/G positions, game lines/pairs/goalie designation, and
+6. **#287** — substitute matching engine (after #205, since eligibility resolves
+   through the Game's `LeagueSeason` and the player's seasonal membership).
+   Deterministic, explainable, League-configurable matching (fairness by fewest
+   completed sub games, 1–7 skill proximity, notice-window exclusion, position
+   preference with goalie strictly separate, random tiebreaker, authorized
+   override) plus an offer → accept/decline/timeout → next-candidate workflow.
+   Six bounded slices: (1) preferences + League policy config; (2) eligibility,
+   ranking, explainable selection; (3) offer/accept/decline/timeout state
+   machine; (4) notifications + auto next-candidate retry; (5) captain/manager
+   override with authz + audit; (6) operator UI + e2e. **Policy and state-machine
+   design (slices 1–3) may begin earlier, but implementation must not land ahead
+   of #205, and #287's five open design questions must be settled first.**
+7. **#276** — privacy-minimized Coach Team directory.
+8. **#275** — Guardian invite-by-email, activation and consent acceptance.
+9. **#278** — C/LW/RW/D/G positions, game lines/pairs/goalie designation, and
    governed affiliate call-ups.
-9. **#280** — emergency contacts and narrowly scoped medical/safety alerts.
-10. **#190** — Team staff records, certifications, screening and expiry (after
+10. **#280** — emergency contacts and narrowly scoped medical/safety alerts.
+11. **#190** — Team staff records, certifications, screening and expiry (after
     scoped identity + sensitive-data governance exist).
 
 **Exit gate:** one athlete can represent different Teams in different Seasons
 without altering old Games; birthdate/governing-body ids stay private with
 audited sensitive reads; jerseys/positions/eligibility become Season-specific;
 Guardian links survive migration; current roster eligibility resolves through the
-Game's `LeagueSeason` and seasonal athlete membership.
+Game's `LeagueSeason` and seasonal athlete membership; substitute matching is
+deterministic, explainable, and League-configurable, resolving eligibility
+through the Game's `LeagueSeason` and seasonal membership.
 
 ## Release 3 — hockey Game operations
 
@@ -221,20 +239,21 @@ identity, Game Sheet and context contracts stabilize).
 ## Exact next implementation queue
 
 ```text
-1. Roadmap reset — this file + issue #212 (documentation only; supersedes PR #281)
-2. #267 — login security
-3. #160 — Player private-read scope
-4. #271 — strict write/API contracts
-5. #269 — jersey constraints
-6. #268 — Player edit workflow
-7. #270 — Player deactivate/reactivate
-8. #272 — Season date-only boundaries
-9. #159 / #124 / #273 — design and privacy foundation
-10. #205 — seasonal athlete membership (on the permanent Team→League spine)
+1. #160 — Player private-read scope        (NEXT)
+2. #271 — strict write/API contracts
+3. #269 — jersey constraints
+4. #268 — Player edit workflow
+5. #270 — Player deactivate/reactivate
+6. #272 — Season date-only boundaries
+7. #159 / #124 / #273 — design and privacy foundation
+8. #205 — seasonal athlete membership (on the permanent Team→League spine)
+9. #287 — substitute matching engine (after #205; design of slices 1–3 may
+          start earlier once its five open questions are settled)
 ```
 
-Production security first; Player invariants before the #205 migration; no new
-broad model change before its privacy and history rules are locked.
+Done: #267 (login security, PR #286). Production security first; Player
+invariants before the #205 migration; no new broad model change before its
+privacy and history rules are locked.
 
 ## Delivery rules
 
