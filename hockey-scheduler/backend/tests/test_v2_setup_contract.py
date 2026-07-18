@@ -46,7 +46,7 @@ REGISTRATION_KEYS = {"id", "season_id", "team_id", "division_id", "league_id",
 GAME_KEYS = {"id", "home_team_id", "start_time", "target_goalies",
              "target_skaters", "max_skaters", "away_team_id", "rink", "end_time",
              "roster_lock_time", "locked", "cancelled", "published", "season_id",
-             "division_id", "ice_slot_id", "is_draft", "league_id"}
+             "division_id", "ice_slot_id", "is_draft", "league_id", "game_type"}
 
 
 class V2SetupContractTest(unittest.TestCase):
@@ -203,6 +203,71 @@ class V2SetupContractTest(unittest.TestCase):
         self.assertEqual(status, 200, game)
         self.assertEqual(set(game), GAME_KEYS, game)
         self.assertEqual(game["league_id"], league["id"])
+
+    # -- exhibition game type (#283 Slice D) --------------------------------
+    def test_v2_exhibition_game_needs_no_league_and_reports_type(self):
+        c = self._admin()
+        org = self._v2(c, "organization", {"name": "Ex Org", "short_name": "EX"})
+        program = self._v2(c, "program",
+                          {"name": "Ex Prog", "operator_organization_id": org["id"]})
+        season = self._v2(c, "season",
+                        {"program_id": program["id"], "name": "ExS"})
+        # Two DIFFERENT permanent Leagues — a friendly may cross League lines.
+        elite = self._v2(c, "league", {"season_id": season["id"], "name": "Elite"})
+        rec = self._v2(c, "league", {"season_id": season["id"], "name": "Rec"})
+        club = self._v2(c, "club", {"name": "ExC"})
+        team_a = self._v2(c, "team",
+                         {"league_id": elite["id"], "club_id": club["id"],
+                          "name": "Comets"})
+        team_b = self._v2(c, "team",
+                         {"league_id": rec["id"], "club_id": club["id"],
+                          "name": "Blazers"})
+        venue = self._v2(c, "venue",
+                        {"name": "Ex Arena", "organization_id": org["id"]})
+        self._req(c, "POST", f"/api/v2/setup/seasons/{season['id']}/venue-access",
+                  {"venue_id": venue["id"]})
+        rink = self._v2(c, "rink", {"venue_id": venue["id"], "name": "R"})
+        slot = self._v2(c, "ice-slot",
+                       {"rink_id": rink["id"],
+                        "start_time": "2026-09-01T18:30:00+00:00",
+                        "end_time": "2026-09-01T20:00:00+00:00",
+                        "slot_type": "game"})
+        for tm, lg in ((team_a, elite), (team_b, rec)):
+            self._req(
+                c, "POST",
+                f"/api/v2/setup/seasons/{season['id']}/team-registrations",
+                {"team_id": tm["id"], "league_id": lg["id"]})
+
+        # A REGULAR game with NO league_id is rejected (league required).
+        status, err = self._req(c, "POST", "/api/v2/setup/game",
+                                {"season_id": season["id"],
+                                 "home_team_id": team_a["id"],
+                                 "away_team_id": team_b["id"],
+                                 "ice_slot_id": slot["id"]})
+        self.assertEqual(err["error"]["code"], "validation_error", err)
+
+        # An EXHIBITION game needs no league_id and reports game_type; it
+        # crosses League lines and carries no owning League/Division.
+        status, game = self._req(c, "POST", "/api/v2/setup/game",
+                                 {"season_id": season["id"],
+                                  "home_team_id": team_a["id"],
+                                  "away_team_id": team_b["id"],
+                                  "ice_slot_id": slot["id"],
+                                  "game_type": "exhibition"})
+        self.assertEqual(status, 200, game)
+        self.assertEqual(set(game), GAME_KEYS, game)
+        self.assertEqual(game["game_type"], "exhibition")
+        self.assertIsNone(game["league_id"])
+        self.assertIsNone(game["division_id"])
+
+        # The LeagueSeason standings route responds with a table (no crash),
+        # and the friendly never appears in it.
+        status, st = self._req(
+            c, "GET",
+            f"/api/standings/league-season/{elite['id']}/{season['id']}")
+        self.assertEqual(status, 200, st)
+        self.assertEqual(st["league_id"], elite["id"])
+        self.assertIn("standings", st)
 
     # -- hierarchy shape ----------------------------------------------------
     def test_v2_hierarchy_is_canonical(self):

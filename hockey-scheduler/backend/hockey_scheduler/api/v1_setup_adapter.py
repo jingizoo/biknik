@@ -89,6 +89,7 @@ def registration_to_v1(result):
 def game_to_v1(result):
     """A Game result → the legacy v1 shape.
 
-    Drops the internal competition ``league_id`` the v1 API never exposed.
+    Drops the internal competition ``league_id`` the v1 API never exposed, and
+    the ``game_type`` field (#283 Slice D) the frozen v1 contract predates.
     """
-    return _drop(result, {"league_id"})
+    return _drop(result, {"league_id", "game_type"})

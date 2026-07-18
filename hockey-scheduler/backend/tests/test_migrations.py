@@ -157,6 +157,8 @@ class MigrationApplyTest(unittest.TestCase):
             cur.execute("ALTER TABLE notification_preferences DROP COLUMN active")  # #232 review 4
             cur.execute("DROP INDEX IF EXISTS ix_clubs_external_ref")  # #260 Slice F
             cur.execute("ALTER TABLE clubs DROP COLUMN external_ref")  # #260 Slice F additive col
+            cur.execute("DROP INDEX IF EXISTS ix_games_game_type")  # #283 Slice D
+            cur.execute("ALTER TABLE games DROP COLUMN game_type")  # #283 Slice D additive col
             cur.execute("DELETE FROM schema_migrations")
             cur.execute("INSERT INTO schema_migrations(version, applied_at) "
                         "VALUES ('0001_initial', '2026-01-01')")

@@ -17,6 +17,7 @@ from ..domain import (
     ContactDestination,
     DeliveryStatus,
     Game,
+    GameType,
     DeviceToken,
     IceSlotStatus,
     IceSlotType,
@@ -2315,6 +2316,11 @@ class ApiService:
         for g in self.store.all_games():
             if g.division_id != division_id or g.cancelled:
                 continue
+            # #283 Slice D: EXHIBITION games are friendlies that never affect
+            # standings (they also carry no division, so this is belt-and-braces
+            # against a future division-tagged friendly).
+            if g.game_type != GameType.REGULAR.value:
+                continue
             if public_only and not g.published:
                 continue
             r = self.store.result_for_game(g.id)
@@ -2328,6 +2334,80 @@ class ApiService:
         ranked = sorted(rows.values(),
                         key=lambda x: (-x["pts"], -x["gd"], -x["gf"], x["team_name"]))
         return {"division_id": division_id, "standings": ranked}
+
+    @catch
+    def get_league_season_standings(self, league_id: str,
+                                    season_id: str) -> dict:
+        """LeagueSeason-wide standings (#283 Slice D): one table across ALL of a
+        LeagueSeason's Divisions (and its division-less teams), from FINAL
+        results of REGULAR games only. The per-Division ``get_standings`` view
+        stays available; this is the League-level aggregate the permanent model
+        makes first-class. Same points model (win=2/tie=1/loss=0) and ordering.
+        """
+        return self._standings_for_league_season(
+            league_id, season_id, public_only=False)
+
+    @catch
+    def get_public_league_season_standings(self, league_id: str,
+                                           season_id: str) -> dict:
+        """Public LeagueSeason standings — published games only, so an
+        unpublished final result cannot leak into the public table."""
+        return self._standings_for_league_season(
+            league_id, season_id, public_only=True)
+
+    def _standings_for_league_season(self, league_id: str, season_id: str,
+                                     public_only: bool = False) -> dict:
+        """Compute a LeagueSeason's standings across all its Divisions.
+
+        Roster = every active, league-consistent registration in the
+        LeagueSeason (whatever its Division, or none). Games counted = REGULAR,
+        non-cancelled games whose ``league_id``/``season_id`` are this
+        LeagueSeason's, with a FINAL result. EXHIBITION games are excluded (they
+        never affect standings). ``public_only`` skips unpublished games so the
+        public table stays consistent with the public schedule.
+        """
+        ls = self.store.league_season_for(league_id, season_id)
+        if ls is None:
+            return {"error": {
+                "code": "not_found",
+                "message": "No such league in that season."}}
+        # The roster is the LeagueSeason's active registrations whose Team is a
+        # permanent member of this exact League (never an orphan/cross-league
+        # row) — the same trust rule the per-Division roster uses.
+        team_ids = set()
+        for reg in self.store.registrations_for_league_season(ls.id):
+            if not reg.active:
+                continue
+            team = self.store.get_team(reg.team_id)
+            if team is None or team.league_id != league_id:
+                continue
+            team_ids.add(reg.team_id)
+        teams = [t for t in (self.store.get_team(tid) for tid in team_ids)
+                 if t is not None]
+        rows = {t.id: {"team_id": t.id, "team_name": t.name, "gp": 0,
+                       "w": 0, "l": 0, "t": 0, "gf": 0, "ga": 0, "gd": 0,
+                       "pts": 0}
+                for t in teams}
+        for g in self.store.all_games():
+            if g.cancelled or g.game_type != GameType.REGULAR.value:
+                continue
+            if g.league_id != league_id or g.season_id != season_id:
+                continue
+            if public_only and not g.published:
+                continue
+            r = self.store.result_for_game(g.id)
+            if r is None or r.status != ResultStatus.FINAL:
+                continue
+            home, away = rows.get(g.home_team_id), rows.get(g.away_team_id)
+            if home is None or away is None:
+                continue
+            self._apply_result(home, r.home_score, r.away_score)
+            self._apply_result(away, r.away_score, r.home_score)
+        ranked = sorted(rows.values(),
+                        key=lambda x: (-x["pts"], -x["gd"], -x["gf"],
+                                       x["team_name"]))
+        return {"league_id": league_id, "season_id": season_id,
+                "standings": ranked}
 
     # -- public, no-auth surface (#83) -------------------------------------
     # A clean public web surface (schedule / standings / result detail) built
@@ -3779,14 +3859,18 @@ class ApiService:
                     target_skaters: int = 15, max_skaters: int = 18,
                     allow_division_override: bool = False,
                     actor_id: Optional[str] = None,
-                    league_id: Optional[str] = None) -> dict:
+                    league_id: Optional[str] = None,
+                    game_type: str = "regular") -> dict:
         # ``league_id`` is the v2 canonical scope (#233 Slice C2): when supplied
         # it is required-and-validated and division_id is optional; when omitted
         # (v1) division_id stays mandatory and the league is derived from it.
+        # ``game_type`` (#283 Slice D): "regular" (standings, one LeagueSeason)
+        # or "exhibition" (a cross-League-allowed friendly, never in standings).
         return _serialize(self.setup.create_game(
             season_id, division_id, home_team_id, away_team_id, ice_slot_id,
             target_goalies, target_skaters, max_skaters,
-            allow_division_override, actor_id, league_id=league_id))
+            allow_division_override, actor_id, league_id=league_id,
+            game_type=game_type))
 
     # ====================================================================
     # Pilot onboarding import — dry-run validator (#92)

@@ -14,6 +14,7 @@ from ..domain import (
     ContactDestination,
     Division,
     Game,
+    GameType,
     IceSlot,
     IceSlotStatus,
     IceSlotType,
@@ -1604,47 +1605,69 @@ class SetupService:
                     target_goalies: int = 1, target_skaters: int = 15,
                     max_skaters: int = 18, allow_division_override: bool = False,
                     actor_id: Optional[str] = None,
-                    league_id: Optional[str] = None) -> Game:
+                    league_id: Optional[str] = None,
+                    game_type: str = GameType.REGULAR.value) -> Game:
         season = self.store.get_season(season_id)
         if season is None:
             raise NotFoundError(f"Season {season_id} not found.")
 
-        # v2 competition scope (#233 Slice C2): when a ``league_id`` is supplied
-        # it is REQUIRED-and-validated against the Season, and ``division_id``
-        # becomes OPTIONAL. v1 (league_id=None) is unchanged — division_id stays
-        # mandatory and the game's league is derived from the division below.
-        scoped_league_id = league_id or None
-        if scoped_league_id:
-            league = self.store.get_league(scoped_league_id)
-            if league is None:
-                raise NotFoundError(f"League {scoped_league_id} not found.")
-            # #283: a League is permanent; it "belongs" to a Season only via a
-            # LeagueSeason. Require that participation to exist.
-            if self.store.league_season_for(scoped_league_id, season_id) is None:
-                raise ValidationError(
-                    "League belongs to a different season than the game.")
+        # #283 Slice D: a Game is REGULAR (counts toward standings, bound to one
+        # LeagueSeason) or EXHIBITION (a friendly that may cross League lines and
+        # never affects standings). An unknown kind is a stable validation error.
+        game_type = (game_type or GameType.REGULAR.value)
+        if game_type not in (GameType.REGULAR.value, GameType.EXHIBITION.value):
+            raise ValidationError(
+                "Unknown game type.",
+                {"reason": "unknown_game_type", "game_type": game_type})
+        is_exhibition = game_type == GameType.EXHIBITION.value
 
-        division = None
-        if division_id:
-            division = self.store.get_division(division_id)
-            if division is None:
+        if is_exhibition:
+            # A friendly: both teams must be real, active participants in THIS
+            # Season (so rosters and venue eligibility resolve), but they MAY
+            # belong to different Leagues within the Season. It carries no owning
+            # League and no Division, and never counts toward standings — so
+            # rules 8/9 (same-League match) are deliberately relaxed here.
+            scoped_league_id = None
+            division_id = None
+        else:
+            # v2 competition scope (#233 Slice C2): when a ``league_id`` is
+            # supplied it is REQUIRED-and-validated against the Season, and
+            # ``division_id`` becomes OPTIONAL. v1 (league_id=None) is unchanged
+            # — division_id stays mandatory and the game's league is derived from
+            # the division below.
+            scoped_league_id = league_id or None
+            if scoped_league_id:
+                league = self.store.get_league(scoped_league_id)
+                if league is None:
+                    raise NotFoundError(f"League {scoped_league_id} not found.")
+                # #283: a League is permanent; it "belongs" to a Season only via
+                # a LeagueSeason. Require that participation to exist.
+                if self.store.league_season_for(scoped_league_id,
+                                                season_id) is None:
+                    raise ValidationError(
+                        "League belongs to a different season than the game.")
+
+            division = None
+            if division_id:
+                division = self.store.get_division(division_id)
+                if division is None:
+                    raise NotFoundError(f"Division {division_id} not found.")
+                # #283: a Division's Season and League resolve via LeagueSeason.
+                div_ls = self.store.get_league_season(division.league_season_id)
+                div_season_id = div_ls.season_id if div_ls else None
+                div_league_id = div_ls.league_id if div_ls else None
+                if div_season_id != season_id:
+                    raise ValidationError(
+                        "Division does not belong to the given season."
+                    )
+                if scoped_league_id and div_league_id != scoped_league_id:
+                    raise ValidationError(
+                        "Division belongs to a different league than the game.")
+                if not scoped_league_id:
+                    scoped_league_id = div_league_id
+            elif not scoped_league_id:
+                # v1 path: a division is mandatory — preserve the legacy error.
                 raise NotFoundError(f"Division {division_id} not found.")
-            # #283: a Division's Season and League resolve via its LeagueSeason.
-            div_ls = self.store.get_league_season(division.league_season_id)
-            div_season_id = div_ls.season_id if div_ls else None
-            div_league_id = div_ls.league_id if div_ls else None
-            if div_season_id != season_id:
-                raise ValidationError(
-                    "Division does not belong to the given season."
-                )
-            if scoped_league_id and div_league_id != scoped_league_id:
-                raise ValidationError(
-                    "Division belongs to a different league than the game.")
-            if not scoped_league_id:
-                scoped_league_id = div_league_id
-        elif not scoped_league_id:
-            # v1 path: a division is mandatory — preserve the exact legacy error.
-            raise NotFoundError(f"Division {division_id} not found.")
 
         if home_team_id == away_team_id:
             raise ValidationError("A team cannot play itself.")
@@ -1673,14 +1696,17 @@ class SetupService:
             season_id, away_team_id, division_id, away,
             require_division=require_division)
 
-        # v2 canonical scope (#233 Slice C2): when the game is created WITH a
-        # ``league_id``, both teams' active registrations must be in that exact
-        # grouping League — a game is tied to its teams' registration League, not
-        # merely to a season they share. (division consistency + division→league
-        # agreement were already checked above.) The v1 path (league_id=None)
-        # keeps today's behavior: no registration-league constraint. This runs
-        # before any slot allocation, so a mismatch mutates nothing.
-        if league_id is not None:
+        # Rules 8/9 (#283 Slice D): a REGULAR game is tied to its teams'
+        # registration League — both teams' active registrations must be in the
+        # game's exact grouping League, so cross-League and cross-Program
+        # pairings are rejected (a League belongs to one Program, so same-League
+        # implies same-Program). This now fires on BOTH the v2 path (explicit
+        # league_id) and the v1 path (league derived from the division): in both
+        # cases ``scoped_league_id`` is resolved by here. EXHIBITION games skip
+        # it — a friendly may cross League lines. Runs before any slot
+        # allocation, so a mismatch mutates nothing. (Division consistency +
+        # division→league agreement were already checked above.)
+        if not is_exhibition and scoped_league_id is not None:
             for team, reg in ((home, home_reg), (away, away_reg)):
                 # #283: a registration's League is resolved via its LeagueSeason.
                 reg_league_id = self._registration_league_id(reg)
@@ -1743,6 +1769,7 @@ class SetupService:
             division_id=division_id or None,
             ice_slot_id=ice_slot_id,
             league_id=scoped_league_id,
+            game_type=game_type,
         )
         self.store.add_game(game)
         # Mark the slot allocated so it reads as taken across the arena.
@@ -1752,6 +1779,7 @@ class SetupService:
             "season_id": season_id, "division_id": division_id,
             "home_team_id": home_team_id, "away_team_id": away_team_id,
             "ice_slot_id": ice_slot_id, "override": allow_division_override,
+            "game_type": game_type,
         })
         return game
 

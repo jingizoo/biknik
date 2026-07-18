@@ -95,6 +95,12 @@ class Game:
     # Owning competition league (#233 Slice C1b). Nullable; backfilled from the
     # game's division league by the reparent migration.
     league_id: Optional[str] = None
+    # A Game's competition kind (#283 Slice D): "regular" (counts toward
+    # standings, bound to one LeagueSeason — both teams registered in it) or
+    # "exhibition" (a friendly that may cross League lines and never affects
+    # standings; carries no owning League or Division). Stored as the plain
+    # GameType enum string.
+    game_type: str = "regular"
 
 
 @dataclass

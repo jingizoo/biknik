@@ -97,6 +97,19 @@ class GameStatus(str, Enum):
     FINAL = "final"
 
 
+class GameType(str, Enum):
+    """A Game's competition kind (#283 Slice D).
+
+    REGULAR games count toward standings and are bound to a single
+    ``LeagueSeason`` — both teams must be registered in it, so cross-League and
+    cross-Program pairings are rejected (rules 8/9). EXHIBITION games are
+    friendlies that MAY cross League lines within a Season and NEVER affect
+    standings; they carry no Division and no owning League.
+    """
+    REGULAR = "regular"
+    EXHIBITION = "exhibition"
+
+
 class AuditAction(str, Enum):
     ROSTER_SELECTED = "roster_selected"
     AVAILABILITY_SET = "availability_set"

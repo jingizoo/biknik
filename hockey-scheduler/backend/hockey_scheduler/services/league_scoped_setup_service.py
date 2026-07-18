@@ -22,7 +22,8 @@ class SetupService(_BaseSetupService):
                     target_goalies: int = 1, target_skaters: int = 15,
                     max_skaters: int = 18, allow_division_override: bool = False,
                     actor_id: Optional[str] = None,
-                    league_id: Optional[str] = None):
+                    league_id: Optional[str] = None,
+                    game_type: str = "regular"):
         # The scope check and all writes share one transaction. Call the base
         # method's undecorated body to avoid opening a nested SqlStore
         # transaction (SQLite rejects BEGIN inside BEGIN).
@@ -31,15 +32,22 @@ class SetupService(_BaseSetupService):
             # Scope validation runs only after season/division/team structure is
             # valid; otherwise the base body reports its original error.
             season = self.store.get_season(season_id) if season_id else None
-            division = self.store.get_division(division_id) if division_id else None
+            # #283 Slice D: an EXHIBITION game carries no Division (the base body
+            # ignores any supplied division and never derives a league from it),
+            # so the ice-eligibility precheck runs season-only — matching the
+            # base method's own relaxed exhibition path.
+            is_exhibition = (game_type or "regular") == "exhibition"
+            division = (self.store.get_division(division_id)
+                        if division_id and not is_exhibition else None)
             home = self.store.get_team(home_team_id) if home_team_id else None
             away = self.store.get_team(away_team_id) if away_team_id else None
             # Participation is resolved through SeasonTeamRegistration (#180),
             # not Team.division_id (#200 review): a league-first team created
             # with division_id=None but correctly registered must still count as
             # a valid matchup so the cross-league ice guard runs. When v2 omits a
-            # division (#233 Slice C2), participation relaxes to season-only.
-            require_division = division_id is not None
+            # division (#233 Slice C2) — or the game is an exhibition (#283
+            # Slice D) — participation relaxes to season-only.
+            require_division = division_id is not None and not is_exhibition
             teams_match = (
                 season is not None
                 and self._team_participates(season, home_team_id, division_id,
@@ -71,7 +79,7 @@ class SetupService(_BaseSetupService):
                 ice_slot_id, target_goalies=target_goalies,
                 target_skaters=target_skaters, max_skaters=max_skaters,
                 allow_division_override=allow_division_override,
-                actor_id=actor_id, league_id=league_id,
+                actor_id=actor_id, league_id=league_id, game_type=game_type,
             )
 
     def move_game(self, game_id: str, new_ice_slot_id: str, reason: str = "",

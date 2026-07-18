@@ -1062,6 +1062,13 @@ class Handler(BaseHTTPRequestHandler):
         sd = re.match(r"^/api/standings/([^/]+)$", path)
         if sd:
             return self._send_api(api.get_standings(sd.group(1)))
+        # #283 Slice D: LeagueSeason-wide standings (across all its Divisions),
+        # keyed by (league_id, season_id). Exhibition games are excluded.
+        lss = re.match(
+            r"^/api/standings/league-season/([^/]+)/([^/]+)$", path)
+        if lss:
+            return self._send_api(api.get_league_season_standings(
+                lss.group(1), lss.group(2)))
         # Public, no-auth surface (#83): schedule / standings / game detail,
         # public-safe fields only. Reachable unauthenticated in production.
         # Rate-limited (#131) — generous, since the public portal itself
@@ -1076,6 +1083,13 @@ class Handler(BaseHTTPRequestHandler):
             if self._rate_limited("public_read", limit=120, window_seconds=60):
                 return
             return self._send_api(api.get_public_standings(ps.group(1)))
+        pls = re.match(
+            r"^/api/public/standings/league-season/([^/]+)/([^/]+)$", path)
+        if pls:
+            if self._rate_limited("public_read", limit=120, window_seconds=60):
+                return
+            return self._send_api(api.get_public_league_season_standings(
+                pls.group(1), pls.group(2)))
         pg = re.match(r"^/api/public/games/([^/]+)$", path)
         if pg:
             if self._rate_limited("public_read", limit=120, window_seconds=60):
@@ -2288,15 +2302,20 @@ class Handler(BaseHTTPRequestHandler):
                 b.get("rink_id"), b.get("start_time"), b.get("end_time"),
                 b.get("slot_type", "game"), actor_id))
         if entity == "game":
-            # v2: league_id REQUIRED (game scope); division_id optional.
-            if not (b.get("league_id") or None):
+            # #283 Slice D: an EXHIBITION game is a cross-League-allowed friendly
+            # with no owning League — so league_id is NOT required for it (and is
+            # ignored). A REGULAR game keeps the v2 rule: league_id REQUIRED,
+            # division_id optional.
+            game_type = (b.get("game_type") or "regular")
+            if game_type == "regular" and not (b.get("league_id") or None):
                 return _required_error("A league_id is required.")
             return self._send_api(api.create_game(
                 b.get("season_id"), b.get("division_id") or None,
                 b.get("home_team_id"), b.get("away_team_id"),
                 b.get("ice_slot_id"),
                 allow_division_override=bool(b.get("allow_division_override")),
-                actor_id=actor_id, league_id=b.get("league_id") or None))
+                actor_id=actor_id, league_id=b.get("league_id") or None,
+                game_type=game_type))
         if entity == "official":
             return self._send_api(api.create_official(
                 b.get("name"), b.get("home_club_id"), actor_id))
