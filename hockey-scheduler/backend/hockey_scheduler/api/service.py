@@ -167,6 +167,65 @@ class ApiService:
             self.store, self.accounts, self.roster.clock)
         self.guardians = GuardianService(self.store, self.roster.clock)
 
+    # -- competition-hierarchy resolution (#283) ---------------------------
+    # After the #283 model change a League is a permanent child of a Program
+    # and its per-Season participation lives in a LeagueSeason; Divisions and
+    # SeasonTeamRegistrations hang off a LeagueSeason (``league_season_id``)
+    # rather than carrying their own ``season_id``/``league_id``. These helpers
+    # resolve the dropped fields back so the response JSON keys (and the v1
+    # boundary adapters that rename/drop ``league_id``) are unchanged.
+    def _resolve_ls(self, league_season_id):
+        """The LeagueSeason for an id, or None (guards a missing/empty link)."""
+        if not league_season_id:
+            return None
+        return self.store.get_league_season(league_season_id)
+
+    @staticmethod
+    def _season_id_via(ls_by_id, league_season_id):
+        ls = ls_by_id.get(league_season_id)
+        return ls.season_id if ls else None
+
+    @staticmethod
+    def _league_id_via(ls_by_id, league_season_id):
+        ls = ls_by_id.get(league_season_id)
+        return ls.league_id if ls else None
+
+    def _division_dict(self, division) -> dict:
+        """A Division serialized with legacy competition keys restored (#283):
+        ``season_id``/``league_id`` resolved via its LeagueSeason, and the
+        internal ``league_season_id`` kept out of the v1-shaped payload so the
+        ``division_to_v1`` boundary (league_id → level_id) is unchanged."""
+        ls = self._resolve_ls(division.league_season_id)
+        return {"id": division.id,
+                "season_id": ls.season_id if ls else None,
+                "league_id": ls.league_id if ls else None,
+                "name": division.name,
+                "age_group": division.age_group,
+                "external_ref": division.external_ref}
+
+    def _registration_dict(self, reg) -> dict:
+        """A SeasonTeamRegistration serialized with legacy ``season_id``/
+        ``league_id`` restored via its LeagueSeason (#283); ``league_season_id``
+        is not exposed so the ``registration_to_v1`` boundary is unchanged."""
+        ls = self._resolve_ls(reg.league_season_id)
+        return {"id": reg.id,
+                "season_id": ls.season_id if ls else None,
+                "league_id": ls.league_id if ls else None,
+                "team_id": reg.team_id,
+                "division_id": reg.division_id,
+                "active": reg.active}
+
+    def _league_dict(self, league) -> dict:
+        """A grouping League serialized in its frozen season-scoped v1 shape
+        (#283): the permanent ``program_id`` is replaced by the ``season_id`` of
+        its LeagueSeason, matching the v1 'level' contract (no adapter maps it)."""
+        lss = self.store.league_seasons_for_league(league.id)
+        return {"id": league.id,
+                "season_id": lss[0].season_id if lss else None,
+                "name": league.name,
+                "sort_order": league.sort_order,
+                "external_ref": league.external_ref}
+
     # -- games -------------------------------------------------------------
     @catch
     def get_game(self, game_id: str) -> dict:
@@ -852,6 +911,9 @@ class ApiService:
         division_ids = {d.id for d in divisions}
         team_ids = {t.id for t in teams}
         league_owner = {lg.id: (lg.operator_organization_id or None) for lg in leagues}
+        # Divisions no longer carry season_id directly (#283) — resolve it via
+        # their LeagueSeason.
+        ls_by_id = {ls.id: ls for ls in self.store.all_league_seasons()}
 
         # #173: a venue truly belongs to a league only when its league_id points
         # at a real league AND the venue's own owner agrees with that league's
@@ -886,8 +948,9 @@ class ApiService:
         # deleted league, a division on a deleted season, or a team on a deleted
         # division can never be scheduled.
         seasons_dangling = [s for s in seasons if s.program_id not in league_ids]
-        divisions_dangling = [d for d in divisions
-                              if d.season_id not in season_ids]
+        divisions_dangling = [
+            d for d in divisions
+            if self._season_id_via(ls_by_id, d.league_season_id) not in season_ids]
         # A Team belongs permanently to a Program via program_id (#180/#233); a
         # team with no valid program is the invalid-legacy-data case, not a
         # missing-division one.
@@ -1000,7 +1063,9 @@ class ApiService:
                   f"{len(seasons_dangling)} season(s) reference a program that "
                   "no longer exists.")
 
-        has_division = any(d.season_id in season_ids for d in divisions)
+        has_division = any(
+            self._season_id_via(ls_by_id, d.league_season_id) in season_ids
+            for d in divisions)
         step("division", "Create a division", has_division,
              detail=f"{len(divisions)} division(s)")
         if has_season:
@@ -1081,6 +1146,10 @@ class ApiService:
         program_ids = {p.id for p in programs}
         season_ids = {s.id for s in seasons}
         team_ids = {t.id for t in teams}
+        # A League's Season participation (and a Division/registration's Season +
+        # League) now resolve through LeagueSeason (#283).
+        all_league_seasons = self.store.all_league_seasons()
+        ls_by_id = {ls.id: ls for ls in all_league_seasons}
 
         # Venue/ice soundness (#233 Slice E): a venue is schedulable once ANY of
         # this program's seasons has granted it active SeasonVenueAccess — the
@@ -1106,7 +1175,10 @@ class ApiService:
             or p.operator_organization_id not in org_ids]
 
         seasons_dangling = [s for s in seasons if s.program_id not in program_ids]
-        leagues_dangling = [lg for lg in leagues if lg.season_id not in season_ids]
+        # A League's Season link is now a LeagueSeason row; a LeagueSeason
+        # pointing at a missing Season is the dangling case (#283).
+        leagues_dangling = [ls for ls in all_league_seasons
+                            if ls.season_id not in season_ids]
         teams_dangling = [t for t in teams
                           if not t.program_id or t.program_id not in program_ids]
 
@@ -1222,7 +1294,9 @@ class ApiService:
         # least one grouping League. The gap fires if ANY such Season lacks one
         # (a single Season with a League no longer masks the others), and reports
         # exactly which Seasons are missing it.
-        league_season_ids = {lg.season_id for lg in leagues}
+        # Which Seasons have at least one grouping League participating (#283):
+        # the set of Seasons named by a LeagueSeason row.
+        league_season_ids = {ls.season_id for ls in all_league_seasons}
         seasons_without_league = [s for s in valid_seasons
                                   if s.id not in league_season_ids]
         all_seasons_have_league = has_season and not seasons_without_league
@@ -1243,7 +1317,9 @@ class ApiService:
                   "no longer exists.")
 
         # Division is optional (#233): show the milestone but never block on it.
-        has_division = any(d.season_id in season_ids for d in divisions)
+        has_division = any(
+            self._season_id_via(ls_by_id, d.league_season_id) in season_ids
+            for d in divisions)
         step("division", "Create a division (optional)", has_division,
              blocking_step=False,
              detail=f"{len(divisions)} division(s)")
@@ -1269,20 +1345,29 @@ class ApiService:
         for reg in self.store.all_season_team_registrations():
             if not reg.active:
                 continue
-            season = seasons_by_id.get(reg.season_id)
+            # A registration's Season + League now come from its LeagueSeason
+            # (#283); an unresolvable link is invalid structure.
+            ls = ls_by_id.get(reg.league_season_id)
+            if ls is None:
+                invalid_regs += 1
+                continue
+            season = seasons_by_id.get(ls.season_id)
             if season is None or season.program_id not in program_ids:
                 invalid_regs += 1
                 continue
-            league = leagues_by_id.get(reg.league_id) if reg.league_id else None
-            league_ok = league is not None and league.season_id == reg.season_id
+            league = leagues_by_id.get(ls.league_id)
+            # The LeagueSeason bundles League + Season, so cross-season league_id
+            # is structurally impossible now — the League need only resolve.
+            league_ok = league is not None
             team = teams_by_id.get(reg.team_id)
             team_ok = team is not None and team.program_id == season.program_id
             div_ok = True
             if reg.division_id:
                 division = divisions_by_id.get(reg.division_id)
+                # A Division belongs to the SAME LeagueSeason iff it agrees on
+                # both Season and League with the registration.
                 div_ok = (division is not None
-                          and division.season_id == reg.season_id
-                          and division.league_id == reg.league_id)
+                          and division.league_season_id == reg.league_season_id)
             if league_ok and team_ok and div_ok:
                 schedulable += 1
             else:
@@ -2438,7 +2523,9 @@ class ApiService:
             canonical_league_id = proposal["league_id"]
         else:
             division = self.store.get_division(division_id) if division_id else None
-            canonical_league_id = division.league_id if division else None
+            # Division.league_id is now resolved through its LeagueSeason (#283).
+            ls = self._resolve_ls(division.league_season_id) if division else None
+            canonical_league_id = ls.league_id if ls else None
         created = []
         for d in proposal["draft_games"]:
             g = Game(
@@ -2628,20 +2715,23 @@ class ApiService:
         / missing-Team / missing-League / **league-less** row is never exposed
         to the operational UI (e.g. the game-scheduling wizard, #233 B2c).
         """
-        season = self.store.get_season(r.season_id)
+        # Season + competition League now resolve through the LeagueSeason (#283).
+        ls = self._resolve_ls(r.league_season_id)
+        if ls is None:
+            return False
+        season = self.store.get_season(ls.season_id)
         if team_registration_valid(
                 self.store, season, r.team_id, r.division_id) is None:
             return False
         if r.division_id is not None:
             division = self.store.get_division(r.division_id)
-            if division is None or division.season_id != r.season_id:
+            # Same LeagueSeason ⟹ same Season AND same League as the registration.
+            if division is None or division.league_season_id != r.league_season_id:
                 return False
-            if division.league_id != r.league_id:
-                return False
-        if not r.league_id:
+        if not ls.league_id:
             return False
-        league = self.store.get_league(r.league_id)
-        if league is None or league.season_id != r.season_id:
+        league = self.store.get_league(ls.league_id)
+        if league is None:
             return False
         return True
 
@@ -2653,6 +2743,8 @@ class ApiService:
         """
         divisions = {d.id: d for d in self.store.all_divisions()}
         levels = {lv.id: lv for lv in self.store.all_leagues()}
+        # Division/registration Season + League resolve via LeagueSeason (#283).
+        ls_by_id = {ls.id: ls for ls in self.store.all_league_seasons()}
         clubs = {c.id: c for c in self.store.all_clubs()}
         teams = {t.id: t for t in self.store.all_teams()}
         orgs = {o.id: o for o in self.store.all_organizations()}
@@ -2672,14 +2764,14 @@ class ApiService:
 
         # Divisions now carry an optional owning level/tier (#166) — surface the
         # id + resolved name so the Setup hierarchy can group divisions by level.
-        division_rows = [
-            {"id": d.id, "season_id": d.season_id, "name": d.name,
-             "age_group": d.age_group, "is_junior": is_junior(d),
-             "level_id": d.league_id,
-             "level_name": levels[d.league_id].name
-             if d.league_id in levels else None}
-            for d in divisions.values()
-        ]
+        def _division_row(d):
+            sid = self._season_id_via(ls_by_id, d.league_season_id)
+            lid = self._league_id_via(ls_by_id, d.league_season_id)
+            return {"id": d.id, "season_id": sid, "name": d.name,
+                    "age_group": d.age_group, "is_junior": is_junior(d),
+                    "level_id": lid,
+                    "level_name": levels[lid].name if lid in levels else None}
+        division_rows = [_division_row(d) for d in divisions.values()]
         # A Team is a permanent member of a League (#180); its season/division
         # participation is NOT on the Team — it lives in SeasonTeamRegistration,
         # exposed as `registrations` below. The legacy Team.division_id is no
@@ -2800,7 +2892,7 @@ class ApiService:
             "league": leagues[0] if leagues else None,
             "leagues": leagues,
             "seasons": seasons,
-            "levels": [_serialize(lv) for lv in levels.values()],
+            "levels": [self._league_dict(lv) for lv in levels.values()],
             "divisions": division_rows,
             "clubs": [_serialize(c) for c in clubs.values()],
             "teams": team_rows,
@@ -2828,8 +2920,10 @@ class ApiService:
             # wizard's League picker needs — required on the registration since
             # #233 Slice C2, so always present for an operational row.
             "registrations": [
-                {"team_id": r.team_id, "season_id": r.season_id,
-                 "division_id": r.division_id, "league_id": r.league_id}
+                {"team_id": r.team_id,
+                 "season_id": self._season_id_via(ls_by_id, r.league_season_id),
+                 "division_id": r.division_id,
+                 "league_id": self._league_id_via(ls_by_id, r.league_season_id)}
                 for r in self.store.all_season_team_registrations()
                 if r.active and self._registration_is_operational(r)
             ],
@@ -2867,10 +2961,26 @@ class ApiService:
         leagues_by_id = {lg.id: lg for lg in leagues}
         venues_by_id = {v.id: v for v in venues}
         rinks_by_id = {r.id: r for r in rinks}
+        # A League's Season and a Division's Season + League resolve through
+        # LeagueSeason now (#283); ``season_by_league`` maps a League to a
+        # participating Season so the DTO keeps its legacy ``season_id``.
+        ls_by_id = {ls.id: ls for ls in self.store.all_league_seasons()}
+        season_by_league = {}
+        for ls in ls_by_id.values():
+            season_by_league.setdefault(ls.league_id, ls.season_id)
 
         def is_junior(div):
             tag = (div.age_group or div.name or "").upper()
             return tag.startswith("U")
+
+        def _division_row_v2(d):
+            lid = self._league_id_via(ls_by_id, d.league_season_id)
+            return {"id": d.id,
+                    "season_id": self._season_id_via(ls_by_id, d.league_season_id),
+                    "name": d.name, "age_group": d.age_group,
+                    "is_junior": is_junior(d), "league_id": lid,
+                    "league_name": (leagues_by_id[lid].name
+                                    if lid in leagues_by_id else None)}
 
         return {
             "programs": [
@@ -2887,16 +2997,10 @@ class ApiService:
                  "end_date": s.end_date.isoformat() if s.end_date else None}
                 for s in seasons],
             "leagues": [
-                {"id": lg.id, "season_id": lg.season_id, "name": lg.name,
-                 "sort_order": lg.sort_order}
+                {"id": lg.id, "season_id": season_by_league.get(lg.id),
+                 "name": lg.name, "sort_order": lg.sort_order}
                 for lg in leagues],
-            "divisions": [
-                {"id": d.id, "season_id": d.season_id, "name": d.name,
-                 "age_group": d.age_group, "is_junior": is_junior(d),
-                 "league_id": d.league_id,
-                 "league_name": (leagues_by_id[d.league_id].name
-                                 if d.league_id in leagues_by_id else None)}
-                for d in divisions],
+            "divisions": [_division_row_v2(d) for d in divisions],
             "teams": [
                 {"id": t.id, "name": t.name, "club_id": t.club_id,
                  "program_id": t.program_id,
@@ -2974,8 +3078,20 @@ class ApiService:
         venues_by_league = _group(venues, "league_id")
         leagues_by_org = _group(leagues, "operator_organization_id")
         seasons_by_league = _group(seasons, "program_id")
-        levels_by_season = _group(levels, "season_id")
-        divs_by_season = _group(divisions, "season_id")
+        # Levels (grouping Leagues) and Divisions no longer carry season_id
+        # directly (#283) — group them by Season through LeagueSeason.
+        ls_by_id = {ls.id: ls for ls in self.store.all_league_seasons()}
+        levels_by_id = {lv.id: lv for lv in levels}
+        levels_by_season = {}
+        for ls in ls_by_id.values():
+            lv = levels_by_id.get(ls.league_id)
+            if lv is not None:
+                levels_by_season.setdefault(ls.season_id, []).append(lv)
+        divs_by_season = {}
+        for d in divisions:
+            sid = self._season_id_via(ls_by_id, d.league_season_id)
+            if sid is not None:
+                divs_by_season.setdefault(sid, []).append(d)
         # Teams nest under a Division via their active SeasonTeamRegistration
         # (#180), never the legacy Team.division_id — so a permanent team with a
         # null legacy division still shows under the division it's registered in.
@@ -3026,15 +3142,21 @@ class ApiService:
                     levels_by_season.get(s.id, []),
                     key=lambda lv: (lv.sort_order or 0, lv.name))
                 level_ids = {lv.id for lv in season_levels}
-                divs_by_level = _group(divs_by_season.get(s.id, []), "league_id")
+                divs_by_level = {}
+                for d in divs_by_season.get(s.id, []):
+                    lid = self._league_id_via(ls_by_id, d.league_season_id)
+                    if lid is not None:
+                        divs_by_level.setdefault(lid, []).append(d)
                 level_nodes = [
                     {"id": lv.id, "name": lv.name, "sort_order": lv.sort_order,
                      "divisions": [division_node(d) for d in divs_by_level.get(lv.id, [])]}
                     for lv in season_levels
                 ]
                 # Divisions in this season with no level (or a dangling one).
-                no_level = [d for d in divs_by_season.get(s.id, [])
-                            if not d.league_id or d.league_id not in level_ids]
+                no_level = [
+                    d for d in divs_by_season.get(s.id, [])
+                    if self._league_id_via(ls_by_id, d.league_season_id)
+                    not in level_ids]
                 season_nodes.append({
                     "id": s.id, "name": s.name, "levels": level_nodes,
                     "divisions_without_level": [division_node(d) for d in no_level],
@@ -3068,7 +3190,9 @@ class ApiService:
             "rinks_without_venue":
                 [idname(r) for r in rinks if not r.venue_id or r.venue_id not in venue_ids],
             "divisions_without_level":
-                [idname(d) for d in divisions if not d.league_id or d.league_id not in level_ids_all],
+                [idname(d) for d in divisions
+                 if self._league_id_via(ls_by_id, d.league_season_id)
+                 not in level_ids_all],
             "teams_without_club":
                 [idname(t) for t in teams if not t.club_id or t.club_id not in clubs],
             # A Team must belong to a valid League (#180); a missing/invalid
@@ -3120,8 +3244,20 @@ class ApiService:
             player_count[p.team_id] = player_count.get(p.team_id, 0) + 1
 
         seasons_by_program = _group(seasons, "program_id")
-        leagues_by_season = _group(leagues, "season_id")
-        divs_by_season = _group(divisions, "season_id")
+        # Leagues, Divisions and registrations resolve their Season (and a
+        # Division/registration its League) via LeagueSeason now (#283).
+        ls_by_id = {ls.id: ls for ls in self.store.all_league_seasons()}
+        leagues_by_id = {lv.id: lv for lv in leagues}
+        leagues_by_season = {}
+        for ls in ls_by_id.values():
+            lv = leagues_by_id.get(ls.league_id)
+            if lv is not None:
+                leagues_by_season.setdefault(ls.season_id, []).append(lv)
+        divs_by_season = {}
+        for d in divisions:
+            sid = self._season_id_via(ls_by_id, d.league_season_id)
+            if sid is not None:
+                divs_by_season.setdefault(sid, []).append(d)
         divisions_by_id = {d.id: d for d in divisions}
         teams_by_id = {t.id: t for t in teams}
         # Active registrations grouped by their Season, so each Season resolves
@@ -3129,7 +3265,9 @@ class ApiService:
         regs_by_season = {}
         for reg in self.store.all_season_team_registrations():
             if reg.active:
-                regs_by_season.setdefault(reg.season_id, []).append(reg)
+                sid = self._season_id_via(ls_by_id, reg.league_season_id)
+                if sid is not None:
+                    regs_by_season.setdefault(sid, []).append(reg)
 
         def team_node(t):
             return {"id": t.id, "name": t.name, "club_id": t.club_id,
@@ -3144,7 +3282,11 @@ class ApiService:
                     leagues_by_season.get(s.id, []),
                     key=lambda lv: (lv.sort_order or 0, lv.name))
                 league_ids = {lv.id for lv in season_leagues}
-                divs_by_league = _group(divs_by_season.get(s.id, []), "league_id")
+                divs_by_league = {}
+                for d in divs_by_season.get(s.id, []):
+                    lid = self._league_id_via(ls_by_id, d.league_season_id)
+                    if lid is not None:
+                        divs_by_league.setdefault(lid, []).append(d)
 
                 # Resolve every active registration in this Season into exactly
                 # one bucket: a valid Division nest, a valid League-direct team,
@@ -3153,11 +3295,15 @@ class ApiService:
                 teams_direct_by_league = {}       # league_id  -> [team]
                 needs_assignment_regs = []
                 for reg in regs_by_season.get(s.id, []):
+                    # The registration's competition League now resolves via its
+                    # LeagueSeason (#283); the DTO keeps the legacy league_id key.
+                    reg_league_id = self._league_id_via(
+                        ls_by_id, reg.league_season_id)
                     tm = teams_by_id.get(reg.team_id)
                     if tm is None:
                         needs_assignment_regs.append(
                             {"registration_id": reg.id, "team_id": reg.team_id,
-                             "league_id": reg.league_id,
+                             "league_id": reg_league_id,
                              "division_id": reg.division_id,
                              "reason": "team_missing"})
                         continue
@@ -3168,41 +3314,42 @@ class ApiService:
                     if tm.program_id != prog.id:
                         needs_assignment_regs.append(
                             {"registration_id": reg.id, "team_id": reg.team_id,
-                             "league_id": reg.league_id,
+                             "league_id": reg_league_id,
                              "division_id": reg.division_id,
                              "reason": "team_program_mismatch"})
                         continue
                     if reg.division_id:
                         div = divisions_by_id.get(reg.division_id)
-                        # A Team nests under its Division only when the Division is
-                        # in this Season, sits under a real League here, and the
-                        # registration's League agrees with the Division's League.
-                        if (div is not None and div.season_id == s.id
-                                and div.league_id in league_ids
-                                and reg.league_id == div.league_id):
+                        # A Team nests under its Division only when the Division
+                        # shares the registration's LeagueSeason (same Season AND
+                        # League) and that League is a real League in this Season.
+                        if (div is not None
+                                and div.league_season_id == reg.league_season_id
+                                and reg_league_id in league_ids):
                             teams_by_div.setdefault(div.id, []).append(tm)
                         else:
                             needs_assignment_regs.append(
                                 {"registration_id": reg.id, "team_id": reg.team_id,
-                                 "league_id": reg.league_id,
+                                 "league_id": reg_league_id,
                                  "division_id": reg.division_id,
                                  "reason": "registration_league_division_mismatch"})
                     else:
                         # Division-less: hangs directly off its registration
                         # League when that League is a real League in this Season.
-                        if reg.league_id in league_ids:
+                        if reg_league_id in league_ids:
                             teams_direct_by_league.setdefault(
-                                reg.league_id, []).append(tm)
+                                reg_league_id, []).append(tm)
                         else:
                             needs_assignment_regs.append(
                                 {"registration_id": reg.id, "team_id": reg.team_id,
-                                 "league_id": reg.league_id,
+                                 "league_id": reg_league_id,
                                  "division_id": reg.division_id,
                                  "reason": "registration_league_not_in_season"})
 
                 def division_node(d):
                     return {"id": d.id, "name": d.name, "age_group": d.age_group,
-                            "league_id": d.league_id,
+                            "league_id": self._league_id_via(
+                                ls_by_id, d.league_season_id),
                             "teams": [team_node(t)
                                       for t in teams_by_div.get(d.id, [])]}
 
@@ -3220,14 +3367,18 @@ class ApiService:
                 # Parentless / dangling Divisions (no League, or a League that
                 # doesn't resolve in this Season) are INVALID structure — surfaced
                 # for reassignment, never presented as a valid branch.
-                dangling_divs = [d for d in divs_by_season.get(s.id, [])
-                                 if not d.league_id or d.league_id not in league_ids]
+                dangling_divs = [
+                    d for d in divs_by_season.get(s.id, [])
+                    if self._league_id_via(ls_by_id, d.league_season_id)
+                    not in league_ids]
                 season_nodes.append({
                     "id": s.id, "name": s.name, "leagues": league_nodes,
                     "needs_assignment": {
                         "divisions_without_league": [
                             {"id": d.id, "name": d.name, "age_group": d.age_group,
-                             "league_id": d.league_id} for d in dangling_divs],
+                             "league_id": self._league_id_via(
+                                 ls_by_id, d.league_season_id)}
+                            for d in dangling_divs],
                         "registrations": needs_assignment_regs,
                     },
                 })
@@ -3264,13 +3415,14 @@ class ApiService:
     @catch
     def create_league(self, season_id: str, name: str, sort_order: int = 0,
                       actor_id: Optional[str] = None) -> dict:
-        return _serialize(self.setup.create_league(season_id, name, sort_order, actor_id))
+        return self._league_dict(
+            self.setup.create_league(season_id, name, sort_order, actor_id))
 
     @catch
     def create_division(self, season_id: str, name: str, age_group: str = "",
                         league_id: Optional[str] = None,
                         actor_id: Optional[str] = None) -> dict:
-        return _serialize(self.setup.create_division(
+        return self._division_dict(self.setup.create_division(
             season_id, name, age_group, league_id, actor_id))
 
     @catch
@@ -3278,7 +3430,7 @@ class ApiService:
                            actor_id: Optional[str] = None) -> dict:
         """Canonical v2 division create (#233 Slice C2): parented by a grouping
         League (REQUIRED); Season is derived from the league."""
-        return _serialize(self.setup.create_division_under_league(
+        return self._division_dict(self.setup.create_division_under_league(
             league_id, name, age_group, actor_id))
 
     @catch
@@ -3302,7 +3454,7 @@ class ApiService:
                                  league_id: Optional[str] = None) -> dict:
         # ``league_id`` is the v2 canonical path (#233 Slice C2): when supplied
         # it is required-and-validated; when omitted (v1) the C1b derivation runs.
-        return _serialize(self.setup.register_team_for_season(
+        return self._registration_dict(self.setup.register_team_for_season(
             season_id, team_id, division_id, actor_id, league_id=league_id))
 
     @catch
@@ -3310,7 +3462,7 @@ class ApiService:
                                     division_id: Optional[str] = None,
                                     actor_id: Optional[str] = None,
                                     v2: bool = False) -> dict:
-        return _serialize(self.setup.assign_season_team_division(
+        return self._registration_dict(self.setup.assign_season_team_division(
             registration_id, division_id, actor_id, v2=v2))
 
     @catch
@@ -3318,19 +3470,19 @@ class ApiService:
                                   league_id: Optional[str] = None,
                                   actor_id: Optional[str] = None) -> dict:
         """Canonical v2 (#233 Slice C2): reassign a registration's League."""
-        return _serialize(self.setup.assign_season_team_league(
+        return self._registration_dict(self.setup.assign_season_team_league(
             registration_id, league_id, actor_id))
 
     @catch
     def unregister_team_from_season(self, registration_id: str,
                                     actor_id: Optional[str] = None) -> dict:
-        return _serialize(self.setup.unregister_team_from_season(
+        return self._registration_dict(self.setup.unregister_team_from_season(
             registration_id, actor_id))
 
     @catch
     def delete_season_team_registration(self, registration_id: str,
                                         actor_id: Optional[str] = None) -> dict:
-        return _serialize(self.setup.delete_season_team_registration(
+        return self._registration_dict(self.setup.delete_season_team_registration(
             registration_id, actor_id))
 
     # -- season venue access (#233 Slice E) ---------------------------------
@@ -3366,7 +3518,8 @@ class ApiService:
             from_season_id, to_season_id, selections, actor_id)
         return {"rolled_forward": result["rolled_forward"],
                 "skipped": result["skipped"],
-                "registrations": [_serialize(r) for r in result["registrations"]]}
+                "registrations": [self._registration_dict(r)
+                                  for r in result["registrations"]]}
 
     @catch
     def roll_forward_registrations_v2(self, from_season_id: str,
@@ -3379,11 +3532,12 @@ class ApiService:
             from_season_id, to_season_id, selections, actor_id)
         return {"rolled_forward": result["rolled_forward"],
                 "skipped": result["skipped"],
-                "registrations": [_serialize(r) for r in result["registrations"]]}
+                "registrations": [self._registration_dict(r)
+                                  for r in result["registrations"]]}
 
     @catch
     def list_season_team_registrations(self, season_id: str) -> dict:
-        rows = [_serialize(r)
+        rows = [self._registration_dict(r)
                 for r in self.store.registrations_for_season(season_id)]
         return {"registrations": rows}
 
@@ -3421,7 +3575,7 @@ class ApiService:
 
     @catch
     def delete_league(self, league_id: str, actor_id: Optional[str] = None) -> dict:
-        return _serialize(self.setup.delete_league(league_id, actor_id))
+        return self._league_dict(self.setup.delete_league(league_id, actor_id))
 
     @catch
     def delete_season(self, season_id: str, actor_id: Optional[str] = None) -> dict:
@@ -3430,7 +3584,7 @@ class ApiService:
     @catch
     def delete_division(self, division_id: str,
                         actor_id: Optional[str] = None) -> dict:
-        return _serialize(self.setup.delete_division(division_id, actor_id))
+        return self._division_dict(self.setup.delete_division(division_id, actor_id))
 
     @catch
     def delete_club(self, club_id: str, actor_id: Optional[str] = None) -> dict:
@@ -3484,7 +3638,7 @@ class ApiService:
                                league_id: Optional[str] = None,
                                actor_id: Optional[str] = None,
                                v2: bool = False) -> dict:
-        return _serialize(self.setup.assign_division_league(
+        return self._division_dict(self.setup.assign_division_league(
             division_id, league_id, actor_id, v2=v2))
 
     @catch

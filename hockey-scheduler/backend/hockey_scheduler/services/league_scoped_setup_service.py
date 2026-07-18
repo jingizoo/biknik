@@ -49,7 +49,11 @@ class SetupService(_BaseSetupService):
             )
             # Division is optional in v2 (a supplied league_id scopes the game);
             # when a division IS given it must belong to the season, as in v1.
-            division_ok = (division is not None and division.season_id == season_id) \
+            # #283: Division.season_id dropped; resolve its Season via LeagueSeason.
+            division_ls = (self.store.get_league_season(division.league_season_id)
+                           if division is not None else None)
+            division_ok = (division is not None and division_ls is not None
+                           and division_ls.season_id == season_id) \
                 if require_division else True
             structure_valid = (
                 season is not None

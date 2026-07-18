@@ -55,14 +55,19 @@ def league_id_for_division(store, division_id: str) -> str:
             "Division not found.",
             details={"reason": "division_missing", "division_id": division_id},
         )
-    season = store.get_season(division.season_id) if division.season_id else None
+    # #283: Division no longer carries season_id; it hangs off a LeagueSeason,
+    # so resolve Division -> LeagueSeason -> Season.
+    league_season = (store.get_league_season(division.league_season_id)
+                     if division.league_season_id else None)
+    season_id = league_season.season_id if league_season else None
+    season = store.get_season(season_id) if season_id else None
     if season is None:
         raise ValidationError(
             "Division is not linked to a valid season.",
             details={
                 "reason": "division_season_missing",
                 "division_id": division.id,
-                "season_id": division.season_id,
+                "season_id": season_id,
             },
         )
     scope_id = season_scope_id(season)
@@ -168,7 +173,10 @@ def team_registration_valid(store, season, team_id, division_id=None,
     # no operational consumer may trust such a row.
     if get_scope_program(store, season_scope) is None:
         return None
-    reg = store.registration_for_team_in_season(season.id, team_id)
+    # #283: registration_for_team_in_season is gone; a Team registers per
+    # LeagueSeason, so find its row among the Season's registrations.
+    reg = next((r for r in store.registrations_for_season(season.id)
+                if r.team_id == team_id), None)
     if reg is None or not reg.active:
         return None
     team = store.get_team(team_id)
@@ -188,12 +196,16 @@ def registered_team_ids_in_division(store, division_id):
     division = store.get_division(division_id)
     if division is None:
         return set()
-    season = store.get_season(division.season_id)
+    # #283: Division.season_id dropped; resolve Season via its LeagueSeason.
+    league_season = (store.get_league_season(division.league_season_id)
+                     if division.league_season_id else None)
+    season = (store.get_season(league_season.season_id)
+              if league_season else None)
     if season is None or not season_scope_id(season):
         return set()  # dangling season, or a season with no league — trust nothing
     league_id = season_scope_id(season)
     ids = set()
-    for reg in store.registrations_for_season(division.season_id):
+    for reg in store.registrations_for_season(season.id):
         if not reg.active or reg.division_id != division_id:
             continue
         team = store.get_team(reg.team_id)
@@ -219,7 +231,9 @@ def require_league_belongs_to_season(store, league_id: str, season_id: str):
             f"League {league_id} not found.",
             details={"reason": "league_missing", "league_id": league_id},
         )
-    if league.season_id != season_id:
+    # #283: League no longer carries season_id; its participation in a Season is
+    # a LeagueSeason row, so "belongs to this Season" is that row's existence.
+    if store.league_season_for(league_id, season_id) is None:
         raise ValidationError(
             "League belongs to a different season.",
             details={
@@ -253,18 +267,22 @@ def registered_teams_by_division_in_league(store, season_id, league_id,
         return {}
     program_scope = season_scope_id(season)
     league = store.get_league(league_id) if league_id else None
-    if league is None or league.season_id != season_id:
+    # #283: a League's participation in this Season is a LeagueSeason row; the
+    # Season's registrations/Divisions for this League hang off it.
+    league_season = store.league_season_for(league_id, season_id) if league_id else None
+    if league is None or league_season is None:
         return {}
     groups = {}
-    for reg in store.registrations_for_season(season_id):
-        if not reg.active or reg.league_id != league_id:
+    for reg in store.registrations_for_league_season(league_season.id):
+        if not reg.active:
             continue
         if division_id is not None and reg.division_id != division_id:
             continue
         if reg.division_id is not None:
             division = store.get_division(reg.division_id)
-            if (division is None or division.season_id != season_id
-                    or division.league_id != league_id):
+            # #283: a Division belongs to a LeagueSeason; it's in this League+Season
+            # exactly when its league_season_id matches this LeagueSeason.
+            if division is None or division.league_season_id != league_season.id:
                 continue  # missing/cross-Season/cross-League Division — never trusted
         team = store.get_team(reg.team_id)
         if team is None or not team_scope_id(team) or team_scope_id(team) != program_scope:

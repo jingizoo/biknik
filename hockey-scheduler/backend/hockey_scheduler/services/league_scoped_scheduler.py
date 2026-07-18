@@ -37,7 +37,11 @@ def draft_schedule(store, division_id, slot_ids=None, constraints=None):
     # Preserve the scheduler/API's established not-found behavior via the shared
     # resolver rather than returning an empty cross-league proposal.
     league_id = league_id_for_division(store, division_id)
-    season_id = division.season_id
+    # #283: Division.season_id dropped; resolve its Season via LeagueSeason.
+    # league_id_for_division above already rejected a dangling Division/chain.
+    division_ls = (store.get_league_season(division.league_season_id)
+                   if division and division.league_season_id else None)
+    season_id = division_ls.season_id if division_ls else None
 
     scoped_slot_ids = _season_scoped_slot_ids(store, season_id, slot_ids)
 
@@ -71,8 +75,11 @@ def draft_schedule_for_league(store, season_id, league_id, division_id=None,
     require_league_belongs_to_season(store, league_id, season_id)
     if division_id is not None:
         division = store.get_division(division_id)
-        if (division is None or division.season_id != season_id
-                or division.league_id != league_id):
+        # #283: a Division belongs to a LeagueSeason; it's in this League+Season
+        # exactly when its league_season_id matches this (league, season) row.
+        league_season = store.league_season_for(league_id, season_id)
+        if (division is None or league_season is None
+                or division.league_season_id != league_season.id):
             raise NotFoundError(
                 f"Division {division_id} not found.",
                 details={"reason": "division_missing", "division_id": division_id})

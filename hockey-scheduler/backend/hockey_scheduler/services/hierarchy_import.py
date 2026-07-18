@@ -401,7 +401,12 @@ def validate_hierarchy_import(sheets: Dict[str, List[dict]], store) -> dict:
         if code:
             league_season.setdefault(code, _optional(row.get("season_code")))
     for code, league in existing_leagues.items():
-        league_season.setdefault(code, season_ref_by_id.get(league.season_id))
+        # #283: League.season_id dropped; a League's Season participation is now
+        # a LeagueSeason row. This map is single-valued per League (all the old
+        # model ever allowed, and the competition sheet still ties a league_code
+        # to one season_code), so record each Season this League plays in.
+        for ls in store.league_seasons_for_league(league.id):
+            league_season.setdefault(code, season_ref_by_id.get(ls.season_id))
 
     division_league = {}
     for row in rows["competition"]:
@@ -409,7 +414,11 @@ def validate_hierarchy_import(sheets: Dict[str, List[dict]], store) -> dict:
         if code:
             division_league.setdefault(code, _optional(row.get("league_code")))
     for code, div in existing_divisions.items():
-        division_league.setdefault(code, league_ref_by_id.get(div.league_id))
+        # #283: Division.league_id dropped; resolve the owning League via the
+        # LeagueSeason the Division hangs off.
+        div_ls = store.get_league_season(div.league_season_id)
+        division_league.setdefault(
+            code, league_ref_by_id.get(div_ls.league_id) if div_ls else None)
 
     team_program = {}
     for row in rows["permanent_teams"]:
@@ -611,7 +620,9 @@ def _preflight_reassignment_safety(store, rows) -> List[dict]:
         for reg in all_regs:
             if reg.team_id != team.id:
                 continue
-            season = store.get_season(reg.season_id)
+            # #283: registration.season_id dropped; resolve Season via LeagueSeason.
+            reg_ls = store.get_league_season(reg.league_season_id)
+            season = store.get_season(reg_ls.season_id) if reg_ls else None
             reg_program = (program_code_by_id.get(season.program_id)
                           if season is not None else None)
             if reg_program != new_program_code:
@@ -634,12 +645,18 @@ def _preflight_reassignment_safety(store, rows) -> List[dict]:
         team = teams.get(_clean(row.get("team_code")))
         if season is None or team is None:
             continue  # a new season/team has no existing registration to move
-        reg = store.registration_for_team_in_season(season.id, team.id)
+        # #283: registration_for_team_in_season is gone; a Team registers per
+        # LeagueSeason, so find its row among the Season's registrations.
+        reg = next((r for r in store.registrations_for_season(season.id)
+                    if r.team_id == team.id), None)
         if reg is None:
             continue  # a genuinely new registration moves nothing
         new_league_code = _clean(row.get("league_code"))
         new_division_code = _clean(row.get("division_code"))
-        league_changed = new_league_code != league_code_by_id.get(reg.league_id)
+        # #283: registration.league_id dropped; resolve current League via LeagueSeason.
+        reg_ls = store.get_league_season(reg.league_season_id)
+        reg_league_id = reg_ls.league_id if reg_ls else None
+        league_changed = new_league_code != league_code_by_id.get(reg_league_id)
         division_changed = (
             new_division_code != division_code_by_id.get(reg.division_id))
         if not league_changed and not division_changed:
@@ -681,7 +698,12 @@ def _preflight_reassignment_safety(store, rows) -> List[dict]:
         new_program_code = _clean(row.get("program_code"))
         if new_program_code == program_code_by_id.get(season.program_id):
             continue  # program unchanged
-        affected_regs = [r.id for r in all_regs if r.season_id == season.id]
+        # #283: registration.season_id dropped; resolve each row's Season via
+        # its LeagueSeason.
+        affected_regs = [
+            r.id for r in all_regs
+            if (rls := store.get_league_season(r.league_season_id)) is not None
+            and rls.season_id == season.id]
         if affected_regs:
             errors.append({
                 "sheet": "competition", "row": index, "field": "program_code",
@@ -702,7 +724,11 @@ def _preflight_reassignment_safety(store, rows) -> List[dict]:
         if division is None:
             continue
         new_season_code = _clean(row.get("season_code"))
-        if new_season_code == season_code_by_id.get(division.season_id):
+        # #283: Division.season_id dropped; resolve current Season via LeagueSeason.
+        div_ls = store.get_league_season(division.league_season_id)
+        current_season_code = (season_code_by_id.get(div_ls.season_id)
+                               if div_ls else None)
+        if new_season_code == current_season_code:
             continue  # season unchanged
         affected_regs = [r.id for r in all_regs if r.division_id == division.id]
         affected_games = [g.id for g in all_games if g.division_id == division.id]
