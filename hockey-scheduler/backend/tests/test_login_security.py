@@ -118,6 +118,68 @@ class LoginThrottleTest(unittest.TestCase):
                         "HS_LOGIN_WINDOW_SECONDS"):
                 os.environ.pop(key, None)
 
+    def test_env_config_has_safe_ceilings(self):
+        # A huge value must not effectively disable the throttle or wedge a lock
+        # open forever — every knob is clamped to a safe upper bound.
+        for key, val in (("HS_LOGIN_MAX_FAILURES", "999999"),
+                         ("HS_LOGIN_IP_MAX_FAILURES", "999999"),
+                         ("HS_LOGIN_WINDOW_SECONDS", "99999999")):
+            os.environ[key] = val
+        try:
+            t = LoginThrottle(clock=self.clock)
+            self.assertLessEqual(t._user_max, 100)
+            self.assertLessEqual(t._ip_max, 5000)
+            self.assertLessEqual(t._window, 86_400.0)
+        finally:
+            for key in ("HS_LOGIN_MAX_FAILURES", "HS_LOGIN_IP_MAX_FAILURES",
+                        "HS_LOGIN_WINDOW_SECONDS"):
+                os.environ.pop(key, None)
+
+    def test_begin_reserves_slots_so_concurrency_cannot_overshoot(self):
+        # Three attempts reserve all three username slots while "in flight"
+        # (before any records a failure). The 4th is rejected up front — this is
+        # the overshoot a bare check-then-record gap would let through.
+        self.assertEqual(self.throttle.begin("ip1", "bob"), 0.0)
+        self.assertEqual(self.throttle.begin("ip1", "bob"), 0.0)
+        self.assertEqual(self.throttle.begin("ip1", "bob"), 0.0)
+        self.assertGreater(self.throttle.begin("ip1", "bob"), 0.0)
+        # Resolving the three in-flight attempts as failures keeps the net count
+        # at the ceiling (reservation converts to a recorded failure, 1:1).
+        for _ in range(3):
+            self.throttle.record_failure("ip1", "bob")
+        self.assertGreater(self.throttle.retry_after("ip1", "bob"), 0.0)
+
+    def test_cancel_releases_a_reserved_slot(self):
+        t = LoginThrottle(clock=self.clock, user_max=2, ip_max=100,
+                          window_seconds=100)
+        self.assertEqual(t.begin("ip1", "bob"), 0.0)   # reserve 1/2
+        self.assertEqual(t.begin("ip1", "bob"), 0.0)   # reserve 2/2
+        self.assertGreater(t.begin("ip1", "bob"), 0.0)  # full → rejected
+        t.cancel("ip1", "bob")                          # release one
+        self.assertEqual(t.begin("ip1", "bob"), 0.0)    # room again
+
+    def test_success_releases_a_reserved_slot(self):
+        t = LoginThrottle(clock=self.clock, user_max=2, ip_max=100,
+                          window_seconds=100)
+        t.begin("ip1", "bob")
+        t.begin("ip1", "bob")
+        t.record_success("ip1", "bob")                  # releases + clears failures
+        self.assertEqual(t.begin("ip1", "bob"), 0.0)
+
+    def test_state_is_bounded_by_an_amortized_sweep(self):
+        # Each of many one-off usernames leaves a bucket behind; once they age
+        # out of the window the amortized sweep must reclaim them instead of
+        # letting a username/IP spray grow memory without bound.
+        t = LoginThrottle(clock=self.clock, user_max=3, ip_max=10_000_000,
+                          window_seconds=100)
+        for i in range(600):
+            t.record_failure("ipX", f"user{i}")
+        self.clock.advance(200)                         # all age out of the window
+        for i in range(600, 1100):
+            t.record_failure("ipX", f"user{i}")         # crosses a sweep boundary
+        # Without the sweep this would hold 1100+ dead username buckets.
+        self.assertLess(len(t._fail), 700)
+
 
 class _PasswordPolicyContract:
     def make_store(self):
@@ -247,6 +309,29 @@ class LoginSecurityHttpTest(unittest.TestCase):
         self.assertEqual(body["error"]["code"], "rate_limited")
         self.assertIn("Retry-After", headers)
         self.assertGreaterEqual(int(headers["Retry-After"]), 1)
+
+    def test_concurrent_failures_do_not_overshoot_the_ceiling(self):
+        # Fire many simultaneous wrong-password attempts at one username. Only
+        # `user_max` may reach the verify path (401); the rest are gated up front
+        # (429). Without the atomic reserve in `begin`, all would slip through the
+        # check-then-record gap and overshoot the ceiling.
+        results = []
+        barrier = threading.Barrier(10)
+
+        def attempt():
+            barrier.wait()  # release all threads together for real contention
+            st, _h, _b = self._req(
+                "POST", "/api/auth/login",
+                {"username": "admin", "password": "wrong"})
+            results.append(st)
+
+        threads = [threading.Thread(target=attempt) for _ in range(10)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+        self.assertLessEqual(sum(1 for s in results if s == 401), 3)  # user_max
+        self.assertTrue(any(s == 429 for s in results))
 
     def test_unknown_username_and_wrong_password_are_indistinguishable(self):
         _st1, _h1, unknown = self._req(

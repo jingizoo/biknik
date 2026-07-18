@@ -29,6 +29,10 @@ _SALT_BYTES = 16
 # the next create/change/reset, not to already-stored credentials.
 _MIN_PASSWORD_LENGTH_DEFAULT = 10
 _MIN_PASSWORD_LENGTH_FLOOR = 8
+# An upper bound so a misconfigured value can't wedge account creation (no
+# reachable password could satisfy an absurd minimum) — safe bounds in both
+# directions, mirroring the login-throttle clamps.
+_MIN_PASSWORD_LENGTH_CEILING = 128
 
 
 def _is_production() -> bool:
@@ -37,7 +41,9 @@ def _is_production() -> bool:
 
 def min_password_length() -> int:
     """The enforced minimum new-password length. Read at call time so a
-    deployment can configure it; clamped to the floor in production."""
+    deployment can configure it; clamped to a safe ``[floor, ceiling]`` range in
+    production so a stray override can neither weaken the policy below the floor
+    nor raise it to an unreachable value."""
     raw = os.environ.get("HS_MIN_PASSWORD_LENGTH")
     if not raw:
         return _MIN_PASSWORD_LENGTH_DEFAULT
@@ -46,8 +52,8 @@ def min_password_length() -> int:
     except ValueError:
         return _MIN_PASSWORD_LENGTH_DEFAULT
     if _is_production():
-        return max(n, _MIN_PASSWORD_LENGTH_FLOOR)
-    return max(1, n)
+        return min(_MIN_PASSWORD_LENGTH_CEILING, max(n, _MIN_PASSWORD_LENGTH_FLOOR))
+    return min(_MIN_PASSWORD_LENGTH_CEILING, max(1, n))
 
 
 def password_policy_error(password) -> Optional[str]:

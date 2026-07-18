@@ -1276,17 +1276,26 @@ class Handler(BaseHTTPRequestHandler):
             # returned whether or not the username exists — a locked caller gets a
             # generic 429 + Retry-After, an unlocked bad credential the generic
             # 401 — so neither the throttle nor the error is a username oracle.
+            #
+            # ``begin`` reserves an in-flight slot atomically, so concurrent
+            # attempts can't overshoot the ceiling between the check and the
+            # record; the reservation is always released below via
+            # record_failure / record_success / cancel.
             ip = self._client_ip()
             norm_username = (body.get("username", "") or "").strip().lower()
-            wait = LOGIN_THROTTLE.retry_after(ip, norm_username)
+            wait = LOGIN_THROTTLE.begin(ip, norm_username)
             if wait > 0:
                 return self._send_json(
                     {"error": {"code": "rate_limited",
                                "message": "Too many login attempts. Please wait "
                                           "and try again shortly."}},
                     429, extra_headers=[("Retry-After", str(int(wait) + 1))])
-            row = api.verify_login(body.get("username", ""),
-                                   body.get("password", ""))
+            try:
+                row = api.verify_login(body.get("username", ""),
+                                       body.get("password", ""))
+            except Exception:  # release the reserved slot; never leak it on error
+                LOGIN_THROTTLE.cancel(ip, norm_username)
+                raise
             if row is None:
                 newly_locked = LOGIN_THROTTLE.record_failure(ip, norm_username)
                 if newly_locked:
