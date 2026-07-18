@@ -101,6 +101,12 @@ class Game:
     # standings; carries no owning League or Division). Stored as the plain
     # GameType enum string.
     game_type: str = "regular"
+    # The exact LeagueSeason a REGULAR game belongs to (#283 Slice E) — its
+    # single source of competition identity, so season_id and league_id can
+    # never drift apart. NULL for exhibitions (which have no owning
+    # LeagueSeason). Backfilled for existing regular games from their unique
+    # (league_id, season_id) pair by migration 037.
+    league_season_id: Optional[str] = None
 
 
 @dataclass

@@ -46,7 +46,8 @@ REGISTRATION_KEYS = {"id", "season_id", "team_id", "division_id", "league_id",
 GAME_KEYS = {"id", "home_team_id", "start_time", "target_goalies",
              "target_skaters", "max_skaters", "away_team_id", "rink", "end_time",
              "roster_lock_time", "locked", "cancelled", "published", "season_id",
-             "division_id", "ice_slot_id", "is_draft", "league_id", "game_type"}
+             "division_id", "ice_slot_id", "is_draft", "league_id", "game_type",
+             "league_season_id"}
 
 
 class V2SetupContractTest(unittest.TestCase):

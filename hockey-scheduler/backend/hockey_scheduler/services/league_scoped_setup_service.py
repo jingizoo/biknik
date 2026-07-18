@@ -89,7 +89,11 @@ class SetupService(_BaseSetupService):
             # Preserve the base service's established same-slot error/reason
             # before running the new scope check.
             if game is not None and new_ice_slot_id != game.ice_slot_id:
-                require_game_league_id(self.store, game)
+                # #283 Slice D/E: an exhibition has no owning League, so only a
+                # regular game needs the league-ice-isolation check; both kinds
+                # still need their new slot's venue to serve the game's Season.
+                if game.game_type != "exhibition":
+                    require_game_league_id(self.store, game)
                 require_slot_belongs_to_season(
                     self.store, new_ice_slot_id, game.season_id)
             return _BaseSetupService.move_game.__wrapped__(
@@ -101,7 +105,10 @@ class SetupService(_BaseSetupService):
         with self.store.transaction():
             game = self.store.get_game(game_id)
             if published and game is not None:
-                require_game_league_id(self.store, game)
+                # #283 Slice D/E: only a regular game needs league-ice isolation;
+                # both kinds need their slot's venue to serve the game's Season.
+                if game.game_type != "exhibition":
+                    require_game_league_id(self.store, game)
                 require_slot_belongs_to_season(
                     self.store, game.ice_slot_id, game.season_id)
             return _BaseSetupService.publish_game.__wrapped__(

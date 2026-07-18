@@ -651,6 +651,58 @@ class SetupService:
         ls = self.store.get_league_season(reg.league_season_id)
         return ls.league_id if ls else None
 
+    def _revalidate_game_participation(self, game):
+        """Both teams must still be valid participants of ``game``'s competition
+        scope (#283 Slice E) — checked before any write (publish/move), so a
+        rejection mutates nothing.
+
+        A REGULAR game requires both teams to have an ACTIVE registration in the
+        game's exact LeagueSeason (its single competition identity); when the
+        game also carries a Division, the stricter season+division match is kept
+        too. A legacy regular game with no ``league_season_id`` falls back to the
+        season(+division) check. An EXHIBITION only requires both teams to remain
+        active participants of the game's Season (it may cross Leagues)."""
+        if game.game_type == GameType.EXHIBITION.value:
+            if not game.season_id:
+                return
+            season = self.store.get_season(game.season_id)
+            for tid in (game.home_team_id, game.away_team_id):
+                if tid is None:
+                    continue
+                if team_registration_valid(self.store, season, tid,
+                                           require_division=False) is None:
+                    label = (self.store.get_team(tid) or Team(id=tid, name=tid)).name
+                    raise ValidationError(
+                        f"{label} is no longer an active participant in this "
+                        "game's season.",
+                        {"reason": "team_not_season_participant",
+                         "team_id": tid, "season_id": game.season_id})
+            return
+        # Regular game. The season+division check runs first: it raises the
+        # precise DivisionMismatchError and is the stricter guard for a
+        # divisioned game (also the sole check for a legacy regular game that
+        # predates league_season_id).
+        if game.season_id and game.division_id:
+            self._require_team_registered(
+                game.season_id, game.home_team_id, game.division_id)
+            self._require_team_registered(
+                game.season_id, game.away_team_id, game.division_id)
+        # LeagueSeason membership covers the division-less regular game the
+        # check above skips — both teams must be active in the exact LeagueSeason.
+        ls_id = getattr(game, "league_season_id", None)
+        if ls_id is not None:
+            active_ids = {r.team_id for r
+                          in self.store.registrations_for_league_season(ls_id)
+                          if r.active}
+            for tid in (game.home_team_id, game.away_team_id):
+                if tid is not None and tid not in active_ids:
+                    label = (self.store.get_team(tid) or Team(id=tid, name=tid)).name
+                    raise ValidationError(
+                        f"{label} is no longer registered in this game's "
+                        "league-season.",
+                        {"reason": "team_not_in_league_season",
+                         "team_id": tid, "league_season_id": ls_id})
+
     @_transactional
     def assign_season_team_division(self, registration_id: str,
                                     division_id: Optional[str] = None,
@@ -702,12 +754,20 @@ class SetupService:
         """Move a Team to a different permanent League — promotion/relegation or
         transfer (#283 rule 10).
 
-        Changes only ``Team.league_id``. Prior-Season registrations, Games, and
-        standings are left untouched — history is preserved exactly. The target
-        League must share the Team's Program (rule 3). The Team keeps its
-        existing registrations; a mismatch between those and the new League is
-        expected for past seasons (that IS the history) and only constrains
-        future registrations (rule 7 is enforced at registration time).
+        History is preserved exactly: INACTIVE (past) registrations, their
+        Games, results, and standings are never touched. The target League must
+        share the Team's Program (rule 3).
+
+        A Team's ACTIVE registrations must stay consistent with its permanent
+        League (rule 7), so the transfer atomically moves each active
+        registration that currently sits in a DIFFERENT League to the target
+        League's LeagueSeason for that same Season (clearing its Division, which
+        belonged to the old LeagueSeason). If any such active registration has
+        committed (non-draft, non-cancelled) games, moving it would strand
+        them, so the WHOLE transfer is rejected before any write — the operator
+        must resolve those games first. All checks run before any mutation, so a
+        rejected transfer changes nothing (zero Team/registration/audit
+        mutation).
         """
         team = self.store.get_team_for_update(team_id)
         if team is None:
@@ -722,12 +782,48 @@ class SetupService:
                  "team_program_id": team.program_id,
                  "league_program_id": league.program_id})
         old = team.league_id
+        if old == new_league_id:
+            return team  # no-op: already in this League.
+
+        # Pre-scan: every ACTIVE registration currently in a different League is
+        # a conflict that must be moved. Gather them, and abort the whole
+        # transfer (zero mutation) if any of them has committed games.
+        to_move = []          # (reg, season_id) pairs eligible to move
+        blocked = []          # {registration_id, season_id, affected_game_ids}
+        for reg in self.store.all_season_team_registrations():
+            if reg.team_id != team_id or not reg.active:
+                continue
+            if self._registration_league_id(reg) == new_league_id:
+                continue  # already in the target League — nothing to do
+            season_id = self._season_of_league_season(reg.league_season_id)
+            stranded = self._games_scheduled_for_team_in_season(
+                season_id, team_id)
+            if stranded:
+                blocked.append({"registration_id": reg.id,
+                                "season_id": season_id,
+                                "affected_game_ids": stranded})
+            else:
+                to_move.append((reg, season_id))
+        if blocked:
+            raise ValidationError(
+                "Cannot transfer this team while it has active registrations "
+                "with scheduled games; resolve those games first.",
+                {"reason": "team_transfer_strands_games", "team_id": team_id,
+                 "blocked": blocked})
+
+        # Apply — all writes happen only after every check passed.
+        for reg, season_id in to_move:
+            target_ls = self._link_league_season(new_league_id, season_id)
+            reg.league_season_id = target_ls.id
+            reg.division_id = None  # the old Division belonged to the old League
+            self.store.save_season_team_registration(reg)
         team.league_id = new_league_id
         # Keep Program consistent with the new League when the Team had none.
         team.program_id = team.program_id or league.program_id
         self.store.save_team(team)
         self._audit("team_league_transferred", "team", team.id, actor_id,
-                    {"from": old, "to": new_league_id})
+                    {"from": old, "to": new_league_id,
+                     "registrations_moved": [r.id for r, _ in to_move]})
         return team
 
     @_transactional
@@ -1755,6 +1851,14 @@ class SetupService:
                 )
 
         rink = self.store.get_rink(slot.rink_id)
+        # #283 Slice E: a REGULAR game references its exact LeagueSeason (its
+        # single competition identity); an EXHIBITION has none. scoped_league_id
+        # + season_id already resolved to a real LeagueSeason above for regular
+        # games, so this lookup always succeeds there.
+        league_season_id = None
+        if not is_exhibition and scoped_league_id is not None:
+            ls = self.store.league_season_for(scoped_league_id, season_id)
+            league_season_id = ls.id if ls else None
         game = Game(
             id=self.store.next_id("game"),
             home_team_id=home_team_id,
@@ -1770,6 +1874,7 @@ class SetupService:
             ice_slot_id=ice_slot_id,
             league_id=scoped_league_id,
             game_type=game_type,
+            league_season_id=league_season_id,
         )
         self.store.add_game(game)
         # Mark the slot allocated so it reads as taken across the arena.
@@ -1789,14 +1894,13 @@ class SetupService:
         game = self.store.get_game(game_id)
         if game is None:
             raise NotFoundError(f"Game {game_id} not found.")
-        # A game may only be made public while both teams are still co-registered
-        # in its season+division (#180 shared guard). Unpublishing is unguarded so
-        # an invalid fixture can always be pulled back from public view.
-        if published and game.season_id and game.division_id:
-            self._require_team_registered(
-                game.season_id, game.home_team_id, game.division_id)
-            self._require_team_registered(
-                game.season_id, game.away_team_id, game.division_id)
+        # A game may only be made public while both teams are still valid
+        # participants of its competition scope (#180 / #283 Slice E: exact
+        # LeagueSeason for a regular game, active Season participation for an
+        # exhibition). Unpublishing is unguarded so an invalid fixture can
+        # always be pulled back from public view.
+        if published:
+            self._revalidate_game_participation(game)
         was_published = game.published
         game.published = published
         self.store.save_game(game)
@@ -1823,13 +1927,10 @@ class SetupService:
             raise ValidationError("Cannot move a cancelled game.",
                                   details={"reason": "game_cancelled"})
         # A move can't revive a fixture whose participation has since become
-        # invalid: both teams must still be co-registered in the game's
-        # season+division (#180 shared guard).
-        if game.season_id and game.division_id:
-            self._require_team_registered(
-                game.season_id, game.home_team_id, game.division_id)
-            self._require_team_registered(
-                game.season_id, game.away_team_id, game.division_id)
+        # invalid: both teams must still be valid participants of the game's
+        # competition scope (#180 / #283 Slice E — exact LeagueSeason for a
+        # regular game, active Season participation for an exhibition).
+        self._revalidate_game_participation(game)
 
         new_slot = self.store.get_ice_slot(new_ice_slot_id)
         if new_slot is None:

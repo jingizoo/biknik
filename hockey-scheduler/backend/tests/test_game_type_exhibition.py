@@ -106,10 +106,24 @@ class _Contract:
             game_type=GameType.EXHIBITION.value)
         self.assertNotIn("error", res, res)
         self.assertEqual(res["game_type"], "exhibition")
-        # A friendly carries no owning League and no Division.
+        # A friendly carries no owning League, Division, or LeagueSeason.
         self.assertIsNone(res["league_id"])
         self.assertIsNone(res["division_id"])
+        self.assertIsNone(res["league_season_id"])
         self.assertEqual(res["season_id"], self.season["id"])
+
+    def test_regular_game_references_its_league_season(self):
+        a = self._team("A", self.elite["id"])
+        b = self._team("B", self.elite["id"])
+        res = self.api.create_game(
+            self.season["id"], None, a["id"], b["id"], self._slot(18)["id"],
+            actor_id=ADMIN, league_id=self.elite["id"])
+        self.assertNotIn("error", res, res)
+        # #283 Slice E: a regular game references the exact LeagueSeason for its
+        # (league, season) pair — its single competition identity.
+        ls = self.api.store.league_season_for(self.elite["id"], self.season["id"])
+        self.assertIsNotNone(ls)
+        self.assertEqual(res["league_season_id"], ls.id)
 
     def test_unknown_game_type_is_rejected_zero_mutation(self):
         a = self._team("A", self.elite["id"])
@@ -195,6 +209,79 @@ class _Contract:
         self.assertEqual(by_team[teams["N1"]["id"]]["pts"], 2)
         self.assertEqual(by_team[teams["S1"]["id"]]["pts"], 2)
         self.assertEqual(by_team[teams["N2"]["id"]]["pts"], 0)
+
+    # -- E2 lifecycle integrity -----------------------------------------
+    def _active_regs(self, team_id):
+        return [r for r in self.api.store.registrations_for_season(self.season["id"])
+                if r.team_id == team_id and r.active]
+
+    def test_transfer_moves_game_free_active_registration(self):
+        t = self._team("Movers", self.elite["id"])
+        moved = self.api.transfer_team_to_league(
+            t["id"], self.rec["id"], actor_id=ADMIN)
+        self.assertNotIn("error", moved, moved)
+        # The permanent League changed, and the active registration was moved to
+        # Rec's LeagueSeason for this Season (its old Division cleared).
+        self.assertEqual(self.api.store.get_team(t["id"]).league_id, self.rec["id"])
+        ls_rec = self.api.store.league_season_for(self.rec["id"], self.season["id"])
+        regs = self._active_regs(t["id"])
+        self.assertEqual(len(regs), 1)
+        self.assertEqual(regs[0].league_season_id, ls_rec.id)
+        self.assertIsNone(regs[0].division_id)
+
+    def test_transfer_blocked_by_committed_game_zero_mutation(self):
+        a = self._team("A", self.elite["id"])
+        b = self._team("B", self.elite["id"])
+        g = self.api.create_game(
+            self.season["id"], None, a["id"], b["id"], self._slot(18)["id"],
+            actor_id=ADMIN, league_id=self.elite["id"])
+        self.assertNotIn("error", g, g)
+        before = self._audit_count()
+        res = self.api.transfer_team_to_league(
+            a["id"], self.rec["id"], actor_id=ADMIN)
+        self.assertEqual(res["error"]["details"]["reason"],
+                         "team_transfer_strands_games", res)
+        # Zero mutation: still in Elite, registration untouched, no audit.
+        self.assertEqual(self.api.store.get_team(a["id"]).league_id,
+                         self.elite["id"])
+        self.assertEqual(self._active_regs(a["id"])[0].league_season_id,
+                         self.api.store.league_season_for(
+                             self.elite["id"], self.season["id"]).id)
+        self.assertEqual(self._audit_count(), before)
+
+    def test_transfer_preserves_inactive_history(self):
+        t = self._team("Hist", self.elite["id"])
+        # Deactivate the current registration (simulate a past, inactive row).
+        reg = self._active_regs(t["id"])[0]
+        reg.active = False
+        self.api.store.save_season_team_registration(reg)
+        moved = self.api.transfer_team_to_league(
+            t["id"], self.rec["id"], actor_id=ADMIN)
+        self.assertNotIn("error", moved, moved)
+        # The inactive historical row is left exactly where it was (in Elite).
+        stored = self.api.store.get_season_team_registration(reg.id)
+        self.assertFalse(stored.active)
+        self.assertEqual(
+            stored.league_season_id,
+            self.api.store.league_season_for(self.elite["id"], self.season["id"]).id)
+
+    def test_exhibition_publish_requires_active_season_participation(self):
+        a = self._team("A", self.elite["id"])
+        b = self._team("B", self.rec["id"])
+        exh = self.api.create_game(
+            self.season["id"], None, a["id"], b["id"], self._slot(18)["id"],
+            actor_id=ADMIN, game_type=GameType.EXHIBITION.value)
+        self.assertNotIn("error", exh, exh)
+        # a leaves the season → the friendly can no longer be published.
+        reg = self._active_regs(a["id"])[0]
+        reg.active = False
+        self.api.store.save_season_team_registration(reg)
+        before = self._audit_count()
+        res = self.api.publish_game(exh["id"], actor_id=ADMIN)
+        self.assertEqual(res["error"]["details"]["reason"],
+                         "team_not_season_participant", res)
+        self.assertFalse(self.api.store.get_game(exh["id"]).published)
+        self.assertEqual(self._audit_count(), before)
 
     def test_league_season_standings_unknown_pair_is_not_found(self):
         # A League that isn't in this Season → not_found, never a crash.

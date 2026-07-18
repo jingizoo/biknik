@@ -2606,6 +2606,11 @@ class ApiService:
             # Division.league_id is now resolved through its LeagueSeason (#283).
             ls = self._resolve_ls(division.league_season_id) if division else None
             canonical_league_id = ls.league_id if ls else None
+        # #283 Slice E: draft games are regular games, so they reference the
+        # same LeagueSeason (canonical_league_id × resolved_season_id).
+        draft_ls = self.store.league_season_for(
+            canonical_league_id, resolved_season_id) if canonical_league_id else None
+        draft_ls_id = draft_ls.id if draft_ls else None
         created = []
         for d in proposal["draft_games"]:
             g = Game(
@@ -2616,6 +2621,7 @@ class ApiService:
                 rink=d.get("rink_name"), division_id=d.get("division_id"),
                 season_id=resolved_season_id, league_id=canonical_league_id,
                 ice_slot_id=d.get("ice_slot_id"),
+                league_season_id=draft_ls_id,
                 published=False, is_draft=True)
             self.store.add_game(g)
             created.append(self._draft_game_dto(g))
