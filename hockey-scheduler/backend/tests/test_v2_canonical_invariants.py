@@ -82,9 +82,11 @@ class GameRegistrationLeagueTest(_Base):
         l2 = self.api.create_league(season["id"], "L2", actor_id=ADMIN)
         club = self.api.create_club("C", actor_id=ADMIN)
         team_a = self.api.create_team(club["id"], None, "A", actor_id=ADMIN,
-                                      program_id=program["id"])
+                                      program_id=program["id"],
+                                      league_id=l1["id"])
         team_b = self.api.create_team(club["id"], None, "B", actor_id=ADMIN,
-                                      program_id=program["id"])
+                                      program_id=program["id"],
+                                      league_id=l1["id"])
         # Both teams registered in L1 (division-less).
         self.api.register_team_for_season(season["id"], team_a["id"],
                                           actor_id=ADMIN, league_id=l1["id"])
@@ -258,15 +260,19 @@ class HierarchyV2PermanentLeagueTreeTest(_Base):
 
     def test_team_without_league_is_surfaced_for_assignment(self):
         org, program, season, league, club = self._program_with_league()
-        # A Team with a Program but no permanent League.
-        team = self.api.create_team(club["id"], None, "Loose", actor_id=ADMIN,
-                                    program_id=program["id"])
+        # A Team with a Program but no permanent League. #283 Slice E: create_team
+        # now requires a resolvable League, so a league-less team (the legacy
+        # remediation state this test surfaces) is injected directly into the
+        # store, bypassing the service guard.
+        team = Team(id=self.api.store.next_id("team"), name="Loose",
+                    club_id=club["id"], program_id=program["id"])
+        self.api.store.add_team(team)
         prog = self._program_node(program["id"])
         self.assertIn(
-            team["id"], [t["id"] for t in prog["teams_without_league"]])
+            team.id, [t["id"] for t in prog["teams_without_league"]])
         # It is not falsely attributed to the existing League.
         lg = next(x for x in prog["leagues"] if x["id"] == league["id"])
-        self.assertNotIn(team["id"], [t["id"] for t in lg["teams"]])
+        self.assertNotIn(team.id, [t["id"] for t in lg["teams"]])
 
     def test_leagues_sorted_by_sort_order_then_name(self):
         org, program = self._org_program()
@@ -302,7 +308,8 @@ class DivisionReparentIntegrityTest(_Base):
         org, program, season, l1, l2, div = self._season_two_leagues_division()
         club = self.api.create_club("C", actor_id=ADMIN)
         team = self.api.create_team(club["id"], None, "T", actor_id=ADMIN,
-                                    program_id=program["id"])
+                                    program_id=program["id"],
+                                    league_id=l1["id"])
         # A registration bound to this division (League L1).
         self.api.register_team_for_season(season["id"], team["id"], div["id"],
                                           actor_id=ADMIN, league_id=l1["id"])
@@ -332,7 +339,8 @@ class AssignDivisionPreservesLeagueTest(_Base):
         d2 = self.api.create_division_v2(l2["id"], "D2", actor_id=ADMIN)
         club = self.api.create_club("C", actor_id=ADMIN)
         team = self.api.create_team(club["id"], None, "T", actor_id=ADMIN,
-                                    program_id=program["id"])
+                                    program_id=program["id"],
+                                    league_id=l1["id"])
         reg = self.api.register_team_for_season(season["id"], team["id"], d1["id"],
                                                 actor_id=ADMIN, league_id=l1["id"])
         return season, l1, l2, d1, d2, reg
@@ -366,12 +374,26 @@ class AssignLeagueGameStrandTest(_Base):
         l1 = self.api.create_league(season["id"], "L1", actor_id=ADMIN)
         l2 = self.api.create_league(season["id"], "L2", actor_id=ADMIN)
         club = self.api.create_club("C", actor_id=ADMIN)
-        team_a = self.api.create_team(club["id"], None, "A", actor_id=ADMIN,
-                                      program_id=program["id"])
+        # #283 Slice E: a permanent-League team may only register in its own
+        # League (rule 7), which short-circuits before the game-strand guard this
+        # test targets. Inject a league-less team_a so its registration can be
+        # moved L1→L2 and the committed-game strand guard is the actual gate.
+        _ta = Team(id=self.api.store.next_id("team"), name="A",
+                   club_id=club["id"], program_id=program["id"])
+        self.api.store.add_team(_ta)
+        team_a = {"id": _ta.id}
         team_b = self.api.create_team(club["id"], None, "B", actor_id=ADMIN,
-                                      program_id=program["id"])
-        reg_a = self.api.register_team_for_season(season["id"], team_a["id"],
-                                                  actor_id=ADMIN, league_id=l1["id"])
+                                      program_id=program["id"],
+                                      league_id=l1["id"])
+        # Inject reg_a directly so team_a stays league-less (register would
+        # backfill its permanent League, pinning it and short-circuiting rule 7
+        # before the game-strand guard this test targets).
+        _reg_a = SeasonTeamRegistration(
+            id=self.api.store.next_id("streg"),
+            league_season_id=self._ls_id(l1["id"], season["id"]),
+            team_id=team_a["id"], division_id=None, active=True)
+        self.api.store.add_season_team_registration(_reg_a)
+        reg_a = {"id": _reg_a.id}
         self.api.register_team_for_season(season["id"], team_b["id"],
                                           actor_id=ADMIN, league_id=l1["id"])
         venue = self.api.create_venue("V", organization_id=org["id"],
@@ -403,10 +425,22 @@ class AssignLeagueGameStrandTest(_Base):
         l1 = self.api.create_league(season["id"], "L1", actor_id=ADMIN)
         l2 = self.api.create_league(season["id"], "L2", actor_id=ADMIN)
         club = self.api.create_club("C", actor_id=ADMIN)
-        team = self.api.create_team(club["id"], None, "T", actor_id=ADMIN,
-                                    program_id=program["id"])
-        reg = self.api.register_team_for_season(season["id"], team["id"],
-                                                actor_id=ADMIN, league_id=l1["id"])
+        # A league-less team so its registration may be moved between L1 and L2
+        # (a permanent-League team is pinned to its own League by rule 7). This
+        # exercises the game-strand guard's allow path: no committed games.
+        _t = Team(id=self.api.store.next_id("team"), name="T",
+                  club_id=club["id"], program_id=program["id"])
+        self.api.store.add_team(_t)
+        team = {"id": _t.id}
+        # Inject the registration directly so the team stays league-less; going
+        # through register_team_for_season would backfill its permanent League
+        # and pin it, blocking the very move this test allows.
+        _reg = SeasonTeamRegistration(
+            id=self.api.store.next_id("streg"),
+            league_season_id=self._ls_id(l1["id"], season["id"]),
+            team_id=team["id"], division_id=None, active=True)
+        self.api.store.add_season_team_registration(_reg)
+        reg = {"id": _reg.id}
         moved = self.api.assign_season_team_league(reg["id"], l2["id"],
                                                    actor_id=ADMIN)
         self.assertNotIn("error", moved, moved)
@@ -446,10 +480,13 @@ class V2RegisterProgramMatchTest(_Base):
         # A team owned by a DIFFERENT program.
         other = self.api.create_program(
             "Other", operator_organization_id=org["id"], actor_id=ADMIN)
-        team = self.api.create_team(club["id"], None, "X", actor_id=ADMIN,
-                                    program_id=other["id"])
+        # A team owned by a DIFFERENT (league-less) program; inject it directly
+        # since create_team can't resolve a League for a program that has none.
+        team = Team(id=self.api.store.next_id("team"), name="X",
+                    club_id=club["id"], program_id=other["id"])
+        self.api.store.add_team(team)
         res = self.api.register_team_for_season(
-            season["id"], team["id"], actor_id=ADMIN, league_id=league["id"])
+            season["id"], team.id, actor_id=ADMIN, league_id=league["id"])
         self.assertEqual(res["error"]["code"], "validation_error", res)
 
 
@@ -466,8 +503,11 @@ class HierarchyV2ProgramMismatchTest(_Base):
         # A team that belongs to ANOTHER program.
         other = self.api.create_program(
             "Other", operator_organization_id=org["id"], actor_id=ADMIN)
-        team = self.api.create_team(club["id"], None, "Foreign", actor_id=ADMIN,
-                                    program_id=other["id"])
+        # Inject the (league-less, cross-program) team directly — create_team
+        # can't resolve a League for the league-less "other" program.
+        team = Team(id=self.api.store.next_id("team"), name="Foreign",
+                    club_id=club["id"], program_id=other["id"])
+        self.api.store.add_team(team)
         # Inject the registration directly (register_team_for_season would now
         # reject it) to reproduce a directly-loaded cross-Program row. #283: the
         # row hangs off the (league, season) LeagueSeason created by
@@ -475,8 +515,8 @@ class HierarchyV2ProgramMismatchTest(_Base):
         self.api.store.add_season_team_registration(SeasonTeamRegistration(
             id=self.api.store.next_id("streg"),
             league_season_id=self._ls_id(league["id"], season["id"]),
-            team_id=team["id"], division_id=division_id, active=True))
-        return program, season, league, team
+            team_id=team.id, division_id=division_id, active=True))
+        return program, season, league, {"id": team.id}
 
     def _season_node(self, program, season):
         tree = self.api.get_setup_hierarchy_v2()
@@ -503,23 +543,26 @@ class HierarchyV2ProgramMismatchTest(_Base):
         club = self.api.create_club("C", actor_id=ADMIN)
         other = self.api.create_program(
             "Other", operator_organization_id=org["id"], actor_id=ADMIN)
-        team = self.api.create_team(club["id"], None, "Foreign", actor_id=ADMIN,
-                                    program_id=other["id"])
+        # Inject the (league-less, cross-program) team directly — create_team
+        # can't resolve a League for the league-less "other" program.
+        team = Team(id=self.api.store.next_id("team"), name="Foreign",
+                    club_id=club["id"], program_id=other["id"])
+        self.api.store.add_team(team)
         self.api.store.add_season_team_registration(SeasonTeamRegistration(
             id=self.api.store.next_id("streg"),
             league_season_id=self._ls_id(league["id"], season["id"]),
-            team_id=team["id"], division_id=div["id"], active=True))
+            team_id=team.id, division_id=div["id"], active=True))
 
         tree = self.api.get_setup_hierarchy_v2()
         prog = next(p for p in tree["programs"] if p["id"] == program["id"])
         s = next(x for x in prog["seasons"] if x["id"] == season["id"])
         na = {r["team_id"]: r for r in s["needs_assignment"]["registrations"]}
-        self.assertEqual(na.get(team["id"], {}).get("reason"),
+        self.assertEqual(na.get(team.id, {}).get("reason"),
                          "team_program_mismatch")
         # Not nested under the Division either.
         lg = next(x for x in s["leagues"] if x["id"] == league["id"])
         dnode = next(d for d in lg["divisions"] if d["id"] == div["id"])
-        self.assertNotIn(team["id"], [t["id"] for t in dnode["teams"]])
+        self.assertNotIn(team.id, [t["id"] for t in dnode["teams"]])
 
 
 if __name__ == "__main__":

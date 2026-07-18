@@ -23,6 +23,8 @@ from http.server import ThreadingHTTPServer
 
 from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
 
+from hockey_scheduler.domain import SeasonTeamRegistration, Team
+
 # Canonical v2 JSON key sets (contrast with the legacy sets in the v1 contract).
 PROGRAM_KEYS = {"id", "name", "country", "timezone", "operator_organization_id",
                 "external_ref"}
@@ -391,20 +393,24 @@ class V2SetupContractTest(unittest.TestCase):
         club = self._v2(c, "club", {"name": "C"})
         # This test reassigns the registration BETWEEN league1 and league2, so
         # the team must have NO permanent League (a team with one may only
-        # register in that League, rule 7). A league-less team is only creatable
-        # via the legacy v1 route (v1 "league_id" means Program).
-        status, team = self._req(
-            c, "POST", "/api/setup/team",
-            {"name": "T", "league_id": program["id"], "club_id": club["id"]})
-        self.assertEqual(status, 200, team)
-
-        status, reg = self._req(
-            c, "POST",
-            f"/api/v2/setup/seasons/{season['id']}/team-registrations",
-            {"team_id": team["id"], "league_id": league1["id"]})
-        self.assertEqual(status, 200, reg)
-        self.assertEqual(reg["league_id"], league1["id"])
-        self.assertIsNone(reg["division_id"])  # division optional
+        # register in that League, rule 7). #283 Slice E: a league-less team can
+        # no longer be created through any service route, and registering it
+        # would backfill (pin) its permanent League — either of which blocks the
+        # cross-league reassignment below. Inject both the league-less team and
+        # its league1 registration directly into the shared store so the team
+        # stays league-less and the assign-league/assign-division routes are the
+        # subject under test.
+        store = self.srv.STATE.api.store
+        _team = Team(id=store.next_id("team"), name="T", club_id=club["id"],
+                     program_id=program["id"])
+        store.add_team(_team)
+        team = {"id": _team.id}
+        _ls = store.league_season_for(league1["id"], season["id"])
+        _reg = SeasonTeamRegistration(
+            id=store.next_id("streg"), league_season_id=_ls.id,
+            team_id=team["id"], division_id=None, active=True)
+        store.add_season_team_registration(_reg)
+        reg = {"id": _reg.id}
 
         # reassign the registration to another league (no division constraint).
         status, moved = self._req(
@@ -461,13 +467,15 @@ class V2SetupContractTest(unittest.TestCase):
         self.assertEqual(team["program_id"], program["id"])
         self.assertNotIn("league_id", team)  # raw competition id stays hidden
 
-        # A Team with a Program but no permanent League. The v2 create route now
-        # requires a league_id (#283 Slice E), so a league-less team can only be
-        # made through the legacy v1 route (where "league_id" means Program).
-        status, loose = self._req(
-            c, "POST", "/api/setup/team",
-            {"name": "Loose", "league_id": program["id"]})
-        self.assertEqual(status, 200, loose)
+        # A Team with a Program but no permanent League. #283 Slice E: create_team
+        # now requires a resolvable League on every route, so this league-less
+        # team (the legacy remediation state the hierarchy surfaces under
+        # teams_without_league) is injected directly into the shared store.
+        store = self.srv.STATE.api.store
+        _loose = Team(id=store.next_id("team"), name="Loose",
+                      program_id=program["id"])
+        store.add_team(_loose)
+        loose = {"id": _loose.id}
 
         # The hierarchy exposes the permanent Program → League → Team tree.
         status, body = self._req(c, "GET", "/api/v2/setup/hierarchy")

@@ -128,7 +128,13 @@ class ImportConvergenceContract:
             registrations_csv=fx.registrations_csv(rows=("FALL26,LIONS,L2,",)))
         result = self.api.commit_hierarchy_import(moved, actor_id="admin")
         self.assertTrue(result["committed"], result.get("errors"))
-        self.assertEqual(result["summary"]["registrations"]["updated"], 1)
+        # #283 Slice E: moving the permanent team to L2 cascades its game-free
+        # current registration to L2 (clearing the L1-only division) through the
+        # team transfer, so the move is tallied on the permanent-team bucket and
+        # the registrations sheet is left a no-op skip. The end state (single
+        # registration now in L2 with no division) is asserted below.
+        self.assertEqual(result["summary"]["permanent_teams"]["updated"], 1)
+        self.assertEqual(result["summary"]["registrations"]["skipped"], 1)
         self.assertEqual(len(self.store.all_season_team_registrations()), 1)
         season = by_ref(self.store.all_seasons(), "FALL26")
         l2 = by_ref(self.store.all_leagues(), "L2")

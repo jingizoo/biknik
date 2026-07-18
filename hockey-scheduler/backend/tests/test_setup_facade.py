@@ -205,10 +205,12 @@ class SetupValidationWordingTest(unittest.TestCase):
     def test_team_without_umbrella_says_program(self):
         club = self.api.create_club("C")
         r = self.api.create_team(club["id"], None, "T")  # no program/league/division
-        # #283: a Team is anchored by a Program or its permanent competition
-        # League, so the message offers both — but the umbrella is named
-        # "program", never the old internal "league".
-        self.assertIn("A team needs a program", self._msg(r))
+        # #283 Slice E: a Team must resolve a permanent competition League, so a
+        # Team created with no league, division, or program is rejected with the
+        # team_league_required rule. The wording names the League/division the
+        # operator picks — the grouping noun, never the old internal "level".
+        self.assertEqual(r["error"]["details"]["reason"], "team_league_required")
+        self.assertIn("must belong to a permanent league", self._msg(r))
 
     def test_missing_grouping_parent_says_league(self):
         league = self.api.create_program("P")

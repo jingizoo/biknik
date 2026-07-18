@@ -29,6 +29,7 @@ from http.server import ThreadingHTTPServer
 from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
 
 from hockey_scheduler.api import ApiService
+from hockey_scheduler.domain import Team
 from hockey_scheduler.store import InMemoryStore
 
 # The exact legacy v1 JSON key set for each setup response (the frozen contract).
@@ -293,9 +294,15 @@ class V1SetupContractTest(unittest.TestCase):
         league = self._create(c, "league",
                               {"name": "Read Program", "organization_id": org["id"]})
         club = self._create(c, "club", {"name": "Read Club"})
-        self._create(c, "team",
-                     {"club_id": club["id"], "name": "Read Team",
-                      "league_id": league["id"]})
+        # #283 Slice E: create_team now requires a resolvable permanent League,
+        # which the v1 team route can't supply (its "league_id" body key means
+        # Program, and this program has no competition League). This read-shape
+        # test just needs a team under the program, so inject it directly into
+        # the shared store, bypassing the service guard (the v1 read route still
+        # derives the legacy league_id from the team's program_id).
+        store = self.srv.STATE.api.store
+        store.add_team(Team(id=store.next_id("team"), name="Read Team",
+                            club_id=club["id"], program_id=league["id"]))
         status, body = self._req(
             c, "GET", f"/api/setup/leagues/{league['id']}/teams")
         self.assertEqual(status, 200, body)
