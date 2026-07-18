@@ -152,7 +152,7 @@ async function checkViewport(browser, viewport) {
     const club = await createViaDrawer("club",
       { "f-club": "Records Delete Club" }, "/api/v2/setup/club");
     const team = await createViaDrawer("team",
-      { "f-team-club": club.id, "f-team-league": program.id, "f-team": "Records Delete Team" },
+      { "f-team-club": club.id, "f-team-perm-league": league.id, "f-team": "Records Delete Team" },
       "/api/v2/setup/team");
     const venue = await createViaDrawer("venue",
       { "f-venue": "Records Delete Venue", "f-venue-org": org.id }, "/api/v2/setup/venue");

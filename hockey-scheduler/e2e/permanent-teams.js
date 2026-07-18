@@ -591,9 +591,15 @@ async function checkSliceB(browser, viewport) {
       const season = await post("/api/v2/setup/season", { program_id: program.id, name: "2027-28" });
       const elite = await post("/api/v2/setup/league", { season_id: season.id, name: "Elite", sort_order: 1 });
       const rec = await post("/api/v2/setup/league", { season_id: season.id, name: "Rec", sort_order: 2 });
-      const loose = await post("/api/v2/setup/team", { program_id: program.id, name: "Undrafted" });
+      // #283 Slice E: the canonical v2 route now requires a permanent league,
+      // so a league-less "remediation" team is created via the legacy v1 route
+      // (v1 league_id maps to Program), leaving Team.league_id null.
+      const loose = await post("/api/setup/team", { league_id: program.id, name: "Undrafted" });
+      // The v1 response renames program_id→league_id, so its permanent-league
+      // status can't be read here — it's verified below by the "No league"
+      // bucket. Just confirm the create itself succeeded.
       return { program: program.id, season: season.id, elite: elite.id, rec: rec.id,
-               loose: loose.id, looseOk: !loose.error && !loose.league_id };
+               loose: loose.id, looseOk: !loose.error && !!loose.id };
     });
     if (!ids.looseOk) fail(`program-only team not created (got ${JSON.stringify(ids)})`);
 
@@ -607,7 +613,6 @@ async function checkSliceB(browser, viewport) {
     await page.click('.setup-card .sc-new[data-drawer="team"]');
     await page.waitForSelector("#f-team", { timeout: 5000 });
     await page.fill("#f-team", "Falcons");
-    await page.selectOption("#f-team-league", ids.program);
     await page.selectOption("#f-team-perm-league", ids.elite);
     await page.click('[data-drawer-submit="team"]');
     const teamBody = (await teamReq).postDataJSON();
