@@ -56,19 +56,29 @@ function stopServer(server) {
 // server's own SQLite connection is autocommit/single-statement, and this
 // script only runs between browser actions (never concurrently with a live
 // request), so there is no write contention with the running server.
-function injectCorruptRegistration(databasePath, { seasonId, teamId, leagueId }) {
+function injectCorruptRegistration(databasePath, { seasonId, teamId }) {
   const script = `
 import os
 from hockey_scheduler.store import create_store
-from hockey_scheduler.domain import SeasonTeamRegistration
+from hockey_scheduler.domain import SeasonTeamRegistration, LeagueSeason
 
 store = create_store(os.environ["FIXTURE_DB_PATH"])
 try:
+    # #283: registration_league_not_in_season is only reachable when a
+    # registration's LeagueSeason binds its Season to a League that is NOT a
+    # real League of that Season. Binding the Season to any REAL League makes
+    # that League a legitimate member of the Season (a League may span
+    # Seasons), so it produces NO defect — the only faithful reproduction,
+    # matching the backend's test_repair_via_v2_after_direct_injection, is a
+    # ghost LeagueSeason binding this Season to a non-existent League id.
+    sid = os.environ["FIXTURE_SEASON_ID"]
+    ghost_ls = store.add_league_season(LeagueSeason(
+        id=store.next_id("leagueseason"),
+        league_id="league_ghost", season_id=sid))
     reg_id = store.next_id("streg")
     store.add_season_team_registration(SeasonTeamRegistration(
-        id=reg_id, season_id=os.environ["FIXTURE_SEASON_ID"],
-        team_id=os.environ["FIXTURE_TEAM_ID"], division_id=None,
-        league_id=os.environ["FIXTURE_LEAGUE_ID"], active=True))
+        id=reg_id, league_season_id=ghost_ls.id,
+        team_id=os.environ["FIXTURE_TEAM_ID"], division_id=None, active=True))
     print(reg_id)
 finally:
     store.close()
@@ -80,7 +90,6 @@ finally:
       FIXTURE_DB_PATH: databasePath,
       FIXTURE_SEASON_ID: seasonId,
       FIXTURE_TEAM_ID: teamId,
-      FIXTURE_LEAGUE_ID: leagueId,
     },
     encoding: "utf8",
   });
@@ -480,11 +489,14 @@ async function checkViewport(browser, viewport) {
         method: "POST", credentials: "same-origin",
         headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
       })).json();
-      // The CORRECT League (repair target) lives in seasonR; the WRONG
-      // League the corrupt row will reference lives in a DIFFERENT season
-      // under the same program — the same shape as
+      // The CORRECT League (repair target) lives in seasonR. The corrupt row
+      // itself references a GHOST (non-existent) League — the only shape that
+      // reproduces registration_league_not_in_season under #283, matching
       // test_repair_via_v2_after_direct_injection in
-      // test_v2_onboarding_status.py.
+      // test_v2_onboarding_status.py (see injectCorruptRegistration). A second
+      // real League (otherLeagueR) in a DIFFERENT season under the same program
+      // proves the repair row's League select is scoped to seasonR — it must
+      // offer leagueR but never otherLeagueR.
       const seasonR = await post("/api/v2/setup/season", { program_id: i.program, name: "Repair Season" });
       const leagueR = await post("/api/v2/setup/league", { season_id: seasonR.id, name: "Repair League" });
       const otherSeasonR = await post("/api/v2/setup/season", { program_id: i.program, name: "Repair Season B" });
@@ -495,7 +507,7 @@ async function checkViewport(browser, viewport) {
       return { seasonR: seasonR.id, leagueR: leagueR.id, otherLeagueR: otherLeagueR.id, teamR: teamR.id };
     }, { program: ids.program });
     const repairRegId = injectCorruptRegistration(databasePath, {
-      seasonId: repairFixture.seasonR, teamId: repairFixture.teamR, leagueId: repairFixture.otherLeagueR,
+      seasonId: repairFixture.seasonR, teamId: repairFixture.teamR,
     });
 
     await refreshSetup({ selector: `[data-repair-save="${repairRegId}"]` });
