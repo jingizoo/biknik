@@ -2371,23 +2371,33 @@ class ApiService:
             return {"error": {
                 "code": "not_found",
                 "message": "No such league in that season."}}
-        # #283 rule 10 / history preservation: membership in THIS LeagueSeason
-        # is the registration's canonical ``league_season_id`` (every row from
-        # ``registrations_for_league_season`` already has it), NOT the Team's
-        # CURRENT ``team.league_id``. A Team validly transferred to another
-        # League after an ended Season keeps its historical registration (and its
-        # Games/results/standings) here, so it must still appear in this table —
-        # filtering by current ownership would erase the transferred Team from
-        # its own completed Season. (Its current/future eligibility follows the
-        # new League via that League's own registrations, computed separately.)
-        # A registration whose Team no longer exists is an orphan with no row to
-        # place, and is skipped.
+        # Roster membership in THIS LeagueSeason is the registration's canonical
+        # ``league_season_id`` (every row from ``registrations_for_league_season``
+        # already has it). Whether the Team's CURRENT permanent ``league_id`` must
+        # still agree depends on the Season:
+        #   * A DEFINITELY-ENDED Season is history (#283 rule 10): a Team validly
+        #     transferred to another League afterward keeps its historical
+        #     registration/Games/results here and must still appear in this table,
+        #     so current ownership is NOT re-checked (same "ended" test the
+        #     transfer uses to leave the registration in place).
+        #   * An undated/current/future Season is live: an active registration
+        #     whose Team's current permanent League differs from this League is a
+        #     rule-7 violation (e.g. a migration-preserved current registration in
+        #     L1 while an operator decision moved the Team to L2) and is EXCLUDED,
+        #     never counted in the wrong League's standings.
+        # A registration whose Team no longer exists is an orphan and is skipped.
+        season = self.store.get_season(season_id)
+        season_ended = (season is not None and season.end_date is not None
+                        and season.end_date < self.setup.clock())
         team_ids = set()
         for reg in self.store.registrations_for_league_season(ls.id):
             if not reg.active:
                 continue
-            if self.store.get_team(reg.team_id) is None:
+            team = self.store.get_team(reg.team_id)
+            if team is None:
                 continue
+            if not season_ended and team.league_id != league_id:
+                continue  # live-Season rule-7 mismatch — never counted here
             team_ids.add(reg.team_id)
         teams = [t for t in (self.store.get_team(tid) for tid in team_ids)
                  if t is not None]

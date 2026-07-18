@@ -306,6 +306,45 @@ class _Contract:
     def test_transfer_preserves_ended_season_public_standings(self):
         self._assert_ended_season_history_unchanged(public=True)
 
+    def test_live_season_league_mismatch_excluded_from_standings(self):
+        # A CURRENT (undated) Season: A is registered in Elite and plays a FINAL
+        # game, but a data-integrity drift leaves A's permanent League as Rec
+        # (the migration-preserved-current-registration case). On a live Season
+        # A must NOT enter Elite's standings (rule 7); B (still consistent) does.
+        a = self._team("A", self.elite["id"])
+        b = self._team("B", self.elite["id"])
+        g = self.api.create_game(
+            self.season["id"], None, a["id"], b["id"], self._slot(18)["id"],
+            actor_id=ADMIN, league_id=self.elite["id"])
+        self.assertNotIn("error", g, g)
+        self._final(g["id"], 3, 1)
+        team = self.api.store.get_team(a["id"])
+        team.league_id = self.rec["id"]  # drift: current League now differs
+        self.api.store.save_team(team)
+        res = self.api.get_league_season_standings(
+            self.elite["id"], self.season["id"])
+        self.assertNotIn("error", res, res)
+        ids = {r["team_id"] for r in res["standings"]}
+        self.assertNotIn(a["id"], ids)
+        self.assertIn(b["id"], ids)
+
+    def test_valid_current_transfer_appears_only_in_target_league_season(self):
+        # A game-free CURRENT registration: transferring A from Elite to Rec
+        # moves its registration, so A leaves Elite's standings and appears in
+        # Rec's — never both.
+        a = self._team("A", self.elite["id"])
+        moved = self.api.transfer_team_to_league(
+            a["id"], self.rec["id"], actor_id=ADMIN)
+        self.assertNotIn("error", moved, moved)
+        elite = self.api.get_league_season_standings(
+            self.elite["id"], self.season["id"])
+        rec = self.api.get_league_season_standings(
+            self.rec["id"], self.season["id"])
+        self.assertNotIn("error", elite, elite)
+        self.assertNotIn("error", rec, rec)
+        self.assertNotIn(a["id"], {r["team_id"] for r in elite["standings"]})
+        self.assertIn(a["id"], {r["team_id"] for r in rec["standings"]})
+
 
 class MemoryBlockerRegressionTest(_Contract, unittest.TestCase):
     def make_store(self):
