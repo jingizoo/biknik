@@ -157,11 +157,19 @@ The throttle counts an attempt the moment it is admitted (reserving an in-flight
 slot inside a single lock), so a burst of simultaneous attempts against one
 username or IP cannot collectively slip past the ceiling — concurrency is bounded
 to the configured limit, not to the number of worker threads. Its memory is
-bounded too: buckets whose failures have aged out of the window are reclaimed by
-an amortized sweep, so a spray across many usernames/IPs can't grow state without
-bound. Every tunable is clamped to a safe range (see the table above), so a
-misconfigured value can move within limits but can neither disable the protection
-nor wedge a lock open indefinitely.
+bounded three ways so a spray attack can't grow state without limit: buckets are
+keyed by a fixed-size (16-byte) digest of the IP/username, so an over-long
+identity can't inflate per-entry size; buckets whose failures have aged out of
+the window are reclaimed by an amortized sweep (and again before any capacity
+rejection); and a hard cap on the number of distinct tracked identities means
+that once the table is full even after a sweep, a **previously unseen** identity
+is failed closed (throttled) rather than allocating a new bucket. Under a
+large-scale spray of fresh identities this briefly throttles genuinely new
+callers — a deliberate, documented degradation — while already-tracked users keep
+working. Every tunable is parsed defensively (non-finite values fall back to the
+default) and clamped to a safe range (see the table above), so a misconfigured
+value can move within limits but can neither disable the protection nor wedge a
+lock open indefinitely.
 
 The throttle is in-process and per-instance (like the anonymous-route limiter,
 #131): a restart clears it, and behind multiple instances each sees only its own

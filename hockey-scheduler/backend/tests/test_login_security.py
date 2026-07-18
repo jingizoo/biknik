@@ -14,6 +14,7 @@ Three layers:
 """
 
 import json
+import math
 import os
 import threading
 import unittest
@@ -179,6 +180,82 @@ class LoginThrottleTest(unittest.TestCase):
             t.record_failure("ipX", f"user{i}")         # crosses a sweep boundary
         # Without the sweep this would hold 1100+ dead username buckets.
         self.assertLess(len(t._fail), 700)
+
+    def test_active_window_spray_is_capped_without_aging(self):
+        # The sweep can't help here: NO time advances, so nothing ages out. The
+        # only thing that can bound memory against a spray of fresh identities
+        # inside one window is the hard cardinality cap.
+        t = LoginThrottle(clock=self.clock, user_max=100, ip_max=100,
+                          window_seconds=1000, max_keys=10)
+        rejected_fresh = 0
+        for i in range(500):
+            if t.begin(f"ip{i}", f"user{i}") > 0:
+                rejected_fresh += 1
+                continue
+            t.record_failure(f"ip{i}", f"user{i}")
+        self.assertLessEqual(t._tracked_size(), 10)     # never grew past the cap
+        self.assertGreater(rejected_fresh, 0)           # fresh identities failed closed
+
+    def test_pending_reservations_count_toward_capacity(self):
+        # Reservations that never resolve (all held in-flight) must also count
+        # toward the cap — pending state cannot be an unbounded side channel.
+        t = LoginThrottle(clock=self.clock, user_max=100, ip_max=100,
+                          window_seconds=1000, max_keys=6)
+        admitted = 0
+        for i in range(50):
+            if t.begin(f"ip{i}", f"user{i}") == 0.0:     # reserved, never recorded
+                admitted += 1
+        self.assertLessEqual(admitted, 3)               # 6 keys / 2 per admit
+        self.assertLessEqual(t._tracked_size(), 6)
+
+    def test_known_identity_still_served_when_table_is_full(self):
+        # Fail-closed applies only to *previously unseen* identities; an already
+        # tracked one keeps working under a full table (serving it adds no key).
+        t = LoginThrottle(clock=self.clock, user_max=100, ip_max=100,
+                          window_seconds=1000, max_keys=4)
+        self.assertEqual(t.begin("known_ip", "known_user"), 0.0)
+        t.record_failure("known_ip", "known_user")
+        for i in range(50):                             # fill the rest of the table
+            if t.begin(f"ip{i}", f"user{i}") == 0.0:
+                t.record_failure(f"ip{i}", f"user{i}")
+        self.assertEqual(t.begin("known_ip", "known_user"), 0.0)      # still served
+        self.assertGreater(t.begin("brand_new_ip", "brand_new_user"), 0.0)  # closed
+
+    def test_oversized_identities_use_fixed_size_keys(self):
+        # A megabyte-long username/IP must not become a megabyte-long dict key.
+        t = LoginThrottle(clock=self.clock, user_max=3, ip_max=3,
+                          window_seconds=100)
+        huge = "x" * 1_000_000
+        t.record_failure(huge, huge)
+        for scope, digest in t._fail:
+            self.assertIn(scope, ("ip", "user"))
+            self.assertIsInstance(digest, bytes)
+            self.assertEqual(len(digest), 16)           # fixed-size, input-independent
+
+    def test_non_finite_window_config_falls_back_safely(self):
+        for bad in ("inf", "-inf", "nan", "1e999"):
+            os.environ["HS_LOGIN_WINDOW_SECONDS"] = bad
+            try:
+                t = LoginThrottle(clock=self.clock)
+                self.assertTrue(math.isfinite(t._window), bad)
+                self.assertGreaterEqual(t._window, 30.0)
+                self.assertLessEqual(t._window, 86_400.0)
+            finally:
+                os.environ.pop("HS_LOGIN_WINDOW_SECONDS", None)
+
+    def test_non_finite_int_config_falls_back_safely(self):
+        for key in ("HS_LOGIN_MAX_FAILURES", "HS_LOGIN_IP_MAX_FAILURES"):
+            for bad in ("inf", "nan", "1e999"):
+                os.environ[key] = bad
+                try:
+                    t = LoginThrottle(clock=self.clock)
+                    # Falls back to the safe default, never an unbounded/off value.
+                    self.assertGreaterEqual(t._user_max, 1)
+                    self.assertLessEqual(t._user_max, 100)
+                    self.assertGreaterEqual(t._ip_max, 1)
+                    self.assertLessEqual(t._ip_max, 5000)
+                finally:
+                    os.environ.pop(key, None)
 
 
 class _PasswordPolicyContract:
