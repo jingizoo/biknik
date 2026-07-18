@@ -223,6 +223,68 @@ class HierarchyV2TeamsWithoutDivisionTest(_Base):
         self.assertNotIn(team["id"], na_team_ids)
 
 
+class HierarchyV2PermanentLeagueTreeTest(_Base):
+    """#283 Slice B: the v2 hierarchy surfaces the PERMANENT Program → League →
+    Team membership (Team.league_id), independent of any Season, so the Setup UI
+    can render and manage the competition structure that persists across
+    Seasons. A Team with a Program but no permanent League is surfaced under
+    ``teams_without_league`` so an operator can assign one."""
+
+    def _program_with_league(self):
+        org, program = self._org_program()
+        # A permanent League is created via a Season (create_league binds a
+        # LeagueSeason), but the League itself belongs to the Program forever.
+        season = self.api.create_season(program["id"], "Fall", actor_id=ADMIN)
+        league = self.api.create_league(season["id"], "Elite", actor_id=ADMIN)
+        club = self.api.create_club("C", actor_id=ADMIN)
+        return org, program, season, league, club
+
+    def _program_node(self, program_id):
+        tree = self.api.get_setup_hierarchy_v2()
+        return next(p for p in tree["programs"] if p["id"] == program_id)
+
+    def test_team_appears_under_its_permanent_league(self):
+        org, program, season, league, club = self._program_with_league()
+        team = self.api.create_team(club["id"], None, "T", actor_id=ADMIN,
+                                    program_id=program["id"],
+                                    league_id=league["id"])
+        prog = self._program_node(program["id"])
+        lg = next(x for x in prog["leagues"] if x["id"] == league["id"])
+        self.assertEqual(lg["name"], "Elite")
+        # season_count reflects the League's Season participation.
+        self.assertEqual(lg["season_count"], 1)
+        self.assertIn(team["id"], [t["id"] for t in lg["teams"]])
+        # A Team with a permanent League is NOT in the unassigned bucket.
+        self.assertNotIn(
+            team["id"], [t["id"] for t in prog["teams_without_league"]])
+
+    def test_team_without_league_is_surfaced_for_assignment(self):
+        org, program, season, league, club = self._program_with_league()
+        # A Team with a Program but no permanent League.
+        team = self.api.create_team(club["id"], None, "Loose", actor_id=ADMIN,
+                                    program_id=program["id"])
+        prog = self._program_node(program["id"])
+        self.assertIn(
+            team["id"], [t["id"] for t in prog["teams_without_league"]])
+        # It is not falsely attributed to the existing League.
+        lg = next(x for x in prog["leagues"] if x["id"] == league["id"])
+        self.assertNotIn(team["id"], [t["id"] for t in lg["teams"]])
+
+    def test_leagues_sorted_by_sort_order_then_name(self):
+        org, program = self._org_program()
+        season = self.api.create_season(program["id"], "Fall", actor_id=ADMIN)
+        # Deliberately out of order; expect (sort_order, name) ordering.
+        self.api.create_league(season["id"], "Bravo", sort_order=2,
+                               actor_id=ADMIN)
+        self.api.create_league(season["id"], "Alpha", sort_order=2,
+                               actor_id=ADMIN)
+        self.api.create_league(season["id"], "Zeta", sort_order=1,
+                               actor_id=ADMIN)
+        prog = self._program_node(program["id"])
+        self.assertEqual([lg["name"] for lg in prog["leagues"]],
+                         ["Zeta", "Alpha", "Bravo"])
+
+
 class DivisionReparentIntegrityTest(_Base):
     def _season_two_leagues_division(self):
         org, program = self._org_program()

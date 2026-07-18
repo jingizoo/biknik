@@ -2079,7 +2079,8 @@ class Handler(BaseHTTPRequestHandler):
         """Dispatch /api/v2/setup/<entity>/<id>/assign-<target> (#233 Slice C2).
 
         Canonical reassign per the ADR 0001 new tree: division→league (the
-        grouping League), team→club, player→team, rink→venue, venue→organization.
+        grouping League), team→club, team→league (the PERMANENT competition
+        League, #283 Slice B), player→team, rink→venue, venue→organization.
         There is NO team→program (a Team is program-permanent) and NO
         division→level (division's parent is now a League). Canonical request
         keys and canonical (_serialize) responses — no v1 mapping. ``actor_id``
@@ -2104,6 +2105,15 @@ class Handler(BaseHTTPRequestHandler):
             # club_id unassigns the team's Club.
             return self._send_api(api.assign_team_club(
                 record_id, b.get("club_id") or None, actor_id))
+        if combo == ("team", "league"):
+            # #283 Slice B: move a Team to a different PERMANENT League
+            # (promotion/relegation/transfer, rule 10). League is required —
+            # a Team is always league-permanent; history is preserved.
+            if not (b.get("league_id") or None):
+                return self._send_api({"error": {"code": "validation_error",
+                    "message": "A league_id is required."}})
+            return self._send_api(api.transfer_team_to_league(
+                record_id, b.get("league_id"), actor_id))
         if combo == ("player", "team"):
             return self._send_api(api.assign_player_team(
                 record_id, b.get("team_id"), actor_id))
@@ -2253,9 +2263,13 @@ class Handler(BaseHTTPRequestHandler):
                 b.get("name"), b.get("country", ""), actor_id))
         if entity == "team":
             # v2: program-owned; club optional; no division_id-derives-owner.
+            # #283 Slice B: an optional permanent-League assignment (league_id).
+            # When given, the service keeps the Team's Program consistent with
+            # the League's Program (rule 3), so program_id may be omitted.
             return self._send_api(api.create_team(
                 b.get("club_id") or None, None, b.get("name"),
-                actor_id, program_id=b.get("program_id") or None))
+                actor_id, program_id=b.get("program_id") or None,
+                league_id=b.get("league_id") or None))
         if entity == "organization":
             return self._send_api(api.create_organization(
                 b.get("name"), b.get("short_name", ""), actor_id))

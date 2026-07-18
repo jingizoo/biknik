@@ -3274,6 +3274,26 @@ class ApiService:
                     "program_id": t.program_id,
                     "player_count": player_count.get(t.id, 0)}
 
+        # #283 Slice B: the PERMANENT Program → League → Team structure (the
+        # competition membership that persists across Seasons), surfaced
+        # alongside the per-Season participation tree below. A Team belongs to
+        # exactly one permanent League (Team.league_id); a Team with a Program
+        # but no League yet is surfaced under ``teams_without_league`` so an
+        # operator can assign one (rule 2 remediation).
+        leagues_by_program = _group(leagues, "program_id")
+        teams_by_league = {}
+        teams_without_league_by_program = {}
+        for t in teams:
+            if t.league_id:
+                teams_by_league.setdefault(t.league_id, []).append(t)
+            elif t.program_id:
+                teams_without_league_by_program.setdefault(
+                    t.program_id, []).append(t)
+        ls_count_by_league = {}
+        for ls in ls_by_id.values():
+            ls_count_by_league[ls.league_id] = \
+                ls_count_by_league.get(ls.league_id, 0) + 1
+
         program_tree = []
         for prog in programs:
             season_nodes = []
@@ -3382,9 +3402,29 @@ class ApiService:
                         "registrations": needs_assignment_regs,
                     },
                 })
+            # #283 Slice B: the permanent League tree for this Program — the
+            # competition membership that persists across Seasons. Each League
+            # carries how many Seasons it participates in (season_count) and its
+            # currently-assigned Teams. Teams with a Program but no League yet
+            # are surfaced separately so an operator can assign one.
+            perm_leagues = sorted(
+                leagues_by_program.get(prog.id, []),
+                key=lambda lv: (lv.sort_order or 0, lv.name))
             program_tree.append({
                 "id": prog.id, "name": prog.name,
                 "operator_organization_id": prog.operator_organization_id,
+                "leagues": [
+                    {"id": lv.id, "name": lv.name, "sort_order": lv.sort_order,
+                     "season_count": ls_count_by_league.get(lv.id, 0),
+                     "teams": [team_node(t)
+                               for t in sorted(teams_by_league.get(lv.id, []),
+                                               key=lambda t: t.name)]}
+                    for lv in perm_leagues],
+                "teams_without_league": [
+                    team_node(t)
+                    for t in sorted(
+                        teams_without_league_by_program.get(prog.id, []),
+                        key=lambda t: t.name)],
                 "seasons": season_nodes,
             })
 
@@ -3442,12 +3482,18 @@ class ApiService:
     def create_team(self, club_id: Optional[str] = None,
                     division_id: Optional[str] = None,
                     name: str = "", actor_id: Optional[str] = None,
-                    program_id: Optional[str] = None) -> dict:
+                    program_id: Optional[str] = None,
+                    league_id: Optional[str] = None) -> dict:
+        # #283 Slice B: ``league_id`` is the permanent-League assignment (rule 2)
+        # the Setup UI supplies when creating a Team under its competition
+        # League. The setup service validates it and keeps Program consistent.
         team = _serialize(self.setup.create_team(
-            club_id, division_id, name, actor_id, program_id=program_id))
-        # #283: drop the new competition Team.league_id from this shared shape —
-        # the canonical v2 team excludes it, and the v1 adapter derives its
-        # league_id from program_id (team_to_v1). Neither exposes the raw field.
+            club_id, division_id, name, actor_id, program_id=program_id,
+            league_id=league_id))
+        # Drop the new competition Team.league_id from this shared response
+        # shape — the canonical v2 team excludes it, and the v1 adapter derives
+        # its league_id from program_id (team_to_v1). Neither exposes the raw
+        # field on the wire.
         team.pop("league_id", None)
         return team
 
@@ -3655,6 +3701,19 @@ class ApiService:
                          actor_id: Optional[str] = None) -> dict:
         return _serialize(self.setup.assign_team_club(
             team_id, club_id, actor_id))
+
+    @catch
+    def transfer_team_to_league(self, team_id: str, league_id: str,
+                                actor_id: Optional[str] = None) -> dict:
+        """#283 Slice B: move a Team to a different permanent League
+        (promotion/relegation/transfer, rule 10). History is untouched.
+
+        The raw competition ``Team.league_id`` is dropped from the response —
+        the shared team shape never exposes it (see ``create_team``)."""
+        team = _serialize(self.setup.transfer_team_to_league(
+            team_id, league_id, actor_id))
+        team.pop("league_id", None)
+        return team
 
     # assign_team_division removed (#180) — see SetupService; a Team's seasonal
     # division lives in SeasonTeamRegistration (assign_season_team_division).

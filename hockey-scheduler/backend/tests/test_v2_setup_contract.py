@@ -366,6 +366,68 @@ class V2SetupContractTest(unittest.TestCase):
         self.assertEqual(set(dmoved), DIVISION_KEYS, dmoved)
         self.assertNotIn("level_id", dmoved)
 
+    # -- permanent-League tree + team transfer (#283 Slice B) ---------------
+    def test_v2_permanent_league_tree_and_team_transfer(self):
+        c = self._admin()
+        org = self._v2(c, "organization", {"name": "P Org", "short_name": "PO"})
+        program = self._v2(c, "program",
+                          {"name": "P Prog", "operator_organization_id": org["id"]})
+        season = self._v2(c, "season",
+                        {"program_id": program["id"], "name": "S"})
+        elite = self._v2(c, "league",
+                         {"season_id": season["id"], "name": "Elite",
+                          "sort_order": 1})
+        rec = self._v2(c, "league",
+                       {"season_id": season["id"], "name": "Rec",
+                        "sort_order": 2})
+        club = self._v2(c, "club", {"name": "C"})
+
+        # Create a Team directly under its PERMANENT League (Slice B: league_id
+        # is accepted on team create; Program is derived from the League).
+        team = self._v2(c, "team",
+                       {"league_id": elite["id"], "club_id": club["id"],
+                        "name": "Falcons"})
+        self.assertEqual(team["program_id"], program["id"])
+        self.assertNotIn("league_id", team)  # raw competition id stays hidden
+
+        # A Team with a Program but no permanent League.
+        loose = self._v2(c, "team",
+                        {"program_id": program["id"], "name": "Loose"})
+
+        # The hierarchy exposes the permanent Program → League → Team tree.
+        status, body = self._req(c, "GET", "/api/v2/setup/hierarchy")
+        self.assertEqual(status, 200, body)
+        prog = next(p for p in body["programs"] if p["id"] == program["id"])
+        self.assertIn("leagues", prog)
+        by_league = {lg["id"]: lg for lg in prog["leagues"]}
+        # Leagues are ordered by (sort_order, name).
+        self.assertEqual([lg["name"] for lg in prog["leagues"]], ["Elite", "Rec"])
+        self.assertIn(team["id"], [t["id"] for t in by_league[elite["id"]]["teams"]])
+        self.assertEqual(by_league[elite["id"]]["season_count"], 1)
+        # The league-less team is surfaced for assignment, not falsely nested.
+        self.assertIn(loose["id"],
+                      [t["id"] for t in prog["teams_without_league"]])
+
+        # Transfer the team from Elite to Rec (promotion/relegation, rule 10).
+        status, moved = self._req(
+            c, "POST", f"/api/v2/setup/team/{team['id']}/assign-league",
+            {"league_id": rec["id"]})
+        self.assertEqual(status, 200, moved)
+        self.assertNotIn("league_id", moved)  # raw competition id stays hidden
+
+        status, body2 = self._req(c, "GET", "/api/v2/setup/hierarchy")
+        prog2 = next(p for p in body2["programs"] if p["id"] == program["id"])
+        by_league2 = {lg["id"]: lg for lg in prog2["leagues"]}
+        self.assertIn(team["id"],
+                      [t["id"] for t in by_league2[rec["id"]]["teams"]])
+        self.assertNotIn(team["id"],
+                         [t["id"] for t in by_league2[elite["id"]]["teams"]])
+
+        # A transfer without a league_id is a validation error.
+        status, err = self._req(
+            c, "POST", f"/api/v2/setup/team/{team['id']}/assign-league", {})
+        self.assertEqual(err["error"]["code"], "validation_error", err)
+
     # -- program operator reassignment (#233 Slice C2 review) ---------------
     def test_v2_program_assign_organization(self):
         c = self._admin()
