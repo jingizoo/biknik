@@ -45,15 +45,21 @@ class ApiService(_BaseApiService):
 
         league_rows = []
         for lg in leagues:
-            season = seasons_by_id.get(lg.season_id)
-            program = (programs_by_id.get(season.program_id)
-                      if season is not None else None)
-            league_rows.append({
-                "code": lg.external_ref, "name": lg.name,
-                "season_code": season.external_ref if season else None,
-                "program_code": (program.external_ref
-                                 if program is not None else None),
-            })
+            # #283: League.season_id dropped — a League now belongs directly to a
+            # Program and participates in Seasons via LeagueSeason rows. Emit one
+            # picker row per Season the League plays in (none -> a single row with
+            # no season_code), with the Program taken from the League directly.
+            program = programs_by_id.get(lg.program_id)
+            program_code = program.external_ref if program is not None else None
+            seasons_for_league = [
+                seasons_by_id.get(ls.season_id)
+                for ls in self.store.league_seasons_for_league(lg.id)] or [None]
+            for season in seasons_for_league:
+                league_rows.append({
+                    "code": lg.external_ref, "name": lg.name,
+                    "season_code": season.external_ref if season else None,
+                    "program_code": program_code,
+                })
 
         return {
             "programs": [{"code": p.external_ref, "name": p.name}

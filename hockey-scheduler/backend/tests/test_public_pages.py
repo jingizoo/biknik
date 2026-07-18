@@ -135,11 +135,19 @@ class PublicStandingsPublishLeakTest(unittest.TestCase):
         p_home0 = self._row(before_pub, self.home.id)
         i_home0 = self._row(before_int, self.home.id)
 
-        # An unpublished (draft) game with a decisive FINAL result.
+        # An unpublished (draft) game with a decisive FINAL result. #283: a
+        # regular game carries its Division's exact LeagueSeason (league_id,
+        # season_id, league_season_id) — standings now fail closed on a Game
+        # whose LeagueSeason disagrees with its Division, so seed a consistent
+        # one; this test is about the published/unpublished distinction.
+        _division = self.store.get_division(self.div_id)
+        _ls = self.store.get_league_season(_division.league_season_id)
         g = Game(id=self.store.next_id("game"), home_team_id=self.home.id,
                  away_team_id=self.away.id,
                  start_time=datetime(2026, 3, 1, tzinfo=UTC),
-                 division_id=self.div_id, published=False)
+                 division_id=self.div_id, published=False,
+                 league_id=_ls.league_id, season_id=_ls.season_id,
+                 league_season_id=_ls.id)
         self.store.add_game(g)
         self.store.add_game_result(GameResult(
             id=self.store.next_id("result"), game_id=g.id,

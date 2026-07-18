@@ -74,10 +74,35 @@ class MigrationApplyTest(unittest.TestCase):
         try:
             store = SqlStore(path)
             cur = store.conn.cursor()
-            # Reverse migration 028 (#233 C1b) first so the DB is back at the
-            # pre-028 competition-model names a legacy adopter would carry. The
-            # legacy-strip below then operates on those original names, and the
-            # re-boot re-applies 001-028 (028 performing the rename again).
+            # Reverse migrations 035 (#283) then 028 (#233 C1b) first so the DB is
+            # back at the pre-028 competition-model names a legacy adopter would
+            # carry. The legacy-strip below then operates on those original names,
+            # and the re-boot re-applies 001-035 (028 renaming, 035 resetting the
+            # hierarchy again).
+            #
+            # 035 folded divisions/registration season_id+league_id into
+            # league_season_id, made leagues a permanent Program child
+            # (program_id, no season_id), and added teams.league_id +
+            # league_seasons. Reverse those to the post-028 shape the 028-reversal
+            # below expects (drop teams.league_id so program_id can be renamed
+            # back onto it without collision).
+            cur.execute("DROP INDEX IF EXISTS ix_teams_league")
+            cur.execute("ALTER TABLE teams DROP COLUMN league_id")
+            cur.execute("DROP INDEX IF EXISTS ux_team_league_season")
+            cur.execute("DROP INDEX IF EXISTS ix_reg_league_season_division")
+            cur.execute("ALTER TABLE season_team_registrations "
+                        "DROP COLUMN league_season_id")
+            cur.execute("ALTER TABLE season_team_registrations ADD COLUMN season_id TEXT")
+            cur.execute("ALTER TABLE season_team_registrations ADD COLUMN league_id TEXT")
+            cur.execute("DROP INDEX IF EXISTS ix_divisions_league_season")
+            cur.execute("ALTER TABLE divisions DROP COLUMN league_season_id")
+            cur.execute("ALTER TABLE divisions ADD COLUMN season_id TEXT")
+            cur.execute("ALTER TABLE divisions ADD COLUMN league_id TEXT")
+            cur.execute("DROP INDEX IF EXISTS ix_leagues_program")
+            cur.execute("ALTER TABLE leagues DROP COLUMN program_id")
+            cur.execute("ALTER TABLE leagues ADD COLUMN season_id TEXT")
+            cur.execute("DROP INDEX IF EXISTS ux_league_season")
+            cur.execute("DROP TABLE IF EXISTS league_seasons")
             cur.execute("ALTER TABLE games DROP COLUMN league_id")
             cur.execute("ALTER TABLE season_team_registrations DROP COLUMN league_id")
             cur.execute("ALTER TABLE divisions RENAME COLUMN league_id TO level_id")
@@ -132,6 +157,10 @@ class MigrationApplyTest(unittest.TestCase):
             cur.execute("ALTER TABLE notification_preferences DROP COLUMN active")  # #232 review 4
             cur.execute("DROP INDEX IF EXISTS ix_clubs_external_ref")  # #260 Slice F
             cur.execute("ALTER TABLE clubs DROP COLUMN external_ref")  # #260 Slice F additive col
+            cur.execute("DROP INDEX IF EXISTS ix_games_game_type")  # #283 Slice D
+            cur.execute("ALTER TABLE games DROP COLUMN game_type")  # #283 Slice D additive col
+            cur.execute("DROP INDEX IF EXISTS ix_games_league_season")  # #283 Slice E
+            cur.execute("ALTER TABLE games DROP COLUMN league_season_id")  # #283 Slice E additive col
             cur.execute("DELETE FROM schema_migrations")
             cur.execute("INSERT INTO schema_migrations(version, applied_at) "
                         "VALUES ('0001_initial', '2026-01-01')")
@@ -166,11 +195,23 @@ class MigrationApplyTest(unittest.TestCase):
                 self.assertIn("external_ref", _table_columns(adopted, tbl))
             # #180 permanent-teams column (now program_id) + registrations table.
             self.assertIn("program_id", _table_columns(adopted, "teams"))
-            self.assertIn("season_id",
+            # #283 migration 035: registrations hang off a LeagueSeason
+            # (league_season_id), season_id + league_id retired.
+            self.assertIn("league_season_id",
                           _table_columns(adopted, "season_team_registrations"))
-            # #233 C1b reparent columns landed on registrations and games.
-            self.assertIn("league_id",
-                          _table_columns(adopted, "season_team_registrations"))
+            self.assertNotIn("season_id",
+                             _table_columns(adopted, "season_team_registrations"))
+            self.assertNotIn("league_id",
+                             _table_columns(adopted, "season_team_registrations"))
+            # #283 migration 035: League is a permanent Program child with a
+            # Season overlay via league_seasons, and Teams gain a permanent
+            # League. Games keep their (repointed) league_id.
+            adopted_tables = {r["name"] for r in adopted.conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+            self.assertIn("league_seasons", adopted_tables)
+            self.assertIn("league_season_id", _table_columns(adopted, "divisions"))
+            self.assertIn("program_id", _table_columns(adopted, "leagues"))
+            self.assertIn("league_id", _table_columns(adopted, "teams"))
             self.assertIn("league_id", _table_columns(adopted, "games"))
         finally:
             os.remove(path)

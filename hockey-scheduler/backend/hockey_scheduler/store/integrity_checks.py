@@ -572,3 +572,257 @@ def assert_venue_season_access_backfill_ready(conn):
         f"deterministically: {shown}{more}. Grant SeasonVenueAccess "
         "explicitly for these venues instead of relying on the legacy link, "
         "or resolve the ambiguity before upgrading.")
+
+
+# --------------------------------------------------------------------------- #
+# 035 competition hierarchy reset (#283 Slice A): Program -> League -> Team    #
+# with a Season overlay via LeagueSeason.                                      #
+# --------------------------------------------------------------------------- #
+def _canonical_league_index(conn):
+    """Compute the permanent-League merge from the pre-035 schema.
+
+    Today a ``leagues`` row is per-Season. Two rows are the SAME permanent
+    League when they share a Program (via their Season) and the same key —
+    ``coalesce(external_ref, lower(name))`` — and the lowest id in that group is
+    the canonical permanent League. Returns ``(canonical_of, name_of,
+    season_of)`` maps keyed by original league id (``canonical_of[lg] `` is the
+    id the row will merge into), for reuse by the finders below.
+    """
+    cur = conn.cursor()
+    cur.execute("SELECT id, program_id FROM seasons")
+    program_of_season = {r["id"]: r["program_id"] for r in cur.fetchall()}
+    cur.execute("SELECT id, season_id, name, external_ref FROM leagues")
+    leagues = cur.fetchall()
+    name_of, season_of, program_of, key_of = {}, {}, {}, {}
+    for lg in leagues:
+        lid = lg["id"]
+        name_of[lid] = lg["name"]
+        season_of[lid] = lg["season_id"]
+        program_of[lid] = program_of_season.get(lg["season_id"])
+        key_of[lid] = (lg["external_ref"] or (lg["name"] or "").lower())
+    # canonical = lexicographically-lowest id within each (program, key) group,
+    # matching migration 035's ``MIN(id)``.
+    group_min = {}
+    for lid in sorted(name_of):
+        g = (program_of[lid], key_of[lid])
+        if g not in group_min or lid < group_min[g]:
+            group_min[g] = lid
+    canonical_of = {lid: group_min[(program_of[lid], key_of[lid])]
+                    for lid in name_of}
+    return canonical_of, name_of, season_of
+
+
+def _effective_original_league(conn):
+    """Map each registration to its effective per-Season league id, mirroring
+    migration 035: the registration's own ``league_id`` when set, else the
+    Season's sole league (``None`` when the Season has zero or several)."""
+    cur = conn.cursor()
+    cur.execute("SELECT season_id, id FROM leagues")
+    leagues_by_season = {}
+    for r in cur.fetchall():
+        leagues_by_season.setdefault(r["season_id"], []).append(r["id"])
+    cur.execute("SELECT id, season_id, team_id, league_id FROM "
+                "season_team_registrations")
+    regs = cur.fetchall()
+    effective = {}
+    for r in regs:
+        lid = r["league_id"]
+        if lid is None:
+            sole = leagues_by_season.get(r["season_id"], [])
+            lid = sole[0] if len(sole) == 1 else None
+        effective[r["id"]] = (r["team_id"], r["season_id"], lid)
+    return effective
+
+
+def find_ambiguous_team_leagues(conn):
+    """Teams whose historical registrations resolve to MORE THAN ONE permanent
+    League and that have no operator decision recorded.
+
+    Returns ``[{team_id, team_name, league_ids, league_names, season_ids}, ...]``
+    — the exception report migration 035 halts on until each is resolved in
+    ``team_league_migration_decisions``.
+    """
+    canonical_of, name_of, _season_of = _canonical_league_index(conn)
+    effective = _effective_original_league(conn)
+    cur = conn.cursor()
+    cur.execute("SELECT id, name FROM teams")
+    team_name = {r["id"]: r["name"] for r in cur.fetchall()}
+    cur.execute("SELECT team_id FROM team_league_migration_decisions")
+    decided = {r["team_id"] for r in cur.fetchall()}
+
+    by_team = {}
+    for team_id, season_id, orig_lid in effective.values():
+        if orig_lid is None:
+            continue
+        canon = canonical_of.get(orig_lid, orig_lid)
+        entry = by_team.setdefault(team_id, {"leagues": set(), "seasons": set()})
+        entry["leagues"].add(canon)
+        entry["seasons"].add(season_id)
+
+    issues = []
+    for team_id, entry in by_team.items():
+        if len(entry["leagues"]) > 1 and team_id not in decided:
+            league_ids = sorted(entry["leagues"])
+            issues.append({
+                "team_id": team_id,
+                "team_name": team_name.get(team_id, team_id),
+                "league_ids": league_ids,
+                "league_names": [name_of.get(lid, lid) for lid in league_ids],
+                "season_ids": sorted(entry["seasons"])})
+    return sorted(issues, key=lambda x: x["team_id"])
+
+
+def find_invalid_team_league_decisions(conn):
+    """Operator decisions naming a ``league_id`` that is not an existing league —
+    a typo or stale id that would strand the team on a nonexistent League."""
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM leagues")
+    league_ids = {r["id"] for r in cur.fetchall()}
+    cur.execute("SELECT team_id, league_id FROM team_league_migration_decisions")
+    return sorted(
+        ({"team_id": r["team_id"], "league_id": r["league_id"]}
+         for r in cur.fetchall() if r["league_id"] not in league_ids),
+        key=lambda x: x["team_id"])
+
+
+def find_league_season_merge_collisions(conn):
+    """(program, key, season) groups holding more than one per-Season league row.
+
+    Two league rows that merge to the same permanent League AND share a Season
+    would produce a duplicate ``league_seasons(league_id, season_id)`` — the
+    migration can't represent both, so the operator must merge/rename them
+    first. Returns ``[{canonical_league_id, season_id, league_ids}, ...]``."""
+    canonical_of, _name_of, season_of = _canonical_league_index(conn)
+    groups = {}
+    for lid, canon in canonical_of.items():
+        groups.setdefault((canon, season_of[lid]), []).append(lid)
+    return sorted(
+        ({"canonical_league_id": canon, "season_id": season_id,
+          "league_ids": sorted(members)}
+         for (canon, season_id), members in groups.items() if len(members) > 1),
+        key=lambda x: (x["canonical_league_id"], x["season_id"]))
+
+
+def find_duplicate_team_league_seasons(conn):
+    """(team, canonical league, season) triples with more than one registration —
+    they would collide on the new ``UNIQUE(team_id, league_season_id)``."""
+    canonical_of, _name_of, _season_of = _canonical_league_index(conn)
+    effective = _effective_original_league(conn)
+    seen = {}
+    for team_id, season_id, orig_lid in effective.values():
+        if orig_lid is None:
+            continue
+        key = (team_id, canonical_of.get(orig_lid, orig_lid), season_id)
+        seen[key] = seen.get(key, 0) + 1
+    return sorted(
+        ({"team_id": t, "canonical_league_id": lg, "season_id": s, "count": n}
+         for (t, lg, s), n in seen.items() if n > 1),
+        key=lambda x: (x["team_id"], x["canonical_league_id"]))
+
+
+def assert_competition_hierarchy_reset_ready(conn):
+    """Abort migration 035 (#283 Slice A) unless the Program -> League -> Team
+    reset is unambiguous and collision-free.
+
+    Read-only: raises :class:`MigrationDataError` with bounded, row-level
+    diagnostics and leaves all data unchanged, so an operator resolves each
+    issue — most importantly by recording a permanent ``league_id`` in
+    ``team_league_migration_decisions`` for every Team historically registered
+    across multiple Leagues — and the migration re-runs and applies on the next
+    startup. A Team resolving to a single League migrates automatically and is
+    never reported.
+    """
+    ambiguous = find_ambiguous_team_leagues(conn)
+    invalid = find_invalid_team_league_decisions(conn)
+    collisions = find_league_season_merge_collisions(conn)
+    dup_regs = find_duplicate_team_league_seasons(conn)
+    if not (ambiguous or invalid or collisions or dup_regs):
+        return
+
+    parts = []
+    if ambiguous:
+        shown = "; ".join(
+            f"team {i['team_id']} ({i['team_name']}) spans leagues "
+            f"{', '.join(i['league_names'])} across seasons "
+            f"{', '.join(i['season_ids'])}" for i in ambiguous[:20])
+        more = "" if len(ambiguous) <= 20 else f" (+{len(ambiguous) - 20} more)"
+        parts.append(
+            f"{len(ambiguous)} team(s) are registered across multiple Leagues "
+            "and need an operator-supplied permanent league_id in "
+            f"team_league_migration_decisions: {shown}{more}")
+    if invalid:
+        shown = ", ".join(
+            f"team {i['team_id']}->league {i['league_id']}" for i in invalid[:20])
+        parts.append(f"{len(invalid)} operator decision(s) name a nonexistent "
+                     f"league: {shown}")
+    if collisions:
+        shown = ", ".join(
+            f"league {i['canonical_league_id']} in season {i['season_id']} "
+            f"(from {', '.join(i['league_ids'])})" for i in collisions[:20])
+        parts.append(f"{len(collisions)} merged League(s) collide within a "
+                     f"single Season: {shown}")
+    if dup_regs:
+        shown = ", ".join(
+            f"team {i['team_id']}/league {i['canonical_league_id']}/season "
+            f"{i['season_id']} (x{i['count']})" for i in dup_regs[:20])
+        parts.append(f"{len(dup_regs)} team(s) have duplicate registrations for "
+                     f"the same League and Season: {shown}")
+    raise MigrationDataError(
+        "Cannot run the competition-hierarchy reset (#283 Slice A): "
+        + "; ".join(parts) + ".")
+
+
+# -- #283 Slice E — every regular Game must resolve to a LeagueSeason ----------
+#
+# Migration 037 stamps games.league_season_id from the unique (league_id,
+# season_id) LeagueSeason. A REGULAR game that cannot resolve one (a null
+# league/season, or a pair with no LeagueSeason row) would be left unscoped —
+# which #283 forbids (only exhibitions may be unscoped). This gate runs BEFORE
+# 037's ALTER (game_type from 036 and league_seasons from 035 already exist) and
+# aborts the upgrade with a bounded row list so an operator resolves each game
+# (set its league/season to an existing LeagueSeason, or mark it an exhibition)
+# rather than migrating an invalid regular game. Pure SELECT, portable, re-runnable.
+
+def find_unresolved_regular_games(conn):
+    """Ids of REGULAR games that cannot be bound to a single, consistent
+    LeagueSeason by migration 037:
+
+      * their ``(league_id, season_id)`` is null on either side, or resolves to
+        no ``league_seasons`` row; OR
+      * they carry a ``division_id`` whose Division belongs to a DIFFERENT
+        LeagueSeason than that pair (a cross-LeagueSeason Division/Game
+        mismatch) — which would let a Game be counted in one Division's
+        standings while its League/Season point elsewhere.
+    """
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT g.id AS id FROM games g "
+        "WHERE g.game_type = 'regular' "
+        "AND (g.league_id IS NULL OR g.season_id IS NULL "
+        "     OR NOT EXISTS (SELECT 1 FROM league_seasons ls "
+        "                    WHERE ls.league_id = g.league_id "
+        "                    AND ls.season_id = g.season_id) "
+        "     OR (g.division_id IS NOT NULL AND NOT EXISTS ("
+        "            SELECT 1 FROM divisions d "
+        "            JOIN league_seasons ls2 ON ls2.id = d.league_season_id "
+        "            WHERE d.id = g.division_id "
+        "            AND ls2.league_id = g.league_id "
+        "            AND ls2.season_id = g.season_id)))")
+    return sorted(row["id"] for row in cur.fetchall())
+
+
+def assert_regular_games_resolve_league_season(conn):
+    """Abort migration 037 if any regular game can't be bound to a single,
+    consistent LeagueSeason — an unresolvable (league, season) pair, or a
+    Division that belongs to a different LeagueSeason (#283 Slice E)."""
+    bad = find_unresolved_regular_games(conn)
+    if bad:
+        shown = ", ".join(bad[:20])
+        more = "" if len(bad) <= 20 else f" (+{len(bad) - 20} more)"
+        raise MigrationDataError(
+            "Cannot bind regular games to a LeagueSeason (#283 Slice E): "
+            f"{len(bad)} regular game(s) have no resolvable (league, season) "
+            "LeagueSeason, or carry a Division from a different LeagueSeason: "
+            f"{shown}{more}. Set each game's league, season, and division to a "
+            "single existing LeagueSeason, or mark it an exhibition, before "
+            "upgrading.")

@@ -48,9 +48,11 @@ def _make(cls, ref):
     if cls is Season:
         return Season(program_id="program_1", **common)
     if cls is League:  # competition grouping (formerly Level)
-        return League(season_id="season_1", **common)
+        # #283: a League is a permanent child of a Program, not a Season.
+        return League(program_id="program_1", **common)
     if cls is Division:
-        return Division(season_id="season_1", **common)
+        # #283: a Division belongs to a LeagueSeason, not a Season directly.
+        return Division(league_season_id="leagueseason_1", **common)
     raise AssertionError(cls)
 
 

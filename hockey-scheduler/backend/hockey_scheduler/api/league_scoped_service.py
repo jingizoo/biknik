@@ -88,7 +88,11 @@ class ApiService(_BaseApiService):
             canonical_league_id = proposal["league_id"]
         else:
             division = self.store.get_division(division_id) if division_id else None
-            canonical_league_id = division.league_id if division else None
+            # #283: Division.league_id dropped; resolve its owning League via
+            # the LeagueSeason it hangs off.
+            division_ls = (self.store.get_league_season(division.league_season_id)
+                           if division and division.league_season_id else None)
+            canonical_league_id = division_ls.league_id if division_ls else None
 
         created = []
         with self.store.transaction():

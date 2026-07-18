@@ -74,13 +74,16 @@ class SetupHierarchyTest(unittest.TestCase):
         league = self.api.create_program("Over 55")
         season = self.api.create_season(league["id"], "Fall 2026")
         self.api.create_league(season["id"], "Level 1")
-        loose = self.api.create_division(season["id"], "Senior A")  # no level
+        loose = self.api.create_division(season["id"], "Senior A")  # no explicit level
         h = self.api.get_setup_hierarchy()
         se = h["leagues"][0]["seasons"][0]
-        names = [d["name"] for d in se["divisions_without_level"]]
-        self.assertIn("Senior A", names)
-        self.assertIn(loose["id"],
-                      [d["id"] for d in h["missing_assignments"]["divisions_without_level"]])
+        # #283: a division created without an explicit league is no longer
+        # level-less — it resolves to the season's sole League, so it is listed
+        # under that level and never surfaces as a divisions_without_level gap.
+        lv = se["levels"][0]
+        self.assertIn("Senior A", [d["name"] for d in lv["divisions"]])
+        self.assertNotIn(loose["id"],
+                         [d["id"] for d in h["missing_assignments"]["divisions_without_level"]])
 
     def test_orphan_player_surfaced_by_id_without_name(self):
         # A player whose team is (somehow) absent must still be findable — but
@@ -132,8 +135,9 @@ class SetupHierarchyTest(unittest.TestCase):
         ma = h["missing_assignments"]
         self.assertEqual([v["name"] for v in ma["venues_without_organization"]],
                          ["Unowned Arena"])
-        # The lone division has no level → flagged.
-        self.assertEqual([d["name"] for d in ma["divisions_without_level"]], ["Div A"])
+        # #283: a division always resolves to a League now (auto-provisioned
+        # when the season has none), so it is never flagged as level-less.
+        self.assertEqual([d["name"] for d in ma["divisions_without_level"]], [])
 
 
 if __name__ == "__main__":

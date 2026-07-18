@@ -246,9 +246,9 @@ async function checkViewport(browser, viewport) {
       const division = await post("/api/v2/setup/division", { league_id: league.id, name: "D" });
       const club = await post("/api/v2/setup/club", { name: "VA Game Club" });
       const home = await post("/api/v2/setup/team",
-        { program_id: program.id, club_id: club.id, name: "Home" });
+        { league_id: league.id, club_id: club.id, name: "Home" });
       const away = await post("/api/v2/setup/team",
-        { program_id: program.id, club_id: club.id, name: "Away" });
+        { league_id: league.id, club_id: club.id, name: "Away" });
       await post(`/api/v2/setup/seasons/${season.id}/team-registrations`,
         { team_id: home.id, league_id: league.id, division_id: division.id });
       await post(`/api/v2/setup/seasons/${season.id}/team-registrations`,

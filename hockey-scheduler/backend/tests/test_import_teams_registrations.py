@@ -17,7 +17,7 @@ from helpers import BACKEND  # noqa: F401
 
 import hierarchy_fixtures as fx
 from hockey_scheduler.api import ApiService
-from hockey_scheduler.domain import Division, League, Season
+from hockey_scheduler.domain import Division, League, LeagueSeason, Season
 from hockey_scheduler.store import InMemoryStore, SqlStore
 
 by_ref = fx.by_ref
@@ -61,7 +61,7 @@ class ImportConvergenceContract:
     def test_dry_run_counts_teams_and_registrations_no_writes(self):
         result = self.api.get_hierarchy_import_dry_run(base_payload(
             permanent_teams_csv=fx.permanent_teams_csv(rows=(
-                "OVER55,LIONS,Lions,", "OVER55,BEARS,Bears,")),
+                "OVER55,L1,LIONS,Lions,", "OVER55,L1,BEARS,Bears,")),
             registrations_csv=fx.registrations_csv(rows=(
                 "FALL26,LIONS,L1,DIVA", "FALL26,BEARS,L1,DIVA"))))
         self.assertTrue(result["ok"], result.get("errors"))
@@ -72,7 +72,7 @@ class ImportConvergenceContract:
     def test_commit_creates_permanent_teams_and_registrations(self):
         self._commit_base(
             permanent_teams_csv=fx.permanent_teams_csv(rows=(
-                "OVER55,LIONS,Lions,", "OVER55,BEARS,Bears,")),
+                "OVER55,L1,LIONS,Lions,", "OVER55,L1,BEARS,Bears,")),
             registrations_csv=fx.registrations_csv(rows=(
                 "FALL26,LIONS,L1,DIVA", "FALL26,BEARS,L1,DIVA")))
         lions = self._team("LIONS")
@@ -85,14 +85,16 @@ class ImportConvergenceContract:
         diva = by_ref(self.store.all_divisions(), "DIVA")
         reg = self.store.registration_for_team_in_season(season.id, lions.id)
         self.assertIsNotNone(reg)
-        self.assertEqual(reg.league_id, league.id)
+        self.assertEqual(
+            self.store.get_league_season(reg.league_season_id).league_id,
+            league.id)
         self.assertEqual(reg.division_id, diva.id)
         self.assertTrue(reg.active)
 
     def test_reimport_is_idempotent(self):
         payload = base_payload(
             permanent_teams_csv=fx.permanent_teams_csv(rows=(
-                "OVER55,LIONS,Lions,", "OVER55,BEARS,Bears,")),
+                "OVER55,L1,LIONS,Lions,", "OVER55,L1,BEARS,Bears,")),
             registrations_csv=fx.registrations_csv(rows=(
                 "FALL26,LIONS,L1,DIVA", "FALL26,BEARS,L1,DIVA")))
         self.api.commit_hierarchy_import(payload, actor_id="admin")
@@ -110,7 +112,7 @@ class ImportConvergenceContract:
                 "OVER55,FALL26,Fall 2026,L1,Adult League,1,DIVB,Division B,Adult",
                 "OVER55,FALL26,Fall 2026,L2,B League,2,,,")),
             permanent_teams_csv=fx.permanent_teams_csv(rows=(
-                "OVER55,LIONS,Lions,",)),
+                "OVER55,L1,LIONS,Lions,",)),
             registrations_csv=fx.registrations_csv(rows=(
                 "FALL26,LIONS,L1,DIVA",)))
         moved = base_payload(
@@ -118,22 +120,34 @@ class ImportConvergenceContract:
                 "OVER55,FALL26,Fall 2026,L1,Adult League,1,DIVA,Division A,Adult",
                 "OVER55,FALL26,Fall 2026,L1,Adult League,1,DIVB,Division B,Adult",
                 "OVER55,FALL26,Fall 2026,L2,B League,2,,,")),
+            # #283 Slice E: a registration may only use the team's permanent
+            # League, so moving the registration to L2 requires moving the
+            # permanent team to L2 too.
+            permanent_teams_csv=fx.permanent_teams_csv(rows=(
+                "OVER55,L2,LIONS,Lions,",)),
             registrations_csv=fx.registrations_csv(rows=("FALL26,LIONS,L2,",)))
         result = self.api.commit_hierarchy_import(moved, actor_id="admin")
         self.assertTrue(result["committed"], result.get("errors"))
-        self.assertEqual(result["summary"]["registrations"]["updated"], 1)
+        # #283 Slice E: moving the permanent team to L2 cascades its game-free
+        # current registration to L2 (clearing the L1-only division) through the
+        # team transfer, so the move is tallied on the permanent-team bucket and
+        # the registrations sheet is left a no-op skip. The end state (single
+        # registration now in L2 with no division) is asserted below.
+        self.assertEqual(result["summary"]["permanent_teams"]["updated"], 1)
+        self.assertEqual(result["summary"]["registrations"]["skipped"], 1)
         self.assertEqual(len(self.store.all_season_team_registrations()), 1)
         season = by_ref(self.store.all_seasons(), "FALL26")
         l2 = by_ref(self.store.all_leagues(), "L2")
         reg = self.store.registration_for_team_in_season(
             season.id, self._team("LIONS").id)
-        self.assertEqual(reg.league_id, l2.id)
+        self.assertEqual(
+            self.store.get_league_season(reg.league_season_id).league_id, l2.id)
         self.assertIsNone(reg.division_id)
 
     def test_incremental_team_import_against_existing_program(self):
         self._commit_base()
         teams_only = {"import_type": "hierarchy", "permanent_teams_csv":
-                      fx.permanent_teams_csv(rows=("OVER55,PUMAS,Pumas,",))}
+                      fx.permanent_teams_csv(rows=("OVER55,L1,PUMAS,Pumas,",))}
         result = self.api.commit_hierarchy_import(teams_only, actor_id="admin")
         self.assertTrue(result["committed"], result.get("errors"))
         self.assertEqual(result["summary"]["permanent_teams"]["created"], 1)
@@ -146,7 +160,7 @@ class ImportConvergenceContract:
         # scheduling guard and can be given a game.
         self._commit_base(
             permanent_teams_csv=fx.permanent_teams_csv(rows=(
-                "OVER55,LIONS,Lions,", "OVER55,BEARS,Bears,")),
+                "OVER55,L1,LIONS,Lions,", "OVER55,L1,BEARS,Bears,")),
             registrations_csv=fx.registrations_csv(rows=(
                 "FALL26,LIONS,L1,DIVA", "FALL26,BEARS,L1,DIVA")))
         season = by_ref(self.store.all_seasons(), "FALL26")
@@ -167,7 +181,7 @@ class ImportConvergenceContract:
         committed game between them. Returns the game id."""
         self._commit_base(
             permanent_teams_csv=fx.permanent_teams_csv(rows=(
-                "OVER55,LIONS,Lions,", "OVER55,BEARS,Bears,")),
+                "OVER55,L1,LIONS,Lions,", "OVER55,L1,BEARS,Bears,")),
             registrations_csv=fx.registrations_csv(rows=(
                 "FALL26,LIONS,L1,DIVA", "FALL26,BEARS,L1,DIVA")))
         season = by_ref(self.store.all_seasons(), "FALL26")
@@ -213,21 +227,28 @@ class ImportConvergenceContract:
                 "OVER55,FALL26,Fall 2026,L1,Adult League,1,DIVA,Division A,Adult",
                 "OVER55,FALL26,Fall 2026,L1,Adult League,1,DIVB,Division B,Adult",
                 "OVER55,FALL26,Fall 2026,L2,B League,2,,,")),
+            # Move the permanent team to L2 as well, so the registration's
+            # league_code is valid (matches the team's permanent League) and
+            # the commit reaches the strand preflight instead of being
+            # rejected earlier by registration_league_not_team_league.
+            permanent_teams_csv=fx.permanent_teams_csv(rows=(
+                "OVER55,L2,LIONS,Lions,",)),
             registrations_csv=fx.registrations_csv(rows=("FALL26,LIONS,L2,",)))
         result = self.api.commit_hierarchy_import(moved, actor_id="admin")
         self.assertFalse(result["committed"])
         err = next(e for e in result["errors"]
                   if e["code"] == "registration_league_move_strands_games")
         self.assertIn(game_id, err["affected_game_ids"])
+        moved_reg = self.store.registration_for_team_in_season(season.id, lions.id)
         self.assertEqual(
-            self.store.registration_for_team_in_season(season.id, lions.id)
-            .league_id, league.id)
+            self.store.get_league_season(moved_reg.league_season_id).league_id,
+            league.id)
         self.assertEqual(len(self.store.all_setup_audit()), audits_before)
 
     def test_import_cannot_move_team_program_while_registrations_remain(self):
         self._commit_base(
             permanent_teams_csv=fx.permanent_teams_csv(rows=(
-                "OVER55,LIONS,Lions,",)),
+                "OVER55,L1,LIONS,Lions,",)),
             registrations_csv=fx.registrations_csv(rows=("FALL26,LIONS,L1,DIVA",)))
         second = base_payload(
             programs_csv=fx.programs_csv(rows=(
@@ -244,7 +265,7 @@ class ImportConvergenceContract:
         reg = self.store.registration_for_team_in_season(season.id, lions.id)
         audits_before = len(self.store.all_setup_audit())
         move = {"import_type": "hierarchy", "permanent_teams_csv":
-                fx.permanent_teams_csv(rows=("OTHER,LIONS,Lions,",))}
+                fx.permanent_teams_csv(rows=("OTHER,O1,LIONS,Lions,",))}
         result = self.api.commit_hierarchy_import(move, actor_id="admin")
         self.assertFalse(result["committed"])
         err = result["errors"][0]
@@ -260,12 +281,18 @@ class ImportConvergenceContract:
         # writes.
         self._commit_base(
             permanent_teams_csv=fx.permanent_teams_csv(rows=(
-                "OVER55,LIONS,Lions,",)),
+                "OVER55,L1,LIONS,Lions,",)),
             registrations_csv=fx.registrations_csv(rows=("FALL26,LIONS,L1,DIVA",)))
         second = base_payload(
             programs_csv=fx.programs_csv(rows=(
                 "OVER55,CANLON,Over 55,US,America/Chicago",
-                "OTHER,CANLON,Other,US,America/Chicago")))
+                "OTHER,CANLON,Other,US,America/Chicago")),
+            # Give OTHER a League so the team's post-move permanent League
+            # (O1) resolves cleanly and the commit reaches the strand
+            # preflight rather than failing on unknown_league_code.
+            competition_csv=fx.competition_csv(rows=(
+                "OVER55,FALL26,Fall 2026,L1,Adult League,1,DIVA,Division A,Adult",
+                "OTHER,OSEA,Other,O1,Other League,1,,,")))
         self.assertTrue(
             self.api.commit_hierarchy_import(second, actor_id="admin")["committed"])
         season = by_ref(self.store.all_seasons(), "FALL26")
@@ -276,7 +303,7 @@ class ImportConvergenceContract:
         self.store.save_season_team_registration(reg)
         audits_before = len(self.store.all_setup_audit())
         move = {"import_type": "hierarchy", "permanent_teams_csv":
-                fx.permanent_teams_csv(rows=("OTHER,LIONS,Lions,",))}
+                fx.permanent_teams_csv(rows=("OTHER,O1,LIONS,Lions,",))}
         result = self.api.commit_hierarchy_import(move, actor_id="admin")
         self.assertFalse(result["committed"])
         err = next(e for e in result["errors"]
@@ -289,7 +316,7 @@ class ImportConvergenceContract:
         # No games scheduled -> moving LIONS to DIVB is safe and audited.
         self._commit_base(
             permanent_teams_csv=fx.permanent_teams_csv(rows=(
-                "OVER55,LIONS,Lions,",)),
+                "OVER55,L1,LIONS,Lions,",)),
             registrations_csv=fx.registrations_csv(rows=("FALL26,LIONS,L1,DIVA",)))
         season = by_ref(self.store.all_seasons(), "FALL26")
         diva = by_ref(self.store.all_divisions(), "DIVA")
@@ -312,15 +339,19 @@ class ImportConvergenceContract:
         # PUMAS has no registrations, so moving its program is safe/audited.
         self._commit_base(
             permanent_teams_csv=fx.permanent_teams_csv(rows=(
-                "OVER55,PUMAS,Pumas,",)))
+                "OVER55,L1,PUMAS,Pumas,",)))
         over55 = by_ref(self.store.all_programs(), "OVER55")
         pumas = self._team("PUMAS")
         move = base_payload(
             programs_csv=fx.programs_csv(rows=(
                 "OVER55,CANLON,Over 55,US,America/Chicago",
                 "OTHER,CANLON,Other,US,America/Chicago")),
+            # OTHER needs a League for PUMAS's new permanent League to resolve.
+            competition_csv=fx.competition_csv(rows=(
+                "OVER55,FALL26,Fall 2026,L1,Adult League,1,DIVA,Division A,Adult",
+                "OTHER,OSEA,Other,O1,Other League,1,,,")),
             permanent_teams_csv=fx.permanent_teams_csv(rows=(
-                "OTHER,PUMAS,Pumas,",)))
+                "OTHER,O1,PUMAS,Pumas,",)))
         result = self.api.commit_hierarchy_import(move, actor_id="admin")
         self.assertTrue(result["committed"], result.get("errors"))
         other = by_ref(self.store.all_programs(), "OTHER")
@@ -332,7 +363,7 @@ class ImportConvergenceContract:
     def test_import_cannot_move_season_program_with_registrations(self):
         self._commit_base(
             permanent_teams_csv=fx.permanent_teams_csv(rows=(
-                "OVER55,LIONS,Lions,",)),
+                "OVER55,L1,LIONS,Lions,",)),
             registrations_csv=fx.registrations_csv(rows=("FALL26,LIONS,L1,DIVA",)))
         second = base_payload(
             programs_csv=fx.programs_csv(rows=(
@@ -381,7 +412,9 @@ class ImportConvergenceContract:
                   if e["code"] == "division_season_move_strands_dependents")
         self.assertIn(game_id, err["affected_game_ids"])
         self.assertTrue(err["affected_registration_ids"])
-        self.assertEqual(self.store.get_division(diva.id).season_id, fall.id)
+        diva_ls = self.store.get_league_season(
+            self.store.get_division(diva.id).league_season_id)
+        self.assertEqual(diva_ls.season_id, fall.id)
         self.assertEqual(len(self.store.all_setup_audit()), audits_before)
 
     def test_inactive_registration_with_committed_game_cannot_move_division(self):
@@ -409,7 +442,7 @@ class ImportConvergenceContract:
     def test_inactive_registration_with_no_games_can_reactivate_and_move(self):
         self._commit_base(
             permanent_teams_csv=fx.permanent_teams_csv(rows=(
-                "OVER55,LIONS,Lions,",)),
+                "OVER55,L1,LIONS,Lions,",)),
             registrations_csv=fx.registrations_csv(rows=("FALL26,LIONS,L1,DIVA",)))
         season = by_ref(self.store.all_seasons(), "FALL26")
         divb = by_ref(self.store.all_divisions(), "DIVB")
@@ -436,7 +469,7 @@ class ImportConvergenceContract:
                 "PLAINFIELD,CANLON,Plainfield Ice,123 Main St,"
                 "America/Chicago,PF1,Rink 1",)),
             permanent_teams_csv=fx.permanent_teams_csv(rows=(
-                "OVER55,LIONS,Lions,", "OVER55,BEARS,Bears,")),
+                "OVER55,L1,LIONS,Lions,", "OVER55,L1,BEARS,Bears,")),
             registrations_csv=fx.registrations_csv(rows=(
                 "FALL26,LIONS,L1,DIVA", "FALL26,BEARS,L1,DIVA")),
             season_venue_access_csv=fx.season_venue_access_csv())
@@ -467,7 +500,7 @@ class ImportConvergenceContract:
         # held, so there is no check->write gap under the threaded server.
         self._commit_base(
             permanent_teams_csv=fx.permanent_teams_csv(rows=(
-                "OVER55,LIONS,Lions,", "OVER55,BEARS,Bears,")),
+                "OVER55,L1,LIONS,Lions,", "OVER55,L1,BEARS,Bears,")),
             registrations_csv=fx.registrations_csv(rows=(
                 "FALL26,LIONS,L1,DIVA", "FALL26,BEARS,L1,DIVA")))
         state = {"depth": 0, "preflight_inside": None}
@@ -526,8 +559,9 @@ class ImportConvergenceValidationTest(unittest.TestCase):
 
     def test_unknown_program_on_team_rejected(self):
         result = self._dry(base_payload(
-            permanent_teams_csv="program_code,team_code,team_name,club_code\n"
-                                "NOPE,X,X,\n"))
+            permanent_teams_csv=
+            "program_code,league_code,team_code,team_name,club_code\n"
+            "NOPE,L1,X,X,\n"))
         self.assertFalse(result["ok"])
         self.assertTrue(self._has(result, "Unknown program_code NOPE"))
 
@@ -545,7 +579,7 @@ class ImportConvergenceValidationTest(unittest.TestCase):
         result = self._dry(base_payload(
             competition_csv=comp,
             permanent_teams_csv=fx.permanent_teams_csv(rows=(
-                "OVER55,LIONS,Lions,",)),
+                "OVER55,L1,LIONS,Lions,",)),
             registrations_csv=fx.registrations_csv(
                 rows=("FALL26,LIONS,L1,DIVB",))))
         self.assertFalse(result["ok"])
@@ -561,7 +595,7 @@ class ImportConvergenceValidationTest(unittest.TestCase):
         result = self._dry(base_payload(
             programs_csv=programs, competition_csv=comp,
             permanent_teams_csv=fx.permanent_teams_csv(rows=(
-                "OVER55,LIONS,Lions,",)),
+                "OVER55,L1,LIONS,Lions,",)),
             registrations_csv=fx.registrations_csv(rows=(
                 "OSEA,LIONS,O1,",))))
         self.assertFalse(result["ok"])
@@ -570,7 +604,7 @@ class ImportConvergenceValidationTest(unittest.TestCase):
     def test_duplicate_registration_rejected(self):
         result = self._dry(base_payload(
             permanent_teams_csv=fx.permanent_teams_csv(rows=(
-                "OVER55,LIONS,Lions,",)),
+                "OVER55,L1,LIONS,Lions,",)),
             registrations_csv=fx.registrations_csv(rows=(
                 "FALL26,LIONS,L1,DIVA", "FALL26,LIONS,L1,DIVB"))))
         self.assertFalse(result["ok"])
@@ -578,9 +612,9 @@ class ImportConvergenceValidationTest(unittest.TestCase):
 
     def test_duplicate_team_code_rejected(self):
         result = self._dry(base_payload(permanent_teams_csv=(
-            "program_code,team_code,team_name,club_code\n"
-            "OVER55,LIONS,Lions,\n"
-            "OVER55,LIONS,Lions Again,\n")))
+            "program_code,league_code,team_code,team_name,club_code\n"
+            "OVER55,L1,LIONS,Lions,\n"
+            "OVER55,L1,LIONS,Lions Again,\n")))
         self.assertFalse(result["ok"])
         self.assertTrue(self._has(result, "Duplicate team_code"))
 
@@ -613,17 +647,19 @@ class ImportConvergenceValidationTest(unittest.TestCase):
     def test_null_season_program_registration_rejected(self):
         self.api.commit_hierarchy_import(base_payload(
             permanent_teams_csv=fx.permanent_teams_csv(rows=(
-                "OVER55,LIONS,Lions,",))), actor_id="admin")
+                "OVER55,L1,LIONS,Lions,",))), actor_id="admin")
         # A season with no program (program_id="") plus its own league/
         # division, so the league_code itself resolves cleanly to this
         # season — isolating the failure to the season<->team program
         # mismatch rather than an unrelated league/season mismatch.
         self.store.add_season(Season(id="se_nl", program_id="", name="NL",
                                      external_ref="SNL"))
-        self.store.add_league(League(id="lg_nl", season_id="se_nl",
+        self.store.add_league(League(id="lg_nl", program_id="",
                                      name="NL League", external_ref="LNL"))
-        self.store.add_division(Division(id="d_nl", season_id="se_nl", name="D",
-                                         league_id="lg_nl", external_ref="DNL"))
+        self.store.add_league_season(LeagueSeason(
+            id="ls_nl", league_id="lg_nl", season_id="se_nl"))
+        self.store.add_division(Division(id="d_nl", league_season_id="ls_nl",
+                                         name="D", external_ref="DNL"))
         reg = {"import_type": "hierarchy", "registrations_csv":
                "season_code,team_code,league_code,division_code\n"
                "SNL,LIONS,LNL,DNL\n"}
@@ -634,8 +670,8 @@ class ImportConvergenceValidationTest(unittest.TestCase):
     def test_dangling_division_league_registration_rejected(self):
         self.api.commit_hierarchy_import(base_payload(
             permanent_teams_csv=fx.permanent_teams_csv(rows=(
-                "OVER55,LIONS,Lions,",))), actor_id="admin")
-        self.store.add_division(Division(id="d_dangle", season_id="missing",
+                "OVER55,L1,LIONS,Lions,",))), actor_id="admin")
+        self.store.add_division(Division(id="d_dangle", league_season_id="missing",
                                          name="D", external_ref="DDG"))
         reg = {"import_type": "hierarchy", "registrations_csv":
                "season_code,team_code,league_code,division_code\n"

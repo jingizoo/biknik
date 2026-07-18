@@ -100,12 +100,15 @@ async function checkViewport(browser, viewport) {
       const division = await post("/api/v2/setup/division",
         { league_id: leagueClean.id, name: "Clean Division" });
       const club = await post("/api/v2/setup/club", { name: "Reg Cleanup Club" });
-      const team = async (name) =>
-        (await post("/api/v2/setup/team", { program_id: program.id, club_id: club.id, name })).id;
-      const teamA = await team("Cleanup Team A");
-      const teamB = await team("Cleanup Team B");
-      const teamGameHome = await team("Game Home");
-      const teamGameAway = await team("Game Away");
+      // A Team is created under its PERMANENT League (rule 7): teamA/teamB
+      // register into leagueClean, teamGameHome/teamGameAway into leagueGame,
+      // so each is created under the league it later registers into.
+      const team = async (name, leagueId) =>
+        (await post("/api/v2/setup/team", { league_id: leagueId, club_id: club.id, name })).id;
+      const teamA = await team("Cleanup Team A", leagueClean.id);
+      const teamB = await team("Cleanup Team B", leagueClean.id);
+      const teamGameHome = await team("Game Home", leagueGame.id);
+      const teamGameAway = await team("Game Away", leagueGame.id);
 
       // Fixture for scenario (4): a cancelled Game under leagueGame, both its
       // teams then removed from the season (a Game still blocks even with

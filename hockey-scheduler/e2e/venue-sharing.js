@@ -280,10 +280,10 @@ async function checkViewport(browser, viewport) {
     const clubA = await createViaDrawer("club",
       { "f-club": "Adult Club" }, "/api/v2/setup/club");
     const teamA1 = await createViaDrawer("team",
-      { "f-team-club": clubA.id, "f-team-league": programA.id, "f-team": "Adult D1" },
+      { "f-team-club": clubA.id, "f-team-perm-league": leagueA.id, "f-team": "Adult D1" },
       "/api/v2/setup/team");
     const teamA2 = await createViaDrawer("team",
-      { "f-team-club": clubA.id, "f-team-league": programA.id, "f-team": "Adult D2" },
+      { "f-team-club": clubA.id, "f-team-perm-league": leagueA.id, "f-team": "Adult D2" },
       "/api/v2/setup/team");
 
     const orgProgramB = await createViaDrawer("organization",
@@ -295,10 +295,10 @@ async function checkViewport(browser, viewport) {
     const leagueB = await createViaDrawer("level",
       { "f-level-season": seasonB.id, "f-level": "Varsity League" }, "/api/v2/setup/league");
     const teamB1 = await createViaDrawer("team",
-      { "f-team-club": "", "f-team-league": programB.id, "f-team": "Varsity Home" },
+      { "f-team-club": "", "f-team-perm-league": leagueB.id, "f-team": "Varsity Home" },
       "/api/v2/setup/team");
     const teamB2 = await createViaDrawer("team",
-      { "f-team-club": "", "f-team-league": programB.id, "f-team": "Varsity Away" },
+      { "f-team-club": "", "f-team-perm-league": leagueB.id, "f-team": "Varsity Away" },
       "/api/v2/setup/team");
     // A THIRD ice slot on the second Venue, deliberately never granted to
     // Season B — the ungranted-Venue negative case below (#258 review).

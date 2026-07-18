@@ -71,8 +71,12 @@ stable external codes (never names — a Club's `club_code` closed the last gap)
 validate every cross-file reference before any write (every error in one pass,
 never fail-fast), commit each batch in one transaction, are idempotent on
 repeat upload, and never delete rows that are absent from a later file. A
-`registrations` row's `league_code` is always explicit and validated against the
-season's chain — never derived from a division or "the season's only league".
+`permanent_teams` row carries a required `league_code`: a Team is a permanent
+member of a League (which belongs to its Program), validated to sit in the
+Team's Program (#283 Slice E). A `registrations` row's `league_code` is always
+explicit and validated against the season's chain — never derived from a
+division or "the season's only league" — and must equal the Team's own
+permanent League (a Team may only register into its own League).
 Every commit reports created/updated/skipped counts per entity and writes a
 batch audit plus entity audits attributed to the signed-in admin.
 

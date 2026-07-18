@@ -198,7 +198,9 @@ class SqlStoreParityTest(unittest.TestCase):
         div = self.api.create_division(season["id"], "Div A", league_id=level["id"])
         self.assertEqual(div["league_id"], level["id"])
         stored = self.store.get_division(div["id"])
-        self.assertEqual(stored.league_id, level["id"])
+        # #283: a Division's League resolves via its LeagueSeason now.
+        stored_ls = self.store.get_league_season(stored.league_season_id)
+        self.assertEqual(stored_ls.league_id, level["id"])
         ov = self.api.get_demo_overview()
         self.assertIn(level["id"], [lv["id"] for lv in ov["levels"]])
         row = next(d for d in ov["divisions"] if d["id"] == div["id"])
@@ -221,18 +223,27 @@ class SqlStoreParityTest(unittest.TestCase):
 
     def test_reassignment_persists_on_sql(self):
         # Moving a record under a new parent (#166 PR D) must UPDATE the row in
-        # the SQL store, not just mutate an in-memory object.
-        league = self.api.create_program("Over 55")
-        season = self.api.create_season(league["id"], "Fall 2026")
-        level = self.api.create_league(season["id"], "Level 1")
-        div = self.api.create_division(season["id"], "Div A")
-        moved = self.api.assign_division_league(div["id"], level["id"])
-        self.assertEqual(moved["league_id"], level["id"])
+        # the SQL store, not just mutate an in-memory object. #283: a Division's
+        # League is fixed by its LeagueSeason, so a reparent repoints that link
+        # (a Division always belongs to a League — there is no "clear to none").
+        program = self.api.create_program("Over 55")
+        season = self.api.create_season(program["id"], "Fall 2026")
+        level1 = self.api.create_league(season["id"], "Level 1")
+        level2 = self.api.create_league(season["id"], "Level 2")
+        div = self.api.create_division(season["id"], "Div A", league_id=level1["id"])
+
+        def stored_league(division_id):
+            d = self.store.get_division(division_id)
+            return self.store.get_league_season(d.league_season_id).league_id
+
+        self.assertEqual(stored_league(div["id"]), level1["id"])
+        moved = self.api.assign_division_league(div["id"], level2["id"])
+        self.assertEqual(moved["league_id"], level2["id"])
         # Re-read straight from the store to prove it persisted.
-        self.assertEqual(self.store.get_division(div["id"]).league_id, level["id"])
-        cleared = self.api.assign_division_league(div["id"], None)
-        self.assertIsNone(cleared["league_id"])
-        self.assertIsNone(self.store.get_division(div["id"]).league_id)
+        self.assertEqual(stored_league(div["id"]), level2["id"])
+        back = self.api.assign_division_league(div["id"], level1["id"])
+        self.assertEqual(back["league_id"], level1["id"])
+        self.assertEqual(stored_league(div["id"]), level1["id"])
 
 
 class SqlStoreTransactionTest(unittest.TestCase):

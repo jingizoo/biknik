@@ -19,9 +19,9 @@ from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
 
 from hockey_scheduler.api import ApiService
 from hockey_scheduler.domain import (
-    Division, Game, IceSlot, IceSlotStatus, Official, Organization,
-    Program, Rink, Season, SeasonTeamRegistration, SeasonVenueAccess, Team,
-    Venue)
+    Division, Game, IceSlot, IceSlotStatus, League, LeagueSeason, Official,
+    Organization, Program, Rink, Season, SeasonTeamRegistration,
+    SeasonVenueAccess, Team, Venue)
 from hockey_scheduler.store import InMemoryStore
 from hockey_scheduler.web import server as srv
 
@@ -33,7 +33,9 @@ def _seeded_api():
     s.add_organization(Organization(id="org", name="Owner"))
     s.add_program(Program(id="league", name="League", operator_organization_id="org"))
     s.add_season(Season(id="se", program_id="league", name="Season"))
-    s.add_division(Division(id="d", season_id="se", name="D1"))
+    s.add_league(League(id="lg", program_id="league", name="Div League"))
+    s.add_league_season(LeagueSeason(id="ls", league_id="lg", season_id="se"))
+    s.add_division(Division(id="d", league_season_id="ls", name="D1"))
     s.add_venue(Venue(id="v", name="Arena", organization_id="org",
                       league_id="league"))
     s.add_season_venue_access(SeasonVenueAccess(
@@ -41,17 +43,34 @@ def _seeded_api():
     s.add_rink(Rink(id="r1", venue_id="v", name="Main"))
     for i in range(4):
         s.add_team(Team(id=f"t{i}", name=f"T{i}", division="D1", division_id="d",
-                        program_id="league"))
+                        program_id="league", league_id="lg"))
         # Participation is per-season (#180): draft scheduling reads the
         # registration, so register each seeded team into the season+division.
         s.add_season_team_registration(SeasonTeamRegistration(
-            id=f"streg_t{i}", season_id="se", team_id=f"t{i}",
+            id=f"streg_t{i}", league_season_id="ls", team_id=f"t{i}",
             division_id="d", active=True))
     base = datetime(2026, 1, 5, 18, tzinfo=UTC)
     for i in range(6):
         s.add_ice_slot(IceSlot(id=f"s{i}", rink_id="r1",
                                start_time=base + timedelta(days=i),
                                end_time=base + timedelta(days=i, hours=1)))
+
+    # #283 Slice E: a regular Game must reference the exact LeagueSeason it
+    # belongs to, and publish now fails closed on any regular game missing it.
+    # Games are persisted here with only (division_id, league_id, season_id), so
+    # backfill league_season_id from the game's Division — the same derivation
+    # migration 037 applies to pre-#283 rows — as each Game is stored, keeping
+    # this fixture focused on the draft commit/publish/discard workflow.
+    _add_game = s.add_game
+
+    def _add_game_with_league_season(game):
+        if getattr(game, "league_season_id", None) is None and game.division_id:
+            division = s.get_division(game.division_id)
+            if division is not None:
+                game.league_season_id = division.league_season_id
+        return _add_game(game)
+
+    s.add_game = _add_game_with_league_season
     return ApiService(s), s
 
 
@@ -307,6 +326,42 @@ class DraftReviewHttpTest(unittest.TestCase):
         self.assertEqual(len(listed["draft_games"]), len(body["created"]))
         status, disc = self._req(c, "POST", "/api/scheduler/drafts/discard", {"all": True})
         self.assertEqual(disc["discarded"], len(body["created"]))
+
+    def test_publish_all_drafts_atomic_on_one_invalid_target(self):
+        # #283 review: batch publish is all-or-nothing over HTTP. Commit a
+        # division's drafts, break ONE (null league_season_id), then publish-all
+        # must be rejected with NO partial publish — every draft stays a draft on
+        # an AVAILABLE slot and no game_published audit is written.
+        c = self._client()
+        self._req(c, "POST", "/api/auth/login",
+                  {"username": "admin", "password": "demo"})
+        status, _ = self._req(c, "POST", "/api/scheduler/commit",
+                              {"division_id": self.div})
+        self.assertEqual(status, 200)
+        _, listed = self._req(c, "GET", "/api/scheduler/drafts")
+        draft_ids = [r["game_id"] for r in listed["draft_games"]]
+        self.assertGreaterEqual(len(draft_ids), 2, listed)
+
+        store = srv.STATE.api.store
+        bad = store.get_game(draft_ids[0])
+        bad.league_season_id = None  # break exactly one target
+        store.save_game(bad)
+        slot_ids = [store.get_game(i).ice_slot_id for i in draft_ids
+                    if store.get_game(i).ice_slot_id]
+        audit_before = len(store.all_setup_audit())
+
+        status, resp = self._req(c, "POST", "/api/scheduler/drafts/publish",
+                                 {"all": True})
+        self.assertNotEqual(status, 200, resp)   # rejected, no partial success
+
+        for i in draft_ids:
+            g = store.get_game(i)
+            self.assertTrue(g.is_draft, i)         # still a draft
+            self.assertFalse(g.published, i)       # still unpublished
+        for sid in slot_ids:
+            self.assertEqual(store.get_ice_slot(sid).status,
+                             IceSlotStatus.AVAILABLE)
+        self.assertEqual(len(store.all_setup_audit()), audit_before)
 
 
 if __name__ == "__main__":

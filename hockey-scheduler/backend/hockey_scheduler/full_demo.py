@@ -100,7 +100,8 @@ def build_full_demo_store(store=None) -> Tuple[InMemoryStore, str, dict]:
     # registration, not Team.division_id. Register idempotently so re-running
     # or double-registering is a no-op.
     def _register(team_id, division_id):
-        if setup.store.registration_for_team_in_season(season.id, team_id) is None:
+        if not any(r.team_id == team_id
+                   for r in setup.store.registrations_for_season(season.id)):
             setup.register_team_for_season(season.id, team_id, division_id,
                                            actor_id=admin)
 
@@ -372,7 +373,8 @@ def _seed_pilot_scale(setup, roster, admin, season, d_u16, d_u18, d_sen,
     # is scheduled for it (#180 shared guard). Idempotent so a team already
     # registered by the core scenario is skipped.
     for _tid, _did in division_of.items():
-        if setup.store.registration_for_team_in_season(season.id, _tid) is None:
+        if not any(r.team_id == _tid
+                   for r in setup.store.registrations_for_season(season.id)):
             setup.register_team_for_season(season.id, _tid, _did, actor_id=admin)
 
     # Every rink's slot on a given day shares the same evening time-of-day,

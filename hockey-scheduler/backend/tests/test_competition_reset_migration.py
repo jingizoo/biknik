@@ -26,6 +26,7 @@ from hockey_scheduler.store.integrity_checks import MigrationDataError
 from hockey_scheduler.store.sql_store import migrate
 
 _VERSION = "028_competition_reset"
+_V035 = "035_competition_hierarchy_reset"
 
 
 def _sql_backends():
@@ -78,6 +79,37 @@ def _table_exists(store, table):
         cur.execute("SELECT table_name FROM information_schema.tables "
                     "WHERE table_name = %s", (table,))
     return cur.fetchone() is not None
+
+
+def _downgrade_035(store):
+    """Reverse migration 035 (#283 competition-hierarchy reset) back to the
+    POST-028 schema and un-record it, so a subsequent ``_downgrade_028`` can
+    finish reversing to pre-028 and a re-``migrate`` re-applies 028 AND 035 over
+    legacy-shaped data. Runs on a freshly-migrated (empty) database, so only the
+    SCHEMA is reversed — 035 added ``league_seasons`` + ``teams.league_id`` +
+    ``leagues.program_id`` and folded ``divisions``/registration
+    ``season_id``+``league_id`` into ``league_season_id``; this restores those."""
+    with store.transaction():
+        cur = store.conn.cursor()
+        cur.execute("DROP INDEX IF EXISTS ix_teams_league")
+        cur.execute("ALTER TABLE teams DROP COLUMN league_id")
+        cur.execute("DROP INDEX IF EXISTS ux_team_league_season")
+        cur.execute("DROP INDEX IF EXISTS ix_reg_league_season_division")
+        cur.execute("ALTER TABLE season_team_registrations "
+                    "DROP COLUMN league_season_id")
+        cur.execute("ALTER TABLE season_team_registrations ADD COLUMN season_id TEXT")
+        cur.execute("ALTER TABLE season_team_registrations ADD COLUMN league_id TEXT")
+        cur.execute("DROP INDEX IF EXISTS ix_divisions_league_season")
+        cur.execute("ALTER TABLE divisions DROP COLUMN league_season_id")
+        cur.execute("ALTER TABLE divisions ADD COLUMN season_id TEXT")
+        cur.execute("ALTER TABLE divisions ADD COLUMN league_id TEXT")
+        cur.execute("DROP INDEX IF EXISTS ix_leagues_program")
+        cur.execute("ALTER TABLE leagues DROP COLUMN program_id")
+        cur.execute("ALTER TABLE leagues ADD COLUMN season_id TEXT")
+        cur.execute("DROP INDEX IF EXISTS ux_league_season")
+        cur.execute("DROP TABLE IF EXISTS league_seasons")
+        cur.execute(store.dialect.sql(
+            "DELETE FROM schema_migrations WHERE version = ?"), (_V035,))
 
 
 def _downgrade_028(store):
@@ -160,15 +192,24 @@ class FreshInstallSchemaTest(unittest.TestCase):
                 try:
                     self.assertTrue(_table_exists(store, "programs"), label)
                     self.assertFalse(_table_exists(store, "levels"), label)
+                    # #283: League is a permanent Program child with a Season
+                    # overlay via league_seasons.
+                    self.assertTrue(_table_exists(store, "league_seasons"), label)
                     self.assertIn("operator_organization_id",
                                   _cols(store, "programs"), label)
                     self.assertIn("program_id", _cols(store, "seasons"), label)
-                    self.assertIn("league_id", _cols(store, "divisions"), label)
+                    self.assertIn("program_id", _cols(store, "leagues"), label)
+                    self.assertIn("league_season_id", _cols(store, "divisions"), label)
+                    self.assertNotIn("league_id", _cols(store, "divisions"), label)
                     self.assertIn("program_id", _cols(store, "teams"), label)
-                    self.assertIn("league_id",
+                    self.assertIn("league_id", _cols(store, "teams"), label)
+                    self.assertIn("league_season_id",
                                   _cols(store, "season_team_registrations"), label)
+                    self.assertNotIn("league_id",
+                                     _cols(store, "season_team_registrations"), label)
                     self.assertIn("league_id", _cols(store, "games"), label)
                     self.assertIn(_VERSION, store.migration_status()["applied"], label)
+                    self.assertIn(_V035, store.migration_status()["applied"], label)
                 finally:
                     _teardown(store)
 
@@ -179,10 +220,12 @@ class HistoricalUpgradeTest(unittest.TestCase):
             with self.subTest(backend=label):
                 store = _fresh(url)
                 try:
+                    _downgrade_035(store)
                     _downgrade_028(store)
                     _seed_pre028_clean(store)
-                    migrate(store.conn, store.dialect)  # re-apply 028
+                    migrate(store.conn, store.dialect)  # re-apply 028 AND 035
                     self.assertIn(_VERSION, store.migration_status()["applied"], label)
+                    self.assertIn(_V035, store.migration_status()["applied"], label)
 
                     # Umbrella renamed to programs; owner column renamed; id kept.
                     self.assertTrue(_table_exists(store, "programs"), label)
@@ -196,38 +239,59 @@ class HistoricalUpgradeTest(unittest.TestCase):
                               ("s1",))
                     self.assertEqual(se["program_id"], "prog1", label)
 
-                    # Grouping promoted to leagues (id kept).
-                    lg = _one(store, "SELECT id FROM leagues WHERE id = ?", ("lg1",))
-                    self.assertEqual(lg["id"], "lg1", label)
+                    # #283: the promoted grouping is now a PERMANENT League — a
+                    # child of the Program, not the Season. The merged canonical
+                    # League keeps id lg1 (lowest id wins) and is reparented onto
+                    # program_id.
+                    lg = _one(store, "SELECT id, program_id FROM leagues "
+                              "WHERE id = ?", ("lg1",))
+                    self.assertEqual((lg["id"], lg["program_id"]), ("lg1", "prog1"),
+                                     label)
 
-                    # Divisions: the leveled one keeps its league; the level-less
-                    # one is backfilled from the season's sole league.
+                    # A LeagueSeason expresses lg1's participation in s1, with the
+                    # deterministic id 'ls_'<league id>.
+                    ls = _one(store, "SELECT id, league_id, season_id FROM "
+                              "league_seasons WHERE id = ?", ("ls_lg1",))
                     self.assertEqual(
-                        _one(store, "SELECT league_id FROM divisions WHERE id = ?",
-                             ("d_lv",))["league_id"], "lg1", label)
-                    self.assertEqual(
-                        _one(store, "SELECT league_id FROM divisions WHERE id = ?",
-                             ("d_none",))["league_id"], "lg1", label)
+                        (ls["id"], ls["league_id"], ls["season_id"]),
+                        ("ls_lg1", "lg1", "s1"), label)
 
-                    # Team reparented onto program_id (id kept).
+                    # Divisions now hang off the LeagueSeason: the leveled one via
+                    # its own league, the level-less one via the season's sole
+                    # league — both resolve to ls_lg1.
                     self.assertEqual(
-                        _one(store, "SELECT program_id FROM teams WHERE id = ?",
-                             ("tm1",))["program_id"], "prog1", label)
+                        _one(store, "SELECT league_season_id FROM divisions "
+                             "WHERE id = ?", ("d_lv",))["league_season_id"],
+                        "ls_lg1", label)
+                    self.assertEqual(
+                        _one(store, "SELECT league_season_id FROM divisions "
+                             "WHERE id = ?", ("d_none",))["league_season_id"],
+                        "ls_lg1", label)
 
-                    # Registration league_id: from the division's league when it
-                    # has one, else the season's sole league.
+                    # Team reparented onto program_id (id kept) AND assigned its
+                    # permanent League automatically (its registrations resolve to
+                    # the single League lg1).
+                    for tm in ("tm1", "tm2"):
+                        row = _one(store, "SELECT program_id, league_id FROM teams "
+                                   "WHERE id = ?", (tm,))
+                        self.assertEqual(
+                            (row["program_id"], row["league_id"]),
+                            ("prog1", "lg1"), f"{label}:{tm}")
+
+                    # Registrations hang off the LeagueSeason: from the division's
+                    # league when it has one, else the season's sole league — both
+                    # ls_lg1.
                     self.assertEqual(
-                        _one(store, "SELECT league_id FROM "
+                        _one(store, "SELECT league_season_id FROM "
                              "season_team_registrations WHERE id = ?",
-                             ("r_div",))["league_id"], "lg1", label)
+                             ("r_div",))["league_season_id"], "ls_lg1", label)
                     self.assertEqual(
-                        _one(store, "SELECT league_id FROM "
+                        _one(store, "SELECT league_season_id FROM "
                              "season_team_registrations WHERE id = ?",
-                             ("r_nodiv",))["league_id"], "lg1", label)
+                             ("r_nodiv",))["league_season_id"], "ls_lg1", label)
 
-                    # Game league_id backfilled from its division; a division-less
-                    # game is backfilled from its Season's sole league (#233 C1b
-                    # item 6), never left unscoped.
+                    # Game league_id: 028 backfilled it from Division/Season, then
+                    # 035 repointed it onto the merged permanent League lg1.
                     self.assertEqual(
                         _one(store, "SELECT league_id FROM games WHERE id = ?",
                              ("g_div",))["league_id"], "lg1", label)
@@ -235,10 +299,12 @@ class HistoricalUpgradeTest(unittest.TestCase):
                         _one(store, "SELECT league_id FROM games WHERE id = ?",
                              ("g_nodiv",))["league_id"], "lg1", label)
 
-                    # No rows lost.
+                    # No rows lost; the single per-Season league became one
+                    # permanent League with one LeagueSeason.
                     for table, n in (("programs", 1), ("seasons", 1), ("leagues", 1),
-                                     ("divisions", 2), ("teams", 2),
-                                     ("season_team_registrations", 2), ("games", 2)):
+                                     ("league_seasons", 1), ("divisions", 2),
+                                     ("teams", 2), ("season_team_registrations", 2),
+                                     ("games", 2)):
                         self.assertEqual(
                             _one(store, f"SELECT COUNT(*) AS n FROM {table}")["n"], n,
                             f"{label}:{table}")
@@ -338,6 +404,7 @@ class C1bGateAbortTest(unittest.TestCase):
                 with self.subTest(case=case, backend=label):
                     store = _fresh(url)
                     try:
+                        _downgrade_035(store)
                         _downgrade_028(store)
                         with store.transaction():
                             seed(store)
@@ -372,6 +439,7 @@ class GameLeagueBackfillTest(unittest.TestCase):
             with self.subTest(backend=label):
                 store = _fresh(url)
                 try:
+                    _downgrade_035(store)
                     _downgrade_028(store)
                     with store.transaction():
                         _exec(store, "INSERT INTO leagues (id, name) VALUES (?, ?)",
@@ -401,12 +469,185 @@ class GameLeagueBackfillTest(unittest.TestCase):
                     _teardown(store)
 
 
+class GameLeagueSeasonBackfillTest(unittest.TestCase):
+    """Migration 037 backfills every REGULAR Game's league_season_id from its
+    unique (league_id, season_id) LeagueSeason; EXHIBITION games stay NULL
+    (#283 Slice E). Simulates a pre-037 database by dropping the additive column
+    and its ledger row, then re-migrates and asserts the re-derivation — a pure
+    read of existing rows that changes no history. Dual-backend."""
+
+    def test_regular_games_scoped_exhibitions_left_null(self):
+        for label, url in _sql_backends():
+            with self.subTest(backend=label):
+                store = _fresh(url)
+                try:
+                    # Canonical fixtures: a LeagueSeason with one regular game
+                    # and one (mislabeled) exhibition sharing the same pair.
+                    with store.transaction():
+                        _exec(store, "INSERT INTO programs (id, name) VALUES (?, ?)",
+                              ("p1", "P1"))
+                        _exec(store, "INSERT INTO seasons (id, program_id, name) "
+                              "VALUES (?, ?, ?)", ("s1", "p1", "S1"))
+                        _exec(store, "INSERT INTO leagues (id, name, sort_order, "
+                              "program_id) VALUES (?, ?, ?, ?)", ("lg1", "Lg1", 0, "p1"))
+                        _exec(store, "INSERT INTO league_seasons (id, league_id, "
+                              "season_id) VALUES (?, ?, ?)", ("ls1", "lg1", "s1"))
+                        _exec(store, "INSERT INTO games (id, season_id, league_id, "
+                              "game_type) VALUES (?, ?, ?, ?)",
+                              ("g_reg", "s1", "lg1", "regular"))
+                        _exec(store, "INSERT INTO games (id, season_id, league_id, "
+                              "game_type) VALUES (?, ?, ?, ?)",
+                              ("g_exh", "s1", "lg1", "exhibition"))
+                    # Simulate pre-037: drop the additive column + ledger row.
+                    with store.transaction():
+                        _exec(store, "DROP INDEX IF EXISTS ix_games_league_season")
+                        _exec(store, "ALTER TABLE games DROP COLUMN league_season_id")
+                        _exec(store, "DELETE FROM schema_migrations "
+                              "WHERE version = ?", ("037_game_league_season",))
+                    migrate(store.conn, store.dialect)  # re-adds col + backfills
+                    self.assertIn("037_game_league_season",
+                                  store.migration_status()["applied"], label)
+                    self.assertEqual(
+                        _one(store, "SELECT league_season_id FROM games WHERE id = ?",
+                             ("g_reg",))["league_season_id"], "ls1", label)
+                    self.assertIsNone(
+                        _one(store, "SELECT league_season_id FROM games WHERE id = ?",
+                             ("g_exh",))["league_season_id"], label)
+                finally:
+                    _teardown(store)
+
+
+class GameLeagueSeasonGateAbortTest(unittest.TestCase):
+    """Migration 037's pre-migration gate (assert_regular_games_resolve_league_
+    season) ABORTS the upgrade when any REGULAR game cannot be bound to a
+    LeagueSeason — a null league/season, or a (league, season) pair with no
+    league_seasons row (#283 Slice E, blocker 1). It names the offending game,
+    leaves EXHIBITIONS (which are legitimately unscoped) alone, and mutates
+    nothing: the additive column is never added and 037 is not recorded.
+    Dual-backend."""
+
+    def _pre037(self, store, seed):
+        """Seed rows, then simulate a pre-037 database (drop the additive
+        league_season_id column + its ledger row) so migrate() re-runs the 037
+        gate over ``seed``'s rows."""
+        with store.transaction():
+            _exec(store, "INSERT INTO programs (id, name) VALUES (?, ?)",
+                  ("p1", "P1"))
+            _exec(store, "INSERT INTO seasons (id, program_id, name) "
+                  "VALUES (?, ?, ?)", ("s1", "p1", "S1"))
+            _exec(store, "INSERT INTO leagues (id, name, sort_order, program_id) "
+                  "VALUES (?, ?, ?, ?)", ("lg1", "Lg1", 0, "p1"))
+            seed(store)
+        with store.transaction():
+            _exec(store, "DROP INDEX IF EXISTS ix_games_league_season")
+            _exec(store, "ALTER TABLE games DROP COLUMN league_season_id")
+            _exec(store, "DELETE FROM schema_migrations WHERE version = ?",
+                  ("037_game_league_season",))
+
+    def test_regular_game_without_league_season_aborts_no_mutation(self):
+        # (label, seed) — each seeds one regular game the gate must reject.
+        def _no_ls_row(store):  # pair exists but no league_seasons row
+            _exec(store, "INSERT INTO games (id, season_id, league_id, game_type) "
+                  "VALUES (?, ?, ?, ?)", ("g_bad", "s1", "lg1", "regular"))
+
+        def _null_league(store):  # regular game with no league at all
+            _exec(store, "INSERT INTO league_seasons (id, league_id, season_id) "
+                  "VALUES (?, ?, ?)", ("ls1", "lg1", "s1"))
+            _exec(store, "INSERT INTO games (id, season_id, league_id, game_type) "
+                  "VALUES (?, ?, ?, ?)", ("g_bad", "s1", None, "regular"))
+
+        for case, seed in (("no_league_season_row", _no_ls_row),
+                           ("null_league", _null_league)):
+            for label, url in _sql_backends():
+                with self.subTest(case=case, backend=label):
+                    store = _fresh(url)
+                    try:
+                        self._pre037(store, seed)
+                        with self.assertRaises(MigrationDataError) as ctx:
+                            migrate(store.conn, store.dialect)
+                        self.assertIn("g_bad", str(ctx.exception),
+                                      f"{case}/{label}")
+                        # Zero mutation: the column is still absent and 037 is
+                        # not recorded, so the operator can repair and re-run.
+                        self.assertNotIn("league_season_id",
+                                         _cols(store, "games"), f"{case}/{label}")
+                        self.assertNotIn(
+                            "037_game_league_season",
+                            store.migration_status()["applied"], f"{case}/{label}")
+                    finally:
+                        _teardown(store)
+
+    def test_regular_game_with_cross_league_season_division_aborts(self):
+        # A regular game whose (league_id, season_id) resolves to ls1 but whose
+        # Division belongs to a DIFFERENT LeagueSeason (ls2) must abort 037 — a
+        # Game bound to one LeagueSeason while its Division points at another
+        # would let Division and LeagueSeason standings disagree.
+        for label, url in _sql_backends():
+            with self.subTest(backend=label):
+                store = _fresh(url)
+                try:
+                    with store.transaction():
+                        _exec(store, "INSERT INTO programs (id, name) VALUES (?, ?)",
+                              ("p1", "P1"))
+                        _exec(store, "INSERT INTO seasons (id, program_id, name) "
+                              "VALUES (?, ?, ?)", ("s1", "p1", "S1"))
+                        _exec(store, "INSERT INTO leagues (id, name, sort_order, "
+                              "program_id) VALUES (?, ?, ?, ?)", ("lg1", "Lg1", 0, "p1"))
+                        _exec(store, "INSERT INTO leagues (id, name, sort_order, "
+                              "program_id) VALUES (?, ?, ?, ?)", ("lg2", "Lg2", 1, "p1"))
+                        _exec(store, "INSERT INTO league_seasons (id, league_id, "
+                              "season_id) VALUES (?, ?, ?)", ("ls1", "lg1", "s1"))
+                        _exec(store, "INSERT INTO league_seasons (id, league_id, "
+                              "season_id) VALUES (?, ?, ?)", ("ls2", "lg2", "s1"))
+                        _exec(store, "INSERT INTO divisions (id, name, "
+                              "league_season_id) VALUES (?, ?, ?)", ("d2", "D2", "ls2"))
+                        # Resolves to ls1 via (lg1, s1), but its Division is in ls2.
+                        _exec(store, "INSERT INTO games (id, season_id, league_id, "
+                              "division_id, game_type) VALUES (?, ?, ?, ?, ?)",
+                              ("g_x", "s1", "lg1", "d2", "regular"))
+                    with store.transaction():
+                        _exec(store, "DROP INDEX IF EXISTS ix_games_league_season")
+                        _exec(store, "ALTER TABLE games DROP COLUMN league_season_id")
+                        _exec(store, "DELETE FROM schema_migrations "
+                              "WHERE version = ?", ("037_game_league_season",))
+                    with self.assertRaises(MigrationDataError) as ctx:
+                        migrate(store.conn, store.dialect)
+                    self.assertIn("g_x", str(ctx.exception), label)
+                    self.assertNotIn("league_season_id", _cols(store, "games"), label)
+                    self.assertNotIn(
+                        "037_game_league_season",
+                        store.migration_status()["applied"], label)
+                finally:
+                    _teardown(store)
+
+    def test_unscoped_exhibition_does_not_abort(self):
+        # An EXHIBITION with no LeagueSeason is legitimate — the gate ignores it
+        # and 037 applies, leaving its league_season_id NULL.
+        for label, url in _sql_backends():
+            with self.subTest(backend=label):
+                store = _fresh(url)
+                try:
+                    self._pre037(store, lambda s: _exec(
+                        s, "INSERT INTO games (id, season_id, league_id, "
+                        "game_type) VALUES (?, ?, ?, ?)",
+                        ("g_exh", "s1", None, "exhibition")))
+                    migrate(store.conn, store.dialect)  # gate passes
+                    self.assertIn("037_game_league_season",
+                                  store.migration_status()["applied"], label)
+                    self.assertIsNone(
+                        _one(store, "SELECT league_season_id FROM games "
+                             "WHERE id = ?", ("g_exh",))["league_season_id"], label)
+                finally:
+                    _teardown(store)
+
+
 class AmbiguityGateTest(unittest.TestCase):
     def test_ambiguous_upgrade_aborts_and_leaves_data_unchanged(self):
         for label, url in _sql_backends():
             with self.subTest(backend=label):
                 store = _fresh(url)
                 try:
+                    _downgrade_035(store)
                     _downgrade_028(store)
                     # A level-less division in a season with TWO leagues cannot be
                     # deterministically reparented — the C1a gate must abort.

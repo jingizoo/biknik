@@ -58,8 +58,8 @@ const SHEETS = {
     "club_code,club_name,country\n" +
     "BROWSERCLUB,Browser Club,US\n",
   permanent_teams_csv:
-    "program_code,team_code,team_name,club_code\n" +
-    "BROWSERPROGRAM,BROWSERTEAM,Browser Team,BROWSERCLUB\n",
+    "program_code,league_code,team_code,team_name,club_code\n" +
+    "BROWSERPROGRAM,BROWSERLEAGUE,BROWSERTEAM,Browser Team,BROWSERCLUB\n",
   players_csv:
     "player_code,team_code,first_name,last_name,jersey_number,position,email\n" +
     "BROWSERPLAYER,BROWSERTEAM,Browser,Player,9,forward,browser.player@example.com\n",

@@ -57,12 +57,16 @@ class Season:
 
 @dataclass
 class League:
-    """A competitive league/grouping between Season and Division (#233, formerly
-    ``Level``). A season like "Over 55" can run several leagues ("Level 1",
-    "Level 2"), each holding its own divisions. Divisions link up via
-    ``league_id``."""
+    """A permanent competitive league — the hard competition boundary (#283).
+
+    A League is a permanent child of a **Program** (``program_id``), not of a
+    Season: ``Platinum``/``Bronze`` exist once per Program and persist across
+    Seasons, rather than being recreated each Season. A League's participation
+    in a particular Season is expressed by a :class:`LeagueSeason` row, and a
+    Team belongs permanently to exactly one League (``Team.league_id``).
+    """
     id: str
-    season_id: str
+    program_id: str
     name: str
     sort_order: int = 0
     # Stable import-matching key (#174 PR E) — leagues are matched across
@@ -71,15 +75,35 @@ class League:
 
 
 @dataclass
-class Division:
+class LeagueSeason:
+    """A permanent :class:`League`'s participation in one :class:`Season` (#283).
+
+    The season overlay on the permanent Program → League → Team structure:
+    Divisions and team registrations for a Season hang off a ``LeagueSeason``,
+    not off the permanent League or Season directly. Uniqueness is
+    ``(league_id, season_id)`` — at most one row per League per Season. The
+    invariant ``league.program_id == season.program_id`` is enforced in the
+    service layer (a League and Season joined here must share a Program).
+    """
     id: str
+    league_id: str
     season_id: str
+
+
+@dataclass
+class Division:
+    """An optional grouping inside a League for one Season (#283).
+
+    Divisions are season-specific (``North``/``South`` may differ in team count
+    and placement each Season), so a Division belongs to a
+    :class:`LeagueSeason` (``league_season_id``), not permanently to a Team or
+    League. Prior-Season Divisions and their history are never rewritten when a
+    Team moves.
+    """
+    id: str
+    league_season_id: str
     name: str
     age_group: str = ""
-    # Owning competitive league/grouping (#166/#233). Nullable at the model
-    # level; the reparent migration (#233 Slice C1b) backfills a league for
-    # every division from its season's sole league.
-    league_id: Optional[str] = None
     # Stable import-matching key (#174 PR E) — divisions are matched across
     # repeat hierarchy uploads by this code (the sheet's division_code).
     external_ref: Optional[str] = None
@@ -87,25 +111,44 @@ class Division:
 
 @dataclass
 class SeasonTeamRegistration:
-    """A permanent league team's participation in one season (#180).
+    """A permanent League team's participation in one Season (#180/#283).
 
-    A team belongs permanently to its league; each season it plays in is a
-    separate registration that carries the season-specific division/group
-    assignment. This is what makes a team "FIFA-group-like" — the same team can
-    be Division A one season and Division B the next without the Team record or
-    prior-season history changing. Uniqueness is ``(season_id, team_id)``:
-    exactly one registration per team per season, so changing division updates
-    this row rather than creating a second simultaneous participation.
+    A Team belongs permanently to its League (``Team.league_id``); each Season
+    it plays in is a separate registration against a :class:`LeagueSeason`,
+    carrying the season-specific optional Division assignment. The same Team can
+    be Division A one Season and Division B the next without the Team record or
+    prior-Season history changing. Uniqueness is ``(team_id, league_season_id)``
+    — exactly one registration per Team per LeagueSeason, so changing Division
+    updates this row rather than creating a second simultaneous participation.
+    The invariant ``team.league_id == league_season.league_id`` (a Team may only
+    register in its own League) is enforced in the service layer.
     """
     id: str
-    season_id: str
+    league_season_id: str
     team_id: str
     division_id: Optional[str] = None
-    # Owning competition league (#233 Slice C1b). Nullable at the model level;
-    # the reparent migration derives it from the validated same-Season chain
-    # (division's league, else the season's sole league).
-    league_id: Optional[str] = None
     active: bool = True
+
+
+@dataclass
+class TeamLeagueMigrationDecision:
+    """An operator-supplied permanent-League assignment for a Team whose
+    historical registrations span more than one League (#283 migration 035).
+
+    Migration tooling only — never read by normal application flow. The
+    competition-hierarchy-reset migration computes each Team's candidate
+    Leagues from its historical registrations; a Team resolving to a single
+    League migrates automatically, but a Team with rows across multiple Leagues
+    is *ambiguous* and halts the migration with an exception report until an
+    operator records the intended permanent ``league_id`` here. Entering the
+    missing decisions and re-running the migration is idempotent: the migration
+    only records once its pre-check passes, so it safely re-runs each startup
+    until every ambiguous Team is resolved, then applies.
+    """
+    id: str
+    team_id: str
+    league_id: str
+    note: str = ""
 
 
 @dataclass

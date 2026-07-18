@@ -20,7 +20,8 @@ from http.server import ThreadingHTTPServer
 from helpers import BACKEND, FakeClock  # noqa: F401  (BACKEND sets up sys.path)
 
 from hockey_scheduler.api import ApiService
-from hockey_scheduler.domain import Division, Game, Player, Position, Rink, Team
+from hockey_scheduler.domain import (
+    Division, Game, LeagueSeason, Player, Position, Rink, Team)
 from hockey_scheduler.store import InMemoryStore
 from hockey_scheduler.web import server as srv
 
@@ -31,7 +32,8 @@ def _seeded_api():
     """Home team with a goalie already rostered so exactly one skater slot is
     open, plus two enrolled skater substitutes for the outreach queue."""
     s = InMemoryStore()
-    s.add_division(Division(id="d", season_id="se", name="D1"))
+    s.add_league_season(LeagueSeason(id="ls", league_id="l", season_id="se"))
+    s.add_division(Division(id="d", league_season_id="ls", name="D1"))
     s.add_rink(Rink(id="r1", venue_id="v", name="Main"))
     s.add_team(Team(id="home", name="Home", division="D1", division_id="d"))
     s.add_team(Team(id="away", name="Away", division="D1", division_id="d"))

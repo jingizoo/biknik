@@ -93,7 +93,7 @@ async function checkViewport(browser, viewport) {
       const divGame = await post("/api/v2/setup/division", { league_id: league.id, name: "Game Gold" });
       const club = await post("/api/v2/setup/club", { name: "Div Cleanup Club" });
       const team = async (name) =>
-        (await post("/api/v2/setup/team", { program_id: program.id, club_id: club.id, name })).id;
+        (await post("/api/v2/setup/team", { league_id: league.id, club_id: club.id, name })).id;
       const team1 = await team("Cleanup Team A");
       const team2 = await team("Cleanup Team B");
       const teamActive = await team("Active Blocker Team");

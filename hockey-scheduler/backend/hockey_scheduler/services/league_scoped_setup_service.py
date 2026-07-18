@@ -22,7 +22,8 @@ class SetupService(_BaseSetupService):
                     target_goalies: int = 1, target_skaters: int = 15,
                     max_skaters: int = 18, allow_division_override: bool = False,
                     actor_id: Optional[str] = None,
-                    league_id: Optional[str] = None):
+                    league_id: Optional[str] = None,
+                    game_type: str = "regular"):
         # The scope check and all writes share one transaction. Call the base
         # method's undecorated body to avoid opening a nested SqlStore
         # transaction (SQLite rejects BEGIN inside BEGIN).
@@ -31,15 +32,22 @@ class SetupService(_BaseSetupService):
             # Scope validation runs only after season/division/team structure is
             # valid; otherwise the base body reports its original error.
             season = self.store.get_season(season_id) if season_id else None
-            division = self.store.get_division(division_id) if division_id else None
+            # #283 Slice D: an EXHIBITION game carries no Division (the base body
+            # ignores any supplied division and never derives a league from it),
+            # so the ice-eligibility precheck runs season-only — matching the
+            # base method's own relaxed exhibition path.
+            is_exhibition = (game_type or "regular") == "exhibition"
+            division = (self.store.get_division(division_id)
+                        if division_id and not is_exhibition else None)
             home = self.store.get_team(home_team_id) if home_team_id else None
             away = self.store.get_team(away_team_id) if away_team_id else None
             # Participation is resolved through SeasonTeamRegistration (#180),
             # not Team.division_id (#200 review): a league-first team created
             # with division_id=None but correctly registered must still count as
             # a valid matchup so the cross-league ice guard runs. When v2 omits a
-            # division (#233 Slice C2), participation relaxes to season-only.
-            require_division = division_id is not None
+            # division (#233 Slice C2) — or the game is an exhibition (#283
+            # Slice D) — participation relaxes to season-only.
+            require_division = division_id is not None and not is_exhibition
             teams_match = (
                 season is not None
                 and self._team_participates(season, home_team_id, division_id,
@@ -49,7 +57,11 @@ class SetupService(_BaseSetupService):
             )
             # Division is optional in v2 (a supplied league_id scopes the game);
             # when a division IS given it must belong to the season, as in v1.
-            division_ok = (division is not None and division.season_id == season_id) \
+            # #283: Division.season_id dropped; resolve its Season via LeagueSeason.
+            division_ls = (self.store.get_league_season(division.league_season_id)
+                           if division is not None else None)
+            division_ok = (division is not None and division_ls is not None
+                           and division_ls.season_id == season_id) \
                 if require_division else True
             structure_valid = (
                 season is not None
@@ -67,7 +79,7 @@ class SetupService(_BaseSetupService):
                 ice_slot_id, target_goalies=target_goalies,
                 target_skaters=target_skaters, max_skaters=max_skaters,
                 allow_division_override=allow_division_override,
-                actor_id=actor_id, league_id=league_id,
+                actor_id=actor_id, league_id=league_id, game_type=game_type,
             )
 
     def move_game(self, game_id: str, new_ice_slot_id: str, reason: str = "",
@@ -77,7 +89,11 @@ class SetupService(_BaseSetupService):
             # Preserve the base service's established same-slot error/reason
             # before running the new scope check.
             if game is not None and new_ice_slot_id != game.ice_slot_id:
-                require_game_league_id(self.store, game)
+                # #283 Slice D/E: an exhibition has no owning League, so only a
+                # regular game needs the league-ice-isolation check; both kinds
+                # still need their new slot's venue to serve the game's Season.
+                if game.game_type != "exhibition":
+                    require_game_league_id(self.store, game)
                 require_slot_belongs_to_season(
                     self.store, new_ice_slot_id, game.season_id)
             return _BaseSetupService.move_game.__wrapped__(
@@ -89,7 +105,10 @@ class SetupService(_BaseSetupService):
         with self.store.transaction():
             game = self.store.get_game(game_id)
             if published and game is not None:
-                require_game_league_id(self.store, game)
+                # #283 Slice D/E: only a regular game needs league-ice isolation;
+                # both kinds need their slot's venue to serve the game's Season.
+                if game.game_type != "exhibition":
+                    require_game_league_id(self.store, game)
                 require_slot_belongs_to_season(
                     self.store, game.ice_slot_id, game.season_id)
             return _BaseSetupService.publish_game.__wrapped__(

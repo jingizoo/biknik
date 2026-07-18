@@ -94,7 +94,7 @@ async function checkViewport(browser, viewport) {
         slot_type: "game",
       });
       const club = await post("/api/v2/setup/club", { name: "Lions Club" });
-      const away = await post("/api/v2/setup/team", { program_id: program.id, name: "Away Team" });
+      const away = await post("/api/v2/setup/team", { league_id: league.id, name: "Away Team" });
       await post(`/api/v2/setup/seasons/${season.id}/team-registrations`,
         { team_id: away.id, league_id: league.id });
       return { program: program.id, season: season.id, league: league.id,
@@ -109,7 +109,7 @@ async function checkViewport(browser, viewport) {
     // "Club (optional)" select is left at its default "— none —" option.
     await page.click('.setup-card .sc-new[data-drawer="team"]');
     await page.waitForSelector(".drawer[role=dialog]", { timeout: 10000 });
-    await page.selectOption("#f-team-league", fx.program);
+    await page.selectOption("#f-team-perm-league", fx.league);
     await page.fill("#f-team", "Optional Club Team");
     const createResp = page.waitForResponse((r) =>
       r.url() === `${base}/api/v2/setup/team` && r.request().method() === "POST");

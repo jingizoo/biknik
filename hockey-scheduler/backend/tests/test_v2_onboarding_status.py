@@ -173,19 +173,20 @@ class V2OnboardingStatusTest(unittest.TestCase):
         # A valid registration keeps the installation otherwise ready...
         api.register_team_for_season(season["id"], team["id"], actor_id="admin",
                                      league_id=league["id"])
-        # ...but a league from a DIFFERENT season is invalid participation.
-        other_season = api.create_season(program["id"], "Other", actor_id="admin")
-        other_league = api.create_league(other_season["id"], "OL",
-                                         actor_id="admin")
+        # ...but a registration whose League doesn't resolve for the season is
+        # invalid participation. #283: a real League may legitimately span
+        # Seasons, so the corrupt case is a LeagueSeason binding this Season to a
+        # League that does not exist. Inject it directly (the service rejects a
+        # league-less registration outright) to reproduce the invalid data.
         team2 = api.create_team(self._club["id"], None, "T2", actor_id="admin",
                                 program_id=program["id"])
-        # Inject a cross-season-league registration directly (the service would
-        # reject it) to reproduce the invalid data the readiness must report.
-        from hockey_scheduler.domain import SeasonTeamRegistration
+        from hockey_scheduler.domain import LeagueSeason, SeasonTeamRegistration
+        ghost_ls = api.store.add_league_season(LeagueSeason(
+            id=api.store.next_id("leagueseason"), league_id="league_ghost",
+            season_id=season["id"]))
         api.store.add_season_team_registration(SeasonTeamRegistration(
-            id=api.store.next_id("streg"), season_id=season["id"],
-            team_id=team2["id"], division_id=None,
-            league_id=other_league["id"], active=True))
+            id=api.store.next_id("streg"), league_season_id=ghost_ls.id,
+            team_id=team2["id"], division_id=None, active=True))
 
         status = api.get_onboarding_status_v2("demo")
         self.assertIn("invalid_registrations", _codes(status), status)
@@ -207,14 +208,18 @@ class V2OnboardingStatusTest(unittest.TestCase):
         league = api.create_league(season["id"], "Adult League", actor_id="admin")
         team = api.create_team(self._club["id"], None, "T", actor_id="admin",
                                program_id=program["id"])
-        other_season = api.create_season(program["id"], "Other", actor_id="admin")
-        other_league = api.create_league(other_season["id"], "OL", actor_id="admin")
 
-        from hockey_scheduler.domain import SeasonTeamRegistration
+        # #283: reproduce the same defect via a LeagueSeason that binds this
+        # Season to a non-existent League (a league-less registration is refused
+        # by the service), so its League "isn't in the season".
+        from hockey_scheduler.domain import LeagueSeason, SeasonTeamRegistration
+        ghost_ls = api.store.add_league_season(LeagueSeason(
+            id=api.store.next_id("leagueseason"), league_id="league_ghost",
+            season_id=season["id"]))
         reg_id = api.store.next_id("streg")
         api.store.add_season_team_registration(SeasonTeamRegistration(
-            id=reg_id, season_id=season["id"], team_id=team["id"],
-            division_id=None, league_id=other_league["id"], active=True))
+            id=reg_id, league_season_id=ghost_ls.id, team_id=team["id"],
+            division_id=None, active=True))
 
         before = api.get_setup_hierarchy_v2()
         season_node = next(s for p in before["programs"] for s in p["seasons"]

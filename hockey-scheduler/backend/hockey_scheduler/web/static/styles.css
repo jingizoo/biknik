@@ -945,6 +945,8 @@ details.tn > .tn-sum:hover { background: #f6f7fb; }
 .wizard h3 { margin: 0 0 4px; font-size: 17px; }
 .wizard .step { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .4px; margin: 10px 0 3px; }
 .wizard select { width: 100%; padding: 9px 10px; border: 1px solid var(--sep); border-radius: 9px; font-size: 14px; background: #fff; }
+.wizard .wiz-exhibition { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--muted); cursor: pointer; }
+.wizard .wiz-exhibition input { width: auto; }
 .valid { font-size: 13px; padding: 3px 0; }
 .valid.ok { color: #1c8c39; }
 .valid.bad { color: var(--red); }

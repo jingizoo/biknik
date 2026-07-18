@@ -72,16 +72,24 @@ async function checkViewport(browser, viewport) {
     await page.goto(base, { waitUntil: "domcontentloaded" });
     await page.waitForSelector("#content > *", { timeout: 10000 });
 
-    // Build a source season with two registered permanent teams and a target
-    // season with TWO Leagues (Adult League/Junior League), each with its own
-    // division;
-    // pre-register one team in the target so the rollover has both an
-    // eligible team (Bears) and an already-registered one (Lions). A v2
-    // registration's League is REQUIRED (#233 Slice C2), so every season here
-    // gets its own grouping League(s) before any registration is created. The
-    // target season deliberately has more than one League so Bears' League
-    // select is NOT auto-preselected — this is what exercises the inline
-    // row-error / disabled-commit gate (review #216, re-scoped to League).
+    // Build three permanent teams, each under its OWN permanent League (#283
+    // Slice E rules 2, 3, 7): a Team is created with a REQUIRED league_id and
+    // may only ever register into — and be rolled into — that same permanent
+    // League. Lions→lgA, Bears→lgB, Wolves→lgC. All three play the source
+    // season (registered into their own League). Lions is ALSO pre-registered
+    // in the target (under its own permanent League) so the rollover has both
+    // an eligible team (Bears) and an already-registered one (Lions, skipped).
+    //
+    // lgA/lgB are created against the TARGET season first (and given a target
+    // Division while each is still bound to a single season — create_division
+    // under a League that spans seasons is ambiguous), so Bears' permanent
+    // League already participates in the target with a Division to carry into.
+    // lgC is created against the SOURCE season ONLY, so Wolves' permanent
+    // League does NOT yet participate in the target — its rollover row offers
+    // just "No division", and the commit binds lgC's target LeagueSeason on
+    // the fly (covers a carried selection whose stored division_id is null).
+    // A fourth, league-less season lets the panel refuse a target with no
+    // Leagues (review #216, point 3 — re-scoped to League).
     const ids = await page.evaluate(async () => {
       const post = async (p, b) => (await fetch(p, {
         method: "POST", credentials: "same-origin",
@@ -90,38 +98,43 @@ async function checkViewport(browser, viewport) {
       const program = await post("/api/v2/setup/program", { name: "Rollover Program" });
       const src = await post("/api/v2/setup/season", { program_id: program.id, name: "2026-27" });
       const dst = await post("/api/v2/setup/season", { program_id: program.id, name: "2027-28" });
-      // A third season in the same program with NO leagues — the rollover must
+      // A fourth season in the same program with NO leagues — the rollover must
       // refuse it as a target (review #216, point 3 — re-scoped to League).
       const empty = await post("/api/v2/setup/season", { program_id: program.id, name: "2028-29" });
-      const lgSrc = await post("/api/v2/setup/league", { season_id: src.id, name: "Adult League" });
-      const lgDstA = await post("/api/v2/setup/league", { season_id: dst.id, name: "Adult League" });
-      const lgDstB = await post("/api/v2/setup/league", { season_id: dst.id, name: "Junior League" });
-      const dSrc = await post("/api/v2/setup/division", { league_id: lgSrc.id, name: "Source Div" });
-      const dstA = await post("/api/v2/setup/division", { league_id: lgDstA.id, name: "Gold" });
-      const dstB = await post("/api/v2/setup/division", { league_id: lgDstB.id, name: "Silver" });
+      // Permanent Leagues. lgA/lgB bound to the target first so each can get a
+      // target Division before it also spans the source season (below).
+      const lgA = await post("/api/v2/setup/league", { season_id: dst.id, name: "Adult League" });
+      const dstA = await post("/api/v2/setup/division", { league_id: lgA.id, name: "Gold" });
+      const lgB = await post("/api/v2/setup/league", { season_id: dst.id, name: "Junior League" });
+      const dstB = await post("/api/v2/setup/division", { league_id: lgB.id, name: "Silver" });
+      // lgC lives in the SOURCE season only — no target participation yet.
+      const lgC = await post("/api/v2/setup/league", { season_id: src.id, name: "Youth League" });
       const club = await post("/api/v2/setup/club", { name: "Rollover Club" });
+      // Each Team is created under its permanent League (league_id REQUIRED).
       const lions = await post("/api/v2/setup/team",
-        { program_id: program.id, club_id: club.id, name: "Lions" });
+        { league_id: lgA.id, club_id: club.id, name: "Lions" });
       const bears = await post("/api/v2/setup/team",
-        { program_id: program.id, club_id: club.id, name: "Bears" });
-      // A third team, carried in a SEPARATE second rollover round below with
-      // only a League chosen (Division left at "No division") — covers a
-      // rollover selection whose stored division_id is actually null.
+        { league_id: lgB.id, club_id: club.id, name: "Bears" });
+      // Carried in a SEPARATE second rollover round below with only its
+      // (fixed, permanent) League and Division left at "No division" — covers
+      // a rollover selection whose stored division_id is actually null.
       const wolves = await post("/api/v2/setup/team",
-        { program_id: program.id, club_id: club.id, name: "Wolves" });
-      // All three teams play the source season.
+        { league_id: lgC.id, club_id: club.id, name: "Wolves" });
+      // All three teams play the source season, each into its OWN permanent
+      // League (rule 7). Registering binds lgA/lgB to the source season too;
+      // the source Division is left null (not asserted below).
       await post(`/api/v2/setup/seasons/${src.id}/team-registrations`,
-        { team_id: lions.id, league_id: lgSrc.id, division_id: dSrc.id });
+        { team_id: lions.id, league_id: lgA.id, division_id: null });
       await post(`/api/v2/setup/seasons/${src.id}/team-registrations`,
-        { team_id: bears.id, league_id: lgSrc.id, division_id: dSrc.id });
+        { team_id: bears.id, league_id: lgB.id, division_id: null });
       await post(`/api/v2/setup/seasons/${src.id}/team-registrations`,
-        { team_id: wolves.id, league_id: lgSrc.id, division_id: dSrc.id });
-      // Lions is already in the target season (League A + Target A) — the
-      // rollover must skip it, not duplicate it.
+        { team_id: wolves.id, league_id: lgC.id, division_id: null });
+      // Lions is already in the target season under its OWN permanent League
+      // (lgA + Gold) — the rollover must skip it, not duplicate it.
       await post(`/api/v2/setup/seasons/${dst.id}/team-registrations`,
-        { team_id: lions.id, league_id: lgDstA.id, division_id: dstA.id });
+        { team_id: lions.id, league_id: lgA.id, division_id: dstA.id });
       return { program: program.id, src: src.id, dst: dst.id, empty: empty.id,
-        lgSrc: lgSrc.id, lgDstA: lgDstA.id, lgDstB: lgDstB.id,
+        lgA: lgA.id, lgB: lgB.id, lgC: lgC.id,
         dstA: dstA.id, dstB: dstB.id, lions: lions.id, bears: bears.id, wolves: wolves.id };
     });
 
@@ -158,12 +171,19 @@ async function checkViewport(browser, viewport) {
       throw new Error(`[${viewport.label}] Lions was offered for rollover despite already being registered`);
     }
 
-    // The target season has TWO Leagues, so Bears' League select starts
-    // unset ("Choose a league…") rather than being auto-preselected.
-    const preselected = await page.$eval(
-      `[data-rollover-league="${ids.bears}"]`, (sel) => sel.value);
-    if (preselected) {
-      throw new Error(`[${viewport.label}] Bears' League was unexpectedly preselected: ${preselected}`);
+    // #283 Slice E: a Team only ever rolls into its OWN permanent League, so
+    // Bears' target-League control is FIXED to lgB (a single-option select
+    // preselected to the team's permanent League — never a free picker). Assert
+    // that fixed value rather than selecting a different League.
+    const bearsLeagueSel = await page.$eval(`[data-rollover-league="${ids.bears}"]`,
+      (sel) => ({ value: sel.value, optionValues: Array.from(sel.options).map((o) => o.value) }));
+    if (bearsLeagueSel.value !== ids.lgB) {
+      throw new Error(`[${viewport.label}] Bears' target League wasn't fixed to its permanent League `
+        + `lgB: ${JSON.stringify(bearsLeagueSel)}`);
+    }
+    if (bearsLeagueSel.optionValues.filter(Boolean).some((v) => v !== ids.lgB)) {
+      throw new Error(`[${viewport.label}] Bears' League select offered a League other than its `
+        + `permanent one: ${JSON.stringify(bearsLeagueSel.optionValues)}`);
     }
 
     // Commit is disabled before any team is chosen.
@@ -171,19 +191,37 @@ async function checkViewport(browser, viewport) {
       throw new Error(`[${viewport.label}] commit was enabled with nothing selected`);
     }
 
-    // Check Bears but leave its League unassigned: the row shows an inline
-    // error and commit stays disabled — an unassigned team cannot be
-    // submitted (review #216, re-scoped to League for v2).
+    // Zero writes so far: the target season still holds only the pre-registered
+    // Lions — merely opening the preview writes nothing.
+    const beforeCheck = await page.evaluate(async (i) => {
+      const get = async (p) => (await fetch(p, { credentials: "same-origin" })).json();
+      const regs = (await get(`/api/v2/setup/seasons/${i.dst}/team-registrations`)).registrations;
+      return regs.filter((r) => r.active).length;
+    }, ids);
+    if (beforeCheck !== 1) {
+      throw new Error(`[${viewport.label}] target season was written before any commit: ${beforeCheck} active regs`);
+    }
+
+    // Check Bears: its League is already fixed to lgB, so the commit gate is
+    // satisfied immediately (no unassigned-League row error to clear) and the
+    // button enables even with Division left at its optional "No division"
+    // default.
     await page.check(`[data-rollover-pick="${ids.bears}"]`);
-    await page.waitForFunction((b) => {
+    await page.waitForFunction(() => {
+      const commit = document.querySelector("[data-rollover-commit]");
+      return commit && !commit.disabled;
+    }, null, { timeout: 10000 });
+    // The inline "no permanent league" row error stays hidden — Bears HAS one.
+    const bearsRowErrHidden = await page.evaluate((b) => {
       const row = document.querySelector(`[data-rollover-pick="${b}"]`).closest(".reg-row");
       const err = row.querySelector(".ro-row-err");
-      const commit = document.querySelector("[data-rollover-commit]");
-      return err && !err.hidden && commit && commit.disabled;
-    }, ids.bears, { timeout: 10000 });
+      return !err || err.hidden;
+    }, ids.bears);
+    if (!bearsRowErrHidden) {
+      throw new Error(`[${viewport.label}] Bears (with a permanent League) showed a row error`);
+    }
 
-    // Zero writes so far: the target season still holds only the pre-registered
-    // Lions. (No rollover request could have been sent from the disabled path.)
+    // Checking a box still writes nothing before the explicit commit.
     const before = await page.evaluate(async (i) => {
       const get = async (p) => (await fetch(p, { credentials: "same-origin" })).json();
       const regs = (await get(`/api/v2/setup/seasons/${i.dst}/team-registrations`)).registrations;
@@ -193,17 +231,8 @@ async function checkViewport(browser, viewport) {
       throw new Error(`[${viewport.label}] target season was written before a valid commit: ${before} active regs`);
     }
 
-    // Assign Bears to League B (Junior League) — the inline error clears and
-    // commit enables even with Division left at its optional "No division"
-    // default (the League→Division cascade rescopes the Division select to
-    // League B's divisions, but picking one is not required).
-    await page.selectOption(`[data-rollover-league="${ids.bears}"]`, ids.lgDstB);
-    await page.waitForFunction(() => {
-      const commit = document.querySelector("[data-rollover-commit]");
-      return commit && !commit.disabled;
-    }, null, { timeout: 10000 });
-
-    // Now pick Target B under League B — commit stays enabled.
+    // Bears' permanent League (lgB) already participates in the target with a
+    // Division (Silver), so pick it — commit stays enabled (Division optional).
     await page.selectOption(`[data-rollover-div="${ids.bears}"]`, ids.dstB);
     if (await page.$eval("[data-rollover-commit]", (b) => b.disabled)) {
       throw new Error(`[${viewport.label}] commit disabled after picking an optional division`);
@@ -241,11 +270,11 @@ async function checkViewport(browser, viewport) {
     if (state.teamCount !== 3) {
       throw new Error(`[${viewport.label}] expected 3 permanent teams, got ${state.teamCount}`);
     }
-    if (state.bearsLeague !== ids.lgDstB) {
-      throw new Error(`[${viewport.label}] Bears not carried into League B: ${JSON.stringify(state)}`);
+    if (state.bearsLeague !== ids.lgB) {
+      throw new Error(`[${viewport.label}] Bears not carried into its permanent League: ${JSON.stringify(state)}`);
     }
     if (state.bearsDiv !== ids.dstB) {
-      throw new Error(`[${viewport.label}] Bears not carried into Target B: ${JSON.stringify(state)}`);
+      throw new Error(`[${viewport.label}] Bears not carried into Silver: ${JSON.stringify(state)}`);
     }
     if (state.lionsDiv !== ids.dstA) {
       throw new Error(`[${viewport.label}] Lions' existing registration was altered: ${JSON.stringify(state)}`);
@@ -264,7 +293,14 @@ async function checkViewport(browser, viewport) {
       (w) => !!document.querySelector(`[data-rollover-pick="${w}"]`),
       ids.wolves, { timeout: 15000 });
     await page.check(`[data-rollover-pick="${ids.wolves}"]`);
-    await page.selectOption(`[data-rollover-league="${ids.wolves}"]`, ids.lgDstA);
+    // Wolves' target League is FIXED to its permanent League (lgC), which does
+    // NOT yet participate in the target season — so the row offers only "No
+    // division" and the commit binds lgC's target LeagueSeason on the fly.
+    const wolvesLeagueSel = await page.$eval(`[data-rollover-league="${ids.wolves}"]`,
+      (sel) => sel.value);
+    if (wolvesLeagueSel !== ids.lgC) {
+      throw new Error(`[${viewport.label}] Wolves' target League wasn't fixed to lgC: ${wolvesLeagueSel}`);
+    }
     // Division select is untouched — stays at its "No division" default.
     await page.waitForFunction(() => {
       const commit = document.querySelector("[data-rollover-commit]");

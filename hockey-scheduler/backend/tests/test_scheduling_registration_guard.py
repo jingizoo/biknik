@@ -15,7 +15,8 @@ from helpers import FakeClock
 
 from hockey_scheduler.api import ApiService
 from hockey_scheduler.domain import (
-    Division, IceSlotStatus, Season, SeasonTeamRegistration, Team)
+    Division, IceSlotStatus, LeagueSeason, Season, SeasonTeamRegistration,
+    Team)
 from hockey_scheduler.domain.errors import DivisionMismatchError
 from hockey_scheduler.services import SetupService
 from hockey_scheduler.services.league_scoped_setup_service import (
@@ -129,8 +130,9 @@ class CreateGameGuardTest(_Base):
         # cross-league row for foreign into THIS season.
         self.svc.register_team_for_season(self.season.id, self.home.id, self.div.id)
         self.store.add_season_team_registration(SeasonTeamRegistration(
-            id="streg_injected", season_id=self.season.id, team_id=foreign.id,
-            division_id=self.div.id, active=True))
+            id="streg_injected",
+            league_season_id=self.store.get_division(self.div.id).league_season_id,
+            team_id=foreign.id, division_id=self.div.id, active=True))
         slot = self._slot()
         with self.assertRaises(DivisionMismatchError):
             self.svc.create_game(self.season.id, self.div.id,
@@ -209,8 +211,9 @@ class StandingsRosterTest(_Base):
         # into the standings roster (#199/#200).
         api = ApiService(self.store)
         self._register_both()
+        div_ls_id = self.store.get_division(self.div.id).league_season_id
         self.store.add_season_team_registration(SeasonTeamRegistration(
-            id="streg_orphan", season_id=self.season.id, team_id="ghost",
+            id="streg_orphan", league_season_id=div_ls_id, team_id="ghost",
             division_id=self.div.id, active=True))
         other = self.svc.create_program("Other")
         foreign = self.svc.create_team(
@@ -218,7 +221,7 @@ class StandingsRosterTest(_Base):
             self.svc.create_division(
                 self.svc.create_season(other.id, "OS").id, "OD").id, "Foreign")
         self.store.add_season_team_registration(SeasonTeamRegistration(
-            id="streg_foreign", season_id=self.season.id, team_id=foreign.id,
+            id="streg_foreign", league_season_id=div_ls_id, team_id=foreign.id,
             division_id=self.div.id, active=True))
         ids = {r["team_id"] for r in api.get_standings(self.div.id)["standings"]}
         self.assertEqual(ids, {self.home.id, self.away.id})
@@ -241,8 +244,9 @@ class DraftScheduleGuardTest(_Base):
         self._register_both()
         self._slot(18)
         self.store.add_season_team_registration(SeasonTeamRegistration(
-            id="streg_orphan", season_id=self.season.id, team_id="ghost",
-            division_id=self.div.id, active=True))
+            id="streg_orphan",
+            league_season_id=self.store.get_division(self.div.id).league_season_id,
+            team_id="ghost", division_id=self.div.id, active=True))
         result = draft_schedule(self.store, self.div.id, constraints=None)
         self.assertEqual(result["team_count"], 2)
         scheduled = set()
@@ -302,8 +306,9 @@ class NullLeagueAndDanglingSeasonTest(_Base):
                      division_id=self.div.id, program_id=None)
         self.store.add_team(ghost)
         self.store.add_season_team_registration(SeasonTeamRegistration(
-            id="streg_nl", season_id=self.season.id, team_id=ghost.id,
-            division_id=self.div.id, active=True))
+            id="streg_nl",
+            league_season_id=self.store.get_division(self.div.id).league_season_id,
+            team_id=ghost.id, division_id=self.div.id, active=True))
         return ghost
 
     def test_null_league_team_rejected_on_create(self):
@@ -329,11 +334,17 @@ class NullLeagueAndDanglingSeasonTest(_Base):
         # A season whose league is missing/empty (or a division whose season is
         # dangling) must trust no registration into create, standings, or drafts.
         self.store.add_season(Season(id="se_nl", program_id="", name="NL"))
-        self.store.add_division(Division(id="d_nl", season_id="se_nl", name="D"))
+        # The season's league is missing/empty: a LeagueSeason whose league_id
+        # references no League row (dangling), so no registration under it can
+        # ever resolve to a concrete league.
+        self.store.add_league_season(LeagueSeason(
+            id="ls_nl", league_id="lg_missing", season_id="se_nl"))
+        self.store.add_division(Division(
+            id="d_nl", league_season_id="ls_nl", name="D"))
         self.store.add_team(Team(id="t_nl", name="T", division_id="d_nl",
                                  program_id=""))
         self.store.add_season_team_registration(SeasonTeamRegistration(
-            id="streg_dnl", season_id="se_nl", team_id="t_nl",
+            id="streg_dnl", league_season_id="ls_nl", team_id="t_nl",
             division_id="d_nl", active=True))
         api = ApiService(self.store)
         self.assertEqual(api.get_standings("d_nl")["standings"], [])

@@ -19,10 +19,26 @@ import unittest
 from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
 
 from hockey_scheduler.api import ApiService
-from hockey_scheduler.domain import IceSlotStatus, Team
+from datetime import datetime, timezone
+
+from hockey_scheduler.domain import (
+    Game, IceSlotStatus, SeasonTeamRegistration, Team)
 from hockey_scheduler.store import SqlStore
 
 ADMIN = "admin"
+
+
+# #283: a registration/Division no longer carries its own league_id — it is
+# fixed by the LeagueSeason. Resolve the League from a raw store row.
+def _reg_league(store, reg):
+    ls = store.get_league_season(reg.league_season_id)
+    return ls.league_id if ls else None
+
+
+def _div_league(store, division_id):
+    d = store.get_division(division_id)
+    ls = store.get_league_season(d.league_season_id) if d else None
+    return ls.league_id if ls else None
 
 
 def _sql_backends():
@@ -95,7 +111,7 @@ class DivisionReparentStrandSqlTest(_SqlIntegrityBase):
             div = api.create_division_v2(l1["id"], "D", actor_id=ADMIN)
             club = api.create_club("C", actor_id=ADMIN)
             team = api.create_team(club["id"], None, "T", actor_id=ADMIN,
-                                   program_id=program["id"])
+                                   program_id=program["id"], league_id=l1["id"])
             api.register_team_for_season(season["id"], team["id"], div["id"],
                                          actor_id=ADMIN, league_id=l1["id"])
 
@@ -104,7 +120,7 @@ class DivisionReparentStrandSqlTest(_SqlIntegrityBase):
                                              v2=True)
             self.assertEqual(res["error"]["code"], "validation_error", res)
             # The division row is unchanged and NO audit row was written.
-            self.assertEqual(store.get_division(div["id"]).league_id, l1["id"])
+            self.assertEqual(_div_league(store, div["id"]), l1["id"])
             self.assertEqual(len(store.all_setup_audit()), audits_before)
 
         self._run(case)
@@ -119,7 +135,7 @@ class DivisionReparentStrandSqlTest(_SqlIntegrityBase):
             res = api.assign_division_league(div["id"], None, actor_id=ADMIN,
                                              v2=True)
             self.assertEqual(res["error"]["code"], "validation_error", res)
-            self.assertEqual(store.get_division(div["id"]).league_id, l1["id"])
+            self.assertEqual(_div_league(store, div["id"]), l1["id"])
             self.assertEqual(len(store.all_setup_audit()), audits_before)
 
         self._run(case)
@@ -144,7 +160,9 @@ class AssignDivisionLeagueSqlTest(_SqlIntegrityBase):
             # Required League preserved through the SQL round-trip.
             self.assertEqual(cleared["league_id"], l1["id"])
             self.assertEqual(
-                store.get_season_team_registration(reg["id"]).league_id, l1["id"])
+                _reg_league(store,
+                            store.get_season_team_registration(reg["id"])),
+                l1["id"])
 
         self._run(case)
 
@@ -158,7 +176,7 @@ class AssignDivisionLeagueSqlTest(_SqlIntegrityBase):
             d2 = api.create_division_v2(l2["id"], "D2", actor_id=ADMIN)
             club = api.create_club("C", actor_id=ADMIN)
             team = api.create_team(club["id"], None, "T", actor_id=ADMIN,
-                                   program_id=program["id"])
+                                   program_id=program["id"], league_id=l1["id"])
             reg = api.register_team_for_season(season["id"], team["id"], d1["id"],
                                                actor_id=ADMIN, league_id=l1["id"])
             audits_before = len(store.all_setup_audit())
@@ -167,7 +185,7 @@ class AssignDivisionLeagueSqlTest(_SqlIntegrityBase):
             self.assertEqual(res["error"]["code"], "validation_error", res)
             stored = store.get_season_team_registration(reg["id"])
             self.assertEqual(stored.division_id, d1["id"])
-            self.assertEqual(stored.league_id, l1["id"])
+            self.assertEqual(_reg_league(store, stored), l1["id"])
             self.assertEqual(len(store.all_setup_audit()), audits_before)
 
         self._run(case)
@@ -181,25 +199,46 @@ class AssignLeagueGameStrandSqlTest(_SqlIntegrityBase):
             l1 = api.create_league(season["id"], "L1", actor_id=ADMIN)
             l2 = api.create_league(season["id"], "L2", actor_id=ADMIN)
             club = api.create_club("C", actor_id=ADMIN)
-            team_a = api.create_team(club["id"], None, "A", actor_id=ADMIN,
-                                     program_id=program["id"])
+            # #283 Slice E: a permanent-League team is pinned to its own League
+            # (rule 7), short-circuiting before the game-strand guard this test
+            # targets. Inject a league-less team_a and its registration directly
+            # (register would backfill/pin the League) so the move L1→L2 reaches
+            # the committed-game strand guard.
+            _ta = Team(id=store.next_id("team"), name="A", club_id=club["id"],
+                       program_id=program["id"])
+            store.add_team(_ta)
+            team_a = {"id": _ta.id}
             team_b = api.create_team(club["id"], None, "B", actor_id=ADMIN,
-                                     program_id=program["id"])
-            reg_a = api.register_team_for_season(season["id"], team_a["id"],
-                                                 actor_id=ADMIN, league_id=l1["id"])
+                                     program_id=program["id"], league_id=l1["id"])
+            _reg_a = SeasonTeamRegistration(
+                id=store.next_id("streg"),
+                league_season_id=store.league_season_for(
+                    l1["id"], season["id"]).id,
+                team_id=team_a["id"], division_id=None, active=True)
+            store.add_season_team_registration(_reg_a)
+            reg_a = {"id": _reg_a.id}
             api.register_team_for_season(season["id"], team_b["id"],
                                          actor_id=ADMIN, league_id=l1["id"])
-            slot = self._game_slot(api, org, program, season["id"])
-            game = api.create_game(season["id"], None, team_a["id"], team_b["id"],
-                                   slot["id"], actor_id=ADMIN, league_id=l1["id"])
-            self.assertNotIn("error", game, game)
+            # Inject a committed L1 game for the league-less team_a directly:
+            # create_game now (correctly) refuses to put a league-less team in a
+            # regular game (#283 rules 7-9), so this otherwise-unreachable state
+            # is seeded straight into the store to exercise
+            # assign_season_team_league's game-strand guard specifically.
+            store.add_game(Game(
+                id=store.next_id("game"), home_team_id=team_a["id"],
+                away_team_id=team_b["id"],
+                start_time=datetime(2026, 9, 1, 18, 30, tzinfo=timezone.utc),
+                season_id=season["id"], league_id=l1["id"],
+                league_season_id=store.league_season_for(
+                    l1["id"], season["id"]).id))
 
             audits_before = len(store.all_setup_audit())
             res = api.assign_season_team_league(reg_a["id"], l2["id"],
                                                 actor_id=ADMIN)
             self.assertEqual(res["error"]["code"], "validation_error", res)
             self.assertEqual(
-                store.get_season_team_registration(reg_a["id"]).league_id,
+                _reg_league(store,
+                            store.get_season_team_registration(reg_a["id"])),
                 l1["id"])
             self.assertEqual(len(store.all_setup_audit()), audits_before)
 
@@ -215,9 +254,9 @@ class GameRegistrationLeagueSqlTest(_SqlIntegrityBase):
             l2 = api.create_league(season["id"], "L2", actor_id=ADMIN)
             club = api.create_club("C", actor_id=ADMIN)
             team_a = api.create_team(club["id"], None, "A", actor_id=ADMIN,
-                                     program_id=program["id"])
+                                     program_id=program["id"], league_id=l1["id"])
             team_b = api.create_team(club["id"], None, "B", actor_id=ADMIN,
-                                     program_id=program["id"])
+                                     program_id=program["id"], league_id=l1["id"])
             api.register_team_for_season(season["id"], team_a["id"],
                                          actor_id=ADMIN, league_id=l1["id"])
             api.register_team_for_season(season["id"], team_b["id"],
@@ -244,9 +283,14 @@ class AssignClubOptionalSqlTest(_SqlIntegrityBase):
     def test_assign_club_null_unassigns_with_audit(self):
         def case(api, store):
             org, program = self._org_program(api)
+            # #283 Slice E: a Team needs a resolvable permanent League — give the
+            # program one so create_team resolves it (this test is about the
+            # optional Club, not the League).
+            season = api.create_season(program["id"], "Fall", actor_id=ADMIN)
+            league = api.create_league(season["id"], "L", actor_id=ADMIN)
             club = api.create_club("C", actor_id=ADMIN)
             team = api.create_team(club["id"], None, "T", actor_id=ADMIN,
-                                   program_id=program["id"])
+                                   program_id=program["id"], league_id=league["id"])
             audits_before = len(store.all_setup_audit())
             res = api.assign_team_club(team["id"], None, actor_id=ADMIN)
             self.assertNotIn("error", res, res)
@@ -266,9 +310,14 @@ class AssignClubOptionalSqlTest(_SqlIntegrityBase):
     def test_assign_unknown_club_rejected_zero_mutation(self):
         def case(api, store):
             org, program = self._org_program(api)
+            # #283 Slice E: a Team needs a resolvable permanent League — give the
+            # program one so create_team resolves it (this test is about the
+            # optional Club, not the League).
+            season = api.create_season(program["id"], "Fall", actor_id=ADMIN)
+            league = api.create_league(season["id"], "L", actor_id=ADMIN)
             club = api.create_club("C", actor_id=ADMIN)
             team = api.create_team(club["id"], None, "T", actor_id=ADMIN,
-                                   program_id=program["id"])
+                                   program_id=program["id"], league_id=league["id"])
             audits_before = len(store.all_setup_audit())
             res = api.assign_team_club(team["id"], "club_missing", actor_id=ADMIN)
             self.assertEqual(res["error"]["code"], "not_found", res)
@@ -302,43 +351,42 @@ class RegisterProgramMatchSqlTest(_SqlIntegrityBase):
 
 class RollForwardConflictSqlTest(_SqlIntegrityBase):
     def _two_league_target(self, api):
+        # #283 Slice E: a rollover only ever targets a Team's OWN permanent
+        # League. Each team's permanent League is the one it rolls into.
         org, program = self._org_program(api)
         s1 = api.create_season(program["id"], "S1", actor_id=ADMIN)
         s2 = api.create_season(program["id"], "S2", actor_id=ADMIN)
-        l1t = api.create_league(s2["id"], "L1t", actor_id=ADMIN)
-        l2t = api.create_league(s2["id"], "L2t", actor_id=ADMIN)
+        l1t = api.create_league(s1["id"], "L1t", actor_id=ADMIN)
+        l2t = api.create_league(s1["id"], "L2t", actor_id=ADMIN)
         club = api.create_club("C", actor_id=ADMIN)
         team_a = api.create_team(club["id"], None, "A", actor_id=ADMIN,
-                                 program_id=program["id"])
+                                 league_id=l1t["id"])
         team_b = api.create_team(club["id"], None, "B", actor_id=ADMIN,
-                                 program_id=program["id"])
-        src = api.create_league(s1["id"], "Src", actor_id=ADMIN)
+                                 league_id=l2t["id"])
         api.register_team_for_season(s1["id"], team_a["id"], actor_id=ADMIN,
-                                     league_id=src["id"])
+                                     league_id=l1t["id"])
         api.register_team_for_season(s1["id"], team_b["id"], actor_id=ADMIN,
-                                     league_id=src["id"])
+                                     league_id=l2t["id"])
         return s1, s2, l1t, l2t, team_a, team_b
 
-    def test_conflicting_active_target_rejected_zero_mutation(self):
+    def test_rollover_into_non_permanent_league_rejected_zero_mutation(self):
         def case(api, store):
             s1, s2, l1t, l2t, team_a, team_b = self._two_league_target(api)
-            # team_a already active in the target under l1t.
-            api.register_team_for_season(s2["id"], team_a["id"], actor_id=ADMIN,
-                                         league_id=l1t["id"])
             audits_before = len(store.all_setup_audit())
-            # A valid team_b→l1t selection first, then conflicting team_a→l2t.
+            # A valid team_a→l1t (its permanent league) first, then the invalid
+            # team_b→l1t (team_b's permanent league is l2t). The whole batch must
+            # abort before any write.
             res = api.roll_forward_registrations_v2(
                 s1["id"], s2["id"],
-                selections=[{"team_id": team_b["id"], "league_id": l1t["id"]},
-                            {"team_id": team_a["id"], "league_id": l2t["id"]}],
+                selections=[{"team_id": team_a["id"], "league_id": l1t["id"]},
+                            {"team_id": team_b["id"], "league_id": l1t["id"]}],
                 actor_id=ADMIN)
             self.assertEqual(res["error"]["code"], "validation_error", res)
             self.assertEqual(res["error"]["details"]["reason"],
-                             "rollover_conflicts_active_registration", res)
+                             "rollover_league_not_team_league", res)
             active = {r.team_id: r for r in
                       store.registrations_for_season(s2["id"]) if r.active}
-            self.assertEqual(active[team_a["id"]].league_id, l1t["id"])
-            self.assertNotIn(team_b["id"], active)
+            self.assertEqual(active, {})
             self.assertEqual(len(store.all_setup_audit()), audits_before)
 
         self._run(case)

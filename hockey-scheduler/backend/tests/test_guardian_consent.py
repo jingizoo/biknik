@@ -35,7 +35,7 @@ from http.server import ThreadingHTTPServer
 from helpers import BACKEND, FakeClock  # noqa: F401  (BACKEND sets up sys.path)
 
 from hockey_scheduler.api import ApiService
-from hockey_scheduler.domain import Division, Player, Position, Team
+from hockey_scheduler.domain import Division, LeagueSeason, Player, Position, Team
 from hockey_scheduler.domain.errors import ValidationError
 from hockey_scheduler.store import InMemoryStore
 from hockey_scheduler.web import server as srv
@@ -43,7 +43,8 @@ from hockey_scheduler.web import server as srv
 
 def _seeded_api():
     s = InMemoryStore()
-    s.add_division(Division(id="d", season_id="se", name="U16 Elite"))
+    s.add_league_season(LeagueSeason(id="ls", league_id="l", season_id="se"))
+    s.add_division(Division(id="d", league_season_id="ls", name="U16 Elite"))
     s.add_team(Team(id="home", name="Home", division="U16 Elite", division_id="d"))
     s.add_player(Player(id="junior", team_id="home", name="Junior J.",
                         position=Position.FORWARD))

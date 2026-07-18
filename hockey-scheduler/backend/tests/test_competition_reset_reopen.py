@@ -23,6 +23,7 @@ from hockey_scheduler.store import SqlStore
 from hockey_scheduler.store.sql_store import migrate
 
 _VERSION = "028_competition_reset"
+_V035 = "035_competition_hierarchy_reset"
 
 
 def _sql_targets():
@@ -37,6 +38,35 @@ def _sql_targets():
 
 def _exec(store, sql, params=()):
     store.conn.cursor().execute(store.dialect.sql(sql), params)
+
+
+def _downgrade_035(store):
+    """Reverse migration 035 (#283 competition-hierarchy reset) back to the
+    POST-028 schema and un-record it, so ``_downgrade_028`` can finish reversing
+    to pre-028 and a re-``migrate`` re-applies 028 AND 035 over legacy-shaped
+    rows. Runs on a freshly-migrated (empty) database — only the SCHEMA is
+    reversed."""
+    with store.transaction():
+        cur = store.conn.cursor()
+        cur.execute("DROP INDEX IF EXISTS ix_teams_league")
+        cur.execute("ALTER TABLE teams DROP COLUMN league_id")
+        cur.execute("DROP INDEX IF EXISTS ux_team_league_season")
+        cur.execute("DROP INDEX IF EXISTS ix_reg_league_season_division")
+        cur.execute("ALTER TABLE season_team_registrations "
+                    "DROP COLUMN league_season_id")
+        cur.execute("ALTER TABLE season_team_registrations ADD COLUMN season_id TEXT")
+        cur.execute("ALTER TABLE season_team_registrations ADD COLUMN league_id TEXT")
+        cur.execute("DROP INDEX IF EXISTS ix_divisions_league_season")
+        cur.execute("ALTER TABLE divisions DROP COLUMN league_season_id")
+        cur.execute("ALTER TABLE divisions ADD COLUMN season_id TEXT")
+        cur.execute("ALTER TABLE divisions ADD COLUMN league_id TEXT")
+        cur.execute("DROP INDEX IF EXISTS ix_leagues_program")
+        cur.execute("ALTER TABLE leagues DROP COLUMN program_id")
+        cur.execute("ALTER TABLE leagues ADD COLUMN season_id TEXT")
+        cur.execute("DROP INDEX IF EXISTS ux_league_season")
+        cur.execute("DROP TABLE IF EXISTS league_seasons")
+        cur.execute(store.dialect.sql(
+            "DELETE FROM schema_migrations WHERE version = ?"), (_V035,))
 
 
 def _downgrade_028(store):
@@ -107,10 +137,12 @@ class C1bUpgradedReopenTest(unittest.TestCase):
                 first = SqlStore(url)
                 if is_shared:
                     first.reset_schema()
+                _downgrade_035(first)
                 _downgrade_028(first)
                 _seed_pre028(first)
-                migrate(first.conn, first.dialect)  # apply 028
+                migrate(first.conn, first.dialect)  # apply 028 AND 035
                 self.assertIn(_VERSION, first.migration_status()["applied"], label)
+                self.assertIn(_V035, first.migration_status()["applied"], label)
                 first.close()
 
                 # 2. A fresh store against the same database (a restart) reads
@@ -118,6 +150,7 @@ class C1bUpgradedReopenTest(unittest.TestCase):
                 store = SqlStore(url)
                 try:
                     self.assertIn(_VERSION, store.migration_status()["applied"], label)
+                    self.assertIn(_V035, store.migration_status()["applied"], label)
 
                     prog = store.get_program("prog1")
                     self.assertIsNotNone(prog, label)
@@ -126,26 +159,34 @@ class C1bUpgradedReopenTest(unittest.TestCase):
                     season = store.get_season("s1")
                     self.assertEqual(season.program_id, "prog1", label)
 
+                    # #283: League is now a permanent child of the Program; its
+                    # participation in s1 is a LeagueSeason (id 'ls_'<league id>).
                     league = store.get_league("lg1")
-                    self.assertEqual(league.season_id, "s1", label)
+                    self.assertEqual(league.program_id, "prog1", label)
 
+                    league_season = store.get_league_season("ls_lg1")
+                    self.assertEqual(league_season.league_id, "lg1", label)
+                    self.assertEqual(league_season.season_id, "s1", label)
+
+                    # Division hangs off the LeagueSeason, not the Season/League.
                     division = store.get_division("d1")
-                    self.assertEqual(division.season_id, "s1", label)
-                    self.assertEqual(division.league_id, "lg1", label)
+                    self.assertEqual(division.league_season_id, "ls_lg1", label)
 
+                    # Team reparented onto its Program AND assigned its permanent
+                    # League (its sole registration resolves to lg1).
                     team = store.get_team("tm1")
                     self.assertEqual(team.program_id, "prog1", label)
+                    self.assertEqual(team.league_id, "lg1", label)
 
                     reg = store.get_season_team_registration("r1")
-                    self.assertEqual(reg.season_id, "s1", label)
+                    self.assertEqual(reg.league_season_id, "ls_lg1", label)
                     self.assertEqual(reg.team_id, "tm1", label)
                     self.assertEqual(reg.division_id, "d1", label)
-                    self.assertEqual(reg.league_id, "lg1", label)  # backfilled
 
                     game = store.get_game("g1")
                     self.assertEqual(game.season_id, "s1", label)
                     self.assertEqual(game.division_id, "d1", label)
-                    self.assertEqual(game.league_id, "lg1", label)  # backfilled
+                    self.assertEqual(game.league_id, "lg1", label)  # repointed
                 finally:
                     store.close()
 

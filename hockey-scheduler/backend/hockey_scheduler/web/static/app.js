@@ -55,6 +55,14 @@ let dashAvailability = null;        // availability-summary for the coach dashbo
 let dashSubQueue = null;            // substitute-candidates for the coach dashboard's next game (#146)
 let playersList = [];               // [{id,name,team_id,position,jersey_number,...}] for Setup (#114)
 let leagueTeams = {};               // program_id -> [{id,name,program_id}] permanent members (#180/#233 v2)
+// #283 Slice B: the permanent Program → League membership tree, derived from
+// the canonical hierarchy so the Setup UI can render a team's permanent League
+// and offer a league-to-league transfer (promotion/relegation). Keyed by
+// program for the transfer picker's program-scoped options; the flat list backs
+// the team-create drawer's optional permanent-League select.
+let permLeaguesByProgram = {};      // program_id -> [{id,name,programName}]
+let allPermLeagues = [];            // [{id,name,programName}] across all programs
+let teamPermLeague = {};            // team_id -> {id,name} permanent League (#283 Slice E)
 let seasonRegs = {};                // season_id -> [{id,team_id,league_id,division_id,active}] registrations (#180/#233 v2)
 let seasonVenueAccess = {};         // season_id -> [{id,season_id,venue_id,active}] (#233 Slice E)
 let leagueDivisions = {};           // league_id -> [{id,name,...}] — cascade data for the League→Division
@@ -73,7 +81,7 @@ let tokenForm = { recipient_ref: "", provider: "fcm", token: "", label: "" };
 let movingGameId = null;    // click-to-move fallback: game awaiting a destination slot
 let conflict = null;        // {ok, title, lines[], undo?} — calendar side panel (#43/#153)
 let pendingMove = null;     // {gid, slotId, willUnpublish, willUnlock} — move awaiting confirmation (#153)
-let pendingReassign = null; // {kind, parent, id, name, curId, seasonId} — setup reassignment awaiting confirm (#166)
+let pendingReassign = null; // {kind, parent, id, name, curId, seasonId, programId} — setup reassignment awaiting confirm (#166, programId #283)
 let drawer = null;          // {kind} when a Setup create drawer is open (#44)
 let drawerError = "";       // validation/API error shown inside the open drawer
 let drawerValues = {};      // {fieldId: value} preserved across re-render on error
@@ -647,15 +655,28 @@ const SETUP_ENTITIES = [
     // A team is a permanent member of a LEAGUE (#180) — its season/division is
     // set separately via Season participation, so the subtitle shows the club
     // only, not a (now season-specific) division.
-    list: (ov) => (ov.teams || []).map((t) => ({
-      id: t.id, title: t.name,
-      sub: t.club_name || "No club",
-    })),
+    // #283 Slice E: the subtitle shows a Team's PERMANENT League (its
+    // competition membership) alongside its Club — the seasonal
+    // Season→LeagueSeason→Division participation is shown separately in the
+    // Hierarchy view, never conflated with the permanent identity here.
+    list: (ov) => (ov.teams || []).map((t) => {
+      const lg = teamPermLeague[t.id];
+      return {
+        id: t.id, title: t.name,
+        sub: [lg ? `🎚️ ${lg.name}` : "No league",
+              t.club_name || "No club"].join(" · "),
+      };
+    }),
     fields: [
       { id: "f-team-club", label: "Club (optional)", type: "select", ofNoun: "club",
         options: (ov) => [["", "— none —"]].concat((ov.clubs || []).map((c) => [c.id, c.name])) },
-      { id: "f-team-league", label: "Program", type: "select", required: true, ofNoun: "league",
-        options: (ov) => (ov.programs || []).map((l) => [l.id, l.name]) },
+      // #283 Slice E: a Team is created under its PERMANENT League (required);
+      // the backend derives its Program from that League, so no Program field is
+      // needed. A league-less Team is only a legacy/migration remediation state,
+      // never a fresh canonical create.
+      { id: "f-team-perm-league", label: "Permanent league", type: "select", required: true,
+        ofNoun: "level",
+        options: () => allPermLeagues.map((lg) => [lg.id, `${lg.programName} · ${lg.name}`]) },
       { id: "f-team", label: "Team name", required: true, placeholder: "e.g. U14 Eagles" }] },
   // Organization (#166): the facility owner/operator that owns venues — a rink
   // company, distinct from a hockey Club. Arena-side, like venue/rink.
@@ -753,7 +774,7 @@ const SETUP_POST = {
   level: () => post("/api/v2/setup/league", { season_id: val("f-level-season"), name: val("f-level"), sort_order: val("f-level-sort") ? Number(val("f-level-sort")) : 0 }),
   division: () => post("/api/v2/setup/division", { league_id: val("f-div-league"), name: val("f-div"), age_group: val("f-div-age") }),
   club: () => post("/api/v2/setup/club", { name: val("f-club") }),
-  team: () => post("/api/v2/setup/team", { program_id: val("f-team-league"), club_id: val("f-team-club") || null, name: val("f-team") }),
+  team: () => post("/api/v2/setup/team", { league_id: val("f-team-perm-league") || null, club_id: val("f-team-club") || null, name: val("f-team") }),
   organization: () => post("/api/v2/setup/organization", { name: val("f-org"), short_name: val("f-org-short") }),
   venue: () => post("/api/v2/setup/venue", { name: val("f-venue"), organization_id: val("f-venue-org") || null }),
   rink: () => post("/api/v2/setup/rink", { venue_id: val("f-rink-venue"), name: val("f-rink") }),
@@ -819,6 +840,15 @@ const REASSIGN = {
     // unassign a Team's Club from the reassign panel.
     perm: "manage_setup", noun: "club", nullable: true, risky: false,
     options: (ov) => (ov.clubs || []).map((c) => [c.id, c.name]) },
+  // team:league (#283 Slice B): move a Team to a different PERMANENT League —
+  // promotion/relegation/transfer (rule 10). Not nullable (a Team is always
+  // league-permanent once assigned) and risky (it changes the Team's standing
+  // competition membership). Candidates are the permanent Leagues in the Team's
+  // OWN program (a Team can't cross programs), scoped via pr.programId.
+  "team:league": {
+    perm: "manage_setup", noun: "league", nullable: false, risky: true,
+    warn: "Moving a team to a different league changes its permanent competition membership. Past registrations, games, and standings are kept as history.",
+    options: (ov, pr) => (permLeaguesByProgram[pr.programId] || []).map((lg) => [lg.id, lg.name]) },
   // team:division removed (#233 B2c): a Team has no seasonal Division of its
   // own — participation is a SeasonTeamRegistration (League required,
   // Division optional), moved via the registration's own League→Division
@@ -847,18 +877,22 @@ const REASSIGN_V2 = {
   "league:organization": { kind: "program", parent: "organization", bodyKey: "operator_organization_id" },
   "division:level": { kind: "division", parent: "league", bodyKey: "league_id" },
   "team:club": { kind: "team", parent: "club", bodyKey: "club_id" },
+  "team:league": { kind: "team", parent: "league", bodyKey: "league_id" },
   "player:team": { kind: "player", parent: "team", bodyKey: "team_id" },
   "rink:venue": { kind: "rink", parent: "venue", bodyKey: "venue_id" },
   "venue:organization": { kind: "venue", parent: "organization", bodyKey: "organization_id" },
 };
 // A small "⇄ Move" button that opens the reassignment confirm panel, seeded
 // with the record's current parent so the operator sees where it sits now.
-function reassignBtn(kind, parent, rec, curId, seasonId) {
+function reassignBtn(kind, parent, rec, curId, seasonId, programId) {
   const cfg = REASSIGN[`${kind}:${parent}`];
   if (!cfg || !hasPerm(cfg.perm)) return "";
+  // programId scopes the candidate list for a permanent-League transfer to the
+  // Team's own program (#283 Slice B) — other moves ignore it.
   return `<button class="act ghost xs tn-reassign-btn" data-reassign="${kind}:${parent}"
     data-rz-id="${esc(rec.id)}" data-rz-name="${esc(rec.name || rec.id)}"
     data-rz-cur="${esc(curId || "")}" data-rz-season="${esc(seasonId || "")}"
+    data-rz-program="${esc(programId || "")}"
     title="Move to a different ${esc(entNoun(cfg))}">⇄ Move</button>`;
 }
 // The confirm panel: pick a new parent, see a warning for risky moves, commit.
@@ -1571,22 +1605,52 @@ function renderSetupHierarchy(sv, hv, ov) {
       <div class="tree-note">Programs, seasons, leagues, and divisions are visible to setup operators.</div></section>`;
   }
 
-  // -- Permanent program teams (#180): a team belongs permanently to its
-  // league, independent of any season. This is the first-class place a team
-  // "exists"; season/division is participation, shown separately below. --
+  // -- Permanent teams (#283 Slice B): a team belongs permanently to a LEAGUE
+  // (Team.league_id), which belongs permanently to a Program — membership that
+  // persists across Seasons. This is the first-class place a team "exists";
+  // its Season/Division participation is shown separately below. Consumed from
+  // the canonical hierarchy (hv.programs[].leagues[] + teams_without_league),
+  // so nesting matches the server's parentage exactly. Each team offers a
+  // league-to-league transfer (⇄ Move, promotion/relegation) and a Club move;
+  // teams with no permanent League yet are surfaced for inline assignment. --
+  const permTeamLeaf = (t, curLeagueId, programId) =>
+    `<div class="tn-leaf"><span class="tn-label">👥 ${esc(t.name)}</span>${
+      t.player_count != null ? `<span class="tn-meta">${t.player_count} player${t.player_count === 1 ? "" : "s"}</span>` : ""}${
+      reassignBtn("team", "league", t, curLeagueId, "", programId)}${
+      reassignBtn("team", "club", t, t.club_id)}${delBtn("team", t.id, t.name)}</div>`;
   const permanentTeams = `<section class="tree-panel">
-    <div class="tree-head"><span class="tree-title">👥 Permanent program teams</span>
-      <span class="tree-sub">Program → its permanent member teams</span></div>
-    ${(ov.leagues || []).map((lg) => {
-      const teams = leagueTeams[lg.id] || [];
-      const rows = teams.map((t) =>
-        `<div class="tn-leaf"><span class="tn-label">👥 ${esc(t.name)}</span>${
-          reassignBtn("team", "club", t, t.club_id)}${delBtn("team", t.id, t.name)}</div>`).join("")
-        || `<div class="tn-empty">No teams yet. Add a permanent team to ${esc(lg.name)}.</div>`;
+    <div class="tree-head"><span class="tree-title">👥 Permanent teams</span>
+      <span class="tree-sub">Program → League → its permanent member teams</span></div>
+    ${(hv.programs || []).map((program) => {
+      const leagues = program.leagues || [];
+      const loose = program.teams_without_league || [];
+      const totalTeams = leagues.reduce((n, lg) => n + (lg.teams || []).length, 0) + loose.length;
+      const leagueBlocks = leagues.map((lg) => {
+        const teams = lg.teams || [];
+        const scount = lg.season_count || 0;
+        const rows = teams.map((t) => permTeamLeaf(t, lg.id, program.id)).join("")
+          || `<div class="tn-empty">No teams yet. Add a permanent team to ${esc(lg.name)}.</div>`;
+        return `<details class="tn" open><summary class="tn-sum">
+            <span class="tn-label">🎚️ ${esc(lg.name)}</span>
+            <span class="tn-meta">${teams.length} team${teams.length === 1 ? "" : "s"} · ${scount} season${scount === 1 ? "" : "s"}</span></summary>
+          <div class="tn-children">${rows}${treeAdd("team", "Add team to " + lg.name, "f-team-perm-league", lg.id)}</div>
+        </details>`;
+      }).join("");
+      // Teams with a Program but no permanent League yet — surfaced (never
+      // hidden) with a ⇄ Move control so an operator can assign one inline.
+      const looseBlock = loose.length
+        ? `<details class="tn" open><summary class="tn-sum">
+            <span class="tn-label tn-warn-text">🏅 No league</span>
+            <span class="tn-meta">${loose.length} team${loose.length === 1 ? "" : "s"}</span></summary>
+          <div class="tn-children">${loose.map((t) => permTeamLeaf(t, "", program.id)).join("")}</div>
+        </details>` : "";
+      const inner = (leagueBlocks || looseBlock)
+        ? `${leagueBlocks}${looseBlock}`
+        : `<div class="tn-empty">No leagues in this program yet. Add a league under a season first.</div>`;
       return `<details class="tn" open><summary class="tn-sum">
-          <span class="tn-label">🏆 ${esc(lg.name)}</span>
-          <span class="tn-meta">${teams.length} team${teams.length === 1 ? "" : "s"}</span></summary>
-        <div class="tn-children">${rows}${treeAdd("team", "Add team to " + lg.name, "f-team-league", lg.id)}</div>
+          <span class="tn-label">🏆 ${esc(program.name)}</span>
+          <span class="tn-meta">${totalTeams} team${totalTeams === 1 ? "" : "s"}</span></summary>
+        <div class="tn-children">${inner}</div>
       </details>`;
     }).join("") || `<div class="tn-empty">No programs yet. Add a program, then its teams.</div>`}
   </section>`;
@@ -1963,19 +2027,24 @@ function renderRollover(hv, ov) {
     // preselected. Division stays optional and defaults to "No division",
     // scoped to whichever League is currently selected. The commit button
     // stays disabled until every checked team has a League.
-    const single = toLeagues.length === 1;
+    // #283 Slice E: a Team only ever rolls into its OWN permanent League — the
+    // backend rejects any other. So each row's target League is FIXED to the
+    // team's permanent League (never a free picker), and its Division options
+    // are that League's divisions in the target season.
     const carryRows = eligible.map((team) => {
-      const leagueOptsHtml = single
-        ? opt(toLeagues[0].id, toLeagues[0].name, true)
-        : `<option value="">Choose a league…</option>${toLeagues.map((lv) => opt(lv.id, lv.name)).join("")}`;
-      const initialDivs = single ? (toLeagues[0].divisions || []) : [];
+      const perm = teamPermLeague[team.id];
+      const permInTo = perm && toLeagues.find((lv) => lv.id === perm.id);
+      const leagueCell = perm
+        ? `<select class="reg-league" data-rollover-league="${esc(team.id)}"><option value="${esc(perm.id)}" selected>${esc(perm.name)}</option></select>`
+        : `<select class="reg-league" data-rollover-league="${esc(team.id)}"><option value="">No permanent league</option></select>`;
+      const initialDivs = permInTo ? (permInTo.divisions || []) : [];
       return `<div class="tn-leaf reg-row">
         <label class="ro-pick"><input type="checkbox" data-rollover-pick="${esc(team.id)}">
           <span class="tn-label">👥 ${esc(team.name)}</span></label>
-        <select class="reg-league" data-rollover-league="${esc(team.id)}">${leagueOptsHtml}</select>
+        ${leagueCell}
         <select class="reg-div" data-rollover-div="${esc(team.id)}"><option value="">No division</option>${
           initialDivs.map((d) => opt(d.id, d.name)).join("")}</select>
-        <span class="ro-row-err" hidden>Pick a target league</span></div>`;
+        <span class="ro-row-err" hidden>This team has no permanent league</span></div>`;
     }).join("");
     let carry;
     if (!toLeagues.length) {
@@ -2441,9 +2510,18 @@ function renderWizard(ov) {
   // and every downstream control (Division/Home/Away/Create) stays disabled
   // until the operator picks one explicitly.
   const leagues = ov.levels || [];
-  if (!wizard.league_id && leagues.length === 1) wizard.league_id = leagues[0].id;
+  const seasons = ov.seasons || [];
+  // #283 Slice D: an Exhibition (friendly) game may cross League lines. It has
+  // no League/Division scope and never counts toward standings — it is
+  // Season-scoped, and its two teams are any active participants in that
+  // Season. A regular game keeps the League → Division cascade below.
+  const isExhibition = !!wizard.exhibition;
+  if (isExhibition && !wizard.season_id && seasons.length === 1) wizard.season_id = seasons[0].id;
+  if (!isExhibition && !wizard.league_id && leagues.length === 1) wizard.league_id = leagues[0].id;
   const leagueChosen = !!wizard.league_id;
-  const divs = leagueChosen ? ov.divisions.filter((d) => d.level_id === wizard.league_id) : [];
+  const seasonChosen = !!wizard.season_id;
+  const ready = isExhibition ? seasonChosen : leagueChosen;
+  const divs = (!isExhibition && leagueChosen) ? ov.divisions.filter((d) => d.level_id === wizard.league_id) : [];
   if (wizard.division_id && !divs.find((d) => d.id === wizard.division_id)) wizard.division_id = "";
   // Teams eligible for this game are those with an ACTIVE SeasonTeamRegistration
   // in the chosen League (#180, #233 B2c) — and, when a Division is also
@@ -2452,30 +2530,41 @@ function renderWizard(ov) {
   // mirrors the server's registration-based game-creation guard, so the
   // picker only offers teams the server will accept. Empty until a League is
   // explicitly chosen.
-  const registeredIds = leagueChosen ? new Set((ov.registrations || [])
-    .filter((r) => r.league_id === wizard.league_id
-      && (!wizard.division_id || r.division_id === wizard.division_id))
-    .map((r) => r.team_id)) : new Set();
+  // Exhibition: any team registered in the chosen Season (any League). Regular:
+  // teams registered in the chosen League (and Division, when one is chosen).
+  const registeredIds = isExhibition
+    ? new Set((ov.registrations || [])
+        .filter((r) => r.season_id === wizard.season_id).map((r) => r.team_id))
+    : (leagueChosen ? new Set((ov.registrations || [])
+        .filter((r) => r.league_id === wizard.league_id
+          && (!wizard.division_id || r.division_id === wizard.division_id))
+        .map((r) => r.team_id)) : new Set());
   const teams = ov.teams.filter((t) => registeredIds.has(t.id));
   if (!teams.find((t) => t.id === wizard.home_id)) wizard.home_id = teams[0] ? teams[0].id : "";
   const awayTeams = teams.filter((t) => t.id !== wizard.home_id);
   if (!awayTeams.find((t) => t.id === wizard.away_id)) wizard.away_id = awayTeams[0] ? awayTeams[0].id : "";
 
-  const sameLeague = wizard.home_id && wizard.away_id;
+  const bothChosen = wizard.home_id && wizard.away_id;
   const distinct = wizard.home_id && wizard.away_id && wizard.home_id !== wizard.away_id;
-  const ok = leagueChosen && sameLeague && distinct && slot.status === "available";
+  const ok = ready && bothChosen && distinct && slot.status === "available";
   const v = (good, t) => `<div class="valid ${good ? "ok" : "bad"}">${good ? "✓" : "✕"} ${t}</div>`;
-  const dis = leagueChosen ? "" : "disabled";
+  const dis = ready ? "" : "disabled";
   return `
     <div class="wizard">
       <h3>Schedule Game</h3>
       <div class="step">1 · Competition</div>
-      <select id="w-league" aria-label="League">${
-        leagueChosen ? "" : `<option value="" disabled selected>Select league…</option>`}${
-        leagues.map((lv) => opt(lv.id, lv.name, lv.id === wizard.league_id)).join("")}</select>
+      <label class="wiz-exhibition"><input type="checkbox" id="w-exhibition"${isExhibition ? " checked" : ""}> Exhibition (friendly — may cross leagues, never counts toward standings)</label>
       <div style="height:8px"></div>
-      <select id="w-div" aria-label="Division" ${dis}><option value="">No division</option>${
-        divs.map((d) => opt(d.id, d.name, d.id === wizard.division_id)).join("")}</select>
+      ${isExhibition
+        ? `<select id="w-season" aria-label="Season">${
+            seasonChosen ? "" : `<option value="" disabled selected>Select season…</option>`}${
+            seasons.map((s) => opt(s.id, s.name, s.id === wizard.season_id)).join("")}</select>`
+        : `<select id="w-league" aria-label="League">${
+            leagueChosen ? "" : `<option value="" disabled selected>Select league…</option>`}${
+            leagues.map((lv) => opt(lv.id, lv.name, lv.id === wizard.league_id)).join("")}</select>
+          <div style="height:8px"></div>
+          <select id="w-div" aria-label="Division" ${dis}><option value="">No division</option>${
+            divs.map((d) => opt(d.id, d.name, d.id === wizard.division_id)).join("")}</select>`}
       <div class="step">2 · Teams</div>
       <select id="w-home" aria-label="Home team" ${dis}>${teams.map((t) => opt(t.id, t.name, t.id === wizard.home_id)).join("")}</select>
       <div style="height:8px"></div>
@@ -2485,15 +2574,18 @@ function renderWizard(ov) {
         <div class="li-main"><div class="li-title">${esc(slot.rink_name)}</div>
           <div class="li-sub">${esc(slotVenueName(ov, slot))}</div></div></div>
       <div class="step">4 · Validation</div>
-      ${v(leagueChosen, "League selected")}
-      ${v(!!teams.length, "Same league")}
+      ${v(ready, isExhibition ? "Season selected" : "League selected")}
+      ${v(!!teams.length, isExhibition ? "Teams registered this season" : "Same league")}
       ${v(distinct, "Home and away are different teams")}
       ${v(slot.status === "available", "Ice slot is available")}
       ${v(true, "Public-safe junior fixture (no PII)")}
       <div class="step">5 · Review</div>
       <div class="review">
-        <div class="kv"><span class="k">League</span><span class="v">${esc((leagues.find((lv) => lv.id === wizard.league_id) || {}).name || "")}</span></div>
-        <div class="kv"><span class="k">Division</span><span class="v">${esc((divs.find((d) => d.id === wizard.division_id) || {}).name || "No division")}</span></div>
+        ${isExhibition
+          ? `<div class="kv"><span class="k">Type</span><span class="v">Exhibition (friendly)</span></div>
+             <div class="kv"><span class="k">Season</span><span class="v">${esc((seasons.find((s) => s.id === wizard.season_id) || {}).name || "")}</span></div>`
+          : `<div class="kv"><span class="k">League</span><span class="v">${esc((leagues.find((lv) => lv.id === wizard.league_id) || {}).name || "")}</span></div>
+             <div class="kv"><span class="k">Division</span><span class="v">${esc((divs.find((d) => d.id === wizard.division_id) || {}).name || "No division")}</span></div>`}
         <div class="kv"><span class="k">Home</span><span class="v">${esc((teams.find((t) => t.id === wizard.home_id) || {}).name || "—")}</span></div>
         <div class="kv"><span class="k">Away</span><span class="v">${esc((awayTeams.find((t) => t.id === wizard.away_id) || {}).name || "—")}</span></div>
         <div class="kv"><span class="k">Venue · Rink</span><span class="v">${esc(slotVenueName(ov, slot))} · ${esc(slot.rink_name)}</span></div>
@@ -4879,9 +4971,24 @@ async function render() {
       // requested ids are consistently canonical; hv is only populated under
       // manage_setup, which already gates this whole block.
       leagueTeams = {}; seasonRegs = {}; leagueDivisions = {}; seasonVenueAccess = {};
+      permLeaguesByProgram = {}; allPermLeagues = []; teamPermLeague = {};
       for (const program of (hv.programs || [])) {
         const r = await getJSON(`/api/v2/setup/programs/${program.id}/teams`);
         leagueTeams[program.id] = (r && r.teams) || [];
+        // #283 Slice B: the program's permanent Leagues (from the canonical
+        // hierarchy) back both the permanent-team tree and the team transfer/
+        // create pickers — each carries its program name for a qualified label.
+        const permLgs = (program.leagues || []).map((lg) => ({
+          id: lg.id, name: lg.name, programName: program.name }));
+        permLeaguesByProgram[program.id] = permLgs;
+        permLgs.forEach((lg) => allPermLeagues.push(lg));
+        // #283 Slice E: map each Team to its permanent League (from the
+        // canonical permanent-league tree) so the Records team card can show it.
+        for (const lg of (program.leagues || [])) {
+          for (const t of (lg.teams || [])) {
+            teamPermLeague[t.id] = { id: lg.id, name: lg.name };
+          }
+        }
         for (const s of (program.seasons || [])) {
           const rr = await getJSON(`/api/v2/setup/seasons/${s.id}/team-registrations`);
           seasonRegs[s.id] = (rr && rr.registrations) || [];
@@ -5160,7 +5267,8 @@ async function render() {
     e.preventDefault();
     const [kind, parent] = b.dataset.reassign.split(":");
     pendingReassign = { kind, parent, id: b.dataset.rzId, name: b.dataset.rzName,
-                        curId: b.dataset.rzCur || "", seasonId: b.dataset.rzSeason || "" };
+                        curId: b.dataset.rzCur || "", seasonId: b.dataset.rzSeason || "",
+                        programId: b.dataset.rzProgram || "" };
     drawer = null; toast = ""; render();
   });
   c.querySelectorAll("[data-reassign-cancel]").forEach((b) => b.onclick = () => {
@@ -6141,6 +6249,13 @@ async function render() {
   const picker = document.getElementById("player-picker");
   if (picker) picker.onchange = (e) => { pickedPlayer = e.target.value; toast = ""; render(); };
   // wizard wiring (#233 B2c: League required, Division optional)
+  // #283 Slice D: the Exhibition toggle switches the game to a Season-scoped
+  // friendly (crosses leagues, no standings), so it resets the competition
+  // scope and team picks; a Season picker replaces the League/Division cascade.
+  const wex = document.getElementById("w-exhibition");
+  if (wex) wex.onchange = (e) => { wizard.exhibition = e.target.checked; wizard.league_id = ""; wizard.division_id = ""; wizard.home_id = null; wizard.away_id = null; render(); };
+  const ws = document.getElementById("w-season");
+  if (ws) ws.onchange = (e) => { wizard.season_id = e.target.value; wizard.home_id = null; wizard.away_id = null; render(); };
   const wl = document.getElementById("w-league");
   if (wl) wl.onchange = (e) => { wizard.league_id = e.target.value; wizard.division_id = ""; wizard.home_id = null; wizard.away_id = null; render(); };
   const wd = document.getElementById("w-div");
@@ -6152,16 +6267,26 @@ async function render() {
   const wc = c.querySelector("[data-wizcancel]"); if (wc) wc.onclick = () => { wizard = null; render(); };
   const wcr = c.querySelector("[data-wizcreate]");
   if (wcr) wcr.onclick = async () => {
-    // v2: League is REQUIRED (game scope); Division is optional (#233 B2c).
-    // season_id comes from the selected League, not a Division (which may be
-    // unset when the game is league-only).
-    const league = (ov.levels || []).find((lv) => lv.id === wizard.league_id);
-    const res = await post("/api/v2/setup/game", {
-      season_id: league ? league.season_id : (ov.seasons[0] || {}).id,
-      league_id: wizard.league_id, division_id: wizard.division_id || null,
-      home_team_id: wizard.home_id, away_team_id: wizard.away_id, ice_slot_id: wizard.slot_id,
-    });
-    if (res && !res.error) { toast = "Game scheduled."; currentGame = res.id; wizard = null; view = "games"; }
+    let body;
+    if (wizard.exhibition) {
+      // #283 Slice D: an Exhibition friendly is Season-scoped with no owning
+      // League/Division — it may pair teams from different Leagues and never
+      // counts toward standings.
+      body = { season_id: wizard.season_id, game_type: "exhibition",
+               home_team_id: wizard.home_id, away_team_id: wizard.away_id,
+               ice_slot_id: wizard.slot_id };
+    } else {
+      // v2: League is REQUIRED (game scope); Division is optional (#233 B2c).
+      // season_id comes from the selected League, not a Division (which may be
+      // unset when the game is league-only).
+      const league = (ov.levels || []).find((lv) => lv.id === wizard.league_id);
+      body = { season_id: league ? league.season_id : (ov.seasons[0] || {}).id,
+               league_id: wizard.league_id, division_id: wizard.division_id || null,
+               home_team_id: wizard.home_id, away_team_id: wizard.away_id,
+               ice_slot_id: wizard.slot_id };
+    }
+    const res = await post("/api/v2/setup/game", body);
+    if (res && !res.error) { toast = wizard.exhibition ? "Exhibition game scheduled." : "Game scheduled."; currentGame = res.id; wizard = null; view = "games"; }
     render();
   };
 }

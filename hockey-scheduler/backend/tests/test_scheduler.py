@@ -26,6 +26,7 @@ from hockey_scheduler.domain import (
     IceSlotStatus,
     IceSlotType,
     League,
+    LeagueSeason,
     Organization,
     Program,
     Rink,
@@ -119,15 +120,17 @@ class SchedulerContract:
         leaving ``league_id`` unset (#233 Slice G: a stale fixture omitting it
         would never exercise the Game.league_id stamping fix below)."""
         self._base()
-        self.store.add_league(League(id="lg1", season_id="se1", name="League"))
+        self.store.add_league(League(id="lg1", program_id="prog1", name="League"))
+        self.store.add_league_season(LeagueSeason(
+            id="ls_lg1_se1", league_id="lg1", season_id="se1"))
         self.store.add_division(Division(
-            id="div1", season_id="se1", name="D1", league_id="lg1"))
+            id="div1", league_season_id="ls_lg1_se1", name="D1"))
         for i in range(n_teams):
             self.store.add_team(Team(id=f"t{i}", name=f"Team {i}",
-                                     program_id="prog1"))
+                                     program_id="prog1", league_id="lg1"))
             self.store.add_season_team_registration(SeasonTeamRegistration(
-                id=f"streg_t{i}", season_id="se1", team_id=f"t{i}",
-                league_id="lg1", division_id="div1", active=True))
+                id=f"streg_t{i}", league_season_id="ls_lg1_se1", team_id=f"t{i}",
+                division_id="div1", active=True))
         self._slots(n_slots)
 
     def _league_two_divisions_fixture(self, per_division=2, n_slots=8):
@@ -135,22 +138,24 @@ class SchedulerContract:
         teams — for asserting a league-wide draft never pairs across
         Divisions (#233 Slice G)."""
         self._base()
-        self.store.add_league(League(id="lg1", season_id="se1", name="League"))
+        self.store.add_league(League(id="lg1", program_id="prog1", name="League"))
+        self.store.add_league_season(LeagueSeason(
+            id="ls_lg1_se1", league_id="lg1", season_id="se1"))
         self.store.add_division(Division(
-            id="gold", season_id="se1", name="Gold", league_id="lg1"))
+            id="gold", league_season_id="ls_lg1_se1", name="Gold"))
         self.store.add_division(Division(
-            id="silver", season_id="se1", name="Silver", league_id="lg1"))
+            id="silver", league_season_id="ls_lg1_se1", name="Silver"))
         for i in range(per_division):
             self.store.add_team(Team(id=f"g{i}", name=f"Gold {i}",
-                                     program_id="prog1"))
+                                     program_id="prog1", league_id="lg1"))
             self.store.add_season_team_registration(SeasonTeamRegistration(
-                id=f"streg_g{i}", season_id="se1", team_id=f"g{i}",
-                league_id="lg1", division_id="gold", active=True))
+                id=f"streg_g{i}", league_season_id="ls_lg1_se1", team_id=f"g{i}",
+                division_id="gold", active=True))
             self.store.add_team(Team(id=f"s{i}", name=f"Silver {i}",
-                                     program_id="prog1"))
+                                     program_id="prog1", league_id="lg1"))
             self.store.add_season_team_registration(SeasonTeamRegistration(
-                id=f"streg_s{i}", season_id="se1", team_id=f"s{i}",
-                league_id="lg1", division_id="silver", active=True))
+                id=f"streg_s{i}", league_season_id="ls_lg1_se1", team_id=f"s{i}",
+                division_id="silver", active=True))
         self._slots(n_slots)
 
     def _two_leagues_fixture(self, n_slots=8):
@@ -158,18 +163,22 @@ class SchedulerContract:
         asserting a league-wide draft rejects/excludes any Division reference
         that crosses League boundaries (#233 Slice G review)."""
         self._base()
-        self.store.add_league(League(id="lg1", season_id="se1", name="League One"))
-        self.store.add_league(League(id="lg2", season_id="se1", name="League Two"))
+        self.store.add_league(League(id="lg1", program_id="prog1", name="League One"))
+        self.store.add_league(League(id="lg2", program_id="prog1", name="League Two"))
+        self.store.add_league_season(LeagueSeason(
+            id="ls_lg1_se1", league_id="lg1", season_id="se1"))
+        self.store.add_league_season(LeagueSeason(
+            id="ls_lg2_se1", league_id="lg2", season_id="se1"))
         self.store.add_division(Division(
-            id="div1", season_id="se1", name="D1", league_id="lg1"))
+            id="div1", league_season_id="ls_lg1_se1", name="D1"))
         self.store.add_division(Division(
-            id="div2", season_id="se1", name="D2", league_id="lg2"))
+            id="div2", league_season_id="ls_lg2_se1", name="D2"))
         for i in range(2):
             self.store.add_team(Team(id=f"t{i}", name=f"Team {i}",
-                                     program_id="prog1"))
+                                     program_id="prog1", league_id="lg1"))
             self.store.add_season_team_registration(SeasonTeamRegistration(
-                id=f"streg_t{i}", season_id="se1", team_id=f"t{i}",
-                league_id="lg1", division_id="div1", active=True))
+                id=f"streg_t{i}", league_season_id="ls_lg1_se1", team_id=f"t{i}",
+                division_id="div1", active=True))
         self._slots(n_slots)
 
     # -- division-only entry point (#84/#85, unchanged behavior) -----------
@@ -381,10 +390,11 @@ class SchedulerContract:
         self._two_leagues_fixture()
         # league_id correctly names lg1, but division_id points to lg2's
         # Division — a corrupt/cross-League row that must never be trusted.
-        self.store.add_team(Team(id="bad", name="Bad Team", program_id="prog1"))
+        self.store.add_team(Team(id="bad", name="Bad Team", program_id="prog1",
+                                 league_id="lg1"))
         self.store.add_season_team_registration(SeasonTeamRegistration(
-            id="streg_bad", season_id="se1", team_id="bad",
-            league_id="lg1", division_id="div2", active=True))
+            id="streg_bad", league_season_id="ls_lg1_se1", team_id="bad",
+            division_id="div2", active=True))
         res = draft_schedule_for_league(self.store, "se1", "lg1")
         self.assertEqual(res["team_count"], 2)  # t0/t1 only; "bad" excluded
         played = {tid for g in res["draft_games"]
@@ -393,10 +403,11 @@ class SchedulerContract:
 
     def test_league_wide_commit_never_creates_cross_league_division_game(self):
         self._two_leagues_fixture()
-        self.store.add_team(Team(id="bad", name="Bad Team", program_id="prog1"))
+        self.store.add_team(Team(id="bad", name="Bad Team", program_id="prog1",
+                                 league_id="lg1"))
         self.store.add_season_team_registration(SeasonTeamRegistration(
-            id="streg_bad", season_id="se1", team_id="bad",
-            league_id="lg1", division_id="div2", active=True))
+            id="streg_bad", league_season_id="ls_lg1_se1", team_id="bad",
+            division_id="div2", active=True))
         result = self.api.commit_draft_schedule(
             season_id="se1", league_id="lg1", actor_id="admin")
         self.assertNotIn("error", result)
@@ -480,12 +491,10 @@ class SchedulerHttpTest(unittest.TestCase):
 
     def test_league_wide_draft_via_http(self):
         div = srv.STATE.api.store.all_divisions()[0].id
-        season_id = srv.STATE.api.store.get_division(div).season_id
-        league_id = None
-        for lg in srv.STATE.api.store.all_leagues():
-            if lg.season_id == season_id:
-                league_id = lg.id
-                break
+        ls = srv.STATE.api.store.get_league_season(
+            srv.STATE.api.store.get_division(div).league_season_id)
+        season_id = ls.season_id
+        league_id = ls.league_id
         c = self._client()
         self._req(c, "POST", "/api/auth/login", {"username": "admin", "password": "demo"})
         status, body = self._req(c, "POST", "/api/scheduler/draft",
@@ -502,17 +511,20 @@ class SchedulerHttpTest(unittest.TestCase):
 
     def test_league_wide_draft_rejects_cross_league_division_via_http(self):
         div = srv.STATE.api.store.all_divisions()[0].id
-        season_id = srv.STATE.api.store.get_division(div).season_id
-        league_id = None
-        for lg in srv.STATE.api.store.all_leagues():
-            if lg.season_id == season_id:
-                league_id = lg.id
-                break
-        other_league = League(id="lg_http_other", season_id=season_id,
+        ls = srv.STATE.api.store.get_league_season(
+            srv.STATE.api.store.get_division(div).league_season_id)
+        season_id = ls.season_id
+        league_id = ls.league_id
+        program_id = srv.STATE.api.store.get_season(season_id).program_id
+        other_league = League(id="lg_http_other", program_id=program_id,
                               name="Other League")
         srv.STATE.api.store.add_league(other_league)
-        other_division = Division(id="div_http_other", season_id=season_id,
-                                  name="Other Division", league_id="lg_http_other")
+        other_ls = LeagueSeason(id="ls_lg_http_other_" + season_id,
+                                league_id="lg_http_other", season_id=season_id)
+        srv.STATE.api.store.add_league_season(other_ls)
+        other_division = Division(id="div_http_other",
+                                  league_season_id=other_ls.id,
+                                  name="Other Division")
         srv.STATE.api.store.add_division(other_division)
         c = self._client()
         self._req(c, "POST", "/api/auth/login", {"username": "admin", "password": "demo"})

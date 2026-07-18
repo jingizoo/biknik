@@ -126,9 +126,14 @@ class HierarchyImportContract:
         # never written by this importer (#260 review).
         self.assertIsNone(venue.league_id)
         self.assertEqual(season.program_id, program.id)
-        self.assertEqual(league.season_id, season.id)
-        self.assertEqual(division.season_id, season.id)
-        self.assertEqual(division.league_id, league.id)
+        # #283: a League belongs to a Program; its participation in this Season
+        # is a LeagueSeason, off which the Division hangs.
+        self.assertEqual(league.program_id, program.id)
+        league_season = self.store.league_season_for(league.id, season.id)
+        self.assertIsNotNone(league_season)
+        div_ls = self.store.get_league_season(division.league_season_id)
+        self.assertEqual(div_ls.season_id, season.id)
+        self.assertEqual(div_ls.league_id, league.id)
         self.assertEqual({r.venue_id for r in self.store.all_rinks()},
                          {venue.id})
         # Club matched by club_code; LIONS resolves it, BEARS' blank
@@ -144,7 +149,9 @@ class HierarchyImportContract:
         self.assertIsNotNone(contact)
         self.assertEqual(contact.destination, "jane@example.com")
         reg = self.store.registration_for_team_in_season(season.id, lions.id)
-        self.assertEqual(reg.league_id, league.id)
+        self.assertEqual(
+            self.store.get_league_season(reg.league_season_id).league_id,
+            league.id)
         self.assertEqual(reg.division_id, division.id)
         self.assertTrue(reg.active)
         access = self.store.season_venue_access_for_pair(season.id, venue.id)
@@ -274,7 +281,7 @@ class HierarchyImportContract:
         result = self.api.commit_hierarchy_import(fx.full_payload(
             clubs_csv="",
             permanent_teams_csv=fx.permanent_teams_csv(
-                rows=("OVER55,LIONS,Lions,",)),
+                rows=("OVER55,L1,LIONS,Lions,",)),
             competition_csv=fx.competition_csv(rows=(
                 "OVER55,FALL26,Fall 2026,L1,Adult League,1,,,",)),
             registrations_csv=fx.registrations_csv(rows=("FALL26,LIONS,L1,",)),
@@ -298,7 +305,7 @@ class HierarchyImportContract:
         self.assertEqual(lions.club_id, club.id)
         result = self.api.commit_hierarchy_import(fx.full_payload(
             permanent_teams_csv=fx.permanent_teams_csv(
-                rows=("OVER55,LIONS,Lions,",))
+                rows=("OVER55,L1,LIONS,Lions,",))
         ), actor_id="admin")
         self.assertTrue(result["committed"], result.get("errors"))
         self.assertIsNone(by_ref(self.store.all_teams(), "LIONS").club_id)

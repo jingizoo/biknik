@@ -73,6 +73,11 @@ class ImportCommitServiceContract:
         league = self.setup.create_program("Test League", actor_id="admin")
         self.season = self.setup.create_season(
             league.id, "2026 Season", actor_id="admin")
+        # #283: teams register into a Season through a LeagueSeason, so the
+        # import target Season needs a League bound to it (the nine-sheet
+        # hierarchy import always establishes one via the competition sheet;
+        # this two-sheet teams+players import expects it to pre-exist).
+        self.setup.create_league(self.season.id, "L1", actor_id="admin")
 
     def _player(self, code):
         return next(p for p in self.store.all_players() if p.external_ref == code)
@@ -135,8 +140,7 @@ class ImportCommitServiceContract:
         reg = self.store.registration_for_team_in_season(self.season.id, t1.id)
         self.assertIsNotNone(reg)
         self.assertTrue(reg.active)
-        u16 = next(d for d in self.store.all_divisions()
-                   if d.name == "U16" and d.season_id == self.season.id)
+        u16 = self._u16()
         self.assertEqual(reg.division_id, u16.id)
 
     def test_import_registration_is_idempotent(self):
@@ -160,6 +164,7 @@ class ImportCommitServiceContract:
         first_div = first.division_id
         league_id = self.store.get_season(self.season.id).program_id
         season2 = self.setup.create_season(league_id, "2027", actor_id="admin")
+        self.setup.create_league(season2.id, "L1", actor_id="admin")
         self.api.commit_teams_players_import(
             season2.id, _valid_sheets_csv(), actor_id="admin")
         # Season 1's registration is unchanged…
@@ -204,8 +209,12 @@ class ImportCommitServiceContract:
         self.assertEqual(self.store.all_teams(), [])  # zero writes
 
     def _u16(self):
-        return next(d for d in self.store.all_divisions()
-                    if d.name == "U16" and d.season_id == self.season.id)
+        # #283: a Division's Season is reached through its LeagueSeason.
+        return next(
+            d for d in self.store.all_divisions()
+            if d.name == "U16"
+            and (ls := self.store.get_league_season(d.league_season_id))
+            and ls.season_id == self.season.id)
 
     def _t1_with_committed_game(self):
         """Import, then a committed U16 game for T1. Returns (t1, u16, game_id)."""

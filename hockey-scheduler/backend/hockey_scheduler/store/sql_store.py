@@ -29,6 +29,7 @@ from ..domain import (
     IceSlotType,
     GameResult,
     League,
+    LeagueSeason,
     Program,
     ContactDestination,
     DeliveryStatus,
@@ -65,6 +66,7 @@ from ..domain import (
     Season,
     SeasonTeamRegistration,
     SeasonVenueAccess,
+    TeamLeagueMigrationDecision,
     SelectionSource,
     Session,
     SetupAuditLog,
@@ -79,7 +81,9 @@ from ..domain.errors import IntegrityConflictError
 from .db import connect
 from .db_errors import translate_db_exception
 from .integrity_checks import (
+    assert_competition_hierarchy_reset_ready,
     assert_competition_reset_ready_c1b,
+    assert_regular_games_resolve_league_season,
     assert_no_duplicate_active_ice_slots,
     assert_no_duplicate_result_games,
     assert_no_duplicate_roster_players,
@@ -148,9 +152,12 @@ SPECS = {
     Program: Spec(Program, "programs"),
     Season: Spec(Season, "seasons", {"start_date": _dt(), "end_date": _dt()}),
     League: Spec(League, "leagues"),
+    LeagueSeason: Spec(LeagueSeason, "league_seasons"),
     Division: Spec(Division, "divisions"),
     SeasonTeamRegistration: Spec(
         SeasonTeamRegistration, "season_team_registrations", {"active": _bool()}),
+    TeamLeagueMigrationDecision: Spec(
+        TeamLeagueMigrationDecision, "team_league_migration_decisions"),
     SeasonVenueAccess: Spec(
         SeasonVenueAccess, "season_venue_access", {"active": _bool()}),
     Club: Spec(Club, "clubs"),
@@ -339,6 +346,8 @@ _PRE_MIGRATION_CHECKS = {
     "027_roster_entry_fks": assert_roster_refs_exist,
     "028_competition_reset": assert_competition_reset_ready_c1b,
     "029_season_venue_access": assert_venue_season_access_backfill_ready,
+    "035_competition_hierarchy_reset": assert_competition_hierarchy_reset_ready,
+    "037_game_league_season": assert_regular_games_resolve_league_season,
 }
 
 
@@ -798,33 +807,88 @@ class SqlStore:
     def seasons_for_program(self, program_id):
         return self._query(Season, "program_id = ?", (program_id,), order="id")
 
-    # Competition grouping: League (#233, formerly Level).
+    # Permanent competition grouping: League (#233/#283). A League is now a
+    # permanent child of a Program (``program_id``), not of a Season.
     def add_league(self, league): return self._insert(league)
     def get_league(self, league_id): return self._get(League, league_id)
     def all_leagues(self): return self._query(League, order="id")
     def save_league(self, league): return self._update(league)
+    def leagues_for_program(self, program_id):
+        return self._query(League, "program_id = ?", (program_id,), order="id")
+
+    # LeagueSeason (#283): a permanent League's participation in one Season.
+    def add_league_season(self, ls): return self._insert(ls)
+    def get_league_season(self, ls_id): return self._get(LeagueSeason, ls_id)
+    def all_league_seasons(self): return self._query(LeagueSeason, order="id")
+    def save_league_season(self, ls): return self._update(ls)
+    def league_seasons_for_season(self, season_id):
+        return self._query(LeagueSeason, "season_id = ?", (season_id,), order="id")
+    def league_seasons_for_league(self, league_id):
+        return self._query(LeagueSeason, "league_id = ?", (league_id,), order="id")
+    def league_season_for(self, league_id, season_id):
+        rows = self._query(LeagueSeason, "league_id = ? AND season_id = ?",
+                           (league_id, season_id))
+        return rows[0] if rows else None
 
     def add_division(self, division): return self._insert(division)
     def get_division(self, division_id): return self._get(Division, division_id)
     def all_divisions(self): return self._query(Division, order="id")
     def save_division(self, division): return self._update(division)
+    def divisions_for_league_season(self, league_season_id):
+        return self._query(Division, "league_season_id = ?",
+                           (league_season_id,), order="id")
     def divisions_for_season(self, season_id):
-        return self._query(Division, "season_id = ?", (season_id,), order="id")
+        """Every Division in a Season, across all its LeagueSeasons (#283
+        convenience for whole-Season reads)."""
+        return self._query(
+            Division,
+            "league_season_id IN (SELECT id FROM league_seasons WHERE season_id = ?)",
+            (season_id,), order="id")
 
-    # -- season team registrations (#180) ----------------------------------
+    # -- season team registrations (#180/#283) -----------------------------
     def add_season_team_registration(self, reg): return self._insert(reg)
     def get_season_team_registration(self, reg_id):
         return self._get(SeasonTeamRegistration, reg_id)
     def save_season_team_registration(self, reg): return self._update(reg)
     def all_season_team_registrations(self):
         return self._query(SeasonTeamRegistration, order="id")
-    def registrations_for_season(self, season_id):
-        return self._query(SeasonTeamRegistration, "season_id = ?",
-                           (season_id,), order="id")
-    def registration_for_team_in_season(self, season_id, team_id):
-        rows = self._query(SeasonTeamRegistration,
-                           "season_id = ? AND team_id = ?", (season_id, team_id))
+    def registrations_for_league_season(self, league_season_id):
+        return self._query(SeasonTeamRegistration, "league_season_id = ?",
+                           (league_season_id,), order="id")
+    def registration_for_team_in_league_season(self, league_season_id, team_id):
+        rows = self._query(
+            SeasonTeamRegistration,
+            "league_season_id = ? AND team_id = ?", (league_season_id, team_id))
         return rows[0] if rows else None
+    def registrations_for_season(self, season_id):
+        """Every registration in a Season, across all its LeagueSeasons (#283
+        convenience for whole-Season reads)."""
+        return self._query(
+            SeasonTeamRegistration,
+            "league_season_id IN (SELECT id FROM league_seasons WHERE season_id = ?)",
+            (season_id,), order="id")
+    def registration_for_team_in_season(self, season_id, team_id):
+        """A team's registration in a Season, across its LeagueSeasons (#283
+        back-compat convenience)."""
+        rows = self._query(
+            SeasonTeamRegistration,
+            "team_id = ? AND league_season_id IN "
+            "(SELECT id FROM league_seasons WHERE season_id = ?)",
+            (team_id, season_id))
+        return rows[0] if rows else None
+
+    # -- team → permanent League migration decisions (#283 migration 035) ---
+    def add_team_league_migration_decision(self, decision):
+        return self._insert(decision)
+    def all_team_league_migration_decisions(self):
+        return self._query(TeamLeagueMigrationDecision, order="id")
+    def team_league_migration_decision_for(self, team_id):
+        rows = self._query(TeamLeagueMigrationDecision, "team_id = ?", (team_id,))
+        return rows[0] if rows else None
+    def delete_team_league_migration_decision(self, decision_id):
+        with self._lock:
+            self._exec("DELETE FROM team_league_migration_decisions WHERE id = ?",
+                       (decision_id,))
 
     # -- season venue access (#233 Slice E) ---------------------------------
     def add_season_venue_access(self, sva): return self._insert(sva)

@@ -15,8 +15,11 @@ import os
 import unittest
 from pathlib import Path
 
+from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
+
 from hockey_scheduler.api.service import ApiService
-from hockey_scheduler.domain import Season, SeasonTeamRegistration, Team
+from hockey_scheduler.domain import (
+    LeagueSeason, Season, SeasonTeamRegistration, Team)
 from hockey_scheduler.services.league_scope import (
     league_id_for_game, team_registration_valid)
 from hockey_scheduler.store import InMemoryStore, SqlStore
@@ -123,10 +126,16 @@ class LegacyFieldIsInertContract:
     def _division(self, season_id, name):
         return self.api.create_division(season_id, name, actor_id=self.ACTOR)["id"]
 
-    def _team(self, name, division_id=None, program_id="_default"):
+    def _team(self, name, division_id=None, program_id="_default",
+              league_id=None):
+        # #283 Slice E: a Team needs a resolvable permanent League. Callers
+        # supply it via a ``division_id`` (League derived from its LeagueSeason)
+        # or an explicit ``league_id``; the Team's legacy ``division_id`` field
+        # is never set either way, so the "no legacy division" intent is kept.
         pid = self.league if program_id == "_default" else program_id
         return self.api.create_team(
-            self.club, division_id, name, actor_id=self.ACTOR, program_id=pid)["id"]
+            self.club, division_id, name, actor_id=self.ACTOR, program_id=pid,
+            league_id=league_id)["id"]
 
     def _slot(self, season_id):
         venue = self.api.create_venue("V", league_id=self.league, actor_id=self.ACTOR)["id"]
@@ -162,9 +171,15 @@ class LegacyFieldIsInertContract:
     def test_one_team_two_seasons_resolves_each_division(self):
         s1 = self._season("2026")
         s2 = self._season("2027")
-        d1 = self._division(s1, "D1")
-        d2 = self._division(s2, "D2")
-        team = self._team("Nomads")           # no legacy division at all
+        # #283: one permanent League spanning both Seasons (a League may span
+        # Seasons); each Season's Division hangs off that shared League, so the
+        # single team can legitimately register in both (rule 7).
+        league = self.api.create_league(s1, "L League", actor_id=self.ACTOR)["id"]
+        d1 = self.api.create_division(
+            s1, "D1", league_id=league, actor_id=self.ACTOR)["id"]
+        d2 = self.api.create_division(
+            s2, "D2", league_id=league, actor_id=self.ACTOR)["id"]
+        team = self._team("Nomads", league_id=league)  # no legacy division at all
         self._register(s1, team, d1)
         self._register(s2, team, d2)
         r1 = self.store.registration_for_team_in_season(s1, team)
@@ -182,10 +197,16 @@ class LegacyFieldIsInertContract:
     def test_changing_registration_leaves_legacy_field_and_history_untouched(self):
         s1 = self._season("2026")
         s2 = self._season("2027")
-        dA = self._division(s1, "A")
-        dB = self._division(s1, "B")
-        d2 = self._division(s2, "D2")
-        team = self._team("T")                       # legacy division_id = None
+        # #283: one permanent League spanning both Seasons so the single team
+        # can register in each (rule 7); dA/dB live in s1, d2 in s2.
+        league = self.api.create_league(s1, "L League", actor_id=self.ACTOR)["id"]
+        dA = self.api.create_division(
+            s1, "A", league_id=league, actor_id=self.ACTOR)["id"]
+        dB = self.api.create_division(
+            s1, "B", league_id=league, actor_id=self.ACTOR)["id"]
+        d2 = self.api.create_division(
+            s2, "D2", league_id=league, actor_id=self.ACTOR)["id"]
+        team = self._team("T", league_id=league)     # legacy division_id = None
         reg1 = self._register(s1, team, dA)
         reg2 = self._register(s2, team, d2)          # a second-season history row
         self.api.assign_season_team_division(reg1, dB, actor_id=self.ACTOR)
@@ -208,8 +229,10 @@ class LegacyFieldIsInertContract:
         orphan = Team(id=self.store.next_id("team"), name="Orphan",
                       division_id=dA, program_id=None)
         self.store.add_team(orphan)
+        # #283: a registration hangs off the division's LeagueSeason.
+        dA_ls = self.store.get_division(dA).league_season_id
         self.store.add_season_team_registration(SeasonTeamRegistration(
-            id=self.store.next_id("streg"), season_id=season,
+            id=self.store.next_id("streg"), league_season_id=dA_ls,
             team_id=orphan.id, division_id=dA, active=True))
         other = self._team("Other")
         self._register(season, other, dA)
@@ -233,9 +256,13 @@ class LegacyFieldIsInertContract:
         self.api.register_team_for_season(
             season, good, dA, actor_id=self.ACTOR, league_id=league)
 
+        # #283: every injected row hangs off this season's LeagueSeason (for the
+        # created league); operational validity is judged from there.
+        season_ls = self.store.league_season_for(league, season).id
+
         def bad_reg(team_id, division_id):
             self.store.add_season_team_registration(SeasonTeamRegistration(
-                id=self.store.next_id("streg"), season_id=season,
+                id=self.store.next_id("streg"), league_season_id=season_ls,
                 team_id=team_id, division_id=division_id, active=True))
 
         # cross-league team
@@ -252,7 +279,7 @@ class LegacyFieldIsInertContract:
         # wrong-season: the division belongs to a different season than the row
         s2 = self._season("S2")
         d2 = self._division(s2, "D2")
-        wrong = self._team("Wrong")
+        wrong = self._team("Wrong", division_id=d2)
         bad_reg(wrong, d2)
 
         exposed = {r["team_id"]
@@ -270,8 +297,13 @@ class LegacyFieldIsInertContract:
         self.store.add_season(season)
         team = Team(id=self.store.next_id("team"), name="Ghost", program_id=ghost)
         self.store.add_team(team)
+        # #283: the row resolves its Season/League via a LeagueSeason; bind one to
+        # this dangling program so the row is found yet still trusts nothing.
+        ghost_ls = self.store.add_league_season(LeagueSeason(
+            id=self.store.next_id("leagueseason"), league_id=ghost,
+            season_id=season.id))
         self.store.add_season_team_registration(SeasonTeamRegistration(
-            id=self.store.next_id("streg"), season_id=season.id,
+            id=self.store.next_id("streg"), league_season_id=ghost_ls.id,
             team_id=team.id, division_id=None, active=True))
         self.assertIsNone(
             team_registration_valid(self.store, season, team.id, None))
@@ -285,10 +317,17 @@ class LegacyFieldIsInertContract:
         # or a derivation that couldn't determine one) must be excluded from
         # the overview, never silently passed through as league-less.
         season = self._season("S")
-        team = self._team("NoLeague")
+        league = self.api.create_league(season, "L League", actor_id=self.ACTOR)["id"]
+        team = self._team("NoLeague", league_id=league)
+        # #283: a registration always references a LeagueSeason; a row whose
+        # League doesn't resolve (bound to a non-existent League) is the
+        # league-less corruption that must be excluded.
+        ghost_ls = self.store.add_league_season(LeagueSeason(
+            id=self.store.next_id("leagueseason"), league_id="league_ghost",
+            season_id=season))
         self.store.add_season_team_registration(SeasonTeamRegistration(
-            id=self.store.next_id("streg"), season_id=season,
-            team_id=team, division_id=None, league_id=None, active=True))
+            id=self.store.next_id("streg"), league_season_id=ghost_ls.id,
+            team_id=team, division_id=None, active=True))
         exposed = {r["team_id"]
                   for r in self.api.get_demo_overview()["registrations"]}
         self.assertNotIn(team, exposed)
@@ -319,20 +358,20 @@ class LegacyFieldIsInertContract:
         self.assertEqual(row2["league_id"], league)
         self.assertIsNone(row2["division_id"])
 
-    def test_overview_excludes_registration_with_dangling_league_id(self):
-        # A registration whose league_id points at a League from a DIFFERENT
-        # season (or no League at all) must never reach the wizard — the same
-        # "cross-league/missing-League" corruption class the division check
-        # already guards against (#233 B2c).
+    def test_overview_excludes_registration_with_dangling_league_season(self):
+        # A registration whose LeagueSeason link is dangling (points at no
+        # LeagueSeason row at all) must never reach the wizard — the same
+        # "missing-League" corruption class the division check already guards
+        # against (#233 B2c). #283: a League may legitimately span Seasons, so
+        # the corruption is an unresolvable LeagueSeason, not a "cross-season"
+        # league.
         season = self._season("S")
-        other_season = self._season("Other")
-        other_league = self.api.create_league(
-            other_season, "Other League", actor_id=self.ACTOR)["id"]
-        team = self._team("Dangling")
+        league = self.api.create_league(season, "L League", actor_id=self.ACTOR)["id"]
+        team = self._team("Dangling", league_id=league)
         self.store.add_season_team_registration(SeasonTeamRegistration(
-            id=self.store.next_id("streg"), season_id=season,
-            team_id=team, division_id=None, league_id=other_league,
-            active=True))
+            id=self.store.next_id("streg"),
+            league_season_id="leagueseason_missing",
+            team_id=team, division_id=None, active=True))
         exposed = {r["team_id"]
                   for r in self.api.get_demo_overview()["registrations"]}
         self.assertNotIn(team, exposed)
@@ -346,12 +385,15 @@ class LegacyFieldIsInertContract:
         league = self.api.create_league(season, "Adult League", actor_id=self.ACTOR)["id"]
         other_league = self.api.create_league(
             season, "Other League", actor_id=self.ACTOR)["id"]
-        dA = self._division(season, "A")
-        self.api.assign_division_league(dA, other_league, actor_id=self.ACTOR)
-        team = self._team("Mismatch")
+        # The division belongs to other_league; the registration below claims
+        # `league`, so its LeagueSeason and the division's disagree.
+        dA = self.api.create_division(
+            season, "A", league_id=other_league, actor_id=self.ACTOR)["id"]
+        team = self._team("Mismatch", league_id=league)
+        league_ls = self.store.league_season_for(league, season).id
         self.store.add_season_team_registration(SeasonTeamRegistration(
-            id=self.store.next_id("streg"), season_id=season,
-            team_id=team, division_id=dA, league_id=league, active=True))
+            id=self.store.next_id("streg"), league_season_id=league_ls,
+            team_id=team, division_id=dA, active=True))
         exposed = {r["team_id"]
                   for r in self.api.get_demo_overview()["registrations"]}
         self.assertNotIn(team, exposed)
