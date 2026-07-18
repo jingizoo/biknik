@@ -115,6 +115,23 @@ def scope_violation(role, scope, path, body, store, *,
     return None
 
 
+def _player_team_id(scope, store):
+    """The team a Player account belongs to, for the private-read gate (#160).
+
+    A Player's canonical scope key is ``player_id``; the team is derived from it
+    live so the gate never trusts a stale denormalized ``team_id`` (e.g. after a
+    transfer). Falls back to an explicit ``scope.team_id`` only when there is no
+    resolvable player — so a legacy account carrying ``team_id`` only still
+    works, and a player with no team resolves to ``None`` (fails closed).
+    """
+    player_id = scope.get("player_id")
+    if player_id:
+        player = store.get_player(player_id)
+        if player is not None and player.team_id:
+            return player.team_id
+    return scope.get("team_id")
+
+
 def can_read_private_game_data(role, scope, game_id, store) -> bool:
     """May this signed-in user read a game's private player data? (#73)
 
@@ -130,9 +147,20 @@ def can_read_private_game_data(role, scope, game_id, store) -> bool:
     game = store.get_game(game_id)
     if game is None:
         return True  # let the facade return its normal not_found payload
-    if role in (Role.COACH, Role.PLAYER):
+    if role == Role.COACH:
         team_id = scope.get("team_id")
-        return team_id in (game.home_team_id, game.away_team_id)
+        return team_id is not None and team_id in (
+            game.home_team_id, game.away_team_id)
+    if role == Role.PLAYER:
+        # A Player account's canonical scope key is ``player_id`` (#135/#160),
+        # but this gate is by team. Resolve the player's team from ``player_id``
+        # live (authoritative, never stale on a transfer), falling back to an
+        # explicit ``scope.team_id`` only when player_id is absent/unresolvable —
+        # so a Player account created with player_id ONLY still reads its own
+        # team's private data, and a teamless player fails closed.
+        team_id = _player_team_id(scope, store)
+        return team_id is not None and team_id in (
+            game.home_team_id, game.away_team_id)
     if role == Role.OFFICIAL:
         official_id = scope.get("official_id")
         return official_id is not None and any(

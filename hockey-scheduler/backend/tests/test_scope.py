@@ -8,10 +8,10 @@ from http.server import ThreadingHTTPServer
 
 from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
 
-from hockey_scheduler.domain import Role
+from hockey_scheduler.domain import Player, Position, Role, Team
 from hockey_scheduler.full_demo import build_full_demo_store
 from hockey_scheduler.web import server as srv
-from hockey_scheduler.web.scope import scope_violation
+from hockey_scheduler.web.scope import can_read_private_game_data, scope_violation
 
 
 class ScopeUnitTest(unittest.TestCase):
@@ -122,6 +122,39 @@ class ScopeUnitTest(unittest.TestCase):
             Role.PLAYER, {}, "/api/games/g/availability",
             {"player_id": self.away_player}, self.store,
             allow_unscoped_dev_fallback=True))
+
+    # -- private-read gate derives the Player's team from player_id (#160) ----
+    def test_player_private_read_derives_team_from_player_id_only(self):
+        # A Player scope carrying player_id ONLY (no team_id) must still resolve
+        # the player's team, so the private-read gate grants own-team access.
+        # This is the #160 mismatch: creation keys player scope on player_id, but
+        # the gate historically read only team_id.
+        self.assertTrue(can_read_private_game_data(
+            Role.PLAYER, {"player_id": self.home_player}, self.game_id, self.store))
+
+    def test_player_private_read_denied_for_unrelated_team(self):
+        # A player whose team is not in the game cannot read its private data,
+        # even when the team is derived from player_id.
+        self.store.add_team(Team(id="team_third", name="Otters"))
+        self.store.add_player(Player(id="p_out", team_id="team_third",
+                                     name="Out", position=Position.FORWARD))
+        self.assertFalse(can_read_private_game_data(
+            Role.PLAYER, {"player_id": "p_out"}, self.game_id, self.store))
+
+    def test_player_private_read_fails_closed_without_resolvable_team(self):
+        # No player_id and no team_id → no team → denied (fail closed).
+        self.assertFalse(can_read_private_game_data(
+            Role.PLAYER, {}, self.game_id, self.store))
+        # An unknown player_id resolves to no player, so still denied.
+        self.assertFalse(can_read_private_game_data(
+            Role.PLAYER, {"player_id": "p_ghost"}, self.game_id, self.store))
+
+    def test_coach_private_read_still_keyed_on_team_id(self):
+        # Coach behavior is unchanged: their canonical scope key is team_id.
+        self.assertTrue(can_read_private_game_data(
+            Role.COACH, {"team_id": self.home}, self.game_id, self.store))
+        self.assertFalse(can_read_private_game_data(
+            Role.COACH, {}, self.game_id, self.store))
 
 
 class ScopeHttpTest(unittest.TestCase):

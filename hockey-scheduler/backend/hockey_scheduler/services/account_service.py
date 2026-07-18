@@ -98,6 +98,13 @@ class AccountService:
         A role-scoped Player/Official reference (#232 review 7) must resolve too:
         deleting a Player/Official then binding the old id would recreate the
         exact dangling live identity that issue set out to prevent.
+
+        Beyond validating, this **canonicalizes a Player scope in place** (#160):
+        a Player's private-game reads gate on ``team_id`` (web/scope.py), so the
+        resolved player's own team is written into ``scope["team_id"]`` even when
+        the caller supplied ``player_id`` only. Both callers pass a scope dict
+        they own and then persist it, so the account/session carries both keys —
+        keeping the account consistent with the read gate and the frontend helper.
         """
         # Reject any scope key the role does not explicitly support (#266
         # review) — an unexpected key is a misconfiguration, not silently kept.
@@ -147,6 +154,15 @@ class AccountService:
                     "A player's team scope must be the player's own team.",
                     {"reason": "scope_team_mismatch",
                      "player_id": player_id, "team_id": team_id})
+            # Canonicalize (#160): carry the resolved player's own team so an
+            # account created/rebound with player_id ONLY still gates private
+            # game reads correctly. If the player has no team yet, drop any
+            # stale team_id (the mismatch check above already rejected a
+            # non-matching one, so nothing valid is discarded here).
+            if player.team_id:
+                scope["team_id"] = player.team_id
+            else:
+                scope.pop("team_id", None)
         # A Coach's authority is entirely its team scope (#266): an account with
         # no team is refused at the scope gate and can manage no roster, so it
         # must be bound to a real, non-deleted Team.

@@ -154,6 +154,42 @@ class CoachScopeContract:
             scope={"player_id": "p_ok", "team_id": "team_home"})
         self.assertEqual(acct.scope, {"player_id": "p_ok", "team_id": "team_home"})
 
+    # -- canonical player scope carries team_id from player_id (#160) ---------
+    def test_player_created_with_player_id_only_gains_team_scope(self):
+        # #160: creation keys a Player scope on player_id, but the private-read
+        # gate is by team. A player_id-only scope is canonicalized to carry the
+        # player's own team, so the account/session stays consistent with the
+        # gate and the frontend helper.
+        self.store.add_player(Player(id="p_solo", team_id="team_home",
+                                     name="Solo", position=Position.FORWARD))
+        acct = self.accounts.create_account(
+            "p_solo_acct", "pw", Role.PLAYER, scope={"player_id": "p_solo"})
+        self.assertEqual(acct.scope,
+                         {"player_id": "p_solo", "team_id": "team_home"})
+
+    def test_rebind_player_to_player_id_only_gains_team_scope(self):
+        self.store.add_player(Player(id="p_reb", team_id="team_home",
+                                     name="Reb", position=Position.FORWARD))
+        acct = UserAccount(
+            id="user_preb", username="preb", password_hash=hash_password("pw"),
+            role=Role.PLAYER, created_at=_clock(),
+            scope={"player_id": "p_reb", "team_id": "team_home"}, active=True)
+        self.store.add_user_account(acct)
+        rebound = self.accounts.rebind_account_scope(
+            acct.id, {"player_id": "p_reb"})
+        self.assertEqual(rebound.scope,
+                         {"player_id": "p_reb", "team_id": "team_home"})
+
+    def test_player_created_with_teamless_player_carries_no_team(self):
+        # A player not yet on a team resolves to no team; the scope carries
+        # player_id only and the gate fails closed (no private-read access) until
+        # the player is rostered — not a spurious team binding.
+        self.store.add_player(Player(id="p_free", team_id=None,
+                                     name="Free", position=Position.FORWARD))
+        acct = self.accounts.create_account(
+            "p_free_acct", "pw", Role.PLAYER, scope={"player_id": "p_free"})
+        self.assertEqual(acct.scope, {"player_id": "p_free"})
+
     # -- player team scope must be the player's OWN team (#266 review) --------
     def test_create_player_with_foreign_team_rejected(self):
         self.store.add_team(Team(id="team_other", name="Bears"))
@@ -510,6 +546,42 @@ class CoachScopeHttpTest(unittest.TestCase):
         c = self._client()
         self._req(c, "POST", "/api/auth/login",
                   {"username": "legacy_coach_rebind", "password": "pw"})
+        status, _ = self._req(c, "GET", f"/api/games/{self.gid}/board")
+        self.assertEqual(status, 200)
+
+    def test_player_created_with_player_id_only_can_read_own_game(self):
+        # #160: a Player account created with player_id ONLY (no team_id) reads
+        # its own team's private game data. The created scope is canonicalized to
+        # carry the team, and the private-read gate grants access.
+        store = srv.STATE.api.store
+        home_player = store.players_for_team(self.home)[0].id
+        admin = self._admin()
+        status, body = self._req(
+            admin, "POST", "/api/accounts",
+            {"username": "player_pidonly", "password": "pw", "role": "player",
+             "scope": {"player_id": home_player}})
+        self.assertEqual(status, 200)
+        self.assertEqual(body["scope"].get("team_id"), self.home)
+        c = self._client()
+        self._req(c, "POST", "/api/auth/login",
+                  {"username": "player_pidonly", "password": "pw"})
+        status, _ = self._req(c, "GET", f"/api/games/{self.gid}/board")
+        self.assertEqual(status, 200)
+
+    def test_legacy_player_id_only_account_can_read_own_game(self):
+        # A pre-fix account stored with player_id ONLY (no team_id, inserted
+        # directly) still reads its own game — the gate derives the team from
+        # player_id live, so existing accounts need no migration (#160).
+        store = srv.STATE.api.store
+        home_player = store.players_for_team(self.home)[0].id
+        store.add_user_account(UserAccount(
+            id="user_legacy_pidonly", username="legacy_pidonly",
+            password_hash=hash_password("pw"), role=Role.PLAYER,
+            created_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            scope={"player_id": home_player}, active=True))
+        c = self._client()
+        self._req(c, "POST", "/api/auth/login",
+                  {"username": "legacy_pidonly", "password": "pw"})
         status, _ = self._req(c, "GET", f"/api/games/{self.gid}/board")
         self.assertEqual(status, 200)
 
