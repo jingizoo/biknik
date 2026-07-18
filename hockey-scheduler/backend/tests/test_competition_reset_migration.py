@@ -577,6 +577,49 @@ class GameLeagueSeasonGateAbortTest(unittest.TestCase):
                     finally:
                         _teardown(store)
 
+    def test_regular_game_with_cross_league_season_division_aborts(self):
+        # A regular game whose (league_id, season_id) resolves to ls1 but whose
+        # Division belongs to a DIFFERENT LeagueSeason (ls2) must abort 037 — a
+        # Game bound to one LeagueSeason while its Division points at another
+        # would let Division and LeagueSeason standings disagree.
+        for label, url in _sql_backends():
+            with self.subTest(backend=label):
+                store = _fresh(url)
+                try:
+                    with store.transaction():
+                        _exec(store, "INSERT INTO programs (id, name) VALUES (?, ?)",
+                              ("p1", "P1"))
+                        _exec(store, "INSERT INTO seasons (id, program_id, name) "
+                              "VALUES (?, ?, ?)", ("s1", "p1", "S1"))
+                        _exec(store, "INSERT INTO leagues (id, name, sort_order, "
+                              "program_id) VALUES (?, ?, ?, ?)", ("lg1", "Lg1", 0, "p1"))
+                        _exec(store, "INSERT INTO leagues (id, name, sort_order, "
+                              "program_id) VALUES (?, ?, ?, ?)", ("lg2", "Lg2", 1, "p1"))
+                        _exec(store, "INSERT INTO league_seasons (id, league_id, "
+                              "season_id) VALUES (?, ?, ?)", ("ls1", "lg1", "s1"))
+                        _exec(store, "INSERT INTO league_seasons (id, league_id, "
+                              "season_id) VALUES (?, ?, ?)", ("ls2", "lg2", "s1"))
+                        _exec(store, "INSERT INTO divisions (id, name, "
+                              "league_season_id) VALUES (?, ?, ?)", ("d2", "D2", "ls2"))
+                        # Resolves to ls1 via (lg1, s1), but its Division is in ls2.
+                        _exec(store, "INSERT INTO games (id, season_id, league_id, "
+                              "division_id, game_type) VALUES (?, ?, ?, ?, ?)",
+                              ("g_x", "s1", "lg1", "d2", "regular"))
+                    with store.transaction():
+                        _exec(store, "DROP INDEX IF EXISTS ix_games_league_season")
+                        _exec(store, "ALTER TABLE games DROP COLUMN league_season_id")
+                        _exec(store, "DELETE FROM schema_migrations "
+                              "WHERE version = ?", ("037_game_league_season",))
+                    with self.assertRaises(MigrationDataError) as ctx:
+                        migrate(store.conn, store.dialect)
+                    self.assertIn("g_x", str(ctx.exception), label)
+                    self.assertNotIn("league_season_id", _cols(store, "games"), label)
+                    self.assertNotIn(
+                        "037_game_league_season",
+                        store.migration_status()["applied"], label)
+                finally:
+                    _teardown(store)
+
     def test_unscoped_exhibition_does_not_abort(self):
         # An EXHIBITION with no LeagueSeason is legitimate — the gate ignores it
         # and 037 applies, leaving its league_season_id NULL.

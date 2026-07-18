@@ -784,8 +784,16 @@ def assert_competition_hierarchy_reset_ready(conn):
 # rather than migrating an invalid regular game. Pure SELECT, portable, re-runnable.
 
 def find_unresolved_regular_games(conn):
-    """Ids of REGULAR games whose (league_id, season_id) does not resolve to an
-    existing LeagueSeason (null on either side, or no matching row)."""
+    """Ids of REGULAR games that cannot be bound to a single, consistent
+    LeagueSeason by migration 037:
+
+      * their ``(league_id, season_id)`` is null on either side, or resolves to
+        no ``league_seasons`` row; OR
+      * they carry a ``division_id`` whose Division belongs to a DIFFERENT
+        LeagueSeason than that pair (a cross-LeagueSeason Division/Game
+        mismatch) — which would let a Game be counted in one Division's
+        standings while its League/Season point elsewhere.
+    """
     cur = conn.cursor()
     cur.execute(
         "SELECT g.id AS id FROM games g "
@@ -793,13 +801,20 @@ def find_unresolved_regular_games(conn):
         "AND (g.league_id IS NULL OR g.season_id IS NULL "
         "     OR NOT EXISTS (SELECT 1 FROM league_seasons ls "
         "                    WHERE ls.league_id = g.league_id "
-        "                    AND ls.season_id = g.season_id))")
+        "                    AND ls.season_id = g.season_id) "
+        "     OR (g.division_id IS NOT NULL AND NOT EXISTS ("
+        "            SELECT 1 FROM divisions d "
+        "            JOIN league_seasons ls2 ON ls2.id = d.league_season_id "
+        "            WHERE d.id = g.division_id "
+        "            AND ls2.league_id = g.league_id "
+        "            AND ls2.season_id = g.season_id)))")
     return sorted(row["id"] for row in cur.fetchall())
 
 
 def assert_regular_games_resolve_league_season(conn):
-    """Abort migration 037 if any regular game can't be bound to a LeagueSeason
-    (#283 Slice E)."""
+    """Abort migration 037 if any regular game can't be bound to a single,
+    consistent LeagueSeason — an unresolvable (league, season) pair, or a
+    Division that belongs to a different LeagueSeason (#283 Slice E)."""
     bad = find_unresolved_regular_games(conn)
     if bad:
         shown = ", ".join(bad[:20])
@@ -807,5 +822,7 @@ def assert_regular_games_resolve_league_season(conn):
         raise MigrationDataError(
             "Cannot bind regular games to a LeagueSeason (#283 Slice E): "
             f"{len(bad)} regular game(s) have no resolvable (league, season) "
-            f"LeagueSeason: {shown}{more}. Set each game's league and season to "
-            "an existing LeagueSeason, or mark it an exhibition, before upgrading.")
+            "LeagueSeason, or carry a Division from a different LeagueSeason: "
+            f"{shown}{more}. Set each game's league, season, and division to a "
+            "single existing LeagueSeason, or mark it an exhibition, before "
+            "upgrading.")

@@ -2295,6 +2295,23 @@ class ApiService:
         """
         return self._standings_for_division(division_id, public_only=False)
 
+    def _league_season_mismatch_error(self, game, expected_ls_id) -> dict:
+        """The shared fail-closed error both standings views return for a regular
+        Game whose LeagueSeason identity is missing or disagrees with the
+        expected one (#283) — one exact Game→LeagueSeason integrity check, so
+        Division and LeagueSeason standings can never tell contradictory
+        histories about the same Game."""
+        return {"error": {
+            "code": "data_integrity_error",
+            "message": "A regular game's league-season disagrees with its "
+                       "league/season; standings cannot be computed until it "
+                       "is repaired.",
+            "details": {"reason": "game_league_season_mismatch",
+                        "game_id": game.id,
+                        "league_season_id": getattr(game, "league_season_id",
+                                                    None),
+                        "expected_league_season_id": expected_ls_id}}}
+
     def _standings_for_division(self, division_id: str,
                                 public_only: bool = False) -> dict:
         """Compute a division's standings table.
@@ -2334,6 +2351,19 @@ class ApiService:
             # against a future division-tagged friendly).
             if g.game_type != GameType.REGULAR.value:
                 continue
+            # #283 blocker: a regular Game claiming this Division must belong to
+            # the Division's exact LeagueSeason — the SAME Game→LeagueSeason
+            # integrity check LeagueSeason standings apply. A null/wrong
+            # league_season_id or a disagreeing legacy (league_id, season_id)
+            # pair is drift: fail closed so Division and LeagueSeason standings
+            # can never count-vs-reject the same Game and tell contradictory
+            # histories. (A dangling Division with no LeagueSeason yields an
+            # empty roster, so no Game is countable there anyway.)
+            if league_season is not None and not (
+                    getattr(g, "league_season_id", None) == league_season.id
+                    and g.league_id == league_season.league_id
+                    and g.season_id == league_season.season_id):
+                return self._league_season_mismatch_error(g, league_season.id)
             if public_only and not g.published:
                 continue
             r = self.store.result_for_game(g.id)
@@ -2434,14 +2464,7 @@ class ApiService:
             if not (by_ls or by_legacy):
                 continue  # belongs to some other LeagueSeason
             if by_ls != by_legacy:
-                return {"error": {
-                    "code": "data_integrity_error",
-                    "message": "A regular game's league-season disagrees with "
-                               "its league/season; standings cannot be computed "
-                               "until it is repaired.",
-                    "details": {"reason": "game_league_season_mismatch",
-                                "game_id": g.id, "league_season_id": ls_id,
-                                "expected_league_season_id": ls.id}}}
+                return self._league_season_mismatch_error(g, ls.id)
             if public_only and not g.published:
                 continue
             r = self.store.result_for_game(g.id)

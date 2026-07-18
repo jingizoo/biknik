@@ -240,6 +240,47 @@ class _Contract:
         self.assertTrue(all(r["pts"] == 0 for r in rec["standings"]))
 
 
+    def _division_regular_final_game(self):
+        """A Division dA in Elite with a FINAL regular game A(3)-B(1). Returns
+        (dA, game)."""
+        dA = self.api.create_division_v2(self.elite["id"], "DA", actor_id=ADMIN)
+        a = self.api.create_team(self.club["id"], None, "A", actor_id=ADMIN,
+                                 league_id=self.elite["id"])
+        b = self.api.create_team(self.club["id"], None, "B", actor_id=ADMIN,
+                                 league_id=self.elite["id"])
+        for t in (a, b):
+            self.api.register_team_for_season(
+                self.season["id"], t["id"], dA["id"], actor_id=ADMIN,
+                league_id=self.elite["id"])
+        g = self.api.create_game(
+            self.season["id"], dA["id"], a["id"], b["id"], self._slot(18)["id"],
+            actor_id=ADMIN, league_id=self.elite["id"])
+        self.assertNotIn("error", g, g)
+        self._final(g["id"], 3, 1)
+        return dA, g
+
+    def test_division_standings_fail_closed_on_missing_game_league_season(self):
+        dA, g = self._division_regular_final_game()
+        stored = self.api.store.get_game(g["id"])
+        stored.league_season_id = None  # drift: Division claims it, LS is gone
+        self.api.store.save_game(stored)
+        for res in (self.api.get_standings(dA["id"]),
+                    self.api.get_public_standings(dA["id"])):
+            self.assertEqual(res["error"]["details"]["reason"],
+                             "game_league_season_mismatch", res)
+
+    def test_division_standings_fail_closed_on_wrong_game_league_season(self):
+        dA, g = self._division_regular_final_game()
+        # Point the Game at Rec's LeagueSeason while it still claims Elite's dA.
+        rec_ls = self.api.store.league_season_for(self.rec["id"], self.season["id"])
+        stored = self.api.store.get_game(g["id"])
+        stored.league_season_id = rec_ls.id
+        self.api.store.save_game(stored)
+        for res in (self.api.get_standings(dA["id"]),
+                    self.api.get_public_standings(dA["id"])):
+            self.assertEqual(res["error"]["details"]["reason"],
+                             "game_league_season_mismatch", res)
+
     # -- history: an ended-Season transfer never changes historical standings --
     def _end_the_season(self):
         season = self.api.store.get_season(self.season["id"])
