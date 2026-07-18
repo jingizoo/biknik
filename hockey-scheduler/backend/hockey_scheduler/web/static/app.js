@@ -2498,9 +2498,18 @@ function renderWizard(ov) {
   // and every downstream control (Division/Home/Away/Create) stays disabled
   // until the operator picks one explicitly.
   const leagues = ov.levels || [];
-  if (!wizard.league_id && leagues.length === 1) wizard.league_id = leagues[0].id;
+  const seasons = ov.seasons || [];
+  // #283 Slice D: an Exhibition (friendly) game may cross League lines. It has
+  // no League/Division scope and never counts toward standings — it is
+  // Season-scoped, and its two teams are any active participants in that
+  // Season. A regular game keeps the League → Division cascade below.
+  const isExhibition = !!wizard.exhibition;
+  if (isExhibition && !wizard.season_id && seasons.length === 1) wizard.season_id = seasons[0].id;
+  if (!isExhibition && !wizard.league_id && leagues.length === 1) wizard.league_id = leagues[0].id;
   const leagueChosen = !!wizard.league_id;
-  const divs = leagueChosen ? ov.divisions.filter((d) => d.level_id === wizard.league_id) : [];
+  const seasonChosen = !!wizard.season_id;
+  const ready = isExhibition ? seasonChosen : leagueChosen;
+  const divs = (!isExhibition && leagueChosen) ? ov.divisions.filter((d) => d.level_id === wizard.league_id) : [];
   if (wizard.division_id && !divs.find((d) => d.id === wizard.division_id)) wizard.division_id = "";
   // Teams eligible for this game are those with an ACTIVE SeasonTeamRegistration
   // in the chosen League (#180, #233 B2c) — and, when a Division is also
@@ -2509,30 +2518,41 @@ function renderWizard(ov) {
   // mirrors the server's registration-based game-creation guard, so the
   // picker only offers teams the server will accept. Empty until a League is
   // explicitly chosen.
-  const registeredIds = leagueChosen ? new Set((ov.registrations || [])
-    .filter((r) => r.league_id === wizard.league_id
-      && (!wizard.division_id || r.division_id === wizard.division_id))
-    .map((r) => r.team_id)) : new Set();
+  // Exhibition: any team registered in the chosen Season (any League). Regular:
+  // teams registered in the chosen League (and Division, when one is chosen).
+  const registeredIds = isExhibition
+    ? new Set((ov.registrations || [])
+        .filter((r) => r.season_id === wizard.season_id).map((r) => r.team_id))
+    : (leagueChosen ? new Set((ov.registrations || [])
+        .filter((r) => r.league_id === wizard.league_id
+          && (!wizard.division_id || r.division_id === wizard.division_id))
+        .map((r) => r.team_id)) : new Set());
   const teams = ov.teams.filter((t) => registeredIds.has(t.id));
   if (!teams.find((t) => t.id === wizard.home_id)) wizard.home_id = teams[0] ? teams[0].id : "";
   const awayTeams = teams.filter((t) => t.id !== wizard.home_id);
   if (!awayTeams.find((t) => t.id === wizard.away_id)) wizard.away_id = awayTeams[0] ? awayTeams[0].id : "";
 
-  const sameLeague = wizard.home_id && wizard.away_id;
+  const bothChosen = wizard.home_id && wizard.away_id;
   const distinct = wizard.home_id && wizard.away_id && wizard.home_id !== wizard.away_id;
-  const ok = leagueChosen && sameLeague && distinct && slot.status === "available";
+  const ok = ready && bothChosen && distinct && slot.status === "available";
   const v = (good, t) => `<div class="valid ${good ? "ok" : "bad"}">${good ? "✓" : "✕"} ${t}</div>`;
-  const dis = leagueChosen ? "" : "disabled";
+  const dis = ready ? "" : "disabled";
   return `
     <div class="wizard">
       <h3>Schedule Game</h3>
       <div class="step">1 · Competition</div>
-      <select id="w-league" aria-label="League">${
-        leagueChosen ? "" : `<option value="" disabled selected>Select league…</option>`}${
-        leagues.map((lv) => opt(lv.id, lv.name, lv.id === wizard.league_id)).join("")}</select>
+      <label class="wiz-exhibition"><input type="checkbox" id="w-exhibition"${isExhibition ? " checked" : ""}> Exhibition (friendly — may cross leagues, never counts toward standings)</label>
       <div style="height:8px"></div>
-      <select id="w-div" aria-label="Division" ${dis}><option value="">No division</option>${
-        divs.map((d) => opt(d.id, d.name, d.id === wizard.division_id)).join("")}</select>
+      ${isExhibition
+        ? `<select id="w-season" aria-label="Season">${
+            seasonChosen ? "" : `<option value="" disabled selected>Select season…</option>`}${
+            seasons.map((s) => opt(s.id, s.name, s.id === wizard.season_id)).join("")}</select>`
+        : `<select id="w-league" aria-label="League">${
+            leagueChosen ? "" : `<option value="" disabled selected>Select league…</option>`}${
+            leagues.map((lv) => opt(lv.id, lv.name, lv.id === wizard.league_id)).join("")}</select>
+          <div style="height:8px"></div>
+          <select id="w-div" aria-label="Division" ${dis}><option value="">No division</option>${
+            divs.map((d) => opt(d.id, d.name, d.id === wizard.division_id)).join("")}</select>`}
       <div class="step">2 · Teams</div>
       <select id="w-home" aria-label="Home team" ${dis}>${teams.map((t) => opt(t.id, t.name, t.id === wizard.home_id)).join("")}</select>
       <div style="height:8px"></div>
@@ -2542,15 +2562,18 @@ function renderWizard(ov) {
         <div class="li-main"><div class="li-title">${esc(slot.rink_name)}</div>
           <div class="li-sub">${esc(slotVenueName(ov, slot))}</div></div></div>
       <div class="step">4 · Validation</div>
-      ${v(leagueChosen, "League selected")}
-      ${v(!!teams.length, "Same league")}
+      ${v(ready, isExhibition ? "Season selected" : "League selected")}
+      ${v(!!teams.length, isExhibition ? "Teams registered this season" : "Same league")}
       ${v(distinct, "Home and away are different teams")}
       ${v(slot.status === "available", "Ice slot is available")}
       ${v(true, "Public-safe junior fixture (no PII)")}
       <div class="step">5 · Review</div>
       <div class="review">
-        <div class="kv"><span class="k">League</span><span class="v">${esc((leagues.find((lv) => lv.id === wizard.league_id) || {}).name || "")}</span></div>
-        <div class="kv"><span class="k">Division</span><span class="v">${esc((divs.find((d) => d.id === wizard.division_id) || {}).name || "No division")}</span></div>
+        ${isExhibition
+          ? `<div class="kv"><span class="k">Type</span><span class="v">Exhibition (friendly)</span></div>
+             <div class="kv"><span class="k">Season</span><span class="v">${esc((seasons.find((s) => s.id === wizard.season_id) || {}).name || "")}</span></div>`
+          : `<div class="kv"><span class="k">League</span><span class="v">${esc((leagues.find((lv) => lv.id === wizard.league_id) || {}).name || "")}</span></div>
+             <div class="kv"><span class="k">Division</span><span class="v">${esc((divs.find((d) => d.id === wizard.division_id) || {}).name || "No division")}</span></div>`}
         <div class="kv"><span class="k">Home</span><span class="v">${esc((teams.find((t) => t.id === wizard.home_id) || {}).name || "—")}</span></div>
         <div class="kv"><span class="k">Away</span><span class="v">${esc((awayTeams.find((t) => t.id === wizard.away_id) || {}).name || "—")}</span></div>
         <div class="kv"><span class="k">Venue · Rink</span><span class="v">${esc(slotVenueName(ov, slot))} · ${esc(slot.rink_name)}</span></div>
@@ -6207,6 +6230,13 @@ async function render() {
   const picker = document.getElementById("player-picker");
   if (picker) picker.onchange = (e) => { pickedPlayer = e.target.value; toast = ""; render(); };
   // wizard wiring (#233 B2c: League required, Division optional)
+  // #283 Slice D: the Exhibition toggle switches the game to a Season-scoped
+  // friendly (crosses leagues, no standings), so it resets the competition
+  // scope and team picks; a Season picker replaces the League/Division cascade.
+  const wex = document.getElementById("w-exhibition");
+  if (wex) wex.onchange = (e) => { wizard.exhibition = e.target.checked; wizard.league_id = ""; wizard.division_id = ""; wizard.home_id = null; wizard.away_id = null; render(); };
+  const ws = document.getElementById("w-season");
+  if (ws) ws.onchange = (e) => { wizard.season_id = e.target.value; wizard.home_id = null; wizard.away_id = null; render(); };
   const wl = document.getElementById("w-league");
   if (wl) wl.onchange = (e) => { wizard.league_id = e.target.value; wizard.division_id = ""; wizard.home_id = null; wizard.away_id = null; render(); };
   const wd = document.getElementById("w-div");
@@ -6218,16 +6248,26 @@ async function render() {
   const wc = c.querySelector("[data-wizcancel]"); if (wc) wc.onclick = () => { wizard = null; render(); };
   const wcr = c.querySelector("[data-wizcreate]");
   if (wcr) wcr.onclick = async () => {
-    // v2: League is REQUIRED (game scope); Division is optional (#233 B2c).
-    // season_id comes from the selected League, not a Division (which may be
-    // unset when the game is league-only).
-    const league = (ov.levels || []).find((lv) => lv.id === wizard.league_id);
-    const res = await post("/api/v2/setup/game", {
-      season_id: league ? league.season_id : (ov.seasons[0] || {}).id,
-      league_id: wizard.league_id, division_id: wizard.division_id || null,
-      home_team_id: wizard.home_id, away_team_id: wizard.away_id, ice_slot_id: wizard.slot_id,
-    });
-    if (res && !res.error) { toast = "Game scheduled."; currentGame = res.id; wizard = null; view = "games"; }
+    let body;
+    if (wizard.exhibition) {
+      // #283 Slice D: an Exhibition friendly is Season-scoped with no owning
+      // League/Division — it may pair teams from different Leagues and never
+      // counts toward standings.
+      body = { season_id: wizard.season_id, game_type: "exhibition",
+               home_team_id: wizard.home_id, away_team_id: wizard.away_id,
+               ice_slot_id: wizard.slot_id };
+    } else {
+      // v2: League is REQUIRED (game scope); Division is optional (#233 B2c).
+      // season_id comes from the selected League, not a Division (which may be
+      // unset when the game is league-only).
+      const league = (ov.levels || []).find((lv) => lv.id === wizard.league_id);
+      body = { season_id: league ? league.season_id : (ov.seasons[0] || {}).id,
+               league_id: wizard.league_id, division_id: wizard.division_id || null,
+               home_team_id: wizard.home_id, away_team_id: wizard.away_id,
+               ice_slot_id: wizard.slot_id };
+    }
+    const res = await post("/api/v2/setup/game", body);
+    if (res && !res.error) { toast = wizard.exhibition ? "Exhibition game scheduled." : "Game scheduled."; currentGame = res.id; wizard = null; view = "games"; }
     render();
   };
 }

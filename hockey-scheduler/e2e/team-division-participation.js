@@ -115,8 +115,13 @@ async function checkViewport(browser, viewport) {
       const slot = await post("/api/setup/ice-slot", {
         rink_id: rink.id, start_time: `${day}T18:00:00+00:00`,
         end_time: `${day}T19:00:00+00:00`, slot_type: "game" });
+      // A second game slot for the #283 Slice D Exhibition step below.
+      const slot2 = await post("/api/setup/ice-slot", {
+        rink_id: rink.id, start_time: `${day}T20:00:00+00:00`,
+        end_time: `${day}T21:00:00+00:00`, slot_type: "game" });
       return { league: league.id, s1: s1.id, s2: s2.id, lv1: lv1.id,
-        d1: d1.id, d1b: d1b.id, d2: d2.id, perma, leagueOnly, slot: slot.id };
+        d1: d1.id, d1b: d1b.id, d2: d2.id, perma, leagueOnly,
+        slot: slot.id, slot2: slot2.id };
     }, CAL_DAY);
 
     // (A) Season participation: one permanent Team, two seasons, two divisions.
@@ -238,10 +243,43 @@ async function checkViewport(browser, viewport) {
     }
     await page.waitForFunction(() => !document.querySelector(".wizard"), null, { timeout: 10000 });
 
+    // (D) #283 Slice D: an Exhibition (friendly) is Season-scoped — the toggle
+    // swaps the League/Division cascade for a Season picker, offers every team
+    // registered in that Season (regardless of League), and the create payload
+    // carries game_type="exhibition" with NO league_id (a friendly has no
+    // owning League and never counts toward standings). Creating the previous
+    // game navigated to the games view, so return to the calendar first.
+    await page.click('.tab[data-tab="calendar"]');
+    await page.waitForSelector(`[data-slot="${ids.slot2}"]`, { timeout: 15000 });
+    await page.click(`[data-slot="${ids.slot2}"]`);
+    await page.waitForSelector("#w-exhibition", { timeout: 10000 });
+    await page.check("#w-exhibition");
+    await page.waitForSelector("#w-season", { timeout: 10000 });
+    // No implicit Season pick with more than one Season present.
+    const exSeason = await page.$eval("#w-season", (s) => s.value);
+    if (exSeason !== "") {
+      throw new Error(`[${viewport.label}] Exhibition Season was implicitly pre-selected: ${exSeason}`);
+    }
+    await page.selectOption("#w-season", ids.s1);
+    await page.waitForFunction(
+      (t) => Array.from(document.querySelectorAll("#w-home option")).some((o) => o.value === t),
+      ids.perma, { timeout: 10000 });
+    await page.selectOption("#w-home", ids.perma);
+    await page.selectOption("#w-away", ids.leagueOnly);
+    const exReq = page.waitForRequest((r) =>
+      r.url() === `${base}/api/v2/setup/game` && r.method() === "POST");
+    await page.click("[data-wizcreate]");
+    const exBody = (await exReq).postDataJSON();
+    if (exBody.game_type !== "exhibition" || exBody.league_id !== undefined
+        || exBody.season_id !== ids.s1) {
+      throw new Error(`[${viewport.label}] exhibition create sent an unexpected payload: ${JSON.stringify(exBody)}`);
+    }
+    await page.waitForFunction(() => !document.querySelector(".wizard"), null, { timeout: 10000 });
+
     if (errors.length) {
       throw new Error(`[${viewport.label}] console/page errors:\n${errors.join("\n")}`);
     }
-    console.log(`[${viewport.label}] OK — one team across two seasons; wizard filters by registration; no implicit League selection.`);
+    console.log(`[${viewport.label}] OK — one team across two seasons; wizard filters by registration; no implicit League selection; Exhibition friendly is season-scoped.`);
   } catch (error) {
     throw new Error(`${error.message}\n--- demo server output ---\n${serverOutput}`);
   } finally {
