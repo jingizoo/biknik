@@ -2375,6 +2375,26 @@ class SetupService:
                         "season_id": season_id, "changed_fields": changed})
         return existing, False, changed
 
+    def upsert_imported_league_season(self, league_id: str, season_id: str,
+                                      actor_id: Optional[str] = None,
+                                      import_batch_id: Optional[str] = None):
+        """Ensure the permanent League participates in the Season (idempotent).
+
+        #283: a League may participate in MULTIPLE Seasons via LeagueSeason. The
+        import must bind EVERY (League, Season) pair the sheet declares — even a
+        Season row that carries no Division and no registration, which the
+        Division/registration upserts would otherwise never reach. Returns
+        ``(league_season, created)``; a repeat import finds the existing binding
+        and is a no-op (no duplicate, no audit)."""
+        existing = self.store.league_season_for(league_id, season_id)
+        if existing is not None:
+            return existing, False
+        ls = self._link_league_season(league_id, season_id)
+        self._audit("league_season_created", "league_season", ls.id, actor_id,
+                    {"import_batch_id": import_batch_id, "league_id": league_id,
+                     "season_id": season_id})
+        return ls, True
+
     def upsert_imported_division(self, code: str, name: str, age_group: str,
                                  season_id: str, league_id: str, existing=None,
                                  actor_id: Optional[str] = None,

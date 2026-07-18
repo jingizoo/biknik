@@ -2391,8 +2391,27 @@ class ApiService:
         for g in self.store.all_games():
             if g.cancelled or g.game_type != GameType.REGULAR.value:
                 continue
-            if g.league_id != league_id or g.season_id != season_id:
-                continue
+            # #283 blocker: the LeagueSeason is a regular Game's single
+            # competition identity — count by ``league_season_id``, never the
+            # redundant legacy (league_id, season_id) pair. A regular Game that
+            # concerns this LeagueSeason by EITHER identity but whose
+            # league_season_id is missing or disagrees with its legacy fields is
+            # drift: fail closed (never silently count it in the wrong table or
+            # omit it) so the row is repaired before standings are trusted.
+            ls_id = getattr(g, "league_season_id", None)
+            by_ls = ls_id == ls.id
+            by_legacy = g.league_id == league_id and g.season_id == season_id
+            if not (by_ls or by_legacy):
+                continue  # belongs to some other LeagueSeason
+            if by_ls != by_legacy:
+                return {"error": {
+                    "code": "data_integrity_error",
+                    "message": "A regular game's league-season disagrees with "
+                               "its league/season; standings cannot be computed "
+                               "until it is repaired.",
+                    "details": {"reason": "game_league_season_mismatch",
+                                "game_id": g.id, "league_season_id": ls_id,
+                                "expected_league_season_id": ls.id}}}
             if public_only and not g.published:
                 continue
             r = self.store.result_for_game(g.id)

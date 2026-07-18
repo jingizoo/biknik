@@ -1027,6 +1027,25 @@ def commit_hierarchy_import(setup, sheets: Dict[str, List[dict]],
             leagues[code] = obj
             _tally("leagues", created, changed)
 
+        # #283 blocker: a permanent League may participate in MULTIPLE Seasons.
+        # The upsert above creates/updates the League once and binds only its
+        # FIRST Season's LeagueSeason; bind every OTHER distinct (League, Season)
+        # pair the sheet declares here — including a Season row that carries no
+        # Division and no registration, which the loops below would never reach.
+        seen_league_seasons = set()
+        for row in rows["competition"]:
+            league_code = _clean(row.get("league_code"))
+            season_code = _clean(row.get("season_code"))
+            if not league_code or not season_code:
+                continue
+            pair = (league_code, season_code)
+            if pair in seen_league_seasons:
+                continue
+            seen_league_seasons.add(pair)
+            setup.upsert_imported_league_season(
+                leagues[league_code].id, seasons[season_code].id,
+                actor_id=actor_id, import_batch_id=batch_id)
+
         for row in rows["competition"]:
             code = _optional(row.get("division_code"))
             if not code:

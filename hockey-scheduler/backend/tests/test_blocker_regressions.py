@@ -170,6 +170,71 @@ class _Contract:
                          self.elite["id"])
 
 
+    # -- Blocker: standings key on league_season_id, fail closed on drift ---
+    def _final(self, game_id, home_score, away_score):
+        self.api.record_result(game_id, home_score, away_score, actor_id=ADMIN)
+        self.api.approve_result(game_id, actor_id=ADMIN)
+
+    def _elite_regular_final_game(self):
+        a = self._team("A", self.elite["id"])
+        b = self._team("B", self.elite["id"])
+        g = self.api.create_game(
+            self.season["id"], None, a["id"], b["id"], self._slot(18)["id"],
+            actor_id=ADMIN, league_id=self.elite["id"])
+        self.assertNotIn("error", g, g)
+        self._final(g["id"], 3, 1)
+        return g
+
+    def test_standings_fail_closed_on_missing_league_season(self):
+        g = self._elite_regular_final_game()
+        stored = self.api.store.get_game(g["id"])
+        stored.league_season_id = None  # legacy pair still says Elite → drift
+        self.api.store.save_game(stored)
+        res = self.api.get_league_season_standings(
+            self.elite["id"], self.season["id"])
+        self.assertEqual(res["error"]["details"]["reason"],
+                         "game_league_season_mismatch", res)
+
+    def test_standings_fail_closed_on_mismatched_league_season(self):
+        g = self._elite_regular_final_game()
+        # Point the game at Rec's LeagueSeason while its legacy fields say Elite.
+        rec_ls = self.api.store.league_season_for(self.rec["id"], self.season["id"])
+        stored = self.api.store.get_game(g["id"])
+        stored.league_season_id = rec_ls.id
+        self.api.store.save_game(stored)
+        res = self.api.get_league_season_standings(
+            self.elite["id"], self.season["id"])
+        self.assertEqual(res["error"]["details"]["reason"],
+                         "game_league_season_mismatch", res)
+
+    def test_public_standings_fail_closed_on_drift(self):
+        g = self._elite_regular_final_game()
+        stored = self.api.store.get_game(g["id"])
+        stored.league_season_id = None
+        self.api.store.save_game(stored)
+        res = self.api.get_public_league_season_standings(
+            self.elite["id"], self.season["id"])
+        self.assertEqual(res["error"]["details"]["reason"],
+                         "game_league_season_mismatch", res)
+
+    def test_standings_count_only_the_exact_league_season(self):
+        # A correctly-scoped Elite game counts; an identical Rec-scoped game in
+        # the same Season never leaks into Elite's table (keyed on
+        # league_season_id, not the shared Season).
+        g = self._elite_regular_final_game()
+        home = self.api.store.get_game(g["id"]).home_team_id
+        res = self.api.get_league_season_standings(
+            self.elite["id"], self.season["id"])
+        self.assertNotIn("error", res, res)
+        by_team = {r["team_id"]: r for r in res["standings"]}
+        self.assertEqual(by_team[home]["pts"], 2)
+        # Rec's standings are empty — Elite's game did not bleed across.
+        rec = self.api.get_league_season_standings(
+            self.rec["id"], self.season["id"])
+        self.assertNotIn("error", rec, rec)
+        self.assertTrue(all(r["pts"] == 0 for r in rec["standings"]))
+
+
 class MemoryBlockerRegressionTest(_Contract, unittest.TestCase):
     def make_store(self):
         return InMemoryStore()
