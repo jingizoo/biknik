@@ -182,6 +182,15 @@ def team_registration_valid(store, season, team_id, division_id=None,
     team = store.get_team(team_id)
     if team is None or not team_scope_id(team) or team_scope_id(team) != season_scope:
         return None
+    # #283 rules 7-9: sharing a Program is not enough — the registration must sit
+    # in the Team's OWN permanent League. Resolve the registration's LeagueSeason
+    # and fail closed unless its League equals the Team's permanent league_id, so
+    # a same-Program cross-League drift (a Bronze Team injected into Platinum's
+    # LeagueSeason) is never trusted by game creation, drafts, or standings.
+    ls = (store.get_league_season(reg.league_season_id)
+          if reg.league_season_id else None)
+    if ls is None or not team.league_id or ls.league_id != team.league_id:
+        return None
     if require_division and division_id is not None and reg.division_id != division_id:
         return None
     return reg
@@ -203,14 +212,20 @@ def registered_team_ids_in_division(store, division_id):
               if league_season else None)
     if season is None or not season_scope_id(season):
         return set()  # dangling season, or a season with no league — trust nothing
-    league_id = season_scope_id(season)
+    program_scope = season_scope_id(season)
+    # #283 rules 7-9: the Division's competition League — a Team is trusted here
+    # only when its permanent League is exactly this one (not merely the same
+    # Program), excluding a same-Program cross-League drift.
+    division_league_id = league_season.league_id
     ids = set()
     for reg in store.registrations_for_season(season.id):
         if not reg.active or reg.division_id != division_id:
             continue
         team = store.get_team(reg.team_id)
-        if team is None or not team_scope_id(team) or team_scope_id(team) != league_id:
-            continue  # orphaned, null-league, or cross-league row — never trusted
+        if team is None or not team_scope_id(team) or team_scope_id(team) != program_scope:
+            continue  # orphaned, null-Program, or cross-Program row — never trusted
+        if not team.league_id or team.league_id != division_league_id:
+            continue  # cross-League drift within the Program — never trusted
         ids.add(reg.team_id)
     return ids
 
@@ -286,7 +301,12 @@ def registered_teams_by_division_in_league(store, season_id, league_id,
                 continue  # missing/cross-Season/cross-League Division — never trusted
         team = store.get_team(reg.team_id)
         if team is None or not team_scope_id(team) or team_scope_id(team) != program_scope:
-            continue  # orphaned, null-league, or cross-Program row — never trusted
+            continue  # orphaned, null-Program, or cross-Program row — never trusted
+        # #283 rules 7-9: the Team's permanent League must be exactly this League
+        # (not merely the same Program) — a same-Program cross-League drift (a
+        # Bronze Team in Platinum's LeagueSeason) is never trusted.
+        if not team.league_id or team.league_id != league_id:
+            continue
         groups.setdefault(reg.division_id, set()).add(reg.team_id)
     return groups
 

@@ -24,8 +24,10 @@ import unittest
 from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
 
 from hockey_scheduler.api import ApiService
+from datetime import datetime, timezone
+
 from hockey_scheduler.domain import (
-    IceSlotStatus, LeagueSeason, SeasonTeamRegistration, Team)
+    Game, IceSlotStatus, LeagueSeason, SeasonTeamRegistration, Team)
 from hockey_scheduler.store import InMemoryStore
 
 ADMIN = "admin"
@@ -396,17 +398,17 @@ class AssignLeagueGameStrandTest(_Base):
         reg_a = {"id": _reg_a.id}
         self.api.register_team_for_season(season["id"], team_b["id"],
                                           actor_id=ADMIN, league_id=l1["id"])
-        venue = self.api.create_venue("V", organization_id=org["id"],
-                                      league_id=program["id"], actor_id=ADMIN)
-        self.api.grant_season_venue_access(season["id"], venue["id"], actor_id=ADMIN)
-        rink = self.api.create_rink(venue["id"], "R", actor_id=ADMIN)
-        slot = self.api.create_ice_slot(
-            rink["id"], "2026-09-01T18:30:00+00:00",
-            "2026-09-01T20:00:00+00:00", "game", actor_id=ADMIN)
-        game = self.api.create_game(season["id"], None, team_a["id"],
-                                    team_b["id"], slot["id"], actor_id=ADMIN,
-                                    league_id=l1["id"])
-        self.assertNotIn("error", game, game)
+        # Inject a committed (non-draft, non-cancelled) L1 game for the
+        # league-less team_a directly: create_game now (correctly) refuses to put
+        # a league-less team in a regular game (#283 rules 7-9), so this
+        # otherwise-unreachable state is seeded straight into the store to
+        # exercise assign_season_team_league's game-strand guard specifically.
+        self.api.store.add_game(Game(
+            id=self.api.store.next_id("game"), home_team_id=team_a["id"],
+            away_team_id=team_b["id"],
+            start_time=datetime(2026, 9, 1, 18, 30, tzinfo=timezone.utc),
+            season_id=season["id"], league_id=l1["id"],
+            league_season_id=self._ls_id(l1["id"], season["id"])))
 
         audits_before = self._audit_count()
         res = self.api.assign_season_team_league(reg_a["id"], l2["id"],

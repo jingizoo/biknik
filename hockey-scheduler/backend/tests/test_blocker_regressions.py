@@ -23,7 +23,12 @@ from datetime import datetime, timedelta, timezone
 from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
 
 from hockey_scheduler.api import ApiService
-from hockey_scheduler.domain import IceSlotStatus
+from hockey_scheduler.domain import GameType, IceSlotStatus
+from hockey_scheduler.domain.setup_models import SeasonTeamRegistration
+from hockey_scheduler.services.league_scope import (
+    registered_team_ids_in_division,
+    registered_teams_by_division_in_league,
+)
 from hockey_scheduler.store import InMemoryStore, SqlStore
 
 ADMIN = "admin"
@@ -344,6 +349,72 @@ class _Contract:
         self.assertNotIn("error", rec, rec)
         self.assertNotIn(a["id"], {r["team_id"] for r in elite["standings"]})
         self.assertIn(a["id"], {r["team_id"] for r in rec["standings"]})
+
+
+    # -- Blocker: same-Program cross-League registration drift is not trusted --
+    def _cross_league_drift(self):
+        """Elite (League A) Division dA with a legit Elite team X registered in
+        it, plus a Rec (League B) team B injected with an ACTIVE registration
+        into Elite's LeagueSeason/dA — a same-Program cross-League drift. Returns
+        (dA, x, b)."""
+        dA = self.api.create_division_v2(self.elite["id"], "DA", actor_id=ADMIN)
+        x = self.api.create_team(self.club["id"], None, "X", actor_id=ADMIN,
+                                 league_id=self.elite["id"])
+        self.api.register_team_for_season(
+            self.season["id"], x["id"], dA["id"], actor_id=ADMIN,
+            league_id=self.elite["id"])
+        b = self.api.create_team(self.club["id"], None, "B", actor_id=ADMIN,
+                                 league_id=self.rec["id"])
+        elite_ls = self.api.store.league_season_for(
+            self.elite["id"], self.season["id"])
+        self.api.store.add_season_team_registration(SeasonTeamRegistration(
+            id=self.api.store.next_id("reg"), league_season_id=elite_ls.id,
+            team_id=b["id"], division_id=dA["id"], active=True))
+        return dA, x, b
+
+    def test_cross_league_drift_excluded_from_rosters(self):
+        dA, x, b = self._cross_league_drift()
+        # The shared roster both draft generation and standings read excludes B.
+        self.assertEqual(
+            registered_team_ids_in_division(self.api.store, dA["id"]), {x["id"]})
+        groups = registered_teams_by_division_in_league(
+            self.api.store, self.season["id"], self.elite["id"])
+        self.assertEqual(groups.get(dA["id"], set()), {x["id"]})
+
+    def test_cross_league_drift_rejected_by_manual_regular_create(self):
+        dA, x, b = self._cross_league_drift()
+        slot = self._slot(18)
+        before = self._audit_count()
+        res = self.api.create_game(
+            self.season["id"], dA["id"], x["id"], b["id"], slot["id"],
+            actor_id=ADMIN, league_id=self.elite["id"])
+        self.assertIn("error", res, res)
+        # Zero mutation: no Game, slot still available, no audit.
+        self.assertEqual(self.api.store.all_games(), [])
+        self.assertEqual(self.api.store.get_ice_slot(slot["id"]).status,
+                         IceSlotStatus.AVAILABLE)
+        self.assertEqual(self._audit_count(), before)
+
+    def test_cross_league_drift_excluded_from_standings(self):
+        dA, x, b = self._cross_league_drift()
+        div = self.api.get_standings(dA["id"])
+        self.assertNotIn("error", div, div)
+        self.assertNotIn(b["id"], {r["team_id"] for r in div["standings"]})
+        ls = self.api.get_league_season_standings(
+            self.elite["id"], self.season["id"])
+        self.assertNotIn("error", ls, ls)
+        self.assertNotIn(b["id"], {r["team_id"] for r in ls["standings"]})
+
+    def test_legit_cross_league_exhibition_still_allowed(self):
+        # An Exhibition between two teams each validly registered in their OWN
+        # League (Elite X, Rec Y) is unaffected by the drift guard.
+        _dA, x, _b = self._cross_league_drift()
+        y = self._team("Y", self.rec["id"])
+        exh = self.api.create_game(
+            self.season["id"], None, x["id"], y["id"], self._slot(20)["id"],
+            actor_id=ADMIN, game_type=GameType.EXHIBITION.value)
+        self.assertNotIn("error", exh, exh)
+        self.assertEqual(exh["game_type"], "exhibition")
 
 
 class MemoryBlockerRegressionTest(_Contract, unittest.TestCase):

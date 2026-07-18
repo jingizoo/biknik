@@ -19,7 +19,10 @@ import unittest
 from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
 
 from hockey_scheduler.api import ApiService
-from hockey_scheduler.domain import IceSlotStatus, SeasonTeamRegistration, Team
+from datetime import datetime, timezone
+
+from hockey_scheduler.domain import (
+    Game, IceSlotStatus, SeasonTeamRegistration, Team)
 from hockey_scheduler.store import SqlStore
 
 ADMIN = "admin"
@@ -216,10 +219,18 @@ class AssignLeagueGameStrandSqlTest(_SqlIntegrityBase):
             reg_a = {"id": _reg_a.id}
             api.register_team_for_season(season["id"], team_b["id"],
                                          actor_id=ADMIN, league_id=l1["id"])
-            slot = self._game_slot(api, org, program, season["id"])
-            game = api.create_game(season["id"], None, team_a["id"], team_b["id"],
-                                   slot["id"], actor_id=ADMIN, league_id=l1["id"])
-            self.assertNotIn("error", game, game)
+            # Inject a committed L1 game for the league-less team_a directly:
+            # create_game now (correctly) refuses to put a league-less team in a
+            # regular game (#283 rules 7-9), so this otherwise-unreachable state
+            # is seeded straight into the store to exercise
+            # assign_season_team_league's game-strand guard specifically.
+            store.add_game(Game(
+                id=store.next_id("game"), home_team_id=team_a["id"],
+                away_team_id=team_b["id"],
+                start_time=datetime(2026, 9, 1, 18, 30, tzinfo=timezone.utc),
+                season_id=season["id"], league_id=l1["id"],
+                league_season_id=store.league_season_for(
+                    l1["id"], season["id"]).id))
 
             audits_before = len(store.all_setup_audit())
             res = api.assign_season_team_league(reg_a["id"], l2["id"],
