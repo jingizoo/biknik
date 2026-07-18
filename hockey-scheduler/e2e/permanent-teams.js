@@ -194,14 +194,20 @@ async function checkViewport(browser, viewport) {
       const league = await post("/api/setup/league", { name: "Permanent League" });
       const season = await post("/api/setup/season", { league_id: league.id, name: "2026-27" });
       const level = await post("/api/setup/level", { season_id: season.id, name: "Adult League" });
-      // A second grouping League in the same season, so the Division-move
-      // dialog (below) has a real target to move to (#233 B2a review r1).
-      const level2 = await post("/api/setup/level", { season_id: season.id, name: "Junior League" });
       const division = await post("/api/setup/division",
         { season_id: season.id, level_id: level.id, name: "U14" });
       const club = await post("/api/setup/club", { name: "Perma Club" });
+      // #283 Slice E: a v1 team create keyed only on the Program (no division)
+      // resolves its permanent League only when that Program has exactly ONE —
+      // so create the Team while "Adult League" is still the sole League, and
+      // the v1 program_id→league_id response still equals league.id.
       const team = await post("/api/setup/team",
         { club_id: club.id, league_id: league.id, name: "Perma Bruins" });
+      // A second grouping League in the same season, so the Division-move
+      // dialog (below) has a real target to move to (#233 B2a review r1).
+      // Created AFTER the Team so it doesn't make the sole-League resolution
+      // above ambiguous.
+      const level2 = await post("/api/setup/level", { season_id: season.id, name: "Junior League" });
       return { league: league.id, team: team.id, division: division.id, level2: level2.id,
                teamOk: !team.error && team.league_id === league.id && !team.division_id,
                structureOk: !level.error && !level2.error && !division.error };
@@ -580,8 +586,8 @@ async function checkSliceB(browser, viewport) {
     await page.waitForSelector("#content > *", { timeout: 10000 });
 
     // Build a program → season → two permanent Leagues via the canonical v2
-    // surface, plus a program-only team (no permanent league) to prove the
-    // "No league" bucket. Elite gets sort_order 1 so it sorts before Rec.
+    // surface, plus an extra Program team under Rec to prove multi-team
+    // league-nesting in the tree. Elite gets sort_order 1 so it sorts before Rec.
     const ids = await page.evaluate(async () => {
       const post = async (p, b) => (await fetch(p, {
         method: "POST", credentials: "same-origin",
@@ -591,13 +597,14 @@ async function checkSliceB(browser, viewport) {
       const season = await post("/api/v2/setup/season", { program_id: program.id, name: "2027-28" });
       const elite = await post("/api/v2/setup/league", { season_id: season.id, name: "Elite", sort_order: 1 });
       const rec = await post("/api/v2/setup/league", { season_id: season.id, name: "Rec", sort_order: 2 });
-      // #283 Slice E: the canonical v2 route now requires a permanent league,
-      // so a league-less "remediation" team is created via the legacy v1 route
-      // (v1 league_id maps to Program), leaving Team.league_id null.
-      const loose = await post("/api/setup/team", { league_id: program.id, name: "Undrafted" });
-      // The v1 response renames program_id→league_id, so its permanent-league
-      // status can't be read here — it's verified below by the "No league"
-      // bucket. Just confirm the create itself succeeded.
+      // #283 Slice E: a Team must always resolve a permanent League — NEITHER
+      // the v1 nor the v2 create path can mint a league-less Team anymore (a
+      // "teams_without_league" row is now only reachable as a legacy migration
+      // remediation state, never through the API). So this extra Program team is
+      // created under a real League (Rec) via the canonical v2 route; the tree
+      // assertion below verifies it nests under that League rather than a
+      // now-unreachable "No league" bucket.
+      const loose = await post("/api/v2/setup/team", { league_id: rec.id, name: "Undrafted" });
       return { program: program.id, season: season.id, elite: elite.id, rec: rec.id,
                loose: loose.id, looseOk: !loose.error && !!loose.id };
     });
@@ -620,36 +627,40 @@ async function checkSliceB(browser, viewport) {
       fail(`team-create POST did not carry the permanent league_id (got ${JSON.stringify(teamBody)})`);
     await page.waitForFunction(() => !document.querySelector(".drawer[role=dialog]"), null, { timeout: 5000 });
 
-    // The permanent-teams tree nests Falcons under Elite and surfaces the
-    // program-only team under a "No league" bucket.
+    // The permanent-teams tree nests each Team under its permanent League —
+    // Falcons under Elite, and the extra Program team (Undrafted) under Rec.
+    // (#283 Slice E removed the ability to create a league-less Team, so the
+    // legacy "No league" remediation bucket is no longer reachable from a fresh
+    // create; the tree instead proves league-nesting for every Program team.)
     await page.click('[data-setup-view="hierarchy"]');
     await page.waitForFunction(
       () => [...document.querySelectorAll(".tree-title")]
         .some((x) => x.textContent.includes("Permanent teams")),
       null, { timeout: 15000 });
-    const nesting = await page.evaluate((leagueName) => {
+    const nesting = await page.evaluate(() => {
       const panel = [...document.querySelectorAll(".tree-panel")]
         .find((p) => (p.querySelector(".tree-title") || {}).textContent.includes("Permanent teams"));
       if (!panel) return { ok: false };
-      // The League block whose summary label is "Elite".
-      const eliteBlock = [...panel.querySelectorAll("details.tn")]
-        .find((d) => {
-          const lbl = d.querySelector(":scope > summary .tn-label");
-          return lbl && lbl.textContent.includes(leagueName);
-        });
-      const eliteTeams = eliteBlock
-        ? [...eliteBlock.querySelectorAll(".tn-leaf .tn-label")].map((l) => l.textContent) : [];
+      // Teams nested under the League block whose summary label matches `name`.
+      const blockTeams = (name) => {
+        const block = [...panel.querySelectorAll("details.tn")]
+          .find((d) => {
+            const lbl = d.querySelector(":scope > summary .tn-label");
+            return lbl && lbl.textContent.includes(name);
+          });
+        return block ? [...block.querySelectorAll(".tn-leaf .tn-label")].map((l) => l.textContent) : [];
+      };
       return {
         ok: true,
-        eliteHasFalcons: eliteTeams.some((t) => t.includes("Falcons")),
-        hasNoLeagueBucket: panel.textContent.includes("No league"),
+        eliteHasFalcons: blockTeams("Elite").some((t) => t.includes("Falcons")),
+        recHasUndrafted: blockTeams("Rec").some((t) => t.includes("Undrafted")),
         looseSurfaced: panel.textContent.includes("Undrafted"),
       };
-    }, "Elite");
+    });
     if (!nesting.ok) fail(`no "Permanent teams" panel in hierarchy`);
     if (!nesting.eliteHasFalcons) fail(`Falcons not nested under its Elite league`);
-    if (!nesting.hasNoLeagueBucket || !nesting.looseSurfaced)
-      fail(`program-only team not surfaced under a "No league" bucket`);
+    if (!nesting.recHasUndrafted || !nesting.looseSurfaced)
+      fail(`extra Program team not nested under its permanent League (Rec)`);
 
     // Transfer Falcons from Elite to Rec via the ⇄ Move (team:league) panel.
     const moveReq = page.waitForRequest((r) =>

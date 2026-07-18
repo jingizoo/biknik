@@ -77,24 +77,38 @@ async function checkViewport(browser, viewport) {
       const league = await post("/api/setup/league", { name: "Perm League" });
       const s1 = await post("/api/setup/season", { league_id: league.id, name: "2026" });
       const s2 = await post("/api/setup/season", { league_id: league.id, name: "2027" });
-      // A grouping League per season (#233 B2c) — the scheduling wizard's
-      // League picker is required, so each season needs one before a game
-      // can be created in it.
-      const lv1 = await post("/api/setup/level", { season_id: s1.id, name: "Level One" });
-      const lv2 = await post("/api/setup/level", { season_id: s2.id, name: "Level Two" });
+      // #283 Slice E / rule 7: Perma's two registrations (d1 in s1, d2 in s2)
+      // must both fall under Perma's SINGLE permanent League. So one permanent
+      // League L_A (lv1) spans BOTH Seasons — it is created for s1 here, and
+      // binds to s2 automatically when d2 is created under it below (a Division
+      // create find-or-creates the LeagueSeason for its (league, season) pair).
+      // A SECOND permanent League L_B (lv2) also exists in s1 so the scheduling
+      // wizard's League picker still offers ≥2 Leagues (never implicitly
+      // pre-selected) and has a foreign Division to prove league-scoping.
+      const lv1 = await post("/api/setup/level", { season_id: s1.id, name: "Level One" });  // L_A
+      const lv2 = await post("/api/setup/level", { season_id: s1.id, name: "Level Two" });  // L_B
       const d1 = await post("/api/setup/division", { season_id: s1.id, level_id: lv1.id, name: "S1 Div One" });
       const d1b = await post("/api/setup/division", { season_id: s1.id, level_id: lv1.id, name: "S1 Div Two" });
-      const d2 = await post("/api/setup/division", { season_id: s2.id, level_id: lv2.id, name: "S2 Div One" });
+      // d2 is L_A's Division in s2 — creating it binds L_A to s2 (rule 7 keeps
+      // Perma's s1 + s2 registrations in the same permanent League).
+      const d2 = await post("/api/setup/division", { season_id: s2.id, level_id: lv1.id, name: "S2 Div One" });
+      // dOther is L_B's own Division in s1 — a foreign-League division that must
+      // never leak into L_A's picker (assertion B1).
+      const dOther = await post("/api/setup/division", { season_id: s1.id, level_id: lv2.id, name: "S1 L2 Div" });
       const venue = await post("/api/setup/venue", { name: "V", league_id: league.id });
       // Game ice eligibility (#233 Slice E) requires the venue to hold active
       // SeasonVenueAccess for the season the game is scheduled in.
       await post(`/api/v2/setup/seasons/${s1.id}/venue-access`, { venue_id: venue.id });
       const rink = await post("/api/setup/rink", { venue_id: venue.id, name: "R" });
       const club = await post("/api/setup/club", { name: "Club" });
-      // #180: create the permanent Team under its LEAGUE (no division); its
-      // season/division placement is set separately via registration below.
+      // #180/#283 Slice E: create every permanent Team under its permanent
+      // League L_A (lv1) via the canonical v2 route (league_id REQUIRED; the
+      // service derives Program from it). Its season/division placement is set
+      // separately via registration below. The v1 route can't be used here: the
+      // Program now holds two permanent Leagues, so a v1 create keyed only on
+      // the Program (no division) is ambiguous (team_league_required).
       const team = async (n) =>
-        (await post("/api/setup/team", { club_id: club.id, league_id: league.id, name: n })).id;
+        (await post("/api/v2/setup/team", { club_id: club.id, league_id: lv1.id, name: n })).id;
       const perma = await team("Perma");   // the one permanent team we track
       const mateA = await team("Mate A");
       const mateB = await team("Mate B");
@@ -120,7 +134,7 @@ async function checkViewport(browser, viewport) {
         rink_id: rink.id, start_time: `${day}T20:00:00+00:00`,
         end_time: `${day}T21:00:00+00:00`, slot_type: "game" });
       return { league: league.id, s1: s1.id, s2: s2.id, lv1: lv1.id,
-        d1: d1.id, d1b: d1b.id, d2: d2.id, perma, leagueOnly,
+        d1: d1.id, d1b: d1b.id, d2: d2.id, dOther: dOther.id, perma, leagueOnly,
         slot: slot.id, slot2: slot2.id };
     }, CAL_DAY);
 
@@ -184,8 +198,10 @@ async function checkViewport(browser, viewport) {
       ids.d1, { timeout: 10000 });
 
     // (B1) Choosing a League enables the downstream controls, and scopes the
-    // Division picker to it — d2 (League 2's own division) must never leak
-    // into League 1's picker.
+    // Division picker to it — dOther (L_B's own division) must never leak
+    // into L_A's picker. (d2 is L_A's own division in the OTHER season, so it
+    // legitimately belongs to L_A here — the picker is league-scoped, not
+    // season-scoped.)
     const postSelect = await page.evaluate(() => ({
       divDisabled: document.querySelector("#w-div").disabled,
       homeDisabled: document.querySelector("#w-home").disabled,
@@ -195,8 +211,8 @@ async function checkViewport(browser, viewport) {
     if (postSelect.divDisabled || postSelect.homeDisabled || postSelect.awayDisabled) {
       throw new Error(`[${viewport.label}] downstream controls stayed disabled after choosing a League: ${JSON.stringify(postSelect)}`);
     }
-    if (postSelect.divOptions.includes(ids.d2)) {
-      throw new Error(`[${viewport.label}] League 1's Division picker leaked League 2's own division: ${JSON.stringify(postSelect.divOptions)}`);
+    if (postSelect.divOptions.includes(ids.dOther)) {
+      throw new Error(`[${viewport.label}] L_A's Division picker leaked L_B's own division: ${JSON.stringify(postSelect.divOptions)}`);
     }
 
     const homeOptions = async () => page.$$eval(
