@@ -2351,21 +2351,26 @@ class ApiService:
             # against a future division-tagged friendly).
             if g.game_type != GameType.REGULAR.value:
                 continue
+            # Public standings must never inspect, count, or disclose a hidden
+            # (unpublished) Game — skip it BEFORE any integrity evaluation or
+            # result lookup, so a draft Game can't leak its existence/identifiers
+            # through a public data_integrity_error (#83 public-only contract).
+            if public_only and not g.published:
+                continue
             # #283 blocker: a regular Game claiming this Division must belong to
             # the Division's exact LeagueSeason — the SAME Game→LeagueSeason
             # integrity check LeagueSeason standings apply. A null/wrong
             # league_season_id or a disagreeing legacy (league_id, season_id)
             # pair is drift: fail closed so Division and LeagueSeason standings
             # can never count-vs-reject the same Game and tell contradictory
-            # histories. (A dangling Division with no LeagueSeason yields an
-            # empty roster, so no Game is countable there anyway.)
+            # histories. The operator path sees every Game; the public path only
+            # its published Games. (A dangling Division with no LeagueSeason
+            # yields an empty roster, so no Game is countable there anyway.)
             if league_season is not None and not (
                     getattr(g, "league_season_id", None) == league_season.id
                     and g.league_id == league_season.league_id
                     and g.season_id == league_season.season_id):
                 return self._league_season_mismatch_error(g, league_season.id)
-            if public_only and not g.published:
-                continue
             r = self.store.result_for_game(g.id)
             if r is None or r.status != ResultStatus.FINAL:
                 continue
@@ -2463,10 +2468,15 @@ class ApiService:
             by_legacy = g.league_id == league_id and g.season_id == season_id
             if not (by_ls or by_legacy):
                 continue  # belongs to some other LeagueSeason
-            if by_ls != by_legacy:
-                return self._league_season_mismatch_error(g, ls.id)
+            # Public standings must never inspect, count, or disclose a hidden
+            # (unpublished) Game — skip it BEFORE the integrity check or result
+            # lookup, so a draft Game can't leak via a public
+            # data_integrity_error (#83). The operator path still fails closed on
+            # every drifted Game.
             if public_only and not g.published:
                 continue
+            if by_ls != by_legacy:
+                return self._league_season_mismatch_error(g, ls.id)
             r = self.store.result_for_game(g.id)
             if r is None or r.status != ResultStatus.FINAL:
                 continue

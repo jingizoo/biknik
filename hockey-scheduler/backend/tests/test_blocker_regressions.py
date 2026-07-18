@@ -17,6 +17,7 @@ the import blockers in test_import_permanent_league.py), on both stores:
 """
 
 import os
+import json
 import unittest
 from datetime import datetime, timedelta, timezone
 
@@ -212,15 +213,42 @@ class _Contract:
         self.assertEqual(res["error"]["details"]["reason"],
                          "game_league_season_mismatch", res)
 
-    def test_public_standings_fail_closed_on_drift(self):
-        g = self._elite_regular_final_game()
-        stored = self.api.store.get_game(g["id"])
-        stored.league_season_id = None
+    def test_public_league_season_standings_exclude_unpublished_drift(self):
+        # #83 public-only contract: an unpublished, mismatched Game must not
+        # affect public standings NOR disclose its identifiers. Seed a valid
+        # PUBLISHED final game plus a separate UNPUBLISHED drifted one.
+        x = self._team("X", self.elite["id"])
+        y = self._team("Y", self.elite["id"])
+        z = self._team("Z", self.elite["id"])
+        ok = self.api.create_game(
+            self.season["id"], None, x["id"], y["id"], self._slot(18)["id"],
+            actor_id=ADMIN, league_id=self.elite["id"])
+        self.assertNotIn("error", ok, ok)
+        self.assertNotIn("error", self.api.publish_game(ok["id"], actor_id=ADMIN))
+        self._final(ok["id"], 2, 0)
+        bad = self.api.create_game(  # unpublished (draft)
+            self.season["id"], None, x["id"], z["id"], self._slot(20)["id"],
+            actor_id=ADMIN, league_id=self.elite["id"])
+        self.assertNotIn("error", bad, bad)
+        self._final(bad["id"], 9, 0)
+        stored = self.api.store.get_game(bad["id"])
+        stored.league_season_id = None  # drift
         self.api.store.save_game(stored)
-        res = self.api.get_public_league_season_standings(
+
+        # Operator view sees the drift and fails closed.
+        priv = self.api.get_league_season_standings(
             self.elite["id"], self.season["id"])
-        self.assertEqual(res["error"]["details"]["reason"],
-                         "game_league_season_mismatch", res)
+        self.assertEqual(priv["error"]["details"]["reason"],
+                         "game_league_season_mismatch", priv)
+        # Public view returns the valid PUBLISHED table and never leaks the
+        # hidden game's identifiers.
+        pub = self.api.get_public_league_season_standings(
+            self.elite["id"], self.season["id"])
+        self.assertNotIn("error", pub, pub)
+        by_team = {r["team_id"]: r for r in pub["standings"]}
+        self.assertEqual(by_team[x["id"]]["pts"], 2)   # only the published game
+        self.assertEqual(by_team[x["id"]]["gf"], 2)    # not the hidden 9
+        self.assertNotIn(bad["id"], json.dumps(pub))
 
     def test_standings_count_only_the_exact_league_season(self):
         # A correctly-scoped Elite game counts; an identical Rec-scoped game in
@@ -260,14 +288,18 @@ class _Contract:
         return dA, g
 
     def test_division_standings_fail_closed_on_missing_game_league_season(self):
+        # The drifted game is unpublished (a draft) — the operator view fails
+        # closed; the public view skips the hidden game and never leaks it.
         dA, g = self._division_regular_final_game()
         stored = self.api.store.get_game(g["id"])
         stored.league_season_id = None  # drift: Division claims it, LS is gone
         self.api.store.save_game(stored)
-        for res in (self.api.get_standings(dA["id"]),
-                    self.api.get_public_standings(dA["id"])):
-            self.assertEqual(res["error"]["details"]["reason"],
-                             "game_league_season_mismatch", res)
+        self.assertEqual(
+            self.api.get_standings(dA["id"])["error"]["details"]["reason"],
+            "game_league_season_mismatch")
+        pub = self.api.get_public_standings(dA["id"])
+        self.assertNotIn("error", pub, pub)
+        self.assertNotIn(g["id"], json.dumps(pub))
 
     def test_division_standings_fail_closed_on_wrong_game_league_season(self):
         dA, g = self._division_regular_final_game()
@@ -276,10 +308,50 @@ class _Contract:
         stored = self.api.store.get_game(g["id"])
         stored.league_season_id = rec_ls.id
         self.api.store.save_game(stored)
-        for res in (self.api.get_standings(dA["id"]),
-                    self.api.get_public_standings(dA["id"])):
-            self.assertEqual(res["error"]["details"]["reason"],
-                             "game_league_season_mismatch", res)
+        self.assertEqual(
+            self.api.get_standings(dA["id"])["error"]["details"]["reason"],
+            "game_league_season_mismatch")
+        pub = self.api.get_public_standings(dA["id"])
+        self.assertNotIn("error", pub, pub)
+        self.assertNotIn(g["id"], json.dumps(pub))
+
+    def test_public_division_standings_exclude_unpublished_drift(self):
+        # #83 public-only contract for the Division view: a valid PUBLISHED
+        # final game counts; a separate UNPUBLISHED mismatched game is excluded
+        # (operator view fails closed; public view shows the valid table only).
+        dA = self.api.create_division_v2(self.elite["id"], "DA", actor_id=ADMIN)
+        x = self.api.create_team(self.club["id"], None, "X", actor_id=ADMIN,
+                                 league_id=self.elite["id"])
+        y = self.api.create_team(self.club["id"], None, "Y", actor_id=ADMIN,
+                                 league_id=self.elite["id"])
+        z = self.api.create_team(self.club["id"], None, "Z", actor_id=ADMIN,
+                                 league_id=self.elite["id"])
+        for t in (x, y, z):
+            self.api.register_team_for_season(
+                self.season["id"], t["id"], dA["id"], actor_id=ADMIN,
+                league_id=self.elite["id"])
+        ok = self.api.create_game(
+            self.season["id"], dA["id"], x["id"], y["id"], self._slot(18)["id"],
+            actor_id=ADMIN, league_id=self.elite["id"])
+        self.assertNotIn("error", self.api.publish_game(ok["id"], actor_id=ADMIN))
+        self._final(ok["id"], 2, 0)
+        bad = self.api.create_game(  # unpublished (draft)
+            self.season["id"], dA["id"], x["id"], z["id"], self._slot(20)["id"],
+            actor_id=ADMIN, league_id=self.elite["id"])
+        self._final(bad["id"], 9, 0)
+        stored = self.api.store.get_game(bad["id"])
+        stored.league_season_id = None  # drift
+        self.api.store.save_game(stored)
+
+        self.assertEqual(
+            self.api.get_standings(dA["id"])["error"]["details"]["reason"],
+            "game_league_season_mismatch")
+        pub = self.api.get_public_standings(dA["id"])
+        self.assertNotIn("error", pub, pub)
+        by_team = {r["team_id"]: r for r in pub["standings"]}
+        self.assertEqual(by_team[x["id"]]["pts"], 2)
+        self.assertEqual(by_team[x["id"]]["gf"], 2)  # not the hidden 9
+        self.assertNotIn(bad["id"], json.dumps(pub))
 
     # -- history: an ended-Season transfer never changes historical standings --
     def _end_the_season(self):
