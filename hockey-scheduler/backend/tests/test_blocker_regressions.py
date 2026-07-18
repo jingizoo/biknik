@@ -235,6 +235,78 @@ class _Contract:
         self.assertTrue(all(r["pts"] == 0 for r in rec["standings"]))
 
 
+    # -- history: an ended-Season transfer never changes historical standings --
+    def _end_the_season(self):
+        season = self.api.store.get_season(self.season["id"])
+        season.end_date = datetime.now(UTC) - timedelta(days=30)
+        self.api.store.save_season(season)
+
+    def _ls_standings(self, public):
+        fn = (self.api.get_public_league_season_standings if public
+              else self.api.get_league_season_standings)
+        res = fn(self.elite["id"], self.season["id"])
+        self.assertNotIn("error", res, res)
+        return res["standings"]
+
+    def _assert_ended_season_history_unchanged(self, public):
+        # A completed Elite Season: A beats B 3-1 (FINAL). For the public table
+        # the Game is published; for the private table it stays unpublished.
+        a = self._team("A", self.elite["id"])
+        b = self._team("B", self.elite["id"])
+        g = self.api.create_game(
+            self.season["id"], None, a["id"], b["id"], self._slot(18)["id"],
+            actor_id=ADMIN, league_id=self.elite["id"])
+        self.assertNotIn("error", g, g)
+        if public:
+            self.assertNotIn(
+                "error", self.api.publish_game(g["id"], actor_id=ADMIN))
+        self._final(g["id"], 3, 1)
+        self._end_the_season()
+
+        before = self._ls_standings(public)
+        reg = self._active_regs(a["id"])[0]
+        reg_before = (reg.id, reg.team_id, reg.league_season_id,
+                      reg.division_id, reg.active)
+        gs = self.api.store.get_game(g["id"])
+        game_before = (gs.home_team_id, gs.away_team_id, gs.league_id,
+                       gs.season_id, gs.league_season_id, gs.game_type,
+                       gs.published)
+        rs = self.api.store.result_for_game(g["id"])
+        result_before = (rs.home_score, rs.away_score, rs.status)
+
+        moved = self.api.transfer_team_to_league(
+            a["id"], self.rec["id"], actor_id=ADMIN)
+        self.assertNotIn("error", moved, moved)
+
+        # The completed Season is byte-identical: standings, registration,
+        # Game, and result all unchanged — the transferred Team still appears
+        # in its own historical table with its 2 points.
+        after = self._ls_standings(public)
+        self.assertEqual(after, before)
+        by_team = {r["team_id"]: r for r in after}
+        self.assertIn(a["id"], by_team)
+        self.assertEqual(by_team[a["id"]]["pts"], 2)
+        ra = self.api.store.get_season_team_registration(reg.id)
+        self.assertEqual((ra.id, ra.team_id, ra.league_season_id,
+                          ra.division_id, ra.active), reg_before)
+        ga = self.api.store.get_game(g["id"])
+        self.assertEqual((ga.home_team_id, ga.away_team_id, ga.league_id,
+                          ga.season_id, ga.league_season_id, ga.game_type,
+                          ga.published), game_before)
+        rra = self.api.store.result_for_game(g["id"])
+        self.assertEqual((rra.home_score, rra.away_score, rra.status),
+                         result_before)
+        # Current/future eligibility follows the NEW permanent League.
+        self.assertEqual(self.api.store.get_team(a["id"]).league_id,
+                         self.rec["id"])
+
+    def test_transfer_preserves_ended_season_private_standings(self):
+        self._assert_ended_season_history_unchanged(public=False)
+
+    def test_transfer_preserves_ended_season_public_standings(self):
+        self._assert_ended_season_history_unchanged(public=True)
+
+
 class MemoryBlockerRegressionTest(_Contract, unittest.TestCase):
     def make_store(self):
         return InMemoryStore()

@@ -2371,15 +2371,22 @@ class ApiService:
             return {"error": {
                 "code": "not_found",
                 "message": "No such league in that season."}}
-        # The roster is the LeagueSeason's active registrations whose Team is a
-        # permanent member of this exact League (never an orphan/cross-league
-        # row) — the same trust rule the per-Division roster uses.
+        # #283 rule 10 / history preservation: membership in THIS LeagueSeason
+        # is the registration's canonical ``league_season_id`` (every row from
+        # ``registrations_for_league_season`` already has it), NOT the Team's
+        # CURRENT ``team.league_id``. A Team validly transferred to another
+        # League after an ended Season keeps its historical registration (and its
+        # Games/results/standings) here, so it must still appear in this table —
+        # filtering by current ownership would erase the transferred Team from
+        # its own completed Season. (Its current/future eligibility follows the
+        # new League via that League's own registrations, computed separately.)
+        # A registration whose Team no longer exists is an orphan with no row to
+        # place, and is skipped.
         team_ids = set()
         for reg in self.store.registrations_for_league_season(ls.id):
             if not reg.active:
                 continue
-            team = self.store.get_team(reg.team_id)
-            if team is None or team.league_id != league_id:
+            if self.store.get_team(reg.team_id) is None:
                 continue
             team_ids.add(reg.team_id)
         teams = [t for t in (self.store.get_team(tid) for tid in team_ids)
