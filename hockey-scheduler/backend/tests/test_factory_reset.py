@@ -34,7 +34,7 @@ class FactoryResetContract:
         self.store = self.make_store()
         self.api = ApiService(self.store)
         self.admin = self.api.accounts.create_account(
-            "boss", "hunter22", Role.LEAGUE_ADMIN)
+            "boss", "hunter22-secure", Role.LEAGUE_ADMIN)
         # A non-admin account used only to prove the League-Admin gate rejects
         # non-admins. A viewer needs no scope subject (a coach would now require
         # a real team, #266) and keeps the baseline row counts unchanged.
@@ -53,7 +53,7 @@ class FactoryResetContract:
     def _preview(self, actor_id=None):
         return self.api.factory_reset.preview(actor_id or self.admin.id)
 
-    def _execute(self, actor_id=None, password="hunter22",
+    def _execute(self, actor_id=None, password="hunter22-secure",
                 phrase=CONFIRMATION_PHRASE, token=None, backup=True,
                 environment="production"):
         return self.api.factory_reset.execute(
@@ -212,7 +212,7 @@ class FactoryResetContract:
         try:
             with self.assertRaises(ValidationError) as cm:
                 self.api.factory_reset.execute(
-                    self.admin.id, "hunter22", CONFIRMATION_PHRASE, token, True)
+                    self.admin.id, "hunter22-secure", CONFIRMATION_PHRASE, token, True)
             self.assertEqual(cm.exception.details["reason"], "reset_in_progress")
         finally:
             self.store.release_factory_reset_lock("held-token")
@@ -229,7 +229,7 @@ class FactoryResetContract:
                                         self.api.roster.clock)
         token = service_a.preview(self.admin.id)["challenge_token"]
         result = service_b.execute(
-            self.admin.id, "hunter22", CONFIRMATION_PHRASE, token, True)
+            self.admin.id, "hunter22-secure", CONFIRMATION_PHRASE, token, True)
         self.assertEqual(result["result"], "success")
 
     def test_stale_lock_reclaimed_allows_new_reset(self):
@@ -324,7 +324,7 @@ class FactoryResetContract:
     def test_execute_success_preserved_admin_can_log_in(self):
         token = self._preview()["challenge_token"]
         self._execute(token=token)
-        verified = self.api.accounts.verify_login("boss", "hunter22")
+        verified = self.api.accounts.verify_login("boss", "hunter22-secure")
         self.assertIsNotNone(verified)
         self.assertEqual(verified.id, self.admin.id)
 
@@ -509,7 +509,7 @@ class FactoryResetPostgresRaceTest(unittest.TestCase):
         try:
             api = ApiService(seed)
             admin = api.accounts.create_account(
-                "boss", "hunter22", Role.LEAGUE_ADMIN)
+                "boss", "hunter22-secure", Role.LEAGUE_ADMIN)
             seed.add_organization(Organization(id="org_seed", name="Seed Org"))
             token = api.factory_reset.preview(admin.id)["challenge_token"]
 
@@ -547,7 +547,7 @@ class FactoryResetPostgresRaceTest(unittest.TestCase):
             outcome = {}
             try:
                 outcome["result"] = api.factory_reset.execute(
-                    admin.id, "hunter22", CONFIRMATION_PHRASE, token, True)
+                    admin.id, "hunter22-secure", CONFIRMATION_PHRASE, token, True)
             except ValidationError as exc:
                 outcome["error"] = exc
             t.join(timeout=10)
@@ -644,7 +644,7 @@ class FactoryResetHttpTest(unittest.TestCase):
         os.environ["APP_MODE"] = "production"
         os.environ["ALLOW_PRODUCTION_FACTORY_RESET"] = "true"
         os.environ["BOOTSTRAP_ADMIN_USER"] = "boss"
-        os.environ["BOOTSTRAP_ADMIN_PASSWORD"] = "hunter22"
+        os.environ["BOOTSTRAP_ADMIN_PASSWORD"] = "hunter22-secure"
         os.environ.pop("DATABASE_URL", None)
         srv.STATE.reset()
         cls.httpd = ThreadingHTTPServer(("127.0.0.1", 0), srv.Handler)
@@ -681,7 +681,7 @@ class FactoryResetHttpTest(unittest.TestCase):
             return (e.code, json.loads(e.read() or b"{}"),
                     e.headers.get("Set-Cookie"))
 
-    def _login(self, username="boss", password="hunter22"):
+    def _login(self, username="boss", password="hunter22-secure"):
         status, _, sc = self._req(
             "POST", "/api/auth/login",
             {"username": username, "password": password})
@@ -732,7 +732,7 @@ class FactoryResetHttpTest(unittest.TestCase):
         token = body["challenge_token"]
         status, body, sc = self._req(
             "POST", "/api/admin/factory-reset/execute",
-            {"password": "hunter22", "typed_phrase": CONFIRMATION_PHRASE,
+            {"password": "hunter22-secure", "typed_phrase": CONFIRMATION_PHRASE,
              "challenge_token": token, "backup_acknowledged": True},
             cookie=cookie)
         self.assertEqual(status, 200)
@@ -750,7 +750,7 @@ class FactoryResetHttpTest(unittest.TestCase):
         token = body["challenge_token"]
         status, body, _ = self._req(
             "POST", "/api/admin/factory-reset/execute",
-            {"password": "hunter22", "typed_phrase": "not it",
+            {"password": "hunter22-secure", "typed_phrase": "not it",
              "challenge_token": token, "backup_acknowledged": True},
             cookie=cookie)
         self.assertEqual(status, 400)
@@ -771,7 +771,7 @@ class FactoryResetHttpTest(unittest.TestCase):
             with self.subTest(bad_value=bad_value):
                 status, body, _ = self._req(
                     "POST", "/api/admin/factory-reset/execute",
-                    {"password": "hunter22", "typed_phrase": CONFIRMATION_PHRASE,
+                    {"password": "hunter22-secure", "typed_phrase": CONFIRMATION_PHRASE,
                      "challenge_token": token, "backup_acknowledged": bad_value},
                     cookie=cookie)
                 self.assertEqual(status, 400, (bad_value, body))

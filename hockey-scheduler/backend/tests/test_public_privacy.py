@@ -48,7 +48,7 @@ class ProductionPublicPrivacyTest(_HttpBase):
     def setUpClass(cls):
         os.environ["APP_MODE"] = "production"
         os.environ["BOOTSTRAP_ADMIN_USER"] = "privadmin"
-        os.environ["BOOTSTRAP_ADMIN_PASSWORD"] = "pw"
+        os.environ["BOOTSTRAP_ADMIN_PASSWORD"] = "privadmin-pw"
         srv.STATE.reset()
         # Seed a real game with a real roster so there IS player data to leak,
         # created through the bootstrapped admin's authority.
@@ -90,7 +90,7 @@ class ProductionPublicPrivacyTest(_HttpBase):
             self.assertNotIn(name, blob)
 
     def test_signed_in_user_can_read_player_data(self):
-        cookie = self._login("privadmin", "pw")
+        cookie = self._login("privadmin", "privadmin-pw")
         self.assertIsNotNone(cookie)
         for sub in PLAYER_DATA_SUBS:
             status, _ = self._get(f"/api/games/{self.game_id}/{sub}",
@@ -115,7 +115,7 @@ class ProductionPublicPrivacyTest(_HttpBase):
         if tid and store.get_team(tid) is None:
             store.add_team(Team(id=tid, name="Scope Team"))
         acct = srv.STATE.api.accounts.create_account(
-            username=account_id, password="pw", role=role, scope=scope)
+            username=account_id, password="scoped-account-pw", role=role, scope=scope)
         token = srv.SESSIONS.login(store, acct.id)
         return self._get(path, cookie=f"{srv.SESSION_COOKIE}={token}")
 

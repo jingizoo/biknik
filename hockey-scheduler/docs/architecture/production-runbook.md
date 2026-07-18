@@ -53,6 +53,10 @@ arrays for the in-memory demo store instead):
 | `TRUST_PROXY_HEADERS` | `1` trusts `X-Forwarded-For` for anonymous-route rate limiting (#131). **Only set this if a real reverse proxy sits in front of the app and is configured to strip/overwrite any client-supplied `X-Forwarded-For` before appending its own** — otherwise any caller can spoof a new value per request and defeat rate limiting entirely. Unset when serving direct HTTP with no proxy. | unset (raw connecting IP) |
 | `ALLOW_PRODUCTION_FACTORY_RESET` | `1`/`true`/`yes` makes the guarded production factory-reset workflow reachable (#256). Leave **unset** except during a deliberate, supervised wipe — see [Factory reset (Danger zone)](#factory-reset-danger-zone). Has no effect outside `APP_MODE=production`. | unset (disabled) |
 | `DEPLOYMENT_ENV` | Free-form environment label recorded on the durable factory-reset audit event (e.g. `prod-eu`). Falls back to `APP_MODE` when unset. | `APP_MODE` |
+| `HS_MIN_PASSWORD_LENGTH` | Minimum length enforced on every new/changed/reset password **in production** (#267). Safe-bounded to `[8, 128]`: a value below the hard floor (`8`) is raised to the floor and one above the ceiling is capped, so a stray override can neither weaken the policy nor wedge account creation. Ignored outside production (demo/dev credentials such as the seeded `demo` password stay usable). | `10` (range `8`–`128`) |
+| `HS_LOGIN_MAX_FAILURES` | Failed login attempts allowed per normalized username per window before that username is temporarily throttled (#267). Clamped to `[1, 100]` so a huge value can't disable the per-username throttle. | `5` |
+| `HS_LOGIN_IP_MAX_FAILURES` | Failed login attempts allowed per source IP per window before that IP is temporarily throttled — a coarse cap across all usernames from one IP (#267). Clamped to `[1, 5000]`. | `50` |
+| `HS_LOGIN_WINDOW_SECONDS` | Sliding window over which login failures are counted; a throttled key unlocks once its oldest in-window failure ages out (#267). Clamped to `[30, 86400]` so a misconfig can't drop protection nor wedge a lock open longer than a day. | `900` (15 min) |
 
 Secrets are read from the environment only — they are never returned by any
 API, logged, or persisted in plaintext (passwords are PBKDF2-hashed).
@@ -111,6 +115,69 @@ the environment:
 - [ ] Served over HTTPS (directly or behind a TLS-terminating proxy) so the
       `Secure` session cookie (#76) is honored.
 - [ ] `GET /api/readiness` returns `ready: true`.
+- [ ] Login throttling + credential policy left at defaults (or tuned within
+      bounds) — see [Login security & credential policy](#login-security--credential-policy-267).
+
+## Login security & credential policy (#267)
+
+Two independent protections guard the `/api/auth/login` route. Both are on by
+default with production-safe defaults; the environment variables above tune
+them within bounds that can only tighten, never disable, the protection.
+
+**Minimum credential policy.** Every password that is created, changed, or reset
+must be a non-empty string, and **in production** must be at least
+`HS_MIN_PASSWORD_LENGTH` characters (default `10`, hard floor `8`). The policy
+is applied at write time, so existing stored hashes are never invalidated — it
+takes effect at the next set/change/reset. Outside production only the
+non-empty rule applies, so the seeded development `demo` credential keeps
+working (and demo login paths are disabled in production regardless).
+
+**Login throttling.** Repeated *failed* logins are counted in a sliding window
+(`HS_LOGIN_WINDOW_SECONDS`, default 15 min) against two independent buckets:
+
+- the **normalized username** (`HS_LOGIN_MAX_FAILURES`, default 5) — protects a
+  single account from online guessing; and
+- the **source IP** (`HS_LOGIN_IP_MAX_FAILURES`, default 50) — a coarse cap
+  across all usernames from one origin, so spraying many usernames from one host
+  is capped even though no single username locks.
+
+When either bucket fills, the route returns `429` with a `Retry-After` header
+and a generic message; the same generic response is sent whether or not the
+username exists, so the throttle is **not a username oracle**. A *successful*
+login clears that username's failure history (a legitimate user is never locked
+out by their own earlier typos), but leaves the IP bucket to decay by time so an
+attacker interleaving one known-good credential can't reset the coarse IP cap. A
+throttled key unlocks automatically once its oldest in-window failure ages out —
+these are short temporary locks, not permanent bans, so no operator unlock step
+is needed. The first time a bucket locks, one durable `login_throttled` setup
+audit entry is written (source IP + which scopes locked, never the username or
+password) so lockouts are visible without leaking credentials.
+
+The throttle counts an attempt the moment it is admitted (reserving an in-flight
+slot inside a single lock), so a burst of simultaneous attempts against one
+username or IP cannot collectively slip past the ceiling — concurrency is bounded
+to the configured limit, not to the number of worker threads. Its memory is
+bounded three ways so a spray attack can't grow state without limit: buckets are
+keyed by a fixed-size (16-byte) digest of the IP/username, so an over-long
+identity can't inflate per-entry size; buckets whose failures have aged out of
+the window are reclaimed by an amortized sweep (and again before any capacity
+rejection); and a hard cap on the number of distinct tracked identities means
+that once the table is full even after a sweep, a **previously unseen** identity
+is failed closed (throttled) rather than allocating a new bucket. Under a
+large-scale spray of fresh identities this briefly throttles genuinely new
+callers — a deliberate, documented degradation — while already-tracked users keep
+working. Every tunable is parsed defensively (non-finite values fall back to the
+default) and clamped to a safe range (see the table above), so a misconfigured
+value can move within limits but can neither disable the protection nor wedge a
+lock open indefinitely.
+
+The throttle is in-process and per-instance (like the anonymous-route limiter,
+#131): a restart clears it, and behind multiple instances each sees only its own
+share of traffic. That is adequate abuse mitigation for the current
+single-/few-instance deployment model, not billing-grade distributed limiting.
+Behind a reverse proxy, set `TRUST_PROXY_HEADERS=1` **only** if the proxy strips
+and rewrites `X-Forwarded-For` (see that row above) — otherwise the per-IP
+bucket can be spoofed away, though the per-username bucket still holds.
 
 ## Smoke test after deploy
 

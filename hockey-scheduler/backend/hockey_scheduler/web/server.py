@@ -47,7 +47,7 @@ from .auth import (
 from .authz import authorize, required_permission
 from ..api import v1_setup_adapter as _v1
 from ..api import v2_setup_projection as _v2p
-from .rate_limit import RateLimiter
+from .rate_limit import LoginThrottle, RateLimiter
 from .scope import can_read_private_game_data, scope_violation
 
 # Acting role resolution (#50): a server-issued session cookie is authoritative.
@@ -104,6 +104,11 @@ SESSIONS = SessionManager()
 # limit. DemoState.reset() clears it explicitly instead, so tests (which
 # reset demo state between classes) start each suite with a clean slate.
 RATE_LIMITER = RateLimiter()
+
+# Login throttle (#267): failed-attempt lockout by source IP AND normalized
+# username, separate from the anonymous-route RateLimiter. Same lifetime as
+# RATE_LIMITER; DemoState.reset() clears it too so each test class starts clean.
+LOGIN_THROTTLE = LoginThrottle()
 
 # Cookie lifetime mirrors the session TTL so the browser drops the cookie when
 # the server-side session would already be expired (#76).
@@ -193,6 +198,7 @@ class DemoState:
             self.ids = {}
             bootstrap_admin_from_env(self.api, os.environ)
             RATE_LIMITER.reset()  # (#131) fresh process → clean rate-limit slate
+            LOGIN_THROTTLE.reset()  # (#267) clear login lockouts on rebuild too
             self._close_store(old_store, store)
             return
 
@@ -233,6 +239,7 @@ class DemoState:
         # the superseded store.
         self.api, self.game_id, self.ids = api, game_id, ids
         RATE_LIMITER.reset()  # (#131) only after the (re)build actually succeeded
+        LOGIN_THROTTLE.reset()  # (#267) login lockouts reset with the rebuild
         self._close_store(old_store, store)
 
     def _seed_admin_account(self, api) -> None:
@@ -1263,12 +1270,45 @@ class Handler(BaseHTTPRequestHandler):
             # (#67); role + scope come from that account, not a login-time
             # special case, so the session already carries "own team / own
             # self" binding for scope enforcement (#51).
-            row = api.verify_login(body.get("username", ""),
-                                   body.get("password", ""))
+            #
+            # Login throttling (#267): a failed-attempt lockout keyed on BOTH the
+            # source IP and the normalized username. The SAME generic response is
+            # returned whether or not the username exists — a locked caller gets a
+            # generic 429 + Retry-After, an unlocked bad credential the generic
+            # 401 — so neither the throttle nor the error is a username oracle.
+            #
+            # ``begin`` reserves an in-flight slot atomically, so concurrent
+            # attempts can't overshoot the ceiling between the check and the
+            # record; the reservation is always released below via
+            # record_failure / record_success / cancel.
+            ip = self._client_ip()
+            norm_username = (body.get("username", "") or "").strip().lower()
+            wait = LOGIN_THROTTLE.begin(ip, norm_username)
+            if wait > 0:
+                return self._send_json(
+                    {"error": {"code": "rate_limited",
+                               "message": "Too many login attempts. Please wait "
+                                          "and try again shortly."}},
+                    429, extra_headers=[("Retry-After", str(int(wait) + 1))])
+            try:
+                row = api.verify_login(body.get("username", ""),
+                                       body.get("password", ""))
+            except Exception:  # release the reserved slot; never leak it on error
+                LOGIN_THROTTLE.cancel(ip, norm_username)
+                raise
             if row is None:
+                newly_locked = LOGIN_THROTTLE.record_failure(ip, norm_username)
+                if newly_locked:
+                    # Best-effort, one-time safe audit when a bucket first locks —
+                    # never let an audit hiccup turn a failed login into a 500.
+                    try:
+                        api.accounts.audit_login_throttled(ip, newly_locked)
+                    except Exception:  # noqa: BLE001 — audit must never break login
+                        pass
                 return self._send_json({"error": {
                     "code": "unauthorized",
                     "message": "Invalid username or password."}}, 401)
+            LOGIN_THROTTLE.record_success(ip, norm_username)
             token = SESSIONS.login(api.store, row["id"],
                                    user_agent=self.headers.get("User-Agent"))
             sess = SESSIONS.resolve(api.store, token)

@@ -193,7 +193,7 @@ class ProductionReadinessHttpTest(unittest.TestCase):
                                 "BOOTSTRAP_ADMIN_PASSWORD", "DATABASE_URL")}
         os.environ["APP_MODE"] = "production"
         os.environ["BOOTSTRAP_ADMIN_USER"] = "boss"
-        os.environ["BOOTSTRAP_ADMIN_PASSWORD"] = "secret"
+        os.environ["BOOTSTRAP_ADMIN_PASSWORD"] = "boss-secret-pw"
         # A real production deployment is persistent (#143) — without this,
         # STATE.reset() below would pick InMemoryStore (no DATABASE_URL) and
         # the "all checks green" assertion this class exists to prove would
