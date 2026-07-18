@@ -491,11 +491,21 @@ class SetupService:
                      "league_id": derived_league_id, "program_id": program_id,
                      "league_program_id": derived_program})
             program_id = derived_program or program_id
-        if not program_id and not derived_league_id:
+        # #283 Slice E (mandatory rule 2): every Team belongs to a permanent
+        # League. When only a Program is given, deterministically resolve its
+        # SOLE League — unambiguous, so never a guess. A Program with zero or
+        # several Leagues can't be resolved and is rejected rather than guessed.
+        if not derived_league_id and program_id:
+            prog_leagues = self.store.leagues_for_program(program_id)
+            if len(prog_leagues) == 1:
+                derived_league_id = prog_leagues[0].id
+        # A new Team is never created league-less; teams_without_league is only a
+        # legacy/migration remediation state, never produced by a fresh create.
+        if not derived_league_id:
             raise ValidationError(
-                "A team needs a program or league (choose one, or a division to "
-                "derive it from).",
-                {"reason": "team_parent_required"})
+                "A team must belong to a permanent league (choose a league, or "
+                "a division to derive it from).",
+                {"reason": "team_league_required"})
         if program_id and self.store.get_program(program_id) is None:
             raise NotFoundError(f"Program {program_id} not found.")
         team = Team(id=self.store.next_id("team"), name=self._require_name(name),
@@ -557,6 +567,16 @@ class SetupService:
                 {"reason": "team_league_mismatch", "team_id": team_id,
                  "team_league_id": team.league_id,
                  "league_season_league_id": ls.league_id})
+        # #283 Slice E (rule 2): a Team must always have a permanent League. A
+        # legacy league-less Team gains one deterministically here — the League
+        # it is registering into — so no registration write ever leaves a Team
+        # league-less. (New Teams already have one; create_team requires it.)
+        if not team.league_id:
+            team.league_id = ls.league_id
+            self.store.save_team(team)
+            self._audit("team_league_resolved", "team", team.id, actor_id,
+                        {"permanent_league_id": ls.league_id,
+                         "via": "registration"})
         if division_id:
             division = self.store.get_division(division_id)
             if division is None:
@@ -678,30 +698,36 @@ class SetupService:
                         {"reason": "team_not_season_participant",
                          "team_id": tid, "season_id": game.season_id})
             return
-        # Regular game. The season+division check runs first: it raises the
-        # precise DivisionMismatchError and is the stricter guard for a
-        # divisioned game (also the sole check for a legacy regular game that
-        # predates league_season_id).
+        # Regular game. #283 Slice E: a regular game MUST reference a
+        # LeagueSeason — fail closed (never a lenient legacy fallback) so an
+        # unscoped regular game can't be published or moved until it is repaired.
+        ls_id = getattr(game, "league_season_id", None)
+        if ls_id is None:
+            raise ValidationError(
+                "This regular game has no league-season; it cannot be published "
+                "or moved until it is repaired.",
+                {"reason": "regular_game_missing_league_season",
+                 "game_id": game.id})
+        # The season+division check runs first: it raises the precise
+        # DivisionMismatchError and is the stricter guard for a divisioned game.
         if game.season_id and game.division_id:
             self._require_team_registered(
                 game.season_id, game.home_team_id, game.division_id)
             self._require_team_registered(
                 game.season_id, game.away_team_id, game.division_id)
-        # LeagueSeason membership covers the division-less regular game the
-        # check above skips — both teams must be active in the exact LeagueSeason.
-        ls_id = getattr(game, "league_season_id", None)
-        if ls_id is not None:
-            active_ids = {r.team_id for r
-                          in self.store.registrations_for_league_season(ls_id)
-                          if r.active}
-            for tid in (game.home_team_id, game.away_team_id):
-                if tid is not None and tid not in active_ids:
-                    label = (self.store.get_team(tid) or Team(id=tid, name=tid)).name
-                    raise ValidationError(
-                        f"{label} is no longer registered in this game's "
-                        "league-season.",
-                        {"reason": "team_not_in_league_season",
-                         "team_id": tid, "league_season_id": ls_id})
+        # Both teams must be active in the game's exact LeagueSeason (covers the
+        # division-less regular game the check above skips).
+        active_ids = {r.team_id for r
+                      in self.store.registrations_for_league_season(ls_id)
+                      if r.active}
+        for tid in (game.home_team_id, game.away_team_id):
+            if tid is not None and tid not in active_ids:
+                label = (self.store.get_team(tid) or Team(id=tid, name=tid)).name
+                raise ValidationError(
+                    f"{label} is no longer registered in this game's "
+                    "league-season.",
+                    {"reason": "team_not_in_league_season",
+                     "team_id": tid, "league_season_id": ls_id})
 
     @_transactional
     def assign_season_team_division(self, registration_id: str,
@@ -772,6 +798,15 @@ class SetupService:
         team = self.store.get_team_for_update(team_id)
         if team is None:
             raise NotFoundError(f"Team {team_id} not found.")
+        return self._transfer_team_to_league_inner(team, new_league_id, actor_id)
+
+    def _transfer_team_to_league_inner(self, team, new_league_id: str,
+                                       actor_id: Optional[str] = None) -> Team:
+        """Body of :meth:`transfer_team_to_league`, without its own transaction
+        or Team fetch — so the import path (#283 Slice E) can route a permanent-
+        League change through the same lifecycle guards inside its own commit
+        transaction. Operates on an already-resolved ``team``."""
+        team_id = team.id
         league = self.store.get_league(new_league_id)
         if league is None:
             raise NotFoundError(f"League {new_league_id} not found.")
@@ -785,9 +820,13 @@ class SetupService:
         if old == new_league_id:
             return team  # no-op: already in this League.
 
-        # Pre-scan: every ACTIVE registration currently in a different League is
-        # a conflict that must be moved. Gather them, and abort the whole
-        # transfer (zero mutation) if any of them has committed games.
+        # Pre-scan: only a CURRENT/FUTURE active registration in a different
+        # League is a conflict to resolve. An ENDED Season's active registration
+        # is history — it (and its Games/results/standings) is never touched, so
+        # a transfer leaves the record of what actually happened intact. A
+        # current/future conflict is moved when game-free, or blocks the whole
+        # transfer (zero mutation) when it has committed games.
+        now = self.clock()
         to_move = []          # (reg, season_id) pairs eligible to move
         blocked = []          # {registration_id, season_id, affected_game_ids}
         for reg in self.store.all_season_team_registrations():
@@ -796,6 +835,13 @@ class SetupService:
             if self._registration_league_id(reg) == new_league_id:
                 continue  # already in the target League — nothing to do
             season_id = self._season_of_league_season(reg.league_season_id)
+            season = self.store.get_season(season_id) if season_id else None
+            # A Season is historical only once it has DEFINITELY ended (a real
+            # end_date in the past). A missing/undated Season is treated as
+            # current/future (the safe default) until an operator resolves it.
+            if season is not None and season.end_date is not None \
+                    and season.end_date < now:
+                continue  # ended Season — leave its active registration as history
             stranded = self._games_scheduled_for_team_in_season(
                 season_id, team_id)
             if stranded:
@@ -2392,17 +2438,28 @@ class SetupService:
         # league_id is written on create AND on re-import (a promotion/
         # relegation in the sheet updates it in place, mirroring
         # transfer_team_to_league's field change).
-        values = {"name": name, "program_id": program_id, "club_id": club_id,
-                  "league_id": league_id}
         if existing is None:
-            obj = Team(id=self.store.next_id("team"), external_ref=code, **values)
+            obj = Team(id=self.store.next_id("team"), external_ref=code,
+                       name=name, program_id=program_id, club_id=club_id,
+                       league_id=league_id)
             self.store.add_team(obj)
             self._audit("team_created", "team", obj.id, actor_id,
                        {"import_batch_id": import_batch_id, "external_ref": code,
-                        "program_id": program_id, "club_id": club_id})
+                        "program_id": program_id, "club_id": club_id,
+                        "permanent_league_id": league_id})
             return obj, True, []
         old_program_id = existing.program_id
-        changed = self._apply_changes(existing, values)
+        # #283 Slice E: a permanent-League change on re-import (promotion/
+        # relegation in the sheet) must go through the SAME lifecycle guards as
+        # transfer_team_to_league — never a raw field write — so it can't strand
+        # committed games or rewrite completed-Season history. Apply the other
+        # fields first, then route the league change through the shared inner
+        # transfer (which raises to abort the whole import if it would strand
+        # games, and moves eligible current/future game-free registrations).
+        league_changed = (league_id is not None
+                          and existing.league_id != league_id)
+        changed = self._apply_changes(
+            existing, {"name": name, "program_id": program_id, "club_id": club_id})
         if changed:
             self.store.save_team(existing)
             detail = {"import_batch_id": import_batch_id, "external_ref": code,
@@ -2411,6 +2468,9 @@ class SetupService:
                 detail["from_program_id"] = old_program_id
                 detail["to_program_id"] = program_id
             self._audit("team_updated", "team", existing.id, actor_id, detail)
+        if league_changed:
+            self._transfer_team_to_league_inner(existing, league_id, actor_id)
+            changed = list(changed) + ["league_id"]
         return existing, False, changed
 
     def upsert_imported_player(self, code: str, name: str, team_id: str,

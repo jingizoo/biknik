@@ -517,6 +517,87 @@ class GameLeagueSeasonBackfillTest(unittest.TestCase):
                     _teardown(store)
 
 
+class GameLeagueSeasonGateAbortTest(unittest.TestCase):
+    """Migration 037's pre-migration gate (assert_regular_games_resolve_league_
+    season) ABORTS the upgrade when any REGULAR game cannot be bound to a
+    LeagueSeason — a null league/season, or a (league, season) pair with no
+    league_seasons row (#283 Slice E, blocker 1). It names the offending game,
+    leaves EXHIBITIONS (which are legitimately unscoped) alone, and mutates
+    nothing: the additive column is never added and 037 is not recorded.
+    Dual-backend."""
+
+    def _pre037(self, store, seed):
+        """Seed rows, then simulate a pre-037 database (drop the additive
+        league_season_id column + its ledger row) so migrate() re-runs the 037
+        gate over ``seed``'s rows."""
+        with store.transaction():
+            _exec(store, "INSERT INTO programs (id, name) VALUES (?, ?)",
+                  ("p1", "P1"))
+            _exec(store, "INSERT INTO seasons (id, program_id, name) "
+                  "VALUES (?, ?, ?)", ("s1", "p1", "S1"))
+            _exec(store, "INSERT INTO leagues (id, name, sort_order, program_id) "
+                  "VALUES (?, ?, ?, ?)", ("lg1", "Lg1", 0, "p1"))
+            seed(store)
+        with store.transaction():
+            _exec(store, "DROP INDEX IF EXISTS ix_games_league_season")
+            _exec(store, "ALTER TABLE games DROP COLUMN league_season_id")
+            _exec(store, "DELETE FROM schema_migrations WHERE version = ?",
+                  ("037_game_league_season",))
+
+    def test_regular_game_without_league_season_aborts_no_mutation(self):
+        # (label, seed) — each seeds one regular game the gate must reject.
+        def _no_ls_row(store):  # pair exists but no league_seasons row
+            _exec(store, "INSERT INTO games (id, season_id, league_id, game_type) "
+                  "VALUES (?, ?, ?, ?)", ("g_bad", "s1", "lg1", "regular"))
+
+        def _null_league(store):  # regular game with no league at all
+            _exec(store, "INSERT INTO league_seasons (id, league_id, season_id) "
+                  "VALUES (?, ?, ?)", ("ls1", "lg1", "s1"))
+            _exec(store, "INSERT INTO games (id, season_id, league_id, game_type) "
+                  "VALUES (?, ?, ?, ?)", ("g_bad", "s1", None, "regular"))
+
+        for case, seed in (("no_league_season_row", _no_ls_row),
+                           ("null_league", _null_league)):
+            for label, url in _sql_backends():
+                with self.subTest(case=case, backend=label):
+                    store = _fresh(url)
+                    try:
+                        self._pre037(store, seed)
+                        with self.assertRaises(MigrationDataError) as ctx:
+                            migrate(store.conn, store.dialect)
+                        self.assertIn("g_bad", str(ctx.exception),
+                                      f"{case}/{label}")
+                        # Zero mutation: the column is still absent and 037 is
+                        # not recorded, so the operator can repair and re-run.
+                        self.assertNotIn("league_season_id",
+                                         _cols(store, "games"), f"{case}/{label}")
+                        self.assertNotIn(
+                            "037_game_league_season",
+                            store.migration_status()["applied"], f"{case}/{label}")
+                    finally:
+                        _teardown(store)
+
+    def test_unscoped_exhibition_does_not_abort(self):
+        # An EXHIBITION with no LeagueSeason is legitimate — the gate ignores it
+        # and 037 applies, leaving its league_season_id NULL.
+        for label, url in _sql_backends():
+            with self.subTest(backend=label):
+                store = _fresh(url)
+                try:
+                    self._pre037(store, lambda s: _exec(
+                        s, "INSERT INTO games (id, season_id, league_id, "
+                        "game_type) VALUES (?, ?, ?, ?)",
+                        ("g_exh", "s1", None, "exhibition")))
+                    migrate(store.conn, store.dialect)  # gate passes
+                    self.assertIn("037_game_league_season",
+                                  store.migration_status()["applied"], label)
+                    self.assertIsNone(
+                        _one(store, "SELECT league_season_id FROM games "
+                             "WHERE id = ?", ("g_exh",))["league_season_id"], label)
+                finally:
+                    _teardown(store)
+
+
 class AmbiguityGateTest(unittest.TestCase):
     def test_ambiguous_upgrade_aborts_and_leaves_data_unchanged(self):
         for label, url in _sql_backends():

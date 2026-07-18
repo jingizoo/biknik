@@ -265,9 +265,14 @@ def validate_hierarchy_import(sheets: Dict[str, List[dict]], store) -> dict:
         ("program_code", "season_name"))
     league_rows = [row for row in rows["competition"]
                   if not _blank(row.get("league_code"))]
+    # #283 Slice E: a permanent League may participate in SEVERAL Seasons, so
+    # repeated league_code rows across different season_code values are valid —
+    # only the League's own attributes (name, sort order) must stay consistent.
+    # Its Season participation is validated as a set of (league, season) pairs
+    # below, not as one Season per League.
     _consistent_groups(
         report, "competition", league_rows, "league_code",
-        ("season_code", "league_name", "league_sort_order"))
+        ("league_name", "league_sort_order"))
     _consistent_groups(
         report, "permanent_teams", rows["permanent_teams"], "team_code",
         ("program_code", "league_code", "team_name", "club_code"))
@@ -398,18 +403,22 @@ def validate_hierarchy_import(sheets: Dict[str, List[dict]], store) -> dict:
     for code, season in existing_seasons.items():
         season_program.setdefault(code, program_ref_by_id.get(season.program_id))
 
-    league_season = {}
+    # #283 Slice E: a permanent League participates in a SET of Seasons (its
+    # LeagueSeasons), not one. Model that as the full set of (league_code,
+    # season_code) memberships — from this upload's competition rows and from
+    # every existing LeagueSeason — so registration validation checks membership
+    # rather than a single scalar Season per League.
+    league_season_pairs = set()
     for row in league_rows:
         code = _optional(row.get("league_code"))
-        if code:
-            league_season.setdefault(code, _optional(row.get("season_code")))
+        scode = _optional(row.get("season_code"))
+        if code and scode:
+            league_season_pairs.add((code, scode))
     for code, league in existing_leagues.items():
-        # #283: League.season_id dropped; a League's Season participation is now
-        # a LeagueSeason row. This map is single-valued per League (all the old
-        # model ever allowed, and the competition sheet still ties a league_code
-        # to one season_code), so record each Season this League plays in.
         for ls in store.league_seasons_for_league(league.id):
-            league_season.setdefault(code, season_ref_by_id.get(ls.season_id))
+            scode = season_ref_by_id.get(ls.season_id)
+            if scode:
+                league_season_pairs.add((code, scode))
 
     division_league = {}
     for row in rows["competition"]:
@@ -507,12 +516,13 @@ def validate_hierarchy_import(sheets: Dict[str, List[dict]], store) -> dict:
         if (season_code in known_season_codes
                 and team_code in known_team_codes
                 and league_code in known_league_codes):
-            # The League must resolve to EXACTLY this Season — #260 review
-            # decision 2: never inferred, always validated.
-            if league_season.get(league_code) != season_code:
+            # The League must actually participate in THIS Season — validated
+            # against the set of (league, season) memberships (#283 Slice E),
+            # never inferred, and never reduced to one Season per League.
+            if (league_code, season_code) not in league_season_pairs:
                 report.error(
                     "registrations", index, "league_season_mismatch",
-                    f"League {league_code} does not belong to Season "
+                    f"League {league_code} does not participate in Season "
                     f"{season_code}.", "league_code")
             # The Team and Season must resolve to the SAME Program.
             tp = team_program.get(team_code)
@@ -625,7 +635,7 @@ def _new_counts() -> dict:
                 "players", "registrations", "season_venue_access")}
 
 
-def _preflight_reassignment_safety(store, rows) -> List[dict]:
+def _preflight_reassignment_safety(store, rows, now=None) -> List[dict]:
     """Reject unsafe program/league/division/venue-access *moves* before any
     write (#214 review, extended #260 review).
 
@@ -688,6 +698,49 @@ def _preflight_reassignment_safety(store, rows) -> List[dict]:
                             "another program; move or clear that history first."),
                 "team_code": code,
                 "affected_registration_ids": stranded_regs})
+
+    # (a2) A team's PERMANENT-LEAGUE move (a promotion/relegation in the sheet)
+    #      must go through the same lifecycle as transfer_team_to_league (#283
+    #      Slice E): it can't strand committed games. Block if any active
+    #      CURRENT/FUTURE registration currently in a DIFFERENT League has
+    #      committed games. An ENDED Season's registration is history and is
+    #      never moved, so it never strands.
+    for index, row in enumerate(
+            _group_first(rows["permanent_teams"], "team_code").values(), start=1):
+        code = _clean(row.get("team_code"))
+        team = teams.get(code)
+        if team is None:
+            continue  # a new team has no history to strand
+        new_league_code = _clean(row.get("league_code"))
+        if new_league_code == league_code_by_id.get(team.league_id):
+            continue  # permanent league unchanged
+        stranded = []
+        for reg in all_regs:
+            if reg.team_id != team.id or not reg.active:
+                continue
+            reg_ls = store.get_league_season(reg.league_season_id)
+            if reg_ls is None:
+                continue
+            if league_code_by_id.get(reg_ls.league_id) == new_league_code:
+                continue  # already in the target League — not moved
+            season = store.get_season(reg_ls.season_id)
+            if (now is not None and season is not None
+                    and season.end_date is not None and season.end_date < now):
+                continue  # ended Season — history, never moved
+            stranded.extend(
+                g.id for g in all_games
+                if g.season_id == reg_ls.season_id and not g.cancelled
+                and not getattr(g, "is_draft", False)
+                and team.id in (g.home_team_id, g.away_team_id))
+        if stranded:
+            errors.append({
+                "sheet": "permanent_teams", "row": index, "field": "league_code",
+                "code": "team_league_move_strands_games",
+                "message": (f"Moving team {code} to league {new_league_code} "
+                            f"would strand {len(stranded)} scheduled game(s); "
+                            "resolve them first."),
+                "team_code": code,
+                "affected_game_ids": stranded})
 
     # (b) A registration's LEAGUE or DIVISION move must not strand committed
     #     games (#260 review: league_code is now an explicit, changeable
@@ -864,7 +917,7 @@ def commit_hierarchy_import(setup, sheets: Dict[str, List[dict]],
         # league/division move or a venue-access revoke that would strand
         # games or orphan registrations aborts the whole batch with zero
         # writes.
-        unsafe = _preflight_reassignment_safety(store, rows)
+        unsafe = _preflight_reassignment_safety(store, rows, now=setup.clock())
         if unsafe:
             return {
                 "committed": False,

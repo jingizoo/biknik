@@ -22,7 +22,7 @@ from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
 from hockey_scheduler.api.service import ApiService
 from hockey_scheduler.domain import (
     AvailabilityStatus, CalendarFeedToken, ContactDestination, DeviceToken,
-    GameAvailability, GameRosterEntry, GuardianLink, IceSlotStatus,
+    GameAvailability, GameRosterEntry, GuardianLink, IceSlotStatus, League,
     Notification, NotificationAudience, NotificationChannel, NotificationKind,
     NotificationPreference, OfficialAssignment, OfficialAssignmentStatus,
     OfficialAvailability, OfficialAvailabilityStatus, OfficialRole, Position,
@@ -55,8 +55,24 @@ class DeletionContract:
         return self.api.create_club(name, actor_id=self.ACTOR)["id"]
 
     def _team(self, club_id, league_id, name="Team"):
+        # #283 Slice E: every Team must resolve a permanent League (rule 2).
+        # The second arg here is the Program; create_team resolves the
+        # Program's SOLE League when only a program is given. Family-A fixtures
+        # let a Division auto-provision that League and Family-B fixtures create
+        # a Level, so the Program already has exactly one League by the time a
+        # team is made. Bare-team fixtures (no season/division/level) have none,
+        # so provision a single permanent League under the Program here — as an
+        # unbound League (no LeagueSeason), so it neither blocks a later
+        # delete_season (which counts only a Season's LeagueSeasons' leagues)
+        # nor is reported by delete_program (which does not block on leagues),
+        # keeping every existing deletion assertion intact.
+        program_id = league_id
+        if not self.store.leagues_for_program(program_id):
+            self.store.add_league(League(
+                id=self.store.next_id("league"), program_id=program_id,
+                name="League", sort_order=0))
         return self.api.create_team(
-            club_id, None, name, actor_id=self.ACTOR, program_id=league_id)["id"]
+            club_id, None, name, actor_id=self.ACTOR, program_id=program_id)["id"]
 
     def _register(self, season_id, team_id, division_id):
         return self.api.register_team_for_season(

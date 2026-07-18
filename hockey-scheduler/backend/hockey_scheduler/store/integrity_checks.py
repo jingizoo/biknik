@@ -770,3 +770,42 @@ def assert_competition_hierarchy_reset_ready(conn):
     raise MigrationDataError(
         "Cannot run the competition-hierarchy reset (#283 Slice A): "
         + "; ".join(parts) + ".")
+
+
+# -- #283 Slice E — every regular Game must resolve to a LeagueSeason ----------
+#
+# Migration 037 stamps games.league_season_id from the unique (league_id,
+# season_id) LeagueSeason. A REGULAR game that cannot resolve one (a null
+# league/season, or a pair with no LeagueSeason row) would be left unscoped —
+# which #283 forbids (only exhibitions may be unscoped). This gate runs BEFORE
+# 037's ALTER (game_type from 036 and league_seasons from 035 already exist) and
+# aborts the upgrade with a bounded row list so an operator resolves each game
+# (set its league/season to an existing LeagueSeason, or mark it an exhibition)
+# rather than migrating an invalid regular game. Pure SELECT, portable, re-runnable.
+
+def find_unresolved_regular_games(conn):
+    """Ids of REGULAR games whose (league_id, season_id) does not resolve to an
+    existing LeagueSeason (null on either side, or no matching row)."""
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT g.id AS id FROM games g "
+        "WHERE g.game_type = 'regular' "
+        "AND (g.league_id IS NULL OR g.season_id IS NULL "
+        "     OR NOT EXISTS (SELECT 1 FROM league_seasons ls "
+        "                    WHERE ls.league_id = g.league_id "
+        "                    AND ls.season_id = g.season_id))")
+    return sorted(row["id"] for row in cur.fetchall())
+
+
+def assert_regular_games_resolve_league_season(conn):
+    """Abort migration 037 if any regular game can't be bound to a LeagueSeason
+    (#283 Slice E)."""
+    bad = find_unresolved_regular_games(conn)
+    if bad:
+        shown = ", ".join(bad[:20])
+        more = "" if len(bad) <= 20 else f" (+{len(bad) - 20} more)"
+        raise MigrationDataError(
+            "Cannot bind regular games to a LeagueSeason (#283 Slice E): "
+            f"{len(bad)} regular game(s) have no resolvable (league, season) "
+            f"LeagueSeason: {shown}{more}. Set each game's league and season to "
+            "an existing LeagueSeason, or mark it an exhibition, before upgrading.")
