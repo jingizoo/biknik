@@ -281,7 +281,7 @@ class HierarchyImportContract:
         result = self.api.commit_hierarchy_import(fx.full_payload(
             clubs_csv="",
             permanent_teams_csv=fx.permanent_teams_csv(
-                rows=("OVER55,LIONS,Lions,",)),
+                rows=("OVER55,L1,LIONS,Lions,",)),
             competition_csv=fx.competition_csv(rows=(
                 "OVER55,FALL26,Fall 2026,L1,Adult League,1,,,",)),
             registrations_csv=fx.registrations_csv(rows=("FALL26,LIONS,L1,",)),
@@ -305,7 +305,7 @@ class HierarchyImportContract:
         self.assertEqual(lions.club_id, club.id)
         result = self.api.commit_hierarchy_import(fx.full_payload(
             permanent_teams_csv=fx.permanent_teams_csv(
-                rows=("OVER55,LIONS,Lions,",))
+                rows=("OVER55,L1,LIONS,Lions,",))
         ), actor_id="admin")
         self.assertTrue(result["committed"], result.get("errors"))
         self.assertIsNone(by_ref(self.store.all_teams(), "LIONS").club_id)

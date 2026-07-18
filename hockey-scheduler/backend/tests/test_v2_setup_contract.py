@@ -139,14 +139,14 @@ class V2SetupContractTest(unittest.TestCase):
         # makes it truly optional; the v2 body accepts the key but C2 still
         # validates a real club.)
         team_a = self._v2(c, "team",
-                         {"program_id": program["id"], "club_id": club["id"],
+                         {"league_id": league["id"], "club_id": club["id"],
                           "name": "Rangers"})
         self.assertEqual(set(team_a), TEAM_KEYS, team_a)
         self.assertEqual(team_a["program_id"], program["id"])
         self.assertNotIn("league_id", team_a)
 
         team_b = self._v2(c, "team",
-                         {"program_id": program["id"], "club_id": club["id"],
+                         {"league_id": league["id"], "club_id": club["id"],
                           "name": "Kings"})
         self.assertEqual(set(team_b), TEAM_KEYS, team_b)
         self.assertEqual(team_b["club_id"], club["id"])
@@ -313,7 +313,7 @@ class V2SetupContractTest(unittest.TestCase):
                            {"league_id": league["id"], "name": "OvD"})
         club = self._v2(c, "club", {"name": "OvC"})
         team = self._v2(c, "team",
-                       {"program_id": program["id"], "club_id": club["id"],
+                       {"league_id": league["id"], "club_id": club["id"],
                         "name": "OvT"})
         venue = self._v2(c, "venue",
                         {"name": "OvV", "organization_id": org["id"]})
@@ -389,9 +389,14 @@ class V2SetupContractTest(unittest.TestCase):
         league2 = self._v2(c, "league", {"season_id": season["id"], "name": "L2"})
         div1 = self._v2(c, "division", {"league_id": league1["id"], "name": "D1"})
         club = self._v2(c, "club", {"name": "C"})
-        team = self._v2(c, "team",
-                       {"program_id": program["id"], "club_id": club["id"],
-                        "name": "T"})
+        # This test reassigns the registration BETWEEN league1 and league2, so
+        # the team must have NO permanent League (a team with one may only
+        # register in that League, rule 7). A league-less team is only creatable
+        # via the legacy v1 route (v1 "league_id" means Program).
+        status, team = self._req(
+            c, "POST", "/api/setup/team",
+            {"name": "T", "league_id": program["id"], "club_id": club["id"]})
+        self.assertEqual(status, 200, team)
 
         status, reg = self._req(
             c, "POST",
@@ -456,9 +461,13 @@ class V2SetupContractTest(unittest.TestCase):
         self.assertEqual(team["program_id"], program["id"])
         self.assertNotIn("league_id", team)  # raw competition id stays hidden
 
-        # A Team with a Program but no permanent League.
-        loose = self._v2(c, "team",
-                        {"program_id": program["id"], "name": "Loose"})
+        # A Team with a Program but no permanent League. The v2 create route now
+        # requires a league_id (#283 Slice E), so a league-less team can only be
+        # made through the legacy v1 route (where "league_id" means Program).
+        status, loose = self._req(
+            c, "POST", "/api/setup/team",
+            {"name": "Loose", "league_id": program["id"]})
+        self.assertEqual(status, 200, loose)
 
         # The hierarchy exposes the permanent Program → League → Team tree.
         status, body = self._req(c, "GET", "/api/v2/setup/hierarchy")
@@ -579,7 +588,7 @@ class V2SetupContractTest(unittest.TestCase):
 
         # -- League Admin success + resolved labels for UI confirmation -----
         team = self._v2(c, "team",
-                       {"program_id": program["id"], "club_id": club["id"],
+                       {"league_id": league["id"], "club_id": club["id"],
                         "name": "R Team"})
         status, reg = self._req(
             c, "POST", f"/api/v2/setup/seasons/{season['id']}/team-registrations",
@@ -619,7 +628,7 @@ class V2SetupContractTest(unittest.TestCase):
 
         # -- an active registration blocks the permanent cleanup delete -----
         team_active = self._v2(c, "team",
-                              {"program_id": program["id"], "club_id": club["id"],
+                              {"league_id": league["id"], "club_id": club["id"],
                                "name": "R Active"})
         status, reg_active = self._req(
             c, "POST", f"/api/v2/setup/seasons/{season['id']}/team-registrations",
@@ -637,10 +646,10 @@ class V2SetupContractTest(unittest.TestCase):
 
         # -- a Game (even cancelled) still blocks the cleanup ---------------
         team_home = self._v2(c, "team",
-                            {"program_id": program["id"], "club_id": club["id"],
+                            {"league_id": league["id"], "club_id": club["id"],
                              "name": "R Home"})
         team_away = self._v2(c, "team",
-                            {"program_id": program["id"], "club_id": club["id"],
+                            {"league_id": league["id"], "club_id": club["id"],
                              "name": "R Away"})
         for tm in (team_home, team_away):
             status, r = self._req(
@@ -693,9 +702,14 @@ class V2SetupContractTest(unittest.TestCase):
         # -- silently deleted or ignored — zero mutation on the block -------
         season2 = self._v2(c, "season",
                           {"program_id": program["id"], "name": "R Season 2"})
-        team_legacy = self._v2(c, "team",
-                              {"program_id": program["id"], "club_id": club["id"],
-                               "name": "R Legacy"})
+        # R Legacy is never registered through the v2 route (below it is bound to
+        # an injected ghost LeagueSeason), so it has no permanent League and must
+        # be created via the legacy v1 route (v1 "league_id" means Program).
+        status, team_legacy = self._req(
+            c, "POST", "/api/setup/team",
+            {"name": "R Legacy", "league_id": program["id"],
+             "club_id": club["id"]})
+        self.assertEqual(status, 200, team_legacy)
         # #283: a registration always hangs off a LeagueSeason, so the service
         # now refuses to create a league-less row. Reproduce the inconsistent
         # parent (a registration whose League no longer resolves) by injecting an
@@ -921,9 +935,9 @@ class V2SetupContractTest(unittest.TestCase):
         rink = self._v2(c, "rink", {"venue_id": venue["id"], "name": "R"})
         club = self._v2(c, "club", {"name": "SVGH Club"})
         home = self._v2(c, "team",
-                       {"program_id": program["id"], "club_id": club["id"], "name": "Home"})
+                       {"league_id": league["id"], "club_id": club["id"], "name": "Home"})
         away = self._v2(c, "team",
-                       {"program_id": program["id"], "club_id": club["id"], "name": "Away"})
+                       {"league_id": league["id"], "club_id": club["id"], "name": "Away"})
         for team in (home, away):
             status, reg = self._req(
                 c, "POST", f"/api/v2/setup/seasons/{season['id']}/team-registrations",
@@ -1018,9 +1032,10 @@ class V2SetupContractTest(unittest.TestCase):
                           {"name": "R Prog", "operator_organization_id": org["id"]})
         season = self._v2(c, "season",
                         {"program_id": program["id"], "name": "S"})
+        league = self._v2(c, "league", {"season_id": season["id"], "name": "L"})
         club = self._v2(c, "club", {"name": "C"})
         team = self._v2(c, "team",
-                       {"program_id": program["id"], "club_id": club["id"],
+                       {"league_id": league["id"], "club_id": club["id"],
                         "name": "T"})
         status, resp = self._req(
             c, "POST",
@@ -1099,10 +1114,10 @@ class V2SetupContractTest(unittest.TestCase):
                           {"league_id": league["id"], "name": "D"})
         club = self._v2(c, "club", {"name": "C"})
         team_a = self._v2(c, "team",
-                        {"program_id": program["id"], "club_id": club["id"],
+                        {"league_id": league["id"], "club_id": club["id"],
                          "name": "A"})
         team_b = self._v2(c, "team",
-                        {"program_id": program["id"], "club_id": club["id"],
+                        {"league_id": league["id"], "club_id": club["id"],
                          "name": "B"})
         # The venue needs active SeasonVenueAccess for this Season for the
         # game ice to be schedulable (#233 Slice E).

@@ -16,7 +16,7 @@ COMPETITION_HEADER = (
     "program_code,season_code,season_name,league_code,league_name,"
     "league_sort_order,division_code,division_name,age_group")
 CLUBS_HEADER = "club_code,club_name,country"
-PERMANENT_TEAMS_HEADER = "program_code,team_code,team_name,club_code"
+PERMANENT_TEAMS_HEADER = "program_code,league_code,team_code,team_name,club_code"
 PLAYERS_HEADER = (
     "player_code,team_code,first_name,last_name,jersey_number,position,email")
 REGISTRATIONS_HEADER = "season_code,team_code,league_code,division_code"
@@ -52,8 +52,8 @@ def clubs_csv(rows=("EAGLES,Eagles HC,US",)):
 
 
 def permanent_teams_csv(rows=(
-        "OVER55,LIONS,Lions,EAGLES",
-        "OVER55,BEARS,Bears,")):
+        "OVER55,L1,LIONS,Lions,EAGLES",
+        "OVER55,L1,BEARS,Bears,")):
     return _csv(PERMANENT_TEAMS_HEADER, rows)
 
 

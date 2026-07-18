@@ -62,6 +62,7 @@ let leagueTeams = {};               // program_id -> [{id,name,program_id}] perm
 // the team-create drawer's optional permanent-League select.
 let permLeaguesByProgram = {};      // program_id -> [{id,name,programName}]
 let allPermLeagues = [];            // [{id,name,programName}] across all programs
+let teamPermLeague = {};            // team_id -> {id,name} permanent League (#283 Slice E)
 let seasonRegs = {};                // season_id -> [{id,team_id,league_id,division_id,active}] registrations (#180/#233 v2)
 let seasonVenueAccess = {};         // season_id -> [{id,season_id,venue_id,active}] (#233 Slice E)
 let leagueDivisions = {};           // league_id -> [{id,name,...}] — cascade data for the League→Division
@@ -654,22 +655,28 @@ const SETUP_ENTITIES = [
     // A team is a permanent member of a LEAGUE (#180) — its season/division is
     // set separately via Season participation, so the subtitle shows the club
     // only, not a (now season-specific) division.
-    list: (ov) => (ov.teams || []).map((t) => ({
-      id: t.id, title: t.name,
-      sub: t.club_name || "No club",
-    })),
+    // #283 Slice E: the subtitle shows a Team's PERMANENT League (its
+    // competition membership) alongside its Club — the seasonal
+    // Season→LeagueSeason→Division participation is shown separately in the
+    // Hierarchy view, never conflated with the permanent identity here.
+    list: (ov) => (ov.teams || []).map((t) => {
+      const lg = teamPermLeague[t.id];
+      return {
+        id: t.id, title: t.name,
+        sub: [lg ? `🎚️ ${lg.name}` : "No league",
+              t.club_name || "No club"].join(" · "),
+      };
+    }),
     fields: [
       { id: "f-team-club", label: "Club (optional)", type: "select", ofNoun: "club",
         options: (ov) => [["", "— none —"]].concat((ov.clubs || []).map((c) => [c.id, c.name])) },
-      { id: "f-team-league", label: "Program", type: "select", required: true, ofNoun: "league",
-        options: (ov) => (ov.programs || []).map((l) => [l.id, l.name]) },
-      // #283 Slice B: a Team may be created directly under a permanent League
-      // (its competition membership). Optional — a program-only team can still
-      // be created and assigned a League later. When set, the backend derives/
-      // validates the Program from the League, so both may be supplied together.
-      { id: "f-team-perm-league", label: "Permanent league (optional)", type: "select",
-        options: () => [["", "— none (program only) —"]].concat(
-          allPermLeagues.map((lg) => [lg.id, `${lg.programName} · ${lg.name}`])) },
+      // #283 Slice E: a Team is created under its PERMANENT League (required);
+      // the backend derives its Program from that League, so no Program field is
+      // needed. A league-less Team is only a legacy/migration remediation state,
+      // never a fresh canonical create.
+      { id: "f-team-perm-league", label: "Permanent league", type: "select", required: true,
+        ofNoun: "level",
+        options: () => allPermLeagues.map((lg) => [lg.id, `${lg.programName} · ${lg.name}`]) },
       { id: "f-team", label: "Team name", required: true, placeholder: "e.g. U14 Eagles" }] },
   // Organization (#166): the facility owner/operator that owns venues — a rink
   // company, distinct from a hockey Club. Arena-side, like venue/rink.
@@ -767,7 +774,7 @@ const SETUP_POST = {
   level: () => post("/api/v2/setup/league", { season_id: val("f-level-season"), name: val("f-level"), sort_order: val("f-level-sort") ? Number(val("f-level-sort")) : 0 }),
   division: () => post("/api/v2/setup/division", { league_id: val("f-div-league"), name: val("f-div"), age_group: val("f-div-age") }),
   club: () => post("/api/v2/setup/club", { name: val("f-club") }),
-  team: () => post("/api/v2/setup/team", { program_id: val("f-team-league") || null, league_id: val("f-team-perm-league") || null, club_id: val("f-team-club") || null, name: val("f-team") }),
+  team: () => post("/api/v2/setup/team", { league_id: val("f-team-perm-league") || null, club_id: val("f-team-club") || null, name: val("f-team") }),
   organization: () => post("/api/v2/setup/organization", { name: val("f-org"), short_name: val("f-org-short") }),
   venue: () => post("/api/v2/setup/venue", { name: val("f-venue"), organization_id: val("f-venue-org") || null }),
   rink: () => post("/api/v2/setup/rink", { venue_id: val("f-rink-venue"), name: val("f-rink") }),
@@ -1626,7 +1633,7 @@ function renderSetupHierarchy(sv, hv, ov) {
         return `<details class="tn" open><summary class="tn-sum">
             <span class="tn-label">🎚️ ${esc(lg.name)}</span>
             <span class="tn-meta">${teams.length} team${teams.length === 1 ? "" : "s"} · ${scount} season${scount === 1 ? "" : "s"}</span></summary>
-          <div class="tn-children">${rows}${treeAdd("team", "Add team to " + lg.name, "f-team-perm-league", lg.id, "f-team-league", program.id)}</div>
+          <div class="tn-children">${rows}${treeAdd("team", "Add team to " + lg.name, "f-team-perm-league", lg.id)}</div>
         </details>`;
       }).join("");
       // Teams with a Program but no permanent League yet — surfaced (never
@@ -2020,19 +2027,24 @@ function renderRollover(hv, ov) {
     // preselected. Division stays optional and defaults to "No division",
     // scoped to whichever League is currently selected. The commit button
     // stays disabled until every checked team has a League.
-    const single = toLeagues.length === 1;
+    // #283 Slice E: a Team only ever rolls into its OWN permanent League — the
+    // backend rejects any other. So each row's target League is FIXED to the
+    // team's permanent League (never a free picker), and its Division options
+    // are that League's divisions in the target season.
     const carryRows = eligible.map((team) => {
-      const leagueOptsHtml = single
-        ? opt(toLeagues[0].id, toLeagues[0].name, true)
-        : `<option value="">Choose a league…</option>${toLeagues.map((lv) => opt(lv.id, lv.name)).join("")}`;
-      const initialDivs = single ? (toLeagues[0].divisions || []) : [];
+      const perm = teamPermLeague[team.id];
+      const permInTo = perm && toLeagues.find((lv) => lv.id === perm.id);
+      const leagueCell = perm
+        ? `<select class="reg-league" data-rollover-league="${esc(team.id)}"><option value="${esc(perm.id)}" selected>${esc(perm.name)}</option></select>`
+        : `<select class="reg-league" data-rollover-league="${esc(team.id)}"><option value="">No permanent league</option></select>`;
+      const initialDivs = permInTo ? (permInTo.divisions || []) : [];
       return `<div class="tn-leaf reg-row">
         <label class="ro-pick"><input type="checkbox" data-rollover-pick="${esc(team.id)}">
           <span class="tn-label">👥 ${esc(team.name)}</span></label>
-        <select class="reg-league" data-rollover-league="${esc(team.id)}">${leagueOptsHtml}</select>
+        ${leagueCell}
         <select class="reg-div" data-rollover-div="${esc(team.id)}"><option value="">No division</option>${
           initialDivs.map((d) => opt(d.id, d.name)).join("")}</select>
-        <span class="ro-row-err" hidden>Pick a target league</span></div>`;
+        <span class="ro-row-err" hidden>This team has no permanent league</span></div>`;
     }).join("");
     let carry;
     if (!toLeagues.length) {
@@ -4959,7 +4971,7 @@ async function render() {
       // requested ids are consistently canonical; hv is only populated under
       // manage_setup, which already gates this whole block.
       leagueTeams = {}; seasonRegs = {}; leagueDivisions = {}; seasonVenueAccess = {};
-      permLeaguesByProgram = {}; allPermLeagues = [];
+      permLeaguesByProgram = {}; allPermLeagues = []; teamPermLeague = {};
       for (const program of (hv.programs || [])) {
         const r = await getJSON(`/api/v2/setup/programs/${program.id}/teams`);
         leagueTeams[program.id] = (r && r.teams) || [];
@@ -4970,6 +4982,13 @@ async function render() {
           id: lg.id, name: lg.name, programName: program.name }));
         permLeaguesByProgram[program.id] = permLgs;
         permLgs.forEach((lg) => allPermLeagues.push(lg));
+        // #283 Slice E: map each Team to its permanent League (from the
+        // canonical permanent-league tree) so the Records team card can show it.
+        for (const lg of (program.leagues || [])) {
+          for (const t of (lg.teams || [])) {
+            teamPermLeague[t.id] = { id: lg.id, name: lg.name };
+          }
+        }
         for (const s of (program.seasons || [])) {
           const rr = await getJSON(`/api/v2/setup/seasons/${s.id}/team-registrations`);
           seasonRegs[s.id] = (rr && rr.registrations) || [];

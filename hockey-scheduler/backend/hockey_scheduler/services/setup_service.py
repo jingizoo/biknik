@@ -1166,6 +1166,13 @@ class SetupService:
                 raise ValidationError(
                     f"Team {tid} belongs to a different program than this "
                     "rollover; it cannot be carried into this season.")
+            # #283 Slice E: rollover resolves the target LeagueSeason from the
+            # Team's PERMANENT League, so a team with none can't be carried.
+            if not team.league_id:
+                raise ValidationError(
+                    f"Team {tid} has no permanent league; it cannot be rolled "
+                    "into the target season.",
+                    {"reason": "team_without_league", "team_id": tid})
         # (b) Every target division must belong to the target season.
         for div_id in set(wanted.values()):
             if div_id is not None:
@@ -1180,26 +1187,23 @@ class SetupService:
 
         rolled, skipped, created = 0, 0, []
         for tid, div_id in wanted.items():
-            # #283: resolve the target LeagueSeason. A chosen Division fixes it
-            # (via its league_season); otherwise use the team's permanent League,
-            # falling back to the Season's sole LeagueSeason.
+            # #283 Slice E: a rollover ALWAYS resolves the target LeagueSeason
+            # from the Team's PERMANENT League — never a "sole/latest/default"
+            # guess. (Gate (a) already proved team + team.league_id exist.) A
+            # chosen target Division must belong to that exact LeagueSeason.
+            team = self.store.get_team(tid)
+            target_ls = self._link_league_season(team.league_id, to_season_id)
             if div_id is not None:
                 division = self.store.get_division(div_id)
-                target_ls = self.store.get_league_season(
-                    division.league_season_id)
-            else:
-                team = self.store.get_team(tid)
-                target_ls = (self._link_league_season(team.league_id,
-                                                      to_season_id)
-                             if team and team.league_id else None)
-                if target_ls is None:
-                    cands = self.store.league_seasons_for_season(to_season_id)
-                    target_ls = cands[0] if len(cands) == 1 else None
-            if target_ls is None:
-                raise ValidationError(
-                    "Cannot resolve a league for this team in the target season.",
-                    {"reason": "no_league_for_season", "season_id": to_season_id,
-                     "team_id": tid})
+                div_ls = (self.store.get_league_season(division.league_season_id)
+                          if division else None)
+                if div_ls is None or div_ls.id != target_ls.id:
+                    raise ValidationError(
+                        "The chosen division is not in this team's league for "
+                        "the target season.",
+                        {"reason": "division_not_in_team_league",
+                         "team_id": tid, "division_id": div_id,
+                         "league_id": team.league_id})
             existing = next(
                 (r for r in self.store.registrations_for_season(to_season_id)
                  if r.team_id == tid), None)
@@ -1324,6 +1328,16 @@ class SetupService:
                 raise ValidationError(
                     f"Team {tid} belongs to a different program than this "
                     "rollover; it cannot be carried into this season.")
+            # #283 Slice E: a Team may only be rolled into its OWN permanent
+            # League — the selection's league_id must equal Team.league_id
+            # (rule 7). Never a sole/latest/default guess.
+            if (team.league_id or None) != lid:
+                raise ValidationError(
+                    f"Team {tid} can only roll into its permanent league "
+                    f"{team.league_id or 'none'}, not {lid}.",
+                    {"reason": "rollover_league_not_team_league",
+                     "team_id": tid, "team_league_id": team.league_id,
+                     "selected_league_id": lid})
             div_id = div or None
             # An already-active target registration is an idempotent skip ONLY
             # when its League AND Division exactly match this selection. A
@@ -2366,6 +2380,7 @@ class SetupService:
 
     def upsert_imported_team(self, code: str, name: str, program_id: str,
                              club_id: Optional[str], existing=None,
+                             league_id: Optional[str] = None,
                              actor_id: Optional[str] = None,
                              import_batch_id: Optional[str] = None):
         # club_id is always set from the row's resolved club (#260 review
@@ -2373,7 +2388,12 @@ class SetupService:
         # create and a repeat row — never a placeholder Club, but a genuine
         # unassign on re-import is allowed, mirroring the interactive
         # "— none —" option exactly.
-        values = {"name": name, "program_id": program_id, "club_id": club_id}
+        # #283 Slice E: a permanent Team is bound to its permanent League;
+        # league_id is written on create AND on re-import (a promotion/
+        # relegation in the sheet updates it in place, mirroring
+        # transfer_team_to_league's field change).
+        values = {"name": name, "program_id": program_id, "club_id": club_id,
+                  "league_id": league_id}
         if existing is None:
             obj = Team(id=self.store.next_id("team"), external_ref=code, **values)
             self.store.add_team(obj)

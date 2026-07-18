@@ -57,13 +57,16 @@ HIERARCHY_TEMPLATES = {
         "club_code,club_name,country\n"
         "EAGLES,Eagles HC,US\n"
     ),
-    # Permanent league teams (#180, extended #260): a team is a permanent
-    # member of a Program, keyed by team_code; it carries no division here —
-    # season participation is a separate registration sheet below. club_code
-    # is optional: blank/NA means club_id=null, never a placeholder Club.
+    # Permanent teams (#180, extended #260, #283 Slice E): a team is a
+    # permanent member of a LEAGUE (league_code is REQUIRED), which belongs to a
+    # Program (program_code). It carries no division here — season
+    # participation is a separate registration sheet below. club_code is
+    # optional: blank/NA means club_id=null, never a placeholder Club. The
+    # league_code must be a League defined in the competition sheet under the
+    # same program_code.
     "permanent_teams_csv": (
-        "program_code,team_code,team_name,club_code\n"
-        "OVER55,LIONS,Lions,EAGLES\n"
+        "program_code,league_code,team_code,team_name,club_code\n"
+        "OVER55,L1,LIONS,Lions,EAGLES\n"
     ),
     # Player (#260): stable player_code -> Team. email is optional; when
     # supplied it may create/update the same player:<id> ContactDestination
@@ -100,7 +103,7 @@ _REQUIRED = {
         "program_code", "season_code", "season_name",
         "league_code", "league_name"),
     "clubs": ("club_code", "club_name"),
-    "permanent_teams": ("program_code", "team_code", "team_name"),
+    "permanent_teams": ("program_code", "league_code", "team_code", "team_name"),
     "players": ("player_code", "team_code", "first_name", "last_name",
                "position"),
     "registrations": ("season_code", "team_code", "league_code"),
@@ -267,7 +270,7 @@ def validate_hierarchy_import(sheets: Dict[str, List[dict]], store) -> dict:
         ("season_code", "league_name", "league_sort_order"))
     _consistent_groups(
         report, "permanent_teams", rows["permanent_teams"], "team_code",
-        ("program_code", "team_name", "club_code"))
+        ("program_code", "league_code", "team_name", "club_code"))
     # season_venue_access has no external_ref of its own; its (season_code,
     # venue_code) pair-consistency (do repeated rows for the same pair agree
     # on active?) is checked further down, once venue codes are known.
@@ -428,6 +431,28 @@ def validate_hierarchy_import(sheets: Dict[str, List[dict]], store) -> dict:
     for code, team in existing_teams.items():
         team_program.setdefault(code, program_ref_by_id.get(team.program_id))
 
+    # #283 Slice E: a Team's PERMANENT League (from the permanent_teams sheet's
+    # league_code, or an existing Team's Team.league_id). Registrations may only
+    # use a Team's own permanent League, so this map drives that check below.
+    team_league = {}
+    for row in rows["permanent_teams"]:
+        code = _optional(row.get("team_code"))
+        if code:
+            team_league.setdefault(code, _optional(row.get("league_code")))
+    for code, team in existing_teams.items():
+        team_league.setdefault(code, league_ref_by_id.get(team.league_id))
+
+    # The Program each League belongs to (competition sheet, or an existing
+    # League's League.program_id) — so a permanent Team's League can be checked
+    # to sit in the Team's own Program.
+    league_program = {}
+    for row in league_rows:
+        code = _optional(row.get("league_code"))
+        if code:
+            league_program.setdefault(code, _optional(row.get("program_code")))
+    for code, league in existing_leagues.items():
+        league_program.setdefault(code, program_ref_by_id.get(league.program_id))
+
     known_season_codes = {_clean(r.get("season_code"))
                           for r in rows["competition"]
                           if not _blank(r.get("season_code"))} | set(existing_seasons)
@@ -437,6 +462,25 @@ def validate_hierarchy_import(sheets: Dict[str, List[dict]], store) -> dict:
                             for r in rows["competition"]
                             if not _blank(r.get("division_code"))} | set(existing_divisions)
     known_team_codes = upload_team_codes | set(existing_teams)
+
+    # #283 Slice E: a permanent Team must resolve to a real permanent League,
+    # and that League must belong to the Team's own Program.
+    for index, row in enumerate(rows["permanent_teams"], start=1):
+        program_code = _optional(row.get("program_code"))
+        league_code = _optional(row.get("league_code"))
+        if program_code and program_code not in known_program_codes:
+            report.error("permanent_teams", index, "unknown_program_code",
+                         f"Unknown program_code {program_code}.", "program_code")
+        if league_code and league_code not in known_league_codes:
+            report.error("permanent_teams", index, "unknown_league_code",
+                         f"Unknown league_code {league_code}.", "league_code")
+        elif (league_code and program_code
+              and league_program.get(league_code) not in (None, program_code)):
+            report.error(
+                "permanent_teams", index, "team_league_program_mismatch",
+                f"League {league_code} (program "
+                f"{league_program.get(league_code)}) is not in this team's "
+                f"program {program_code}.", "league_code")
 
     seen_registrations = set()
     for index, row in enumerate(rows["registrations"], start=1):
@@ -479,6 +523,14 @@ def validate_hierarchy_import(sheets: Dict[str, List[dict]], store) -> dict:
                     f"team_code {team_code} (program {tp or 'none'}) cannot "
                     f"register in season {season_code} (program "
                     f"{sp or 'none'}).", "team_code")
+            # #283 Slice E: a Team may only register into its OWN permanent
+            # League — the registration's league_code must equal Team.league_id.
+            tl = team_league.get(team_code)
+            if tl and tl != league_code:
+                report.error(
+                    "registrations", index, "registration_league_not_team_league",
+                    f"team_code {team_code} may only register in its permanent "
+                    f"league {tl}, not {league_code}.", "league_code")
             if division_code and division_code in known_division_codes:
                 if division_league.get(division_code) != league_code:
                     report.error(
@@ -956,11 +1008,14 @@ def commit_hierarchy_import(setup, sheets: Dict[str, List[dict]],
         for code, row in _group_first(
                 rows["permanent_teams"], "team_code").items():
             program = programs[_clean(row.get("program_code"))]
+            # #283 Slice E: a permanent Team is bound to its permanent League.
+            league = leagues[_clean(row.get("league_code"))]
             club_code = _optional(row.get("club_code"))
             club = clubs.get(club_code) if club_code else None
             obj, created, changed = setup.upsert_imported_team(
                 code, _clean(row.get("team_name")), program.id,
                 club.id if club else None, existing=teams.get(code),
+                league_id=league.id,
                 actor_id=actor_id, import_batch_id=batch_id)
             teams[code] = obj
             _tally("permanent_teams", created, changed)

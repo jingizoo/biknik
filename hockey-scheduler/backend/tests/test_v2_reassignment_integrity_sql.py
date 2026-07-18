@@ -318,43 +318,42 @@ class RegisterProgramMatchSqlTest(_SqlIntegrityBase):
 
 class RollForwardConflictSqlTest(_SqlIntegrityBase):
     def _two_league_target(self, api):
+        # #283 Slice E: a rollover only ever targets a Team's OWN permanent
+        # League. Each team's permanent League is the one it rolls into.
         org, program = self._org_program(api)
         s1 = api.create_season(program["id"], "S1", actor_id=ADMIN)
         s2 = api.create_season(program["id"], "S2", actor_id=ADMIN)
-        l1t = api.create_league(s2["id"], "L1t", actor_id=ADMIN)
-        l2t = api.create_league(s2["id"], "L2t", actor_id=ADMIN)
+        l1t = api.create_league(s1["id"], "L1t", actor_id=ADMIN)
+        l2t = api.create_league(s1["id"], "L2t", actor_id=ADMIN)
         club = api.create_club("C", actor_id=ADMIN)
         team_a = api.create_team(club["id"], None, "A", actor_id=ADMIN,
-                                 program_id=program["id"])
+                                 league_id=l1t["id"])
         team_b = api.create_team(club["id"], None, "B", actor_id=ADMIN,
-                                 program_id=program["id"])
-        src = api.create_league(s1["id"], "Src", actor_id=ADMIN)
+                                 league_id=l2t["id"])
         api.register_team_for_season(s1["id"], team_a["id"], actor_id=ADMIN,
-                                     league_id=src["id"])
+                                     league_id=l1t["id"])
         api.register_team_for_season(s1["id"], team_b["id"], actor_id=ADMIN,
-                                     league_id=src["id"])
+                                     league_id=l2t["id"])
         return s1, s2, l1t, l2t, team_a, team_b
 
-    def test_conflicting_active_target_rejected_zero_mutation(self):
+    def test_rollover_into_non_permanent_league_rejected_zero_mutation(self):
         def case(api, store):
             s1, s2, l1t, l2t, team_a, team_b = self._two_league_target(api)
-            # team_a already active in the target under l1t.
-            api.register_team_for_season(s2["id"], team_a["id"], actor_id=ADMIN,
-                                         league_id=l1t["id"])
             audits_before = len(store.all_setup_audit())
-            # A valid team_b→l1t selection first, then conflicting team_a→l2t.
+            # A valid team_a→l1t (its permanent league) first, then the invalid
+            # team_b→l1t (team_b's permanent league is l2t). The whole batch must
+            # abort before any write.
             res = api.roll_forward_registrations_v2(
                 s1["id"], s2["id"],
-                selections=[{"team_id": team_b["id"], "league_id": l1t["id"]},
-                            {"team_id": team_a["id"], "league_id": l2t["id"]}],
+                selections=[{"team_id": team_a["id"], "league_id": l1t["id"]},
+                            {"team_id": team_b["id"], "league_id": l1t["id"]}],
                 actor_id=ADMIN)
             self.assertEqual(res["error"]["code"], "validation_error", res)
             self.assertEqual(res["error"]["details"]["reason"],
-                             "rollover_conflicts_active_registration", res)
+                             "rollover_league_not_team_league", res)
             active = {r.team_id: r for r in
                       store.registrations_for_season(s2["id"]) if r.active}
-            self.assertEqual(_reg_league(store, active[team_a["id"]]), l1t["id"])
-            self.assertNotIn(team_b["id"], active)
+            self.assertEqual(active, {})
             self.assertEqual(len(store.all_setup_audit()), audits_before)
 
         self._run(case)

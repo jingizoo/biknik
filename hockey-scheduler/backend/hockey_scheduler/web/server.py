@@ -2276,10 +2276,12 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_api(api.create_club(
                 b.get("name"), b.get("country", ""), actor_id))
         if entity == "team":
-            # v2: program-owned; club optional; no division_id-derives-owner.
-            # #283 Slice B: an optional permanent-League assignment (league_id).
-            # When given, the service keeps the Team's Program consistent with
-            # the League's Program (rule 3), so program_id may be omitted.
+            # v2 canonical (#283 Slice E): a Team is created under its PERMANENT
+            # League (league_id REQUIRED); the service derives Program from it.
+            # teams_without_league is only a legacy/migration remediation state —
+            # the canonical create path never mints a new league-less Team.
+            if not (b.get("league_id") or None):
+                return _required_error("A league_id is required.")
             return self._send_api(api.create_team(
                 b.get("club_id") or None, None, b.get("name"),
                 actor_id, program_id=b.get("program_id") or None,

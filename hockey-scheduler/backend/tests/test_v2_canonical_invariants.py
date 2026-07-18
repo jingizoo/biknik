@@ -114,21 +114,24 @@ class GameRegistrationLeagueTest(_Base):
 
 class RollForwardV2Test(_Base):
     def _two_league_target(self):
+        # #283 Slice E: a rollover only ever targets a Team's OWN permanent
+        # League. Each team has a permanent League (created in s1) and is rolled
+        # into that same League in s2 — the rollover binds the target
+        # LeagueSeason on the fly. l1t/l2t ARE those permanent leagues.
         org, program = self._org_program()
         s1 = self.api.create_season(program["id"], "S1", actor_id=ADMIN)
         s2 = self.api.create_season(program["id"], "S2", actor_id=ADMIN)
-        src_league = self.api.create_league(s1["id"], "SrcL", actor_id=ADMIN)
-        l1t = self.api.create_league(s2["id"], "L1t", actor_id=ADMIN)
-        l2t = self.api.create_league(s2["id"], "L2t", actor_id=ADMIN)
+        l1t = self.api.create_league(s1["id"], "L1t", actor_id=ADMIN)
+        l2t = self.api.create_league(s1["id"], "L2t", actor_id=ADMIN)
         club = self.api.create_club("C", actor_id=ADMIN)
         team_a = self.api.create_team(club["id"], None, "A", actor_id=ADMIN,
-                                      program_id=program["id"])
+                                      league_id=l1t["id"])
         team_b = self.api.create_team(club["id"], None, "B", actor_id=ADMIN,
-                                      program_id=program["id"])
+                                      league_id=l2t["id"])
         self.api.register_team_for_season(s1["id"], team_a["id"],
-                                          actor_id=ADMIN, league_id=src_league["id"])
+                                          actor_id=ADMIN, league_id=l1t["id"])
         self.api.register_team_for_season(s1["id"], team_b["id"],
-                                          actor_id=ADMIN, league_id=src_league["id"])
+                                          actor_id=ADMIN, league_id=l2t["id"])
         return s1, s2, l1t, l2t, team_a, team_b
 
     def test_v2_rollover_writes_the_selected_league(self):
@@ -158,33 +161,28 @@ class RollForwardV2Test(_Base):
              if r.active], [])
         self.assertEqual(self._audit_count(), audits_before)
 
-    def test_v2_rollover_conflicting_active_target_rejected_zero_mutation(self):
-        """An already-active target registration under a DIFFERENT league than
-        the selection must abort the whole batch (not a silent skip), leaving
-        zero registration/audit mutation — including an earlier valid selection
-        in the same batch."""
+    def test_v2_rollover_into_non_permanent_league_rejected_zero_mutation(self):
+        """#283 Slice E: a Team may only be rolled into its OWN permanent
+        League. Selecting any other League aborts the whole batch before any
+        write — including an earlier valid selection in the same batch."""
         s1, s2, l1t, l2t, team_a, team_b = self._two_league_target()
-        # team_a is already active in the TARGET season under l1t.
-        self.api.register_team_for_season(s2["id"], team_a["id"], actor_id=ADMIN,
-                                          league_id=l1t["id"])
         audits_before = self._audit_count()
-        # Batch: a valid team_b→l1t selection FIRST, then the conflicting
-        # team_a→l2t (already active in l1t). The pre-write gate must reject the
-        # whole batch before any write.
+        # Batch: a valid team_a→l1t (its permanent league) FIRST, then the
+        # invalid team_b→l1t (team_b's permanent league is l2t). The pre-write
+        # gate must reject the whole batch before any write.
         res = self.api.roll_forward_registrations_v2(
             s1["id"], s2["id"],
-            selections=[{"team_id": team_b["id"], "league_id": l1t["id"]},
-                        {"team_id": team_a["id"], "league_id": l2t["id"]}],
+            selections=[{"team_id": team_a["id"], "league_id": l1t["id"]},
+                        {"team_id": team_b["id"], "league_id": l1t["id"]}],
             actor_id=ADMIN)
         self.assertEqual(res["error"]["code"], "validation_error", res)
         self.assertEqual(res["error"]["details"]["reason"],
-                         "rollover_conflicts_active_registration", res)
-        # team_a is untouched (still l1t); team_b was NOT written despite being a
-        # valid earlier selection; no audit grew.
+                         "rollover_league_not_team_league", res)
+        # Nothing was written into the target season despite the valid earlier
+        # selection; no audit grew.
         active = {r.team_id: r for r in
                   self.api.store.registrations_for_season(s2["id"]) if r.active}
-        self.assertEqual(self._reg_league(active[team_a["id"]]), l1t["id"])
-        self.assertNotIn(team_b["id"], active)
+        self.assertEqual(active, {})
         self.assertEqual(self._audit_count(), audits_before)
 
     def test_v2_rollover_exact_match_active_is_idempotent_skip(self):
