@@ -24,7 +24,7 @@ from datetime import datetime, timedelta, timezone
 from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
 
 from hockey_scheduler.api import ApiService
-from hockey_scheduler.domain import GameType, IceSlotStatus
+from hockey_scheduler.domain import Game, GameType, IceSlotStatus
 from hockey_scheduler.domain.setup_models import SeasonTeamRegistration
 from hockey_scheduler.services.league_scope import (
     registered_team_ids_in_division,
@@ -581,6 +581,61 @@ class _Contract:
             actor_id=ADMIN, game_type=GameType.EXHIBITION.value)
         self.assertNotIn("error", exh, exh)
         self.assertEqual(exh["game_type"], "exhibition")
+
+
+    # -- Blocker: batch draft publish is atomic (no partial publish) ---------
+    def _inject_draft_game(self, home_id, away_id, slot_id, league_season_id):
+        g = Game(id=self.api.store.next_id("game"), home_team_id=home_id,
+                 away_team_id=away_id,
+                 start_time=datetime(2026, 9, 1, 18, tzinfo=UTC),
+                 season_id=self.season["id"], league_id=self.elite["id"],
+                 division_id=None, ice_slot_id=slot_id,
+                 league_season_id=league_season_id, is_draft=True,
+                 published=False)
+        self.api.store.add_game(g)
+        return g
+
+    def _two_draft_games_one_invalid(self):
+        """Two draft Elite games on their own slots; the SECOND is invalid — its
+        league_season_id is null (a regular game publish.publish_game will reject
+        it). Returns (g_ok, g_bad, slot_ok, slot_bad)."""
+        ls = self.api.store.league_season_for(self.elite["id"], self.season["id"])
+        a = self._team("A", self.elite["id"])
+        b = self._team("B", self.elite["id"])
+        c = self._team("C", self.elite["id"])
+        d = self._team("D", self.elite["id"])
+        s_ok, s_bad = self._slot(18), self._slot(20)
+        g_ok = self._inject_draft_game(a["id"], b["id"], s_ok["id"], ls.id)
+        g_bad = self._inject_draft_game(c["id"], d["id"], s_bad["id"], None)
+        return g_ok, g_bad, s_ok, s_bad
+
+    def _assert_batch_fully_rolled_back(self, games, slots, before_audit):
+        for g in games:
+            stored = self.api.store.get_game(g.id)
+            self.assertTrue(stored.is_draft, g.id)     # still a draft
+            self.assertFalse(stored.published, g.id)   # still unpublished
+        for s in slots:
+            self.assertEqual(self.api.store.get_ice_slot(s["id"]).status,
+                             IceSlotStatus.AVAILABLE)   # slot never allocated
+        # No audit at all — the whole batch rolled back (incl. game_published).
+        self.assertEqual(len(self.api.store.all_setup_audit()), before_audit)
+
+    def test_publish_selected_drafts_atomic_on_one_invalid_target(self):
+        g_ok, g_bad, s_ok, s_bad = self._two_draft_games_one_invalid()
+        before = len(self.api.store.all_setup_audit())
+        res = self.api.publish_draft_games(
+            game_ids=[g_ok.id, g_bad.id], actor_id=ADMIN)
+        self.assertIn("error", res, res)  # no partial success
+        self._assert_batch_fully_rolled_back(
+            [g_ok, g_bad], [s_ok, s_bad], before)
+
+    def test_publish_all_drafts_atomic_on_one_invalid_target(self):
+        g_ok, g_bad, s_ok, s_bad = self._two_draft_games_one_invalid()
+        before = len(self.api.store.all_setup_audit())
+        res = self.api.publish_draft_games(all_drafts=True, actor_id=ADMIN)
+        self.assertIn("error", res, res)
+        self._assert_batch_fully_rolled_back(
+            [g_ok, g_bad], [s_ok, s_bad], before)
 
 
 class MemoryBlockerRegressionTest(_Contract, unittest.TestCase):

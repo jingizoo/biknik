@@ -327,6 +327,42 @@ class DraftReviewHttpTest(unittest.TestCase):
         status, disc = self._req(c, "POST", "/api/scheduler/drafts/discard", {"all": True})
         self.assertEqual(disc["discarded"], len(body["created"]))
 
+    def test_publish_all_drafts_atomic_on_one_invalid_target(self):
+        # #283 review: batch publish is all-or-nothing over HTTP. Commit a
+        # division's drafts, break ONE (null league_season_id), then publish-all
+        # must be rejected with NO partial publish — every draft stays a draft on
+        # an AVAILABLE slot and no game_published audit is written.
+        c = self._client()
+        self._req(c, "POST", "/api/auth/login",
+                  {"username": "admin", "password": "demo"})
+        status, _ = self._req(c, "POST", "/api/scheduler/commit",
+                              {"division_id": self.div})
+        self.assertEqual(status, 200)
+        _, listed = self._req(c, "GET", "/api/scheduler/drafts")
+        draft_ids = [r["game_id"] for r in listed["draft_games"]]
+        self.assertGreaterEqual(len(draft_ids), 2, listed)
+
+        store = srv.STATE.api.store
+        bad = store.get_game(draft_ids[0])
+        bad.league_season_id = None  # break exactly one target
+        store.save_game(bad)
+        slot_ids = [store.get_game(i).ice_slot_id for i in draft_ids
+                    if store.get_game(i).ice_slot_id]
+        audit_before = len(store.all_setup_audit())
+
+        status, resp = self._req(c, "POST", "/api/scheduler/drafts/publish",
+                                 {"all": True})
+        self.assertNotEqual(status, 200, resp)   # rejected, no partial success
+
+        for i in draft_ids:
+            g = store.get_game(i)
+            self.assertTrue(g.is_draft, i)         # still a draft
+            self.assertFalse(g.published, i)       # still unpublished
+        for sid in slot_ids:
+            self.assertEqual(store.get_ice_slot(sid).status,
+                             IceSlotStatus.AVAILABLE)
+        self.assertEqual(len(store.all_setup_audit()), audit_before)
+
 
 if __name__ == "__main__":
     unittest.main()

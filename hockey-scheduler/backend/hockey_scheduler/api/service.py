@@ -2796,30 +2796,46 @@ class ApiService:
     @catch
     def publish_draft_games(self, game_ids=None, all_drafts=False,
                             actor_id=None) -> dict:
-        """Publish draft games (#86).
+        """Publish draft games (#86) — atomically for the whole batch (#283 review).
 
-        Clears the draft flag, then routes each game through
-        ``setup.publish_game`` so bulk publish uses the *same* audited publish
-        path as single-game publish (a ``game_published`` audit entry per
-        game) rather than a silent direct save that bypasses the trail.
+        Slot allocation, the draft→real transition, and the audited publish for
+        every targeted game run inside ONE store transaction. ``publish_game``
+        re-validates each game's #283 participation (a regular game's exact
+        LeagueSeason, an exhibition's active Season participation) and RAISES on
+        an invalid target; the enclosing transaction then rolls the WHOLE batch
+        back. So a single bad target (a missing/mismatched LeagueSeason, an
+        inactive registration) can never leave a non-draft unpublished game on an
+        allocated slot, nor partially publish earlier rows — every targeted game
+        stays a draft, every slot stays AVAILABLE, and no ``game_published``
+        audit is written. Each game is routed through the same audited
+        ``setup.publish_game`` as single-game publish.
         """
+        targets = self._draft_targets(game_ids, all_drafts)
+        # Validate EVERY target BEFORE any mutation: run publish_game's own #283
+        # participation revalidation (exact LeagueSeason for a regular game,
+        # active Season participation for an exhibition) read-only up front, so a
+        # single invalid target aborts with ZERO writes — never a partial
+        # publish. The transaction below is a second, independent guarantee.
+        for g in targets:
+            self.setup._revalidate_game_participation(g)
         published = 0
-        for g in self._draft_targets(game_ids, all_drafts):
-            # Allocate the ice slot, matching the manual create_game invariant
-            # (a game's slot is ALLOCATED, not left AVAILABLE) — otherwise a
-            # published game sits on a slot the grid still treats as an open
-            # drop target.
-            slot = (self.store.get_ice_slot(g.ice_slot_id)
-                    if g.ice_slot_id else None)
-            if slot is not None:
-                slot.status = IceSlotStatus.ALLOCATED
-                self.store.save_ice_slot(slot)
-            # Persist the draft→real transition first so it survives the
-            # re-fetch inside publish_game (SqlStore returns fresh instances).
-            g.is_draft = False
-            self.store.save_game(g)
-            self.setup.publish_game(g.id, True, actor_id)  # published + audit
-            published += 1
+        with self.store.transaction():
+            for g in targets:
+                # Allocate the ice slot, matching the manual create_game
+                # invariant (a game's slot is ALLOCATED, not left AVAILABLE) —
+                # otherwise a published game sits on a slot the grid still treats
+                # as an open drop target.
+                slot = (self.store.get_ice_slot(g.ice_slot_id)
+                        if g.ice_slot_id else None)
+                if slot is not None:
+                    slot.status = IceSlotStatus.ALLOCATED
+                    self.store.save_ice_slot(slot)
+                # Persist the draft→real transition first so it survives the
+                # re-fetch inside publish_game (SqlStore returns fresh instances).
+                g.is_draft = False
+                self.store.save_game(g)
+                self.setup.publish_game(g.id, True, actor_id)  # published + audit
+                published += 1
         return {"published": published}
 
     @catch
