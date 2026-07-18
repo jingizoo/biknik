@@ -54,6 +54,23 @@ def _seeded_api():
         s.add_ice_slot(IceSlot(id=f"s{i}", rink_id="r1",
                                start_time=base + timedelta(days=i),
                                end_time=base + timedelta(days=i, hours=1)))
+
+    # #283 Slice E: a regular Game must reference the exact LeagueSeason it
+    # belongs to, and publish now fails closed on any regular game missing it.
+    # Games are persisted here with only (division_id, league_id, season_id), so
+    # backfill league_season_id from the game's Division — the same derivation
+    # migration 037 applies to pre-#283 rows — as each Game is stored, keeping
+    # this fixture focused on the draft commit/publish/discard workflow.
+    _add_game = s.add_game
+
+    def _add_game_with_league_season(game):
+        if getattr(game, "league_season_id", None) is None and game.division_id:
+            division = s.get_division(game.division_id)
+            if division is not None:
+                game.league_season_id = division.league_season_id
+        return _add_game(game)
+
+    s.add_game = _add_game_with_league_season
     return ApiService(s), s
 
 

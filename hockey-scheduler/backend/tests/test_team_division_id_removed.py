@@ -126,10 +126,16 @@ class LegacyFieldIsInertContract:
     def _division(self, season_id, name):
         return self.api.create_division(season_id, name, actor_id=self.ACTOR)["id"]
 
-    def _team(self, name, division_id=None, program_id="_default"):
+    def _team(self, name, division_id=None, program_id="_default",
+              league_id=None):
+        # #283 Slice E: a Team needs a resolvable permanent League. Callers
+        # supply it via a ``division_id`` (League derived from its LeagueSeason)
+        # or an explicit ``league_id``; the Team's legacy ``division_id`` field
+        # is never set either way, so the "no legacy division" intent is kept.
         pid = self.league if program_id == "_default" else program_id
         return self.api.create_team(
-            self.club, division_id, name, actor_id=self.ACTOR, program_id=pid)["id"]
+            self.club, division_id, name, actor_id=self.ACTOR, program_id=pid,
+            league_id=league_id)["id"]
 
     def _slot(self, season_id):
         venue = self.api.create_venue("V", league_id=self.league, actor_id=self.ACTOR)["id"]
@@ -165,9 +171,15 @@ class LegacyFieldIsInertContract:
     def test_one_team_two_seasons_resolves_each_division(self):
         s1 = self._season("2026")
         s2 = self._season("2027")
-        d1 = self._division(s1, "D1")
-        d2 = self._division(s2, "D2")
-        team = self._team("Nomads")           # no legacy division at all
+        # #283: one permanent League spanning both Seasons (a League may span
+        # Seasons); each Season's Division hangs off that shared League, so the
+        # single team can legitimately register in both (rule 7).
+        league = self.api.create_league(s1, "L League", actor_id=self.ACTOR)["id"]
+        d1 = self.api.create_division(
+            s1, "D1", league_id=league, actor_id=self.ACTOR)["id"]
+        d2 = self.api.create_division(
+            s2, "D2", league_id=league, actor_id=self.ACTOR)["id"]
+        team = self._team("Nomads", league_id=league)  # no legacy division at all
         self._register(s1, team, d1)
         self._register(s2, team, d2)
         r1 = self.store.registration_for_team_in_season(s1, team)
@@ -185,10 +197,16 @@ class LegacyFieldIsInertContract:
     def test_changing_registration_leaves_legacy_field_and_history_untouched(self):
         s1 = self._season("2026")
         s2 = self._season("2027")
-        dA = self._division(s1, "A")
-        dB = self._division(s1, "B")
-        d2 = self._division(s2, "D2")
-        team = self._team("T")                       # legacy division_id = None
+        # #283: one permanent League spanning both Seasons so the single team
+        # can register in each (rule 7); dA/dB live in s1, d2 in s2.
+        league = self.api.create_league(s1, "L League", actor_id=self.ACTOR)["id"]
+        dA = self.api.create_division(
+            s1, "A", league_id=league, actor_id=self.ACTOR)["id"]
+        dB = self.api.create_division(
+            s1, "B", league_id=league, actor_id=self.ACTOR)["id"]
+        d2 = self.api.create_division(
+            s2, "D2", league_id=league, actor_id=self.ACTOR)["id"]
+        team = self._team("T", league_id=league)     # legacy division_id = None
         reg1 = self._register(s1, team, dA)
         reg2 = self._register(s2, team, d2)          # a second-season history row
         self.api.assign_season_team_division(reg1, dB, actor_id=self.ACTOR)
@@ -261,7 +279,7 @@ class LegacyFieldIsInertContract:
         # wrong-season: the division belongs to a different season than the row
         s2 = self._season("S2")
         d2 = self._division(s2, "D2")
-        wrong = self._team("Wrong")
+        wrong = self._team("Wrong", division_id=d2)
         bad_reg(wrong, d2)
 
         exposed = {r["team_id"]
@@ -299,7 +317,8 @@ class LegacyFieldIsInertContract:
         # or a derivation that couldn't determine one) must be excluded from
         # the overview, never silently passed through as league-less.
         season = self._season("S")
-        team = self._team("NoLeague")
+        league = self.api.create_league(season, "L League", actor_id=self.ACTOR)["id"]
+        team = self._team("NoLeague", league_id=league)
         # #283: a registration always references a LeagueSeason; a row whose
         # League doesn't resolve (bound to a non-existent League) is the
         # league-less corruption that must be excluded.
@@ -347,7 +366,8 @@ class LegacyFieldIsInertContract:
         # the corruption is an unresolvable LeagueSeason, not a "cross-season"
         # league.
         season = self._season("S")
-        team = self._team("Dangling")
+        league = self.api.create_league(season, "L League", actor_id=self.ACTOR)["id"]
+        team = self._team("Dangling", league_id=league)
         self.store.add_season_team_registration(SeasonTeamRegistration(
             id=self.store.next_id("streg"),
             league_season_id="leagueseason_missing",
@@ -369,7 +389,7 @@ class LegacyFieldIsInertContract:
         # `league`, so its LeagueSeason and the division's disagree.
         dA = self.api.create_division(
             season, "A", league_id=other_league, actor_id=self.ACTOR)["id"]
-        team = self._team("Mismatch")
+        team = self._team("Mismatch", league_id=league)
         league_ls = self.store.league_season_for(league, season).id
         self.store.add_season_team_registration(SeasonTeamRegistration(
             id=self.store.next_id("streg"), league_season_id=league_ls,

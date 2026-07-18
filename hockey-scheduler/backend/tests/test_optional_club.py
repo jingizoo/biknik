@@ -31,6 +31,13 @@ class OptionalClubContract:
         self.api = ApiService(self.store)
         self.program = self.api.create_program("Adult Men", actor_id=self.ACTOR)["id"]
         self.club = self.api.create_club("Lions Club", actor_id=self.ACTOR)["id"]
+        # #283 Slice E: every Team now needs a resolvable permanent League. The
+        # Program is given EXACTLY ONE League so a create_team that supplies only
+        # ``program_id`` resolves it unambiguously (rule 3) — keeping these Club
+        # tests focused on the Club dimension, not league wiring.
+        season = self.api.create_season(
+            self.program, "2026", actor_id=self.ACTOR)["id"]
+        self.api.create_league(season, "Adult League", actor_id=self.ACTOR)
 
     # -- create_team ---------------------------------------------------
 
