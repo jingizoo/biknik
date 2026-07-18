@@ -89,7 +89,7 @@ class ProductionModeTest(unittest.TestCase):
         # Even after an account exists, the unauthenticated picker must not
         # enumerate real usernames/roles in production (#68 review).
         srv.STATE.api.accounts.create_account(
-            "prod_admin_visible", "pw", Role.LEAGUE_ADMIN)
+            "prod_admin_visible", "prod-visible-pw", Role.LEAGUE_ADMIN)
         c = self._client()
         status, body = self._req(c, "GET", "/api/auth/accounts")
         self.assertEqual(status, 200)
@@ -148,9 +148,9 @@ class ProductionModeTest(unittest.TestCase):
         # Disabled outright — even a legitimate, currently-signed-in admin
         # cannot trigger it in production.
         srv.STATE.api.accounts.create_account(
-            "prod_admin2", "pw", Role.LEAGUE_ADMIN)
+            "prod_admin2", "prod-admin2-pw", Role.LEAGUE_ADMIN)
         c = self._client()
-        _, _, cookie = self._login(c, "prod_admin2", "pw")
+        _, _, cookie = self._login(c, "prod_admin2", "prod-admin2-pw")
         status, body = self._req(c, "POST", "/api/reset", {"confirm": "RESET"},
                                  cookie=cookie)
         self.assertEqual(status, 403)

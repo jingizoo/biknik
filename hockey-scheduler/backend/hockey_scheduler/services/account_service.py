@@ -20,7 +20,12 @@ from ..domain.errors import (
     ValidationError,
 )
 from ..store import InMemoryStore
-from .passwords import DUMMY_PASSWORD_HASH, hash_password, verify_password
+from .passwords import (
+    DUMMY_PASSWORD_HASH,
+    hash_password,
+    password_policy_error,
+    verify_password,
+)
 
 
 _INSTALLATION_STATE_ID = "primary"
@@ -169,8 +174,12 @@ class AccountService:
             raise ValidationError("A username is required.")
         if self.store.get_user_account_by_username(username) is not None:
             raise ValidationError(f"Username '{username}' is already taken.")
-        if not password:
-            raise ValidationError("A password is required.")
+        # Minimum credential policy (#267): enforced for every new account in
+        # production; non-empty everywhere. Applies at creation only — existing
+        # stored hashes are never invalidated.
+        policy_error = password_policy_error(password)
+        if policy_error:
+            raise ValidationError(policy_error, {"reason": "weak_password"})
         role = self._parse_role(role)
         # Scope must be a JSON object (#266 review): a string or array would let
         # ``dict(scope)`` raise a raw ValueError/TypeError — a 500 rather than a
@@ -215,8 +224,12 @@ class AccountService:
         username = (username or "").strip().lower()
         if not username:
             raise ValidationError("A username is required.")
-        if not isinstance(password, str) or not password:
-            raise ValidationError("A password is required.")
+        # Same minimum credential policy as create_account (#267) — checked
+        # before the installation marker is written, so a weak-password claim
+        # attempt writes nothing.
+        policy_error = password_policy_error(password)
+        if policy_error:
+            raise ValidationError(policy_error, {"reason": "weak_password"})
         method = (claim_method or "operations").strip()[:40] or "operations"
 
         try:
@@ -385,6 +398,22 @@ class AccountService:
         if account is None or not account.active or not ok:
             return None
         return account
+
+    @_transactional
+    def audit_login_throttled(self, ip: Optional[str], scopes) -> SetupAuditLog:
+        """Record a login-throttle lockout at a safe, aggregate level (#267).
+
+        Written once when a bucket first locks (not per blocked request), so the
+        audit can't be flooded. Records the abuse source IP and which bucket(s)
+        locked (``ip``/``username``) — never the submitted username value or the
+        password, so the audit trail is not a username oracle and holds no raw
+        credential.
+        """
+        return self.store.add_setup_audit(SetupAuditLog(
+            id=self.store.next_id("setupaudit"), action="login_throttled",
+            entity_type="auth", entity_id=(ip or "unknown")[:64],
+            at=self.clock(), actor_id=None,
+            detail={"scopes": sorted(scopes)}))
 
     def list_accounts(self):
         return sorted(self.store.all_user_accounts(), key=lambda a: a.username)

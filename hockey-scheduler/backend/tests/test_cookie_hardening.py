@@ -128,12 +128,13 @@ class DemoCookieTest(_CookieBase):
 
 class ProductionCookieTest(_CookieBase):
     APP_MODE = "production"
-    ENV = {"BOOTSTRAP_ADMIN_USER": "boss", "BOOTSTRAP_ADMIN_PASSWORD": "secret"}
+    ENV = {"BOOTSTRAP_ADMIN_USER": "boss",
+           "BOOTSTRAP_ADMIN_PASSWORD": "boss-secret-pw"}
 
     def test_login_always_secure_in_production(self):
         # Even over plain HTTP (the app sits behind a TLS proxy in prod).
         status, cookies = self._post("/api/auth/login",
-                                     {"username": "boss", "password": "secret"})
+                                     {"username": "boss", "password": "boss-secret-pw"})
         self.assertEqual(status, 200)
         c = self._session_set_cookie(cookies)
         self.assertIn("Secure", c)

@@ -66,7 +66,7 @@ class ProductionBootstrapHttpTest(unittest.TestCase):
     def setUpClass(cls):
         os.environ["APP_MODE"] = "production"
         os.environ["BOOTSTRAP_ADMIN_USER"] = "prodroot"
-        os.environ["BOOTSTRAP_ADMIN_PASSWORD"] = "prod-pass"
+        os.environ["BOOTSTRAP_ADMIN_PASSWORD"] = "prod-password-1"
         srv.STATE.reset()  # boots production: no demo personas, bootstrap admin
         cls.httpd = ThreadingHTTPServer(("127.0.0.1", 0), srv.Handler)
         cls.port = cls.httpd.server_address[1]
@@ -120,7 +120,7 @@ class ProductionBootstrapHttpTest(unittest.TestCase):
         _, accts = self._req(c, "GET", "/api/auth/accounts")
         self.assertEqual(accts["accounts"], [])
         # But the bootstrapped admin can sign in via the manual form path.
-        status, body, cookie = self._login(c, "prodroot", "prod-pass")
+        status, body, cookie = self._login(c, "prodroot", "prod-password-1")
         self.assertEqual(status, 200)
         self.assertEqual(body["user"]["role"], "league_admin")
         self.assertIsNotNone(cookie)
@@ -161,7 +161,7 @@ class ProductionResetPreservesSqlStoreTest(unittest.TestCase):
     def test_reset_does_not_drop_existing_accounts_and_bootstrap_skips(self):
         # Boot once to create the first admin from env.
         os.environ["BOOTSTRAP_ADMIN_USER"] = "firstadmin"
-        os.environ["BOOTSTRAP_ADMIN_PASSWORD"] = "pw1"
+        os.environ["BOOTSTRAP_ADMIN_PASSWORD"] = "firstadmin-pw1"
         srv.DemoState()  # __init__ → reset(): production path, bootstraps admin
         self.assertIn("firstadmin", self._accounts())
 
@@ -169,11 +169,11 @@ class ProductionResetPreservesSqlStoreTest(unittest.TestCase):
         # A non-admin account that must survive a reboot; a viewer needs no
         # team scope (#266).
         ApiService(SqlStore(self.db_path)).create_user_account(
-            "returning_viewer", "pw2", "viewer")
+            "returning_viewer", "returning-viewer-pw", "viewer")
 
         # Reboot with a DIFFERENT bootstrap user set.
         os.environ["BOOTSTRAP_ADMIN_USER"] = "shouldnotexist"
-        os.environ["BOOTSTRAP_ADMIN_PASSWORD"] = "pw3"
+        os.environ["BOOTSTRAP_ADMIN_PASSWORD"] = "shouldnotexist-pw"
         srv.DemoState()  # reboot
 
         names = self._accounts()

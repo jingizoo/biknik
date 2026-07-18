@@ -10,10 +10,61 @@ import hashlib
 import hmac
 import os
 import secrets
+from typing import Optional
 
 _ALGORITHM = "pbkdf2_sha256"
 _DEFAULT_ITERATIONS = 260_000
 _SALT_BYTES = 16
+
+# -- minimum credential policy (#267) --------------------------------------
+#
+# A newly created / activated / reset / changed password must meet a minimum
+# length in PRODUCTION. Development/demo credentials (e.g. the seeded "demo"
+# password) stay explicitly development-only: the policy is enforced only when
+# APP_MODE=production, and the demo seed paths run only outside production. The
+# minimum is configurable via HS_MIN_PASSWORD_LENGTH within safe bounds — in
+# production it can be raised but never lowered below the floor, so a stray or
+# accidental override can NEVER weaken the policy (mirrors the PBKDF2-iteration
+# floor). Existing stored hashes are never invalidated: the policy applies at
+# the next create/change/reset, not to already-stored credentials.
+_MIN_PASSWORD_LENGTH_DEFAULT = 10
+_MIN_PASSWORD_LENGTH_FLOOR = 8
+
+
+def _is_production() -> bool:
+    return (os.environ.get("APP_MODE") or "demo").strip().lower() == "production"
+
+
+def min_password_length() -> int:
+    """The enforced minimum new-password length. Read at call time so a
+    deployment can configure it; clamped to the floor in production."""
+    raw = os.environ.get("HS_MIN_PASSWORD_LENGTH")
+    if not raw:
+        return _MIN_PASSWORD_LENGTH_DEFAULT
+    try:
+        n = int(raw)
+    except ValueError:
+        return _MIN_PASSWORD_LENGTH_DEFAULT
+    if _is_production():
+        return max(n, _MIN_PASSWORD_LENGTH_FLOOR)
+    return max(1, n)
+
+
+def password_policy_error(password) -> Optional[str]:
+    """Return a stable, user-facing reason string if ``password`` violates the
+    minimum credential policy, else ``None``.
+
+    Always requires a non-empty string. In production it additionally requires
+    at least ``min_password_length()`` characters; outside production only the
+    non-empty rule applies, so development/demo credentials remain usable while
+    production account paths cannot be created below the configured minimum.
+    """
+    if not isinstance(password, str) or not password:
+        return "A password is required."
+    if _is_production() and len(password) < min_password_length():
+        return (f"Password must be at least {min_password_length()} "
+                "characters.")
+    return None
 
 
 def _resolve_iterations() -> int:

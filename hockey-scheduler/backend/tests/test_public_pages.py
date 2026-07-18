@@ -48,7 +48,7 @@ class PublicPagesProductionTest(_Base):
     def setUpClass(cls):
         os.environ["APP_MODE"] = "production"
         os.environ["BOOTSTRAP_ADMIN_USER"] = "pubadmin"
-        os.environ["BOOTSTRAP_ADMIN_PASSWORD"] = "pw"
+        os.environ["BOOTSTRAP_ADMIN_PASSWORD"] = "pubadmin-pw"
         srv.STATE.reset()
         build_full_demo_store(srv.STATE.api.store)  # give the store data
         cls.game_id = next(iter(srv.STATE.api.store.games)) \
