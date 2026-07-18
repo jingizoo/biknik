@@ -2307,7 +2307,20 @@ class ApiService:
         # The division roster comes from active SeasonTeamRegistrations (#180
         # shared guard), not the legacy Team.division_id — a team plays in a
         # division only for the season(s) it is registered there.
-        team_ids = self.setup.registered_team_ids_in_division(division_id)
+        # #283 rule 10: on a DEFINITELY-ended Season, historical standings keep a
+        # validly-transferred Team (its permanent League has since changed), so
+        # the current-ownership check that live scheduling/draft applies is
+        # skipped here — matching _standings_for_league_season. A live Season
+        # still excludes a same-Program cross-League drift.
+        division = self.store.get_division(division_id)
+        league_season = (self.store.get_league_season(division.league_season_id)
+                         if division and division.league_season_id else None)
+        season = (self.store.get_season(league_season.season_id)
+                  if league_season else None)
+        season_ended = (season is not None and season.end_date is not None
+                        and season.end_date < self.setup.clock())
+        team_ids = self.setup.registered_team_ids_in_division(
+            division_id, enforce_team_league=not season_ended)
         teams = [t for t in (self.store.get_team(tid) for tid in team_ids)
                  if t is not None]
         rows = {t.id: {"team_id": t.id, "team_name": t.name, "gp": 0,

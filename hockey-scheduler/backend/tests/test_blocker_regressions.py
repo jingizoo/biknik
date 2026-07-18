@@ -311,6 +311,54 @@ class _Contract:
     def test_transfer_preserves_ended_season_public_standings(self):
         self._assert_ended_season_history_unchanged(public=True)
 
+    def _assert_ended_season_division_history_unchanged(self, public):
+        # A completed Elite Season with a Division dA: A beats B 3-1 (FINAL) in
+        # dA. For the public tables the Game is published. Both the Division and
+        # LeagueSeason standings must survive a post-Season transfer byte-for-byte
+        # (#283 rule 10) — the Division view must not drop the transferred Team.
+        dA = self.api.create_division_v2(self.elite["id"], "DA", actor_id=ADMIN)
+        a = self.api.create_team(self.club["id"], None, "A", actor_id=ADMIN,
+                                 league_id=self.elite["id"])
+        b = self.api.create_team(self.club["id"], None, "B", actor_id=ADMIN,
+                                 league_id=self.elite["id"])
+        for t in (a, b):
+            self.api.register_team_for_season(
+                self.season["id"], t["id"], dA["id"], actor_id=ADMIN,
+                league_id=self.elite["id"])
+        g = self.api.create_game(
+            self.season["id"], dA["id"], a["id"], b["id"], self._slot(18)["id"],
+            actor_id=ADMIN, league_id=self.elite["id"])
+        self.assertNotIn("error", g, g)
+        if public:
+            self.assertNotIn(
+                "error", self.api.publish_game(g["id"], actor_id=ADMIN))
+        self._final(g["id"], 3, 1)
+        self._end_the_season()
+
+        div_fn = self.api.get_public_standings if public else self.api.get_standings
+        div_before = div_fn(dA["id"])["standings"]
+        ls_before = self._ls_standings(public)
+
+        moved = self.api.transfer_team_to_league(
+            a["id"], self.rec["id"], actor_id=ADMIN)
+        self.assertNotIn("error", moved, moved)
+
+        # Both views are byte-identical, and A still appears in the Division
+        # table with its 2 points despite its permanent League having changed.
+        self.assertEqual(div_fn(dA["id"])["standings"], div_before)
+        self.assertEqual(self._ls_standings(public), ls_before)
+        by_team = {r["team_id"]: r for r in div_fn(dA["id"])["standings"]}
+        self.assertIn(a["id"], by_team)
+        self.assertEqual(by_team[a["id"]]["pts"], 2)
+        self.assertEqual(self.api.store.get_team(a["id"]).league_id,
+                         self.rec["id"])
+
+    def test_transfer_preserves_ended_season_division_standings_private(self):
+        self._assert_ended_season_division_history_unchanged(public=False)
+
+    def test_transfer_preserves_ended_season_division_standings_public(self):
+        self._assert_ended_season_division_history_unchanged(public=True)
+
     def test_live_season_league_mismatch_excluded_from_standings(self):
         # A CURRENT (undated) Season: A is registered in Elite and plays a FINAL
         # game, but a data-integrity drift leaves A's permanent League as Rec
@@ -397,13 +445,18 @@ class _Contract:
 
     def test_cross_league_drift_excluded_from_standings(self):
         dA, x, b = self._cross_league_drift()
-        div = self.api.get_standings(dA["id"])
-        self.assertNotIn("error", div, div)
-        self.assertNotIn(b["id"], {r["team_id"] for r in div["standings"]})
-        ls = self.api.get_league_season_standings(
-            self.elite["id"], self.season["id"])
-        self.assertNotIn("error", ls, ls)
-        self.assertNotIn(b["id"], {r["team_id"] for r in ls["standings"]})
+        # A LIVE (undated) Season: the drift is excluded from BOTH the Division
+        # and LeagueSeason standings, in both the private and public variants.
+        for div in (self.api.get_standings(dA["id"]),
+                    self.api.get_public_standings(dA["id"])):
+            self.assertNotIn("error", div, div)
+            self.assertNotIn(b["id"], {r["team_id"] for r in div["standings"]})
+        for ls in (self.api.get_league_season_standings(
+                       self.elite["id"], self.season["id"]),
+                   self.api.get_public_league_season_standings(
+                       self.elite["id"], self.season["id"])):
+            self.assertNotIn("error", ls, ls)
+            self.assertNotIn(b["id"], {r["team_id"] for r in ls["standings"]})
 
     def test_legit_cross_league_exhibition_still_allowed(self):
         # An Exhibition between two teams each validly registered in their OWN

@@ -196,12 +196,22 @@ def team_registration_valid(store, season, team_id, division_id=None,
     return reg
 
 
-def registered_team_ids_in_division(store, division_id):
+def registered_team_ids_in_division(store, division_id, enforce_team_league=True):
     """Team ids validly registered in ``division_id`` this season: the row is
     active and in this division, its Team exists, and the Team's permanent
     league matches the division's season league. Orphaned/cross-league rows are
     excluded rather than trusted (#199). Shared by standings and draft
-    generation so both read exactly the same roster."""
+    generation so both read exactly the same roster.
+
+    ``enforce_team_league`` (default ``True``) is the LIVE-scheduling rule: a
+    Team must currently belong to this Division's League (rules 7-9), so draft
+    generation and current-Season standings exclude a same-Program cross-League
+    drift. Pass ``False`` for an ENDED Season's historical standings (#283 rule
+    10): a Team validly transferred to another League afterward keeps its
+    completed-Season registration/Games here and must still be counted — the
+    caller decides a Season is ended and asks history not to re-check current
+    ownership. Orphaned/null-Program/cross-Program rows are excluded either way.
+    """
     division = store.get_division(division_id)
     if division is None:
         return set()
@@ -224,8 +234,9 @@ def registered_team_ids_in_division(store, division_id):
         team = store.get_team(reg.team_id)
         if team is None or not team_scope_id(team) or team_scope_id(team) != program_scope:
             continue  # orphaned, null-Program, or cross-Program row — never trusted
-        if not team.league_id or team.league_id != division_league_id:
-            continue  # cross-League drift within the Program — never trusted
+        if enforce_team_league and (
+                not team.league_id or team.league_id != division_league_id):
+            continue  # live cross-League drift within the Program — never trusted
         ids.add(reg.team_id)
     return ids
 

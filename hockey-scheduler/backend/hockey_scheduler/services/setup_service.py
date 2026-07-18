@@ -1748,11 +1748,18 @@ class SetupService:
             self.store, season, team_id, division_id,
             require_division=require_division) is not None
 
-    def registered_team_ids_in_division(self, division_id: str) -> set:
+    def registered_team_ids_in_division(self, division_id: str,
+                                        enforce_team_league: bool = True) -> set:
         """Team ids validly registered in ``division_id`` — the division's
         membership/standings roster. Delegates to the shared resolver so it
-        excludes orphaned/cross-league rows exactly as draft generation does."""
-        return _registered_team_ids(self.store, division_id)
+        excludes orphaned/cross-league rows exactly as draft generation does.
+
+        ``enforce_team_league`` (default ``True``) keeps the live-scheduling
+        rule that a Team must currently belong to the Division's League; pass
+        ``False`` for an ENDED Season's historical standings so a validly
+        transferred Team is still counted (#283 rule 10)."""
+        return _registered_team_ids(self.store, division_id,
+                                    enforce_team_league=enforce_team_league)
 
     # -- manual game creation ---------------------------------------------
     @_transactional
