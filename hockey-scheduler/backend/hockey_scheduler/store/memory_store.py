@@ -507,6 +507,14 @@ class InMemoryStore:
         return [r for r in self.season_team_registrations.values()
                 if r.league_season_id in ls_ids]
 
+    def registration_for_team_in_season(
+            self, season_id: str, team_id: str
+    ) -> Optional[SeasonTeamRegistration]:
+        """A team's registration in a Season, across its LeagueSeasons (#283
+        back-compat convenience)."""
+        return next((r for r in self.registrations_for_season(season_id)
+                     if r.team_id == team_id), None)
+
     # -- team → permanent League migration decisions (#283 migration 035) ---
     def add_team_league_migration_decision(
             self, decision: TeamLeagueMigrationDecision

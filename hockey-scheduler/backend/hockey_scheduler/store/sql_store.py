@@ -865,6 +865,15 @@ class SqlStore:
             SeasonTeamRegistration,
             "league_season_id IN (SELECT id FROM league_seasons WHERE season_id = ?)",
             (season_id,), order="id")
+    def registration_for_team_in_season(self, season_id, team_id):
+        """A team's registration in a Season, across its LeagueSeasons (#283
+        back-compat convenience)."""
+        rows = self._query(
+            SeasonTeamRegistration,
+            "team_id = ? AND league_season_id IN "
+            "(SELECT id FROM league_seasons WHERE season_id = ?)",
+            (team_id, season_id))
+        return rows[0] if rows else None
 
     # -- team → permanent League migration decisions (#283 migration 035) ---
     def add_team_league_migration_decision(self, decision):

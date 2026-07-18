@@ -3482,8 +3482,10 @@ class ApiService:
     @catch
     def delete_season_team_registration(self, registration_id: str,
                                         actor_id: Optional[str] = None) -> dict:
-        return self._registration_dict(self.setup.delete_season_team_registration(
-            registration_id, actor_id))
+        # setup.delete_season_team_registration already returns a rich v1 dict
+        # (with season_name/team_name/league_name/division_name); return as-is.
+        return self.setup.delete_season_team_registration(
+            registration_id, actor_id)
 
     # -- season venue access (#233 Slice E) ---------------------------------
     @catch
@@ -3584,7 +3586,9 @@ class ApiService:
     @catch
     def delete_division(self, division_id: str,
                         actor_id: Optional[str] = None) -> dict:
-        return self._division_dict(self.setup.delete_division(division_id, actor_id))
+        # setup.delete_division already returns a rich v1-shaped dict (with
+        # inactive_registrations_cleaned); return it as-is (#283).
+        return self.setup.delete_division(division_id, actor_id)
 
     @catch
     def delete_club(self, club_id: str, actor_id: Optional[str] = None) -> dict:

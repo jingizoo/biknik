@@ -306,7 +306,11 @@ class SetupService:
                                         league_id: Optional[str]) -> LeagueSeason:
         """The LeagueSeason a Division should belong to (#283). With a league,
         find/create its binding to the Season; without one, the Season's sole
-        LeagueSeason (a Division now always belongs to a League — rule 6)."""
+        LeagueSeason. A Division now always belongs to a League (rule 6), so a
+        league-less division added to a Season that has NO league yet
+        auto-provisions a single default League for that Season — this preserves
+        the pre-#283 ergonomics (a Season implicitly had one grouping) so a
+        caller that only cares about divisions/teams/games keeps working."""
         if league_id:
             if self.store.get_league(league_id) is None:
                 raise NotFoundError(f"League {league_id} not found.")
@@ -315,13 +319,97 @@ class SetupService:
         if len(candidates) == 1:
             return candidates[0]
         if not candidates:
-            raise ValidationError(
-                "Create a league for this season before adding a division.",
-                {"reason": "no_league_for_season", "season_id": season_id})
+            season = self.store.get_season(season_id)
+            league = League(id=self.store.next_id("league"),
+                            program_id=season.program_id, name="League",
+                            sort_order=0)
+            self.store.add_league(league)
+            return self._link_league_season(league.id, season_id)
         raise ValidationError(
             "This season has several leagues; specify which league the division "
             "belongs to.",
             {"reason": "ambiguous_league_for_season", "season_id": season_id})
+
+    @_transactional
+    def create_division_under_league(self, league_id: str, name: str,
+                                     age_group: str = "",
+                                     actor_id: Optional[str] = None) -> Division:
+        """Create a Division under a permanent League (#283 back-compat, v2).
+
+        The League participates in one Season here (the common case); the
+        LeagueSeason is resolved from the league's sole binding. Delegates to the
+        Division create against that LeagueSeason."""
+        lss = self.store.league_seasons_for_league(league_id)
+        if not lss:
+            if self.store.get_league(league_id) is None:
+                raise NotFoundError(f"League {league_id} not found.")
+            raise ValidationError(
+                "That league is not yet part of any season.",
+                {"reason": "league_has_no_season", "league_id": league_id})
+        if len(lss) > 1:
+            raise ValidationError(
+                "That league participates in several seasons; create the "
+                "division against a specific season.",
+                {"reason": "ambiguous_season_for_league", "league_id": league_id})
+        division = Division(id=self.store.next_id("division"),
+                            league_season_id=lss[0].id,
+                            name=self._require_name(name), age_group=age_group)
+        self.store.add_division(division)
+        self._audit("division_created", "division", division.id, actor_id,
+                    {"league_season_id": lss[0].id, "level_id": league_id})
+        return division
+
+    @_transactional
+    def assign_season_team_league(self, registration_id: str,
+                                  league_id: Optional[str] = None,
+                                  actor_id: Optional[str] = None
+                                  ) -> SeasonTeamRegistration:
+        """Move a registration to a different League within the same Season
+        (#283 back-compat). The registration's League is fixed by its
+        LeagueSeason, so this repoints it to the LeagueSeason of
+        ``(league_id, same season)``; when the Team has a permanent League it may
+        only be that League (rule 7). Refuses to strand a committed game."""
+        reg = self.store.get_season_team_registration(registration_id)
+        if reg is None:
+            raise NotFoundError(f"Registration {registration_id} not found.")
+        if not league_id:
+            raise ValidationError("A league_id is required.")
+        if self.store.get_league(league_id) is None:
+            raise NotFoundError(f"League {league_id} not found.")
+        team = self.store.get_team(reg.team_id)
+        if team and team.league_id and team.league_id != league_id:
+            raise ValidationError(
+                "A team may only register in its own League.",
+                {"reason": "team_league_mismatch", "team_id": reg.team_id,
+                 "team_league_id": team.league_id, "league_id": league_id})
+        season_id = self._season_of_league_season(reg.league_season_id)
+        old_league = self._registration_league_id(reg)
+        if (league_id or None) != (old_league or None):
+            stranded = [
+                g.id for g in self.store.all_games()
+                if not g.cancelled and not g.is_draft
+                and g.season_id == season_id and g.league_id == old_league
+                and reg.team_id in (g.home_team_id, g.away_team_id)]
+            if stranded:
+                raise ValidationError(
+                    "Cannot change this registration's league while committed "
+                    "games reference its current league for this team; resolve "
+                    "those games first.",
+                    {"reason": "registration_league_change_strands_games",
+                     "registration_id": reg.id,
+                     "affected_game_ids": stranded, "count": len(stranded)})
+        new_ls = self._link_league_season(league_id, season_id)
+        # A division set on the registration must belong to the new LeagueSeason;
+        # clear it if it doesn't (the league moved out from under it).
+        if reg.division_id:
+            division = self.store.get_division(reg.division_id)
+            if division and division.league_season_id != new_ls.id:
+                reg.division_id = None
+        reg.league_season_id = new_ls.id
+        self.store.save_season_team_registration(reg)
+        self._audit("season_team_league_assigned", "season_team_registration",
+                    reg.id, actor_id, {"from": old_league, "to": league_id})
+        return reg
 
     # -- club / team -------------------------------------------------------
     @_transactional
@@ -538,7 +626,8 @@ class SetupService:
     @_transactional
     def assign_season_team_division(self, registration_id: str,
                                     division_id: Optional[str] = None,
-                                    actor_id: Optional[str] = None
+                                    actor_id: Optional[str] = None,
+                                    v2: bool = False
                                     ) -> SeasonTeamRegistration:
         """Set (or clear) a registration's Division within its LeagueSeason
         (#283 rule 6). A registration's League is fixed by its LeagueSeason and
