@@ -1,12 +1,18 @@
 // Season participation browser journey (#180 PR D, cut to v2 canonical #233
-// Slice B2b).
+// Slice B2b; re-modelled for #283 Slice E permanent Leagues).
 //
-// At desktop and phone widths, a League Admin builds a permanent program team,
-// registers it for two different seasons — each under its own grouping League
-// and division — through the Setup "Season participation" panel, confirms
-// exactly one permanent Team backs two registrations, then removes it from one
-// season and confirms the other season's registration is untouched. Fails on
-// any browser console/page error.
+// At desktop and phone widths, a League Admin builds a permanent program team
+// under its PERMANENT League (#283 rule 2: a Team is created with a required
+// league_id), registers it for two different seasons — a permanent League
+// spans Seasons, so BOTH registrations are under that same League (#283 rule
+// 7: a Team may only register into its own permanent League) — through the
+// Setup "Season participation" panel, confirms exactly one permanent Team
+// backs two registrations, then removes it from one season and confirms the
+// other season's registration is untouched. It then drives the Save controls'
+// Division cascade within the team's permanent League, proves the backend
+// refuses to move a registration OUT of that League (rule 7), and exercises
+// the Needs-assignment repair surface. Fails on any browser console/page
+// error.
 const { chromium } = require("playwright");
 const { spawn, spawnSync } = require("child_process");
 const fs = require("fs");
@@ -136,11 +142,35 @@ async function checkViewport(browser, viewport) {
     await page.goto(base, { waitUntil: "domcontentloaded" });
     await page.waitForSelector("#content > *", { timeout: 10000 });
 
-    // Build a permanent program team + two seasons, each with its own grouping
-    // League and division, through the canonical v2 API (demo default is
-    // League Admin) — the same records an operator would type in. A v2
-    // registration's League is REQUIRED, so each season needs one before the
-    // panel can register anything into it (#233 Slice C2).
+    // Shared helpers (defined up front so both the main flow and the
+    // edit/repair sections below can use them). refreshSetup re-clicks the
+    // Setup tab (its onclick calls render() unconditionally, even when already
+    // on that tab) so a raw fetch that mutated server state is reflected in
+    // the page's own in-memory `hv`/`seasonRegs`/`leagueDivisions` state.
+    const refreshSetup = async (marker) => {
+      await page.click('.tab[data-tab="setup"]');
+      await page.waitForFunction((m) => {
+        const sel = document.querySelector(m.selector);
+        return !!sel && (!m.optionValue || Array.from(sel.options).some((o) => o.value === m.optionValue));
+      }, marker, { timeout: 15000 });
+    };
+    const toastText = () => page.$eval(
+      "#toast-root .toast-msg", (el) => el.textContent).catch(() => "");
+    const waitForToast = (expected) => page.waitForFunction(
+      (t) => (document.querySelector("#toast-root .toast-msg") || {}).textContent === t,
+      expected, { timeout: 15000 });
+
+    // Build a permanent program team under its PERMANENT League, plus two
+    // seasons. #283 Slice E: a Team is created with a REQUIRED league_id (its
+    // permanent League) and may only ever register into THAT League (rule 7).
+    // A permanent League spans Seasons, so the single League `lg1` is what the
+    // team plays in BOTH seasons — created against season 1 here and bound to
+    // season 2 later (there is no v2 "bind league to season" call; a League
+    // joins a Season only via a registration, so the season-2 binding is
+    // bootstrapped in the middle of the flow below). A second Division `dA2`
+    // under lg1 (created now, while lg1 spans a single Season — a Division
+    // create is ambiguous once its League spans several) gives the edit-path
+    // Save a real Division to move the registration to WITHIN its own League.
     const ids = await page.evaluate(async () => {
       const post = async (p, b) => (await fetch(p, {
         method: "POST", credentials: "same-origin",
@@ -150,15 +180,17 @@ async function checkViewport(browser, viewport) {
       const s1 = await post("/api/v2/setup/season", { program_id: program.id, name: "2026-27" });
       const s2 = await post("/api/v2/setup/season", { program_id: program.id, name: "2027-28" });
       const lg1 = await post("/api/v2/setup/league", { season_id: s1.id, name: "Adult League" });
-      const lg2 = await post("/api/v2/setup/league", { season_id: s2.id, name: "Adult League" });
       const dA = await post("/api/v2/setup/division", { league_id: lg1.id, name: "Gold" });
-      const dB = await post("/api/v2/setup/division", { league_id: lg2.id, name: "Division B" });
+      const dA2 = await post("/api/v2/setup/division", { league_id: lg1.id, name: "Platinum" });
       const club = await post("/api/v2/setup/club", { name: "Participation Club" });
       const team = await post("/api/v2/setup/team",
-        { program_id: program.id, club_id: club.id, name: "Perma Lions" });
-      return { program: program.id, s1: s1.id, s2: s2.id, lg1: lg1.id, lg2: lg2.id,
-        dA: dA.id, dB: dB.id, team: team.id };
-    }, );
+        { league_id: lg1.id, club_id: club.id, name: "Perma Lions" });
+      // lg1 is the team's ONE permanent League; the team plays it in BOTH
+      // seasons. lg2 is kept as an alias so the season-2 selectors below read
+      // naturally — it is the SAME permanent League id.
+      return { program: program.id, s1: s1.id, s2: s2.id, lg1: lg1.id, lg2: lg1.id,
+        dA: dA.id, dA2: dA2.id, team: team.id };
+    });
 
     // Open Setup → Season participation reflects the fresh, empty seasons.
     // (Navigating to the tab re-renders and re-fetches the registration data;
@@ -181,8 +213,9 @@ async function checkViewport(browser, viewport) {
       throw new Error(`[${viewport.label}] orgless Program listed under Needs assignment: ${naText}`);
     }
 
-    // Register the permanent team for season 1 / League 1 / Division Gold. The
-    // League select already defaults to lg1 (the section it's under).
+    // Register the permanent team for season 1 under its permanent League /
+    // Division Gold. lg1 is only in season 1 so far, so this register control
+    // is unambiguous. The League select already defaults to lg1 (its section).
     await page.selectOption(`#reg-team-${ids.lg1}`, ids.team);
     await page.selectOption(`#reg-div-add-${ids.lg1}`, ids.dA);
     let resp = page.waitForResponse((r) =>
@@ -191,19 +224,39 @@ async function checkViewport(browser, viewport) {
     await page.click(`[data-reg-add="${ids.lg1}"]`);
     if ((await resp).status() !== 200) throw new Error(`[${viewport.label}] register s1 failed`);
 
-    // Register the SAME team for season 2 / League 2 / Division B. The team is
-    // still available for s2 (registering it for s1 doesn't touch s2), so its
-    // s2 register control is present.
-    await page.waitForFunction(
-      (sel) => !!document.querySelector(sel), `#reg-team-${ids.lg2}`, { timeout: 15000 });
+    // Bootstrap the permanent League into season 2: a League participates in a
+    // Season only via a LeagueSeason, which a registration creates (#283) —
+    // there is no standalone v2 bind call. Register the team into season 2 and
+    // immediately remove it, so the LeagueSeason(lg1, s2) persists but the team
+    // has NO active season-2 registration. The team is registered in season 1
+    // now, so its season-1 register control is gone — after this bootstrap the
+    // team's season-2 register control (same League id) is the ONLY one on the
+    // page, keeping the selector unambiguous, and the real UI registration
+    // below reactivates the bootstrapped row in place.
+    await page.evaluate(async (i) => {
+      const post = async (p, b) => (await fetch(p, {
+        method: "POST", credentials: "same-origin",
+        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
+      })).json();
+      const boot = await post(`/api/v2/setup/seasons/${i.s2}/team-registrations`,
+        { team_id: i.team, league_id: i.lg1, division_id: null });
+      await post(`/api/v2/setup/season-team-registration/${boot.id}/remove`, {});
+    }, ids);
+    await refreshSetup({ selector: `#reg-team-${ids.lg2}` });
+
+    // Register the SAME permanent team for season 2 under the SAME permanent
+    // League (rule 7 — it can register nowhere else). Division is left at "No
+    // division": a Division under lg1 for season 2 can't be created via the v2
+    // API once lg1 spans both seasons (ambiguous), so this registration is
+    // league-only. The team is still available for s2 (its bootstrapped row is
+    // inactive), so its s2 register control is present.
     await page.selectOption(`#reg-team-${ids.lg2}`, ids.team);
-    await page.selectOption(`#reg-div-add-${ids.lg2}`, ids.dB);
     resp = page.waitForResponse((r) =>
       r.url() === `${base}/api/v2/setup/seasons/${ids.s2}/team-registrations`
       && r.request().method() === "POST");
     await page.click(`[data-reg-add="${ids.lg2}"]`);
     if ((await resp).status() !== 200) throw new Error(`[${viewport.label}] register s2 failed`);
-    // Now the team is registered for BOTH seasons, so each league shows a
+    // Now the team is registered for BOTH seasons, so each season shows a
     // Remove control (and its register select is gone — nothing left to add).
     await page.waitForFunction(
       () => document.querySelectorAll("[data-reg-remove]").length >= 2, null, { timeout: 15000 });
@@ -220,6 +273,20 @@ async function checkViewport(browser, viewport) {
     }, ids);
     if (state.teamCount !== 1 || state.r1 !== 1 || state.r2 !== 1) {
       throw new Error(`[${viewport.label}] expected 1 team + 2 registrations, got ${JSON.stringify(state)}`);
+    }
+
+    // Both registrations are under the team's ONE permanent League (rule 7).
+    const bothLeagues = await page.evaluate(async (i) => {
+      const get = async (p) => (await fetch(p, { credentials: "same-origin" })).json();
+      const r1 = (await get(`/api/v2/setup/seasons/${i.s1}/team-registrations`)).registrations
+        .find((r) => r.active && r.team_id === i.team);
+      const r2 = (await get(`/api/v2/setup/seasons/${i.s2}/team-registrations`)).registrations
+        .find((r) => r.active && r.team_id === i.team);
+      return { l1: r1 && r1.league_id, l2: r2 && r2.league_id };
+    }, ids);
+    if (bothLeagues.l1 !== ids.lg1 || bothLeagues.l2 !== ids.lg1) {
+      throw new Error(`[${viewport.label}] registrations weren't both under the permanent League: ${
+        JSON.stringify(bothLeagues)}`);
     }
 
     // Remove the team from season 2; season 1 must be untouched. Season/league
@@ -245,34 +312,22 @@ async function checkViewport(browser, viewport) {
     }, ids);
     if (after.teamCount !== 1) throw new Error(`[${viewport.label}] team was deleted on removal`);
     if (after.r1 !== 1) throw new Error(`[${viewport.label}] season 1 registration was lost`);
+    if (after.r2 !== 0) throw new Error(`[${viewport.label}] season 2 removal didn't take effect`);
 
-    // --- Edit-path + repair-surface coverage (#233 B2b review) -----------
-    // The journey above only exercised Register/Remove. These steps drive
-    // the Save controls' full League→Division cascade (shared by both Season
-    // participation and the Needs-assignment repair row via the
-    // saveRegistrationPlacement() helper in app.js), plus the repair row
-    // itself. New fixtures are created via raw v2 fetches (like the setup
-    // above) since a raw fetch doesn't refresh the page's own in-memory `hv`/
-    // `leagueDivisions` state — refreshSetup() below forces that refetch by
-    // re-clicking the Setup tab (its onclick calls render() unconditionally,
-    // even when already on that tab).
-    const refreshSetup = async (marker) => {
-      await page.click('.tab[data-tab="setup"]');
-      await page.waitForFunction((m) => {
-        const sel = document.querySelector(m.selector);
-        return !!sel && (!m.optionValue || Array.from(sel.options).some((o) => o.value === m.optionValue));
-      }, marker, { timeout: 15000 });
-    };
-    const toastText = () => page.$eval(
-      "#toast-root .toast-msg", (el) => el.textContent).catch(() => "");
-    const waitForToast = (expected) => page.waitForFunction(
-      (t) => (document.querySelector("#toast-root .toast-msg") || {}).textContent === t,
-      expected, { timeout: 15000 });
+    // --- Edit-path + repair-surface coverage (#233 B2b review, #283 rule 7) --
+    // The journey above only exercised Register/Remove. These steps drive the
+    // Save controls' Division cascade (shared by both Season participation and
+    // the Needs-assignment repair row via saveRegistrationPlacement() in
+    // app.js) WITHIN the team's permanent League, prove the backend refuses to
+    // move a registration OUT of that League (rule 7), and drive the repair
+    // row itself. New fixtures are created via raw v2 fetches (like the setup
+    // above); refreshSetup() forces the page to refetch its in-memory state.
 
-    // Lions (still active in season 1 under League 1 / Division Gold) is reused
-    // for the edit-path steps. A second League ("Sapphire") with its own
-    // Division ("Division C") in the SAME season gives Save somewhere real
-    // to move it to.
+    // Lions (still active in season 1 under lg1 / Division Gold) is reused for
+    // the edit-path steps. A SECOND permanent League ("Sapphire") with its own
+    // Division ("Division C") in the SAME season is where the rule-7 rejection
+    // below tries (and fails) to move Lions, and is the permanent League of a
+    // NEW team (Perma Bears) used for the league-only register step.
     const edit = await page.evaluate(async (i) => {
       const post = async (p, b) => (await fetch(p, {
         method: "POST", credentials: "same-origin",
@@ -282,17 +337,19 @@ async function checkViewport(browser, viewport) {
       const lg1b = await post("/api/v2/setup/league", { season_id: i.s1, name: "Sapphire" });
       const divC = await post("/api/v2/setup/division", { league_id: lg1b.id, name: "Division C" });
       const club = await post("/api/v2/setup/club", { name: "Edit Coverage Club" });
+      // Perma Bears' permanent League is Sapphire (rule 2/7).
       const bears = await post("/api/v2/setup/team",
-        { program_id: i.program, club_id: club.id, name: "Perma Bears" });
+        { league_id: lg1b.id, club_id: club.id, name: "Perma Bears" });
       const r1 = (await get(`/api/v2/setup/seasons/${i.s1}/team-registrations`)).registrations;
       const lionsReg = r1.find((r) => r.active && r.team_id === i.team);
       return { lg1b: lg1b.id, divC: divC.id, club: club.id, bears: bears.id, lionsReg: lionsReg.id };
     }, ids);
     await refreshSetup({ selector: `#reg-league-${edit.lionsReg}`, optionValue: edit.lg1b });
 
-    // (1) Full edit path L1/D1 → L2/D2: Save fires clear-division, then
-    // assign-league, then assign-division, in that order, and the stored
-    // registration lands on the new League/Division.
+    // (1) Division change WITHIN the permanent League: move Lions from Gold to
+    // Platinum (both Divisions of lg1). League is unchanged, so Save fires a
+    // single assign-division to the new Division, and the stored registration
+    // lands on lg1 / Platinum.
     let seq = [];
     const track = (req) => {
       const url = req.url();
@@ -301,24 +358,21 @@ async function checkViewport(browser, viewport) {
       }
     };
     page.on("request", track);
-    await page.selectOption(`#reg-league-${edit.lionsReg}`, edit.lg1b);
-    await page.selectOption(`#reg-div-${edit.lionsReg}`, edit.divC);
+    await page.selectOption(`#reg-div-${edit.lionsReg}`, ids.dA2);
     await page.click(`[data-reg-save="${edit.lionsReg}"]`);
     await waitForToast("Season registration updated.");
     page.off("request", track);
-    if (seq.length !== 3
-        || !seq[0].url.endsWith("/assign-division") || seq[0].body.division_id !== null
-        || !seq[1].url.endsWith("/assign-league") || seq[1].body.league_id !== edit.lg1b
-        || !seq[2].url.endsWith("/assign-division") || seq[2].body.division_id !== edit.divC) {
-      throw new Error(`[${viewport.label}] unexpected edit-path request sequence: ${JSON.stringify(seq)}`);
+    if (seq.length !== 1
+        || !seq[0].url.endsWith("/assign-division") || seq[0].body.division_id !== ids.dA2) {
+      throw new Error(`[${viewport.label}] unexpected division-change request sequence: ${JSON.stringify(seq)}`);
     }
     let stored = await page.evaluate(async (i) => {
       const get = async (p) => (await fetch(p, { credentials: "same-origin" })).json();
       const regs = (await get(`/api/v2/setup/seasons/${i.s1}/team-registrations`)).registrations;
       return regs.find((r) => r.id === i.reg);
     }, { s1: ids.s1, reg: edit.lionsReg });
-    if (!stored || stored.league_id !== edit.lg1b || stored.division_id !== edit.divC) {
-      throw new Error(`[${viewport.label}] edit path didn't land on League 2 / Division C: ${JSON.stringify(stored)}`);
+    if (!stored || stored.league_id !== ids.lg1 || stored.division_id !== ids.dA2) {
+      throw new Error(`[${viewport.label}] division change didn't land on lg1 / Platinum: ${JSON.stringify(stored)}`);
     }
 
     // (2) Clear Division, keep League: Save with the League unchanged and
@@ -337,20 +391,20 @@ async function checkViewport(browser, viewport) {
       const regs = (await get(`/api/v2/setup/seasons/${i.s1}/team-registrations`)).registrations;
       return regs.find((r) => r.id === i.reg);
     }, { s1: ids.s1, reg: edit.lionsReg });
-    if (!stored || stored.league_id !== edit.lg1b || stored.division_id) {
-      throw new Error(`[${viewport.label}] clear-division didn't keep League 2 with a null Division: ${JSON.stringify(stored)}`);
+    if (!stored || stored.league_id !== ids.lg1 || stored.division_id) {
+      throw new Error(`[${viewport.label}] clear-division didn't keep lg1 with a null Division: ${JSON.stringify(stored)}`);
     }
 
-    // (3) League-only registration: register a NEW team choosing a League
-    // but leaving Division at "No division" — the create POST body must
-    // carry division_id: null (not omitted, not "").
+    // (3) League-only registration: register a NEW team (Perma Bears) under
+    // its permanent League (Sapphire) but leaving Division at "No division" —
+    // the create POST body must carry division_id: null (not omitted, not "").
     await page.waitForFunction(
-      (sel) => !!document.querySelector(sel), `#reg-team-${ids.lg1}`, { timeout: 15000 });
-    await page.selectOption(`#reg-team-${ids.lg1}`, edit.bears);
+      (sel) => !!document.querySelector(sel), `#reg-team-${edit.lg1b}`, { timeout: 15000 });
+    await page.selectOption(`#reg-team-${edit.lg1b}`, edit.bears);
     const addResp = page.waitForResponse((r) =>
       r.url() === `${base}/api/v2/setup/seasons/${ids.s1}/team-registrations`
       && r.request().method() === "POST");
-    await page.click(`[data-reg-add="${ids.lg1}"]`);
+    await page.click(`[data-reg-add="${edit.lg1b}"]`);
     const addBody = (await addResp).request().postDataJSON();
     if (addBody.division_id !== null) {
       throw new Error(`[${viewport.label}] league-only register body had division_id ${
@@ -361,55 +415,38 @@ async function checkViewport(browser, viewport) {
       const regs = (await get(`/api/v2/setup/seasons/${i.s1}/team-registrations`)).registrations;
       return regs.find((r) => r.active && r.team_id === i.bears);
     }, { s1: ids.s1, bears: edit.bears });
-    if (!stored || stored.division_id !== null) {
-      throw new Error(`[${viewport.label}] league-only registration didn't store a null division_id: ${
+    if (!stored || stored.league_id !== edit.lg1b || stored.division_id !== null) {
+      throw new Error(`[${viewport.label}] league-only registration didn't store Sapphire + null division: ${
         JSON.stringify(stored)}`);
     }
 
-    // (5) Partial-failure toast for Save: intercept the FINAL assign-division
-    // request (the one that sets a real Division, not the null-clearing one)
-    // and force it to fail. Lions is currently League 2 ("Sapphire") /
-    // no Division; move it to League 1 ("Adult League") / Division Gold — the
-    // League change succeeds, the Division change is intercepted and fails,
-    // so the toast must clearly say the update was only partially applied
-    // (matches app.js's placementSaveToast() partial-branch text exactly).
-    await page.route("**/api/v2/setup/season-team-registration/*/assign-division", async (route) => {
-      const body = route.request().postDataJSON();
-      if (body && body.division_id) {
-        await route.fulfill({
-          status: 500, contentType: "application/json",
-          body: JSON.stringify({ error: { code: "simulated_failure",
-                                          message: "Simulated division-assign failure." } }),
-        });
-      } else {
-        await route.continue();
-      }
-    });
+    // (5) Rule-7 rejection (#283 Slice E): a Team may only ever be in its OWN
+    // permanent League, so trying to move Lions' registration out of lg1 into
+    // Sapphire (Perma Bears' League, NOT Lions') is refused by the backend and
+    // the registration is left exactly as it was. This replaces the pre-#283
+    // cross-league edit path, which is no longer a valid operation.
     await page.waitForFunction(
       (sel) => !!document.querySelector(sel), `#reg-league-${edit.lionsReg}`, { timeout: 15000 });
-    await page.selectOption(`#reg-league-${edit.lionsReg}`, ids.lg1);
-    await page.selectOption(`#reg-div-${edit.lionsReg}`, ids.dA);
+    await page.selectOption(`#reg-league-${edit.lionsReg}`, edit.lg1b);
     // Detach the console-error listener only for this deliberately-failing
-    // request: Chromium logs a benign "Failed to load resource: 500" entry
-    // for the simulated failure above, which isn't a real page bug.
+    // request: the server's 400 response logs a benign "Failed to load
+    // resource: 400" Chromium console entry, not a real page bug.
     page.off("console", consoleErrorHandler);
     await page.click(`[data-reg-save="${edit.lionsReg}"]`);
-    const expectedPartialToast = "Partially saved — an earlier change was applied, but a later "
-      + "step failed (Simulated division-assign failure.). Please retry to finish.";
-    await waitForToast(expectedPartialToast);
+    const expectedRejectToast = "A team may only register in its own League.";
+    await waitForToast(expectedRejectToast);
     page.on("console", consoleErrorHandler);
     const actualToast = await toastText();
-    if (actualToast !== expectedPartialToast) {
-      throw new Error(`[${viewport.label}] partial-failure toast mismatch: ${actualToast}`);
+    if (actualToast !== expectedRejectToast) {
+      throw new Error(`[${viewport.label}] rule-7 rejection toast mismatch: ${actualToast}`);
     }
-    await page.unroute("**/api/v2/setup/season-team-registration/*/assign-division");
     stored = await page.evaluate(async (i) => {
       const get = async (p) => (await fetch(p, { credentials: "same-origin" })).json();
       const regs = (await get(`/api/v2/setup/seasons/${i.s1}/team-registrations`)).registrations;
       return regs.find((r) => r.id === i.reg);
     }, { s1: ids.s1, reg: edit.lionsReg });
     if (!stored || stored.league_id !== ids.lg1 || stored.division_id) {
-      throw new Error(`[${viewport.label}] partial-failure left unexpected state: ${JSON.stringify(stored)}`);
+      throw new Error(`[${viewport.label}] rejected league move altered the registration: ${JSON.stringify(stored)}`);
     }
 
     // (6) Blocked delete: a League still holding a live, division-less
@@ -434,8 +471,9 @@ async function checkViewport(browser, viewport) {
         headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
       })).json();
       const lg = await post("/api/v2/setup/league", { season_id: i.s1, name: "Bronze" });
+      // Perma Foxes' permanent League is Bronze; it registers there (rule 7).
       const foxes = await post("/api/v2/setup/team",
-        { program_id: i.program, club_id: i.club, name: "Perma Foxes" });
+        { league_id: lg.id, club_id: i.club, name: "Perma Foxes" });
       const reg = await post(`/api/v2/setup/seasons/${i.s1}/team-registrations`,
         { team_id: foxes.id, league_id: lg.id, division_id: null });
       return { lg: lg.id, reg: reg.id };
@@ -489,21 +527,23 @@ async function checkViewport(browser, viewport) {
         method: "POST", credentials: "same-origin",
         headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
       })).json();
-      // The CORRECT League (repair target) lives in seasonR. The corrupt row
-      // itself references a GHOST (non-existent) League — the only shape that
-      // reproduces registration_league_not_in_season under #283, matching
-      // test_repair_via_v2_after_direct_injection in
-      // test_v2_onboarding_status.py (see injectCorruptRegistration). A second
-      // real League (otherLeagueR) in a DIFFERENT season under the same program
-      // proves the repair row's League select is scoped to seasonR — it must
-      // offer leagueR but never otherLeagueR.
+      // The CORRECT League (repair target) lives in seasonR and is the
+      // permanent League of the corrupt row's team (rule 7 — the repair's
+      // assign-league only succeeds into the team's own League). The corrupt
+      // row itself references a GHOST (non-existent) League — the only shape
+      // that reproduces registration_league_not_in_season under #283, matching
+      // test_repair_via_v2_after_direct_injection in test_v2_onboarding_status.py
+      // (see injectCorruptRegistration). A second real League (otherLeagueR) in
+      // a DIFFERENT season under the same program proves the repair row's
+      // League select is scoped to seasonR — it must offer leagueR but never
+      // otherLeagueR.
       const seasonR = await post("/api/v2/setup/season", { program_id: i.program, name: "Repair Season" });
       const leagueR = await post("/api/v2/setup/league", { season_id: seasonR.id, name: "Repair League" });
       const otherSeasonR = await post("/api/v2/setup/season", { program_id: i.program, name: "Repair Season B" });
       const otherLeagueR = await post("/api/v2/setup/league", { season_id: otherSeasonR.id, name: "Repair League B" });
       const clubR = await post("/api/v2/setup/club", { name: "Repair Club" });
       const teamR = await post("/api/v2/setup/team",
-        { program_id: i.program, club_id: clubR.id, name: "Repair Foxes" });
+        { league_id: leagueR.id, club_id: clubR.id, name: "Repair Foxes" });
       return { seasonR: seasonR.id, leagueR: leagueR.id, otherLeagueR: otherLeagueR.id, teamR: teamR.id };
     }, { program: ids.program });
     const repairRegId = injectCorruptRegistration(databasePath, {
@@ -539,8 +579,8 @@ async function checkViewport(browser, viewport) {
       throw new Error(`[${viewport.label}] readiness didn't block on the injected invalid registration`);
     }
 
-    // Repair through the cascade: choose the correct League, leave Division
-    // at "No division", Save.
+    // Repair through the cascade: choose the correct League (the team's own),
+    // leave Division at "No division", Save.
     await page.selectOption(`[data-repair-league-for="${repairRegId}"]`, repairFixture.leagueR);
     await page.click(`[data-repair-save="${repairRegId}"]`);
     await waitForToast("Registration repaired — moved into the selected league/division.");
@@ -576,7 +616,7 @@ async function checkViewport(browser, viewport) {
     if (errors.length) {
       throw new Error(`[${viewport.label}] console/page errors:\n${errors.join("\n")}`);
     }
-    console.log(`[${viewport.label}] OK — one permanent team, two seasons, safe removal.`);
+    console.log(`[${viewport.label}] OK — one permanent team, two seasons under its permanent league, safe removal.`);
   } catch (error) {
     throw new Error(`${error.message}\n--- demo server output ---\n${serverOutput}`);
   } finally {
