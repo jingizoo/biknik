@@ -481,9 +481,43 @@ class SqlStore:
                     translated = translate_db_exception(exc)
                     if translated is not None:
                         raise translated from exc
+                    # A jersey unique-conflict was already translated at the
+                    # write site into a stable duplicate_jersey_number error,
+                    # but the racing writer couldn't name the winning holder.
+                    # Now that the rollback is done and the connection is clean,
+                    # look it up so the lost-race error carries the SAME
+                    # conflicting-player context the service pre-check does
+                    # (#292) — id + display name only, never contact data.
+                    self._enrich_jersey_conflict(exc)
                     raise
             finally:
                 self._txn_depth = 0
+
+    def _enrich_jersey_conflict(self, exc) -> None:
+        """Add the conflicting player to a rolled-back jersey conflict (#292).
+
+        A no-op unless ``exc`` is the stable ``duplicate_jersey_number`` conflict
+        that is still missing its holder. The lookup runs AFTER rollback (a plain
+        read on a clean connection, portable across SQLite/PostgreSQL), and adds
+        only ``conflicting_player_id`` + ``conflicting_player_name`` — the same
+        non-private fields the service pre-check exposes.
+        """
+        details = getattr(exc, "details", None)
+        if not isinstance(details, dict):
+            return
+        if details.get("reason") != "duplicate_jersey_number":
+            return
+        if details.get("conflicting_player_id"):
+            return
+        team_id, jersey = details.get("team_id"), details.get("jersey_number")
+        if team_id is None or jersey is None:
+            return
+        holder = next(
+            (p for p in self.players_for_team(team_id)
+             if p.is_active and p.jersey_number == jersey), None)
+        if holder is not None:
+            details["conflicting_player_id"] = holder.id
+            details["conflicting_player_name"] = holder.name
 
     def close(self) -> None:
         self.conn.close()

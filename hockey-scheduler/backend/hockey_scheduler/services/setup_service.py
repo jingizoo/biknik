@@ -2708,6 +2708,41 @@ class SetupService:
                      "conflicting_player_id": other.id,
                      "conflicting_player_name": other.name})
 
+    def release_batch_player_jerseys(self, assignments) -> None:
+        """Stage a batch import's jersey moves so a valid swap can commit (#292).
+
+        A sequential per-row apply cannot commit an otherwise-valid same-team
+        swap (A ``7→8``, B ``8→7``): the first write collides with the number
+        the second player still holds. Run FIRST, inside the batch's single
+        transaction: for every EXISTING active player whose final
+        ``(team, jersey)`` slot differs from its current one, release the number
+        it holds now (set ``jersey_number = NULL`` — always unconstrained), so
+        the subsequent per-row assignment lands the validated final state with
+        no transient uniqueness failure (the DB partial index never sees a
+        duplicate mid-batch). Only ``jersey_number`` is touched — the id, the
+        roster/availability/guardian history, and every other field are
+        preserved — and no audit is written here: the per-row upsert emits the
+        real ``player_created`` / ``player_updated`` entry with the final value.
+        A genuine final-state collision is still caught by the per-row
+        ``_assert_jersey_available`` (and the DB index), so the whole batch
+        rolls back with zero writes.
+
+        ``assignments`` is an iterable of ``(existing_player, final_team_id,
+        final_jersey)``; new players (``existing_player is None``), inactive
+        players, numberless players, and players staying in the same slot are
+        skipped.
+        """
+        for existing, final_team_id, final_jersey in assignments:
+            if existing is None or not existing.is_active:
+                continue
+            if existing.jersey_number is None:
+                continue  # holds no number → nothing to release
+            if (existing.team_id, existing.jersey_number) == (
+                    final_team_id, final_jersey):
+                continue  # staying put → keep it so real collisions still catch
+            existing.jersey_number = None
+            self.store.save_player(existing)
+
     # -- convenience: add a player to a team ------------------------------
     @_transactional
     def add_player(self, team_id: str, name: str, position: Position,
@@ -3031,6 +3066,24 @@ class SetupService:
                                 {"season_id": season_id, "team_id": team.id,
                                  "division_id": division_id,
                                  "import_batch_id": batch_id})
+
+            # Swap-safe apply (#292): release every existing player's jersey
+            # whose final slot moves BEFORE any per-row write, so a valid
+            # same-team swap (A 7→8, B 8→7) commits without a transient
+            # uniqueness failure. A blank jersey cell keeps the current number
+            # (final == current → not released).
+            by_code = {p.external_ref: p for p in self.store.all_players()
+                       if p.external_ref is not None}
+
+            def _final_slot(row):
+                existing = by_code.get(_clean(row.get("player_code")))
+                team_id = team_code_to_id.get(_clean(row.get("team_code")))
+                raw = row.get("jersey_number")
+                jersey = (int(_clean(raw)) if not _blank(raw)
+                          else (existing.jersey_number if existing else None))
+                return existing, team_id, jersey
+            self.release_batch_player_jerseys(
+                _final_slot(row) for row in player_rows)
 
             for row in player_rows:
                 player_code = _clean(row.get("player_code"))

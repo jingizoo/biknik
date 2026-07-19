@@ -593,6 +593,9 @@ class JerseyPreMigrationTest(unittest.TestCase):
 
 class JerseyConstraintEnforcementTest(unittest.TestCase):
     def test_second_active_same_team_jersey_is_translated_conflict(self):
+        # The DB-enforced path carries the SAME conflict contract the service
+        # pre-check does, now including the conflicting player (#292): a lost
+        # race must not return thinner detail than the pre-check.
         for label, url in _sql_backends():
             store = _fresh(url)
             try:
@@ -601,9 +604,15 @@ class JerseyConstraintEnforcementTest(unittest.TestCase):
                 with self.assertRaises(IntegrityConflictError, msg=label) as ctx:
                     with store.transaction():
                         store.add_player(_player("b", "t1", 7))
-                self.assertEqual(ctx.exception.details,
-                                 {"reason": "duplicate_jersey_number",
-                                  "team_id": "t1", "jersey_number": 7}, label)
+                d = ctx.exception.details
+                self.assertEqual(d["reason"], "duplicate_jersey_number", label)
+                self.assertEqual(d["team_id"], "t1", label)
+                self.assertEqual(d["jersey_number"], 7, label)
+                # Enriched post-rollback with the winning holder (id + name),
+                # never any contact/private field.
+                self.assertEqual(d["conflicting_player_id"], "a", label)
+                self.assertEqual(d["conflicting_player_name"], "a", label)
+                self.assertNotIn("email", d, label)
             finally:
                 store.close()
 

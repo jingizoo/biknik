@@ -1181,6 +1181,15 @@ def commit_hierarchy_import(setup, sheets: Dict[str, List[dict]],
         # — an existing player:<id> ContactDestination's value is updated in
         # place, never duplicated; omitting the email column on a repeat row
         # leaves a previously-set contact untouched.
+        # Swap-safe apply (#292): release every existing player's jersey whose
+        # final slot moves, BEFORE any per-row assignment, so a valid same-team
+        # (or cross-team) swap commits without a transient uniqueness failure.
+        setup.release_batch_player_jerseys(
+            (players.get(_clean(row.get("player_code"))),
+             teams[_clean(row.get("team_code"))].id,
+             int(_optional(row.get("jersey_number")))
+             if _optional(row.get("jersey_number")) else None)
+            for row in rows["players"])
         for row in rows["players"]:
             code = _clean(row.get("player_code"))
             team = teams[_clean(row.get("team_code"))]
