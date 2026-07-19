@@ -45,7 +45,7 @@ Game ──< AuditLog
 | name | str | fictional in seed data |
 | position | Position | `GOALIE` / `DEFENSE` / `FORWARD` / `SKATER` |
 | shoots | str? | "L" / "R" (optional) |
-| jersey_number | int? | |
+| jersey_number | int? | 1–98, or unset; unique among a team's **active** players (#269) |
 | is_active | bool | inactive players are not eligible |
 | guardian_person_id | str? | set for junior players |
 

@@ -826,3 +826,45 @@ def assert_regular_games_resolve_league_season(conn):
             f"{shown}{more}. Set each game's league, season, and division to a "
             "single existing LeagueSeason, or mark it an exhibition, before "
             "upgrading.")
+
+
+# -- #269 — active-team jersey uniqueness ----------------------------------
+#
+# Migration 038 adds a partial UNIQUE index on players(team_id, jersey_number)
+# WHERE is_active = 1 AND jersey_number IS NOT NULL. This read-only check reports
+# every (team, jersey) that ALREADY has more than one active player before the
+# index is created, so an upgrade against dirty data fails loudly with the
+# offending pairs named. Only active, concrete-jersey rows are considered, so it
+# matches the partial index exactly (NULL jerseys and inactive players are free
+# to repeat). Pure SELECT, portable across SQLite/PostgreSQL, safe to re-run.
+
+
+def find_duplicate_active_team_jerseys(conn):
+    """Concrete (team_id, jersey_number) pairs worn by >1 ACTIVE player.
+
+    Only ``is_active = 1`` rows with a non-null ``jersey_number`` are counted —
+    matching migration 038's partial unique index, which excludes inactive
+    players (they don't reserve a number) and NULL jerseys (a player may have
+    none). Returns a sorted list of ``(team_id, jersey_number)`` tuples.
+    """
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT team_id, jersey_number FROM players "
+        "WHERE is_active = 1 AND jersey_number IS NOT NULL "
+        "GROUP BY team_id, jersey_number HAVING COUNT(*) > 1")
+    return sorted((row["team_id"], row["jersey_number"])
+                  for row in cur.fetchall())
+
+
+def assert_no_duplicate_active_team_jerseys(conn):
+    """Abort migration 038 if any team has two active players sharing a jersey
+    number (#269)."""
+    duplicates = find_duplicate_active_team_jerseys(conn)
+    if duplicates:
+        pairs = [f"team {team}/#{jersey}" for team, jersey in duplicates[:20]]
+        more = "" if len(duplicates) <= 20 else f" (+{len(duplicates) - 20} more)"
+        raise MigrationDataError(
+            "Cannot enforce one active player per jersey number per team: "
+            f"{len(duplicates)} (team, jersey) pair(s) already have multiple "
+            f"active players: {', '.join(pairs)}{more}. Reassign or deactivate "
+            "the duplicates before upgrading.")

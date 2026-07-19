@@ -45,10 +45,13 @@ from ..domain import (
     Team,
     Venue,
     intervals_overlap,
+    jersey_number_error,
 )
+from ..domain.jersey import MAX_JERSEY_NUMBER, MIN_JERSEY_NUMBER
 from ..domain.errors import (
     DivisionMismatchError,
     HasDependenciesError,
+    IntegrityConflictError,
     InvalidTransitionError,
     NotEligibleError,
     NotFoundError,
@@ -1579,6 +1582,13 @@ class SetupService:
         if not team_id or self.store.get_team(team_id) is None:
             raise NotFoundError(f"Team {team_id} not found.")
         old = player.team_id
+        # Reject a destination-team jersey collision BEFORE moving the player
+        # (#269): an active player carrying a number can only move to a team
+        # where that number is free among active players. exclude_player_id
+        # keeps a same-team no-op from colliding with itself.
+        if player.is_active:
+            self._assert_jersey_available(team_id, player.jersey_number,
+                                          exclude_player_id=player.id)
         player.team_id = team_id
         self.store.save_player(player)
         self._audit("player_team_assigned", "player", player.id, actor_id,
@@ -2512,6 +2522,18 @@ class SetupService:
         previously-set contact untouched — clearing/retiring a contact is
         #232's own explicit, audited action, never an import side effect.
         """
+        self._validate_jersey_number(jersey_number)
+        # Enforce active-team jersey uniqueness on the IMPORTED target state
+        # before any write (#269), so a conflicting row aborts the whole
+        # one-transaction batch with zero committed players. An import never
+        # toggles is_active, so an updated player keeps its current active
+        # state; only an active target reserves a number, and it excludes
+        # itself so re-importing the same row is a no-op, not a self-collision.
+        target_active = True if existing is None else existing.is_active
+        if target_active:
+            self._assert_jersey_available(
+                team_id, jersey_number,
+                exclude_player_id=None if existing is None else existing.id)
         values = {"name": name, "team_id": team_id, "position": position,
                   "jersey_number": jersey_number}
         if existing is None:
@@ -2645,6 +2667,47 @@ class SetupService:
             return access, False, ["active"]
         return access, False, []
 
+    # -- jersey-number invariants (#269) ----------------------------------
+    def _validate_jersey_number(self, jersey_number) -> None:
+        """Range/type gate: an integer 1..98, or ``None`` (#269).
+
+        A field-level ``validation_error`` names the offending field, so a bad
+        value is a clear 400 rather than a mysterious downstream failure. The
+        check is here in the service (not only the HTTP schema) so a direct
+        service/import caller is held to the same contract.
+        """
+        if jersey_number_error(jersey_number) is not None:
+            raise ValidationError(
+                f"jersey_number must be a whole number from {MIN_JERSEY_NUMBER} "
+                f"to {MAX_JERSEY_NUMBER}, or left blank.",
+                {"reason": "invalid_jersey_number", "field": "jersey_number"})
+
+    def _assert_jersey_available(self, team_id: str, jersey_number,
+                                 *, exclude_player_id: Optional[str] = None) -> None:
+        """Reject a jersey already worn by an ACTIVE player on the same team (#269).
+
+        Only ACTIVE players hold a number — an inactive player frees it for
+        reuse — and only a concrete (non-null) jersey is constrained, so a
+        team may have any number of players with no jersey. ``exclude_player_id``
+        skips the player being edited/reassigned so it never collides with
+        itself. Raises the SAME stable ``IntegrityConflictError`` the database's
+        partial unique index raises on a lost race, carrying the conflicting
+        team/jersey/player context (never any other private field). Callers must
+        run this BEFORE mutating, so a rejected write leaves zero state.
+        """
+        if jersey_number is None:
+            return
+        for other in self.store.players_for_team(team_id):
+            if (other.is_active and other.jersey_number == jersey_number
+                    and other.id != exclude_player_id):
+                raise IntegrityConflictError(
+                    f"Jersey number {jersey_number} is already worn by an "
+                    f"active player on this team.",
+                    {"reason": "duplicate_jersey_number", "team_id": team_id,
+                     "jersey_number": jersey_number,
+                     "conflicting_player_id": other.id,
+                     "conflicting_player_name": other.name})
+
     # -- convenience: add a player to a team ------------------------------
     @_transactional
     def add_player(self, team_id: str, name: str, position: Position,
@@ -2667,9 +2730,11 @@ class SetupService:
                 {"reason": "field_required", "field": "team_id"})
         if self.store.get_team(team_id) is None:
             raise NotFoundError(f"Team {team_id} not found.")
-        if jersey_number is not None and (
-                not isinstance(jersey_number, int) or jersey_number <= 0):
-            raise ValidationError("jersey_number must be a positive number.")
+        self._validate_jersey_number(jersey_number)
+        # Uniqueness is only meaningful among ACTIVE players; a player created
+        # inactive parks its number without reserving it (#269).
+        if is_active:
+            self._assert_jersey_available(team_id, jersey_number)
         if email:
             at = email.find("@")
             if at <= 0 or "." not in email[at + 1:]:
@@ -2982,6 +3047,7 @@ class SetupService:
                 jersey_raw = row.get("jersey_number")
                 jersey_number = (int(_clean(jersey_raw)) if not _blank(jersey_raw)
                                 else None)
+                self._validate_jersey_number(jersey_number)
                 position_raw = row.get("position")
                 position = (Position(_clean(position_raw))
                            if not _blank(position_raw) else None)
@@ -2992,7 +3058,15 @@ class SetupService:
                               if p.external_ref == player_code), None)
                 if player is not None:
                     # Partial-field-overwrite: only fields the sheet actually
-                    # supplies this time are updated.
+                    # supplies this time are updated. A blank jersey cell leaves
+                    # the existing number in place, so the uniqueness check uses
+                    # the resulting number on the resulting team (#269), before
+                    # any write — a collision aborts the whole batch, zero rows.
+                    target_jersey = (jersey_number if jersey_number is not None
+                                     else player.jersey_number)
+                    if player.is_active:
+                        self._assert_jersey_available(
+                            team_id, target_jersey, exclude_player_id=player.id)
                     player.name = full_name
                     player.team_id = team_id
                     if jersey_number is not None:
@@ -3004,6 +3078,9 @@ class SetupService:
                                 {"team_id": team_id, "import_batch_id": batch_id})
                     counts["players_updated"] += 1
                 else:
+                    # A brand-new imported player is active, so its number must
+                    # be free among the team's active players (#269).
+                    self._assert_jersey_available(team_id, jersey_number)
                     # The domain model requires a Position with no default,
                     # but #92 doesn't require the CSV to supply one — default
                     # a brand-new player to FORWARD as an explicit judgment

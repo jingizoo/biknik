@@ -98,6 +98,12 @@ from .setup_models import (
     TeamLeagueMigrationDecision,
     Venue,
 )
+from .jersey import (
+    MAX_JERSEY_NUMBER,
+    MIN_JERSEY_NUMBER,
+    jersey_number_error,
+    parse_jersey_cell,
+)
 from .time_utils import intervals_overlap
 
 __all__ = [
@@ -195,4 +201,9 @@ __all__ = [
     "Organization",
     "Venue",
     "intervals_overlap",
+    # jersey rules (#269)
+    "MIN_JERSEY_NUMBER",
+    "MAX_JERSEY_NUMBER",
+    "jersey_number_error",
+    "parse_jersey_cell",
 ]

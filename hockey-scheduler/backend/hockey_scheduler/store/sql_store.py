@@ -85,6 +85,7 @@ from .integrity_checks import (
     assert_competition_reset_ready_c1b,
     assert_regular_games_resolve_league_season,
     assert_no_duplicate_active_ice_slots,
+    assert_no_duplicate_active_team_jerseys,
     assert_no_duplicate_result_games,
     assert_no_duplicate_roster_players,
     assert_result_games_exist,
@@ -348,6 +349,7 @@ _PRE_MIGRATION_CHECKS = {
     "029_season_venue_access": assert_venue_season_access_backfill_ready,
     "035_competition_hierarchy_reset": assert_competition_hierarchy_reset_ready,
     "037_game_league_season": assert_regular_games_resolve_league_season,
+    "038_active_team_jersey_unique": assert_no_duplicate_active_team_jerseys,
 }
 
 

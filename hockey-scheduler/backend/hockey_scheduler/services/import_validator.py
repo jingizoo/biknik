@@ -32,7 +32,14 @@ import io
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
-from ..domain import IceSlotType, OfficialAvailabilityStatus, intervals_overlap
+from ..domain import (
+    IceSlotType,
+    MAX_JERSEY_NUMBER,
+    MIN_JERSEY_NUMBER,
+    OfficialAvailabilityStatus,
+    intervals_overlap,
+    parse_jersey_cell,
+)
 
 IMPORT_SHEET_NAMES = ("teams", "players", "officials", "rinks", "ice_slots")
 
@@ -144,21 +151,37 @@ def _codes(rows: List[dict], field: str) -> set:
 
 
 def _check_players(report: _Report, rows: List[dict], team_codes: set) -> None:
+    # Track each valid (team_code, jersey_number) seen so two players on the
+    # same team in THIS upload can't claim the same number (#269). Existing-
+    # active conflicts are caught store-side at commit (add_player /
+    # commit_teams_players_import), which rolls the whole batch back.
+    seen_team_jersey = {}
     for i, row in enumerate(rows, start=1):
         team_code = row.get("team_code")
-        if not _blank(team_code) and _clean(team_code) not in team_codes:
-            report.error("players", i, f"Unknown team_code {_clean(team_code)}",
+        team_code_clean = None if _blank(team_code) else _clean(team_code)
+        if team_code_clean is not None and team_code_clean not in team_codes:
+            report.error("players", i, f"Unknown team_code {team_code_clean}",
                         field="team_code")
-        jersey = row.get("jersey_number")
-        if _blank(jersey):
+        jersey_number, reason = parse_jersey_cell(row.get("jersey_number"))
+        if reason is not None:
+            report.error(
+                "players", i,
+                f"Invalid jersey_number {row.get('jersey_number')} "
+                f"(must be {MIN_JERSEY_NUMBER}-{MAX_JERSEY_NUMBER}).",
+                field="jersey_number")
             continue
-        try:
-            valid = int(_clean(jersey)) > 0
-        except ValueError:
-            valid = False
-        if not valid:
-            report.error("players", i, f"Invalid jersey_number {jersey}",
-                        field="jersey_number")
+        if jersey_number is None or team_code_clean is None:
+            continue
+        key = (team_code_clean, jersey_number)
+        first_row = seen_team_jersey.get(key)
+        if first_row is not None:
+            report.error(
+                "players", i,
+                f"Duplicate jersey_number {jersey_number} on team "
+                f"{team_code_clean} (also on row {first_row}).",
+                field="jersey_number")
+        else:
+            seen_team_jersey[key] = i
 
 
 def _check_ice_slots(report: _Report, rows: List[dict], rink_codes: set) -> None:
