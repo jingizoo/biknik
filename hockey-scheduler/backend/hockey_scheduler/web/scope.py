@@ -115,6 +115,38 @@ def scope_violation(role, scope, path, body, store, *,
     return None
 
 
+def _player_team_id(scope, store):
+    """The team a Player account belongs to, for the private-read gate (#160).
+
+    A Player's canonical scope key is ``player_id``; the team is resolved **live**
+    from it every time and is **never** taken from a stored ``team_id``. A stored
+    team_id could be stale after a transfer or a removal and would then retain
+    access to a former team's private data, so it is not trusted here at all.
+    No player_id, an unknown/deleted player, or a teamless player each resolve to
+    ``None`` — the gate then fails closed.
+    """
+    player_id = scope.get("player_id")
+    if not player_id:
+        return None
+    player = store.get_player(player_id)
+    return player.team_id if player is not None else None
+
+
+def own_team_id(role, scope, store):
+    """The team the caller acts for, for team-level scope checks (#160).
+
+    A Coach's team is its canonical stored ``team_id``; a Player's is resolved
+    LIVE from ``player_id`` (never a stored ``team_id``, which could be stale).
+    Returns ``None`` for any other role or when there is no bound/current team.
+    """
+    scope = scope or {}
+    if role == Role.COACH:
+        return scope.get("team_id")
+    if role == Role.PLAYER:
+        return _player_team_id(scope, store)
+    return None
+
+
 def can_read_private_game_data(role, scope, game_id, store) -> bool:
     """May this signed-in user read a game's private player data? (#73)
 
@@ -130,9 +162,20 @@ def can_read_private_game_data(role, scope, game_id, store) -> bool:
     game = store.get_game(game_id)
     if game is None:
         return True  # let the facade return its normal not_found payload
-    if role in (Role.COACH, Role.PLAYER):
+    if role == Role.COACH:
         team_id = scope.get("team_id")
-        return team_id in (game.home_team_id, game.away_team_id)
+        return team_id is not None and team_id in (
+            game.home_team_id, game.away_team_id)
+    if role == Role.PLAYER:
+        # A Player account's canonical scope key is ``player_id`` (#135/#160),
+        # but this gate is by team. Resolve the player's team from ``player_id``
+        # live (authoritative, never stale on a transfer), falling back to an
+        # explicit ``scope.team_id`` only when player_id is absent/unresolvable —
+        # so a Player account created with player_id ONLY still reads its own
+        # team's private data, and a teamless player fails closed.
+        team_id = _player_team_id(scope, store)
+        return team_id is not None and team_id in (
+            game.home_team_id, game.away_team_id)
     if role == Role.OFFICIAL:
         official_id = scope.get("official_id")
         return official_id is not None and any(

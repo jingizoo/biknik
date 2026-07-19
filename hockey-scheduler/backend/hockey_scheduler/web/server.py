@@ -48,7 +48,7 @@ from .authz import authorize, required_permission
 from ..api import v1_setup_adapter as _v1
 from ..api import v2_setup_projection as _v2p
 from .rate_limit import LoginThrottle, RateLimiter
-from .scope import can_read_private_game_data, scope_violation
+from .scope import can_read_private_game_data, own_team_id, scope_violation
 
 # Acting role resolution (#50): a server-issued session cookie is authoritative.
 # The X-Demo-Role header remains only as a dev fallback for scripts/curl; when
@@ -1174,7 +1174,11 @@ class Handler(BaseHTTPRequestHandler):
                 # scope when not specified.
                 from urllib.parse import parse_qs, urlparse
                 qs = parse_qs(urlparse(self.path).query)
-                own_team = scope.get("team_id") or ""
+                # Resolve the caller's own team authoritatively (#160): a Coach's
+                # stored team_id, a Player's live team from player_id — never a
+                # stale stored team_id — so the opponent-summary block holds for
+                # a Player whose scope is player_id only.
+                own_team = own_team_id(role, scope, api.store) or ""
                 team_id = (qs.get("team_id") or [own_team])[0]
                 if role in (Role.COACH, Role.PLAYER) and own_team \
                         and team_id != own_team:
