@@ -480,13 +480,34 @@ class WriteSchemaHttpTest(unittest.TestCase):
 
     # -- Blocker 4: HEAD / OPTIONS JSON method contract ----------------------
     def test_head_on_get_path_is_200_no_body(self):
+        # HEAD mirrors the (public) GET on /api/health: 200, and no body.
         admin = self._admin()
-        status, headers, body = self._req(admin, "HEAD", "/api/health")
+        status, _headers, body = self._req(admin, "HEAD", "/api/health")
         self.assertEqual(status, 200)
-        self.assertEqual(headers.get("Content-Length"), "0")
-        self.assertEqual(body, {})  # no body
-        self.assertIn("GET", headers.get("Allow", ""))
-        self.assertIn("HEAD", headers.get("Allow", ""))
+        self.assertEqual(body, {})  # no body written
+
+    def test_head_mirrors_get_auth_not_blind_200(self):
+        # HEAD must run the real GET (auth/authz), NOT a regex-derived 200: an
+        # UNAUTHENTICATED HEAD on the operator-gated /api/accounts mirrors the
+        # GET's 401/403, never a blind 200.
+        anon = self._client()  # never logs in
+        status, _headers, _body = self._req(anon, "HEAD", "/api/accounts")
+        self.assertNotEqual(status, 200)
+        self.assertIn(status, (401, 403))
+
+    def test_head_on_authenticated_get_path_is_200(self):
+        admin = self._admin()
+        status, _headers, body = self._req(admin, "HEAD", "/api/accounts")
+        self.assertEqual(status, 200)
+        self.assertEqual(body, {})  # no body written
+
+    def test_head_on_nonexistent_resource_path_is_404(self):
+        # A resource-shaped GET path whose record doesn't exist mirrors GET's
+        # 404 (not a regex-derived 200).
+        admin = self._admin()
+        status, _headers, _body = self._req(
+            admin, "HEAD", "/api/games/ghost_game/board")
+        self.assertEqual(status, 404)
 
     def test_head_on_post_only_path_is_405_with_allow(self):
         admin = self._admin()
@@ -509,6 +530,114 @@ class WriteSchemaHttpTest(unittest.TestCase):
         admin = self._admin()
         status, _headers, _body = self._req(admin, "OPTIONS", "/api/nope")
         self.assertEqual(status, 404)
+
+    # -- Blocker 2: cross-method 405 in do_GET / do_POST ---------------------
+    def test_get_on_post_only_path_is_405_with_allow(self):
+        admin = self._admin()
+        status, headers, body = self._req(admin, "GET", "/api/auth/login")
+        self.assertEqual(status, 405)
+        self.assertEqual(body["error"]["code"], "method_not_allowed")
+        allow = headers.get("Allow", "")
+        self.assertIn("POST", allow)
+        self.assertIn("OPTIONS", allow)
+
+    def test_post_on_get_only_path_is_405_with_allow(self):
+        admin = self._admin()
+        status, headers, body = self._req(admin, "POST", "/api/players", {})
+        self.assertEqual(status, 405)
+        self.assertEqual(body["error"]["code"], "method_not_allowed")
+        allow = headers.get("Allow", "")
+        for m in ("GET", "HEAD", "OPTIONS"):
+            self.assertIn(m, allow)
+
+    def test_get_on_unknown_api_path_is_404(self):
+        admin = self._admin()
+        status, _headers, body = self._req(admin, "GET", "/api/nope")
+        self.assertEqual(status, 404)
+        self.assertEqual(body["error"]["code"], "not_found")
+
+    # -- Blocker 1: nullable vs non-nullable lifecycle schemas ---------------
+    def test_player_assign_team_missing_id_is_field_required_zero_writes(self):
+        admin = self._admin()
+        store = srv.STATE.api.store
+        pid = store.players_for_team(self.home)[0].id
+        original = store.get_player(pid).team_id
+        audits_before = len(store.all_setup_audit())
+        status, _headers, body = self._req(
+            admin, "POST", f"/api/setup/player/{pid}/assign-team", {})
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"]["details"]["reason"], "field_required")
+        self.assertEqual(body["error"]["details"]["field"], "team_id")
+        self.assertEqual(store.get_player(pid).team_id, original)
+        self.assertEqual(len(store.all_setup_audit()), audits_before)
+
+    def test_player_assign_team_id_wrong_type_is_wrong_type_zero_writes(self):
+        admin = self._admin()
+        store = srv.STATE.api.store
+        pid = store.players_for_team(self.home)[0].id
+        original = store.get_player(pid).team_id
+        audits_before = len(store.all_setup_audit())
+        status, _headers, body = self._req(
+            admin, "POST", f"/api/setup/player/{pid}/assign-team",
+            {"team_id": ["array", "not", "id"]})
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"]["details"]["reason"], "wrong_type")
+        self.assertEqual(body["error"]["details"]["field"], "team_id")
+        self.assertEqual(store.get_player(pid).team_id, original)
+        self.assertEqual(len(store.all_setup_audit()), audits_before)
+
+    def test_v2_player_assign_team_missing_id_is_field_required(self):
+        admin = self._admin()
+        store = srv.STATE.api.store
+        pid = store.players_for_team(self.home)[0].id
+        status, _headers, body = self._req(
+            admin, "POST", f"/api/v2/setup/player/{pid}/assign-team", {})
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"]["details"]["reason"], "field_required")
+        self.assertEqual(body["error"]["details"]["field"], "team_id")
+
+    def test_nullable_assign_club_empty_body_is_field_required(self):
+        # A nullable relation still requires the key PRESENT: `{}` can't silently
+        # unassign the team's club.
+        admin = self._admin()
+        store = srv.STATE.api.store
+        # A real team to reassign.
+        team_id = self.home
+        status, _headers, body = self._req(
+            admin, "POST", f"/api/setup/team/{team_id}/assign-club", {})
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"]["details"]["reason"], "field_required")
+        self.assertEqual(body["error"]["details"]["field"], "club_id")
+
+    def test_nullable_assign_club_explicit_null_unassigns(self):
+        # An explicit {"club_id": null} is the sanctioned way to unassign.
+        admin = self._admin()
+        store = srv.STATE.api.store
+        team_id = self.home
+        status, _headers, body = self._req(
+            admin, "POST", f"/api/setup/team/{team_id}/assign-club",
+            {"club_id": None})
+        self.assertEqual(status, 200)
+        self.assertIsNone(store.get_team(team_id).club_id)
+
+    def test_nullable_assign_club_wrong_type_is_wrong_type(self):
+        admin = self._admin()
+        status, _headers, body = self._req(
+            admin, "POST", f"/api/setup/team/{self.home}/assign-club",
+            {"club_id": {"an": "object"}})
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"]["details"]["reason"], "wrong_type")
+
+    def test_v2_assign_division_empty_body_is_field_required(self):
+        # v2 season-team assign-division is nullable (clearing preserves the
+        # league) — `{}` still can't silently unassign.
+        admin = self._admin()
+        status, _headers, body = self._req(
+            admin, "POST",
+            "/api/v2/setup/season-team-registration/streg_1/assign-division", {})
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"]["details"]["reason"], "field_required")
+        self.assertEqual(body["error"]["details"]["field"], "division_id")
 
 
 # --------------------------------------------------------------------------- #

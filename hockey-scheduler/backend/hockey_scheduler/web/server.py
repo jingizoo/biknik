@@ -452,6 +452,11 @@ STATE = DemoState()
 
 
 class Handler(BaseHTTPRequestHandler):
+    # When True (set by ``do_HEAD``), the body-writing response helpers send the
+    # status line + headers + a correct Content-Length but SKIP the body write,
+    # so HEAD mirrors GET exactly without a payload (#271).
+    _head_only = False
+
     # Quieter logging.
     def log_message(self, *args):  # noqa: D401
         pass
@@ -473,7 +478,8 @@ class Handler(BaseHTTPRequestHandler):
         for name, value in (extra_headers or []):
             self.send_header(name, value)
         self.end_headers()
-        self.wfile.write(body)
+        if not self._head_only:  # HEAD mirrors GET but writes no body (#271)
+            self.wfile.write(body)
 
     def _send_ics(self, text: str) -> None:
         body = text.encode("utf-8")
@@ -484,7 +490,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self._security_headers()
         self.end_headers()
-        self.wfile.write(body)
+        if not self._head_only:
+            self.wfile.write(body)
 
     def _own_feed_actor(self, role, scope, actor_type, actor_ref) -> bool:
         """Whether the signed-in user owns (team/official/player, ref) — used to
@@ -883,7 +890,8 @@ class Handler(BaseHTTPRequestHandler):
                              "form-action 'self'")
             self.send_header("X-Frame-Options", "DENY")
         self.end_headers()
-        self.wfile.write(data)
+        if not self._head_only:  # HEAD mirrors GET but writes no body (#271)
+            self.wfile.write(data)
 
     # -- routing -----------------------------------------------------------
     def do_GET(self):
@@ -1388,8 +1396,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_api(
                     api.get_addable_substitutes(gid, team_id))
         if path.startswith("/api/"):
-            return self._send_json({"error": {"code": "not_found",
-                                              "message": "Unknown endpoint."}}, 404)
+            # Cross-method 405 (#271): a GET on a known POST-only path → 405 +
+            # Allow; a truly unknown /api path → 404.
+            return self._unmatched_route("GET")
         return self._serve_static(path)
 
     def _supported_methods(self, path: str) -> set:
@@ -1444,6 +1453,27 @@ class Handler(BaseHTTPRequestHandler):
         return self._send_json({"error": {
             "code": "not_found", "message": "Unknown endpoint."}}, 404)
 
+    def _unmatched_route(self, method: str) -> None:
+        """Tail for do_GET/do_POST when no route matched (#271).
+
+        Cross-method 405: if the path IS a known route for the OTHER data method
+        (GET↔POST) — e.g. GET on a POST-only path, or POST on a GET-only path —
+        answer 405 + the full ``Allow`` set (incl. HEAD/OPTIONS). Only GET/POST
+        are redirect targets, never HEAD/OPTIONS. Otherwise a JSON 404.
+        """
+        path = self.path.split("?", 1)[0]
+        methods = self._supported_methods(path)
+        data_methods = methods & {"GET", "POST"}
+        if data_methods and method not in data_methods:
+            allow = ", ".join(sorted(methods))
+            return self._send_json({"error": {
+                "code": "method_not_allowed",
+                "message": f"The {method} method is not allowed for {path}.",
+                "details": {"allow": allow},
+            }}, 405, extra_headers=[("Allow", allow)])
+        return self._send_json({"error": {
+            "code": "not_found", "message": "Unknown endpoint."}}, 404)
+
     def do_PUT(self):
         self._method_fallback("PUT")
 
@@ -1454,18 +1484,16 @@ class Handler(BaseHTTPRequestHandler):
         self._method_fallback("DELETE")
 
     def do_HEAD(self):
-        """HEAD contract (#271): a bodyless mirror of GET's method posture.
-
-        A GET-supported path → 200 (+ ``Allow``); a POST-only path → 405
-        (+ ``Allow``); an unknown path → 404 — always without a body.
-        """
-        path = self.path.split("?", 1)[0]
-        methods = self._supported_methods(path)
-        if not methods:
-            return self._send_status(404)
-        allow = ", ".join(sorted(methods))
-        code = 200 if "GET" in methods else 405
-        return self._send_status(code, [("Allow", allow)])
+        """HEAD contract (#271): a body-suppressed mirror of the authenticated
+        GET. It runs the real ``do_GET`` — so auth/authz/resource checks apply
+        (an unauthenticated ``HEAD /api/accounts`` mirrors GET's 401/403, never
+        a blind 200) — with body writes suppressed via ``_head_only``. A
+        POST-only path falls through do_GET's tail to a bodyless 405 + Allow."""
+        self._head_only = True
+        try:
+            self.do_GET()
+        finally:
+            self._head_only = False
 
     def do_OPTIONS(self):
         """OPTIONS contract (#271): a known path → 204 (+ ``Allow``); an unknown
@@ -2221,8 +2249,9 @@ class Handler(BaseHTTPRequestHandler):
             if coach:
                 return self._send_api(coach(gid, user_id))
 
-        return self._send_json({"error": {"code": "not_found",
-                                          "message": "Unknown endpoint."}}, 404)
+        # Cross-method 405 (#271): a POST on a known GET-only path → 405 +
+        # Allow; a truly unknown path → 404.
+        return self._unmatched_route("POST")
 
     def _handle_reassign(self, entity: str, record_id: str, target: str,
                          body: dict, actor_id: str):
@@ -2237,19 +2266,35 @@ class Handler(BaseHTTPRequestHandler):
         b = body
         combo = (entity, target)
         # Strict schema (#271): each real reassign reads exactly one target key.
-        # Reject any unknown key BEFORE the service call so a misplaced field
-        # can't be silently dropped (zero writes/audits on rejection).
-        _V1_REASSIGN_KEYS = {
-            ("league", "organization"): {"organization_id"},
-            ("venue", "organization"): {"organization_id"},
-            ("rink", "venue"): {"venue_id"},
-            ("division", "level"): {"level_id"},
-            ("team", "club"): {"club_id"},
-            ("player", "team"): {"team_id"},
+        # A non-nullable relation (rink→venue, player→team) REQUIRES a str id; a
+        # nullable one (organization/level/club) must be PRESENT but may be null
+        # (so `{}` can't silently unassign — an explicit {"key": null} is the
+        # only way to clear it). Every id is type-checked before any store
+        # lookup. Zero writes/audits on rejection.
+        _NONE = type(None)
+        _V1_REASSIGN_SCHEMA = {
+            ("league", "organization"): dict(
+                allowed={"organization_id"}, present=("organization_id",),
+                types={"organization_id": (str, _NONE)}),
+            ("venue", "organization"): dict(
+                allowed={"organization_id"}, present=("organization_id",),
+                types={"organization_id": (str, _NONE)}),
+            ("rink", "venue"): dict(
+                allowed={"venue_id"}, required=("venue_id",),
+                types={"venue_id": str}),
+            ("division", "level"): dict(
+                allowed={"level_id"}, present=("level_id",),
+                types={"level_id": (str, _NONE)}),
+            ("team", "club"): dict(
+                allowed={"club_id"}, present=("club_id",),
+                types={"club_id": (str, _NONE)}),
+            ("player", "team"): dict(
+                allowed={"team_id"}, required=("team_id",),
+                types={"team_id": str}),
         }
-        if combo in _V1_REASSIGN_KEYS:
+        if combo in _V1_REASSIGN_SCHEMA:
             try:
-                check_body(b, allowed=_V1_REASSIGN_KEYS[combo])
+                check_body(b, **_V1_REASSIGN_SCHEMA[combo])
             except BodyError as exc:
                 return self._send_json(exc.payload, exc.status)
         # v1 boundary (#233 C1b): legacy request keys map straight onto the
@@ -2303,9 +2348,13 @@ class Handler(BaseHTTPRequestHandler):
         # via _v1.registration_to_v1 so the v1 registration shape is unchanged.
         mr = re.match(r"^seasons/([^/]+)/team-registrations$", entity)
         if mr:
-            # Strict schema (#271): reject unknown keys before the write.
+            # Strict schema (#271): team_id required+str; division_id optional
+            # (absent or null), str-or-null when present.
             try:
-                check_body(b, allowed={"team_id", "division_id"})
+                check_body(b, allowed={"team_id", "division_id"},
+                           required=("team_id",),
+                           types={"team_id": str,
+                                  "division_id": (str, type(None))})
             except BodyError as exc:
                 return self._send_json(exc.payload, exc.status)
             return self._send_api(_v1.registration_to_v1(
@@ -2314,8 +2363,12 @@ class Handler(BaseHTTPRequestHandler):
                     actor_id)))
         ma = re.match(r"^season-team-registration/([^/]+)/assign-division$", entity)
         if ma:
+            # division_id is nullable (null clears): must be PRESENT but may be
+            # null, so `{}` can't silently unassign.
             try:
-                check_body(b, allowed={"division_id"})
+                check_body(b, allowed={"division_id"},
+                           present=("division_id",),
+                           types={"division_id": (str, type(None))})
             except BodyError as exc:
                 return self._send_json(exc.payload, exc.status)
             return self._send_api(_v1.registration_to_v1(
@@ -2492,20 +2545,39 @@ class Handler(BaseHTTPRequestHandler):
         b = body
         combo = (entity, target)
         # Strict schema (#271): each real reassign reads exactly one target key
-        # (the v2 key set differs from v1). Reject unknown keys before the
-        # service call — zero writes/audits on rejection.
-        _V2_REASSIGN_KEYS = {
-            ("program", "organization"): {"operator_organization_id"},
-            ("division", "league"): {"league_id"},
-            ("team", "club"): {"club_id"},
-            ("team", "league"): {"league_id"},
-            ("player", "team"): {"team_id"},
-            ("rink", "venue"): {"venue_id"},
-            ("venue", "organization"): {"organization_id"},
+        # (the v2 key set differs from v1). Non-nullable relations (division→
+        # league, team→league, player→team, rink→venue) REQUIRE a str id;
+        # nullable ones (program/team/venue organization/club) must be PRESENT
+        # but may be null (explicit-null unassign — `{}` can't silently clear).
+        # Every id is type-checked. Zero writes/audits on rejection.
+        _NONE = type(None)
+        _V2_REASSIGN_SCHEMA = {
+            ("program", "organization"): dict(
+                allowed={"operator_organization_id"},
+                present=("operator_organization_id",),
+                types={"operator_organization_id": (str, _NONE)}),
+            ("division", "league"): dict(
+                allowed={"league_id"}, required=("league_id",),
+                types={"league_id": str}),
+            ("team", "club"): dict(
+                allowed={"club_id"}, present=("club_id",),
+                types={"club_id": (str, _NONE)}),
+            ("team", "league"): dict(
+                allowed={"league_id"}, required=("league_id",),
+                types={"league_id": str}),
+            ("player", "team"): dict(
+                allowed={"team_id"}, required=("team_id",),
+                types={"team_id": str}),
+            ("rink", "venue"): dict(
+                allowed={"venue_id"}, required=("venue_id",),
+                types={"venue_id": str}),
+            ("venue", "organization"): dict(
+                allowed={"organization_id"}, present=("organization_id",),
+                types={"organization_id": (str, _NONE)}),
         }
-        if combo in _V2_REASSIGN_KEYS:
+        if combo in _V2_REASSIGN_SCHEMA:
             try:
-                check_body(b, allowed=_V2_REASSIGN_KEYS[combo])
+                check_body(b, **_V2_REASSIGN_SCHEMA[combo])
             except BodyError as exc:
                 return self._send_json(exc.payload, exc.status)
         if combo == ("program", "organization"):
@@ -2579,21 +2651,25 @@ class Handler(BaseHTTPRequestHandler):
         # optional. The result keeps its competition league_id (canonical).
         mr = re.match(r"^seasons/([^/]+)/team-registrations$", entity)
         if mr:
-            # Strict schema (#271): reject unknown keys before the write.
+            # Strict schema (#271): team_id + league_id required+str (v2 requires
+            # a competition League); division_id optional (absent or null),
+            # str-or-null when present.
             try:
-                check_body(b, allowed={"team_id", "division_id", "league_id"})
+                check_body(b, allowed={"team_id", "division_id", "league_id"},
+                           required=("team_id", "league_id"),
+                           types={"team_id": str, "league_id": str,
+                                  "division_id": (str, type(None))})
             except BodyError as exc:
                 return self._send_json(exc.payload, exc.status)
-            if not (b.get("league_id") or None):
-                return self._send_api({"error": {"code": "validation_error",
-                    "message": "A league_id is required."}})
             return self._send_api(api.register_team_for_season(
                 mr.group(1), b.get("team_id"), b.get("division_id") or None,
                 actor_id, league_id=b.get("league_id") or None))
         ml = re.match(r"^season-team-registration/([^/]+)/assign-league$", entity)
         if ml:
+            # A registration's League is mandatory (non-nullable): required+str.
             try:
-                check_body(b, allowed={"league_id"})
+                check_body(b, allowed={"league_id"}, required=("league_id",),
+                           types={"league_id": str})
             except BodyError as exc:
                 return self._send_json(exc.payload, exc.status)
             return self._send_api(api.assign_season_team_league(
@@ -2601,9 +2677,12 @@ class Handler(BaseHTTPRequestHandler):
         ma = re.match(r"^season-team-registration/([^/]+)/assign-division$", entity)
         if ma:
             # v2: clearing the Division PRESERVES the required league_id; a set
-            # Division must match the registration's League.
+            # Division must match the registration's League. division_id is
+            # nullable — must be PRESENT but may be null (no silent unassign).
             try:
-                check_body(b, allowed={"division_id"})
+                check_body(b, allowed={"division_id"},
+                           present=("division_id",),
+                           types={"division_id": (str, type(None))})
             except BodyError as exc:
                 return self._send_json(exc.payload, exc.status)
             return self._send_api(api.assign_season_team_division(
@@ -2633,13 +2712,12 @@ class Handler(BaseHTTPRequestHandler):
         # v1 route — this is a new v2-only feature, no legacy shape to adapt.
         mva = re.match(r"^seasons/([^/]+)/venue-access$", entity)
         if mva:
+            # Granting access requires a real Venue (non-nullable): required+str.
             try:
-                check_body(b, allowed={"venue_id"})
+                check_body(b, allowed={"venue_id"}, required=("venue_id",),
+                           types={"venue_id": str})
             except BodyError as exc:
                 return self._send_json(exc.payload, exc.status)
-            if not (b.get("venue_id") or None):
-                return self._send_api({"error": {"code": "validation_error",
-                    "message": "A venue_id is required."}})
             return self._send_api(api.grant_season_venue_access(
                 mva.group(1), b.get("venue_id"), actor_id))
         mvr = re.match(r"^season-venue-access/([^/]+)/remove$", entity)

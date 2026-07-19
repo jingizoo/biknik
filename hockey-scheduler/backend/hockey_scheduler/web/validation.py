@@ -56,7 +56,8 @@ def parse_json_object(raw: bytes) -> dict:
     return value
 
 
-def check_body(body: dict, *, allowed, required=(), types: dict = None) -> dict:
+def check_body(body: dict, *, allowed, required=(), present=(),
+               types: dict = None) -> dict:
     """Validate a parsed body dict against a strict per-route schema.
 
     Faults are checked in a fixed order and the FIRST one raises ``BodyError``
@@ -64,11 +65,17 @@ def check_body(body: dict, *, allowed, required=(), types: dict = None) -> dict:
 
     * unknown keys                 → ``reason="unknown_field"``, ``fields=[...]``
     * missing/empty required key    → ``reason="field_required"``, ``field``
+    * missing present key           → ``reason="field_required"``, ``field``
     * present key of the wrong type → ``reason="wrong_type"``, ``field``
 
-    ``types`` maps a field to a type (or tuple of types) checked via
-    ``isinstance`` for keys that are present and not ``None``. Returns ``body``
-    so it can be used inline.
+    ``required`` keys must be present AND non-null/non-empty. ``present`` keys
+    must merely BE a key of the body (a ``null`` value is allowed) — this is the
+    explicit-null contract for a NULLABLE relation: ``{}`` can't silently
+    unassign, only an explicit ``{"key": null}`` may. ``types`` maps a field to
+    a type (or tuple of types) checked via ``isinstance`` for keys that are
+    present and not ``None`` (so a nullable key uses ``(str, type(None))`` to
+    accept a string or null while still rejecting an array/object). Returns
+    ``body`` so it can be used inline.
     """
     allowed = set(allowed)
     unknown = sorted(k for k in body if k not in allowed)
@@ -83,6 +90,12 @@ def check_body(body: dict, *, allowed, required=(), types: dict = None) -> dict:
             raise BodyError(
                 "validation_error",
                 f"The field '{field}' is required.",
+                400, {"reason": "field_required", "field": field})
+    for field in present:
+        if field not in body:
+            raise BodyError(
+                "validation_error",
+                f"The field '{field}' is required (send null to unassign).",
                 400, {"reason": "field_required", "field": field})
     for field, expected in (types or {}).items():
         value = body.get(field)
