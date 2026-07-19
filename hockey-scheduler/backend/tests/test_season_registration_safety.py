@@ -128,17 +128,20 @@ class RegistrationActorIntegrityHttpTest(unittest.TestCase):
         _, team = self._post("/api/setup/team",
                             {"club_id": club["id"], "division_id": division["id"],
                              "name": "A"})
-        status, reg = self._post(
+        # The registration route now carries a strict write schema (#271): a
+        # forged top-level actor_id is an unknown field and is rejected outright
+        # (400) rather than silently ignored — an even stronger guarantee that
+        # it can never reach the audit trail, and no registration is written.
+        audits_before = len(STATE.api.store.all_setup_audit())
+        status, body = self._post(
             f"/api/setup/seasons/{season['id']}/team-registrations",
             {"team_id": team["id"], "division_id": division["id"],
              "actor_id": "hacker"})
-        self.assertEqual(status, 200)
-        # The audit for this registration must not carry the forged actor.
-        audit = [a for a in STATE.api.store.all_setup_audit()
-                 if a.entity_id == reg["id"]
-                 and a.action == "season_team_registered"]
-        self.assertTrue(audit)
-        self.assertNotEqual(audit[0].actor_id, "hacker")
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"]["details"]["reason"], "unknown_field")
+        self.assertIn("actor_id", body["error"]["details"]["fields"])
+        # No registration and no audit row were written.
+        self.assertEqual(len(STATE.api.store.all_setup_audit()), audits_before)
 
 
 if __name__ == "__main__":

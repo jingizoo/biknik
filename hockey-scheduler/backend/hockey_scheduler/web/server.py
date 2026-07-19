@@ -229,8 +229,45 @@ _POST_ROUTES = [re.compile(p) for p in (
     r"^/api/demo/(?:reset|load|clear)$",
     r"^/api/admin/factory-reset/(?:preview|execute)$",
     r"^/api/demo/add-ice-slot$",
-    r"^/api/v2/setup/.+$",
-    r"^/api/setup/.+$",
+    # v1 setup writes (#271): EXACT routes transcribed from _handle_setup /
+    # _handle_reassign — a broad `.+` over-claims POST on nonexistent paths
+    # whose real POST is a 404, so the fallback would wrongly answer 405.
+    r"^/api/setup/(?:league|season|level|division|club|team|organization"
+    r"|venue|rink|ice-slot|game|official|player)$",  # entity creates
+    r"^/api/setup/(?:organization|league|season|level|division|club|team"
+    r"|venue|rink|ice-slot|game|player|official)/[^/]+/delete$",  # deletes
+    r"^/api/setup/league/[^/]+/assign-organization$",
+    r"^/api/setup/venue/[^/]+/assign-organization$",
+    r"^/api/setup/rink/[^/]+/assign-venue$",
+    r"^/api/setup/division/[^/]+/assign-level$",
+    r"^/api/setup/team/[^/]+/assign-club$",
+    r"^/api/setup/player/[^/]+/assign-team$",
+    r"^/api/setup/seasons/[^/]+/team-registrations$",
+    r"^/api/setup/seasons/[^/]+/roll-forward$",
+    r"^/api/setup/season-team-registration/[^/]+/assign-division$",
+    r"^/api/setup/season-team-registration/[^/]+/remove$",
+    # v2 setup writes (#271): EXACT routes from _handle_setup_v2 /
+    # _handle_reassign_v2 (the v2 entity/target sets differ from v1).
+    r"^/api/v2/setup/(?:program|season|league|division|club|team|organization"
+    r"|venue|rink|ice-slot|game|official|player)$",  # entity creates
+    r"^/api/v2/setup/(?:organization|program|season|league|division|club|team"
+    r"|venue|rink|ice-slot|game|official|player)/[^/]+/delete$",  # deletes
+    r"^/api/v2/setup/program/[^/]+/assign-organization$",
+    r"^/api/v2/setup/division/[^/]+/assign-league$",
+    r"^/api/v2/setup/team/[^/]+/assign-club$",
+    r"^/api/v2/setup/team/[^/]+/assign-league$",
+    r"^/api/v2/setup/player/[^/]+/assign-team$",
+    r"^/api/v2/setup/rink/[^/]+/assign-venue$",
+    r"^/api/v2/setup/venue/[^/]+/assign-organization$",
+    r"^/api/v2/setup/seasons/[^/]+/team-registrations$",
+    r"^/api/v2/setup/seasons/[^/]+/venue-access$",
+    r"^/api/v2/setup/seasons/[^/]+/roll-forward$",
+    r"^/api/v2/setup/season-team-registration/[^/]+/assign-league$",
+    r"^/api/v2/setup/season-team-registration/[^/]+/assign-division$",
+    r"^/api/v2/setup/season-team-registration/[^/]+/remove$",
+    r"^/api/v2/setup/season-team-registration/[^/]+/delete$",
+    r"^/api/v2/setup/season-venue-access/[^/]+/remove$",
+    r"^/api/v2/setup/season-venue-access/[^/]+/delete$",
     r"^/api/import/dry-run$",
     r"^/api/import/commit/(?:teams-players|officials-availability"
     r"|rinks-ice-slots)$",
@@ -1355,22 +1392,50 @@ class Handler(BaseHTTPRequestHandler):
                                               "message": "Unknown endpoint."}}, 404)
         return self._serve_static(path)
 
+    def _supported_methods(self, path: str) -> set:
+        """The HTTP methods a known path supports (#271).
+
+        A GET-pattern match implies ``HEAD`` (the stdlib services HEAD from the
+        same route); a POST-pattern match implies ``POST``. When any method is
+        supported the path also answers ``OPTIONS``. An empty set means the path
+        is unknown.
+        """
+        methods = set()
+        if any(p.match(path) for p in _GET_ROUTES):
+            methods.update({"GET", "HEAD"})
+        if any(p.match(path) for p in _POST_ROUTES):
+            methods.add("POST")
+        if methods:
+            methods.add("OPTIONS")
+        return methods
+
+    def _send_status(self, code: int, extra_headers=None) -> None:
+        """Send a bodyless response (status line + standard headers, no body).
+
+        Used for HEAD/OPTIONS and other empty responses (#271): a HEAD or a 204
+        must never write a body, so this sends ``Content-Length: 0`` and ends
+        the headers without a payload.
+        """
+        self.send_response(code)
+        self.send_header("Content-Length", "0")
+        self._security_headers()
+        for name, value in (extra_headers or []):
+            self.send_header(name, value)
+        self.end_headers()
+
     def _method_fallback(self, method: str) -> None:
         """Answer a known path hit with an unsupported method (#271).
 
         The stdlib returns an HTML 501 for any verb without a ``do_<METHOD>``
-        handler. Instead: a known path (matching a GET and/or POST pattern in
-        the routing table) → JSON 405 with a correct ``Allow`` header; an
-        unknown ``/api/...`` path → JSON 404; any other path → JSON 404.
+        handler. Instead: a known path → JSON 405 with a correct ``Allow``
+        header (built from ``_supported_methods``, so it includes HEAD/OPTIONS
+        where applicable); an unknown ``/api/...`` path → JSON 404; any other
+        path → JSON 404.
         """
         path = self.path.split("?", 1)[0]
-        allowed = set()
-        if any(p.match(path) for p in _GET_ROUTES):
-            allowed.add("GET")
-        if any(p.match(path) for p in _POST_ROUTES):
-            allowed.add("POST")
-        if allowed:
-            allow = ", ".join(sorted(allowed))
+        methods = self._supported_methods(path)
+        if methods:
+            allow = ", ".join(sorted(methods))
             return self._send_json({"error": {
                 "code": "method_not_allowed",
                 "message": f"The {method} method is not allowed for {path}.",
@@ -1387,6 +1452,29 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_DELETE(self):
         self._method_fallback("DELETE")
+
+    def do_HEAD(self):
+        """HEAD contract (#271): a bodyless mirror of GET's method posture.
+
+        A GET-supported path → 200 (+ ``Allow``); a POST-only path → 405
+        (+ ``Allow``); an unknown path → 404 — always without a body.
+        """
+        path = self.path.split("?", 1)[0]
+        methods = self._supported_methods(path)
+        if not methods:
+            return self._send_status(404)
+        allow = ", ".join(sorted(methods))
+        code = 200 if "GET" in methods else 405
+        return self._send_status(code, [("Allow", allow)])
+
+    def do_OPTIONS(self):
+        """OPTIONS contract (#271): a known path → 204 (+ ``Allow``); an unknown
+        path → 404. Always bodyless."""
+        path = self.path.split("?", 1)[0]
+        methods = self._supported_methods(path)
+        if not methods:
+            return self._send_status(404)
+        return self._send_status(204, [("Allow", ", ".join(sorted(methods)))])
 
     def do_POST(self):
         path = self.path.split("?", 1)[0]
@@ -1951,7 +2039,9 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 check_body(body, allowed={"username", "password", "role",
                                           "scope"},
-                           required=("username", "password", "role"))
+                           required=("username", "password", "role"),
+                           types={"username": str, "password": str,
+                                  "role": str})
             except BodyError as exc:
                 return self._send_json(exc.payload, exc.status)
             # Attribute the mint to the signed-in league admin (server-
@@ -2146,6 +2236,22 @@ class Handler(BaseHTTPRequestHandler):
         api = STATE.api
         b = body
         combo = (entity, target)
+        # Strict schema (#271): each real reassign reads exactly one target key.
+        # Reject any unknown key BEFORE the service call so a misplaced field
+        # can't be silently dropped (zero writes/audits on rejection).
+        _V1_REASSIGN_KEYS = {
+            ("league", "organization"): {"organization_id"},
+            ("venue", "organization"): {"organization_id"},
+            ("rink", "venue"): {"venue_id"},
+            ("division", "level"): {"level_id"},
+            ("team", "club"): {"club_id"},
+            ("player", "team"): {"team_id"},
+        }
+        if combo in _V1_REASSIGN_KEYS:
+            try:
+                check_body(b, allowed=_V1_REASSIGN_KEYS[combo])
+            except BodyError as exc:
+                return self._send_json(exc.payload, exc.status)
         # v1 boundary (#233 C1b): legacy request keys map straight onto the
         # canonical facade args (same id values), and canonical result dicts are
         # mapped back to the exact legacy v1 response keys via _v1.
@@ -2197,17 +2303,30 @@ class Handler(BaseHTTPRequestHandler):
         # via _v1.registration_to_v1 so the v1 registration shape is unchanged.
         mr = re.match(r"^seasons/([^/]+)/team-registrations$", entity)
         if mr:
+            # Strict schema (#271): reject unknown keys before the write.
+            try:
+                check_body(b, allowed={"team_id", "division_id"})
+            except BodyError as exc:
+                return self._send_json(exc.payload, exc.status)
             return self._send_api(_v1.registration_to_v1(
                 api.register_team_for_season(
                     mr.group(1), b.get("team_id"), b.get("division_id") or None,
                     actor_id)))
         ma = re.match(r"^season-team-registration/([^/]+)/assign-division$", entity)
         if ma:
+            try:
+                check_body(b, allowed={"division_id"})
+            except BodyError as exc:
+                return self._send_json(exc.payload, exc.status)
             return self._send_api(_v1.registration_to_v1(
                 api.assign_season_team_division(
                     ma.group(1), b.get("division_id") or None, actor_id)))
         mx = re.match(r"^season-team-registration/([^/]+)/remove$", entity)
         if mx:
+            try:
+                check_body(b, allowed=set())  # no body
+            except BodyError as exc:
+                return self._send_json(exc.payload, exc.status)
             return self._send_api(_v1.registration_to_v1(
                 api.unregister_team_from_season(mx.group(1), actor_id)))
         # Safe destructive deletion (#215): /api/setup/<entity>/<id>/delete.
@@ -2219,6 +2338,12 @@ class Handler(BaseHTTPRequestHandler):
             r"^(organization|league|season|level|division|club|team|venue|rink"
             r"|ice-slot|game)/([^/]+)/delete$", entity)
         if md:
+            # Delete routes take no body (#271): reject any key before the
+            # dependency gate/write so a stray field can't be silently ignored.
+            try:
+                check_body(b, allowed=set())
+            except BodyError as exc:
+                return self._send_json(exc.payload, exc.status)
             kind = md.group(1)
             deleter = {
                 "organization": api.delete_organization,
@@ -2242,6 +2367,11 @@ class Handler(BaseHTTPRequestHandler):
         # supports player/official delete.
         mmv = re.match(r"^(player|official)/([^/]+)/delete$", entity)
         if mmv:
+            # This delete route takes no body either (#271) — reject stray keys.
+            try:
+                check_body(b, allowed=set())
+            except BodyError as exc:
+                return self._send_json(exc.payload, exc.status)
             kind, rec = mmv.group(1), mmv.group(2)
             route = f"/api/v2/setup/{kind}/{rec}/delete"
             return self._send_json({"error": {
@@ -2327,13 +2457,16 @@ class Handler(BaseHTTPRequestHandler):
                 b.get("name"), b.get("home_club_id"), actor_id))
         if entity == "player":
             # Strict schema (#271): name the missing required field (team_id /
-            # name / position) and reject unknown keys before the service call,
-            # so a missing team_id becomes a `field_required` validation_error
+            # name / position), reject unknown keys, and type-check each field
+            # (a boolean jersey_number is rejected) before the service call, so
+            # a missing team_id becomes a `field_required` validation_error
             # rather than the old `NotFoundError("Team None not found.")`.
             try:
                 check_body(b, allowed={"team_id", "name", "position",
                                        "jersey_number", "email"},
-                           required=("team_id", "name", "position"))
+                           required=("team_id", "name", "position"),
+                           types={"team_id": str, "name": str, "position": str,
+                                  "jersey_number": int, "email": str})
             except BodyError as exc:
                 return self._send_json(exc.payload, exc.status)
             return self._send_api(api.create_player(
@@ -2358,6 +2491,23 @@ class Handler(BaseHTTPRequestHandler):
         api = STATE.api
         b = body
         combo = (entity, target)
+        # Strict schema (#271): each real reassign reads exactly one target key
+        # (the v2 key set differs from v1). Reject unknown keys before the
+        # service call — zero writes/audits on rejection.
+        _V2_REASSIGN_KEYS = {
+            ("program", "organization"): {"operator_organization_id"},
+            ("division", "league"): {"league_id"},
+            ("team", "club"): {"club_id"},
+            ("team", "league"): {"league_id"},
+            ("player", "team"): {"team_id"},
+            ("rink", "venue"): {"venue_id"},
+            ("venue", "organization"): {"organization_id"},
+        }
+        if combo in _V2_REASSIGN_KEYS:
+            try:
+                check_body(b, allowed=_V2_REASSIGN_KEYS[combo])
+            except BodyError as exc:
+                return self._send_json(exc.payload, exc.status)
         if combo == ("program", "organization"):
             # v2 Program operator reassignment (#233 Slice C2 review): the
             # canonical umbrella owner move, using ``operator_organization_id``.
@@ -2429,6 +2579,11 @@ class Handler(BaseHTTPRequestHandler):
         # optional. The result keeps its competition league_id (canonical).
         mr = re.match(r"^seasons/([^/]+)/team-registrations$", entity)
         if mr:
+            # Strict schema (#271): reject unknown keys before the write.
+            try:
+                check_body(b, allowed={"team_id", "division_id", "league_id"})
+            except BodyError as exc:
+                return self._send_json(exc.payload, exc.status)
             if not (b.get("league_id") or None):
                 return self._send_api({"error": {"code": "validation_error",
                     "message": "A league_id is required."}})
@@ -2437,16 +2592,28 @@ class Handler(BaseHTTPRequestHandler):
                 actor_id, league_id=b.get("league_id") or None))
         ml = re.match(r"^season-team-registration/([^/]+)/assign-league$", entity)
         if ml:
+            try:
+                check_body(b, allowed={"league_id"})
+            except BodyError as exc:
+                return self._send_json(exc.payload, exc.status)
             return self._send_api(api.assign_season_team_league(
                 ml.group(1), b.get("league_id") or None, actor_id))
         ma = re.match(r"^season-team-registration/([^/]+)/assign-division$", entity)
         if ma:
             # v2: clearing the Division PRESERVES the required league_id; a set
             # Division must match the registration's League.
+            try:
+                check_body(b, allowed={"division_id"})
+            except BodyError as exc:
+                return self._send_json(exc.payload, exc.status)
             return self._send_api(api.assign_season_team_division(
                 ma.group(1), b.get("division_id") or None, actor_id, v2=True))
         mx = re.match(r"^season-team-registration/([^/]+)/remove$", entity)
         if mx:
+            try:
+                check_body(b, allowed=set())  # no body
+            except BodyError as exc:
+                return self._send_json(exc.payload, exc.status)
             return self._send_api(api.unregister_team_from_season(
                 mx.group(1), actor_id))
         # Explicit permanent cleanup of an already-inactive, game-free
@@ -2455,6 +2622,10 @@ class Handler(BaseHTTPRequestHandler):
         mdr = re.match(
             r"^season-team-registration/([^/]+)/delete$", entity)
         if mdr:
+            try:
+                check_body(b, allowed=set())  # no body
+            except BodyError as exc:
+                return self._send_json(exc.payload, exc.status)
             return self._send_api(api.delete_season_team_registration(
                 mdr.group(1), actor_id))
         # Season-venue access (#233 Slice E, E1): grant/revoke which Venues a
@@ -2462,6 +2633,10 @@ class Handler(BaseHTTPRequestHandler):
         # v1 route — this is a new v2-only feature, no legacy shape to adapt.
         mva = re.match(r"^seasons/([^/]+)/venue-access$", entity)
         if mva:
+            try:
+                check_body(b, allowed={"venue_id"})
+            except BodyError as exc:
+                return self._send_json(exc.payload, exc.status)
             if not (b.get("venue_id") or None):
                 return self._send_api({"error": {"code": "validation_error",
                     "message": "A venue_id is required."}})
@@ -2469,12 +2644,20 @@ class Handler(BaseHTTPRequestHandler):
                 mva.group(1), b.get("venue_id"), actor_id))
         mvr = re.match(r"^season-venue-access/([^/]+)/remove$", entity)
         if mvr:
+            try:
+                check_body(b, allowed=set())  # no body
+            except BodyError as exc:
+                return self._send_json(exc.payload, exc.status)
             return self._send_api(api.revoke_season_venue_access(
                 mvr.group(1), actor_id))
         # Explicit permanent cleanup of an already-revoked access row (#255
         # review), mirroring #251's season-team-registration .../delete.
         mvd = re.match(r"^season-venue-access/([^/]+)/delete$", entity)
         if mvd:
+            try:
+                check_body(b, allowed=set())  # no body
+            except BodyError as exc:
+                return self._send_json(exc.payload, exc.status)
             return self._send_api(api.delete_season_venue_access(
                 mvd.group(1), actor_id))
         # Season rollover (canonical v2): each selection REQUIRES a target
@@ -2490,6 +2673,11 @@ class Handler(BaseHTTPRequestHandler):
             r"^(organization|program|season|league|division|club|team|venue|rink"
             r"|ice-slot|game|official|player)/([^/]+)/delete$", entity)
         if md:
+            # Delete routes take no body (#271): reject any key before the write.
+            try:
+                check_body(b, allowed=set())
+            except BodyError as exc:
+                return self._send_json(exc.payload, exc.status)
             kind = md.group(1)
             deleter = {
                 "organization": api.delete_organization,
@@ -2578,11 +2766,14 @@ class Handler(BaseHTTPRequestHandler):
                 b.get("name"), b.get("home_club_id"), actor_id))
         if entity == "player":
             # Strict schema (#271), same as the v1 route: required fields named,
-            # unknown keys rejected, before the service call.
+            # unknown keys rejected, fields type-checked (bool jersey_number
+            # rejected), before the service call.
             try:
                 check_body(b, allowed={"team_id", "name", "position",
                                        "jersey_number", "email"},
-                           required=("team_id", "name", "position"))
+                           required=("team_id", "name", "position"),
+                           types={"team_id": str, "name": str, "position": str,
+                                  "jersey_number": int, "email": str})
             except BodyError as exc:
                 return self._send_json(exc.payload, exc.status)
             return self._send_api(api.create_player(

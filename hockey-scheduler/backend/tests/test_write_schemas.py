@@ -17,6 +17,7 @@ directly, not the old ``NotFoundError("Team None not found.")``.
 """
 
 import json
+import os
 import threading
 import unittest
 import urllib.error
@@ -76,6 +77,15 @@ class MemoryAddPlayerTest(AddPlayerRequiredContract, unittest.TestCase):
 class DurableAddPlayerTest(AddPlayerRequiredContract, unittest.TestCase):
     def make_store(self):
         return SqlStore(":memory:")
+
+
+@unittest.skipUnless(os.environ.get("TEST_DATABASE_URL"),
+                     "PostgreSQL required (set TEST_DATABASE_URL)")
+class PostgresAddPlayerTest(AddPlayerRequiredContract, unittest.TestCase):
+    def make_store(self):
+        store = SqlStore(os.environ["TEST_DATABASE_URL"])
+        store.clear_all_data()  # isolate from any prior run's rows
+        return store
 
 
 # --------------------------------------------------------------------------- #
@@ -240,29 +250,29 @@ class WriteSchemaHttpTest(unittest.TestCase):
         admin = self._admin()
         status, headers, body = self._req(admin, "PUT", "/api/players")
         self.assertEqual(status, 405)
-        self.assertEqual(headers.get("Allow"), "GET")
+        self.assertEqual(headers.get("Allow"), "GET, HEAD, OPTIONS")
         self.assertEqual(body["error"]["code"], "method_not_allowed")
-        self.assertEqual(body["error"]["details"]["allow"], "GET")
+        self.assertEqual(body["error"]["details"]["allow"], "GET, HEAD, OPTIONS")
 
     def test_patch_on_players_is_405(self):
         admin = self._admin()
         status, headers, _body = self._req(admin, "PATCH", "/api/players")
         self.assertEqual(status, 405)
-        self.assertEqual(headers.get("Allow"), "GET")
+        self.assertEqual(headers.get("Allow"), "GET, HEAD, OPTIONS")
 
     def test_delete_on_game_board_is_405_allow_get(self):
         admin = self._admin()
         status, headers, body = self._req(
             admin, "DELETE", f"/api/games/{self.gid}/board")
         self.assertEqual(status, 405)
-        self.assertEqual(headers.get("Allow"), "GET")
+        self.assertEqual(headers.get("Allow"), "GET, HEAD, OPTIONS")
         self.assertEqual(body["error"]["code"], "method_not_allowed")
 
     def test_put_on_accounts_is_405_allow_get_post(self):
         admin = self._admin()
         status, headers, _body = self._req(admin, "PUT", "/api/accounts")
         self.assertEqual(status, 405)
-        self.assertEqual(headers.get("Allow"), "GET, POST")
+        self.assertEqual(headers.get("Allow"), "GET, HEAD, OPTIONS, POST")
 
     def test_delete_on_unknown_api_path_is_404_json(self):
         admin = self._admin()
@@ -307,6 +317,198 @@ class WriteSchemaHttpTest(unittest.TestCase):
             {"note": "hi"})
         self.assertEqual(status, 400)
         self.assertEqual(body["error"]["details"]["reason"], "unknown_field")
+
+    # -- Blocker 1: strict TYPE validation -----------------------------------
+    def test_account_username_wrong_type_is_400_zero_writes(self):
+        admin = self._admin()
+        store = srv.STATE.api.store
+        before = len(store.all_user_accounts())
+        status, _headers, body = self._req(
+            admin, "POST", "/api/accounts",
+            {"username": ["not", "a", "string"], "password": "pw",
+             "role": "viewer"})
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"]["details"]["reason"], "wrong_type")
+        self.assertEqual(body["error"]["details"]["field"], "username")
+        self.assertEqual(len(store.all_user_accounts()), before)
+
+    def test_player_name_wrong_type_is_400(self):
+        admin = self._admin()
+        status, _headers, body = self._req(
+            admin, "POST", "/api/setup/player",
+            {"team_id": self.home, "name": {"first": "N"}, "position": "forward"})
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"]["details"]["reason"], "wrong_type")
+        self.assertEqual(body["error"]["details"]["field"], "name")
+
+    def test_player_jersey_number_bool_is_wrong_type_zero_writes(self):
+        # ``true`` is a JSON bool; even though bool subclasses int it must be
+        # rejected for an int-typed field, and nothing is written.
+        admin = self._admin()
+        store = srv.STATE.api.store
+        before = len(store.all_players())
+        status, _headers, body = self._req(
+            admin, "POST", "/api/setup/player",
+            {"team_id": self.home, "name": "Boolplayer", "position": "forward",
+             "jersey_number": True})
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"]["details"]["reason"], "wrong_type")
+        self.assertEqual(body["error"]["details"]["field"], "jersey_number")
+        self.assertEqual(len(store.all_players()), before)
+
+    def test_player_valid_int_jersey_number_succeeds(self):
+        admin = self._admin()
+        status, _headers, _body = self._req(
+            admin, "POST", "/api/setup/player",
+            {"team_id": self.home, "name": "Numbered", "position": "forward",
+             "jersey_number": 42})
+        self.assertEqual(status, 200)
+
+    # -- Blocker 2: exact setup-route recognition ----------------------------
+    def test_delete_on_nonexistent_setup_path_is_404(self):
+        admin = self._admin()
+        for path in ("/api/setup/nonsense", "/api/setup/player/x/frobnicate"):
+            status, _headers, body = self._req(admin, "DELETE", path)
+            self.assertEqual(status, 404, path)
+            self.assertEqual(body["error"]["code"], "not_found", path)
+
+    def test_put_on_real_setup_path_is_405_with_allow(self):
+        admin = self._admin()
+        for path in ("/api/setup/player/x/delete", "/api/setup/team"):
+            status, headers, body = self._req(admin, "PUT", path)
+            self.assertEqual(status, 405, path)
+            self.assertEqual(headers.get("Allow"), "OPTIONS, POST", path)
+            self.assertEqual(body["error"]["code"], "method_not_allowed", path)
+
+    # -- Blocker 3: strict schemas on lifecycle routes -----------------------
+    def test_player_assign_team_unknown_key_is_400_zero_writes(self):
+        admin = self._admin()
+        store = srv.STATE.api.store
+        pid = store.players_for_team(self.home)[0].id
+        original_team = store.get_player(pid).team_id
+        audits_before = len(store.all_setup_audit())
+        status, _headers, body = self._req(
+            admin, "POST", f"/api/setup/player/{pid}/assign-team",
+            {"team_id": self.home, "surprise": 1})
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"]["details"]["reason"], "unknown_field")
+        self.assertIn("surprise", body["error"]["details"]["fields"])
+        # Zero writes / audits: the player's team is unchanged.
+        self.assertEqual(store.get_player(pid).team_id, original_team)
+        self.assertEqual(len(store.all_setup_audit()), audits_before)
+
+    def test_v2_player_assign_team_unknown_key_is_400(self):
+        admin = self._admin()
+        store = srv.STATE.api.store
+        pid = store.players_for_team(self.home)[0].id
+        status, _headers, body = self._req(
+            admin, "POST", f"/api/v2/setup/player/{pid}/assign-team",
+            {"team_id": self.home, "surprise": 1})
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"]["details"]["reason"], "unknown_field")
+
+    def test_delete_route_with_unknown_key_is_400_zero_writes(self):
+        admin = self._admin()
+        store = srv.STATE.api.store
+        # A real, deletable entity: create a throwaway club.
+        _s, _h, club = self._req(
+            admin, "POST", "/api/setup/club", {"name": "Throwaway"})
+        club_id = club["id"]
+        audits_before = len(store.all_setup_audit())
+        status, _headers, body = self._req(
+            admin, "POST", f"/api/setup/club/{club_id}/delete",
+            {"surprise": 1})
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"]["details"]["reason"], "unknown_field")
+        # Zero writes / audits and the club is still present.
+        self.assertIsNotNone(store.get_club(club_id))
+        self.assertEqual(len(store.all_setup_audit()), audits_before)
+
+    # -- Blocker 3 (cont.): registration / venue-access lifecycle routes ------
+    def test_v1_assign_division_unknown_key_is_400_zero_audits(self):
+        # The unknown-key check fires before the service, so an arbitrary
+        # registration id still 400s on a stray key with zero audits written.
+        admin = self._admin()
+        store = srv.STATE.api.store
+        audits_before = len(store.all_setup_audit())
+        status, _headers, body = self._req(
+            admin, "POST",
+            "/api/setup/season-team-registration/streg_1/assign-division",
+            {"division_id": "division_1", "surprise": 1})
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"]["details"]["reason"], "unknown_field")
+        self.assertIn("surprise", body["error"]["details"]["fields"])
+        self.assertEqual(len(store.all_setup_audit()), audits_before)
+
+    def test_v1_registration_remove_unknown_key_row_present(self):
+        admin = self._admin()
+        store = srv.STATE.api.store
+        reg = store.all_season_team_registrations()[0]
+        active_before = reg.active
+        status, _headers, body = self._req(
+            admin, "POST",
+            f"/api/setup/season-team-registration/{reg.id}/remove",
+            {"surprise": 1})
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"]["details"]["reason"], "unknown_field")
+        # The row is untouched (not deactivated).
+        after = next(r for r in store.all_season_team_registrations()
+                     if r.id == reg.id)
+        self.assertEqual(after.active, active_before)
+
+    def test_v2_registration_delete_unknown_key_row_present(self):
+        admin = self._admin()
+        store = srv.STATE.api.store
+        reg_id = store.all_season_team_registrations()[0].id
+        status, _headers, body = self._req(
+            admin, "POST",
+            f"/api/v2/setup/season-team-registration/{reg_id}/delete",
+            {"surprise": 1})
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"]["details"]["reason"], "unknown_field")
+        # The row is still present.
+        self.assertIn(reg_id,
+                      [r.id for r in store.all_season_team_registrations()])
+
+    def test_v2_venue_access_grant_unknown_key_is_400(self):
+        admin = self._admin()
+        status, _headers, body = self._req(
+            admin, "POST", "/api/v2/setup/seasons/season_1/venue-access",
+            {"venue_id": "venue_1", "surprise": 1})
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"]["details"]["reason"], "unknown_field")
+
+    # -- Blocker 4: HEAD / OPTIONS JSON method contract ----------------------
+    def test_head_on_get_path_is_200_no_body(self):
+        admin = self._admin()
+        status, headers, body = self._req(admin, "HEAD", "/api/health")
+        self.assertEqual(status, 200)
+        self.assertEqual(headers.get("Content-Length"), "0")
+        self.assertEqual(body, {})  # no body
+        self.assertIn("GET", headers.get("Allow", ""))
+        self.assertIn("HEAD", headers.get("Allow", ""))
+
+    def test_head_on_post_only_path_is_405_with_allow(self):
+        admin = self._admin()
+        status, headers, _body = self._req(admin, "HEAD", "/api/auth/login")
+        self.assertEqual(status, 405)
+        self.assertEqual(headers.get("Allow"), "OPTIONS, POST")
+
+    def test_options_on_known_path_is_204_with_allow(self):
+        admin = self._admin()
+        status, headers, _body = self._req(admin, "OPTIONS", "/api/accounts")
+        self.assertEqual(status, 204)
+        self.assertEqual(headers.get("Allow"), "GET, HEAD, OPTIONS, POST")
+
+    def test_head_on_unknown_api_path_is_404(self):
+        admin = self._admin()
+        status, _headers, _body = self._req(admin, "HEAD", "/api/nope")
+        self.assertEqual(status, 404)
+
+    def test_options_on_unknown_api_path_is_404(self):
+        admin = self._admin()
+        status, _headers, _body = self._req(admin, "OPTIONS", "/api/nope")
+        self.assertEqual(status, 404)
 
 
 # --------------------------------------------------------------------------- #

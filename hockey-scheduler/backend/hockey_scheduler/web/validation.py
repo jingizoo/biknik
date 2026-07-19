@@ -86,7 +86,20 @@ def check_body(body: dict, *, allowed, required=(), types: dict = None) -> dict:
                 400, {"reason": "field_required", "field": field})
     for field, expected in (types or {}).items():
         value = body.get(field)
-        if value is not None and not isinstance(value, expected):
+        if value is None:
+            continue
+        # ``bool`` is a subclass of ``int``, so ``isinstance(True, int)`` is
+        # True — an int-expected field must still reject a JSON boolean (e.g. a
+        # jersey_number of ``true``). Reject when the value is a bool but bool
+        # isn't among the expected types even though int is.
+        expected_types = expected if isinstance(expected, tuple) else (expected,)
+        if isinstance(value, bool) and bool not in expected_types \
+                and int in expected_types:
+            raise BodyError(
+                "validation_error",
+                f"The field '{field}' has the wrong type.",
+                400, {"reason": "wrong_type", "field": field})
+        if not isinstance(value, expected):
             raise BodyError(
                 "validation_error",
                 f"The field '{field}' has the wrong type.",
