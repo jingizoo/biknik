@@ -361,6 +361,15 @@ def require_slot_belongs_to_season(store, ice_slot_id: str, season_id: str):
                 "ice_slot_id": ice_slot_id,
                 "venue_id": venue.id,
                 "season_id": season_id,
+                # Actionable remediation (#271) built only from ids already in
+                # this error — grant the season→venue access that unblocks it.
+                # No private data is added.
+                "remediation": (
+                    "Grant this season access to the venue, then retry: add a "
+                    "season-venue-access grant for this venue on the season's "
+                    "venue-access list."),
+                "remediation_route":
+                    f"/api/v2/setup/seasons/{season_id}/venue-access",
             },
         )
     return venue

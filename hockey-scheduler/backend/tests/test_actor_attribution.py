@@ -109,17 +109,20 @@ class ActorAttributionHttpTest(unittest.TestCase):
         self.assertNotEqual(entry.actor_id, FORGED_ACTOR)
 
     def test_setup_player_actor_is_server_resolved(self):
-        # Distinct code path from league: create_player takes actor_id as a
-        # keyword argument in _handle_setup, not a trailing positional.
+        # Player create now carries a strict write schema (#271): a forged
+        # top-level actor_id is an unknown field and is rejected outright (400)
+        # rather than silently ignored — an even stronger guarantee that it can
+        # never reach the audit trail, and no player is written at all.
         admin = self._login("admin")
+        before = len(srv.STATE.api.store.all_players())
         status, body = self._req(
             admin, "POST", "/api/setup/player",
             {"team_id": srv.STATE.ids["home_team_id"], "name": "Forged Test Player",
              "position": "forward", "actor_id": FORGED_ACTOR})
-        self.assertEqual(status, 200)
-        entry = self._setup_audit_entry("player_added", body["id"])
-        self.assertEqual(entry.actor_id, self.admin_id)
-        self.assertNotEqual(entry.actor_id, FORGED_ACTOR)
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"]["details"]["reason"], "unknown_field")
+        self.assertIn("actor_id", body["error"]["details"]["fields"])
+        self.assertEqual(len(srv.STATE.api.store.all_players()), before)
 
     # -- /api/games/{id}/{action} ------------------------------------------
 
