@@ -155,6 +155,38 @@ class WriteSchemaHttpTest(unittest.TestCase):
         status, _headers, _body = self._req(admin, "POST", "/api/auth/logout")
         self.assertEqual(status, 200)
 
+    def test_malformed_post_on_get_only_route_is_405_not_400(self):
+        # The method contract is decided BEFORE the body is parsed (#271): a POST
+        # to a GET-only route (/api/players is GET-only; player creates go to the
+        # v2 setup routes) is 405 + Allow even when its body is malformed JSON —
+        # the malformed_json 400 must not mask the real method_not_allowed answer.
+        admin = self._admin()
+        status, headers, body = self._req(
+            admin, "POST", "/api/players", raw=b"{not valid json")
+        self.assertEqual(status, 405)
+        self.assertEqual(body["error"]["code"], "method_not_allowed")
+        allow = {m.strip() for m in headers.get("Allow", "").split(",")}
+        self.assertEqual(allow, {"GET", "HEAD", "OPTIONS"})
+
+    def test_malformed_post_on_unknown_route_is_404_not_400(self):
+        # A malformed POST to a path that supports no method at all is 404
+        # (unknown endpoint), never 400 malformed_json — the route is rejected
+        # before the body is ever read.
+        admin = self._admin()
+        status, _headers, body = self._req(
+            admin, "POST", "/api/nope", raw=b"{not valid json")
+        self.assertEqual(status, 404)
+        self.assertEqual(body["error"]["code"], "not_found")
+
+    def test_malformed_post_on_valid_post_route_is_400(self):
+        # Only a route that genuinely accepts POST reaches body parsing, so
+        # malformed JSON there is the 400 malformed_json it should be.
+        admin = self._admin()
+        status, _headers, body = self._req(
+            admin, "POST", "/api/accounts", raw=b"{not valid json")
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"]["code"], "malformed_json")
+
     # -- unknown-key rejection (criterion 1) ---------------------------------
     def test_unknown_key_on_account_create_is_rejected(self):
         admin = self._admin()

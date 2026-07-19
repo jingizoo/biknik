@@ -1506,6 +1506,14 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = self.path.split("?", 1)[0]
+        # Confirm the path actually supports POST *before* touching the body
+        # (#271). Otherwise a malformed body on a non-POST path 400s as
+        # ``malformed_json`` and masks the real answer: POST to a GET-only route
+        # (e.g. ``POST /api/players``) must be 405 + ``Allow``, and POST to an
+        # unknown path must be 404 — regardless of whether the body is valid
+        # JSON. Only a valid POST route may reject a malformed body with 400.
+        if "POST" not in self._supported_methods(path):
+            return self._unmatched_route("POST")
         api = STATE.api
         try:
             body = self._read_json_object()
