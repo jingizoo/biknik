@@ -27,7 +27,8 @@ from ..bootstrap import (
     installation_claim_status,
 )
 from ..domain import (
-    DomainError, ROLE_LABELS, Permission, Role, can, permissions_for,
+    AvailabilityStatus, DomainError, ROLE_LABELS, Permission, Role, can,
+    permissions_for,
 )
 from ..full_demo import build_full_demo_store
 from ..services import (
@@ -49,6 +50,7 @@ from ..api import v1_setup_adapter as _v1
 from ..api import v2_setup_projection as _v2p
 from .rate_limit import LoginThrottle, RateLimiter
 from .scope import can_read_private_game_data, own_team_id, scope_violation
+from .validation import BodyError, check_body, parse_json_object
 
 # Acting role resolution (#50): a server-issued session cookie is authoritative.
 # The X-Demo-Role header remains only as a dev fallback for scripts/curl; when
@@ -140,7 +142,126 @@ ERROR_HTTP_STATUS = {
     "claim_unavailable": 403,
     "conflict": 409,               # DB integrity conflict, translated (#201)
     "concurrency_conflict": 409,   # serialization/deadlock/lock, retryable (#201)
+    "malformed_json": 400,         # request body wasn't a JSON object (#271)
+    "method_not_allowed": 405,     # known path, unsupported HTTP method (#271)
+    "moved_to_v2": 409,            # v1 Player/Official CRUD moved to v2 (#271)
 }
+
+# Valid availability values, reused from the domain enum so the HTTP-layer
+# schema check (#271) can't drift from what the service accepts.
+_AVAILABILITY_VALUES = frozenset(s.value for s in AvailabilityStatus)
+
+
+# Method-405 routing table (#271). Two ordered lists of compiled path patterns
+# transcribed from the ``do_GET``/``do_POST`` dispatch below (an explicitly
+# scoped near-term list, a bounded child of #202). ``_method_fallback`` uses
+# them to answer an unsupported method with a JSON 405 + a correct ``Allow``
+# header instead of the stdlib's HTML 501. Every method/path claimed here is
+# verified against the real dispatch (see tests/test_write_schemas.py). The
+# game POST pattern enumerates only the ACTUAL write actions, so a read-only
+# subpath (``.../board``) is NOT claimed as POST.
+_GET_ROUTES = [re.compile(p) for p in (
+    r"^/api/demo/overview$",
+    r"^/api/setup/hierarchy$",
+    r"^/api/import/hierarchy-codes$",
+    r"^/api/setup/leagues/[^/]+/teams$",
+    r"^/api/setup/seasons/[^/]+/team-registrations$",
+    r"^/api/onboarding/status$",
+    r"^/api/v2/setup/overview$",
+    r"^/api/v2/setup/hierarchy$",
+    r"^/api/v2/setup/programs/[^/]+/teams$",
+    r"^/api/v2/setup/seasons/[^/]+/team-registrations$",
+    r"^/api/v2/setup/seasons/[^/]+/venue-access$",
+    r"^/api/v2/onboarding/status$",
+    r"^/api/bootstrap/status$",
+    r"^/api/status$",
+    r"^/api/health$",
+    r"^/api/readiness$",
+    r"^/api/auth/roles$",
+    r"^/api/auth/accounts$",
+    r"^/api/accounts$",
+    r"^/api/accounts/[^/]+/sessions$",
+    r"^/api/guardians/links$",
+    r"^/api/officials$",
+    r"^/api/players$",
+    r"^/api/reschedule/pending$",
+    r"^/api/officials/[^/]+/availability$",
+    r"^/api/notifications$",
+    r"^/api/notifications/deliveries$",
+    r"^/api/notifications/contacts$",
+    r"^/api/notifications/preferences$",
+    r"^/api/calendar-feeds$",
+    r"^/api/notifications/device-tokens$",
+    r"^/api/me/assignments$",
+    r"^/api/me/player-home$",
+    r"^/api/me/substitute-opportunities/[^/]+$",
+    r"^/api/me/guardian/home$",
+    r"^/api/me/guardian/[^/]+/substitute-opportunities/[^/]+$",
+    r"^/api/standings/[^/]+$",
+    r"^/api/standings/league-season/[^/]+/[^/]+$",
+    r"^/api/public/schedule$",
+    r"^/api/public/standings/[^/]+$",
+    r"^/api/public/standings/league-season/[^/]+/[^/]+$",
+    r"^/api/public/games/[^/]+$",
+    r"^/api/scheduler/drafts$",
+    r"^/api/auth/me$",
+    r"^/api/games/[^/]+(?:/(?:board|lineups|roster-status|roster|substitutes"
+    r"|substitute-candidates|substitute-addable|reschedule|officials"
+    r"|availability-summary))?$",
+)]
+_POST_ROUTES = [re.compile(p) for p in (
+    r"^/api/bootstrap/claim$",
+    r"^/api/auth/login$",
+    r"^/api/auth/logout$",
+    r"^/api/public/calendar-feeds$",
+    r"^/api/notifications/preferences$",
+    r"^/api/officials/[^/]+/availability$",
+    r"^/api/officials/availability/[^/]+/delete$",
+    r"^/api/games/[^/]+/reschedule/[^/]+/respond$",
+    r"^/api/calendar-feeds$",
+    r"^/api/calendar-feeds/[^/]+/revoke$",
+    r"^/api/me/substitute-opportunities/[^/]+/"
+    r"(?:enroll|withdraw|accept-offer|decline-offer)$",
+    r"^/api/me/guardian/[^/]+/games/[^/]+/availability$",
+    r"^/api/me/guardian/[^/]+/substitute-opportunities/[^/]+/"
+    r"(?:accept-offer|decline-offer)$",
+    r"^/api/reset$",
+    r"^/api/demo/(?:reset|load|clear)$",
+    r"^/api/admin/factory-reset/(?:preview|execute)$",
+    r"^/api/demo/add-ice-slot$",
+    r"^/api/v2/setup/.+$",
+    r"^/api/setup/.+$",
+    r"^/api/import/dry-run$",
+    r"^/api/import/commit/(?:teams-players|officials-availability"
+    r"|rinks-ice-slots)$",
+    r"^/api/scheduler/draft$",
+    r"^/api/scheduler/commit$",
+    r"^/api/scheduler/drafts/(?:publish|discard)$",
+    r"^/api/notifications/deliveries/process$",
+    r"^/api/notifications/deliveries/[^/]+/(?:retry|ignore)$",
+    r"^/api/notifications/contacts$",
+    r"^/api/notifications/contacts/[^/]+/active$",
+    r"^/api/notifications/device-tokens$",
+    r"^/api/notifications/device-tokens/[^/]+/active$",
+    r"^/api/notifications/preferences/[^/]+/active$",
+    r"^/api/accounts$",
+    r"^/api/accounts/[^/]+/active$",
+    r"^/api/accounts/[^/]+/scope$",
+    r"^/api/accounts/[^/]+/sessions/[^/]+/revoke$",
+    r"^/api/guardians/links$",
+    r"^/api/guardians/links/[^/]+/verify$",
+    r"^/api/notifications/read-all$",
+    r"^/api/notifications/[^/]+/read$",
+    r"^/api/officials/assignments/[^/]+/(?:accept|decline|unassign)$",
+    # Game write actions only (NOT the read-only subpaths above): a POST to a
+    # read subpath like ``.../board`` is a 404, never a real route.
+    r"^/api/games/[^/]+/(?:availability|availability/remind|build-roster"
+    r"|roster/select|roster/remove|roster/copy-previous|officials/assign"
+    r"|result|result/approve|publish|move|reschedule/request"
+    r"|reschedule/[^/]+/decide|substitutes/enroll|substitutes/withdraw"
+    r"|substitutes/add-candidate|substitutes/[^/]+/(?:offer|accept|decline"
+    r"|add-to-roster)|roster/lock|roster/unlock|cancel)$",
+)]
 
 
 def _json_default(obj):
@@ -679,15 +800,17 @@ class Handler(BaseHTTPRequestHandler):
             403)
         return True
 
-    def _read_body(self) -> dict:
+    def _read_json_object(self) -> dict:
+        """Read the request body as a JSON object (#271).
+
+        Replaces the old silent ``{}`` coercion of malformed JSON: an invalid or
+        non-object body raises ``BodyError`` (surfaced by ``do_POST`` as a stable
+        400) instead of quietly reaching business logic as an empty dict. An
+        empty body (no Content-Length) stays ``{}`` — many routes take no body.
+        """
         length = int(self.headers.get("Content-Length", 0) or 0)
-        if not length:
-            return {}
-        raw = self.rfile.read(length)
-        try:
-            return json.loads(raw or b"{}")
-        except json.JSONDecodeError:
-            return {}
+        raw = self.rfile.read(length) if length else b""
+        return parse_json_object(raw)
 
     def _serve_static(self, path: str) -> None:
         if path in ("/setup", "/setup/"):
@@ -1232,10 +1355,46 @@ class Handler(BaseHTTPRequestHandler):
                                               "message": "Unknown endpoint."}}, 404)
         return self._serve_static(path)
 
+    def _method_fallback(self, method: str) -> None:
+        """Answer a known path hit with an unsupported method (#271).
+
+        The stdlib returns an HTML 501 for any verb without a ``do_<METHOD>``
+        handler. Instead: a known path (matching a GET and/or POST pattern in
+        the routing table) → JSON 405 with a correct ``Allow`` header; an
+        unknown ``/api/...`` path → JSON 404; any other path → JSON 404.
+        """
+        path = self.path.split("?", 1)[0]
+        allowed = set()
+        if any(p.match(path) for p in _GET_ROUTES):
+            allowed.add("GET")
+        if any(p.match(path) for p in _POST_ROUTES):
+            allowed.add("POST")
+        if allowed:
+            allow = ", ".join(sorted(allowed))
+            return self._send_json({"error": {
+                "code": "method_not_allowed",
+                "message": f"The {method} method is not allowed for {path}.",
+                "details": {"allow": allow},
+            }}, 405, extra_headers=[("Allow", allow)])
+        return self._send_json({"error": {
+            "code": "not_found", "message": "Unknown endpoint."}}, 404)
+
+    def do_PUT(self):
+        self._method_fallback("PUT")
+
+    def do_PATCH(self):
+        self._method_fallback("PATCH")
+
+    def do_DELETE(self):
+        self._method_fallback("DELETE")
+
     def do_POST(self):
         path = self.path.split("?", 1)[0]
         api = STATE.api
-        body = self._read_body()
+        try:
+            body = self._read_json_object()
+        except BodyError as exc:
+            return self._send_json(exc.payload, exc.status)
         pid: Optional[str] = body.get("player_id")
         # There is deliberately no shared client-suppliable `actor`/`actor_id`
         # variable here (#136): every route below that writes to the audit
@@ -1783,21 +1942,18 @@ class Handler(BaseHTTPRequestHandler):
         # one (#67). No self-service signup — this is the only way an
         # account comes into existence besides the demo seed.
         if path == "/api/accounts":
-            # Reject unknown top-level fields (#266): the scope binding must
+            # Reject unknown top-level fields (#266/#271): the scope binding must
             # travel inside `scope` (e.g. {"scope": {"team_id": …}}). A misplaced
             # top-level `team_id` (or any stray key) would otherwise be silently
             # dropped, creating an unscoped Coach that looks assigned to the
-            # operator — so fail loudly instead of quietly ignoring it.
-            _ACCOUNT_FIELDS = {"username", "password", "role", "scope"}
-            unknown = sorted(k for k in (body or {}) if k not in _ACCOUNT_FIELDS)
-            if unknown:
-                return self._send_json({"error": {
-                    "code": "validation_error",
-                    "message": ("Unknown field(s): " + ", ".join(unknown)
-                                + ". The scope binding (e.g. team_id) must be "
-                                "sent inside \"scope\"."),
-                    "details": {"reason": "unknown_field", "fields": unknown},
-                }}, 400)
+            # operator — so fail loudly instead of quietly ignoring it. Required
+            # fields are named here too, before the service call.
+            try:
+                check_body(body, allowed={"username", "password", "role",
+                                          "scope"},
+                           required=("username", "password", "role"))
+            except BodyError as exc:
+                return self._send_json(exc.payload, exc.status)
             # Attribute the mint to the signed-in league admin (server-
             # resolved), never a client-supplied actor_id, so the audit
             # trail (#67) cannot be forged (#135).
@@ -1858,6 +2014,13 @@ class Handler(BaseHTTPRequestHandler):
         # Official accepts/declines a proposed assignment, or it's unassigned (#30).
         oa = re.match(r"^/api/officials/assignments/([^/]+)/(accept|decline|unassign)$", path)
         if oa:
+            # These verbs carry no body — the assignment id is in the path and
+            # the actor is the server-resolved session (#271): reject any key so
+            # a stray/typo'd field can't be silently ignored.
+            try:
+                check_body(body, allowed=set())
+            except BodyError as exc:
+                return self._send_json(exc.payload, exc.status)
             aid, op = oa.group(1), oa.group(2)
             if op == "unassign":
                 return self._send_api(api.unassign_official(aid, user_id))
@@ -1868,8 +2031,30 @@ class Handler(BaseHTTPRequestHandler):
         if m:
             gid, action = m.group(1), m.group(2)
             if action == "availability":
+                # Strict schema (#271): reject unknown keys so a typo'd status
+                # field can't be silently recorded as the default `pending`, and
+                # validate the status value against the domain enum before the
+                # write so nothing is recorded for a bad value.
+                try:
+                    check_body(body,
+                               allowed={"player_id", "availability_status",
+                                        "response_source"},
+                               types={"player_id": str,
+                                      "availability_status": str,
+                                      "response_source": str})
+                except BodyError as exc:
+                    return self._send_json(exc.payload, exc.status)
+                status_val = body.get("availability_status", "pending")
+                if status_val not in _AVAILABILITY_VALUES:
+                    return self._send_json({"error": {
+                        "code": "validation_error",
+                        "message": (f"'{status_val}' is not a valid availability "
+                                    "status."),
+                        "details": {"reason": "invalid_value",
+                                    "field": "availability_status"},
+                    }}, 400)
                 return self._send_api(api.set_availability(
-                    gid, pid, body.get("availability_status", "pending"),
+                    gid, pid, status_val,
                     body.get("response_source", "player"), user_id))
             if action == "availability/remind":
                 # One-click reminder to players who haven't responded (#89).
@@ -2050,6 +2235,22 @@ class Handler(BaseHTTPRequestHandler):
                       "game": _v1.game_to_v1}
             mapper = _to_v1.get(kind, lambda r: r)
             return self._send_api(mapper(deleter(md.group(2), actor_id)))
+        # Player/Official delete moved to v2 (#232/#271): the v1 delete regex
+        # above deliberately excludes them, so the old v1 path would otherwise
+        # fall through to a bare "Unknown setup entity" 404. Return an explicit
+        # moved_to_v2 (409) pointing at the canonical v2 route, which already
+        # supports player/official delete.
+        mmv = re.match(r"^(player|official)/([^/]+)/delete$", entity)
+        if mmv:
+            kind, rec = mmv.group(1), mmv.group(2)
+            route = f"/api/v2/setup/{kind}/{rec}/delete"
+            return self._send_json({"error": {
+                "code": "moved_to_v2",
+                "message": (f"{kind.capitalize()} delete has moved to v2. "
+                            f"Use POST {route} instead."),
+                "details": {"reason": "moved_to_v2", "entity": kind,
+                            "route": route},
+            }}, 409)
         # Season rollover (#180): copy a prior season's participation forward
         # into this one, reusing the permanent teams. body carries the source
         # season and an optional per-team target-division selection.
@@ -2125,6 +2326,16 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_api(api.create_official(
                 b.get("name"), b.get("home_club_id"), actor_id))
         if entity == "player":
+            # Strict schema (#271): name the missing required field (team_id /
+            # name / position) and reject unknown keys before the service call,
+            # so a missing team_id becomes a `field_required` validation_error
+            # rather than the old `NotFoundError("Team None not found.")`.
+            try:
+                check_body(b, allowed={"team_id", "name", "position",
+                                       "jersey_number", "email"},
+                           required=("team_id", "name", "position"))
+            except BodyError as exc:
+                return self._send_json(exc.payload, exc.status)
             return self._send_api(api.create_player(
                 b.get("team_id"), b.get("name"), b.get("position"),
                 jersey_number=b.get("jersey_number"), email=b.get("email"),
@@ -2366,6 +2577,14 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_api(api.create_official(
                 b.get("name"), b.get("home_club_id"), actor_id))
         if entity == "player":
+            # Strict schema (#271), same as the v1 route: required fields named,
+            # unknown keys rejected, before the service call.
+            try:
+                check_body(b, allowed={"team_id", "name", "position",
+                                       "jersey_number", "email"},
+                           required=("team_id", "name", "position"))
+            except BodyError as exc:
+                return self._send_json(exc.payload, exc.status)
             return self._send_api(api.create_player(
                 b.get("team_id"), b.get("name"), b.get("position"),
                 jersey_number=b.get("jersey_number"), email=b.get("email"),

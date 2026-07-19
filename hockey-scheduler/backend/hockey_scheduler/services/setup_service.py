@@ -2657,6 +2657,14 @@ class SetupService:
         a single new arrival. Validation mirrors import_validator's row
         checks (jersey_number > 0, an ``@`` with a ``.`` after it in email)
         so a manual create can't slip in data the bulk path would reject."""
+        # Name the missing required field (#271) BEFORE the team lookup, so a
+        # None/empty team_id is a clear `field_required` validation error rather
+        # than the misleading `NotFoundError("Team None not found.")` — correct
+        # even when the service is called directly, not just via the HTTP layer.
+        if not team_id:
+            raise ValidationError(
+                "team_id is required.",
+                {"reason": "field_required", "field": "team_id"})
         if self.store.get_team(team_id) is None:
             raise NotFoundError(f"Team {team_id} not found.")
         if jersey_number is not None and (
