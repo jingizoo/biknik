@@ -23,6 +23,11 @@ from collections import OrderedDict
 from typing import Dict, Iterable, List, Optional, Tuple
 
 from ..domain.enums import Position
+from ..domain.jersey import (
+    MAX_JERSEY_NUMBER,
+    MIN_JERSEY_NUMBER,
+    parse_jersey_cell,
+)
 
 
 HIERARCHY_SHEET_NAMES = (
@@ -228,6 +233,85 @@ def _group_first(rows: List[dict], code_field: str) -> OrderedDict:
     return grouped
 
 
+def _check_player_jersey_conflicts(report, player_rows, store, existing_teams,
+                                   upload_team_codes) -> None:
+    """Report import rows whose active-team jersey collides (#269).
+
+    Simulates the post-import active (team, jersey) occupancy so the preview
+    names every conflicting row up front with its Team, Player, and jersey —
+    both a duplicate WITHIN this upload and a collision against an EXISTING
+    active player. The store-side service check + partial unique index remain
+    the authoritative guarantee at commit (a conflict rolls back the whole
+    batch), so this is the operator-facing early report, not the enforcement.
+    """
+    def team_key(code):
+        # Existing teams resolve to their real id (shared with existing players);
+        # a team created in THIS upload gets a placeholder key so its imported
+        # players still collide with each other. An unknown code is skipped —
+        # the unknown_team_code error already covers it.
+        team = existing_teams.get(code)
+        if team is not None:
+            return team.id
+        if code in upload_team_codes:
+            return ("upload", code)
+        return None
+
+    # A player_code present in this upload UPDATES that existing player in place,
+    # so its current number must not seed occupancy — its own row re-places it.
+    upload_player_codes = {_clean(r.get("player_code")) for r in player_rows
+                           if not _blank(r.get("player_code"))}
+    existing_players = {
+        player.external_ref: player for player in store.all_players()
+        if player.external_ref}
+    occupancy = {}  # (team_key, jersey) -> existing active Players
+    for player in store.all_players():
+        if not player.is_active or player.jersey_number is None:
+            continue
+        if player.external_ref and player.external_ref in upload_player_codes:
+            continue
+        occupancy.setdefault((player.team_id, player.jersey_number), []).append(
+            player)
+
+    grouped = {}
+    for index, row in enumerate(player_rows, start=1):
+        jersey_number, reason = parse_jersey_cell(row.get("jersey_number"))
+        if reason is not None or jersey_number is None:
+            continue  # invalid/absent jersey handled by the range check
+        team_code = _optional(row.get("team_code"))
+        if team_code is None:
+            continue
+        key = team_key(team_code)
+        if key is None:
+            continue  # unknown team already reported
+        player_code = _optional(row.get("player_code"))
+        existing = existing_players.get(player_code)
+        # Hierarchy import preserves an existing player's active state. An
+        # inactive Player therefore does not reserve a number after this row.
+        if existing is not None and not existing.is_active:
+            continue
+        grouped.setdefault((key, jersey_number), []).append(
+            (index, team_code, player_code or f"row {index}"))
+
+    # Report every imported row participating in a collision. Reporting only
+    # the later row leaves the operator guessing which earlier row must change.
+    for occ_key, participants in grouped.items():
+        existing_holders = occupancy.get(occ_key, [])
+        if len(participants) < 2 and not existing_holders:
+            continue
+        upload_rows = ", ".join(str(item[0]) for item in participants)
+        holder_text = ""
+        if existing_holders:
+            holders = ", ".join(
+                f"{player.name} ({player.id})" for player in existing_holders)
+            holder_text = f"; existing active player(s): {holders}"
+        for index, team_code, _player_code in participants:
+            report.error(
+                "players", index, "duplicate_jersey_number",
+                f"Jersey number {occ_key[1]} on team {team_code} conflicts "
+                f"with upload row(s) {upload_rows}{holder_text}.",
+                "jersey_number")
+
+
 def validate_hierarchy_import(sheets: Dict[str, List[dict]], store) -> dict:
     """Validate every hierarchy reference before any write.
 
@@ -367,15 +451,12 @@ def validate_hierarchy_import(sheets: Dict[str, List[dict]], store) -> dict:
         if team_code and team_code not in known_team_codes_for_players:
             report.error("players", index, "unknown_team_code",
                          f"Unknown team_code {team_code}.", "team_code")
-        jersey = _optional(row.get("jersey_number"))
-        if jersey:
-            try:
-                if int(jersey) <= 0:
-                    raise ValueError
-            except ValueError:
-                report.error("players", index, "invalid_jersey_number",
-                            f"Invalid jersey_number {jersey!r}.",
-                            "jersey_number")
+        _jersey, jersey_reason = parse_jersey_cell(row.get("jersey_number"))
+        if jersey_reason is not None:
+            report.error("players", index, "invalid_jersey_number",
+                        f"Invalid jersey_number {row.get('jersey_number')!r} "
+                        f"(must be {MIN_JERSEY_NUMBER}-{MAX_JERSEY_NUMBER}).",
+                        "jersey_number")
         position = _optional(row.get("position"))
         if position and position.lower() not in valid_positions:
             report.error("players", index, "invalid_position",
@@ -386,6 +467,9 @@ def validate_hierarchy_import(sheets: Dict[str, List[dict]], store) -> dict:
             if at <= 0 or "." not in email[at + 1:]:
                 report.error("players", index, "invalid_email",
                             f"Invalid email {email!r}.", "email")
+
+    _check_player_jersey_conflicts(
+        report, rows["players"], store, existing_teams, upload_team_codes)
 
     # -- permanent teams + registrations + season venue access --------------
     # Codes may resolve from this upload or from existing external_refs.

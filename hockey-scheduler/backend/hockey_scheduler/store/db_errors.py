@@ -61,6 +61,41 @@ _CONCURRENCY_MESSAGE = (
     "Please retry.")
 
 _CONCURRENCY_REASONS = frozenset(_PG_CONCURRENCY.values())
+_ACTIVE_TEAM_JERSEY_CONSTRAINT = "ux_players_active_team_jersey"
+
+
+def translate_player_jersey_exception(
+        exc: BaseException, team_id: str, jersey_number) -> Optional[DomainError]:
+    """Translate migration 038's unique violation with domain-safe context.
+
+    The generic transaction boundary intentionally hides constraint/table names,
+    but the Player store methods know the attempted Team and jersey. Detect the
+    one specific driver constraint internally and return the same stable conflict
+    as the service pre-check, without exposing driver text or SQL metadata.
+    """
+    if isinstance(exc, DomainError):
+        return None
+    if not _is_active_team_jersey_violation(exc):
+        return None
+    return IntegrityConflictError(
+        f"Jersey number {jersey_number} is already worn by an active player "
+        "on this team.",
+        details={"reason": "duplicate_jersey_number",
+                 "team_id": team_id, "jersey_number": jersey_number})
+
+
+def _is_active_team_jersey_violation(exc: BaseException) -> bool:
+    sqlstate = getattr(exc, "sqlstate", None)
+    if sqlstate == "23505":
+        diag = getattr(exc, "diag", None)
+        return (getattr(diag, "constraint_name", None)
+                == _ACTIVE_TEAM_JERSEY_CONSTRAINT)
+    if isinstance(exc, sqlite3.IntegrityError):
+        text = str(exc)
+        return ("UNIQUE constraint failed" in text
+                and "players.team_id" in text
+                and "players.jersey_number" in text)
+    return False
 
 
 def translate_db_exception(exc: BaseException) -> Optional[DomainError]:

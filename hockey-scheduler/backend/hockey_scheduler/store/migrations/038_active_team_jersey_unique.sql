@@ -1,0 +1,32 @@
+-- At most one ACTIVE player per (team, jersey number) (#269).
+--
+-- The service layer already rejects a jersey worn by another active player on
+-- the same team (SetupService._assert_jersey_available) across create, import,
+-- edit, and reassignment — but that check-then-write is not safe under a
+-- cross-process race. A partial UNIQUE index makes the invariant hold in the
+-- database, so two concurrent writers can never both land the same active
+-- (team, jersey) pair; the loser's UNIQUE violation is translated to the same
+-- stable conflict the service raises (store.db_errors -> IntegrityConflictError).
+--
+-- The predicate is deliberately narrow, matching the service rule exactly:
+--   * is_active = 1  — only an ACTIVE player reserves a number. A player parked
+--     inactive frees the number for reuse, so inactive rows are unconstrained.
+--   * jersey_number IS NOT NULL — a player may have no number, and any number of
+--     a team's players may share "no number"; only concrete numbers are unique.
+-- Both SQLite and PostgreSQL treat NULLs as distinct in a unique index, so the
+-- explicit NOT NULL predicate keeps the index identical to the pre-migration
+-- check and to what the service enforces.
+--
+-- Portable across SQLite and PostgreSQL: both support partial unique indexes,
+-- and is_active is an INTEGER 0/1 column in both dialects (as with migration
+-- 022's cancelled = 0).
+--
+-- A forward-only pre-migration check (store.integrity_checks:
+-- assert_player_jersey_constraints_ready) reports both pre-existing active
+-- (team, jersey) duplicates and every non-null jersey outside 1..98 before this
+-- index is created. An upgrade against dirty data fails loudly with Player,
+-- Team, and jersey context rather than retaining the verified bad values or
+-- surfacing an opaque index-creation error from the driver.
+CREATE UNIQUE INDEX IF NOT EXISTS ux_players_active_team_jersey
+  ON players (team_id, jersey_number)
+  WHERE is_active = 1 AND jersey_number IS NOT NULL;

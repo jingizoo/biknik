@@ -5,18 +5,11 @@ spreadsheet-shaped rows for teams, players, officials, rinks, and ice slots
 and gets back a structured validation report — WITHOUT writing anything to
 the database. Commit/write flows are separate follow-up slices (#93-#96).
 
-Scope decision: teams/players/officials/rinks have no "external code" concept
-in the domain yet (only opaque store ids). This importer is the FIRST place
-introducing spreadsheet-style codes (``team_code``, ``player_code``,
-``official_code``, ``rink_code``), so a row's cross-sheet reference (a
-player's ``team_code``, an ice slot's ``rink_code``) is validated only
-against the OTHER SHEETS IN THE SAME UPLOAD, never against existing store
-records — there is no store lookup by external code yet. Mapping an external
-code to an existing (or new) store record is #93's job.
-
-``validate_import`` is a pure function: it never receives or touches a
-store, so "no database writes" holds by construction, not just by
-convention.
+The original dry-run predates persisted ``external_ref`` codes. Validation is
+still sheet-local for ordinary references, but #269 optionally supplies a store
+for one read-only purpose: simulate the post-import Player jersey occupancy and
+report collisions with existing active players. ``validate_import`` never writes;
+mapping and commit remain #93's job.
 
 CSV column shapes (header row + data rows; no template/UI in this slice):
     teams.csv:      team_code, team_name, club_name, division_name
@@ -32,7 +25,14 @@ import io
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
-from ..domain import IceSlotType, OfficialAvailabilityStatus, intervals_overlap
+from ..domain import (
+    IceSlotType,
+    MAX_JERSEY_NUMBER,
+    MIN_JERSEY_NUMBER,
+    OfficialAvailabilityStatus,
+    intervals_overlap,
+    parse_jersey_cell,
+)
 
 IMPORT_SHEET_NAMES = ("teams", "players", "officials", "rinks", "ice_slots")
 
@@ -143,22 +143,90 @@ def _codes(rows: List[dict], field: str) -> set:
     return {_clean(r.get(field)) for r in rows if not _blank(r.get(field))}
 
 
-def _check_players(report: _Report, rows: List[dict], team_codes: set) -> None:
+def _check_players(report: _Report, rows: List[dict], team_codes: set,
+                   store=None) -> None:
+    """Validate Player rows, including their post-import jersey occupancy.
+
+    The legacy preview originally had no store context.  When a store is
+    supplied, resolve uploaded team/player codes to the rows that the commit
+    path would update and compare the resulting active ``(team, jersey)``
+    state with existing players.  Grouping first lets us report *every* upload
+    row in a collision instead of only the second and later rows.
+    """
+    existing_teams = {}
+    existing_players = {}
+    occupancy = {}
+    upload_player_codes = {
+        _clean(row.get("player_code")) for row in rows
+        if not _blank(row.get("player_code"))}
+    if store is not None:
+        existing_teams = {
+            team.external_ref: team for team in store.all_teams()
+            if team.external_ref}
+        existing_players = {
+            player.external_ref: player for player in store.all_players()
+            if player.external_ref}
+        # Uploaded existing players are removed before being placed at their
+        # target team/jersey below; otherwise an unchanged re-import would
+        # falsely collide with itself.
+        for player in store.all_players():
+            if (not player.is_active or player.jersey_number is None
+                    or (player.external_ref
+                        and player.external_ref in upload_player_codes)):
+                continue
+            occupancy.setdefault(
+                (player.team_id, player.jersey_number), []).append(player)
+
+    grouped = {}
     for i, row in enumerate(rows, start=1):
         team_code = row.get("team_code")
-        if not _blank(team_code) and _clean(team_code) not in team_codes:
-            report.error("players", i, f"Unknown team_code {_clean(team_code)}",
+        team_code_clean = None if _blank(team_code) else _clean(team_code)
+        if team_code_clean is not None and team_code_clean not in team_codes:
+            report.error("players", i, f"Unknown team_code {team_code_clean}",
                         field="team_code")
-        jersey = row.get("jersey_number")
-        if _blank(jersey):
+        jersey_number, reason = parse_jersey_cell(row.get("jersey_number"))
+        if reason is not None:
+            report.error(
+                "players", i,
+                f"Invalid jersey_number {row.get('jersey_number')} "
+                f"(must be {MIN_JERSEY_NUMBER}-{MAX_JERSEY_NUMBER}).",
+                field="jersey_number")
             continue
-        try:
-            valid = int(_clean(jersey)) > 0
-        except ValueError:
-            valid = False
-        if not valid:
-            report.error("players", i, f"Invalid jersey_number {jersey}",
-                        field="jersey_number")
+        if team_code_clean is None:
+            continue
+
+        player_code = (None if _blank(row.get("player_code"))
+                       else _clean(row.get("player_code")))
+        existing = existing_players.get(player_code)
+        # The legacy commit leaves a blank jersey unchanged on update and never
+        # reactivates an inactive player, so mirror that exact target state.
+        target_jersey = (existing.jersey_number
+                         if jersey_number is None and existing is not None
+                         else jersey_number)
+        target_active = True if existing is None else existing.is_active
+        if target_jersey is None or not target_active:
+            continue
+        team = existing_teams.get(team_code_clean)
+        team_key = team.id if team is not None else ("upload", team_code_clean)
+        grouped.setdefault((team_key, target_jersey), []).append(
+            (i, team_code_clean, player_code or f"row {i}"))
+
+    for key, participants in grouped.items():
+        existing_holders = occupancy.get(key, [])
+        if len(participants) < 2 and not existing_holders:
+            continue
+        upload_rows = ", ".join(str(item[0]) for item in participants)
+        holder_text = ""
+        if existing_holders:
+            holders = ", ".join(
+                f"{player.name} ({player.id})" for player in existing_holders)
+            holder_text = f"; existing active player(s): {holders}"
+        for row_number, team_code, _player_code in participants:
+            report.error(
+                "players", row_number,
+                f"Duplicate jersey_number {key[1]} on team {team_code}; "
+                f"conflicting upload row(s): {upload_rows}{holder_text}.",
+                field="jersey_number")
 
 
 def _check_ice_slots(report: _Report, rows: List[dict], rink_codes: set) -> None:
@@ -210,8 +278,8 @@ def _check_overlaps(report: _Report, parsed_slots) -> None:
                     f"Slot overlaps another slot on the same rink (row {row_b}).")
 
 
-def validate_import(sheets: Dict[str, List[dict]]) -> dict:
-    """Validate spreadsheet-shaped import rows without touching the store.
+def validate_import(sheets: Dict[str, List[dict]], store=None) -> dict:
+    """Validate spreadsheet-shaped import rows without writing to the store.
 
     ``sheets`` maps sheet name -> list of row dicts; any of
     :data:`IMPORT_SHEET_NAMES` may be absent, treated as an empty sheet.
@@ -228,7 +296,8 @@ def validate_import(sheets: Dict[str, List[dict]]) -> dict:
     _check_email(report, "players", rows["players"])
     _check_email(report, "officials", rows["officials"])
 
-    _check_players(report, rows["players"], _codes(rows["teams"], "team_code"))
+    _check_players(report, rows["players"],
+                   _codes(rows["teams"], "team_code"), store=store)
     parsed_slots = _check_ice_slots(report, rows["ice_slots"],
                                     _codes(rows["rinks"], "rink_code"))
     _check_overlaps(report, parsed_slots)

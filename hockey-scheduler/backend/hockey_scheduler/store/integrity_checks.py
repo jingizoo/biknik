@@ -12,6 +12,8 @@ before that version's statements run (see ``_PRE_MIGRATION_CHECKS`` in
 ``sql_store``). They are plain SELECTs — no writes — so they are safe to re-run.
 """
 
+from ..domain.jersey import MAX_JERSEY_NUMBER, MIN_JERSEY_NUMBER
+
 
 class MigrationDataError(RuntimeError):
     """Existing data would violate a constraint a migration is about to add."""
@@ -826,3 +828,93 @@ def assert_regular_games_resolve_league_season(conn):
             f"{shown}{more}. Set each game's league, season, and division to a "
             "single existing LeagueSeason, or mark it an exhibition, before "
             "upgrading.")
+
+
+# -- #269 — active-team jersey uniqueness ----------------------------------
+#
+# Migration 038 adds a partial UNIQUE index on players(team_id, jersey_number)
+# WHERE is_active = 1 AND jersey_number IS NOT NULL. This read-only check reports
+# every (team, jersey) that ALREADY has more than one active player before the
+# index is created, so an upgrade against dirty data fails loudly with the
+# offending pairs named. Only active, concrete-jersey rows are considered, so it
+# matches the partial index exactly (NULL jerseys and inactive players are free
+# to repeat). Pure SELECT, portable across SQLite/PostgreSQL, safe to re-run.
+
+
+def find_duplicate_active_team_jerseys(conn):
+    """Concrete (team_id, jersey_number) pairs worn by >1 ACTIVE player.
+
+    Only ``is_active = 1`` rows with a non-null ``jersey_number`` are counted —
+    matching migration 038's partial unique index, which excludes inactive
+    players (they don't reserve a number) and NULL jerseys (a player may have
+    none). Returns a sorted list of ``(team_id, jersey_number)`` tuples.
+    """
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT team_id, jersey_number FROM players "
+        "WHERE is_active = 1 AND jersey_number IS NOT NULL "
+        "GROUP BY team_id, jersey_number HAVING COUNT(*) > 1")
+    return sorted((row["team_id"], row["jersey_number"])
+                  for row in cur.fetchall())
+
+
+def assert_no_duplicate_active_team_jerseys(conn):
+    """Abort migration 038 if any team has two active players sharing a jersey
+    number (#269)."""
+    duplicates = find_duplicate_active_team_jerseys(conn)
+    if duplicates:
+        pairs = [f"team {team}/#{jersey}" for team, jersey in duplicates[:20]]
+        more = "" if len(duplicates) <= 20 else f" (+{len(duplicates) - 20} more)"
+        raise MigrationDataError(
+            "Cannot enforce one active player per jersey number per team: "
+            f"{len(duplicates)} (team, jersey) pair(s) already have multiple "
+            f"active players: {', '.join(pairs)}{more}. Reassign or deactivate "
+            "the duplicates before upgrading.")
+
+
+def find_invalid_player_jersey_numbers(conn):
+    """Existing non-null jerseys outside the canonical ``1..98`` range.
+
+    Range validity applies to active and inactive Players alike; inactivity
+    releases uniqueness but does not make an invalid stored number valid.
+    Returns actionable ``(player_id, team_id, jersey_number, is_active)`` rows.
+    """
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT id, team_id, jersey_number, is_active FROM players "
+        "WHERE jersey_number IS NOT NULL "
+        f"AND (jersey_number < {MIN_JERSEY_NUMBER} "
+        f"OR jersey_number > {MAX_JERSEY_NUMBER}) ORDER BY id")
+    return [(row["id"], row["team_id"], row["jersey_number"],
+             bool(row["is_active"])) for row in cur.fetchall()]
+
+
+def assert_player_jersey_constraints_ready(conn):
+    """Abort migration 038 unless existing data satisfies both jersey rules."""
+    invalid = find_invalid_player_jersey_numbers(conn)
+    duplicates = find_duplicate_active_team_jerseys(conn)
+    if not invalid and not duplicates:
+        return
+
+    problems = []
+    if invalid:
+        shown = [
+            f"player {player} on team {team}/#{jersey} "
+            f"({'active' if active else 'inactive'})"
+            for player, team, jersey, active in invalid[:20]]
+        more = "" if len(invalid) <= 20 else f" (+{len(invalid) - 20} more)"
+        problems.append(
+            f"{len(invalid)} player(s) have a non-null jersey outside "
+            f"{MIN_JERSEY_NUMBER}..{MAX_JERSEY_NUMBER}: "
+            f"{', '.join(shown)}{more}")
+    if duplicates:
+        pairs = [f"team {team}/#{jersey}" for team, jersey in duplicates[:20]]
+        more = ("" if len(duplicates) <= 20
+                else f" (+{len(duplicates) - 20} more)")
+        problems.append(
+            f"{len(duplicates)} active (team, jersey) pair(s) are duplicated: "
+            f"{', '.join(pairs)}{more}")
+    raise MigrationDataError(
+        "Cannot enforce Player jersey constraints: " + "; ".join(problems)
+        + ". Reassign a valid jersey or deactivate/reassign duplicate active "
+          "players before upgrading.")
