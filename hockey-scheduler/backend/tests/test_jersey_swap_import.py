@@ -17,17 +17,14 @@ Covered on Memory, SQLite, and (when ``TEST_DATABASE_URL`` is set) PostgreSQL.
 """
 
 import os
-import threading
 import unittest
 
 from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
 import hierarchy_fixtures as fx
 
 from hockey_scheduler.api import ApiService
-from hockey_scheduler.domain import Team
 from hockey_scheduler.domain.errors import IntegrityConflictError
 from hockey_scheduler.services import SetupService
-from hockey_scheduler.services.import_validator import validate_import
 from hockey_scheduler.services.hierarchy_import import validate_hierarchy_import
 from hockey_scheduler.store import InMemoryStore, SqlStore
 
@@ -44,6 +41,10 @@ def _backends():
 
 _TEAMS_CSV = ("team_code,team_name,club_name,division_name\n"
               "T1,Team One,Lions,U16\n")
+
+_TWO_TEAMS_CSV = ("team_code,team_name,club_name,division_name\n"
+                  "T1,Team One,Lions,U16\n"
+                  "T2,Team Two,Falcons,U18\n")
 
 
 def _players_csv(*rows):
@@ -117,6 +118,63 @@ class LegacyImportSwapTest(unittest.TestCase):
                 if isinstance(store, SqlStore):
                     store.close()
 
+    def _seed_two_teams(self, store, *, second_team_players=()):
+        setup = SetupService(store)
+        api = ApiService(store)
+        program = setup.create_program("L", actor_id="a")
+        season = setup.create_season(program.id, "S", actor_id="a")
+        setup.create_league(season.id, "L1", actor_id="a")
+        api.commit_teams_players_import(
+            season.id,
+            {"teams_csv": _TWO_TEAMS_CSV,
+             "players_csv": _players_csv(
+                 "P1,Ann,X,T1,7,forward,", *second_team_players)},
+            actor_id="a")
+        return setup, api, season
+
+    def test_team_move_with_blank_jersey_keeps_the_number(self):
+        # A Team move whose jersey cell is blank must KEEP the existing number,
+        # never erase it to NULL through the swap-safe staging (#292 review).
+        for label, store in _backends():
+            with self.subTest(backend=label):
+                setup, api, season = self._seed_two_teams(store)
+                t2 = next(t for t in store.all_teams()
+                          if t.external_ref == "T2")
+                move = {"teams_csv": _TWO_TEAMS_CSV,
+                        "players_csv": _players_csv("P1,Ann,X,T2,,forward,")}
+                res = api.commit_teams_players_import(season.id, move,
+                                                      actor_id="a")
+                self.assertTrue(res["committed"], (label, res))
+                p1 = next(p for p in store.all_players()
+                          if p.external_ref == "P1")
+                self.assertEqual(p1.team_id, t2.id, label)      # Team changed
+                self.assertEqual(p1.jersey_number, 7, label)    # number kept
+                if isinstance(store, SqlStore):
+                    store.close()
+
+    def test_team_move_blank_jersey_into_occupied_number_writes_nothing(self):
+        # Moving P1 (keeps #7) onto T2, which already has an active #7, is a
+        # true final-state collision — zero writes, zero audits, unchanged rows.
+        for label, store in _backends():
+            with self.subTest(backend=label):
+                setup, api, season = self._seed_two_teams(
+                    store, second_team_players=("P2,Bob,Y,T2,7,forward,",))
+                before = {p.external_ref: (p.team_id, p.jersey_number)
+                          for p in store.all_players()}
+                audits_before = len(_player_audits(store))
+                move = {"teams_csv": _TWO_TEAMS_CSV,
+                        "players_csv": _players_csv("P1,Ann,X,T2,,forward,")}
+                res = api.commit_teams_players_import(season.id, move,
+                                                      actor_id="a")
+                self.assertIsNot(res.get("committed"), True, (label, res))
+                after = {p.external_ref: (p.team_id, p.jersey_number)
+                         for p in store.all_players()}
+                self.assertEqual(after, before, label)          # nothing moved
+                self.assertEqual(len(_player_audits(store)), audits_before,
+                                 label)
+                if isinstance(store, SqlStore):
+                    store.close()
+
 
 class HierarchyImportSwapTest(unittest.TestCase):
     """Nine-sheet hierarchy import: swap, cross-team exchange, true collision."""
@@ -184,6 +242,35 @@ class HierarchyImportSwapTest(unittest.TestCase):
                 if isinstance(store, SqlStore):
                     store.close()
 
+    def test_team_move_keeping_jersey_does_not_falsely_audit_jersey(self):
+        # A Team-only move that keeps the same explicit number is released to
+        # NULL during staging; the single final audit must describe the real
+        # change (Team) and must NOT claim a jersey change (#292 review).
+        for label, store in _backends():
+            with self.subTest(backend=label):
+                api = ApiService(store)
+                api.commit_hierarchy_import(
+                    fx.full_payload(players_csv=self._two(7, 8)), actor_id="a")
+                # P1 was LIONS#7; move to BEARS, still #7. P2 stays LIONS#8.
+                api.commit_hierarchy_import(
+                    fx.full_payload(players_csv=self._two(7, 8, team1="BEARS")),
+                    actor_id="a")
+                p1 = next(p for p in store.all_players()
+                          if p.external_ref == "P1")
+                bears = next(t for t in store.all_teams()
+                             if t.external_ref == "BEARS")
+                self.assertEqual(p1.team_id, bears.id, label)   # Team changed
+                self.assertEqual(p1.jersey_number, 7, label)    # number kept
+                updates = [a for a in store.all_setup_audit()
+                           if a.action == "player_updated"
+                           and a.detail.get("external_ref") == "P1"]
+                self.assertTrue(updates, label)
+                changed = updates[-1].detail.get("changed_fields", [])
+                self.assertIn("team_id", changed, label)
+                self.assertNotIn("jersey_number", changed, label)
+                if isinstance(store, SqlStore):
+                    store.close()
+
 
 def _parse(csv_text):
     import csv as _csvmod
@@ -219,45 +306,13 @@ class LostRaceConflictContextTest(unittest.TestCase):
         finally:
             store.close()
 
-    @unittest.skipUnless(os.environ.get("TEST_DATABASE_URL"),
-                         "cross-connection race needs PostgreSQL")
-    def test_forced_postgres_race_carries_full_conflict_context(self):
-        url = os.environ["TEST_DATABASE_URL"]
-        seed = SqlStore(url)
-        seed.reset_schema()
-        seed.add_team(Team(id="race_t", name="Race"))
-        seed.close()
-        barrier = threading.Barrier(2)
-        outcomes = {}
-
-        def attempt(pid):
-            store = SqlStore(url)
-            api = ApiService(store)
-            try:
-                barrier.wait(timeout=5)
-                res = api.create_player("race_t", f"Name {pid}", "forward",
-                                        jersey_number=7)
-                outcomes[pid] = res
-            finally:
-                store.close()
-
-        threads = [threading.Thread(target=attempt, args=(p,))
-                   for p in ("p_a", "p_b")]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join(timeout=10)
-
-        errors = [r for r in outcomes.values() if "error" in r]
-        wins = [r for r in outcomes.values() if "error" not in r]
-        self.assertEqual(len(wins), 1, outcomes)
-        self.assertEqual(len(errors), 1, outcomes)
-        d = errors[0]["error"]["details"]
-        self.assertEqual(d["reason"], "duplicate_jersey_number")
-        self.assertEqual(d["team_id"], "race_t")
-        self.assertEqual(d["jersey_number"], 7)
-        self.assertIn("conflicting_player_id", d)
-        self.assertNotIn("email", d)
+    # The authoritative forced-race journey lives in
+    # test_jersey_number_rules.JerseyRaceTest: it holds the two-thread barrier
+    # AFTER both service pre-checks observe a free slot, so the DATABASE index
+    # (not the pre-check) decides the race, and asserts the enriched
+    # conflicting-player context. A barrier before create_player can let one
+    # request finish first and exercise only the pre-check path, so it is not
+    # reproduced here.
 
 
 if __name__ == "__main__":

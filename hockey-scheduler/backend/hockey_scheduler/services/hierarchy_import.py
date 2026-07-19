@@ -1184,7 +1184,11 @@ def commit_hierarchy_import(setup, sheets: Dict[str, List[dict]],
         # Swap-safe apply (#292): release every existing player's jersey whose
         # final slot moves, BEFORE any per-row assignment, so a valid same-team
         # (or cross-team) swap commits without a transient uniqueness failure.
-        setup.release_batch_player_jerseys(
+        # The returned map preserves each released player's ORIGINAL number so
+        # the per-row upsert diffs against the operator's real before-value, not
+        # the transient NULL (a Team-only move keeping the same number must not
+        # falsely audit a jersey change).
+        released = setup.release_batch_player_jerseys(
             (players.get(_clean(row.get("player_code"))),
              teams[_clean(row.get("team_code"))].id,
              int(_optional(row.get("jersey_number")))
@@ -1196,12 +1200,17 @@ def commit_hierarchy_import(setup, sheets: Dict[str, List[dict]],
             jersey = _optional(row.get("jersey_number"))
             name = (f"{_clean(row.get('first_name'))} "
                     f"{_clean(row.get('last_name'))}").strip()
+            existing_player = players.get(code)
+            extra = {}
+            if existing_player is not None:
+                extra["staged_original_jersey"] = released.get(
+                    existing_player.id, existing_player.jersey_number)
             obj, created, changed = setup.upsert_imported_player(
                 code, name, team.id,
                 Position(_clean(row.get("position")).lower()),
                 int(jersey) if jersey else None, _optional(row.get("email")),
-                existing=players.get(code), actor_id=actor_id,
-                import_batch_id=batch_id)
+                existing=existing_player, actor_id=actor_id,
+                import_batch_id=batch_id, **extra)
             players[code] = obj
             _tally("players", created, changed)
 

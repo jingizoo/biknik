@@ -715,10 +715,18 @@ class JerseyRaceTest(unittest.TestCase):
         self.assertEqual(len(winners), 1, results)
         self.assertEqual(len(losers), 1, results)
         self.assertEqual(losers[0]["error"]["code"], "conflict")
-        self.assertEqual(
-            losers[0]["error"]["details"],
-            {"reason": "duplicate_jersey_number",
-             "team_id": "race_t", "jersey_number": 7})
+        # The lost race must carry the SAME context the service pre-check does,
+        # including the winning holder (#292) — enriched post-rollback, never
+        # any contact/private field.
+        d = losers[0]["error"]["details"]
+        self.assertEqual(d["reason"], "duplicate_jersey_number")
+        self.assertEqual(d["team_id"], "race_t")
+        self.assertEqual(d["jersey_number"], 7)
+        winner_id = [res for res in results.values()
+                     if "error" not in res][0]["id"]
+        self.assertEqual(d["conflicting_player_id"], winner_id)
+        self.assertIn("conflicting_player_name", d)
+        self.assertNotIn("email", d)
         checker = SqlStore(url)
         try:
             cur = checker.conn.cursor()

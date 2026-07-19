@@ -71,6 +71,12 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+# Sentinel distinguishing "argument omitted" from an explicit value (including
+# None). Used by the swap-safe import staging (#292) to tell a per-row upsert
+# whether a pre-release original jersey was supplied.
+_UNSET = object()
+
+
 def _blank(value) -> bool:
     return value is None or not str(value).strip()
 
@@ -2514,7 +2520,8 @@ class SetupService:
                                position: Position, jersey_number: Optional[int],
                                email: Optional[str], existing=None,
                                actor_id: Optional[str] = None,
-                               import_batch_id: Optional[str] = None):
+                               import_batch_id: Optional[str] = None,
+                               staged_original_jersey=_UNSET):
         """Upsert a Player by its stable player_code (#260), syncing an
         optional email the same way ``add_player`` does: an existing
         ``player:<id>`` ContactDestination's value is updated in place,
@@ -2546,6 +2553,13 @@ class SetupService:
             created, changed = True, []
         else:
             obj = existing
+            # If a swap-safe pre-pass released this row's jersey to NULL (#292),
+            # restore its real pre-staging value BEFORE diffing so the change
+            # set reflects the operator's true before→after — a Team-only move
+            # that keeps the same number must NOT report a jersey change, and a
+            # blank/keep-current cell must land the original, not the NULL.
+            if staged_original_jersey is not _UNSET:
+                obj.jersey_number = staged_original_jersey
             changed = self._apply_changes(obj, values)
             if changed:
                 self.store.save_player(obj)
@@ -2708,7 +2722,7 @@ class SetupService:
                      "conflicting_player_id": other.id,
                      "conflicting_player_name": other.name})
 
-    def release_batch_player_jerseys(self, assignments) -> None:
+    def release_batch_player_jerseys(self, assignments) -> dict:
         """Stage a batch import's jersey moves so a valid swap can commit (#292).
 
         A sequential per-row apply cannot commit an otherwise-valid same-team
@@ -2730,8 +2744,13 @@ class SetupService:
         ``assignments`` is an iterable of ``(existing_player, final_team_id,
         final_jersey)``; new players (``existing_player is None``), inactive
         players, numberless players, and players staying in the same slot are
-        skipped.
+        skipped. Returns ``{player_id: pre-release jersey_number}`` for exactly
+        the players it released, so the apply step can restore each real
+        original — a blank/keep-current cell must land the ORIGINAL number, not
+        the transient NULL (#292 review), and the single final audit must
+        describe the operator's real before→after, not the staging.
         """
+        released = {}
         for existing, final_team_id, final_jersey in assignments:
             if existing is None or not existing.is_active:
                 continue
@@ -2740,8 +2759,10 @@ class SetupService:
             if (existing.team_id, existing.jersey_number) == (
                     final_team_id, final_jersey):
                 continue  # staying put → keep it so real collisions still catch
+            released[existing.id] = existing.jersey_number
             existing.jersey_number = None
             self.store.save_player(existing)
+        return released
 
     # -- convenience: add a player to a team ------------------------------
     @_transactional
@@ -3082,7 +3103,7 @@ class SetupService:
                 jersey = (int(_clean(raw)) if not _blank(raw)
                           else (existing.jersey_number if existing else None))
                 return existing, team_id, jersey
-            self.release_batch_player_jerseys(
+            released = self.release_batch_player_jerseys(
                 _final_slot(row) for row in player_rows)
 
             for row in player_rows:
@@ -3111,19 +3132,22 @@ class SetupService:
                               if p.external_ref == player_code), None)
                 if player is not None:
                     # Partial-field-overwrite: only fields the sheet actually
-                    # supplies this time are updated. A blank jersey cell leaves
-                    # the existing number in place, so the uniqueness check uses
-                    # the resulting number on the resulting team (#269), before
-                    # any write — a collision aborts the whole batch, zero rows.
+                    # supplies this time are updated. A blank jersey cell keeps
+                    # the existing number — resolved from the ORIGINAL captured
+                    # before the swap-safe release (#292), never the transient
+                    # NULL the release wrote, so a Team move with a blank cell
+                    # never erases the number. The uniqueness check uses the
+                    # resulting number on the resulting team (#269), before any
+                    # write — a collision aborts the whole batch, zero rows.
+                    original_jersey = released.get(player.id, player.jersey_number)
                     target_jersey = (jersey_number if jersey_number is not None
-                                     else player.jersey_number)
+                                     else original_jersey)
                     if player.is_active:
                         self._assert_jersey_available(
                             team_id, target_jersey, exclude_player_id=player.id)
                     player.name = full_name
                     player.team_id = team_id
-                    if jersey_number is not None:
-                        player.jersey_number = jersey_number
+                    player.jersey_number = target_jersey
                     if position is not None:
                         player.position = position
                     self.store.save_player(player)
