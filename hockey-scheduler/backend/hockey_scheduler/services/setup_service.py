@@ -2798,7 +2798,7 @@ class SetupService:
         # program of the season being imported into.
         season_league_id = _season.program_id
 
-        result = validate_import(sheets)
+        result = validate_import(sheets, store=self.store)
         if not result["ok"]:
             return {"committed": False, "summary": result["summary"],
                     "errors": result["errors"], "warnings": result["warnings"]}

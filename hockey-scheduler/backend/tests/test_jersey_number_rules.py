@@ -41,7 +41,9 @@ from hockey_scheduler.store import InMemoryStore, SqlStore
 from hockey_scheduler.store.integrity_checks import (
     MigrationDataError,
     assert_no_duplicate_active_team_jerseys,
+    assert_player_jersey_constraints_ready,
     find_duplicate_active_team_jerseys,
+    find_invalid_player_jersey_numbers,
 )
 from hockey_scheduler.store.sql_store import migrate
 from hockey_scheduler.web import server as srv
@@ -325,9 +327,9 @@ class HttpJerseyTest(unittest.TestCase):
 # Import previews report conflicts; a failed preview commits nothing          #
 # --------------------------------------------------------------------------- #
 class LegacyImportPreviewTest(unittest.TestCase):
-    def _players(self, rows):
+    def _players(self, rows, store=None):
         return validate_import({"teams": [{"team_code": "T1", "team_name": "T"}],
-                                "players": rows})
+                                "players": rows}, store=store)
 
     def test_out_of_range_jersey_is_reported(self):
         r = self._players([{"player_code": "P1", "first_name": "A",
@@ -341,12 +343,32 @@ class LegacyImportPreviewTest(unittest.TestCase):
             {"player_code": "P1", "first_name": "A", "last_name": "B",
              "team_code": "T1", "jersey_number": "9"},
             {"player_code": "P2", "first_name": "C", "last_name": "D",
+             "team_code": "T1", "jersey_number": "9"},
+            {"player_code": "P3", "first_name": "E", "last_name": "F",
              "team_code": "T1", "jersey_number": "9"}])
         self.assertFalse(r["ok"])
         dupes = [e for e in r["errors"]
                  if e["field"] == "jersey_number" and "Duplicate" in e["message"]]
-        self.assertEqual(len(dupes), 1)
-        self.assertEqual(dupes[0]["row"], 2)
+        self.assertEqual({e["row"] for e in dupes}, {1, 2, 3})
+
+    def test_existing_active_player_collision_is_reported(self):
+        store = InMemoryStore()
+        store.add_team(Team(id="team_t1", name="T", external_ref="T1"))
+        store.add_player(Player(
+            id="existing", team_id="team_t1", name="Existing",
+            position=Position.FORWARD, jersey_number=9, external_ref="PX"))
+        # Exercise the live legacy preview facade, not only the validator, so a
+        # regression that stops passing the store cannot silently return.
+        result = ApiService(store).get_import_dry_run({
+            "teams_csv": "team_code,team_name\nT1,T\n",
+            "players_csv": (
+                "player_code,first_name,last_name,team_code,jersey_number\n"
+                "P1,A,B,T1,9\n")})
+        conflicts = [e for e in result["errors"]
+                     if e.get("field") == "jersey_number"]
+        self.assertEqual([e["row"] for e in conflicts], [1])
+        self.assertIn("Existing", conflicts[0]["message"])
+        self.assertIn("existing", conflicts[0]["message"])
 
     def test_same_jersey_different_teams_within_upload_is_ok(self):
         r = validate_import({
@@ -389,12 +411,13 @@ class HierarchyImportPreviewTest(unittest.TestCase):
                 "position": "forward"}
 
     def test_within_upload_duplicate_is_reported_with_context(self):
-        sheets = _hier_sheets([self._prow("P1", 9), self._prow("P2", 9)])
+        sheets = _hier_sheets([
+            self._prow("P1", 9), self._prow("P2", 9), self._prow("P3", 9)])
         result = validate_hierarchy_import(sheets, self.store)
         self.assertFalse(result["ok"])
         dupes = [e for e in result["errors"]
                  if e.get("code") == "duplicate_jersey_number"]
-        self.assertEqual(len(dupes), 1)
+        self.assertEqual({e["row"] for e in dupes}, {1, 2, 3})
         self.assertIn("T1", dupes[0]["message"])
         self.assertIn("9", dupes[0]["message"])
 
@@ -521,6 +544,37 @@ class JerseyPreMigrationTest(unittest.TestCase):
             finally:
                 self._cleanup(store)
 
+    def test_out_of_range_existing_rows_abort_with_player_context(self):
+        for label, url in _sql_backends():
+            store = _fresh(url)
+            _downgrade_038(store)
+            try:
+                with store.transaction():
+                    store.add_player(_player("bad_0", "t1", 0))
+                    store.add_player(_player("bad_99", "t1", 99,
+                                             active=False))
+                    store.add_player(_player("bad_131", "t2", 131))
+                    store.add_player(_player("valid_1", "t1", 1))
+                    store.add_player(_player("valid_98", "t1", 98))
+                    store.add_player(_player("inactive_valid", "t1", 7,
+                                             active=False))
+                    store.add_player(_player("null_ok", "t1", None))
+                invalid = find_invalid_player_jersey_numbers(store.conn)
+                self.assertEqual(
+                    [(row[0], row[2]) for row in invalid],
+                    [("bad_0", 0), ("bad_131", 131), ("bad_99", 99)], label)
+                with self.assertRaises(MigrationDataError, msg=label) as ctx:
+                    assert_player_jersey_constraints_ready(store.conn)
+                message = str(ctx.exception)
+                for token in ("bad_0", "#0", "bad_99", "#99",
+                              "bad_131", "#131"):
+                    self.assertIn(token, message, label)
+                with self.assertRaises(MigrationDataError, msg=label):
+                    migrate(store.conn, store.dialect)
+                self.assertNotIn(_VERSION, store.migration_status()["applied"])
+            finally:
+                self._cleanup(store)
+
     def test_clean_upgrade_applies(self):
         for label, url in _sql_backends():
             store = _fresh(url)
@@ -547,8 +601,9 @@ class JerseyConstraintEnforcementTest(unittest.TestCase):
                 with self.assertRaises(IntegrityConflictError, msg=label) as ctx:
                     with store.transaction():
                         store.add_player(_player("b", "t1", 7))
-                self.assertEqual(ctx.exception.details["reason"],
-                                 "unique_violation", label)
+                self.assertEqual(ctx.exception.details,
+                                 {"reason": "duplicate_jersey_number",
+                                  "team_id": "t1", "jersey_number": 7}, label)
             finally:
                 store.close()
 
@@ -621,10 +676,18 @@ class JerseyRaceTest(unittest.TestCase):
             store = SqlStore(url)
             api = ApiService(store)
             try:
-                barrier.wait(timeout=5)
+                # Force both service checks to observe the number as free before
+                # either insert begins; the DB index must decide the race.
+                original = api.setup._assert_jersey_available
+
+                def checked_then_wait(*args, **kwargs):
+                    original(*args, **kwargs)
+                    barrier.wait(timeout=5)
+
+                api.setup._assert_jersey_available = checked_then_wait
                 res = api.create_player("race_t", pid, "forward",
                                         jersey_number=7)
-                results[pid] = "won" if "error" not in res else res["error"]["code"]
+                results[pid] = res
             except Exception as exc:  # pragma: no cover
                 results[pid] = f"error:{exc!r}"
             finally:
@@ -637,7 +700,16 @@ class JerseyRaceTest(unittest.TestCase):
         for t in threads:
             t.join(timeout=10)
 
-        self.assertEqual(sorted(results.values()), ["conflict", "won"], results)
+        self.assertEqual(len(results), 2, results)
+        winners = [res for res in results.values() if "error" not in res]
+        losers = [res for res in results.values() if "error" in res]
+        self.assertEqual(len(winners), 1, results)
+        self.assertEqual(len(losers), 1, results)
+        self.assertEqual(losers[0]["error"]["code"], "conflict")
+        self.assertEqual(
+            losers[0]["error"]["details"],
+            {"reason": "duplicate_jersey_number",
+             "team_id": "race_t", "jersey_number": 7})
         checker = SqlStore(url)
         try:
             cur = checker.conn.cursor()

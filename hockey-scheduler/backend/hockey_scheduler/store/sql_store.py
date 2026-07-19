@@ -79,19 +79,19 @@ from ..domain import (
 from ..domain.enums import NotificationType
 from ..domain.errors import IntegrityConflictError
 from .db import connect
-from .db_errors import translate_db_exception
+from .db_errors import translate_db_exception, translate_player_jersey_exception
 from .integrity_checks import (
     assert_competition_hierarchy_reset_ready,
     assert_competition_reset_ready_c1b,
     assert_regular_games_resolve_league_season,
     assert_no_duplicate_active_ice_slots,
-    assert_no_duplicate_active_team_jerseys,
     assert_no_duplicate_result_games,
     assert_no_duplicate_roster_players,
     assert_result_games_exist,
     assert_results_have_game,
     assert_roster_refs_exist,
     assert_venue_season_access_backfill_ready,
+    assert_player_jersey_constraints_ready,
 )
 
 
@@ -349,7 +349,7 @@ _PRE_MIGRATION_CHECKS = {
     "029_season_venue_access": assert_venue_season_access_backfill_ready,
     "035_competition_hierarchy_reset": assert_competition_hierarchy_reset_ready,
     "037_game_league_season": assert_regular_games_resolve_league_season,
-    "038_active_team_jersey_unique": assert_no_duplicate_active_team_jerseys,
+    "038_active_team_jersey_unique": assert_player_jersey_constraints_ready,
 }
 
 
@@ -717,11 +717,23 @@ class SqlStore:
     def save_team(self, team): return self._update(team)
     def teams_for_program(self, program_id):
         return self._query(Team, "program_id = ?", (program_id,), order="id")
-    def add_player(self, player): return self._insert(player)
+    def _write_player(self, write, player):
+        try:
+            return write(player)
+        except Exception as exc:
+            translated = translate_player_jersey_exception(
+                exc, player.team_id, player.jersey_number)
+            if translated is not None:
+                raise translated from exc
+            raise
+
+    def add_player(self, player):
+        return self._write_player(self._insert, player)
     def get_player(self, player_id): return self._get(Player, player_id)
     def get_player_for_update(self, player_id):
         return self._get_for_update(Player, player_id)
-    def save_player(self, player): return self._update(player)
+    def save_player(self, player):
+        return self._write_player(self._update, player)
 
     def players_for_team(self, team_id):
         return self._query(Player, "team_id = ?", (team_id,), order="id")

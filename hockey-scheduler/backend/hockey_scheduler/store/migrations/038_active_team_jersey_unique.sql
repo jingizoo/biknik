@@ -22,10 +22,11 @@
 -- 022's cancelled = 0).
 --
 -- A forward-only pre-migration check (store.integrity_checks:
--- assert_no_duplicate_active_team_jerseys) reports any pre-existing active
--- (team, jersey) duplicates before this index is created, so an upgrade against
--- dirty data fails loudly with the offending team/jersey named rather than an
--- opaque index-creation error from the driver.
+-- assert_player_jersey_constraints_ready) reports both pre-existing active
+-- (team, jersey) duplicates and every non-null jersey outside 1..98 before this
+-- index is created. An upgrade against dirty data fails loudly with Player,
+-- Team, and jersey context rather than retaining the verified bad values or
+-- surfacing an opaque index-creation error from the driver.
 CREATE UNIQUE INDEX IF NOT EXISTS ux_players_active_team_jersey
   ON players (team_id, jersey_number)
   WHERE is_active = 1 AND jersey_number IS NOT NULL;

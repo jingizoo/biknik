@@ -3988,9 +3988,11 @@ class ApiService:
         key may be absent (treated as an empty sheet). Parses each present
         sheet, then delegates to the pure :func:`validate_import` — this
         method (and everything it calls) never touches ``self.store``.
-        Row-level problems are collected into the returned report rather than
-        raised; ``@catch`` here only guards a malformed request itself (e.g. a
-        non-string CSV value).
+        The validator receives the store read-only so a Player preview can
+        evaluate the post-import jersey state against existing active players;
+        it never writes. Row-level problems are collected into the returned
+        report rather than raised; ``@catch`` here only guards a malformed
+        request itself (e.g. a non-string CSV value).
         """
         sheets_csv = sheets_csv or {}
         sheets = {}
@@ -4001,7 +4003,7 @@ class ApiService:
             if not isinstance(text, str):
                 raise ValidationError(f"{name}_csv must be a CSV text string.")
             sheets[name] = parse_csv_text(text)
-        return validate_import(sheets)
+        return validate_import(sheets, store=self.store)
 
     # ====================================================================
     # Pilot onboarding import — teams + players commit (#93)

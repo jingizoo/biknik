@@ -260,15 +260,19 @@ def _check_player_jersey_conflicts(report, player_rows, store, existing_teams,
     # so its current number must not seed occupancy — its own row re-places it.
     upload_player_codes = {_clean(r.get("player_code")) for r in player_rows
                            if not _blank(r.get("player_code"))}
-    occupancy = {}  # (team_key, jersey) -> (kind, label)
+    existing_players = {
+        player.external_ref: player for player in store.all_players()
+        if player.external_ref}
+    occupancy = {}  # (team_key, jersey) -> existing active Players
     for player in store.all_players():
         if not player.is_active or player.jersey_number is None:
             continue
         if player.external_ref and player.external_ref in upload_player_codes:
             continue
-        occupancy[(player.team_id, player.jersey_number)] = (
-            "existing", player.name)
+        occupancy.setdefault((player.team_id, player.jersey_number), []).append(
+            player)
 
+    grouped = {}
     for index, row in enumerate(player_rows, start=1):
         jersey_number, reason = parse_jersey_cell(row.get("jersey_number"))
         if reason is not None or jersey_number is None:
@@ -279,19 +283,33 @@ def _check_player_jersey_conflicts(report, player_rows, store, existing_teams,
         key = team_key(team_code)
         if key is None:
             continue  # unknown team already reported
-        occ_key = (key, jersey_number)
-        holder = occupancy.get(occ_key)
-        if holder is not None:
-            kind, label = holder
-            who = ("an existing active player" if kind == "existing"
-                   else "another imported player")
+        player_code = _optional(row.get("player_code"))
+        existing = existing_players.get(player_code)
+        # Hierarchy import preserves an existing player's active state. An
+        # inactive Player therefore does not reserve a number after this row.
+        if existing is not None and not existing.is_active:
+            continue
+        grouped.setdefault((key, jersey_number), []).append(
+            (index, team_code, player_code or f"row {index}"))
+
+    # Report every imported row participating in a collision. Reporting only
+    # the later row leaves the operator guessing which earlier row must change.
+    for occ_key, participants in grouped.items():
+        existing_holders = occupancy.get(occ_key, [])
+        if len(participants) < 2 and not existing_holders:
+            continue
+        upload_rows = ", ".join(str(item[0]) for item in participants)
+        holder_text = ""
+        if existing_holders:
+            holders = ", ".join(
+                f"{player.name} ({player.id})" for player in existing_holders)
+            holder_text = f"; existing active player(s): {holders}"
+        for index, team_code, _player_code in participants:
             report.error(
                 "players", index, "duplicate_jersey_number",
-                f"Jersey number {jersey_number} on team {team_code} is already "
-                f"used by {who} ({label}).", "jersey_number")
-        else:
-            occupancy[occ_key] = (
-                "import", _optional(row.get("player_code")) or f"row {index}")
+                f"Jersey number {occ_key[1]} on team {team_code} conflicts "
+                f"with upload row(s) {upload_rows}{holder_text}.",
+                "jersey_number")
 
 
 def validate_hierarchy_import(sheets: Dict[str, List[dict]], store) -> dict:
