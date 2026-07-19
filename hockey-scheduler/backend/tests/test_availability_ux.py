@@ -171,11 +171,24 @@ class AvailabilityUxHttpTest(unittest.TestCase):
         self.assertEqual(status, 403)
 
     def test_scoped_player_cannot_read_opponent_summary(self):
+        # #160: the demo player's scope stores player_id only; its own team is
+        # resolved live, so the opponent-summary block still holds (a stripped
+        # team_id must not silently skip the check).
         c = self._client()
         self._req(c, "POST", "/api/auth/login", {"username": "player", "password": "demo"})
         status, _ = self._req(
             c, "GET", f"/api/games/{self.game_id}/availability-summary?team_id={self.away}")
         self.assertEqual(status, 403)
+
+    def test_scoped_player_sees_own_team_summary(self):
+        # #160: the same player_id-only account CAN read its own team's summary,
+        # its team resolved live from player_id.
+        c = self._client()
+        self._req(c, "POST", "/api/auth/login", {"username": "player", "password": "demo"})
+        status, body = self._req(
+            c, "GET", f"/api/games/{self.game_id}/availability-summary?team_id={self.home}")
+        self.assertEqual(status, 200)
+        self.assertIn("counts", body)
 
     def test_operator_can_read_either_team_summary(self):
         c = self._client()

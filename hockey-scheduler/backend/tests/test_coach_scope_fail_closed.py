@@ -146,44 +146,42 @@ class CoachScopeContract:
                 "a", "pw", Role.LEAGUE_ADMIN, scope={"team_id": "team_home"})
         self.assertEqual(cm.exception.details.get("reason"), "unknown_scope_key")
 
-    def test_player_scope_allows_player_id_and_team_id(self):
+    def test_player_scope_accepts_team_id_input_but_stores_player_id_only(self):
+        # #160: a supplied team_id is still validated as the player's own team
+        # (see the mismatch tests below), but the STORED scope is player_id only
+        # — the team is resolved live from the player everywhere it's needed, so
+        # no stored team_id can go stale after a transfer/removal.
         self.store.add_player(Player(id="p_ok", team_id="team_home", name="P",
                                      position=Position.FORWARD))
         acct = self.accounts.create_account(
             "p", "pw", Role.PLAYER,
             scope={"player_id": "p_ok", "team_id": "team_home"})
-        self.assertEqual(acct.scope, {"player_id": "p_ok", "team_id": "team_home"})
+        self.assertEqual(acct.scope, {"player_id": "p_ok"})
 
-    # -- canonical player scope carries team_id from player_id (#160) ---------
-    def test_player_created_with_player_id_only_gains_team_scope(self):
-        # #160: creation keys a Player scope on player_id, but the private-read
-        # gate is by team. A player_id-only scope is canonicalized to carry the
-        # player's own team, so the account/session stays consistent with the
-        # gate and the frontend helper.
+    # -- canonical player scope is player_id only (#160) ---------------------
+    def test_player_created_with_player_id_only_stores_player_id_only(self):
         self.store.add_player(Player(id="p_solo", team_id="team_home",
                                      name="Solo", position=Position.FORWARD))
         acct = self.accounts.create_account(
             "p_solo_acct", "pw", Role.PLAYER, scope={"player_id": "p_solo"})
-        self.assertEqual(acct.scope,
-                         {"player_id": "p_solo", "team_id": "team_home"})
+        self.assertEqual(acct.scope, {"player_id": "p_solo"})
 
-    def test_rebind_player_to_player_id_only_gains_team_scope(self):
+    def test_rebind_player_scope_stores_player_id_only(self):
         self.store.add_player(Player(id="p_reb", team_id="team_home",
                                      name="Reb", position=Position.FORWARD))
         acct = UserAccount(
             id="user_preb", username="preb", password_hash=hash_password("pw"),
             role=Role.PLAYER, created_at=_clock(),
-            scope={"player_id": "p_reb", "team_id": "team_home"}, active=True)
+            scope={"player_id": "p_reb"}, active=True)
         self.store.add_user_account(acct)
+        # Even supplying a (correct) team_id, the persisted scope is player_id only.
         rebound = self.accounts.rebind_account_scope(
-            acct.id, {"player_id": "p_reb"})
-        self.assertEqual(rebound.scope,
-                         {"player_id": "p_reb", "team_id": "team_home"})
+            acct.id, {"player_id": "p_reb", "team_id": "team_home"})
+        self.assertEqual(rebound.scope, {"player_id": "p_reb"})
 
     def test_player_created_with_teamless_player_carries_no_team(self):
-        # A player not yet on a team resolves to no team; the scope carries
-        # player_id only and the gate fails closed (no private-read access) until
-        # the player is rostered — not a spurious team binding.
+        # A player not yet on a team stores player_id only; the gate fails closed
+        # (no private-read access) until the player is rostered.
         self.store.add_player(Player(id="p_free", team_id=None,
                                      name="Free", position=Position.FORWARD))
         acct = self.accounts.create_account(
@@ -550,9 +548,9 @@ class CoachScopeHttpTest(unittest.TestCase):
         self.assertEqual(status, 200)
 
     def test_player_created_with_player_id_only_can_read_own_game(self):
-        # #160: a Player account created with player_id ONLY (no team_id) reads
-        # its own team's private game data. The created scope is canonicalized to
-        # carry the team, and the private-read gate grants access.
+        # #160: a Player account created with player_id ONLY reads its own team's
+        # private game data. The STORED scope is player_id only; the login view
+        # surfaces the team live, and the private-read gate grants access.
         store = srv.STATE.api.store
         home_player = store.players_for_team(self.home)[0].id
         admin = self._admin()
@@ -561,10 +559,12 @@ class CoachScopeHttpTest(unittest.TestCase):
             {"username": "player_pidonly", "password": "pw", "role": "player",
              "scope": {"player_id": home_player}})
         self.assertEqual(status, 200)
-        self.assertEqual(body["scope"].get("team_id"), self.home)
+        self.assertNotIn("team_id", body["scope"])   # stored scope is player_id only
         c = self._client()
-        self._req(c, "POST", "/api/auth/login",
-                  {"username": "player_pidonly", "password": "pw"})
+        _, login = self._req(c, "POST", "/api/auth/login",
+                             {"username": "player_pidonly", "password": "pw"})
+        # The login view resolves the team live, so the frontend hint is correct.
+        self.assertEqual(login["user"]["scope"].get("team_id"), self.home)
         status, _ = self._req(c, "GET", f"/api/games/{self.gid}/board")
         self.assertEqual(status, 200)
 
@@ -583,6 +583,38 @@ class CoachScopeHttpTest(unittest.TestCase):
         self._req(c, "POST", "/api/auth/login",
                   {"username": "legacy_pidonly", "password": "pw"})
         status, _ = self._req(c, "GET", f"/api/games/{self.gid}/board")
+        self.assertEqual(status, 200)
+
+    def test_later_team_assignment_is_reflected_in_scope_and_access(self):
+        # #160 lifecycle: a Player account created while the player is teamless
+        # shows NO team scope and is denied private reads (fail closed); once the
+        # player is assigned a team, both the surfaced scope (frontend hint) and
+        # the read gate reflect it live — no stale player_id-only lockout.
+        store = srv.STATE.api.store
+        store.add_player(Player(id="p_late", team_id=None, name="Late",
+                                position=Position.FORWARD))
+        admin = self._admin()
+        status, body = self._req(
+            admin, "POST", "/api/accounts",
+            {"username": "player_late", "password": "pw", "role": "player",
+             "scope": {"player_id": "p_late"}})
+        self.assertEqual(status, 200)
+        self.assertNotIn("team_id", body["scope"])          # teamless → no team
+        # Teamless: the surfaced scope has no team and the game read is denied.
+        c = self._client()
+        _, login = self._req(c, "POST", "/api/auth/login",
+                             {"username": "player_late", "password": "pw"})
+        self.assertNotIn("team_id", login["user"]["scope"])
+        status, _ = self._req(c, "GET", f"/api/games/{self.gid}/board")
+        self.assertEqual(status, 403)
+        # Assign the player to the home team, then a fresh login reflects it.
+        store.save_player(Player(id="p_late", team_id=self.home, name="Late",
+                                 position=Position.FORWARD))
+        c2 = self._client()
+        _, login2 = self._req(c2, "POST", "/api/auth/login",
+                              {"username": "player_late", "password": "pw"})
+        self.assertEqual(login2["user"]["scope"].get("team_id"), self.home)
+        status, _ = self._req(c2, "GET", f"/api/games/{self.gid}/board")
         self.assertEqual(status, 200)
 
     def test_player_cannot_be_rebound_to_foreign_team_over_http(self):

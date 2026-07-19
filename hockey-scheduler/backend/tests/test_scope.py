@@ -123,31 +123,68 @@ class ScopeUnitTest(unittest.TestCase):
             {"player_id": self.away_player}, self.store,
             allow_unscoped_dev_fallback=True))
 
-    # -- private-read gate derives the Player's team from player_id (#160) ----
+    # -- private-read gate resolves the Player's team LIVE from player_id (#160)
+    def _reads(self, scope):
+        return can_read_private_game_data(
+            Role.PLAYER, scope, self.game_id, self.store)
+
     def test_player_private_read_derives_team_from_player_id_only(self):
-        # A Player scope carrying player_id ONLY (no team_id) must still resolve
-        # the player's team, so the private-read gate grants own-team access.
-        # This is the #160 mismatch: creation keys player scope on player_id, but
-        # the gate historically read only team_id.
-        self.assertTrue(can_read_private_game_data(
-            Role.PLAYER, {"player_id": self.home_player}, self.game_id, self.store))
+        # A Player scope carrying player_id ONLY (no team_id) resolves the team
+        # live, so the private-read gate grants own-team access. This is the #160
+        # mismatch: creation keys player scope on player_id, but the gate
+        # historically read only team_id.
+        self.assertTrue(self._reads({"player_id": self.home_player}))
 
     def test_player_private_read_denied_for_unrelated_team(self):
-        # A player whose team is not in the game cannot read its private data,
-        # even when the team is derived from player_id.
         self.store.add_team(Team(id="team_third", name="Otters"))
         self.store.add_player(Player(id="p_out", team_id="team_third",
                                      name="Out", position=Position.FORWARD))
-        self.assertFalse(can_read_private_game_data(
-            Role.PLAYER, {"player_id": "p_out"}, self.game_id, self.store))
+        self.assertFalse(self._reads({"player_id": "p_out"}))
 
     def test_player_private_read_fails_closed_without_resolvable_team(self):
-        # No player_id and no team_id → no team → denied (fail closed).
-        self.assertFalse(can_read_private_game_data(
-            Role.PLAYER, {}, self.game_id, self.store))
-        # An unknown player_id resolves to no player, so still denied.
-        self.assertFalse(can_read_private_game_data(
-            Role.PLAYER, {"player_id": "p_ghost"}, self.game_id, self.store))
+        # No player_id → no identity → denied (fail closed)...
+        self.assertFalse(self._reads({}))
+        # ...and an unknown/DELETED player resolves to no player, still denied.
+        self.assertFalse(self._reads({"player_id": "p_ghost"}))
+
+    def test_player_private_read_ignores_stale_stored_team_id(self):
+        # The KEY #160 fix: a stored team_id must NEVER grant access. Here the
+        # player_id resolves to a player who is NOT on the game's teams; a stale
+        # team_id pointing at the game's home team must be ignored → denied.
+        self.store.add_team(Team(id="team_third", name="Otters"))
+        self.store.add_player(Player(id="p_moved", team_id="team_third",
+                                     name="Moved", position=Position.FORWARD))
+        self.assertFalse(self._reads(
+            {"player_id": "p_moved", "team_id": self.home}))
+
+    def test_player_private_read_follows_removal(self):
+        # A player who can read their game loses access the moment they are
+        # removed (deleted) — the gate resolves live, so a stale stored team_id
+        # can't keep the door open.
+        self.assertTrue(self._reads(
+            {"player_id": self.home_player, "team_id": self.home}))
+        self.store.delete_player(self.home_player)
+        self.assertFalse(self._reads(
+            {"player_id": self.home_player, "team_id": self.home}))
+
+    def test_player_private_read_follows_transfer_out_of_game(self):
+        # Transferring the player to a team not in the game revokes access on the
+        # next read — live resolution, not the stored team_id.
+        self.assertTrue(self._reads({"player_id": self.home_player}))
+        self.store.add_team(Team(id="team_third", name="Otters"))
+        moved = self.store.get_player(self.home_player)
+        self.store.save_player(Player(
+            id=moved.id, team_id="team_third", name=moved.name,
+            position=moved.position))
+        self.assertFalse(self._reads(
+            {"player_id": self.home_player, "team_id": self.home}))
+
+    def test_player_private_read_denied_when_teamless(self):
+        # A player with no current team resolves to None → denied.
+        self.store.add_player(Player(id="p_free", team_id=None, name="Free",
+                                     position=Position.FORWARD))
+        self.assertFalse(self._reads(
+            {"player_id": "p_free", "team_id": self.home}))
 
     def test_coach_private_read_still_keyed_on_team_id(self):
         # Coach behavior is unchanged: their canonical scope key is team_id.

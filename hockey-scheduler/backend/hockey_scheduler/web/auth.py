@@ -150,6 +150,17 @@ def user_view(session, store=None) -> dict:
         account = store.get_user_account(session.get("user_id"))
         if account is not None:
             username = account.username
+        # A Player's stored scope is player_id only (#160); resolve the team LIVE
+        # from the player so the client's coarse "can read private games" hint
+        # tracks the player's CURRENT team — reflecting a later team assignment or
+        # a transfer, and showing none when teamless — instead of a stale copy.
+        if role == Role.PLAYER:
+            pid = scope.get("player_id")
+            player = store.get_player(pid) if pid else None
+            if player is not None and player.team_id:
+                scope["team_id"] = player.team_id
+            else:
+                scope.pop("team_id", None)
         tid = scope.get("team_id")
         if tid:
             team = store.get_team(tid)
