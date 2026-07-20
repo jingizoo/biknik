@@ -6,8 +6,10 @@ Pure logic over the store with an injected clock; every create is audited.
 """
 
 import functools
-from datetime import datetime, timezone
+import re
+from datetime import date, datetime, timezone
 from typing import Callable, List, Optional
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from ..domain import (
     Club,
@@ -115,6 +117,85 @@ def _parse_iso_utc(value) -> Optional[datetime]:
     return parsed.astimezone(timezone.utc)
 
 
+_DATE_ONLY = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def resolve_timezone(name):
+    """Return a ``ZoneInfo`` for an IANA name, or ``None`` if it is unknown.
+
+    ``Program.timezone`` is a free-form string. This is the single place the
+    backend turns it into a real zone; callers that must never fail (e.g. the
+    season-boundary parser applied to legacy data) fall back to UTC when this
+    returns ``None``.
+    """
+    if not name:
+        return None
+    try:
+        return ZoneInfo(name)
+    except (ZoneInfoNotFoundError, ValueError, OSError):
+        return None
+
+
+def parse_season_boundary(value, field_name: str, tz) -> Optional[datetime]:
+    """Normalize a Season start/end boundary to a timezone-aware UTC datetime
+    (#272). See ``docs/architecture/season-dates.md`` for the contract.
+
+    Accepts, in the Program's timezone ``tz`` (a ``tzinfo``):
+
+    * ``None`` / ``""`` → ``None`` (an unset boundary).
+    * a **date-only** ``YYYY-MM-DD`` string (or a bare ``date``) → interpreted as
+      LOCAL MIDNIGHT (00:00) on that calendar day in ``tz``, stored as the
+      equivalent UTC instant. This lets a league office enter ``2026-09-15``
+      without manufacturing a UTC time, and the value round-trips to the same
+      calendar day when displayed in the Program timezone.
+    * a **timezone-aware** ISO-8601 string or ``datetime`` → that exact instant,
+      converted to UTC (existing behavior; no drift for stored values).
+
+    A naive value that carries a TIME component (e.g. ``2026-09-15T18:30:00``)
+    stays rejected as ambiguous — only a bare calendar date is tz-anchored.
+    Invalid input raises a field-level ``ValidationError``
+    (``invalid_<field_name>``).
+    """
+    if value is None or value == "":
+        return None
+    field = {"reason": f"invalid_{field_name}", "field": field_name}
+    # datetime FIRST — datetime is a subclass of date, so the date branch below
+    # must not swallow it.
+    if isinstance(value, datetime):
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValidationError(
+                f"{field_name} must be timezone-aware, or a YYYY-MM-DD date.",
+                field)
+        return value.astimezone(timezone.utc)
+    if isinstance(value, date):
+        return datetime(value.year, value.month, value.day,
+                        tzinfo=tz).astimezone(timezone.utc)
+    if isinstance(value, str):
+        s = value.strip()
+        if _DATE_ONLY.match(s):
+            try:
+                d = date.fromisoformat(s)
+            except ValueError:
+                raise ValidationError(
+                    f"Invalid {field_name}: {value!r} is not a real date.", field)
+            return datetime(d.year, d.month, d.day,
+                            tzinfo=tz).astimezone(timezone.utc)
+        try:
+            dt = datetime.fromisoformat(s)
+        except (ValueError, TypeError):
+            raise ValidationError(
+                f"Invalid {field_name}: {value!r}. Expected YYYY-MM-DD or a "
+                "timezone-aware ISO-8601 timestamp.", field)
+        if dt.tzinfo is None or dt.utcoffset() is None:
+            raise ValidationError(
+                f"Invalid {field_name}: {value!r}. A timestamp with a time must "
+                "be timezone-aware; use YYYY-MM-DD for a calendar date.", field)
+        return dt.astimezone(timezone.utc)
+    raise ValidationError(
+        f"{field_name} must be a YYYY-MM-DD date or an ISO-8601 timestamp.",
+        field)
+
+
 def _transactional(fn):
     """Wrap a mutating service method in a single store transaction."""
     @functools.wraps(fn)
@@ -203,9 +284,19 @@ class SetupService:
                 self.store.get_organization(operator_organization_id) is None:
             raise NotFoundError(
                 f"Organization {operator_organization_id} not found.")
+        # The Program timezone is the anchor for date-only Season boundaries
+        # (#272), so it must be a real IANA zone — reject a garbage value at
+        # creation rather than silently falling back to UTC when a season date
+        # is later interpreted.
+        tz_name = timezone_name or "UTC"
+        if resolve_timezone(tz_name) is None:
+            raise ValidationError(
+                f"Invalid timezone: {tz_name!r}. Expected an IANA name like "
+                "'America/Chicago' or 'UTC'.",
+                {"reason": "invalid_timezone", "field": "timezone"})
         program = Program(id=self.store.next_id("league"),
                           name=self._require_name(name), country=country,
-                          timezone=timezone_name or "UTC",
+                          timezone=tz_name,
                           operator_organization_id=operator_organization_id or None)
         self.store.add_program(program)
         self._audit("league_created", "league", program.id, actor_id,
@@ -215,15 +306,22 @@ class SetupService:
 
     @_transactional
     def create_season(self, program_id: str, name: str,
-                      start_date: Optional[datetime] = None,
-                      end_date: Optional[datetime] = None,
+                      start_date=None, end_date=None,
                       actor_id: Optional[str] = None) -> Season:
-        if self.store.get_program(program_id) is None:
+        program = self.store.get_program(program_id)
+        if program is None:
             raise NotFoundError(f"Program {program_id} not found.")
-        start = self._require_utc(start_date, "start_date") if start_date else None
-        end = self._require_utc(end_date, "end_date") if end_date else None
+        # Date-only boundaries (e.g. '2026-09-15') are anchored to local midnight
+        # in the PROGRAM's timezone (#272); timezone-aware values pass through to
+        # UTC unchanged. A legacy/unknown zone falls back to UTC so creation
+        # never 500s (new programs validate the zone at create_program).
+        tz = resolve_timezone(program.timezone) or timezone.utc
+        start = parse_season_boundary(start_date, "start_date", tz)
+        end = parse_season_boundary(end_date, "end_date", tz)
         if start and end and end < start:
-            raise ValidationError("end_date cannot be before start_date.")
+            raise ValidationError(
+                "end_date cannot be before start_date.",
+                {"reason": "end_before_start", "field": "end_date"})
         season = Season(id=self.store.next_id("season"), program_id=program_id,
                         name=self._require_name(name), start_date=start, end_date=end)
         self.store.add_season(season)

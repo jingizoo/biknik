@@ -3641,9 +3641,12 @@ class ApiService:
     def create_season(self, program_id: str, name: str,
                       start_date: Optional[str] = None, end_date: Optional[str] = None,
                       actor_id: Optional[str] = None) -> dict:
+        # Season boundaries accept a date-only 'YYYY-MM-DD' or a timezone-aware
+        # ISO-8601 timestamp (#272). Parsing happens in the service where the
+        # Program's timezone (the anchor for a date-only value) is known, so the
+        # raw values are forwarded unparsed rather than pre-validated here.
         return _serialize(self.setup.create_season(
-            program_id, name, _parse_dt(start_date, "start_date"),
-            _parse_dt(end_date, "end_date"), actor_id))
+            program_id, name, start_date, end_date, actor_id))
 
     @catch
     def create_league(self, season_id: str, name: str, sort_order: int = 0,

@@ -150,6 +150,25 @@ const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) =>
   ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const fmt = (iso) => { const m = /T(\d{2}:\d{2})/.exec(iso || ""); return m ? m[1] : ""; };
 const val = (id) => { const e = document.getElementById(id); return e ? e.value.trim() : ""; };
+// Format a stored UTC season boundary as its intended CALENDAR date, rendered in
+// the Program's timezone (#272) — a date-only bound was anchored to local
+// midnight there, so formatting in that zone shows the entered day, never an
+// adjacent one from raw UTC conversion.
+const fmtDateInTz = (iso, tz) => {
+  if (!iso) return null;
+  try {
+    return new Intl.DateTimeFormat("en-CA", {
+      timeZone: tz || "UTC", year: "numeric", month: "short", day: "numeric",
+    }).format(new Date(iso));
+  } catch (e) { return null; }
+};
+const seasonDateRange = (s, tz) => {
+  const a = fmtDateInTz(s.start_date, tz), b = fmtDateInTz(s.end_date, tz);
+  if (a && b) return `${a} – ${b}`;
+  if (a) return `from ${a}`;
+  if (b) return `until ${b}`;
+  return null;
+};
 const hasPerm = (p) => rolePerms.has(p);
 // Demo vs production posture (#215): the "Reset demo" action and demo-only
 // affordances only make sense outside production. Defaults to demo until the
@@ -615,12 +634,21 @@ const SETUP_ENTITIES = [
         options: (ov) => [["", "— none —"]].concat((ov.organizations || []).map((o) => [o.id, o.name])) }] },
   { key: "season", title: "Seasons", icon: "🗓️", noun: "season", perm: "manage_setup",
     delKind: "season",
-    list: (ov) => (ov.seasons || []).map((s) => ({
-      id: s.id, title: s.name, sub: nameById(ov.programs, s.program_id) })),
+    list: (ov) => (ov.seasons || []).map((s) => {
+      const prog = (ov.programs || []).find((p) => p.id === s.program_id);
+      const range = seasonDateRange(s, prog && prog.timezone);
+      return { id: s.id, title: s.name,
+        sub: nameById(ov.programs, s.program_id) + (range ? ` · ${range}` : "") };
+    }),
     fields: [
       { id: "f-season-league", label: "Program", type: "select", required: true, ofNoun: "league",
         options: (ov) => (ov.programs || []).map((l) => [l.id, l.name]) },
-      { id: "f-season", label: "Season name", required: true, placeholder: "e.g. 2027–28" }] },
+      { id: "f-season", label: "Season name", required: true, placeholder: "e.g. 2027–28" },
+      // Optional calendar-date boundaries (#272). A native date input sends
+      // YYYY-MM-DD, which the API anchors to local midnight in the Program's
+      // timezone — no need to hand-craft a UTC instant.
+      { id: "f-season-start", label: "Start date (optional)", type: "date" },
+      { id: "f-season-end", label: "End date (optional)", type: "date" }] },
   // League (#233): the season-specific competitive grouping (e.g. Adult
   // League, Junior League). Internally still the "level" entity/key/noun (v1
   // API frozen) — only the display noun changes. Gold/Silver/Diamond etc. are
@@ -778,7 +806,8 @@ const ofNounLabel = (f) => {
 // Each entity's POST body, built from the drawer inputs (ids match the fields).
 const SETUP_POST = {
   league: () => post("/api/v2/setup/program", { name: val("f-league"), operator_organization_id: val("f-league-org") || null }),
-  season: () => post("/api/v2/setup/season", { program_id: val("f-season-league"), name: val("f-season") }),
+  season: () => post("/api/v2/setup/season", { program_id: val("f-season-league"), name: val("f-season"),
+    start_date: val("f-season-start") || null, end_date: val("f-season-end") || null }),
   level: () => post("/api/v2/setup/league", { season_id: val("f-level-season"), name: val("f-level"), sort_order: val("f-level-sort") ? Number(val("f-level-sort")) : 0 }),
   division: () => post("/api/v2/setup/division", { league_id: val("f-div-league"), name: val("f-div"), age_group: val("f-div-age") }),
   club: () => post("/api/v2/setup/club", { name: val("f-club") }),
@@ -1675,9 +1704,11 @@ function renderSetupHierarchy(sv, hv, ov) {
       const seasonBody = (levelSections || orphanDivSection)
         ? `${levelSections}${orphanDivSection}`
         : `<div class="tn-empty">No divisions in this season yet.</div>`;
+      const dateRange = seasonDateRange(s, program.timezone);
       return `<details class="tn" open><summary class="tn-sum">
           <span class="tn-label">🗓️ ${esc(s.name)}</span>
-          <span class="tn-meta">${divCount} division(s) · ${teamCount} team(s)</span>${delBtn("season", s.id, s.name)}</summary>
+          <span class="tn-meta">${divCount} division(s) · ${teamCount} team(s)${
+            dateRange ? ` · ${esc(dateRange)}` : ""}</span>${delBtn("season", s.id, s.name)}</summary>
         <div class="tn-children">${seasonBody}
           <div class="tree-actions sub">${treeAdd("level", "Add league to " + s.name, "f-level-season", s.id)}</div></div>
       </details>`;
