@@ -4,12 +4,16 @@
 // is the supported roster exit — distinct from delete, preserving all history.
 // This journey is the operator-UI half: at desktop AND 390px, a League Admin in
 // Setup > Records
-//   * builds a minimal chain and a Player through the real create drawers;
+//   * builds a minimal chain and a Player through the real create drawers, and
+//     binds a scoped Player account to that Player;
 //   * clicks the Player row's Deactivate control and confirms a themed modal
-//     whose text makes clear history is kept and this is not a delete;
-//   * confirms — asserting the row now reads "inactive" and the control flips
-//     to Reactivate;
-//   * clicks Reactivate, confirms, and asserts the row is active again.
+//     whose text makes clear history is kept, this is not a delete, AND that any
+//     linked login is disabled and signed out;
+//   * confirms — asserting the row now reads "inactive", the control flips to
+//     Reactivate, and the scoped account is now disabled;
+//   * clicks Reactivate, asserts the modal warns the login is NOT restored,
+//     confirms, and asserts the row is active again while the account stays
+//     disabled (Player reactivation never silently restores login authority).
 // Fails on any browser console/page error.
 const { chromium } = require("playwright");
 const { spawn } = require("child_process");
@@ -91,6 +95,24 @@ async function checkViewport(browser, viewport) {
     return li ? li.textContent : null;
   }, id);
 
+  // Create an account over the wire (the operator is signed in; the session
+  // cookie rides along). Returns the created account row.
+  const apiPost = (url, payload) => page.evaluate(async ([u, b]) => {
+    const r = await fetch(u, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(b),
+    });
+    return { status: r.status, body: await r.json() };
+  }, [url, payload]);
+
+  // The `active` flag of the account with this username, via GET /api/accounts.
+  const accountActive = (username) => page.evaluate(async (uname) => {
+    const r = await fetch("/api/accounts");
+    const j = await r.json();
+    const row = (j.user_accounts || []).find((a) => a.username === uname);
+    return row ? row.active : null;
+  }, username);
+
   try {
     await waitForServer(`${base}/api/health`, READY_TIMEOUT_MS);
     await page.goto(base, { waitUntil: "domcontentloaded" });
@@ -118,6 +140,21 @@ async function checkViewport(browser, viewport) {
     }, "/api/v2/setup/player");
 
     const pid = player.id;
+    // Bind a scoped Player account so we can prove the account-security side
+    // effect the confirmations disclose (login disabled on deactivate; not
+    // restored by Player reactivation).
+    const acctUser = `life_player_${viewport.port}`;
+    const acctRes = await apiPost("/api/accounts", {
+      username: acctUser, password: "scoped-account-pw", role: "player",
+      scope: { player_id: pid, team_id: team.id },
+    });
+    if (acctRes.status !== 200 || acctRes.body.error) {
+      throw new Error(`[${L}] account create failed: ${JSON.stringify(acctRes)}`);
+    }
+    if ((await accountActive(acctUser)) !== true) {
+      throw new Error(`[${L}] scoped account should start active`);
+    }
+
     const activeSel = `[data-player-active="${pid}"]`;
     // The row starts active (no "inactive" tag; the control offers Deactivate).
     if (/inactive/i.test(await rowText(pid))) {
@@ -135,6 +172,11 @@ async function checkViewport(browser, viewport) {
     const modalText = await page.textContent(".modal .modal-body");
     if (!/history/i.test(modalText) || !/not a\s+delete/i.test(modalText)) {
       throw new Error(`[${L}] deactivate modal missing history/not-a-delete copy: "${modalText}"`);
+    }
+    // ...and it must disclose the account-security side effect (#270 review):
+    // any linked login is disabled and signed out.
+    if (!/login/i.test(modalText) || !/signed out/i.test(modalText)) {
+      throw new Error(`[${L}] deactivate modal missing login-disable disclosure: "${modalText}"`);
     }
     const deResp = page.waitForResponse((r) =>
       r.url() === `${base}/api/v2/setup/player/${pid}/active`
@@ -154,10 +196,20 @@ async function checkViewport(browser, viewport) {
     if (!/reactivate/i.test(reLabel)) {
       throw new Error(`[${L}] expected a Reactivate control after deactivate, got "${reLabel}"`);
     }
+    // The scoped account was disabled by the deactivation, not just the read
+    // gate — the confirmation promised exactly this.
+    if ((await accountActive(acctUser)) !== false) {
+      throw new Error(`[${L}] scoped account should be disabled after deactivate`);
+    }
 
-    // Reactivate → confirm → the row is active again.
+    // Reactivate → the modal must warn that login is NOT restored → confirm.
     await page.click(activeSel);
     await page.waitForSelector(".modal[role=dialog]", { timeout: 10000 });
+    const reModalText = await page.textContent(".modal .modal-body");
+    if (!/login/i.test(reModalText)
+        || !/(does not restore|not restore|stays disabled)/i.test(reModalText)) {
+      throw new Error(`[${L}] reactivate modal missing login-not-restored copy: "${reModalText}"`);
+    }
     const reResp = page.waitForResponse((r) =>
       r.url() === `${base}/api/v2/setup/player/${pid}/active`
       && r.request().method() === "POST");
@@ -170,6 +222,11 @@ async function checkViewport(browser, viewport) {
       const li = btn && btn.closest(".li");
       return li && !/inactive/i.test(li.textContent);
     }, pid, { timeout: 10000 });
+    // Player is active again, but its login stays disabled — reactivation must
+    // not silently restore account authority (#270 review).
+    if ((await accountActive(acctUser)) !== false) {
+      throw new Error(`[${L}] scoped account must stay disabled after Player reactivation`);
+    }
 
     if (errors.length) throw new Error(`[${L}] console/page errors:\n${errors.join("\n")}`);
     console.log(`[${L}] OK — Player deactivated + reactivated in place, history kept.`);

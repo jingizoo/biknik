@@ -1075,7 +1075,10 @@ function playerActiveModalHtml(m) {
       `<p>You're about to reactivate <strong>${esc(m.name || "this player")}</strong>.
          They'll be eligible for new rosters again.</p>
        <p class="muted">Their jersey number must still be free on the team —
-         if a teammate took it, reactivation is blocked.</p>`,
+         if a teammate took it, reactivation is blocked.</p>
+       <p class="muted">Reactivating the player does <strong>not</strong> restore
+         their login. If they had a player account, it stays disabled — reactivate
+         it separately from account management.</p>`,
       `<button class="act ghost" data-modal-close>Cancel</button>
        <button class="act primary" data-player-active-confirm>Reactivate player</button>`);
   }
@@ -1085,7 +1088,10 @@ function playerActiveModalHtml(m) {
        delete.</p>
      <p class="muted">They'll be removed from future roster selection and
        substitute lists, and their jersey number frees up for the team. You can
-       reactivate them anytime.</p>`,
+       reactivate the player anytime.</p>
+     <p class="muted">Any player login for them will be disabled and signed out
+       immediately. Reactivating the player later does not bring the login back —
+       you'd reactivate the account separately.</p>`,
     `<button class="act ghost" data-modal-close>Keep active</button>
      <button class="act danger" data-player-active-confirm>Deactivate player</button>`);
 }

@@ -3089,20 +3089,31 @@ class SetupService:
         if player is None:
             raise NotFoundError(f"Player {player_id} not found.")
         target = active
-        if not target:
-            # A login must not outlive the roster exit (#270 review): atomically
-            # retire any ACTIVE scoped account bound to this player and revoke
-            # its live sessions, in this same transaction. This runs BEFORE the
-            # idempotent short-circuit below so an ALREADY-inactive Player that
-            # still carries a live scoped account/session (legacy data — inactive
-            # players were once creatable and account binding did not reject
-            # them) is reconciled rather than left dangling. The reconcile is
-            # itself idempotent — it touches only still-active accounts and
-            # un-revoked sessions — and audits only the accounts it actually
-            # changes, so a repeat call mutates nothing. Reactivation never
-            # touches accounts: the operator reactivates one explicitly through
-            # the account lifecycle, which re-checks the Player is active
-            # (#266/#282), so reactivation can't silently restore authority.
+        if not target or not player.is_active:
+            # Reconcile dangling scoped-account authority for this Player, in
+            # this same transaction, BEFORE the idempotent short-circuit below
+            # (#270 review). A login must never outlive the roster exit, and
+            # bringing a Player record back must never silently restore a login:
+            #   • Deactivation (target False) — retire any ACTIVE scoped account
+            #     and revoke its live sessions. Runs even when the Player row is
+            #     ALREADY inactive so legacy data (inactive Players were once
+            #     creatable and account binding did not reject them) that still
+            #     carries a live account/session is reconciled, not left
+            #     dangling.
+            #   • Reactivation TRANSITION (target True while the row is still
+            #     inactive) — retire any account still bound from before the
+            #     Player went inactive, so once ``is_active`` flips true (and
+            #     ``_player_team_id`` resolves again) that stale account/session
+            #     does NOT immediately regain private-game / self-service
+            #     access. Account access is restored only by the separate,
+            #     explicit account-lifecycle reactivation, which re-checks the
+            #     Player is active (#266/#282).
+            # An idempotent reactivation of an ALREADY-active Player skips this
+            # (``not target`` false, ``not player.is_active`` false) so a
+            # legitimate live login is never nuked. The reconcile is itself
+            # idempotent — it touches only still-active accounts and un-revoked
+            # sessions and audits only what it actually changes — so a repeat
+            # call mutates nothing further.
             self._retire_player_account_authority(player.id, actor_id)
         if player.is_active == target:
             # No Player-state change → no player_activated/deactivated audit

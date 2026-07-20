@@ -384,6 +384,79 @@ class InactivePlayerAccountBindingTest(unittest.TestCase):
             api.setup.set_player_active(player.id, False, actor_id="a")
             self.assertEqual(len(store.all_setup_audit()), all_before, label)
 
+    def test_reactivation_retires_dangling_account_no_silent_restore(self):
+        # Legacy data can carry an INACTIVE Player that still has an active
+        # scoped account + un-revoked session (inactive players were once
+        # creatable and binding didn't reject them). Reactivating the Player
+        # (inactive->active) must retire that dangling authority BEFORE flipping
+        # the row active, so once is_active is true the stale account/session
+        # does NOT silently regain access — the operator restores login only
+        # through the separate account-lifecycle reactivation (#270 review).
+        for label, store, api, player in self._each():
+            acct = api.accounts.create_account(
+                "player_login", "pw", Role.PLAYER,
+                scope={"player_id": player.id})
+            now = datetime(2026, 1, 1, tzinfo=UTC)
+            store.add_session(Session(
+                id="sess1", token_hash="hash1", user_id=acct.id,
+                issued_at=now, expires_at=now + timedelta(days=1)))
+            # Legacy state: flip the Player inactive DIRECTLY so the account and
+            # session stay live and the row is already inactive.
+            legacy = store.get_player_for_update(player.id)
+            legacy.is_active = False
+            store.save_player(legacy)
+            self.assertTrue(store.get_user_account(acct.id).active, label)
+
+            # Reactivate the Player.
+            reactivated = api.setup.set_player_active(
+                player.id, True, actor_id="a")
+            self.assertTrue(reactivated.is_active, label)               # player back
+            self.assertFalse(
+                store.get_user_account(acct.id).active, label)          # login retired
+            self.assertIsNotNone(
+                store.sessions_for_user(acct.id)[0].revoked_at, label)  # session revoked
+
+            # Exactly one Player reactivation audit + one real account audit.
+            acts = [a for a in _lifecycle_audits(store)
+                    if a.action == "player_activated"]
+            self.assertEqual(len(acts), 1, label)
+            acct_audits = [a for a in store.all_setup_audit()
+                           if a.action == "user_account_deactivated"
+                           and a.entity_id == acct.id]
+            self.assertEqual(len(acct_audits), 1, label)
+
+            # Repeat active=true on the now-active Player → no further mutation
+            # (the legitimate-account guard: an already-active Player is not
+            # re-reconciled, so nothing is touched).
+            all_before = len(store.all_setup_audit())
+            api.setup.set_player_active(player.id, True, actor_id="a")
+            self.assertEqual(len(store.all_setup_audit()), all_before, label)
+
+            # Only the explicit account-lifecycle reactivation restores login —
+            # and it succeeds now that the Player is active again.
+            api.accounts.set_active(acct.id, True, actor_id="a")
+            self.assertTrue(store.get_user_account(acct.id).active, label)
+
+    def test_reactivating_active_player_keeps_live_login(self):
+        # Guard: an idempotent active=true on an ALREADY-active Player must NOT
+        # nuke a legitimate live login. Reconciliation only runs on a real
+        # inactive->active transition (or any deactivate) — never on a no-op
+        # reactivation (#270 review).
+        for label, store, api, player in self._each():
+            acct = api.accounts.create_account(
+                "player_login", "pw", Role.PLAYER,
+                scope={"player_id": player.id})
+            now = datetime(2026, 1, 1, tzinfo=UTC)
+            store.add_session(Session(
+                id="sess1", token_hash="hash1", user_id=acct.id,
+                issued_at=now, expires_at=now + timedelta(days=1)))
+            self.assertTrue(player.is_active, label)
+
+            api.setup.set_player_active(player.id, True, actor_id="a")
+            self.assertTrue(store.get_user_account(acct.id).active, label)  # preserved
+            self.assertIsNone(
+                store.sessions_for_user(acct.id)[0].revoked_at, label)      # live
+
 
 class SetPlayerActiveHttpTest(unittest.TestCase):
     @classmethod
