@@ -2571,20 +2571,14 @@ class SetupService:
                             "external_ref": code, "team_id": team_id,
                             "changed_fields": changed})
             created = False
+        # A supplied nonblank email validates, updates, AND reactivates the
+        # single player:<id> EMAIL contact via the shared set/retire path — so
+        # re-importing an address that a prior edit retired makes the contact
+        # active again (was: destination updated but left active=False). An
+        # absent/blank cell never reaches the helper, so it stays a no-op that
+        # leaves any existing contact untouched (#268 review).
         if email:
-            recipient_ref = f"player:{obj.id}"
-            existing_contact = self.store.get_contact_destination(
-                recipient_ref, NotificationChannel.EMAIL)
-            if existing_contact is not None:
-                if existing_contact.destination != email:
-                    existing_contact.destination = email
-                    self.store.save_contact_destination(existing_contact)
-            else:
-                self.store.add_contact_destination(ContactDestination(
-                    id=self.store.next_id("contact"),
-                    recipient_ref=recipient_ref,
-                    channel=NotificationChannel.EMAIL,
-                    destination=email))
+            self._set_email_contact(f"player:{obj.id}", email)
         return obj, created, changed
 
     def upsert_imported_registration(self, season_id: str, team_id: str,
@@ -2807,11 +2801,8 @@ class SetupService:
         self._audit("player_added", "player", player.id, actor_id,
                     {"team_id": team_id})
         if email:
-            self.store.add_contact_destination(ContactDestination(
-                id=self.store.next_id("contact"),
-                recipient_ref=f"player:{player.id}",
-                channel=NotificationChannel.EMAIL,
-                destination=email))
+            # Nonblank only: create/reactivate via the shared set/retire path.
+            self._set_email_contact(f"player:{player.id}", email)
         return player
 
     @staticmethod
@@ -2903,22 +2894,28 @@ class SetupService:
                         {"changed_fields": fields})
         return player
 
-    def _apply_player_email(self, player: Player, email) -> bool:
-        """Create/update/retire the Player's email ``ContactDestination`` (#268).
+    def _set_email_contact(self, recipient_ref: str, email) -> bool:
+        """The one set/retire path for a recipient's EMAIL ``ContactDestination``.
 
-        The edit drawer's email field IS the Player's current email: a non-empty
-        value sets it as the single active ``player:<id>`` EMAIL destination
-        (created, or updated-and-reactivated in place — never duplicated); an
-        empty/None value retires an existing active one (``active=False``, never
-        deleted, so its history and any notification preferences survive — prefs
-        key on the recipient_ref, not this row, so they are never orphaned). The
-        raw address is never returned to the caller or placed in the audit;
-        returns ``True`` only when something actually changed.
+        Shared by Player create, edit, and BOTH import paths so no caller can
+        drift on the contact lifecycle (#268 review). A non-empty ``email``
+        validates then becomes the single active EMAIL destination for
+        ``recipient_ref`` — created, or **updated-and-reactivated in place**, so
+        a value re-supplied after a retirement makes the contact active again
+        rather than silently staying ``active=False``. An empty/``None`` value
+        retires an existing active one (``active=False``, never deleted, so its
+        history and any notification preferences — keyed on ``recipient_ref``,
+        not this row — survive and are never orphaned). Returns ``True`` only
+        when something actually changed.
+
+        Callers that must treat a blank value as a *no-op* rather than a
+        retirement (the imports, where an absent cell means "leave as-is")
+        simply guard the call on a non-empty email; this helper never sees the
+        blank in that case.
         """
-        ref = f"player:{player.id}"
         normalized = (email or "").strip() or None
         existing = self.store.get_contact_destination(
-            ref, NotificationChannel.EMAIL)
+            recipient_ref, NotificationChannel.EMAIL)
         if normalized is None:
             if existing is not None and existing.active:
                 existing.active = False
@@ -2934,9 +2931,18 @@ class SetupService:
             self.store.save_contact_destination(existing)
             return True
         self.store.add_contact_destination(ContactDestination(
-            id=self.store.next_id("contact"), recipient_ref=ref,
+            id=self.store.next_id("contact"), recipient_ref=recipient_ref,
             channel=NotificationChannel.EMAIL, destination=normalized))
         return True
+
+    def _apply_player_email(self, player: Player, email) -> bool:
+        """Set/retire the Player's email contact from the edit drawer (#268).
+
+        The edit field IS the Player's current email, so an explicit ``None``
+        retires it — thin wrapper over the shared ``_set_email_contact`` on the
+        single ``player:<id>`` EMAIL destination.
+        """
+        return self._set_email_contact(f"player:{player.id}", email)
 
     def active_player_email(self, player_id: str) -> Optional[str]:
         """The Player's current active email, for the operator edit drawer (#268).
@@ -3312,19 +3318,14 @@ class SetupService:
                                 {"team_id": team_id, "import_batch_id": batch_id})
                     counts["players_created"] += 1
 
+                # A blank cell parsed to None above → no-op (leave any existing
+                # contact untouched). A supplied address validates, updates AND
+                # reactivates the single player:<id> EMAIL contact through the
+                # shared set/retire path, so a re-import revives a contact a
+                # prior edit had retired instead of leaving it active=False
+                # (#268 review).
                 if email is not None:
-                    recipient_ref = f"player:{player.id}"
-                    existing = self.store.get_contact_destination(
-                        recipient_ref, NotificationChannel.EMAIL)
-                    if existing is not None:
-                        existing.destination = email
-                        self.store.save_contact_destination(existing)
-                    else:
-                        self.store.add_contact_destination(ContactDestination(
-                            id=self.store.next_id("contact"),
-                            recipient_ref=recipient_ref,
-                            channel=NotificationChannel.EMAIL,
-                            destination=email))
+                    self._set_email_contact(f"player:{player.id}", email)
 
             # skipped/errors are always 0 here by construction: the
             # all-or-nothing gate above means the only way to reach this line
