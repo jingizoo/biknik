@@ -3103,12 +3103,42 @@ class SetupService:
         prior = player.is_active
         player.is_active = target
         self.store.save_player(player)
+        if not target:
+            # A login must not outlive the roster exit (#270 review): atomically
+            # retire any active scoped account bound to this player and revoke
+            # its live sessions, in this same transaction. Reactivating the
+            # Player does NOT silently restore account authority — the operator
+            # reactivates the account through the account lifecycle, which
+            # re-checks the Player is active (#266/#282).
+            self._retire_player_account_authority(player.id, actor_id)
         detail = {"from_active": prior, "to_active": target}
         if reason:
             detail["reason"] = reason
         self._audit("player_activated" if target else "player_deactivated",
                     "player", player.id, actor_id, detail)
         return player
+
+    def _retire_player_account_authority(self, player_id: str,
+                                         actor_id: Optional[str]) -> None:
+        """Deactivate every active account scoped to ``player_id`` and revoke
+        its live sessions (#270 review). Runs inside ``set_player_active``'s
+        transaction, so it rolls back with the rest on any failure. Because
+        ``SessionManager.resolve`` fails closed on an inactive account, killing
+        the account row is what terminates the session; the explicit revoke is
+        belt-and-suspenders and mirrors the account-active route."""
+        now = _utcnow()
+        for acct in self.store.all_user_accounts():
+            if not acct.active or (acct.scope or {}).get("player_id") != player_id:
+                continue
+            acct.active = False
+            self.store.save_user_account(acct)
+            self._audit("user_account_deactivated", "user_account", acct.id,
+                        actor_id, {"reason": "player_deactivated",
+                                   "player_id": player_id})
+            for sess in self.store.sessions_for_user(acct.id):
+                if sess.revoked_at is None:
+                    sess.revoked_at = now
+                    self.store.save_session(sess)
 
     # -- CSV import commit (#93) --------------------------------------------
     def commit_teams_players_import(self, season_id: str, sheets: dict,

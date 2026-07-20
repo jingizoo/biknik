@@ -83,6 +83,16 @@ class RosterService:
             raise NotFoundError(f"Player {player_id} not found.")
         return player
 
+    def _require_active_player(self, player_id: str) -> Player:
+        """Fail closed on a deactivated player at every substitute transition
+        (#270 review). A player enrolled while active, then deactivated, must
+        not be offer-able, accept, or be coach-added — the enrollment row stays
+        as history but can no longer act. Same message the enroll gate uses."""
+        player = self._require_player(player_id)
+        if not player.is_active:
+            raise NotEligibleError(f"{player.name} is not an active player.")
+        return player
+
     def _guard_mutable(self, game: Game) -> None:
         """Guard for operations that change the committed roster."""
         if game.cancelled:
@@ -445,6 +455,7 @@ class RosterService:
     ) -> SubstituteEnrollment:
         game = self._require_game(game_id)
         self._guard_mutable(game)
+        self._require_active_player(player_id)   # fail closed on deactivation
         sub = self.store.substitute_for_player(game_id, player_id)
         if sub is None or sub.status != SubstituteStatus.ENROLLED:
             raise InvalidTransitionError(
@@ -496,6 +507,7 @@ class RosterService:
         with self.store.transaction():
             game = self._require_game(game_id)
             self._guard_mutable(game)
+            self._require_active_player(player_id)   # fail closed on deactivation
             sub = self.store.substitute_for_player(game_id, player_id)
             if sub is None or sub.status != SubstituteStatus.OFFERED:
                 raise InvalidTransitionError("No active offer to accept.")
@@ -585,6 +597,7 @@ class RosterService:
         """Coach override: offer + accept in one step (audited)."""
         game = self._require_game(game_id)
         self._guard_mutable(game)
+        self._require_active_player(player_id)   # fail closed on deactivation
         sub = self.store.substitute_for_player(game_id, player_id)
         if sub is None or sub.status not in (
             SubstituteStatus.ENROLLED,
@@ -886,7 +899,9 @@ class RosterService:
         rows = []
         for sub in self.store.substitutes_for_game(game_id):
             player = self.store.get_player(sub.player_id)
-            if player is None or player.team_id != team_id:
+            # A deactivated player's enrollment stays as history but drops out
+            # of the live outreach queue (#270 review) — never offer-able.
+            if player is None or player.team_id != team_id or not player.is_active:
                 continue
             can_offer = (sub.status == SubstituteStatus.ENROLLED
                          and not game.locked and not game.cancelled

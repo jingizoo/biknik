@@ -17,7 +17,7 @@ import threading
 import unittest
 import urllib.error
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http.cookiejar import CookieJar
 from http.server import ThreadingHTTPServer
 
@@ -25,10 +25,10 @@ from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
 
 from hockey_scheduler.api import ApiService
 from hockey_scheduler.domain import (
-    Division, Game, GameRosterEntry, LeagueSeason, Position, Role,
-    RosterEntryStatus, RosterRole, SelectionSource, Team)
+    Division, Game, GameRosterEntry, LeagueSeason, Position, Role, Session,
+    RosterEntryStatus, RosterRole, SelectionSource, SubstituteStatus, Team)
 from hockey_scheduler.domain.errors import (
-    IntegrityConflictError, ValidationError)
+    IntegrityConflictError, NotEligibleError, ValidationError)
 from hockey_scheduler.store import InMemoryStore, SqlStore
 
 UTC = timezone.utc
@@ -180,6 +180,52 @@ class SetPlayerActiveServiceTest(unittest.TestCase):
             self.assertTrue(store.get_player(player.id).is_active, label)  # unchanged
             self.assertEqual(len(_lifecycle_audits(store)), 0, label)
 
+    def _sub_game(self, store, api):
+        # A published, upcoming game the home player can substitute for, with a
+        # single open skater slot. A deterministic clock keeps it "upcoming".
+        from helpers import FakeClock
+        api.roster.clock = FakeClock()
+        store.add_game(Game(
+            id="g1", home_team_id="home",
+            start_time=datetime(2026, 1, 2, tzinfo=UTC),
+            division_id="d", published=True,
+            target_goalies=0, target_skaters=1))
+
+    def test_deactivation_hides_candidate_and_blocks_offer(self):
+        # An ENROLLED substitute who is then deactivated drops out of the live
+        # candidate queue and cannot be offered — the enrollment stays as
+        # history, but no roster/audit mutation happens on the rejected path.
+        for label, store, api, setup, player in self._each():
+            self._sub_game(store, api)
+            api.roster.enroll_substitute("g1", player.id, actor_id="a")
+            self.assertIn(player.id, [c["player_id"] for c in
+                          api.roster.list_substitute_candidates("g1", "home")],
+                          label)
+            setup.set_player_active(player.id, False, actor_id="a")
+            self.assertNotIn(player.id, [c["player_id"] for c in
+                             api.roster.list_substitute_candidates("g1", "home")],
+                             label)                                # candidate hidden
+            with self.assertRaises(NotEligibleError, msg=label):
+                api.roster.offer_substitute("g1", player.id, actor_id="a")
+            self.assertEqual(
+                store.substitute_for_player("g1", player.id).status,
+                SubstituteStatus.ENROLLED, label)                 # unchanged
+
+    def test_deactivation_blocks_accept_and_coach_add(self):
+        # A player OFFERED a slot, then deactivated, can neither accept nor be
+        # coach-added — and no roster row is created on the rejected paths.
+        for label, store, api, setup, player in self._each():
+            self._sub_game(store, api)
+            api.roster.enroll_substitute("g1", player.id, actor_id="a")
+            api.roster.offer_substitute("g1", player.id, actor_id="a")
+            setup.set_player_active(player.id, False, actor_id="a")
+            with self.assertRaises(NotEligibleError, msg=label):
+                api.roster.accept_substitute("g1", player.id, actor_id="a")
+            with self.assertRaises(NotEligibleError, msg=label):
+                api.roster.add_substitute_to_roster("g1", player.id, actor_id="a")
+            self.assertIsNone(
+                store.roster_entry_for_player("g1", player.id), label)
+
     def test_blank_reason_is_omitted_from_audit(self):
         for label, store, api, setup, player in self._each():
             setup.set_player_active(player.id, False, actor_id="a",
@@ -272,6 +318,31 @@ class InactivePlayerAccountBindingTest(unittest.TestCase):
                 api.accounts.set_active(acct.id, True, actor_id="a")
             self.assertEqual(ctx.exception.details.get("reason"),
                              "player_inactive", label)
+
+    def test_deactivation_retires_account_and_sessions_no_silent_restore(self):
+        # Deactivating a Player atomically retires its ACTIVE scoped account and
+        # revokes live sessions (a login must not outlive the roster exit), and
+        # reactivating the Player does NOT silently restore that authority
+        # (#270 review).
+        for label, store, api, player in self._each():
+            acct = api.accounts.create_account(
+                "player_login", "pw", Role.PLAYER,
+                scope={"player_id": player.id})
+            now = datetime(2026, 1, 1, tzinfo=UTC)
+            store.add_session(Session(
+                id="sess1", token_hash="hash1", user_id=acct.id,
+                issued_at=now, expires_at=now + timedelta(days=1)))
+            self.assertTrue(store.get_user_account(acct.id).active, label)
+
+            api.setup.set_player_active(player.id, False, actor_id="a")
+            self.assertFalse(store.get_user_account(acct.id).active, label)  # retired
+            self.assertIsNotNone(
+                store.sessions_for_user(acct.id)[0].revoked_at, label)   # revoked
+
+            # Reactivating the Player must leave the account inactive — the
+            # operator reactivates it explicitly (which re-checks player active).
+            api.setup.set_player_active(player.id, True, actor_id="a")
+            self.assertFalse(store.get_user_account(acct.id).active, label)
 
 
 class SetPlayerActiveHttpTest(unittest.TestCase):

@@ -163,6 +163,35 @@ class ProductionPublicPrivacyTest(_HttpBase):
             f"/api/games/{self.game_id}/roster-status")
         self.assertEqual(no, 403)
 
+    def test_deactivated_player_session_loses_private_read(self):
+        # #270 review: a scoped Player's login must not outlive the roster exit.
+        # A logged-in player can read its team's private game data; once the
+        # operator deactivates the Player, the SAME session cookie is denied —
+        # the private-read gate fails closed AND the scoped account is retired.
+        from hockey_scheduler.domain import Player, Position, Role
+        g = self._game()
+        store = srv.STATE.api.store
+        # A DEDICATED player on the away team (so deactivating it doesn't
+        # disturb the shared demo players other tests in this class rely on).
+        away_player = "dp_test_player"
+        store.add_player(Player(id=away_player, team_id=g.away_team_id,
+                                name="Departing Player", position=Position.FORWARD))
+        acct = srv.STATE.api.accounts.create_account(
+            username="u_dp", password="scoped-account-pw", role=Role.PLAYER,
+            scope={"player_id": away_player, "team_id": g.away_team_id})
+        token = srv.SESSIONS.login(store, acct.id)
+        cookie = f"{srv.SESSION_COOKIE}={token}"
+        ok, _ = self._get(
+            f"/api/games/{self.game_id}/roster-status", cookie=cookie)
+        self.assertEqual(ok, 200)
+        # Operator deactivates the Player.
+        srv.STATE.api.set_player_active(away_player, False, actor_id="admin")
+        denied, _ = self._get(
+            f"/api/games/{self.game_id}/roster-status", cookie=cookie)
+        self.assertIn(denied, (401, 403))
+        # The scoped account itself was retired, not just the read gate.
+        self.assertFalse(store.get_user_account(acct.id).active)
+
     def test_official_assignment_controls_officials_access(self):
         from hockey_scheduler.domain import Role
         assigned = srv.STATE.api.store.assignments_for_game(self.game_id)
