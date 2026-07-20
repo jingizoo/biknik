@@ -28,7 +28,6 @@ from ..domain import (
     NotificationRecipient,
     Role,
     OfficialRole,
-    Position,
     ResultStatus,
     RosterEntryStatus,
     SlotType,
@@ -3947,8 +3946,11 @@ class ApiService:
                       shoots: Optional[str] = None,
                       is_active: bool = True,
                       actor_id: Optional[str] = None) -> dict:
+        # Pass position through raw: the service's canonical _validate_position
+        # parses/validates it with a field-level invalid_position error (#268
+        # review), so create and edit share one validator and the same field.
         return _serialize(self.setup.add_player(
-            team_id, name, _parse_enum(Position, position, "position"),
+            team_id, name, position,
             jersey_number=jersey_number, email=email, shoots=shoots,
             is_active=is_active, actor_id=actor_id))
 
@@ -3975,16 +3977,14 @@ class ApiService:
         Accepts only the correctable fields (``name``, ``position``,
         ``jersey_number``, ``shoots``, ``email``); a caller passes just the ones
         it wants to change, and any absent field is left untouched by the
-        service. ``position`` is parsed to the domain enum here so an invalid
-        value is a field-level error before the write.
+        service. Each value (including ``position``) is validated by the service
+        with a field-level error before any write, so create and edit share one
+        canonical validator per field (#268 review).
         """
-        kwargs = {}
-        for key in ("name", "jersey_number", "shoots", "email"):
-            if key in fields:
-                kwargs[key] = fields[key]
-        if "position" in fields:
-            kwargs["position"] = _parse_enum(
-                Position, fields["position"], "position")
+        kwargs = {key: fields[key]
+                  for key in ("name", "position", "jersey_number", "shoots",
+                              "email")
+                  if key in fields}
         return _serialize(self.setup.update_player(
             player_id, actor_id=actor_id, **kwargs))
 

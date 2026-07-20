@@ -252,6 +252,50 @@ class UpdatePlayerServiceTest(unittest.TestCase):
                                  "invalid_email", (label, bad))
             self.assertEqual(len(store.players_for_team("home")), before, label)
 
+    def test_invalid_position_on_edit_is_field_error_and_atomic(self):
+        # A direct service edit must not persist a non-Position: an invalid
+        # string, an explicit None (position is required, not nullable), or a
+        # wrong type is a field-level invalid_position — and because the edit is
+        # one transaction, the same-call name change and the audit are unchanged.
+        from hockey_scheduler.domain.errors import ValidationError
+        for label, store, api, setup, player in self._each():
+            pid = player.id
+            for bad in ("wing", None, 5, ["forward"]):
+                with self.assertRaises(ValidationError, msg=(label, repr(bad))) as ctx:
+                    setup.update_player(pid, name="Should Not Land",
+                                        position=bad, actor_id="a")
+                self.assertEqual(ctx.exception.details.get("field"), "position",
+                                 (label, repr(bad)))
+                self.assertEqual(ctx.exception.details.get("reason"),
+                                 "invalid_position", (label, repr(bad)))
+                fresh = store.get_player(pid)
+                self.assertEqual(fresh.name, "Jordn Le", (label, repr(bad)))   # rolled back
+                self.assertEqual(fresh.position, Position.FORWARD, (label, repr(bad)))
+            self.assertEqual(len(_player_updated_audits(store)), 0, label)
+
+    def test_invalid_position_on_create_is_field_error_and_no_player(self):
+        from hockey_scheduler.domain.errors import ValidationError
+        for label, store, api, setup, player in self._each():
+            before = len(store.players_for_team("home"))
+            for bad in ("wing", None, 5):
+                with self.assertRaises(ValidationError, msg=(label, repr(bad))) as ctx:
+                    setup.add_player("home", "Ghost", bad, actor_id="a")
+                self.assertEqual(ctx.exception.details.get("reason"),
+                                 "invalid_position", (label, repr(bad)))
+                self.assertEqual(ctx.exception.details.get("field"), "position",
+                                 (label, repr(bad)))
+            self.assertEqual(len(store.players_for_team("home")), before, label)
+
+    def test_valid_position_string_accepted_on_create_and_edit(self):
+        # The canonical validator also parses a valid position string (the
+        # import-aligned form), so a direct string caller still works.
+        for label, store, api, setup, player in self._each():
+            created = setup.add_player("home", "Skater", "defense", actor_id="a")
+            self.assertEqual(created.position, Position.DEFENSE, label)
+            updated = setup.update_player(player.id, position="goalie",
+                                          actor_id="a")
+            self.assertEqual(updated.position, Position.GOALIE, label)
+
 
 class UpdatePlayerHttpTest(unittest.TestCase):
     @classmethod
@@ -393,6 +437,31 @@ class UpdatePlayerHttpTest(unittest.TestCase):
             self.assertEqual(s, 400, bad)
             self.assertEqual(body["error"]["details"]["reason"], "wrong_type", bad)
             self.assertEqual(body["error"]["details"]["field"], "email", bad)
+
+    def test_edit_invalid_position_string_is_400_field_error(self):
+        c = self._admin()
+        p = self._a_player(c)
+        # A well-typed but non-canonical position string reaches the service's
+        # canonical validator → invalid_position on field "position".
+        s, _h, body = self._req(
+            c, "POST", f"/api/v2/setup/player/{p['id']}/update",
+            {"name": "Kept", "position": "wing"})
+        self.assertEqual(s, 400)
+        self.assertEqual(body["error"]["details"]["reason"], "invalid_position")
+        self.assertEqual(body["error"]["details"]["field"], "position")
+
+    def test_edit_null_and_wrong_type_position_are_400_on_field(self):
+        c = self._admin()
+        p = self._a_player(c)
+        # Explicit null and a wrong JSON type are caught at the HTTP schema
+        # (position is typed str) — a stable 400 that still names field
+        # "position", not a fieldless enum error.
+        for bad in (None, 5):
+            s, _h, body = self._req(
+                c, "POST", f"/api/v2/setup/player/{p['id']}/update",
+                {"position": bad})
+            self.assertEqual(s, 400, repr(bad))
+            self.assertEqual(body["error"]["details"]["field"], "position", repr(bad))
 
     def test_create_invalid_shoots_is_400_field_error(self):
         c = self._admin()

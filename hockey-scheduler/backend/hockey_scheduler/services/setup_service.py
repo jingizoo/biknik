@@ -2801,8 +2801,10 @@ class SetupService:
         # player is created — a blank/None just means "no email" (#268 review).
         canonical_email = self._validate_email(email)
         canonical_shoots = self._validate_shoots(shoots)
+        canonical_position = self._validate_position(position)
         player = Player(id=self.store.next_id("player"), team_id=team_id,
-                        name=self._require_name(name), position=position,
+                        name=self._require_name(name),
+                        position=canonical_position,
                         jersey_number=jersey_number,
                         shoots=canonical_shoots,
                         is_active=is_active)
@@ -2863,6 +2865,30 @@ class SetupService:
                 {"reason": "invalid_shoots", "field": "shoots"})
         return canonical
 
+    @staticmethod
+    def _validate_position(position) -> Position:
+        """Canonicalize a Player position to a ``Position`` (#268 review).
+
+        The single validator shared by Player create and edit (and aligned with
+        the import parser, which likewise turns a cell string into ``Position``).
+        Accepts a ``Position`` as-is or parses a valid position string; every
+        other value — an invalid string, ``None`` (position is required, not
+        nullable), or a wrong type — raises a field-level ``validation_error``
+        (``reason="invalid_position"``, ``field="position"``) BEFORE any
+        mutation, so a direct service caller can't persist a bad position and
+        the HTTP error carries the field the same way jersey/shoots/email do.
+        """
+        if isinstance(position, Position):
+            return position
+        if isinstance(position, str):
+            try:
+                return Position(position)
+            except ValueError:
+                pass
+        raise ValidationError(
+            f"position must be one of {', '.join(p.value for p in Position)}.",
+            {"reason": "invalid_position", "field": "position"})
+
     @_transactional
     def update_player(self, player_id: str, *, name=_UNSET, position=_UNSET,
                       jersey_number=_UNSET, shoots=_UNSET, email=_UNSET,
@@ -2894,9 +2920,11 @@ class SetupService:
             if new_name != player.name:
                 player.name = new_name
                 changed.append("name")
-        if position is not _UNSET and position != player.position:
-            player.position = position
-            changed.append("position")
+        if position is not _UNSET:
+            new_position = self._validate_position(position)
+            if new_position != player.position:
+                player.position = new_position
+                changed.append("position")
         if shoots is not _UNSET:
             new_shoots = self._validate_shoots(shoots)
             if new_shoots != player.shoots:
