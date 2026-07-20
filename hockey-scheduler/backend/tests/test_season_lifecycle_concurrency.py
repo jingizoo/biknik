@@ -27,7 +27,7 @@ from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
 
 from hockey_scheduler.api import ApiService
 from hockey_scheduler.domain.enums import SeasonStatus
-from hockey_scheduler.domain.errors import ValidationError
+from hockey_scheduler.domain.errors import NotFoundError, ValidationError
 from hockey_scheduler.store import InMemoryStore, SqlStore
 
 
@@ -175,6 +175,123 @@ class SeasonArchiveRaceTest(unittest.TestCase):
         else:
             # Registration committed before the archive — frozen history.
             self.assertEqual(len(regs), 1)
+
+
+    def test_archive_vs_delete_season_is_linearizable(self):
+        # An empty Season can be deleted while active. A delete racing an archive
+        # serializes on the same row lock: either delete wins (season active when
+        # it ran → removed, archive then finds nothing) or archive wins (season
+        # archived → delete fails season_archived, history retained). An archived
+        # Season is NEVER deleted.
+        store0 = SqlStore(self.url)
+        api0 = ApiService(store0)
+        pid = api0.create_program("Prog", "US", "UTC")["id"]
+        sid = api0.create_season(pid, "S1")["id"]  # empty → deletable
+        api_arch = ApiService(SqlStore(self.url))
+        api_del = ApiService(SqlStore(self.url))
+        barrier = threading.Barrier(2)
+        results = {}
+
+        def run(fn, key):
+            barrier.wait()
+            try:
+                fn(); results[key] = "ok"
+            except ValidationError as exc:
+                results[key] = exc.details.get("reason")
+            except NotFoundError:
+                results[key] = "not_found"
+            except Exception as exc:
+                results[key] = f"ERR:{exc}"
+
+        ta = threading.Thread(target=run, args=(
+            lambda: api_arch.setup.archive_season(sid, actor_id="a", reason="x"),
+            "archive"))
+        tb = threading.Thread(target=run, args=(
+            lambda: api_del.setup.delete_season(sid, actor_id="b"), "delete"))
+        ta.start(); tb.start(); ta.join(15); tb.join(15)
+
+        check = SqlStore(self.url)
+        season = check.get_season(sid)
+        if results["delete"] == "ok":
+            # Delete won the row first (season was active) → gone; archive found
+            # nothing.
+            self.assertIsNone(season, results)
+            self.assertEqual(results["archive"], "not_found", results)
+        else:
+            # Archive won → archived, and the delete fails closed (history kept).
+            self.assertEqual(results["archive"], "ok", results)
+            self.assertEqual(results["delete"], "season_archived", results)
+            self.assertIsNotNone(season, results)
+            self.assertEqual(season.status, SeasonStatus.ARCHIVED, results)
+
+    def test_archive_vs_transfer_freezes_registration_linearizably(self):
+        # A Team registered in a Season is transferred to a NEW League while an
+        # archive races. The transfer locks the Season row before deciding, so
+        # its move-or-freeze decision is serialized against the archive and the
+        # persisted registration state always agrees with the transfer audit —
+        # the archived registration is never rewritten out from under the lock.
+        store0 = SqlStore(self.url)
+        api0 = ApiService(store0)
+        pid = api0.create_program("Prog", "US", "UTC")["id"]
+        sid = api0.create_season(pid, "S1")["id"]
+        l1 = api0.create_league(sid, "Gold")["id"]
+        l2 = api0.create_league(sid, "Silver")["id"]
+        did = api0.create_division(sid, "D1", league_id=l1)["id"]
+        club = api0.create_club("Club")["id"]
+        tid = api0.create_team(club_id=club, name="Alpha", league_id=l1)["id"]
+        api0.register_team_for_season(sid, tid, division_id=did)
+        reg = store0.registration_for_team_in_season(sid, tid)
+        reg_id, old_ls = reg.id, reg.league_season_id
+
+        api_arch = ApiService(SqlStore(self.url))
+        api_tx = ApiService(SqlStore(self.url))
+        barrier = threading.Barrier(2)
+        results = {}
+
+        def run(fn, key):
+            barrier.wait()
+            try:
+                fn(); results[key] = "ok"
+            except ValidationError as exc:
+                results[key] = exc.details.get("reason")
+            except Exception as exc:
+                results[key] = f"ERR:{exc}"
+
+        ta = threading.Thread(target=run, args=(
+            lambda: api_arch.setup.archive_season(sid, actor_id="a", reason="x"),
+            "archive"))
+        tb = threading.Thread(target=run, args=(
+            lambda: api_tx.setup.transfer_team_to_league(tid, l2, actor_id="b"),
+            "transfer"))
+        ta.start(); tb.start(); ta.join(15); tb.join(15)
+
+        # Archive always commits (nothing here archives/removes the Season under
+        # it); the transfer always succeeds (it either moves the reg or freezes
+        # it), leaving the Season archived.
+        self.assertEqual(results["archive"], "ok", results)
+        self.assertEqual(results["transfer"], "ok", results)
+        check = SqlStore(self.url)
+        self.assertEqual(check.get_season(sid).status, SeasonStatus.ARCHIVED)
+        reg2 = check.get_season_team_registration(reg_id)
+        moved = reg2.league_season_id != old_ls
+        tx_audit = [a for a in check.all_setup_audit()
+                    if a.action == "team_league_transferred"
+                    and a.entity_id == tid][0]
+        audit_moved = reg_id in tx_audit.detail.get("registrations_moved", [])
+        # The persisted registration and the transfer's own audit agree — the
+        # move-or-freeze decision and the write are one atomic, serialized unit.
+        self.assertEqual(moved, audit_moved, (moved, tx_audit.detail))
+        if moved:
+            # Moved before the archive linearization point → into the target
+            # League's LeagueSeason for the same Season, never a torn value.
+            new_ls = check.league_season_for(l2, sid)
+            self.assertIsNotNone(new_ls, results)
+            self.assertEqual(reg2.league_season_id, new_ls.id, results)
+        else:
+            # Archive won the row first → the registration stayed frozen.
+            self.assertEqual(reg2.league_season_id, old_ls, results)
+        # Whichever order, the Team's permanent League still moved.
+        self.assertEqual(check.get_team(tid).league_id, l2, results)
 
 
 # =====================================================================

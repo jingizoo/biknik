@@ -95,10 +95,18 @@ invariant via their process-wide transaction lock.
 
 Archived Seasons remain fully readable — all prior registrations, divisions,
 games, results and history are preserved and continue to render; only new writes
-are blocked. Reopening restores writability. (`delete_season` itself is a
-separate destructive operation with its own dependency guards and is
-deliberately **not** blocked by archive — removing a Season is not a write
-*into* it.)
+are blocked. Reopening restores writability. **Deleting** an archived Season is
+blocked too (`delete_season` fails closed with `season_archived` before its
+dependency scan, under the same Season row lock): read-only history must be
+retained, so an operator must reopen a Season before it can be removed.
+
+A **Team transfer** (direct or import-driven, via the shared
+`_transfer_team_to_league_inner`) locks every distinct Season its candidate
+registrations touch — in canonical sorted order — *before* classifying them, so
+its move-or-freeze decision reads each Season's status under that lock. A
+registration in a Season that is archived under the lock is frozen history and
+never moved; a concurrent archive cannot slip between the status read and the
+registration rewrite.
 
 ## Scope / follow-ups
 

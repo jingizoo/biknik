@@ -356,6 +356,68 @@ class SeasonArchivedRegistrationDivisionGuardTest(unittest.TestCase):
             self.assertEqual(len(store.all_games()), games_after_draft, label)
 
 
+class SeasonArchivedDeleteAndTransferGuardTest(unittest.TestCase):
+    """Deleting an archived Season is blocked (read-only history must be
+    retained), and a Team transfer — direct or import-driven — freezes an
+    archived Season's registration by reading the Season under its row lock, so
+    an archived registration is never rewritten (#159 re-review)."""
+
+    def _reg_id(self, store, sid, tid):
+        r = store.registration_for_team_in_season(sid, tid)
+        return r.id if r else None
+
+    def test_delete_archived_season_blocked_zero_mutation(self):
+        for label, store in _backends():
+            api = ApiService(store)
+            pid = api.create_program("P", "US", "UTC")["id"]
+            sid = api.create_season(pid, "S1")["id"]  # empty → otherwise deletable
+            api.setup.archive_season(sid, actor_id="admin", reason="done")
+            audits0 = len(store.all_setup_audit())
+            with self.assertRaises(ValidationError) as ctx:
+                api.setup.delete_season(sid, actor_id="a")
+            self.assertEqual(ctx.exception.details.get("reason"),
+                             "season_archived", label)
+            self.assertIsNotNone(store.get_season(sid), label)  # history retained
+            self.assertEqual(len(store.all_setup_audit()), audits0, label)
+            self.assertNotIn("season_deleted",
+                             [a.action for a in store.all_setup_audit()], label)
+
+    def test_delete_active_empty_season_still_works(self):
+        # The guard doesn't over-block: an ACTIVE empty Season still deletes.
+        for label, store in _backends():
+            api = ApiService(store)
+            pid = api.create_program("P", "US", "UTC")["id"]
+            sid = api.create_season(pid, "S1")["id"]
+            api.setup.delete_season(sid, actor_id="a")
+            self.assertIsNone(store.get_season(sid), label)
+
+    def test_import_driven_transfer_freezes_archived_registration(self):
+        # The import path routes a permanent-League change through the same
+        # locked _transfer_team_to_league_inner, so it too must freeze an
+        # archived Season's registration rather than rewrite it.
+        for label, store in _backends():
+            api = ApiService(store)
+            pid = api.create_program("P", "US", "UTC")["id"]
+            sid = api.create_season(pid, "S1")["id"]
+            l1 = api.create_league(sid, "Gold")["id"]
+            l2 = api.create_league(sid, "Silver")["id"]
+            did = api.create_division(sid, "D1", league_id=l1)["id"]
+            club = api.create_club("Club")["id"]
+            team = api.create_team(club_id=club, name="Alpha", league_id=l1)["id"]
+            api.register_team_for_season(sid, team, division_id=did)
+            reg = self._reg_id(store, sid, team)
+            ls_before = store.get_season_team_registration(reg).league_season_id
+            api.setup.archive_season(sid, actor_id="admin", reason="done")
+
+            # Route the permanent-League change through the import helper.
+            api.setup._transfer_team_to_league_inner(
+                store.get_team(team), l2, actor_id="import")
+            self.assertEqual(
+                store.get_season_team_registration(reg).league_season_id,
+                ls_before, label)  # frozen — never moved into the archived Season
+            self.assertEqual(store.get_team(team).league_id, l2, label)  # team moved
+
+
 class SeasonLifecycleReasonValidationTest(unittest.TestCase):
     """The lifecycle ``reason`` is type-validated and normalized BEFORE any
     mutation (#159 r3): archive accepts ``null`` or a string; reopen requires a

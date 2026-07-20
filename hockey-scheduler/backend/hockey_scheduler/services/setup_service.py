@@ -1042,15 +1042,30 @@ class SetupService:
         # current/future conflict is moved when game-free, or blocks the whole
         # transfer (zero mutation) when it has committed games.
         now = self.clock()
+        # The candidate registrations to (maybe) move: this Team's own active
+        # rows that currently sit in a DIFFERENT League than the target.
+        candidates = [
+            reg for reg in self.store.all_season_team_registrations()
+            if reg.team_id == team_id and reg.active
+            and self._registration_league_id(reg) != new_league_id]
+        # #159 — lock every distinct Season these registrations touch, in
+        # canonical sorted order, BEFORE classifying or mutating. The locked read
+        # is the linearization point: a Season that reads ARCHIVED under its lock
+        # is frozen history and never moved, and a concurrent archive cannot slip
+        # in between the status check and the registration rewrite (it blocks on
+        # the row until this transfer commits, or committed first and is observed
+        # here). Sorted order avoids lock-order deadlocks across the batch.
+        locked_seasons = {}
+        for sid in sorted({
+                self._season_of_league_season(r.league_season_id)
+                for r in candidates
+                if self._season_of_league_season(r.league_season_id)}):
+            locked_seasons[sid] = self.store.get_season_for_update(sid)
         to_move = []          # (reg, season_id) pairs eligible to move
         blocked = []          # {registration_id, season_id, affected_game_ids}
-        for reg in self.store.all_season_team_registrations():
-            if reg.team_id != team_id or not reg.active:
-                continue
-            if self._registration_league_id(reg) == new_league_id:
-                continue  # already in the target League — nothing to do
+        for reg in candidates:
             season_id = self._season_of_league_season(reg.league_season_id)
-            season = self.store.get_season(season_id) if season_id else None
+            season = locked_seasons.get(season_id) if season_id else None
             # A Season is historical only once it has DEFINITELY ended (a real
             # end_date in the past). A missing/undated Season is treated as
             # current/future (the safe default) until an operator resolves it.
@@ -4709,9 +4724,16 @@ class SetupService:
 
     @_transactional
     def delete_season(self, season_id: str, actor_id: Optional[str] = None) -> Season:
-        season = self.store.get_season(season_id)
+        # Lock the Season row (#159) so this serializes against a concurrent
+        # archive on the same row.
+        season = self.store.get_season_for_update(season_id)
         if season is None:
             raise NotFoundError(f"Season {season_id} not found.")
+        # #159 — an archived Season is read-only history and must retain it:
+        # deleting it (even when empty) would destroy that history, so it fails
+        # closed through the same active-season guard before any dependent scan
+        # or write. Reopen it first if it genuinely needs removing.
+        self._require_active_season(season_id)
         # #283: leagues are permanent; those participating in this Season are its
         # LeagueSeasons' leagues.
         levels = [lg for lg in (self.store.get_league(ls.league_id)
