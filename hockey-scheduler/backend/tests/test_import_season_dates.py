@@ -317,6 +317,98 @@ class ImportSeasonBoundaryTest(unittest.TestCase):
             self.assertEqual(self._season(store).start_date.isoformat(),
                              "2026-09-15T00:00:00+00:00", label)  # midnight UTC
 
+    # -- moving a dated Season across timezones is rejected -----------------
+    def _seed_two_programs(self, api, comp_rows, program_rows):
+        return api.commit_hierarchy_import(fx.full_payload(
+            programs_csv=fx.programs_csv(rows=program_rows),
+            competition_csv=fx.competition_csv(rows=comp_rows),
+            permanent_teams_csv="", players_csv="",
+            registrations_csv="", season_venue_access_csv=""), actor_id="admin")
+
+    def _move(self, api, program_rows, comp_rows, dry=False):
+        payload = fx.full_payload(
+            programs_csv=fx.programs_csv(rows=program_rows),
+            competition_csv=fx.competition_csv(rows=comp_rows),
+            permanent_teams_csv="", players_csv="",
+            registrations_csv="", season_venue_access_csv="")
+        return (api.get_hierarchy_import_dry_run(payload) if dry
+                else api.commit_hierarchy_import(payload, actor_id="admin"))
+
+    def test_dated_season_move_to_different_zone_rejected(self):
+        for label, store, api, tz in self._each("UTC"):
+            self._seed_two_programs(
+                api, ("P1,S1,Season One,L1,League One,1,D1,Div One,Adult,"
+                      "2026-09-15,",), ("P1,CANLON,Prog One,US,UTC",))
+            s1 = fx.by_ref(store.all_seasons(), "S1")
+            p1_id, s1_start = s1.program_id, s1.start_date
+            audits_before = len(store.all_setup_audit())
+            prev = self._move(api, ("P2,CANLON,Prog Two,US,America/New_York",),
+                              ("P2,S1,Season One,L2,League Two,1,D2,Div Two,"
+                               "Adult,,",), dry=True)
+            self.assertTrue(any(e["code"] == "season_program_timezone_move"
+                                and e["sheet"] == "competition"
+                                and e.get("field") == "program_code"
+                                for e in prev["errors"]), prev["errors"])
+            res = self._move(api, ("P2,CANLON,Prog Two,US,America/New_York",),
+                             ("P2,S1,Season One,L2,League Two,1,D2,Div Two,"
+                              "Adult,,",))
+            self.assertFalse(res["committed"], label)
+            # S1 unchanged (same Program + instant); P2 not created; no audits.
+            s1_after = fx.by_ref(store.all_seasons(), "S1")
+            self.assertEqual(s1_after.program_id, p1_id, label)
+            self.assertEqual(s1_after.start_date, s1_start, label)
+            self.assertEqual([p for p in store.all_programs()
+                              if p.external_ref == "P2"], [], label)
+            self.assertEqual(len(store.all_setup_audit()), audits_before, label)
+
+    def test_same_zone_season_move_is_allowed(self):
+        for label, store, api, tz in self._each("UTC"):
+            self._seed_two_programs(
+                api, ("P1,S1,Season One,L1,League One,1,D1,Div One,Adult,"
+                      "2026-09-15,",), ("P1,CANLON,Prog One,US,UTC",))
+            res = self._move(api, ("P2,CANLON,Prog Two,US,UTC",),
+                             ("P2,S1,Season One,L2,League Two,1,D2,Div Two,"
+                              "Adult,,",))
+            self.assertTrue(res["committed"], res.get("errors"))
+            p2_id = fx.by_ref(store.all_programs(), "P2").id
+            self.assertEqual(fx.by_ref(store.all_seasons(), "S1").program_id,
+                             p2_id, label)  # moved within the same timezone
+
+    def test_undated_season_moves_across_zones(self):
+        for label, store, api, tz in self._each("UTC"):
+            self._seed_two_programs(
+                api, ("P1,S1,Season One,L1,League One,1,D1,Div One,Adult,,",),
+                ("P1,CANLON,Prog One,US,UTC",))
+            self.assertIsNone(fx.by_ref(store.all_seasons(), "S1").start_date)
+            res = self._move(api, ("P2,CANLON,Prog Two,US,America/New_York",),
+                             ("P2,S1,Season One,L2,League Two,1,D2,Div Two,"
+                              "Adult,,",))
+            self.assertTrue(res["committed"], res.get("errors"))
+            p2_id = fx.by_ref(store.all_programs(), "P2").id
+            self.assertEqual(fx.by_ref(store.all_seasons(), "S1").program_id,
+                             p2_id, label)
+
+    def test_move_uses_effective_uploaded_destination_timezone(self):
+        # P2 is stored as UTC, but the SAME upload changes it to New_York while
+        # moving the dated S1 into it — the effective (uploaded) NY zone is used,
+        # so the move is rejected even though P2's stored zone matches the source.
+        for label, store, api, tz in self._each("UTC"):
+            self._seed_two_programs(
+                api, ("P1,S1,Season One,L1,League One,1,D1,Div One,Adult,"
+                      "2026-09-15,",),
+                ("P1,CANLON,Prog One,US,UTC", "P2,CANLON,Prog Two,US,UTC"))
+            self.assertEqual(fx.by_ref(store.all_programs(), "P2").timezone,
+                             "UTC", label)
+            res = self._move(api, ("P2,CANLON,Prog Two,US,America/New_York",),
+                             ("P2,S1,Season One,L2,League Two,1,D2,Div Two,"
+                              "Adult,,",))
+            self.assertFalse(res["committed"], label)
+            # Both the move AND P2's stored zone are unchanged (batch rolled back).
+            self.assertEqual(fx.by_ref(store.all_seasons(), "S1").program_id,
+                             fx.by_ref(store.all_programs(), "P1").id, label)
+            self.assertEqual(fx.by_ref(store.all_programs(), "P2").timezone,
+                             "UTC", label)
+
     # -- old template without the optional columns --------------------------
     def test_old_template_without_columns_is_accepted(self):
         for label, store, api, tz in self._each("America/New_York"):

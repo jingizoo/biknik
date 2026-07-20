@@ -345,6 +345,51 @@ def _error_message(exc) -> str:
     return exc.args[0] if getattr(exc, "args", None) else "Invalid date."
 
 
+def _validate_season_program_moves(report, comp_rows, upload_programs,
+                                   existing_programs, existing_seasons,
+                                   store) -> None:
+    """Reject moving a DATED Season to a Program in a different timezone (#272
+    review). ``upsert_imported_season`` can repoint an existing Season's
+    ``program_id``; a blank boundary cell then preserves the stored instant, but
+    the destination Program's timezone now formats it — so a cross-timezone move
+    silently shifts the displayed calendar day. With no per-Season date/timezone
+    provenance, a move of a Season with any stored boundary is rejected when the
+    source and EFFECTIVE destination Program timezones differ. A same-timezone
+    move stays governed by the existing reassignment/dependency checks, and an
+    undated Season may move freely.
+    """
+    programs_by_id = {p.id: p for p in store.all_programs()}
+    seen = set()
+    for index, row in enumerate(comp_rows, start=1):
+        scode = _optional(row.get("season_code"))
+        if not scode or scode in seen:
+            continue
+        seen.add(scode)
+        existing = existing_seasons.get(scode)
+        if existing is None:
+            continue  # a new Season is not a move
+        if existing.start_date is None and existing.end_date is None:
+            continue  # an undated Season may move across zones
+        dest_code = _clean(row.get("program_code"))
+        src_program = programs_by_id.get(existing.program_id)
+        src_code = src_program.external_ref if src_program else None
+        if dest_code == src_code:
+            continue  # same Program — not a move
+        src_zone = resolve_timezone(src_program.timezone) if src_program else None
+        src_tz = str(src_zone or timezone.utc)
+        dest_tz = str(_import_program_timezone(
+            dest_code, upload_programs, existing_programs))
+        if src_tz != dest_tz:
+            report.error(
+                "competition", index, "season_program_timezone_move",
+                f"Cannot move Season {scode} to Program {dest_code}: its stored "
+                f"start/end dates were set under timezone {src_tz}, but the "
+                f"destination Program uses {dest_tz}, which would shift the "
+                "displayed dates. Move it only to a Program in the same "
+                "timezone, or reschedule the Season through an explicit "
+                "workflow.", "program_code")
+
+
 def _check_player_jersey_conflicts(report, player_rows, store, existing_teams,
                                    upload_team_codes) -> None:
     """Report import rows whose active-team jersey collides (#269).
@@ -532,8 +577,9 @@ def validate_hierarchy_import(sheets: Dict[str, List[dict]], store) -> dict:
                 f"Cannot change the timezone of Program "
                 f"{existing_program.external_ref} from "
                 f"{existing_program.timezone!r} to {new_tz!r}: it has Seasons "
-                "with stored start/end dates that would shift. Remove the "
-                "Season boundaries first or keep the timezone.", "timezone")
+                "with stored start/end dates that would shift. Keep the "
+                "timezone, or reschedule those Seasons through an explicit "
+                "workflow before changing it.", "timezone")
 
     upload_program_codes = {
         _clean(row.get("program_code")) for row in rows["programs"]
@@ -546,6 +592,11 @@ def validate_hierarchy_import(sheets: Dict[str, List[dict]], store) -> dict:
     _validate_season_boundaries(
         report, rows["competition"], rows["programs"],
         existing_programs, existing_seasons)
+    # Moving a dated Season across timezones would reinterpret its stored
+    # instants just as a Program timezone change would (#272 review).
+    _validate_season_program_moves(
+        report, rows["competition"], rows["programs"],
+        existing_programs, existing_seasons, store)
 
     for index, row in enumerate(rows["venues_rinks"], start=1):
         org_code = _optional(row.get("organization_code"))

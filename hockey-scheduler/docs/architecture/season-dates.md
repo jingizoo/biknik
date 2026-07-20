@@ -100,6 +100,18 @@ Same-zone/idempotent imports pass, and a timezone change is allowed only when
 the Program has no dated Seasons. Changing the timezone of a Program with dated
 Seasons needs an explicit product decision plus durable per-Season provenance.
 
+**Moving a Season to another Program.** The import can also repoint a Season's
+Program. Because the destination Program's timezone would then format the
+Season's unchanged instants, moving a Season **with a stored boundary** across
+timezones has the same hazard. The import therefore **rejects such a move when
+the source and effective destination Program timezones differ**
+(`season_program_timezone_move`, `field="program_code"`, zero writes). The
+destination timezone is the effective same-upload value (an uploaded `programs`
+timezone wins). A move between Programs in the same timezone stays governed by
+the existing reassignment/dependency checks, and an undated Season may move
+freely. Supplying replacement boundary cells is **not** implicit permission to
+reinterpret history.
+
 ## Scope
 
 `parse_season_boundary` is the single entry point for season boundaries, shared
