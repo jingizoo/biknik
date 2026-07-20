@@ -26,7 +26,8 @@
     "team-club-optional": "node team-club-optional.js",
     "division-delete-cleanup": "node division-delete-cleanup.js",
     "registration-cleanup": "node registration-cleanup.js",
-    "records-delete": "node records-delete.js"
+    "records-delete": "node records-delete.js",
+    "player-edit": "node player-edit.js"
   },
   "devDependencies": {
     "playwright": "^1.48.0"

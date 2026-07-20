@@ -71,9 +71,11 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
-# Sentinel distinguishing "argument omitted" from an explicit value (including
-# None). Used by the swap-safe import staging (#292) to tell a per-row upsert
-# whether a pre-release original jersey was supplied.
+# Sentinel distinguishing "argument omitted, leave as-is" from an explicit
+# value (including None, which clears a nullable field). Used by update_player
+# (#268) for partial edits and by the swap-safe import staging (#292) to tell a
+# per-row upsert whether a pre-release original jersey was supplied — a plain
+# default of None can't express "don't touch" for a nullable column.
 _UNSET = object()
 
 
@@ -2769,6 +2771,7 @@ class SetupService:
     def add_player(self, team_id: str, name: str, position: Position,
                    jersey_number: Optional[int] = None,
                    email: Optional[str] = None,
+                   shoots: Optional[str] = None,
                    is_active: bool = True,
                    actor_id: Optional[str] = None) -> Player:
         """Manually create one Player (#114) — the same model/store the CSV
@@ -2792,12 +2795,12 @@ class SetupService:
         if is_active:
             self._assert_jersey_available(team_id, jersey_number)
         if email:
-            at = email.find("@")
-            if at <= 0 or "." not in email[at + 1:]:
-                raise ValidationError(f"Invalid email {email}.")
+            self._validate_email(email)
         player = Player(id=self.store.next_id("player"), team_id=team_id,
                         name=self._require_name(name), position=position,
-                        jersey_number=jersey_number, is_active=is_active)
+                        jersey_number=jersey_number,
+                        shoots=(shoots or "").strip() or None,
+                        is_active=is_active)
         self.store.add_player(player)
         self._audit("player_added", "player", player.id, actor_id,
                     {"team_id": team_id})
@@ -2808,6 +2811,125 @@ class SetupService:
                 channel=NotificationChannel.EMAIL,
                 destination=email))
         return player
+
+    @staticmethod
+    def _validate_email(email: str) -> None:
+        """The same lightweight email shape check the import path applies."""
+        at = email.find("@")
+        if at <= 0 or "." not in email[at + 1:]:
+            raise ValidationError(
+                f"Invalid email {email}.",
+                {"reason": "invalid_email", "field": "email"})
+
+    @_transactional
+    def update_player(self, player_id: str, *, name=_UNSET, position=_UNSET,
+                      jersey_number=_UNSET, shoots=_UNSET, email=_UNSET,
+                      actor_id: Optional[str] = None) -> Player:
+        """Correct a Player's profile in place (#268) — id and history unchanged.
+
+        A partial, audited edit for ``name`` / ``position`` / ``jersey_number`` /
+        ``shoots`` and the Player's email ``ContactDestination``. Team
+        reassignment (``assign_player_team``) and the active/inactive lifecycle
+        (#270) stay separate operations and are intentionally NOT editable here.
+        Any field left ``_UNSET`` is untouched; an explicit ``None`` clears a
+        nullable one (jersey/shoots, or the email → the contact is retired).
+
+        Every change reuses the shared validation (jersey range + active-team
+        uniqueness from #269, name required, email shape). A rejected value
+        raises a field-level error and — because the whole method is one
+        transaction — leaves ZERO partial state. A genuine no-op writes nothing
+        and appends no ``player_updated`` audit (so the trail never lies). The
+        audit's ``changed_fields`` names WHICH fields changed, never the email
+        address or any other value.
+        """
+        player = self.store.get_player_for_update(player_id)
+        if player is None:
+            raise NotFoundError(f"Player {player_id} not found.")
+
+        changed = []
+        if name is not _UNSET:
+            new_name = self._require_name(name)
+            if new_name != player.name:
+                player.name = new_name
+                changed.append("name")
+        if position is not _UNSET and position != player.position:
+            player.position = position
+            changed.append("position")
+        if shoots is not _UNSET:
+            new_shoots = (shoots or "").strip() or None if shoots is not None \
+                else None
+            if new_shoots != player.shoots:
+                player.shoots = new_shoots
+                changed.append("shoots")
+        if jersey_number is not _UNSET:
+            self._validate_jersey_number(jersey_number)
+            if jersey_number != player.jersey_number:
+                # Only an active player reserves a number; check the CURRENT team
+                # (reassignment is a separate op), excluding self (#269).
+                if player.is_active:
+                    self._assert_jersey_available(
+                        player.team_id, jersey_number,
+                        exclude_player_id=player.id)
+                player.jersey_number = jersey_number
+                changed.append("jersey_number")
+
+        email_changed = False
+        if email is not _UNSET:
+            email_changed = self._apply_player_email(player, email)
+
+        if changed:
+            self.store.save_player(player)
+        if changed or email_changed:
+            fields = list(changed) + (["email"] if email_changed else [])
+            self._audit("player_updated", "player", player.id, actor_id,
+                        {"changed_fields": fields})
+        return player
+
+    def _apply_player_email(self, player: Player, email) -> bool:
+        """Create/update/retire the Player's email ``ContactDestination`` (#268).
+
+        The edit drawer's email field IS the Player's current email: a non-empty
+        value sets it as the single active ``player:<id>`` EMAIL destination
+        (created, or updated-and-reactivated in place — never duplicated); an
+        empty/None value retires an existing active one (``active=False``, never
+        deleted, so its history and any notification preferences survive — prefs
+        key on the recipient_ref, not this row, so they are never orphaned). The
+        raw address is never returned to the caller or placed in the audit;
+        returns ``True`` only when something actually changed.
+        """
+        ref = f"player:{player.id}"
+        normalized = (email or "").strip() or None
+        existing = self.store.get_contact_destination(
+            ref, NotificationChannel.EMAIL)
+        if normalized is None:
+            if existing is not None and existing.active:
+                existing.active = False
+                self.store.save_contact_destination(existing)
+                return True
+            return False
+        self._validate_email(normalized)
+        if existing is not None:
+            if existing.destination == normalized and existing.active:
+                return False
+            existing.destination = normalized
+            existing.active = True
+            self.store.save_contact_destination(existing)
+            return True
+        self.store.add_contact_destination(ContactDestination(
+            id=self.store.next_id("contact"), recipient_ref=ref,
+            channel=NotificationChannel.EMAIL, destination=normalized))
+        return True
+
+    def active_player_email(self, player_id: str) -> Optional[str]:
+        """The Player's current active email, for the operator edit drawer (#268).
+
+        Operator-gated read only (its one caller is the MANAGE_SETUP ``/api/
+        players`` route). Returns the address of the active ``player:<id>``
+        EMAIL destination, or ``None`` — a retired row reads as no email.
+        """
+        c = self.store.get_contact_destination(
+            f"player:{player_id}", NotificationChannel.EMAIL)
+        return c.destination if (c is not None and c.active) else None
 
     # -- CSV import commit (#93) --------------------------------------------
     def commit_teams_players_import(self, season_id: str, sheets: dict,

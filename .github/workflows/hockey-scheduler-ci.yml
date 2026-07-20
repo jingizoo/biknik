@@ -101,6 +101,7 @@ jobs:
           node --check hockey-scheduler/e2e/venue-sharing.js
           node --check hockey-scheduler/e2e/records-delete.js
           node --check hockey-scheduler/e2e/coach-scope.js
+          node --check hockey-scheduler/e2e/player-edit.js
       - name: Check v1 route contract (#233 B2c)
         run: node hockey-scheduler/e2e/check-v1-route-contract.js
 
@@ -126,7 +127,7 @@ jobs:
           - shard: 1
             scripts: "smoke setup-claim onboarding-wizard hierarchy-import season-participation season-rollover"
           - shard: 2
-            scripts: "team-division-participation allowed-venues venue-access-cleanup venue-sharing permanent-teams"
+            scripts: "team-division-participation allowed-venues venue-access-cleanup venue-sharing permanent-teams player-edit"
           - shard: 3
             scripts: "safe-destructive destructive-surfaces reset-visibility factory-reset demo-lifecycle api-error-resilience"
           - shard: 4

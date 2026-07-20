@@ -3944,18 +3944,49 @@ class ApiService:
     def create_player(self, team_id: str, name: str, position: str,
                       jersey_number: Optional[int] = None,
                       email: Optional[str] = None,
+                      shoots: Optional[str] = None,
                       is_active: bool = True,
                       actor_id: Optional[str] = None) -> dict:
         return _serialize(self.setup.add_player(
             team_id, name, _parse_enum(Position, position, "position"),
-            jersey_number=jersey_number, email=email, is_active=is_active,
-            actor_id=actor_id))
+            jersey_number=jersey_number, email=email, shoots=shoots,
+            is_active=is_active, actor_id=actor_id))
 
     @catch
-    def list_players(self, team_id: Optional[str] = None) -> List[dict]:
+    def list_players(self, team_id: Optional[str] = None,
+                     include_email: bool = False) -> List[dict]:
         players = (self.store.players_for_team(team_id) if team_id
                   else self.store.all_players())
-        return [_serialize(p) for p in players]
+        rows = [_serialize(p) for p in players]
+        # The Player DTO deliberately carries no email (it reaches coach/roster
+        # views). Only the MANAGE_SETUP-gated operator list opts in, so the edit
+        # drawer (#268) can prefill the current address without ever exposing it
+        # on a coach/public payload.
+        if include_email:
+            for player, row in zip(players, rows):
+                row["email"] = self.setup.active_player_email(player.id)
+        return rows
+
+    @catch
+    def update_player(self, player_id: str,
+                      actor_id: Optional[str] = None, **fields) -> dict:
+        """Audited in-place Player profile edit (#268).
+
+        Accepts only the correctable fields (``name``, ``position``,
+        ``jersey_number``, ``shoots``, ``email``); a caller passes just the ones
+        it wants to change, and any absent field is left untouched by the
+        service. ``position`` is parsed to the domain enum here so an invalid
+        value is a field-level error before the write.
+        """
+        kwargs = {}
+        for key in ("name", "jersey_number", "shoots", "email"):
+            if key in fields:
+                kwargs[key] = fields[key]
+        if "position" in fields:
+            kwargs["position"] = _parse_enum(
+                Position, fields["position"], "position")
+        return _serialize(self.setup.update_player(
+            player_id, actor_id=actor_id, **kwargs))
 
     @catch
     def create_game(self, season_id: str, division_id: str, home_team_id: str,
