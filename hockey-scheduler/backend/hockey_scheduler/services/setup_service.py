@@ -430,15 +430,45 @@ class SetupService:
                     {"reason": normalized_reason})
         return season
 
+    def _lock_league_for_binding(self, league_id: str) -> League:
+        """Row-lock an existing permanent League before binding it to a Season
+        (#159 concurrency). This establishes the FIRST half of the canonical
+        **League → Season** lock order that ``delete_league`` and
+        ``transfer_team_to_league`` already follow: a binding path locks the
+        League row HERE, before it takes the Season read-only guard, so a
+        concurrent ``delete_league`` (which locks the same row) serializes —
+        either this binding commits first and the delete then sees it and blocks
+        (bindings are itemized dependents), or the delete commits first and this
+        lock finds the League gone. Never an orphaned ``LeagueSeason`` (migration
+        035 defines no FK to catch one at the DB layer). Raises ``NotFoundError``
+        when the League does not exist. Callers MUST invoke this before any
+        Season lock; acquiring the League lock AFTER the Season lock would invert
+        the canonical order and can deadlock against ``delete``/``transfer`` on
+        PostgreSQL (Memory/SQLite serialize whole transactions, so order is moot
+        there, but the guarantee must hold on every backend)."""
+        league = self.store.get_league_for_update(league_id)
+        if league is None:
+            raise NotFoundError(f"League {league_id} not found.")
+        return league
+
     def _link_league_season(self, league_id: str, season_id: str) -> LeagueSeason:
         """Find or create the LeagueSeason binding ``league_id`` to ``season_id``
         (#283). Enforces the invariant ``league.program_id == season.program_id``
         (rule 5) before creating a new binding. Plain helper (no audit, no own
-        transaction) so it composes inside a caller's transaction."""
+        transaction) so it composes inside a caller's transaction.
+
+        #159 concurrency: when a NEW binding must be created, the League row is
+        RE-VALIDATED under a row lock (``get_league_for_update``) so the binding
+        can never be inserted for a League a concurrent ``delete_league`` is
+        removing (no orphan; migration 035 has no FK). Every binding caller must
+        already have taken this same League lock BEFORE its Season guard (see
+        :meth:`_lock_league_for_binding`) so the lock here is re-entrant and the
+        canonical League→Season order holds; the lock is repeated defensively so
+        a caller that forgets still cannot orphan a binding."""
         existing = self.store.league_season_for(league_id, season_id)
         if existing is not None:
             return existing
-        league = self.store.get_league(league_id)
+        league = self.store.get_league_for_update(league_id)
         if league is None:
             raise NotFoundError(f"League {league_id} not found.")
         season = self.store.get_season(season_id)
@@ -482,6 +512,10 @@ class SetupService:
         """Bind an existing permanent League to a Season (#283 rule 5). Returns
         the existing binding when already present; enforces the shared-Program
         invariant via :meth:`_link_league_season`."""
+        # #159 — canonical League→Season lock order: lock the League row BEFORE
+        # the Season guard so this serializes with delete_league (never an
+        # orphaned binding) and never deadlocks against delete/transfer.
+        self._lock_league_for_binding(league_id)
         self._require_active_season(season_id)  # #159 read-only guard
         existing = self.store.league_season_for(league_id, season_id)
         ls = self._link_league_season(league_id, season_id)
@@ -542,6 +576,12 @@ class SetupService:
         or the Season's sole LeagueSeason when no league is given — so existing
         callers keep working while the Division is stored against its
         LeagueSeason."""
+        # #159 — canonical League→Season order: an explicit League is row-locked
+        # BEFORE the Season guard (a league-less division auto-provisions a NEW
+        # League inside the resolver, created in-txn and unreachable by a
+        # concurrent delete, so it needs no pre-lock).
+        if league_id:
+            self._lock_league_for_binding(league_id)
         self._require_active_season(season_id)  # #159 read-only guard
         ls = self._resolve_division_league_season(season_id, league_id)
         division = Division(id=self.store.next_id("division"),
@@ -642,8 +682,10 @@ class SetupService:
             raise NotFoundError(f"Registration {registration_id} not found.")
         if not league_id:
             raise ValidationError("A league_id is required.")
-        if self.store.get_league(league_id) is None:
-            raise NotFoundError(f"League {league_id} not found.")
+        # #159 — canonical League→Season order: lock the target League row here,
+        # before the Season guard below, so a new binding can't be orphaned by a
+        # concurrent delete_league and the lock order never inverts.
+        self._lock_league_for_binding(league_id)
         team = self.store.get_team(reg.team_id)
         if team and team.league_id and team.league_id != league_id:
             raise ValidationError(
@@ -796,10 +838,20 @@ class SetupService:
         must belong to the resolved LeagueSeason (rule 6). One registration per
         (team, LeagueSeason); a prior inactive one is reactivated in place.
         """
-        season = self._require_active_season(season_id)  # #159 read-only guard
         team = self.store.get_team(team_id)
         if team is None:
             raise NotFoundError(f"Team {team_id} not found.")
+        # #159 — canonical League→Season order: resolve the candidate permanent
+        # League (reads only) and row-lock it BEFORE the Season guard, so a new
+        # LeagueSeason binding can't be orphaned by a concurrent delete_league
+        # and the lock order never inverts against delete/transfer. The Season's-
+        # sole-League fallback (no candidate League) creates no new binding, so
+        # it needs no pre-lock.
+        candidate_league = self._candidate_registration_league_id(
+            team, division_id, league_id)
+        if candidate_league:
+            self._lock_league_for_binding(candidate_league)
+        season = self._require_active_season(season_id)  # #159 read-only guard
         # Rule 4 — program consistency (legacy-permissive: only a non-null
         # mismatch is rejected, so a legacy program-less team still registers).
         if team.program_id and team.program_id != season.program_id:
@@ -873,11 +925,34 @@ class SetupService:
                      "division_id": reg.division_id})
         return reg
 
+    def _candidate_registration_league_id(self, team, division_id,
+                                          league_id) -> Optional[str]:
+        """The permanent League a registration would bind to, resolved from
+        reads only (#159): explicit ``league_id`` → the Team's permanent League →
+        the Division's League. Returns ``None`` when none resolves (the Season's-
+        sole-League fallback, which binds no new League). Used to row-lock that
+        League BEFORE the Season guard, ahead of :meth:`_resolve_registration_
+        league_season` which re-resolves the same League and creates the binding.
+        Tolerant of a missing Division (returns ``None``) so the resolver keeps
+        its own not-found/precedence semantics after the guard."""
+        candidate = league_id or team.league_id
+        if not candidate and division_id:
+            division = self.store.get_division(division_id)
+            ls_of_div = (self.store.get_league_season(division.league_season_id)
+                         if division is not None else None)
+            candidate = ls_of_div.league_id if ls_of_div else None
+        return candidate
+
     def _resolve_registration_league_season(self, season, team, division_id,
                                             league_id) -> LeagueSeason:
         """The LeagueSeason a registration belongs to (#283 back-compat). Prefer
         the explicit ``league_id``, else the Team's permanent League, else the
-        Division's League, else the Season's sole LeagueSeason."""
+        Division's League, else the Season's sole LeagueSeason.
+
+        #159: the resolved League is expected to already be row-locked by the
+        caller (:meth:`_candidate_registration_league_id` +
+        :meth:`_lock_league_for_binding`) before the Season guard, so the binding
+        created here can't be orphaned by a concurrent delete_league."""
         candidate_league = league_id or team.league_id
         if not candidate_league and division_id:
             division = self.store.get_division(division_id)
@@ -1431,6 +1506,25 @@ class SetupService:
         src = self.store.get_season(from_season_id)
         if src is None:
             raise NotFoundError(f"Season {from_season_id} not found.")
+        # #159 — canonical League→Season lock order: a v1 rollover derives each
+        # carried Team's target League from Team.league_id. Row-lock those Leagues
+        # (sorted, deduped) via a read-only pre-pass BEFORE locking the target
+        # Season below, so no rollover binding is orphaned by a concurrent
+        # delete_league and the order never inverts against delete/transfer. A
+        # None/bad team league is skipped here and still fails the pre-write gate.
+        _carry = ([s.get("team_id") for s in selections
+                   if isinstance(s, dict) and isinstance(s.get("team_id"), str)]
+                  if isinstance(selections, list)
+                  else [r.team_id for r
+                        in self.store.registrations_for_season(from_season_id)
+                        if r.active] if selections is None else [])
+        _roll_lids = set()
+        for _tid in _carry:
+            _t = self.store.get_team(_tid)
+            if _t is not None and _t.league_id:
+                _roll_lids.add(_t.league_id)
+        for _lid in sorted(_roll_lids):
+            self._lock_league_for_binding(_lid)
         # #159 — lock the target row so a rollover serializes with archive.
         dst = self.store.get_season_for_update(to_season_id)
         if dst is None:
@@ -1605,6 +1699,19 @@ class SetupService:
         src = self.store.get_season(from_season_id)
         if src is None:
             raise NotFoundError(f"Season {from_season_id} not found.")
+        # #159 — canonical League→Season lock order: row-lock every distinct
+        # target League named in the selections (sorted, so a batch never
+        # deadlocks League-vs-League) BEFORE locking the target Season below, so
+        # a rollover binding can't be orphaned by a concurrent delete_league and
+        # the order never inverts against delete/transfer. Malformed selections
+        # are re-validated in the pre-write gate; only well-formed league_ids are
+        # pre-locked here (a bad one still fails the gate with zero writes).
+        if isinstance(selections, list):
+            for _lid in sorted({sel.get("league_id") for sel in selections
+                                if isinstance(sel, dict)
+                                and isinstance(sel.get("league_id"), str)
+                                and not _blank(sel.get("league_id"))}):
+                self._lock_league_for_binding(_lid)
         # #159 — lock the target row so a rollover serializes with archive.
         dst = self.store.get_season_for_update(to_season_id)
         if dst is None:
@@ -1806,6 +1913,12 @@ class SetupService:
         # division's own Season).
         div_ls = self.store.get_league_season(division.league_season_id)
         season_id = div_ls.season_id if div_ls else None
+        # #159 — canonical League→Season lock order: row-lock the target League
+        # BEFORE the Season guard, so the reparent's new LeagueSeason binding
+        # can't be orphaned by a concurrent delete_league and the lock order never
+        # inverts against delete/transfer.
+        if league_id:
+            self._lock_league_for_binding(league_id)
         if season_id:
             self._require_active_season(season_id)  # #159 read-only guard
         old = div_ls.league_id if div_ls else None
@@ -1814,10 +1927,6 @@ class SetupService:
         # unassign behavior (league_id=None clears the division's level).
         if v2 and not league_id:
             raise ValidationError("A league_id is required.")
-        if league_id:
-            league = self.store.get_league(league_id)
-            if league is None:
-                raise NotFoundError(f"League {league_id} not found.")
         # v2 dependent-record integrity (#233 Slice C2 review): moving a Division
         # between Leagues must not strand its registrations or committed games
         # under a League that no longer matches. Any active registration or

@@ -397,6 +397,114 @@ class SeasonArchiveRaceTest(unittest.TestCase):
             self.assertIsNone(check.get_league(lid), results)
             self.assertEqual(teams, [], results)
 
+    def test_delete_league_vs_create_binding_is_linearizable(self):
+        # #159 review r9: an UNBOUND permanent League is deleted while
+        # create_league_season concurrently binds it to a Season. Both now lock
+        # the SAME League row (delete via get_league_for_update; the binder via
+        # _lock_league_for_binding, taken BEFORE its Season guard). Either the
+        # bind wins (LeagueSeason exists → delete blocks on the season-binding
+        # dependent) or the delete wins (League gone → the binder fails
+        # not-found). A binding is NEVER orphaned onto a deleted League (migration
+        # 035 has no FK to catch one).
+        store0 = SqlStore(self.url)
+        api0 = ApiService(store0)
+        pid = api0.create_program("Prog", "US", "UTC")["id"]
+        sid = api0.create_season(pid, "S1")["id"]
+        lid = store0.next_id("league")
+        store0.add_league(League(id=lid, program_id=pid, name="Unbound",
+                                 sort_order=0))
+        api_del = ApiService(SqlStore(self.url))
+        api_bind = ApiService(SqlStore(self.url))
+        barrier = threading.Barrier(2)
+        results = {}
+
+        def run(fn, key):
+            barrier.wait()
+            try:
+                fn(); results[key] = "ok"
+            except HasDependenciesError:
+                results[key] = "blocked"
+            except NotFoundError:
+                results[key] = "not_found"
+            except Exception as exc:
+                results[key] = f"ERR:{exc}"
+
+        ta = threading.Thread(target=run, args=(
+            lambda: api_del.setup.delete_league(lid, actor_id="a"), "delete"))
+        tb = threading.Thread(target=run, args=(
+            lambda: api_bind.setup.create_league_season(
+                lid, sid, actor_id="b"), "bind"))
+        ta.start(); tb.start(); ta.join(15); tb.join(15)
+
+        check = SqlStore(self.url)
+        binding = check.league_season_for(lid, sid)
+        if results["bind"] == "ok":
+            # Bind won the row first → binding exists, delete blocked on it.
+            self.assertEqual(results["delete"], "blocked", results)
+            self.assertIsNotNone(check.get_league(lid), results)
+            self.assertIsNotNone(binding, results)
+        else:
+            # Delete won → League gone, binder fails not-found, NO orphan binding.
+            self.assertEqual(results["bind"], "not_found", results)
+            self.assertEqual(results["delete"], "ok", results)
+            self.assertIsNone(check.get_league(lid), results)
+            self.assertIsNone(binding, results)
+
+    def test_delete_league_vs_division_bind_is_linearizable(self):
+        # #159 review r9: the shared _link_league_season helper caller. An
+        # UNBOUND, division-free permanent League is deleted while create_division
+        # concurrently binds it (create_division → _resolve_division_league_season
+        # → _link_league_season) and adds a Division under the new binding. The
+        # binder row-locks the League BEFORE its Season guard, so it serializes
+        # with the delete: either the create wins (binding + Division exist →
+        # delete blocks) or the delete wins (League gone → create fails
+        # not-found). No orphaned binding or Division onto a deleted League.
+        store0 = SqlStore(self.url)
+        api0 = ApiService(store0)
+        pid = api0.create_program("Prog", "US", "UTC")["id"]
+        sid = api0.create_season(pid, "S1")["id"]
+        lid = store0.next_id("league")
+        store0.add_league(League(id=lid, program_id=pid, name="Unbound",
+                                 sort_order=0))
+        api_del = ApiService(SqlStore(self.url))
+        api_div = ApiService(SqlStore(self.url))
+        barrier = threading.Barrier(2)
+        results = {}
+
+        def run(fn, key):
+            barrier.wait()
+            try:
+                fn(); results[key] = "ok"
+            except HasDependenciesError:
+                results[key] = "blocked"
+            except NotFoundError:
+                results[key] = "not_found"
+            except Exception as exc:
+                results[key] = f"ERR:{exc}"
+
+        ta = threading.Thread(target=run, args=(
+            lambda: api_del.setup.delete_league(lid, actor_id="a"), "delete"))
+        tb = threading.Thread(target=run, args=(
+            lambda: api_div.setup.create_division(
+                sid, "D1", league_id=lid, actor_id="b"), "bind"))
+        ta.start(); tb.start(); ta.join(15); tb.join(15)
+
+        check = SqlStore(self.url)
+        binding = check.league_season_for(lid, sid)
+        divs_under = ([d for d in check.all_divisions()
+                       if binding is not None and d.league_season_id == binding.id]
+                      if binding is not None else [])
+        if results["bind"] == "ok":
+            self.assertEqual(results["delete"], "blocked", results)
+            self.assertIsNotNone(check.get_league(lid), results)
+            self.assertIsNotNone(binding, results)
+            self.assertEqual(len(divs_under), 1, results)
+        else:
+            # Delete won → League gone; no orphan binding AND no orphan Division.
+            self.assertEqual(results["bind"], "not_found", results)
+            self.assertEqual(results["delete"], "ok", results)
+            self.assertIsNone(check.get_league(lid), results)
+            self.assertIsNone(binding, results)
 
     def test_archive_vs_legacy_import_is_linearizable(self):
         # The teams+players import holds the archived-Season row lock through ALL

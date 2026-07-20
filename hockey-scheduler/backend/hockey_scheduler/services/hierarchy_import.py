@@ -1293,6 +1293,23 @@ def commit_hierarchy_import(setup, sheets: Dict[str, List[dict]],
             rinks[code] = obj
             _tally("rinks", created, changed)
 
+        # #159 — canonical League→Season lock order for the whole batch: row-lock
+        # every EXISTING League this import will bind (a competition league_code
+        # that already resolves to a stored League) in sorted order, BEFORE the
+        # upserts below take any Season row lock (upsert_imported_season /
+        # _league_season / _division / _registration all guard the Season). A
+        # League created by this import is locked in-txn by its own upsert and is
+        # unreachable by a concurrent delete, so only pre-existing Leagues need
+        # pre-locking here. This keeps the batch's League→Season order canonical:
+        # a bound League can't be orphaned by a concurrent delete_league, and the
+        # order never inverts against delete/transfer (no deadlock on Postgres).
+        for _lid in sorted({
+                leagues[_lc].id
+                for _lc in {_clean(r.get("league_code"))
+                            for r in rows["competition"]}
+                if _lc and _lc in leagues}):
+            setup._lock_league_for_binding(_lid)
+
         for code, row in _group_first(
                 rows["competition"], "season_code").items():
             program = programs[_clean(row.get("program_code"))]
