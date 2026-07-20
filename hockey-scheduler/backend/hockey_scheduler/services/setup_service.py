@@ -64,6 +64,7 @@ from ..domain.errors import (
 )
 from ..store import InMemoryStore
 from .import_validator import validate_import, validate_official_availability
+from .season_guard import require_active_season
 from .league_scope import (
     registered_team_ids_in_division as _registered_team_ids,
     team_registration_valid,
@@ -338,20 +339,20 @@ class SetupService:
         return season
 
     def _require_active_season(self, season_id: str) -> Season:
-        """Fail closed if a Season is archived/read-only (#159). Returns the
-        Season so callers can reuse it. Every operational write that targets a
-        Season routes through here so archived history stays immutable — an
-        archived Season accepts no new registrations, venue access, leagues,
-        divisions, games, or roll-forward-target rows until it is reopened."""
-        season = self.store.get_season(season_id)
-        if season is None:
-            raise NotFoundError(f"Season {season_id} not found.")
-        if season.status == SeasonStatus.ARCHIVED:
-            raise ValidationError(
-                f"Season '{season.name}' is archived and read-only. Reopen it "
-                "before making changes.",
-                {"reason": "season_archived", "season_id": season_id})
-        return season
+        """Fail closed if a Season is archived/read-only (#159). Thin wrapper over
+        the shared :func:`season_guard.require_active_season` (row-locked, must run
+        inside the caller's ``transaction()``); see that module for the full
+        linearizability contract. Every Season-owned write in SetupService routes
+        through here."""
+        return require_active_season(self.store, season_id)
+
+    def _guard_game_season(self, game) -> None:
+        """Guard a Game-owned mutation against its archived Season (#159).
+        Row-locks + checks the Game's Season so no write lands on a Game whose
+        Season is archived. Takes the already-fetched Game (preserving each
+        caller's own not-found semantics); a Season-less legacy Game is a no-op."""
+        if game is not None and game.season_id:
+            require_active_season(self.store, game.season_id)
 
     @_transactional
     def archive_season(self, season_id: str, *, actor_id: Optional[str] = None,
@@ -359,8 +360,10 @@ class SetupService:
         """Archive a Season into read-only historical mode (#159). Idempotent
         transitions are rejected (re-archiving an archived Season is an explicit
         error) so the audit trail records exactly one transition. Authorization
-        (MANAGE_SETUP) is enforced at the HTTP boundary."""
-        season = self.store.get_season(season_id)
+        (MANAGE_SETUP) is enforced at the HTTP boundary. The Season row is locked
+        (#159) so concurrent archive/reopen serialize — exactly one wins, the
+        loser gets the stable lifecycle error with no duplicate audit."""
+        season = self.store.get_season_for_update(season_id)
         if season is None:
             raise NotFoundError(f"Season {season_id} not found.")
         if season.status == SeasonStatus.ARCHIVED:
@@ -385,7 +388,8 @@ class SetupService:
             raise ValidationError(
                 "A reason is required to reopen an archived Season.",
                 {"reason": "reason_required", "field": "reason"})
-        season = self.store.get_season(season_id)
+        # Lock the row (#159) so concurrent archive/reopen serialize.
+        season = self.store.get_season_for_update(season_id)
         if season is None:
             raise NotFoundError(f"Season {season_id} not found.")
         if season.status != SeasonStatus.ARCHIVED:
@@ -1214,6 +1218,7 @@ class SetupService:
             raise ValidationError(
                 "This access is already revoked.",
                 {"reason": "already_revoked", "access_id": access.id})
+        self._require_active_season(access.season_id)  # #159 read-only guard
         access.active = False
         self.store.save_season_venue_access(access)
         self._audit("season_venue_access_revoked", "season_venue_access",
@@ -1251,6 +1256,7 @@ class SetupService:
         # Season or Venue has since vanished is not safe to purge blindly,
         # and the caller needs real labels (not bare ids) to confirm what it
         # just removed (mirrors delete_season_team_registration exactly).
+        self._require_active_season(access.season_id)  # #159 read-only guard
         season = self.store.get_season(access.season_id)
         if season is None:
             raise ValidationError(
@@ -1313,7 +1319,8 @@ class SetupService:
         src = self.store.get_season(from_season_id)
         if src is None:
             raise NotFoundError(f"Season {from_season_id} not found.")
-        dst = self.store.get_season(to_season_id)
+        # #159 — lock the target row so a rollover serializes with archive.
+        dst = self.store.get_season_for_update(to_season_id)
         if dst is None:
             raise NotFoundError(f"Season {to_season_id} not found.")
         # #159 — a rollover may READ an archived source season's history, but
@@ -1486,7 +1493,8 @@ class SetupService:
         src = self.store.get_season(from_season_id)
         if src is None:
             raise NotFoundError(f"Season {from_season_id} not found.")
-        dst = self.store.get_season(to_season_id)
+        # #159 — lock the target row so a rollover serializes with archive.
+        dst = self.store.get_season_for_update(to_season_id)
         if dst is None:
             raise NotFoundError(f"Season {to_season_id} not found.")
         # #159 — never roll participation INTO an archived (read-only) season.
@@ -2153,6 +2161,7 @@ class SetupService:
         game = self.store.get_game(game_id)
         if game is None:
             raise NotFoundError(f"Game {game_id} not found.")
+        self._guard_game_season(game)  # #159 read-only guard
         # A game may only be made public while both teams are still valid
         # participants of its competition scope (#180 / #283 Slice E: exact
         # LeagueSeason for a regular game, active Season participation for an
@@ -2182,6 +2191,7 @@ class SetupService:
         if game is None:
             raise NotFoundError(f"Game {game_id} not found.",
                                 details={"reason": "game_missing"})
+        self._guard_game_season(game)  # #159 read-only guard
         if game.cancelled:
             raise ValidationError("Cannot move a cancelled game.",
                                   details={"reason": "game_cancelled"})
@@ -2279,6 +2289,7 @@ class SetupService:
         game = self.store.get_game(game_id)
         if game is None:
             raise NotFoundError(f"Game {game_id} not found.")
+        self._guard_game_season(game)  # #159 read-only guard
         if game.cancelled:
             raise ValidationError("Cannot request a reschedule for a cancelled game.")
         if not game.published:
@@ -2321,6 +2332,7 @@ class SetupService:
                 "This reschedule request is not awaiting an opponent response.",
                 details={"status": req.status.value})
         game = self.store.get_game(req.game_id)
+        self._guard_game_season(game)  # #159 read-only guard
         req.status = (RescheduleStatus.PENDING_LEAGUE_APPROVAL if accept
                      else RescheduleStatus.OPPONENT_REJECTED)
         req.opponent_responded_at = self.clock()
@@ -2357,6 +2369,7 @@ class SetupService:
             raise InvalidTransitionError(
                 "This reschedule request is not awaiting league approval.",
                 details={"status": req.status.value})
+        self._guard_game_season(self.store.get_game(req.game_id))  # #159
         if not approve:
             req.status = RescheduleStatus.DENIED
             req.decision_note = note
@@ -2535,6 +2548,8 @@ class SetupService:
         # boundary rather than clearing it; a supplied side that already equals
         # the stored instant is a no-op (_apply_changes skips it → no false
         # update/audit on an equivalent repeat import).
+        if existing is not None:
+            self._require_active_season(existing.id)  # #159 read-only guard
         if existing is None:
             obj = Season(id=self.store.next_id("season"), external_ref=code,
                          name=name, program_id=program_id,
@@ -2788,6 +2803,7 @@ class SetupService:
         re-importing the same or corrected registration data must never
         error.
         """
+        self._require_active_season(season_id)  # #159 read-only guard
         # #283: a registration is stored against a LeagueSeason. Resolve (create
         # if needed) the imported League's participation in the Season; a change
         # of League is now a change of the registration's LeagueSeason.
@@ -2846,6 +2862,7 @@ class SetupService:
         no-op flagged as a warning at dry-run time, never a fabricated
         inactive record.
         """
+        self._require_active_season(season_id)  # #159 read-only guard
         access = self.store.season_venue_access_for_pair(season_id, venue_id)
         if access is None:
             if not active:
@@ -3432,6 +3449,7 @@ class SetupService:
         _season = self.store.get_season(season_id)
         if _season is None:
             raise NotFoundError(f"Season {season_id} not found.")
+        self._require_active_season(season_id)  # #159 read-only guard
         # The permanent program every imported team belongs to (#180): the
         # program of the season being imported into.
         season_league_id = _season.program_id
@@ -4309,6 +4327,7 @@ class SetupService:
         game = self.store.get_game(game_id)
         if game is None:
             raise NotFoundError(f"Game {game_id} not found.")
+        self._guard_game_season(game)  # #159 read-only guard
         if game.cancelled:
             raise ValidationError("Cannot assign officials to a cancelled game.")
         official = self.store.get_official(official_id)
@@ -4380,6 +4399,7 @@ class SetupService:
         a = self.store.get_official_assignment(assignment_id)
         if a is None:
             raise NotFoundError(f"Assignment {assignment_id} not found.")
+        self._guard_game_season(self.store.get_game(a.game_id))  # #159
         if a.status != OfficialAssignmentStatus.PROPOSED:
             raise ValidationError("Only a proposed assignment can be responded to.")
         a.status = (OfficialAssignmentStatus.ACCEPTED if accept
@@ -4409,6 +4429,7 @@ class SetupService:
         a = self.store.get_official_assignment(assignment_id)
         if a is None:
             raise NotFoundError(f"Assignment {assignment_id} not found.")
+        self._guard_game_season(self.store.get_game(a.game_id))  # #159
         self.store.remove_official_assignment(assignment_id)
         self._audit("official_unassigned", "official_assignment", assignment_id,
                     actor_id, {"game_id": a.game_id, "official_id": a.official_id})
@@ -4429,6 +4450,7 @@ class SetupService:
         game = self.store.get_game(game_id)
         if game is None:
             raise NotFoundError(f"Game {game_id} not found.")
+        self._guard_game_season(game)  # #159 read-only guard
         if game.cancelled:
             raise ValidationError("Cannot record a result for a cancelled game.")
         hs, as_ = self._require_score(home_score), self._require_score(away_score)
@@ -4458,6 +4480,7 @@ class SetupService:
         game = self.store.get_game(game_id)
         if game is None:
             raise NotFoundError(f"Game {game_id} not found.")
+        self._guard_game_season(game)  # #159 read-only guard
         if game.cancelled:
             raise ValidationError("Cannot approve a result for a cancelled game.")
         result = self.store.result_for_game(game_id)
@@ -4990,6 +5013,7 @@ class SetupService:
         game = self.store.get_game(game_id)
         if game is None:
             raise NotFoundError(f"Game {game_id} not found.")
+        self._guard_game_season(game)  # #159 read-only guard
         if not getattr(game, "is_draft", False) or game.published \
                 or game.cancelled \
                 or self.store.result_for_game(game_id) is not None:

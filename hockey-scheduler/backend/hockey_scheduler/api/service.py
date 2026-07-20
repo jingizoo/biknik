@@ -2848,8 +2848,14 @@ class ApiService:
 
         Each discard is audited before deletion so the review action leaves a
         trail (a draft is state; discarding it is a state change)."""
+        targets = self._draft_targets(game_ids, all_drafts)
+        # #159 — validate up front so an archived-Season draft aborts the
+        # whole batch with zero deletes/audits (read-only history).
+        for g in targets:
+            if g.season_id:
+                self.setup._require_active_season(g.season_id)
         discarded = 0
-        for g in self._draft_targets(game_ids, all_drafts):
+        for g in targets:
             self.setup._audit("draft_game_discarded", "game", g.id, actor_id,
                               {"division_id": g.division_id,
                                "ice_slot_id": g.ice_slot_id})

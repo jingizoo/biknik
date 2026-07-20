@@ -853,6 +853,11 @@ class SqlStore:
 
     def add_season(self, season): return self._insert(season)
     def get_season(self, season_id): return self._get(Season, season_id)
+
+    def get_season_for_update(self, season_id):
+        # Row lock (#159) so concurrent archive/reopen serialize — exactly one
+        # transition wins, the loser sees the stable lifecycle error.
+        return self._get_for_update(Season, season_id)
     def all_seasons(self): return self._query(Season, order="id")
     def save_season(self, season): return self._update(season)
     def seasons_for_program(self, program_id):

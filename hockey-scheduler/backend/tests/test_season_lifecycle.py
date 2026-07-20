@@ -182,6 +182,76 @@ class SeasonLifecycleTest(unittest.TestCase):
             self.assertTrue(any(d.name == "D2" for d in store.all_divisions()), label)
 
 
+class SeasonArchivedGameWriteGuardTest(unittest.TestCase):
+    """Every Game/roster/substitute/reschedule/venue/import write into an
+    archived Season fails closed (season_archived) with zero mutation (#159)."""
+
+    def _game_fixture(self, api):
+        from hockey_scheduler.domain.enums import Position
+        pid = api.create_program("Prog", "US", "UTC")["id"]
+        sid = api.create_season(pid, "S1")["id"]
+        lid = api.create_league(sid, "Gold")["id"]
+        did = api.create_division(sid, "D1", league_id=lid)["id"]
+        club = api.create_club("Club")["id"]
+        t1 = api.create_team(club_id=club, name="Alpha", league_id=lid)["id"]
+        t2 = api.create_team(club_id=club, name="Bravo", league_id=lid)["id"]
+        api.register_team_for_season(sid, t1, division_id=did)
+        api.register_team_for_season(sid, t2, division_id=did)
+        ven = api.create_venue("Rink")["id"]
+        access = api.grant_season_venue_access(sid, ven)["id"]
+        rink = api.create_rink(ven, "Sheet 1")["id"]
+        slot = api.create_ice_slot(
+            rink, "2026-10-01T18:00:00+00:00", "2026-10-01T19:00:00+00:00")["id"]
+        game = api.create_game(sid, did, t1, t2, slot)["id"]
+        p1 = api.setup.add_player(t1, "Skater One", Position.FORWARD,
+                                  actor_id="a").id
+        return {"sid": sid, "did": did, "t1": t1, "t2": t2, "ven": ven,
+                "access": access, "slot": slot, "game": game, "p1": p1}
+
+    def test_all_game_owned_writes_blocked_on_archived_season(self):
+        for label, store in _backends():
+            api = ApiService(store)
+            fx = self._game_fixture(api)
+            sid, gid = fx["sid"], fx["game"]
+            api.setup.archive_season(sid, actor_id="admin", reason="done")
+
+            games0 = [(g.id, g.published, g.cancelled, g.ice_slot_id)
+                      for g in store.all_games()]
+            audits0 = len(store.all_setup_audit())
+            regs0 = len(store.registrations_for_season(sid))
+
+            def blocked(fn, note):
+                with self.assertRaises(ValidationError) as ctx:
+                    fn()
+                self.assertEqual(ctx.exception.details.get("reason"),
+                                 "season_archived", (label, note))
+
+            blocked(lambda: api.setup.publish_game(gid, actor_id="a"), "publish")
+            blocked(lambda: api.setup.move_game(gid, fx["slot"], actor_id="a"),
+                    "move")
+            blocked(lambda: api.roster.cancel_game(gid, actor_id="a"), "cancel")
+            blocked(lambda: api.setup.record_result(gid, 3, 2, actor_id="a"),
+                    "record_result")
+            blocked(lambda: api.setup.request_reschedule(
+                gid, fx["t1"], "x", actor_id="a"), "reschedule")
+            blocked(lambda: api.roster.select_roster(
+                gid, [fx["p1"]], actor_id="a"), "select_roster")
+            blocked(lambda: api.roster.enroll_substitute(
+                gid, fx["p1"], actor_id="a"), "enroll_substitute")
+            blocked(lambda: api.roster.lock_roster(gid, actor_id="a"), "lock")
+            blocked(lambda: api.setup.delete_game(gid, actor_id="a"), "delete_game")
+            blocked(lambda: api.setup.revoke_season_venue_access(
+                fx["access"], actor_id="a"), "revoke_venue")
+
+            # Zero mutation from any blocked write.
+            self.assertEqual([(g.id, g.published, g.cancelled, g.ice_slot_id)
+                              for g in store.all_games()], games0, label)
+            self.assertEqual(len(store.all_setup_audit()), audits0, label)
+            self.assertEqual(len(store.registrations_for_season(sid)), regs0, label)
+            self.assertIsNone(store.result_for_game(gid), label)
+            self.assertEqual(store.roster_for_game(gid), [], label)
+
+
 class SeasonLifecycleHttpTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

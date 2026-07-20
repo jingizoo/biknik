@@ -382,6 +382,12 @@ class InMemoryStore:
     def get_season(self, season_id: str) -> Optional[Season]:
         return self.seasons.get(season_id)
 
+    def get_season_for_update(self, season_id: str) -> Optional[Season]:
+        # No row locking needed (#159): transaction() holds self._lock for its
+        # entire body, so a concurrent archive/reopen can't interleave with the
+        # caller's check-then-write. Provided for interface parity with SqlStore.
+        return self.seasons.get(season_id)
+
     def seasons_for_program(self, program_id: str) -> List[Season]:
         return [s for s in self.seasons.values() if s.program_id == program_id]
 
