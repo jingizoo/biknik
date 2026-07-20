@@ -3370,8 +3370,14 @@ class ApiService:
                     lid = self._league_id_via(ls_by_id, d.league_season_id)
                     if lid is not None:
                         divs_by_level.setdefault(lid, []).append(d)
+                # #159 — expose the LeagueSeason binding id so the UI can drive
+                # the explicit unbind (delete_league_season) before a League can
+                # be deleted (bindings are itemized dependents, never cascaded).
+                lvl_binding = self.store.league_season_for
                 level_nodes = [
                     {"id": lv.id, "name": lv.name, "sort_order": lv.sort_order,
+                     "league_season_id": (
+                         getattr(lvl_binding(lv.id, s.id), "id", None)),
                      "divisions": [division_node(d) for d in divs_by_level.get(lv.id, [])]}
                     for lv in season_levels
                 ]
@@ -3603,6 +3609,11 @@ class ApiService:
 
                 league_nodes = [
                     {"id": lv.id, "name": lv.name, "sort_order": lv.sort_order,
+                     # #159 — the LeagueSeason binding id, so the UI can drive
+                     # the explicit unbind (delete_league_season) that clears a
+                     # League's binding dependency before deletion.
+                     "league_season_id": getattr(
+                         self.store.league_season_for(lv.id, s.id), "id", None),
                      "divisions": [division_node(d)
                                    for d in divs_by_league.get(lv.id, [])],
                      # Division-optional: teams registered directly under this

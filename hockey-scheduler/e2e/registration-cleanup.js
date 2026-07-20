@@ -224,21 +224,78 @@ async function checkViewport(browser, viewport) {
       throw new Error(`[${viewport.label}] a cleaned registration still exists: ${JSON.stringify(afterCleanup)}`);
     }
 
-    // The empty Division itself still blocks the League (proven separately
-    // by division-delete-cleanup.js) — clear it via the API so this journey
-    // stays focused on the registration-cleanup surface.
-    const divDelResult = await page.evaluate(async (i) => {
-      const post = async (p, b) => (await fetch(p, {
+    // A League is deleted only once every dependent is cleared, itemized, with
+    // no silent cascades (#159). Cleaning the two inactive registrations left
+    // the League's two PERMANENT Teams (Team.league_id) and its LeagueSeason
+    // binding, so the delete is now correctly blocked. Clear them explicitly:
+    // Division (proven separately, via API), Teams, then the authorized audited
+    // LeagueSeason unbind — asserting the blocker before, and success after.
+    const apiPost = (p) => page.evaluate(async (path) => {
+      const r = await fetch(path, {
         method: "POST", credentials: "same-origin",
-        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b || {}),
-      })).json();
-      return post(`/api/v2/setup/division/${i.division}/delete`, {});
-    }, { division: fx.division });
-    if (divDelResult.error) {
-      throw new Error(`[${viewport.label}] Division cleanup failed: ${JSON.stringify(divDelResult.error)}`);
+        headers: { "Content-Type": "application/json" }, body: "{}" });
+      return { status: r.status, body: await r.json() };
+    }, p);
+    const blockTypes = (res) => new Set(
+      ((res.body.error && res.body.error.details
+        && res.body.error.details.dependencies) || []).map((g) => g.type));
+
+    const divDel = await apiPost(`/api/v2/setup/division/${fx.division}/delete`);
+    if (divDel.body.error) {
+      throw new Error(`[${viewport.label}] Division cleanup failed: ${JSON.stringify(divDel.body.error)}`);
     }
 
-    // Delete the now-empty League from the Season participation panel.
+    // The two deliberately-blocked League deletes below each return a 409, which
+    // logs a benign "Failed to load resource" Chromium console entry (same
+    // pattern as scenario (4) and division-delete-cleanup.js) — detach the
+    // console-error listener around them so only real page bugs fail the run.
+    page.off("console", consoleErrorHandler);
+
+    // Blocked before cleanup: the two permanent Teams and the season binding.
+    const blockedBefore = await apiPost(`/api/v2/setup/league/${fx.leagueClean}/delete`);
+    if (!blockedBefore.body.error || blockedBefore.body.error.code !== "has_dependencies"
+      || !blockTypes(blockedBefore).has("team") || !blockTypes(blockedBefore).has("season binding")) {
+      throw new Error(`[${viewport.label}] expected League delete blocked on team + season binding, `
+        + `got ${JSON.stringify(blockedBefore.body)}`);
+    }
+
+    // Remove both permanent Teams.
+    for (const teamId of [fx.teamA, fx.teamB]) {
+      const del = await apiPost(`/api/v2/setup/team/${teamId}/delete`);
+      if (del.body.error) {
+        throw new Error(`[${viewport.label}] Team ${teamId} delete failed: ${JSON.stringify(del.body.error)}`);
+      }
+    }
+
+    // Still blocked — now only on the LeagueSeason binding.
+    const blockedStill = await apiPost(`/api/v2/setup/league/${fx.leagueClean}/delete`);
+    if (!blockedStill.body.error || !blockTypes(blockedStill).has("season binding")
+      || blockTypes(blockedStill).has("team")) {
+      throw new Error(`[${viewport.label}] expected binding-only block after Team removal, `
+        + `got ${JSON.stringify(blockedStill.body)}`);
+    }
+    page.on("console", consoleErrorHandler);
+
+    // Explicitly unbind the LeagueSeason via the authorized, audited endpoint;
+    // resolve its id from the setup hierarchy's level node (#159).
+    const lsId = await page.evaluate(async (i) => {
+      const h = await (await fetch("/api/v2/setup/hierarchy", { credentials: "same-origin" })).json();
+      for (const prog of h.programs || []) {
+        for (const se of prog.seasons || []) {
+          for (const lv of se.leagues || []) {
+            if (lv.id === i.leagueClean) return lv.league_season_id;
+          }
+        }
+      }
+      return null;
+    }, { leagueClean: fx.leagueClean });
+    if (!lsId) throw new Error(`[${viewport.label}] could not resolve LeagueSeason id from hierarchy`);
+    const unbind = await apiPost(`/api/v2/setup/league-season/${lsId}/delete`);
+    if (unbind.status !== 200 || unbind.body.error) {
+      throw new Error(`[${viewport.label}] LeagueSeason unbind failed: ${JSON.stringify(unbind.body)}`);
+    }
+
+    // Delete the now truly-unbound, team-free League from the participation panel.
     await page.waitForSelector(
       `#season-participation [data-del="level"][data-del-id="${fx.leagueClean}"]`, { timeout: 10000 });
     await page.click(`#season-participation [data-del="level"][data-del-id="${fx.leagueClean}"]`);
