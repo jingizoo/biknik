@@ -3089,8 +3089,26 @@ class SetupService:
         if player is None:
             raise NotFoundError(f"Player {player_id} not found.")
         target = active
+        if not target:
+            # A login must not outlive the roster exit (#270 review): atomically
+            # retire any ACTIVE scoped account bound to this player and revoke
+            # its live sessions, in this same transaction. This runs BEFORE the
+            # idempotent short-circuit below so an ALREADY-inactive Player that
+            # still carries a live scoped account/session (legacy data — inactive
+            # players were once creatable and account binding did not reject
+            # them) is reconciled rather than left dangling. The reconcile is
+            # itself idempotent — it touches only still-active accounts and
+            # un-revoked sessions — and audits only the accounts it actually
+            # changes, so a repeat call mutates nothing. Reactivation never
+            # touches accounts: the operator reactivates one explicitly through
+            # the account lifecycle, which re-checks the Player is active
+            # (#266/#282), so reactivation can't silently restore authority.
+            self._retire_player_account_authority(player.id, actor_id)
         if player.is_active == target:
-            return player                      # idempotent no-op, no audit
+            # No Player-state change → no player_activated/deactivated audit
+            # (idempotent lifecycle). Any account/session repair above audited
+            # itself; nothing else is written.
+            return player
         if target:
             # Reactivation integrity: the Team must still exist and the jersey
             # must be free among the team's ACTIVE players (it was released
@@ -3103,14 +3121,6 @@ class SetupService:
         prior = player.is_active
         player.is_active = target
         self.store.save_player(player)
-        if not target:
-            # A login must not outlive the roster exit (#270 review): atomically
-            # retire any active scoped account bound to this player and revoke
-            # its live sessions, in this same transaction. Reactivating the
-            # Player does NOT silently restore account authority — the operator
-            # reactivates the account through the account lifecycle, which
-            # re-checks the Player is active (#266/#282).
-            self._retire_player_account_authority(player.id, actor_id)
         detail = {"from_active": prior, "to_active": target}
         if reason:
             detail["reason"] = reason

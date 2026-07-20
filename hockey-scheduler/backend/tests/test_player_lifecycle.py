@@ -344,6 +344,46 @@ class InactivePlayerAccountBindingTest(unittest.TestCase):
             api.setup.set_player_active(player.id, True, actor_id="a")
             self.assertFalse(store.get_user_account(acct.id).active, label)
 
+    def test_deactivate_reconciles_already_inactive_player_authority(self):
+        # Legacy data can carry an inactive Player that still has an active
+        # scoped account + live session (inactive players were once creatable
+        # and binding didn't reject them). A deactivate request must reconcile
+        # that authority even though the Player row is already inactive — the
+        # idempotent short-circuit must not skip the account/session retire
+        # (#270 review). No Player state/history change, no duplicate Player
+        # lifecycle audit; a repeat call mutates nothing further.
+        for label, store, api, player in self._each():
+            acct = api.accounts.create_account(
+                "player_login", "pw", Role.PLAYER,
+                scope={"player_id": player.id})
+            now = datetime(2026, 1, 1, tzinfo=UTC)
+            store.add_session(Session(
+                id="sess1", token_hash="hash1", user_id=acct.id,
+                issued_at=now, expires_at=now + timedelta(days=1)))
+            # Simulate the legacy state: flip the Player inactive DIRECTLY,
+            # bypassing set_player_active, so the account/session stay live.
+            legacy = store.get_player_for_update(player.id)
+            legacy.is_active = False
+            store.save_player(legacy)
+            life_before = len(_lifecycle_audits(store))
+
+            api.setup.set_player_active(player.id, False, actor_id="a")
+            self.assertFalse(store.get_player(player.id).is_active, label)   # unchanged
+            self.assertFalse(store.get_user_account(acct.id).active, label)  # retired
+            self.assertIsNotNone(
+                store.sessions_for_user(acct.id)[0].revoked_at, label)       # revoked
+            self.assertEqual(len(_lifecycle_audits(store)), life_before,
+                             label)                                          # no player audit
+            acct_audits = [a for a in store.all_setup_audit()
+                           if a.action == "user_account_deactivated"
+                           and a.entity_id == acct.id]
+            self.assertEqual(len(acct_audits), 1, label)   # real account audit written
+
+            # Repeat the request → no further account/session/audit mutation.
+            all_before = len(store.all_setup_audit())
+            api.setup.set_player_active(player.id, False, actor_id="a")
+            self.assertEqual(len(store.all_setup_audit()), all_before, label)
+
 
 class SetPlayerActiveHttpTest(unittest.TestCase):
     @classmethod
@@ -398,6 +438,53 @@ class SetPlayerActiveHttpTest(unittest.TestCase):
             {"active": True})
         self.assertEqual(s, 200)
         self.assertTrue(body["is_active"])
+
+    def test_http_deactivate_reconciles_already_inactive_player(self):
+        # HTTP regression for the idempotent-early-return blocker (#270 review):
+        # a legacy inactive Player still carrying an ACTIVE scoped account + live
+        # session must have that authority reconciled when the operator POSTs
+        # active=false over the wire, even though the Player row is already
+        # inactive. No Player state/history change, no duplicate Player lifecycle
+        # audit; a repeat POST mutates nothing further.
+        c = self._admin()
+        p = self._a_player(c)
+        store = self.srv.STATE.api.store
+        acct = self.srv.STATE.api.accounts.create_account(
+            "u_http_legacy", "scoped-account-pw", Role.PLAYER,
+            scope={"player_id": p["id"]})
+        now = datetime(2026, 1, 1, tzinfo=UTC)
+        store.add_session(Session(
+            id="sess_http_legacy", token_hash="hash_http_legacy",
+            user_id=acct.id, issued_at=now, expires_at=now + timedelta(days=1)))
+        # Simulate legacy state: flip the Player inactive DIRECTLY so the
+        # account/session stay live and the row is already inactive.
+        legacy = store.get_player_for_update(p["id"])
+        legacy.is_active = False
+        store.save_player(legacy)
+        self.assertTrue(store.get_user_account(acct.id).active)
+        life_before = len(_lifecycle_audits(store))
+
+        s, _h, body = self._req(
+            c, "POST", f"/api/v2/setup/player/{p['id']}/active",
+            {"active": False})
+        self.assertEqual(s, 200)
+        self.assertFalse(body["is_active"])                       # unchanged
+        self.assertFalse(store.get_user_account(acct.id).active)  # retired
+        self.assertIsNotNone(
+            store.sessions_for_user(acct.id)[0].revoked_at)       # revoked
+        self.assertEqual(len(_lifecycle_audits(store)), life_before)  # no dup
+        acct_audits = [a for a in store.all_setup_audit()
+                       if a.action == "user_account_deactivated"
+                       and a.entity_id == acct.id]
+        self.assertEqual(len(acct_audits), 1)                     # real audit
+
+        # Repeat over the wire → no further account/session/audit mutation.
+        all_before = len(store.all_setup_audit())
+        s, _h, _b = self._req(
+            c, "POST", f"/api/v2/setup/player/{p['id']}/active",
+            {"active": False})
+        self.assertEqual(s, 200)
+        self.assertEqual(len(store.all_setup_audit()), all_before)
 
     def test_missing_active_is_400(self):
         c = self._admin()
