@@ -2533,6 +2533,13 @@ class SetupService:
         #232's own explicit, audited action, never an import side effect.
         """
         self._validate_jersey_number(jersey_number)
+        # Validate/canonicalize the email BEFORE any player write (#268 review):
+        # a non-string/non-None value (False, 0, a list) or a malformed string
+        # raises a field-level invalid_email here, so the method never applies a
+        # partial player change even when a direct caller supplies no outer
+        # transaction. None/blank canonicalizes to None -> a no-op below (the
+        # import rule: an absent cell is "leave as-is", never a retirement).
+        canonical_email = self._validate_email(email)
         # Enforce active-team jersey uniqueness on the IMPORTED target state
         # before any write (#269), so a conflicting row aborts the whole
         # one-transaction batch with zero committed players. An import never
@@ -2571,14 +2578,14 @@ class SetupService:
                             "external_ref": code, "team_id": team_id,
                             "changed_fields": changed})
             created = False
-        # A supplied nonblank email validates, updates, AND reactivates the
-        # single player:<id> EMAIL contact via the shared set/retire path — so
-        # re-importing an address that a prior edit retired makes the contact
-        # active again (was: destination updated but left active=False). An
-        # absent/blank cell never reaches the helper, so it stays a no-op that
-        # leaves any existing contact untouched (#268 review).
-        if email:
-            self._set_email_contact(f"player:{obj.id}", email)
+        # A supplied nonblank email (already validated/canonicalized above)
+        # updates AND reactivates the single player:<id> EMAIL contact via the
+        # shared set/retire path — so re-importing an address that a prior edit
+        # retired makes the contact active again (was: destination updated but
+        # left active=False). An absent/blank cell canonicalized to None, so it
+        # stays a no-op that leaves any existing contact untouched (#268 review).
+        if canonical_email is not None:
+            self._set_email_contact(f"player:{obj.id}", canonical_email)
         return obj, created, changed
 
     def upsert_imported_registration(self, season_id: str, team_id: str,

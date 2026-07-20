@@ -178,12 +178,72 @@ class HierarchyImportReactivatesRetiredEmailTest(unittest.TestCase):
                 setup, player = self._seed(store)
                 pid = player.id
                 setup.update_player(pid, email=None, actor_id="a")   # retire
-                with store.transaction():
+                # BOTH None and a blank string are import no-ops: the player
+                # updates but the retired contact must NOT come back to life.
+                for blank in (None, "", "   "):
+                    with store.transaction():
+                        setup.upsert_imported_player(
+                            "P1", player.name, "home", Position.FORWARD, 7,
+                            blank, existing=player, actor_id="a")
+                    self.assertFalse(_contact(store, pid).active,
+                                     (label, repr(blank)))         # still retired
+                    self.assertIsNone(setup.active_player_email(pid),
+                                      (label, repr(blank)))
+                if isinstance(store, SqlStore):
+                    store.close()
+
+    def test_nonstring_email_rejected_before_any_player_write(self):
+        # The import must reject a non-string/non-None email BEFORE mutating the
+        # player — and the method itself must do so WITHOUT relying on an outer
+        # transaction, so a direct caller never observes partial player state
+        # (#268 review). No `with store.transaction()` wrapper here on purpose.
+        from hockey_scheduler.domain.errors import ValidationError
+        for label, store in _backends():
+            with self.subTest(backend=label):
+                setup, player = self._seed(store)
+                pid = player.id
+                audits_before = len(store.all_setup_audit())
+                for bad in (False, 0, ["a@b.co"], {"e": "a@b.co"}):
+                    with self.assertRaises(ValidationError,
+                                           msg=(label, repr(bad))) as ctx:
+                        # A changed name in the same call must NOT land.
+                        setup.upsert_imported_player(
+                            "P1", "Renamed Import", "home", Position.FORWARD, 7,
+                            bad, existing=player, actor_id="a")
+                    self.assertEqual(ctx.exception.details.get("reason"),
+                                     "invalid_email", (label, repr(bad)))
+                    fresh = store.get_player(pid)
+                    self.assertEqual(fresh.name, "Ann X", (label, repr(bad)))  # unchanged
+                    # Pre-existing email untouched; not retired by a falsy value.
+                    self.assertEqual(setup.active_player_email(pid), "ann@x.com",
+                                     (label, repr(bad)))
+                # Not one audit was written across all the rejected attempts.
+                self.assertEqual(len(store.all_setup_audit()), audits_before, label)
+                if isinstance(store, SqlStore):
+                    store.close()
+
+    def test_new_player_with_bad_email_creates_no_player(self):
+        # A brand-new imported row with a truthy non-string email rejects with
+        # no player and no audit created (atomic, no outer transaction).
+        from hockey_scheduler.domain.errors import ValidationError
+        for label, store in _backends():
+            with self.subTest(backend=label):
+                setup, _player = self._seed(store)
+                before_players = len(store.players_for_team("home"))
+                before_audits = len(store.all_setup_audit())
+                with self.assertRaises(ValidationError, msg=label) as ctx:
                     setup.upsert_imported_player(
-                        "P1", player.name, "home", Position.FORWARD, 7,
-                        None, existing=player, actor_id="a")
-                self.assertFalse(_contact(store, pid).active, label)  # still retired
-                self.assertIsNone(setup.active_player_email(pid), label)
+                        "P2", "Newbie", "home", Position.FORWARD, 9,
+                        ["a@b.co"], existing=None, actor_id="a")
+                self.assertEqual(ctx.exception.details.get("reason"),
+                                 "invalid_email", label)
+                self.assertEqual(len(store.players_for_team("home")),
+                                 before_players, label)            # no player added
+                self.assertIsNone(
+                    next((p for p in store.all_players()
+                          if p.external_ref == "P2"), None), label)
+                self.assertEqual(len(store.all_setup_audit()),
+                                 before_audits, label)             # no audit
                 if isinstance(store, SqlStore):
                     store.close()
 
