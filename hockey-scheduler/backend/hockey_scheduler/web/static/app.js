@@ -184,6 +184,7 @@ const ICONS = {
   trash: _svg('<path d="M3 6h18"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/>'),
   swap: _svg('<path d="M8 3L4 7l4 4"/><path d="M4 7h16"/><path d="M16 21l4-4-4-4"/><path d="M20 17H4"/>'),
   circleMinus: _svg('<circle cx="12" cy="12" r="9"/><path d="M8 12h8"/>'),
+  circleCheck: _svg('<circle cx="12" cy="12" r="9"/><path d="M8.5 12.5l2.5 2.5 4.5-5"/>'),
   circleX: _svg('<circle cx="12" cy="12" r="9"/><path d="M15 9l-6 6"/><path d="M9 9l6 6"/>'),
   database: _svg('<ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v14c0 1.7 3.6 3 8 3s8-1.3 8-3V5"/><path d="M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"/>'),
   pencil: _svg('<path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4 12.5-12.5z"/>'),
@@ -735,10 +736,10 @@ const SETUP_ENTITIES = [
   // while this view is open) — never from /api/demo/overview, which is
   // unauthenticated and this app's own convention keeps player names out of.
   { key: "player", title: "Players", icon: "🧑", noun: "player", perm: "manage_setup",
-    delKind: "player", editKind: "player",
+    delKind: "player", editKind: "player", activeKind: "player",
     list: (ov) => playersList.map((p) => ({
-      id: p.id, title: p.name,
-      sub: `${nameById(ov.teams, p.team_id) || ""}${p.jersey_number != null ? " · #" + p.jersey_number : ""}`,
+      id: p.id, title: p.name, active: p.is_active !== false,
+      sub: `${nameById(ov.teams, p.team_id) || ""}${p.jersey_number != null ? " · #" + p.jersey_number : ""}${p.is_active === false ? " · inactive" : ""}`,
     })),
     fields: [
       // On EDIT the Team is shown for context but locked — moving a player to
@@ -986,6 +987,21 @@ function editBtn(kind, id, name) {
     aria-label="${esc(aria)}">${ICONS.pencil}</button>`;
 }
 
+function activeBtn(kind, id, name, isActive) {
+  // Deactivate/reactivate control (#270): the supported roster exit that keeps
+  // all history, distinct from delete. The click opens a confirmation; it never
+  // toggles outright. MANAGE_SETUP-gated. A deactivate reads as the neutral
+  // circle-minus; a reactivate as the check.
+  if (!hasPerm("manage_setup")) return "";
+  const verb = isActive ? "Deactivate" : "Reactivate";
+  const aria = `${verb}${name ? " " + name : ""}`;
+  return `<button class="icon-btn" data-player-active="${esc(id)}"
+    data-player-active-next="${isActive ? "0" : "1"}"
+    data-player-active-name="${esc(name || id)}"
+    title="${esc(aria)}" aria-label="${esc(aria)}">${
+      isActive ? ICONS.circleMinus : ICONS.circleCheck}</button>`;
+}
+
 // Human labels for the entity kinds shown in the confirm/blocked modals.
 // Keys are internal delete-kinds (frozen); values are display nouns (#233:
 // the "league" kind is the umbrella Program, the "level" kind is the League).
@@ -1031,6 +1047,7 @@ function renderModal() {
   if (!modal) return "";
   if (modal.type === "demo-confirm") return demoConfirmModalHtml(modal);
   if (modal.type === "confirm-delete") return confirmDeleteModalHtml(modal);
+  if (modal.type === "player-active") return playerActiveModalHtml(modal);
   if (modal.type === "cancel-game") return cancelGameModalHtml(modal);
   if (modal.type === "blocked") return blockedModalHtml(modal);
   if (modal.type === "factory-reset") return factoryResetModalHtml(modal);
@@ -1046,6 +1063,31 @@ function cancelGameModalHtml(m) {
      <p class="muted">Rosters can no longer be changed for a cancelled game.</p>`,
     `<button class="act ghost" data-modal-close>Keep game</button>
      <button class="act danger" data-cancel-game-confirm>Cancel game</button>`);
+}
+
+// Deactivate/reactivate a Player (#270): the supported roster exit — never a
+// delete. Deactivation keeps every historical row; it only removes the player
+// from FUTURE roster selection and substitute candidacy. Reactivation re-runs
+// jersey/team integrity server-side, so a collision is surfaced as an error.
+function playerActiveModalHtml(m) {
+  if (m.next) {
+    return modalShell("neutral", "Reactivate this player?",
+      `<p>You're about to reactivate <strong>${esc(m.name || "this player")}</strong>.
+         They'll be eligible for new rosters again.</p>
+       <p class="muted">Their jersey number must still be free on the team —
+         if a teammate took it, reactivation is blocked.</p>`,
+      `<button class="act ghost" data-modal-close>Cancel</button>
+       <button class="act primary" data-player-active-confirm>Reactivate player</button>`);
+  }
+  return modalShell("danger", "Deactivate this player?",
+    `<p>You're about to deactivate <strong>${esc(m.name || "this player")}</strong>.
+       Their history — past rosters, games, and stats — is kept; this is not a
+       delete.</p>
+     <p class="muted">They'll be removed from future roster selection and
+       substitute lists, and their jersey number frees up for the team. You can
+       reactivate them anytime.</p>`,
+    `<button class="act ghost" data-modal-close>Keep active</button>
+     <button class="act danger" data-player-active-confirm>Deactivate player</button>`);
 }
 
 function modalShell(kind, title, body, foot) {
@@ -1311,6 +1353,24 @@ function wireModal(c) {
       toast = `Deleted ${DEL_NOUN[m.kind] || "record"} “${m.name}”.` + (cleaned
         ? ` Cleared ${cleaned} inactive registration${cleaned === 1 ? "" : "s"}.`
         : "");
+      await render();
+    };
+  }
+  // Deactivate/reactivate confirm (#270): POST the state change. On a jersey
+  // conflict the server error toast is surfaced (post() sets it) and the modal
+  // closes; on success the setup view re-fetches so the row reflects the new
+  // state (and the team's active-player count updates).
+  const paConfirm = c.querySelector("[data-player-active-confirm]");
+  if (paConfirm && modal && modal.type === "player-active") {
+    const m = modal;
+    paConfirm.onclick = async () => {
+      paConfirm.disabled = true;  // prevent a duplicate submit while running
+      toast = "";
+      const res = await post(`/api/v2/setup/player/${m.id}/active`,
+                             { active: m.next });
+      if (res && res.error) { modal = null; return render(); }  // post() set the toast
+      modal = null;
+      toast = m.next ? `Reactivated ${m.name}.` : `Deactivated ${m.name}.`;
       await render();
     };
   }
@@ -2176,6 +2236,8 @@ function setupCard(ent, sv) {
       <div class="li-title">${esc(it.title)}</div>
       ${it.sub ? `<div class="li-sub">${esc(it.sub)}</div>` : ""}</div>${
         ent.editKind && it.id ? editBtn(ent.editKind, it.id, it.title) : ""}${
+        ent.activeKind && it.id
+          ? activeBtn(ent.activeKind, it.id, it.title, it.active) : ""}${
         ent.delKind && it.id ? delBtn(ent.delKind, it.id, it.title) : ""}</div>`).join("");
   }
   const count = items ? `<span class="setup-count">${items.length}</span>` : "";
@@ -5474,6 +5536,15 @@ async function render() {
     e.stopPropagation();
     modal = { type: "confirm-delete", kind: b.dataset.del,
               id: b.dataset.delId, name: b.dataset.delName };
+    render();
+  });
+  // Deactivate/reactivate a Player (#270): open a confirmation, never toggle
+  // outright — same "click opens a themed modal" convention as delete.
+  c.querySelectorAll("[data-player-active]").forEach((b) => b.onclick = (e) => {
+    e.stopPropagation();
+    modal = { type: "player-active", id: b.dataset.playerActive,
+              next: b.dataset.playerActiveNext === "1",
+              name: b.dataset.playerActiveName };
     render();
   });
   // Cancel game (#215): committed/published fixtures are cancelled, not deleted.

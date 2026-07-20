@@ -138,6 +138,14 @@ class AccountService:
             raise ValidationError(
                 "That player does not exist.",
                 {"reason": "scope_subject_missing", "player_id": player_id})
+        # A scoped Player account can never bind to an INACTIVE Player (#270):
+        # deactivation is the roster exit, so a login must not outlive it — a
+        # Player who left/was placed on IR has no identity to act as. This
+        # gates both create and rebind (both route through here).
+        if player is not None and not player.is_active:
+            raise ValidationError(
+                "That player is inactive.",
+                {"reason": "player_inactive", "player_id": player_id})
         # A Player account MUST carry its own player_id (#266/#282 review): a
         # Player holds RESPOND_AVAILABILITY and substitute self-service, and the
         # scope gate fails closed for an unscoped Player, so an account with no
@@ -328,12 +336,23 @@ class AccountService:
                     "player before reactivating.",
                     {"reason": "scope_required", "account_id": account_id,
                      "field": "player_id"})
-            if player_id and self.store.get_player_for_update(player_id) is None:
-                raise ValidationError(
-                    "This account's player no longer exists; rebind it to "
-                    "a valid player before reactivating.",
-                    {"reason": "scope_subject_missing", "account_id": account_id,
-                     "player_id": player_id})
+            if player_id:
+                scoped_player = self.store.get_player_for_update(player_id)
+                if scoped_player is None:
+                    raise ValidationError(
+                        "This account's player no longer exists; rebind it to "
+                        "a valid player before reactivating.",
+                        {"reason": "scope_subject_missing",
+                         "account_id": account_id, "player_id": player_id})
+                # A login must not outlive the roster exit (#270): reactivating
+                # an account onto a deactivated Player is refused the same way a
+                # deleted one is — reactivate the Player first, or rebind.
+                if not scoped_player.is_active:
+                    raise ValidationError(
+                        "This account's player is inactive; reactivate the "
+                        "player (or rebind) before reactivating the account.",
+                        {"reason": "player_inactive",
+                         "account_id": account_id, "player_id": player_id})
             # A Coach account must still carry a valid team scope to be
             # reactivated (#266) — reactivating an unscoped or dangling-team
             # coach would resurrect a login the scope gate now refuses, or (if

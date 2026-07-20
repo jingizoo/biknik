@@ -3040,6 +3040,61 @@ class SetupService:
             f"player:{player_id}", NotificationChannel.EMAIL)
         return c.destination if (c is not None and c.active) else None
 
+    @_transactional
+    def set_player_active(self, player_id: str, active: bool, *,
+                          actor_id: Optional[str] = None,
+                          reason: Optional[str] = None) -> Player:
+        """Deactivate or reactivate a Player without deleting history (#270).
+
+        The supported exit for an injured-reserve, a mid-season move, or a
+        departure — distinct from delete (which correctly refuses to shed
+        historical dependencies) and from the profile edit (#268) and Team
+        reassignment, which stay their own operations. The Player id, guardian
+        links, contact history, roster/game history, availability, audit, and
+        statistics are all preserved; only ``is_active`` flips. Roster
+        selection and substitute eligibility already gate on ``is_active``
+        (roster_service), so deactivation removes the Player from FUTURE
+        selection while every historical row stays readable and unchanged.
+
+        Reactivation is NOT a silent resurrection: it re-runs the same jersey
+        integrity the create/edit paths enforce (#269) — while the Player was
+        inactive its number was released and an active teammate may now wear it,
+        so a collision blocks reactivation with the usual field-level conflict —
+        and it re-checks that the Player's Team still exists. A scoped Player
+        account can never be bound or reactivated onto an inactive Player
+        (account_service), so a login can't outlive the roster exit.
+
+        Idempotent: setting the state the Player is already in is a no-op that
+        writes nothing and appends no audit (no duplicate audit noise). A real
+        change writes a ``player_activated`` / ``player_deactivated`` audit with
+        the actor, prior + new state, and the ``reason`` when supplied — never a
+        raw value beyond the caller-provided reason string.
+        """
+        player = self.store.get_player_for_update(player_id)
+        if player is None:
+            raise NotFoundError(f"Player {player_id} not found.")
+        target = bool(active)
+        if player.is_active == target:
+            return player                      # idempotent no-op, no audit
+        if target:
+            # Reactivation integrity: the Team must still exist and the jersey
+            # must be free among the team's ACTIVE players (it was released
+            # while inactive) — never resurrect an invalid record silently.
+            if self.store.get_team(player.team_id) is None:
+                raise NotFoundError(f"Team {player.team_id} not found.")
+            self._assert_jersey_available(
+                player.team_id, player.jersey_number,
+                exclude_player_id=player.id)
+        prior = player.is_active
+        player.is_active = target
+        self.store.save_player(player)
+        detail = {"from_active": prior, "to_active": target}
+        if reason:
+            detail["reason"] = reason
+        self._audit("player_activated" if target else "player_deactivated",
+                    "player", player.id, actor_id, detail)
+        return player
+
     # -- CSV import commit (#93) --------------------------------------------
     def commit_teams_players_import(self, season_id: str, sheets: dict,
                                     actor_id: Optional[str] = None) -> dict:

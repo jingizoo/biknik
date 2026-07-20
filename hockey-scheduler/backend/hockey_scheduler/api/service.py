@@ -3255,6 +3255,11 @@ class ApiService:
             slot_count[s.rink_id] = slot_count.get(s.rink_id, 0) + 1
         player_count = {}
         for p in self.store.all_players():
+            # Active-directory count (#270): inactive players are excluded from
+            # the team roster count shown in the setup hierarchy; historical
+            # rows still render, but the directory reflects the active roster.
+            if not p.is_active:
+                continue
             player_count[p.team_id] = player_count.get(p.team_id, 0) + 1
 
         rinks_by_venue = _group(rinks, "venue_id")
@@ -3424,6 +3429,11 @@ class ApiService:
 
         player_count = {}
         for p in self.store.all_players():
+            # Active-directory count (#270): inactive players are excluded from
+            # the team roster count shown in the setup hierarchy; historical
+            # rows still render, but the directory reflects the active roster.
+            if not p.is_active:
+                continue
             player_count[p.team_id] = player_count.get(p.team_id, 0) + 1
 
         seasons_by_program = _group(seasons, "program_id")
@@ -3987,6 +3997,14 @@ class ApiService:
                   if key in fields}
         return _serialize(self.setup.update_player(
             player_id, actor_id=actor_id, **kwargs))
+
+    @catch
+    def set_player_active(self, player_id: str, active: bool,
+                          actor_id: Optional[str] = None,
+                          reason: Optional[str] = None) -> dict:
+        """Deactivate/reactivate a Player without deleting history (#270)."""
+        return _serialize(self.setup.set_player_active(
+            player_id, active, actor_id=actor_id, reason=reason))
 
     @catch
     def create_game(self, season_id: str, division_id: str, home_team_id: str,
