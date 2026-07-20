@@ -29,7 +29,7 @@ from hockey_scheduler.domain import SeasonTeamRegistration, Team
 PROGRAM_KEYS = {"id", "name", "country", "timezone", "operator_organization_id",
                 "external_ref"}
 SEASON_KEYS = {"id", "program_id", "name", "start_date", "end_date",
-               "external_ref"}
+               "external_ref", "status", "archived_at"}
 LEAGUE_KEYS = {"id", "season_id", "name", "sort_order", "external_ref"}
 DIVISION_KEYS = {"id", "season_id", "name", "age_group", "league_id",
                  "external_ref"}

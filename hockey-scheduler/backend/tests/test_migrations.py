@@ -161,6 +161,8 @@ class MigrationApplyTest(unittest.TestCase):
             cur.execute("ALTER TABLE games DROP COLUMN game_type")  # #283 Slice D additive col
             cur.execute("DROP INDEX IF EXISTS ix_games_league_season")  # #283 Slice E
             cur.execute("ALTER TABLE games DROP COLUMN league_season_id")  # #283 Slice E additive col
+            cur.execute("ALTER TABLE seasons DROP COLUMN status")  # #159 additive col
+            cur.execute("ALTER TABLE seasons DROP COLUMN archived_at")  # #159 additive col
             cur.execute("DELETE FROM schema_migrations")
             cur.execute("INSERT INTO schema_migrations(version, applied_at) "
                         "VALUES ('0001_initial', '2026-01-01')")
@@ -171,6 +173,8 @@ class MigrationApplyTest(unittest.TestCase):
                 {"last_attempt_at", "next_attempt_at", "dead_lettered_at"}
                 <= _table_columns(adopted, "notification_deliveries"))
             self.assertIn("external_ref", _table_columns(adopted, "teams"))
+            self.assertTrue(  # #159 season lifecycle re-added on adoption
+                {"status", "archived_at"} <= _table_columns(adopted, "seasons"))
             self.assertIn("external_ref", _table_columns(adopted, "players"))
             self.assertIn("external_ref", _table_columns(adopted, "officials"))
             self.assertIn("external_ref", _table_columns(adopted, "rinks"))

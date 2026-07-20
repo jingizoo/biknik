@@ -27,6 +27,15 @@ class SlotType(str, Enum):
     SKATER = "skater"
 
 
+class SeasonStatus(str, Enum):
+    """Lifecycle state of a Season (#159). ``active`` Seasons accept operational
+    writes (registrations, venue access, divisions, games, roll-forward target);
+    ``archived`` Seasons are read-only historical records — still fully readable,
+    but excluded from active work until an authorized, reasoned reopen."""
+    ACTIVE = "active"
+    ARCHIVED = "archived"
+
+
 class SlotStatus(str, Enum):
     FULL = "full"
     OPEN = "open"

@@ -2672,6 +2672,10 @@ class ApiService:
         if isinstance(proposal, dict) and proposal.get("error"):
             return proposal
         resolved_season_id = proposal["season_id"]
+        # #159 — committing a draft writes real Game rows, so it is blocked when
+        # the target Season is archived (read-only). The draft above only reads,
+        # so a preview of historical data is still allowed; nothing is written.
+        self.setup._require_active_season(resolved_season_id)
         # The Division-only proposal's own "league_id" is this tenancy
         # layer's frozen Program-scoped vocabulary (league_scope.py's
         # league_id_for_division -> season.program_id, see scope_bridge.py's
@@ -3177,7 +3181,13 @@ class ApiService:
             "seasons": [
                 {"id": s.id, "program_id": s.program_id, "name": s.name,
                  "start_date": s.start_date.isoformat() if s.start_date else None,
-                 "end_date": s.end_date.isoformat() if s.end_date else None}
+                 "end_date": s.end_date.isoformat() if s.end_date else None,
+                 # Lifecycle state (#159): archived Seasons stay in the read
+                 # payload (history remains visible) but carry their status so
+                 # the UI can flag them and exclude them from active-work pickers.
+                 "status": s.status.value,
+                 "archived_at": (s.archived_at.isoformat()
+                                 if s.archived_at else None)}
                 for s in seasons],
             "leagues": [
                 {"id": lg.id, "season_id": season_by_league.get(lg.id),
@@ -3647,6 +3657,20 @@ class ApiService:
         # raw values are forwarded unparsed rather than pre-validated here.
         return _serialize(self.setup.create_season(
             program_id, name, start_date, end_date, actor_id))
+
+    @catch
+    def archive_season(self, season_id: str, reason: Optional[str] = None,
+                       actor_id: Optional[str] = None) -> dict:
+        """Archive a Season into read-only historical mode (#159)."""
+        return _serialize(self.setup.archive_season(
+            season_id, actor_id=actor_id, reason=reason))
+
+    @catch
+    def reopen_season(self, season_id: str, reason: Optional[str] = None,
+                      actor_id: Optional[str] = None) -> dict:
+        """Reopen an archived Season back to active (#159). Requires a reason."""
+        return _serialize(self.setup.reopen_season(
+            season_id, actor_id=actor_id, reason=reason))
 
     @catch
     def create_league(self, season_id: str, name: str, sort_order: int = 0,

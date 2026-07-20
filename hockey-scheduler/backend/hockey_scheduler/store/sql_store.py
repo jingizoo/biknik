@@ -64,6 +64,7 @@ from ..domain import (
     InstallationState,
     RosterRole,
     Season,
+    SeasonStatus,
     SeasonTeamRegistration,
     SeasonVenueAccess,
     TeamLeagueMigrationDecision,
@@ -151,7 +152,9 @@ class Spec:
 
 SPECS = {
     Program: Spec(Program, "programs"),
-    Season: Spec(Season, "seasons", {"start_date": _dt(), "end_date": _dt()}),
+    Season: Spec(Season, "seasons", {"start_date": _dt(), "end_date": _dt(),
+                                     "status": _enum(SeasonStatus),
+                                     "archived_at": _dt()}),
     League: Spec(League, "leagues"),
     LeagueSeason: Spec(LeagueSeason, "league_seasons"),
     Division: Spec(Division, "divisions"),

@@ -41,6 +41,7 @@ from ..domain import (
     Organization,
     Rink,
     Season,
+    SeasonStatus,
     SeasonTeamRegistration,
     SeasonVenueAccess,
     SetupAuditLog,
@@ -336,6 +337,68 @@ class SetupService:
                     {"league_id": program_id})
         return season
 
+    def _require_active_season(self, season_id: str) -> Season:
+        """Fail closed if a Season is archived/read-only (#159). Returns the
+        Season so callers can reuse it. Every operational write that targets a
+        Season routes through here so archived history stays immutable — an
+        archived Season accepts no new registrations, venue access, leagues,
+        divisions, games, or roll-forward-target rows until it is reopened."""
+        season = self.store.get_season(season_id)
+        if season is None:
+            raise NotFoundError(f"Season {season_id} not found.")
+        if season.status == SeasonStatus.ARCHIVED:
+            raise ValidationError(
+                f"Season '{season.name}' is archived and read-only. Reopen it "
+                "before making changes.",
+                {"reason": "season_archived", "season_id": season_id})
+        return season
+
+    @_transactional
+    def archive_season(self, season_id: str, *, actor_id: Optional[str] = None,
+                       reason: Optional[str] = None) -> Season:
+        """Archive a Season into read-only historical mode (#159). Idempotent
+        transitions are rejected (re-archiving an archived Season is an explicit
+        error) so the audit trail records exactly one transition. Authorization
+        (MANAGE_SETUP) is enforced at the HTTP boundary."""
+        season = self.store.get_season(season_id)
+        if season is None:
+            raise NotFoundError(f"Season {season_id} not found.")
+        if season.status == SeasonStatus.ARCHIVED:
+            raise ValidationError(
+                f"Season '{season.name}' is already archived.",
+                {"reason": "season_already_archived", "season_id": season_id})
+        season.status = SeasonStatus.ARCHIVED
+        season.archived_at = self.clock()
+        self.store.save_season(season)
+        self._audit("season_archived", "season", season_id, actor_id,
+                    {"reason": (reason or "").strip() or None})
+        return season
+
+    @_transactional
+    def reopen_season(self, season_id: str, *, actor_id: Optional[str] = None,
+                      reason: Optional[str] = None) -> Season:
+        """Reopen an archived Season back to active/writable (#159). This is a
+        privileged, *reasoned* operation — a non-empty ``reason`` is required and
+        recorded in the audit trail (authorization is enforced at the HTTP
+        boundary). Reopening a Season that is not archived is an explicit error."""
+        if not (reason or "").strip():
+            raise ValidationError(
+                "A reason is required to reopen an archived Season.",
+                {"reason": "reason_required", "field": "reason"})
+        season = self.store.get_season(season_id)
+        if season is None:
+            raise NotFoundError(f"Season {season_id} not found.")
+        if season.status != SeasonStatus.ARCHIVED:
+            raise ValidationError(
+                f"Season '{season.name}' is not archived.",
+                {"reason": "season_not_archived", "season_id": season_id})
+        season.status = SeasonStatus.ACTIVE
+        season.archived_at = None
+        self.store.save_season(season)
+        self._audit("season_reopened", "season", season_id, actor_id,
+                    {"reason": reason.strip()})
+        return season
+
     def _link_league_season(self, league_id: str, season_id: str) -> LeagueSeason:
         """Find or create the LeagueSeason binding ``league_id`` to ``season_id``
         (#283). Enforces the invariant ``league.program_id == season.program_id``
@@ -372,9 +435,7 @@ class SetupService:
         the Season via a :class:`LeagueSeason` in one step, so existing callers
         keep working. (Slice C adds the program-first create + explicit
         LeagueSeason API.)"""
-        season = self.store.get_season(season_id)
-        if season is None:
-            raise NotFoundError(f"Season {season_id} not found.")
+        season = self._require_active_season(season_id)  # #159 read-only guard
         league = League(id=self.store.next_id("league"),
                         program_id=season.program_id,
                         name=self._require_name(name), sort_order=sort_order or 0)
@@ -390,6 +451,7 @@ class SetupService:
         """Bind an existing permanent League to a Season (#283 rule 5). Returns
         the existing binding when already present; enforces the shared-Program
         invariant via :meth:`_link_league_season`."""
+        self._require_active_season(season_id)  # #159 read-only guard
         existing = self.store.league_season_for(league_id, season_id)
         ls = self._link_league_season(league_id, season_id)
         if existing is None:
@@ -408,8 +470,7 @@ class SetupService:
         or the Season's sole LeagueSeason when no league is given — so existing
         callers keep working while the Division is stored against its
         LeagueSeason."""
-        if self.store.get_season(season_id) is None:
-            raise NotFoundError(f"Season {season_id} not found.")
+        self._require_active_season(season_id)  # #159 read-only guard
         ls = self._resolve_division_league_season(season_id, league_id)
         division = Division(id=self.store.next_id("division"),
                             league_season_id=ls.id,
@@ -653,9 +714,7 @@ class SetupService:
         must belong to the resolved LeagueSeason (rule 6). One registration per
         (team, LeagueSeason); a prior inactive one is reactivated in place.
         """
-        season = self.store.get_season(season_id)
-        if season is None:
-            raise NotFoundError(f"Season {season_id} not found.")
+        season = self._require_active_season(season_id)  # #159 read-only guard
         team = self.store.get_team(team_id)
         if team is None:
             raise NotFoundError(f"Team {team_id} not found.")
@@ -1106,9 +1165,7 @@ class SetupService:
         duplicated, honoring the (season_id, venue_id) one-active-row
         invariant enforced by the partial unique index (migration 029).
         """
-        season = self.store.get_season(season_id)
-        if season is None:
-            raise NotFoundError(f"Season {season_id} not found.")
+        season = self._require_active_season(season_id)  # #159 read-only guard
         venue = self.store.get_venue(venue_id)
         if venue is None:
             raise NotFoundError(f"Venue {venue_id} not found.")
@@ -1259,6 +1316,13 @@ class SetupService:
         dst = self.store.get_season(to_season_id)
         if dst is None:
             raise NotFoundError(f"Season {to_season_id} not found.")
+        # #159 — a rollover may READ an archived source season's history, but
+        # never write registrations INTO an archived (read-only) target.
+        if dst.status == SeasonStatus.ARCHIVED:
+            raise ValidationError(
+                f"Season '{dst.name}' is archived and read-only. Reopen it "
+                "before rolling participation into it.",
+                {"reason": "season_archived", "season_id": to_season_id})
         if from_season_id == to_season_id:
             raise ValidationError("Source and target seasons must differ.")
         # Rule 4 — a rollover stays within one program.
@@ -1425,6 +1489,12 @@ class SetupService:
         dst = self.store.get_season(to_season_id)
         if dst is None:
             raise NotFoundError(f"Season {to_season_id} not found.")
+        # #159 — never roll participation INTO an archived (read-only) season.
+        if dst.status == SeasonStatus.ARCHIVED:
+            raise ValidationError(
+                f"Season '{dst.name}' is archived and read-only. Reopen it "
+                "before rolling participation into it.",
+                {"reason": "season_archived", "season_id": to_season_id})
         if from_season_id == to_season_id:
             raise ValidationError("Source and target seasons must differ.")
         if (src.program_id or None) != (dst.program_id or None):
@@ -1894,9 +1964,7 @@ class SetupService:
                     actor_id: Optional[str] = None,
                     league_id: Optional[str] = None,
                     game_type: str = GameType.REGULAR.value) -> Game:
-        season = self.store.get_season(season_id)
-        if season is None:
-            raise NotFoundError(f"Season {season_id} not found.")
+        season = self._require_active_season(season_id)  # #159 read-only guard
 
         # #283 Slice D: a Game is REGULAR (counts toward standings, bound to one
         # LeagueSeason) or EXHIBITION (a friendly that may cross League lines and

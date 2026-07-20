@@ -21,6 +21,7 @@ from .enums import (
     OfficialRole,
     RescheduleStatus,
     ResultStatus,
+    SeasonStatus,
 )
 from .roles import Role
 
@@ -53,6 +54,12 @@ class Season:
     # Stable import-matching key (#174 PR E) — seasons are matched across
     # repeat hierarchy uploads by this code (the sheet's season_code).
     external_ref: Optional[str] = None
+    # Lifecycle state (#159). Defaults to ACTIVE; archiving flips this to
+    # ARCHIVED and stamps ``archived_at``, making the Season a read-only
+    # historical record (no new registrations/venue access/divisions/games/
+    # roll-forward target) until an authorized, reasoned reopen clears it.
+    status: SeasonStatus = SeasonStatus.ACTIVE
+    archived_at: Optional[datetime] = None
 
 
 @dataclass

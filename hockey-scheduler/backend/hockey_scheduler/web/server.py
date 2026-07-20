@@ -264,6 +264,8 @@ _POST_ROUTES = [re.compile(p) for p in (
     r"^/api/v2/setup/seasons/[^/]+/team-registrations$",
     r"^/api/v2/setup/seasons/[^/]+/venue-access$",
     r"^/api/v2/setup/seasons/[^/]+/roll-forward$",
+    r"^/api/v2/setup/seasons/[^/]+/archive$",
+    r"^/api/v2/setup/seasons/[^/]+/reopen$",
     r"^/api/v2/setup/season-team-registration/[^/]+/assign-league$",
     r"^/api/v2/setup/season-team-registration/[^/]+/assign-division$",
     r"^/api/v2/setup/season-team-registration/[^/]+/remove$",
@@ -2797,6 +2799,18 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_api(api.roll_forward_registrations_v2(
                 b.get("from_season_id"), mrf.group(1), b.get("selections"),
                 actor_id))
+        # Season lifecycle (#159): archive → read-only historical; reopen →
+        # active (requires a reason). Only ``reason`` is accepted in the body.
+        mar = re.match(r"^seasons/([^/]+)/(archive|reopen)$", entity)
+        if mar:
+            try:
+                check_body(b, allowed={"reason"})
+            except BodyError as exc:
+                return self._send_json(exc.payload, exc.status)
+            call = (api.archive_season if mar.group(2) == "archive"
+                    else api.reopen_season)
+            return self._send_api(call(
+                mar.group(1), reason=b.get("reason"), actor_id=actor_id))
         # Delete: /api/v2/setup/<entity>/<id>/delete — canonical names
         # (program-delete = umbrella, league-delete = the grouping League).
         md = re.match(
