@@ -3040,6 +3040,171 @@ class SetupService:
             f"player:{player_id}", NotificationChannel.EMAIL)
         return c.destination if (c is not None and c.active) else None
 
+    @_transactional
+    def set_player_active(self, player_id: str, active: bool, *,
+                          actor_id: Optional[str] = None,
+                          reason: Optional[str] = None) -> Player:
+        """Deactivate or reactivate a Player without deleting history (#270).
+
+        The supported exit for an injured-reserve, a mid-season move, or a
+        departure — distinct from delete (which correctly refuses to shed
+        historical dependencies) and from the profile edit (#268) and Team
+        reassignment, which stay their own operations. The Player id, guardian
+        links, contact history, roster/game history, availability, audit, and
+        statistics are all preserved; only ``is_active`` flips. Roster
+        selection and substitute eligibility already gate on ``is_active``
+        (roster_service), so deactivation removes the Player from FUTURE
+        selection while every historical row stays readable and unchanged.
+
+        Reactivation is NOT a silent resurrection: it re-runs the same jersey
+        integrity the create/edit paths enforce (#269) — while the Player was
+        inactive its number was released and an active teammate may now wear it,
+        so a collision blocks reactivation with the usual field-level conflict —
+        and it re-checks that the Player's Team still exists. A scoped Player
+        account can never be bound or reactivated onto an inactive Player
+        (account_service), so a login can't outlive the roster exit.
+
+        Idempotent: setting the state the Player is already in is a no-op that
+        writes nothing and appends no audit (no duplicate audit noise). A real
+        change writes a ``player_activated`` / ``player_deactivated`` audit with
+        the actor, prior + new state, and the ``reason`` when supplied — never a
+        raw value beyond the caller-provided reason string.
+        """
+        # Validate the contract fields BEFORE any read/mutation (#270 review):
+        # ApiService.set_player_active is also a supported boundary and forwards
+        # raw values, so `active` must be an actual bool (never bool()-coerced —
+        # "false"/"0"/[] would flip state silently) and `reason` must be a
+        # string or None (a non-string must not enter or vanish from the audit).
+        if not isinstance(active, bool):
+            raise ValidationError(
+                "active must be true or false.",
+                {"reason": "invalid_active", "field": "active"})
+        if reason is not None:
+            if not isinstance(reason, str):
+                raise ValidationError(
+                    "reason must be a string.",
+                    {"reason": "invalid_reason", "field": "reason"})
+            reason = reason.strip() or None   # blank/whitespace → omitted
+        player = self.store.get_player_for_update(player_id)
+        if player is None:
+            raise NotFoundError(f"Player {player_id} not found.")
+        target = active
+        if not target or not player.is_active:
+            # Reconcile dangling scoped-account authority for this Player, in
+            # this same transaction, BEFORE the idempotent short-circuit below
+            # (#270 review). A login must never outlive the roster exit, and
+            # bringing a Player record back must never silently restore a login:
+            #   • Deactivation (target False) — retire any ACTIVE scoped account
+            #     and revoke its live sessions. Runs even when the Player row is
+            #     ALREADY inactive so legacy data (inactive Players were once
+            #     creatable and account binding did not reject them) that still
+            #     carries a live account/session is reconciled, not left
+            #     dangling.
+            #   • Reactivation TRANSITION (target True while the row is still
+            #     inactive) — retire any account still bound from before the
+            #     Player went inactive, so once ``is_active`` flips true (and
+            #     ``_player_team_id`` resolves again) that stale account/session
+            #     does NOT immediately regain private-game / self-service
+            #     access. Account access is restored only by the separate,
+            #     explicit account-lifecycle reactivation, which re-checks the
+            #     Player is active (#266/#282).
+            # An idempotent reactivation of an ALREADY-active Player skips this
+            # (``not target`` false, ``not player.is_active`` false) so a
+            # legitimate live login is never nuked. The reconcile is itself
+            # idempotent — it touches only still-active accounts and un-revoked
+            # sessions and audits only what it actually changes — so a repeat
+            # call mutates nothing further.
+            #
+            # Pass the ACCURATE lifecycle cause into the audit (#270 review): the
+            # helper runs in three distinct cases and the account-deactivation
+            # audit reason must tell the truth so an investigator can tell a real
+            # deactivation apart from a legacy reconcile or the reactivation
+            # safety reconcile — never a hard-coded "player_deactivated" beside a
+            # player_activated event.
+            if not target:
+                retire_reason = ("player_deactivated" if player.is_active
+                                 else "player_deactivation_reconcile")
+            else:
+                retire_reason = "player_reactivation_reconcile"
+            self._retire_player_account_authority(
+                player.id, actor_id, retire_reason)
+        if player.is_active == target:
+            # No Player-state change → no player_activated/deactivated audit
+            # (idempotent lifecycle). Any account/session repair above audited
+            # itself; nothing else is written.
+            return player
+        if target:
+            # Reactivation integrity: the Team must still exist and the jersey
+            # must be free among the team's ACTIVE players (it was released
+            # while inactive) — never resurrect an invalid record silently.
+            if self.store.get_team(player.team_id) is None:
+                raise NotFoundError(f"Team {player.team_id} not found.")
+            self._assert_jersey_available(
+                player.team_id, player.jersey_number,
+                exclude_player_id=player.id)
+        prior = player.is_active
+        player.is_active = target
+        self.store.save_player(player)
+        detail = {"from_active": prior, "to_active": target}
+        if reason:
+            detail["reason"] = reason
+        self._audit("player_activated" if target else "player_deactivated",
+                    "player", player.id, actor_id, detail)
+        return player
+
+    def _retire_player_account_authority(self, player_id: str,
+                                         actor_id: Optional[str],
+                                         reason: str) -> None:
+        """Deactivate every active account scoped to ``player_id`` and revoke
+        its live sessions (#270 review). ``reason`` is the accurate lifecycle
+        cause recorded on each ``user_account_deactivated`` audit — the caller
+        passes ``player_deactivated`` for a real deactivation,
+        ``player_deactivation_reconcile`` for a legacy already-inactive Player,
+        or ``player_reactivation_reconcile`` for the inactive→active safety
+        reconcile — so the committed audit trail never claims a deactivation
+        cause beside a ``player_activated`` event. Runs inside
+        ``set_player_active``'s transaction, so it rolls back with the rest on
+        any failure. Because ``SessionManager.resolve`` fails closed on an
+        inactive account, killing the account row is what terminates the
+        session; the explicit revoke is belt-and-suspenders and mirrors the
+        account-active route.
+
+        Concurrency (#270 review): the unlocked ``all_user_accounts()`` scan only
+        picks CANDIDATE ids; each account is then re-read under its ROW LOCK
+        (``get_user_account_for_update``) and re-checked immediately before the
+        write. This is what makes the reconcile safe against a concurrent
+        ``rebind_account_scope`` / ``set_active`` on the same account: we never
+        blind-save a stale whole-row object (which would clobber a completed
+        rebind and re-bind the account to this inactive Player while the audit
+        said it moved). If, under the lock, the account was rebound away from
+        this Player or is already inactive, we skip it — leaving the rebind's new
+        scope intact. The lock order is Player→Account everywhere
+        (``set_player_active`` already holds the Player lock; account
+        create/rebind/reactivate lock the Player subject BEFORE the account), so
+        this cannot deadlock with those paths."""
+        now = _utcnow()
+        candidate_ids = [a.id for a in self.store.all_user_accounts()
+                         if a.active
+                         and (a.scope or {}).get("player_id") == player_id]
+        for account_id in candidate_ids:
+            acct = self.store.get_user_account_for_update(account_id)
+            if acct is None:
+                continue
+            # Re-check UNDER THE LOCK: a concurrent rebind may have moved the
+            # scope off this Player, or a concurrent deactivate may have already
+            # retired it. Only retire an account still active AND still bound to
+            # this Player — never overwrite a rebind's committed new scope.
+            if not acct.active or (acct.scope or {}).get("player_id") != player_id:
+                continue
+            acct.active = False
+            self.store.save_user_account(acct)
+            self._audit("user_account_deactivated", "user_account", acct.id,
+                        actor_id, {"reason": reason, "player_id": player_id})
+            for sess in self.store.sessions_for_user(acct.id):
+                if sess.revoked_at is None:
+                    sess.revoked_at = now
+                    self.store.save_session(sess)
+
     # -- CSV import commit (#93) --------------------------------------------
     def commit_teams_players_import(self, season_id: str, sheets: dict,
                                     actor_id: Optional[str] = None) -> dict:

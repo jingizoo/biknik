@@ -163,6 +163,80 @@ class ProductionPublicPrivacyTest(_HttpBase):
             f"/api/games/{self.game_id}/roster-status")
         self.assertEqual(no, 403)
 
+    def test_deactivated_player_session_loses_private_read(self):
+        # #270 review: a scoped Player's login must not outlive the roster exit.
+        # A logged-in player can read its team's private game data; once the
+        # operator deactivates the Player, the SAME session cookie is denied —
+        # the private-read gate fails closed AND the scoped account is retired.
+        from hockey_scheduler.domain import Player, Position, Role
+        g = self._game()
+        store = srv.STATE.api.store
+        # A DEDICATED player on the away team (so deactivating it doesn't
+        # disturb the shared demo players other tests in this class rely on).
+        away_player = "dp_test_player"
+        store.add_player(Player(id=away_player, team_id=g.away_team_id,
+                                name="Departing Player", position=Position.FORWARD))
+        acct = srv.STATE.api.accounts.create_account(
+            username="u_dp", password="scoped-account-pw", role=Role.PLAYER,
+            scope={"player_id": away_player, "team_id": g.away_team_id})
+        token = srv.SESSIONS.login(store, acct.id)
+        cookie = f"{srv.SESSION_COOKIE}={token}"
+        ok, _ = self._get(
+            f"/api/games/{self.game_id}/roster-status", cookie=cookie)
+        self.assertEqual(ok, 200)
+        # Operator deactivates the Player.
+        srv.STATE.api.set_player_active(away_player, False, actor_id="admin")
+        denied, _ = self._get(
+            f"/api/games/{self.game_id}/roster-status", cookie=cookie)
+        self.assertIn(denied, (401, 403))
+        # The scoped account itself was retired, not just the read gate.
+        self.assertFalse(store.get_user_account(acct.id).active)
+
+    def test_reactivating_player_does_not_restore_private_read(self):
+        # #270 review: reactivating a Player record must NOT silently restore a
+        # dangling scoped login. A legacy inactive Player still carrying an
+        # active account + live session, once reactivated, keeps that account
+        # inactive and the session revoked — the private read stays denied until
+        # the operator reactivates the ACCOUNT separately.
+        from hockey_scheduler.domain import Player, Position, Role
+        g = self._game()
+        store = srv.STATE.api.store
+        pid = "dp_reactivate_player"
+        # An ACTIVE Player with a live scoped account (binding rejects inactive
+        # players)...
+        store.add_player(Player(id=pid, team_id=g.away_team_id,
+                                name="Returning Player",
+                                position=Position.FORWARD))
+        acct = srv.STATE.api.accounts.create_account(
+            username="u_reacc", password="scoped-account-pw", role=Role.PLAYER,
+            scope={"player_id": pid, "team_id": g.away_team_id})
+        token = srv.SESSIONS.login(store, acct.id)
+        cookie = f"{srv.SESSION_COOKIE}={token}"
+        # ...then flip the Player inactive DIRECTLY so the account/session stay
+        # live and the row is already inactive (the legacy state a reactivate
+        # must reconcile).
+        legacy = store.get_player_for_update(pid)
+        legacy.is_active = False
+        store.save_player(legacy)
+
+        # Operator reactivates the PLAYER record.
+        srv.STATE.api.set_player_active(pid, True, actor_id="admin")
+        self.assertTrue(store.get_player(pid).is_active)
+        # The dangling account/session were retired, so the old cookie is denied
+        # and the account stays inactive.
+        denied, _ = self._get(
+            f"/api/games/{self.game_id}/roster-status", cookie=cookie)
+        self.assertIn(denied, (401, 403))
+        self.assertFalse(store.get_user_account(acct.id).active)
+
+        # Only the explicit account reactivation restores login — and a FRESH
+        # login then reads the private data (the Player is active again).
+        srv.STATE.api.accounts.set_active(acct.id, True, actor_id="admin")
+        fresh = srv.SESSIONS.login(store, acct.id)
+        ok, _ = self._get(f"/api/games/{self.game_id}/roster-status",
+                          cookie=f"{srv.SESSION_COOKIE}={fresh}")
+        self.assertEqual(ok, 200)
+
     def test_official_assignment_controls_officials_access(self):
         from hockey_scheduler.domain import Role
         assigned = srv.STATE.api.store.assignments_for_game(self.game_id)

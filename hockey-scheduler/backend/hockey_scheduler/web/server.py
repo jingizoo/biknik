@@ -258,6 +258,7 @@ _POST_ROUTES = [re.compile(p) for p in (
     r"^/api/v2/setup/team/[^/]+/assign-league$",
     r"^/api/v2/setup/player/[^/]+/assign-team$",
     r"^/api/v2/setup/player/[^/]+/update$",
+    r"^/api/v2/setup/player/[^/]+/active$",
     r"^/api/v2/setup/rink/[^/]+/assign-venue$",
     r"^/api/v2/setup/venue/[^/]+/assign-organization$",
     r"^/api/v2/setup/seasons/[^/]+/team-registrations$",
@@ -2681,6 +2682,23 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_json(exc.payload, exc.status)
             return self._send_api(api.update_player(
                 mpu.group(1), actor_id=actor_id, **b))
+        # Deactivate/reactivate a Player without deleting history (#270): the
+        # supported roster exit for IR / a move / a departure. `active` is a
+        # REQUIRED bool; `reason` is an optional free-text note recorded in the
+        # audit. Reactivation re-runs the jersey/team integrity checks in the
+        # service. PUT/PATCH/DELETE on this path fall through to the 405 gate.
+        mpa = re.match(r"^player/([^/]+)/active$", entity)
+        if mpa:
+            try:
+                check_body(b, allowed={"active", "reason"},
+                           required=("active",),
+                           types={"active": bool,
+                                  "reason": (str, type(None))})
+            except BodyError as exc:
+                return self._send_json(exc.payload, exc.status)
+            return self._send_api(api.set_player_active(
+                mpa.group(1), b["active"], actor_id=actor_id,
+                reason=b.get("reason")))
         # Season team registrations (canonical): league_id REQUIRED, division
         # optional. The result keeps its competition league_id (canonical).
         mr = re.match(r"^seasons/([^/]+)/team-registrations$", entity)

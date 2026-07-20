@@ -122,14 +122,17 @@ def _player_team_id(scope, store):
     from it every time and is **never** taken from a stored ``team_id``. A stored
     team_id could be stale after a transfer or a removal and would then retain
     access to a former team's private data, so it is not trusted here at all.
-    No player_id, an unknown/deleted player, or a teamless player each resolve to
-    ``None`` — the gate then fails closed.
+    No player_id, an unknown/deleted player, an INACTIVE player (#270 — a
+    departed/IR player's login must not outlive the roster exit), or a teamless
+    player each resolve to ``None`` — the gate then fails closed.
     """
     player_id = scope.get("player_id")
     if not player_id:
         return None
     player = store.get_player(player_id)
-    return player.team_id if player is not None else None
+    if player is None or not player.is_active:
+        return None
+    return player.team_id
 
 
 def own_team_id(role, scope, store):

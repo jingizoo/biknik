@@ -15,6 +15,7 @@ from typing import Callable, Optional
 from ..domain import InstallationState, Role, SetupAuditLog, UserAccount
 from ..domain.errors import (
     AlreadyClaimedError,
+    ConcurrencyConflictError,
     IntegrityConflictError,
     NotFoundError,
     ValidationError,
@@ -138,6 +139,14 @@ class AccountService:
             raise ValidationError(
                 "That player does not exist.",
                 {"reason": "scope_subject_missing", "player_id": player_id})
+        # A scoped Player account can never bind to an INACTIVE Player (#270):
+        # deactivation is the roster exit, so a login must not outlive it — a
+        # Player who left/was placed on IR has no identity to act as. This
+        # gates both create and rebind (both route through here).
+        if player is not None and not player.is_active:
+            raise ValidationError(
+                "That player is inactive.",
+                {"reason": "player_inactive", "player_id": player_id})
         # A Player account MUST carry its own player_id (#266/#282 review): a
         # Player holds RESPOND_AVAILABILITY and substitute self-service, and the
         # scope gate fails closed for an unscoped Player, so an account with no
@@ -286,73 +295,114 @@ class AccountService:
                     "This installation has already been claimed.") from None
             raise
 
+    def _lock_and_validate_reactivation_subject(self, account) -> None:
+        # Reactivating an account whose scoped subject was deleted/deactivated
+        # while it sat inactive (#232/#270 review) would resurrect a login
+        # pointing at a nonexistent or departed Official/Player — the exact
+        # dangling-identity hole active-only account blockers close. Refuse
+        # until the account is rebound to a valid subject. Row-lock the
+        # Player/Official/Team subject (#282 review) so a concurrent delete
+        # can't strand this reactivated login against a deleted subject — the
+        # same lock delete_player/delete_official/delete_team take.
+        scope = account.scope or {}
+        account_id = account.id
+        official_id = scope.get("official_id")
+        if official_id and self.store.get_official_for_update(official_id) is None:
+            raise ValidationError(
+                "This account's official no longer exists; rebind it to "
+                "a valid official before reactivating.",
+                {"reason": "scope_subject_missing", "account_id": account_id,
+                 "official_id": official_id})
+        player_id = scope.get("player_id")
+        # A Player account must carry a valid player_id to be reactivated
+        # (#282 review): the scope gate fails closed for an unscoped Player,
+        # so reactivating one would resurrect a login that can act for no
+        # one — refuse until it is rebound to a real player.
+        if account.role == Role.PLAYER and not player_id:
+            raise ValidationError(
+                "This player account has no assigned player; assign a "
+                "player before reactivating.",
+                {"reason": "scope_required", "account_id": account_id,
+                 "field": "player_id"})
+        if player_id:
+            scoped_player = self.store.get_player_for_update(player_id)
+            if scoped_player is None:
+                raise ValidationError(
+                    "This account's player no longer exists; rebind it to "
+                    "a valid player before reactivating.",
+                    {"reason": "scope_subject_missing",
+                     "account_id": account_id, "player_id": player_id})
+            # A login must not outlive the roster exit (#270): reactivating
+            # an account onto a deactivated Player is refused the same way a
+            # deleted one is — reactivate the Player first, or rebind.
+            if not scoped_player.is_active:
+                raise ValidationError(
+                    "This account's player is inactive; reactivate the "
+                    "player (or rebind) before reactivating the account.",
+                    {"reason": "player_inactive",
+                     "account_id": account_id, "player_id": player_id})
+        # A Coach account must still carry a valid team scope to be
+        # reactivated (#266) — reactivating an unscoped or dangling-team
+        # coach would resurrect a login the scope gate now refuses, or (if
+        # the team was deleted meanwhile) a coach bound to a nonexistent
+        # team. Refuse until it is rebound to a real team.
+        if account.role == Role.COACH:
+            team_id = scope.get("team_id")
+            if not team_id:
+                raise ValidationError(
+                    "This coach account has no assigned team; assign a "
+                    "team before reactivating.",
+                    {"reason": "scope_required", "account_id": account_id,
+                     "field": "team_id"})
+            if self.store.get_team_for_update(team_id) is None:
+                raise ValidationError(
+                    "This account's team no longer exists; rebind it to "
+                    "a valid team before reactivating.",
+                    {"reason": "scope_subject_missing",
+                     "account_id": account_id, "team_id": team_id})
+
     @_transactional
     def set_active(self, account_id: str, active: bool,
                    actor_id: Optional[str] = None) -> UserAccount:
         # Transactional (#266 review): the account save and its audit row must
         # commit together — an audit failure after the save would otherwise
-        # leave an unaudited activation/deactivation. Row-lock the account so a
-        # concurrent rebind can't lost-update this activation change (#266
-        # review): both read-modify-write the whole row, so without the lock one
-        # would silently clobber the other (e.g. a rebind restoring active=True
-        # over a deactivation, with no activation audit).
+        # leave an unaudited activation/deactivation.
+        #
+        # Lock order (#270 review concurrency): a REACTIVATION must row-lock the
+        # scoped subject (Player/Official/Team) so a concurrent delete /
+        # Player-deactivation can't strand a resurrected login. That subject
+        # lock is taken BEFORE the account row lock, because the global order is
+        # subject → account (set_player_active and its account-retire hold the
+        # Player lock first); locking the account first here would invert that
+        # order and could AB-BA deadlock a concurrent Player deactivation. A
+        # deactivation (active False) needs no subject and only locks the
+        # account. The account row is then row-locked so a concurrent rebind
+        # can't lost-update this activation change.
+        peek = None
+        if active:
+            # Peek the scope (unlocked) to know which subject to lock first; the
+            # role is immutable, so reading it unlocked is safe.
+            peek = self.store.get_user_account(account_id)
+            if peek is None:
+                raise NotFoundError("User account not found.")
+            self._lock_and_validate_reactivation_subject(peek)
         account = self.store.get_user_account_for_update(account_id)
         if account is None:
             raise NotFoundError("User account not found.")
-        if active:
-            # Reactivating an account whose scoped subject was deleted while
-            # the account sat deactivated (#232 review) would resurrect a
-            # login pointing at a nonexistent Official/Player — the exact
-            # dangling-identity hole scoping delete_official/delete_player's
-            # account blocker to active-only accounts opened up. Refuse
-            # until the account is rebound to a valid subject.
-            # Row-lock the Player/Official subject (#282 review) so a concurrent
-            # delete can't strand this reactivated login against a deleted
-            # subject — same lock delete_player/delete_official take.
-            scope = account.scope or {}
-            official_id = scope.get("official_id")
-            if official_id and self.store.get_official_for_update(official_id) is None:
-                raise ValidationError(
-                    "This account's official no longer exists; rebind it to "
-                    "a valid official before reactivating.",
-                    {"reason": "scope_subject_missing", "account_id": account_id,
-                     "official_id": official_id})
-            player_id = scope.get("player_id")
-            # A Player account must carry a valid player_id to be reactivated
-            # (#282 review): the scope gate fails closed for an unscoped Player,
-            # so reactivating one would resurrect a login that can act for no
-            # one — refuse until it is rebound to a real player.
-            if account.role == Role.PLAYER and not player_id:
-                raise ValidationError(
-                    "This player account has no assigned player; assign a "
-                    "player before reactivating.",
-                    {"reason": "scope_required", "account_id": account_id,
-                     "field": "player_id"})
-            if player_id and self.store.get_player_for_update(player_id) is None:
-                raise ValidationError(
-                    "This account's player no longer exists; rebind it to "
-                    "a valid player before reactivating.",
-                    {"reason": "scope_subject_missing", "account_id": account_id,
-                     "player_id": player_id})
-            # A Coach account must still carry a valid team scope to be
-            # reactivated (#266) — reactivating an unscoped or dangling-team
-            # coach would resurrect a login the scope gate now refuses, or (if
-            # the team was deleted meanwhile) a coach bound to a nonexistent
-            # team. Refuse until it is rebound to a real team.
-            if account.role == Role.COACH:
-                team_id = scope.get("team_id")
-                if not team_id:
-                    raise ValidationError(
-                        "This coach account has no assigned team; assign a "
-                        "team before reactivating.",
-                        {"reason": "scope_required", "account_id": account_id,
-                         "field": "team_id"})
-                if self.store.get_team_for_update(team_id) is None:
-                    raise ValidationError(
-                        "This account's team no longer exists; rebind it to "
-                        "a valid team before reactivating.",
-                        {"reason": "scope_subject_missing",
-                         "account_id": account_id, "team_id": team_id})
+        if active and (account.scope or {}) != (peek.scope or {}):
+            # A concurrent rebind moved the scope AFTER we locked the peeked
+            # subject, so the subject we validated/locked is no longer the one
+            # bound. Rather than lock a second subject after the account row
+            # (which would invert the global lock order and could deadlock a
+            # Player deactivation), fail with a DETERMINISTIC retryable conflict
+            # — nothing has been written, and the retry re-peeks and locks the
+            # now-current subject first. This preserves the rebind (never
+            # clobbers it) and never deadlocks.
+            raise ConcurrencyConflictError(
+                "The account's assignment changed while reactivating it; "
+                "please retry.",
+                {"reason": "scope_changed_during_reactivation",
+                 "retryable": True, "account_id": account_id})
         account.active = bool(active)
         self.store.save_user_account(account)
         self._audit(
@@ -375,18 +425,28 @@ class AccountService:
         active or inactive accounts, so a deactivated legacy coach can be rebound
         and then reactivated.
         """
+        if scope is not None and not isinstance(scope, dict):
+            raise ValidationError(
+                "Account scope must be a JSON object.",
+                {"reason": "invalid_scope"})
+        scope = dict(scope or {})
+        # Lock the NEW scope's subject BEFORE the account row (#270 review
+        # concurrency): the global lock order is Player/Official/Team → Account
+        # (set_player_active + its account retire hold the Player lock first),
+        # so validating-and-locking the subject here before
+        # ``get_user_account_for_update`` keeps rebind on the same order and
+        # cannot AB-BA deadlock a concurrent Player deactivation. The role is
+        # immutable, so reading it from an unlocked peek is safe.
+        peek = self.store.get_user_account(account_id)
+        if peek is None:
+            raise NotFoundError("User account not found.")
+        self._validate_scope_subjects(peek.role, scope)
         # Row-lock the account (#266 review): rebind and set_active both
         # read-modify-write the whole row, so locking serializes them and a
         # concurrent deactivation can't be clobbered by this scope change.
         account = self.store.get_user_account_for_update(account_id)
         if account is None:
             raise NotFoundError("User account not found.")
-        if scope is not None and not isinstance(scope, dict):
-            raise ValidationError(
-                "Account scope must be a JSON object.",
-                {"reason": "invalid_scope"})
-        scope = dict(scope or {})
-        self._validate_scope_subjects(account.role, scope)
         old_scope = dict(account.scope or {})
         account.scope = scope
         self.store.save_user_account(account)

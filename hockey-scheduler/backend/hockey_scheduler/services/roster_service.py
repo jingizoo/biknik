@@ -83,6 +83,28 @@ class RosterService:
             raise NotFoundError(f"Player {player_id} not found.")
         return player
 
+    def _require_active_player(self, player_id: str) -> Player:
+        """Fail closed on a deactivated player at every substitute transition
+        (#270 review). A player enrolled while active, then deactivated, must
+        not be offer-able, accept, or be coach-added — the enrollment row stays
+        as history but can no longer act. Same message the enroll gate uses.
+
+        The read takes the Player ROW LOCK (``get_player_for_update``) so the
+        ``is_active`` check is serialized with a concurrent ``set_player_active``
+        deactivation, which locks the same row (#270 review concurrency). On
+        PostgreSQL the ``SELECT … FOR UPDATE`` is held to commit: if a
+        deactivation locks and commits ``is_active=False`` first, this
+        transaction blocks on the lock and then re-reads the committed value and
+        fails closed — it cannot proceed on a stale active read, then insert or
+        revive a row. MUST be called inside the caller's ``transaction()`` for
+        the lock to persist across the subsequent write."""
+        player = self.store.get_player_for_update(player_id)
+        if player is None:
+            raise NotFoundError(f"Player {player_id} not found.")
+        if not player.is_active:
+            raise NotEligibleError(f"{player.name} is not an active player.")
+        return player
+
     def _guard_mutable(self, game: Game) -> None:
         """Guard for operations that change the committed roster."""
         if game.cancelled:
@@ -138,9 +160,24 @@ class RosterService:
         game = self._require_game(game_id)
         self._guard_mutable(game)
 
+        # Row-lock every referenced Player so each is_active eligibility check is
+        # serialized with a concurrent set_player_active deactivation (which
+        # locks the same row) — otherwise a stale is_active=True read could
+        # insert/revive a roster row after deactivation committed is_active=False
+        # (#270 review concurrency). Acquire the locks UP FRONT in a
+        # deterministic canonical order (sorted unique ids) so two concurrent
+        # selections of the same Players in opposite caller order can't AB-BA
+        # deadlock on PostgreSQL (#270 review). The locks are held to commit by
+        # this @_transactional method; the per-player eligibility errors are
+        # still raised below in the CALLER's order, and the output preserves it.
+        locked_players = {pid: self.store.get_player_for_update(pid)
+                          for pid in sorted(set(player_ids))}
+
         entries: List[GameRosterEntry] = []
         for player_id in player_ids:
-            player = self._require_player(player_id)
+            player = locked_players[player_id]
+            if player is None:
+                raise NotFoundError(f"Player {player_id} not found.")
             if player.team_id not in (game.home_team_id, game.away_team_id):
                 raise NotEligibleError(
                     f"{player.name} is not on either team in this game."
@@ -445,6 +482,7 @@ class RosterService:
     ) -> SubstituteEnrollment:
         game = self._require_game(game_id)
         self._guard_mutable(game)
+        self._require_active_player(player_id)   # fail closed on deactivation
         sub = self.store.substitute_for_player(game_id, player_id)
         if sub is None or sub.status != SubstituteStatus.ENROLLED:
             raise InvalidTransitionError(
@@ -496,6 +534,7 @@ class RosterService:
         with self.store.transaction():
             game = self._require_game(game_id)
             self._guard_mutable(game)
+            self._require_active_player(player_id)   # fail closed on deactivation
             sub = self.store.substitute_for_player(game_id, player_id)
             if sub is None or sub.status != SubstituteStatus.OFFERED:
                 raise InvalidTransitionError("No active offer to accept.")
@@ -585,6 +624,7 @@ class RosterService:
         """Coach override: offer + accept in one step (audited)."""
         game = self._require_game(game_id)
         self._guard_mutable(game)
+        self._require_active_player(player_id)   # fail closed on deactivation
         sub = self.store.substitute_for_player(game_id, player_id)
         if sub is None or sub.status not in (
             SubstituteStatus.ENROLLED,
@@ -886,7 +926,9 @@ class RosterService:
         rows = []
         for sub in self.store.substitutes_for_game(game_id):
             player = self.store.get_player(sub.player_id)
-            if player is None or player.team_id != team_id:
+            # A deactivated player's enrollment stays as history but drops out
+            # of the live outreach queue (#270 review) — never offer-able.
+            if player is None or player.team_id != team_id or not player.is_active:
                 continue
             can_offer = (sub.status == SubstituteStatus.ENROLLED
                          and not game.locked and not game.cancelled
