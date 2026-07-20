@@ -3562,13 +3562,14 @@ class SetupService:
         duplicates the small amount of create-logic it needs via raw store
         calls + its own ``self._audit(...)`` calls.
         """
-        _season = self.store.get_season(season_id)
-        if _season is None:
+        if self.store.get_season(season_id) is None:
             raise NotFoundError(f"Season {season_id} not found.")
-        self._require_active_season(season_id)  # #159 read-only guard
-        # The permanent program every imported team belongs to (#180): the
-        # program of the season being imported into.
-        season_league_id = _season.program_id
+        # NOTE: the archived-Season read-only guard is NOT taken here — an
+        # unlocked pre-transaction check runs in autocommit on PostgreSQL and
+        # releases its FOR UPDATE lock before the writes, letting a concurrent
+        # archive commit in between. It is acquired as the first statement inside
+        # the single write transaction below, so the lock is held through every
+        # import mutation (#159).
 
         result = validate_import(sheets, store=self.store)
         if not result["ok"]:
@@ -3603,6 +3604,18 @@ class SetupService:
         batch_id = self.store.next_id("importbatch")
 
         with self.store.transaction():
+            # #159 — acquire the archived-Season row lock as the FIRST statement
+            # inside the single transaction that holds every import write, and
+            # derive Season-owned values from that same locked read. On
+            # PostgreSQL the FOR UPDATE lock is then held through all the
+            # Team/Division/registration/Player/contact/audit writes, so a
+            # concurrent archive either commits before this import (which then
+            # fails season_archived with zero mutation) or blocks until this
+            # import commits — never a write into an already-archived Season.
+            _season = self._require_active_season(season_id)
+            # The permanent program every imported team belongs to (#180): the
+            # program of the season being imported into.
+            season_league_id = _season.program_id
             # Pre-write integrity gate (#180 review): before ANY write, prove the
             # import won't silently re-home a permanent Team across leagues or
             # strand committed games by moving a registration's division. A

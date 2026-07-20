@@ -398,6 +398,71 @@ class SeasonArchiveRaceTest(unittest.TestCase):
             self.assertEqual(teams, [], results)
 
 
+    def test_archive_vs_legacy_import_is_linearizable(self):
+        # The teams+players import holds the archived-Season row lock through ALL
+        # its writes (guard is the first statement inside the single write
+        # transaction). Racing an archive on PostgreSQL: either the whole import
+        # commits before the archive (Teams/Players present), or the archive wins
+        # and the import returns season_archived with zero Team/Player mutation —
+        # never a partial import into an already-archived Season.
+        csv = {
+            "teams_csv": ("team_code,team_name,club_name,division_name\n"
+                          "T1,Team One,Lions Club,U16\n"),
+            "players_csv": ("player_code,first_name,last_name,team_code,"
+                            "jersey_number,position,email\n"
+                            "P1,Aarav,M,T1,9,forward,a@example.com\n"),
+        }
+        store0 = SqlStore(self.url)
+        api0 = ApiService(store0)
+        pid = api0.create_program("Prog", "US", "UTC")["id"]
+        sid = api0.create_season(pid, "S1")["id"]
+        api0.create_league(sid, "Gold")  # a League bound to the import target
+        api_arch = ApiService(SqlStore(self.url))
+        api_imp = ApiService(SqlStore(self.url))
+        barrier = threading.Barrier(2)
+        results = {}
+
+        def run(fn, key):
+            barrier.wait()
+            try:
+                r = fn()
+                if isinstance(r, dict) and r.get("error"):
+                    results[key] = (r["error"].get("details", {}).get("reason")
+                                    or r["error"].get("code"))
+                elif isinstance(r, dict) and r.get("committed") is False:
+                    results[key] = f"not_committed:{r.get('errors')}"
+                else:
+                    results[key] = "ok"
+            except ValidationError as exc:
+                results[key] = exc.details.get("reason")
+            except Exception as exc:
+                results[key] = f"ERR:{exc}"
+
+        ta = threading.Thread(target=run, args=(
+            lambda: api_arch.setup.archive_season(sid, actor_id="a", reason="x"),
+            "archive"))
+        tb = threading.Thread(target=run, args=(
+            lambda: api_imp.commit_teams_players_import(sid, csv, actor_id="b"),
+            "import"))
+        ta.start(); tb.start(); ta.join(20); tb.join(20)
+
+        # Archive always commits (the import never archives/removes the Season).
+        self.assertEqual(results["archive"], "ok", results)
+        check = SqlStore(self.url)
+        self.assertEqual(check.get_season(sid).status, SeasonStatus.ARCHIVED)
+        teams = check.all_teams()
+        players = check.all_players()
+        if results["import"] == "ok":
+            # Import committed before the archive → its rows are all present.
+            self.assertEqual(len(teams), 1, results)
+            self.assertEqual(len(players), 1, results)
+        else:
+            # Archive won the row → import fails closed, zero Team/Player writes.
+            self.assertEqual(results["import"], "season_archived", results)
+            self.assertEqual(teams, [], results)
+            self.assertEqual(players, [], results)
+
+
 # =====================================================================
 # Memory + SQLite sequential parity
 # =====================================================================
