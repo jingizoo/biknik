@@ -112,6 +112,16 @@ the existing reassignment/dependency checks, and an undated Season may move
 freely. Supplying replacement boundary cells is **not** implicit permission to
 reinterpret history.
 
+## Display
+
+The frontend renders a stored instant as a calendar date **in the Program's
+timezone** (`fmtDateInTz` / `seasonDateRange`, used by the Records Seasons card
+and the Hierarchy competition tree). When that timezone cannot be resolved by
+`Intl` — a legacy Program stored before `create_program` validated the zone —
+the formatter **falls back to UTC**, the same fallback `create_season` /
+`parse_season_boundary` use, so a validly-stored boundary is shown as its UTC
+calendar day rather than disappearing.
+
 ## Scope
 
 `parse_season_boundary` is the single entry point for season boundaries, shared

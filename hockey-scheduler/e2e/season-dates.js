@@ -77,6 +77,26 @@ async function checkViewport(browser, viewport) {
     await waitForServer(`${base}/api/health`, READY_TIMEOUT_MS);
     await page.goto(base, { waitUntil: "domcontentloaded" });
     await page.waitForSelector("#content > *", { timeout: 10000 });
+
+    // #272 review: the SHIPPED display helpers must fall back to UTC for an
+    // unresolvable (legacy) Program timezone so a stored boundary is displayed
+    // as its UTC calendar day instead of vanishing. A rendered legacy-Program
+    // card can't be seeded here (demo boot resets a persistent store, both
+    // create paths reject invalid zones, and the CSP forbids injecting the
+    // function), so assert the REAL app functions in this browser/viewport via
+    // the app's own read-only test hook.
+    const fallback = await page.evaluate(() => {
+      const f = window.__seasonFmt;
+      return {
+        day: f.fmtDateInTz("2026-09-15T00:00:00+00:00", "Not/AZone"),
+        range: f.seasonDateRange(
+          { start_date: "2026-09-15T00:00:00+00:00",
+            end_date: "2026-09-20T00:00:00+00:00" }, "Not/AZone"),
+      };
+    });
+    if (fallback.day !== "Sep 15, 2026" || !/Sep 15, 2026/.test(fallback.range)) {
+      throw new Error(`[${L}] invalid-timezone display did not fall back to the UTC day: ${JSON.stringify(fallback)}`);
+    }
     await page.click('.tab[data-tab="setup"]');
     await page.click('[data-setup-view="records"]');
     await page.waitForSelector(".setup-card", { timeout: 10000 });

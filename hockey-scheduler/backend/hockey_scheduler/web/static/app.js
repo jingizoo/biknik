@@ -156,11 +156,18 @@ const val = (id) => { const e = document.getElementById(id); return e ? e.value.
 // adjacent one from raw UTC conversion.
 const fmtDateInTz = (iso, tz) => {
   if (!iso) return null;
-  try {
-    return new Intl.DateTimeFormat("en-CA", {
-      timeZone: tz || "UTC", year: "numeric", month: "short", day: "numeric",
-    }).format(new Date(iso));
-  } catch (e) { return null; }
+  // Fall back to UTC when the Program's stored timezone can't be resolved by
+  // Intl (a legacy/invalid zone) — matching create_season/parse_season_boundary
+  // — so a validly-stored boundary is shown as its UTC calendar day rather than
+  // silently disappearing (#272 review).
+  for (const zone of [tz || "UTC", "UTC"]) {
+    try {
+      return new Intl.DateTimeFormat("en-CA", {
+        timeZone: zone, year: "numeric", month: "short", day: "numeric",
+      }).format(new Date(iso));
+    } catch (e) { /* unresolved zone → retry in UTC */ }
+  }
+  return null;
 };
 const seasonDateRange = (s, tz) => {
   const a = fmtDateInTz(s.start_date, tz), b = fmtDateInTz(s.end_date, tz);
@@ -169,6 +176,12 @@ const seasonDateRange = (s, tz) => {
   if (b) return `until ${b}`;
   return null;
 };
+// Read-only test hook (#272): the strict CSP (script-src 'self') forbids a
+// browser regression from injecting these pure display helpers, so expose them
+// for e2e assertion of the unresolvable-timezone UTC fallback. No app state.
+if (typeof window !== "undefined") {
+  window.__seasonFmt = { fmtDateInTz, seasonDateRange };
+}
 const hasPerm = (p) => rolePerms.has(p);
 // Demo vs production posture (#215): the "Reset demo" action and demo-only
 // affordances only make sense outside production. Defaults to demo until the
