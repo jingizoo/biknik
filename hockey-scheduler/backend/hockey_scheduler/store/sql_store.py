@@ -867,6 +867,8 @@ class SqlStore:
     # permanent child of a Program (``program_id``), not of a Season.
     def add_league(self, league): return self._insert(league)
     def get_league(self, league_id): return self._get(League, league_id)
+    def get_league_for_update(self, league_id):
+        return self._get_for_update(League, league_id)
     def all_leagues(self): return self._query(League, order="id")
     def save_league(self, league): return self._update(league)
     def leagues_for_program(self, program_id):

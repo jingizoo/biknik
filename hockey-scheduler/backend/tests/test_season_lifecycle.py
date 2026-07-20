@@ -450,19 +450,84 @@ class SeasonArchivedDeleteAndTransferGuardTest(unittest.TestCase):
             self.assertIn("game", types, (label, types))
             self.assertIsNotNone(store.get_league(lid), label)
 
-    def test_delete_active_bound_league_cascades_binding(self):
-        # A truly-empty League bound only to an ACTIVE Season deletes cleanly and
-        # its own (now empty) LeagueSeason binding is removed, not orphaned.
+    def test_bound_league_blocks_then_deletes_after_explicit_unbind(self):
+        # A League bound to an ACTIVE Season blocks on its LeagueSeason binding
+        # (itemized dependency, never a silent cascade). The explicit, audited
+        # unbind then clears it and the now-unbound League deletes.
         for label, store in _backends():
             api = ApiService(store)
             pid = api.create_program("P", "US", "UTC")["id"]
             sid = api.create_season(pid, "S1")["id"]
             lid = api.create_league(sid, "Gold")["id"]
-            self.assertTrue(store.league_seasons_for_league(lid), label)
+            ls_id = store.league_seasons_for_league(lid)[0].id
+            r = api.delete_league(lid, actor_id="a")
+            self.assertEqual(r["error"]["code"], "has_dependencies", label)
+            self.assertIn("season binding",
+                          {g["type"] for g in r["error"]["details"]["dependencies"]},
+                          label)
+            self.assertIsNotNone(store.get_league(lid), label)  # zero mutation
+            self.assertIsNotNone(store.get_league_season(ls_id), label)
+            # Explicit unbind, then the League deletes cleanly.
+            api.setup.delete_league_season(ls_id, actor_id="a")
+            self.assertIsNone(store.get_league_season(ls_id), label)
             api.setup.delete_league(lid, actor_id="a")
             self.assertIsNone(store.get_league(lid), label)
-            self.assertEqual(store.league_seasons_for_league(lid), [],
-                             label)  # binding cascaded, not orphaned
+
+    def test_delete_league_season_blocked_on_archived_season(self):
+        # Unbinding is itself read-only-guarded: an archived Season's binding is
+        # frozen history — season_archived with zero mutation.
+        for label, store in _backends():
+            api = ApiService(store)
+            pid = api.create_program("P", "US", "UTC")["id"]
+            sid = api.create_season(pid, "S1")["id"]
+            lid = api.create_league(sid, "Gold")["id"]
+            ls_id = store.league_seasons_for_league(lid)[0].id
+            api.setup.archive_season(sid, actor_id="admin", reason="done")
+            audits0 = len(store.all_setup_audit())
+            with self.assertRaises(ValidationError) as ctx:
+                api.setup.delete_league_season(ls_id, actor_id="a")
+            self.assertEqual(ctx.exception.details.get("reason"),
+                             "season_archived", label)
+            self.assertIsNotNone(store.get_league_season(ls_id), label)
+            self.assertEqual(len(store.all_setup_audit()), audits0, label)
+
+    def test_delete_league_season_blocked_by_division(self):
+        # A binding that still owns a Division is refused (dependency-gated),
+        # zero mutation.
+        for label, store in _backends():
+            api = ApiService(store)
+            pid = api.create_program("P", "US", "UTC")["id"]
+            sid = api.create_season(pid, "S1")["id"]
+            lid = api.create_league(sid, "Gold")["id"]
+            api.create_division(sid, "D1", league_id=lid)
+            ls_id = store.league_seasons_for_league(lid)[0].id
+            r = api.delete_league_season(ls_id, actor_id="a")
+            self.assertEqual(r["error"]["code"], "has_dependencies", label)
+            self.assertIn("division",
+                          {g["type"] for g in r["error"]["details"]["dependencies"]},
+                          label)
+            self.assertIsNotNone(store.get_league_season(ls_id), label)
+
+    def test_delete_league_blocked_by_permanent_team(self):
+        # A League with a permanent Team (Team.league_id) but no seasonal records
+        # blocks on the Team — never orphaned — with zero mutation.
+        for label, store in _backends():
+            api = ApiService(store)
+            pid = api.create_program("P", "US", "UTC")["id"]
+            sid = api.create_season(pid, "S1")["id"]
+            lid = api.create_league(sid, "Gold")["id"]
+            club = api.create_club("Club")["id"]
+            tid = api.create_team(club_id=club, name="Alpha", league_id=lid)["id"]
+            teams0 = {t.id for t in store.all_teams()}
+            audits0 = len(store.all_setup_audit())
+            r = api.delete_league(lid, actor_id="a")
+            self.assertEqual(r["error"]["code"], "has_dependencies", label)
+            types = {g["type"] for g in r["error"]["details"]["dependencies"]}
+            self.assertIn("team", types, (label, types))
+            self.assertIsNotNone(store.get_league(lid), label)
+            self.assertEqual({t.id for t in store.all_teams()}, teams0, label)
+            self.assertEqual(len(store.all_setup_audit()), audits0, label)
+            self.assertIsNotNone(store.get_team(tid), label)
 
     def test_import_driven_transfer_freezes_archived_registration(self):
         # The import path routes a permanent-League change through the same
@@ -736,6 +801,38 @@ class SeasonLifecycleHttpTest(unittest.TestCase):
         self.assertEqual(body["error"]["details"]["reason"], "season_archived")
         self.assertIsNotNone(store.get_league(lid))  # zero mutation
         self.assertEqual({ls.id for ls in store.all_league_seasons()}, bindings0)
+
+    def test_unbind_league_season_over_http(self):
+        # The explicit unbind route is MANAGE_SETUP-gated; once unbound the
+        # League deletes.
+        sid = self._seed_season()
+        lid = STATE.api.create_league(sid, "Gold")["id"]
+        ls_id = STATE.api.store.league_seasons_for_league(lid)[0].id
+        st, _ = self._req("POST", f"/api/v2/setup/league-season/{ls_id}/delete",
+                          role="coach")
+        self.assertEqual(st, 403)  # non-admin refused
+        self.assertIsNotNone(STATE.api.store.get_league_season(ls_id))
+        st, body = self._req("POST",
+                             f"/api/v2/setup/league-season/{ls_id}/delete")
+        self.assertEqual(st, 200, body)
+        self.assertIsNone(STATE.api.store.get_league_season(ls_id))
+        st, body = self._req("POST", f"/api/v2/setup/league/{lid}/delete")
+        self.assertEqual(st, 200, body)
+        self.assertIsNone(STATE.api.store.get_league(lid))
+
+    def test_delete_league_blocked_by_team_over_http(self):
+        sid = self._seed_season()
+        lid = STATE.api.create_league(sid, "Gold")["id"]
+        club = STATE.api.create_club("Club")["id"]
+        STATE.api.create_team(club_id=club, name="Alpha", league_id=lid)
+        teams0 = len(STATE.api.store.all_teams())
+        st, body = self._req("POST", f"/api/v2/setup/league/{lid}/delete")
+        self.assertEqual(st, 409, body)
+        self.assertEqual(body["error"]["code"], "has_dependencies")
+        types = {g["type"] for g in body["error"]["details"]["dependencies"]}
+        self.assertIn("team", types)
+        self.assertIsNotNone(STATE.api.store.get_league(lid))  # zero mutation
+        self.assertEqual(len(STATE.api.store.all_teams()), teams0)
 
     def test_write_into_archived_season_blocked_over_http(self):
         sid = self._seed_season(name="From")

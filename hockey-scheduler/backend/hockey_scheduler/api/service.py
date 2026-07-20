@@ -3876,6 +3876,14 @@ class ApiService:
         return self._league_dict(self.setup.delete_league(league_id, actor_id))
 
     @catch
+    def delete_league_season(self, league_season_id: str,
+                             actor_id: Optional[str] = None) -> dict:
+        # Explicit, authorized, audited unbind of a League↔Season binding (#159)
+        # — the operator step that clears a League's binding dependency before
+        # the League itself can be deleted (no silent cascades).
+        return self.setup.delete_league_season(league_season_id, actor_id)
+
+    @catch
     def delete_season(self, season_id: str, actor_id: Optional[str] = None) -> dict:
         return _serialize(self.setup.delete_season(season_id, actor_id))
 

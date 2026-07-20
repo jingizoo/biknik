@@ -100,15 +100,29 @@ blocked too (`delete_season` fails closed with `season_archived` before its
 dependency scan, under the same Season row lock): read-only history must be
 retained, so an operator must reopen a Season before it can be removed.
 
-**Deleting a permanent League** (`delete_league`) is guarded the same way: a
-League participates in a Season only through its `LeagueSeason` bindings, so the
-delete first locks every distinct Season those bindings reference (canonical
-sorted order) and fails `season_archived` if any is archived — otherwise the
-League's deletion would drop that archived Season's `LeagueSeason` (and Game)
-history. Game references are treated as explicit dependencies (a Game-backed
-League blocks on the Game), and when the delete is permitted the League's own
-now-empty `LeagueSeason` bindings are removed in the same transaction so none
-are orphaned. A truly unbound League still deletes cleanly.
+**Deleting a permanent League** (`delete_league`) is dependency-gated with **no
+silent cascades** (the service's destructive-delete contract). It locks the
+League row (so a concurrent Team create/rebind serializes) and every distinct
+Season its `LeagueSeason` bindings reference (canonical order), failing
+`season_archived` if any is archived. It then blocks — itemized — on every
+dependent: Divisions, registrations, Games, the League's permanent **Teams**
+(`Team.league_id`, which have no DB FK to catch an orphan), and the
+`LeagueSeason` **bindings themselves**. Nothing is implicitly removed; a truly
+unbound, team-free League still deletes cleanly.
+
+To remove a binding, an operator calls the explicit, authorized
+(`MANAGE_SETUP`), audited **unbind** — `delete_league_season` /
+`POST /api/v2/setup/league-season/{id}/delete`. It is itself dependency-gated
+(a binding still owning a Division, registration, or Game is refused) and
+read-only-guarded (`season_archived` on an archived Season, under the Season row
+lock). This is the counterpart to `create_league_season`, and the step that
+clears a League's binding dependency before the League can be deleted.
+
+**Team create / rebind** (`create_team`, `transfer_team_to_league`, direct and
+import-driven) lock the target League row, so a Team can never be bound to a
+League that a concurrent `delete_league` is removing, nor deleted out from under
+the create — on PostgreSQL the two serialize on that row; Memory/SQLite via the
+process-wide transaction lock.
 
 A **Team transfer** (direct or import-driven, via the shared
 `_transfer_team_to_league_inner`) locks every distinct Season its candidate

@@ -491,6 +491,47 @@ class SetupService:
         return ls
 
     @_transactional
+    def delete_league_season(self, league_season_id: str,
+                             actor_id: Optional[str] = None) -> dict:
+        """Explicitly unbind a permanent League from a Season (#159).
+
+        This is the authorized, audited counterpart to ``create_league_season``:
+        it removes a single ``LeagueSeason`` binding so an operator can, in turn,
+        delete a permanent League (which blocks on its bindings — deletions are
+        dependency-gated with no silent cascades). It is itself dependency-gated:
+        a binding that still owns Divisions, registrations, or Games is refused
+        (resolve those first), and it fails closed with ``season_archived`` on an
+        archived Season so read-only history is never rewritten. All checks run
+        before the single delete, so a refused unbind changes nothing."""
+        ls = self.store.get_league_season(league_season_id)
+        if ls is None:
+            raise NotFoundError(
+                f"LeagueSeason {league_season_id} not found.")
+        # #159 — read-only guard: an archived Season's participation history is
+        # frozen (locks the Season row, serializing against a concurrent
+        # archive).
+        if ls.season_id:
+            self._require_active_season(ls.season_id)
+        divisions = [d for d in self.store.all_divisions()
+                     if d.league_season_id == league_season_id]
+        regs = [r for r in self.store.all_season_team_registrations()
+                if r.league_season_id == league_season_id]
+        games = [g for g in self.store.all_games()
+                 if g.league_season_id == league_season_id]
+        self._block_if_dependents(
+            "league_season", league_season_id, "season binding", [
+                self._dep_group("division", divisions, lambda d: d.name),
+                self._dep_group("team registration", regs,
+                                lambda r: self._team_name(r.team_id)),
+                self._dep_group("game", games, self._matchup)])
+        self.store.delete_league_season(league_season_id)
+        self._audit("league_season_deleted", "league_season", league_season_id,
+                    actor_id, {"league_id": ls.league_id,
+                               "season_id": ls.season_id})
+        return {"id": league_season_id, "league_id": ls.league_id,
+                "season_id": ls.season_id, "deleted": True}
+
+    @_transactional
     def create_division(self, season_id: str, name: str, age_group: str = "",
                         league_id: Optional[str] = None,
                         actor_id: Optional[str] = None) -> Division:
@@ -720,6 +761,13 @@ class SetupService:
                 {"reason": "team_league_required"})
         if program_id and self.store.get_program(program_id) is None:
             raise NotFoundError(f"Program {program_id} not found.")
+        # #159 — lock the permanent League row before binding a Team to it, so a
+        # concurrent delete_league of the same League (which locks the same row)
+        # serializes: either this create commits first and the delete then sees
+        # the Team and blocks, or the delete commits first and this re-check
+        # finds the League gone — never an orphaned Team.
+        if self.store.get_league_for_update(derived_league_id) is None:
+            raise NotFoundError(f"League {derived_league_id} not found.")
         team = Team(id=self.store.next_id("team"), name=self._require_name(name),
                     club_id=club_id or None, program_id=program_id,
                     league_id=derived_league_id)
@@ -1022,7 +1070,11 @@ class SetupService:
         League change through the same lifecycle guards inside its own commit
         transaction. Operates on an already-resolved ``team``."""
         team_id = team.id
-        league = self.store.get_league(new_league_id)
+        # #159 — lock the target League row so a rebind of a Team's permanent
+        # League serializes against a concurrent delete_league of that League
+        # (which locks the same row): the Team can't be rebound onto a League
+        # that is being deleted, nor deleted out from under this rebind.
+        league = self.store.get_league_for_update(new_league_id)
         if league is None:
             raise NotFoundError(f"League {new_league_id} not found.")
         if team.program_id and league.program_id != team.program_id:
@@ -4680,7 +4732,11 @@ class SetupService:
 
     @_transactional
     def delete_league(self, league_id: str, actor_id: Optional[str] = None) -> League:
-        league = self.store.get_league(league_id)
+        # #159 — lock the League row so a concurrent Team create/rebind
+        # (create_team / transfer_team_to_league, which take the same lock)
+        # serializes against this dependency scan: a Team can't be bound to the
+        # League between the scan and the delete, and vice-versa.
+        league = self.store.get_league_for_update(league_id)
         if league is None:
             raise NotFoundError(f"League {league_id} not found.")
         # #283: a Division/registration no longer stores league_id directly —
@@ -4712,16 +4768,25 @@ class SetupService:
         # first (its owning Season, if archived, has already failed above).
         games = [g for g in self.store.all_games()
                  if g.league_season_id in ls_ids or g.league_id == league_id]
+        # #159 — a permanent Team references exactly one League (Team.league_id,
+        # #283 rule 3). Deleting the League would orphan those Teams, so they are
+        # explicit dependents (there is no FK to catch this at the DB layer).
+        teams = [t for t in self.store.all_teams()
+                 if t.league_id == league_id]
+        # #159 — a LeagueSeason binding is itself a dependent, NOT something this
+        # delete may silently cascade away: the destructive-delete contract is
+        # dependency-gated, itemized blockers with no implicit cascades. An
+        # operator must remove each binding through its own authorized path
+        # before the League can be deleted. Archived bindings have already
+        # failed above with season_archived.
         self._block_if_dependents("level", league_id, "league", [
             self._dep_group("division", divisions, lambda d: d.name),
             self._dep_group("team registration", regs,
                             lambda r: self._team_name(r.team_id)),
-            self._dep_group("game", games, self._matchup)])
-        # No dependents survive, and every bound Season is active — remove the
-        # League's own (now empty) LeagueSeason bindings in the same transaction
-        # so none are orphaned, then the League row itself.
-        for ls in ls_rows:
-            self.store.delete_league_season(ls.id)
+            self._dep_group("game", games, self._matchup),
+            self._dep_group("team", teams, lambda t: t.name),
+            self._dep_group("season binding", ls_rows,
+                            lambda ls: self._season_name(ls.season_id))])
         self.store.delete_league(league_id)
         self._audit("level_deleted", "level", league_id, actor_id,
                     {"name": league.name, "program_id": league.program_id})

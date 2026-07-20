@@ -400,6 +400,13 @@ class InMemoryStore:
     def get_league(self, league_id: str) -> Optional[League]:
         return self.leagues.get(league_id)
 
+    def get_league_for_update(self, league_id: str) -> Optional[League]:
+        # No row locking needed (#159): transaction() holds self._lock for its
+        # whole body, so a concurrent Team create/rebind or delete can't
+        # interleave with the caller's check-then-write. Interface parity with
+        # SqlStore, whose implementation takes SELECT ... FOR UPDATE.
+        return self.leagues.get(league_id)
+
     def leagues_for_program(self, program_id: str) -> List[League]:
         return [lg for lg in self.leagues.values()
                 if lg.program_id == program_id]

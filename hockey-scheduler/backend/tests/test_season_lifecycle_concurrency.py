@@ -27,7 +27,12 @@ from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
 
 from hockey_scheduler.api import ApiService
 from hockey_scheduler.domain.enums import SeasonStatus
-from hockey_scheduler.domain.errors import NotFoundError, ValidationError
+from hockey_scheduler.domain.errors import (
+    HasDependenciesError,
+    NotFoundError,
+    ValidationError,
+)
+from hockey_scheduler.domain.setup_models import League
 from hockey_scheduler.store import InMemoryStore, SqlStore
 
 
@@ -294,20 +299,21 @@ class SeasonArchiveRaceTest(unittest.TestCase):
         self.assertEqual(check.get_team(tid).league_id, l2, results)
 
 
-    def test_archive_vs_delete_league_is_linearizable(self):
-        # An empty permanent League bound to a Season is deleted while an archive
-        # races. Both lock the same Season row: either delete_league wins (Season
-        # active → League + binding removed, archive then archives the empty
-        # Season) or archive wins (delete_league fails season_archived, the
-        # League and its binding survive). A League is NEVER deleted out of an
-        # already-archived Season.
+    def test_archive_vs_unbind_league_season_is_linearizable(self):
+        # Unbinding a League↔Season binding (the explicit, audited step that
+        # clears a League's binding dependency) races an archive on that Season.
+        # Both lock the same Season row: either the unbind wins (Season active →
+        # binding removed, archive then archives the now league-less Season) or
+        # the archive wins (unbind fails season_archived, the binding survives as
+        # frozen history). A binding is NEVER removed from an archived Season.
         store0 = SqlStore(self.url)
         api0 = ApiService(store0)
         pid = api0.create_program("Prog", "US", "UTC")["id"]
         sid = api0.create_season(pid, "S1")["id"]
-        lid = api0.create_league(sid, "Gold")["id"]  # binds a LeagueSeason
+        lid = api0.create_league(sid, "Gold")["id"]
+        ls_id = store0.league_seasons_for_league(lid)[0].id
         api_arch = ApiService(SqlStore(self.url))
-        api_del = ApiService(SqlStore(self.url))
+        api_unbind = ApiService(SqlStore(self.url))
         barrier = threading.Barrier(2)
         results = {}
 
@@ -317,8 +323,6 @@ class SeasonArchiveRaceTest(unittest.TestCase):
                 fn(); results[key] = "ok"
             except ValidationError as exc:
                 results[key] = exc.details.get("reason")
-            except NotFoundError:
-                results[key] = "not_found"
             except Exception as exc:
                 results[key] = f"ERR:{exc}"
 
@@ -326,25 +330,72 @@ class SeasonArchiveRaceTest(unittest.TestCase):
             lambda: api_arch.setup.archive_season(sid, actor_id="a", reason="x"),
             "archive"))
         tb = threading.Thread(target=run, args=(
-            lambda: api_del.setup.delete_league(lid, actor_id="b"), "delete"))
+            lambda: api_unbind.setup.delete_league_season(ls_id, actor_id="b"),
+            "unbind"))
         ta.start(); tb.start(); ta.join(15); tb.join(15)
 
-        # Archive always commits (delete_league never removes/archives the
-        # Season itself).
+        # Archive always commits (the unbind never archives/removes the Season).
         self.assertEqual(results["archive"], "ok", results)
         check = SqlStore(self.url)
         self.assertEqual(check.get_season(sid).status, SeasonStatus.ARCHIVED)
-        bindings = check.league_seasons_for_league(lid)
-        if results["delete"] == "ok":
-            # Delete won the row first (Season active) → League + binding gone.
-            self.assertIsNone(check.get_league(lid), results)
-            self.assertEqual(bindings, [], results)
+        if results["unbind"] == "ok":
+            # Unbind won the row first (Season active) → binding gone.
+            self.assertIsNone(check.get_league_season(ls_id), results)
         else:
-            # Archive won → delete fails closed; the archived Season keeps its
-            # League and LeagueSeason history.
-            self.assertEqual(results["delete"], "season_archived", results)
+            # Archive won → unbind fails closed; the binding is frozen history.
+            self.assertEqual(results["unbind"], "season_archived", results)
+            self.assertIsNotNone(check.get_league_season(ls_id), results)
+
+    def test_delete_league_vs_team_create_is_linearizable(self):
+        # An UNBOUND permanent League is deleted while a Team is concurrently
+        # created into it. Both lock the same League row: either the create wins
+        # (Team exists → delete blocks on the Team) or the delete wins (League
+        # gone → the create fails not-found). A Team is never orphaned onto a
+        # deleted League.
+        store0 = SqlStore(self.url)
+        api0 = ApiService(store0)
+        pid = api0.create_program("Prog", "US", "UTC")["id"]
+        lid = store0.next_id("league")
+        store0.add_league(League(id=lid, program_id=pid, name="Unbound",
+                                 sort_order=0))
+        club = api0.create_club("Club")["id"]
+        api_del = ApiService(SqlStore(self.url))
+        api_new = ApiService(SqlStore(self.url))
+        barrier = threading.Barrier(2)
+        results = {}
+
+        def run(fn, key):
+            barrier.wait()
+            try:
+                fn(); results[key] = "ok"
+            except HasDependenciesError:
+                results[key] = "blocked"
+            except NotFoundError:
+                results[key] = "not_found"
+            except Exception as exc:
+                results[key] = f"ERR:{exc}"
+
+        ta = threading.Thread(target=run, args=(
+            lambda: api_del.setup.delete_league(lid, actor_id="a"), "delete"))
+        tb = threading.Thread(target=run, args=(
+            lambda: api_new.setup.create_team(
+                club_id=club, name="Alpha", league_id=lid, actor_id="b"),
+            "create"))
+        ta.start(); tb.start(); ta.join(15); tb.join(15)
+
+        check = SqlStore(self.url)
+        teams = [t for t in check.all_teams() if t.league_id == lid]
+        if results["create"] == "ok":
+            # Create won the row first → Team exists, delete blocked on it.
+            self.assertEqual(results["delete"], "blocked", results)
             self.assertIsNotNone(check.get_league(lid), results)
-            self.assertEqual(len(bindings), 1, results)
+            self.assertEqual(len(teams), 1, results)
+        else:
+            # Delete won → League gone, create fails not-found, no orphan Team.
+            self.assertEqual(results["create"], "not_found", results)
+            self.assertEqual(results["delete"], "ok", results)
+            self.assertIsNone(check.get_league(lid), results)
+            self.assertEqual(teams, [], results)
 
 
 # =====================================================================

@@ -562,6 +562,13 @@ class V2SetupContractTest(unittest.TestCase):
         self.assertEqual(status, 200, deleted)
         self.assertEqual(set(deleted), DIVISION_DELETE_KEYS, deleted)
 
+        # A bound League blocks on its LeagueSeason binding (#159 — itemized
+        # dependency, no silent cascade); the explicit unbind clears it first.
+        ls_id = self.srv.STATE.api.store.league_seasons_for_league(
+            league["id"])[0].id
+        status, _ = self._req(
+            c, "POST", f"/api/v2/setup/league-season/{ls_id}/delete", {})
+        self.assertEqual(status, 200)
         status, dleague = self._req(
             c, "POST", f"/api/v2/setup/league/{league['id']}/delete", {})
         self.assertEqual(status, 200, dleague)
