@@ -103,8 +103,12 @@ jobs:
           node --check hockey-scheduler/e2e/coach-scope.js
           node --check hockey-scheduler/e2e/player-edit.js
           node --check hockey-scheduler/e2e/player-lifecycle.js
+          node --check hockey-scheduler/e2e/season-dates.js
+          node --check hockey-scheduler/e2e/season-fmt-unit.js
       - name: Check v1 route contract (#233 B2c)
         run: node hockey-scheduler/e2e/check-v1-route-contract.js
+      - name: Season date formatter unit regression (#272)
+        run: node hockey-scheduler/e2e/season-fmt-unit.js
 
   browser-smoke:
     runs-on: ubuntu-latest
@@ -126,7 +130,7 @@ jobs:
         # runner.
         include:
           - shard: 1
-            scripts: "smoke setup-claim onboarding-wizard hierarchy-import season-participation season-rollover"
+            scripts: "smoke setup-claim onboarding-wizard hierarchy-import season-participation season-rollover season-dates"
           - shard: 2
             scripts: "team-division-participation allowed-venues venue-access-cleanup venue-sharing permanent-teams player-edit"
           - shard: 3

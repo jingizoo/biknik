@@ -28,7 +28,9 @@
     "registration-cleanup": "node registration-cleanup.js",
     "records-delete": "node records-delete.js",
     "player-edit": "node player-edit.js",
-    "player-lifecycle": "node player-lifecycle.js"
+    "player-lifecycle": "node player-lifecycle.js",
+    "season-dates": "node season-dates.js",
+    "season-fmt-unit": "node season-fmt-unit.js"
   },
   "devDependencies": {
     "playwright": "^1.48.0"
