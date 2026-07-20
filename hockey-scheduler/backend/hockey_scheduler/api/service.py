@@ -303,13 +303,19 @@ class ApiService:
             return summary
         unresponded = [p for p in summary["players"]
                        if p["status"] == "no_response"]
-        for p in unresponded:
-            _push_notification(
-                self.store, self.roster.clock,
-                NotificationKind.AVAILABILITY_REMINDER,
-                NotificationAudience.PLAYER, "Availability reminder",
-                "Please confirm your availability for this game.",
-                audience_ref=p["player_id"], game_id=game_id)
+        _rg = self.store.get_game(game_id)
+        with self.store.transaction():
+            # #159 — no reminders may be generated for an archived Season's
+            # Game; lock the Season and emit inside one transaction.
+            if _rg is not None and _rg.season_id:
+                self.setup._require_active_season(_rg.season_id)
+            for p in unresponded:
+                _push_notification(
+                    self.store, self.roster.clock,
+                    NotificationKind.AVAILABILITY_REMINDER,
+                    NotificationAudience.PLAYER, "Availability reminder",
+                    "Please confirm your availability for this game.",
+                    audience_ref=p["player_id"], game_id=game_id)
         return {"reminded": len(unresponded)}
 
     @catch
@@ -2645,6 +2651,13 @@ class ApiService:
             "roster_status": roster_status, "issues": issues,
         }
 
+    def _guard_active_seasons(self, season_ids) -> None:
+        """Row-lock every distinct Season in canonical (sorted) order and
+        guard it read-only (#159). Sorted order avoids lock-order deadlocks
+        across a multi-Season batch; MUST run inside a store.transaction()."""
+        for sid in sorted({s for s in season_ids if s}):
+            self.setup._require_active_season(sid)
+
     @catch
     def commit_draft_schedule(self, division_id: str = None,
                               season_id: str = None, league_id: str = None,
@@ -2672,10 +2685,6 @@ class ApiService:
         if isinstance(proposal, dict) and proposal.get("error"):
             return proposal
         resolved_season_id = proposal["season_id"]
-        # #159 — committing a draft writes real Game rows, so it is blocked when
-        # the target Season is archived (read-only). The draft above only reads,
-        # so a preview of historical data is still allowed; nothing is written.
-        self.setup._require_active_season(resolved_season_id)
         # The Division-only proposal's own "league_id" is this tenancy
         # layer's frozen Program-scoped vocabulary (league_scope.py's
         # league_id_for_division -> season.program_id, see scope_bridge.py's
@@ -2696,33 +2705,39 @@ class ApiService:
         draft_ls = self.store.league_season_for(
             canonical_league_id, resolved_season_id) if canonical_league_id else None
         draft_ls_id = draft_ls.id if draft_ls else None
-        created = []
-        for d in proposal["draft_games"]:
-            g = Game(
-                id=self.store.next_id("game"),
-                home_team_id=d["home_team_id"], away_team_id=d["away_team_id"],
-                start_time=datetime.fromisoformat(d["start_time"]),
-                end_time=datetime.fromisoformat(d["end_time"]) if d.get("end_time") else None,
-                rink=d.get("rink_name"), division_id=d.get("division_id"),
-                season_id=resolved_season_id, league_id=canonical_league_id,
-                ice_slot_id=d.get("ice_slot_id"),
-                league_season_id=draft_ls_id,
-                published=False, is_draft=True)
-            self.store.add_game(g)
-            created.append(self._draft_game_dto(g))
-        # Committing a draft creates real (unpublished) rows — a state change,
-        # so it is audited (#86).
-        if season_id and league_id:
-            scope_type, scope_id = "league", league_id
-        else:
-            scope_type, scope_id = "division", division_id
-        self.setup._audit(
-            "draft_schedule_committed", scope_type, scope_id, actor_id,
-            {"created_count": len(created),
-             "game_ids": [c["game_id"] for c in created],
-             "unscheduled_count": len(proposal["unscheduled"]),
-             "season_id": resolved_season_id,
-             "league_id": proposal["league_id"]})
+        # #159 — lock the target Season and do EVERY Game/audit write in one
+        # transaction, so a concurrent archive cannot commit between the guard
+        # and the writes (autocommit would release the FOR UPDATE lock at the
+        # end of the check) and the batch stays all-or-nothing.
+        with self.store.transaction():
+            self._guard_active_seasons([resolved_season_id])
+            created = []
+            for d in proposal["draft_games"]:
+                g = Game(
+                    id=self.store.next_id("game"),
+                    home_team_id=d["home_team_id"], away_team_id=d["away_team_id"],
+                    start_time=datetime.fromisoformat(d["start_time"]),
+                    end_time=datetime.fromisoformat(d["end_time"]) if d.get("end_time") else None,
+                    rink=d.get("rink_name"), division_id=d.get("division_id"),
+                    season_id=resolved_season_id, league_id=canonical_league_id,
+                    ice_slot_id=d.get("ice_slot_id"),
+                    league_season_id=draft_ls_id,
+                    published=False, is_draft=True)
+                self.store.add_game(g)
+                created.append(self._draft_game_dto(g))
+            # Committing a draft creates real (unpublished) rows — a state change,
+            # so it is audited (#86).
+            if season_id and league_id:
+                scope_type, scope_id = "league", league_id
+            else:
+                scope_type, scope_id = "division", division_id
+            self.setup._audit(
+                "draft_schedule_committed", scope_type, scope_id, actor_id,
+                {"created_count": len(created),
+                 "game_ids": [c["game_id"] for c in created],
+                 "unscheduled_count": len(proposal["unscheduled"]),
+                 "season_id": resolved_season_id,
+                 "league_id": proposal["league_id"]})
         return {"division_id": division_id, "season_id": resolved_season_id,
                 "league_id": proposal["league_id"], "created": created,
                 "unscheduled": proposal["unscheduled"]}
@@ -2823,6 +2838,10 @@ class ApiService:
             self.setup._revalidate_game_participation(g)
         published = 0
         with self.store.transaction():
+            # #159 — lock every target Season (sorted) FIRST, before any
+            # slot/Game write, so the lock order is Season-before-slot/Game
+            # (matching every other path) and no write precedes the guard.
+            self._guard_active_seasons([g.season_id for g in targets])
             for g in targets:
                 # Allocate the ice slot, matching the manual create_game
                 # invariant (a game's slot is ALLOCATED, not left AVAILABLE) —
@@ -2849,18 +2868,18 @@ class ApiService:
         Each discard is audited before deletion so the review action leaves a
         trail (a draft is state; discarding it is a state change)."""
         targets = self._draft_targets(game_ids, all_drafts)
-        # #159 — validate up front so an archived-Season draft aborts the
-        # whole batch with zero deletes/audits (read-only history).
-        for g in targets:
-            if g.season_id:
-                self.setup._require_active_season(g.season_id)
         discarded = 0
-        for g in targets:
-            self.setup._audit("draft_game_discarded", "game", g.id, actor_id,
-                              {"division_id": g.division_id,
-                               "ice_slot_id": g.ice_slot_id})
-            self.store.delete_game(g.id)
-            discarded += 1
+        # #159 — lock every distinct target Season (sorted) and delete inside
+        # ONE transaction: an archived-Season draft aborts the whole batch
+        # with zero deletes/audits, and the lock is held through the writes.
+        with self.store.transaction():
+            self._guard_active_seasons([g.season_id for g in targets])
+            for g in targets:
+                self.setup._audit("draft_game_discarded", "game", g.id,
+                                  actor_id, {"division_id": g.division_id,
+                                             "ice_slot_id": g.ice_slot_id})
+                self.store.delete_game(g.id)
+                discarded += 1
         return {"discarded": discarded}
 
     @staticmethod

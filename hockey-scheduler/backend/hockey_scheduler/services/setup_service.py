@@ -354,6 +354,29 @@ class SetupService:
         if game is not None and game.season_id:
             require_active_season(self.store, game.season_id)
 
+    @staticmethod
+    def _normalize_lifecycle_reason(reason, *, required: bool) -> Optional[str]:
+        """Validate + normalize a lifecycle ``reason`` BEFORE any mutation (#159).
+
+        The reason may only be JSON ``null`` or a string; every other JSON type
+        (boolean, number, array, object) is a stable ``invalid_reason`` /
+        ``field="reason"`` error — never a silent coercion or a 500 from calling
+        ``.strip()`` on a non-string. ``bool`` is rejected explicitly because it
+        is an ``int`` subclass. A string is trimmed; a blank string collapses to
+        ``None``. When ``required`` (reopen), a ``None``/blank result is the
+        stable ``reason_required`` error."""
+        if reason is not None and (isinstance(reason, bool)
+                                   or not isinstance(reason, str)):
+            raise ValidationError(
+                "The reason must be a string.",
+                {"reason": "invalid_reason", "field": "reason"})
+        normalized = (reason or "").strip() or None
+        if required and normalized is None:
+            raise ValidationError(
+                "A reason is required to reopen an archived Season.",
+                {"reason": "reason_required", "field": "reason"})
+        return normalized
+
     @_transactional
     def archive_season(self, season_id: str, *, actor_id: Optional[str] = None,
                        reason: Optional[str] = None) -> Season:
@@ -363,6 +386,10 @@ class SetupService:
         (MANAGE_SETUP) is enforced at the HTTP boundary. The Season row is locked
         (#159) so concurrent archive/reopen serialize — exactly one wins, the
         loser gets the stable lifecycle error with no duplicate audit."""
+        # Validate/normalize the reason before touching any row so a bad-typed
+        # reason is a stable invalid_reason error with zero mutation.
+        normalized_reason = self._normalize_lifecycle_reason(
+            reason, required=False)
         season = self.store.get_season_for_update(season_id)
         if season is None:
             raise NotFoundError(f"Season {season_id} not found.")
@@ -374,7 +401,7 @@ class SetupService:
         season.archived_at = self.clock()
         self.store.save_season(season)
         self._audit("season_archived", "season", season_id, actor_id,
-                    {"reason": (reason or "").strip() or None})
+                    {"reason": normalized_reason})
         return season
 
     @_transactional
@@ -384,10 +411,10 @@ class SetupService:
         privileged, *reasoned* operation — a non-empty ``reason`` is required and
         recorded in the audit trail (authorization is enforced at the HTTP
         boundary). Reopening a Season that is not archived is an explicit error."""
-        if not (reason or "").strip():
-            raise ValidationError(
-                "A reason is required to reopen an archived Season.",
-                {"reason": "reason_required", "field": "reason"})
+        # A wrong-typed reason is a stable invalid_reason error, and a
+        # missing/blank one is reason_required — both before any mutation.
+        normalized_reason = self._normalize_lifecycle_reason(
+            reason, required=True)
         # Lock the row (#159) so concurrent archive/reopen serialize.
         season = self.store.get_season_for_update(season_id)
         if season is None:
@@ -400,7 +427,7 @@ class SetupService:
         season.archived_at = None
         self.store.save_season(season)
         self._audit("season_reopened", "season", season_id, actor_id,
-                    {"reason": reason.strip()})
+                    {"reason": normalized_reason})
         return season
 
     def _link_league_season(self, league_id: str, season_id: str) -> LeagueSeason:
@@ -550,6 +577,7 @@ class SetupService:
                 "That league participates in several seasons; create the "
                 "division against a specific season.",
                 {"reason": "ambiguous_season_for_league", "league_id": league_id})
+        self._require_active_season(lss[0].season_id)  # #159 read-only guard
         division = Division(id=self.store.next_id("division"),
                             league_season_id=lss[0].id,
                             name=self._require_name(name), age_group=age_group)
@@ -582,6 +610,8 @@ class SetupService:
                 {"reason": "team_league_mismatch", "team_id": reg.team_id,
                  "team_league_id": team.league_id, "league_id": league_id})
         season_id = self._season_of_league_season(reg.league_season_id)
+        if season_id:
+            self._require_active_season(season_id)  # #159 read-only guard
         old_league = self._registration_league_id(reg)
         if (league_id or None) != (old_league or None):
             stranded = [
@@ -921,6 +951,12 @@ class SetupService:
         reg = self.store.get_season_team_registration(registration_id)
         if reg is None:
             raise NotFoundError(f"Registration {registration_id} not found.")
+        # #159 read-only guard — reassigning a registration's Division is a
+        # Season-owned write, so it is blocked on an archived Season regardless
+        # of whether the Division value actually changes.
+        season_id = self._season_of_league_season(reg.league_season_id)
+        if season_id:
+            self._require_active_season(season_id)
         if division_id:
             division = self.store.get_division(division_id)
             if division is None:
@@ -939,7 +975,6 @@ class SetupService:
         # report the affected games so the operator can resolve them first,
         # rather than silently invalidating a published schedule.
         if (division_id or None) != (old or None):
-            season_id = self._season_of_league_season(reg.league_season_id)
             stranded = self._games_scheduled_for_team_in_season(
                 season_id, reg.team_id)
             if stranded:
@@ -1019,9 +1054,12 @@ class SetupService:
             # A Season is historical only once it has DEFINITELY ended (a real
             # end_date in the past). A missing/undated Season is treated as
             # current/future (the safe default) until an operator resolves it.
-            if season is not None and season.end_date is not None \
-                    and season.end_date < now:
-                continue  # ended Season — leave its active registration as history
+            if season is not None and (
+                    season.status == SeasonStatus.ARCHIVED
+                    or (season.end_date is not None and season.end_date < now)):
+                # #159 — an ended OR archived Season is frozen history: never
+                # move its registration (archived may be undated/future).
+                continue
             stranded = self._games_scheduled_for_team_in_season(
                 season_id, team_id)
             if stranded:
@@ -1065,6 +1103,8 @@ class SetupService:
         # Safety — refuse to strand a team that still has committed games this
         # season, returning the affected game ids so they can be resolved first.
         season_id = self._season_of_league_season(reg.league_season_id)  # #283
+        if season_id:
+            self._require_active_season(season_id)  # #159 read-only guard
         stranded = self._games_scheduled_for_team_in_season(
             season_id, reg.team_id)
         if stranded:
@@ -1101,6 +1141,12 @@ class SetupService:
         reg = self.store.get_season_team_registration(registration_id)
         if reg is None:
             raise NotFoundError(f"Registration {registration_id} not found.")
+        # #159 read-only guard — an archived Season fails closed before any
+        # other precheck, so purging a registration under it is uniformly
+        # season_archived (not registration_active) with zero mutation.
+        season_id = self._season_of_league_season(reg.league_season_id)  # #283
+        if season_id:
+            self._require_active_season(season_id)
         if reg.active:
             raise ValidationError(
                 "Cannot permanently delete an active registration; remove "
@@ -1111,7 +1157,6 @@ class SetupService:
         # whose Division no longer resolves, is not safe to purge blindly,
         # and the caller needs real labels (not bare ids) to confirm what it
         # just removed. Division alone is genuinely optional on the model.
-        season_id = self._season_of_league_season(reg.league_season_id)  # #283
         season = self.store.get_season(season_id) if season_id else None
         if season is None:
             raise ValidationError(
@@ -1694,6 +1739,8 @@ class SetupService:
         # division's own Season).
         div_ls = self.store.get_league_season(division.league_season_id)
         season_id = div_ls.season_id if div_ls else None
+        if season_id:
+            self._require_active_season(season_id)  # #159 read-only guard
         old = div_ls.league_id if div_ls else None
         # v2 (#233 Slice C2): a canonical Division is always parented by a
         # grouping League — the reparent target is REQUIRED. v1 keeps its nullable
@@ -2616,6 +2663,7 @@ class SetupService:
         existing = self.store.league_season_for(league_id, season_id)
         if existing is not None:
             return existing, False
+        self._require_active_season(season_id)  # #159 read-only guard
         ls = self._link_league_season(league_id, season_id)
         self._audit("league_season_created", "league_season", ls.id, actor_id,
                     {"import_batch_id": import_batch_id, "league_id": league_id,
@@ -2630,6 +2678,7 @@ class SetupService:
         # actually carries a division_code.
         # #283: a Division belongs to a LeagueSeason (the League's participation
         # in the Season), resolved/created from (league_id, season_id).
+        self._require_active_season(season_id)  # #159 read-only guard
         ls = self._link_league_season(league_id, season_id)
         values = {"name": name, "age_group": age_group,
                   "league_season_id": ls.id}
@@ -4703,6 +4752,9 @@ class SetupService:
         division = self.store.get_division(division_id)
         if division is None:
             raise NotFoundError(f"Division {division_id} not found.")
+        _dsid = self._season_of_league_season(division.league_season_id)  # #159
+        if _dsid:
+            self._require_active_season(_dsid)  # read-only guard
         regs = [r for r in self.store.all_season_team_registrations()
                 if r.division_id == division_id]
         games = [g for g in self.store.all_games() if g.division_id == division_id]

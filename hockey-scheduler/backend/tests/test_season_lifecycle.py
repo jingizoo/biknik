@@ -252,6 +252,220 @@ class SeasonArchivedGameWriteGuardTest(unittest.TestCase):
             self.assertEqual(store.roster_for_game(gid), [], label)
 
 
+class SeasonArchivedRegistrationDivisionGuardTest(unittest.TestCase):
+    """Registration reassignment/removal, Division delete, transfer-freeze,
+    reminders, and the draft batches are all blocked on an archived Season with
+    zero mutation (#159 re-review — completeness beyond the game paths)."""
+
+    def _reg_id(self, store, sid, tid):
+        r = store.registration_for_team_in_season(sid, tid)
+        return r.id if r else None
+
+    def test_registration_and_division_writes_blocked(self):
+        for label, store in _backends():
+            api = ApiService(store)
+            fx = SeasonArchivedGameWriteGuardTest()._game_fixture(api)
+            sid = fx["sid"]
+            reg = self._reg_id(store, sid, fx["t1"])
+            lid = store.all_league_seasons()[0].league_id
+            api.setup.archive_season(sid, actor_id="admin", reason="done")
+            regs0 = [(r.id, r.active, r.league_season_id, r.division_id)
+                     for r in store.all_season_team_registrations()]
+            divs0 = {d.id for d in store.all_divisions()}
+            audits0 = len(store.all_setup_audit())
+
+            def blocked(fn, note):
+                with self.assertRaises(ValidationError) as ctx:
+                    fn()
+                self.assertEqual(ctx.exception.details.get("reason"),
+                                 "season_archived", (label, note))
+
+            blocked(lambda: api.setup.assign_season_team_league(
+                reg, lid, actor_id="a"), "assign_league")
+            blocked(lambda: api.setup.assign_season_team_division(
+                reg, fx["did"], actor_id="a"), "assign_division")
+            blocked(lambda: api.setup.unregister_team_from_season(
+                reg, actor_id="a"), "unregister")
+            blocked(lambda: api.setup.delete_season_team_registration(
+                reg, actor_id="a"), "delete_registration")
+            blocked(lambda: api.setup.delete_division(fx["did"], actor_id="a"),
+                    "delete_division")
+
+            self.assertEqual([(r.id, r.active, r.league_season_id, r.division_id)
+                              for r in store.all_season_team_registrations()],
+                             regs0, label)
+            self.assertEqual({d.id for d in store.all_divisions()}, divs0, label)
+            self.assertEqual(len(store.all_setup_audit()), audits0, label)
+
+    def test_transfer_freezes_archived_registration(self):
+        # A team registered in an ARCHIVED Season keeps that (frozen) League even
+        # when the team is transferred to a new League — only end_date used to
+        # count as historical; ARCHIVED now does too.
+        for label, store in _backends():
+            api = ApiService(store)
+            pid = api.create_program("P", "US", "UTC")["id"]
+            sid = api.create_season(pid, "S1")["id"]
+            l1 = api.create_league(sid, "Gold")["id"]
+            l2 = api.create_league(sid, "Silver")["id"]
+            did = api.create_division(sid, "D1", league_id=l1)["id"]
+            club = api.create_club("Club")["id"]
+            team = api.create_team(club_id=club, name="Alpha", league_id=l1)["id"]
+            api.register_team_for_season(sid, team, division_id=did)
+            reg = self._reg_id(store, sid, team)
+            ls_before = store.get_season_team_registration(reg).league_season_id
+            api.setup.archive_season(sid, actor_id="admin", reason="done")
+
+            # Transfer the team to L2 — the archived Season's registration must
+            # NOT move (stays in L1's LeagueSeason); the transfer itself succeeds.
+            api.setup.transfer_team_to_league(team, l2, actor_id="a")
+            self.assertEqual(
+                store.get_season_team_registration(reg).league_season_id,
+                ls_before, label)  # frozen
+
+    def test_reminders_and_draft_batches_blocked(self):
+        for label, store in _backends():
+            api = ApiService(store)
+            fx = SeasonArchivedGameWriteGuardTest()._game_fixture(api)
+            sid = fx["sid"]
+            notifs0 = len(store.all_notifications_feed())
+            # The fixture's only slot is taken by its manual game, so give the
+            # scheduler a free slot; otherwise the draft is empty and the batch
+            # guards would have nothing to act on (a vacuous pass).
+            rink_id = store.all_rinks()[0].id
+            api.create_ice_slot(
+                rink_id, "2026-10-08T18:00:00+00:00",
+                "2026-10-08T19:00:00+00:00")
+            # A draft exists to discard/commit-race; build one while active.
+            draft = api.commit_draft_schedule(division_id=fx["did"], actor_id="a")
+            self.assertNotIn("error", draft, (label, draft))
+            self.assertTrue(draft["created"], (label, "expected a draft game"))
+            games_after_draft = len(store.all_games())
+            api.setup.archive_season(sid, actor_id="admin", reason="done")
+
+            # Facade batches + reminder return the structured error, no mutation.
+            r1 = api.remind_unresponded(fx["game"], fx["t1"], actor_id="a")
+            self.assertEqual(r1["error"]["details"]["reason"], "season_archived",
+                             label)
+            r2 = api.commit_draft_schedule(division_id=fx["did"], actor_id="a")
+            self.assertEqual(r2["error"]["details"]["reason"], "season_archived",
+                             label)
+            r3 = api.discard_draft_games(all_drafts=True, actor_id="a")
+            self.assertEqual(r3["error"]["details"]["reason"], "season_archived",
+                             label)
+            self.assertEqual(len(store.all_notifications_feed()), notifs0, label)
+            self.assertEqual(len(store.all_games()), games_after_draft, label)
+
+
+class SeasonLifecycleReasonValidationTest(unittest.TestCase):
+    """The lifecycle ``reason`` is type-validated and normalized BEFORE any
+    mutation (#159 r3): archive accepts ``null`` or a string; reopen requires a
+    nonblank string; every OTHER JSON type is a stable ``invalid_reason`` /
+    ``field="reason"`` error with zero Season/audit change (never a 500 from
+    calling ``.strip()`` on a non-string, never a silent coercion of a falsy
+    non-string to "missing"). A valid string is trimmed and that trimmed value
+    is what the audit records. Covered on Memory, SQLite, and PostgreSQL."""
+
+    # JSON types that are neither null nor a string — every one is rejected,
+    # including the *falsy* ones (False/0/[]/{}) that a truthiness test would
+    # have silently swallowed and the *truthy* ones that would have 500'd.
+    BAD_TYPES = [("boolean_true", True), ("boolean_false", False),
+                 ("integer", 5), ("zero", 0), ("float", 1.5),
+                 ("array", ["x"]), ("empty_array", []),
+                 ("object", {"k": "v"}), ("empty_object", {})]
+
+    def _seed(self, api):
+        pid = api.create_program("P", "US", "UTC")["id"]
+        return api.create_season(pid, "S1")["id"]
+
+    def _archive_audit(self, store, sid):
+        return [a for a in store.all_setup_audit()
+                if a.action == "season_archived" and a.entity_id == sid][0]
+
+    def _reopen_audit(self, store, sid):
+        return [a for a in store.all_setup_audit()
+                if a.action == "season_reopened" and a.entity_id == sid][0]
+
+    def test_archive_rejects_nonstring_reason_zero_mutation(self):
+        for label, store in _backends():
+            api = ApiService(store)
+            for tlabel, bad in self.BAD_TYPES:
+                sid = self._seed(api)
+                audits0 = len(store.all_setup_audit())
+                with self.assertRaises(ValidationError) as ctx:
+                    api.setup.archive_season(sid, actor_id="a", reason=bad)
+                self.assertEqual(ctx.exception.details.get("reason"),
+                                 "invalid_reason", (label, tlabel))
+                self.assertEqual(ctx.exception.details.get("field"),
+                                 "reason", (label, tlabel))
+                s = store.get_season(sid)
+                self.assertEqual(s.status, SeasonStatus.ACTIVE, (label, tlabel))
+                self.assertIsNone(s.archived_at, (label, tlabel))
+                self.assertEqual(len(store.all_setup_audit()), audits0,
+                                 (label, tlabel))
+
+    def test_archive_accepts_null_blank_and_trims(self):
+        for label, store in _backends():
+            api = ApiService(store)
+            for reason in (None, "", "   "):
+                sid = self._seed(api)
+                api.setup.archive_season(sid, actor_id="a", reason=reason)
+                self.assertEqual(store.get_season(sid).status,
+                                 SeasonStatus.ARCHIVED, (label, repr(reason)))
+                self.assertIsNone(self._archive_audit(store, sid).detail
+                                  .get("reason"), (label, repr(reason)))
+            sid = self._seed(api)
+            api.setup.archive_season(sid, actor_id="a", reason="  done  ")
+            self.assertEqual(self._archive_audit(store, sid).detail.get("reason"),
+                             "done", label)
+
+    def test_reopen_rejects_nonstring_reason_zero_mutation(self):
+        for label, store in _backends():
+            api = ApiService(store)
+            for tlabel, bad in self.BAD_TYPES:
+                sid = self._seed(api)
+                api.setup.archive_season(sid, actor_id="a", reason="close")
+                at0 = store.get_season(sid).archived_at
+                audits0 = len(store.all_setup_audit())
+                with self.assertRaises(ValidationError) as ctx:
+                    api.setup.reopen_season(sid, actor_id="a", reason=bad)
+                self.assertEqual(ctx.exception.details.get("reason"),
+                                 "invalid_reason", (label, tlabel))
+                self.assertEqual(ctx.exception.details.get("field"),
+                                 "reason", (label, tlabel))
+                s = store.get_season(sid)
+                self.assertEqual(s.status, SeasonStatus.ARCHIVED, (label, tlabel))
+                self.assertEqual(s.archived_at, at0, (label, tlabel))
+                self.assertEqual(len(store.all_setup_audit()), audits0,
+                                 (label, tlabel))
+
+    def test_reopen_null_blank_requires_reason_zero_mutation(self):
+        for label, store in _backends():
+            api = ApiService(store)
+            for reason in (None, "", "   "):
+                sid = self._seed(api)
+                api.setup.archive_season(sid, actor_id="a", reason="close")
+                audits0 = len(store.all_setup_audit())
+                with self.assertRaises(ValidationError) as ctx:
+                    api.setup.reopen_season(sid, actor_id="a", reason=reason)
+                self.assertEqual(ctx.exception.details.get("reason"),
+                                 "reason_required", (label, repr(reason)))
+                self.assertEqual(store.get_season(sid).status,
+                                 SeasonStatus.ARCHIVED, (label, repr(reason)))
+                self.assertEqual(len(store.all_setup_audit()), audits0,
+                                 (label, repr(reason)))
+
+    def test_reopen_trims_valid_reason(self):
+        for label, store in _backends():
+            api = ApiService(store)
+            sid = self._seed(api)
+            api.setup.archive_season(sid, actor_id="a", reason="close")
+            api.setup.reopen_season(sid, actor_id="a", reason="  mistake  ")
+            self.assertEqual(store.get_season(sid).status,
+                             SeasonStatus.ACTIVE, label)
+            self.assertEqual(self._reopen_audit(store, sid).detail.get("reason"),
+                             "mistake", label)
+
+
 class SeasonLifecycleHttpTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -325,6 +539,56 @@ class SeasonLifecycleHttpTest(unittest.TestCase):
         st, body = self._req("POST", "/api/v2/setup/seasons/missing/archive",
                              {"reason": "x"})
         self.assertEqual(st, 404, body)
+
+    def test_archive_rejects_nonstring_reason_over_http(self):
+        # boolean / number / array / object reasons → 400 invalid_reason with a
+        # stable field, and the Season is untouched (no 500, no silent archive).
+        for bad in (True, False, 5, 0, 1.5, ["x"], [], {"k": "v"}, {}):
+            sid = self._seed_season()
+            st, body = self._req("POST", f"/api/v2/setup/seasons/{sid}/archive",
+                                 {"reason": bad})
+            self.assertEqual(st, 400, (bad, body))
+            self.assertEqual(body["error"]["details"]["reason"],
+                             "invalid_reason", (bad, body))
+            self.assertEqual(body["error"]["details"]["field"], "reason",
+                             (bad, body))
+            self.assertEqual(STATE.api.store.get_season(sid).status,
+                             SeasonStatus.ACTIVE, bad)
+
+    def test_archive_accepts_null_reason_over_http(self):
+        sid = self._seed_season()
+        st, body = self._req("POST", f"/api/v2/setup/seasons/{sid}/archive",
+                             {"reason": None})
+        self.assertEqual(st, 200, body)
+        self.assertEqual(body["status"], "archived")
+        aud = [a for a in STATE.api.store.all_setup_audit()
+               if a.action == "season_archived"][0]
+        self.assertIsNone(aud.detail.get("reason"))
+
+    def test_reopen_rejects_nonstring_reason_over_http(self):
+        for bad in (True, 5, ["x"], {"k": "v"}):
+            sid = self._seed_season()
+            STATE.api.setup.archive_season(sid, actor_id="admin", reason="c")
+            st, body = self._req("POST", f"/api/v2/setup/seasons/{sid}/reopen",
+                                 {"reason": bad})
+            self.assertEqual(st, 400, (bad, body))
+            self.assertEqual(body["error"]["details"]["reason"],
+                             "invalid_reason", (bad, body))
+            self.assertEqual(body["error"]["details"]["field"], "reason",
+                             (bad, body))
+            self.assertEqual(STATE.api.store.get_season(sid).status,
+                             SeasonStatus.ARCHIVED, bad)
+
+    def test_reopen_trims_reason_over_http(self):
+        sid = self._seed_season()
+        STATE.api.setup.archive_season(sid, actor_id="admin", reason="c")
+        st, body = self._req("POST", f"/api/v2/setup/seasons/{sid}/reopen",
+                             {"reason": "  fixed  "})
+        self.assertEqual(st, 200, body)
+        self.assertEqual(body["status"], "active")
+        aud = [a for a in STATE.api.store.all_setup_audit()
+               if a.action == "season_reopened"][0]
+        self.assertEqual(aud.detail.get("reason"), "fixed")
 
     def test_write_into_archived_season_blocked_over_http(self):
         sid = self._seed_season(name="From")

@@ -37,6 +37,22 @@ Both are audited (`SetupAuditLog`) and authorized at the HTTP boundary with
 Only `reason` is accepted in either body (strict schema, #271); unknown keys are
 rejected before any write.
 
+### The `reason` value contract
+
+`reason` is type-validated and normalized **before any row is touched**, so a
+malformed value never mutates a Season or writes a 500:
+
+- `reason` may only be JSON `null` or a string. Any other JSON type — boolean,
+  number, array, object — returns a stable `invalid_reason` /
+  `field="reason"` error (400) with zero Season/audit change. `false`/`0`/`[]`/
+  `{}` are rejected the same as their truthy counterparts — never silently
+  coerced to "missing" — and a truthy non-string never reaches `.strip()`.
+- A string is trimmed; the trimmed value is what the audit records. A blank
+  string collapses to `null` (recorded as no reason on archive; `reason_required`
+  on reopen).
+- Archive accepts `null`/blank (audit `reason` is `null`); reopen requires the
+  trimmed result to be non-empty (`reason_required` otherwise).
+
 ## Read-only enforcement
 
 Every write that creates or modifies anything a Season owns fails closed with
