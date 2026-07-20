@@ -338,6 +338,12 @@ class InactivePlayerAccountBindingTest(unittest.TestCase):
             self.assertFalse(store.get_user_account(acct.id).active, label)  # retired
             self.assertIsNotNone(
                 store.sessions_for_user(acct.id)[0].revoked_at, label)   # revoked
+            # The account-deactivation audit cause is a REAL deactivation.
+            acct_audit = next(a for a in store.all_setup_audit()
+                              if a.action == "user_account_deactivated"
+                              and a.entity_id == acct.id)
+            self.assertEqual(acct_audit.detail.get("reason"),
+                             "player_deactivated", label)
 
             # Reactivating the Player must leave the account inactive — the
             # operator reactivates it explicitly (which re-checks player active).
@@ -378,6 +384,10 @@ class InactivePlayerAccountBindingTest(unittest.TestCase):
                            if a.action == "user_account_deactivated"
                            and a.entity_id == acct.id]
             self.assertEqual(len(acct_audits), 1, label)   # real account audit written
+            # The cause is the legacy already-inactive reconcile — NOT a real
+            # deactivation (no player lifecycle event accompanies it).
+            self.assertEqual(acct_audits[0].detail.get("reason"),
+                             "player_deactivation_reconcile", label)
 
             # Repeat the request → no further account/session/audit mutation.
             all_before = len(store.all_setup_audit())
@@ -424,6 +434,10 @@ class InactivePlayerAccountBindingTest(unittest.TestCase):
                            if a.action == "user_account_deactivated"
                            and a.entity_id == acct.id]
             self.assertEqual(len(acct_audits), 1, label)
+            # The cause is the reactivation safety reconcile — recorded beside a
+            # player_activated event, NOT a false "player_deactivated".
+            self.assertEqual(acct_audits[0].detail.get("reason"),
+                             "player_reactivation_reconcile", label)
 
             # Repeat active=true on the now-active Player → no further mutation
             # (the legitimate-account guard: an already-active Player is not
@@ -550,6 +564,8 @@ class SetPlayerActiveHttpTest(unittest.TestCase):
                        if a.action == "user_account_deactivated"
                        and a.entity_id == acct.id]
         self.assertEqual(len(acct_audits), 1)                     # real audit
+        self.assertEqual(acct_audits[0].detail.get("reason"),
+                         "player_deactivation_reconcile")         # accurate cause
 
         # Repeat over the wire → no further account/session/audit mutation.
         all_before = len(store.all_setup_audit())

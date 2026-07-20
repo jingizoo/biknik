@@ -3114,7 +3114,20 @@ class SetupService:
             # idempotent — it touches only still-active accounts and un-revoked
             # sessions and audits only what it actually changes — so a repeat
             # call mutates nothing further.
-            self._retire_player_account_authority(player.id, actor_id)
+            #
+            # Pass the ACCURATE lifecycle cause into the audit (#270 review): the
+            # helper runs in three distinct cases and the account-deactivation
+            # audit reason must tell the truth so an investigator can tell a real
+            # deactivation apart from a legacy reconcile or the reactivation
+            # safety reconcile — never a hard-coded "player_deactivated" beside a
+            # player_activated event.
+            if not target:
+                retire_reason = ("player_deactivated" if player.is_active
+                                 else "player_deactivation_reconcile")
+            else:
+                retire_reason = "player_reactivation_reconcile"
+            self._retire_player_account_authority(
+                player.id, actor_id, retire_reason)
         if player.is_active == target:
             # No Player-state change → no player_activated/deactivated audit
             # (idempotent lifecycle). Any account/session repair above audited
@@ -3140,13 +3153,21 @@ class SetupService:
         return player
 
     def _retire_player_account_authority(self, player_id: str,
-                                         actor_id: Optional[str]) -> None:
+                                         actor_id: Optional[str],
+                                         reason: str) -> None:
         """Deactivate every active account scoped to ``player_id`` and revoke
-        its live sessions (#270 review). Runs inside ``set_player_active``'s
-        transaction, so it rolls back with the rest on any failure. Because
-        ``SessionManager.resolve`` fails closed on an inactive account, killing
-        the account row is what terminates the session; the explicit revoke is
-        belt-and-suspenders and mirrors the account-active route.
+        its live sessions (#270 review). ``reason`` is the accurate lifecycle
+        cause recorded on each ``user_account_deactivated`` audit — the caller
+        passes ``player_deactivated`` for a real deactivation,
+        ``player_deactivation_reconcile`` for a legacy already-inactive Player,
+        or ``player_reactivation_reconcile`` for the inactive→active safety
+        reconcile — so the committed audit trail never claims a deactivation
+        cause beside a ``player_activated`` event. Runs inside
+        ``set_player_active``'s transaction, so it rolls back with the rest on
+        any failure. Because ``SessionManager.resolve`` fails closed on an
+        inactive account, killing the account row is what terminates the
+        session; the explicit revoke is belt-and-suspenders and mirrors the
+        account-active route.
 
         Concurrency (#270 review): the unlocked ``all_user_accounts()`` scan only
         picks CANDIDATE ids; each account is then re-read under its ROW LOCK
@@ -3178,8 +3199,7 @@ class SetupService:
             acct.active = False
             self.store.save_user_account(acct)
             self._audit("user_account_deactivated", "user_account", acct.id,
-                        actor_id, {"reason": "player_deactivated",
-                                   "player_id": player_id})
+                        actor_id, {"reason": reason, "player_id": player_id})
             for sess in self.store.sessions_for_user(acct.id):
                 if sess.revoked_at is None:
                     sess.revoked_at = now
