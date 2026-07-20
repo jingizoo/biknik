@@ -257,6 +257,7 @@ _POST_ROUTES = [re.compile(p) for p in (
     r"^/api/v2/setup/team/[^/]+/assign-club$",
     r"^/api/v2/setup/team/[^/]+/assign-league$",
     r"^/api/v2/setup/player/[^/]+/assign-team$",
+    r"^/api/v2/setup/player/[^/]+/update$",
     r"^/api/v2/setup/rink/[^/]+/assign-venue$",
     r"^/api/v2/setup/venue/[^/]+/assign-organization$",
     r"^/api/v2/setup/seasons/[^/]+/team-registrations$",
@@ -1099,7 +1100,10 @@ class Handler(BaseHTTPRequestHandler):
             from urllib.parse import parse_qs, urlparse
             qs = parse_qs(urlparse(self.path).query)
             team_id = (qs.get("team_id") or [None])[0]
-            return self._send_api(api.list_players(team_id))
+            # This list feeds the operator Player edit drawer (#268), so it
+            # opts into the current email — safe here because the route is
+            # MANAGE_SETUP-gated (an operator), never a coach/public surface.
+            return self._send_api(api.list_players(team_id, include_email=True))
         if path == "/api/reschedule/pending":
             # League-wide "awaiting my decision" queue (#29) — the opponent
             # has already accepted; a league admin/arena manager just needs
@@ -2524,16 +2528,17 @@ class Handler(BaseHTTPRequestHandler):
             # rather than the old `NotFoundError("Team None not found.")`.
             try:
                 check_body(b, allowed={"team_id", "name", "position",
-                                       "jersey_number", "email"},
+                                       "jersey_number", "email", "shoots"},
                            required=("team_id", "name", "position"),
                            types={"team_id": str, "name": str, "position": str,
-                                  "jersey_number": int, "email": str})
+                                  "jersey_number": int, "email": str,
+                                  "shoots": (str, type(None))})
             except BodyError as exc:
                 return self._send_json(exc.payload, exc.status)
             return self._send_api(api.create_player(
                 b.get("team_id"), b.get("name"), b.get("position"),
                 jersey_number=b.get("jersey_number"), email=b.get("email"),
-                actor_id=actor_id))
+                shoots=b.get("shoots"), actor_id=actor_id))
         return self._send_json({"error": {"code": "not_found",
                                           "message": "Unknown setup entity."}}, 404)
 
@@ -2655,6 +2660,27 @@ class Handler(BaseHTTPRequestHandler):
         if m:
             return self._handle_reassign_v2(
                 m.group(1), m.group(2), m.group(3), b, actor_id)
+        # Audited in-place Player profile edit (#268): correct name / position /
+        # jersey_number / shoots / email without touching the id, Team, active
+        # state, or any history. Every field is OPTIONAL (a partial edit) but an
+        # unknown key is rejected and each present value is type-checked before
+        # the write (#271); jersey/shoots/email are nullable (an explicit null
+        # clears them — a null email retires the contact). Team reassignment and
+        # the active/inactive lifecycle stay their own explicit operations.
+        mpu = re.match(r"^player/([^/]+)/update$", entity)
+        if mpu:
+            try:
+                check_body(
+                    b,
+                    allowed={"name", "position", "jersey_number", "shoots",
+                             "email"},
+                    types={"name": str, "position": str, "jersey_number": int,
+                           "shoots": (str, type(None)),
+                           "email": (str, type(None))})
+            except BodyError as exc:
+                return self._send_json(exc.payload, exc.status)
+            return self._send_api(api.update_player(
+                mpu.group(1), actor_id=actor_id, **b))
         # Season team registrations (canonical): league_id REQUIRED, division
         # optional. The result keeps its competition league_id (canonical).
         mr = re.match(r"^seasons/([^/]+)/team-registrations$", entity)
@@ -2856,16 +2882,17 @@ class Handler(BaseHTTPRequestHandler):
             # rejected), before the service call.
             try:
                 check_body(b, allowed={"team_id", "name", "position",
-                                       "jersey_number", "email"},
+                                       "jersey_number", "email", "shoots"},
                            required=("team_id", "name", "position"),
                            types={"team_id": str, "name": str, "position": str,
-                                  "jersey_number": int, "email": str})
+                                  "jersey_number": int, "email": str,
+                                  "shoots": (str, type(None))})
             except BodyError as exc:
                 return self._send_json(exc.payload, exc.status)
             return self._send_api(api.create_player(
                 b.get("team_id"), b.get("name"), b.get("position"),
                 jersey_number=b.get("jersey_number"), email=b.get("email"),
-                actor_id=actor_id))
+                shoots=b.get("shoots"), actor_id=actor_id))
         return self._send_json({"error": {"code": "not_found",
                                           "message": "Unknown setup entity."}}, 404)
 

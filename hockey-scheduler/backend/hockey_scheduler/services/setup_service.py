@@ -48,6 +48,7 @@ from ..domain import (
     jersey_number_error,
 )
 from ..domain.jersey import MAX_JERSEY_NUMBER, MIN_JERSEY_NUMBER
+from ..domain.shooting import VALID_SHOOTS, normalize_shoots
 from ..domain.errors import (
     DivisionMismatchError,
     HasDependenciesError,
@@ -71,9 +72,11 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
-# Sentinel distinguishing "argument omitted" from an explicit value (including
-# None). Used by the swap-safe import staging (#292) to tell a per-row upsert
-# whether a pre-release original jersey was supplied.
+# Sentinel distinguishing "argument omitted, leave as-is" from an explicit
+# value (including None, which clears a nullable field). Used by update_player
+# (#268) for partial edits and by the swap-safe import staging (#292) to tell a
+# per-row upsert whether a pre-release original jersey was supplied — a plain
+# default of None can't express "don't touch" for a nullable column.
 _UNSET = object()
 
 
@@ -2530,6 +2533,14 @@ class SetupService:
         #232's own explicit, audited action, never an import side effect.
         """
         self._validate_jersey_number(jersey_number)
+        # Validate/canonicalize the email BEFORE any player write (#268 review):
+        # a non-string/non-None value (False, 0, a list) or a malformed string
+        # raises a field-level invalid_email here, so the method never applies a
+        # partial player change even when a direct caller supplies no outer
+        # transaction. None/blank canonicalizes to None -> a no-op below (the
+        # import rule: an absent cell is "leave as-is", never a retirement).
+        canonical_email = self._validate_email(email)
+        canonical_name = self._validate_player_name(name)
         # Enforce active-team jersey uniqueness on the IMPORTED target state
         # before any write (#269), so a conflicting row aborts the whole
         # one-transaction batch with zero committed players. An import never
@@ -2541,8 +2552,8 @@ class SetupService:
             self._assert_jersey_available(
                 team_id, jersey_number,
                 exclude_player_id=None if existing is None else existing.id)
-        values = {"name": name, "team_id": team_id, "position": position,
-                  "jersey_number": jersey_number}
+        values = {"name": canonical_name, "team_id": team_id,
+                  "position": position, "jersey_number": jersey_number}
         if existing is None:
             obj = Player(id=self.store.next_id("player"), external_ref=code,
                         **values)
@@ -2568,20 +2579,14 @@ class SetupService:
                             "external_ref": code, "team_id": team_id,
                             "changed_fields": changed})
             created = False
-        if email:
-            recipient_ref = f"player:{obj.id}"
-            existing_contact = self.store.get_contact_destination(
-                recipient_ref, NotificationChannel.EMAIL)
-            if existing_contact is not None:
-                if existing_contact.destination != email:
-                    existing_contact.destination = email
-                    self.store.save_contact_destination(existing_contact)
-            else:
-                self.store.add_contact_destination(ContactDestination(
-                    id=self.store.next_id("contact"),
-                    recipient_ref=recipient_ref,
-                    channel=NotificationChannel.EMAIL,
-                    destination=email))
+        # A supplied nonblank email (already validated/canonicalized above)
+        # updates AND reactivates the single player:<id> EMAIL contact via the
+        # shared set/retire path — so re-importing an address that a prior edit
+        # retired makes the contact active again (was: destination updated but
+        # left active=False). An absent/blank cell canonicalized to None, so it
+        # stays a no-op that leaves any existing contact untouched (#268 review).
+        if canonical_email is not None:
+            self._set_email_contact(f"player:{obj.id}", canonical_email)
         return obj, created, changed
 
     def upsert_imported_registration(self, season_id: str, team_id: str,
@@ -2769,6 +2774,7 @@ class SetupService:
     def add_player(self, team_id: str, name: str, position: Position,
                    jersey_number: Optional[int] = None,
                    email: Optional[str] = None,
+                   shoots: Optional[str] = None,
                    is_active: bool = True,
                    actor_id: Optional[str] = None) -> Player:
         """Manually create one Player (#114) — the same model/store the CSV
@@ -2791,23 +2797,248 @@ class SetupService:
         # inactive parks its number without reserving it (#269).
         if is_active:
             self._assert_jersey_available(team_id, jersey_number)
-        if email:
-            at = email.find("@")
-            if at <= 0 or "." not in email[at + 1:]:
-                raise ValidationError(f"Invalid email {email}.")
+        # Validate/normalize the email BEFORE any write, so a bad type/format
+        # (False, 0, a list, or a malformed string) is a field-level 400 and no
+        # player is created — a blank/None just means "no email" (#268 review).
+        canonical_email = self._validate_email(email)
+        canonical_shoots = self._validate_shoots(shoots)
+        canonical_position = self._validate_position(position)
+        canonical_name = self._validate_player_name(name)
         player = Player(id=self.store.next_id("player"), team_id=team_id,
-                        name=self._require_name(name), position=position,
-                        jersey_number=jersey_number, is_active=is_active)
+                        name=canonical_name,
+                        position=canonical_position,
+                        jersey_number=jersey_number,
+                        shoots=canonical_shoots,
+                        is_active=is_active)
         self.store.add_player(player)
         self._audit("player_added", "player", player.id, actor_id,
                     {"team_id": team_id})
-        if email:
-            self.store.add_contact_destination(ContactDestination(
-                id=self.store.next_id("contact"),
-                recipient_ref=f"player:{player.id}",
-                channel=NotificationChannel.EMAIL,
-                destination=email))
+        if canonical_email is not None:
+            # Nonblank only: create/reactivate via the shared set/retire path.
+            self._set_email_contact(f"player:{player.id}", canonical_email)
         return player
+
+    @staticmethod
+    def _validate_email(email) -> Optional[str]:
+        """Validate + normalize a Player/Official email (#268 review).
+
+        The single type-safe gate reused by create, edit, and both import
+        paths. The ONLY non-address values allowed are ``None`` and a
+        blank/whitespace string — both normalize to ``None`` (no email / a
+        retire on the set-or-retire path). EVERY other non-string (``False``,
+        ``0``, a list/dict — note ``bool`` is an ``int`` subclass, so it is
+        rejected here rather than coerced) and any malformed string raises a
+        field-level ``validation_error`` (``reason="invalid_email"``,
+        ``field="email"``) BEFORE any normalization or mutation, so a direct
+        service/import caller gets the same atomic, structured rejection the
+        HTTP schema gives — never a silent retire or a bare ``AttributeError``.
+        Returns the trimmed canonical address, or ``None``.
+        """
+        if email is None:
+            return None
+        if not isinstance(email, str):
+            raise ValidationError(
+                "email must be a string.",
+                {"reason": "invalid_email", "field": "email"})
+        trimmed = email.strip()
+        if not trimmed:
+            return None
+        at = trimmed.find("@")
+        if at <= 0 or "." not in trimmed[at + 1:]:
+            raise ValidationError(
+                f"Invalid email {trimmed}.",
+                {"reason": "invalid_email", "field": "email"})
+        return trimmed
+
+    @staticmethod
+    def _validate_shoots(shoots) -> Optional[str]:
+        """Normalize a shooting hand to canonical ``L``/``R``/``None`` (#268).
+
+        The single enforcement point for the ``shoots`` contract on create and
+        edit — the browser dropdown is not a boundary. Returns the canonical
+        stored value (``"L"``, ``"R"`` or ``None``); a non-canonical string or a
+        non-string raises a field-level ``validation_error`` so a bad value is a
+        clean 400 that never reaches the store, contact, or audit trail.
+        """
+        canonical, reason = normalize_shoots(shoots)
+        if reason is not None:
+            raise ValidationError(
+                f"shoots must be one of {', '.join(VALID_SHOOTS)}, or left blank.",
+                {"reason": "invalid_shoots", "field": "shoots"})
+        return canonical
+
+    @staticmethod
+    def _validate_position(position) -> Position:
+        """Canonicalize a Player position to a ``Position`` (#268 review).
+
+        The single validator shared by Player create and edit (and aligned with
+        the import parser, which likewise turns a cell string into ``Position``).
+        Accepts a ``Position`` as-is or parses a valid position string; every
+        other value — an invalid string, ``None`` (position is required, not
+        nullable), or a wrong type — raises a field-level ``validation_error``
+        (``reason="invalid_position"``, ``field="position"``) BEFORE any
+        mutation, so a direct service caller can't persist a bad position and
+        the HTTP error carries the field the same way jersey/shoots/email do.
+        """
+        if isinstance(position, Position):
+            return position
+        if isinstance(position, str):
+            try:
+                return Position(position)
+            except ValueError:
+                pass
+        raise ValidationError(
+            f"position must be one of {', '.join(p.value for p in Position)}.",
+            {"reason": "invalid_position", "field": "position"})
+
+    @staticmethod
+    def _validate_player_name(name) -> str:
+        """Canonicalize a Player name (#268 review).
+
+        The one name validator shared by Player create, edit, and import — it
+        does NOT go through the generic ``_require_name`` (which ``str()``-
+        coerces, so ``False``/``0``/``[]``/``{}`` would persist as
+        ``"False"``/``"0"``/…). Accepts only a nonblank string and returns it
+        trimmed; every non-string (``None``, a bool, a number, a collection) and
+        a blank/whitespace string raises a field-level ``validation_error``
+        (``reason="invalid_name"``, ``field="name"``) BEFORE any mutation, so a
+        direct service/import caller gets the same atomic, field-named rejection
+        the other Player fields now give.
+        """
+        if not isinstance(name, str) or not name.strip():
+            raise ValidationError(
+                "name is required and must be a non-empty string.",
+                {"reason": "invalid_name", "field": "name"})
+        return name.strip()
+
+    @_transactional
+    def update_player(self, player_id: str, *, name=_UNSET, position=_UNSET,
+                      jersey_number=_UNSET, shoots=_UNSET, email=_UNSET,
+                      actor_id: Optional[str] = None) -> Player:
+        """Correct a Player's profile in place (#268) — id and history unchanged.
+
+        A partial, audited edit for ``name`` / ``position`` / ``jersey_number`` /
+        ``shoots`` and the Player's email ``ContactDestination``. Team
+        reassignment (``assign_player_team``) and the active/inactive lifecycle
+        (#270) stay separate operations and are intentionally NOT editable here.
+        Any field left ``_UNSET`` is untouched; an explicit ``None`` clears a
+        nullable one (jersey/shoots, or the email → the contact is retired).
+
+        Every change reuses the shared validation (jersey range + active-team
+        uniqueness from #269, name required, email shape). A rejected value
+        raises a field-level error and — because the whole method is one
+        transaction — leaves ZERO partial state. A genuine no-op writes nothing
+        and appends no ``player_updated`` audit (so the trail never lies). The
+        audit's ``changed_fields`` names WHICH fields changed, never the email
+        address or any other value.
+        """
+        player = self.store.get_player_for_update(player_id)
+        if player is None:
+            raise NotFoundError(f"Player {player_id} not found.")
+
+        changed = []
+        if name is not _UNSET:
+            new_name = self._validate_player_name(name)
+            if new_name != player.name:
+                player.name = new_name
+                changed.append("name")
+        if position is not _UNSET:
+            new_position = self._validate_position(position)
+            if new_position != player.position:
+                player.position = new_position
+                changed.append("position")
+        if shoots is not _UNSET:
+            new_shoots = self._validate_shoots(shoots)
+            if new_shoots != player.shoots:
+                player.shoots = new_shoots
+                changed.append("shoots")
+        if jersey_number is not _UNSET:
+            self._validate_jersey_number(jersey_number)
+            if jersey_number != player.jersey_number:
+                # Only an active player reserves a number; check the CURRENT team
+                # (reassignment is a separate op), excluding self (#269).
+                if player.is_active:
+                    self._assert_jersey_available(
+                        player.team_id, jersey_number,
+                        exclude_player_id=player.id)
+                player.jersey_number = jersey_number
+                changed.append("jersey_number")
+
+        email_changed = False
+        if email is not _UNSET:
+            email_changed = self._apply_player_email(player, email)
+
+        if changed:
+            self.store.save_player(player)
+        if changed or email_changed:
+            fields = list(changed) + (["email"] if email_changed else [])
+            self._audit("player_updated", "player", player.id, actor_id,
+                        {"changed_fields": fields})
+        return player
+
+    def _set_email_contact(self, recipient_ref: str, email) -> bool:
+        """The one set/retire path for a recipient's EMAIL ``ContactDestination``.
+
+        Shared by Player create, edit, and BOTH import paths so no caller can
+        drift on the contact lifecycle (#268 review). A non-empty ``email``
+        validates then becomes the single active EMAIL destination for
+        ``recipient_ref`` — created, or **updated-and-reactivated in place**, so
+        a value re-supplied after a retirement makes the contact active again
+        rather than silently staying ``active=False``. An empty/``None`` value
+        retires an existing active one (``active=False``, never deleted, so its
+        history and any notification preferences — keyed on ``recipient_ref``,
+        not this row — survive and are never orphaned). Returns ``True`` only
+        when something actually changed.
+
+        Callers that must treat a blank value as a *no-op* rather than a
+        retirement (the imports, where an absent cell means "leave as-is")
+        simply guard the call on a non-empty email; this helper never sees the
+        blank in that case.
+        """
+        # Type-safe gate FIRST: a non-string/non-None value (False, 0, a list)
+        # or a malformed string raises a field-level error before any read or
+        # mutation — never coerced to "" (which would silently retire) and
+        # never a bare AttributeError (#268 review). None/blank → None (retire).
+        normalized = self._validate_email(email)
+        existing = self.store.get_contact_destination(
+            recipient_ref, NotificationChannel.EMAIL)
+        if normalized is None:
+            if existing is not None and existing.active:
+                existing.active = False
+                self.store.save_contact_destination(existing)
+                return True
+            return False
+        if existing is not None:
+            if existing.destination == normalized and existing.active:
+                return False
+            existing.destination = normalized
+            existing.active = True
+            self.store.save_contact_destination(existing)
+            return True
+        self.store.add_contact_destination(ContactDestination(
+            id=self.store.next_id("contact"), recipient_ref=recipient_ref,
+            channel=NotificationChannel.EMAIL, destination=normalized))
+        return True
+
+    def _apply_player_email(self, player: Player, email) -> bool:
+        """Set/retire the Player's email contact from the edit drawer (#268).
+
+        The edit field IS the Player's current email, so an explicit ``None``
+        retires it — thin wrapper over the shared ``_set_email_contact`` on the
+        single ``player:<id>`` EMAIL destination.
+        """
+        return self._set_email_contact(f"player:{player.id}", email)
+
+    def active_player_email(self, player_id: str) -> Optional[str]:
+        """The Player's current active email, for the operator edit drawer (#268).
+
+        Operator-gated read only (its one caller is the MANAGE_SETUP ``/api/
+        players`` route). Returns the address of the active ``player:<id>``
+        EMAIL destination, or ``None`` — a retired row reads as no email.
+        """
+        c = self.store.get_contact_destination(
+            f"player:{player_id}", NotificationChannel.EMAIL)
+        return c.destination if (c is not None and c.active) else None
 
     # -- CSV import commit (#93) --------------------------------------------
     def commit_teams_players_import(self, season_id: str, sheets: dict,
@@ -3108,8 +3339,9 @@ class SetupService:
 
             for row in player_rows:
                 player_code = _clean(row.get("player_code"))
-                full_name = (f"{_clean(row.get('first_name'))} "
-                            f"{_clean(row.get('last_name'))}").strip()
+                full_name = self._validate_player_name(
+                    (f"{_clean(row.get('first_name'))} "
+                     f"{_clean(row.get('last_name'))}").strip())
                 # validate_import already guarantees this team_code matches a
                 # row in THIS SAME upload's teams sheet; .get() is just a
                 # defensive belt-and-suspenders check against a bug elsewhere.
@@ -3172,19 +3404,14 @@ class SetupService:
                                 {"team_id": team_id, "import_batch_id": batch_id})
                     counts["players_created"] += 1
 
+                # A blank cell parsed to None above → no-op (leave any existing
+                # contact untouched). A supplied address validates, updates AND
+                # reactivates the single player:<id> EMAIL contact through the
+                # shared set/retire path, so a re-import revives a contact a
+                # prior edit had retired instead of leaving it active=False
+                # (#268 review).
                 if email is not None:
-                    recipient_ref = f"player:{player.id}"
-                    existing = self.store.get_contact_destination(
-                        recipient_ref, NotificationChannel.EMAIL)
-                    if existing is not None:
-                        existing.destination = email
-                        self.store.save_contact_destination(existing)
-                    else:
-                        self.store.add_contact_destination(ContactDestination(
-                            id=self.store.next_id("contact"),
-                            recipient_ref=recipient_ref,
-                            channel=NotificationChannel.EMAIL,
-                            destination=email))
+                    self._set_email_contact(f"player:{player.id}", email)
 
             # skipped/errors are always 0 here by construction: the
             # all-or-nothing gate above means the only way to reach this line

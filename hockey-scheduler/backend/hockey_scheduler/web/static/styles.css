@@ -790,6 +790,7 @@ details.tn > .tn-sum:hover { background: #f6f7fb; }
   border-radius: 9px; font-size: 14px; background: #fff; }
 .drawer-body .req { color: var(--red); }
 .drawer-note { font-size: 13px; color: var(--muted); background: var(--bg); border-radius: 8px; padding: 8px 10px; }
+.drawer-note-inline { font-size: 12px; color: var(--muted); font-weight: 400; }
 .drawer-err { margin-top: 14px; background: #fdecec; color: #a3231f; border: 1px solid #f3b7b4;
   border-radius: 9px; padding: 10px 12px; font-size: 13px; }
 .drawer-foot { display: flex; justify-content: flex-end; gap: 8px; padding: 12px 16px; border-top: 1px solid var(--sep); }

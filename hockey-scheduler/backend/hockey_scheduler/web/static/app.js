@@ -186,6 +186,7 @@ const ICONS = {
   circleMinus: _svg('<circle cx="12" cy="12" r="9"/><path d="M8 12h8"/>'),
   circleX: _svg('<circle cx="12" cy="12" r="9"/><path d="M15 9l-6 6"/><path d="M9 9l6 6"/>'),
   database: _svg('<ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v14c0 1.7 3.6 3 8 3s8-1.3 8-3V5"/><path d="M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"/>'),
+  pencil: _svg('<path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4 12.5-12.5z"/>'),
 };
 
 // Shared page-intro block (#146): every view's *title* already comes from
@@ -734,17 +735,23 @@ const SETUP_ENTITIES = [
   // while this view is open) — never from /api/demo/overview, which is
   // unauthenticated and this app's own convention keeps player names out of.
   { key: "player", title: "Players", icon: "🧑", noun: "player", perm: "manage_setup",
-    delKind: "player",
+    delKind: "player", editKind: "player",
     list: (ov) => playersList.map((p) => ({
       id: p.id, title: p.name,
       sub: `${nameById(ov.teams, p.team_id) || ""}${p.jersey_number != null ? " · #" + p.jersey_number : ""}`,
     })),
     fields: [
+      // On EDIT the Team is shown for context but locked — moving a player to
+      // another Team is the separate "⇄ Move" reassignment (#268 keeps
+      // reassignment and the active/inactive lifecycle as their own operations).
       { id: "f-player-team", label: "Team", type: "select", required: true, ofNoun: "team",
+        lockOnEdit: true,
         options: (ov) => (ov.teams || []).map((t) => [t.id, t.name]) },
       { id: "f-player-name", label: "Player name", required: true, placeholder: "e.g. Jordan Lee" },
       { id: "f-player-position", label: "Position", type: "select", required: true,
         options: () => [["forward", "Forward"], ["defense", "Defense"], ["goalie", "Goalie"]] },
+      { id: "f-player-shoots", label: "Shoots (optional)", type: "select",
+        options: () => [["", "—"], ["L", "Left"], ["R", "Right"]] },
       { id: "f-player-jersey", label: "Jersey number (optional)", type: "number", placeholder: "e.g. 17" },
       { id: "f-player-email", label: "Email (optional)", type: "email", placeholder: "player@example.com" }] },
 ];
@@ -785,6 +792,19 @@ const SETUP_POST = {
   player: () => post("/api/v2/setup/player", {
     team_id: val("f-player-team"), name: val("f-player-name"),
     position: val("f-player-position"),
+    shoots: val("f-player-shoots") || null,
+    jersey_number: val("f-player-jersey") ? Number(val("f-player-jersey")) : null,
+    email: val("f-player-email") || null,
+  }),
+};
+
+// Each editable entity's UPDATE body (#268). Distinct from SETUP_POST: it
+// targets /<id>/update and omits fields that are their own operation (Team
+// reassignment, active/inactive) — only the correctable profile fields.
+const SETUP_EDIT = {
+  player: (id) => post(`/api/v2/setup/player/${id}/update`, {
+    name: val("f-player-name"), position: val("f-player-position"),
+    shoots: val("f-player-shoots") || null,
     jersey_number: val("f-player-jersey") ? Number(val("f-player-jersey")) : null,
     email: val("f-player-email") || null,
   }),
@@ -954,6 +974,16 @@ function delBtn(kind, id, name, label) {
   return `<button class="icon-btn danger" data-del="${esc(kind)}"
     data-del-id="${esc(id)}" data-del-name="${esc(name || id)}"
     title="${esc(aria)}" aria-label="${esc(aria)}">${ICONS.trash}</button>`;
+}
+
+function editBtn(kind, id, name) {
+  // Compact neutral pencil button (#268): opens the edit drawer prefilled from
+  // the record. MANAGE_SETUP-gated, same as create/delete.
+  if (!hasPerm("manage_setup")) return "";
+  const aria = `Edit${name ? " " + name : ""}`;
+  return `<button class="icon-btn" data-edit="${esc(kind)}"
+    data-edit-id="${esc(id)}" title="${esc(aria)}"
+    aria-label="${esc(aria)}">${ICONS.pencil}</button>`;
 }
 
 // Human labels for the entity kinds shown in the confirm/blocked modals.
@@ -2145,6 +2175,7 @@ function setupCard(ent, sv) {
     body = items.map((it) => `<div class="li"><div class="li-main">
       <div class="li-title">${esc(it.title)}</div>
       ${it.sub ? `<div class="li-sub">${esc(it.sub)}</div>` : ""}</div>${
+        ent.editKind && it.id ? editBtn(ent.editKind, it.id, it.title) : ""}${
         ent.delKind && it.id ? delBtn(ent.delKind, it.id, it.title) : ""}</div>`).join("");
   }
   const count = items ? `<span class="setup-count">${items.length}</span>` : "";
@@ -2159,6 +2190,11 @@ function setupCard(ent, sv) {
 
 function drawerField(f, sv) {
   const req = f.required ? ` <span class="req">*</span>` : "";
+  // A locked field on an edit drawer (e.g. Team — reassignment is its own
+  // operation) is shown for context but disabled (#268).
+  const locked = drawer && drawer.mode === "edit" && f.lockOnEdit;
+  const dis = locked ? " disabled" : "";
+  const note = locked ? ` <span class="drawer-note-inline">— use “⇄ Move” to change</span>` : "";
   // Preserve what the user already typed/selected across an error re-render;
   // fall back to the field's default only on first open.
   const current = f.id in drawerValues ? drawerValues[f.id] : (f.value || "");
@@ -2173,11 +2209,11 @@ function drawerField(f, sv) {
     const sel = current || rows[0][0];
     const opts = rows.map(([v, label]) =>
       `<option value="${esc(v)}"${v === sel ? " selected" : ""}>${esc(label)}</option>`).join("");
-    return `<label>${esc(f.label)}${req}</label><select id="${f.id}">${opts}</select>`;
+    return `<label>${esc(f.label)}${req}${note}</label><select id="${f.id}"${dis}>${opts}</select>`;
   }
   const type = f.type || "text";
   const attrs = `${current ? ` value="${esc(current)}"` : ""}${f.placeholder ? ` placeholder="${esc(f.placeholder)}"` : ""}`;
-  return `<label>${esc(f.label)}${req}</label><input id="${f.id}" type="${type}"${attrs} />`;
+  return `<label>${esc(f.label)}${req}${note}</label><input id="${f.id}" type="${type}"${attrs}${dis} />`;
 }
 
 function renderDrawer(sv) {
@@ -2186,17 +2222,26 @@ function renderDrawer(sv) {
   if (!ent) return "";
   const fields = ent.fields.map((f) => drawerField(f, sv)).join("");
   const err = drawerError ? `<div class="drawer-err">⚠ ${esc(drawerError)}</div>` : "";
-  // A required select with no options can never be satisfied — block submit.
-  const blocked = ent.fields.some((f) => f.type === "select" && f.required && !f.options(sv).length);
+  // An edit drawer (#268) reuses the same fields but corrects an existing
+  // record in place: it never blocks on an empty parent select (its locked
+  // Team is already set) and its title/action verb say "Edit"/"Save changes".
+  const editing = drawer.mode === "edit";
+  const noun = entNoun(ent);
+  const heading = editing ? `Edit ${esc(noun)}` : `New ${esc(noun)}`;
+  const action = editing ? "Save changes" : `Create ${esc(noun)}`;
+  // A required select with no options can never be satisfied — block a CREATE
+  // submit (an edit's parents already exist).
+  const blocked = !editing && ent.fields.some(
+    (f) => f.type === "select" && f.required && !f.options(sv).length);
   return `<div class="drawer-scrim" data-drawer-close></div>
-    <aside class="drawer" role="dialog" aria-modal="true" aria-label="New ${esc(entNoun(ent))}">
+    <aside class="drawer" role="dialog" aria-modal="true" aria-label="${heading}">
       <header class="drawer-head"><span class="drawer-ico">${ent.icon}</span>
-        <span class="drawer-title">New ${esc(entNoun(ent))}</span>
+        <span class="drawer-title">${heading}</span>
         <button class="drawer-x" data-drawer-close aria-label="Close">×</button></header>
       <div class="drawer-body">${fields}${err}</div>
       <footer class="drawer-foot">
         <button class="act ghost" data-drawer-close>Cancel</button>
-        <button class="act primary" data-drawer-submit="${ent.key}"${blocked ? " disabled" : ""}>Create ${esc(entNoun(ent))}</button>
+        <button class="act primary" data-drawer-submit="${ent.key}"${blocked ? " disabled" : ""}>${action}</button>
       </footer>
     </aside>`;
 }
@@ -4784,6 +4829,7 @@ function captureDrawerValues(ent) {
 
 async function submitSetup(kind) {
   const ent = SETUP_ENTITIES.find((e) => e.key === kind);
+  const editing = drawer && drawer.mode === "edit";
   toast = "";
   captureDrawerValues(ent);
   // Validate required fields client-side; the backend stays authoritative.
@@ -4793,7 +4839,9 @@ async function submitSetup(kind) {
     return render();
   }
   drawerError = "";
-  const res = await SETUP_POST[kind]();
+  // Edit (#268) routes to the entity's /<id>/update endpoint (Team + lifecycle
+  // stay separate); create routes to the entity's POST.
+  const res = editing ? await SETUP_EDIT[kind](drawer.id) : await SETUP_POST[kind]();
   if (res && res.error) {
     // Keep the drawer open, preserve input, surface the server's message.
     drawerError = res.error.message;
@@ -4801,7 +4849,8 @@ async function submitSetup(kind) {
     return render();
   }
   drawer = null; drawerError = ""; drawerValues = {};
-  toast = `${entNoun(ent)[0].toUpperCase() + entNoun(ent).slice(1)} created.`;
+  const noun = entNoun(ent);
+  toast = `${noun[0].toUpperCase() + noun.slice(1)} ${editing ? "updated" : "created"}.`;
   await render();
 }
 
@@ -5246,6 +5295,24 @@ async function render() {
     drawer = { kind: b.dataset.drawer }; drawerError = ""; drawerValues = {};
     if (b.dataset.prefillField) drawerValues[b.dataset.prefillField] = b.dataset.prefillValue || "";
     if (b.dataset.prefillField2) drawerValues[b.dataset.prefillField2] = b.dataset.prefillValue2 || "";
+    toast = ""; render();
+  });
+  // Edit a Player in place (#268): open the same drawer in edit mode, prefilled
+  // from the record (Team locked — reassignment is its own action). The Player
+  // list is the only editable entity today.
+  c.querySelectorAll("[data-edit]").forEach((b) => b.onclick = () => {
+    const p = (playersList || []).find((x) => x.id === b.dataset.editId);
+    if (!p) return;
+    drawer = { kind: b.dataset.edit, mode: "edit", id: p.id };
+    drawerError = "";
+    drawerValues = {
+      "f-player-team": p.team_id || "",
+      "f-player-name": p.name || "",
+      "f-player-position": p.position || "",
+      "f-player-shoots": p.shoots || "",
+      "f-player-jersey": p.jersey_number == null ? "" : String(p.jersey_number),
+      "f-player-email": p.email || "",
+    };
     toast = ""; render();
   });
   // Empty-state "Load demo data" (#215): builds the sample dataset then refreshes.
