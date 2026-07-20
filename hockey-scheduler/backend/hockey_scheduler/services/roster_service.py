@@ -87,8 +87,20 @@ class RosterService:
         """Fail closed on a deactivated player at every substitute transition
         (#270 review). A player enrolled while active, then deactivated, must
         not be offer-able, accept, or be coach-added — the enrollment row stays
-        as history but can no longer act. Same message the enroll gate uses."""
-        player = self._require_player(player_id)
+        as history but can no longer act. Same message the enroll gate uses.
+
+        The read takes the Player ROW LOCK (``get_player_for_update``) so the
+        ``is_active`` check is serialized with a concurrent ``set_player_active``
+        deactivation, which locks the same row (#270 review concurrency). On
+        PostgreSQL the ``SELECT … FOR UPDATE`` is held to commit: if a
+        deactivation locks and commits ``is_active=False`` first, this
+        transaction blocks on the lock and then re-reads the committed value and
+        fails closed — it cannot proceed on a stale active read, then insert or
+        revive a row. MUST be called inside the caller's ``transaction()`` for
+        the lock to persist across the subsequent write."""
+        player = self.store.get_player_for_update(player_id)
+        if player is None:
+            raise NotFoundError(f"Player {player_id} not found.")
         if not player.is_active:
             raise NotEligibleError(f"{player.name} is not an active player.")
         return player
@@ -150,7 +162,15 @@ class RosterService:
 
         entries: List[GameRosterEntry] = []
         for player_id in player_ids:
-            player = self._require_player(player_id)
+            # Row-lock the Player so the is_active eligibility check is
+            # serialized with a concurrent set_player_active deactivation (which
+            # locks the same row) — otherwise a stale is_active=True read could
+            # insert/revive a roster row after deactivation committed
+            # is_active=False (#270 review concurrency). Held to commit inside
+            # this @_transactional method.
+            player = self.store.get_player_for_update(player_id)
+            if player is None:
+                raise NotFoundError(f"Player {player_id} not found.")
             if player.team_id not in (game.home_team_id, game.away_team_id):
                 raise NotEligibleError(
                     f"{player.name} is not on either team in this game."

@@ -3146,9 +3146,33 @@ class SetupService:
         transaction, so it rolls back with the rest on any failure. Because
         ``SessionManager.resolve`` fails closed on an inactive account, killing
         the account row is what terminates the session; the explicit revoke is
-        belt-and-suspenders and mirrors the account-active route."""
+        belt-and-suspenders and mirrors the account-active route.
+
+        Concurrency (#270 review): the unlocked ``all_user_accounts()`` scan only
+        picks CANDIDATE ids; each account is then re-read under its ROW LOCK
+        (``get_user_account_for_update``) and re-checked immediately before the
+        write. This is what makes the reconcile safe against a concurrent
+        ``rebind_account_scope`` / ``set_active`` on the same account: we never
+        blind-save a stale whole-row object (which would clobber a completed
+        rebind and re-bind the account to this inactive Player while the audit
+        said it moved). If, under the lock, the account was rebound away from
+        this Player or is already inactive, we skip it — leaving the rebind's new
+        scope intact. The lock order is Player→Account everywhere
+        (``set_player_active`` already holds the Player lock; account
+        create/rebind/reactivate lock the Player subject BEFORE the account), so
+        this cannot deadlock with those paths."""
         now = _utcnow()
-        for acct in self.store.all_user_accounts():
+        candidate_ids = [a.id for a in self.store.all_user_accounts()
+                         if a.active
+                         and (a.scope or {}).get("player_id") == player_id]
+        for account_id in candidate_ids:
+            acct = self.store.get_user_account_for_update(account_id)
+            if acct is None:
+                continue
+            # Re-check UNDER THE LOCK: a concurrent rebind may have moved the
+            # scope off this Player, or a concurrent deactivate may have already
+            # retired it. Only retire an account still active AND still bound to
+            # this Player — never overwrite a rebind's committed new scope.
             if not acct.active or (acct.scope or {}).get("player_id") != player_id:
                 continue
             acct.active = False
