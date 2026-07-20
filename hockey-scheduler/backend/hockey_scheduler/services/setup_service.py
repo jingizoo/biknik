@@ -3070,10 +3070,25 @@ class SetupService:
         the actor, prior + new state, and the ``reason`` when supplied — never a
         raw value beyond the caller-provided reason string.
         """
+        # Validate the contract fields BEFORE any read/mutation (#270 review):
+        # ApiService.set_player_active is also a supported boundary and forwards
+        # raw values, so `active` must be an actual bool (never bool()-coerced —
+        # "false"/"0"/[] would flip state silently) and `reason` must be a
+        # string or None (a non-string must not enter or vanish from the audit).
+        if not isinstance(active, bool):
+            raise ValidationError(
+                "active must be true or false.",
+                {"reason": "invalid_active", "field": "active"})
+        if reason is not None:
+            if not isinstance(reason, str):
+                raise ValidationError(
+                    "reason must be a string.",
+                    {"reason": "invalid_reason", "field": "reason"})
+            reason = reason.strip() or None   # blank/whitespace → omitted
         player = self.store.get_player_for_update(player_id)
         if player is None:
             raise NotFoundError(f"Player {player_id} not found.")
-        target = bool(active)
+        target = active
         if player.is_active == target:
             return player                      # idempotent no-op, no audit
         if target:

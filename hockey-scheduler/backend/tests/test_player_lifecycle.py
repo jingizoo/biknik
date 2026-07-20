@@ -152,6 +152,49 @@ class SetPlayerActiveServiceTest(unittest.TestCase):
                 api.roster.substitute_block_reason(player.id, "g1"),
                 "You are not an active player.", label)
 
+    def test_non_bool_active_is_field_error_and_no_change(self):
+        # ApiService.set_player_active forwards raw values, so the service must
+        # validate `active` as an ACTUAL bool — never bool()-coerce "false"/"0"/
+        # a collection into a silent state flip (#270 review).
+        for label, store, api, setup, player in self._each():
+            for bad in ("false", "0", "true", [], {}, ["x"], 1, 0, None):
+                with self.assertRaises(ValidationError, msg=(label, repr(bad))) as ctx:
+                    setup.set_player_active(player.id, bad, actor_id="a")
+                self.assertEqual(ctx.exception.details.get("reason"),
+                                 "invalid_active", (label, repr(bad)))
+                self.assertEqual(ctx.exception.details.get("field"), "active",
+                                 (label, repr(bad)))
+            self.assertTrue(store.get_player(player.id).is_active, label)  # unchanged
+            self.assertEqual(len(_lifecycle_audits(store)), 0, label)
+
+    def test_non_string_reason_is_field_error_and_no_change(self):
+        for label, store, api, setup, player in self._each():
+            for bad in (5, ["x"], {"r": 1}, True, 0):
+                with self.assertRaises(ValidationError, msg=(label, repr(bad))) as ctx:
+                    setup.set_player_active(player.id, False, actor_id="a",
+                                            reason=bad)
+                self.assertEqual(ctx.exception.details.get("reason"),
+                                 "invalid_reason", (label, repr(bad)))
+                self.assertEqual(ctx.exception.details.get("field"), "reason",
+                                 (label, repr(bad)))
+            self.assertTrue(store.get_player(player.id).is_active, label)  # unchanged
+            self.assertEqual(len(_lifecycle_audits(store)), 0, label)
+
+    def test_blank_reason_is_omitted_from_audit(self):
+        for label, store, api, setup, player in self._each():
+            setup.set_player_active(player.id, False, actor_id="a",
+                                    reason="   ")
+            audit = _lifecycle_audits(store)[-1]
+            self.assertNotIn("reason", audit.detail, label)   # blank → omitted
+
+    def test_facade_rejects_non_bool_active_with_field_error(self):
+        # The facade is a supported boundary: a bad value must be a structured
+        # error dict, not a silent success.
+        for label, store, api, setup, player in self._each():
+            res = api.set_player_active(player.id, "nope", actor_id="a")
+            self.assertEqual(res["error"]["details"]["reason"], "invalid_active",
+                             label)
+            self.assertTrue(store.get_player(player.id).is_active, label)
 
 
 def _team_node(hierarchy, team_id):
@@ -311,6 +354,17 @@ class SetPlayerActiveHttpTest(unittest.TestCase):
             {"active": False, "bogus": 1})
         self.assertEqual(s, 400)
         self.assertEqual(body["error"]["details"]["reason"], "unknown_field")
+
+    def test_wrong_type_reason_is_400(self):
+        c = self._admin()
+        p = self._a_player(c)
+        for bad in (5, ["x"], True):
+            s, _h, body = self._req(
+                c, "POST", f"/api/v2/setup/player/{p['id']}/active",
+                {"active": False, "reason": bad})
+            self.assertEqual(s, 400, repr(bad))
+            self.assertEqual(body["error"]["details"]["reason"], "wrong_type", repr(bad))
+            self.assertEqual(body["error"]["details"]["field"], "reason", repr(bad))
 
     def test_put_and_patch_on_active_route_are_405_json(self):
         c = self._admin()
