@@ -222,6 +222,30 @@ class HierarchyImportReactivatesRetiredEmailTest(unittest.TestCase):
                 if isinstance(store, SqlStore):
                     store.close()
 
+    def test_nonstring_name_rejected_before_any_player_write(self):
+        # The hierarchy upsert must reject a non-string/blank name through the
+        # shared validator BEFORE mutating the player (no str()-coercion into
+        # "False"/"0"), self-atomic without an outer transaction.
+        from hockey_scheduler.domain.errors import ValidationError
+        for label, store in _backends():
+            with self.subTest(backend=label):
+                setup, player = self._seed(store)
+                pid = player.id
+                audits_before = len(store.all_setup_audit())
+                for bad in (False, 0, ["x"], {}, "", "   "):
+                    with self.assertRaises(ValidationError,
+                                           msg=(label, repr(bad))) as ctx:
+                        setup.upsert_imported_player(
+                            "P1", bad, "home", Position.FORWARD, 7,
+                            "ann@x.com", existing=player, actor_id="a")
+                    self.assertEqual(ctx.exception.details.get("reason"),
+                                     "invalid_name", (label, repr(bad)))
+                    self.assertEqual(store.get_player(pid).name, "Ann X",
+                                     (label, repr(bad)))          # unchanged
+                self.assertEqual(len(store.all_setup_audit()), audits_before, label)
+                if isinstance(store, SqlStore):
+                    store.close()
+
     def test_new_player_with_bad_email_creates_no_player(self):
         # A brand-new imported row with a truthy non-string email rejects with
         # no player and no audit created (atomic, no outer transaction).

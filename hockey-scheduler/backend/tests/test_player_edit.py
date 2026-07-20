@@ -296,6 +296,40 @@ class UpdatePlayerServiceTest(unittest.TestCase):
                                           actor_id="a")
             self.assertEqual(updated.position, Position.GOALIE, label)
 
+    def test_invalid_name_on_edit_is_field_error_and_atomic(self):
+        # A direct service edit must not str()-coerce a non-string name into
+        # "False"/"0"/"[]"/"{}", nor accept a blank one — each is a field-level
+        # invalid_name, and being one transaction the same-call jersey change
+        # and the audit stay unchanged.
+        from hockey_scheduler.domain.errors import ValidationError
+        for label, store, api, setup, player in self._each():
+            pid = player.id
+            for bad in (False, 0, [], {}, "", "   ", None):
+                with self.assertRaises(ValidationError, msg=(label, repr(bad))) as ctx:
+                    setup.update_player(pid, name=bad, jersey_number=8,
+                                        actor_id="a")
+                self.assertEqual(ctx.exception.details.get("field"), "name",
+                                 (label, repr(bad)))
+                self.assertEqual(ctx.exception.details.get("reason"),
+                                 "invalid_name", (label, repr(bad)))
+                fresh = store.get_player(pid)
+                self.assertEqual(fresh.name, "Jordn Le", (label, repr(bad)))
+                self.assertEqual(fresh.jersey_number, 17, (label, repr(bad)))  # rolled back
+            self.assertEqual(len(_player_updated_audits(store)), 0, label)
+
+    def test_invalid_name_on_create_is_field_error_and_no_player(self):
+        from hockey_scheduler.domain.errors import ValidationError
+        for label, store, api, setup, player in self._each():
+            before = len(store.players_for_team("home"))
+            for bad in (False, 0, [], {}, "", "   ", None):
+                with self.assertRaises(ValidationError, msg=(label, repr(bad))) as ctx:
+                    setup.add_player("home", bad, Position.FORWARD, actor_id="a")
+                self.assertEqual(ctx.exception.details.get("reason"),
+                                 "invalid_name", (label, repr(bad)))
+                self.assertEqual(ctx.exception.details.get("field"), "name",
+                                 (label, repr(bad)))
+            self.assertEqual(len(store.players_for_team("home")), before, label)
+
 
 class UpdatePlayerHttpTest(unittest.TestCase):
     @classmethod
@@ -462,6 +496,30 @@ class UpdatePlayerHttpTest(unittest.TestCase):
                 {"position": bad})
             self.assertEqual(s, 400, repr(bad))
             self.assertEqual(body["error"]["details"]["field"], "position", repr(bad))
+
+    def test_edit_blank_name_is_400_field_error(self):
+        c = self._admin()
+        p = self._a_player(c)
+        # A blank string is well-typed but empty → the service's canonical
+        # name validator makes it invalid_name on field "name".
+        s, _h, body = self._req(
+            c, "POST", f"/api/v2/setup/player/{p['id']}/update",
+            {"name": "   ", "jersey_number": 8})
+        self.assertEqual(s, 400)
+        self.assertEqual(body["error"]["details"]["reason"], "invalid_name")
+        self.assertEqual(body["error"]["details"]["field"], "name")
+
+    def test_edit_null_and_wrong_type_name_are_400_on_field(self):
+        c = self._admin()
+        p = self._a_player(c)
+        # Explicit null and a wrong JSON type are caught at the HTTP schema
+        # (name is typed str) — a stable 400 that still names field "name".
+        for bad in (None, 5, ["x"]):
+            s, _h, body = self._req(
+                c, "POST", f"/api/v2/setup/player/{p['id']}/update",
+                {"name": bad})
+            self.assertEqual(s, 400, repr(bad))
+            self.assertEqual(body["error"]["details"]["field"], "name", repr(bad))
 
     def test_create_invalid_shoots_is_400_field_error(self):
         c = self._admin()

@@ -2540,6 +2540,7 @@ class SetupService:
         # transaction. None/blank canonicalizes to None -> a no-op below (the
         # import rule: an absent cell is "leave as-is", never a retirement).
         canonical_email = self._validate_email(email)
+        canonical_name = self._validate_player_name(name)
         # Enforce active-team jersey uniqueness on the IMPORTED target state
         # before any write (#269), so a conflicting row aborts the whole
         # one-transaction batch with zero committed players. An import never
@@ -2551,8 +2552,8 @@ class SetupService:
             self._assert_jersey_available(
                 team_id, jersey_number,
                 exclude_player_id=None if existing is None else existing.id)
-        values = {"name": name, "team_id": team_id, "position": position,
-                  "jersey_number": jersey_number}
+        values = {"name": canonical_name, "team_id": team_id,
+                  "position": position, "jersey_number": jersey_number}
         if existing is None:
             obj = Player(id=self.store.next_id("player"), external_ref=code,
                         **values)
@@ -2802,8 +2803,9 @@ class SetupService:
         canonical_email = self._validate_email(email)
         canonical_shoots = self._validate_shoots(shoots)
         canonical_position = self._validate_position(position)
+        canonical_name = self._validate_player_name(name)
         player = Player(id=self.store.next_id("player"), team_id=team_id,
-                        name=self._require_name(name),
+                        name=canonical_name,
                         position=canonical_position,
                         jersey_number=jersey_number,
                         shoots=canonical_shoots,
@@ -2889,6 +2891,26 @@ class SetupService:
             f"position must be one of {', '.join(p.value for p in Position)}.",
             {"reason": "invalid_position", "field": "position"})
 
+    @staticmethod
+    def _validate_player_name(name) -> str:
+        """Canonicalize a Player name (#268 review).
+
+        The one name validator shared by Player create, edit, and import — it
+        does NOT go through the generic ``_require_name`` (which ``str()``-
+        coerces, so ``False``/``0``/``[]``/``{}`` would persist as
+        ``"False"``/``"0"``/…). Accepts only a nonblank string and returns it
+        trimmed; every non-string (``None``, a bool, a number, a collection) and
+        a blank/whitespace string raises a field-level ``validation_error``
+        (``reason="invalid_name"``, ``field="name"``) BEFORE any mutation, so a
+        direct service/import caller gets the same atomic, field-named rejection
+        the other Player fields now give.
+        """
+        if not isinstance(name, str) or not name.strip():
+            raise ValidationError(
+                "name is required and must be a non-empty string.",
+                {"reason": "invalid_name", "field": "name"})
+        return name.strip()
+
     @_transactional
     def update_player(self, player_id: str, *, name=_UNSET, position=_UNSET,
                       jersey_number=_UNSET, shoots=_UNSET, email=_UNSET,
@@ -2916,7 +2938,7 @@ class SetupService:
 
         changed = []
         if name is not _UNSET:
-            new_name = self._require_name(name)
+            new_name = self._validate_player_name(name)
             if new_name != player.name:
                 player.name = new_name
                 changed.append("name")
@@ -3317,8 +3339,9 @@ class SetupService:
 
             for row in player_rows:
                 player_code = _clean(row.get("player_code"))
-                full_name = (f"{_clean(row.get('first_name'))} "
-                            f"{_clean(row.get('last_name'))}").strip()
+                full_name = self._validate_player_name(
+                    (f"{_clean(row.get('first_name'))} "
+                     f"{_clean(row.get('last_name'))}").strip())
                 # validate_import already guarantees this team_code matches a
                 # row in THIS SAME upload's teams sheet; .get() is just a
                 # defensive belt-and-suspenders check against a bug elsewhere.
