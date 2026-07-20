@@ -631,7 +631,11 @@ const SETUP_ENTITIES = [
       // forcing an organization to exist before a Program can be created.
       { id: "f-league-org", label: "Operating organization (optional)", type: "select",
         ofNoun: "organization", ofNounDisplay: "operating organization",
-        options: (ov) => [["", "— none —"]].concat((ov.organizations || []).map((o) => [o.id, o.name])) }] },
+        options: (ov) => [["", "— none —"]].concat((ov.organizations || []).map((o) => [o.id, o.name])) },
+      // The Program timezone anchors date-only Season boundaries (#272): an
+      // IANA name, defaulting to UTC. A bad name is rejected server-side with
+      // invalid_timezone and surfaced in the drawer.
+      { id: "f-league-tz", label: "Timezone (IANA)", placeholder: "e.g. America/Chicago", value: "UTC" }] },
   { key: "season", title: "Seasons", icon: "🗓️", noun: "season", perm: "manage_setup",
     delKind: "season",
     list: (ov) => (ov.seasons || []).map((s) => {
@@ -805,7 +809,7 @@ const ofNounLabel = (f) => {
 
 // Each entity's POST body, built from the drawer inputs (ids match the fields).
 const SETUP_POST = {
-  league: () => post("/api/v2/setup/program", { name: val("f-league"), operator_organization_id: val("f-league-org") || null }),
+  league: () => post("/api/v2/setup/program", { name: val("f-league"), operator_organization_id: val("f-league-org") || null, timezone: val("f-league-tz") || "UTC" }),
   season: () => post("/api/v2/setup/season", { program_id: val("f-season-league"), name: val("f-season"),
     start_date: val("f-season-start") || null, end_date: val("f-season-end") || null }),
   level: () => post("/api/v2/setup/league", { season_id: val("f-level-season"), name: val("f-level"), sort_order: val("f-level-sort") ? Number(val("f-level-sort")) : 0 }),

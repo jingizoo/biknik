@@ -66,14 +66,6 @@ async function checkViewport(browser, viewport) {
   page.on("pageerror", (e) => errors.push(`[pageerror] ${e.message}`));
   page.on("console", (m) => { if (m.type() === "error") errors.push(`[console] ${m.text()}`); });
 
-  const apiPost = (url, payload) => page.evaluate(async ([u, b]) => {
-    const r = await fetch(u, {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(b),
-    });
-    return { status: r.status, body: await r.json() };
-  }, [url, payload]);
-
   // The Seasons entity-card list-item text for the season with this name.
   const seasonRowText = (name) => page.evaluate((nm) => {
     const item = Array.from(document.querySelectorAll(".setup-card .li"))
@@ -85,19 +77,46 @@ async function checkViewport(browser, viewport) {
     await waitForServer(`${base}/api/health`, READY_TIMEOUT_MS);
     await page.goto(base, { waitUntil: "domcontentloaded" });
     await page.waitForSelector("#content > *", { timeout: 10000 });
-
-    // Seed a POSITIVE-offset Program over the wire (the create-Program drawer
-    // has no timezone field; the timezone is the anchor we need to exercise).
-    const prog = await apiPost("/api/v2/setup/program",
-      { name: "Tokyo Program", country: "JP", timezone: "Asia/Tokyo" });
-    if (prog.status !== 200 || prog.body.error) {
-      throw new Error(`[${L}] program seed failed: ${JSON.stringify(prog)}`);
-    }
-    const programId = prog.body.id;
-
     await page.click('.tab[data-tab="setup"]');
     await page.click('[data-setup-view="records"]');
     await page.waitForSelector(".setup-card", { timeout: 10000 });
+
+    // Create a POSITIVE-offset Program through the operator drawer (the anchor
+    // we need to exercise), including the timezone field the drawer now
+    // exposes. First prove a bad IANA name is rejected in the drawer.
+    await page.click('.setup-card .sc-new[data-drawer="league"]');
+    await page.waitForSelector(".drawer[role=dialog]", { timeout: 10000 });
+    await page.fill("#f-league", "Tokyo Program");
+    await page.fill("#f-league-tz", "Not/AZone");
+    const badTzErrs = errors.length;
+    await page.click('[data-drawer-submit="league"]');
+    await page.waitForSelector(".drawer-err", { timeout: 10000 });
+    const tzErr = await page.textContent(".drawer-err");
+    if (!/timezone/i.test(tzErr)) {
+      throw new Error(`[${L}] expected an invalid-timezone drawer error, got "${tzErr}"`);
+    }
+    // Correct the timezone in place and submit for real.
+    await page.fill("#f-league-tz", "Asia/Tokyo");
+    const progResp = page.waitForResponse((r) =>
+      r.url() === `${base}/api/v2/setup/program` && r.request().method() === "POST"
+      && r.status() === 200);
+    await page.click('[data-drawer-submit="league"]');
+    const progBody = await (await progResp).json();
+    if (progBody.error) throw new Error(`[${L}] program create failed: ${JSON.stringify(progBody.error)}`);
+    if (progBody.timezone !== "Asia/Tokyo") {
+      throw new Error(`[${L}] program timezone not stored: ${JSON.stringify(progBody)}`);
+    }
+    const programId = progBody.id;
+    await page.waitForFunction(() => !document.querySelector(".drawer[role=dialog]"),
+      null, { timeout: 10000 });
+    // The bad-timezone submit logs one expected HTTP 400; anything else is a
+    // real error and still fails the run below.
+    const progUnexpected = errors.slice(badTzErrs).filter(
+      (e) => !/\b400\b|Failed to load resource/i.test(e));
+    if (progUnexpected.length) {
+      throw new Error(`[${L}] unexpected errors creating program:\n${progUnexpected.join("\n")}`);
+    }
+    errors.length = 0;  // reset for the console-clean season happy-path below
 
     const openSeasonDrawer = async () => {
       await page.click('.setup-card .sc-new[data-drawer="season"]');

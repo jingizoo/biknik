@@ -121,14 +121,12 @@ _DATE_ONLY = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
 def resolve_timezone(name):
-    """Return a ``ZoneInfo`` for an IANA name, or ``None`` if it is unknown.
-
-    ``Program.timezone`` is a free-form string. This is the single place the
-    backend turns it into a real zone; callers that must never fail (e.g. the
-    season-boundary parser applied to legacy data) fall back to UTC when this
-    returns ``None``.
+    """Return a ``ZoneInfo`` for an IANA name, or ``None`` if it is unknown or
+    not a non-empty string. Total (never raises), so callers on the hot path —
+    e.g. the season-boundary parser applied to stored/legacy data — can fall
+    back to UTC without a try/except of their own.
     """
-    if not name:
+    if not isinstance(name, str) or not name:
         return None
     try:
         return ZoneInfo(name)
@@ -285,14 +283,23 @@ class SetupService:
             raise NotFoundError(
                 f"Organization {operator_organization_id} not found.")
         # The Program timezone is the anchor for date-only Season boundaries
-        # (#272), so it must be a real IANA zone — reject a garbage value at
-        # creation rather than silently falling back to UTC when a season date
-        # is later interpreted.
-        tz_name = timezone_name or "UTC"
+        # (#272), so it must be a real IANA zone — validate the TYPE and value
+        # explicitly, before any write (#272 review). `timezone_name or "UTC"`
+        # would silently map a falsy non-string (False/0/[]/{}) to UTC, and a
+        # truthy non-string would reach ZoneInfo(...) and raise an uncaught
+        # TypeError/500. None/blank is the intentional UTC default.
+        if timezone_name is None:
+            tz_name = "UTC"
+        elif isinstance(timezone_name, str):
+            tz_name = timezone_name.strip() or "UTC"
+        else:
+            raise ValidationError(
+                "timezone must be a string IANA name (or null for UTC).",
+                {"reason": "invalid_timezone", "field": "timezone"})
         if resolve_timezone(tz_name) is None:
             raise ValidationError(
-                f"Invalid timezone: {tz_name!r}. Expected an IANA name like "
-                "'America/Chicago' or 'UTC'.",
+                f"Invalid timezone: {timezone_name!r}. Expected an IANA name "
+                "like 'America/Chicago' or 'UTC'.",
                 {"reason": "invalid_timezone", "field": "timezone"})
         program = Program(id=self.store.next_id("league"),
                           name=self._require_name(name), country=country,

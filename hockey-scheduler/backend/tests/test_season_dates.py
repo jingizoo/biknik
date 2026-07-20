@@ -144,13 +144,35 @@ class SeasonDateBoundaryTest(unittest.TestCase):
 
 
 class ProgramTimezoneValidationTest(unittest.TestCase):
-    def test_invalid_program_timezone_rejected(self):
+    # Non-string / non-null values that must be rejected with a stable field
+    # error and NO Program/audit mutation (#272 review): a falsy non-string must
+    # not silently become UTC, a truthy non-string must not 500 inside ZoneInfo.
+    BAD_TYPES = [False, True, 0, 1, 3.5, [], ["x"], {}, {"a": 1}]
+    BAD_NAMES = ["Not/AZone", "utc/utc", "America/Nowhere"]
+
+    def test_bad_type_timezone_rejected_no_mutation(self):
         for label, store in _backends():
             with self.subTest(backend=label):
                 api = ApiService(store)
-                res = api.create_program("Bad", "US", "Not/AZone")
-                self.assertEqual(res["error"]["details"]["reason"],
-                                 "invalid_timezone", label)
+                for bad in self.BAD_TYPES:
+                    res = api.create_program("Bad", "US", bad)
+                    self.assertEqual(res["error"]["details"]["reason"],
+                                     "invalid_timezone", (label, repr(bad)))
+                    self.assertEqual(res["error"]["details"]["field"],
+                                     "timezone", (label, repr(bad)))
+                self.assertEqual(len(store.all_programs()), 0, label)  # no writes
+                if isinstance(store, SqlStore):
+                    store.close()
+
+    def test_malformed_name_rejected(self):
+        for label, store in _backends():
+            with self.subTest(backend=label):
+                api = ApiService(store)
+                for bad in self.BAD_NAMES:
+                    res = api.create_program("Bad", "US", bad)
+                    self.assertEqual(res["error"]["details"]["reason"],
+                                     "invalid_timezone", (label, bad))
+                self.assertEqual(len(store.all_programs()), 0, label)
                 if isinstance(store, SqlStore):
                     store.close()
 
@@ -160,6 +182,17 @@ class ProgramTimezoneValidationTest(unittest.TestCase):
                 api = ApiService(store)
                 res = api.create_program("Good", "US", "America/Chicago")
                 self.assertEqual(res["timezone"], "America/Chicago", label)
+                if isinstance(store, SqlStore):
+                    store.close()
+
+    def test_null_and_blank_default_to_utc(self):
+        for label, store in _backends():
+            with self.subTest(backend=label):
+                api = ApiService(store)
+                self.assertEqual(api.create_program("N", "US", None)["timezone"],
+                                 "UTC", label)
+                self.assertEqual(api.create_program("B", "US", "   ")["timezone"],
+                                 "UTC", label)
                 if isinstance(store, SqlStore):
                     store.close()
 
@@ -267,6 +300,19 @@ class SeasonDateHttpTest(unittest.TestCase):
                            "start_date": "2026-09-15", "end_date": "2026-09-01"})
         self.assertEqual(s, 400, err)
         self.assertEqual(err["error"]["details"]["reason"], "end_before_start")
+
+    def test_bad_type_program_timezone_over_the_wire_is_400(self):
+        # A JSON bool/number/array/object timezone must be a stable 400, never a
+        # 500 from ZoneInfo or a silent UTC coercion (#272 review).
+        c = self._admin()
+        for bad in [False, 0, 123, [], {}, "Not/AZone"]:
+            s, err = self._req(c, "POST", "/api/v2/setup/program",
+                              {"name": "HTTP Bad TZ", "timezone": bad})
+            self.assertEqual(s, 400, (bad, err))
+            self.assertEqual(err["error"]["details"]["reason"],
+                             "invalid_timezone", (bad, err))
+            self.assertEqual(err["error"]["details"]["field"], "timezone",
+                             (bad, err))
 
 
 if __name__ == "__main__":
