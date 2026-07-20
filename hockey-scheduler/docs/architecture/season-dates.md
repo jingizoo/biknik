@@ -87,6 +87,18 @@ zone; only when no Program row is supplied is the stored Program timezone used
   (`season_end_before_start`). Invalid values are row/field-specific
   (`invalid_season_start` / `invalid_season_end`) and produce **zero writes**
   (the whole batch rolls back).
+- The uploaded `programs.timezone` is itself validated with the same
+  `invalid_timezone` contract, so an unknown zone is never persisted.
+
+**Changing a Program's timezone.** Stored Season instants are never rewritten,
+and every Season display formats them in the Program's *current* timezone — so
+changing a Program's timezone would silently shift the calendar day of its
+already-dated Seasons. With no per-Season date/timezone provenance, the import
+**rejects a timezone change for a Program that has any Season with a stored
+boundary** (`program_timezone_in_use`, `field="timezone"`, zero writes).
+Same-zone/idempotent imports pass, and a timezone change is allowed only when
+the Program has no dated Seasons. Changing the timezone of a Program with dated
+Seasons needs an explicit product decision plus durable per-Season provenance.
 
 ## Scope
 

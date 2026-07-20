@@ -214,21 +214,63 @@ class ImportSeasonBoundaryTest(unittest.TestCase):
             self.assertEqual(season.end_date.isoformat(),
                              "2027-04-01T04:00:00+00:00", label)  # updated
 
-    # -- effective (uploaded) timezone --------------------------------------
-    def test_uploaded_timezone_change_reanchors_new_dates(self):
-        # First import under UTC, then a second upload that CHANGES the Program
-        # timezone to New_York must anchor NEW date-only values in New_York.
+    # -- timezone change on a Program with dated Seasons is rejected --------
+    def test_timezone_change_with_dated_seasons_rejected_zero_writes(self):
+        # A UTC Program with a dated S1; a same-upload timezone change to
+        # New_York (plus a new S2) must be rejected with zero writes — changing
+        # the zone would silently reinterpret S1's stored instant (#272 review).
         for label, store, api, tz in self._each("UTC"):
             self._commit(api, "UTC", (_comp(season_code="S1", start="2026-09-15",
                                             division="D1", division_name="D1"),))
-            self.assertEqual(self._season(store, "S1").start_date.isoformat(),
-                             "2026-09-15T00:00:00+00:00", label)  # midnight UTC
+            s1_start = self._season(store, "S1").start_date
+            audits_before = len(store.all_setup_audit())
+            prev = self._preview(api, "America/New_York",
+                                 (_comp(season_code="S1", start="2026-09-15",
+                                        division="D1", division_name="D1"),
+                                  _comp(season_code="S2", start="2026-10-01",
+                                        division="D2", division_name="D2")))
+            self.assertTrue(any(e["code"] == "program_timezone_in_use"
+                                and e["sheet"] == "programs"
+                                and e.get("field") == "timezone"
+                                for e in prev["errors"]), prev["errors"])
             res = self._commit(api, "America/New_York",
-                               (_comp(season_code="S2", start="2026-09-15",
-                                      division="D2", division_name="D2"),))
+                               (_comp(season_code="S1", start="2026-09-15",
+                                      division="D1", division_name="D1"),
+                                _comp(season_code="S2", start="2026-10-01",
+                                      division="D2", division_name="D2")))
+            self.assertFalse(res["committed"], label)
+            # Program zone, S1 instant, audits, and absence of S2 all unchanged.
+            self.assertEqual(fx.by_ref(store.all_programs(), "OVER55").timezone,
+                             "UTC", label)
+            self.assertEqual(self._season(store, "S1").start_date, s1_start, label)
+            self.assertEqual(len(store.all_setup_audit()), audits_before, label)
+            self.assertEqual([s for s in store.all_seasons()
+                              if s.external_ref == "S2"], [], label)
+
+    def test_same_zone_reimport_with_dated_seasons_is_allowed(self):
+        for label, store, api, tz in self._each("America/New_York"):
+            self._commit(api, "America/New_York", (_comp(start="2026-09-15"),))
+            res = self._commit(api, "America/New_York", (_comp(start="2026-09-15"),))
             self.assertTrue(res["committed"], res.get("errors"))
+            self.assertEqual(res["summary"]["programs"]["updated"], 0, label)
+
+    def test_timezone_change_allowed_when_no_dated_seasons(self):
+        # A Program whose only Season has NO stored boundary may still change
+        # timezone, and a NEW date-only value anchors in the new zone.
+        for label, store, api, tz in self._each("UTC"):
+            self._commit(api, "UTC", (_comp(season_code="S1", division="D1",
+                                            division_name="D1"),))  # no dates
+            self.assertIsNone(self._season(store, "S1").start_date, label)
+            res = self._commit(api, "America/New_York",
+                               (_comp(season_code="S1", division="D1",
+                                      division_name="D1"),
+                                _comp(season_code="S2", start="2026-09-15",
+                                      division="D2", division_name="D2")))
+            self.assertTrue(res["committed"], res.get("errors"))
+            self.assertEqual(fx.by_ref(store.all_programs(), "OVER55").timezone,
+                             "America/New_York", label)
             self.assertEqual(self._season(store, "S2").start_date.isoformat(),
-                             "2026-09-15T04:00:00+00:00", label)  # New_York now
+                             "2026-09-15T04:00:00+00:00", label)  # New_York
 
     # -- uploaded Program timezone must be a real IANA zone -----------------
     def test_new_program_invalid_timezone_rejected_zero_writes(self):

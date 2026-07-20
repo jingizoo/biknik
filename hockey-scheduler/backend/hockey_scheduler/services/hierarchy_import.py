@@ -493,6 +493,15 @@ def validate_hierarchy_import(sheets: Dict[str, List[dict]], store) -> dict:
         if not _blank(row.get("organization_code"))}
     known_org_codes = upload_org_codes | set(existing_orgs)
 
+    # Programs that already own a Season with a stored boundary (#272 review):
+    # changing such a Program's timezone would silently reinterpret those fixed
+    # instants at display time (fmtDateInTz uses the Program's CURRENT zone),
+    # shifting the originally-intended calendar day. There is no per-Season
+    # date/timezone provenance, so the safe scoped rule is to reject the change.
+    dated_program_ids = {
+        s.program_id for s in store.all_seasons()
+        if s.start_date is not None or s.end_date is not None}
+
     for index, row in enumerate(rows["programs"], start=1):
         org_code = _optional(row.get("operator_organization_code"))
         if org_code and org_code not in known_org_codes:
@@ -509,6 +518,22 @@ def validate_hierarchy_import(sheets: Dict[str, List[dict]], store) -> dict:
             report.error("programs", index, "invalid_timezone",
                          f"Invalid timezone: {tz_name!r}. Expected an IANA "
                          "name like 'America/Chicago' or 'UTC'.", "timezone")
+        # Reject a timezone CHANGE for a Program that has dated Seasons. The
+        # effective new zone (blank → UTC, matching upsert_imported_program) is
+        # compared to the stored one; same-zone/idempotent imports pass, and a
+        # change is allowed only when the Program has no dated Seasons.
+        existing_program = existing_programs.get(_clean(row.get("program_code")))
+        new_tz = _clean(row.get("timezone")) or "UTC"
+        if (existing_program is not None
+                and new_tz != existing_program.timezone
+                and existing_program.id in dated_program_ids):
+            report.error(
+                "programs", index, "program_timezone_in_use",
+                f"Cannot change the timezone of Program "
+                f"{existing_program.external_ref} from "
+                f"{existing_program.timezone!r} to {new_tz!r}: it has Seasons "
+                "with stored start/end dates that would shift. Remove the "
+                "Season boundaries first or keep the timezone.", "timezone")
 
     upload_program_codes = {
         _clean(row.get("program_code")) for row in rows["programs"]
