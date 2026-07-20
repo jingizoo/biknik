@@ -198,6 +198,89 @@ class ActiveStateTransitionParityTest(unittest.TestCase):
                     store.close()
 
 
+@unittest.skipUnless(os.environ.get("TEST_DATABASE_URL"),
+                     "PostgreSQL required (set TEST_DATABASE_URL)")
+class RosterSelectionLockOrderRaceTest(unittest.TestCase):
+    """Two concurrent roster selections of the SAME Players in OPPOSITE order
+    ([P1,P2] vs [P2,P1]) must not AB-BA deadlock: select_roster acquires every
+    Player row lock up front in a canonical (sorted) order (#270 review)."""
+
+    def setUp(self):
+        self.url = os.environ["TEST_DATABASE_URL"]
+        SqlStore(self.url).clear_all_data()
+
+    def test_reversed_order_selections_never_deadlock(self):
+        seed = SqlStore(self.url)
+        _seed_chain(seed)
+        api_seed = ApiService(seed)
+        p1 = api_seed.setup.add_player("home", "P1", Position.FORWARD, actor_id="a")
+        p2 = api_seed.setup.add_player("home", "P2", Position.DEFENSE, actor_id="a")
+        _seed_game(seed)
+
+        api_a = ApiService(SqlStore(self.url))
+        api_b = ApiService(SqlStore(self.url))
+        errs = {}
+        # Repeat the barrier a few rounds to make the interleaving likely.
+        for _ in range(5):
+            barrier = threading.Barrier(2)
+
+            def sel(api, ids, key):
+                barrier.wait()
+                try:
+                    api.roster.select_roster("g1", ids, actor_id="a")
+                except Exception as exc:  # a raw DB deadlock/500 would land here
+                    errs[key] = exc
+
+            ta = threading.Thread(target=sel, args=(api_a, [p1.id, p2.id], "a"))
+            tb = threading.Thread(target=sel, args=(api_b, [p2.id, p1.id], "b"))
+            ta.start(); tb.start(); ta.join(15); tb.join(15)
+
+        self.assertEqual(errs, {}, f"reversed-order selection raised: {errs}")
+        check = SqlStore(self.url)
+        # At most one roster row per (game, player) — the selections converged.
+        for pid in (p1.id, p2.id):
+            self.assertIsNotNone(check.roster_entry_for_player("g1", pid))
+        rows = [e for e in check.roster_for_game("g1")]
+        seen = [(e.game_id, e.player_id) for e in rows]
+        self.assertEqual(len(seen), len(set(seen)),
+                         "duplicate roster row for a (game, player)")
+
+
+class RosterSelectionOrderParityTest(unittest.TestCase):
+    """Memory + SQLite parity: the up-front canonical locking preserves the
+    caller's output order and yields a duplicate-free final state."""
+
+    def _backends(self):
+        yield "memory", InMemoryStore()
+        yield "sqlite", SqlStore(":memory:")
+
+    def test_output_follows_caller_order_and_is_duplicate_free(self):
+        for label, store in self._backends():
+            with self.subTest(backend=label):
+                _seed_chain(store)
+                api = ApiService(store)
+                p1 = api.setup.add_player("home", "P1", Position.FORWARD,
+                                          actor_id="a")
+                p2 = api.setup.add_player("home", "P2", Position.DEFENSE,
+                                          actor_id="a")
+                p3 = api.setup.add_player("home", "P3", Position.FORWARD,
+                                          actor_id="a")
+                _seed_game(store)
+                # Reversed vs sorted, with a duplicate, to exercise both the
+                # canonical lock order and caller-order output.
+                entries = api.roster.select_roster(
+                    "g1", [p3.id, p1.id, p2.id, p1.id], actor_id="a")
+                self.assertEqual([e.player_id for e in entries],
+                                 [p3.id, p1.id, p2.id, p1.id], label)
+                # One row per (game, player) despite the duplicate p1.
+                for pid in (p1.id, p2.id, p3.id):
+                    rows = [e for e in store.roster_for_game("g1")
+                            if e.player_id == pid]
+                    self.assertEqual(len(rows), 1, (label, pid))
+                if isinstance(store, SqlStore):
+                    store.close()
+
+
 # =====================================================================
 # 2. Player deactivation vs account rebind / reactivation (PostgreSQL)
 # =====================================================================

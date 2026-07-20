@@ -160,15 +160,22 @@ class RosterService:
         game = self._require_game(game_id)
         self._guard_mutable(game)
 
+        # Row-lock every referenced Player so each is_active eligibility check is
+        # serialized with a concurrent set_player_active deactivation (which
+        # locks the same row) — otherwise a stale is_active=True read could
+        # insert/revive a roster row after deactivation committed is_active=False
+        # (#270 review concurrency). Acquire the locks UP FRONT in a
+        # deterministic canonical order (sorted unique ids) so two concurrent
+        # selections of the same Players in opposite caller order can't AB-BA
+        # deadlock on PostgreSQL (#270 review). The locks are held to commit by
+        # this @_transactional method; the per-player eligibility errors are
+        # still raised below in the CALLER's order, and the output preserves it.
+        locked_players = {pid: self.store.get_player_for_update(pid)
+                          for pid in sorted(set(player_ids))}
+
         entries: List[GameRosterEntry] = []
         for player_id in player_ids:
-            # Row-lock the Player so the is_active eligibility check is
-            # serialized with a concurrent set_player_active deactivation (which
-            # locks the same row) — otherwise a stale is_active=True read could
-            # insert/revive a roster row after deactivation committed
-            # is_active=False (#270 review concurrency). Held to commit inside
-            # this @_transactional method.
-            player = self.store.get_player_for_update(player_id)
+            player = locked_players[player_id]
             if player is None:
                 raise NotFoundError(f"Player {player_id} not found.")
             if player.team_id not in (game.home_team_id, game.away_team_id):
