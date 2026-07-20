@@ -171,6 +171,49 @@ class UpdatePlayerServiceTest(unittest.TestCase):
             self.assertEqual(fresh.team_id, "home", label)
             self.assertTrue(fresh.is_active, label)
 
+    def test_shoots_canonicalized_on_create_and_edit(self):
+        # Canonical L/R persist; case is normalized to uppercase; an explicit
+        # None clears the hand. The same rule holds on create and edit.
+        for label, store, api, setup, player in self._each():
+            created = setup.add_player("home", "Lefty", Position.FORWARD,
+                                       shoots="l", actor_id="a")
+            self.assertEqual(created.shoots, "L", label)   # normalized on create
+            updated = setup.update_player(player.id, shoots=" r ", actor_id="a")
+            self.assertEqual(updated.shoots, "R", label)   # trimmed + upper
+            cleared = setup.update_player(player.id, shoots=None, actor_id="a")
+            self.assertIsNone(cleared.shoots, label)        # explicit clear
+
+    def test_invalid_shoots_is_field_error_and_atomic(self):
+        from hockey_scheduler.domain.errors import ValidationError
+        for label, store, api, setup, player in self._each():
+            # Create rejects a non-canonical hand before persisting anything.
+            with self.assertRaises(ValidationError, msg=label) as cc:
+                setup.add_player("home", "Bad", Position.FORWARD,
+                                 shoots="left", actor_id="a")
+            self.assertEqual(cc.exception.details.get("field"), "shoots", label)
+            self.assertEqual(cc.exception.details.get("reason"),
+                             "invalid_shoots", label)
+            before = store.get_player(player.id).shoots
+            # Edit rejects "banana" AND leaves the player untouched (atomic):
+            # the name change in the same call must not land.
+            with self.assertRaises(ValidationError, msg=label) as ec:
+                setup.update_player(player.id, name="Renamed", shoots="banana",
+                                    actor_id="a")
+            self.assertEqual(ec.exception.details.get("field"), "shoots", label)
+            fresh = store.get_player(player.id)
+            self.assertEqual(fresh.shoots, before, label)
+            self.assertEqual(fresh.name, "Jordn Le", label)   # rolled back
+            self.assertEqual(len(_player_updated_audits(store)), 0, label)
+
+    def test_non_string_shoots_is_field_error(self):
+        from hockey_scheduler.domain.errors import ValidationError
+        for label, store, api, setup, player in self._each():
+            # A boolean is not a string handedness (and bool-is-int must not
+            # sneak through) — a clean field-level error, nothing persisted.
+            with self.assertRaises(ValidationError, msg=label) as ctx:
+                setup.update_player(player.id, shoots=True, actor_id="a")
+            self.assertEqual(ctx.exception.details.get("field"), "shoots", label)
+
 
 class UpdatePlayerHttpTest(unittest.TestCase):
     @classmethod
@@ -254,6 +297,60 @@ class UpdatePlayerHttpTest(unittest.TestCase):
             self.assertEqual(s, 405, method)
             self.assertEqual(body["error"]["code"], "method_not_allowed", method)
             self.assertIn("POST", headers.get("Allow", ""))
+
+    def _shoots_of(self, c, pid):
+        _s, _h, players = self._req(c, "GET", "/api/players")
+        return next(x for x in players if x["id"] == pid).get("shoots")
+
+    def test_edit_valid_shoots_normalizes_and_null_clears(self):
+        c = self._admin()
+        p = self._a_player(c)
+        # Lowercase "l" over the wire is stored canonically as "L".
+        s, _h, _b = self._req(
+            c, "POST", f"/api/v2/setup/player/{p['id']}/update", {"shoots": "l"})
+        self.assertEqual(s, 200)
+        self.assertEqual(self._shoots_of(c, p["id"]), "L")
+        # Explicit null clears the hand.
+        s, _h, _b = self._req(
+            c, "POST", f"/api/v2/setup/player/{p['id']}/update", {"shoots": None})
+        self.assertEqual(s, 200)
+        self.assertIsNone(self._shoots_of(c, p["id"]))
+
+    def test_edit_invalid_shoots_string_is_400_field_error(self):
+        c = self._admin()
+        p = self._a_player(c)
+        before = self._shoots_of(c, p["id"])
+        s, _h, body = self._req(
+            c, "POST", f"/api/v2/setup/player/{p['id']}/update",
+            {"name": "Renamed Too", "shoots": "banana"})
+        self.assertEqual(s, 400)
+        self.assertEqual(body["error"]["details"]["reason"], "invalid_shoots")
+        self.assertEqual(body["error"]["details"]["field"], "shoots")
+        # Atomic: neither the hand nor the name in the same request landed.
+        self.assertEqual(self._shoots_of(c, p["id"]), before)
+        _s, _h, players = self._req(c, "GET", "/api/players")
+        self.assertNotEqual(
+            next(x for x in players if x["id"] == p["id"])["name"], "Renamed Too")
+
+    def test_edit_wrong_type_shoots_is_400(self):
+        c = self._admin()
+        p = self._a_player(c)
+        # A number is the wrong JSON type entirely — caught at the HTTP schema.
+        s, _h, body = self._req(
+            c, "POST", f"/api/v2/setup/player/{p['id']}/update", {"shoots": 5})
+        self.assertEqual(s, 400)
+        self.assertEqual(body["error"]["details"]["reason"], "wrong_type")
+        self.assertEqual(body["error"]["details"]["field"], "shoots")
+
+    def test_create_invalid_shoots_is_400_field_error(self):
+        c = self._admin()
+        team_id = self._a_player(c)["team_id"]
+        s, _h, body = self._req(c, "POST", "/api/v2/setup/player", {
+            "team_id": team_id, "name": "New Skater", "position": "forward",
+            "shoots": "both"})
+        self.assertEqual(s, 400)
+        self.assertEqual(body["error"]["details"]["reason"], "invalid_shoots")
+        self.assertEqual(body["error"]["details"]["field"], "shoots")
 
 
 if __name__ == "__main__":

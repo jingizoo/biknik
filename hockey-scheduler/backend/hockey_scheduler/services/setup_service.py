@@ -48,6 +48,7 @@ from ..domain import (
     jersey_number_error,
 )
 from ..domain.jersey import MAX_JERSEY_NUMBER, MIN_JERSEY_NUMBER
+from ..domain.shooting import VALID_SHOOTS, normalize_shoots
 from ..domain.errors import (
     DivisionMismatchError,
     HasDependenciesError,
@@ -2796,10 +2797,11 @@ class SetupService:
             self._assert_jersey_available(team_id, jersey_number)
         if email:
             self._validate_email(email)
+        canonical_shoots = self._validate_shoots(shoots)
         player = Player(id=self.store.next_id("player"), team_id=team_id,
                         name=self._require_name(name), position=position,
                         jersey_number=jersey_number,
-                        shoots=(shoots or "").strip() or None,
+                        shoots=canonical_shoots,
                         is_active=is_active)
         self.store.add_player(player)
         self._audit("player_added", "player", player.id, actor_id,
@@ -2820,6 +2822,23 @@ class SetupService:
             raise ValidationError(
                 f"Invalid email {email}.",
                 {"reason": "invalid_email", "field": "email"})
+
+    @staticmethod
+    def _validate_shoots(shoots) -> Optional[str]:
+        """Normalize a shooting hand to canonical ``L``/``R``/``None`` (#268).
+
+        The single enforcement point for the ``shoots`` contract on create and
+        edit — the browser dropdown is not a boundary. Returns the canonical
+        stored value (``"L"``, ``"R"`` or ``None``); a non-canonical string or a
+        non-string raises a field-level ``validation_error`` so a bad value is a
+        clean 400 that never reaches the store, contact, or audit trail.
+        """
+        canonical, reason = normalize_shoots(shoots)
+        if reason is not None:
+            raise ValidationError(
+                f"shoots must be one of {', '.join(VALID_SHOOTS)}, or left blank.",
+                {"reason": "invalid_shoots", "field": "shoots"})
+        return canonical
 
     @_transactional
     def update_player(self, player_id: str, *, name=_UNSET, position=_UNSET,
@@ -2856,8 +2875,7 @@ class SetupService:
             player.position = position
             changed.append("position")
         if shoots is not _UNSET:
-            new_shoots = (shoots or "").strip() or None if shoots is not None \
-                else None
+            new_shoots = self._validate_shoots(shoots)
             if new_shoots != player.shoots:
                 player.shoots = new_shoots
                 changed.append("shoots")
