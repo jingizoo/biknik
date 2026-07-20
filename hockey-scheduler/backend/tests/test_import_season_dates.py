@@ -230,6 +230,51 @@ class ImportSeasonBoundaryTest(unittest.TestCase):
             self.assertEqual(self._season(store, "S2").start_date.isoformat(),
                              "2026-09-15T04:00:00+00:00", label)  # New_York now
 
+    # -- uploaded Program timezone must be a real IANA zone -----------------
+    def test_new_program_invalid_timezone_rejected_zero_writes(self):
+        for label, store, api, tz in self._each("Not/AZone"):
+            rows = (_comp(start="2026-09-15"),)
+            prev = self._preview(api, "Not/AZone", rows)
+            self.assertFalse(prev["ok"], label)
+            self.assertTrue(any(e["code"] == "invalid_timezone"
+                                and e["sheet"] == "programs"
+                                and e.get("field") == "timezone"
+                                for e in prev["errors"]), prev["errors"])
+            res = self._commit(api, "Not/AZone", rows)
+            self.assertFalse(res["committed"], label)
+            self.assertEqual(len(store.all_programs()), 0, label)  # no program
+            self.assertEqual(len(store.all_seasons()), 0, label)   # no season
+            self.assertEqual(  # no fallback-created boundary, no audit
+                [a for a in store.all_setup_audit()
+                 if a.action in ("program_created", "season_created")], [], label)
+
+    def test_existing_program_changed_to_invalid_timezone_rejected(self):
+        for label, store, api, tz in self._each("America/New_York"):
+            # First a valid import establishes the Program + a dated Season.
+            self._commit(api, "America/New_York", (_comp(start="2026-09-15"),))
+            season = self._season(store)
+            stored_start = season.start_date
+            # Re-import changing ONLY the Program timezone to an invalid zone.
+            prev = self._preview(api, "Not/AZone", (_comp(start="2026-09-15"),))
+            self.assertTrue(any(e["code"] == "invalid_timezone"
+                                and e["sheet"] == "programs"
+                                for e in prev["errors"]), prev["errors"])
+            res = self._commit(api, "Not/AZone", (_comp(start="2026-09-15"),))
+            self.assertFalse(res["committed"], label)
+            # The stored Program zone + Season instant are untouched.
+            self.assertEqual(fx.by_ref(store.all_programs(), "OVER55").timezone,
+                             "America/New_York", label)
+            self.assertEqual(self._season(store).start_date, stored_start, label)
+
+    def test_blank_program_timezone_defaults_to_utc(self):
+        for label, store, api, tz in self._each(""):
+            res = self._commit(api, "", (_comp(start="2026-09-15"),))
+            self.assertTrue(res["committed"], res.get("errors"))
+            self.assertEqual(fx.by_ref(store.all_programs(), "OVER55").timezone,
+                             "UTC", label)
+            self.assertEqual(self._season(store).start_date.isoformat(),
+                             "2026-09-15T00:00:00+00:00", label)  # midnight UTC
+
     # -- old template without the optional columns --------------------------
     def test_old_template_without_columns_is_accepted(self):
         for label, store, api, tz in self._each("America/New_York"):

@@ -499,6 +499,16 @@ def validate_hierarchy_import(sheets: Dict[str, List[dict]], store) -> dict:
             report.error("programs", index, "unknown_organization_code",
                          f"Unknown operator_organization_code {org_code}.",
                          "operator_organization_code")
+        # A non-blank Program timezone must be a real IANA zone — the SAME
+        # invalid_timezone contract as interactive create_program (#272 review).
+        # Reject at preview so an unknown zone is never persisted (which would
+        # anchor Season instants as UTC yet leave fmtDateInTz with a broken
+        # zone). Blank/missing keeps the documented UTC default.
+        tz_name = _optional(row.get("timezone"))
+        if tz_name is not None and resolve_timezone(tz_name) is None:
+            report.error("programs", index, "invalid_timezone",
+                         f"Invalid timezone: {tz_name!r}. Expected an IANA "
+                         "name like 'America/Chicago' or 'UTC'.", "timezone")
 
     upload_program_codes = {
         _clean(row.get("program_code")) for row in rows["programs"]
