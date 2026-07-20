@@ -214,6 +214,44 @@ class UpdatePlayerServiceTest(unittest.TestCase):
                 setup.update_player(player.id, shoots=True, actor_id="a")
             self.assertEqual(ctx.exception.details.get("field"), "shoots", label)
 
+    def test_non_string_email_on_edit_is_field_error_and_atomic(self):
+        # A direct (non-HTTP) caller must not slip a non-string email past the
+        # helper: False/0 must NOT coerce to "" and silently retire, and a
+        # list/object must NOT raise a bare AttributeError. Each is a clean
+        # field-level invalid_email, and — being one transaction — the
+        # same-call name change and the existing contact are left untouched.
+        from hockey_scheduler.domain.errors import ValidationError
+        for label, store, api, setup, player in self._each():
+            pid = player.id
+            for bad in (False, 0, ["a@b.co"], {"e": "a@b.co"}, "no-at-sign"):
+                with self.assertRaises(ValidationError, msg=(label, bad)) as ctx:
+                    setup.update_player(pid, name="Should Not Land",
+                                        email=bad, actor_id="a")
+                self.assertEqual(ctx.exception.details.get("field"), "email",
+                                 (label, bad))
+                self.assertEqual(ctx.exception.details.get("reason"),
+                                 "invalid_email", (label, bad))
+                fresh = store.get_player(pid)
+                self.assertEqual(fresh.name, "Jordn Le", (label, bad))  # rolled back
+                # The email set at creation ("j@x.com") is untouched — not
+                # retired by a falsy value.
+                self.assertEqual(setup.active_player_email(pid), "j@x.com",
+                                 (label, bad))
+
+    def test_non_string_email_on_create_is_field_error_and_no_player(self):
+        # The same gate on create: a bad-typed email rejects BEFORE the player
+        # is added, so no orphan player is created (atomic create).
+        from hockey_scheduler.domain.errors import ValidationError
+        for label, store, api, setup, player in self._each():
+            before = len(store.players_for_team("home"))
+            for bad in (False, 0, ["a@b.co"], {"e": 1}, "bogus"):
+                with self.assertRaises(ValidationError, msg=(label, bad)) as ctx:
+                    setup.add_player("home", "Ghost", Position.FORWARD,
+                                     email=bad, actor_id="a")
+                self.assertEqual(ctx.exception.details.get("reason"),
+                                 "invalid_email", (label, bad))
+            self.assertEqual(len(store.players_for_team("home")), before, label)
+
 
 class UpdatePlayerHttpTest(unittest.TestCase):
     @classmethod
@@ -341,6 +379,20 @@ class UpdatePlayerHttpTest(unittest.TestCase):
         self.assertEqual(s, 400)
         self.assertEqual(body["error"]["details"]["reason"], "wrong_type")
         self.assertEqual(body["error"]["details"]["field"], "shoots")
+
+    def test_edit_wrong_type_email_is_400(self):
+        c = self._admin()
+        p = self._a_player(c)
+        # A non-string/non-null email (number, bool, array) is the wrong JSON
+        # type — rejected at the HTTP schema with a stable field-level 400,
+        # never coerced into a silent retire.
+        for bad in (5, True, ["a@b.co"]):
+            s, _h, body = self._req(
+                c, "POST", f"/api/v2/setup/player/{p['id']}/update",
+                {"email": bad})
+            self.assertEqual(s, 400, bad)
+            self.assertEqual(body["error"]["details"]["reason"], "wrong_type", bad)
+            self.assertEqual(body["error"]["details"]["field"], "email", bad)
 
     def test_create_invalid_shoots_is_400_field_error(self):
         c = self._admin()

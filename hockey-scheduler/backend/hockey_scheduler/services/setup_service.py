@@ -2789,8 +2789,10 @@ class SetupService:
         # inactive parks its number without reserving it (#269).
         if is_active:
             self._assert_jersey_available(team_id, jersey_number)
-        if email:
-            self._validate_email(email)
+        # Validate/normalize the email BEFORE any write, so a bad type/format
+        # (False, 0, a list, or a malformed string) is a field-level 400 and no
+        # player is created — a blank/None just means "no email" (#268 review).
+        canonical_email = self._validate_email(email)
         canonical_shoots = self._validate_shoots(shoots)
         player = Player(id=self.store.next_id("player"), team_id=team_id,
                         name=self._require_name(name), position=position,
@@ -2800,19 +2802,42 @@ class SetupService:
         self.store.add_player(player)
         self._audit("player_added", "player", player.id, actor_id,
                     {"team_id": team_id})
-        if email:
+        if canonical_email is not None:
             # Nonblank only: create/reactivate via the shared set/retire path.
-            self._set_email_contact(f"player:{player.id}", email)
+            self._set_email_contact(f"player:{player.id}", canonical_email)
         return player
 
     @staticmethod
-    def _validate_email(email: str) -> None:
-        """The same lightweight email shape check the import path applies."""
-        at = email.find("@")
-        if at <= 0 or "." not in email[at + 1:]:
+    def _validate_email(email) -> Optional[str]:
+        """Validate + normalize a Player/Official email (#268 review).
+
+        The single type-safe gate reused by create, edit, and both import
+        paths. The ONLY non-address values allowed are ``None`` and a
+        blank/whitespace string — both normalize to ``None`` (no email / a
+        retire on the set-or-retire path). EVERY other non-string (``False``,
+        ``0``, a list/dict — note ``bool`` is an ``int`` subclass, so it is
+        rejected here rather than coerced) and any malformed string raises a
+        field-level ``validation_error`` (``reason="invalid_email"``,
+        ``field="email"``) BEFORE any normalization or mutation, so a direct
+        service/import caller gets the same atomic, structured rejection the
+        HTTP schema gives — never a silent retire or a bare ``AttributeError``.
+        Returns the trimmed canonical address, or ``None``.
+        """
+        if email is None:
+            return None
+        if not isinstance(email, str):
             raise ValidationError(
-                f"Invalid email {email}.",
+                "email must be a string.",
                 {"reason": "invalid_email", "field": "email"})
+        trimmed = email.strip()
+        if not trimmed:
+            return None
+        at = trimmed.find("@")
+        if at <= 0 or "." not in trimmed[at + 1:]:
+            raise ValidationError(
+                f"Invalid email {trimmed}.",
+                {"reason": "invalid_email", "field": "email"})
+        return trimmed
 
     @staticmethod
     def _validate_shoots(shoots) -> Optional[str]:
@@ -2913,7 +2938,11 @@ class SetupService:
         simply guard the call on a non-empty email; this helper never sees the
         blank in that case.
         """
-        normalized = (email or "").strip() or None
+        # Type-safe gate FIRST: a non-string/non-None value (False, 0, a list)
+        # or a malformed string raises a field-level error before any read or
+        # mutation — never coerced to "" (which would silently retire) and
+        # never a bare AttributeError (#268 review). None/blank → None (retire).
+        normalized = self._validate_email(email)
         existing = self.store.get_contact_destination(
             recipient_ref, NotificationChannel.EMAIL)
         if normalized is None:
@@ -2922,7 +2951,6 @@ class SetupService:
                 self.store.save_contact_destination(existing)
                 return True
             return False
-        self._validate_email(normalized)
         if existing is not None:
             if existing.destination == normalized and existing.active:
                 return False
