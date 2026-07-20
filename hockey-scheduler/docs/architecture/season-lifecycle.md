@@ -100,6 +100,16 @@ blocked too (`delete_season` fails closed with `season_archived` before its
 dependency scan, under the same Season row lock): read-only history must be
 retained, so an operator must reopen a Season before it can be removed.
 
+**Deleting a permanent League** (`delete_league`) is guarded the same way: a
+League participates in a Season only through its `LeagueSeason` bindings, so the
+delete first locks every distinct Season those bindings reference (canonical
+sorted order) and fails `season_archived` if any is archived — otherwise the
+League's deletion would drop that archived Season's `LeagueSeason` (and Game)
+history. Game references are treated as explicit dependencies (a Game-backed
+League blocks on the Game), and when the delete is permitted the League's own
+now-empty `LeagueSeason` bindings are removed in the same transaction so none
+are orphaned. A truly unbound League still deletes cleanly.
+
 A **Team transfer** (direct or import-driven, via the shared
 `_transfer_team_to_league_inner`) locks every distinct Season its candidate
 registrations touch — in canonical sorted order — *before* classifying them, so

@@ -419,6 +419,9 @@ class InMemoryStore:
         self.league_seasons[ls.id] = ls
         return ls
 
+    def delete_league_season(self, ls_id: str) -> None:
+        self.league_seasons.pop(ls_id, None)
+
     def league_seasons_for_season(self, season_id: str) -> List[LeagueSeason]:
         return [ls for ls in self.league_seasons.values()
                 if ls.season_id == season_id]

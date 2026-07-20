@@ -294,6 +294,59 @@ class SeasonArchiveRaceTest(unittest.TestCase):
         self.assertEqual(check.get_team(tid).league_id, l2, results)
 
 
+    def test_archive_vs_delete_league_is_linearizable(self):
+        # An empty permanent League bound to a Season is deleted while an archive
+        # races. Both lock the same Season row: either delete_league wins (Season
+        # active → League + binding removed, archive then archives the empty
+        # Season) or archive wins (delete_league fails season_archived, the
+        # League and its binding survive). A League is NEVER deleted out of an
+        # already-archived Season.
+        store0 = SqlStore(self.url)
+        api0 = ApiService(store0)
+        pid = api0.create_program("Prog", "US", "UTC")["id"]
+        sid = api0.create_season(pid, "S1")["id"]
+        lid = api0.create_league(sid, "Gold")["id"]  # binds a LeagueSeason
+        api_arch = ApiService(SqlStore(self.url))
+        api_del = ApiService(SqlStore(self.url))
+        barrier = threading.Barrier(2)
+        results = {}
+
+        def run(fn, key):
+            barrier.wait()
+            try:
+                fn(); results[key] = "ok"
+            except ValidationError as exc:
+                results[key] = exc.details.get("reason")
+            except NotFoundError:
+                results[key] = "not_found"
+            except Exception as exc:
+                results[key] = f"ERR:{exc}"
+
+        ta = threading.Thread(target=run, args=(
+            lambda: api_arch.setup.archive_season(sid, actor_id="a", reason="x"),
+            "archive"))
+        tb = threading.Thread(target=run, args=(
+            lambda: api_del.setup.delete_league(lid, actor_id="b"), "delete"))
+        ta.start(); tb.start(); ta.join(15); tb.join(15)
+
+        # Archive always commits (delete_league never removes/archives the
+        # Season itself).
+        self.assertEqual(results["archive"], "ok", results)
+        check = SqlStore(self.url)
+        self.assertEqual(check.get_season(sid).status, SeasonStatus.ARCHIVED)
+        bindings = check.league_seasons_for_league(lid)
+        if results["delete"] == "ok":
+            # Delete won the row first (Season active) → League + binding gone.
+            self.assertIsNone(check.get_league(lid), results)
+            self.assertEqual(bindings, [], results)
+        else:
+            # Archive won → delete fails closed; the archived Season keeps its
+            # League and LeagueSeason history.
+            self.assertEqual(results["delete"], "season_archived", results)
+            self.assertIsNotNone(check.get_league(lid), results)
+            self.assertEqual(len(bindings), 1, results)
+
+
 # =====================================================================
 # Memory + SQLite sequential parity
 # =====================================================================

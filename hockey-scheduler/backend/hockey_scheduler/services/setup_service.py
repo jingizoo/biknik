@@ -4685,8 +4685,18 @@ class SetupService:
             raise NotFoundError(f"League {league_id} not found.")
         # #283: a Division/registration no longer stores league_id directly —
         # both hang off the League's LeagueSeasons. Resolve this League's
-        # LeagueSeason ids and find dependents through them.
-        ls_ids = {ls.id for ls in self.store.league_seasons_for_league(league_id)}
+        # LeagueSeason bindings and find dependents through them.
+        ls_rows = self.store.league_seasons_for_league(league_id)
+        ls_ids = {ls.id for ls in ls_rows}
+        # #159 — a permanent League participates in a Season only through its
+        # LeagueSeason bindings. Lock every distinct Season it touches, in
+        # canonical sorted order, and fail closed if ANY is archived: deleting
+        # the League would drop that archived Season's LeagueSeason (and any
+        # Game) history, changing the archived hierarchy after the read-only
+        # linearization point. The lock serializes this against a concurrent
+        # archive on the same Season row.
+        for sid in sorted({ls.season_id for ls in ls_rows if ls.season_id}):
+            self._require_active_season(sid)
         divisions = [d for d in self.store.all_divisions()
                      if d.league_season_id in ls_ids]
         # #233 B2b review r2: a registration's league is REQUIRED in v2 and can
@@ -4696,10 +4706,22 @@ class SetupService:
         # own registration check just below.
         regs = [r for r in self.store.all_season_team_registrations()
                 if r.league_season_id in ls_ids]
+        # #159 — Games reference this League by its LeagueSeason (or, for legacy
+        # rows, its league_id). Historical Game-backed participation must not be
+        # silently dropped: a Game blocks the delete so the operator resolves it
+        # first (its owning Season, if archived, has already failed above).
+        games = [g for g in self.store.all_games()
+                 if g.league_season_id in ls_ids or g.league_id == league_id]
         self._block_if_dependents("level", league_id, "league", [
             self._dep_group("division", divisions, lambda d: d.name),
             self._dep_group("team registration", regs,
-                            lambda r: self._team_name(r.team_id))])
+                            lambda r: self._team_name(r.team_id)),
+            self._dep_group("game", games, self._matchup)])
+        # No dependents survive, and every bound Season is active — remove the
+        # League's own (now empty) LeagueSeason bindings in the same transaction
+        # so none are orphaned, then the League row itself.
+        for ls in ls_rows:
+            self.store.delete_league_season(ls.id)
         self.store.delete_league(league_id)
         self._audit("level_deleted", "level", league_id, actor_id,
                     {"name": league.name, "program_id": league.program_id})

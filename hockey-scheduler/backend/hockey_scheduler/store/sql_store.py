@@ -877,6 +877,7 @@ class SqlStore:
     def get_league_season(self, ls_id): return self._get(LeagueSeason, ls_id)
     def all_league_seasons(self): return self._query(LeagueSeason, order="id")
     def save_league_season(self, ls): return self._update(ls)
+    def delete_league_season(self, ls_id): self._delete(LeagueSeason, ls_id)
     def league_seasons_for_season(self, season_id):
         return self._query(LeagueSeason, "season_id = ?", (season_id,), order="id")
     def league_seasons_for_league(self, league_id):
