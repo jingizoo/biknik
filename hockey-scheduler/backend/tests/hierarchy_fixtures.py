@@ -14,7 +14,8 @@ VENUES_RINKS_HEADER = (
     "rink_code,rink_name")
 COMPETITION_HEADER = (
     "program_code,season_code,season_name,league_code,league_name,"
-    "league_sort_order,division_code,division_name,age_group")
+    "league_sort_order,division_code,division_name,age_group,"
+    "season_start,season_end")
 CLUBS_HEADER = "club_code,club_name,country"
 PERMANENT_TEAMS_HEADER = "program_code,league_code,team_code,team_name,club_code"
 PLAYERS_HEADER = (

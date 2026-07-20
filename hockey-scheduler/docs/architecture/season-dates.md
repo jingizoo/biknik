@@ -64,12 +64,34 @@ ISO-8601 text and serialized on the wire as ISO-8601 strings (or `null`) —
 unchanged from before #272. **Existing stored instants are never rewritten**;
 this change only widens what `create_season` accepts as input.
 
+## Import path
+
+The canonical hierarchy `competition` sheet carries two **optional** trailing
+columns, `season_start` and `season_end`, accepting the same forms as manual
+setup. Old templates without the columns still import (absent → unset). Import
+preview and commit use the **same** `parse_season_boundary` and the **effective
+Program timezone**: if the upload's `programs` sheet supplies (or changes) the
+Program's timezone, date-only Season values are normalized with that uploaded
+zone; only when no Program row is supplied is the stored Program timezone used
+— preview and commit resolve this identically.
+
+- **Repeated `competition` rows** for one `season_code` are compared **after
+  normalization**: two non-blank forms resolving to the same UTC instant agree;
+  a blank cell is unspecified (never a conflict); two different normalized
+  non-blank values are rejected (`inconsistent_season_dates`).
+- **Blank re-import preserves** a stored boundary — a blank cell never clears an
+  existing Season's start/end. A supplied value equal to the stored instant is a
+  no-op (no update/audit).
+- The **final merged pair** is range-checked: a supplied side is compared against
+  the preserved opposite side, and a reversed final range is rejected
+  (`season_end_before_start`). Invalid values are row/field-specific
+  (`invalid_season_start` / `invalid_season_end`) and produce **zero writes**
+  (the whole batch rolls back).
+
 ## Scope
 
-The identical parser (`parse_season_boundary`) is the single entry point for
-season boundaries. Today only `create_season` sets them (manual setup and the
-canonical import both route through it; the import sheet does not yet carry
-season dates, and rollover/copy-forward reuses an existing target season's
-boundaries rather than recomputing them). Any future season-date writer — a
-season editor, a dated import column, or registration windows — must call
+`parse_season_boundary` is the single entry point for season boundaries, shared
+by `create_season` (manual setup) and the hierarchy import. Rollover/copy-forward
+reuses an existing target season's boundaries rather than recomputing them. Any
+future season-date writer — a season editor or registration windows — must call
 `parse_season_boundary` so the contract stays uniform.

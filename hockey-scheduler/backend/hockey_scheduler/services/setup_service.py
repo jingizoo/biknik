@@ -2457,17 +2457,30 @@ class SetupService:
         return existing, False, changed
 
     def upsert_imported_season(self, code: str, name: str, program_id: str,
+                               start_date=None, end_date=None,
                                existing=None, actor_id: Optional[str] = None,
                                import_batch_id: Optional[str] = None):
-        values = {"name": name, "program_id": program_id}
+        # start_date/end_date are ALREADY-PARSED timezone-aware UTC datetimes (or
+        # None) from the caller's shared parse_season_boundary (#272). On CREATE
+        # they set the boundaries (None → unset). On UPDATE a None side is
+        # OMITTED from the diff so a blank import cell PRESERVES the stored
+        # boundary rather than clearing it; a supplied side that already equals
+        # the stored instant is a no-op (_apply_changes skips it → no false
+        # update/audit on an equivalent repeat import).
         if existing is None:
             obj = Season(id=self.store.next_id("season"), external_ref=code,
-                        **values)
+                         name=name, program_id=program_id,
+                         start_date=start_date, end_date=end_date)
             self.store.add_season(obj)
             self._audit("season_created", "season", obj.id, actor_id,
                        {"import_batch_id": import_batch_id, "external_ref": code,
                         "program_id": program_id})
             return obj, True, []
+        values = {"name": name, "program_id": program_id}
+        if start_date is not None:
+            values["start_date"] = start_date
+        if end_date is not None:
+            values["end_date"] = end_date
         changed = self._apply_changes(existing, values)
         if changed:
             self.store.save_season(existing)

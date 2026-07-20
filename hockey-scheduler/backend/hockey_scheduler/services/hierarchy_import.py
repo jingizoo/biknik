@@ -20,14 +20,20 @@ bridge) is never written by this importer.
 """
 
 from collections import OrderedDict
+from datetime import timezone
 from typing import Dict, Iterable, List, Optional, Tuple
 
 from ..domain.enums import Position
+from ..domain.errors import ValidationError
 from ..domain.jersey import (
     MAX_JERSEY_NUMBER,
     MIN_JERSEY_NUMBER,
     parse_jersey_cell,
 )
+# The season-boundary parser + timezone resolver are shared with the interactive
+# create_season path (#272) so manual setup and this import normalize dates
+# identically. setup_service does not import this module, so there is no cycle.
+from .setup_service import parse_season_boundary, resolve_timezone
 
 
 HIERARCHY_SHEET_NAMES = (
@@ -51,10 +57,16 @@ HIERARCHY_TEMPLATES = {
         "venue_code,organization_code,venue_name,address,timezone,rink_code,rink_name\n"
         "PLAINFIELD,CANLON,Plainfield Ice,123 Main St,America/Chicago,PF1,Rink 1\n"
     ),
+    # season_start / season_end are OPTIONAL (#272): a date-only YYYY-MM-DD or a
+    # timezone-aware ISO-8601 value, normalized to the Program's timezone. Old
+    # templates without these trailing columns still import (blank → unset, and
+    # on re-import a blank cell preserves the stored boundary).
     "competition_csv": (
         "program_code,season_code,season_name,league_code,league_name,"
-        "league_sort_order,division_code,division_name,age_group\n"
-        "OVER55,FALL26,Fall 2026,L1,Adult League,1,DIVA,Division A,Adult\n"
+        "league_sort_order,division_code,division_name,age_group,"
+        "season_start,season_end\n"
+        "OVER55,FALL26,Fall 2026,L1,Adult League,1,DIVA,Division A,Adult,"
+        "2026-09-15,2027-03-15\n"
     ),
     # Club (#260): matched by its own stable club_code, never by name — a
     # renamed Club (same code, new club_name) updates the existing record.
@@ -233,6 +245,106 @@ def _group_first(rows: List[dict], code_field: str) -> OrderedDict:
     return grouped
 
 
+def _import_program_timezone(program_code, upload_programs, existing_programs):
+    """Resolve the timezone to normalize a Season's date-only boundaries (#272).
+
+    The EFFECTIVE post-import timezone wins: if this upload supplies a
+    ``programs`` row for ``program_code``, that row's timezone is used (even if
+    it changes an existing Program's zone); only when no Program row is supplied
+    is the stored Program's timezone used. An unknown/blank zone falls back to
+    UTC (matching the interactive path), never a 500. Preview and commit call
+    this identically so their normalization can never diverge.
+    """
+    for row in upload_programs:
+        if _clean(row.get("program_code")) == program_code:
+            return resolve_timezone(_clean(row.get("timezone"), "UTC")) \
+                or timezone.utc
+    existing = existing_programs.get(program_code)
+    if existing is not None:
+        return resolve_timezone(existing.timezone) or timezone.utc
+    return timezone.utc
+
+
+def _season_raw_boundaries(comp_rows: List[dict], season_code: str) -> dict:
+    """The first non-blank ``season_start`` / ``season_end`` cell for a season
+    across its (already consistency-validated) competition rows. A blank field
+    stays ``None`` so the caller can preserve an existing stored boundary."""
+    out = {"season_start": None, "season_end": None}
+    for row in comp_rows:
+        if _clean(row.get("season_code")) != season_code:
+            continue
+        for field in ("season_start", "season_end"):
+            if out[field] is None:
+                out[field] = _optional(row.get(field))
+    return out
+
+
+def _validate_season_boundaries(report, comp_rows, upload_programs,
+                                existing_programs, existing_seasons) -> None:
+    """Preview-validate optional Season start/end boundaries (#272).
+
+    Uses the SAME parser (``parse_season_boundary``) and the effective Program
+    timezone as the interactive path. Rows repeating a ``season_code`` are
+    compared AFTER normalization — two non-blank forms that resolve to the same
+    UTC instant agree; a blank cell is unspecified (never a conflict); two
+    different normalized non-blank values conflict. The FINAL MERGED pair is
+    range-checked: a blank cell preserves the existing Season's stored side, and
+    a supplied side is compared against that preserved opposite side.
+    """
+    per_season = {}
+    for index, row in enumerate(comp_rows, start=1):
+        scode = _optional(row.get("season_code"))
+        if not scode:
+            continue
+        entry = per_season.setdefault(
+            scode, {"program_code": _clean(row.get("program_code")),
+                    "season_start": [], "season_end": []})
+        for field in ("season_start", "season_end"):
+            raw = _optional(row.get(field))
+            if raw is not None:
+                entry[field].append((raw, index))
+
+    for scode, entry in per_season.items():
+        tz = _import_program_timezone(
+            entry["program_code"], upload_programs, existing_programs)
+        normalized = {}
+        for field in ("season_start", "season_end"):
+            instant = None
+            for raw, index in entry[field]:
+                try:
+                    dt = parse_season_boundary(raw, field, tz)
+                except ValidationError as exc:
+                    report.error("competition", index, f"invalid_{field}",
+                                 _error_message(exc), field)
+                    continue
+                if instant is None:
+                    instant = dt
+                elif dt != instant:
+                    report.error(
+                        "competition", index, "inconsistent_season_dates",
+                        f"Rows for season_code {scode} give a different "
+                        f"{field}.", field)
+            normalized[field] = instant
+        # Merge with the existing Season: a blank supplied side preserves the
+        # stored side, then range-check the FINAL pair.
+        existing = existing_seasons.get(scode)
+        merged_start = normalized["season_start"] if \
+            normalized["season_start"] is not None else \
+            (existing.start_date if existing else None)
+        merged_end = normalized["season_end"] if \
+            normalized["season_end"] is not None else \
+            (existing.end_date if existing else None)
+        if merged_start and merged_end and merged_end < merged_start:
+            idx = (entry["season_end"] or entry["season_start"] or [(None, 1)])[0][1]
+            report.error("competition", idx, "season_end_before_start",
+                         "season_end cannot be before season_start.",
+                         "season_end")
+
+
+def _error_message(exc) -> str:
+    return exc.args[0] if getattr(exc, "args", None) else "Invalid date."
+
+
 def _check_player_jersey_conflicts(report, player_rows, store, existing_teams,
                                    upload_team_codes) -> None:
     """Report import rows whose active-team jersey collides (#269).
@@ -392,6 +504,13 @@ def validate_hierarchy_import(sheets: Dict[str, List[dict]], store) -> dict:
         _clean(row.get("program_code")) for row in rows["programs"]
         if not _blank(row.get("program_code"))}
     known_program_codes = upload_program_codes | set(existing_programs)
+
+    # Optional Season start/end boundaries (#272): same parser + effective
+    # Program timezone as the interactive path; rejects invalid, reversed
+    # (final merged pair), and inconsistent-after-normalization repeated rows.
+    _validate_season_boundaries(
+        report, rows["competition"], rows["programs"],
+        existing_programs, existing_seasons)
 
     for index, row in enumerate(rows["venues_rinks"], start=1):
         org_code = _optional(row.get("organization_code"))
@@ -1091,8 +1210,17 @@ def commit_hierarchy_import(setup, sheets: Dict[str, List[dict]],
         for code, row in _group_first(
                 rows["competition"], "season_code").items():
             program = programs[_clean(row.get("program_code"))]
+            # Normalize date-only boundaries in the freshly-upserted Program's
+            # timezone — the SAME parser + zone preview validated (#272). A blank
+            # cell parses to None and preserves any stored boundary in the
+            # upsert. Validation already passed, so parsing cannot raise here.
+            tz = resolve_timezone(program.timezone) or timezone.utc
+            raw = _season_raw_boundaries(rows["competition"], code)
+            start = parse_season_boundary(raw["season_start"], "start_date", tz)
+            end = parse_season_boundary(raw["season_end"], "end_date", tz)
             obj, created, changed = setup.upsert_imported_season(
                 code, _clean(row.get("season_name")), program.id,
+                start_date=start, end_date=end,
                 existing=seasons.get(code), actor_id=actor_id,
                 import_batch_id=batch_id)
             seasons[code] = obj
