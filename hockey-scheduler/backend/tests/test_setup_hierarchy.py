@@ -51,6 +51,31 @@ class SetupHierarchyTest(unittest.TestCase):
         self.assertEqual(v["id"], venue["id"])
         self.assertEqual(v["rinks"][0]["ice_slot_count"], 1)
 
+    def test_v1_level_node_key_set_frozen(self):
+        # #233 freezes the v1 hierarchy shape: the nested level node exposes ONLY
+        # its legacy UI keys. The #159 unbind's league_season_id must never leak
+        # into v1 (it lives on the v2 hierarchy only).
+        league, season, level, div, club, team = self._competition()
+        h = self.api.get_setup_hierarchy()
+        lg = next(x for x in h["leagues"] if x["id"] == league["id"])
+        lv = lg["seasons"][0]["levels"][0]
+        self.assertEqual(set(lv), {"id", "name", "sort_order", "divisions"}, lv)
+        self.assertNotIn("league_season_id", lv)
+        self.assertNotIn("league_season_id", json.dumps(h))
+
+    def test_v2_league_node_exposes_binding_id(self):
+        # The v2 hierarchy DOES expose the LeagueSeason binding id, so the UI can
+        # drive the explicit unbind (delete_league_season) before deleting a
+        # League (#159).
+        league, season, level, div, club, team = self._competition()
+        binding = self.api.store.league_season_for(level["id"], season["id"])
+        self.assertIsNotNone(binding)
+        h2 = self.api.get_setup_hierarchy_v2()
+        prog = next(p for p in h2["programs"] if p["id"] == league["id"])
+        lv = prog["seasons"][0]["leagues"][0]
+        self.assertEqual(lv["id"], level["id"])
+        self.assertEqual(lv["league_season_id"], binding.id)
+
     def test_competition_tree_nests_level_division_team(self):
         league, season, level, div, club, team = self._competition()
         self.api.create_player(team["id"], "Vince Skater", "forward")

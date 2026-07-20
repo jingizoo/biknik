@@ -316,8 +316,14 @@ class V1SetupContractTest(unittest.TestCase):
     def test_v1_hierarchy_never_leaks_canonical_keys(self):
         c = self._admin()
         org = self._create(c, "organization", {"name": "H Org", "short_name": "HOG"})
-        self._create(c, "league",
-                     {"name": "H Prog", "organization_id": org["id"]})
+        league = self._create(c, "league",
+                              {"name": "H Prog", "organization_id": org["id"]})
+        season = self._create(c, "season",
+                              {"league_id": league["id"], "name": "H S"})
+        level = self._create(c, "level", {"season_id": season["id"], "name": "H L"})
+        self._create(c, "division",
+                     {"season_id": season["id"], "level_id": level["id"],
+                      "name": "H D"})
         status, body = self._req(c, "GET", "/api/setup/hierarchy")
         self.assertEqual(status, 200, body)
         # The nested hierarchy uses its own explicit UI keys; the canonical field
@@ -325,6 +331,12 @@ class V1SetupContractTest(unittest.TestCase):
         blob = json.dumps(body)
         self.assertNotIn("operator_organization_id", blob)
         self.assertNotIn("program_id", blob)
+        # #233: the v1 level-node key set is FROZEN — the #159 unbind's
+        # league_season_id lives on the v2 hierarchy only, never v1.
+        self.assertNotIn("league_season_id", blob)
+        lg = next(x for x in body["leagues"] if x["id"] == league["id"])
+        lv = lg["seasons"][0]["levels"][0]
+        self.assertEqual(set(lv), {"id", "name", "sort_order", "divisions"}, lv)
 
     def test_v1_error_envelope_shape_and_status(self):
         c = self._admin()

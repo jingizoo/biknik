@@ -294,6 +294,10 @@ class V2SetupContractTest(unittest.TestCase):
         s = next(x for x in prog["seasons"] if x["id"] == season["id"])
         lg = next(x for x in s["leagues"] if x["id"] == league["id"])
         self.assertEqual(len(lg["divisions"]), 1)
+        # #159 — the v2 League node exposes its LeagueSeason binding id so the UI
+        # can drive the explicit unbind before deleting a League.
+        self.assertIn("league_season_id", lg)
+        self.assertTrue(lg["league_season_id"])
         # Canonical vocabulary only — no legacy key names anywhere in the tree.
         blob = json.dumps(body)
         self.assertNotIn("level_id", blob)
