@@ -52,15 +52,17 @@ Schema changes are applied by a small forward-only runner in `migrate()`:
   (`001_initial.sql`, `002_sessions.sql`, …), applied in numeric order.
 - `schema_migrations(version, applied_at)` is **authoritative**: a version
   already recorded there is skipped, and a version is recorded only after all
-  of its statements succeed. Migrations preserve logical data — no migration
-  discards or alters row *values* — but some are not purely additive: because
-  SQLite cannot add a foreign key to an existing table, an FK migration on SQLite
-  **rebuilds** the affected tables (create-copy-drop-rename, e.g. migration 040
-  copies every team and player row into a new table with the FK, then drops the
-  old one). The rebuild runs inside the migration's single transaction, preserves
-  every column/index/incoming reference, and is validated by a fail-closed
-  pre-migration data check first, so it is all-or-nothing — but it is a physical
-  table rewrite, not an in-place `ALTER`. **Take a backup before upgrading.**
+  of its statements succeed. Migrations are forward-only and vary in kind: most
+  add columns or indexes; some **backfill or transform existing row values**
+  (e.g. 037 populates `game.league_season_id`); and — because SQLite cannot add a
+  foreign key to an existing table — an FK migration on SQLite **rebuilds** the
+  affected tables (create-copy-drop-rename; e.g. migration 040 copies every team
+  and player row into a new table with the foreign key, then drops the old one).
+  That rebuild preserves each row's values, columns, indexes, and incoming
+  references, runs inside the migration's single transaction, and is gated by a
+  fail-closed pre-migration data check — so it is all-or-nothing — but it is a
+  physical table rewrite, not an in-place `ALTER`. **Take a backup before
+  upgrading.**
 - The DDL is `CREATE … IF NOT EXISTS`, so adopting this system on a database
   that predates it (all tables present, no per-migration rows) is safe: the
   files re-run harmlessly and backfill the ledger.

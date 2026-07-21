@@ -565,14 +565,38 @@ class ReassignmentRaceTest(unittest.TestCase):
             self.fail("child never reached its foreign-key write")
         td.start()
         # The child holds the parent's FK key-share lock; the delete's
-        # get_*_for_update conflicts and must block. Give it time to reach the
-        # lock, then prove it is still waiting (has not committed a delete).
-        time.sleep(0.5)
+        # get_*_for_update conflicts and must block. Prove it is ACTUALLY blocked
+        # on the lock by polling PostgreSQL's own pg_stat_activity view (not a
+        # fixed sleep) until the delete's backend registers as waiting on a
+        # heavyweight Lock.
+        self.assertTrue(self._wait_until_blocked_on_lock(),
+                        "delete never registered as waiting on a row lock")
         self.assertIsNone(results.get("delete"),
-                          "delete did not wait on the child's parent-row lock")
+                          "delete completed without blocking on the child's lock")
         release.set()               # child commits → delete unblocks → sees child
         tc.join(25); td.join(25)
         return results
+
+    def _wait_until_blocked_on_lock(self, timeout=10.0):
+        """Poll PostgreSQL's pg_stat_activity until a backend in this database is
+        ACTIVELY waiting on a heavyweight lock (``wait_event_type = 'Lock'``) — a
+        deterministic proof that the delete is blocked on the parent row lock,
+        with no reliance on a fixed sleep. Returns True once observed, else False
+        on timeout. A short poll interval only bounds busy-spin; correctness comes
+        from the lock-state query, not from any elapsed time."""
+        import psycopg
+        deadline = time.monotonic() + timeout
+        with psycopg.connect(self.url, autocommit=True) as mon:
+            while time.monotonic() < deadline:
+                with mon.cursor() as cur:
+                    cur.execute(
+                        "SELECT count(*) FROM pg_stat_activity "
+                        "WHERE datname = current_database() "
+                        "AND state = 'active' AND wait_event_type = 'Lock'")
+                    if cur.fetchone()[0] >= 1:
+                        return True
+                time.sleep(0.02)
+        return False
 
     # -- seeds -------------------------------------------------------------
     def _seed_team(self, api, extra_team=False):

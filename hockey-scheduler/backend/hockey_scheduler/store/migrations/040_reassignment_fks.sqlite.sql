@@ -47,7 +47,7 @@ CREATE INDEX IF NOT EXISTS ix_teams_league ON teams (league_id);
 -- (ix_players_team lookup and the 038 partial-unique active-jersey index).
 CREATE TABLE players_new (
   id TEXT PRIMARY KEY,
-  team_id TEXT REFERENCES teams (id),
+  team_id TEXT REFERENCES teams (id) ON DELETE NO ACTION,
   name TEXT,
   position TEXT,
   shoots TEXT,
