@@ -20,7 +20,11 @@ from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
 
 from hockey_scheduler.api import ApiService
 from hockey_scheduler.domain.enums import SeasonStatus
-from hockey_scheduler.domain.errors import HasDependenciesError, ValidationError
+from hockey_scheduler.domain.errors import (
+    HasDependenciesError,
+    NotFoundError,
+    ValidationError,
+)
 from hockey_scheduler.domain.setup_models import Program, Season
 from hockey_scheduler.store import InMemoryStore, SqlStore
 from hockey_scheduler.web.server import STATE, Handler
@@ -507,6 +511,40 @@ class SeasonArchivedDeleteAndTransferGuardTest(unittest.TestCase):
                           {g["type"] for g in r["error"]["details"]["dependencies"]},
                           label)
             self.assertIsNotNone(store.get_league_season(ls_id), label)
+
+    def test_reunbind_and_division_after_unbind_fail_closed(self):
+        # Deterministic parity (all backends) for the re-fetch-under-lock
+        # invariant behind the unbind-vs-unbind / unbind-vs-create_division PG
+        # barrier races: unbinding an already-unbound binding fails not-found
+        # with NO second audit, and creating a Division under a League whose sole
+        # binding was unbound fails closed (league_has_no_season) — never an
+        # orphaned Division on a deleted LeagueSeason.
+        for label, store in _backends():
+            api = ApiService(store)
+            pid = api.create_program("P", "US", "UTC")["id"]
+            sid = api.create_season(pid, "S1")["id"]
+            lid = api.create_league(sid, "Gold")["id"]
+            ls_id = store.league_seasons_for_league(lid)[0].id
+
+            def _del_audits():
+                return [a for a in store.all_setup_audit()
+                        if a.action == "league_season_deleted"
+                        and a.entity_id == ls_id]
+
+            api.setup.delete_league_season(ls_id, actor_id="a")
+            self.assertIsNone(store.get_league_season(ls_id), label)
+            self.assertEqual(len(_del_audits()), 1, label)
+            # Re-unbind the now-gone binding: not-found, zero extra audit.
+            with self.assertRaises(NotFoundError):
+                api.setup.delete_league_season(ls_id, actor_id="b")
+            self.assertEqual(len(_del_audits()), 1, label)
+            # Division create against the League's absent sole binding fails
+            # closed rather than orphaning a Division on the deleted binding.
+            with self.assertRaises(ValidationError) as ctx:
+                api.setup.create_division_under_league(lid, "D1", actor_id="c")
+            self.assertEqual(ctx.exception.details.get("reason"),
+                             "league_has_no_season", label)
+            self.assertEqual(store.all_divisions(), [], label)
 
     def test_delete_league_blocked_by_permanent_team(self):
         # A League with a permanent Team (Team.league_id) but no seasonal records

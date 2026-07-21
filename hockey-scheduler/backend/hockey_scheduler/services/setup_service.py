@@ -543,9 +543,20 @@ class SetupService:
                 f"LeagueSeason {league_season_id} not found.")
         # #159 — read-only guard: an archived Season's participation history is
         # frozen (locks the Season row, serializing against a concurrent
-        # archive).
+        # archive AND a concurrent unbind/create on the same binding).
         if ls.season_id:
             self._require_active_season(ls.season_id)
+        # #159 — RE-FETCH the binding UNDER the Season lock before scanning
+        # dependents or deleting. The first read above is unlocked, so a
+        # concurrent delete_league_season of the SAME binding (which locks the
+        # same Season row) could have already removed it; without this re-check
+        # both callers would "succeed" and write duplicate league_season_deleted
+        # audits. A binding that is already gone fails closed with zero
+        # delete/audit — exactly one unbind wins.
+        ls = self.store.get_league_season(league_season_id)
+        if ls is None:
+            raise NotFoundError(
+                f"LeagueSeason {league_season_id} not found.")
         divisions = [d for d in self.store.all_divisions()
                      if d.league_season_id == league_season_id]
         regs = [r for r in self.store.all_season_team_registrations()
@@ -646,10 +657,11 @@ class SetupService:
         The League participates in one Season here (the common case); the
         LeagueSeason is resolved from the league's sole binding. Delegates to the
         Division create against that LeagueSeason."""
+        # #159 — canonical League→Season lock order: lock the League row first,
+        # then resolve its sole binding, then lock that binding's Season.
+        self._lock_league_for_binding(league_id)
         lss = self.store.league_seasons_for_league(league_id)
         if not lss:
-            if self.store.get_league(league_id) is None:
-                raise NotFoundError(f"League {league_id} not found.")
             raise ValidationError(
                 "That league is not yet part of any season.",
                 {"reason": "league_has_no_season", "league_id": league_id})
@@ -659,12 +671,23 @@ class SetupService:
                 "division against a specific season.",
                 {"reason": "ambiguous_season_for_league", "league_id": league_id})
         self._require_active_season(lss[0].season_id)  # #159 read-only guard
+        # #159 — RE-FETCH the binding UNDER the Season lock before inserting: the
+        # sole-binding read above is unlocked, so a concurrent
+        # delete_league_season (which locks the same Season row) could have
+        # unbound it. Inserting a Division against a deleted LeagueSeason would
+        # orphan it (migration 035 has no FK). A binding unbound out from under us
+        # fails closed with zero write/audit.
+        binding = self.store.get_league_season(lss[0].id)
+        if binding is None:
+            raise ValidationError(
+                "That league is not yet part of any season.",
+                {"reason": "league_has_no_season", "league_id": league_id})
         division = Division(id=self.store.next_id("division"),
-                            league_season_id=lss[0].id,
+                            league_season_id=binding.id,
                             name=self._require_name(name), age_group=age_group)
         self.store.add_division(division)
         self._audit("division_created", "division", division.id, actor_id,
-                    {"league_season_id": lss[0].id, "level_id": league_id})
+                    {"league_season_id": binding.id, "level_id": league_id})
         return division
 
     @_transactional
