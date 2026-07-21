@@ -17,7 +17,7 @@ import os
 import tempfile
 import unittest
 
-from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
+from helpers import BACKEND, suspend_program_org_fks  # noqa: F401
 
 from hockey_scheduler.store import SqlStore
 from hockey_scheduler.store.sql_store import migrate
@@ -102,6 +102,11 @@ def _downgrade_028(store):
 def _seed_pre028(store):
     """Representative pre-028 rows covering the full competition chain."""
     with store.transaction():
+        # Seed the operator organization so the program's operator ref stays
+        # valid through migration 042's FK (#201 Slice 4); the re-migrate's
+        # foreign_key_check gate would otherwise flag it.
+        _exec(store, "INSERT INTO organizations (id, name) VALUES (?, ?)",
+              ("org1", "Org One"))
         _exec(store, "INSERT INTO leagues (id, name, organization_id) "
               "VALUES (?, ?, ?)", ("prog1", "Program One", "org1"))
         _exec(store, "INSERT INTO seasons (id, league_id, name) VALUES (?, ?, ?)",
@@ -137,6 +142,11 @@ class C1bUpgradedReopenTest(unittest.TestCase):
                 first = SqlStore(url)
                 if is_shared:
                     first.reset_schema()
+                # The pre-028 seed models legacy data migration 042's FKs would
+                # reject; suspend them BEFORE the downgrade renames programs/
+                # leagues away, so PostgreSQL can drop the named constraints while
+                # the tables still carry their canonical names (#201 Slice 4).
+                suspend_program_org_fks(first)
                 _downgrade_035(first)
                 _downgrade_028(first)
                 _seed_pre028(first)

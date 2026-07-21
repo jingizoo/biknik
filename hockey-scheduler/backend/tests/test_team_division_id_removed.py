@@ -15,7 +15,7 @@ import os
 import unittest
 from pathlib import Path
 
-from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
+from helpers import BACKEND, suspend_program_org_fks  # noqa: F401
 
 from hockey_scheduler.api.service import ApiService
 from hockey_scheduler.domain import (
@@ -293,6 +293,10 @@ class LegacyFieldIsInertContract:
         # review): the resolver must still reject it, not trust matching-but-
         # dangling ids.
         ghost = "league_ghost"
+        # Deliberately dangling program id: migration 042's seasons.program_id →
+        # programs FK would reject this legacy row, so suspend it for the plant
+        # (#201 Slice 4). The resolver must still reject the dangling reference.
+        suspend_program_org_fks(self.store)
         season = Season(id=self.store.next_id("season"), program_id=ghost, name="S")
         self.store.add_season(season)
         team = Team(id=self.store.next_id("team"), name="Ghost", program_id=ghost)

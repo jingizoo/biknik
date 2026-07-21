@@ -20,6 +20,36 @@ if str(BACKEND) not in sys.path:
     sys.path.insert(0, str(BACKEND))
 
 
+def suspend_program_org_fks(store):
+    """Disable migration 042's Program/Organization + Venue-owner foreign keys on
+    a test store so legacy *dangling* rows can be planted — a program/season/
+    league/venue whose owner id resolves to no row. Those are the pre-042 data
+    older migration/preflight/legacy-field tests deliberately model, which the new
+    constraints would now reject.
+
+    PostgreSQL drops the five named constraints. SQLite disables enforcement on
+    the connection (its inline column-level foreign keys can't be dropped without
+    a full table rebuild, and these tests either only read afterward or re-run
+    ``migrate()``, which manages the pragma itself). A no-op on the in-memory
+    store, which has no foreign keys. Idempotent and safe to call at setup time.
+    """
+    from hockey_scheduler.store import SqlStore
+    if not isinstance(store, SqlStore):
+        return
+    if store.backend == "postgres":
+        cur = store.conn.cursor()
+        for table, constraint in (
+                ("programs", "fk_programs_operator_org"),
+                ("venues", "fk_venues_organization"),
+                ("seasons", "fk_seasons_program"),
+                ("leagues", "fk_leagues_program"),
+                ("venues", "fk_venues_program")):
+            cur.execute(
+                f"ALTER TABLE {table} DROP CONSTRAINT IF EXISTS {constraint}")
+    else:
+        store.conn.execute("PRAGMA foreign_keys = OFF")
+
+
 def cookie_from_set_cookie(set_cookie_header, name):
     """Extract a single cookie's ``name=value`` from a Set-Cookie header.
 

@@ -5093,14 +5093,49 @@ class SetupService:
         games = [g for g in self.store.all_games() if g.ice_slot_id == slot_id]
         return [self._dep_group("game", games, self._matchup)]
 
+    # #201 Slice 4 — Program/Organization + Venue-owner ownership integrity. The
+    # organization/program deletes take no row lock (FK-only, mirroring the
+    # facility deletes above): a child CREATE that commits in the
+    # pre-check→delete window is invisible to _block_if_dependents and only the
+    # incoming foreign key stops the orphaning delete. Same shared machinery — the
+    # store signals DependentDeleteConflict, the outermost transaction()
+    # post-rollback handler re-resolves via these builders and raises the SAME
+    # itemised HasDependenciesError the pre-check raises.
+    def _organization_dependent_groups(self, org_id: str) -> list:
+        programs = [p for p in self.store.all_programs()
+                    if p.operator_organization_id == org_id]
+        venues = [v for v in self.store.all_venues()
+                  if v.organization_id == org_id]
+        return [self._dep_group("league", programs, lambda p: p.name,
+                                display="program"),
+                self._dep_group("venue", venues, lambda v: v.name)]
+
+    def _program_dependent_groups(self, program_id: str) -> list:
+        seasons = self.store.seasons_for_program(program_id)
+        leagues = [lg for lg in self.store.all_leagues()
+                   if lg.program_id == program_id]
+        teams = self.store.teams_for_program(program_id)
+        venues = [v for v in self.store.all_venues()
+                  if v.league_id == program_id]
+        return [self._dep_group("season", seasons, lambda s: s.name),
+                self._dep_group("level", leagues, lambda lg: lg.name,
+                                display="league"),
+                self._dep_group("team", teams, lambda t: t.name),
+                self._dep_group("venue", venues, lambda v: v.name)]
+
     # Store entity_type (from DependentDeleteConflict) → (details entity_type,
     # itemised-block label, dependent-groups resolver). The details entity_type
     # matches the pre-check's exactly, so the race loser and the up-front block
-    # carry byte-identical HasDependenciesError.details.
+    # carry byte-identical HasDependenciesError.details. (delete_program's
+    # pre-check entity_type is the legacy "league", from before #233 renamed
+    # League → Program.)
     _DEPENDENT_DELETE_SPECS = {
         "venue": ("venue", "venue", "_venue_dependent_groups"),
         "rink": ("rink", "rink", "_rink_dependent_groups"),
         "ice_slot": ("ice slot", "ice slot", "_ice_slot_dependent_groups"),
+        "organization": ("organization", "facility owner",
+                         "_organization_dependent_groups"),
+        "program": ("league", "program", "_program_dependent_groups"),
     }
 
     def _resolve_dependent_delete_conflict(self, conflict) -> None:
@@ -5147,17 +5182,16 @@ class SetupService:
     @_transactional
     def delete_organization(self, org_id: str,
                             actor_id: Optional[str] = None) -> Organization:
+        # No row lock (#201 Slice 4, FK-only like the facility deletes): the
+        # incoming programs.operator_organization_id / venues.organization_id
+        # foreign keys backstop the create-child-vs-delete race, and the
+        # itemised block is re-resolved from the outermost transaction's
+        # post-rollback handler when the child commits first.
         org = self.store.get_organization(org_id)
         if org is None:
             raise NotFoundError(f"Organization {org_id} not found.")
-        leagues = [lg for lg in self.store.all_programs()
-                   if lg.operator_organization_id == org_id]
-        venues = [v for v in self.store.all_venues()
-                  if v.organization_id == org_id]
-        self._block_if_dependents("organization", org_id, "facility owner", [
-            self._dep_group("league", leagues, lambda lg: lg.name,
-                            display="program"),
-            self._dep_group("venue", venues, lambda v: v.name)])
+        self._block_if_dependents("organization", org_id, "facility owner",
+                                  self._organization_dependent_groups(org_id))
         self.store.delete_organization(org_id)
         self._audit("organization_deleted", "organization", org_id, actor_id,
                     {"name": org.name})
@@ -5230,13 +5264,14 @@ class SetupService:
         program = self.store.get_program(program_id)
         if program is None:
             raise NotFoundError(f"Program {program_id} not found.")
-        seasons = self.store.seasons_for_program(program_id)
-        teams = self.store.teams_for_program(program_id)
-        venues = [v for v in self.store.all_venues() if v.league_id == program_id]
-        self._block_if_dependents("league", program_id, "program", [
-            self._dep_group("season", seasons, lambda s: s.name),
-            self._dep_group("team", teams, lambda t: t.name),
-            self._dep_group("venue", venues, lambda v: v.name)])
+        # #201 Slice 4: seasons.program_id / leagues.program_id / venues.league_id
+        # now have foreign keys onto programs, so a permanent League is a real
+        # dependent (added to the itemised block below, no longer silently
+        # orphaned). The delete takes no row lock; the incoming FKs backstop the
+        # create-child-vs-delete race and the block is re-resolved on the
+        # post-rollback path.
+        self._block_if_dependents("league", program_id, "program",
+                                  self._program_dependent_groups(program_id))
         self.store.delete_program(program_id)
         self._audit("league_deleted", "league", program_id, actor_id,
                     {"name": program.name})

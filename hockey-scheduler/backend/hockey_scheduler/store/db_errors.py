@@ -137,6 +137,38 @@ def translate_venue_hierarchy_fk_exception(
         message, details={"reason": reason, **context})
 
 
+def translate_program_org_fk_exception(
+        exc: BaseException, *, constraint: str, reason: str,
+        message: str, **context) -> Optional[DomainError]:
+    """Translate migration 042's Program/Organization + Venue-owner FK violation
+    with domain context (#201 Slice 4).
+
+    programs.operator_organization_id → organizations(id),
+    venues.organization_id → organizations(id), seasons.program_id → programs(id),
+    leagues.program_id → programs(id) and the legacy venues.league_id →
+    programs(id) are the concurrency backstops for the create-child-vs-delete-
+    parent races (create_program/create_season/create_league/create_venue racing
+    delete_organization/delete_program): the service validates the destination
+    parent up front, so a violation here means a race-losing writer tried to land
+    a row whose parent was concurrently deleted. Callers surface a precise, stable
+    reason (organization_not_found / program_not_found) with the offending parent
+    id — the same secret-free shape the service pre-check raises on the non-race
+    path, never exposing driver text, SQL, or the constraint name.
+
+    On PostgreSQL the exact violated constraint is matched by name (``.diag``), so
+    a write site with more than one foreign key (venues) is disambiguated here. On
+    SQLite the message names no constraint, so a single-foreign-key write site is
+    unambiguous, but a multi-foreign-key one (venues) must disambiguate by which
+    validated parent is now missing (see SqlStore._write_venue).
+    """
+    if isinstance(exc, DomainError):
+        return None
+    if not _is_named_fk_violation(exc, constraint):
+        return None
+    return IntegrityConflictError(
+        message, details={"reason": reason, **context})
+
+
 def translate_ice_slot_conflict_exception(
         exc: BaseException, ice_slot_id: str) -> Optional[DomainError]:
     """Translate migration 022's one-active-game-per-ice-slot violation (#201

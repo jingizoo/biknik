@@ -108,12 +108,35 @@ by the partial unique index `ux_games_active_ice_slot` (migration 022); migratio
 `ScheduleConflictError` (`ice_slot_taken`), so the race loser sees the same
 conflict the service pre-check raises — no new constraint is needed.
 
-Migration 041 is the **facility-hierarchy subset** of #201's no-row-lock work; it
-does not complete #201. The Program/Organization structural relationships carry
-the same unlocked-read → stale-write exposure (`programs.operator_organization_id
-→ organizations` for `create_program` vs `delete_organization`; `seasons.program_id
-→ programs` for `create_season` vs `delete_program`) and are tracked as a
-follow-up slice — #201 stays open until they land.
+Migration 041 is the **facility-hierarchy subset** of #201's no-row-lock work.
+**Migration 042** (#201 Slice 4) adds the **Program/Organization + Venue-owner**
+subset — the same unlocked-read → stale-write exposure one level up:
+
+- `programs.operator_organization_id → organizations(id)` (`create_program` vs
+  `delete_organization`);
+- `venues.organization_id → organizations(id)` (`create_venue` vs
+  `delete_organization`);
+- `seasons.program_id → programs(id)` (`create_season` vs `delete_program`);
+- `leagues.program_id → programs(id)` (`create_league` vs `delete_program`);
+- the legacy `venues.league_id → programs(id)` owner link (`create_venue` vs
+  `delete_program`).
+
+`venues` therefore carries **two** outgoing foreign keys; a racing write's
+violation is disambiguated at the store boundary by constraint name on
+PostgreSQL and by re-reading which validated parent is now missing on SQLite
+(whose error names neither). `delete_program` now reports the Program's permanent
+Leagues as a dependency group — with `leagues.program_id` a real foreign key, a
+League can no longer be silently orphaned. Because `create_league` requires a
+Season (whose presence itself blocks `delete_program`), the `leagues → programs`
+race is exercised at the store boundary; the other four families have forced
+PostgreSQL race coverage. On SQLite, migration 042 rebuilds
+programs/seasons/leagues/venues in dependency order (programs first); `venues` is
+referenced by `rinks`/`season_venue_access` (migration 041), so the populated
+upgrade rides the same runner `foreign_keys = OFF` + `foreign_key_check`
+mechanism 041 introduced.
+
+Together 041 and 042 close the setup-hierarchy no-row-lock structural races that
+#201 catalogued.
 
 Each such migration ships with (a) a forward-only pre-migration check in
 `store/integrity_checks.py` that reports any pre-existing dangling row and aborts
@@ -127,10 +150,11 @@ behaviour is spelled out explicitly as `ON DELETE NO ACTION` in both dialects
 rejected. The in-memory store has no foreign keys; it relies on its process-wide
 transaction lock plus the same service dependency checks for parity.
 
-For the facility-hierarchy deletes (migration 041), losing the "no row lock" race
-must still return the operator the **same itemised has-dependencies error** the
-pre-check produces — the concurrently-committed dependent named with its
-group/count/ids — not a thin timing error. Because the losing `DELETE` aborts the
+For the no-row-lock deletes (`delete_venue`/`delete_rink`/`delete_ice_slot` from
+migration 041, and `delete_organization`/`delete_program` from migration 042),
+losing the race must still return the operator the **same itemised
+has-dependencies error** the pre-check produces — the concurrently-committed
+dependent named with its group/count/ids — not a thin timing error. Because the losing `DELETE` aborts the
 PostgreSQL transaction, that re-resolution can only read a clean connection *after*
 the transaction has rolled back. The store therefore raises an internal
 `DependentDeleteConflict` at the delete site and re-resolves it from the
@@ -145,7 +169,8 @@ or poisons the caller's atomic unit.
 **Rollback / recovery (forward-only).** These migrations are forward-only; there
 is no down-migration. On SQLite these FK migrations physically rebuild their
 tables (migration 040: `teams`/`players`; migration 041:
-`rinks`/`ice_slots`/`games`/`season_venue_access` — see the migration runner note
+`rinks`/`ice_slots`/`games`/`season_venue_access`; migration 042:
+`programs`/`seasons`/`leagues`/`venues` — see the migration runner note
 above), so **a backup taken before the upgrade is the recovery path** — rollback
 means restore-from-backup (or a future explicit down-migration), not re-running
 the runner. Logical row values are preserved by the rebuild, but the physical

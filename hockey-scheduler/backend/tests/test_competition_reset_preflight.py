@@ -29,7 +29,7 @@ create real parent rows so the gate is never fed invalid input.
 import os
 import unittest
 
-from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
+from helpers import BACKEND, suspend_program_org_fks  # noqa: F401
 
 from hockey_scheduler.store import SqlStore
 from hockey_scheduler.store.integrity_checks import (
@@ -86,6 +86,12 @@ def _fresh(url):
     store = SqlStore(url)
     if url != ":memory:":
         store.reset_schema()
+    # Migration 042's seasons.program_id → programs FK would reject the legacy
+    # dangling rows these pre-028 gate tests plant; suspend it (and its siblings)
+    # so the pre-042 data can be modeled (#201 Slice 4). Must run BEFORE the
+    # downgrade renames leagues/programs away, so PostgreSQL can drop the named
+    # constraints while the tables still carry their canonical names.
+    suspend_program_org_fks(store)
     _downgrade_to_pre028(store)
     return store
 
