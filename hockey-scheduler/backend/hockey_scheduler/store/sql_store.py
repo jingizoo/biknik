@@ -82,12 +82,16 @@ from ..domain.errors import IntegrityConflictError
 from .db import connect
 from .db_errors import (
     translate_db_exception,
+    translate_dependency_delete_exception,
+    translate_ice_slot_conflict_exception,
     translate_player_jersey_exception,
     translate_reassignment_fk_exception,
+    translate_venue_hierarchy_fk_exception,
 )
 from .integrity_checks import (
     assert_competition_hierarchy_reset_ready,
     assert_competition_reset_ready_c1b,
+    assert_iceslot_venue_fks_ready,
     assert_reassignment_fks_ready,
     assert_regular_games_resolve_league_season,
     assert_no_duplicate_active_ice_slots,
@@ -359,6 +363,7 @@ _PRE_MIGRATION_CHECKS = {
     "037_game_league_season": assert_regular_games_resolve_league_season,
     "038_active_team_jersey_unique": assert_player_jersey_constraints_ready,
     "040_reassignment_fks": assert_reassignment_fks_ready,
+    "041_iceslot_venue_fks": assert_iceslot_venue_fks_ready,
 }
 
 
@@ -808,10 +813,32 @@ class SqlStore:
         return self._query(Player, order="id")
 
     # -- games -------------------------------------------------------------
-    def add_game(self, game): return self._insert(game)
+    def _write_game(self, write, game):
+        try:
+            return write(game)
+        except Exception as exc:
+            # ux_games_active_ice_slot (migration 022): a race-losing create onto
+            # a slot another active game just booked — even from a different
+            # Season — surfaces as the same stable ScheduleConflictError the
+            # service raises via game_using_ice_slot (#201 Slice 3).
+            translated = translate_ice_slot_conflict_exception(
+                exc, game.ice_slot_id)
+            # games.ice_slot_id → ice_slots(id) (migration 041): a race-losing
+            # write onto a concurrently-deleted slot surfaces as the same stable
+            # conflict the service raises when it validates the slot up front.
+            if translated is None:
+                translated = translate_venue_hierarchy_fk_exception(
+                    exc, constraint="fk_games_ice_slot", reason="ice_slot_not_found",
+                    message="The change references an ice slot that does not exist.",
+                    ice_slot_id=game.ice_slot_id)
+            if translated is not None:
+                raise translated from exc
+            raise
+
+    def add_game(self, game): return self._write_game(self._insert, game)
     def get_game(self, game_id): return self._get(Game, game_id)
     def all_games(self): return self._query(Game, order="id")
-    def save_game(self, game): return self._update(game)
+    def save_game(self, game): return self._write_game(self._update, game)
     def delete_game(self, game_id):
         with self._lock:
             self._exec("DELETE FROM games WHERE id = ?", (game_id,))
@@ -979,10 +1006,29 @@ class SqlStore:
                        (decision_id,))
 
     # -- season venue access (#233 Slice E) ---------------------------------
-    def add_season_venue_access(self, sva): return self._insert(sva)
+    def _write_season_venue_access(self, write, sva):
+        try:
+            return write(sva)
+        except Exception as exc:
+            # season_venue_access.venue_id → venues(id) (migration 041): a
+            # race-losing grant onto a concurrently-deleted venue surfaces as the
+            # same stable conflict the service raises when it validates the venue
+            # (#201 Slice 3). The season side takes the Season row lock, so only
+            # the venue side needs this backstop — one FK, unambiguous on SQLite.
+            translated = translate_venue_hierarchy_fk_exception(
+                exc, constraint="fk_sva_venue", reason="venue_not_found",
+                message="The change references a venue that does not exist.",
+                venue_id=sva.venue_id)
+            if translated is not None:
+                raise translated from exc
+            raise
+
+    def add_season_venue_access(self, sva):
+        return self._write_season_venue_access(self._insert, sva)
     def get_season_venue_access(self, sva_id):
         return self._get(SeasonVenueAccess, sva_id)
-    def save_season_venue_access(self, sva): return self._update(sva)
+    def save_season_venue_access(self, sva):
+        return self._write_season_venue_access(self._update, sva)
     def all_season_venue_access(self):
         return self._query(SeasonVenueAccess, order="id")
     def season_venue_access_for_season(self, season_id):
@@ -1013,15 +1059,45 @@ class SqlStore:
     def all_venues(self): return self._query(Venue, order="id")
     def save_venue(self, venue): return self._update(venue)
 
-    def add_rink(self, rink): return self._insert(rink)
+    def _write_rink(self, write, rink):
+        try:
+            return write(rink)
+        except Exception as exc:
+            # rinks.venue_id → venues(id) (migration 041): a race-losing create
+            # onto a concurrently-deleted venue surfaces as the same stable
+            # conflict the service raises when it validates the venue (#201 Slice 3).
+            translated = translate_venue_hierarchy_fk_exception(
+                exc, constraint="fk_rinks_venue", reason="venue_not_found",
+                message="The change references a venue that does not exist.",
+                venue_id=rink.venue_id)
+            if translated is not None:
+                raise translated from exc
+            raise
+
+    def add_rink(self, rink): return self._write_rink(self._insert, rink)
     def get_rink(self, rink_id): return self._get(Rink, rink_id)
     def all_rinks(self): return self._query(Rink, order="id")
-    def save_rink(self, rink): return self._update(rink)
+    def save_rink(self, rink): return self._write_rink(self._update, rink)
 
-    def add_ice_slot(self, slot): return self._insert(slot)
+    def _write_ice_slot(self, write, slot):
+        try:
+            return write(slot)
+        except Exception as exc:
+            # ice_slots.rink_id → rinks(id) (migration 041): a race-losing create
+            # onto a concurrently-deleted rink surfaces as the same stable
+            # conflict the service raises when it validates the rink (#201 Slice 3).
+            translated = translate_venue_hierarchy_fk_exception(
+                exc, constraint="fk_ice_slots_rink", reason="rink_not_found",
+                message="The change references a rink that does not exist.",
+                rink_id=slot.rink_id)
+            if translated is not None:
+                raise translated from exc
+            raise
+
+    def add_ice_slot(self, slot): return self._write_ice_slot(self._insert, slot)
     def get_ice_slot(self, slot_id): return self._get(IceSlot, slot_id)
     def all_ice_slots(self): return self._query(IceSlot, order="id")
-    def save_ice_slot(self, slot): return self._update(slot)
+    def save_ice_slot(self, slot): return self._write_ice_slot(self._update, slot)
 
     def add_setup_audit(self, entry): return self._insert(entry)
     def all_setup_audit(self): return self._query(SetupAuditLog, order="id")
@@ -1128,11 +1204,32 @@ class SqlStore:
     def delete_team(self, team_id): self._delete(Team, team_id)
     def delete_season_team_registration(self, registration_id):
         self._delete(SeasonTeamRegistration, registration_id)
-    def delete_venue(self, venue_id): self._delete(Venue, venue_id)
+    def _delete_parent(self, model, entity_type, entity_id):
+        # A parent delete that races behind a committed child blocks on the
+        # child's FK key-share lock, then fails on the incoming reference — the
+        # #201 Slice 3 facility-hierarchy backstop (rinks→venues, ice_slots→rinks,
+        # games→ice_slots, season_venue_access→venues). Translate that incoming-FK
+        # violation into the same stable has-dependencies block the service
+        # pre-check raises, never a raw driver error or cascade.
+        try:
+            self._delete(model, entity_id)
+        except Exception as exc:
+            translated = translate_dependency_delete_exception(
+                exc, entity_type=entity_type, entity_id=entity_id,
+                message=f"Can't delete this {entity_type} — dependent record(s) "
+                        "still exist. Remove them first.")
+            if translated is not None:
+                raise translated from exc
+            raise
+
+    def delete_venue(self, venue_id):
+        self._delete_parent(Venue, "venue", venue_id)
     def delete_season_venue_access(self, sva_id):
         self._delete(SeasonVenueAccess, sva_id)
-    def delete_rink(self, rink_id): self._delete(Rink, rink_id)
-    def delete_ice_slot(self, slot_id): self._delete(IceSlot, slot_id)
+    def delete_rink(self, rink_id):
+        self._delete_parent(Rink, "rink", rink_id)
+    def delete_ice_slot(self, slot_id):
+        self._delete_parent(IceSlot, "ice_slot", slot_id)
     def delete_official(self, official_id): self._delete(Official, official_id)
     def delete_player(self, player_id): self._delete(Player, player_id)
 

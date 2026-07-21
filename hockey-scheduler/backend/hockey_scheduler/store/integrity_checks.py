@@ -235,6 +235,91 @@ def assert_reassignment_fks_ready(conn):
         + ". Reattach or clear these references before upgrading.")
 
 
+# -- #201 Slice 3 — IceSlot / venue facility-hierarchy integrity preflight ---
+#
+# Migration 041 adds rinks.venue_id → venues(id), ice_slots.rink_id → rinks(id),
+# games.ice_slot_id → ice_slots(id), and season_venue_access.venue_id →
+# venues(id). These read-only checks report every non-null child reference that
+# names no parent BEFORE the constraints are added, so an upgrade against
+# dangling data fails loudly with the offending row ids rather than an opaque
+# constraint error. NULLs are excluded: a nullable foreign key permits NULL, so
+# only a concrete dangling reference blocks the upgrade. Pure SELECTs, portable
+# across SQLite/PostgreSQL, safe to re-run.
+
+
+def find_orphan_rink_venues(conn):
+    """Rink ids whose non-null venue_id names no existing venue (migration 041)."""
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT r.id FROM rinks r "
+        "LEFT JOIN venues v ON v.id = r.venue_id "
+        "WHERE r.venue_id IS NOT NULL AND v.id IS NULL")
+    return sorted(row["id"] for row in cur.fetchall())
+
+
+def find_orphan_ice_slot_rinks(conn):
+    """Ice-slot ids whose non-null rink_id names no existing rink (migration 041)."""
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT s.id FROM ice_slots s "
+        "LEFT JOIN rinks r ON r.id = s.rink_id "
+        "WHERE s.rink_id IS NOT NULL AND r.id IS NULL")
+    return sorted(row["id"] for row in cur.fetchall())
+
+
+def find_orphan_game_ice_slots(conn):
+    """Game ids whose non-null ice_slot_id names no existing ice slot (migration 041)."""
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT g.id FROM games g "
+        "LEFT JOIN ice_slots s ON s.id = g.ice_slot_id "
+        "WHERE g.ice_slot_id IS NOT NULL AND s.id IS NULL")
+    return sorted(row["id"] for row in cur.fetchall())
+
+
+def find_orphan_sva_venues(conn):
+    """SeasonVenueAccess ids whose venue_id names no existing venue (migration 041)."""
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT a.id FROM season_venue_access a "
+        "LEFT JOIN venues v ON v.id = a.venue_id "
+        "WHERE a.venue_id IS NOT NULL AND v.id IS NULL")
+    return sorted(row["id"] for row in cur.fetchall())
+
+
+def assert_iceslot_venue_fks_ready(conn):
+    """Abort migration 041 if any rink references a missing venue, any ice slot a
+    missing rink, any game a missing ice slot, or any season-venue-access a
+    missing venue (#201 Slice 3)."""
+    orphan_rinks = find_orphan_rink_venues(conn)
+    orphan_slots = find_orphan_ice_slot_rinks(conn)
+    orphan_games = find_orphan_game_ice_slots(conn)
+    orphan_access = find_orphan_sva_venues(conn)
+    if not (orphan_rinks or orphan_slots or orphan_games or orphan_access):
+        return
+
+    def _describe(ids, noun, parent):
+        shown = ", ".join(ids[:20])
+        more = "" if len(ids) <= 20 else f" (+{len(ids) - 20} more)"
+        return (f"{len(ids)} {noun} reference a {parent} that does not exist: "
+                f"{shown}{more}")
+
+    problems = []
+    if orphan_rinks:
+        problems.append(_describe(orphan_rinks, "rink(s)", "venue"))
+    if orphan_slots:
+        problems.append(_describe(orphan_slots, "ice slot(s)", "rink"))
+    if orphan_games:
+        problems.append(_describe(orphan_games, "game(s)", "ice slot"))
+    if orphan_access:
+        problems.append(_describe(orphan_access, "season-venue-access row(s)",
+                                  "venue"))
+    raise MigrationDataError(
+        "Cannot add the rink → venue / ice slot → rink / game → ice slot / "
+        "season-venue-access → venue foreign keys: " + "; ".join(problems)
+        + ". Reattach or clear these references before upgrading.")
+
+
 # -- #233 Slice C — competition-model reset reparent preflight -------------
 #
 # Slice C reparents each Division onto a League (today's `levels`) and derives a

@@ -57,9 +57,12 @@ Schema changes are applied by a small forward-only runner in `migrate()`:
   (e.g. 037 populates `game.league_season_id`); and — because SQLite cannot add a
   foreign key to an existing table — an FK migration on SQLite **rebuilds** the
   affected tables (create-copy-drop-rename; e.g. migration 040 copies every team
-  and player row into a new table with the foreign key, then drops the old one).
-  That rebuild preserves each row's values, columns, indexes, and incoming
-  references, runs inside the migration's single transaction, and is gated by a
+  and player row into a new table with the foreign key, and migration 041 does
+  the same for rinks, ice slots, games, and season-venue-access rows, then drops
+  the old ones). That rebuild preserves each row's values, columns, indexes
+  (including the partial unique `ux_games_active_ice_slot`), and incoming
+  references (`game_results`/`game_roster_entries` still target the rebuilt
+  `games`), runs inside the migration's single transaction, and is gated by a
   fail-closed pre-migration data check — so it is all-or-nothing — but it is a
   physical table rewrite, not an in-place `ALTER`. **Take a backup before
   upgrading.**
@@ -82,7 +85,22 @@ foreign keys are:
 - `game_roster_entries.game_id → games(id)` and `.player_id → players(id)`
   (migration 027);
 - `teams.club_id → clubs(id)` and `players.team_id → teams(id)` (migration 040 —
-  the backstop for the assign/delete reassignment races).
+  the backstop for the assign/delete reassignment races);
+- `rinks.venue_id → venues(id)`, `ice_slots.rink_id → rinks(id)`,
+  `games.ice_slot_id → ice_slots(id)`, and `season_venue_access.venue_id →
+  venues(id)` (migration 041 — the backstop for the facility-hierarchy "no row
+  lock" races: create_rink vs delete_venue, create_ice_slot vs delete_rink,
+  create_game vs delete_ice_slot, and grant_season_venue_access vs delete_venue).
+  The season side of `season_venue_access` deliberately gets **no** foreign key:
+  `grant_season_venue_access` and `delete_season` both take the Season row lock,
+  so that pair already serialises; only the venue side lacked a lock.
+
+Cross-Season ice-slot **double-booking** (two active games on one slot, created
+under different Season locks that don't serialise) is already database-enforced
+by the partial unique index `ux_games_active_ice_slot` (migration 022); migration
+041 adds only the store-boundary translation of that violation into a stable
+`ScheduleConflictError` (`ice_slot_taken`), so the race loser sees the same
+conflict the service pre-check raises — no new constraint is needed.
 
 Each such migration ships with (a) a forward-only pre-migration check in
 `store/integrity_checks.py` that reports any pre-existing dangling row and aborts
@@ -97,13 +115,15 @@ rejected. The in-memory store has no foreign keys; it relies on its process-wide
 transaction lock plus the same service dependency checks for parity.
 
 **Rollback / recovery (forward-only).** These migrations are forward-only; there
-is no down-migration. On SQLite the FK migration physically rebuilds `teams` and
-`players` (see the migration runner note above), so **a backup taken before the
-upgrade is the recovery path** — rollback means restore-from-backup (or a future
-explicit down-migration), not re-running the runner. Logical row values are
-preserved by the rebuild, but the physical tables are replaced. On PostgreSQL the
-migration is two `ADD CONSTRAINT` statements (no table rewrite); reverting would
-be an explicit `DROP CONSTRAINT` migration. In all cases the fail-closed
+is no down-migration. On SQLite these FK migrations physically rebuild their
+tables (migration 040: `teams`/`players`; migration 041:
+`rinks`/`ice_slots`/`games`/`season_venue_access` — see the migration runner note
+above), so **a backup taken before the upgrade is the recovery path** — rollback
+means restore-from-backup (or a future explicit down-migration), not re-running
+the runner. Logical row values are preserved by the rebuild, but the physical
+tables are replaced. On PostgreSQL these migrations are `ADD CONSTRAINT`
+statements (no table rewrite); reverting would be an explicit `DROP CONSTRAINT`
+migration. In all cases the fail-closed
 pre-migration check refuses to touch a database that still holds dangling
 references, so a dirty upgrade aborts cleanly with the offending ids named and
 zero mutation.
