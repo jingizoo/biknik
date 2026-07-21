@@ -5180,7 +5180,6 @@ class SetupService:
         return f"{rink.name if rink else 'ice slot'} {when}".strip()
 
     @_transactional
-    @_transactional
     def delete_organization(self, org_id: str,
                             actor_id: Optional[str] = None) -> Organization:
         # No row lock (#201 Slice 4, FK-only like the facility deletes): the

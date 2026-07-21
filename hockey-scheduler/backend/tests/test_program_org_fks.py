@@ -25,6 +25,7 @@ Two Slice-4 specifics:
 """
 
 import os
+import tempfile
 import threading
 import time
 import unittest
@@ -371,6 +372,24 @@ class StoreBoundaryTranslationTest(unittest.TestCase):
             store.save_season(s)
         self._run(plant, "program_not_found", {"program_id": "ghost"})
 
+    def test_save_league_onto_missing_program(self):
+        def plant(store):
+            _add_program(store, "p1")
+            _add_league(store, "l1", "p1")
+            lg = store.get_league("l1")
+            lg.program_id = "ghost"
+            store.save_league(lg)
+        self._run(plant, "program_not_found", {"program_id": "ghost"})
+
+    def test_save_venue_onto_missing_org(self):
+        def plant(store):
+            _add_org(store, "o1")
+            _add_venue(store, "v1", org="o1")
+            v = store.get_venue("v1")
+            v.organization_id = "ghost"
+            store.save_venue(v)
+        self._run(plant, "organization_not_found", {"organization_id": "ghost"})
+
     def test_save_venue_onto_missing_program(self):
         def plant(store):
             _add_venue(store, "v1")
@@ -409,6 +428,165 @@ class MigrationLedgerTest(unittest.TestCase):
                         _add_season(store, "s_bad", "ghost_prog")
             finally:
                 store.reset_schema()
+                store.close()
+
+
+class MigrationRebuildPreservationTest(unittest.TestCase):
+    """A *populated* upgrade-from-041 preserves every rebuilt row value, every
+    recreated index, the five new outgoing FKs, AND the incoming
+    rinks → venues / season_venue_access → venues references (migration 041) that
+    the venues rebuild must keep. This is the regression that would catch a
+    column drop/reorder or a botched populated rebuild — the failure mode the
+    runner foreign_keys=OFF + foreign_key_check mechanism exists for. Runs on a
+    file-backed SQLite database (so the reopen is real) and on PostgreSQL when
+    available."""
+
+    _ORG = ("o1", "Org One", "OO", "EXT-O1")
+    _PROGRAM = ("p1", "Program One", "CA", "America/Toronto", "o1", "EXT-P1")
+    _SEASON = ("s1", "p1", "Winter", "2027-01-01", "2027-03-31", "EXT-S1",
+               "archived", "2027-04-01T00:00:00+00:00")
+    _LEAGUE = ("l1", "Gold", 7, "EXT-L1", "p1")
+    _VENUE = ("v1", "Ice Palace", "1 Rink Rd", "America/New_York", "o1", "p1",
+              "EXT-V1")
+    _RINK = ("r1", "v1", "North Rink", "EXT-R1")     # incoming (041 FK)
+    _SVA = ("a1", "s1", "v1", 1)                      # incoming (041 FK)
+
+    def _locations(self):
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        self._tmp = path
+        yield "sqlite", path
+        url = os.environ.get("TEST_DATABASE_URL")
+        if url:
+            yield "postgres", url
+
+    def tearDown(self):
+        if getattr(self, "_tmp", None) and os.path.exists(self._tmp):
+            os.remove(self._tmp)
+
+    def _seed_rich(self, store):
+        cur = store.conn.cursor()
+        q = store.dialect.sql
+
+        def ins(sql, params):
+            cur.execute(q(sql), params)
+
+        # Owners first, then venue, then the incoming (041-FK) dependents.
+        ins("INSERT INTO organizations (id, name, short_name, external_ref) "
+            "VALUES (?, ?, ?, ?)", self._ORG)
+        ins("INSERT INTO programs (id, name, country, timezone, "
+            "operator_organization_id, external_ref) VALUES (?, ?, ?, ?, ?, ?)",
+            self._PROGRAM)
+        ins("INSERT INTO seasons (id, program_id, name, start_date, end_date, "
+            "external_ref, status, archived_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            self._SEASON)
+        ins("INSERT INTO leagues (id, name, sort_order, external_ref, program_id) "
+            "VALUES (?, ?, ?, ?, ?)", self._LEAGUE)
+        ins("INSERT INTO venues (id, name, address, timezone, organization_id, "
+            "league_id, external_ref) VALUES (?, ?, ?, ?, ?, ?, ?)", self._VENUE)
+        ins("INSERT INTO rinks (id, venue_id, name, external_ref) "
+            "VALUES (?, ?, ?, ?)", self._RINK)
+        ins("INSERT INTO season_venue_access (id, season_id, venue_id, active) "
+            "VALUES (?, ?, ?, ?)", self._SVA)
+
+    def _row(self, store, sql, params=()):
+        cur = store.conn.cursor()
+        cur.execute(store.dialect.sql(sql), params)
+        return cur.fetchone()
+
+    def _row_values(self, store, cols, sql, params):
+        # psycopg dict_row makes tuple(row) yield keys, so index by name.
+        r = self._row(store, sql, params)
+        return tuple(r[c] for c in cols)
+
+    def _assert_preserved(self, store, label):
+        prog_cols = ("id", "name", "country", "timezone",
+                     "operator_organization_id", "external_ref")
+        self.assertEqual(
+            self._row_values(store, prog_cols,
+                             "SELECT " + ", ".join(prog_cols)
+                             + " FROM programs WHERE id = ?", ("p1",)),
+            self._PROGRAM, label)
+        season_cols = ("id", "program_id", "name", "start_date", "end_date",
+                       "external_ref", "status", "archived_at")
+        self.assertEqual(
+            self._row_values(store, season_cols,
+                             "SELECT " + ", ".join(season_cols)
+                             + " FROM seasons WHERE id = ?", ("s1",)),
+            self._SEASON, label)
+        league_cols = ("id", "name", "sort_order", "external_ref", "program_id")
+        self.assertEqual(
+            self._row_values(store, league_cols,
+                             "SELECT " + ", ".join(league_cols)
+                             + " FROM leagues WHERE id = ?", ("l1",)),
+            self._LEAGUE, label)
+        venue_cols = ("id", "name", "address", "timezone", "organization_id",
+                      "league_id", "external_ref")
+        self.assertEqual(
+            self._row_values(store, venue_cols,
+                             "SELECT " + ", ".join(venue_cols)
+                             + " FROM venues WHERE id = ?", ("v1",)),
+            self._VENUE, label)
+        # Incoming references survived the venues rebuild.
+        self.assertEqual(
+            self._row(store, "SELECT venue_id FROM rinks WHERE id = ?",
+                      ("r1",))["venue_id"], "v1", label)
+        self.assertEqual(
+            self._row(store, "SELECT venue_id FROM season_venue_access "
+                             "WHERE id = ?", ("a1",))["venue_id"], "v1", label)
+        # Outgoing FK catalogs (all five) + the incoming rinks/sva → venues.
+        self.assertEqual(
+            _fks(store, "programs"),
+            {("operator_organization_id", "organizations", "id",
+              _name(store, "fk_programs_operator_org"), "NO ACTION")}, label)
+        self.assertEqual(
+            _fks(store, "seasons"),
+            {("program_id", "programs", "id",
+              _name(store, "fk_seasons_program"), "NO ACTION")}, label)
+        self.assertEqual(
+            _fks(store, "leagues"),
+            {("program_id", "programs", "id",
+              _name(store, "fk_leagues_program"), "NO ACTION")}, label)
+        self.assertEqual(
+            _fks(store, "venues"),
+            {("organization_id", "organizations", "id",
+              _name(store, "fk_venues_organization"), "NO ACTION"),
+             ("league_id", "programs", "id",
+              _name(store, "fk_venues_program"), "NO ACTION")}, label)
+        rink_fk_targets = {ref for (_c, ref, _t, _n, _d) in _fks(store, "rinks")}
+        self.assertIn("venues", rink_fk_targets, label)
+        sva_fk_targets = {ref for (_c, ref, _t, _n, _d)
+                          in _fks(store, "season_venue_access")}
+        self.assertIn("venues", sva_fk_targets, label)
+        # Every recreated index.
+        for table, names in (
+                ("programs", ("ix_programs_operator_organization",
+                              "ix_programs_external_ref")),
+                ("seasons", ("ix_seasons_external_ref", "ix_seasons_program")),
+                ("leagues", ("ix_leagues_external_ref", "ix_leagues_program")),
+                ("venues", ("ix_venues_league", "ix_venues_external_ref"))):
+            idx = _indexes(store, table)
+            for name in names:
+                self.assertIn(name, idx, f"{label}: {table} index {name}")
+        self.assertTrue(_foreign_key_check_clean(store), label)
+
+    def test_populated_upgrade_from_041_preserves_values_indexes_incoming_refs(self):
+        for label, loc in self._locations():
+            store = SqlStore(loc)
+            try:
+                if store.backend == "postgres":
+                    store.reset_schema()
+                _downgrade_042(store)         # back to the pre-042 schema
+                with store.transaction():
+                    self._seed_rich(store)
+                migrate(store.conn, store.dialect)   # apply 042 (the rebuild)
+                self.assertIn(_VERSION, store.migration_status()["applied"], label)
+                store.close()
+                store = SqlStore(loc)         # a real close/reopen cycle
+                self._assert_preserved(store, label)
+            finally:
+                if store.backend == "postgres":
+                    store.reset_schema()
                 store.close()
 
 
