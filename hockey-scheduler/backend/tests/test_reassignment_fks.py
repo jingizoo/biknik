@@ -531,11 +531,13 @@ class ReassignmentRaceTest(unittest.TestCase):
         tc.start(); td.start(); tc.join(20); td.join(20)
         return results
 
-    def _forced_child_wins(self, child_store, write_method, child_fn, delete_fn):
+    def _forced_child_wins(self, child_store, write_method, child_fn,
+                           delete_store, delete_fn):
         """Force the child-commit-wins ordering deterministically: pause the child
         AFTER its foreign-key write (its transaction still open, so it holds the
-        FK key-share lock on the parent row), start the delete and CONFIRM it is
-        waiting on the parent's FOR UPDATE lock, then release the child to commit.
+        FK key-share lock on the parent row), start the delete and CONFIRM its
+        exact backend is waiting on the parent's FOR UPDATE lock, then release the
+        child to commit.
         The delete then observes the committed child and must lose with the
         has-dependencies block — never a cascade, orphan, deadlock, or delete
         audit. Complements _forced_delete_wins (the other ordering)."""
@@ -559,41 +561,52 @@ class ReassignmentRaceTest(unittest.TestCase):
                                                           child_fn))
         td = threading.Thread(target=lambda: self._record(results, "delete",
                                                           delete_fn))
+        # Capture the delete connection's own backend PID BEFORE it runs, so the
+        # lock-wait proof targets exactly that connection (an unrelated waiter can
+        # never satisfy it). Its SqlStore uses one connection, so the PID is
+        # stable across the delete it is about to run.
+        delete_pid = self._backend_pid(delete_store)
         tc.start()
         if not written.wait(15):
             release.set(); tc.join(15)
             self.fail("child never reached its foreign-key write")
         td.start()
         # The child holds the parent's FK key-share lock; the delete's
-        # get_*_for_update conflicts and must block. Prove it is ACTUALLY blocked
-        # on the lock by polling PostgreSQL's own pg_stat_activity view (not a
-        # fixed sleep) until the delete's backend registers as waiting on a
-        # heavyweight Lock.
-        self.assertTrue(self._wait_until_blocked_on_lock(),
-                        "delete never registered as waiting on a row lock")
+        # get_*_for_update conflicts and must block. Prove THAT EXACT backend is
+        # blocked by polling PostgreSQL's pg_stat_activity for delete_pid waiting
+        # on a heavyweight Lock (not a fixed sleep, not any waiter).
+        self.assertTrue(self._wait_until_blocked_on_lock(delete_pid),
+                        "delete backend never registered as waiting on a row lock")
         self.assertIsNone(results.get("delete"),
                           "delete completed without blocking on the child's lock")
         release.set()               # child commits → delete unblocks → sees child
         tc.join(25); td.join(25)
         return results
 
-    def _wait_until_blocked_on_lock(self, timeout=10.0):
-        """Poll PostgreSQL's pg_stat_activity until a backend in this database is
-        ACTIVELY waiting on a heavyweight lock (``wait_event_type = 'Lock'``) — a
-        deterministic proof that the delete is blocked on the parent row lock,
-        with no reliance on a fixed sleep. Returns True once observed, else False
-        on timeout. A short poll interval only bounds busy-spin; correctness comes
-        from the lock-state query, not from any elapsed time."""
+    def _backend_pid(self, store):
+        """The server-side backend PID of a store's PostgreSQL connection."""
+        with store.conn.cursor() as cur:
+            cur.execute("SELECT pg_backend_pid() AS pid")
+            return cur.fetchone()["pid"]
+
+    def _wait_until_blocked_on_lock(self, backend_pid, timeout=10.0):
+        """Poll PostgreSQL's pg_stat_activity until the DELETE'S OWN backend
+        (``backend_pid``) is ACTIVELY waiting on a heavyweight lock
+        (``wait_event_type = 'Lock'``) — a deterministic proof that *that exact
+        connection* is blocked on the parent row lock, so an unrelated waiter can
+        never satisfy it. No reliance on a fixed sleep: the short poll interval
+        only bounds busy-spin; correctness comes from the per-PID lock state."""
         import psycopg
         deadline = time.monotonic() + timeout
         with psycopg.connect(self.url, autocommit=True) as mon:
             while time.monotonic() < deadline:
                 with mon.cursor() as cur:
                     cur.execute(
-                        "SELECT count(*) FROM pg_stat_activity "
-                        "WHERE datname = current_database() "
-                        "AND state = 'active' AND wait_event_type = 'Lock'")
-                    if cur.fetchone()[0] >= 1:
+                        "SELECT state, wait_event_type FROM pg_stat_activity "
+                        "WHERE pid = %s", (backend_pid,))
+                    row = cur.fetchone()
+                    if (row is not None and row[0] == "active"
+                            and row[1] == "Lock"):
                         return True
                 time.sleep(0.02)
         return False
@@ -804,11 +817,13 @@ class ReassignmentRaceTest(unittest.TestCase):
         team_t = api0.create_team(club_id=club, name="Target", league_id=lid)["id"]
         child_store = SqlStore(self.url)
         api_c = ApiService(child_store)
-        api_d = ApiService(SqlStore(self.url))
+        delete_store = SqlStore(self.url)
+        api_d = ApiService(delete_store)
         results = self._forced_child_wins(
             child_store, "add_player",
             child_fn=lambda: api_c.setup.add_player(
                 team_t, "Newbie", Position.FORWARD, actor_id="add"),
+            delete_store=delete_store,
             delete_fn=lambda: api_d.setup.delete_team(team_t, actor_id="del"))
         self.assertEqual(results, {"child": "ok", "delete": "blocked"}, results)
         check = SqlStore(self.url)
@@ -822,11 +837,13 @@ class ReassignmentRaceTest(unittest.TestCase):
         team_a, team_t, player = self._seed_move(api0)
         child_store = SqlStore(self.url)
         api_c = ApiService(child_store)
-        api_d = ApiService(SqlStore(self.url))
+        delete_store = SqlStore(self.url)
+        api_d = ApiService(delete_store)
         results = self._forced_child_wins(
             child_store, "save_player",
             child_fn=lambda: api_c.setup.assign_player_team(
                 player, team_t, actor_id="assign"),
+            delete_store=delete_store,
             delete_fn=lambda: api_d.setup.delete_team(team_t, actor_id="del"))
         self.assertEqual(results, {"child": "ok", "delete": "blocked"}, results)
         check = SqlStore(self.url)
@@ -840,11 +857,13 @@ class ReassignmentRaceTest(unittest.TestCase):
         _p, _s, lid, club = self._seed_team(api0)
         child_store = SqlStore(self.url)
         api_c = ApiService(child_store)
-        api_d = ApiService(SqlStore(self.url))
+        delete_store = SqlStore(self.url)
+        api_d = ApiService(delete_store)
         results = self._forced_child_wins(
             child_store, "add_team",
             child_fn=lambda: api_c.setup.create_team(
                 club_id=club, name="New", league_id=lid, actor_id="create"),
+            delete_store=delete_store,
             delete_fn=lambda: api_d.setup.delete_club(club, actor_id="del"))
         self.assertEqual(results, {"child": "ok", "delete": "blocked"}, results)
         check = SqlStore(self.url)
@@ -859,11 +878,13 @@ class ReassignmentRaceTest(unittest.TestCase):
         club_old, club_c, team_t = self._seed_rebind(api0)
         child_store = SqlStore(self.url)
         api_c = ApiService(child_store)
-        api_d = ApiService(SqlStore(self.url))
+        delete_store = SqlStore(self.url)
+        api_d = ApiService(delete_store)
         results = self._forced_child_wins(
             child_store, "save_team",
             child_fn=lambda: api_c.setup.assign_team_club(
                 team_t, club_c, actor_id="assign"),
+            delete_store=delete_store,
             delete_fn=lambda: api_d.setup.delete_club(club_c, actor_id="del"))
         self.assertEqual(results, {"child": "ok", "delete": "blocked"}, results)
         check = SqlStore(self.url)
