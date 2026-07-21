@@ -81,13 +81,18 @@ from ..domain.enums import NotificationType
 from ..domain.errors import IntegrityConflictError
 from .db import connect
 from .db_errors import (
+    DependentDeleteConflict,
+    dependent_delete_conflict,
     translate_db_exception,
+    translate_ice_slot_conflict_exception,
     translate_player_jersey_exception,
     translate_reassignment_fk_exception,
+    translate_venue_hierarchy_fk_exception,
 )
 from .integrity_checks import (
     assert_competition_hierarchy_reset_ready,
     assert_competition_reset_ready_c1b,
+    assert_iceslot_venue_fks_ready,
     assert_reassignment_fks_ready,
     assert_regular_games_resolve_league_season,
     assert_no_duplicate_active_ice_slots,
@@ -359,6 +364,7 @@ _PRE_MIGRATION_CHECKS = {
     "037_game_league_season": assert_regular_games_resolve_league_season,
     "038_active_team_jersey_unique": assert_player_jersey_constraints_ready,
     "040_reassignment_fks": assert_reassignment_fks_ready,
+    "041_iceslot_venue_fks": assert_iceslot_venue_fks_ready,
 }
 
 
@@ -367,8 +373,14 @@ def migrate(conn, dialect) -> None:
 
     ``schema_migrations`` is authoritative: a version already recorded there is
     skipped, and a version is recorded only after all of its statements succeed
-    (so a partially-applied file simply re-runs next boot — safe, since the DDL
-    is idempotent). Nothing here drops or mutates existing data.
+    (so a partially-applied file simply re-runs next boot). Migrations are
+    forward-only and vary in kind: most add columns or indexes; some backfill or
+    transform existing row values; and — because SQLite cannot add a foreign key
+    to an existing table — an FK migration on SQLite rebuilds the affected tables
+    (create-copy-drop-rename), which drops and physically rewrites data while
+    preserving each row's values. Every such change is applied inside the
+    migration's single transaction (see ``_apply_migration``), so it is
+    all-or-nothing; it is never an in-place no-op. Take a backup before upgrading.
 
     A version with a registered pre-migration check (``_PRE_MIGRATION_CHECKS``)
     runs that check first; it raises (aborting the upgrade) if existing data
@@ -415,13 +427,35 @@ def _apply_migration(conn, dialect, version, statements) -> None:
         # outer transaction already makes this migration all-or-nothing.
         body()
     else:  # sqlite (autocommit) — explicit txn so the rebuild is all-or-nothing
+        # A migration may rebuild a table that is REFERENCED by a foreign key
+        # (create-copy-drop-rename; e.g. migration 040 rebuilds players, 041
+        # rebuilds games). PRAGMA foreign_keys is a no-op inside a transaction,
+        # and PRAGMA defer_foreign_keys does NOT clear the deferred violations
+        # that dropping a still-referenced parent (with existing child rows)
+        # registers — so on a populated upgrade the COMMIT would fail even though
+        # the final state is consistent. Enforcement is therefore suspended the
+        # SQLite-recommended way — foreign_keys = OFF, set BEFORE BEGIN — and a
+        # foreign_key_check inside the same transaction proves the result is clean
+        # before COMMIT re-enables it, so a genuinely inconsistent rebuild still
+        # fails loudly and rolls back. (Fresh/empty databases are unaffected; this
+        # matters only when the table already holds child rows. The nested-txn
+        # branch above keeps using the migration file's PRAGMA defer_foreign_keys,
+        # which is sound there because the demo reset re-migrates emptied tables.)
+        conn.execute("PRAGMA foreign_keys = OFF")
         try:
             conn.execute("BEGIN")
             body()
+            violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+            if violations:
+                raise RuntimeError(
+                    f"migration {version} left {len(violations)} foreign-key "
+                    "violation(s); rolling back")
             conn.commit()
         except Exception:
             conn.rollback()
             raise
+        finally:
+            conn.execute("PRAGMA foreign_keys = ON")
 
 
 def _utcnow() -> datetime:
@@ -448,7 +482,28 @@ class SqlStore:
         # atomic — e.g. the demo reset's reset_schema + full reseed — wrap many
         # @_transactional service calls in a single commit/rollback.
         self._txn_depth = 0
+        # Re-resolver for the no-row-lock parent-delete FK race (#201 Slice 3),
+        # set by the service via set_dependent_conflict_resolver. Invoked by the
+        # OUTERMOST transaction() only after rollback, so the itemised
+        # has-dependencies re-scan always runs on a clean connection — even when
+        # the losing delete was nested inside a caller's transaction() and the
+        # connection was transaction-aborted mid-flight.
+        self._dependent_conflict_resolver = None
         migrate(self.conn, self.dialect)
+
+    def set_dependent_conflict_resolver(self, resolver) -> None:
+        """Register the callback that turns a DependentDeleteConflict (a
+        no-row-lock parent delete that lost to a concurrently-committed child,
+        #201 Slice 3) into the itemised has-dependencies domain error.
+
+        The store cannot itemise dependents itself — that is service logic
+        (display names, group types) — so it calls back into the service, but
+        only from the outermost transaction()'s post-rollback handler where the
+        connection is guaranteed clean. Doing the re-scan any earlier (e.g. in
+        the service before the outer rollback) would read on a transaction-
+        aborted connection and raise InFailedSqlTransaction.
+        """
+        self._dependent_conflict_resolver = resolver
 
     @contextmanager
     def transaction(self):
@@ -482,11 +537,24 @@ class SqlStore:
                             raise
                 except Exception as exc:
                     # The transaction has now rolled back, so there is zero
-                    # partial state. Translate a recognized DB integrity/
-                    # concurrency failure into a stable, secret-free domain
-                    # error (#201 Slice 2); anything unrecognized propagates
-                    # unchanged so it surfaces as an internal error rather than
-                    # a misclassified user error.
+                    # partial state and the connection is clean again.
+                    #
+                    # A no-row-lock parent delete (venue/rink/ice-slot, #201
+                    # Slice 3) that lost the FK race surfaces here as a
+                    # DependentDeleteConflict: a child committed between the
+                    # pre-check and the DELETE, so the DB rejected the DELETE and
+                    # aborted the connection mid-transaction. Re-resolve the
+                    # now-committed dependents into the SAME itemised
+                    # has-dependencies error the pre-check raises. This runs at
+                    # the OUTERMOST boundary AFTER rollback, so it is correct
+                    # whether the delete ran on its own or nested inside a
+                    # caller's transaction() — re-scanning inside the still-
+                    # aborted transaction would raise InFailedSqlTransaction.
+                    self._resolve_dependent_delete_conflict(exc)
+                    # Translate a recognized DB integrity/concurrency failure
+                    # into a stable, secret-free domain error (#201 Slice 2);
+                    # anything unrecognized propagates unchanged so it surfaces
+                    # as an internal error rather than a misclassified user error.
                     translated = translate_db_exception(exc)
                     if translated is not None:
                         raise translated from exc
@@ -527,6 +595,31 @@ class SqlStore:
         if holder is not None:
             details["conflicting_player_id"] = holder.id
             details["conflicting_player_name"] = holder.name
+
+    def _resolve_dependent_delete_conflict(self, exc) -> None:
+        """Post-rollback re-resolution of a lost no-row-lock parent delete (#201
+        Slice 3). A no-op unless ``exc`` (or its cause chain) is a
+        ``DependentDeleteConflict`` and a resolver is registered.
+
+        When it fires it hands the conflict to the service-registered resolver,
+        which raises the itemised has-dependencies error (or a stable retry
+        conflict) — so the caller sees the SAME structured error whether the
+        dependent was present at pre-check or committed during the race. Runs
+        only from the outermost transaction()'s handler, i.e. after rollback, so
+        the resolver's fresh dependent scan reads on a clean connection.
+        """
+        if self._dependent_conflict_resolver is None:
+            return
+        conflict = exc
+        while conflict is not None and not isinstance(
+                conflict, DependentDeleteConflict):
+            conflict = getattr(conflict, "__cause__", None)
+        if conflict is None:
+            return
+        # Raises the itemised domain error; if the resolver can't itemise this
+        # entity type it returns and the original DependentDeleteConflict
+        # propagates (surfacing as an internal error, never a partial delete).
+        self._dependent_conflict_resolver(conflict)
 
     def close(self) -> None:
         self.conn.close()
@@ -808,10 +901,32 @@ class SqlStore:
         return self._query(Player, order="id")
 
     # -- games -------------------------------------------------------------
-    def add_game(self, game): return self._insert(game)
+    def _write_game(self, write, game):
+        try:
+            return write(game)
+        except Exception as exc:
+            # ux_games_active_ice_slot (migration 022): a race-losing create onto
+            # a slot another active game just booked — even from a different
+            # Season — surfaces as the same stable ScheduleConflictError the
+            # service raises via game_using_ice_slot (#201 Slice 3).
+            translated = translate_ice_slot_conflict_exception(
+                exc, game.ice_slot_id)
+            # games.ice_slot_id → ice_slots(id) (migration 041): a race-losing
+            # write onto a concurrently-deleted slot surfaces as the same stable
+            # conflict the service raises when it validates the slot up front.
+            if translated is None:
+                translated = translate_venue_hierarchy_fk_exception(
+                    exc, constraint="fk_games_ice_slot", reason="ice_slot_not_found",
+                    message="The change references an ice slot that does not exist.",
+                    ice_slot_id=game.ice_slot_id)
+            if translated is not None:
+                raise translated from exc
+            raise
+
+    def add_game(self, game): return self._write_game(self._insert, game)
     def get_game(self, game_id): return self._get(Game, game_id)
     def all_games(self): return self._query(Game, order="id")
-    def save_game(self, game): return self._update(game)
+    def save_game(self, game): return self._write_game(self._update, game)
     def delete_game(self, game_id):
         with self._lock:
             self._exec("DELETE FROM games WHERE id = ?", (game_id,))
@@ -979,10 +1094,29 @@ class SqlStore:
                        (decision_id,))
 
     # -- season venue access (#233 Slice E) ---------------------------------
-    def add_season_venue_access(self, sva): return self._insert(sva)
+    def _write_season_venue_access(self, write, sva):
+        try:
+            return write(sva)
+        except Exception as exc:
+            # season_venue_access.venue_id → venues(id) (migration 041): a
+            # race-losing grant onto a concurrently-deleted venue surfaces as the
+            # same stable conflict the service raises when it validates the venue
+            # (#201 Slice 3). The season side takes the Season row lock, so only
+            # the venue side needs this backstop — one FK, unambiguous on SQLite.
+            translated = translate_venue_hierarchy_fk_exception(
+                exc, constraint="fk_sva_venue", reason="venue_not_found",
+                message="The change references a venue that does not exist.",
+                venue_id=sva.venue_id)
+            if translated is not None:
+                raise translated from exc
+            raise
+
+    def add_season_venue_access(self, sva):
+        return self._write_season_venue_access(self._insert, sva)
     def get_season_venue_access(self, sva_id):
         return self._get(SeasonVenueAccess, sva_id)
-    def save_season_venue_access(self, sva): return self._update(sva)
+    def save_season_venue_access(self, sva):
+        return self._write_season_venue_access(self._update, sva)
     def all_season_venue_access(self):
         return self._query(SeasonVenueAccess, order="id")
     def season_venue_access_for_season(self, season_id):
@@ -1013,15 +1147,45 @@ class SqlStore:
     def all_venues(self): return self._query(Venue, order="id")
     def save_venue(self, venue): return self._update(venue)
 
-    def add_rink(self, rink): return self._insert(rink)
+    def _write_rink(self, write, rink):
+        try:
+            return write(rink)
+        except Exception as exc:
+            # rinks.venue_id → venues(id) (migration 041): a race-losing create
+            # onto a concurrently-deleted venue surfaces as the same stable
+            # conflict the service raises when it validates the venue (#201 Slice 3).
+            translated = translate_venue_hierarchy_fk_exception(
+                exc, constraint="fk_rinks_venue", reason="venue_not_found",
+                message="The change references a venue that does not exist.",
+                venue_id=rink.venue_id)
+            if translated is not None:
+                raise translated from exc
+            raise
+
+    def add_rink(self, rink): return self._write_rink(self._insert, rink)
     def get_rink(self, rink_id): return self._get(Rink, rink_id)
     def all_rinks(self): return self._query(Rink, order="id")
-    def save_rink(self, rink): return self._update(rink)
+    def save_rink(self, rink): return self._write_rink(self._update, rink)
 
-    def add_ice_slot(self, slot): return self._insert(slot)
+    def _write_ice_slot(self, write, slot):
+        try:
+            return write(slot)
+        except Exception as exc:
+            # ice_slots.rink_id → rinks(id) (migration 041): a race-losing create
+            # onto a concurrently-deleted rink surfaces as the same stable
+            # conflict the service raises when it validates the rink (#201 Slice 3).
+            translated = translate_venue_hierarchy_fk_exception(
+                exc, constraint="fk_ice_slots_rink", reason="rink_not_found",
+                message="The change references a rink that does not exist.",
+                rink_id=slot.rink_id)
+            if translated is not None:
+                raise translated from exc
+            raise
+
+    def add_ice_slot(self, slot): return self._write_ice_slot(self._insert, slot)
     def get_ice_slot(self, slot_id): return self._get(IceSlot, slot_id)
     def all_ice_slots(self): return self._query(IceSlot, order="id")
-    def save_ice_slot(self, slot): return self._update(slot)
+    def save_ice_slot(self, slot): return self._write_ice_slot(self._update, slot)
 
     def add_setup_audit(self, entry): return self._insert(entry)
     def all_setup_audit(self): return self._query(SetupAuditLog, order="id")
@@ -1128,11 +1292,32 @@ class SqlStore:
     def delete_team(self, team_id): self._delete(Team, team_id)
     def delete_season_team_registration(self, registration_id):
         self._delete(SeasonTeamRegistration, registration_id)
-    def delete_venue(self, venue_id): self._delete(Venue, venue_id)
+    def _delete_parent(self, model, entity_type, entity_id):
+        # A parent delete that races behind a committed child blocks on the
+        # child's FK key-share lock, then fails on the incoming reference — the
+        # #201 Slice 3 facility-hierarchy backstop (rinks→venues, ice_slots→rinks,
+        # games→ice_slots, season_venue_access→venues). Signal that incoming-FK
+        # violation as a DependentDeleteConflict; the service catches it, rolls
+        # back, re-resolves the now-committed dependents, and raises the SAME
+        # itemised has-dependencies error its pre-check raises — never a raw
+        # driver error or cascade.
+        try:
+            self._delete(model, entity_id)
+        except Exception as exc:
+            conflict = dependent_delete_conflict(
+                exc, entity_type=entity_type, entity_id=entity_id)
+            if conflict is not None:
+                raise conflict from exc
+            raise
+
+    def delete_venue(self, venue_id):
+        self._delete_parent(Venue, "venue", venue_id)
     def delete_season_venue_access(self, sva_id):
         self._delete(SeasonVenueAccess, sva_id)
-    def delete_rink(self, rink_id): self._delete(Rink, rink_id)
-    def delete_ice_slot(self, slot_id): self._delete(IceSlot, slot_id)
+    def delete_rink(self, rink_id):
+        self._delete_parent(Rink, "rink", rink_id)
+    def delete_ice_slot(self, slot_id):
+        self._delete_parent(IceSlot, "ice_slot", slot_id)
     def delete_official(self, official_id): self._delete(Official, official_id)
     def delete_player(self, player_id): self._delete(Player, player_id)
 

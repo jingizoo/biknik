@@ -184,6 +184,34 @@ def _foreign_key_check_clean(store):
     return cur.fetchall() == []
 
 
+def _indexes(store, table):
+    """Set of secondary index names on ``table`` (excludes auto/PK indexes)."""
+    cur = store.conn.cursor()
+    if store.backend == "sqlite":
+        cur.execute(f"PRAGMA index_list('{table}')")
+        return {r["name"] for r in cur.fetchall()
+                if not r["name"].startswith("sqlite_autoindex")}
+    cur.execute("SELECT indexname FROM pg_indexes WHERE tablename = %s", (table,))
+    return {r["indexname"] for r in cur.fetchall()
+            if not r["indexname"].endswith("_pkey")}
+
+
+def _is_partial_unique(store, table, index_name):
+    """True if ``index_name`` on ``table`` is a partial (WHERE-clause) UNIQUE
+    index — the shape of ux_players_active_team_jersey that must survive the
+    players rebuild."""
+    cur = store.conn.cursor()
+    if store.backend == "sqlite":
+        cur.execute(f"SELECT name, [unique], partial FROM pragma_index_list('{table}')")
+        for r in cur.fetchall():
+            if r["name"] == index_name:
+                return bool(r["unique"]) and bool(r["partial"])
+        return False
+    cur.execute("SELECT indexdef FROM pg_indexes WHERE indexname = %s", (index_name,))
+    row = cur.fetchone()
+    return bool(row) and "UNIQUE" in row["indexdef"] and "WHERE" in row["indexdef"]
+
+
 class PreMigrationValidationTest(unittest.TestCase):
     def _pre040(self, url):
         store = _fresh(url)
@@ -903,6 +931,129 @@ class ReassignmentRaceTest(unittest.TestCase):
         orphans = [t.id for t in store.all_teams()
                    if t.club_id is not None and store.get_club(t.club_id) is None]
         self.assertEqual(orphans, [], "team stranded on a deleted club")
+
+
+class MigrationRebuildPreservationTest(unittest.TestCase):
+    """Migration 040 rebuilds `teams` and `players` (create-copy-drop-rename),
+    and `players` is REFERENCED by game_roster_entries (migration 027). This is
+    the durable regression proof that a POPULATED upgrade through 040 preserves —
+    across a close/reopen — every team/player row value, the incoming
+    game_roster_entries → players reference, the new FKs, and every recreated
+    index (including the partial unique ux_players_active_team_jersey). It guards
+    the shared migration-runner fix (SQLite foreign_keys = OFF around the rebuild
+    + foreign_key_check gate) that #201 Slice 3 introduced: without it, dropping
+    the still-referenced `players` with an existing roster row fails at COMMIT.
+    Runs on a file-backed SQLite database (so the reopen is real) and on
+    PostgreSQL when available."""
+
+    _TEAM_COLS = ("id", "name", "division", "club_id", "division_id",
+                  "external_ref", "program_id", "league_id")
+    _TEAM = ("t1", "Team One", "U16", "c1", "div1", "EXT-T1", "prog1", "lg1")
+    _PLAYER_COLS = ("id", "team_id", "name", "position", "shoots",
+                    "jersey_number", "is_active", "guardian_person_id",
+                    "external_ref")
+    _PLAYER = ("p1", "t1", "Player One", "forward", "left", 17, 1, "guard1",
+               "EXT-P1")
+
+    def _locations(self):
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        self._tmp = path
+        yield "sqlite", path
+        url = os.environ.get("TEST_DATABASE_URL")
+        if url:
+            yield "postgres", url
+
+    def tearDown(self):
+        if getattr(self, "_tmp", None) and os.path.exists(self._tmp):
+            os.remove(self._tmp)
+
+    def _seed_rich(self, store):
+        q = store.dialect.sql
+        cur = store.conn.cursor()
+
+        def ins(sql, params):
+            cur.execute(q(sql), params)
+
+        ins("INSERT INTO clubs (id, name) VALUES (?, ?)", ("c1", "Club One"))
+        ins("INSERT INTO teams (" + ", ".join(self._TEAM_COLS) + ") VALUES ("
+            + ", ".join("?" for _ in self._TEAM_COLS) + ")", self._TEAM)
+        ins("INSERT INTO players (" + ", ".join(self._PLAYER_COLS) + ") VALUES ("
+            + ", ".join("?" for _ in self._PLAYER_COLS) + ")", self._PLAYER)
+        # A Game + roster row so players carries an INCOMING reference during the
+        # 040 rebuild (game_roster_entries.player_id → players, migration 027).
+        ins("INSERT INTO games (id, ice_slot_id, cancelled, game_type) "
+            "VALUES (?, ?, 0, 'regular')", ("g1", None))
+        ins("INSERT INTO game_roster_entries (id, game_id, player_id) "
+            "VALUES (?, ?, ?)", ("re1", "g1", "p1"))
+
+    def _row_values(self, store, cols, sql, params):
+        # sqlite3.Row supports tuple(row) → values, but psycopg's dict_row makes
+        # tuple(row) → keys; index by column name so the comparison is portable.
+        cur = store.conn.cursor()
+        cur.execute(store.dialect.sql(sql), params)
+        r = cur.fetchone()
+        return tuple(r[c] for c in cols)
+
+    def _assert_preserved(self, store, label):
+        self.assertEqual(
+            self._row_values(store, self._TEAM_COLS,
+                             "SELECT " + ", ".join(self._TEAM_COLS)
+                             + " FROM teams WHERE id = ?", ("t1",)),
+            self._TEAM, label)
+        self.assertEqual(
+            self._row_values(store, self._PLAYER_COLS,
+                             "SELECT " + ", ".join(self._PLAYER_COLS)
+                             + " FROM players WHERE id = ?", ("p1",)),
+            self._PLAYER, label)
+        # Incoming roster reference survived the players rebuild.
+        self.assertEqual(
+            self._row_values(store, ("game_id", "player_id"),
+                             "SELECT game_id, player_id FROM game_roster_entries "
+                             "WHERE id = ?", ("re1",)),
+            ("g1", "p1"), label)
+        # Named FKs — outgoing on the rebuilt tables and the incoming roster ones.
+        self.assertEqual(
+            _fks(store, "teams"),
+            {("club_id", "clubs", "id", _name(store, "fk_teams_club"),
+              "NO ACTION")}, label)
+        self.assertEqual(
+            _fks(store, "players"),
+            {("team_id", "teams", "id", _name(store, "fk_players_team"),
+              "NO ACTION")}, label)
+        roster_targets = {ref for (_c, ref, _t, _n, _d)
+                          in _fks(store, "game_roster_entries")}
+        self.assertIn("players", roster_targets, label)
+        self.assertIn("games", roster_targets, label)
+        # Every recreated index, including the partial unique active-jersey one.
+        self.assertIn("ix_players_team", _indexes(store, "players"), label)
+        self.assertTrue(
+            _is_partial_unique(store, "players", "ux_players_active_team_jersey"),
+            label)
+        team_idx = _indexes(store, "teams")
+        self.assertIn("ix_teams_program", team_idx, label)
+        self.assertIn("ix_teams_league", team_idx, label)
+        self.assertTrue(_foreign_key_check_clean(store), label)
+
+    def test_populated_upgrade_through_040_preserves_teams_players_and_roster(self):
+        for label, loc in self._locations():
+            store = SqlStore(loc)
+            try:
+                if store.backend == "postgres":
+                    store.reset_schema()
+                _downgrade_040(store)          # back to the pre-040 schema
+                with store.transaction():
+                    self._seed_rich(store)     # now teams/players carry data + a
+                                               # live incoming roster reference
+                migrate(store.conn, store.dialect)   # re-apply 040 (the rebuild)
+                self.assertIn(_VERSION, store.migration_status()["applied"], label)
+                store.close()
+                store = SqlStore(loc)          # a real close/reopen cycle
+                self._assert_preserved(store, label)
+            finally:
+                if store.backend == "postgres":
+                    store.reset_schema()
+                store.close()
 
 
 if __name__ == "__main__":

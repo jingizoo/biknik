@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
 
 from hockey_scheduler.domain import AuditAction, AuditLog, Game
-from hockey_scheduler.domain.errors import IntegrityConflictError
+from hockey_scheduler.domain.errors import ScheduleConflictError
 from hockey_scheduler.store import SqlStore
 from hockey_scheduler.store.integrity_checks import (
     MigrationDataError,
@@ -55,6 +55,18 @@ def _fresh(url):
     return store
 
 
+def _seed_slots(store, *slot_ids):
+    """Create the ice_slots rows the planted games reference so the #201 Slice 3
+    games.ice_slot_id → ice_slots(id) foreign key is satisfied. rink_id stays NULL
+    (a nullable foreign key), so no rink/venue is needed; seeding the referenced
+    slot does not affect the one-active-game-per-slot invariant under test."""
+    with store.transaction():
+        cur = store.conn.cursor()
+        for sid in slot_ids:
+            cur.execute(store.dialect.sql(
+                "INSERT INTO ice_slots (id, rink_id) VALUES (?, ?)"), (sid, None))
+
+
 def _downgrade_022(store):
     """Simulate a pre-022 database: drop the index and un-record the migration."""
     with store.transaction():
@@ -71,6 +83,7 @@ class PreMigrationValidationTest(unittest.TestCase):
         store = SqlStore(":memory:")
         try:
             _downgrade_022(store)
+            _seed_slots(store, "slotA", "slotB")
             with store.transaction():
                 store.add_game(_game("g1", slot="slotA"))
                 store.add_game(_game("g2", slot="slotA"))  # dup active, now allowed
@@ -86,6 +99,7 @@ class PreMigrationValidationTest(unittest.TestCase):
         store = SqlStore(":memory:")
         try:
             _downgrade_022(store)
+            _seed_slots(store, "slotA")
             with store.transaction():
                 store.add_game(_game("g1", slot="slotA"))
                 store.add_game(_game("g2", slot="slotA", cancelled=True))
@@ -98,6 +112,7 @@ class PreMigrationValidationTest(unittest.TestCase):
         store = SqlStore(":memory:")
         try:
             _downgrade_022(store)
+            _seed_slots(store, "slotA")
             with store.transaction():
                 store.add_game(_game("g1", slot="slotA"))
                 store.add_game(_game("g2", slot="slotA"))
@@ -117,13 +132,19 @@ class ConstraintEnforcementTest(unittest.TestCase):
         for label, url in _sql_backends():
             store = _fresh(url)
             try:
+                _seed_slots(store, "slot1")
                 with store.transaction():
                     store.add_game(_game("g1"))
-                with self.assertRaises(IntegrityConflictError, msg=label) as ctx:
+                # #201 Slice 3: the double-book loser now surfaces the domain
+                # ScheduleConflictError (ice_slot_taken) — the same conflict the
+                # create_game pre-check raises — not the generic unique_violation.
+                with self.assertRaises(ScheduleConflictError, msg=label) as ctx:
                     with store.transaction():
                         store.add_game(_game("g2"))
                 self.assertEqual(ctx.exception.details["reason"],
-                                 "unique_violation", label)
+                                 "ice_slot_taken", label)
+                self.assertEqual(ctx.exception.details["ice_slot_id"],
+                                 "slot1", label)
             finally:
                 store.close()
 
@@ -131,6 +152,7 @@ class ConstraintEnforcementTest(unittest.TestCase):
         for label, url in _sql_backends():
             store = _fresh(url)
             try:
+                _seed_slots(store, "slot1")
                 with store.transaction():
                     store.add_game(_game("g1"))
                 game = store.get_game("g1")
@@ -149,9 +171,10 @@ class ConstraintEnforcementTest(unittest.TestCase):
         for label, url in _sql_backends():
             store = _fresh(url)
             try:
+                _seed_slots(store, "slot1")
                 with store.transaction():
                     store.add_game(_game("g1"))
-                with self.assertRaises(IntegrityConflictError, msg=label):
+                with self.assertRaises(ScheduleConflictError, msg=label):
                     with store.transaction():
                         store.add_audit(AuditLog(
                             id="a1", game_id="g9",
@@ -171,7 +194,10 @@ class SlotRaceTest(unittest.TestCase):
                          "cross-connection race needs PostgreSQL")
     def test_only_one_of_two_racing_inserts_wins(self):
         url = os.environ["TEST_DATABASE_URL"]
-        SqlStore(url).reset_schema()
+        seed = SqlStore(url)
+        seed.reset_schema()
+        _seed_slots(seed, "race_slot")   # satisfy games.ice_slot_id → ice_slots
+        seed.close()
         barrier = threading.Barrier(2)
         results = {}
 
@@ -182,7 +208,7 @@ class SlotRaceTest(unittest.TestCase):
                 with store.transaction():
                     store.add_game(_game(gid, slot="race_slot"))
                 results[gid] = "won"
-            except IntegrityConflictError:
+            except ScheduleConflictError:
                 results[gid] = "conflict"
             except Exception as exc:  # pragma: no cover - surfaced by assert
                 results[gid] = f"error:{exc!r}"
@@ -217,6 +243,7 @@ class MigrationLedgerTest(unittest.TestCase):
         try:
             first = SqlStore(path)
             self.assertIn(_VERSION, first.migration_status()["applied"])
+            _seed_slots(first, "slot1")
             with first.transaction():
                 first.add_game(_game("g1"))
             first.close()
@@ -224,7 +251,7 @@ class MigrationLedgerTest(unittest.TestCase):
             second = SqlStore(path)
             self.assertIn(_VERSION, second.migration_status()["applied"])
             self.assertTrue(second.migration_status()["current"])
-            with self.assertRaises(IntegrityConflictError):
+            with self.assertRaises(ScheduleConflictError):
                 with second.transaction():
                     second.add_game(_game("g2"))
             second.close()
