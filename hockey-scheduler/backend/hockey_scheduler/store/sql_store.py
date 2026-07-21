@@ -372,8 +372,14 @@ def migrate(conn, dialect) -> None:
 
     ``schema_migrations`` is authoritative: a version already recorded there is
     skipped, and a version is recorded only after all of its statements succeed
-    (so a partially-applied file simply re-runs next boot — safe, since the DDL
-    is idempotent). Nothing here drops or mutates existing data.
+    (so a partially-applied file simply re-runs next boot). Migrations are
+    forward-only and vary in kind: most add columns or indexes; some backfill or
+    transform existing row values; and — because SQLite cannot add a foreign key
+    to an existing table — an FK migration on SQLite rebuilds the affected tables
+    (create-copy-drop-rename), which drops and physically rewrites data while
+    preserving each row's values. Every such change is applied inside the
+    migration's single transaction (see ``_apply_migration``), so it is
+    all-or-nothing; it is never an in-place no-op. Take a backup before upgrading.
 
     A version with a registered pre-migration check (``_PRE_MIGRATION_CHECKS``)
     runs that check first; it raises (aborting the upgrade) if existing data
