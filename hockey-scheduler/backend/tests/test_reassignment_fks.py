@@ -35,6 +35,7 @@ Coverage:
 import os
 import tempfile
 import threading
+import time
 import unittest
 
 from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
@@ -403,6 +404,12 @@ class ServiceParityTest(unittest.TestCase):
     def _backends(self):
         yield "memory", InMemoryStore()
         yield "sqlite", SqlStore(":memory:")
+        # #201 Slice 2 review: the gate requires Memory/SQLite/PostgreSQL parity
+        # for these service-level outcomes, not only the store-boundary tests.
+        url = os.environ.get("TEST_DATABASE_URL")
+        if url:
+            SqlStore(url).clear_all_data()
+            yield "postgres", SqlStore(url)
 
     def test_reassign_and_add_onto_missing_parent_rejected(self):
         for label, store in self._backends():
@@ -509,7 +516,9 @@ class ReassignmentRaceTest(unittest.TestCase):
 
     def _barrier(self, child_fn, delete_fn):
         """Open barrier race — both start together; the row locks pick one valid
-        linearization. Returns {child, delete} outcomes."""
+        linearization. Returns {child, delete} outcomes. This is optional extra
+        stress; the two orderings are each proven deterministically by
+        _forced_delete_wins and _forced_child_wins."""
         barrier = threading.Barrier(2)
         results = {}
 
@@ -520,6 +529,49 @@ class ReassignmentRaceTest(unittest.TestCase):
         tc = threading.Thread(target=run, args=("child", child_fn))
         td = threading.Thread(target=run, args=("delete", delete_fn))
         tc.start(); td.start(); tc.join(20); td.join(20)
+        return results
+
+    def _forced_child_wins(self, child_store, write_method, child_fn, delete_fn):
+        """Force the child-commit-wins ordering deterministically: pause the child
+        AFTER its foreign-key write (its transaction still open, so it holds the
+        FK key-share lock on the parent row), start the delete and CONFIRM it is
+        waiting on the parent's FOR UPDATE lock, then release the child to commit.
+        The delete then observes the committed child and must lose with the
+        has-dependencies block — never a cascade, orphan, deadlock, or delete
+        audit. Complements _forced_delete_wins (the other ordering)."""
+        orig = getattr(child_store, write_method)
+        written = threading.Event()
+        release = threading.Event()
+        calls = [0]
+
+        def instrumented(*a, **k):
+            result = orig(*a, **k)   # the INSERT/UPDATE takes the FK key-share lock
+            calls[0] += 1
+            if calls[0] == 1:
+                written.set()
+                release.wait(15)
+            return result
+
+        setattr(child_store, write_method, instrumented)
+        results = {}
+
+        tc = threading.Thread(target=lambda: self._record(results, "child",
+                                                          child_fn))
+        td = threading.Thread(target=lambda: self._record(results, "delete",
+                                                          delete_fn))
+        tc.start()
+        if not written.wait(15):
+            release.set(); tc.join(15)
+            self.fail("child never reached its foreign-key write")
+        td.start()
+        # The child holds the parent's FK key-share lock; the delete's
+        # get_*_for_update conflicts and must block. Give it time to reach the
+        # lock, then prove it is still waiting (has not committed a delete).
+        time.sleep(0.5)
+        self.assertIsNone(results.get("delete"),
+                          "delete did not wait on the child's parent-row lock")
+        release.set()               # child commits → delete unblocks → sees child
+        tc.join(25); td.join(25)
         return results
 
     # -- seeds -------------------------------------------------------------
@@ -720,6 +772,81 @@ class ReassignmentRaceTest(unittest.TestCase):
             self.assertIsNone(check.get_club(club_c), results)
             self.assertEqual(_audit_actions(check, "team_club_assigned"), 0,
                              results)
+
+    # -- child-commit-wins (delete loses with has_dependencies) -----------
+    def test_add_player_vs_delete_team_child_wins(self):
+        api0 = ApiService(SqlStore(self.url))
+        _p, _s, lid, club = self._seed_team(api0)
+        team_t = api0.create_team(club_id=club, name="Target", league_id=lid)["id"]
+        child_store = SqlStore(self.url)
+        api_c = ApiService(child_store)
+        api_d = ApiService(SqlStore(self.url))
+        results = self._forced_child_wins(
+            child_store, "add_player",
+            child_fn=lambda: api_c.setup.add_player(
+                team_t, "Newbie", Position.FORWARD, actor_id="add"),
+            delete_fn=lambda: api_d.setup.delete_team(team_t, actor_id="del"))
+        self.assertEqual(results, {"child": "ok", "delete": "blocked"}, results)
+        check = SqlStore(self.url)
+        self._no_orphan_players(check)
+        self.assertEqual(len(check.players_for_team(team_t)), 1, results)
+        self.assertIsNotNone(check.get_team(team_t), results)
+        self.assertEqual(_audit_actions(check, "team_deleted"), 0, results)
+
+    def test_assign_player_team_vs_delete_team_child_wins(self):
+        api0 = ApiService(SqlStore(self.url))
+        team_a, team_t, player = self._seed_move(api0)
+        child_store = SqlStore(self.url)
+        api_c = ApiService(child_store)
+        api_d = ApiService(SqlStore(self.url))
+        results = self._forced_child_wins(
+            child_store, "save_player",
+            child_fn=lambda: api_c.setup.assign_player_team(
+                player, team_t, actor_id="assign"),
+            delete_fn=lambda: api_d.setup.delete_team(team_t, actor_id="del"))
+        self.assertEqual(results, {"child": "ok", "delete": "blocked"}, results)
+        check = SqlStore(self.url)
+        self._no_orphan_players(check)
+        self.assertEqual(check.get_player(player).team_id, team_t, results)
+        self.assertIsNotNone(check.get_team(team_t), results)
+        self.assertEqual(_audit_actions(check, "team_deleted"), 0, results)
+
+    def test_create_team_vs_delete_club_child_wins(self):
+        api0 = ApiService(SqlStore(self.url))
+        _p, _s, lid, club = self._seed_team(api0)
+        child_store = SqlStore(self.url)
+        api_c = ApiService(child_store)
+        api_d = ApiService(SqlStore(self.url))
+        results = self._forced_child_wins(
+            child_store, "add_team",
+            child_fn=lambda: api_c.setup.create_team(
+                club_id=club, name="New", league_id=lid, actor_id="create"),
+            delete_fn=lambda: api_d.setup.delete_club(club, actor_id="del"))
+        self.assertEqual(results, {"child": "ok", "delete": "blocked"}, results)
+        check = SqlStore(self.url)
+        self._no_orphan_team_clubs(check)
+        self.assertEqual(
+            len([t for t in check.all_teams() if t.club_id == club]), 1, results)
+        self.assertIsNotNone(check.get_club(club), results)
+        self.assertEqual(_audit_actions(check, "club_deleted"), 0, results)
+
+    def test_assign_team_club_vs_delete_club_child_wins(self):
+        api0 = ApiService(SqlStore(self.url))
+        club_old, club_c, team_t = self._seed_rebind(api0)
+        child_store = SqlStore(self.url)
+        api_c = ApiService(child_store)
+        api_d = ApiService(SqlStore(self.url))
+        results = self._forced_child_wins(
+            child_store, "save_team",
+            child_fn=lambda: api_c.setup.assign_team_club(
+                team_t, club_c, actor_id="assign"),
+            delete_fn=lambda: api_d.setup.delete_club(club_c, actor_id="del"))
+        self.assertEqual(results, {"child": "ok", "delete": "blocked"}, results)
+        check = SqlStore(self.url)
+        self._no_orphan_team_clubs(check)
+        self.assertEqual(check.get_team(team_t).club_id, club_c, results)
+        self.assertIsNotNone(check.get_club(club_c), results)
+        self.assertEqual(_audit_actions(check, "club_deleted"), 0, results)
 
     # -- invariants --------------------------------------------------------
     def _no_orphan_players(self, store):

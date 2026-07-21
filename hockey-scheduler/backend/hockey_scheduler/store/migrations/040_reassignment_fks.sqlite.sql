@@ -28,7 +28,7 @@ CREATE TABLE teams_new (
   id TEXT PRIMARY KEY,
   name TEXT,
   division TEXT,
-  club_id TEXT REFERENCES clubs (id),
+  club_id TEXT REFERENCES clubs (id) ON DELETE NO ACTION,
   division_id TEXT,
   external_ref TEXT,
   program_id TEXT,

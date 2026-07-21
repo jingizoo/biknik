@@ -27,9 +27,12 @@
 -- a missing team and any team whose non-null club_id names a missing club before
 -- the constraints are added, so an upgrade against dangling data fails loudly,
 -- naming the rows, rather than with an opaque constraint error.
+-- ON DELETE NO ACTION is spelled out (not left to PostgreSQL's default) so the
+-- restrictive, non-cascading safety contract is visible in the DDL: deleting a
+-- still-referenced team or club is rejected, never cascaded.
 ALTER TABLE teams
   ADD CONSTRAINT fk_teams_club
-  FOREIGN KEY (club_id) REFERENCES clubs (id);
+  FOREIGN KEY (club_id) REFERENCES clubs (id) ON DELETE NO ACTION;
 ALTER TABLE players
   ADD CONSTRAINT fk_players_team
-  FOREIGN KEY (team_id) REFERENCES teams (id);
+  FOREIGN KEY (team_id) REFERENCES teams (id) ON DELETE NO ACTION;
