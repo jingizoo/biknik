@@ -81,8 +81,8 @@ from ..domain.enums import NotificationType
 from ..domain.errors import IntegrityConflictError
 from .db import connect
 from .db_errors import (
+    dependent_delete_conflict,
     translate_db_exception,
-    translate_dependency_delete_exception,
     translate_ice_slot_conflict_exception,
     translate_player_jersey_exception,
     translate_reassignment_fk_exception,
@@ -1236,18 +1236,18 @@ class SqlStore:
         # A parent delete that races behind a committed child blocks on the
         # child's FK key-share lock, then fails on the incoming reference — the
         # #201 Slice 3 facility-hierarchy backstop (rinks→venues, ice_slots→rinks,
-        # games→ice_slots, season_venue_access→venues). Translate that incoming-FK
-        # violation into the same stable has-dependencies block the service
-        # pre-check raises, never a raw driver error or cascade.
+        # games→ice_slots, season_venue_access→venues). Signal that incoming-FK
+        # violation as a DependentDeleteConflict; the service catches it, rolls
+        # back, re-resolves the now-committed dependents, and raises the SAME
+        # itemised has-dependencies error its pre-check raises — never a raw
+        # driver error or cascade.
         try:
             self._delete(model, entity_id)
         except Exception as exc:
-            translated = translate_dependency_delete_exception(
-                exc, entity_type=entity_type, entity_id=entity_id,
-                message=f"Can't delete this {entity_type} — dependent record(s) "
-                        "still exist. Remove them first.")
-            if translated is not None:
-                raise translated from exc
+            conflict = dependent_delete_conflict(
+                exc, entity_type=entity_type, entity_id=entity_id)
+            if conflict is not None:
+                raise conflict from exc
             raise
 
     def delete_venue(self, venue_id):

@@ -24,7 +24,6 @@ from typing import Optional
 from ..domain.errors import (
     ConcurrencyConflictError,
     DomainError,
-    HasDependenciesError,
     IntegrityConflictError,
     ScheduleConflictError,
 )
@@ -159,28 +158,44 @@ def translate_ice_slot_conflict_exception(
         details={"reason": "ice_slot_taken", "ice_slot_id": ice_slot_id})
 
 
-def translate_dependency_delete_exception(
-        exc: BaseException, *, entity_type: str, entity_id: str,
-        message: str) -> Optional[DomainError]:
-    """Translate a delete blocked by an INCOMING foreign key into the same stable
-    has-dependencies conflict the service pre-check raises (#201 Slice 3).
+class DependentDeleteConflict(Exception):
+    """Internal signal — a parent delete was rejected by an INCOMING foreign key
+    because a concurrent create committed a dependent in the pre-check→delete
+    window (#201 Slice 3).
 
     The facility-hierarchy deletes (delete_venue / delete_rink / delete_ice_slot)
     take no row lock — the reviewer's FK-only direction — so in the
     child-commits-first ordering the delete blocks on the child's foreign-key
     key-share lock and, once the child commits, fails because the row is now
-    referenced. At the delete store method the only possible foreign-key violation
-    is an incoming reference (the row being deleted is a parent), so any FK
-    violation here means dependents exist: surface the stable HasDependenciesError
-    (matching the non-race service block), never a raw driver error or cascade.
+    referenced. This signal is NEVER surfaced to callers: the service catches it,
+    re-resolves the now-committed dependents on a fresh read, and raises the SAME
+    itemised ``HasDependenciesError`` (dependency groups + counts + ids) its
+    pre-check raises — so the operator sees an identical, actionable error whether
+    the dependent was present up front or committed during the race.
+    """
+
+    def __init__(self, entity_type: str, entity_id: str):
+        super().__init__(f"{entity_type} {entity_id} has dependents")
+        self.entity_type = entity_type
+        self.entity_id = entity_id
+
+
+def dependent_delete_conflict(
+        exc: BaseException, *, entity_type: str,
+        entity_id: str) -> Optional["DependentDeleteConflict"]:
+    """Return a :class:`DependentDeleteConflict` if ``exc`` is an incoming-FK
+    violation on a parent delete, else ``None`` (the caller re-raises unchanged).
+
+    At the delete store method the only possible foreign-key violation is an
+    incoming reference (the row being deleted is a parent), so any FK violation
+    here means dependents exist — the store signals that, and the service turns it
+    into the itemised has-dependencies block. Never a raw driver error or cascade.
     """
     if isinstance(exc, DomainError):
         return None
     if not _is_any_fk_violation(exc):
         return None
-    return HasDependenciesError(
-        message, details={"entity_type": entity_type, "entity_id": entity_id,
-                          "reason": "has_dependencies"})
+    return DependentDeleteConflict(entity_type, entity_id)
 
 
 def _is_any_fk_violation(exc: BaseException) -> bool:

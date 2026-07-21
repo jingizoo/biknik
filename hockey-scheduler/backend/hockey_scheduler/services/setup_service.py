@@ -53,6 +53,7 @@ from ..domain import (
 from ..domain.jersey import MAX_JERSEY_NUMBER, MIN_JERSEY_NUMBER
 from ..domain.shooting import VALID_SHOOTS, normalize_shoots
 from ..domain.errors import (
+    ConcurrencyConflictError,
     DivisionMismatchError,
     HasDependenciesError,
     IntegrityConflictError,
@@ -63,6 +64,7 @@ from ..domain.errors import (
     ValidationError,
 )
 from ..store import InMemoryStore
+from ..store.db_errors import DependentDeleteConflict
 from .import_validator import validate_import, validate_official_availability
 from .season_guard import require_active_season
 from .league_scope import (
@@ -5052,6 +5054,53 @@ class SetupService:
             details={"entity_type": entity_type, "entity_id": entity_id,
                      "dependencies": groups})
 
+    # -- facility-hierarchy delete: itemised block on the concurrency race -----
+    # The venue/rink/ice-slot deletes take no row lock (#201 Slice 3 is FK-only),
+    # so a dependent CREATE that commits in the pre-check→delete window is invisible
+    # to _block_if_dependents and only the incoming foreign key stops the orphaning
+    # delete. The store signals that as a DependentDeleteConflict; here we roll the
+    # (aborted) transaction back, re-resolve the now-committed dependents on a fresh
+    # read, and raise the SAME itemised HasDependenciesError the pre-check raises —
+    # so the operator gets identical dependency groups/counts/ids whether the
+    # dependent was present up front or landed during the race, never a thin error.
+    def _venue_dependent_groups(self, venue_id: str) -> list:
+        rinks = [r for r in self.store.all_rinks() if r.venue_id == venue_id]
+        venue_access = self.store.season_venue_access_for_venue(venue_id)
+        return [self._dep_group("rink", rinks, lambda r: r.name),
+                self._dep_group("venue access", venue_access,
+                                lambda a: self._season_name(a.season_id))]
+
+    def _rink_dependent_groups(self, rink_id: str) -> list:
+        slots = [s for s in self.store.all_ice_slots() if s.rink_id == rink_id]
+        return [self._dep_group("ice slot", slots, self._slot_label)]
+
+    def _ice_slot_dependent_groups(self, slot_id: str) -> list:
+        games = [g for g in self.store.all_games() if g.ice_slot_id == slot_id]
+        return [self._dep_group("game", games, self._matchup)]
+
+    def _delete_parent_guarded(self, entity_type: str, entity_label: str,
+                               entity_id: str, groups_fn, txn_fn):
+        """Run a facility-hierarchy delete; on the FK-loses-to-committed-child
+        race, re-raise the same itemised has-dependencies block the pre-check
+        raises. ``txn_fn`` is the transactional delete; ``groups_fn`` re-resolves
+        the dependent groups. This wrapper is deliberately NOT transactional, so
+        by the time it catches the conflict ``txn_fn``'s transaction has already
+        rolled back — the fresh scan then runs on a clean connection and sees the
+        concurrently-committed dependent."""
+        try:
+            return txn_fn()
+        except DependentDeleteConflict:
+            self._block_if_dependents(entity_type, entity_id, entity_label,
+                                      groups_fn())
+            # Pathological: the dependent was created then removed again before the
+            # re-scan, so there is nothing to itemise. Surface a stable, retryable
+            # conflict rather than leaking the internal signal.
+            raise ConcurrencyConflictError(
+                "The delete could not complete because of concurrent activity. "
+                "Please retry.",
+                details={"reason": "concurrent_dependent_change",
+                         "entity_type": entity_type, "entity_id": entity_id})
+
     def _team_name(self, team_id) -> str:
         team = self.store.get_team(team_id) if team_id else None
         return team.name if team else (team_id or "—")
@@ -5467,40 +5516,56 @@ class SetupService:
         game = self.store.get_game(entry.game_id)
         return self._matchup(game) if game else entry.game_id
 
-    @_transactional
     def delete_venue(self, venue_id: str, actor_id: Optional[str] = None) -> Venue:
+        # Public wrapper (NOT @_transactional): the guard re-blocks on the
+        # FK-loses-to-committed-child race AFTER the inner transaction rolls back.
+        return self._delete_parent_guarded(
+            "venue", "venue", venue_id,
+            lambda: self._venue_dependent_groups(venue_id),
+            lambda: self._delete_venue_txn(venue_id, actor_id))
+
+    @_transactional
+    def _delete_venue_txn(self, venue_id: str, actor_id: Optional[str]) -> Venue:
         venue = self.store.get_venue(venue_id)
         if venue is None:
             raise NotFoundError(f"Venue {venue_id} not found.")
-        rinks = [r for r in self.store.all_rinks() if r.venue_id == venue_id]
         # SeasonVenueAccess (#233 Slice E, reviewer blocker on #255): checked
         # regardless of active status — see delete_season's identical
         # comment; delete_season_venue_access is the matching cleanup op.
-        venue_access = self.store.season_venue_access_for_venue(venue_id)
-        self._block_if_dependents("venue", venue_id, "venue", [
-            self._dep_group("rink", rinks, lambda r: r.name),
-            self._dep_group("venue access", venue_access,
-                            lambda a: self._season_name(a.season_id))])
+        self._block_if_dependents("venue", venue_id, "venue",
+                                  self._venue_dependent_groups(venue_id))
         self.store.delete_venue(venue_id)
         self._audit("venue_deleted", "venue", venue_id, actor_id,
                     {"name": venue.name})
         return venue
 
-    @_transactional
     def delete_rink(self, rink_id: str, actor_id: Optional[str] = None) -> Rink:
+        return self._delete_parent_guarded(
+            "rink", "rink", rink_id,
+            lambda: self._rink_dependent_groups(rink_id),
+            lambda: self._delete_rink_txn(rink_id, actor_id))
+
+    @_transactional
+    def _delete_rink_txn(self, rink_id: str, actor_id: Optional[str]) -> Rink:
         rink = self.store.get_rink(rink_id)
         if rink is None:
             raise NotFoundError(f"Rink {rink_id} not found.")
-        slots = [s for s in self.store.all_ice_slots() if s.rink_id == rink_id]
-        self._block_if_dependents("rink", rink_id, "rink", [
-            self._dep_group("ice slot", slots, self._slot_label)])
+        self._block_if_dependents("rink", rink_id, "rink",
+                                  self._rink_dependent_groups(rink_id))
         self.store.delete_rink(rink_id)
         self._audit("rink_deleted", "rink", rink_id, actor_id,
                     {"name": rink.name, "venue_id": rink.venue_id})
         return rink
 
-    @_transactional
     def delete_ice_slot(self, slot_id: str, actor_id: Optional[str] = None) -> IceSlot:
+        return self._delete_parent_guarded(
+            "ice slot", "ice slot", slot_id,
+            lambda: self._ice_slot_dependent_groups(slot_id),
+            lambda: self._delete_ice_slot_txn(slot_id, actor_id))
+
+    @_transactional
+    def _delete_ice_slot_txn(self, slot_id: str,
+                             actor_id: Optional[str]) -> IceSlot:
         slot = self.store.get_ice_slot(slot_id)
         if slot is None:
             raise NotFoundError(f"Ice slot {slot_id} not found.")
@@ -5510,9 +5575,8 @@ class SetupService:
         # allocated/blocked/maintenance slot is in use — neither is a free future
         # opening; those are state rules that raise a plain validation error.
         # Every path is zero-write.
-        games = [g for g in self.store.all_games() if g.ice_slot_id == slot_id]
-        self._block_if_dependents("ice slot", slot_id, "ice slot", [
-            self._dep_group("game", games, self._matchup)])
+        self._block_if_dependents("ice slot", slot_id, "ice slot",
+                                  self._ice_slot_dependent_groups(slot_id))
         if slot.start_time is not None and slot.start_time <= self.clock():
             raise ValidationError(
                 "Only a future ice slot can be deleted; past slots are history.")

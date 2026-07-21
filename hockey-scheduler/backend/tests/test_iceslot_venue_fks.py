@@ -851,7 +851,19 @@ class ServiceParityTest(unittest.TestCase):
                 if isinstance(store, SqlStore):
                     store.close()
 
+    def _assert_block_group(self, cm, entity_type, entity_id, group_type,
+                            count, label):
+        d = cm.exception.details
+        self.assertEqual(d.get("entity_type"), entity_type, label)
+        self.assertEqual(d.get("entity_id"), entity_id, label)
+        groups = {g["type"]: g for g in d.get("dependencies", [])}
+        self.assertIn(group_type, groups, label)
+        self.assertEqual(groups[group_type]["count"], count, label)
+        self.assertEqual(len(groups[group_type]["items"]), count, label)
+
     def test_delete_blocked_by_dependents(self):
+        # Sequential Memory/SQLite/PostgreSQL parity — the same itemised
+        # dependency contract the child-wins race loser must reproduce.
         for label, store in self._backends():
             with self.subTest(backend=label):
                 api = ApiService(store)
@@ -860,12 +872,17 @@ class ServiceParityTest(unittest.TestCase):
                 api.setup.create_game(ctx["sid"], ctx["did"], ctx["home"],
                                       ctx["away"], slot)
                 # venue has a rink + access; rink has a slot; slot has a game.
-                with self.assertRaises(HasDependenciesError, msg=label):
+                with self.assertRaises(HasDependenciesError, msg=label) as cm:
                     api.setup.delete_venue(ctx["venue"])
-                with self.assertRaises(HasDependenciesError, msg=label):
+                self._assert_block_group(cm, "venue", ctx["venue"], "rink", 1,
+                                         label)
+                with self.assertRaises(HasDependenciesError, msg=label) as cm:
                     api.setup.delete_rink(ctx["rink"])
-                with self.assertRaises(HasDependenciesError, msg=label):
+                self._assert_block_group(cm, "rink", ctx["rink"], "ice slot", 1,
+                                         label)
+                with self.assertRaises(HasDependenciesError, msg=label) as cm:
                     api.setup.delete_ice_slot(slot)
+                self._assert_block_group(cm, "ice slot", slot, "game", 1, label)
                 self.assertIsNotNone(store.get_venue(ctx["venue"]), label)
                 if isinstance(store, SqlStore):
                     store.close()
@@ -889,14 +906,28 @@ class IceSlotRaceTest(unittest.TestCase):
     def _record(self, results, key, fn):
         try:
             fn(); results[key] = "ok"
-        except HasDependenciesError:
+        except HasDependenciesError as exc:
             results[key] = "blocked"
+            # Capture the itemised payload so the child-wins races can assert the
+            # race loser carries the SAME dependency groups/counts/ids as the
+            # non-race pre-check (reviewer requirement).
+            results[key + "_details"] = exc.details
         except NotFoundError:
             results[key] = "not_found"
         except DomainError as exc:
             results[key] = exc.details.get("reason") or exc.code
         except Exception as exc:  # a raw driver error would land here → fail
             results[key] = f"ERR:{exc}"
+
+    def _reference_block_details(self, delete_call):
+        """The itemised HasDependenciesError.details the NON-race pre-check
+        produces for the same delete against a store where the dependent already
+        exists — the ground truth the child-wins race loser must match exactly."""
+        try:
+            delete_call()
+        except HasDependenciesError as exc:
+            return exc.details
+        raise AssertionError("expected the reference delete to be blocked")
 
     def _forced_delete_wins(self, victim_store, locator_method, victim_fn,
                             racer_fn):
@@ -1082,13 +1113,22 @@ class IceSlotRaceTest(unittest.TestCase):
             child_fn=lambda: api_c.setup.create_rink(venue, "New", actor_id="c"),
             delete_store=delete_store,
             delete_fn=lambda: api_d.setup.delete_venue(venue, actor_id="d"))
-        self.assertEqual(results, {"child": "ok", "delete": "blocked"}, results)
+        self.assertEqual(results["child"], "ok", results)
+        self.assertEqual(results["delete"], "blocked", results)
         check = SqlStore(self.url)
         self._no_orphan_rinks(check)
         self.assertEqual(len([r for r in check.all_rinks()
                               if r.venue_id == venue]), 1, results)
         self.assertIsNotNone(check.get_venue(venue), results)
         self.assertEqual(_audit_actions(check, "venue_deleted"), 0, results)
+        # The race loser carries the SAME itemised dependency payload the non-race
+        # pre-check produces against the now-committed rink — identical groups,
+        # counts, and ids (reviewer requirement), not a thin error.
+        reference = self._reference_block_details(
+            lambda: ApiService(SqlStore(self.url)).setup.delete_venue(venue))
+        self.assertEqual(results["delete_details"], reference, results)
+        self._assert_itemised(results["delete_details"], "venue", venue,
+                              "rink", 1)
 
     def test_create_rink_vs_delete_venue_barrier(self):
         api0 = ApiService(SqlStore(self.url))
@@ -1150,13 +1190,19 @@ class IceSlotRaceTest(unittest.TestCase):
                 actor_id="c"),
             delete_store=delete_store,
             delete_fn=lambda: api_d.setup.delete_rink(rink, actor_id="d"))
-        self.assertEqual(results, {"child": "ok", "delete": "blocked"}, results)
+        self.assertEqual(results["child"], "ok", results)
+        self.assertEqual(results["delete"], "blocked", results)
         check = SqlStore(self.url)
         self._no_orphan_slots(check)
         self.assertEqual(len([s for s in check.all_ice_slots()
                               if s.rink_id == rink]), 1, results)
         self.assertIsNotNone(check.get_rink(rink), results)
         self.assertEqual(_audit_actions(check, "rink_deleted"), 0, results)
+        reference = self._reference_block_details(
+            lambda: ApiService(SqlStore(self.url)).setup.delete_rink(rink))
+        self.assertEqual(results["delete_details"], reference, results)
+        self._assert_itemised(results["delete_details"], "rink", rink,
+                              "ice slot", 1)
 
     def test_create_ice_slot_vs_delete_rink_barrier(self):
         api0 = ApiService(SqlStore(self.url))
@@ -1224,13 +1270,19 @@ class IceSlotRaceTest(unittest.TestCase):
                 actor_id="c"),
             delete_store=delete_store,
             delete_fn=lambda: api_d.setup.delete_ice_slot(slot, actor_id="d"))
-        self.assertEqual(results, {"child": "ok", "delete": "blocked"}, results)
+        self.assertEqual(results["child"], "ok", results)
+        self.assertEqual(results["delete"], "blocked", results)
         check = SqlStore(self.url)
         self._no_orphan_games(check)
         self.assertEqual(len([g for g in check.all_games()
                               if g.ice_slot_id == slot]), 1, results)
         self.assertIsNotNone(check.get_ice_slot(slot), results)
         self.assertEqual(_audit_actions(check, "ice_slot_deleted"), 0, results)
+        reference = self._reference_block_details(
+            lambda: ApiService(SqlStore(self.url)).setup.delete_ice_slot(slot))
+        self.assertEqual(results["delete_details"], reference, results)
+        self._assert_itemised(results["delete_details"], "ice slot", slot,
+                              "game", 1)
 
     def test_create_game_vs_delete_ice_slot_barrier(self):
         api0 = ApiService(SqlStore(self.url))
@@ -1294,13 +1346,19 @@ class IceSlotRaceTest(unittest.TestCase):
                 sid, venue, actor_id="c"),
             delete_store=delete_store,
             delete_fn=lambda: api_d.setup.delete_venue(venue, actor_id="d"))
-        self.assertEqual(results, {"child": "ok", "delete": "blocked"}, results)
+        self.assertEqual(results["child"], "ok", results)
+        self.assertEqual(results["delete"], "blocked", results)
         check = SqlStore(self.url)
         self._no_orphan_access(check)
         self.assertEqual(len([a for a in check.all_season_venue_access()
                               if a.venue_id == venue]), 1, results)
         self.assertIsNotNone(check.get_venue(venue), results)
         self.assertEqual(_audit_actions(check, "venue_deleted"), 0, results)
+        reference = self._reference_block_details(
+            lambda: ApiService(SqlStore(self.url)).setup.delete_venue(venue))
+        self.assertEqual(results["delete_details"], reference, results)
+        self._assert_itemised(results["delete_details"], "venue", venue,
+                              "venue access", 1)
 
     def test_grant_access_vs_delete_venue_barrier(self):
         api0 = ApiService(SqlStore(self.url))
@@ -1392,6 +1450,23 @@ class IceSlotRaceTest(unittest.TestCase):
         self.assertEqual(sorted(results.values()), ["ice_slot_taken", "ok"],
                          results)
         self.assertEqual(_audit_actions(check, "game_created"), 1, results)
+
+    # -- itemised has-dependencies payload assertion -----------------------
+    def _assert_itemised(self, details, entity_type, entity_id, group_type,
+                         count):
+        """The race-loser block carries the full itemised dependency contract:
+        the deleted entity, and a dependency group of ``group_type`` with the
+        expected count and per-row {id, name} items (secret-free)."""
+        self.assertEqual(details.get("entity_type"), entity_type, details)
+        self.assertEqual(details.get("entity_id"), entity_id, details)
+        groups = {g["type"]: g for g in details.get("dependencies", [])}
+        self.assertIn(group_type, groups, details)
+        g = groups[group_type]
+        self.assertEqual(g["count"], count, details)
+        self.assertEqual(len(g["items"]), count, details)
+        for item in g["items"]:
+            self.assertIn("id", item, details)
+            self.assertIn("name", item, details)
 
     # -- invariants --------------------------------------------------------
     def _no_orphan_rinks(self, store):
