@@ -62,7 +62,13 @@ Schema changes are applied by a small forward-only runner in `migrate()`:
   the old ones). That rebuild preserves each row's values, columns, indexes
   (including the partial unique `ux_games_active_ice_slot`), and incoming
   references (`game_results`/`game_roster_entries` still target the rebuilt
-  `games`), runs inside the migration's single transaction, and is gated by a
+  `games`). Because dropping a still-referenced parent that holds child rows
+  registers a deferred foreign-key violation that `PRAGMA defer_foreign_keys` does
+  not clear, the runner suspends enforcement the SQLite-recommended way for a
+  populated upgrade — `PRAGMA foreign_keys = OFF` set before the migration's
+  transaction, with a `foreign_key_check` gate before `COMMIT` so a genuinely
+  inconsistent rebuild still fails loudly and rolls back. The whole rebuild runs
+  inside the migration's single transaction and is gated by a
   fail-closed pre-migration data check — so it is all-or-nothing — but it is a
   physical table rewrite, not an in-place `ALTER`. **Take a backup before
   upgrading.**
@@ -101,6 +107,13 @@ by the partial unique index `ux_games_active_ice_slot` (migration 022); migratio
 041 adds only the store-boundary translation of that violation into a stable
 `ScheduleConflictError` (`ice_slot_taken`), so the race loser sees the same
 conflict the service pre-check raises — no new constraint is needed.
+
+Migration 041 is the **facility-hierarchy subset** of #201's no-row-lock work; it
+does not complete #201. The Program/Organization structural relationships carry
+the same unlocked-read → stale-write exposure (`programs.operator_organization_id
+→ organizations` for `create_program` vs `delete_organization`; `seasons.program_id
+→ programs` for `create_season` vs `delete_program`) and are tracked as a
+follow-up slice — #201 stays open until they land.
 
 Each such migration ships with (a) a forward-only pre-migration check in
 `store/integrity_checks.py` that reports any pre-existing dangling row and aborts

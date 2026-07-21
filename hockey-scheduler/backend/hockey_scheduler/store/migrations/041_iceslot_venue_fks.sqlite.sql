@@ -23,16 +23,21 @@
 -- existing index is recreated. Tables are rebuilt in dependency order so each
 -- child's foreign-key target already exists as its rebuilt self: rinks (→ the
 -- unchanged venues) BEFORE ice_slots (→ rinks) BEFORE games (→ ice_slots);
--- season_venue_access (→ venues) is independent. games IS referenced by
--- game_results.game_id (migration 025/026) and game_roster_entries.game_id
--- (migration 027), so its drop/recreate is done with PRAGMA defer_foreign_keys =
--- ON: PRAGMA foreign_keys is a no-op mid-transaction, and migrations run inside a
--- transaction, so deferral is the only way to hold enforcement until COMMIT — by
--- which point games has been recreated with the same ids and those roster/result
--- foreign keys resolve cleanly again. The whole rebuild runs inside one
--- transaction (see _apply_migration), so it is all-or-nothing. The pre-migration
--- check (assert_iceslot_venue_fks_ready) validates the data first, so the new
--- foreign keys reject nothing on upgrade.
+-- season_venue_access (→ venues) is independent.
+--
+-- games IS referenced by game_results.game_id (migration 025/026) and
+-- game_roster_entries.game_id (migration 027). Dropping a still-referenced parent
+-- that already holds child rows leaves a deferred foreign-key violation that
+-- PRAGMA defer_foreign_keys does NOT clear when the parent is recreated, so on a
+-- populated upgrade the migration runner suspends enforcement the
+-- SQLite-recommended way instead — PRAGMA foreign_keys = OFF set *before* the
+-- transaction (see _apply_migration), with a foreign_key_check gate before COMMIT
+-- proving the incoming game_results / game_roster_entries references resolve
+-- cleanly against the rebuilt games. The defer pragma below still covers the
+-- nested-transaction path (the demo reset re-migrating emptied tables, where
+-- foreign_keys cannot be toggled mid-transaction and every table is empty). The
+-- whole rebuild runs inside one transaction, so it is all-or-nothing, and the
+-- pre-migration check (assert_iceslot_venue_fks_ready) validates the data first.
 PRAGMA defer_foreign_keys = ON;
 
 -- rinks: add venue_id → venues(id); preserve every column (incl. external_ref

@@ -420,13 +420,35 @@ def _apply_migration(conn, dialect, version, statements) -> None:
         # outer transaction already makes this migration all-or-nothing.
         body()
     else:  # sqlite (autocommit) — explicit txn so the rebuild is all-or-nothing
+        # A migration may rebuild a table that is REFERENCED by a foreign key
+        # (create-copy-drop-rename; e.g. migration 040 rebuilds players, 041
+        # rebuilds games). PRAGMA foreign_keys is a no-op inside a transaction,
+        # and PRAGMA defer_foreign_keys does NOT clear the deferred violations
+        # that dropping a still-referenced parent (with existing child rows)
+        # registers — so on a populated upgrade the COMMIT would fail even though
+        # the final state is consistent. Enforcement is therefore suspended the
+        # SQLite-recommended way — foreign_keys = OFF, set BEFORE BEGIN — and a
+        # foreign_key_check inside the same transaction proves the result is clean
+        # before COMMIT re-enables it, so a genuinely inconsistent rebuild still
+        # fails loudly and rolls back. (Fresh/empty databases are unaffected; this
+        # matters only when the table already holds child rows. The nested-txn
+        # branch above keeps using the migration file's PRAGMA defer_foreign_keys,
+        # which is sound there because the demo reset re-migrates emptied tables.)
+        conn.execute("PRAGMA foreign_keys = OFF")
         try:
             conn.execute("BEGIN")
             body()
+            violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+            if violations:
+                raise RuntimeError(
+                    f"migration {version} left {len(violations)} foreign-key "
+                    "violation(s); rolling back")
             conn.commit()
         except Exception:
             conn.rollback()
             raise
+        finally:
+            conn.execute("PRAGMA foreign_keys = ON")
 
 
 def _utcnow() -> datetime:

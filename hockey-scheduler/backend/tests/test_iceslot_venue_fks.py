@@ -1,15 +1,21 @@
 """Referential integrity for the facility hierarchy (#201 Slice 3).
 
-SCOPE: this slice adds four foreign keys — rinks.venue_id → venues(id),
-ice_slots.rink_id → rinks(id), games.ice_slot_id → ice_slots(id), and
-season_venue_access.venue_id → venues(id) — as the DATABASE backstop for the
-reviewer-catalogued "no row lock" races (create_rink vs delete_venue,
-create_ice_slot vs delete_rink, create_game vs delete_ice_slot,
-grant_season_venue_access vs delete_venue). It ALSO adds the store-boundary
-translation of migration 022's ux_games_active_ice_slot violation into a stable
-ScheduleConflictError (ice_slot_taken) — the cross-Season slot double-booking
-loser. It does NOT add a season-side FK to season_venue_access: grant and
-delete_season both take the Season row lock, so that pair already serialises.
+SCOPE: this is the FACILITY-HIERARCHY subset of #201's no-row-lock work — it adds
+four foreign keys — rinks.venue_id → venues(id), ice_slots.rink_id → rinks(id),
+games.ice_slot_id → ice_slots(id), and season_venue_access.venue_id → venues(id)
+— as the DATABASE backstop for the reviewer-catalogued "no row lock" races
+(create_rink vs delete_venue, create_ice_slot vs delete_rink, create_game vs
+delete_ice_slot, grant_season_venue_access vs delete_venue). It ALSO adds the
+store-boundary translation of migration 022's ux_games_active_ice_slot violation
+into a stable ScheduleConflictError (ice_slot_taken) — the cross-Season slot
+double-booking loser. It does NOT add a season-side FK to season_venue_access:
+grant and delete_season both take the Season row lock, so that pair already
+serialises.
+
+It does NOT complete #201's no-row-lock scope: the Program/Organization structural
+races (create_program vs delete_organization → programs.operator_organization_id →
+organizations; create_season vs delete_program → seasons.program_id → programs)
+remain and are tracked as a separate follow-up slice on #201.
 
 All four foreign keys are NAMED (fk_rinks_venue, fk_ice_slots_rink,
 fk_games_ice_slot, fk_sva_venue) with explicit ON DELETE NO ACTION — never
@@ -244,6 +250,33 @@ def _foreign_key_check_clean(store):
     return cur.fetchall() == []
 
 
+def _indexes(store, table):
+    """Set of secondary index names on ``table`` (excludes auto/PK indexes)."""
+    cur = store.conn.cursor()
+    if store.backend == "sqlite":
+        cur.execute(f"PRAGMA index_list('{table}')")
+        return {r["name"] for r in cur.fetchall()
+                if not r["name"].startswith("sqlite_autoindex")}
+    cur.execute("SELECT indexname FROM pg_indexes WHERE tablename = %s", (table,))
+    return {r["indexname"] for r in cur.fetchall()
+            if not r["indexname"].endswith("_pkey")}
+
+
+def _is_partial_unique(store, table, index_name):
+    """True if ``index_name`` on ``table`` is a partial (WHERE-clause) UNIQUE
+    index — the shape of ux_games_active_ice_slot that must survive the rebuild."""
+    cur = store.conn.cursor()
+    if store.backend == "sqlite":
+        cur.execute(f"SELECT name, [unique], partial FROM pragma_index_list('{table}')")
+        for r in cur.fetchall():
+            if r["name"] == index_name:
+                return bool(r["unique"]) and bool(r["partial"])
+        return False
+    cur.execute("SELECT indexdef FROM pg_indexes WHERE indexname = %s", (index_name,))
+    row = cur.fetchone()
+    return bool(row) and "UNIQUE" in row["indexdef"] and "WHERE" in row["indexdef"]
+
+
 class PreMigrationValidationTest(unittest.TestCase):
     def _pre041(self, url):
         store = _fresh(url)
@@ -444,6 +477,91 @@ class StoreBoundaryTranslationTest(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_saving_slot_onto_missing_rink_is_rink_not_found(self):
+        for label, url in _sql_backends():
+            store = _fresh(url)
+            try:
+                _add_rink_raw(store, "r1", None)
+                with store.transaction():
+                    store.add_ice_slot(IceSlot(
+                        id="s1", rink_id="r1",
+                        start_time=datetime(2027, 1, 1, tzinfo=UTC),
+                        end_time=datetime(2027, 1, 1, 1, tzinfo=UTC)))
+                moved = store.get_ice_slot("s1")
+                moved.rink_id = "ghost"
+                with self.assertRaises(IntegrityConflictError, msg=label) as ctx:
+                    with store.transaction():
+                        store.save_ice_slot(moved)
+                self.assertEqual(ctx.exception.details["reason"],
+                                 "rink_not_found", label)
+                self.assertEqual(store.get_ice_slot("s1").rink_id, "r1", label)
+            finally:
+                store.close()
+
+    def test_saving_game_onto_missing_slot_is_ice_slot_not_found(self):
+        for label, url in _sql_backends():
+            store = _fresh(url)
+            try:
+                _add_slot_raw(store, "s1")
+                with store.transaction():
+                    store.add_game(Game(id="g1", home_team_id="h", away_team_id="a",
+                                        start_time=None, ice_slot_id="s1",
+                                        cancelled=False))
+                moved = store.get_game("g1")
+                moved.ice_slot_id = "ghost"
+                with self.assertRaises(IntegrityConflictError, msg=label) as ctx:
+                    with store.transaction():
+                        store.save_game(moved)
+                self.assertEqual(ctx.exception.details["reason"],
+                                 "ice_slot_not_found", label)
+                self.assertEqual(store.get_game("g1").ice_slot_id, "s1", label)
+            finally:
+                store.close()
+
+    def test_saving_game_onto_booked_slot_is_ice_slot_taken(self):
+        for label, url in _sql_backends():
+            store = _fresh(url)
+            try:
+                _add_slot_raw(store, "s1")
+                _add_slot_raw(store, "s2")
+                with store.transaction():
+                    store.add_game(Game(id="g1", home_team_id="h", away_team_id="a",
+                                        start_time=None, ice_slot_id="s1",
+                                        cancelled=False))
+                    store.add_game(Game(id="g2", home_team_id="x", away_team_id="y",
+                                        start_time=None, ice_slot_id="s2",
+                                        cancelled=False))
+                moved = store.get_game("g2")
+                moved.ice_slot_id = "s1"   # collides with g1's active booking
+                with self.assertRaises(ScheduleConflictError, msg=label) as ctx:
+                    with store.transaction():
+                        store.save_game(moved)
+                self.assertEqual(ctx.exception.details["reason"],
+                                 "ice_slot_taken", label)
+                self.assertEqual(store.get_game("g2").ice_slot_id, "s2", label)
+            finally:
+                store.close()
+
+    def test_saving_access_onto_missing_venue_is_venue_not_found(self):
+        for label, url in _sql_backends():
+            store = _fresh(url)
+            try:
+                _add_venue_raw(store, "v1")
+                with store.transaction():
+                    store.add_season_venue_access(SeasonVenueAccess(
+                        id="a1", season_id="s", venue_id="v1", active=True))
+                moved = store.get_season_venue_access("a1")
+                moved.venue_id = "ghost"
+                with self.assertRaises(IntegrityConflictError, msg=label) as ctx:
+                    with store.transaction():
+                        store.save_season_venue_access(moved)
+                self.assertEqual(ctx.exception.details["reason"],
+                                 "venue_not_found", label)
+                self.assertEqual(store.get_season_venue_access("a1").venue_id,
+                                 "v1", label)
+            finally:
+                store.close()
+
     def test_null_parents_are_allowed(self):
         for label, url in _sql_backends():
             store = _fresh(url)
@@ -486,6 +604,178 @@ class MigrationLedgerTest(unittest.TestCase):
             second.close()
         finally:
             os.remove(path)
+
+
+class MigrationRebuildPreservationTest(unittest.TestCase):
+    """The SQLite create-copy-drop-rename of rinks/ice_slots/games/
+    season_venue_access is a physical table rewrite. This is the durable
+    regression proof that migration 041 preserves — across a close/reopen — every
+    row value, every recreated index (including the partial unique
+    ux_games_active_ice_slot), the new outgoing FKs, AND the incoming
+    game_results → games / game_roster_entries → games references the migration
+    documentation promises to keep. Runs upgrade-from-040 on a file-backed SQLite
+    database (so the reopen is real) and on PostgreSQL when available."""
+
+    # Non-default values in EVERY column of each rebuilt table — a column drop,
+    # reorder, or truncation in the rebuild would change one of these.
+    _VENUE = ("v1", "Ice Palace", "1 Rink Rd", "America/New_York")
+    _RINK = ("r1", "v1", "North Rink", "EXT-R1")
+    _SLOT = ("s1", "r1", "2027-03-01T18:00:00+00:00",
+             "2027-03-01T19:30:00+00:00", "game", "allocated")
+    _SVA = ("a1", "seas1", "v1", 1)
+    _GAME = ("g1", "team_home", "2027-03-01T18:00:00+00:00", 2, 17, 21,
+             "team_away", "North Rink", "2027-03-01T19:30:00+00:00",
+             "2027-03-01T17:00:00+00:00", 1, 0, 1, "seas1", "div1", "s1", 1,
+             "lg1", "exhibition", "ls1")
+    _GAME_COLS = ("id", "home_team_id", "start_time", "target_goalies",
+                  "target_skaters", "max_skaters", "away_team_id", "rink",
+                  "end_time", "roster_lock_time", "locked", "cancelled",
+                  "published", "season_id", "division_id", "ice_slot_id",
+                  "is_draft", "league_id", "game_type", "league_season_id")
+
+    def _locations(self):
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        self._tmp = path
+        yield "sqlite", path
+        url = os.environ.get("TEST_DATABASE_URL")
+        if url:
+            yield "postgres", url
+
+    def tearDown(self):
+        if getattr(self, "_tmp", None) and os.path.exists(self._tmp):
+            os.remove(self._tmp)
+
+    def _seed_rich(self, store):
+        cur = store.conn.cursor()
+        q = store.dialect.sql
+
+        def ins(sql, params):
+            cur.execute(q(sql), params)
+
+        # Parents for the incoming-FK dependents (teams→clubs, players→teams).
+        ins("INSERT INTO clubs (id, name) VALUES (?, ?)", ("c1", "Club One"))
+        ins("INSERT INTO teams (id, name, club_id) VALUES (?, ?, ?)",
+            ("t1", "Team One", "c1"))
+        ins("INSERT INTO players (id, team_id, name, position) VALUES (?, ?, ?, ?)",
+            ("p1", "t1", "Player One", "forward"))
+        # The four rebuilt tables, every column set to a non-default value.
+        ins("INSERT INTO venues (id, name, address, timezone) VALUES (?, ?, ?, ?)",
+            self._VENUE)
+        ins("INSERT INTO rinks (id, venue_id, name, external_ref) "
+            "VALUES (?, ?, ?, ?)", self._RINK)
+        ins("INSERT INTO ice_slots (id, rink_id, start_time, end_time, slot_type, "
+            "status) VALUES (?, ?, ?, ?, ?, ?)", self._SLOT)
+        ins("INSERT INTO season_venue_access (id, season_id, venue_id, active) "
+            "VALUES (?, ?, ?, ?)", self._SVA)
+        ins("INSERT INTO games (" + ", ".join(self._GAME_COLS) + ") VALUES ("
+            + ", ".join("?" for _ in self._GAME_COLS) + ")", self._GAME)
+        # Both incoming Game dependents (game_results + game_roster_entries).
+        ins("INSERT INTO game_results (id, game_id, home_score, away_score) "
+            "VALUES (?, ?, ?, ?)", ("gr1", "g1", 3, 2))
+        ins("INSERT INTO game_roster_entries (id, game_id, player_id) "
+            "VALUES (?, ?, ?)", ("re1", "g1", "p1"))
+
+    def _row(self, store, sql, params=()):
+        cur = store.conn.cursor()
+        cur.execute(store.dialect.sql(sql), params)
+        return cur.fetchone()
+
+    def _row_values(self, store, cols, sql, params):
+        # sqlite3.Row supports tuple(row) → values, but psycopg's dict_row makes
+        # tuple(row) → keys; index by column name so the comparison is portable.
+        r = self._row(store, sql, params)
+        return tuple(r[c] for c in cols)
+
+    def _assert_preserved(self, store, label):
+        # 1) Exact row-for-row values in every rebuilt table.
+        venue_cols = ("id", "name", "address", "timezone")
+        self.assertEqual(
+            self._row_values(store, venue_cols,
+                             "SELECT id, name, address, timezone FROM venues "
+                             "WHERE id = ?", ("v1",)), self._VENUE, label)
+        rink_cols = ("id", "venue_id", "name", "external_ref")
+        self.assertEqual(
+            self._row_values(store, rink_cols,
+                             "SELECT id, venue_id, name, external_ref FROM rinks "
+                             "WHERE id = ?", ("r1",)), self._RINK, label)
+        slot_cols = ("id", "rink_id", "start_time", "end_time", "slot_type",
+                     "status")
+        self.assertEqual(
+            self._row_values(store, slot_cols,
+                             "SELECT id, rink_id, start_time, end_time, "
+                             "slot_type, status FROM ice_slots WHERE id = ?",
+                             ("s1",)), self._SLOT, label)
+        sva_cols = ("id", "season_id", "venue_id", "active")
+        self.assertEqual(
+            self._row_values(store, sva_cols,
+                             "SELECT id, season_id, venue_id, active FROM "
+                             "season_venue_access WHERE id = ?", ("a1",)),
+            self._SVA, label)
+        self.assertEqual(
+            self._row_values(store, self._GAME_COLS,
+                             "SELECT " + ", ".join(self._GAME_COLS)
+                             + " FROM games WHERE id = ?", ("g1",)),
+            self._GAME, label)
+        # 2) Incoming Game references survived the games rebuild.
+        r = self._row(store, "SELECT game_id FROM game_results WHERE id = ?",
+                      ("gr1",))
+        self.assertEqual(r["game_id"], "g1", label)
+        r = self._row(store, "SELECT game_id, player_id FROM game_roster_entries "
+                             "WHERE id = ?", ("re1",))
+        self.assertEqual((r["game_id"], r["player_id"]), ("g1", "p1"), label)
+        # 3) Outgoing + incoming FK catalogs.
+        self.assertEqual(
+            _fks(store, "games"),
+            {("ice_slot_id", "ice_slots", "id",
+              _name(store, "fk_games_ice_slot"), "NO ACTION")}, label)
+        self.assertEqual(
+            _fks(store, "rinks"),
+            {("venue_id", "venues", "id", _name(store, "fk_rinks_venue"),
+              "NO ACTION")}, label)
+        result_fk_targets = {ref for (_c, ref, _t, _n, _d)
+                             in _fks(store, "game_results")}
+        self.assertIn("games", result_fk_targets, label)
+        roster_fk_targets = {ref for (_c, ref, _t, _n, _d)
+                             in _fks(store, "game_roster_entries")}
+        self.assertIn("games", roster_fk_targets, label)
+        self.assertIn("players", roster_fk_targets, label)
+        # 4) Every recreated index, including the partial unique one.
+        game_idx = _indexes(store, "games")
+        for name in ("ix_games_slot", "ix_games_teams", "ux_games_active_ice_slot",
+                     "ix_games_game_type", "ix_games_league_season"):
+            self.assertIn(name, game_idx, f"{label}: games index {name}")
+        self.assertTrue(
+            _is_partial_unique(store, "games", "ux_games_active_ice_slot"), label)
+        self.assertIn("ix_ice_slots_rink", _indexes(store, "ice_slots"), label)
+        sva_idx = _indexes(store, "season_venue_access")
+        for name in ("ux_season_venue_access_active",
+                     "ix_season_venue_access_season", "ix_season_venue_access_venue"):
+            self.assertIn(name, sva_idx, f"{label}: sva index {name}")
+        self.assertTrue(
+            _is_partial_unique(store, "season_venue_access",
+                               "ux_season_venue_access_active"), label)
+        # 5) A clean structural check (SQLite).
+        self.assertTrue(_foreign_key_check_clean(store), label)
+
+    def test_upgrade_from_040_preserves_values_indexes_and_incoming_refs(self):
+        for label, loc in self._locations():
+            store = SqlStore(loc)
+            try:
+                if store.backend == "postgres":
+                    store.reset_schema()
+                _downgrade_041(store)          # back to the pre-041 (post-040) schema
+                with store.transaction():
+                    self._seed_rich(store)
+                migrate(store.conn, store.dialect)   # apply 041 (the rebuild)
+                self.assertIn(_VERSION, store.migration_status()["applied"], label)
+                store.close()
+                store = SqlStore(loc)          # reopen — a real close/reopen cycle
+                self._assert_preserved(store, label)
+            finally:
+                if store.backend == "postgres":
+                    store.reset_schema()       # leave the shared DB pristine
+                store.close()
 
 
 # =====================================================================
