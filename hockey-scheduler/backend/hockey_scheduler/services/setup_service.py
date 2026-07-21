@@ -5242,7 +5242,16 @@ class SetupService:
 
     @_transactional
     def delete_club(self, club_id: str, actor_id: Optional[str] = None) -> Club:
-        club = self.store.get_club(club_id)
+        # Row-lock the club before scanning its dependent teams (#201 Slice 2,
+        # mirroring delete_team's #266 lock): a concurrent create_team /
+        # assign_team_club whose write takes the FK key-share lock on this club
+        # row serializes against this FOR UPDATE, so either the team is already
+        # bound and this delete sees it and blocks, or this delete commits first
+        # and the team write then fails the club_id → clubs(id) foreign key
+        # (club_not_found). Without the lock the two could interleave between the
+        # dependent scan and the delete and surface a raw FK violation on the
+        # losing delete instead of the stable has-dependencies block.
+        club = self.store.get_club_for_update(club_id)
         if club is None:
             raise NotFoundError(f"Club {club_id} not found.")
         teams = [t for t in self.store.all_teams() if t.club_id == club_id]

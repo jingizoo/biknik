@@ -62,6 +62,29 @@ Schema changes are applied by a small forward-only runner in `migrate()`:
   production boot preserves the existing database and only runs pending
   migrations forward.
 
+## Referential integrity (#201)
+
+Selected relationships are enforced by database foreign keys so a concurrent
+delete can never strand a child row under PostgreSQL READ COMMITTED (the service
+dependency checks alone are check-then-write and lose the race). The declared
+foreign keys are:
+
+- `game_results.game_id → games(id)` (migrations 025/026, later `NOT NULL`);
+- `game_roster_entries.game_id → games(id)` and `.player_id → players(id)`
+  (migration 027);
+- `teams.club_id → clubs(id)` and `players.team_id → teams(id)` (migration 040 —
+  the backstop for the assign/delete reassignment races).
+
+Each such migration ships with (a) a forward-only pre-migration check in
+`store/integrity_checks.py` that reports any pre-existing dangling row and aborts
+the upgrade with the offending ids named, and (b) a translation in
+`store/db_errors.py` so a runtime violation surfaces as a stable, secret-free
+domain conflict (e.g. `team_not_found` / `club_not_found`) rather than a raw
+driver error. FK columns that hold an optional link (`teams.club_id`) stay
+nullable — a nullable foreign key still rejects a concrete missing parent. The
+in-memory store has no foreign keys; it relies on its process-wide transaction
+lock plus the same service dependency checks for parity.
+
 ## Tables
 
 `leagues, seasons, divisions, clubs, teams, players, venues, rinks, ice_slots,

@@ -80,10 +80,15 @@ from ..domain import (
 from ..domain.enums import NotificationType
 from ..domain.errors import IntegrityConflictError
 from .db import connect
-from .db_errors import translate_db_exception, translate_player_jersey_exception
+from .db_errors import (
+    translate_db_exception,
+    translate_player_jersey_exception,
+    translate_reassignment_fk_exception,
+)
 from .integrity_checks import (
     assert_competition_hierarchy_reset_ready,
     assert_competition_reset_ready_c1b,
+    assert_reassignment_fks_ready,
     assert_regular_games_resolve_league_season,
     assert_no_duplicate_active_ice_slots,
     assert_no_duplicate_result_games,
@@ -353,6 +358,7 @@ _PRE_MIGRATION_CHECKS = {
     "035_competition_hierarchy_reset": assert_competition_hierarchy_reset_ready,
     "037_game_league_season": assert_regular_games_resolve_league_season,
     "038_active_team_jersey_unique": assert_player_jersey_constraints_ready,
+    "040_reassignment_fks": assert_reassignment_fks_ready,
 }
 
 
@@ -748,10 +754,25 @@ class SqlStore:
         return f"{prefix}_{row['value']}"
 
     # -- teams / players ---------------------------------------------------
-    def add_team(self, team): return self._insert(team)
+    def _write_team(self, write, team):
+        try:
+            return write(team)
+        except Exception as exc:
+            # teams.club_id → clubs(id) (migration 040): a race-losing write onto
+            # a concurrently-deleted club surfaces as the same stable conflict the
+            # service raises when it validates the club up front (#201 Slice 2).
+            translated = translate_reassignment_fk_exception(
+                exc, constraint="fk_teams_club", reason="club_not_found",
+                message="The change references a club that does not exist.",
+                club_id=team.club_id)
+            if translated is not None:
+                raise translated from exc
+            raise
+
+    def add_team(self, team): return self._write_team(self._insert, team)
     def get_team(self, team_id): return self._get(Team, team_id)
     def get_team_for_update(self, team_id): return self._get_for_update(Team, team_id)
-    def save_team(self, team): return self._update(team)
+    def save_team(self, team): return self._write_team(self._update, team)
     def teams_for_program(self, program_id):
         return self._query(Team, "program_id = ?", (program_id,), order="id")
     def _write_player(self, write, player):
@@ -760,6 +781,14 @@ class SqlStore:
         except Exception as exc:
             translated = translate_player_jersey_exception(
                 exc, player.team_id, player.jersey_number)
+            # players.team_id → teams(id) (migration 040): a race-losing write
+            # onto a concurrently-deleted team surfaces as the same stable
+            # conflict the service raises when it validates the team (#201 Slice 2).
+            if translated is None:
+                translated = translate_reassignment_fk_exception(
+                    exc, constraint="fk_players_team", reason="team_not_found",
+                    message="The change references a team that does not exist.",
+                    team_id=player.team_id)
             if translated is not None:
                 raise translated from exc
             raise
@@ -969,6 +998,7 @@ class SqlStore:
 
     def add_club(self, club): return self._insert(club)
     def get_club(self, club_id): return self._get(Club, club_id)
+    def get_club_for_update(self, club_id): return self._get_for_update(Club, club_id)
     def save_club(self, club): return self._update(club)
     def all_clubs(self): return self._query(Club, order="id")
     def all_teams(self): return self._query(Team, order="id")

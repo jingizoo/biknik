@@ -486,6 +486,15 @@ def _player(pid, team, jersey, active=True):
                   jersey_number=jersey, is_active=active)
 
 
+def _seed_teams(store, *tids):
+    """Create the teams referenced by the planted players so migration 040's
+    players.team_id → teams(id) foreign key is satisfied — this suite exercises
+    the jersey index in isolation with synthetic team ids."""
+    with store.transaction():
+        for tid in tids:
+            store.add_team(Team(id=tid, name=tid))
+
+
 def _index_present(store):
     cur = store.conn.cursor()
     if store.backend == "sqlite":
@@ -511,6 +520,7 @@ class JerseyPreMigrationTest(unittest.TestCase):
             store = _fresh(url)
             _downgrade_038(store)
             try:
+                _seed_teams(store, "t1", "t2")
                 with store.transaction():
                     store.add_player(_player("a", "t1", 7))
                     store.add_player(_player("b", "t1", 7))   # dup active
@@ -530,6 +540,7 @@ class JerseyPreMigrationTest(unittest.TestCase):
             store = _fresh(url)
             _downgrade_038(store)
             try:
+                _seed_teams(store, "t1", "t2")
                 with store.transaction():
                     # two inactive #7, and two active NULL — neither reserves.
                     store.add_player(_player("a", "t1", 7, active=False))
@@ -549,6 +560,7 @@ class JerseyPreMigrationTest(unittest.TestCase):
             store = _fresh(url)
             _downgrade_038(store)
             try:
+                _seed_teams(store, "t1", "t2")
                 with store.transaction():
                     store.add_player(_player("bad_0", "t1", 0))
                     store.add_player(_player("bad_99", "t1", 99,
@@ -580,6 +592,7 @@ class JerseyPreMigrationTest(unittest.TestCase):
             store = _fresh(url)
             _downgrade_038(store)
             try:
+                _seed_teams(store, "t1", "t2")
                 with store.transaction():
                     store.add_player(_player("a", "t1", 7))
                     store.add_player(_player("b", "t1", 8))
@@ -599,6 +612,7 @@ class JerseyConstraintEnforcementTest(unittest.TestCase):
         for label, url in _sql_backends():
             store = _fresh(url)
             try:
+                _seed_teams(store, "t1", "t2")
                 with store.transaction():
                     store.add_player(_player("a", "t1", 7))
                 with self.assertRaises(IntegrityConflictError, msg=label) as ctx:
@@ -620,6 +634,7 @@ class JerseyConstraintEnforcementTest(unittest.TestCase):
         for label, url in _sql_backends():
             store = _fresh(url)
             try:
+                _seed_teams(store, "t1", "t2")
                 with store.transaction():
                     store.add_player(_player("a", "t1", 7))
                     store.add_player(_player("b", "t2", 7))         # other team
@@ -636,6 +651,7 @@ class JerseyConstraintEnforcementTest(unittest.TestCase):
         for label, url in _sql_backends():
             store = _fresh(url)
             try:
+                _seed_teams(store, "t1", "t2")
                 with store.transaction():
                     store.add_player(_player("a", "t1", 7))
                 with self.assertRaises(IntegrityConflictError, msg=label):
@@ -655,6 +671,7 @@ class JerseyMigrationLedgerTest(unittest.TestCase):
             first = SqlStore(path)
             self.assertIn(_VERSION, first.migration_status()["applied"])
             self.assertTrue(_index_present(first))
+            _seed_teams(first, "t1")
             with first.transaction():
                 first.add_player(_player("a", "t1", 7))
             first.close()
