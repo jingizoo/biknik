@@ -618,6 +618,77 @@ class SeasonArchiveRaceTest(unittest.TestCase):
                          r.league_season_id).league_id == l1]
         self.assertEqual(l1_active, [], results)
 
+    def test_rollover_all_vs_source_register_and_transfer_stays_consistent(self):
+        # #159 review: v1 copy-all rollover freezes the source-active Team set
+        # ONCE (READ COMMITTED safety), so a Team that registers into the source
+        # Season concurrently is never rolled forward WITHOUT its Team/League
+        # locks. Three-way barrier race: (A) roll_forward_registrations(copy-all)
+        # while (B) a new Team registers into the SOURCE Season and (C) that same
+        # Team is transferred to another League. All three take the canonical
+        # Team → League → Season lock order, so they serialize on the shared Team
+        # row with no deadlock, and the persisted target Season never holds a
+        # registration whose League disagrees with its Team's permanent league_id.
+        store0 = SqlStore(self.url)
+        api0 = ApiService(store0)
+        pid = api0.create_program("Prog", "US", "UTC")["id"]
+        src = api0.create_season(pid, "SRC")["id"]
+        dst = api0.create_season(pid, "DST")["id"]
+        l1 = api0.create_league(src, "Gold")["id"]
+        l2 = api0.create_league(src, "Silver")["id"]
+        club = api0.create_club("Club")["id"]
+        # A stable carried Team, already active in the source Season under L1.
+        t0 = api0.create_team(club_id=club, name="Anchor", league_id=l1)["id"]
+        api0.register_team_for_season(src, t0)
+        # A late entrant: permanent L1, NOT yet registered in the source.
+        t_late = api0.create_team(club_id=club, name="Latecomer",
+                                  league_id=l1)["id"]
+        api_roll = ApiService(SqlStore(self.url))
+        api_reg = ApiService(SqlStore(self.url))
+        api_xfer = ApiService(SqlStore(self.url))
+        barrier = threading.Barrier(3)
+        results = {}
+
+        def run(fn, key):
+            barrier.wait()
+            try:
+                fn(); results[key] = "ok"
+            except ValidationError as exc:
+                results[key] = exc.details.get("reason") or "validation"
+            except Exception as exc:
+                results[key] = f"ERR:{exc}"
+
+        ta = threading.Thread(target=run, args=(
+            lambda: api_roll.setup.roll_forward_registrations(
+                src, dst, selections=None, actor_id="roll"), "roll"))
+        tb = threading.Thread(target=run, args=(
+            lambda: api_reg.setup.register_team_for_season(
+                src, t_late, actor_id="reg"), "reg"))
+        tc = threading.Thread(target=run, args=(
+            lambda: api_xfer.setup.transfer_team_to_league(
+                t_late, l2, actor_id="xfer"), "xfer"))
+        ta.start(); tb.start(); tc.start()
+        ta.join(20); tb.join(20); tc.join(20)
+
+        # No thread hit a raw DB error / deadlock (canonical order → serialize).
+        for key in ("roll", "reg", "xfer"):
+            self.assertFalse(str(results.get(key)).startswith("ERR:"), results)
+        check = SqlStore(self.url)
+        # THE invariant: every active registration in the TARGET Season sits in
+        # the same League as its Team's permanent league_id — no late entrant was
+        # ever rolled forward unlocked into a League a transfer then diverged from.
+        dst_active = [r for r in check.all_season_team_registrations()
+                      if check.get_league_season(r.league_season_id).season_id
+                      == dst and r.active]
+        for r in dst_active:
+            team = check.get_team(r.team_id)
+            reg_league = check.get_league_season(r.league_season_id).league_id
+            self.assertEqual(reg_league, team.league_id,
+                             (r.team_id, reg_league, team.league_id, results))
+        # The stable anchor Team was carried forward exactly once (no partial or
+        # duplicate rollover write).
+        t0_dst = [r for r in dst_active if r.team_id == t0]
+        self.assertEqual(len(t0_dst), 1, results)
+
     def test_archive_vs_legacy_import_is_linearizable(self):
         # The teams+players import holds the archived-Season row lock through ALL
         # its writes (guard is the first statement inside the single write

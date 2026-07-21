@@ -1521,6 +1521,17 @@ class SetupService:
         src = self.store.get_season(from_season_id)
         if src is None:
             raise NotFoundError(f"Season {from_season_id} not found.")
+        # #159 — freeze the source-active Team set ONCE. The store's default
+        # PostgreSQL isolation is READ COMMITTED, so re-reading the source
+        # registrations after the lock pre-pass could observe a Team that
+        # registered into the source Season in between — a "late entrant" that
+        # would then be rolled forward WITHOUT its Team/League locks (and could
+        # race a transfer into a mismatched League). Read the set once here and
+        # use this exact frozen set for BOTH the lock pre-pass and the wanted/
+        # validation below, so every carried Team is one this batch locked.
+        source_active = {r.team_id
+                         for r in self.store.registrations_for_season(from_season_id)
+                         if r.active}
         # #159 — canonical Team → League → Season lock order (shared with
         # transfer_team_to_league): a v1 rollover derives each carried Team's
         # target League from Team.league_id and writes a registration in it.
@@ -1533,9 +1544,7 @@ class SetupService:
         _carry = ([s.get("team_id") for s in selections
                    if isinstance(s, dict) and isinstance(s.get("team_id"), str)]
                   if isinstance(selections, list)
-                  else [r.team_id for r
-                        in self.store.registrations_for_season(from_season_id)
-                        if r.active] if selections is None else [])
+                  else list(source_active) if selections is None else [])
         _roll_lids = set()
         for _tid in sorted({t for t in _carry if isinstance(t, str)}):
             _t = self.store.get_team_for_update(_tid)
@@ -1560,9 +1569,9 @@ class SetupService:
         if (src.program_id or None) != (dst.program_id or None):
             raise ValidationError(
                 "Cannot roll participation between seasons of different programs.")
-        source_active = {r.team_id
-                         for r in self.store.registrations_for_season(from_season_id)
-                         if r.active}
+        # `source_active` was frozen once above (READ COMMITTED safety) and is
+        # reused here for selection validation / the copy-all wanted set, so it
+        # can't diverge from the Team set the lock pre-pass locked.
         if selections is not None:
             # Malformed HTTP input must surface as a structured validation
             # error, not an AttributeError 500 (#197): ``selections`` is a list
