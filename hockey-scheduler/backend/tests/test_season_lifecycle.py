@@ -567,6 +567,39 @@ class SeasonArchivedDeleteAndTransferGuardTest(unittest.TestCase):
             self.assertEqual(len(store.all_setup_audit()), audits0, label)
             self.assertIsNotNone(store.get_team(tid), label)
 
+    def test_rollover_all_reads_source_registrations_once(self):
+        # Structural parity (all backends) for the copy-all freeze (#159 review):
+        # the source-active Team set is queried EXACTLY ONCE, so it cannot diverge
+        # under READ COMMITTED and carry an unlocked late entrant. The former
+        # double-read implementation queried the source twice and would fail this
+        # on every backend — a deterministic regression guard independent of the
+        # PostgreSQL barrier timing.
+        for label, store in _backends():
+            api = ApiService(store)
+            pid = api.create_program("P", "US", "UTC")["id"]
+            src = api.create_season(pid, "SRC")["id"]
+            dst = api.create_season(pid, "DST")["id"]
+            lid = api.create_league(src, "Gold")["id"]
+            club = api.create_club("Club")["id"]
+            tid = api.create_team(club_id=club, name="Alpha", league_id=lid)["id"]
+            api.register_team_for_season(src, tid)
+            orig = store.registrations_for_season
+            reads = []
+
+            def _counting(season_id, _orig=orig, _reads=reads):
+                _reads.append(season_id)
+                return _orig(season_id)
+
+            store.registrations_for_season = _counting
+            try:
+                api.setup.roll_forward_registrations(
+                    src, dst, selections=None, actor_id="roll")
+            finally:
+                store.registrations_for_season = orig
+            # Exactly one read of the SOURCE season's registrations (the frozen
+            # snapshot); target-season reads are a separate concern.
+            self.assertEqual([s for s in reads if s == src], [src], label)
+
     def test_import_driven_transfer_freezes_archived_registration(self):
         # The import path routes a permanent-League change through the same
         # locked _transfer_team_to_league_inner, so it too must freeze an

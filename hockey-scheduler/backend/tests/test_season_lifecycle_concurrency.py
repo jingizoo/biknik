@@ -618,16 +618,17 @@ class SeasonArchiveRaceTest(unittest.TestCase):
                          r.league_season_id).league_id == l1]
         self.assertEqual(l1_active, [], results)
 
-    def test_rollover_all_vs_source_register_and_transfer_stays_consistent(self):
-        # #159 review: v1 copy-all rollover freezes the source-active Team set
-        # ONCE (READ COMMITTED safety), so a Team that registers into the source
-        # Season concurrently is never rolled forward WITHOUT its Team/League
-        # locks. Three-way barrier race: (A) roll_forward_registrations(copy-all)
-        # while (B) a new Team registers into the SOURCE Season and (C) that same
-        # Team is transferred to another League. All three take the canonical
-        # Team → League → Season lock order, so they serialize on the shared Team
-        # row with no deadlock, and the persisted target Season never holds a
-        # registration whose League disagrees with its Team's permanent league_id.
+    def test_rollover_all_excludes_post_snapshot_source_register(self):
+        # #159 review: DETERMINISTIC proof that v1 copy-all rollover reads the
+        # source-active set EXACTLY ONCE and freezes it. The rollover's store is
+        # instrumented to pause the moment it takes the first source snapshot
+        # (registrations_for_season(src)); while it is paused a late Team both
+        # registers into the SOURCE Season and is transferred to another League;
+        # then the rollover resumes. Because the set is frozen, the late Team is
+        # excluded from the target and never rolled forward unlocked. The former
+        # double-read implementation would re-query the source here (a SECOND
+        # read), carry the late Team, and fail every assertion below — so this
+        # regression-protects the fix rather than depending on thread ordering.
         store0 = SqlStore(self.url)
         api0 = ApiService(store0)
         pid = api0.create_program("Prog", "US", "UTC")["id"]
@@ -636,58 +637,89 @@ class SeasonArchiveRaceTest(unittest.TestCase):
         l1 = api0.create_league(src, "Gold")["id"]
         l2 = api0.create_league(src, "Silver")["id"]
         club = api0.create_club("Club")["id"]
-        # A stable carried Team, already active in the source Season under L1.
         t0 = api0.create_team(club_id=club, name="Anchor", league_id=l1)["id"]
         api0.register_team_for_season(src, t0)
-        # A late entrant: permanent L1, NOT yet registered in the source.
         t_late = api0.create_team(club_id=club, name="Latecomer",
                                   league_id=l1)["id"]
-        api_roll = ApiService(SqlStore(self.url))
-        api_reg = ApiService(SqlStore(self.url))
-        api_xfer = ApiService(SqlStore(self.url))
-        barrier = threading.Barrier(3)
+
+        # Instrument the rollover's store: record every source query and, on the
+        # FIRST source snapshot, signal + block until the late writer commits.
+        roll_store = SqlStore(self.url)
+        _orig = roll_store.registrations_for_season
+        snapshot_taken = threading.Event()
+        resume = threading.Event()
+        src_reads = []
+
+        def _instrumented(season_id):
+            result = _orig(season_id)
+            if season_id == src:
+                src_reads.append(season_id)
+                if len(src_reads) == 1:
+                    snapshot_taken.set()
+                    resume.wait(15)
+            return result
+
+        roll_store.registrations_for_season = _instrumented
+        api_roll = ApiService(roll_store)
+        api_late = ApiService(SqlStore(self.url))
         results = {}
 
-        def run(fn, key):
-            barrier.wait()
+        def run_roll():
             try:
-                fn(); results[key] = "ok"
-            except ValidationError as exc:
-                results[key] = exc.details.get("reason") or "validation"
+                api_roll.setup.roll_forward_registrations(
+                    src, dst, selections=None, actor_id="roll")
+                results["roll"] = "ok"
             except Exception as exc:
-                results[key] = f"ERR:{exc}"
+                results["roll"] = f"ERR:{exc}"
 
-        ta = threading.Thread(target=run, args=(
-            lambda: api_roll.setup.roll_forward_registrations(
-                src, dst, selections=None, actor_id="roll"), "roll"))
-        tb = threading.Thread(target=run, args=(
-            lambda: api_reg.setup.register_team_for_season(
-                src, t_late, actor_id="reg"), "reg"))
-        tc = threading.Thread(target=run, args=(
-            lambda: api_xfer.setup.transfer_team_to_league(
-                t_late, l2, actor_id="xfer"), "xfer"))
-        ta.start(); tb.start(); tc.start()
-        ta.join(20); tb.join(20); tc.join(20)
+        def run_late():
+            if not snapshot_taken.wait(15):
+                results["late"] = "ERR:snapshot-never-taken"
+                return
+            try:
+                # Commit AFTER the rollover's source snapshot, BEFORE it resumes.
+                api_late.setup.register_team_for_season(
+                    src, t_late, actor_id="late")
+                api_late.setup.transfer_team_to_league(
+                    t_late, l2, actor_id="late")
+                results["late"] = "ok"
+            except Exception as exc:
+                results["late"] = f"ERR:{exc}"
+            finally:
+                resume.set()
 
-        # No thread hit a raw DB error / deadlock (canonical order → serialize).
-        for key in ("roll", "reg", "xfer"):
-            self.assertFalse(str(results.get(key)).startswith("ERR:"), results)
+        tr = threading.Thread(target=run_roll)
+        tl = threading.Thread(target=run_late)
+        tr.start(); tl.start()
+        tl.join(25)
+        resume.set()  # never leave the rollover blocked, even on a late failure
+        tr.join(25)
+
+        self.assertEqual(results.get("roll"), "ok", results)
+        self.assertEqual(results.get("late"), "ok", results)
+        # The source-active set was queried EXACTLY ONCE (frozen — no double read).
+        self.assertEqual(len(src_reads), 1, (src_reads, results))
         check = SqlStore(self.url)
-        # THE invariant: every active registration in the TARGET Season sits in
-        # the same League as its Team's permanent league_id — no late entrant was
-        # ever rolled forward unlocked into a League a transfer then diverged from.
         dst_active = [r for r in check.all_season_team_registrations()
                       if check.get_league_season(r.league_season_id).season_id
                       == dst and r.active]
+        # The late Team, registered into the source AFTER the snapshot, is absent
+        # from the target — never carried forward (and so never carried unlocked).
+        self.assertEqual([r for r in dst_active if r.team_id == t_late], [],
+                         results)
+        # The anchor Team was carried forward exactly once (no partial/duplicate).
+        self.assertEqual([r.team_id for r in dst_active], [t0], results)
+        # Every target registration's League agrees with its Team's league_id.
         for r in dst_active:
             team = check.get_team(r.team_id)
-            reg_league = check.get_league_season(r.league_season_id).league_id
-            self.assertEqual(reg_league, team.league_id,
-                             (r.team_id, reg_league, team.league_id, results))
-        # The stable anchor Team was carried forward exactly once (no partial or
-        # duplicate rollover write).
-        t0_dst = [r for r in dst_active if r.team_id == t0]
-        self.assertEqual(len(t0_dst), 1, results)
+            self.assertEqual(
+                check.get_league_season(r.league_season_id).league_id,
+                team.league_id, (r.team_id, results))
+        # Exactly one rollover registration audit in the target (no duplicate).
+        rolled_audits = [a for a in check.all_setup_audit()
+                         if a.action == "season_team_registered"
+                         and a.detail.get("season_id") == dst]
+        self.assertEqual(len(rolled_audits), 1, results)
 
     def _ls_deleted_audits(self, store, ls_id):
         return [a for a in store.all_setup_audit()
