@@ -127,6 +127,21 @@ behaviour is spelled out explicitly as `ON DELETE NO ACTION` in both dialects
 rejected. The in-memory store has no foreign keys; it relies on its process-wide
 transaction lock plus the same service dependency checks for parity.
 
+For the facility-hierarchy deletes (migration 041), losing the "no row lock" race
+must still return the operator the **same itemised has-dependencies error** the
+pre-check produces — the concurrently-committed dependent named with its
+group/count/ids — not a thin timing error. Because the losing `DELETE` aborts the
+PostgreSQL transaction, that re-resolution can only read a clean connection *after*
+the transaction has rolled back. The store therefore raises an internal
+`DependentDeleteConflict` at the delete site and re-resolves it from the
+**outermost** `transaction()`'s post-rollback handler (a service callback
+registered via `set_dependent_conflict_resolver`). This is correct whether the
+delete ran on its own or was nested inside a caller's `with store.transaction():`
+(the service delete joins that outer unit without a savepoint): the whole outer
+unit rolls back with zero partial state, and the re-scan never runs on the
+still-aborted connection — so a nested delete never leaks `InFailedSqlTransaction`
+or poisons the caller's atomic unit.
+
 **Rollback / recovery (forward-only).** These migrations are forward-only; there
 is no down-migration. On SQLite these FK migrations physically rebuild their
 tables (migration 040: `teams`/`players`; migration 041:

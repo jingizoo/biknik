@@ -64,7 +64,6 @@ from ..domain.errors import (
     ValidationError,
 )
 from ..store import InMemoryStore
-from ..store.db_errors import DependentDeleteConflict
 from .import_validator import validate_import, validate_official_availability
 from .season_guard import require_active_season
 from .league_scope import (
@@ -211,6 +210,16 @@ class SetupService:
     def __init__(self, store: InMemoryStore, clock: Callable[[], datetime] = _utcnow):
         self.store = store
         self.clock = clock
+        # Re-resolve a no-row-lock facility delete that lost the FK race into the
+        # itemised has-dependencies error (#201 Slice 3). Registered on the store
+        # so it fires from the OUTERMOST transaction()'s post-rollback handler —
+        # on a clean connection — even when the delete was nested inside a
+        # caller's transaction(). Stores without the hook (in-memory) never raise
+        # the conflict (their pre-check catches dependents), so the getattr guard
+        # simply skips them.
+        register = getattr(store, "set_dependent_conflict_resolver", None)
+        if register is not None:
+            register(self._resolve_dependent_delete_conflict)
 
     # -- helpers -----------------------------------------------------------
     def _require_name(self, name: str, field_name: str = "name") -> str:
@@ -5058,11 +5067,17 @@ class SetupService:
     # The venue/rink/ice-slot deletes take no row lock (#201 Slice 3 is FK-only),
     # so a dependent CREATE that commits in the pre-check→delete window is invisible
     # to _block_if_dependents and only the incoming foreign key stops the orphaning
-    # delete. The store signals that as a DependentDeleteConflict; here we roll the
-    # (aborted) transaction back, re-resolve the now-committed dependents on a fresh
-    # read, and raise the SAME itemised HasDependenciesError the pre-check raises —
-    # so the operator gets identical dependency groups/counts/ids whether the
-    # dependent was present up front or landed during the race, never a thin error.
+    # delete. The store signals that as a DependentDeleteConflict and — from the
+    # OUTERMOST transaction()'s post-rollback handler, once the connection is clean
+    # again — calls _resolve_dependent_delete_conflict below. We re-resolve the
+    # now-committed dependents on a fresh read and raise the SAME itemised
+    # HasDependenciesError the pre-check raises, so the operator gets identical
+    # dependency groups/counts/ids whether the dependent was present up front or
+    # landed during the race, never a thin error. Deferring to the outermost
+    # rollback is essential: when the delete is nested inside a caller's
+    # transaction() the connection stays transaction-aborted until that outer unit
+    # rolls back, so re-scanning any earlier would raise InFailedSqlTransaction and
+    # poison the caller's atomic unit.
     def _venue_dependent_groups(self, venue_id: str) -> list:
         rinks = [r for r in self.store.all_rinks() if r.venue_id == venue_id]
         venue_access = self.store.season_venue_access_for_venue(venue_id)
@@ -5078,28 +5093,39 @@ class SetupService:
         games = [g for g in self.store.all_games() if g.ice_slot_id == slot_id]
         return [self._dep_group("game", games, self._matchup)]
 
-    def _delete_parent_guarded(self, entity_type: str, entity_label: str,
-                               entity_id: str, groups_fn, txn_fn):
-        """Run a facility-hierarchy delete; on the FK-loses-to-committed-child
-        race, re-raise the same itemised has-dependencies block the pre-check
-        raises. ``txn_fn`` is the transactional delete; ``groups_fn`` re-resolves
-        the dependent groups. This wrapper is deliberately NOT transactional, so
-        by the time it catches the conflict ``txn_fn``'s transaction has already
-        rolled back — the fresh scan then runs on a clean connection and sees the
-        concurrently-committed dependent."""
-        try:
-            return txn_fn()
-        except DependentDeleteConflict:
-            self._block_if_dependents(entity_type, entity_id, entity_label,
-                                      groups_fn())
-            # Pathological: the dependent was created then removed again before the
-            # re-scan, so there is nothing to itemise. Surface a stable, retryable
-            # conflict rather than leaking the internal signal.
-            raise ConcurrencyConflictError(
-                "The delete could not complete because of concurrent activity. "
-                "Please retry.",
-                details={"reason": "concurrent_dependent_change",
-                         "entity_type": entity_type, "entity_id": entity_id})
+    # Store entity_type (from DependentDeleteConflict) → (details entity_type,
+    # itemised-block label, dependent-groups resolver). The details entity_type
+    # matches the pre-check's exactly, so the race loser and the up-front block
+    # carry byte-identical HasDependenciesError.details.
+    _DEPENDENT_DELETE_SPECS = {
+        "venue": ("venue", "venue", "_venue_dependent_groups"),
+        "rink": ("rink", "rink", "_rink_dependent_groups"),
+        "ice_slot": ("ice slot", "ice slot", "_ice_slot_dependent_groups"),
+    }
+
+    def _resolve_dependent_delete_conflict(self, conflict) -> None:
+        """Store callback, invoked from the outermost transaction()'s
+        post-rollback handler when a no-row-lock facility delete lost the FK race
+        (#201 Slice 3). Runs on a clean connection, so the fresh dependent scan
+        is safe — including when the delete was nested inside a caller's
+        transaction() (the outer unit has fully rolled back, zero partial state).
+
+        Raises the SAME itemised has-dependencies error the pre-check raises. If
+        the dependent was created then removed again before this re-scan, there is
+        nothing to itemise, so it raises a stable, retryable conflict rather than
+        leaking the internal signal."""
+        spec = self._DEPENDENT_DELETE_SPECS.get(conflict.entity_type)
+        if spec is None:  # not a facility delete we itemise — let it propagate
+            return
+        entity_type, entity_label, groups_attr = spec
+        entity_id = conflict.entity_id
+        self._block_if_dependents(entity_type, entity_id, entity_label,
+                                  getattr(self, groups_attr)(entity_id))
+        raise ConcurrencyConflictError(
+            "The delete could not complete because of concurrent activity. "
+            "Please retry.",
+            details={"reason": "concurrent_dependent_change",
+                     "entity_type": entity_type, "entity_id": entity_id})
 
     def _team_name(self, team_id) -> str:
         team = self.store.get_team(team_id) if team_id else None
@@ -5516,16 +5542,8 @@ class SetupService:
         game = self.store.get_game(entry.game_id)
         return self._matchup(game) if game else entry.game_id
 
-    def delete_venue(self, venue_id: str, actor_id: Optional[str] = None) -> Venue:
-        # Public wrapper (NOT @_transactional): the guard re-blocks on the
-        # FK-loses-to-committed-child race AFTER the inner transaction rolls back.
-        return self._delete_parent_guarded(
-            "venue", "venue", venue_id,
-            lambda: self._venue_dependent_groups(venue_id),
-            lambda: self._delete_venue_txn(venue_id, actor_id))
-
     @_transactional
-    def _delete_venue_txn(self, venue_id: str, actor_id: Optional[str]) -> Venue:
+    def delete_venue(self, venue_id: str, actor_id: Optional[str] = None) -> Venue:
         venue = self.store.get_venue(venue_id)
         if venue is None:
             raise NotFoundError(f"Venue {venue_id} not found.")
@@ -5539,14 +5557,8 @@ class SetupService:
                     {"name": venue.name})
         return venue
 
-    def delete_rink(self, rink_id: str, actor_id: Optional[str] = None) -> Rink:
-        return self._delete_parent_guarded(
-            "rink", "rink", rink_id,
-            lambda: self._rink_dependent_groups(rink_id),
-            lambda: self._delete_rink_txn(rink_id, actor_id))
-
     @_transactional
-    def _delete_rink_txn(self, rink_id: str, actor_id: Optional[str]) -> Rink:
+    def delete_rink(self, rink_id: str, actor_id: Optional[str] = None) -> Rink:
         rink = self.store.get_rink(rink_id)
         if rink is None:
             raise NotFoundError(f"Rink {rink_id} not found.")
@@ -5557,15 +5569,9 @@ class SetupService:
                     {"name": rink.name, "venue_id": rink.venue_id})
         return rink
 
-    def delete_ice_slot(self, slot_id: str, actor_id: Optional[str] = None) -> IceSlot:
-        return self._delete_parent_guarded(
-            "ice slot", "ice slot", slot_id,
-            lambda: self._ice_slot_dependent_groups(slot_id),
-            lambda: self._delete_ice_slot_txn(slot_id, actor_id))
-
     @_transactional
-    def _delete_ice_slot_txn(self, slot_id: str,
-                             actor_id: Optional[str]) -> IceSlot:
+    def delete_ice_slot(self, slot_id: str,
+                        actor_id: Optional[str] = None) -> IceSlot:
         slot = self.store.get_ice_slot(slot_id)
         if slot is None:
             raise NotFoundError(f"Ice slot {slot_id} not found.")

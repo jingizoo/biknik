@@ -887,6 +887,44 @@ class ServiceParityTest(unittest.TestCase):
                 if isinstance(store, SqlStore):
                     store.close()
 
+    def test_delete_inside_outer_transaction_blocks_and_rolls_back(self):
+        # Memory/SQLite (+ PostgreSQL) nested-transaction parity for the reviewer
+        # scenario: the caller wraps the facility delete in its own
+        # `with store.transaction():`, so the @_transactional delete JOINS that
+        # outer unit. When a dependent exists the delete must still raise the SAME
+        # itemised has-dependencies error, the whole outer unit must roll back
+        # (parent survives, zero delete audit), and the connection must stay
+        # usable afterward — never left transaction-aborted.
+        for label, store in self._backends():
+            with self.subTest(backend=label):
+                api = ApiService(store)
+                ctx = _seed_arena(api)
+                slot = _future_slot(api, ctx["rink"])
+                api.setup.create_game(ctx["sid"], ctx["did"], ctx["home"],
+                                      ctx["away"], slot)
+                for entity_type, entity_id, group_type, delete_call in (
+                        ("venue", ctx["venue"], "rink",
+                         lambda: api.setup.delete_venue(ctx["venue"], actor_id="d")),
+                        ("rink", ctx["rink"], "ice slot",
+                         lambda: api.setup.delete_rink(ctx["rink"], actor_id="d")),
+                        ("ice slot", slot, "game",
+                         lambda: api.setup.delete_ice_slot(slot, actor_id="d"))):
+                    with self.assertRaises(HasDependenciesError, msg=label) as cm:
+                        with store.transaction():
+                            delete_call()
+                    self._assert_block_group(cm, entity_type, entity_id,
+                                             group_type, 1, label)
+                # Nothing deleted, nothing audited, connection still usable.
+                self.assertIsNotNone(store.get_venue(ctx["venue"]), label)
+                self.assertIsNotNone(store.get_rink(ctx["rink"]), label)
+                self.assertIsNotNone(store.get_ice_slot(slot), label)
+                self.assertEqual(_audit_actions(store, "venue_deleted"), 0, label)
+                self.assertEqual(_audit_actions(store, "rink_deleted"), 0, label)
+                self.assertEqual(_audit_actions(store, "ice_slot_deleted"), 0,
+                                 label)
+                if isinstance(store, SqlStore):
+                    store.close()
+
 
 # =====================================================================
 # PostgreSQL forced barrier races (real row locks + the DB foreign key)
@@ -1081,6 +1119,135 @@ class IceSlotRaceTest(unittest.TestCase):
                         return True
                 time.sleep(0.02)
         return False
+
+    @staticmethod
+    def _in_txn(store, thunk):
+        """Return a callable that runs ``thunk`` inside an explicit outer
+        ``store.transaction()`` — the caller's atomic unit the reviewer's nested
+        scenario wraps the losing delete in. The service delete is @_transactional
+        and simply JOINS this outer transaction (no savepoint), so when its DELETE
+        loses at the FK the whole outer unit is what must roll back."""
+        def run():
+            with store.transaction():
+                thunk()
+        return run
+
+    def _assert_nested_child_wins(self, *, child_store, write_method, child_fn,
+                                  delete_store, delete_thunk, reference_delete,
+                                  entity_type, entity_id, group_type,
+                                  delete_audit):
+        """Child-commits-wins with the parent delete nested inside a caller's
+        outer transaction(). The connection is transaction-aborted the moment the
+        DELETE hits 23503, so re-resolution must run only after the OUTERMOST
+        rollback. Asserts the loser still carries the identical itemised
+        has-dependencies payload, never a raw driver error (InFailedSqlTransaction
+        would surface as ``ERR:`` via _record), and the whole outer unit rolls
+        back (parent survives, dependent survives, zero delete audit)."""
+        results = self._forced_child_wins(
+            child_store, write_method, child_fn=child_fn,
+            delete_store=delete_store,
+            delete_fn=self._in_txn(delete_store, delete_thunk))
+        self.assertEqual(results["child"], "ok", results)
+        self.assertEqual(results["delete"], "blocked", results)
+        reference = self._reference_block_details(reference_delete)
+        self.assertEqual(results["delete_details"], reference, results)
+        self._assert_itemised(results["delete_details"], entity_type, entity_id,
+                              group_type, 1)
+        check = SqlStore(self.url)
+        self.assertEqual(_audit_actions(check, delete_audit), 0, results)
+        return results, check
+
+    # -- nested-transaction child-wins (reviewer: aborted-connection re-scan) --
+    def test_nested_create_rink_vs_delete_venue_child_wins(self):
+        api0 = ApiService(SqlStore(self.url))
+        venue = api0.setup.create_venue("Arena").id
+        child_store = SqlStore(self.url)
+        api_c = ApiService(child_store)
+        delete_store = SqlStore(self.url)
+        api_d = ApiService(delete_store)
+        _results, check = self._assert_nested_child_wins(
+            child_store=child_store, write_method="add_rink",
+            child_fn=lambda: api_c.setup.create_rink(venue, "New", actor_id="c"),
+            delete_store=delete_store,
+            delete_thunk=lambda: api_d.setup.delete_venue(venue, actor_id="d"),
+            reference_delete=lambda: ApiService(
+                SqlStore(self.url)).setup.delete_venue(venue),
+            entity_type="venue", entity_id=venue, group_type="rink",
+            delete_audit="venue_deleted")
+        self._no_orphan_rinks(check)
+        self.assertEqual(len([r for r in check.all_rinks()
+                              if r.venue_id == venue]), 1)
+        self.assertIsNotNone(check.get_venue(venue))
+
+    def test_nested_create_ice_slot_vs_delete_rink_child_wins(self):
+        api0 = ApiService(SqlStore(self.url))
+        _venue, rink = self._seed_venue_rink(api0)
+        child_store = SqlStore(self.url)
+        api_c = ApiService(child_store)
+        delete_store = SqlStore(self.url)
+        api_d = ApiService(delete_store)
+        _results, check = self._assert_nested_child_wins(
+            child_store=child_store, write_method="add_ice_slot",
+            child_fn=lambda: api_c.setup.create_ice_slot(
+                rink, datetime(2027, 1, 1, 18, tzinfo=UTC),
+                datetime(2027, 1, 1, 19, tzinfo=UTC), IceSlotType.GAME,
+                actor_id="c"),
+            delete_store=delete_store,
+            delete_thunk=lambda: api_d.setup.delete_rink(rink, actor_id="d"),
+            reference_delete=lambda: ApiService(
+                SqlStore(self.url)).setup.delete_rink(rink),
+            entity_type="rink", entity_id=rink, group_type="ice slot",
+            delete_audit="rink_deleted")
+        self._no_orphan_slots(check)
+        self.assertEqual(len([s for s in check.all_ice_slots()
+                              if s.rink_id == rink]), 1)
+        self.assertIsNotNone(check.get_rink(rink))
+
+    def test_nested_create_game_vs_delete_ice_slot_child_wins(self):
+        api0 = ApiService(SqlStore(self.url))
+        ctx = _seed_arena(api0)
+        slot = _future_slot(api0, ctx["rink"])
+        child_store = SqlStore(self.url)
+        api_c = ApiService(child_store)
+        delete_store = SqlStore(self.url)
+        api_d = ApiService(delete_store)
+        _results, check = self._assert_nested_child_wins(
+            child_store=child_store, write_method="add_game",
+            child_fn=lambda: api_c.setup.create_game(
+                ctx["sid"], ctx["did"], ctx["home"], ctx["away"], slot,
+                actor_id="c"),
+            delete_store=delete_store,
+            delete_thunk=lambda: api_d.setup.delete_ice_slot(slot, actor_id="d"),
+            reference_delete=lambda: ApiService(
+                SqlStore(self.url)).setup.delete_ice_slot(slot),
+            entity_type="ice slot", entity_id=slot, group_type="game",
+            delete_audit="ice_slot_deleted")
+        self._no_orphan_games(check)
+        self.assertEqual(len([g for g in check.all_games()
+                              if g.ice_slot_id == slot]), 1)
+        self.assertIsNotNone(check.get_ice_slot(slot))
+
+    def test_nested_grant_access_vs_delete_venue_child_wins(self):
+        api0 = ApiService(SqlStore(self.url))
+        sid, venue = self._seed_season_venue(api0)
+        child_store = SqlStore(self.url)
+        api_c = ApiService(child_store)
+        delete_store = SqlStore(self.url)
+        api_d = ApiService(delete_store)
+        _results, check = self._assert_nested_child_wins(
+            child_store=child_store, write_method="add_season_venue_access",
+            child_fn=lambda: api_c.setup.grant_season_venue_access(
+                sid, venue, actor_id="c"),
+            delete_store=delete_store,
+            delete_thunk=lambda: api_d.setup.delete_venue(venue, actor_id="d"),
+            reference_delete=lambda: ApiService(
+                SqlStore(self.url)).setup.delete_venue(venue),
+            entity_type="venue", entity_id=venue, group_type="venue access",
+            delete_audit="venue_deleted")
+        self._no_orphan_access(check)
+        self.assertEqual(len([a for a in check.all_season_venue_access()
+                              if a.venue_id == venue]), 1)
+        self.assertIsNotNone(check.get_venue(venue))
 
     # -- create_rink vs delete_venue --------------------------------------
     def test_create_rink_vs_delete_venue_forced(self):

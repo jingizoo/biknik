@@ -81,6 +81,7 @@ from ..domain.enums import NotificationType
 from ..domain.errors import IntegrityConflictError
 from .db import connect
 from .db_errors import (
+    DependentDeleteConflict,
     dependent_delete_conflict,
     translate_db_exception,
     translate_ice_slot_conflict_exception,
@@ -481,7 +482,28 @@ class SqlStore:
         # atomic — e.g. the demo reset's reset_schema + full reseed — wrap many
         # @_transactional service calls in a single commit/rollback.
         self._txn_depth = 0
+        # Re-resolver for the no-row-lock parent-delete FK race (#201 Slice 3),
+        # set by the service via set_dependent_conflict_resolver. Invoked by the
+        # OUTERMOST transaction() only after rollback, so the itemised
+        # has-dependencies re-scan always runs on a clean connection — even when
+        # the losing delete was nested inside a caller's transaction() and the
+        # connection was transaction-aborted mid-flight.
+        self._dependent_conflict_resolver = None
         migrate(self.conn, self.dialect)
+
+    def set_dependent_conflict_resolver(self, resolver) -> None:
+        """Register the callback that turns a DependentDeleteConflict (a
+        no-row-lock parent delete that lost to a concurrently-committed child,
+        #201 Slice 3) into the itemised has-dependencies domain error.
+
+        The store cannot itemise dependents itself — that is service logic
+        (display names, group types) — so it calls back into the service, but
+        only from the outermost transaction()'s post-rollback handler where the
+        connection is guaranteed clean. Doing the re-scan any earlier (e.g. in
+        the service before the outer rollback) would read on a transaction-
+        aborted connection and raise InFailedSqlTransaction.
+        """
+        self._dependent_conflict_resolver = resolver
 
     @contextmanager
     def transaction(self):
@@ -515,11 +537,24 @@ class SqlStore:
                             raise
                 except Exception as exc:
                     # The transaction has now rolled back, so there is zero
-                    # partial state. Translate a recognized DB integrity/
-                    # concurrency failure into a stable, secret-free domain
-                    # error (#201 Slice 2); anything unrecognized propagates
-                    # unchanged so it surfaces as an internal error rather than
-                    # a misclassified user error.
+                    # partial state and the connection is clean again.
+                    #
+                    # A no-row-lock parent delete (venue/rink/ice-slot, #201
+                    # Slice 3) that lost the FK race surfaces here as a
+                    # DependentDeleteConflict: a child committed between the
+                    # pre-check and the DELETE, so the DB rejected the DELETE and
+                    # aborted the connection mid-transaction. Re-resolve the
+                    # now-committed dependents into the SAME itemised
+                    # has-dependencies error the pre-check raises. This runs at
+                    # the OUTERMOST boundary AFTER rollback, so it is correct
+                    # whether the delete ran on its own or nested inside a
+                    # caller's transaction() — re-scanning inside the still-
+                    # aborted transaction would raise InFailedSqlTransaction.
+                    self._resolve_dependent_delete_conflict(exc)
+                    # Translate a recognized DB integrity/concurrency failure
+                    # into a stable, secret-free domain error (#201 Slice 2);
+                    # anything unrecognized propagates unchanged so it surfaces
+                    # as an internal error rather than a misclassified user error.
                     translated = translate_db_exception(exc)
                     if translated is not None:
                         raise translated from exc
@@ -560,6 +595,31 @@ class SqlStore:
         if holder is not None:
             details["conflicting_player_id"] = holder.id
             details["conflicting_player_name"] = holder.name
+
+    def _resolve_dependent_delete_conflict(self, exc) -> None:
+        """Post-rollback re-resolution of a lost no-row-lock parent delete (#201
+        Slice 3). A no-op unless ``exc`` (or its cause chain) is a
+        ``DependentDeleteConflict`` and a resolver is registered.
+
+        When it fires it hands the conflict to the service-registered resolver,
+        which raises the itemised has-dependencies error (or a stable retry
+        conflict) — so the caller sees the SAME structured error whether the
+        dependent was present at pre-check or committed during the race. Runs
+        only from the outermost transaction()'s handler, i.e. after rollback, so
+        the resolver's fresh dependent scan reads on a clean connection.
+        """
+        if self._dependent_conflict_resolver is None:
+            return
+        conflict = exc
+        while conflict is not None and not isinstance(
+                conflict, DependentDeleteConflict):
+            conflict = getattr(conflict, "__cause__", None)
+        if conflict is None:
+            return
+        # Raises the itemised domain error; if the resolver can't itemise this
+        # entity type it returns and the original DependentDeleteConflict
+        # propagates (surfacing as an internal error, never a partial delete).
+        self._dependent_conflict_resolver(conflict)
 
     def close(self) -> None:
         self.conn.close()
