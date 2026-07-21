@@ -78,6 +78,18 @@ class RosterService:
             raise NotFoundError(f"Game {game_id} not found.")
         return game
 
+    def _refetch_under_season_lock(self, game_id: str) -> Game:
+        """Re-fetch a Game AFTER ``_guard_active_season`` has taken its Season
+        row lock (#201): the pre-lock ``_require_game`` read is only a locator.
+        A concurrent ``cancel_game`` / ``move_game`` / ``publish_game`` commits
+        under the same Season lock, so a Game-state mutation must act on the
+        FRESH row — otherwise saving the stale object silently resurrects a
+        cancelled Game or clobbers a relocation."""
+        game = self.store.get_game(game_id)
+        if game is None:
+            raise NotFoundError(f"Game {game_id} not found.")
+        return game
+
     def _require_player(self, player_id: str) -> Player:
         player = self.store.get_player(player_id)
         if player is None:
@@ -1049,6 +1061,7 @@ class RosterService:
     def lock_roster(self, game_id: str, actor_id: Optional[str] = None) -> Game:
         game = self._require_game(game_id)
         self._guard_active_season(game)  # #159 read-only guard
+        game = self._refetch_under_season_lock(game_id)  # #201
         if game.cancelled:
             raise GameCancelledError("Game is cancelled.")
         was_locked = game.locked
@@ -1071,6 +1084,7 @@ class RosterService:
     def unlock_roster(self, game_id: str, actor_id: Optional[str] = None) -> Game:
         game = self._require_game(game_id)
         self._guard_active_season(game)  # #159 read-only guard
+        game = self._refetch_under_season_lock(game_id)  # #201
         was_locked = game.locked
         game.locked = False
         self.store.save_game(game)
@@ -1085,6 +1099,7 @@ class RosterService:
     def cancel_game(self, game_id: str, actor_id: Optional[str] = None) -> Game:
         game = self._require_game(game_id)
         self._guard_active_season(game)  # #159 read-only guard
+        game = self._refetch_under_season_lock(game_id)  # #201
         was_cancelled = game.cancelled
         game.cancelled = True
         self.store.save_game(game)

@@ -3105,6 +3105,18 @@ class SetupService:
                         "program_id": program_id, "club_id": club_id,
                         "permanent_league_id": league_id})
             return obj, True, []
+        # #201 — re-fetch the Team under its ROW LOCK before any field/league
+        # write, mirroring the public transfer_team_to_league (which locks the
+        # Team first). This serializes the import's writes with a concurrent
+        # register_team_for_season / transfer_team_to_league (both lock the same
+        # Team row), so an inactive old-League registration can't be reactivated
+        # between the transfer's candidate scan and the league change — which
+        # would otherwise leave an active registration in the old League while
+        # Team.league_id moved. A Team deleted out from under the import fails
+        # the whole batch closed rather than writing against a ghost.
+        existing = self.store.get_team_for_update(existing.id)
+        if existing is None:
+            raise NotFoundError("Team no longer exists.")
         old_program_id = existing.program_id
         # #283 Slice E: a permanent-League change on re-import (promotion/
         # relegation in the sheet) must go through the SAME lifecycle guards as
@@ -4876,6 +4888,12 @@ class SetupService:
         if a is None:
             raise NotFoundError(f"Assignment {assignment_id} not found.")
         self._guard_game_season(self.store.get_game(a.game_id))  # #159
+        # #201 — re-fetch under the Season lock; a concurrent unassign that
+        # already removed the row makes this loser a clean not-found, with no
+        # duplicate official_unassigned audit/notification for a row that's gone.
+        a = self.store.get_official_assignment(assignment_id)
+        if a is None:
+            raise NotFoundError(f"Assignment {assignment_id} not found.")
         self.store.remove_official_assignment(assignment_id)
         self._audit("official_unassigned", "official_assignment", assignment_id,
                     actor_id, {"game_id": a.game_id, "official_id": a.official_id})
@@ -4897,6 +4915,11 @@ class SetupService:
         if game is None:
             raise NotFoundError(f"Game {game_id} not found.")
         self._guard_game_season(game)  # #159 read-only guard
+        # #201 — re-fetch under the Season lock; a concurrent cancel_game commits
+        # under the same lock, so the cancelled gate must see the fresh Game.
+        game = self.store.get_game(game_id)
+        if game is None:
+            raise NotFoundError(f"Game {game_id} not found.")
         if game.cancelled:
             raise ValidationError("Cannot record a result for a cancelled game.")
         hs, as_ = self._require_score(home_score), self._require_score(away_score)
@@ -4927,6 +4950,11 @@ class SetupService:
         if game is None:
             raise NotFoundError(f"Game {game_id} not found.")
         self._guard_game_season(game)  # #159 read-only guard
+        # #201 — re-fetch under the Season lock; a concurrent cancel_game commits
+        # under the same lock, so the cancelled gate must see the fresh Game.
+        game = self.store.get_game(game_id)
+        if game is None:
+            raise NotFoundError(f"Game {game_id} not found.")
         if game.cancelled:
             raise ValidationError("Cannot approve a result for a cancelled game.")
         result = self.store.result_for_game(game_id)
