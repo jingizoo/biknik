@@ -48,6 +48,7 @@ from ..domain.errors import (
 )
 from ..store import InMemoryStore
 from .notifier import push as _push_notification
+from .season_guard import require_active_season
 
 
 def _utcnow() -> datetime:
@@ -105,8 +106,18 @@ class RosterService:
             raise NotEligibleError(f"{player.name} is not an active player.")
         return player
 
+    def _guard_active_season(self, game: Game) -> None:
+        """An archived Season is read-only (#159): its Games accept no roster,
+        availability, substitute, lock, or cancel changes. Row-locks the Season
+        (must run inside the caller's transaction) so the check is linearizable
+        with ``archive_season``. Shared by ``_guard_mutable`` and the few
+        mutations that legitimately bypass the cancelled/locked guard."""
+        if game.season_id:
+            require_active_season(self.store, game.season_id)
+
     def _guard_mutable(self, game: Game) -> None:
         """Guard for operations that change the committed roster."""
+        self._guard_active_season(game)  # #159 — archived Season is read-only
         if game.cancelled:
             raise GameCancelledError("Game is cancelled.")
         if game.locked:
@@ -240,6 +251,7 @@ class RosterService:
         notes: Optional[str] = None,
     ) -> GameAvailability:
         game = self._require_game(game_id)
+        self._guard_active_season(game)  # #159 read-only guard
         if game.cancelled:
             raise GameCancelledError("Game is cancelled.")
         if game.locked:
@@ -1036,6 +1048,7 @@ class RosterService:
     @_transactional
     def lock_roster(self, game_id: str, actor_id: Optional[str] = None) -> Game:
         game = self._require_game(game_id)
+        self._guard_active_season(game)  # #159 read-only guard
         if game.cancelled:
             raise GameCancelledError("Game is cancelled.")
         was_locked = game.locked
@@ -1057,6 +1070,7 @@ class RosterService:
     @_transactional
     def unlock_roster(self, game_id: str, actor_id: Optional[str] = None) -> Game:
         game = self._require_game(game_id)
+        self._guard_active_season(game)  # #159 read-only guard
         was_locked = game.locked
         game.locked = False
         self.store.save_game(game)
@@ -1070,6 +1084,7 @@ class RosterService:
     @_transactional
     def cancel_game(self, game_id: str, actor_id: Optional[str] = None) -> Game:
         game = self._require_game(game_id)
+        self._guard_active_season(game)  # #159 read-only guard
         was_cancelled = game.cancelled
         game.cancelled = True
         self.store.save_game(game)

@@ -59,8 +59,13 @@ def program_to_v1(result):
 
 
 def season_to_v1(result):
-    """A Season result → the legacy v1 shape (``program_id`` → ``league_id``)."""
-    return _rename(result, {"program_id": "league_id"})
+    """A Season result → the legacy v1 shape (``program_id`` → ``league_id``).
+
+    #159: Season gained lifecycle fields (``status``/``archived_at``) that the
+    frozen v1 contract does not expose — drop them before the rename so the
+    legacy key set is unchanged (canonical/v2 consumers still see them)."""
+    return _rename(_drop(result, {"status", "archived_at"}),
+                   {"program_id": "league_id"})
 
 
 def division_to_v1(result):

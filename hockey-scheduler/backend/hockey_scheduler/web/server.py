@@ -250,8 +250,9 @@ _POST_ROUTES = [re.compile(p) for p in (
     # _handle_reassign_v2 (the v2 entity/target sets differ from v1).
     r"^/api/v2/setup/(?:program|season|league|division|club|team|organization"
     r"|venue|rink|ice-slot|game|official|player)$",  # entity creates
-    r"^/api/v2/setup/(?:organization|program|season|league|division|club|team"
-    r"|venue|rink|ice-slot|game|official|player)/[^/]+/delete$",  # deletes
+    r"^/api/v2/setup/(?:organization|program|season|league|league-season"
+    r"|division|club|team|venue|rink|ice-slot|game|official|player)"
+    r"/[^/]+/delete$",  # deletes
     r"^/api/v2/setup/program/[^/]+/assign-organization$",
     r"^/api/v2/setup/division/[^/]+/assign-league$",
     r"^/api/v2/setup/team/[^/]+/assign-club$",
@@ -264,6 +265,8 @@ _POST_ROUTES = [re.compile(p) for p in (
     r"^/api/v2/setup/seasons/[^/]+/team-registrations$",
     r"^/api/v2/setup/seasons/[^/]+/venue-access$",
     r"^/api/v2/setup/seasons/[^/]+/roll-forward$",
+    r"^/api/v2/setup/seasons/[^/]+/archive$",
+    r"^/api/v2/setup/seasons/[^/]+/reopen$",
     r"^/api/v2/setup/season-team-registration/[^/]+/assign-league$",
     r"^/api/v2/setup/season-team-registration/[^/]+/assign-division$",
     r"^/api/v2/setup/season-team-registration/[^/]+/remove$",
@@ -2797,11 +2800,24 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_api(api.roll_forward_registrations_v2(
                 b.get("from_season_id"), mrf.group(1), b.get("selections"),
                 actor_id))
+        # Season lifecycle (#159): archive → read-only historical; reopen →
+        # active (requires a reason). Only ``reason`` is accepted in the body.
+        mar = re.match(r"^seasons/([^/]+)/(archive|reopen)$", entity)
+        if mar:
+            try:
+                check_body(b, allowed={"reason"})
+            except BodyError as exc:
+                return self._send_json(exc.payload, exc.status)
+            call = (api.archive_season if mar.group(2) == "archive"
+                    else api.reopen_season)
+            return self._send_api(call(
+                mar.group(1), reason=b.get("reason"), actor_id=actor_id))
         # Delete: /api/v2/setup/<entity>/<id>/delete — canonical names
         # (program-delete = umbrella, league-delete = the grouping League).
         md = re.match(
-            r"^(organization|program|season|league|division|club|team|venue|rink"
-            r"|ice-slot|game|official|player)/([^/]+)/delete$", entity)
+            r"^(organization|program|season|league|league-season|division|club"
+            r"|team|venue|rink|ice-slot|game|official|player)/([^/]+)/delete$",
+            entity)
         if md:
             # Delete routes take no body (#271): reject any key before the write.
             try:
@@ -2813,6 +2829,8 @@ class Handler(BaseHTTPRequestHandler):
                 "organization": api.delete_organization,
                 "program": api.delete_program, "season": api.delete_season,
                 "league": api.delete_league, "division": api.delete_division,
+                # #159: explicit unbind of a League↔Season binding.
+                "league-season": api.delete_league_season,
                 "club": api.delete_club, "team": api.delete_team,
                 "venue": api.delete_venue, "rink": api.delete_rink,
                 "ice-slot": api.delete_ice_slot, "game": api.delete_game,

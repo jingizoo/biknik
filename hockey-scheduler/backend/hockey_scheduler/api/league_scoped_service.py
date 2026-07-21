@@ -95,7 +95,12 @@ class ApiService(_BaseApiService):
             canonical_league_id = division_ls.league_id if division_ls else None
 
         created = []
+        # #159 — lock the target Season read-only and do EVERY Game/audit write
+        # in one transaction, so a concurrent archive cannot slip between the
+        # guard and the writes (autocommit would drop the FOR UPDATE lock at the
+        # end of the check) and the batch stays all-or-nothing.
         with self.store.transaction():
+            self._guard_active_seasons([resolved_season_id])
             for row in proposal["draft_games"]:
                 game = Game(
                     id=self.store.next_id("game"),

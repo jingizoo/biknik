@@ -28,6 +28,9 @@ class SetupService(_BaseSetupService):
         # method's undecorated body to avoid opening a nested SqlStore
         # transaction (SQLite rejects BEGIN inside BEGIN).
         with self.store.transaction():
+            # #159 — an archived (read-only) Season blocks game creation before
+            # any slot/scope resolution, matching the base body's own guard.
+            self._require_active_season(season_id)
             # Preserve the base service's established validation precedence.
             # Scope validation runs only after season/division/team structure is
             # valid; otherwise the base body reports its original error.

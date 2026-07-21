@@ -64,6 +64,7 @@ from ..domain import (
     InstallationState,
     RosterRole,
     Season,
+    SeasonStatus,
     SeasonTeamRegistration,
     SeasonVenueAccess,
     TeamLeagueMigrationDecision,
@@ -151,7 +152,9 @@ class Spec:
 
 SPECS = {
     Program: Spec(Program, "programs"),
-    Season: Spec(Season, "seasons", {"start_date": _dt(), "end_date": _dt()}),
+    Season: Spec(Season, "seasons", {"start_date": _dt(), "end_date": _dt(),
+                                     "status": _enum(SeasonStatus),
+                                     "archived_at": _dt()}),
     League: Spec(League, "leagues"),
     LeagueSeason: Spec(LeagueSeason, "league_seasons"),
     Division: Spec(Division, "divisions"),
@@ -850,6 +853,11 @@ class SqlStore:
 
     def add_season(self, season): return self._insert(season)
     def get_season(self, season_id): return self._get(Season, season_id)
+
+    def get_season_for_update(self, season_id):
+        # Row lock (#159) so concurrent archive/reopen serialize — exactly one
+        # transition wins, the loser sees the stable lifecycle error.
+        return self._get_for_update(Season, season_id)
     def all_seasons(self): return self._query(Season, order="id")
     def save_season(self, season): return self._update(season)
     def seasons_for_program(self, program_id):
@@ -859,6 +867,8 @@ class SqlStore:
     # permanent child of a Program (``program_id``), not of a Season.
     def add_league(self, league): return self._insert(league)
     def get_league(self, league_id): return self._get(League, league_id)
+    def get_league_for_update(self, league_id):
+        return self._get_for_update(League, league_id)
     def all_leagues(self): return self._query(League, order="id")
     def save_league(self, league): return self._update(league)
     def leagues_for_program(self, program_id):
@@ -869,6 +879,7 @@ class SqlStore:
     def get_league_season(self, ls_id): return self._get(LeagueSeason, ls_id)
     def all_league_seasons(self): return self._query(LeagueSeason, order="id")
     def save_league_season(self, ls): return self._update(ls)
+    def delete_league_season(self, ls_id): self._delete(LeagueSeason, ls_id)
     def league_seasons_for_season(self, season_id):
         return self._query(LeagueSeason, "season_id = ?", (season_id,), order="id")
     def league_seasons_for_league(self, league_id):

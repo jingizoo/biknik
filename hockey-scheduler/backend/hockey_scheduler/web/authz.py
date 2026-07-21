@@ -37,7 +37,10 @@ def _v2_setup_permission(rest: str):
     if re.match(r"^season-team-registration/[^/]+/"
                 r"(assign-league|assign-division|remove)$", rest):
         return Permission.MANAGE_SETUP
-    if re.match(r"^seasons/[^/]+/(team-registrations|roll-forward)$", rest):
+    # Season lifecycle archive/reopen (#159) are setup actions, same as
+    # registration/roll-forward above.
+    if re.match(r"^seasons/[^/]+/(team-registrations|roll-forward|archive|reopen)$",
+                rest):
         return Permission.MANAGE_SETUP
     # Season-venue access (#233 Slice E): granting/revoking which Venues a
     # Season may use is a competition-side setup action, same permission as

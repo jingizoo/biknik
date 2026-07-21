@@ -29,7 +29,7 @@ from hockey_scheduler.domain import SeasonTeamRegistration, Team
 PROGRAM_KEYS = {"id", "name", "country", "timezone", "operator_organization_id",
                 "external_ref"}
 SEASON_KEYS = {"id", "program_id", "name", "start_date", "end_date",
-               "external_ref"}
+               "external_ref", "status", "archived_at"}
 LEAGUE_KEYS = {"id", "season_id", "name", "sort_order", "external_ref"}
 DIVISION_KEYS = {"id", "season_id", "name", "age_group", "league_id",
                  "external_ref"}
@@ -294,6 +294,10 @@ class V2SetupContractTest(unittest.TestCase):
         s = next(x for x in prog["seasons"] if x["id"] == season["id"])
         lg = next(x for x in s["leagues"] if x["id"] == league["id"])
         self.assertEqual(len(lg["divisions"]), 1)
+        # #159 — the v2 League node exposes its LeagueSeason binding id so the UI
+        # can drive the explicit unbind before deleting a League.
+        self.assertIn("league_season_id", lg)
+        self.assertTrue(lg["league_season_id"])
         # Canonical vocabulary only — no legacy key names anywhere in the tree.
         blob = json.dumps(body)
         self.assertNotIn("level_id", blob)
@@ -562,6 +566,13 @@ class V2SetupContractTest(unittest.TestCase):
         self.assertEqual(status, 200, deleted)
         self.assertEqual(set(deleted), DIVISION_DELETE_KEYS, deleted)
 
+        # A bound League blocks on its LeagueSeason binding (#159 — itemized
+        # dependency, no silent cascade); the explicit unbind clears it first.
+        ls_id = self.srv.STATE.api.store.league_seasons_for_league(
+            league["id"])[0].id
+        status, _ = self._req(
+            c, "POST", f"/api/v2/setup/league-season/{ls_id}/delete", {})
+        self.assertEqual(status, 200)
         status, dleague = self._req(
             c, "POST", f"/api/v2/setup/league/{league['id']}/delete", {})
         self.assertEqual(status, 200, dleague)

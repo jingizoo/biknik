@@ -541,9 +541,12 @@ class DeletionContract:
         # blocking is isolated to the hidden inactive registration itself.
         self.api.delete_division(d, actor_id=self.ACTOR)
 
+        # A League now also blocks on its permanent Teams (Team.league_id) and
+        # its LeagueSeason bindings (#159) — itemized dependents, never a silent
+        # cascade.
         self.assertBlocked(
             self.api.delete_league(level, actor_id=self.ACTOR),
-            expect_types={"team registration"})
+            expect_types={"team registration", "team", "season binding"})
         self.assertBlocked(
             self.api.delete_season(s, actor_id=self.ACTOR),
             expect_types={"level", "team registration"})
@@ -556,10 +559,17 @@ class DeletionContract:
             self.store.get_season_team_registration, reg,
             "season_team_registration_deleted")
 
-        self.assertDeleted(self.api.delete_league(level, actor_id=self.ACTOR),
-                           self.store.get_league, level, "level_deleted")
+        # Delete the permanent Team, then explicitly (authorized, audited) unbind
+        # the League from the Season — its last dependency — so the now-unbound
+        # League deletes, then the Season and Program.
         self.assertDeleted(self.api.delete_team(team, actor_id=self.ACTOR),
                            self.store.get_team, team, "team_deleted")
+        ls_id = self.store.league_seasons_for_league(level)[0].id
+        self.assertDeleted(
+            self.api.delete_league_season(ls_id, actor_id=self.ACTOR),
+            self.store.get_league_season, ls_id, "league_season_deleted")
+        self.assertDeleted(self.api.delete_league(level, actor_id=self.ACTOR),
+                           self.store.get_league, level, "level_deleted")
         self.assertDeleted(self.api.delete_season(s, actor_id=self.ACTOR),
                            self.store.get_season, s, "season_deleted")
         self.assertDeleted(self.api.delete_program(lg, actor_id=self.ACTOR),
@@ -773,11 +783,16 @@ class DeletionContract:
         level = self.api.create_league(s, "Level A", actor_id=self.ACTOR)["id"]
         self.api.create_division(s, "In Level", league_id=level, actor_id=self.ACTOR)
         blocked = self.api.delete_league(level, actor_id=self.ACTOR)
-        self.assertBlocked(blocked, expect_types={"division"})
+        # A bound League with a Division blocks on both the Division and its
+        # LeagueSeason binding (#159 — bindings are dependency-gated, no cascade).
+        self.assertBlocked(blocked, expect_types={"division", "season binding"})
         self.assertIsNotNone(self.store.get_league(level))
-        empty = self.api.create_league(s, "Empty Level", actor_id=self.ACTOR)["id"]
-        self.assertDeleted(self.api.delete_league(empty, actor_id=self.ACTOR),
-                           self.store.get_league, empty, "level_deleted")
+        # A truly UNBOUND permanent League (no LeagueSeason) still deletes cleanly.
+        unbound = self.store.next_id("league")
+        self.store.add_league(League(id=unbound, program_id=lg, name="Unbound",
+                                     sort_order=0))
+        self.assertDeleted(self.api.delete_league(unbound, actor_id=self.ACTOR),
+                           self.store.get_league, unbound, "level_deleted")
 
     def test_level_blocked_by_registration(self):
         """#233 B2b review r2: a v2 registration's REQUIRED league_id can
@@ -800,7 +815,10 @@ class DeletionContract:
         regs_before = len(self.store.all_season_team_registrations())
         audits_before = len(self.store.all_setup_audit())
         blocked = self.api.delete_league(level, actor_id=self.ACTOR)
-        self.assertBlocked(blocked, expect_types={"team registration"})
+        # The bound League also reports its permanent Team (Team.league_id) and
+        # its LeagueSeason binding as itemized dependents (#159).
+        self.assertBlocked(blocked, expect_types={
+            "team registration", "team", "season binding"})
         self.assertIsNotNone(self.store.get_league(level))
         self.assertIsNotNone(
             self.store.get_season_team_registration(reg["id"]))
@@ -826,8 +844,8 @@ class DeletionContract:
             s, div_team, div, actor_id=self.ACTOR, league_id=level)
         self.assertNotIn("error", reg2, reg2)
         blocked2 = self.api.delete_league(level, actor_id=self.ACTOR)
-        self.assertBlocked(blocked2,
-                           expect_types={"division", "team registration"})
+        self.assertBlocked(blocked2, expect_types={
+            "division", "team registration", "team", "season binding"})
         self.assertIsNotNone(self.store.get_league(level))
 
     # -- season blocked by a game (direct season_id reference) -------------

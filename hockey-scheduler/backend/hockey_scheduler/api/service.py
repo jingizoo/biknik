@@ -303,13 +303,19 @@ class ApiService:
             return summary
         unresponded = [p for p in summary["players"]
                        if p["status"] == "no_response"]
-        for p in unresponded:
-            _push_notification(
-                self.store, self.roster.clock,
-                NotificationKind.AVAILABILITY_REMINDER,
-                NotificationAudience.PLAYER, "Availability reminder",
-                "Please confirm your availability for this game.",
-                audience_ref=p["player_id"], game_id=game_id)
+        _rg = self.store.get_game(game_id)
+        with self.store.transaction():
+            # #159 — no reminders may be generated for an archived Season's
+            # Game; lock the Season and emit inside one transaction.
+            if _rg is not None and _rg.season_id:
+                self.setup._require_active_season(_rg.season_id)
+            for p in unresponded:
+                _push_notification(
+                    self.store, self.roster.clock,
+                    NotificationKind.AVAILABILITY_REMINDER,
+                    NotificationAudience.PLAYER, "Availability reminder",
+                    "Please confirm your availability for this game.",
+                    audience_ref=p["player_id"], game_id=game_id)
         return {"reminded": len(unresponded)}
 
     @catch
@@ -2645,6 +2651,13 @@ class ApiService:
             "roster_status": roster_status, "issues": issues,
         }
 
+    def _guard_active_seasons(self, season_ids) -> None:
+        """Row-lock every distinct Season in canonical (sorted) order and
+        guard it read-only (#159). Sorted order avoids lock-order deadlocks
+        across a multi-Season batch; MUST run inside a store.transaction()."""
+        for sid in sorted({s for s in season_ids if s}):
+            self.setup._require_active_season(sid)
+
     @catch
     def commit_draft_schedule(self, division_id: str = None,
                               season_id: str = None, league_id: str = None,
@@ -2692,33 +2705,39 @@ class ApiService:
         draft_ls = self.store.league_season_for(
             canonical_league_id, resolved_season_id) if canonical_league_id else None
         draft_ls_id = draft_ls.id if draft_ls else None
-        created = []
-        for d in proposal["draft_games"]:
-            g = Game(
-                id=self.store.next_id("game"),
-                home_team_id=d["home_team_id"], away_team_id=d["away_team_id"],
-                start_time=datetime.fromisoformat(d["start_time"]),
-                end_time=datetime.fromisoformat(d["end_time"]) if d.get("end_time") else None,
-                rink=d.get("rink_name"), division_id=d.get("division_id"),
-                season_id=resolved_season_id, league_id=canonical_league_id,
-                ice_slot_id=d.get("ice_slot_id"),
-                league_season_id=draft_ls_id,
-                published=False, is_draft=True)
-            self.store.add_game(g)
-            created.append(self._draft_game_dto(g))
-        # Committing a draft creates real (unpublished) rows — a state change,
-        # so it is audited (#86).
-        if season_id and league_id:
-            scope_type, scope_id = "league", league_id
-        else:
-            scope_type, scope_id = "division", division_id
-        self.setup._audit(
-            "draft_schedule_committed", scope_type, scope_id, actor_id,
-            {"created_count": len(created),
-             "game_ids": [c["game_id"] for c in created],
-             "unscheduled_count": len(proposal["unscheduled"]),
-             "season_id": resolved_season_id,
-             "league_id": proposal["league_id"]})
+        # #159 — lock the target Season and do EVERY Game/audit write in one
+        # transaction, so a concurrent archive cannot commit between the guard
+        # and the writes (autocommit would release the FOR UPDATE lock at the
+        # end of the check) and the batch stays all-or-nothing.
+        with self.store.transaction():
+            self._guard_active_seasons([resolved_season_id])
+            created = []
+            for d in proposal["draft_games"]:
+                g = Game(
+                    id=self.store.next_id("game"),
+                    home_team_id=d["home_team_id"], away_team_id=d["away_team_id"],
+                    start_time=datetime.fromisoformat(d["start_time"]),
+                    end_time=datetime.fromisoformat(d["end_time"]) if d.get("end_time") else None,
+                    rink=d.get("rink_name"), division_id=d.get("division_id"),
+                    season_id=resolved_season_id, league_id=canonical_league_id,
+                    ice_slot_id=d.get("ice_slot_id"),
+                    league_season_id=draft_ls_id,
+                    published=False, is_draft=True)
+                self.store.add_game(g)
+                created.append(self._draft_game_dto(g))
+            # Committing a draft creates real (unpublished) rows — a state change,
+            # so it is audited (#86).
+            if season_id and league_id:
+                scope_type, scope_id = "league", league_id
+            else:
+                scope_type, scope_id = "division", division_id
+            self.setup._audit(
+                "draft_schedule_committed", scope_type, scope_id, actor_id,
+                {"created_count": len(created),
+                 "game_ids": [c["game_id"] for c in created],
+                 "unscheduled_count": len(proposal["unscheduled"]),
+                 "season_id": resolved_season_id,
+                 "league_id": proposal["league_id"]})
         return {"division_id": division_id, "season_id": resolved_season_id,
                 "league_id": proposal["league_id"], "created": created,
                 "unscheduled": proposal["unscheduled"]}
@@ -2819,6 +2838,10 @@ class ApiService:
             self.setup._revalidate_game_participation(g)
         published = 0
         with self.store.transaction():
+            # #159 — lock every target Season (sorted) FIRST, before any
+            # slot/Game write, so the lock order is Season-before-slot/Game
+            # (matching every other path) and no write precedes the guard.
+            self._guard_active_seasons([g.season_id for g in targets])
             for g in targets:
                 # Allocate the ice slot, matching the manual create_game
                 # invariant (a game's slot is ALLOCATED, not left AVAILABLE) —
@@ -2844,13 +2867,19 @@ class ApiService:
 
         Each discard is audited before deletion so the review action leaves a
         trail (a draft is state; discarding it is a state change)."""
+        targets = self._draft_targets(game_ids, all_drafts)
         discarded = 0
-        for g in self._draft_targets(game_ids, all_drafts):
-            self.setup._audit("draft_game_discarded", "game", g.id, actor_id,
-                              {"division_id": g.division_id,
-                               "ice_slot_id": g.ice_slot_id})
-            self.store.delete_game(g.id)
-            discarded += 1
+        # #159 — lock every distinct target Season (sorted) and delete inside
+        # ONE transaction: an archived-Season draft aborts the whole batch
+        # with zero deletes/audits, and the lock is held through the writes.
+        with self.store.transaction():
+            self._guard_active_seasons([g.season_id for g in targets])
+            for g in targets:
+                self.setup._audit("draft_game_discarded", "game", g.id,
+                                  actor_id, {"division_id": g.division_id,
+                                             "ice_slot_id": g.ice_slot_id})
+                self.store.delete_game(g.id)
+                discarded += 1
         return {"discarded": discarded}
 
     @staticmethod
@@ -3177,7 +3206,13 @@ class ApiService:
             "seasons": [
                 {"id": s.id, "program_id": s.program_id, "name": s.name,
                  "start_date": s.start_date.isoformat() if s.start_date else None,
-                 "end_date": s.end_date.isoformat() if s.end_date else None}
+                 "end_date": s.end_date.isoformat() if s.end_date else None,
+                 # Lifecycle state (#159): archived Seasons stay in the read
+                 # payload (history remains visible) but carry their status so
+                 # the UI can flag them and exclude them from active-work pickers.
+                 "status": s.status.value,
+                 "archived_at": (s.archived_at.isoformat()
+                                 if s.archived_at else None)}
                 for s in seasons],
             "leagues": [
                 {"id": lg.id, "season_id": season_by_league.get(lg.id),
@@ -3335,6 +3370,9 @@ class ApiService:
                     lid = self._league_id_via(ls_by_id, d.league_season_id)
                     if lid is not None:
                         divs_by_level.setdefault(lid, []).append(d)
+                # v1 hierarchy shape is frozen (#233) — the LeagueSeason binding
+                # id needed for the #159 unbind is exposed on the v2 hierarchy
+                # only (get_setup_hierarchy_v2), never broadened into v1.
                 level_nodes = [
                     {"id": lv.id, "name": lv.name, "sort_order": lv.sort_order,
                      "divisions": [division_node(d) for d in divs_by_level.get(lv.id, [])]}
@@ -3568,6 +3606,11 @@ class ApiService:
 
                 league_nodes = [
                     {"id": lv.id, "name": lv.name, "sort_order": lv.sort_order,
+                     # #159 — the LeagueSeason binding id, so the UI can drive
+                     # the explicit unbind (delete_league_season) that clears a
+                     # League's binding dependency before deletion.
+                     "league_season_id": getattr(
+                         self.store.league_season_for(lv.id, s.id), "id", None),
                      "divisions": [division_node(d)
                                    for d in divs_by_league.get(lv.id, [])],
                      # Division-optional: teams registered directly under this
@@ -3647,6 +3690,20 @@ class ApiService:
         # raw values are forwarded unparsed rather than pre-validated here.
         return _serialize(self.setup.create_season(
             program_id, name, start_date, end_date, actor_id))
+
+    @catch
+    def archive_season(self, season_id: str, reason: Optional[str] = None,
+                       actor_id: Optional[str] = None) -> dict:
+        """Archive a Season into read-only historical mode (#159)."""
+        return _serialize(self.setup.archive_season(
+            season_id, actor_id=actor_id, reason=reason))
+
+    @catch
+    def reopen_season(self, season_id: str, reason: Optional[str] = None,
+                      actor_id: Optional[str] = None) -> dict:
+        """Reopen an archived Season back to active (#159). Requires a reason."""
+        return _serialize(self.setup.reopen_season(
+            season_id, actor_id=actor_id, reason=reason))
 
     @catch
     def create_league(self, season_id: str, name: str, sort_order: int = 0,
@@ -3825,6 +3882,14 @@ class ApiService:
     @catch
     def delete_league(self, league_id: str, actor_id: Optional[str] = None) -> dict:
         return self._league_dict(self.setup.delete_league(league_id, actor_id))
+
+    @catch
+    def delete_league_season(self, league_season_id: str,
+                             actor_id: Optional[str] = None) -> dict:
+        # Explicit, authorized, audited unbind of a League↔Season binding (#159)
+        # — the operator step that clears a League's binding dependency before
+        # the League itself can be deleted (no silent cascades).
+        return self.setup.delete_league_season(league_season_id, actor_id)
 
     @catch
     def delete_season(self, season_id: str, actor_id: Optional[str] = None) -> dict:
