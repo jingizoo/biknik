@@ -723,21 +723,34 @@ class SetupService:
         season_id = self._season_of_league_season(reg.league_season_id)
         if season_id:
             self._require_active_season(season_id)  # #159 read-only guard
+        # #159 r14 — the pre-lock read was only a LOCATOR. Re-fetch the
+        # registration UNDER the Season row lock (which every unregister /
+        # reactivate / permanent-delete also takes) and operate on the fresh
+        # row, so a concurrent unregister that committed active=False can't be
+        # silently resurrected by saving a stale active=True snapshot. The row's
+        # Team is immutable and its Season never changes, so the Team/League/
+        # Season locks taken above still apply to the fresh row.
+        reg = self.store.get_season_team_registration(registration_id)
+        if reg is None:
+            raise NotFoundError(f"Registration {registration_id} not found.")
         old_league = self._registration_league_id(reg)
-        if (league_id or None) != (old_league or None):
-            stranded = [
-                g.id for g in self.store.all_games()
-                if not g.cancelled and not g.is_draft
-                and g.season_id == season_id and g.league_id == old_league
-                and reg.team_id in (g.home_team_id, g.away_team_id)]
-            if stranded:
-                raise ValidationError(
-                    "Cannot change this registration's league while committed "
-                    "games reference its current league for this team; resolve "
-                    "those games first.",
-                    {"reason": "registration_league_change_strands_games",
-                     "registration_id": reg.id,
-                     "affected_game_ids": stranded, "count": len(stranded)})
+        if (league_id or None) == (old_league or None):
+            # No-op League assignment: write and audit NOTHING, so it can never
+            # reactivate a row a concurrent unregister just deactivated.
+            return reg
+        stranded = [
+            g.id for g in self.store.all_games()
+            if not g.cancelled and not g.is_draft
+            and g.season_id == season_id and g.league_id == old_league
+            and reg.team_id in (g.home_team_id, g.away_team_id)]
+        if stranded:
+            raise ValidationError(
+                "Cannot change this registration's league while committed "
+                "games reference its current league for this team; resolve "
+                "those games first.",
+                {"reason": "registration_league_change_strands_games",
+                 "registration_id": reg.id,
+                 "affected_game_ids": stranded, "count": len(stranded)})
         new_ls = self._link_league_season(league_id, season_id)
         # A division set on the registration must belong to the new LeagueSeason;
         # clear it if it doesn't (the league moved out from under it).
@@ -1118,6 +1131,19 @@ class SetupService:
         season_id = self._season_of_league_season(reg.league_season_id)
         if season_id:
             self._require_active_season(season_id)
+        # #159 r14 — re-fetch the registration UNDER the Season row lock (the
+        # pre-lock read was only a locator) and operate on the fresh row, so a
+        # concurrent unregister/permanent-delete isn't silently clobbered by a
+        # stale snapshot. A row purged out from under us is now a clean
+        # not-found rather than a resurrecting save.
+        reg = self.store.get_season_team_registration(registration_id)
+        if reg is None:
+            raise NotFoundError(f"Registration {registration_id} not found.")
+        old = reg.division_id
+        if (division_id or None) == (old or None):
+            # No-op Division assignment: write and audit NOTHING, so it can
+            # never reactivate a row a concurrent unregister just deactivated.
+            return reg
         if division_id:
             division = self.store.get_division(division_id)
             if division is None:
@@ -1130,7 +1156,6 @@ class SetupService:
                      "registration_id": reg.id,
                      "registration_league_season_id": reg.league_season_id,
                      "division_league_season_id": division.league_season_id})
-        old = reg.division_id
         # Safety — a division change would leave already-scheduled games in the
         # old division mismatched against the team's participation. Refuse and
         # report the affected games so the operator can resolve them first,
@@ -1285,6 +1310,16 @@ class SetupService:
         season_id = self._season_of_league_season(reg.league_season_id)  # #283
         if season_id:
             self._require_active_season(season_id)  # #159 read-only guard
+        # #159 r14 — re-fetch UNDER the Season row lock (the pre-lock read was
+        # only a locator). A concurrent permanent-delete may have removed the
+        # row (→ clean not-found, never resurrect it by saving a stale
+        # snapshot); a concurrent unregister may have already deactivated it
+        # (→ idempotent, no duplicate deactivation audit).
+        reg = self.store.get_season_team_registration(registration_id)
+        if reg is None:
+            raise NotFoundError(f"Registration {registration_id} not found.")
+        if not reg.active:
+            return reg  # already unregistered — idempotent, no second write/audit
         stranded = self._games_scheduled_for_team_in_season(
             season_id, reg.team_id)
         if stranded:
@@ -1327,6 +1362,14 @@ class SetupService:
         season_id = self._season_of_league_season(reg.league_season_id)  # #283
         if season_id:
             self._require_active_season(season_id)
+        # #159 r14 — re-fetch UNDER the Season row lock (the pre-lock read was
+        # only a locator). A concurrent register/reactivate may have flipped
+        # this row back to active AFTER the locator read; deleting it on the
+        # stale inactive snapshot would destroy a live registration. A row
+        # already purged by a concurrent delete is a clean not-found.
+        reg = self.store.get_season_team_registration(registration_id)
+        if reg is None:
+            raise NotFoundError(f"Registration {registration_id} not found.")
         if reg.active:
             raise ValidationError(
                 "Cannot permanently delete an active registration; remove "

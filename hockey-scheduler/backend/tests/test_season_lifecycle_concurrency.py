@@ -721,6 +721,168 @@ class SeasonArchiveRaceTest(unittest.TestCase):
                          and a.detail.get("season_id") == dst]
         self.assertEqual(len(rolled_audits), 1, results)
 
+    # --- #159 r14: stale-registration re-fetch-under-lock races -----------
+    def _run_locator_stale_race(self, victim_fn, victim_store, racer_fn):
+        """Force the dangerous stale-registration ordering (#159 r14).
+
+        Pause the VICTIM the instant it takes its first (locator)
+        ``get_season_team_registration`` read — before it has acquired any lock
+        — run the RACER to completion on another connection, then resume the
+        victim so it acquires the canonical Team/League/Season locks and
+        RE-FETCHES the row under them. Returns the ``{victim, racer}`` outcome
+        map. The victim's own re-fetch is the SECOND read, so only the first
+        (locator) read pauses."""
+        orig = victim_store.get_season_team_registration
+        paused = threading.Event()
+        resume = threading.Event()
+        calls = []
+
+        def instrumented(rid):
+            result = orig(rid)
+            calls.append(rid)
+            if len(calls) == 1:          # the locator read, before any lock
+                paused.set()
+                resume.wait(15)
+            return result
+
+        victim_store.get_season_team_registration = instrumented
+        results = {}
+
+        def run_victim():
+            try:
+                victim_fn(); results["victim"] = "ok"
+            except ValidationError as exc:
+                results["victim"] = exc.details.get("reason") or "validation"
+            except NotFoundError:
+                results["victim"] = "not_found"
+            except Exception as exc:
+                results["victim"] = f"ERR:{exc}"
+
+        def run_racer():
+            if not paused.wait(15):
+                results["racer"] = "ERR:victim-never-paused"
+                return
+            try:
+                racer_fn(); results["racer"] = "ok"
+            except ValidationError as exc:
+                results["racer"] = exc.details.get("reason") or "validation"
+            except Exception as exc:
+                results["racer"] = f"ERR:{exc}"
+            finally:
+                resume.set()
+
+        tv = threading.Thread(target=run_victim)
+        trc = threading.Thread(target=run_racer)
+        tv.start(); trc.start()
+        trc.join(25); resume.set(); tv.join(25)
+        return results
+
+    def _reg_actions(self, store, reg_id):
+        return [a.action for a in store.all_setup_audit()
+                if a.entity_id == reg_id]
+
+    def test_unregister_vs_noop_league_assign_no_resurrection(self):
+        # A no-op League assignment (same League) whose locator read saw the row
+        # ACTIVE must not resurrect it after a concurrent unregister commits
+        # active=False. With the re-fetch, the assign sees the fresh inactive row
+        # and — being a no-op — writes and audits nothing.
+        store0 = SqlStore(self.url)
+        api0 = ApiService(store0)
+        pid = api0.create_program("P", "US", "UTC")["id"]
+        sid = api0.create_season(pid, "S")["id"]
+        l1 = api0.create_league(sid, "Gold")["id"]
+        club = api0.create_club("Club")["id"]
+        tid = api0.create_team(club_id=club, name="Alpha", league_id=l1)["id"]
+        reg_id = api0.register_team_for_season(sid, tid)["id"]
+
+        victim_store = SqlStore(self.url)
+        api_victim = ApiService(victim_store)
+        api_racer = ApiService(SqlStore(self.url))
+        results = self._run_locator_stale_race(
+            victim_fn=lambda: api_victim.setup.assign_season_team_league(
+                reg_id, l1, actor_id="assign"),
+            victim_store=victim_store,
+            racer_fn=lambda: api_racer.setup.unregister_team_from_season(
+                reg_id, actor_id="unreg"))
+        self.assertEqual(results.get("racer"), "ok", results)
+        self.assertEqual(results.get("victim"), "ok", results)
+        check = SqlStore(self.url)
+        reg = check.get_season_team_registration(reg_id)
+        self.assertIsNotNone(reg, results)
+        self.assertFalse(reg.active, results)          # unregister stands
+        actions = self._reg_actions(check, reg_id)
+        self.assertEqual(actions.count("season_team_unregistered"), 1, actions)
+        self.assertEqual(actions.count("season_team_league_assigned"), 0, actions)
+
+    def test_unregister_vs_noop_division_assign_no_resurrection(self):
+        # As above for a no-op Division assignment.
+        store0 = SqlStore(self.url)
+        api0 = ApiService(store0)
+        pid = api0.create_program("P", "US", "UTC")["id"]
+        sid = api0.create_season(pid, "S")["id"]
+        l1 = api0.create_league(sid, "Gold")["id"]
+        did = api0.create_division(sid, "D1", league_id=l1)["id"]
+        club = api0.create_club("Club")["id"]
+        tid = api0.create_team(club_id=club, name="Alpha", league_id=l1)["id"]
+        reg_id = api0.register_team_for_season(sid, tid, division_id=did)["id"]
+
+        victim_store = SqlStore(self.url)
+        api_victim = ApiService(victim_store)
+        api_racer = ApiService(SqlStore(self.url))
+        results = self._run_locator_stale_race(
+            victim_fn=lambda: api_victim.setup.assign_season_team_division(
+                reg_id, did, actor_id="assign"),
+            victim_store=victim_store,
+            racer_fn=lambda: api_racer.setup.unregister_team_from_season(
+                reg_id, actor_id="unreg"))
+        self.assertEqual(results.get("racer"), "ok", results)
+        self.assertEqual(results.get("victim"), "ok", results)
+        check = SqlStore(self.url)
+        reg = check.get_season_team_registration(reg_id)
+        self.assertIsNotNone(reg, results)
+        self.assertFalse(reg.active, results)
+        actions = self._reg_actions(check, reg_id)
+        self.assertEqual(actions.count("season_team_unregistered"), 1, actions)
+        self.assertEqual(
+            actions.count("season_team_division_assigned"), 0, actions)
+
+    def test_reactivate_vs_permanent_delete_no_stale_delete(self):
+        # A permanent-delete whose locator read saw the row INACTIVE must not
+        # delete it after a concurrent register reactivates it. With the
+        # re-fetch, the delete sees the fresh active row and fails closed
+        # (registration_active) with zero delete/audit; the live registration
+        # survives.
+        store0 = SqlStore(self.url)
+        api0 = ApiService(store0)
+        pid = api0.create_program("P", "US", "UTC")["id"]
+        sid = api0.create_season(pid, "S")["id"]
+        l1 = api0.create_league(sid, "Gold")["id"]
+        club = api0.create_club("Club")["id"]
+        tid = api0.create_team(club_id=club, name="Alpha", league_id=l1)["id"]
+        reg_id = api0.register_team_for_season(sid, tid)["id"]
+        api0.unregister_team_from_season(reg_id, actor_id="u")  # now inactive
+
+        victim_store = SqlStore(self.url)
+        api_victim = ApiService(victim_store)
+        api_racer = ApiService(SqlStore(self.url))
+        results = self._run_locator_stale_race(
+            victim_fn=lambda: api_victim.setup.delete_season_team_registration(
+                reg_id, actor_id="del"),
+            victim_store=victim_store,
+            racer_fn=lambda: api_racer.setup.register_team_for_season(
+                sid, tid, actor_id="react"))
+        self.assertEqual(results.get("racer"), "ok", results)   # reactivated
+        self.assertEqual(results.get("victim"), "registration_active", results)
+        check = SqlStore(self.url)
+        reg = check.get_season_team_registration(reg_id)
+        self.assertIsNotNone(reg, results)             # NOT deleted
+        self.assertTrue(reg.active, results)           # live reg preserved
+        actions = self._reg_actions(check, reg_id)
+        self.assertEqual(
+            actions.count("season_team_registration_deleted"), 0, actions)
+        self.assertGreaterEqual(actions.count("season_team_registered"), 1,
+                                actions)
+
     def _ls_deleted_audits(self, store, ls_id):
         return [a for a in store.all_setup_audit()
                 if a.action == "league_season_deleted" and a.entity_id == ls_id]

@@ -600,6 +600,40 @@ class SeasonArchivedDeleteAndTransferGuardTest(unittest.TestCase):
             # snapshot); target-season reads are a separate concern.
             self.assertEqual([s for s in reads if s == src], [src], label)
 
+    def test_stale_registration_write_guards_parity(self):
+        # Parity (all backends) for the re-fetch-under-lock registration guards
+        # (#159 r14). Memory/SQLite serialize the whole transaction, so the race
+        # the PostgreSQL barrier tests force can't occur here — but the guard
+        # SEMANTICS must match: a no-op League/Division assignment never
+        # resurrects an unregistered row or writes an audit, and a permanent
+        # delete refuses a (re)active row.
+        for label, store in _backends():
+            api = ApiService(store)
+            pid = api.create_program("P", "US", "UTC")["id"]
+            sid = api.create_season(pid, "S")["id"]
+            l1 = api.create_league(sid, "Gold")["id"]
+            did = api.create_division(sid, "D1", league_id=l1)["id"]
+            club = api.create_club("Club")["id"]
+            tid = api.create_team(club_id=club, name="Alpha", league_id=l1)["id"]
+            reg_id = api.register_team_for_season(sid, tid, division_id=did)["id"]
+            api.setup.unregister_team_from_season(reg_id, actor_id="u")
+            base_audits = len(store.all_setup_audit())
+            # No-op League then Division assignment on the INACTIVE row: neither
+            # reactivates it nor writes an audit.
+            api.setup.assign_season_team_league(reg_id, l1, actor_id="a")
+            api.setup.assign_season_team_division(reg_id, did, actor_id="a")
+            reg = store.get_season_team_registration(reg_id)
+            self.assertFalse(reg.active, label)                       # no revival
+            self.assertEqual(len(store.all_setup_audit()), base_audits, label)
+            # Reactivate, then a permanent delete must refuse the now-active row.
+            api.register_team_for_season(sid, tid, division_id=did, actor_id="r")
+            with self.assertRaises(ValidationError) as ctx:
+                api.setup.delete_season_team_registration(reg_id, actor_id="d")
+            self.assertEqual(ctx.exception.details.get("reason"),
+                             "registration_active", label)
+            self.assertIsNotNone(
+                store.get_season_team_registration(reg_id), label)
+
     def test_import_driven_transfer_freezes_archived_registration(self):
         # The import path routes a permanent-League change through the same
         # locked _transfer_team_to_league_inner, so it too must freeze an
