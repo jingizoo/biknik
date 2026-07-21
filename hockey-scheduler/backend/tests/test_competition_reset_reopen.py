@@ -142,12 +142,13 @@ class C1bUpgradedReopenTest(unittest.TestCase):
                 first = SqlStore(url)
                 if is_shared:
                     first.reset_schema()
+                # The pre-028 seed models legacy data migration 042's FKs would
+                # reject; suspend them BEFORE the downgrade renames programs/
+                # leagues away, so PostgreSQL can drop the named constraints while
+                # the tables still carry their canonical names (#201 Slice 4).
+                suspend_program_org_fks(first)
                 _downgrade_035(first)
                 _downgrade_028(first)
-                # The pre-028 seed models a program owned by org1 with no
-                # organization row (legacy data); migration 042's FKs would reject
-                # it, so suspend them for the plant (#201 Slice 4).
-                suspend_program_org_fks(first)
                 _seed_pre028(first)
                 migrate(first.conn, first.dialect)  # apply 028 AND 035
                 self.assertIn(_VERSION, first.migration_status()["applied"], label)

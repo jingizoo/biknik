@@ -1342,8 +1342,12 @@ class IceSlotRaceTest(unittest.TestCase):
             self.assertEqual(results["delete"], "blocked", results)
             self.assertIsNotNone(check.get_venue(venue), results)
         else:
-            self.assertEqual(results, {"child": "venue_not_found", "delete": "ok"},
-                             results)
+            # The child loses cleanly by EITHER path: its pre-check read the
+            # deleted venue (-> not_found), or it wrote and lost at the FK
+            # (-> venue_not_found). Both are stable; never a raw error or orphan.
+            self.assertEqual(results["delete"], "ok", results)
+            self.assertIn(results["child"], ("venue_not_found", "not_found"),
+                          results)
             self.assertIsNone(check.get_venue(venue), results)
 
     # -- create_ice_slot vs delete_rink -----------------------------------
@@ -1419,8 +1423,13 @@ class IceSlotRaceTest(unittest.TestCase):
             self.assertEqual(results["delete"], "blocked", results)
             self.assertIsNotNone(check.get_rink(rink), results)
         else:
-            self.assertEqual(results, {"child": "rink_not_found", "delete": "ok"},
-                             results)
+            # The child loses cleanly by EITHER path, depending on timing: its
+            # service pre-check read the deleted rink (-> not_found), or it wrote
+            # and lost at the FK (-> rink_not_found). Both are stable; never a raw
+            # error or an orphan slot. (Mirrors the create_game barrier below.)
+            self.assertEqual(results["delete"], "ok", results)
+            self.assertIn(results["child"], ("rink_not_found", "not_found"),
+                          results)
             self.assertIsNone(check.get_rink(rink), results)
 
     # -- create_game vs delete_ice_slot -----------------------------------
@@ -1573,8 +1582,12 @@ class IceSlotRaceTest(unittest.TestCase):
             self.assertEqual(results["delete"], "blocked", results)
             self.assertIsNotNone(check.get_venue(venue), results)
         else:
-            self.assertEqual(results, {"child": "venue_not_found", "delete": "ok"},
-                             results)
+            # The child loses cleanly by EITHER path: its pre-check read the
+            # deleted venue (-> not_found), or it wrote and lost at the FK
+            # (-> venue_not_found). Both are stable; never a raw error or orphan.
+            self.assertEqual(results["delete"], "ok", results)
+            self.assertIn(results["child"], ("venue_not_found", "not_found"),
+                          results)
             self.assertIsNone(check.get_venue(venue), results)
 
     # -- cross-Season create_game vs create_game (double-book) ------------
