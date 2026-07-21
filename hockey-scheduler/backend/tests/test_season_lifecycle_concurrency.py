@@ -32,7 +32,7 @@ from hockey_scheduler.domain.errors import (
     NotFoundError,
     ValidationError,
 )
-from hockey_scheduler.domain.setup_models import League
+from hockey_scheduler.domain.setup_models import League, SeasonTeamRegistration
 from hockey_scheduler.store import InMemoryStore, SqlStore
 
 
@@ -505,6 +505,118 @@ class SeasonArchiveRaceTest(unittest.TestCase):
             self.assertEqual(results["delete"], "ok", results)
             self.assertIsNone(check.get_league(lid), results)
             self.assertIsNone(binding, results)
+
+    def _seed_two_league_team(self):
+        """Program → Season → {L1 Gold, L2 Silver} → Club → Team(permanent L1).
+        Returns (sid, l1, l2, tid)."""
+        store0 = SqlStore(self.url)
+        api0 = ApiService(store0)
+        pid = api0.create_program("Prog", "US", "UTC")["id"]
+        sid = api0.create_season(pid, "S1")["id"]
+        l1 = api0.create_league(sid, "Gold")["id"]
+        l2 = api0.create_league(sid, "Silver")["id"]
+        club = api0.create_club("Club")["id"]
+        tid = api0.create_team(club_id=club, name="Alpha", league_id=l1)["id"]
+        return sid, l1, l2, tid
+
+    def _assert_team_registration_consistent(self, sid, l2, tid, results):
+        # Transfer always commits (no games to strand) → Team ends in L2, and its
+        # single ACTIVE registration is in the SAME League as the Team. The
+        # canonical invariant team.league_id == registration.league_season.
+        # league_id holds regardless of which thread won the Team-row lock.
+        check = SqlStore(self.url)
+        team = check.get_team(tid)
+        self.assertEqual(results.get("transfer"), "ok", results)
+        self.assertEqual(team.league_id, l2, results)
+        active = [r for r in check.all_season_team_registrations()
+                  if r.team_id == tid and r.active]
+        self.assertEqual(len(active), 1, results)
+        reg_league = check.get_league_season(active[0].league_season_id).league_id
+        self.assertEqual(reg_league, team.league_id, (results, reg_league))
+        # No mismatched registration committed at all (active or otherwise) for
+        # the League the Team no longer belongs to beyond the pre-seeded row.
+        return check
+
+    def test_transfer_vs_register_create_keeps_team_league_consistent(self):
+        # #159 review: register_team_for_season derives its candidate League from
+        # the Team's permanent league_id and now row-locks the Team FIRST
+        # (canonical Team→League→Season, shared with transfer). Racing a transfer
+        # that moves the Team to another League: either register wins (registers
+        # into L1, then the transfer re-homes BOTH the Team and the registration
+        # to L2) or the transfer wins (Team→L2, then register derives L2). The
+        # persisted Team and its active registration always agree — no
+        # LeagueSeason(L1) row left behind while team.league_id == L2.
+        sid, _l1, l2, tid = self._seed_two_league_team()
+        api_reg = ApiService(SqlStore(self.url))
+        api_xfer = ApiService(SqlStore(self.url))
+        barrier = threading.Barrier(2)
+        results = {}
+
+        def run(fn, key):
+            barrier.wait()
+            try:
+                fn(); results[key] = "ok"
+            except ValidationError as exc:
+                results[key] = exc.details.get("reason")
+            except Exception as exc:
+                results[key] = f"ERR:{exc}"
+
+        ta = threading.Thread(target=run, args=(
+            lambda: api_reg.setup.register_team_for_season(
+                sid, tid, actor_id="r"), "register"))
+        tb = threading.Thread(target=run, args=(
+            lambda: api_xfer.setup.transfer_team_to_league(
+                tid, l2, actor_id="x"), "transfer"))
+        ta.start(); tb.start(); ta.join(15); tb.join(15)
+
+        self.assertEqual(results.get("register"), "ok", results)
+        self._assert_team_registration_consistent(sid, l2, tid, results)
+
+    def test_transfer_vs_register_reactivate_keeps_team_league_consistent(self):
+        # As above but the Team already has an INACTIVE registration in L1
+        # (removed then re-added is a reactivation, not a duplicate). Racing the
+        # register (which would reactivate the L1 row when the Team is still in
+        # L1, or create an L2 row when the transfer already moved it) against the
+        # transfer still leaves exactly one ACTIVE registration, in the Team's
+        # final League — never an active L1 row while team.league_id == L2.
+        sid, l1, l2, tid = self._seed_two_league_team()
+        store0 = SqlStore(self.url)
+        ls1 = store0.league_season_for(l1, sid)
+        store0.add_season_team_registration(SeasonTeamRegistration(
+            id=store0.next_id("streg"), league_season_id=ls1.id, team_id=tid,
+            division_id=None, active=False))
+        api_reg = ApiService(SqlStore(self.url))
+        api_xfer = ApiService(SqlStore(self.url))
+        barrier = threading.Barrier(2)
+        results = {}
+
+        def run(fn, key):
+            barrier.wait()
+            try:
+                fn(); results[key] = "ok"
+            except ValidationError as exc:
+                results[key] = exc.details.get("reason")
+            except Exception as exc:
+                results[key] = f"ERR:{exc}"
+
+        ta = threading.Thread(target=run, args=(
+            lambda: api_reg.setup.register_team_for_season(
+                sid, tid, actor_id="r"), "register"))
+        tb = threading.Thread(target=run, args=(
+            lambda: api_xfer.setup.transfer_team_to_league(
+                tid, l2, actor_id="x"), "transfer"))
+        ta.start(); tb.start(); ta.join(15); tb.join(15)
+
+        self.assertEqual(results.get("register"), "ok", results)
+        check = self._assert_team_registration_consistent(sid, l2, tid, results)
+        # The Team's active registration is in L2 (its final League); any L1 row
+        # that remains is inactive — never an active registration in a League the
+        # Team no longer belongs to.
+        l1_active = [r for r in check.all_season_team_registrations()
+                     if r.team_id == tid and r.active
+                     and check.get_league_season(
+                         r.league_season_id).league_id == l1]
+        self.assertEqual(l1_active, [], results)
 
     def test_archive_vs_legacy_import_is_linearizable(self):
         # The teams+players import holds the archived-Season row lock through ALL

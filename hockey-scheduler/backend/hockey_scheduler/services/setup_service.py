@@ -682,16 +682,21 @@ class SetupService:
             raise NotFoundError(f"Registration {registration_id} not found.")
         if not league_id:
             raise ValidationError("A league_id is required.")
-        # #159 — canonical League→Season order: lock the target League row here,
-        # before the Season guard below, so a new binding can't be orphaned by a
-        # concurrent delete_league and the lock order never inverts.
-        self._lock_league_for_binding(league_id)
-        team = self.store.get_team(reg.team_id)
+        # #159 — canonical Team → League → Season lock order (shared with
+        # transfer_team_to_league): row-lock the Team FIRST so its permanent
+        # league_id can't change under a concurrent transfer between the rule-7
+        # check below and the registration write, THEN the target League, THEN
+        # the Season guard. Reading the Team unlocked would let a transfer commit
+        # Team→L2 after this rule-7 check passed for L1, binding the registration
+        # to a League that is no longer the Team's — a canonical-invariant
+        # violation. The lock is held through the binding/registration/audit.
+        team = self.store.get_team_for_update(reg.team_id)
         if team and team.league_id and team.league_id != league_id:
             raise ValidationError(
                 "A team may only register in its own League.",
                 {"reason": "team_league_mismatch", "team_id": reg.team_id,
                  "team_league_id": team.league_id, "league_id": league_id})
+        self._lock_league_for_binding(league_id)
         season_id = self._season_of_league_season(reg.league_season_id)
         if season_id:
             self._require_active_season(season_id)  # #159 read-only guard
@@ -838,15 +843,25 @@ class SetupService:
         must belong to the resolved LeagueSeason (rule 6). One registration per
         (team, LeagueSeason); a prior inactive one is reactivated in place.
         """
-        team = self.store.get_team(team_id)
+        # #159 — canonical Team → League → Season lock order (shared with
+        # transfer_team_to_league, which row-locks the Team first): row-lock the
+        # Team BEFORE deriving/locking its candidate League, so its permanent
+        # league_id can't be moved by a concurrent transfer between the read and
+        # this registration write. Reading the Team unlocked here would let a
+        # transfer commit Team→L2 after we resolved Team→L1, leaving a
+        # registration in LeagueSeason(L1) while team.league_id == L2 — a
+        # canonical-invariant violation with no DB constraint to catch it. The
+        # lock is held (to commit on PostgreSQL; process-wide on Memory/SQLite)
+        # through the League lock, the binding, and the registration/audit writes.
+        team = self.store.get_team_for_update(team_id)
         if team is None:
             raise NotFoundError(f"Team {team_id} not found.")
-        # #159 — canonical League→Season order: resolve the candidate permanent
-        # League (reads only) and row-lock it BEFORE the Season guard, so a new
-        # LeagueSeason binding can't be orphaned by a concurrent delete_league
-        # and the lock order never inverts against delete/transfer. The Season's-
-        # sole-League fallback (no candidate League) creates no new binding, so
-        # it needs no pre-lock.
+        # Resolve the candidate permanent League (reads only, off the now-locked
+        # Team) and row-lock it BEFORE the Season guard, so a new LeagueSeason
+        # binding can't be orphaned by a concurrent delete_league and the lock
+        # order never inverts against delete/transfer. The Season's-sole-League
+        # fallback (no candidate League) creates no new binding, so it needs no
+        # pre-lock.
         candidate_league = self._candidate_registration_league_id(
             team, division_id, league_id)
         if candidate_league:
@@ -1506,12 +1521,15 @@ class SetupService:
         src = self.store.get_season(from_season_id)
         if src is None:
             raise NotFoundError(f"Season {from_season_id} not found.")
-        # #159 — canonical League→Season lock order: a v1 rollover derives each
-        # carried Team's target League from Team.league_id. Row-lock those Leagues
-        # (sorted, deduped) via a read-only pre-pass BEFORE locking the target
-        # Season below, so no rollover binding is orphaned by a concurrent
-        # delete_league and the order never inverts against delete/transfer. A
-        # None/bad team league is skipped here and still fails the pre-write gate.
+        # #159 — canonical Team → League → Season lock order (shared with
+        # transfer_team_to_league): a v1 rollover derives each carried Team's
+        # target League from Team.league_id and writes a registration in it.
+        # Row-lock every carried Team FIRST (sorted, deduped) so its permanent
+        # league_id can't move under a concurrent transfer between the derive and
+        # the write, THEN lock the Leagues derived from those now-locked Teams
+        # (so no binding is orphaned by a concurrent delete_league and the order
+        # never inverts), THEN the target Season below. A None/bad team league is
+        # skipped here and still fails the pre-write gate.
         _carry = ([s.get("team_id") for s in selections
                    if isinstance(s, dict) and isinstance(s.get("team_id"), str)]
                   if isinstance(selections, list)
@@ -1519,8 +1537,8 @@ class SetupService:
                         in self.store.registrations_for_season(from_season_id)
                         if r.active] if selections is None else [])
         _roll_lids = set()
-        for _tid in _carry:
-            _t = self.store.get_team(_tid)
+        for _tid in sorted({t for t in _carry if isinstance(t, str)}):
+            _t = self.store.get_team_for_update(_tid)
             if _t is not None and _t.league_id:
                 _roll_lids.add(_t.league_id)
         for _lid in sorted(_roll_lids):
@@ -1699,14 +1717,21 @@ class SetupService:
         src = self.store.get_season(from_season_id)
         if src is None:
             raise NotFoundError(f"Season {from_season_id} not found.")
-        # #159 — canonical League→Season lock order: row-lock every distinct
-        # target League named in the selections (sorted, so a batch never
-        # deadlocks League-vs-League) BEFORE locking the target Season below, so
-        # a rollover binding can't be orphaned by a concurrent delete_league and
-        # the order never inverts against delete/transfer. Malformed selections
-        # are re-validated in the pre-write gate; only well-formed league_ids are
-        # pre-locked here (a bad one still fails the gate with zero writes).
+        # #159 — canonical Team → League → Season lock order (shared with
+        # transfer_team_to_league). Row-lock every carried Team FIRST (sorted, so
+        # a batch never deadlocks Team-vs-Team), so its permanent league_id can't
+        # move under a concurrent transfer between the rule-7 gate and the
+        # registration write; THEN row-lock every distinct target League (sorted)
+        # so a binding can't be orphaned by a concurrent delete_league and the
+        # order never inverts; THEN the target Season below. Malformed selections
+        # are re-validated in the pre-write gate; only well-formed ids are locked
+        # here (a bad one still fails the gate with zero writes).
         if isinstance(selections, list):
+            for _tid in sorted({sel.get("team_id") for sel in selections
+                                if isinstance(sel, dict)
+                                and isinstance(sel.get("team_id"), str)
+                                and not _blank(sel.get("team_id"))}):
+                self.store.get_team_for_update(_tid)
             for _lid in sorted({sel.get("league_id") for sel in selections
                                 if isinstance(sel, dict)
                                 and isinstance(sel.get("league_id"), str)
