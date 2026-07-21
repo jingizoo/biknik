@@ -469,6 +469,12 @@ class InMemoryStore:
     def get_club(self, club_id: str) -> Optional[Club]:
         return self.clubs.get(club_id)
 
+    def get_club_for_update(self, club_id: str) -> Optional[Club]:
+        # No row locking needed (#266/#201): transaction() holds self._lock for
+        # its entire body, so a concurrent delete can't interleave with the
+        # caller's check-then-write. Provided for interface parity with SqlStore.
+        return self.clubs.get(club_id)
+
     def save_club(self, club: Club) -> Club:
         self.clubs[club.id] = club
         return club

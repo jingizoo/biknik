@@ -84,6 +84,48 @@ def translate_player_jersey_exception(
                  "team_id": team_id, "jersey_number": jersey_number})
 
 
+def translate_reassignment_fk_exception(
+        exc: BaseException, *, constraint: str, reason: str,
+        message: str, **context) -> Optional[DomainError]:
+    """Translate migration 040's reassignment FK violation with domain context.
+
+    players.team_id → teams(id) and teams.club_id → clubs(id) are the concurrency
+    backstops for the reassignment races (#201 Slice 2): the service already
+    validates the destination parent, so a violation here means a race-losing
+    writer tried to land a row whose parent was concurrently deleted. The generic
+    transaction boundary would render this as the stable but shape-less
+    ``foreign_key_violation`` conflict; the Player/Team store methods know exactly
+    which parent was missing, so they surface a precise, stable reason
+    (``team_not_found`` / ``club_not_found``) with the offending parent id — the
+    same secret-free shape the service pre-check raises on the non-race path,
+    never exposing driver text, SQL, or the constraint name.
+    """
+    if isinstance(exc, DomainError):
+        return None
+    if not _is_named_fk_violation(exc, constraint):
+        return None
+    return IntegrityConflictError(
+        message, details={"reason": reason, **context})
+
+
+def _is_named_fk_violation(exc: BaseException, constraint: str) -> bool:
+    """A foreign-key violation for ``constraint``.
+
+    PostgreSQL/psycopg carry the authoritative constraint name on ``.diag`` (a
+    23503 for a different FK is not matched, so it falls through to the generic
+    boundary). SQLite's ``FOREIGN KEY constraint failed`` names no column or
+    constraint, so the caller's write site — which has exactly one foreign key —
+    disambiguates it.
+    """
+    sqlstate = getattr(exc, "sqlstate", None)
+    if sqlstate == "23503":
+        diag = getattr(exc, "diag", None)
+        return getattr(diag, "constraint_name", None) == constraint
+    if isinstance(exc, sqlite3.IntegrityError):
+        return "FOREIGN KEY constraint failed" in str(exc)
+    return False
+
+
 def _is_active_team_jersey_violation(exc: BaseException) -> bool:
     sqlstate = getattr(exc, "sqlstate", None)
     if sqlstate == "23505":

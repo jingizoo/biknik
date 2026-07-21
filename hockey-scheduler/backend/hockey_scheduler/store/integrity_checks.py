@@ -175,6 +175,66 @@ def assert_roster_refs_exist(conn):
             f"not exist: {shown}{more}. Reattach or remove them before upgrading.")
 
 
+# -- #201 Slice 2 — reassignment referential integrity preflight -----------
+#
+# Migration 040 adds players.team_id → teams(id) and teams.club_id → clubs(id).
+# These read-only checks report every non-null player.team_id that names no team
+# and every non-null teams.club_id that names no club BEFORE the constraints are
+# added, so an upgrade against dangling data fails loudly with the offending row
+# ids rather than an opaque constraint error. NULLs are excluded: a nullable
+# foreign key permits NULL, so only a concrete dangling reference blocks the
+# upgrade. Pure SELECTs, portable across SQLite/PostgreSQL, safe to re-run.
+
+
+def find_orphan_player_teams(conn):
+    """Player ids whose non-null team_id names no existing team (migration 040)."""
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT p.id FROM players p "
+        "LEFT JOIN teams t ON t.id = p.team_id "
+        "WHERE p.team_id IS NOT NULL AND t.id IS NULL")
+    return sorted(row["id"] for row in cur.fetchall())
+
+
+def find_orphan_team_clubs(conn):
+    """Team ids whose non-null club_id names no existing club (migration 040)."""
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT t.id FROM teams t "
+        "LEFT JOIN clubs c ON c.id = t.club_id "
+        "WHERE t.club_id IS NOT NULL AND c.id IS NULL")
+    return sorted(row["id"] for row in cur.fetchall())
+
+
+def assert_reassignment_fks_ready(conn):
+    """Abort migration 040 if any player references a missing team or any team
+    references a missing club (#201 Slice 2)."""
+    orphan_players = find_orphan_player_teams(conn)
+    orphan_teams = find_orphan_team_clubs(conn)
+    if not orphan_players and not orphan_teams:
+        return
+
+    problems = []
+    if orphan_players:
+        shown = ", ".join(orphan_players[:20])
+        more = ("" if len(orphan_players) <= 20
+                else f" (+{len(orphan_players) - 20} more)")
+        problems.append(
+            f"{len(orphan_players)} player(s) reference a team that does not "
+            f"exist: {shown}{more}")
+    if orphan_teams:
+        shown = ", ".join(orphan_teams[:20])
+        more = ("" if len(orphan_teams) <= 20
+                else f" (+{len(orphan_teams) - 20} more)")
+        problems.append(
+            f"{len(orphan_teams)} team(s) reference a club that does not "
+            f"exist: {shown}{more}")
+    raise MigrationDataError(
+        "Cannot add the player → team / team → club foreign keys: "
+        + "; ".join(problems)
+        + ". Reattach or clear these references before upgrading.")
+
+
 # -- #233 Slice C — competition-model reset reparent preflight -------------
 #
 # Slice C reparents each Division onto a League (today's `levels`) and derives a

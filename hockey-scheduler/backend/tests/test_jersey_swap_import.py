@@ -291,6 +291,11 @@ class LostRaceConflictContextTest(unittest.TestCase):
         # conflict with the winning holder id + name post-rollback (#292).
         store = SqlStore(":memory:")
         try:
+            # Seed the team the planted players reference so migration 040's
+            # players.team_id → teams(id) foreign key is satisfied.
+            from hockey_scheduler.domain import Team
+            with store.transaction():
+                store.add_team(Team(id="t1", name="t1"))
             with store.transaction():
                 store.add_player(self._player("keep", "t1", 7))
             with self.assertRaises(IntegrityConflictError) as ctx:

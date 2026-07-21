@@ -52,8 +52,17 @@ Schema changes are applied by a small forward-only runner in `migrate()`:
   (`001_initial.sql`, `002_sessions.sql`, …), applied in numeric order.
 - `schema_migrations(version, applied_at)` is **authoritative**: a version
   already recorded there is skipped, and a version is recorded only after all
-  of its statements succeed. The runner never drops or rewrites data — it only
-  applies pending migrations.
+  of its statements succeed. Migrations are forward-only and vary in kind: most
+  add columns or indexes; some **backfill or transform existing row values**
+  (e.g. 037 populates `game.league_season_id`); and — because SQLite cannot add a
+  foreign key to an existing table — an FK migration on SQLite **rebuilds** the
+  affected tables (create-copy-drop-rename; e.g. migration 040 copies every team
+  and player row into a new table with the foreign key, then drops the old one).
+  That rebuild preserves each row's values, columns, indexes, and incoming
+  references, runs inside the migration's single transaction, and is gated by a
+  fail-closed pre-migration data check — so it is all-or-nothing — but it is a
+  physical table rewrite, not an in-place `ALTER`. **Take a backup before
+  upgrading.**
 - The DDL is `CREATE … IF NOT EXISTS`, so adopting this system on a database
   that predates it (all tables present, no per-migration rows) is safe: the
   files re-run harmlessly and backfill the ledger.
@@ -61,6 +70,43 @@ Schema changes are applied by a small forward-only runner in `migrate()`:
   the demo Reset and tests. It is **never** invoked in production — the
   production boot preserves the existing database and only runs pending
   migrations forward.
+
+## Referential integrity (#201)
+
+Selected relationships are enforced by database foreign keys so a concurrent
+delete can never strand a child row under PostgreSQL READ COMMITTED (the service
+dependency checks alone are check-then-write and lose the race). The declared
+foreign keys are:
+
+- `game_results.game_id → games(id)` (migrations 025/026, later `NOT NULL`);
+- `game_roster_entries.game_id → games(id)` and `.player_id → players(id)`
+  (migration 027);
+- `teams.club_id → clubs(id)` and `players.team_id → teams(id)` (migration 040 —
+  the backstop for the assign/delete reassignment races).
+
+Each such migration ships with (a) a forward-only pre-migration check in
+`store/integrity_checks.py` that reports any pre-existing dangling row and aborts
+the upgrade with the offending ids named, and (b) a translation in
+`store/db_errors.py` so a runtime violation surfaces as a stable, secret-free
+domain conflict (e.g. `team_not_found` / `club_not_found`) rather than a raw
+driver error. FK columns that hold an optional link (`teams.club_id`) stay
+nullable — a nullable foreign key still rejects a concrete missing parent. Delete
+behaviour is spelled out explicitly as `ON DELETE NO ACTION` in both dialects
+(never cascade, never data cleanup): deleting a still-referenced parent is
+rejected. The in-memory store has no foreign keys; it relies on its process-wide
+transaction lock plus the same service dependency checks for parity.
+
+**Rollback / recovery (forward-only).** These migrations are forward-only; there
+is no down-migration. On SQLite the FK migration physically rebuilds `teams` and
+`players` (see the migration runner note above), so **a backup taken before the
+upgrade is the recovery path** — rollback means restore-from-backup (or a future
+explicit down-migration), not re-running the runner. Logical row values are
+preserved by the rebuild, but the physical tables are replaced. On PostgreSQL the
+migration is two `ADD CONSTRAINT` statements (no table rewrite); reverting would
+be an explicit `DROP CONSTRAINT` migration. In all cases the fail-closed
+pre-migration check refuses to touch a database that still holds dangling
+references, so a dirty upgrade aborts cleanly with the offending ids named and
+zero mutation.
 
 ## Tables
 
