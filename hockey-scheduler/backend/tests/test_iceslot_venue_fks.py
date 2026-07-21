@@ -66,7 +66,8 @@ from hockey_scheduler.domain.errors import (
     ScheduleConflictError,
 )
 from hockey_scheduler.domain.models import Game
-from hockey_scheduler.domain.setup_models import IceSlot, Rink, SeasonVenueAccess
+from hockey_scheduler.domain.setup_models import (
+    IceSlot, Rink, SeasonVenueAccess, Venue)
 from hockey_scheduler.store import InMemoryStore, SqlStore
 from hockey_scheduler.store.integrity_checks import (
     MigrationDataError,
@@ -909,11 +910,19 @@ class ServiceParityTest(unittest.TestCase):
                          lambda: api.setup.delete_rink(ctx["rink"], actor_id="d")),
                         ("ice slot", slot, "game",
                          lambda: api.setup.delete_ice_slot(slot, actor_id="d"))):
+                    # A distinct sentinel create earlier in the SAME outer unit
+                    # must be undone when the delete blocks — all-or-nothing.
+                    sentinel = f"SENTINEL-{entity_id}"
                     with self.assertRaises(HasDependenciesError, msg=label) as cm:
                         with store.transaction():
+                            api.setup.create_venue(sentinel, actor_id="s")
                             delete_call()
                     self._assert_block_group(cm, entity_type, entity_id,
                                              group_type, 1, label)
+                    self.assertFalse(
+                        any(v.name == sentinel for v in store.all_venues()),
+                        f"{label}: sentinel {sentinel} survived — outer unit "
+                        "did NOT roll back")
                 # Nothing deleted, nothing audited, connection still usable.
                 self.assertIsNotNone(store.get_venue(ctx["venue"]), label)
                 self.assertIsNotNone(store.get_rink(ctx["rink"]), label)
@@ -1121,32 +1130,50 @@ class IceSlotRaceTest(unittest.TestCase):
         return False
 
     @staticmethod
-    def _in_txn(store, thunk):
-        """Return a callable that runs ``thunk`` inside an explicit outer
-        ``store.transaction()`` — the caller's atomic unit the reviewer's nested
-        scenario wraps the losing delete in. The service delete is @_transactional
-        and simply JOINS this outer transaction (no savepoint), so when its DELETE
-        loses at the FK the whole outer unit is what must roll back."""
+    def _in_txn(store, *thunks):
+        """Return a callable that runs ``thunks`` in order inside a single
+        explicit outer ``store.transaction()`` — the caller's atomic unit the
+        reviewer's nested scenario wraps the losing delete in. The service delete
+        is @_transactional and simply JOINS this outer transaction (no savepoint),
+        so when its DELETE loses at the FK the whole outer unit — including any
+        earlier successful write in the same block — is what must roll back."""
         def run():
             with store.transaction():
-                thunk()
+                for thunk in thunks:
+                    thunk()
         return run
 
     def _assert_nested_child_wins(self, *, child_store, write_method, child_fn,
-                                  delete_store, delete_thunk, reference_delete,
-                                  entity_type, entity_id, group_type,
-                                  delete_audit):
+                                  delete_store, delete_thunk,
+                                  reference_delete, entity_type, entity_id,
+                                  group_type, delete_audit):
         """Child-commits-wins with the parent delete nested inside a caller's
         outer transaction(). The connection is transaction-aborted the moment the
         DELETE hits 23503, so re-resolution must run only after the OUTERMOST
         rollback. Asserts the loser still carries the identical itemised
         has-dependencies payload, never a raw driver error (InFailedSqlTransaction
         would surface as ``ERR:`` via _record), and the whole outer unit rolls
-        back (parent survives, dependent survives, zero delete audit)."""
+        back.
+
+        To prove *all-or-nothing* rollback (not merely a clean post-error
+        connection + an unchanged failed delete), the outer transaction first
+        performs a distinct SENTINEL write that WOULD commit on success; after the
+        itemised block we assert the sentinel is absent — i.e. the caller's
+        earlier successful work was undone with the failed delete. The sentinel is
+        a direct ``add_venue`` (its own explicit id, no audit): an audited service
+        call would grab the shared setup-audit id counter and hold it across the
+        outer transaction, deadlocking against the paused child's own audit write
+        and masking the FK child-wins path this test exists to exercise."""
+        sentinel = f"SENTINEL-{entity_id}"
+        sentinel_id = f"venue_sentinel_{entity_id}"
         results = self._forced_child_wins(
             child_store, write_method, child_fn=child_fn,
             delete_store=delete_store,
-            delete_fn=self._in_txn(delete_store, delete_thunk))
+            delete_fn=self._in_txn(
+                delete_store,
+                lambda: delete_store.add_venue(
+                    Venue(id=sentinel_id, name=sentinel)),
+                delete_thunk))
         self.assertEqual(results["child"], "ok", results)
         self.assertEqual(results["delete"], "blocked", results)
         reference = self._reference_block_details(reference_delete)
@@ -1155,6 +1182,10 @@ class IceSlotRaceTest(unittest.TestCase):
                               group_type, 1)
         check = SqlStore(self.url)
         self.assertEqual(_audit_actions(check, delete_audit), 0, results)
+        # The sentinel write committed nowhere: the whole outer unit rolled back.
+        self.assertIsNone(check.get_venue(sentinel_id),
+                          f"{results}: sentinel venue survived — outer unit "
+                          "did NOT roll back")
         return results, check
 
     # -- nested-transaction child-wins (reviewer: aborted-connection re-scan) --
@@ -1614,9 +1645,18 @@ class IceSlotRaceTest(unittest.TestCase):
         active = [g for g in check.all_games()
                   if g.ice_slot_id == slot and not g.cancelled]
         self.assertEqual(len(active), 1, results)   # exactly one wins the slot
-        self.assertEqual(sorted(results.values()), ["ice_slot_taken", "ok"],
-                         results)
         self.assertEqual(_audit_actions(check, "game_created"), 1, results)
+        # Exactly one create wins; the loser loses cleanly by EITHER path,
+        # depending on unsynchronised timing: it read the already-committed game
+        # at the service pre-check (-> schedule_conflict), or both passed the
+        # pre-check and it lost the insert race at the DB partial unique index
+        # (-> ice_slot_taken). Both are correct — never two games, never a raw
+        # error. (The forced sibling pins ice_slot_taken deterministically.)
+        self.assertIn("ok", results.values(), results)
+        losers = [v for v in results.values() if v != "ok"]
+        self.assertEqual(len(losers), 1, results)
+        self.assertIn(losers[0], ("ice_slot_taken", "schedule_conflict"),
+                      results)
 
     # -- itemised has-dependencies payload assertion -----------------------
     def _assert_itemised(self, details, entity_type, entity_id, group_type,
