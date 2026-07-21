@@ -883,6 +883,160 @@ class SeasonArchiveRaceTest(unittest.TestCase):
         self.assertGreaterEqual(actions.count("season_team_registered"), 1,
                                 actions)
 
+    # --- #159 r15: proactive sweep — re-fetch-under-lock across the surface --
+    def _pause_race(self, victim_store, method_name, victim_fn, racer_fn,
+                    pause_on_call=1):
+        """Force the dangerous stale-read ordering for ANY method: pause the
+        victim's store the Nth time it calls ``method_name`` (its locator read,
+        before the governing lock), run the racer to completion on another
+        connection, then resume so the victim acquires its lock and re-fetches.
+        Returns the ``{victim, racer}`` outcome map."""
+        orig = getattr(victim_store, method_name)
+        paused = threading.Event()
+        resume = threading.Event()
+        calls = [0]
+
+        def instrumented(*args, **kwargs):
+            result = orig(*args, **kwargs)
+            calls[0] += 1
+            if calls[0] == pause_on_call:
+                paused.set()
+                resume.wait(15)
+            return result
+
+        setattr(victim_store, method_name, instrumented)
+        results = {}
+
+        def run_victim():
+            try:
+                victim_fn(); results["victim"] = "ok"
+            except ValidationError as exc:
+                results["victim"] = exc.details.get("reason") or "validation"
+            except NotFoundError:
+                results["victim"] = "not_found"
+            except Exception as exc:
+                results["victim"] = f"ERR:{exc}"
+
+        def run_racer():
+            if not paused.wait(15):
+                results["racer"] = "ERR:victim-never-paused"
+                return
+            try:
+                racer_fn(); results["racer"] = "ok"
+            except ValidationError as exc:
+                results["racer"] = exc.details.get("reason") or "validation"
+            except Exception as exc:
+                results["racer"] = f"ERR:{exc}"
+            finally:
+                resume.set()
+
+        tv = threading.Thread(target=run_victim)
+        trc = threading.Thread(target=run_racer)
+        tv.start(); trc.start()
+        trc.join(25); resume.set(); tv.join(25)
+        return results
+
+    def test_transfer_vs_unregister_freezes_the_unregistered_row(self):
+        # #159 r15 (reviewer): the Team transfer snapshots its active
+        # registrations as a locator, then re-fetches each under the Season lock.
+        # Pause the transfer right after that snapshot; a concurrent unregister of
+        # one of those rows commits active=False; resume. The transfer completes
+        # but EXCLUDES the now-inactive row (frozen in its historical
+        # LeagueSeason) — no resurrection, and its audit does not list it.
+        store0 = SqlStore(self.url)
+        api0 = ApiService(store0)
+        pid = api0.create_program("P", "US", "UTC")["id"]
+        s1 = api0.create_season(pid, "S1")["id"]
+        l1 = api0.create_league(s1, "Gold")["id"]
+        l2 = api0.create_league(s1, "Silver")["id"]
+        club = api0.create_club("Club")["id"]
+        tid = api0.create_team(club_id=club, name="Alpha", league_id=l1)["id"]
+        reg_id = api0.register_team_for_season(s1, tid)["id"]
+
+        victim_store = SqlStore(self.url)
+        api_victim = ApiService(victim_store)
+        api_racer = ApiService(SqlStore(self.url))
+        results = self._pause_race(
+            victim_store, "all_season_team_registrations",
+            victim_fn=lambda: api_victim.setup.transfer_team_to_league(
+                tid, l2, actor_id="xfer"),
+            racer_fn=lambda: api_racer.setup.unregister_team_from_season(
+                reg_id, actor_id="unreg"))
+        self.assertEqual(results.get("racer"), "ok", results)
+        self.assertEqual(results.get("victim"), "ok", results)  # transfer done
+        check = SqlStore(self.url)
+        reg = check.get_season_team_registration(reg_id)
+        self.assertIsNotNone(reg, results)
+        self.assertFalse(reg.active, results)                    # stayed inactive
+        # Frozen in its historical L1 LeagueSeason — the transfer did not move it.
+        self.assertEqual(
+            check.get_league_season(reg.league_season_id).league_id, l1, results)
+        self.assertEqual(check.get_team(tid).league_id, l2, results)  # team moved
+        xfer = [a for a in check.all_setup_audit()
+                if a.action == "team_league_transferred"]
+        self.assertEqual(len(xfer), 1, results)
+        self.assertNotIn(reg_id, xfer[0].detail.get("registrations_moved", []),
+                         results)
+        unreg = [a for a in check.all_setup_audit()
+                 if a.action == "season_team_unregistered"
+                 and a.entity_id == reg_id]
+        self.assertEqual(len(unreg), 1, results)                 # one, agrees
+
+    def test_assign_division_league_vs_delete_division_no_resurrection(self):
+        # #159 r15: assign_division_league re-fetches the Division under the
+        # Season lock. Pause it at its locator read; a concurrent delete_division
+        # removes it; resume. The assign sees the deleted row and fails not-found
+        # with zero write — never resurrecting a deleted Division.
+        store0 = SqlStore(self.url)
+        api0 = ApiService(store0)
+        pid = api0.create_program("P", "US", "UTC")["id"]
+        s1 = api0.create_season(pid, "S1")["id"]
+        l1 = api0.create_league(s1, "Gold")["id"]
+        l2 = api0.create_league(s1, "Silver")["id"]
+        did = api0.create_division(s1, "D1", league_id=l1)["id"]
+
+        victim_store = SqlStore(self.url)
+        api_victim = ApiService(victim_store)
+        api_racer = ApiService(SqlStore(self.url))
+        results = self._pause_race(
+            victim_store, "get_division",
+            victim_fn=lambda: api_victim.setup.assign_division_league(
+                did, l2, actor_id="asg", v2=True),
+            racer_fn=lambda: api_racer.setup.delete_division(did, actor_id="del"))
+        self.assertEqual(results.get("racer"), "ok", results)     # delete won
+        self.assertEqual(results.get("victim"), "not_found", results)
+        check = SqlStore(self.url)
+        self.assertIsNone(check.get_division(did), results)       # stays deleted
+
+    def test_delete_venue_access_vs_grant_no_stale_delete(self):
+        # #159 r15: delete_season_venue_access re-fetches + re-checks active under
+        # the Season lock. Pause it at its locator read; a concurrent grant
+        # reactivates the revoked row; resume. The delete sees the now-active row
+        # and fails closed access_active — never hard-deleting live access.
+        store0 = SqlStore(self.url)
+        api0 = ApiService(store0)
+        pid = api0.create_program("P", "US", "UTC")["id"]
+        s1 = api0.create_season(pid, "S1")["id"]
+        venue = api0.create_venue("Rink House")["id"]
+        acc_id = api0.setup.grant_season_venue_access(s1, venue, actor_id="g").id
+        api0.setup.revoke_season_venue_access(acc_id, actor_id="r")  # inactive
+
+        victim_store = SqlStore(self.url)
+        api_victim = ApiService(victim_store)
+        api_racer = ApiService(SqlStore(self.url))
+        results = self._pause_race(
+            victim_store, "get_season_venue_access",
+            victim_fn=lambda: api_victim.setup.delete_season_venue_access(
+                acc_id, actor_id="del"),
+            racer_fn=lambda: api_racer.setup.grant_season_venue_access(
+                s1, venue, actor_id="regrant"))
+        self.assertEqual(results.get("racer"), "ok", results)     # reactivated
+        self.assertEqual(results.get("victim"), "access_active", results)
+        check = SqlStore(self.url)
+        acc = check.get_season_venue_access(acc_id)
+        self.assertIsNotNone(acc, results)                        # NOT deleted
+        self.assertTrue(acc.active, results)                      # live, preserved
+
     def _ls_deleted_audits(self, store, ls_id):
         return [a for a in store.all_setup_audit()
                 if a.action == "league_season_deleted" and a.entity_id == ls_id]

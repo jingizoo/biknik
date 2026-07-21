@@ -1251,9 +1251,25 @@ class SetupService:
                 for r in candidates
                 if self._season_of_league_season(r.league_season_id)}):
             locked_seasons[sid] = self.store.get_season_for_update(sid)
+        # #159 r15 — the candidate scan above was an UNLOCKED locator snapshot.
+        # Re-fetch every candidate under its now-locked Season and re-validate
+        # its CURRENT state: a row a concurrent unregister deactivated (or a
+        # delete removed, or a rebind already moved to the target League) between
+        # the snapshot and the lock must stay frozen — drop it here so it is
+        # never resurrected by saving a stale active=True object, and so it is
+        # excluded from registrations_moved. A registration's Season never
+        # changes, so every surviving candidate's Season is already locked.
+        fresh_candidates = []
+        for reg in candidates:
+            current = self.store.get_season_team_registration(reg.id)
+            if current is None or not current.active:
+                continue
+            if self._registration_league_id(current) == new_league_id:
+                continue
+            fresh_candidates.append(current)
         to_move = []          # (reg, season_id) pairs eligible to move
         blocked = []          # {registration_id, season_id, affected_game_ids}
-        for reg in candidates:
+        for reg in fresh_candidates:
             season_id = self._season_of_league_season(reg.league_season_id)
             season = locked_seasons.get(season_id) if season_id else None
             # A Season is historical only once it has DEFINITELY ended (a real
@@ -1487,6 +1503,17 @@ class SetupService:
                 "This access is already revoked.",
                 {"reason": "already_revoked", "access_id": access.id})
         self._require_active_season(access.season_id)  # #159 read-only guard
+        # #159 r15 — re-fetch under the Season lock (the pre-lock read was a
+        # locator). A concurrent revoke or delete may have committed first; act
+        # on the fresh row so exactly one revoke writes one audit and a deleted
+        # row is a clean not-found, never a resurrecting save.
+        access = self.store.get_season_venue_access(access_id)
+        if access is None:
+            raise NotFoundError(f"Season-venue access {access_id} not found.")
+        if not access.active:
+            raise ValidationError(
+                "This access is already revoked.",
+                {"reason": "already_revoked", "access_id": access.id})
         access.active = False
         self.store.save_season_venue_access(access)
         self._audit("season_venue_access_revoked", "season_venue_access",
@@ -1525,6 +1552,18 @@ class SetupService:
         # and the caller needs real labels (not bare ids) to confirm what it
         # just removed (mirrors delete_season_team_registration exactly).
         self._require_active_season(access.season_id)  # #159 read-only guard
+        # #159 r15 — re-fetch under the Season lock and re-check active: a
+        # concurrent grant may have reactivated this row after the pre-lock read,
+        # and hard-deleting a now-active access would destroy live state (mirrors
+        # delete_season_team_registration).
+        access = self.store.get_season_venue_access(access_id)
+        if access is None:
+            raise NotFoundError(f"Season-venue access {access_id} not found.")
+        if access.active:
+            raise ValidationError(
+                "Cannot permanently delete an active access; revoke it "
+                "first.",
+                {"reason": "access_active", "access_id": access.id})
         season = self.store.get_season(access.season_id)
         if season is None:
             raise ValidationError(
@@ -2021,6 +2060,14 @@ class SetupService:
             self._lock_league_for_binding(league_id)
         if season_id:
             self._require_active_season(season_id)  # #159 read-only guard
+        # #159 r15 — re-fetch the Division under the Season lock; the pre-lock
+        # read was a locator. A concurrent delete_division (removes it) or
+        # rename (both lock the same Season) can commit in the window, so act on
+        # the fresh row — never resurrect a deleted Division or clobber a rename.
+        division = self.store.get_division(division_id)
+        if division is None:
+            raise NotFoundError(f"Division {division_id} not found.")
+        div_ls = self.store.get_league_season(division.league_season_id)
         old = div_ls.league_id if div_ls else None
         # v2 (#233 Slice C2): a canonical Division is always parented by a
         # grouping League — the reparent target is REQUIRED. v1 keeps its nullable
@@ -2069,7 +2116,11 @@ class SetupService:
     @_transactional
     def assign_team_club(self, team_id: str, club_id: Optional[str] = None,
                          actor_id: Optional[str] = None) -> Team:
-        team = self.store.get_team(team_id)
+        # #159 r15 — row-lock the Team (not an unlocked read): transfer_team_to_
+        # league / register / delete_team all lock this row, so without the lock
+        # a concurrent transfer could rebind team.league_id and this whole-object
+        # save would revert it while only meaning to change club_id.
+        team = self.store.get_team_for_update(team_id)
         if team is None:
             raise NotFoundError(f"Team {team_id} not found.")
         # Club is optional on a Team in both v1 and v2 (#233 Slice D): null
@@ -2091,7 +2142,11 @@ class SetupService:
     @_transactional
     def assign_player_team(self, player_id: str, team_id: str,
                            actor_id: Optional[str] = None) -> Player:
-        player = self.store.get_player(player_id)
+        # #159 r15 — row-lock the Player (not an unlocked read): update_player /
+        # set_player_active / delete_player all lock this row, so without the
+        # lock a concurrent profile edit or deactivation would be clobbered (or a
+        # retired player resurrected active) by this whole-object save.
+        player = self.store.get_player_for_update(player_id)
         if player is None:
             raise NotFoundError(f"Player {player_id} not found.")
         if not team_id or self.store.get_team(team_id) is None:
@@ -2485,6 +2540,13 @@ class SetupService:
         if game is None:
             raise NotFoundError(f"Game {game_id} not found.")
         self._guard_game_season(game)  # #159 read-only guard
+        # #159 r15 — re-fetch under the Season lock (the pre-lock read was a
+        # locator). A concurrent move_game relocates the game (new slot/time,
+        # unpublished) under the same Season lock; publishing the stale object
+        # would clobber those fields back. Act on the fresh row.
+        game = self.store.get_game(game_id)
+        if game is None:
+            raise NotFoundError(f"Game {game_id} not found.")
         # A game may only be made public while both teams are still valid
         # participants of its competition scope (#180 / #283 Slice E: exact
         # LeagueSeason for a regular game, active Season participation for an
@@ -2515,6 +2577,14 @@ class SetupService:
             raise NotFoundError(f"Game {game_id} not found.",
                                 details={"reason": "game_missing"})
         self._guard_game_season(game)  # #159 read-only guard
+        # #159 r15 — re-fetch under the Season lock (the pre-lock read was a
+        # locator). A concurrent move_game/publish_game commits under the same
+        # Season lock; acting on the stale object would release the WRONG old
+        # slot and clobber the game's current slot/time/published state.
+        game = self.store.get_game(game_id)
+        if game is None:
+            raise NotFoundError(f"Game {game_id} not found.",
+                                details={"reason": "game_missing"})
         if game.cancelled:
             raise ValidationError("Cannot move a cancelled game.",
                                   details={"reason": "game_cancelled"})
@@ -2613,6 +2683,11 @@ class SetupService:
         if game is None:
             raise NotFoundError(f"Game {game_id} not found.")
         self._guard_game_season(game)  # #159 read-only guard
+        # #159 r15 — re-fetch under the Season lock; a concurrent move_game may
+        # have unpublished/relocated the game after the locator read.
+        game = self.store.get_game(game_id)
+        if game is None:
+            raise NotFoundError(f"Game {game_id} not found.")
         if game.cancelled:
             raise ValidationError("Cannot request a reschedule for a cancelled game.")
         if not game.published:
@@ -2656,6 +2731,16 @@ class SetupService:
                 details={"status": req.status.value})
         game = self.store.get_game(req.game_id)
         self._guard_game_season(game)  # #159 read-only guard
+        # #159 r15 — re-fetch the request under the Season lock and re-check its
+        # status: a concurrent responder/unassign committed first would make this
+        # a stale double-transition otherwise.
+        req = self.store.get_reschedule_request(request_id)
+        if req is None:
+            raise NotFoundError(f"Reschedule request {request_id} not found.")
+        if req.status != RescheduleStatus.PENDING_OPPONENT:
+            raise InvalidTransitionError(
+                "This reschedule request is not awaiting an opponent response.",
+                details={"status": req.status.value})
         req.status = (RescheduleStatus.PENDING_LEAGUE_APPROVAL if accept
                      else RescheduleStatus.OPPONENT_REJECTED)
         req.opponent_responded_at = self.clock()
@@ -3318,6 +3403,13 @@ class SetupService:
             raise ValidationError(
                 "team_id is required.",
                 {"reason": "field_required", "field": "team_id"})
+        # NOTE (#159 r15): a concurrent delete_team could in principle orphan a
+        # player added in its lock window. We deliberately DON'T row-lock the
+        # Team here — that would serialize all concurrent same-team player
+        # creates, which is a supported path (the jersey partial-unique index
+        # decides same-number races). The correct durable fix is a real
+        # player.team_id → teams(id) FK (a migration), tracked separately; a
+        # broad create-time lock is the wrong trade-off.
         if self.store.get_team(team_id) is None:
             raise NotFoundError(f"Team {team_id} not found.")
         self._validate_jersey_number(jersey_number)
@@ -4666,9 +4758,19 @@ class SetupService:
         if game is None:
             raise NotFoundError(f"Game {game_id} not found.")
         self._guard_game_season(game)  # #159 read-only guard
+        # #159 r15 — re-fetch the game under the Season lock so the cancelled /
+        # time-overlap checks below run on its current state, not a locator
+        # snapshot a concurrent move_game may have changed.
+        game = self.store.get_game(game_id)
+        if game is None:
+            raise NotFoundError(f"Game {game_id} not found.")
         if game.cancelled:
             raise ValidationError("Cannot assign officials to a cancelled game.")
-        official = self.store.get_official(official_id)
+        # #159 r15 — row-lock the Official: delete_official locks the Official row
+        # and blocks on assignments_for_official, so without this lock a
+        # concurrent delete_official could remove it while this inserts an
+        # assignment referencing it — an orphan.
+        official = self.store.get_official_for_update(official_id)
         if official is None:
             raise NotFoundError(f"Official {official_id} not found.")
         if not official.is_active:
@@ -4738,6 +4840,12 @@ class SetupService:
         if a is None:
             raise NotFoundError(f"Assignment {assignment_id} not found.")
         self._guard_game_season(self.store.get_game(a.game_id))  # #159
+        # #159 r15 — re-fetch under the Season lock; a concurrent unassign
+        # (removes the row) or a second respond commits first, so the stale
+        # PROPOSED check would double-transition or resurrect it otherwise.
+        a = self.store.get_official_assignment(assignment_id)
+        if a is None:
+            raise NotFoundError(f"Assignment {assignment_id} not found.")
         if a.status != OfficialAssignmentStatus.PROPOSED:
             raise ValidationError("Only a proposed assignment can be responded to.")
         a.status = (OfficialAssignmentStatus.ACCEPTED if accept
@@ -5397,6 +5505,13 @@ class SetupService:
         if game is None:
             raise NotFoundError(f"Game {game_id} not found.")
         self._guard_game_season(game)  # #159 read-only guard
+        # #159 r15 — re-fetch under the Season lock; a concurrent publish_game/
+        # move_game commits under the same lock, so decide draft-eligibility and
+        # release the slot from the FRESH row (never delete a just-published game
+        # or free the wrong old slot).
+        game = self.store.get_game(game_id)
+        if game is None:
+            raise NotFoundError(f"Game {game_id} not found.")
         if not getattr(game, "is_draft", False) or game.published \
                 or game.cancelled \
                 or self.store.result_for_game(game_id) is not None:

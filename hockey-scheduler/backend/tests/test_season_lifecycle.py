@@ -634,6 +634,35 @@ class SeasonArchivedDeleteAndTransferGuardTest(unittest.TestCase):
             self.assertIsNotNone(
                 store.get_season_team_registration(reg_id), label)
 
+    def test_transfer_freezes_an_already_unregistered_row_parity(self):
+        # Parity (all backends) for the transfer re-fetch (#159 r15). Once a
+        # registration is unregistered (inactive), a subsequent Team transfer
+        # leaves it FROZEN in its historical LeagueSeason and excludes it from
+        # registrations_moved — the Team's permanent League still moves. On
+        # PostgreSQL the barrier test forces the concurrent ordering; here the
+        # observable frozen-history contract must match on every backend.
+        for label, store in _backends():
+            api = ApiService(store)
+            pid = api.create_program("P", "US", "UTC")["id"]
+            s1 = api.create_season(pid, "S1")["id"]
+            l1 = api.create_league(s1, "Gold")["id"]
+            l2 = api.create_league(s1, "Silver")["id"]
+            club = api.create_club("Club")["id"]
+            tid = api.create_team(club_id=club, name="Alpha", league_id=l1)["id"]
+            reg_id = api.register_team_for_season(s1, tid)["id"]
+            api.setup.unregister_team_from_season(reg_id, actor_id="u")
+            api.setup.transfer_team_to_league(tid, l2, actor_id="x")
+            reg = store.get_season_team_registration(reg_id)
+            self.assertFalse(reg.active, label)                  # stayed inactive
+            self.assertEqual(
+                store.get_league_season(reg.league_season_id).league_id, l1,
+                label)                                           # frozen in L1
+            self.assertEqual(store.get_team(tid).league_id, l2, label)  # moved
+            moved = [a.detail.get("registrations_moved", [])
+                     for a in store.all_setup_audit()
+                     if a.action == "team_league_transferred"]
+            self.assertTrue(all(reg_id not in m for m in moved), label)
+
     def test_import_driven_transfer_freezes_archived_registration(self):
         # The import path routes a permanent-League change through the same
         # locked _transfer_team_to_league_inner, so it too must freeze an
