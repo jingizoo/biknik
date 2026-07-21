@@ -1927,7 +1927,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_api({"error": {"code": "validation_error",
                     "message": "A rink_id is required."}})
             date = body.get("date")  # "YYYY-MM-DD"
-            ends = [s.end_time for s in api.store.ice_slots.values()
+            # Use the portable store accessor: `ice_slots` is an InMemoryStore
+            # dict attribute that SqlStore does not expose (SqlStore crashes with
+            # AttributeError otherwise). all_ice_slots() is defined on both stores.
+            ends = [s.end_time for s in api.store.all_ice_slots()
                     if s.rink_id == rink_id
                     and (not date or s.start_time.isoformat().startswith(date))]
             if ends:
