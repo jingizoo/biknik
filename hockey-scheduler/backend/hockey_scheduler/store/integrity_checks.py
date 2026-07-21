@@ -320,6 +320,112 @@ def assert_iceslot_venue_fks_ready(conn):
         + ". Reattach or clear these references before upgrading.")
 
 
+# -- #201 Slice 4 — Program / Organization + Venue-owner integrity preflight --
+#
+# Migration 042 adds programs.operator_organization_id → organizations(id),
+# venues.organization_id → organizations(id), seasons.program_id → programs(id),
+# leagues.program_id → programs(id), and the legacy venues.league_id →
+# programs(id) owner link. These read-only checks report every non-null child
+# reference that names no parent BEFORE the constraints are added, so an upgrade
+# against dangling data fails loudly with the offending row ids rather than an
+# opaque constraint error. NULLs are excluded: a nullable foreign key permits
+# NULL, so only a concrete dangling reference blocks the upgrade. Pure SELECTs,
+# portable across SQLite/PostgreSQL, safe to re-run.
+
+
+def find_orphan_program_orgs(conn):
+    """Program ids whose non-null operator_organization_id names no existing
+    organization (migration 042)."""
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT p.id FROM programs p "
+        "LEFT JOIN organizations o ON o.id = p.operator_organization_id "
+        "WHERE p.operator_organization_id IS NOT NULL AND o.id IS NULL")
+    return sorted(row["id"] for row in cur.fetchall())
+
+
+def find_orphan_venue_orgs(conn):
+    """Venue ids whose non-null organization_id names no existing organization
+    (migration 042)."""
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT v.id FROM venues v "
+        "LEFT JOIN organizations o ON o.id = v.organization_id "
+        "WHERE v.organization_id IS NOT NULL AND o.id IS NULL")
+    return sorted(row["id"] for row in cur.fetchall())
+
+
+def find_orphan_season_programs(conn):
+    """Season ids whose non-null program_id names no existing program
+    (migration 042)."""
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT s.id FROM seasons s "
+        "LEFT JOIN programs p ON p.id = s.program_id "
+        "WHERE s.program_id IS NOT NULL AND p.id IS NULL")
+    return sorted(row["id"] for row in cur.fetchall())
+
+
+def find_orphan_league_programs(conn):
+    """League ids whose non-null program_id names no existing program
+    (migration 042)."""
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT l.id FROM leagues l "
+        "LEFT JOIN programs p ON p.id = l.program_id "
+        "WHERE l.program_id IS NOT NULL AND p.id IS NULL")
+    return sorted(row["id"] for row in cur.fetchall())
+
+
+def find_orphan_venue_programs(conn):
+    """Venue ids whose non-null league_id (legacy owner) names no existing
+    program (migration 042)."""
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT v.id FROM venues v "
+        "LEFT JOIN programs p ON p.id = v.league_id "
+        "WHERE v.league_id IS NOT NULL AND p.id IS NULL")
+    return sorted(row["id"] for row in cur.fetchall())
+
+
+def assert_program_org_fks_ready(conn):
+    """Abort migration 042 if any program references a missing organization, any
+    venue a missing organization, any season/league a missing program, or any
+    venue a missing (legacy owner) program (#201 Slice 4)."""
+    orphan_program_orgs = find_orphan_program_orgs(conn)
+    orphan_venue_orgs = find_orphan_venue_orgs(conn)
+    orphan_season_programs = find_orphan_season_programs(conn)
+    orphan_league_programs = find_orphan_league_programs(conn)
+    orphan_venue_programs = find_orphan_venue_programs(conn)
+    if not (orphan_program_orgs or orphan_venue_orgs or orphan_season_programs
+            or orphan_league_programs or orphan_venue_programs):
+        return
+
+    def _describe(ids, noun, parent):
+        shown = ", ".join(ids[:20])
+        more = "" if len(ids) <= 20 else f" (+{len(ids) - 20} more)"
+        return (f"{len(ids)} {noun} reference a {parent} that does not exist: "
+                f"{shown}{more}")
+
+    problems = []
+    if orphan_program_orgs:
+        problems.append(_describe(orphan_program_orgs, "program(s)",
+                                  "organization"))
+    if orphan_venue_orgs:
+        problems.append(_describe(orphan_venue_orgs, "venue(s)", "organization"))
+    if orphan_season_programs:
+        problems.append(_describe(orphan_season_programs, "season(s)", "program"))
+    if orphan_league_programs:
+        problems.append(_describe(orphan_league_programs, "league(s)", "program"))
+    if orphan_venue_programs:
+        problems.append(_describe(orphan_venue_programs, "venue(s)", "program"))
+    raise MigrationDataError(
+        "Cannot add the program → organization / venue → organization / "
+        "season → program / league → program / venue → program foreign keys: "
+        + "; ".join(problems)
+        + ". Reattach or clear these references before upgrading.")
+
+
 # -- #233 Slice C — competition-model reset reparent preflight -------------
 #
 # Slice C reparents each Division onto a League (today's `levels`) and derives a

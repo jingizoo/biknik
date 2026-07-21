@@ -86,6 +86,7 @@ from .db_errors import (
     translate_db_exception,
     translate_ice_slot_conflict_exception,
     translate_player_jersey_exception,
+    translate_program_org_fk_exception,
     translate_reassignment_fk_exception,
     translate_venue_hierarchy_fk_exception,
 )
@@ -93,6 +94,7 @@ from .integrity_checks import (
     assert_competition_hierarchy_reset_ready,
     assert_competition_reset_ready_c1b,
     assert_iceslot_venue_fks_ready,
+    assert_program_org_fks_ready,
     assert_reassignment_fks_ready,
     assert_regular_games_resolve_league_season,
     assert_no_duplicate_active_ice_slots,
@@ -365,6 +367,7 @@ _PRE_MIGRATION_CHECKS = {
     "038_active_team_jersey_unique": assert_player_jersey_constraints_ready,
     "040_reassignment_fks": assert_reassignment_fks_ready,
     "041_iceslot_venue_fks": assert_iceslot_venue_fks_ready,
+    "042_program_org_fks": assert_program_org_fks_ready,
 }
 
 
@@ -990,12 +993,44 @@ class SqlStore:
 
     # -- organization & arena setup ---------------------------------------
     # Umbrella competition entity: Program (#233, formerly League).
-    def add_program(self, program): return self._insert(program)
+    def _write_program(self, write, program):
+        try:
+            return write(program)
+        except Exception as exc:
+            # programs.operator_organization_id → organizations(id) (migration
+            # 042): a race-losing create/update onto a concurrently-deleted
+            # organization surfaces as the same stable conflict the service raises
+            # when it validates the organization (#201 Slice 4).
+            translated = translate_program_org_fk_exception(
+                exc, constraint="fk_programs_operator_org",
+                reason="organization_not_found",
+                message="The change references an organization that does not exist.",
+                organization_id=program.operator_organization_id)
+            if translated is not None:
+                raise translated from exc
+            raise
+
+    def add_program(self, program): return self._write_program(self._insert, program)
     def get_program(self, program_id): return self._get(Program, program_id)
     def all_programs(self): return self._query(Program, order="id")
-    def save_program(self, program): return self._update(program)
+    def save_program(self, program): return self._write_program(self._update, program)
 
-    def add_season(self, season): return self._insert(season)
+    def _write_season(self, write, season):
+        try:
+            return write(season)
+        except Exception as exc:
+            # seasons.program_id → programs(id) (migration 042): a race-losing
+            # create onto a concurrently-deleted program surfaces as the same
+            # stable conflict the service raises when it validates the program.
+            translated = translate_program_org_fk_exception(
+                exc, constraint="fk_seasons_program", reason="program_not_found",
+                message="The change references a program that does not exist.",
+                program_id=season.program_id)
+            if translated is not None:
+                raise translated from exc
+            raise
+
+    def add_season(self, season): return self._write_season(self._insert, season)
     def get_season(self, season_id): return self._get(Season, season_id)
 
     def get_season_for_update(self, season_id):
@@ -1003,18 +1038,33 @@ class SqlStore:
         # transition wins, the loser sees the stable lifecycle error.
         return self._get_for_update(Season, season_id)
     def all_seasons(self): return self._query(Season, order="id")
-    def save_season(self, season): return self._update(season)
+    def save_season(self, season): return self._write_season(self._update, season)
     def seasons_for_program(self, program_id):
         return self._query(Season, "program_id = ?", (program_id,), order="id")
 
     # Permanent competition grouping: League (#233/#283). A League is now a
     # permanent child of a Program (``program_id``), not of a Season.
-    def add_league(self, league): return self._insert(league)
+    def _write_league(self, write, league):
+        try:
+            return write(league)
+        except Exception as exc:
+            # leagues.program_id → programs(id) (migration 042): a race-losing
+            # create onto a concurrently-deleted program surfaces as the same
+            # stable conflict the service raises when it validates the program.
+            translated = translate_program_org_fk_exception(
+                exc, constraint="fk_leagues_program", reason="program_not_found",
+                message="The change references a program that does not exist.",
+                program_id=league.program_id)
+            if translated is not None:
+                raise translated from exc
+            raise
+
+    def add_league(self, league): return self._write_league(self._insert, league)
     def get_league(self, league_id): return self._get(League, league_id)
     def get_league_for_update(self, league_id):
         return self._get_for_update(League, league_id)
     def all_leagues(self): return self._query(League, order="id")
-    def save_league(self, league): return self._update(league)
+    def save_league(self, league): return self._write_league(self._update, league)
     def leagues_for_program(self, program_id):
         return self._query(League, "program_id = ?", (program_id,), order="id")
 
@@ -1142,10 +1192,48 @@ class SqlStore:
     def all_organizations(self): return self._query(Organization, order="id")
     def save_organization(self, org): return self._update(org)
 
-    def add_venue(self, venue): return self._insert(venue)
+    def _write_venue(self, write, venue):
+        try:
+            return write(venue)
+        except Exception as exc:
+            # venues carries TWO outgoing foreign keys (migration 042):
+            # organization_id → organizations(id) and league_id → programs(id).
+            # A race-losing create/update onto a concurrently-deleted parent must
+            # surface the same stable conflict the service raises when it
+            # validates that parent (organization_not_found / program_not_found).
+            org_hit = translate_program_org_fk_exception(
+                exc, constraint="fk_venues_organization",
+                reason="organization_not_found",
+                message="The change references an organization that does not exist.",
+                organization_id=venue.organization_id)
+            prog_hit = translate_program_org_fk_exception(
+                exc, constraint="fk_venues_program", reason="program_not_found",
+                message="The change references a program that does not exist.",
+                program_id=venue.league_id)
+            # PostgreSQL matched exactly one by constraint name. SQLite matched
+            # both (its message names no constraint), so disambiguate by which
+            # validated parent is actually missing now — a plain read is safe
+            # here (a SQLite constraint failure rolls back only the statement, not
+            # the transaction) and, because SQLite serializes writers, the racing
+            # delete has already committed and is visible.
+            if org_hit is not None and prog_hit is not None:
+                if (venue.organization_id is not None
+                        and self.get_organization(venue.organization_id) is None):
+                    raise org_hit from exc
+                if (venue.league_id is not None
+                        and self.get_program(venue.league_id) is None):
+                    raise prog_hit from exc
+                raise  # neither parent missing — not our FK, re-raise unchanged
+            if org_hit is not None:
+                raise org_hit from exc
+            if prog_hit is not None:
+                raise prog_hit from exc
+            raise
+
+    def add_venue(self, venue): return self._write_venue(self._insert, venue)
     def get_venue(self, venue_id): return self._get(Venue, venue_id)
     def all_venues(self): return self._query(Venue, order="id")
-    def save_venue(self, venue): return self._update(venue)
+    def save_venue(self, venue): return self._write_venue(self._update, venue)
 
     def _write_rink(self, write, rink):
         try:
@@ -1283,8 +1371,10 @@ class SqlStore:
     # -- setup-entity deletion (#215 safe destructive actions) -------------
     # Single-record hard deletes; the service runs a pre-write dependency gate
     # before calling these, so they never cascade.
-    def delete_organization(self, org_id): self._delete(Organization, org_id)
-    def delete_program(self, program_id): self._delete(Program, program_id)
+    def delete_organization(self, org_id):
+        self._delete_parent(Organization, "organization", org_id)
+    def delete_program(self, program_id):
+        self._delete_parent(Program, "program", program_id)
     def delete_season(self, season_id): self._delete(Season, season_id)
     def delete_league(self, league_id): self._delete(League, league_id)
     def delete_division(self, division_id): self._delete(Division, division_id)

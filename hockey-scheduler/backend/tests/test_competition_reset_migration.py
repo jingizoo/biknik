@@ -19,7 +19,7 @@ Runs on SQLite and (when TEST_DATABASE_URL is set) PostgreSQL.
 import os
 import unittest
 
-from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
+from helpers import BACKEND, suspend_program_org_fks  # noqa: F401
 
 from hockey_scheduler.store import SqlStore
 from hockey_scheduler.store.integrity_checks import MigrationDataError
@@ -41,6 +41,11 @@ def _fresh(url):
     store = SqlStore(url)
     if url != ":memory:":
         store.reset_schema()
+    # Migration 042's seasons.program_id → programs FK would reject the legacy
+    # dangling rows these historical-upgrade / gate-abort tests plant before
+    # re-running the 028/035 migrations; suspend it so the pre-042 data can be
+    # modeled (#201 Slice 4). migrate() manages the SQLite pragma itself.
+    suspend_program_org_fks(store)
     return store
 
 
@@ -156,6 +161,12 @@ def _seed_pre028_clean(store):
     """A gate-clean pre-028 dataset covering every reparent path, with stable
     ids so the upgrade's id-preservation can be asserted."""
     with store.transaction():
+        # The umbrella references org1 as its operator; seed that organization so
+        # the row is valid all the way through migration 042's
+        # programs.operator_organization_id → organizations FK (#201 Slice 4) —
+        # the re-migrate's foreign_key_check gate would otherwise flag it.
+        _exec(store, "INSERT INTO organizations (id, name) VALUES (?, ?)",
+              ("org1", "Org One"))
         _exec(store, "INSERT INTO leagues (id, name, organization_id) "
               "VALUES (?, ?, ?)", ("prog1", "Program One", "org1"))
         _exec(store, "INSERT INTO seasons (id, league_id, name) VALUES (?, ?, ?)",

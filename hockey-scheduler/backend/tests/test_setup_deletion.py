@@ -62,10 +62,10 @@ class DeletionContract:
         # a Level, so the Program already has exactly one League by the time a
         # team is made. Bare-team fixtures (no season/division/level) have none,
         # so provision a single permanent League under the Program here — as an
-        # unbound League (no LeagueSeason), so it neither blocks a later
-        # delete_season (which counts only a Season's LeagueSeasons' leagues)
-        # nor is reported by delete_program (which does not block on leagues),
-        # keeping every existing deletion assertion intact.
+        # unbound League (no LeagueSeason), so it does not block a later
+        # delete_season (which counts only a Season's LeagueSeasons' leagues).
+        # It IS reported by delete_program as a "level" dependent (#201 Slice 4
+        # added the leagues.program_id → programs foreign key).
         program_id = league_id
         if not self.store.leagues_for_program(program_id):
             self.store.add_league(League(
@@ -154,13 +154,21 @@ class DeletionContract:
         team = self._team(club, lg)
         self._venue(league_id=lg)
         blocked = self.api.delete_program(lg, actor_id=self.ACTOR)
-        self.assertBlocked(blocked, expect_types={"season", "team", "venue"})
+        # #201 Slice 4: leagues.program_id → programs is now a foreign key, so the
+        # Program's permanent League (auto-provisioned by _team) is a real
+        # dependent reported as a "level" group alongside season/team/venue.
+        self.assertBlocked(blocked,
+                           expect_types={"season", "team", "venue", "level"})
         self.assertIsNotNone(self.store.get_program(lg))  # zero-write
         self.assertEqual(self._audits("league_deleted"), [])
-        # Clear the dependents, then the league deletes cleanly.
+        # Clear the dependents, then the program deletes cleanly. The team goes
+        # before its League (delete_league blocks on member teams); the League
+        # goes before the Program (its program_id FK).
         for v in list(self.store.all_venues()):
             self.api.delete_venue(v.id, actor_id=self.ACTOR)
         self.api.delete_team(team, actor_id=self.ACTOR)
+        for lvl in [x for x in self.store.all_leagues() if x.program_id == lg]:
+            self.api.delete_league(lvl.id, actor_id=self.ACTOR)
         self.api.delete_season(s, actor_id=self.ACTOR)
         self.assertDeleted(self.api.delete_program(lg, actor_id=self.ACTOR),
                            self.store.get_program, lg, "league_deleted")
