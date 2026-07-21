@@ -858,6 +858,28 @@ class SeasonLifecycleHttpTest(unittest.TestCase):
         self.assertEqual(st, 200, body)
         self.assertIsNone(STATE.api.store.get_league(lid))
 
+    def test_reunbind_league_season_over_http_is_not_found_single_audit(self):
+        # HTTP parity for the re-fetch-under-lock invariant (#159 review):
+        # unbinding an already-unbound binding over HTTP returns 404 not-found
+        # and writes NO second league_season_deleted audit — exactly one unbind
+        # succeeds, matching the delete_league_season service + PostgreSQL
+        # unbind-vs-unbind barrier behaviour.
+        sid = self._seed_season()
+        lid = STATE.api.create_league(sid, "Gold")["id"]
+        ls_id = STATE.api.store.league_seasons_for_league(lid)[0].id
+        st, body = self._req("POST",
+                             f"/api/v2/setup/league-season/{ls_id}/delete")
+        self.assertEqual(st, 200, body)
+        self.assertIsNone(STATE.api.store.get_league_season(ls_id))
+        # Second unbind of the now-gone binding → 404, zero mutation.
+        st, body = self._req("POST",
+                             f"/api/v2/setup/league-season/{ls_id}/delete")
+        self.assertEqual(st, 404, body)
+        self.assertEqual(body["error"]["code"], "not_found", body)
+        audits = [a for a in STATE.api.store.all_setup_audit()
+                  if a.action == "league_season_deleted" and a.entity_id == ls_id]
+        self.assertEqual(len(audits), 1, body)  # exactly one, no duplicate
+
     def test_delete_league_blocked_by_team_over_http(self):
         sid = self._seed_season()
         lid = STATE.api.create_league(sid, "Gold")["id"]
