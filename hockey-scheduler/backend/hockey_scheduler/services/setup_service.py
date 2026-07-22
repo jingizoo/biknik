@@ -3007,6 +3007,60 @@ class SetupService:
                                     enforce_team_league=enforce_team_league)
 
     # -- manual game creation ---------------------------------------------
+    def _assert_slot_free_for_game(self, ice_slot_id, home_team_id, away_team_id,
+                                   *, exclude_game_id=None):
+        """Shared final conflict check for placing a game on an ice slot (#277).
+
+        create_game, move_game, and the draft-commit path all route through this
+        one function so they enforce identical rules — the slot exists, is a GAME
+        slot, is AVAILABLE, is not already used by another active game, and puts
+        neither team on an overlapping fixture. Returns the resolved slot on
+        success; raises a structured error carrying ``details["reason"]`` (the
+        machine-readable code the move panel and draft review already consume)
+        otherwise. ``exclude_game_id`` is the game being moved — excluded from the
+        slot-in-use and team-overlap checks so a move never conflicts with itself.
+
+        Read-only (no transaction of its own) — callers run inside theirs.
+        Turnover-buffer and curfew enforcement layer onto this single choke point
+        in the #277 policy slice.
+        """
+        slot = self.store.get_ice_slot(ice_slot_id)
+        if slot is None:
+            raise NotFoundError(f"Ice slot {ice_slot_id} not found.",
+                                details={"reason": "slot_missing"})
+        if slot.slot_type != IceSlotType.GAME:
+            raise ValidationError(
+                "Only game ice slots can host a game (not maintenance / "
+                "public skate / practice / tournament).",
+                details={"reason": "not_game_slot",
+                         "slot_type": slot.slot_type.value})
+        if slot.status != IceSlotStatus.AVAILABLE:
+            raise ScheduleConflictError(
+                f"Ice slot {ice_slot_id} is not available.",
+                details={"reason": "slot_unavailable",
+                         "slot_status": slot.status.value})
+        clash = self.store.game_using_ice_slot(ice_slot_id)
+        if clash is not None and clash.id != exclude_game_id:
+            raise ScheduleConflictError(
+                f"Ice slot {ice_slot_id} is already used by game {clash.id}.",
+                details={"reason": "slot_already_filled",
+                         "conflict_game_id": clash.id})
+        for ex in self.store.all_games():
+            if ex.id == exclude_game_id or ex.cancelled or ex.ice_slot_id is None:
+                continue
+            ex_slot = self.store.get_ice_slot(ex.ice_slot_id)
+            if ex_slot is None:
+                continue
+            overlaps = intervals_overlap(slot.start_time, slot.end_time,
+                                         ex_slot.start_time, ex_slot.end_time)
+            same_team = (ex.home_team_id in (home_team_id, away_team_id)
+                         or ex.away_team_id in (home_team_id, away_team_id))
+            if overlaps and same_team:
+                raise ScheduleConflictError(
+                    f"A team already has an overlapping game {ex.id}.",
+                    details={"reason": "team_overlap", "conflict_game_id": ex.id})
+        return slot
+
     @_transactional
     def create_game(self, season_id: str, division_id: str, home_team_id: str,
                     away_team_id: str, ice_slot_id: str,
@@ -3127,38 +3181,11 @@ class SetupService:
                          "expected_league_id": scoped_league_id,
                          "registered_league_id": reg_league_id})
 
-        slot = self.store.get_ice_slot(ice_slot_id)
-        if slot is None:
-            raise NotFoundError(f"Ice slot {ice_slot_id} not found.")
-        if slot.slot_type != IceSlotType.GAME:
-            raise ValidationError(
-                "Only game ice slots can host a game (not maintenance / "
-                "public skate / practice / tournament)."
-            )
-        if slot.status != IceSlotStatus.AVAILABLE:
-            raise ScheduleConflictError(
-                f"Ice slot {ice_slot_id} is not available."
-            )
-        clash = self.store.game_using_ice_slot(ice_slot_id)
-        if clash is not None:
-            raise ScheduleConflictError(
-                f"Ice slot {ice_slot_id} is already used by game {clash.id}."
-            )
-        # Neither team may already have an overlapping (non-cancelled) game.
-        for ex in self.store.all_games():
-            if ex.cancelled or ex.ice_slot_id is None:
-                continue
-            ex_slot = self.store.get_ice_slot(ex.ice_slot_id)
-            if ex_slot is None:
-                continue
-            overlaps = intervals_overlap(slot.start_time, slot.end_time,
-                                         ex_slot.start_time, ex_slot.end_time)
-            same_team = (ex.home_team_id in (home_team_id, away_team_id)
-                         or ex.away_team_id in (home_team_id, away_team_id))
-            if overlaps and same_team:
-                raise ScheduleConflictError(
-                    f"A team already has an overlapping game {ex.id}."
-                )
+        # Shared final conflict check (#277): create/move/draft-commit all route
+        # through the one checker so they enforce identical slot + team-overlap
+        # rules (and, in the policy slice, turnover + curfew).
+        slot = self._assert_slot_free_for_game(
+            ice_slot_id, home_team_id, away_team_id)
 
         rink = self.store.get_rink(slot.rink_id)
         # #283 Slice E: a REGULAR game references its exact LeagueSeason (its
@@ -3266,35 +3293,11 @@ class SetupService:
         if new_slot.id == game.ice_slot_id:
             raise ValidationError("Game is already in that ice slot.",
                                   details={"reason": "same_slot"})
-        if new_slot.slot_type != IceSlotType.GAME:
-            raise ValidationError(
-                "Only game ice slots can host a game (not maintenance / "
-                "public skate / practice / tournament).",
-                details={"reason": "not_game_slot",
-                         "slot_type": new_slot.slot_type.value},
-            )
-        if new_slot.status != IceSlotStatus.AVAILABLE:
-            raise ScheduleConflictError(
-                f"Ice slot {new_ice_slot_id} is not available.",
-                details={"reason": "slot_unavailable",
-                         "slot_status": new_slot.status.value},
-            )
-        # Neither team may already have an overlapping game (excluding this one).
-        for ex in self.store.all_games():
-            if ex.id == game_id or ex.cancelled or ex.ice_slot_id is None:
-                continue
-            ex_slot = self.store.get_ice_slot(ex.ice_slot_id)
-            if ex_slot is None:
-                continue
-            overlaps = intervals_overlap(new_slot.start_time, new_slot.end_time,
-                                         ex_slot.start_time, ex_slot.end_time)
-            same_team = (ex.home_team_id in (game.home_team_id, game.away_team_id)
-                         or ex.away_team_id in (game.home_team_id, game.away_team_id))
-            if overlaps and same_team:
-                raise ScheduleConflictError(
-                    f"A team already has an overlapping game {ex.id}.",
-                    details={"reason": "team_overlap", "conflict_game_id": ex.id},
-                )
+        # Shared final conflict check (#277) — identical rules to create +
+        # draft-commit; excludes THIS game so a move never conflicts with itself.
+        new_slot = self._assert_slot_free_for_game(
+            new_ice_slot_id, game.home_team_id, game.away_team_id,
+            exclude_game_id=game_id)
 
         old_slot_id = game.ice_slot_id
         if old_slot_id:
