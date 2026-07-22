@@ -11,35 +11,19 @@ resource-scoped in the current account model (#211) — they see every Program.
 If org-scoped operators are introduced later, THIS is the single place to narrow
 them; resolve/set already route through here on every request.
 
-Kept in the service layer (not `web/scope.py`) so context authorization never
-imports the web layer; the Coach/Player team resolution below mirrors
-`web.scope.own_team_id` semantics.
+Caller-identity resolution ("which team does this caller act for") is NOT
+redefined here — it is the shared `subject_scope.own_team_id`, the SAME resolver
+the web scope guards use, so the two gates can never drift. This module only adds
+the new Program/Season *projection* on top of that canonical identity.
 """
 
 from ..domain import Role
 from . import scope_bridge
+from .subject_scope import own_team_id as _own_team_id
 
 # Roles that see every Program under the current account model (#211): the two
 # global operators plus the global read-only Viewer.
 _GLOBAL_ROLES = frozenset({Role.LEAGUE_ADMIN, Role.ARENA_MANAGER, Role.VIEWER})
-
-
-def _own_team_id(role, scope, store):
-    """A Coach's stored ``team_id``; a Player's team resolved LIVE from
-    ``player_id`` (a stored team_id could be stale after a transfer), failing
-    closed on an unknown/inactive/teamless player. ``None`` for other roles."""
-    scope = scope or {}
-    if role == Role.COACH:
-        return scope.get("team_id")
-    if role == Role.PLAYER:
-        player_id = scope.get("player_id")
-        if not player_id:
-            return None
-        player = store.get_player(player_id)
-        if player is None or not getattr(player, "is_active", True):
-            return None
-        return player.team_id
-    return None
 
 
 def _team_season_ids(store, team):

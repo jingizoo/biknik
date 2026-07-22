@@ -148,9 +148,15 @@ the rest of the app uses): the two global operators and the read-only Viewer see
 every Program (the current model has no org-scoped operator — when one lands,
 `context_scope` is the single place to narrow it); a Coach/Player sees only its
 team's Program and that team's participating Seasons; an Official only the
-Programs/Seasons of its assigned games; a Guardian only its verified juniors'.
-So a scoped account can neither select nor *enumerate* an unrelated context, and
-a saved selection is dropped the instant the caller's scope changes.
+Programs/Seasons of its assigned games; a Guardian only its verified juniors';
+an unbound/unknown role fails closed. So a scoped account can neither select nor
+*enumerate* an unrelated context. A saved selection outside the caller's *current*
+authorized scope is **ignored** (a fallback is returned) but the row is **not
+rewritten**, so if authorization is later restored the saved choice resolves
+again. "Which team does this caller act for" is resolved by
+`services/subject_scope.own_team_id` — the **same** resolver the web scope guards
+use, so the two gates can never drift; `context_scope` adds only the new
+Program/Season projection on top of that shared identity.
 
 - **`GET /api/context`** → the effective `{program_id, season_id, read_only,
   program, season}`: the saved selection when its Program is still authorized+
@@ -166,8 +172,11 @@ a saved selection is dropped the instant the caller's scope changes.
   accepted as a **read-only historical** context — honored, never silently
   swapped for an active one — while writes against it stay blocked by the Season
   read-only guard above. An unauthorized **or** non-existent Program/Season both
-  return the *same* generic `not_found` (no existence oracle). Setting a
-  selection is idempotent; concurrent sets are last-write-wins.
+  return the *same* generic `not_found` (no existence oracle). `set_active_context`
+  is an atomic `INSERT .. ON CONFLICT (id) DO UPDATE`, so re-selecting the same
+  context is idempotent and two concurrent first writes for one user both succeed
+  (exactly one row, last-committed wins) rather than racing the primary key into a
+  500.
 
 Both endpoints need only a valid session — never the operator permission gate —
 because the selection grants nothing (a Viewer may record its own selection yet

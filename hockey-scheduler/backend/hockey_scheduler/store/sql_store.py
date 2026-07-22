@@ -1630,7 +1630,22 @@ class SqlStore:
         return self._get(ActiveContext, user_id)
 
     def set_active_context(self, ctx):
-        """Persist a user's selected context (one row per user; upsert)."""
+        """Persist a user's selected context (one row per user), last-write-wins.
+
+        An ATOMIC ``INSERT ... ON CONFLICT (id) DO UPDATE`` (portable, as
+        ``next_id`` already uses) — NOT a read-then-write upsert: two concurrent
+        first writes for the same user would both see "missing" and race the
+        PRIMARY KEY, one hitting a raw integrity error/500. Here one INSERTs and
+        the other DO-UPDATEs; both commit, exactly one row remains, and the
+        last-committed values win."""
         with self.transaction():
-            self._upsert(ctx)
+            self._exec(
+                "INSERT INTO user_active_context "
+                "(id, program_id, season_id, updated_at) VALUES (?, ?, ?, ?) "
+                "ON CONFLICT (id) DO UPDATE SET "
+                "program_id = excluded.program_id, "
+                "season_id = excluded.season_id, "
+                "updated_at = excluded.updated_at",
+                (ctx.id, ctx.program_id, ctx.season_id,
+                 ctx.updated_at.isoformat() if ctx.updated_at else None))
         return ctx

@@ -1,27 +1,25 @@
-"""Per-user active Program/Season context — backend selection foundation (#159).
+"""Per-user active Program/Season context — the selection backend (#159).
 
-Which Program + Season a user is currently working in, persisted per user. This
-is a backend PREFERENCE + RESOLUTION foundation only — NOT the shell switcher/UI,
-NOT deep-link restoration, NOT cross-context isolation of existing reads/writes/
-workers/exports (those still take explicit ids), and NOT completion of #159.
+A VIEW selection only: on every resolve/set it is filtered through the caller's
+REAL role + account scope (the same #211/#266/#202 rules the rest of the app
+enforces), so a scoped account can neither select nor enumerate a Program/Season
+outside its scope. It never grants authority. Supports Program-only selection;
+honors an archived Season as a read-only historical context; and a deleted or
+no-longer-authorized saved selection is ignored (fallback), the row not rewritten.
 
-The selection is a VIEW preference, never authority: on EVERY resolve and set it
-is filtered through the caller's real role + account scope, so a scoped account
-can neither select nor enumerate a Program/Season outside its scope. Program-only
-selection (no Season) is supported; an archived Season is honored as a read-only
-historical context, never silently replaced.
-
-Coverage: Memory/SQLite/PostgreSQL parity for the authorization matrix,
-non-oracle errors, program-only + archived-read-only, deterministic semantic-date
-fallback, stale-scope/deleted-record behavior, idempotent/last-write set; a
-durable migration-044 upgrade+reopen proof; and a strict authenticated HTTP
-contract.
+Coverage: resolve/set behavior; the full authorization MATRIX (League Admin,
+Arena Manager, Viewer, Coach, Player, Official, Guardian, unknown role) on
+Memory/SQLite/PostgreSQL; a subject-resolution contract proving the context
+selector and the web scope guards resolve the SAME caller identity; concurrent
+last-write-wins; migration-044 durability; and the strict authenticated HTTP
+contract (including a genuinely scoped identity).
 """
 
 import json
 import os
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -32,18 +30,21 @@ from http.server import ThreadingHTTPServer
 from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
 
 from hockey_scheduler.api.service import ApiService
-from hockey_scheduler.domain import ActiveContext, Role, SeasonStatus
+from hockey_scheduler.domain import (
+    ActiveContext, GuardianLink, OfficialRole, Role, SeasonStatus)
+from hockey_scheduler.domain.models import Game
+from hockey_scheduler.domain.setup_models import OfficialAssignment
+from hockey_scheduler.services import context_scope
+from hockey_scheduler.services.subject_scope import own_team_id
 from hockey_scheduler.store import InMemoryStore, SqlStore
 from hockey_scheduler.store.sql_store import migrate
 from hockey_scheduler.web.server import STATE, Handler
 
 _VERSION = "044_active_context"
-_ADMIN = (Role.LEAGUE_ADMIN, {})
-_EMPTY = {"program_id": None, "season_id": None, "read_only": False,
-          "program": None, "season": None}
+ADMIN = (Role.LEAGUE_ADMIN, {})       # (role, scope) for a global operator
 
 
-def _sql_backends():
+def _backends():
     yield "memory", InMemoryStore()
     yield "sqlite", SqlStore(":memory:")
     url = os.environ.get("TEST_DATABASE_URL")
@@ -57,30 +58,36 @@ def _close(store):
         store.close()
 
 
-def _seed(api):
-    """Two Programs, each with an active Season and a registered Team, so a
-    Coach scoped to one Team is authorized for exactly one Program+Season."""
+# -- scenario builders ---------------------------------------------------
+def _program_season(api, pname="P1", sname="S1"):
+    pid = api.create_program(pname, "US", "UTC")["id"]
+    sid = api.create_season(pid, sname)["id"]
+    return pid, sid
+
+
+def _team_registered(api, sid, tname="Alpha"):
+    """A League+Division+Club+Team registered in Season ``sid``. Returns team_id."""
+    lid = api.create_league(sid, "Gold")["id"]
+    did = api.create_division(sid, "D1", league_id=lid)["id"]
     club = api.create_club("Club")["id"]
-
-    def program(pn, sn, tn):
-        pid = api.create_program(pn, "US", "UTC")["id"]
-        sid = api.create_season(pid, sn)["id"]
-        lid = api.create_league(sid, pn + " League")["id"]
-        did = api.create_division(sid, "D", league_id=lid)["id"]
-        tid = api.create_team(club_id=club, name=tn, league_id=lid,
-                              division_id=did)["id"]
-        api.setup.register_team_for_season(sid, tid, did)
-        return pid, sid, tid
-
-    p1, s1, t1 = program("P1", "S1", "Alpha")
-    p2, s2, t2 = program("P2", "S2", "Beta")
-    return dict(p1=p1, s1=s1, t1=t1, p2=p2, s2=s2, t2=t2)
+    team = api.create_team(club_id=club, name=tname, league_id=lid,
+                           division_id=did)["id"]
+    api.setup.register_team_for_season(sid, team, did)
+    return team
 
 
-def _set_start(store, season_id, dt):
-    s = store.get_season(season_id)
-    s.start_date = dt
-    store.save_season(s)
+def _official_assigned(api, sid, team_id):
+    """An Official assigned to a Game in Season ``sid``. Returns (official_id, game_id)."""
+    oid = api.create_official("Ref")["id"]
+    store = api.store
+    with store.transaction():
+        gid = store.next_id("game")
+        store.add_game(Game(id=gid, home_team_id=team_id, away_team_id=team_id,
+                            start_time=None, season_id=sid))
+        store.add_official_assignment(OfficialAssignment(
+            id=store.next_id("assign"), game_id=gid, official_id=oid,
+            role=OfficialRole.REFEREE))
+    return oid, gid
 
 
 def _archive(store, season_id):
@@ -89,205 +96,338 @@ def _archive(store, season_id):
     store.save_season(s)
 
 
-class ContextAuthorizationTest(unittest.TestCase):
-    """Resolve/set filter through the caller's real authorized scope on every
-    request — a scoped account cannot select or enumerate an unrelated context,
-    and a stale saved selection is dropped the instant scope changes."""
+class ContextResolveSetTest(unittest.TestCase):
+    """resolve/set behavior for a global operator (role/scope threaded)."""
 
-    def test_operator_sees_all_scoped_coach_sees_only_own(self):
-        for label, store in _sql_backends():
-            with self.subTest(backend=label):
-                api = ApiService(store)
-                ids = _seed(api)
-                coach = (Role.COACH, {"team_id": ids["t1"]})
-                # League Admin may select either Program/Season.
-                self.assertNotIn(
-                    "error", api.set_active_context("adm", *_ADMIN,
-                                                    ids["p2"], ids["s2"]))
-                # Coach resolves to its own team's context...
-                c = api.get_active_context("cu", *coach)
-                self.assertEqual((c["program_id"], c["season_id"]),
-                                 (ids["p1"], ids["s1"]), label)
-                # ...may set it...
-                self.assertNotIn("error", api.set_active_context(
-                    "cu", *coach, ids["p1"], ids["s1"]))
-                # ...but not another Program (exists, not theirs) NOR a ghost —
-                # BOTH the SAME non-oracle not_found (no existence oracle).
-                other = api.set_active_context("cu", *coach, ids["p2"], ids["s2"])
-                ghost = api.set_active_context("cu", *coach, "ghost_prog", None)
-                self.assertEqual(other["error"]["code"], "not_found", label)
-                self.assertEqual(ghost["error"]["code"], "not_found", label)
-                self.assertEqual(other["error"]["message"],
-                                 ghost["error"]["message"], label)
-                # A Season outside the Program is likewise a generic not_found.
-                cross = api.set_active_context("cu", *coach, ids["p1"], ids["s2"])
-                self.assertEqual(cross["error"]["details"]["reason"],
-                                 "season_not_accessible", label)
-                _close(store)
-
-    def test_stale_scope_rebind_and_revoke_refilters_immediately(self):
-        for label, store in _sql_backends():
-            with self.subTest(backend=label):
-                api = ApiService(store)
-                ids = _seed(api)
-                # Coach on team1 saves its context.
-                api.set_active_context("cu", Role.COACH, {"team_id": ids["t1"]},
-                                       ids["p1"], ids["s1"])
-                # REBOUND to team2 → the saved p1/s1 is no longer authorized, so
-                # resolve returns team2's context, never the stale one.
-                c = api.get_active_context("cu", Role.COACH,
-                                           {"team_id": ids["t2"]})
-                self.assertEqual((c["program_id"], c["season_id"]),
-                                 (ids["p2"], ids["s2"]), label)
-                # REVOKED (teamless) → empty context, never the stale p1/s1.
-                c = api.get_active_context("cu", Role.COACH, {"team_id": None})
-                self.assertEqual(c, _EMPTY, label)
-                _close(store)
-
-    def test_viewer_is_global_readonly(self):
-        for label, store in _sql_backends():
-            with self.subTest(backend=label):
-                api = ApiService(store)
-                ids = _seed(api)
-                # Under the current #211 model a Viewer is global read-only.
-                c = api.get_active_context("vu", Role.VIEWER, {})
-                self.assertIn(c["program_id"], (ids["p1"], ids["p2"]), label)
-                self.assertNotIn("error", api.set_active_context(
-                    "vu", Role.VIEWER, {}, ids["p2"], ids["s2"]))
-                _close(store)
-
-
-class ContextResolveFallbackTest(unittest.TestCase):
     def test_empty_world_is_empty_context(self):
-        for label, store in _sql_backends():
+        for label, store in _backends():
             with self.subTest(backend=label):
                 api = ApiService(store)
-                self.assertEqual(api.get_active_context("u", *_ADMIN), _EMPTY,
-                                 label)
+                self.assertEqual(
+                    api.get_active_context("u1", *ADMIN),
+                    {"program_id": None, "season_id": None, "read_only": False,
+                     "program": None, "season": None}, label)
                 _close(store)
 
-    def test_fallback_prefers_latest_active_season_by_date(self):
-        # Deterministic fallback parses the boundary date semantically — the
-        # latest start_date wins regardless of insertion/id order; a null-date
-        # Season is never preferred over a dated one.
-        for label, store in _sql_backends():
+    def test_fallback_prefers_latest_active_season_semantically(self):
+        for label, store in _backends():
             with self.subTest(backend=label):
                 api = ApiService(store)
-                p = api.create_program("P", "US", "UTC")["id"]
-                early = api.create_season(p, "early")["id"]
-                late = api.create_season(p, "late")["id"]   # higher id / later insert
-                nul = api.create_season(p, "nodate")["id"]
-                _set_start(store, early, datetime(2027, 1, 1, tzinfo=timezone.utc))
-                _set_start(store, late, datetime(2027, 6, 1, tzinfo=timezone.utc))
-                _set_start(store, nul, None)
-                c = api.get_active_context("u", *_ADMIN)
-                self.assertEqual(c["season_id"], late, label)   # by DATE, not id
-                _close(store)
-
-    def test_program_only_fallback_when_no_active_season(self):
-        # A Program can exist before its first Season (or with only archived
-        # ones): the fallback still selects the Program, with a null Season.
-        for label, store in _sql_backends():
-            with self.subTest(backend=label):
-                api = ApiService(store)
-                p = api.create_program("Solo", "US", "UTC")["id"]
-                c = api.get_active_context("u", *_ADMIN)
-                self.assertEqual(c["program_id"], p, label)
-                self.assertIsNone(c["season_id"], label)
+                pid = api.create_program("P", "US", "UTC")["id"]
+                # Insert out of date order; a null-date season must NOT win over a
+                # dated one, and the LATEST date wins (not string/insertion order).
+                s_mid = api.create_season(pid, "mid", start_date="2027-06-01")["id"]
+                s_late = api.create_season(pid, "late", start_date="2027-09-01")["id"]
+                api.create_season(pid, "nodate")           # null start_date
+                api.create_season(pid, "early", start_date="2027-01-01")
+                c = api.get_active_context("u1", *ADMIN)
+                self.assertEqual(c["season_id"], s_late, (label, c))
                 self.assertFalse(c["read_only"], label)
-                self.assertIsNotNone(c["program"], label)
+                self.assertNotEqual(c["season_id"], s_mid, label)
                 _close(store)
 
-    def test_saved_archived_season_is_kept_read_only(self):
-        # An explicit archived-history selection is honored as read-only, NOT
-        # silently replaced by an unrelated active Season.
-        for label, store in _sql_backends():
+    def test_program_only_when_no_active_season(self):
+        for label, store in _backends():
             with self.subTest(backend=label):
                 api = ApiService(store)
-                p = api.create_program("P", "US", "UTC")["id"]
-                arch = api.create_season(p, "Old")["id"]
-                api.create_season(p, "New")["id"]            # an active alternative
-                api.set_active_context("u", *_ADMIN, p, arch)
-                _archive(store, arch)
-                c = api.get_active_context("u", *_ADMIN)
-                self.assertEqual(c["season_id"], arch, label)   # kept, not swapped
-                self.assertTrue(c["read_only"], label)          # historical
-                _close(store)
-
-    def test_saved_deleted_season_falls_back(self):
-        for label, store in _sql_backends():
-            with self.subTest(backend=label):
-                api = ApiService(store)
-                p = api.create_program("P", "US", "UTC")["id"]
-                s = api.create_season(p, "S")["id"]
-                api.set_active_context("u", *_ADMIN, p, s)
-                store.delete_season(s)                       # vanishes
-                c = api.get_active_context("u", *_ADMIN)
-                self.assertIsNone(c["season_id"], label)     # program-only fallback
-                self.assertEqual(c["program_id"], p, label)
-                _close(store)
-
-    def test_per_user_isolation(self):
-        for label, store in _sql_backends():
-            with self.subTest(backend=label):
-                api = ApiService(store)
-                ids = _seed(api)
-                api.set_active_context("u1", *_ADMIN, ids["p2"], ids["s2"])
-                self.assertEqual(api.get_active_context("u1", *_ADMIN)["season_id"],
-                                 ids["s2"], label)
-                # u2 never sees u1's selection — its own deterministic fallback.
-                self.assertEqual(api.get_active_context("u2", *_ADMIN)["program_id"],
-                                 ids["p1"], label)
-                _close(store)
-
-
-class ContextSetTest(unittest.TestCase):
-    def test_program_only_and_archived_read_only_set(self):
-        for label, store in _sql_backends():
-            with self.subTest(backend=label):
-                api = ApiService(store)
-                p = api.create_program("P", "US", "UTC")["id"]
-                s = api.create_season(p, "S")["id"]
-                # Program-only set (null Season) is allowed.
-                c = api.set_active_context("u", *_ADMIN, p, None)
-                self.assertEqual((c["program_id"], c["season_id"]), (p, None),
+                pid = api.create_program("P", "US", "UTC")["id"]   # no Season yet
+                c = api.get_active_context("u1", *ADMIN)
+                self.assertEqual(c["program_id"], pid, label)      # Program-only
+                self.assertIsNone(c["season_id"], label)
+                # Explicit Program-only set round-trips.
+                c = api.set_active_context("u1", *ADMIN, pid, None)
+                self.assertEqual((c["program_id"], c["season_id"]), (pid, None),
                                  label)
-                # Selecting an archived Season is accepted as read-only history.
-                _archive(store, s)
-                c = api.set_active_context("u", *_ADMIN, p, s)
-                self.assertEqual(c["season_id"], s, label)
-                self.assertTrue(c["read_only"], label)
+                self.assertFalse(c["read_only"], label)
                 _close(store)
 
-    def test_missing_program_id_is_validation_error(self):
-        for label, store in _sql_backends():
+    def test_archived_selection_is_read_only_history_not_replaced(self):
+        for label, store in _backends():
             with self.subTest(backend=label):
                 api = ApiService(store)
-                r = api.set_active_context("u", *_ADMIN, None, None)
-                self.assertEqual(r["error"]["code"], "validation_error", label)
+                p1, s1 = _program_season(api, "P1", "S1")
+                p2, s2 = _program_season(api, "P2", "S2")
+                _archive(store, s2)
+                # Setting an archived Season is allowed — a read-only historical
+                # context — NOT rejected, NOT swapped for p1's active Season.
+                c = api.set_active_context("u1", *ADMIN, p2, s2)
+                self.assertEqual(c["season_id"], s2, (label, c))
+                self.assertTrue(c["read_only"], (label, c))
+                self.assertEqual(api.get_active_context("u1", *ADMIN)["season_id"],
+                                 s2, label)                        # honored on resolve
                 _close(store)
 
-    def test_same_selection_is_idempotent_and_last_write_wins(self):
-        for label, store in _sql_backends():
+    def test_deleted_season_and_deleted_program_fall_back(self):
+        for label, store in _backends():
             with self.subTest(backend=label):
                 api = ApiService(store)
-                ids = _seed(api)
-                a = api.set_active_context("u", *_ADMIN, ids["p1"], ids["s1"])
-                b = api.set_active_context("u", *_ADMIN, ids["p1"], ids["s1"])
-                self.assertEqual(a, b, label)                # idempotent
-                self.assertEqual(len([c for c in [
-                    store.get_active_context("u")] if c]), 1, label)  # one row
-                # A different selection overwrites (last write wins).
-                api.set_active_context("u", *_ADMIN, ids["p2"], ids["s2"])
-                self.assertEqual(store.get_active_context("u").season_id,
-                                 ids["s2"], label)
+                p1, s1 = _program_season(api, "P1", "S1")
+                p2, s2 = _program_season(api, "P2", "S2")
+                # deleted Season → fallback
+                api.set_active_context("u1", *ADMIN, p2, s2)
+                store.delete_season(s2)
+                self.assertNotEqual(
+                    api.get_active_context("u1", *ADMIN)["season_id"], s2, label)
+                # deleted Program → fallback (never a dangling program_id)
+                api.set_active_context("u2", *ADMIN, p1, s1)
+                with store.transaction():
+                    store.delete_season(s1)          # clear the dependent first
+                    store.delete_program(p1)
+                c = api.get_active_context("u2", *ADMIN)
+                self.assertNotEqual(c["program_id"], p1, (label, c))
                 _close(store)
+
+    def test_orphan_row_and_per_user_isolation(self):
+        for label, store in _backends():
+            with self.subTest(backend=label):
+                api = ApiService(store)
+                p1, s1 = _program_season(api, "P1", "S1")
+                p2, s2 = _program_season(api, "P2", "S2")
+                api.set_active_context("u1", *ADMIN, p2, s2)
+                # u2 has no saved row ⇒ deterministic fallback, not u1's choice.
+                self.assertEqual(
+                    api.get_active_context("u2", *ADMIN)["program_id"], p1, label)
+                # An orphan row (user has no account) is inert: resolving it just
+                # applies the passed role/scope; no crash.
+                store.set_active_context(ActiveContext(
+                    "ghost_user", p2, s2, datetime(2027, 1, 1, tzinfo=timezone.utc)))
+                self.assertEqual(
+                    api.get_active_context("ghost_user", *ADMIN)["season_id"], s2,
+                    label)
+                _close(store)
+
+
+class ContextAuthorizationMatrixTest(unittest.TestCase):
+    """resolve/set are filtered through the caller's REAL role + scope."""
+
+    def test_global_roles_see_all_programs(self):
+        for label, store in _backends():
+            with self.subTest(backend=label):
+                api = ApiService(store)
+                p1, s1 = _program_season(api, "P1", "S1")
+                for role in (Role.LEAGUE_ADMIN, Role.ARENA_MANAGER, Role.VIEWER):
+                    c = api.get_active_context(f"u_{role.value}", role, {})
+                    self.assertEqual(c["program_id"], p1, (label, role))
+                    ok = api.set_active_context(f"u_{role.value}", role, {}, p1, s1)
+                    self.assertEqual(ok["season_id"], s1, (label, role))
+                _close(store)
+
+    def test_unknown_or_unbound_role_fails_closed(self):
+        for label, store in _backends():
+            with self.subTest(backend=label):
+                api = ApiService(store)
+                p1, s1 = _program_season(api, "P1", "S1")
+                # A Coach with no team_id, an Official with no official_id: empty
+                # authorized set ⇒ empty context, and a set is a non-oracle 404.
+                for role, scope in ((Role.COACH, {}), (Role.OFFICIAL, {}),
+                                    (Role.GUARDIAN, {})):
+                    self.assertIsNone(
+                        api.get_active_context("x", role, scope)["program_id"],
+                        (label, role))
+                    r = api.set_active_context("x", role, scope, p1, s1)
+                    self.assertEqual(r["error"]["code"], "not_found", (label, role))
+                _close(store)
+
+    def test_coach_scoped_to_own_program_only(self):
+        for label, store in _backends():
+            with self.subTest(backend=label):
+                api = ApiService(store)
+                p1, s1 = _program_season(api, "P1", "S1")
+                team = _team_registered(api, s1)
+                p2, s2 = _program_season(api, "P2", "S2")   # unrelated
+                coach = (Role.COACH, {"team_id": team})
+                c = api.get_active_context("c1", *coach)
+                self.assertEqual(c["program_id"], p1, (label, c))   # only own program
+                self.assertEqual(c["season_id"], s1, (label, c))
+                # Selecting the unrelated Program is a non-oracle not_found.
+                r = api.set_active_context("c1", *coach, p2, s2)
+                self.assertEqual(r["error"]["code"], "not_found", label)
+                self.assertEqual(r["error"]["details"]["reason"],
+                                 "program_not_accessible", label)
+                # Its own is allowed.
+                self.assertEqual(
+                    api.set_active_context("c1", *coach, p1, s1)["season_id"], s1,
+                    label)
+                _close(store)
+
+    def test_player_live_team_transfer_deactivate_teamless(self):
+        for label, store in _backends():
+            with self.subTest(backend=label):
+                api = ApiService(store)
+                p1, s1 = _program_season(api, "P1", "S1")
+                team1 = _team_registered(api, s1, "T1")
+                p2, s2 = _program_season(api, "P2", "S2")
+                team2 = _team_registered(api, s2, "T2")
+                player = api.create_player(team1, "Pat", "forward")["id"]
+                pl = (Role.PLAYER, {"player_id": player})
+                # Live resolution: player sees team1's Program only.
+                self.assertEqual(api.get_active_context("pl", *pl)["program_id"],
+                                 p1, label)
+                # Transfer to team2 (different Program) → former Program rejected,
+                # new one granted — resolved LIVE from player_id.
+                pobj = store.get_player(player)
+                pobj.team_id = team2
+                store.save_player(pobj)
+                self.assertEqual(api.get_active_context("pl", *pl)["program_id"],
+                                 p2, label)
+                self.assertEqual(api.set_active_context("pl", *pl, p1, s1)
+                                 ["error"]["code"], "not_found", label)  # former
+                # Deactivated player → fails closed (empty).
+                pobj = store.get_player(player)
+                pobj.is_active = False
+                store.save_player(pobj)
+                self.assertIsNone(api.get_active_context("pl", *pl)["program_id"],
+                                  label)
+                _close(store)
+
+    def test_official_sees_only_assigned_season_and_loses_it_on_unassign(self):
+        for label, store in _backends():
+            with self.subTest(backend=label):
+                api = ApiService(store)
+                p1, s1 = _program_season(api, "P1", "S1")
+                team = _team_registered(api, s1)
+                p2, s2 = _program_season(api, "P2", "S2")     # unassigned → unseen
+                oid, gid = _official_assigned(api, s1, team)
+                off = (Role.OFFICIAL, {"official_id": oid})
+                c = api.get_active_context("o1", *off)
+                self.assertEqual(c["program_id"], p1, (label, c))  # assigned only
+                self.assertEqual(api.set_active_context("o1", *off, p2, s2)
+                                 ["error"]["code"], "not_found", label)  # unrelated
+                # Removing the assignment removes access immediately.
+                with store.transaction():
+                    store.remove_official_assignment(
+                        store.assignments_for_official(oid)[0].id)
+                self.assertIsNone(api.get_active_context("o1", *off)["program_id"],
+                                  label)
+                _close(store)
+
+    def test_guardian_verified_link_only(self):
+        for label, store in _backends():
+            with self.subTest(backend=label):
+                api = ApiService(store)
+                p1, s1 = _program_season(api, "P1", "S1")
+                team = _team_registered(api, s1)
+                junior = api.create_player(team, "Junior", "forward")["id"]
+                ts = datetime(2027, 1, 1, tzinfo=timezone.utc)
+                with store.transaction():   # link rows directly (context reads them)
+                    store.add_guardian_link(GuardianLink(
+                        id="gl_unv", guardian_user_id="g_unv", player_id=junior,
+                        created_at=ts, verified=False))
+                    store.add_guardian_link(GuardianLink(
+                        id="gl_ver", guardian_user_id="g_ver", player_id=junior,
+                        created_at=ts, verified=True))
+                # Unverified link grants nothing; a verified link grants the
+                # junior's authorized Program/Season.
+                self.assertIsNone(
+                    api.get_active_context("g_unv", Role.GUARDIAN, {})["program_id"],
+                    label)
+                self.assertEqual(
+                    api.get_active_context("g_ver", Role.GUARDIAN, {})["program_id"],
+                    p1, label)
+                _close(store)
+
+
+class ContextSubjectContractTest(unittest.TestCase):
+    """The context selector and the web scope guards resolve the SAME caller
+    identity (one shared resolver), after transfer and deactivate — proving the
+    de-duplication holds, not just today's happy path."""
+
+    def test_context_and_web_agree_on_team_after_transfer_and_deactivate(self):
+        store = InMemoryStore()
+        api = ApiService(store)
+        p1, s1 = _program_season(api, "P1", "S1")
+        team1 = _team_registered(api, s1, "T1")
+        p2, s2 = _program_season(api, "P2", "S2")
+        team2 = _team_registered(api, s2, "T2")
+        player = api.create_player(team1, "Pat", "forward")["id"]
+        scope = {"player_id": player}
+        # Both gates resolve the same live team, and context's Program set matches.
+        self.assertEqual(own_team_id(Role.PLAYER, scope, store), team1)
+        self.assertEqual(
+            context_scope.authorized_program_ids(store, Role.PLAYER, scope, "pl"),
+            {p1})
+        # After a transfer, both still agree (same shared resolver).
+        pobj = store.get_player(player); pobj.team_id = team2; store.save_player(pobj)
+        self.assertEqual(own_team_id(Role.PLAYER, scope, store), team2)
+        self.assertEqual(
+            context_scope.authorized_program_ids(store, Role.PLAYER, scope, "pl"),
+            {p2})
+        # After deactivate, both fail closed identically.
+        pobj = store.get_player(player); pobj.is_active = False; store.save_player(pobj)
+        self.assertIsNone(own_team_id(Role.PLAYER, scope, store))
+        self.assertEqual(
+            context_scope.authorized_program_ids(store, Role.PLAYER, scope, "pl"),
+            set())
+
+    def test_stale_saved_selection_is_ignored_not_rewritten(self):
+        # A saved selection whose Program the caller is no longer authorized for
+        # is IGNORED (fallback) but NOT rewritten, so restoring authorization
+        # restores the choice.
+        store = InMemoryStore()
+        api = ApiService(store)
+        p1, s1 = _program_season(api, "P1", "S1")
+        team = _team_registered(api, s1)
+        p2, s2 = _program_season(api, "P2", "S2")
+        api.set_active_context("u", *ADMIN, p2, s2)          # admin saves p2
+        coach = (Role.COACH, {"team_id": team})              # coach can't see p2
+        self.assertEqual(api.get_active_context("u", *coach)["program_id"], p1)
+        self.assertEqual(store.get_active_context("u").program_id, p2)  # not rewritten
+        self.assertEqual(api.get_active_context("u", *ADMIN)["season_id"], s2)  # reappears
+
+
+@unittest.skipUnless(os.environ.get("TEST_DATABASE_URL"),
+                     "PostgreSQL required (set TEST_DATABASE_URL)")
+class ContextConcurrencyTest(unittest.TestCase):
+    def setUp(self):
+        self.url = os.environ["TEST_DATABASE_URL"]
+        SqlStore(self.url).clear_all_data()
+        api = ApiService(SqlStore(self.url))
+        self.p1, self.s1 = _program_season(api, "P1", "S1")
+        self.p2, self.s2 = _program_season(api, "P2", "S2")
+
+    def _barrier_set(self, sels):
+        barrier = threading.Barrier(len(sels))
+        results = {}
+
+        def run(key, program_id, season_id):
+            store = SqlStore(self.url)
+            api = ApiService(store)
+            barrier.wait()
+            try:
+                results[key] = api.set_active_context(
+                    "same_user", Role.LEAGUE_ADMIN, {}, program_id, season_id)
+            except Exception as exc:            # a raw integrity error/500 → fail
+                results[key] = f"ERR:{exc}"
+            store.close()
+
+        threads = [threading.Thread(target=run, args=(k, p, s))
+                   for k, (p, s) in sels.items()]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(20)
+        return results
+
+    def test_concurrent_first_writes_both_succeed_one_row_last_wins(self):
+        results = self._barrier_set({"a": (self.p1, self.s1),
+                                     "b": (self.p2, self.s2)})
+        for key, res in results.items():
+            self.assertNotIn("ERR", str(res), (key, res))      # no 500
+            self.assertNotIn("error", res, (key, res))         # both 200
+        check = SqlStore(self.url)
+        with check.conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) AS c FROM user_active_context "
+                        "WHERE id = 'same_user'")
+            self.assertEqual(cur.fetchone()["c"], 1)           # exactly one row
+        final = check.get_active_context("same_user")
+        self.assertIn((final.program_id, final.season_id),
+                      [(self.p1, self.s1), (self.p2, self.s2)])  # last-committed wins
+        check.close()
 
 
 class ActiveContextMigrationTest(unittest.TestCase):
-    """Migration 044 is a plain additive table. Prove it applies to an ADOPTED
-    (pre-044) database and that a stored selection survives a real close/reopen,
-    on file-backed SQLite and PostgreSQL — not only in-memory parity."""
+    """Migration 044 applies to an ADOPTED (pre-044) database and a stored
+    selection survives a real close/reopen — file-backed SQLite + PostgreSQL."""
 
     def _locations(self):
         fd, path = tempfile.mkstemp(suffix=".db")
@@ -316,26 +456,28 @@ class ActiveContextMigrationTest(unittest.TestCase):
             try:
                 if store.backend == "postgres":
                     store.reset_schema()
-                self._downgrade(store)                        # adopt a pre-044 DB
+                self._downgrade(store)
                 self.assertNotIn(_VERSION, store.migration_status()["applied"],
                                  label)
-                migrate(store.conn, store.dialect)            # apply 044
+                migrate(store.conn, store.dialect)
                 self.assertIn(_VERSION, store.migration_status()["applied"], label)
                 store.set_active_context(ActiveContext(
                     id="user_x", program_id="prog_x", season_id="seas_x",
                     updated_at=stamp))
-                store.set_active_context(ActiveContext(       # program-only row
-                    id="user_y", program_id="prog_y", season_id=None,
-                    updated_at=stamp))
                 store.close()
-                store = SqlStore(loc)                         # real close/reopen
+                store = SqlStore(loc)
                 self.assertIn(_VERSION, store.migration_status()["applied"], label)
                 rec = store.get_active_context("user_x")
                 self.assertEqual((rec.program_id, rec.season_id, rec.updated_at),
                                  ("prog_x", "seas_x", stamp), label)
-                rec = store.get_active_context("user_y")
-                self.assertEqual((rec.program_id, rec.season_id),
-                                 ("prog_y", None), label)
+                # A Program-only (null Season) selection round-trips durably too.
+                store.set_active_context(ActiveContext(
+                    id="user_y", program_id="prog_y", season_id=None,
+                    updated_at=stamp))
+                store.close()
+                store = SqlStore(loc)
+                self.assertIsNone(store.get_active_context("user_y").season_id,
+                                  label)
             finally:
                 if store.backend == "postgres":
                     store.reset_schema()
@@ -377,58 +519,54 @@ class ActiveContextHttpTest(unittest.TestCase):
                   {"username": username, "password": "demo"}, opener=op)
         return op
 
-    def test_get_set_roundtrip_carries_read_only(self):
+    def test_roundtrip_and_no_500_on_repeat(self):
         admin = self._login("admin")
         s, ctx = self._req("GET", "/api/context", opener=admin)
         self.assertEqual(s, 200, ctx)
-        self.assertIn("read_only", ctx)
         self.assertIsNotNone(ctx["program_id"], ctx)
-        s, out = self._req("POST", "/api/context",
-                           {"program_id": ctx["program_id"],
-                            "season_id": ctx["season_id"]}, opener=admin)
-        self.assertEqual(s, 200, out)
-        self.assertEqual(out["season_id"], ctx["season_id"])
-        # Program-only selection over HTTP (explicit-null season) is accepted.
-        s, out = self._req("POST", "/api/context",
-                           {"program_id": ctx["program_id"], "season_id": None},
-                           opener=admin)
-        self.assertEqual(s, 200, out)
-        self.assertIsNone(out["season_id"], out)
+        body = {"program_id": ctx["program_id"], "season_id": ctx["season_id"]}
+        s1, a = self._req("POST", "/api/context", body, opener=admin)
+        s2, b = self._req("POST", "/api/context", body, opener=admin)   # idempotent
+        self.assertEqual((s1, s2), (200, 200), (a, b))
+        self.assertEqual(a["season_id"], b["season_id"])
 
     def test_unauthenticated_is_rejected(self):
         self.assertEqual(self._req("GET", "/api/context")[0], 401)
         self.assertEqual(self._req("POST", "/api/context",
                                    {"program_id": "p"})[0], 401)
 
-    def test_strict_body_schema(self):
+    def test_strict_schema(self):
         admin = self._login("admin")
-        # missing required program_id
-        s, b = self._req("POST", "/api/context", {}, opener=admin)
-        self.assertEqual((s, b["error"]["details"]["reason"]),
-                         (400, "field_required"))
         # unknown field
         s, b = self._req("POST", "/api/context",
-                         {"program_id": "p", "nope": 1}, opener=admin)
-        self.assertEqual((s, b["error"]["details"]["reason"]),
-                         (400, "unknown_field"))
+                         {"program_id": "p", "extra": 1}, opener=admin)
+        self.assertEqual(s, 400, b)
+        self.assertEqual(b["error"]["details"]["reason"], "unknown_field")
+        # missing required program_id
+        s, b = self._req("POST", "/api/context", {"season_id": "s"}, opener=admin)
+        self.assertEqual(s, 400, b)
+        self.assertEqual(b["error"]["details"]["reason"], "field_required")
         # wrong type
-        s, b = self._req("POST", "/api/context", {"program_id": 123}, opener=admin)
-        self.assertEqual((s, b["error"]["details"]["reason"]), (400, "wrong_type"))
+        s, b = self._req("POST", "/api/context", {"program_id": 5}, opener=admin)
+        self.assertEqual(s, 400, b)
+        self.assertEqual(b["error"]["details"]["reason"], "wrong_type")
 
-    def test_selecting_a_context_grants_no_authority(self):
-        # A viewer may record its own view selection, but that must not let it
-        # perform an operator action — context is orthogonal to authority.
-        admin = self._login("admin")
-        _, ctx = self._req("GET", "/api/context", opener=admin)
-        viewer = self._login("viewer")
+    def test_scoped_identity_through_the_real_boundary(self):
+        # The seeded "coach" account is scoped to the demo home team. Its context
+        # resolves to that team's Program, proving session role/scope threading —
+        # and setting context still grants it no operator authority.
+        coach = self._login("coach")
+        s, ctx = self._req("GET", "/api/context", opener=coach)
+        self.assertEqual(s, 200, ctx)
+        self.assertIsNotNone(ctx["program_id"], ctx)
         s, _ = self._req("POST", "/api/context",
                          {"program_id": ctx["program_id"],
-                          "season_id": ctx["season_id"]}, opener=viewer)
-        self.assertEqual(s, 200)                    # selecting a context: allowed
+                          "season_id": ctx["season_id"]}, opener=coach)
+        self.assertEqual(s, 200)
+        # ...yet an operator write stays forbidden.
         s, denied = self._req("POST", "/api/setup/venue", {"name": "V"},
-                              opener=viewer)
-        self.assertEqual(s, 403, denied)            # operator write: still forbidden
-        self.assertEqual(denied["error"]["code"], "forbidden")
+                              opener=coach)
+        self.assertEqual(s, 403, denied)
 
 
 if __name__ == "__main__":
