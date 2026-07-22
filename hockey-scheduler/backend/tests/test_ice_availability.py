@@ -32,7 +32,7 @@ from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
 
 from hockey_scheduler.api import ApiService
 from hockey_scheduler.domain import IceSlotStatus, IceSlotType
-from hockey_scheduler.domain.errors import ValidationError
+from hockey_scheduler.domain.errors import ScheduleConflictError, ValidationError
 from hockey_scheduler.domain.setup_models import (
     IceSlot, Program, Rink, Season, SeasonStatus, SeasonVenueAccess, Venue)
 from hockey_scheduler.services import SetupService
@@ -387,6 +387,58 @@ class PostgresIceAvailabilityConcurrencyTest(unittest.TestCase):
         # one of the six) or loses the rink-lock race with a clean overlap
         # conflict — never a partial write or a duplicate/overlapping tuple.
         self.assertNotIsInstance(out[0], Exception, f"commit raised: {out[0]!r}")
+        slots = self._assert_unique_and_non_overlapping()
+        self.assertEqual(len(slots), 6)
+
+    # -- builder vs CSV import (the lock-free sibling writer, #158 review) -----
+    def _tag_rink_code(self, code):
+        """Give the seeded rink an external_ref so a CSV import (which matches
+        rinks by rink_code == external_ref) targets the SAME physical rink the
+        builder commits onto, instead of creating a fresh one."""
+        store = SqlStore(self.url)
+        rink = store.get_rink(self.rink_id)
+        rink.external_ref = code
+        store.save_rink(rink)
+
+    def _import(self, start_iso, end_iso):
+        return lambda svc: svc.commit_rinks_ice_slots_import(  # noqa: E731
+            {"rinks": [{"venue_name": "Main Arena", "rink_code": "RA"}],
+             "ice_slots": [{"rink_code": "RA", "start_time": start_iso,
+                            "end_time": end_iso, "slot_type": "game"}]},
+            actor_id="i")
+
+    def test_commit_vs_import_nonexact_overlap(self):
+        # The import's 22:30-23:30 UTC overlaps the builder's first window
+        # (22:00-23:00) WITHOUT being an exact tuple, so migration 045's unique
+        # index cannot catch it -- only the shared rink lock + write-boundary
+        # overlap revalidation can. Under either interleaving no physical overlap
+        # may survive: the import either wins the lock (its slot lands, the
+        # builder then skips the windows it clashes with) or loses and is cleanly
+        # rejected once the builder's slot is visible.
+        self._tag_rink_code("RA")
+        commit = lambda svc: svc.commit_ice_availability(  # noqa: E731
+            actor_id="c", **self._template())
+        out = self._run([commit, self._import("2026-09-01T22:30:00+00:00",
+                                              "2026-09-01T23:30:00+00:00")])
+        self.assertNotIsInstance(out[0], Exception, f"commit raised: {out[0]!r}")
+        if isinstance(out[1], Exception):        # the import may lose the race
+            self.assertIsInstance(out[1], ScheduleConflictError,
+                                  f"import raised non-conflict: {out[1]!r}")
+        self._assert_unique_and_non_overlapping()
+
+    def test_commit_vs_import_exact_duplicate(self):
+        # The import's 22:00-23:00 UTC is the builder's first window EXACTLY.
+        # Whichever writer lands first, the other treats the tuple as a duplicate
+        # (the builder skips it; the import takes its update path), so the slot
+        # never doubles and both operations complete cleanly -- always the
+        # builder's six windows, no more.
+        self._tag_rink_code("RA")
+        commit = lambda svc: svc.commit_ice_availability(  # noqa: E731
+            actor_id="c", **self._template())
+        out = self._run([commit, self._import("2026-09-01T22:00:00+00:00",
+                                              "2026-09-01T23:00:00+00:00")])
+        self.assertNotIsInstance(out[0], Exception, f"commit raised: {out[0]!r}")
+        self.assertNotIsInstance(out[1], Exception, f"import raised: {out[1]!r}")
         slots = self._assert_unique_and_non_overlapping()
         self.assertEqual(len(slots), 6)
 

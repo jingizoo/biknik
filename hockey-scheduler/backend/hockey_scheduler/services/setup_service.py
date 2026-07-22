@@ -4870,12 +4870,20 @@ class SetupService:
         guarantee as everything else here — if an incoming row would change
         the ``slot_type`` of a slot a game already uses.
 
-        Also unlike ``create_ice_slot``'s single-entity route, this does NOT
-        hard-block on overlapping ice times via ``ScheduleConflictError`` —
-        ``validate_import``'s overlap check is a WARNING only (mirroring
-        #94's own availability-overlap warning), so newly-created slots here
-        are allowed to overlap; the warning surfaces in the response instead
-        of aborting the whole commit.
+        Overlap handling is split by SOURCE. Overlaps WITHIN this upload
+        (two rows in the same ``ice_slots`` sheet) stay ``validate_import``'s
+        WARNING-only concern (mirroring #94's availability-overlap warning) —
+        both slots are created and the warning surfaces in the response,
+        never aborting the commit. But a new slot that would overlap ice
+        ALREADY PERSISTED on the rink by another writer — a concurrent
+        ``commit_ice_availability`` batch or an earlier import — IS a hard
+        conflict: the whole commit is rejected with a ``ScheduleConflictError``
+        and rolled back. Migration 045's ``(rink, start, end)`` unique index
+        only catches an exact-tuple duplicate (which takes the update path
+        here), so this write-boundary revalidation, under the per-rink row
+        lock taken below, is what stops a NON-exact overlap (e.g. an imported
+        22:30-23:30 against a committed 22:00-23:00) from leaving both rows
+        alive (#158 review).
         """
         result = validate_import(sheets)
         if not result["ok"]:
@@ -4924,6 +4932,59 @@ class SetupService:
         batch_id = self.store.next_id("importbatch")
 
         with self.store.transaction():
+            # Row-lock every rink this import already has (matched by
+            # external_ref), in ascending id order, before any slot read or
+            # write. commit_ice_availability locks its accessible rinks in the
+            # same order, so a concurrent builder commit (or a second import) on
+            # a shared rink serializes here instead of racing or deadlocking, and
+            # the overlap snapshot below then reads state no locked-out writer can
+            # still grow underneath it (#158 review).
+            _existing_rink_by_code = {r.external_ref: r
+                                      for r in self.store.all_rinks()
+                                      if r.external_ref}
+            _codes = {_clean(row.get("rink_code")) for row in rink_rows}
+            for _rid in sorted(_existing_rink_by_code[c].id for c in _codes
+                               if c in _existing_rink_by_code):
+                self.store.get_rink_for_update(_rid)
+
+            # Overlap gate, under the locks and BEFORE any write (mirrors the
+            # slot_type gate's all-or-nothing placement so it rolls back cleanly
+            # on every backend, including InMemoryStore's no-op transaction). A
+            # new slot on an EXISTING rink must not physically overlap ice already
+            # persisted there by another writer — a concurrent
+            # commit_ice_availability batch or an earlier import. Migration 045's
+            # (rink, start, end) unique index catches only an exact-tuple
+            # duplicate (which takes the update path below), so a NON-exact
+            # overlap (an imported 22:30-23:30 against a committed 22:00-23:00)
+            # would otherwise leave both rows alive. Slots on rinks this import
+            # is creating have no persisted ice to clash with; overlaps *within
+            # this upload* aren't persisted yet, so they stay validate_import's
+            # warning-only concern (#158 review).
+            _persisted_by_rink = {}
+            for _s in self.store.all_ice_slots():
+                _persisted_by_rink.setdefault(_s.rink_id, []).append(_s)
+            for row in slot_rows:
+                _rink = _existing_rink_by_code.get(_clean(row.get("rink_code")))
+                if _rink is None:
+                    continue  # a brand-new rink can't yet have persisted ice
+                _start = _parse_iso_utc(row.get("start_time"))
+                _end = _parse_iso_utc(row.get("end_time"))
+                _persisted = _persisted_by_rink.get(_rink.id, [])
+                if any(s.start_time == _start and s.end_time == _end
+                       for s in _persisted):
+                    continue  # exact tuple -> update path, not a new overlap
+                _clash = next((s for s in _persisted if intervals_overlap(
+                    _start, _end, s.start_time, s.end_time)), None)
+                if _clash is not None:
+                    raise ScheduleConflictError(
+                        f"Imported ice slot {_start.isoformat()} to "
+                        f"{_end.isoformat()} on rink_code "
+                        f"{_clean(row.get('rink_code'))} overlaps persisted slot "
+                        f"{_clash.id} on the same rink.",
+                        {"reason": "ice_slot_overlap", "rink_id": _rink.id,
+                         "rink_code": _clean(row.get("rink_code")),
+                         "conflict_slot_id": _clash.id})
+
             rink_code_to_id = {}
             for row in rink_rows:
                 rink_code = _clean(row.get("rink_code"))
