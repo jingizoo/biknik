@@ -907,6 +907,256 @@ class ContextSnapshotConsistencyPgTest(unittest.TestCase):
                 _assert_context_consistent(self, self._race("POST", kind), kind)
 
 
+def _pause_after_program_snapshot():
+    """Patch context_scope.authorized_program_ids so the FIRST caller pauses
+    right after it returns — i.e. after its authorization snapshot is fixed but
+    before Seasons are read. Returns (paused, release, restore)."""
+    cs = context_scope
+    orig = cs.authorized_program_ids
+    paused = threading.Event()
+    release = threading.Event()
+    armed = {"v": True}
+
+    def barrier(*a, **k):
+        r = orig(*a, **k)
+        if armed["v"]:
+            armed["v"] = False
+            paused.set()
+            release.wait(20)
+        return r
+
+    cs.authorized_program_ids = barrier
+    return paused, release, (lambda: setattr(cs, "authorized_program_ids", orig))
+
+
+@unittest.skipUnless(os.environ.get("TEST_DATABASE_URL"),
+                     "PostgreSQL required (set TEST_DATABASE_URL)")
+class ContextAuthorizationRacePgTest(unittest.TestCase):
+    """The whole authorization + selection reads ONE SERIALIZABLE snapshot, so a
+    scope revocation that COMMITS mid-request can never produce a hybrid
+    former-Program/empty-Season result: the request resolves wholly to the
+    pre-change scope (authorized) OR wholly to the post-change scope (denied),
+    never a mix, and errors stay non-oracle. Forced PostgreSQL: two independent
+    connections (reader + revoker); the reader pauses after its authorized-Program
+    snapshot is fixed while the revoker commits, then resumes."""
+
+    def setUp(self):
+        self.url = os.environ["TEST_DATABASE_URL"]
+        SqlStore(self.url).clear_all_data()
+
+    def _run_race(self, build, reader_call, revoker):
+        seed = SqlStore(self.url)
+        world = build(ApiService(seed))
+        seed.close()
+        reader = SqlStore(self.url)
+        rapi = ApiService(reader)
+        mutator = SqlStore(self.url)
+        mapi = ApiService(mutator)
+        paused, release, restore = _pause_after_program_snapshot()
+        out = {}
+
+        def run():
+            try:
+                out["c"] = reader_call(rapi, world)
+            except Exception as exc:                       # noqa: BLE001
+                out["err"] = repr(exc)
+
+        t = threading.Thread(target=run)
+        try:
+            t.start()
+            self.assertTrue(paused.wait(20), "reader never fixed its snapshot")
+            revoker(mapi, mutator, world)                  # commits on connection B
+            release.set()
+            t.join(30)
+        finally:
+            restore()
+        reader.close()
+        mutator.close()
+        self.assertNotIn("err", out, out)
+        return out["c"], world
+
+    def _assert_between(self, c, pre, post):
+        """The rendered context is EXACTLY one of the two consistent snapshots —
+        wholly pre-change or wholly post-change — never the hybrid in between."""
+        self.assertNotIn("error", c, c)
+        got = (c["program_id"], c["season_id"])
+        self.assertIn(got, (pre, post),
+                      ("hybrid or unexpected authorization result", got, pre, post))
+
+    # -- Official assignment ------------------------------------------------
+    def _official_world(self, api):
+        pid, sid = _program_season(api, "P", "S")
+        team = _team_registered(api, sid)
+        oid, gid = _official_assigned(api, sid, team)
+        return {"pid": pid, "sid": sid, "oid": oid}
+
+    def _unassign(self, mapi, mstore, w):
+        with mstore.transaction():
+            mstore.remove_official_assignment(
+                mstore.assignments_for_official(w["oid"])[0].id)
+
+    def test_official_unassign_vs_get_is_wholly_pre_or_post(self):
+        c, w = self._run_race(
+            self._official_world,
+            lambda api, w: api.get_active_context(
+                "o", Role.OFFICIAL, {"official_id": w["oid"]}),
+            self._unassign)
+        self._assert_between(c, (w["pid"], w["sid"]), (None, None))
+
+    def test_program_only_post_vs_unassign_is_wholly_pre_or_post(self):
+        c, w = self._run_race(
+            self._official_world,
+            lambda api, w: api.set_active_context(
+                "o", Role.OFFICIAL, {"official_id": w["oid"]}, w["pid"], None),
+            self._unassign)
+        if "error" in c:                                   # post-change: denied
+            self.assertEqual(c["error"]["code"], "not_found", c)
+            self.assertEqual(c["error"]["details"]["reason"],
+                             "program_not_accessible", c)
+        else:                                              # pre-change: persisted
+            self.assertEqual((c["program_id"], c["season_id"]), (w["pid"], None), c)
+
+    # -- Player -------------------------------------------------------------
+    def test_player_deactivate_vs_get_is_wholly_pre_or_post(self):
+        def build(api):
+            pid, sid = _program_season(api, "P", "S")
+            team = _team_registered(api, sid)
+            player = api.create_player(team, "Pat", "forward")["id"]
+            return {"pid": pid, "sid": sid, "player": player}
+
+        def deactivate(mapi, mstore, w):
+            with mstore.transaction():
+                p = mstore.get_player(w["player"])
+                p.is_active = False
+                mstore.save_player(p)
+
+        c, w = self._run_race(
+            build,
+            lambda api, w: api.get_active_context(
+                "pl", Role.PLAYER, {"player_id": w["player"]}),
+            deactivate)
+        self._assert_between(c, (w["pid"], w["sid"]), (None, None))
+
+    def test_player_transfer_vs_get_is_wholly_pre_or_post(self):
+        def build(api):
+            p1, s1 = _program_season(api, "P1", "S1")
+            t1 = _team_registered(api, s1, "T1")
+            p2, s2 = _program_season(api, "P2", "S2")
+            t2 = _team_registered(api, s2, "T2")
+            player = api.create_player(t1, "Pat", "forward")["id"]
+            return {"p1": p1, "s1": s1, "p2": p2, "s2": s2, "t2": t2,
+                    "player": player}
+
+        def transfer(mapi, mstore, w):
+            with mstore.transaction():
+                p = mstore.get_player(w["player"])
+                p.team_id = w["t2"]
+                mstore.save_player(p)
+
+        c, w = self._run_race(
+            build,
+            lambda api, w: api.get_active_context(
+                "pl", Role.PLAYER, {"player_id": w["player"]}),
+            transfer)
+        self._assert_between(c, (w["p1"], w["s1"]), (w["p2"], w["s2"]))
+
+    # -- Guardian -----------------------------------------------------------
+    def _guardian_world(self, api):
+        pid, sid = _program_season(api, "P", "S")
+        team = _team_registered(api, sid)
+        junior = api.create_player(team, "Jun", "forward")["id"]
+        ts = datetime(2027, 1, 1, tzinfo=timezone.utc)
+        with api.store.transaction():
+            api.store.add_guardian_link(GuardianLink(
+                id="gl_r", guardian_user_id="g", player_id=junior,
+                created_at=ts, verified=True))
+        return {"pid": pid, "sid": sid, "junior": junior}
+
+    def test_guardian_revocation_vs_get_is_wholly_pre_or_post(self):
+        def revoke(mapi, mstore, w):
+            with mstore.transaction():
+                link = mstore.guardian_links_for("g")[0]
+                link.verified = False
+                mstore.save_guardian_link(link)
+
+        c, w = self._run_race(
+            self._guardian_world,
+            lambda api, w: api.get_active_context("g", Role.GUARDIAN, {}),
+            revoke)
+        self._assert_between(c, (w["pid"], w["sid"]), (None, None))
+
+    def test_guardian_junior_transfer_vs_get_is_wholly_pre_or_post(self):
+        def build(api):
+            w = self._guardian_world(api)
+            p2, s2 = _program_season(api, "P2", "S2")
+            t2 = _team_registered(api, s2, "T2")
+            w.update({"p2": p2, "s2": s2, "t2": t2})
+            return w
+
+        def transfer(mapi, mstore, w):
+            with mstore.transaction():
+                j = mstore.get_player(w["junior"])
+                j.team_id = w["t2"]
+                mstore.save_player(j)
+
+        c, w = self._run_race(
+            build,
+            lambda api, w: api.get_active_context("g", Role.GUARDIAN, {}),
+            transfer)
+        self._assert_between(c, (w["pid"], w["sid"]), (w["p2"], w["s2"]))
+
+
+class ContextAuthorizationRaceLocalTest(unittest.TestCase):
+    """Memory/SQLite parity for the linearizable-authorization contract: the
+    process-wide transaction lock fully serializes a concurrent revocation
+    against an in-flight resolve, so the reader's result is wholly pre-change
+    (never a hybrid) and the revocation applies strictly after."""
+
+    def _stores(self):
+        yield "memory", InMemoryStore()
+        yield "sqlite", SqlStore(":memory:")
+
+    def test_concurrent_revocation_is_serialized_not_hybrid(self):
+        for label, store in self._stores():
+            with self.subTest(backend=label):
+                api = ApiService(store)
+                pid, sid = _program_season(api, "P", "S")
+                team = _team_registered(api, sid)
+                oid, _ = _official_assigned(api, sid, team)
+                off = (Role.OFFICIAL, {"official_id": oid})
+                paused, release, restore = _pause_after_program_snapshot()
+                out = {}
+
+                def read():
+                    out["c"] = api.get_active_context("o", *off)
+
+                def revoke():
+                    # BLOCKS on the process lock the paused reader still holds,
+                    # so it can only apply AFTER the reader's resolve commits.
+                    with store.transaction():
+                        store.remove_official_assignment(
+                            store.assignments_for_official(oid)[0].id)
+
+                tr = threading.Thread(target=read)
+                tv = threading.Thread(target=revoke)
+                try:
+                    tr.start()
+                    self.assertTrue(paused.wait(20), label)
+                    tv.start()          # contends for the lock, blocks
+                    release.set()
+                    tr.join(20)
+                    tv.join(20)
+                finally:
+                    restore()
+                c = out["c"]
+                self.assertEqual((c["program_id"], c["season_id"]), (pid, sid),
+                                 (label, c))                # wholly pre-change
+                # The revocation serialized strictly after and has now applied.
+                self.assertIsNone(
+                    api.get_active_context("o", *off)["program_id"], label)
+                _close(store)
+
+
 class ActiveContextMigrationTest(unittest.TestCase):
     """Migration 044 applies to an ADOPTED (pre-044) database and a stored
     selection survives a real close/reopen — file-backed SQLite + PostgreSQL."""

@@ -196,22 +196,20 @@ because the selection grants nothing (a Viewer may record its own selection yet
 still gets 403 on an operator write). `user_id` is always the server-resolved
 session user; no client-supplied actor.
 
-**Authorization is per-request-current, not linearizable against a concurrent
-revocation.** The scope filter reflects the *committed* state each read observes
-(the context transaction runs at the store's default isolation — READ COMMITTED
-on PostgreSQL), computed fresh on every request. It is **not** a serializable
-snapshot taken atomically with a concurrent scope-changing write: if an Official
-unassignment or a Player/Guardian reassignment commits *while* a `GET`/`POST
-/api/context` is mid-flight, that request may still resolve/persist the caller's
-former Program(-only) context for that one call. This is low-impact and
-self-correcting by design — the selection **grants no authority** (every real
-read/write re-authorizes against explicit ids), and the very next request sees
-the revoked scope and falls back — so a stale *view* preference can never be used
-to reach anything. Making context authorization strictly **linearizable** with
-scope-changing writes (a serializable/locked snapshot so the request either
-orders before the revocation or sees the new scope, never a torn mix) is a
-tracked **#159 follow-up** (below); it is deferred rather than bolted on because
-it is a cross-cutting isolation change and this preference grants no authority.
+**Authorization is linearizable with scope-changing writes.** The whole scope
+computation + selection (and, for `POST`, the write) runs under **one
+`SERIALIZABLE` snapshot** — a narrow, per-request isolation on the context
+transaction only, never a global connection change — with a bounded retry on a
+serialization conflict (`ContextService._snapshot` → `store.transaction(isolation=
+"SERIALIZABLE")`). So a concurrent scope revocation (an Official unassignment, a
+Player/Guardian reassignment) either orders **entirely before** the request (it
+sees the old scope) or **entirely after** it (it sees the new scope): the result
+always corresponds *wholly* to one authorization snapshot and can never be a
+hybrid — e.g. an old Program set paired with a now-empty Season set, or a
+Program-only fallback that matches no single snapshot. Errors stay non-oracle
+across the boundary. Memory/SQLite get the identical guarantee from their
+process-wide transaction lock, which already fully serializes writers, so the
+retry is a no-op there.
 
 **Snapshot-consistent rendering.** `ContextService.resolve`/`set` do every read
 inside one `store.transaction()` and return the *exact* Program/Season objects
@@ -237,15 +235,9 @@ Remaining #159 work, to be taken as separate slices: the authenticated-shell
 **switcher UI + deep-link restoration** consuming these endpoints; then
 **consumer-by-consumer cross-context isolation** (lists, counts, exports,
 background jobs resolving strictly through the selected Season); then
-**new-Season copy-forward preview**; **prior-Team historical entitlement**
+**new-Season copy-forward preview**; and **prior-Team historical entitlement**
 — letting a scoped Coach/Player/Guardian re-enter (read-only) a Season their
 Team was registered in under a League it has since **left** (resolving view
 entitlement from all of a Team's registrations, independent of its current
 `league_id`, kept separate from the active-work fallback; a security-sensitive
-scope widening, so intentionally its own slice); and **linearizable context
-authorization** — resolving/persisting a selection under a serializable or
-row-locked snapshot so a request racing a scope revocation (Official unassign,
-Player/Guardian reassignment) either orders before it or sees the new scope,
-never the former Program for that one call (today it is per-request-current and
-grants no authority, so a stale view self-corrects on the next request). #159
-stays open.
+scope widening, so intentionally its own slice). #159 stays open.

@@ -287,6 +287,10 @@ _MIGRATIONS_DIR = os.path.join(os.path.dirname(__file__), "migrations")
 # A version given per-dialect must supply BOTH engines' files (never just one).
 _DIALECT_PAIR = {"sqlite", "postgres"}
 
+# Per-transaction isolation levels a caller may request (SQL is interpolated, so
+# this whitelist is the injection guard — never format an arbitrary string in).
+_ISOLATION_LEVELS = frozenset({"SERIALIZABLE", "REPEATABLE READ"})
+
 
 def _split_statements(raw):
     # Drop whole-line comments first (a comment may itself contain a ';', so it
@@ -512,15 +516,30 @@ class SqlStore:
         self._dependent_conflict_resolver = resolver
 
     @contextmanager
-    def transaction(self):
+    def transaction(self, isolation=None):
         """Atomic multi-write block: commit on success, roll back on error.
 
         Reentrant (#215): only the outermost ``transaction()`` opens and
         commits/rolls back the real database transaction; nested calls simply
         run inside it, so the whole nest succeeds or fails as one unit.
+
+        ``isolation`` (``"SERIALIZABLE"`` / ``"REPEATABLE READ"``) raises the
+        isolation of **this one** PostgreSQL transaction — a narrow, per-call
+        snapshot, never a global connection change — so all its reads observe a
+        single consistent snapshot (used by the context selector so an
+        authorization computation can't straddle a concurrent scope revocation,
+        #159). It must be requested on the OUTERMOST transaction (a nested join
+        cannot retro-raise the isolation of the already-open transaction). On
+        SQLite it is a no-op: the process-wide lock already serializes writers.
         """
+        if isolation is not None and isolation not in _ISOLATION_LEVELS:
+            raise ValueError(f"unsupported isolation level: {isolation!r}")
         with self._lock:
             if self._txn_depth > 0:  # already inside a transaction — just join it
+                if isolation is not None:
+                    raise RuntimeError(
+                        "transaction(isolation=...) must be the outermost "
+                        "transaction; a nested join cannot change isolation")
                 self._txn_depth += 1
                 try:
                     yield
@@ -532,8 +551,13 @@ class SqlStore:
                 try:
                     if self.dialect.paramstyle == "pyformat":  # psycopg manages it
                         with self.conn.transaction():
+                            if isolation is not None:
+                                # First statement in the txn (after BEGIN), before
+                                # any read — required for SET TRANSACTION to apply.
+                                self.conn.execute(
+                                    "SET TRANSACTION ISOLATION LEVEL " + isolation)
                             yield
-                    else:  # sqlite (autocommit) — explicit txn
+                    else:  # sqlite (autocommit) — explicit txn (isolation no-op)
                         try:
                             self.conn.execute("BEGIN")
                             yield

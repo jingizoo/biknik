@@ -208,8 +208,14 @@ class InMemoryStore:
                 value.clear()
 
     @contextmanager
-    def transaction(self):
+    def transaction(self, isolation=None):
         """Atomic, reentrant unit of work — the shared store transaction contract.
+
+        ``isolation`` (e.g. ``"SERIALIZABLE"``) is accepted for parity with
+        :class:`SqlStore` but is a **no-op** here: the process-wide re-entrant
+        lock already fully serializes every transaction, so all reads inside one
+        transaction observe a single consistent snapshot with no concurrent
+        interleaving — the strongest isolation, for free.
 
         Contract (identical observable behavior in every store implementation):
 

@@ -20,15 +20,14 @@ rendered payload can never internally contradict itself (``read_only`` always
 agrees with the serialized Season status; a non-null id always has its object)
 even if a concurrent archive / reopen / delete lands between requests.
 
-**Authorization is per-request-current, not linearizable.** The scope filter
-reflects the committed state each read sees (READ COMMITTED on PostgreSQL),
-recomputed every request — NOT a serializable snapshot taken atomically with a
-concurrent scope-changing write. A revocation (Official unassign, Player/Guardian
-reassignment) that commits mid-request may leave this one call resolving/persisting
-the caller's former Program(-only) context. That is low-impact and self-correcting
-by design: the selection grants no authority (every real op re-authorizes) and the
-next request sees the new scope. Strict linearizability is a tracked #159 follow-up
-(see ``docs/architecture/season-lifecycle.md``).
+**Authorization is linearizable with scope-changing writes.** The whole scope
+computation + selection (and, for ``set``, the write) runs under ONE SERIALIZABLE
+snapshot (``_snapshot``, with bounded retry on a serialization conflict), so a
+concurrent revocation (Official unassign, Player/Guardian reassignment) either
+orders entirely before this request (it sees the old scope) or entirely after it
+(it sees the new scope) — the result can never be a hybrid of the two (e.g. an
+old Program set with a now-empty Season set). Memory/SQLite get the same guarantee
+for free: their process-wide lock fully serializes every transaction.
 """
 
 import copy
@@ -36,8 +35,18 @@ from datetime import datetime, timezone
 from typing import Callable, Optional, Tuple
 
 from ..domain import ActiveContext, SeasonStatus
-from ..domain.errors import NotFoundError, ValidationError
+from ..domain.errors import (
+    ConcurrencyConflictError, NotFoundError, ValidationError)
 from . import context_scope
+
+# The context authorization + selection runs under one SERIALIZABLE snapshot so a
+# request can never observe a hybrid of pre- and post-revocation scope (#159). A
+# serialization conflict (e.g. two concurrent writes for one user, or a scope
+# change the snapshot anti-depends on) is retried a bounded number of times; each
+# attempt re-reads a fresh consistent snapshot. Memory/SQLite serialize via their
+# process lock, so the retry never fires there.
+_SNAPSHOT_ISOLATION = "SERIALIZABLE"
+_MAX_SNAPSHOT_RETRIES = 10
 
 # (program, season) — the exact validated objects (either may be None), read
 # within one transaction so the caller renders a single authoritative snapshot.
@@ -77,6 +86,24 @@ class ContextService:
         self.store = store
         self.clock = clock
 
+    def _snapshot(self, work):
+        """Run ``work()`` inside ONE serializable transaction, so the whole
+        authorization computation + selection (and, for ``set``, the write) reads
+        a single consistent snapshot — the result always corresponds wholly to
+        the pre- OR post-revocation scope, never a hybrid. Retry a bounded number
+        of times on a serialization conflict (each retry re-reads a fresh
+        snapshot); a domain error (e.g. a non-oracle not-found) is not a conflict,
+        so it propagates immediately and unchanged."""
+        for attempt in range(_MAX_SNAPSHOT_RETRIES):
+            try:
+                with self.store.transaction(isolation=_SNAPSHOT_ISOLATION):
+                    return work()
+            except ConcurrencyConflictError:
+                if attempt == _MAX_SNAPSHOT_RETRIES - 1:
+                    raise
+        # Unreachable: the loop either returns or re-raises on the last attempt.
+        raise AssertionError("snapshot retry loop exited without a result")
+
     # -- resolution --------------------------------------------------------
     def resolve(self, user_id: Optional[str], role, scope) -> _Resolved:
         """The caller's effective ``(program, season)`` — the exact objects to
@@ -93,10 +120,13 @@ class ContextService:
         these very objects, so the payload is snapshot-consistent by construction.
         The returned objects are DETACHED from the store's live rows before the
         lock is released, so rendering cannot observe a concurrent in-place edit.
+        All reads run under one serializable snapshot (``_snapshot``), so the
+        result never mixes pre- and post-revocation scope.
         """
-        with self.store.transaction():
+        def work():
             program, season = self._resolve_locked(user_id, role, scope)
             return _detached(program), _detached(season)
+        return self._snapshot(work)
 
     def _resolve_locked(self, user_id, role, scope) -> _Resolved:
         """The validated ``(program, season)`` live rows — MUST run inside the
@@ -160,7 +190,8 @@ class ContextService:
         if not program_id:
             raise ValidationError("A program_id is required.",
                                   {"reason": "field_required"})
-        with self.store.transaction():
+
+        def work():
             programs = context_scope.authorized_program_ids(
                 self.store, role, scope, user_id)
             program = (self.store.get_program(program_id)
@@ -181,3 +212,8 @@ class ContextService:
                 id=user_id, program_id=program_id, season_id=season_id,
                 updated_at=self.clock()))
             return _detached(program), _detached(season)
+
+        # Validation + write share ONE serializable snapshot (with bounded retry),
+        # so a concurrent revocation is either seen here (rejected non-oracle) or
+        # ordered entirely after this call — never a half-applied hybrid.
+        return self._snapshot(work)
