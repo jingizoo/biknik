@@ -1922,12 +1922,25 @@ class Handler(BaseHTTPRequestHandler):
         # Quick action: add an available 90-min game slot on a rink for the
         # given date, after the latest existing slot on that rink that day.
         if path == "/api/demo/add-ice-slot":
+            # Demo convenience action — unavailable in production, like the other
+            # /api/demo/* controls. It writes a real ice slot + audit, so exposing
+            # it in production would let this demo route mutate durable data (the
+            # audit was even attributed to a synthetic actor). Operators create
+            # real slots via /api/setup/ice-slot, which is server-attributed.
+            if _app_mode() == "production":
+                return self._send_json({"error": {
+                    "code": "demo_action_not_available",
+                    "message": ("Demo controls are not available in this "
+                                "environment.")}}, 403)
             rink_id = body.get("rink_id") or STATE.ids.get("main_rink_id")
             if not rink_id:
                 return self._send_api({"error": {"code": "validation_error",
                     "message": "A rink_id is required."}})
             date = body.get("date")  # "YYYY-MM-DD"
-            ends = [s.end_time for s in api.store.ice_slots.values()
+            # Use the portable store accessor: `ice_slots` is an InMemoryStore
+            # dict attribute that SqlStore does not expose (SqlStore crashes with
+            # AttributeError otherwise). all_ice_slots() is defined on both stores.
+            ends = [s.end_time for s in api.store.all_ice_slots()
                     if s.rink_id == rink_id
                     and (not date or s.start_time.isoformat().startswith(date))]
             if ends:
@@ -1938,9 +1951,13 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_api({"error": {"code": "validation_error",
                                                  "message": "No reference slot."}})
             end = start + timedelta(minutes=90)
+            # Server-attributed audit (CLAUDE.md #5): name the real signed-in
+            # operator. The synthetic "arena_mgr" actor is only the non-production
+            # demo header fallback (user_id is None) — impossible in production,
+            # which is gated out above.
             return self._send_api(api.create_ice_slot(
                 rink_id, start.isoformat(), end.isoformat(),
-                body.get("slot_type", "game"), actor_id="arena_mgr"))
+                body.get("slot_type", "game"), actor_id=user_id or "arena_mgr"))
 
         # Canonical v2 setup writes (#233 Slice C2). Same operator authz as v1
         # (enforced above), but canonical request bodies and canonical
