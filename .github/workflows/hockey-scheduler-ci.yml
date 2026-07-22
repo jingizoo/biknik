@@ -101,6 +101,7 @@ jobs:
           node --check hockey-scheduler/e2e/venue-sharing.js
           node --check hockey-scheduler/e2e/records-delete.js
           node --check hockey-scheduler/e2e/coach-scope.js
+          node --check hockey-scheduler/e2e/context-switcher.js
           node --check hockey-scheduler/e2e/player-edit.js
           node --check hockey-scheduler/e2e/player-lifecycle.js
           node --check hockey-scheduler/e2e/season-dates.js
@@ -134,7 +135,7 @@ jobs:
           - shard: 2
             scripts: "team-division-participation allowed-venues venue-access-cleanup venue-sharing permanent-teams player-edit"
           - shard: 3
-            scripts: "safe-destructive destructive-surfaces reset-visibility factory-reset demo-lifecycle api-error-resilience"
+            scripts: "safe-destructive destructive-surfaces reset-visibility factory-reset demo-lifecycle api-error-resilience context-switcher"
           - shard: 4
             scripts: "v1-dependency-proof team-club-optional division-delete-cleanup registration-cleanup records-delete coach-scope player-lifecycle"
     steps:

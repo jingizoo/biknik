@@ -85,6 +85,14 @@
           <div id="breadcrumb" class="crumbs"></div>
         </div>
         <div class="topbar-actions">
+          <!-- Active Program/Season switcher (#159): a saved DISPLAY context,
+               filtered to what the signed-in user is authorized to select. One
+               component for every role; it renders as a static chip when there
+               is only one option. Existing screens are not filtered by it yet. -->
+          <div id="context-switcher" class="ctx-switcher" hidden>
+            <button id="ctx-btn" class="ctx-btn" aria-haspopup="true" aria-expanded="false"></button>
+            <div id="ctx-dropdown" class="ctx-dropdown" role="menu" hidden></div>
+          </div>
           <button class="act ghost" data-open-drawer="ice-slot">＋ Add Ice</button>
           <button class="act primary" data-goto="calendar">＋ Schedule Game</button>
           <div id="demo-menu" class="demo-menu" hidden>

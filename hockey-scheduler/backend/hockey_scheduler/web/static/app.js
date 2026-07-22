@@ -39,6 +39,12 @@ let newAccountError = "";
 let notifPrefs = null;             // signed-in user's own channel prefs (#81)
 let feedTokens = [];               // signed-in user's calendar feed tokens (#82)
 let newFeedUrl = null;             // freshly-minted feed URL, shown once (#82)
+// Active Program/Season context (#159): the AUTHORIZED options + the current
+// selection, from GET /api/context/options (never the unfiltered overview, so a
+// scoped user can neither select nor enumerate an unrelated context). A saved
+// DISPLAY context only — existing screens are not filtered by it yet.
+let contextOptions = null;         // {programs:[{id,name,seasons:[...]}], selected:{program_id,season_id,read_only}}
+let contextMenuOpen = false;       // switcher popover open state
 let publicState = { schedule: null, standings: null, division: null, game: null,
   feedUrl: null, feedLabel: null };  // feedUrl/feedLabel: freshly-minted public calendar subscription (#33)
 let publicTab = "schedule";        // "schedule" | "standings" (#83)
@@ -5347,6 +5353,7 @@ async function render() {
     envStatus.demo_empty = !(ov.leagues || []).length && !(ov.teams || []).length;
   }
   renderDemoMenu();
+  renderContextSwitcher();  // active Program/Season switcher (#159), state-aware
   // Roster/Sheet expose private player data — a signed-in user outside the
   // game's scope gets a 403 (#73). Show a clear "restricted" state instead of
   // the generic backend-error banner.
@@ -6565,6 +6572,174 @@ function renderDemoMenu() {
     `<button class="demo-item" role="menuitem" data-demo-action="${a}">${esc(label)}</button>`).join("");
   dd.hidden = !demoMenuOpen;
 }
+
+// -- active Program/Season context switcher (#159) -----------------------
+// A structured, ENCODED hash (versioned JSON, base64) rather than a plain
+// "#ctx=program:season" — it round-trips program/season without a fragile
+// delimiter and coexists with the existing "#public" guest route (different
+// prefix), which we never clobber.
+function encodeContextHash(programId, seasonId) {
+  try {
+    return "#ctx=" + encodeURIComponent(
+      btoa(JSON.stringify({ v: 1, p: programId || null, s: seasonId || null })));
+  } catch (_) { return ""; }
+}
+function decodeContextHash(hash) {
+  if (!hash || hash.indexOf("#ctx=") !== 0) return null;
+  try {
+    const o = JSON.parse(atob(decodeURIComponent(hash.slice(5))));
+    if (!o || o.v !== 1 || !o.p) return null;
+    return { program_id: o.p, season_id: o.s || null };
+  } catch (_) { return null; }
+}
+// Reflect the current selection in the URL (replaceState, like the #public
+// precedent) so a reload/bookmark restores it; never touch the #public route.
+function syncContextHash() {
+  if (!currentUser || location.hash === "#public") return;
+  const sel = contextOptions && contextOptions.selected;
+  const want = (sel && sel.program_id)
+    ? encodeContextHash(sel.program_id, sel.season_id) : "";
+  if (location.hash !== want) {
+    history.replaceState(null, "", location.pathname + location.search + want);
+  }
+}
+// Load the caller's AUTHORIZED options + current selection. Session-only; a
+// signed-out user has no context.
+async function loadContextOptions() {
+  if (!currentUser) { contextOptions = null; return; }
+  const o = await getJSON("/api/context/options");
+  contextOptions = (o && !o.error) ? o : null;
+}
+// Restore on load: the persisted context is already loaded above; if the URL
+// carries a DIFFERENT context, adopt it — delegating the authorization decision
+// to the backend (no client-side role logic). An unauthorized OR non-existent
+// link both come back as the same generic not-found, which we normalize to the
+// persisted context with a generic message (no existence oracle), then rewrite
+// the hash to the resolved selection.
+async function restoreContextDeepLink() {
+  if (!currentUser) return;
+  const link = decodeContextHash(location.hash);
+  const sel = (contextOptions && contextOptions.selected) || {};
+  if (!link
+      || (link.program_id === sel.program_id
+          && (link.season_id || null) === (sel.season_id || null))) {
+    syncContextHash();
+    return;
+  }
+  const r = await post("/api/context",
+    { program_id: link.program_id, season_id: link.season_id });
+  if (r && !r.error) {
+    if (contextOptions) {
+      contextOptions.selected = { program_id: r.program_id,
+        season_id: r.season_id, read_only: !!r.read_only };
+    }
+    toast = "";
+  } else {
+    toast = "That shared context isn't available — showing your saved context.";
+    toastIsError = true;
+  }
+  syncContextHash();
+}
+// Persist a switcher pick, then reflect it in the hash and re-render.
+async function setActiveContext(programId, seasonId) {
+  contextMenuOpen = false;
+  const r = await post("/api/context",
+    { program_id: programId, season_id: seasonId || null });
+  if (!r || r.error) {
+    // Generic, no existence oracle (the backend returns the same not-found
+    // whether it doesn't exist or isn't ours). Refresh options in case the
+    // authorized set shifted underneath us.
+    toast = "That Program/Season isn't available."; toastIsError = true;
+    await loadContextOptions();
+    render();
+    return;
+  }
+  if (contextOptions) {
+    contextOptions.selected = { program_id: r.program_id,
+      season_id: r.season_id, read_only: !!r.read_only };
+  }
+  toast = "";
+  syncContextHash();
+  render();
+}
+// Paint the switcher for the current authorized options + selection. One
+// component for every role: a menu when there is a real choice, a static chip
+// when there is exactly one selectable context.
+function renderContextSwitcher() {
+  const wrap = document.getElementById("context-switcher");
+  const btn = document.getElementById("ctx-btn");
+  const dd = document.getElementById("ctx-dropdown");
+  if (!wrap || !btn || !dd) return;
+  const opts = contextOptions;
+  const show = !!(currentUser && opts && opts.programs && opts.programs.length);
+  wrap.hidden = !show;
+  if (!show) { contextMenuOpen = false; dd.hidden = true; return; }
+  const sel = opts.selected || {};
+  const prog = opts.programs.find((p) => p.id === sel.program_id) || null;
+  const season = (prog && sel.season_id)
+    ? (prog.seasons.find((s) => s.id === sel.season_id) || null) : null;
+  const ro = !!(season && season.read_only);
+  const label = prog ? (season ? `${prog.name} · ${season.name}` : prog.name)
+    : "No active context";
+  // A program with Seasons contributes one option per Season; a Season-less
+  // program contributes one (Program-only). One total ⇒ a static chip.
+  const count = opts.programs.reduce(
+    (n, p) => n + Math.max(1, p.seasons.length), 0);
+  const single = count <= 1;
+  btn.innerHTML = `<span class="ctx-caption">Context</span>`
+    + `<span class="ctx-label">${esc(label)}</span>`
+    + (ro ? `<span class="ctx-ro">read-only</span>` : "")
+    + (single ? "" : `<span class="ctx-caret" aria-hidden="true">▾</span>`);
+  btn.disabled = single;
+  btn.classList.toggle("is-static", single);
+  btn.setAttribute("aria-expanded", (!single && contextMenuOpen) ? "true" : "false");
+  btn.title = single
+    ? "Your active Program/Season (saved display context)"
+    : "Switch your active Program/Season — a saved display context";
+  if (single) { contextMenuOpen = false; dd.hidden = true; return; }
+  const multiProgram = opts.programs.length > 1;
+  const item = (pid, sid, text, isSel, badgeRo) =>
+    `<button class="ctx-item${isSel ? " sel" : ""}" role="menuitemradio"`
+    + ` aria-checked="${isSel ? "true" : "false"}"`
+    + ` data-ctx-p="${esc(pid)}" data-ctx-s="${esc(sid || "")}">`
+    + `<span>${esc(text)}</span>`
+    + (badgeRo ? `<span class="ctx-badge">archived · read-only</span>` : "")
+    + (isSel ? `<span class="ctx-check" aria-hidden="true">✓</span>` : "")
+    + `</button>`;
+  const rows = [`<div class="ctx-note">Saved display context — screens aren't`
+    + ` filtered by this yet.</div>`];
+  opts.programs.forEach((p) => {
+    if (multiProgram) rows.push(`<div class="ctx-prog">${esc(p.name)}</div>`);
+    if (!p.seasons.length) {
+      rows.push(item(p.id, "", multiProgram ? "No seasons yet"
+        : `${p.name} (no seasons yet)`, sel.program_id === p.id, false));
+    } else {
+      p.seasons.forEach((s) => rows.push(item(p.id, s.id, s.name,
+        sel.program_id === p.id && sel.season_id === s.id, s.read_only)));
+    }
+  });
+  dd.innerHTML = rows.join("");
+  dd.hidden = !contextMenuOpen;
+}
+// Wire the switcher once (mirrors the demo-menu wiring above).
+const ctxBtn = document.getElementById("ctx-btn");
+const ctxDropdown = document.getElementById("ctx-dropdown");
+if (ctxBtn) ctxBtn.onclick = (e) => {
+  e.stopPropagation();
+  if (ctxBtn.disabled) return;
+  contextMenuOpen = !contextMenuOpen;
+  renderContextSwitcher();
+};
+if (ctxDropdown) ctxDropdown.onclick = (e) => {
+  const item = e.target.closest("[data-ctx-p]");
+  if (!item) return;
+  e.stopPropagation();
+  setActiveContext(item.dataset.ctxP, item.dataset.ctxS || null);
+};
+document.addEventListener("click", () => {
+  if (contextMenuOpen) { contextMenuOpen = false; renderContextSwitcher(); }
+});
+
 // Sign out ends the server session and returns to the sign-in screen (#71).
 const signoutBtn = document.getElementById("signout-btn");
 if (signoutBtn) signoutBtn.onclick = async () => {
@@ -6573,6 +6748,11 @@ if (signoutBtn) signoutBtn.onclick = async () => {
   // zero-friction demo auto-login — logout must stick until the user signs in.
   try { localStorage.setItem("hs_signed_out", "1"); } catch (_) {}
   setUser(null); toast = "";
+  // Drop the active-context selection + its URL hash with the session (#159).
+  contextOptions = null; contextMenuOpen = false;
+  if (location.hash.indexOf("#ctx=") === 0) {
+    history.replaceState(null, "", location.pathname + location.search);
+  }
   renderRoleSwitch();
   showLogin("You've been signed out.");
 };
@@ -6915,6 +7095,11 @@ async function signIn(username, password) {
   // pendingReassign is cleared for the same reason (#166).
   drawer = null; movingGameId = null; conflict = null; pendingMove = null; pendingReassign = null;
   hideLogin();
+  // Load this identity's authorized context (a persona switch re-scopes it),
+  // then reconcile the URL: adopt an authorized deep link, else reflect the
+  // persisted selection (#159).
+  await loadContextOptions();
+  await restoreContextDeepLink();
   renderRoleSwitch(); render();
   return true;
 }
@@ -7035,7 +7220,14 @@ async function bootstrap() {
   applyRolePerms();
   renderRoleSwitch();
   renderEnvChips();
-  if (currentUser) { hideLogin(); render(); }
+  if (currentUser) {
+    // Load the persisted active context first, then adopt a different authorized
+    // deep link if the URL carries one (#159).
+    await loadContextOptions();
+    await restoreContextDeepLink();
+    hideLogin();
+    render();
+  }
   // A bookmarked/shared #public link (#34) drops a signed-out visitor
   // straight into the guest schedule instead of the sign-in wall.
   else if (location.hash === "#public") { showPublicGuest(); }

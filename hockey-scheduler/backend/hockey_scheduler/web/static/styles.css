@@ -823,6 +823,61 @@ details.tn > .tn-sum:hover { background: #f6f7fb; }
   background: transparent; font-size: 13px; color: var(--ink); cursor: pointer;
 }
 .demo-item:hover, .demo-item:focus-visible { background: #f0f0f3; outline: none; }
+
+/* ----- Active Program/Season switcher (#159) ----- */
+.ctx-switcher { position: relative; display: inline-block; }
+.ctx-switcher[hidden] { display: none; }
+.ctx-btn {
+  display: inline-flex; align-items: center; gap: 8px; max-width: 320px;
+  padding: 6px 12px; border: 1px solid var(--line); border-radius: 9px;
+  background: var(--card); color: var(--ink); font-size: 13px; cursor: pointer;
+}
+.ctx-btn:hover:not(:disabled), .ctx-btn:focus-visible {
+  border-color: var(--muted); outline: none;
+}
+.ctx-btn:focus-visible { box-shadow: 0 0 0 2px rgba(0,0,0,.12); }
+/* A single-option (static) chip reads as a label, not a button. */
+.ctx-btn.is-static { cursor: default; background: transparent; border-style: dashed; }
+.ctx-caption {
+  font-size: 10px; letter-spacing: .04em; text-transform: uppercase;
+  color: var(--muted);
+}
+.ctx-label { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ctx-ro {
+  font-size: 10px; padding: 1px 6px; border-radius: 999px;
+  background: #fff0d6; color: #8a5a00; text-transform: uppercase; letter-spacing: .03em;
+}
+.ctx-caret { color: var(--muted); font-size: 11px; }
+.ctx-dropdown {
+  position: absolute; right: 0; top: 100%; margin-top: 6px; z-index: 60;
+  min-width: 240px; max-width: 340px; max-height: 60vh; overflow-y: auto;
+  background: var(--card); border: 1px solid var(--sep); border-radius: 10px;
+  box-shadow: 0 10px 28px rgba(0,0,0,.16); padding: 4px;
+}
+.ctx-note { padding: 8px 12px 6px; font-size: 11px; color: var(--muted); line-height: 1.35; }
+.ctx-prog {
+  padding: 8px 12px 4px; font-size: 10px; letter-spacing: .05em;
+  text-transform: uppercase; color: var(--muted);
+}
+.ctx-item {
+  display: flex; align-items: center; gap: 8px; width: 100%; text-align: left;
+  padding: 8px 12px; border: none; background: transparent; border-radius: 7px;
+  font-size: 13px; color: var(--ink); cursor: pointer;
+}
+.ctx-item > span:first-child { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ctx-item:hover, .ctx-item:focus-visible { background: #f0f0f3; outline: none; }
+.ctx-item.sel { font-weight: 600; }
+.ctx-check { color: var(--accent, var(--blue)); }
+.ctx-badge {
+  font-size: 10px; padding: 1px 6px; border-radius: 999px;
+  background: #fff0d6; color: #8a5a00; white-space: nowrap;
+}
+/* Phone: keep the switcher usable without dominating the topbar. */
+@media (max-width: 480px) {
+  .ctx-btn { max-width: 190px; }
+  .ctx-caption { display: none; }
+}
+
 .start-league .actions { margin-top: 12px; }
 
 /* ----- Safe destructive actions (#215): reset + delete ----- */
