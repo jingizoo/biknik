@@ -142,6 +142,7 @@ ERROR_HTTP_STATUS = {
     "claim_unavailable": 403,
     "conflict": 409,               # DB integrity conflict, translated (#201)
     "concurrency_conflict": 409,   # serialization/deadlock/lock, retryable (#201)
+    "idempotency_conflict": 409,   # Idempotency-Key reused for a different request (#201)
     "malformed_json": 400,         # request body wasn't a JSON object (#271)
     "method_not_allowed": 405,     # known path, unsupported HTTP method (#271)
     "moved_to_v2": 409,            # v1 Player/Official CRUD moved to v2 (#271)
@@ -2521,14 +2522,16 @@ class Handler(BaseHTTPRequestHandler):
         if entity == "venue":
             return self._send_api(api.create_venue(
                 b.get("name"), b.get("address", ""), b.get("timezone", "UTC"),
-                b.get("organization_id") or None, b.get("league_id") or None, actor_id))
+                b.get("organization_id") or None, b.get("league_id") or None, actor_id,
+                idempotency_key=self.headers.get("Idempotency-Key")))
         if entity == "rink":
             return self._send_api(api.create_rink(
                 b.get("venue_id"), b.get("name"), actor_id))
         if entity == "ice-slot":
             return self._send_api(api.create_ice_slot(
                 b.get("rink_id"), b.get("start_time"), b.get("end_time"),
-                b.get("slot_type", "game"), actor_id))
+                b.get("slot_type", "game"), actor_id,
+                idempotency_key=self.headers.get("Idempotency-Key")))
         if entity == "game":
             # v1 boundary (#233 C1b): a game result carries the canonical
             # competition league_id, which the v1 API never exposed — drop it via

@@ -181,6 +181,37 @@ pre-migration check refuses to touch a database that still holds dangling
 references, so a dirty upgrade aborts cleanly with the offending ids named and
 zero mutation.
 
+### Idempotency keys for externally-retried writes (#201)
+
+The epic requires every externally-retried write to be safe under retry via
+**either a natural unique key or an idempotency key**. Most writes already carry
+a natural key: a duplicate create collides on a UNIQUE index (`create_game` on
+`ux_games_active_ice_slot`, one result per game, one registration per
+`(team, league-season)`, …), a state transition is a no-op (`publish_game`,
+`approve_result`), or an import re-applies by its external `code`. What remains
+are the opaque-id entity creates, which mint a fresh `next_id(...)` on every
+call and so **duplicate on a client retry**.
+
+For those, a caller sends an `Idempotency-Key` request header. The write runs at
+most once per `(actor, key)` and every retry replays the first response. The
+record lives in `idempotency_keys` (`key_hash` UNIQUE), written **in the same
+transaction as the create**, so a crash can never leave a committed write
+without its key. `key_hash` = SHA-256 of the per-actor scope + the client key
+(one caller's key can never replay another's write); `fingerprint` = SHA-256 of
+the endpoint + arguments, so re-using a key for a *different* request is refused
+with `idempotency_conflict` rather than returning the wrong resource. Concurrency
+is covered on every backend at once: an in-transaction re-read catches a winner
+already committed under the in-memory/SQLite serialized-writer lock, and the
+`UNIQUE(key_hash)` index makes two concurrent PostgreSQL retries race on the
+insert — the loser rolls its duplicate back and replays. This is the same
+insert-first pattern `InstallationState` uses for the first-admin claim.
+
+The mechanism is wired through two representative creates so far —
+`create_venue` and `create_ice_slot` — with the remaining opaque-id creates
+(program/season/league/division/club/team/rink/organization/official, plus the
+calendar-feed-token / reschedule / official-availability outliers) a tracked
+follow-up.
+
 ## Tables
 
 `leagues, seasons, divisions, clubs, teams, players, venues, rinks, ice_slots,
@@ -188,7 +219,8 @@ games, game_roster_entries, game_availability, substitute_enrollments,
 audit_logs, notification_events, setup_audit_logs, officials,
 official_assignments, game_results, notifications_feed,
 notification_recipients, notification_deliveries, contact_destinations,
-device_tokens, user_accounts, sessions, counters, schema_migrations`.
+device_tokens, user_accounts, sessions, idempotency_keys, counters,
+schema_migrations`.
 
 ## Testing
 

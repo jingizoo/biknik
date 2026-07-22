@@ -28,6 +28,8 @@ from ..domain import (
     FactoryResetChallenge,
     FactoryResetEvent,
     FactoryResetLock,
+    IdempotencyKey,
+    IntegrityConflictError,
     League,
     LeagueSeason,
     Program,
@@ -98,6 +100,7 @@ class InMemoryStore:
         self.installation_state: Dict[str, InstallationState] = {}
         self.user_accounts: Dict[str, UserAccount] = {}
         self.sessions: Dict[str, Session] = {}
+        self.idempotency_keys: Dict[str, IdempotencyKey] = {}
         self.guardian_links: Dict[str, GuardianLink] = {}
         self.reschedule_requests: Dict[str, RescheduleRequest] = {}
         self.setup_audit: List[SetupAuditLog] = []
@@ -972,6 +975,26 @@ class InMemoryStore:
 
     def sessions_for_user(self, user_id: str) -> List[Session]:
         return [s for s in self.sessions.values() if s.user_id == user_id]
+
+    # -- idempotency keys (#201) -------------------------------------------
+    def add_idempotency_key(self, rec: IdempotencyKey) -> IdempotencyKey:
+        # Mirror the SqlStore's UNIQUE(key_hash) index: a duplicate raises the
+        # same IntegrityConflictError the store boundary would, so the service's
+        # insert-first/replay path behaves identically on every backend. (Under
+        # transaction() this store fully serializes writers, so the service also
+        # re-checks inside the txn; this guard is the belt-and-suspenders match.)
+        if any(r.key_hash == rec.key_hash for r in self.idempotency_keys.values()):
+            raise IntegrityConflictError(
+                "Idempotency key already recorded.",
+                {"reason": "unique_violation"})
+        self.idempotency_keys[rec.id] = rec
+        return rec
+
+    def get_idempotency_key(self, key_hash: str) -> Optional[IdempotencyKey]:
+        for rec in self.idempotency_keys.values():
+            if rec.key_hash == key_hash:
+                return rec
+        return None
 
     def delete_sessions_before(self, cutoff: datetime) -> int:
         """Delete finished sessions whose terminal time is before ``cutoff`` —

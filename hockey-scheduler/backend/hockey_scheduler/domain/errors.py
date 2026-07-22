@@ -126,3 +126,14 @@ class ConcurrencyConflictError(DomainError):
     """
 
     code = "concurrency_conflict"
+
+
+class IdempotencyConflictError(DomainError):
+    """An ``Idempotency-Key`` was reused for a materially different request (#201).
+
+    A retry must replay the original write; a request that presents a previously
+    used key but a different fingerprint (endpoint + arguments) is a client bug,
+    not a retry, and is refused rather than returning the wrong stored resource.
+    """
+
+    code = "idempotency_conflict"

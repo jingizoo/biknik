@@ -6,6 +6,8 @@ returned as the structured ``{"error": {...}}`` shape so callers (and a future
 web framework) never see Python tracebacks across the boundary.
 """
 
+import hashlib
+import json
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
 from enum import Enum
@@ -21,6 +23,7 @@ from ..domain import (
     DeviceToken,
     IceSlotStatus,
     IceSlotType,
+    IdempotencyKey,
     NotificationAudience,
     NotificationChannel,
     NotificationKind,
@@ -36,6 +39,8 @@ from ..domain import (
 )
 from ..domain.errors import (
     DomainError,
+    IdempotencyConflictError,
+    IntegrityConflictError,
     NotAuthorizedError,
     NotFoundError,
     ValidationError,
@@ -147,6 +152,25 @@ def catch(fn: Callable):
     return wrapper
 
 
+def _idem_scope(actor_id) -> str:
+    """Per-actor scope for an idempotency key: a signed-in caller scopes by its
+    account id, so one user's key can never replay another's write; the
+    identity-less demo/anonymous path shares a single ``anon`` bucket."""
+    return actor_id or "anon"
+
+
+def _idem_hash(scope: str, key: str) -> str:
+    return hashlib.sha256(f"{scope}\x00{key}".encode("utf-8")).hexdigest()
+
+
+def _idem_fingerprint(endpoint: str, args: dict) -> str:
+    """Stable hash of the endpoint + its request arguments, so re-using one key
+    for a materially different request is detectable (and refused)."""
+    payload = json.dumps({"endpoint": endpoint, "args": args},
+                         sort_keys=True, default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 class ApiService:
     def __init__(self, store: Optional[InMemoryStore] = None,
                  email_transport=None, push_transport=None):
@@ -166,6 +190,53 @@ class ApiService:
         self.factory_reset = FactoryResetService(
             self.store, self.accounts, self.roster.clock)
         self.guardians = GuardianService(self.store, self.roster.clock)
+
+    # -- idempotency for externally-retried writes (#201) ------------------
+    def _idempotent(self, actor_id, key, fingerprint, thunk):
+        """Run ``thunk`` (a create returning a serialized dict) at most once per
+        ``(actor, key)``; every retry replays the first stored response.
+
+        The key record is written in the SAME transaction as the create, so a
+        crash can never leave a committed write without its key. Concurrency is
+        covered on every backend two ways at once: an in-transaction re-read
+        catches a winner already committed under the in-memory / SQLite
+        serialized-writer lock, and the ``UNIQUE(key_hash)`` index makes two
+        concurrent PostgreSQL retries race on the insert — the loser's duplicate
+        rolls back with the transaction and it replays. Mirrors the
+        ``InstallationState`` first-admin claim (account_service.py)."""
+        scope = _idem_scope(actor_id)
+        key_hash = _idem_hash(scope, key)
+        existing = self.store.get_idempotency_key(key_hash)
+        if existing is not None:
+            return self._replay_idempotent(existing, fingerprint)
+        try:
+            with self.store.transaction():
+                existing = self.store.get_idempotency_key(key_hash)
+                if existing is not None:
+                    return self._replay_idempotent(existing, fingerprint)
+                result = thunk()
+                self.store.add_idempotency_key(IdempotencyKey(
+                    id=self.store.next_id("idem"), key_hash=key_hash,
+                    actor_id=scope, fingerprint=fingerprint,
+                    response=result, created_at=self.roster.clock()))
+                return result
+        except IntegrityConflictError:
+            # Lost the UNIQUE(key_hash) race — our duplicate rolled back with the
+            # transaction; replay the winner's now-committed response. A conflict
+            # that is NOT our key (some other rule the create itself violated)
+            # has no recorded key, so re-raise it unchanged.
+            existing = self.store.get_idempotency_key(key_hash)
+            if existing is None:
+                raise
+            return self._replay_idempotent(existing, fingerprint)
+
+    @staticmethod
+    def _replay_idempotent(record, fingerprint):
+        if record.fingerprint != fingerprint:
+            raise IdempotencyConflictError(
+                "This Idempotency-Key was already used for a different request.",
+                {"reason": "idempotency_key_reused"})
+        return record.response
 
     # -- competition-hierarchy resolution (#283) ---------------------------
     # After the #283 model change a League is a permanent child of a Program
@@ -4000,9 +4071,17 @@ class ApiService:
     def create_venue(self, name: str, address: str = "", timezone: str = "UTC",
                      organization_id: Optional[str] = None,
                      league_id: Optional[str] = None,
-                     actor_id: Optional[str] = None) -> dict:
-        return _serialize(self.setup.create_venue(
-            name, address, timezone, organization_id, league_id, actor_id))
+                     actor_id: Optional[str] = None,
+                     idempotency_key: Optional[str] = None) -> dict:
+        def _do():
+            return _serialize(self.setup.create_venue(
+                name, address, timezone, organization_id, league_id, actor_id))
+        if not idempotency_key:
+            return _do()
+        return self._idempotent(actor_id, idempotency_key, _idem_fingerprint(
+            "create_venue",
+            {"name": name, "address": address, "timezone": timezone,
+             "organization_id": organization_id, "league_id": league_id}), _do)
 
     @catch
     def create_rink(self, venue_id: str, name: str,
@@ -4011,11 +4090,19 @@ class ApiService:
 
     @catch
     def create_ice_slot(self, rink_id: str, start_time: str, end_time: str,
-                        slot_type: str = "game", actor_id: Optional[str] = None) -> dict:
-        return _serialize(self.setup.create_ice_slot(
-            rink_id, _parse_dt(start_time, "start_time"),
-            _parse_dt(end_time, "end_time"),
-            _parse_enum(IceSlotType, slot_type, "slot_type"), actor_id))
+                        slot_type: str = "game", actor_id: Optional[str] = None,
+                        idempotency_key: Optional[str] = None) -> dict:
+        def _do():
+            return _serialize(self.setup.create_ice_slot(
+                rink_id, _parse_dt(start_time, "start_time"),
+                _parse_dt(end_time, "end_time"),
+                _parse_enum(IceSlotType, slot_type, "slot_type"), actor_id))
+        if not idempotency_key:
+            return _do()
+        return self._idempotent(actor_id, idempotency_key, _idem_fingerprint(
+            "create_ice_slot",
+            {"rink_id": rink_id, "start_time": start_time, "end_time": end_time,
+             "slot_type": slot_type}), _do)
 
     @catch
     def create_player(self, team_id: str, name: str, position: str,

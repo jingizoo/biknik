@@ -645,3 +645,30 @@ class FactoryResetLock:
     token: str
     acquired_at: datetime
     expires_at: datetime
+
+
+@dataclass
+class IdempotencyKey:
+    """A recorded result for an externally-retried write (#201).
+
+    A client that retries a POST (network hiccup, double-tap) sends the same
+    ``Idempotency-Key`` header; the write runs at most once per ``(actor, key)``
+    and every retry replays the first response instead of creating a duplicate
+    row. The record is inserted in the SAME transaction as the write it dedups,
+    so a crash can never leave a committed write without its key; ``key_hash``
+    carries a UNIQUE index, so two concurrent retries race on that constraint —
+    one commits, the loser rolls its duplicate back and replays (the same
+    insert-first pattern ``InstallationState`` uses for the first-admin claim).
+
+    ``key_hash`` = SHA-256 of ``actor-scope`` + the client key (per-actor, so one
+    caller's key can never replay another's write). ``fingerprint`` = SHA-256 of
+    the endpoint + its request arguments, so re-using a key for a *different*
+    request is rejected rather than silently returning the wrong resource.
+    ``response`` is the stored serialized result replayed on a hit.
+    """
+    id: str
+    key_hash: str
+    actor_id: str
+    fingerprint: str
+    response: dict
+    created_at: datetime

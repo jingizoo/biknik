@@ -37,6 +37,7 @@ from ..domain import (
     FactoryResetChallenge,
     FactoryResetEvent,
     FactoryResetLock,
+    IdempotencyKey,
     Notification,
     NotificationAudience,
     NotificationChannel,
@@ -220,6 +221,9 @@ SPECS = {
     FactoryResetLock: Spec(
         FactoryResetLock, "factory_reset_locks",
         {"acquired_at": _dt(), "expires_at": _dt()}),
+    IdempotencyKey: Spec(
+        IdempotencyKey, "idempotency_keys",
+        {"response": _jsonc(), "created_at": _dt()}),
     Official: Spec(Official, "officials", {"is_active": _bool()}),
     OfficialAssignment: Spec(OfficialAssignment, "official_assignments",
                              {"role": _enum(OfficialRole),
@@ -1298,6 +1302,18 @@ class SqlStore:
     def clear_factory_reset_challenge(self) -> None:
         with self.transaction():
             self._delete(FactoryResetChallenge, self._FACTORY_RESET_CHALLENGE_ID)
+
+    # -- idempotency keys (#201) -------------------------------------------
+    def add_idempotency_key(self, rec: IdempotencyKey) -> IdempotencyKey:
+        # No own transaction: the caller inserts this inside the SAME
+        # transaction() as the write it dedups, so both commit atomically and a
+        # duplicate key_hash collides on ix_idempotency_keys_hash — the outermost
+        # transaction() translates that unique violation into IntegrityConflictError.
+        return self._insert(rec)
+
+    def get_idempotency_key(self, key_hash: str) -> Optional[IdempotencyKey]:
+        rows = self._query(IdempotencyKey, "key_hash = ?", (key_hash,), order="id")
+        return rows[0] if rows else None
 
     def acquire_factory_reset_lock(self, lock) -> bool:
         """Try to become the sole in-progress factory reset installation-
