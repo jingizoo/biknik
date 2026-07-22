@@ -926,13 +926,19 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_api(api.get_demo_overview())
         if path == "/api/context":
             # The signed-in user's active Program/Season selection (#159),
-            # filtered through their real role/scope. A per-user VIEW preference,
-            # so it needs only a valid session — never the operator permission
-            # gate (switching context grants nothing).
+            # filtered through their real role/scope. Per-user, so it requires a
+            # real SESSION-backed account — never the operator permission gate
+            # (switching context grants nothing), but also never the identity-less
+            # demo X-Demo-Role / headerless-admin fallbacks (they have no user to
+            # own a context and must not enumerate one).
             role, scope, user_id, err = self._resolve_role()
             if err is not None:
                 code, payload = err
                 return self._send_json(payload, code)
+            if user_id is None:
+                return self._send_json({"error": {
+                    "code": "unauthorized",
+                    "message": "A signed-in account is required."}}, 401)
             return self._send_api(api.get_active_context(user_id, role, scope))
         if path == "/api/setup/hierarchy":
             # Nested setup tree for the operator's mental model (#166 PR C).
@@ -1815,14 +1821,20 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/context":
             # Set the signed-in user's active Program/Season (#159), filtered
-            # through their real role/scope. A per-user VIEW preference: it needs
-            # a valid session but NOT the operator permission gate below — the
-            # selection grants no authority. Strict body: program_id required,
+            # through their real role/scope. Per-user: requires a real SESSION-
+            # backed account (never the operator permission gate below, but also
+            # never the identity-less demo X-Demo-Role / headerless-admin
+            # fallbacks — they must fail authentication at the boundary, not reach
+            # the service with no identity). Strict body: program_id required,
             # season_id optional and nullable (Program-only), no unknown fields.
             role, scope, user_id, err = self._resolve_role()
             if err is not None:
                 code, payload = err
                 return self._send_json(payload, code)
+            if user_id is None:
+                return self._send_json({"error": {
+                    "code": "unauthorized",
+                    "message": "A signed-in account is required."}}, 401)
             try:
                 check_body(body, allowed={"program_id", "season_id"},
                            required=("program_id",),

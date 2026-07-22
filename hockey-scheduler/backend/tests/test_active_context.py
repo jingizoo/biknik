@@ -278,6 +278,17 @@ class ContextAuthorizationMatrixTest(unittest.TestCase):
                 store.save_player(pobj)
                 self.assertIsNone(api.get_active_context("pl", *pl)["program_id"],
                                   label)
+                # Reactivated but teamless (no team at all) → still closed.
+                pobj = store.get_player(player)
+                pobj.is_active = True
+                pobj.team_id = None
+                store.save_player(pobj)
+                self.assertIsNone(api.get_active_context("pl", *pl)["program_id"],
+                                  label)
+                # Deleted player row → closed (no live subject to resolve).
+                store.delete_player(player)
+                self.assertIsNone(api.get_active_context("pl", *pl)["program_id"],
+                                  label)
                 _close(store)
 
     def test_official_sees_only_assigned_season_and_loses_it_on_unassign(self):
@@ -324,6 +335,42 @@ class ContextAuthorizationMatrixTest(unittest.TestCase):
                 self.assertEqual(
                     api.get_active_context("g_ver", Role.GUARDIAN, {})["program_id"],
                     p1, label)
+                # Junior transfer to a team in a different Program → the guardian's
+                # authorized context refilters LIVE to the new Program.
+                p2, s2 = _program_season(api, "P2", "S2")
+                team2 = _team_registered(api, s2, "T2")
+                jobj = store.get_player(junior)
+                jobj.team_id = team2
+                store.save_player(jobj)
+                self.assertEqual(
+                    api.get_active_context("g_ver", Role.GUARDIAN, {})["program_id"],
+                    p2, label)
+                # Revoking the link (verified → False) removes all access.
+                link = store.guardian_links_for("g_ver")[0]
+                link.verified = False
+                store.save_guardian_link(link)
+                self.assertIsNone(
+                    api.get_active_context("g_ver", Role.GUARDIAN, {})["program_id"],
+                    label)
+                _close(store)
+
+    def test_genuinely_unknown_role_fails_closed(self):
+        for label, store in _backends():
+            with self.subTest(backend=label):
+                api = ApiService(store)
+                p1, s1 = _program_season(api, "P1", "S1")
+                # A role value OUTSIDE the known set (not a handled Role) must hit
+                # the fail-closed default — empty authorized set, empty context,
+                # and a non-oracle not_found on set. Proves the default branch.
+                for unknown in (None, "superuser"):
+                    self.assertEqual(context_scope.authorized_program_ids(
+                        store, unknown, {}, "u"), set(), (label, unknown))
+                    self.assertIsNone(
+                        api.get_active_context("u", unknown, {})["program_id"],
+                        (label, unknown))
+                    r = api.set_active_context("u", unknown, {}, p1, s1)
+                    self.assertEqual(r["error"]["code"], "not_found",
+                                     (label, unknown))
                 _close(store)
 
 
@@ -375,54 +422,157 @@ class ContextSubjectContractTest(unittest.TestCase):
         self.assertEqual(api.get_active_context("u", *ADMIN)["season_id"], s2)  # reappears
 
 
+class ContextUpsertParityTest(unittest.TestCase):
+    """set_active_context is last-write-wins on every backend: a repeat is
+    idempotent (one row), and two threads racing one user leave exactly one row
+    with no error — the Memory/SQLite parity for the atomic SQL upsert."""
+
+    _TS = datetime(2027, 1, 1, tzinfo=timezone.utc)
+
+    def _row_count(self, store):
+        if isinstance(store, SqlStore):
+            cur = store.conn.cursor()   # sqlite3 cursor isn't a context manager
+            cur.execute("SELECT COUNT(*) AS c FROM user_active_context")
+            return cur.fetchone()["c"]
+        return len(store.user_active_context)
+
+    def _stores(self):
+        yield "memory", InMemoryStore()
+        yield "sqlite", SqlStore(":memory:")
+
+    def test_sequential_repeat_is_one_row_last_wins(self):
+        for label, store in self._stores():
+            with self.subTest(backend=label):
+                store.set_active_context(ActiveContext("u", "pA", "sA", self._TS))
+                store.set_active_context(ActiveContext("u", "pB", "sB", self._TS))
+                self.assertEqual(self._row_count(store), 1, label)
+                self.assertEqual(store.get_active_context("u").program_id, "pB",
+                                 label)
+                _close(store)
+
+    def test_concurrent_writes_leave_exactly_one_row(self):
+        for label, store in self._stores():
+            with self.subTest(backend=label):
+                barrier = threading.Barrier(2)
+                errs = []
+
+                def w(program):
+                    try:
+                        barrier.wait()
+                        store.set_active_context(
+                            ActiveContext("u", program, "s", self._TS))
+                    except Exception as exc:
+                        errs.append(f"{program}:{exc}")
+
+                threads = [threading.Thread(target=w, args=(p,))
+                           for p in ("pX", "pY")]
+                for t in threads:
+                    t.start()
+                for t in threads:
+                    t.join(10)
+                self.assertEqual(errs, [], (label, errs))            # no error
+                self.assertEqual(self._row_count(store), 1, label)   # one row
+                self.assertIn(store.get_active_context("u").program_id,
+                              ("pX", "pY"), label)
+                _close(store)
+
+
 @unittest.skipUnless(os.environ.get("TEST_DATABASE_URL"),
                      "PostgreSQL required (set TEST_DATABASE_URL)")
-class ContextConcurrencyTest(unittest.TestCase):
+class ContextConcurrencyPgTest(unittest.TestCase):
+    """Two independent PostgreSQL connections write one user's context with a
+    CONTROLLED release order, so the last committer is deterministic: the write
+    that is released FIRST commits first, and the one that was blocked commits
+    LAST and owns the final value. Both succeed (no 500) and exactly one row
+    remains — for a first write and for an existing row."""
+
+    _TS = datetime(2027, 1, 1, tzinfo=timezone.utc)
+
     def setUp(self):
         self.url = os.environ["TEST_DATABASE_URL"]
         SqlStore(self.url).clear_all_data()
-        api = ApiService(SqlStore(self.url))
-        self.p1, self.s1 = _program_season(api, "P1", "S1")
-        self.p2, self.s2 = _program_season(api, "P2", "S2")
 
-    def _barrier_set(self, sels):
-        barrier = threading.Barrier(len(sels))
+    def _backend_pid(self, store):
+        with store.conn.cursor() as cur:
+            cur.execute("SELECT pg_backend_pid() AS pid")
+            return cur.fetchone()["pid"]
+
+    def _wait_until_blocked_on_lock(self, backend_pid, timeout=10.0):
+        import psycopg
+        deadline = time.monotonic() + timeout
+        with psycopg.connect(self.url, autocommit=True) as mon:
+            while time.monotonic() < deadline:
+                with mon.cursor() as cur:
+                    cur.execute(
+                        "SELECT state, wait_event_type FROM pg_stat_activity "
+                        "WHERE pid = %s", (backend_pid,))
+                    row = cur.fetchone()
+                    if (row is not None and row[0] == "active"
+                            and row[1] == "Lock"):
+                        return True
+                time.sleep(0.02)
+        return False
+
+    def _controlled_race(self, seed):
+        if seed:
+            SqlStore(self.url).set_active_context(
+                ActiveContext("u", "pInit", "sInit", self._TS))
+        first = SqlStore(self.url)   # released FIRST → commits first
+        last = SqlStore(self.url)    # blocks on first's lock → commits LAST
+        orig = first._exec
+        wrote = threading.Event()
+        release = threading.Event()
+
+        def instrumented(query, params=()):
+            result = orig(query, params)
+            if "user_active_context" in query:   # after the write, txn still open
+                wrote.set()
+                release.wait(15)
+            return result
+
+        first._exec = instrumented
         results = {}
 
-        def run(key, program_id, season_id):
-            store = SqlStore(self.url)
-            api = ApiService(store)
-            barrier.wait()
+        def write(store, key, program):
             try:
-                results[key] = api.set_active_context(
-                    "same_user", Role.LEAGUE_ADMIN, {}, program_id, season_id)
-            except Exception as exc:            # a raw integrity error/500 → fail
+                store.set_active_context(
+                    ActiveContext("u", program, "s", self._TS))
+                results[key] = "ok"
+            except Exception as exc:
                 results[key] = f"ERR:{exc}"
-            store.close()
 
-        threads = [threading.Thread(target=run, args=(k, p, s))
-                   for k, (p, s) in sels.items()]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join(20)
+        t_first = threading.Thread(
+            target=lambda: write(first, "first", "pFirst"))
+        t_last = threading.Thread(target=lambda: write(last, "last", "pLast"))
+        last_pid = self._backend_pid(last)
+        t_first.start()
+        self.assertTrue(wrote.wait(15), "first write never reached its INSERT")
+        t_last.start()
+        self.assertTrue(self._wait_until_blocked_on_lock(last_pid),
+                        "second write never blocked on the first's row lock")
+        release.set()                # first commits, THEN last proceeds & commits
+        t_first.join(20)
+        t_last.join(20)
+        first.close()
+        last.close()
         return results
 
-    def test_concurrent_first_writes_both_succeed_one_row_last_wins(self):
-        results = self._barrier_set({"a": (self.p1, self.s1),
-                                     "b": (self.p2, self.s2)})
-        for key, res in results.items():
-            self.assertNotIn("ERR", str(res), (key, res))      # no 500
-            self.assertNotIn("error", res, (key, res))         # both 200
+    def _assert_last_wins(self, results):
+        self.assertEqual(results, {"first": "ok", "last": "ok"}, results)  # 200
         check = SqlStore(self.url)
         with check.conn.cursor() as cur:
             cur.execute("SELECT COUNT(*) AS c FROM user_active_context "
-                        "WHERE id = 'same_user'")
-            self.assertEqual(cur.fetchone()["c"], 1)           # exactly one row
-        final = check.get_active_context("same_user")
-        self.assertIn((final.program_id, final.season_id),
-                      [(self.p1, self.s1), (self.p2, self.s2)])  # last-committed wins
+                        "WHERE id = 'u'")
+            self.assertEqual(cur.fetchone()["c"], 1)                # one row
+        self.assertEqual(check.get_active_context("u").program_id,
+                         "pLast")                                   # last wins
         check.close()
+
+    def test_first_write_race_last_commit_wins(self):
+        self._assert_last_wins(self._controlled_race(seed=False))
+
+    def test_existing_row_race_last_commit_wins(self):
+        self._assert_last_wins(self._controlled_race(seed=True))
 
 
 class ActiveContextMigrationTest(unittest.TestCase):
@@ -499,12 +649,14 @@ class ActiveContextHttpTest(unittest.TestCase):
         cls.httpd.shutdown()
         cls.thread.join(timeout=5)
 
-    def _req(self, method, path, body=None, opener=None):
+    def _req(self, method, path, body=None, opener=None, role=None):
         url = f"http://127.0.0.1:{self.port}{path}"
         data = json.dumps(body).encode() if body is not None else None
         req = urllib.request.Request(url, data=data, method=method)
         if data is not None:
             req.add_header("Content-Type", "application/json")
+        if role is not None:
+            req.add_header("X-Demo-Role", role)
         op = opener or urllib.request.build_opener()
         try:
             with op.open(req) as r:
@@ -534,6 +686,47 @@ class ActiveContextHttpTest(unittest.TestCase):
         self.assertEqual(self._req("GET", "/api/context")[0], 401)
         self.assertEqual(self._req("POST", "/api/context",
                                    {"program_id": "p"})[0], 401)
+
+    def test_identity_less_fallbacks_are_401_and_persist_nothing(self):
+        # A per-user context needs a real SESSION. The identity-less demo
+        # fallbacks — the X-Demo-Role header, and DEMO_HEADERLESS_ADMIN=1 — must
+        # NOT enumerate (GET) or set (POST) a context: same stable 401, zero rows.
+        store = STATE.api.store
+        before = len(store.user_active_context)
+        self.assertEqual(
+            self._req("GET", "/api/context", role="league_admin")[0], 401)
+        self.assertEqual(
+            self._req("POST", "/api/context", {"program_id": "p", "season_id": None},
+                      role="league_admin")[0], 401)
+        os.environ["DEMO_HEADERLESS_ADMIN"] = "1"
+        try:
+            self.assertEqual(self._req("GET", "/api/context")[0], 401)
+            self.assertEqual(
+                self._req("POST", "/api/context", {"program_id": "p"})[0], 401)
+        finally:
+            os.environ.pop("DEMO_HEADERLESS_ADMIN", None)
+        self.assertEqual(len(store.user_active_context), before)   # nothing written
+
+    def test_concurrent_posts_are_all_200(self):
+        # Concurrent POSTs for one authenticated user all return 200 (no 500 at
+        # the HTTP boundary); the atomic upsert leaves one row.
+        admin = self._login("admin")
+        _, ctx = self._req("GET", "/api/context", opener=admin)
+        body = {"program_id": ctx["program_id"], "season_id": ctx["season_id"]}
+        results = {}
+        barrier = threading.Barrier(2)
+
+        def post(k):
+            op = self._login("admin")
+            barrier.wait()
+            results[k] = self._req("POST", "/api/context", body, opener=op)[0]
+
+        threads = [threading.Thread(target=post, args=(k,)) for k in ("a", "b")]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(10)
+        self.assertEqual(set(results.values()), {200}, results)
 
     def test_strict_schema(self):
         admin = self._login("admin")

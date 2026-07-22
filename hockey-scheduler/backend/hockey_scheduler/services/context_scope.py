@@ -4,7 +4,9 @@ A context selection is a VIEW preference, never authority: on every resolve and
 set it is filtered through the caller's real role + account scope (the same
 #211/#266/#202 rules the rest of the app enforces), so a scoped Coach, Player,
 Official, or Guardian can neither select nor enumerate a Program/Season outside
-their scope, and a stale saved selection is dropped the instant scope changes.
+their scope. A saved selection outside the caller's current authorized scope is
+IGNORED on resolve (a fallback is returned) but is NOT rewritten, so restoring
+authorization restores the choice.
 
 Global operators (League Admin, Arena Manager) and the read-only Viewer are not
 resource-scoped in the current account model (#211) — they see every Program.
