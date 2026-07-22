@@ -4,21 +4,17 @@ concurrency:
   group: hockey-ci-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
+# NO event-level `paths:` filter — that was fail-open: an unrecognized path
+# (Makefile, scripts/, a new root file, another .github/** file) never started
+# the workflow, so the fail-closed classifier could not turn it into a full
+# matrix. Every PR / main push now reaches the cheap classifier, which is the
+# sole gate; it skips only paths it positively recognizes as the sibling root
+# project (this is a monorepo) and fails closed on everything else.
 on:
   pull_request:
-    paths:
-      - "hockey-scheduler/backend/**"
-      - "hockey-scheduler/docs/**"
-      - "hockey-scheduler/e2e/**"
-      - ".github/workflows/hockey-scheduler-ci.yml"
   push:
     branches:
       - main
-    paths:
-      - "hockey-scheduler/backend/**"
-      - "hockey-scheduler/docs/**"
-      - "hockey-scheduler/e2e/**"
-      - ".github/workflows/hockey-scheduler-ci.yml"
 
 jobs:
   # The classifier is CI-critical, so it is validated on EVERY run (cheap,
@@ -31,11 +27,13 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
-      - name: Classifier syntax + unit tests
+      - name: Classifier syntax + unit + integration tests
         run: |
           node --check hockey-scheduler/e2e/ci-classify.js
           node --check hockey-scheduler/e2e/ci-classify.test.js
+          node --check hockey-scheduler/e2e/ci-classify.integration.test.js
           node hockey-scheduler/e2e/ci-classify.test.js
+          node hockey-scheduler/e2e/ci-classify.integration.test.js
 
   # Change-based routing, FAIL-CLOSED. Diffs the PR against its base with plain
   # git (no third-party action) and pipes the file list through the tested
@@ -64,16 +62,23 @@ jobs:
         env:
           CI_EVENT_NAME: ${{ github.event_name }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
+          FILES=""
           if [ "$CI_EVENT_NAME" = "pull_request" ]; then
-            git fetch --no-tags --depth=1 origin "$BASE_SHA" || git fetch --no-tags origin "$BASE_SHA"
-            git diff --name-only "$BASE_SHA" HEAD | node hockey-scheduler/e2e/ci-classify.js
-          else
-            # Non-PR events (push to main, dispatch): the classifier returns the
-            # full matrix for any non-pull_request event; the file list is moot.
-            printf '' | node hockey-scheduler/e2e/ci-classify.js
+            # Make sure the base tip is present, then diff with:
+            #   * three-dot (BASE...HEAD) — a MERGE-BASE diff, so changes the base
+            #     branch advanced with after the fork don't pollute the set;
+            #   * --no-renames — so BOTH sides of a rename surface; a move OUT of a
+            #     backend/API path must still classify as that change, not vanish
+            #     into its (possibly docs) destination.
+            # If the diff can't be computed we emit a sentinel that classifies as
+            # unknown -> full matrix (fail closed), never an empty skip.
+            git fetch --no-tags origin "$BASE_SHA" || true
+            FILES="$(git diff --name-only --no-renames "$BASE_SHA...$HEAD_SHA")" || FILES="__DIFF_ERROR__"
           fi
+          printf '%s\n' "$FILES" | node hockey-scheduler/e2e/ci-classify.js
 
   test:
     needs: changes
@@ -142,6 +147,7 @@ jobs:
           node --check hockey-scheduler/backend/hockey_scheduler/web/static/hierarchy-import.js
           node --check hockey-scheduler/e2e/ci-classify.js
           node --check hockey-scheduler/e2e/ci-classify.test.js
+          node --check hockey-scheduler/e2e/ci-classify.integration.test.js
           node --check hockey-scheduler/e2e/setup-claim.js
           node --check hockey-scheduler/e2e/onboarding-wizard.js
           node --check hockey-scheduler/e2e/hierarchy-import.js

@@ -10,18 +10,45 @@
 //   * other backend Python / SQL migrations -> the DB matrix (memory+SQLite and
 //     PostgreSQL) — migrations keep the full DB matrix, never a single backend;
 //   * front-end (served static assets) or e2e journeys -> frontend-check + browser;
-//   * docs / markdown only -> no heavy job;
+//   * hockey docs / markdown only -> no heavy job;
+//   * a path that is unambiguously the SIBLING root project (this is a monorepo)
+//     -> no hockey job (skip-safe); anything NOT recognized as hockey or sibling
+//     still falls through to `unknown` -> full matrix, so an omitted sibling path
+//     over-runs rather than silently skipping;
 //   * any non-pull_request event (push to main, dispatch, schedule) -> full matrix,
 //     since main is the gate of record and there is no cheap base to diff.
 //
-// This is a pure module (no deps) so it can be unit-tested deterministically
-// (see ci-classify.test.js). The GitHub workflow pipes `git diff --name-only`
-// into the CLI at the bottom, which appends the booleans to $GITHUB_OUTPUT.
+// The trigger deliberately does NOT path-filter (that was fail-open — an
+// unrecognized path never reached this classifier); every change reaches here
+// and THIS decides. This is a pure module (no deps) so it can be unit-tested
+// deterministically (see ci-classify.test.js); a cross-category rename and the
+// merge-base diff are covered by ci-classify.integration.test.js. The workflow
+// pipes `git diff --name-only --no-renames BASE...HEAD` into the CLI at the
+// bottom, which appends the booleans to $GITHUB_OUTPUT.
 
 "use strict";
 
 const PROJECT = "hockey-scheduler/";
 const BACKEND = PROJECT + "backend/hockey_scheduler/";
+
+// This repo is a MONOREPO: `hockey-scheduler/` sits alongside an unrelated root
+// project (a Java/Gradle + Python document-transfer service). This workflow
+// gates the hockey-scheduler subtree only, but the trigger no longer path-
+// filters (fail-open), so EVERY change reaches the classifier. Paths that are
+// unambiguously the sibling project are skip-safe for the hockey suite; ANY
+// path we do not positively recognize as hockey OR known-sibling falls through
+// to `unknown` -> full matrix. Omitting a sibling path therefore fails CLOSED
+// (it over-runs the hockey suite, it never silently skips a gate).
+const SIBLING_DIRS = [
+  "src/", "sql/", "tests/", "config/", "k8s/", "terraform/", "tools/", "data/",
+  "docs/", ".vscode/", ".claude/",
+];
+const SIBLING_FILES = new Set([
+  "build.gradle", "render.yaml", "run_local.py", "run_single_transfer.py",
+  "document_xfer.md", "sample_bip_with_pre_dff_updates.json",
+  "sample_requests.json", ".env.example", "requirements.txt", "README.md",
+  ".gitignore",
+]);
 
 // Exactly one category per file; first match wins, so ORDER MATTERS.
 function categorize(file) {
@@ -31,34 +58,41 @@ function categorize(file) {
   // 1. CI workflow definitions — any change reruns the full matrix.
   if (f.startsWith(".github/workflows/")) return "workflow";
 
-  // 2. Dependency / build / packaging manifests (by basename, anywhere). A
+  // 2. The sibling root project — skip-safe for the hockey suite. Checked
+  //    BEFORE the manifest/docs rules so a root `requirements.txt`, `build.gradle`
+  //    or `docs/` (the sibling's, not hockey's under hockey-scheduler/) is a
+  //    skip, not a full-matrix dependency/doc trigger. These patterns are root-
+  //    anchored, so they never match a `hockey-scheduler/...` path.
+  if (SIBLING_FILES.has(f) || SIBLING_DIRS.some((d) => f.startsWith(d))) return "sibling";
+
+  // 3. Dependency / build / packaging manifests (by basename, anywhere). A
   //    resolved-version or build change can alter any layer -> fail closed.
   const base = f.split("/").pop();
   if (/^(requirements[^/]*\.txt|constraints[^/]*\.txt|pyproject\.toml|setup\.py|setup\.cfg|Pipfile|Pipfile\.lock|poetry\.lock|package\.json|package-lock\.json|npm-shrinkwrap\.json|yarn\.lock|pnpm-lock\.yaml|Dockerfile|docker-compose\.ya?ml|\.tool-versions)$/.test(base)) {
     return "deps";
   }
 
-  // 3. Docs — project docs or any markdown.
+  // 5. Docs — hockey project docs or any markdown.
   if (f.startsWith(PROJECT + "docs/") || /\.md$/i.test(f)) return "docs";
 
-  // 4. Front-end — the served static assets the browser actually runs.
+  // 6. Front-end — the served static assets the browser actually runs.
   if (f.startsWith(BACKEND + "web/static/")) return "frontend";
 
-  // 5. e2e — the Playwright journeys / node scripts.
+  // 7. e2e — the Playwright journeys / node scripts.
   if (f.startsWith(PROJECT + "e2e/")) return "e2e";
 
-  // 6. SQL migrations — DB-sensitive backend (kept on the full DB matrix).
+  // 8. SQL migrations — DB-sensitive backend (kept on the full DB matrix).
   if (/\.sql$/i.test(f) || f.startsWith(BACKEND + "store/migrations/")) return "migration";
 
-  // 7. Backend API-contract surface — the HTTP transport (web/, minus the
-  //    static assets handled in (4)) and the facade the journeys consume. A
+  // 9. Backend API-contract surface — the HTTP transport (web/, minus the
+  //    static assets handled in (6)) and the facade the journeys consume. A
   //    change here can break the browser gate, so it also runs the browser.
   if (f.startsWith(BACKEND + "web/") || f.startsWith(BACKEND + "api/")) return "backend_api";
 
-  // 8. Other backend Python (domain / services / store / tests) — DB matrix.
+  // 10. Other backend Python (domain / services / store / tests) — DB matrix.
   if (/\.py$/i.test(f) && f.startsWith(PROJECT + "backend/")) return "backend_model";
 
-  // 9. Anything else — unknown -> fail closed.
+  // 11. Anything else — unknown -> fail closed (full matrix).
   return "unknown";
 }
 
@@ -92,7 +126,10 @@ function classify(files, eventName) {
     if (c === "backend_api" || c === "frontend" || c === "e2e") {
       frontend_check = true; browser_smoke = true;
     }
-    // 'docs' contributes no heavy job.
+    // 'docs' and 'sibling' contribute no heavy job (a hockey-docs-only or
+    // sibling-project-only PR runs just the cheap classifier). Mixed PRs take
+    // the union, so a sibling change alongside a hockey change still runs the
+    // hockey job the hockey change needs.
   }
   return { test, postgres, frontend_check, browser_smoke, reason: cats.join(",") };
 }
