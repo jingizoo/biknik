@@ -2750,6 +2750,12 @@ class ApiService:
             self._guard_active_seasons([resolved_season_id])
             created = []
             for d in proposal["draft_games"]:
+                # #277: the draft-commit path now runs the SAME final conflict
+                # check as create/move, so a regenerated proposal that would
+                # double-book a slot or a team fails atomically (the whole batch
+                # rolls back) instead of silently persisting a bad fixture.
+                self.setup._assert_slot_free_for_game(
+                    d["ice_slot_id"], d["home_team_id"], d["away_team_id"])
                 g = Game(
                     id=self.store.next_id("game"),
                     home_team_id=d["home_team_id"], away_team_id=d["away_team_id"],
