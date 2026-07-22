@@ -15,6 +15,11 @@
 //     in the normal closed state (a static chip too);
 //   * flag an archived Season as read-only; and render a static chip when a
 //     Program has no Seasons (single option);
+//   * RECONCILE a concurrent lifecycle/scope change (a Season archived, reopened,
+//     or newly created between the options load and a successful POST) from a
+//     fresh GET /api/context/options — WITHOUT reloading the page — so the label,
+//     read-only badge and selection are never rendered from the stale pre-POST
+//     rows (a second browser context makes the concurrent change);
 // all with zero console/page errors.
 //
 // Setup that needs manage_setup runs as the League Admin; the switcher itself
@@ -30,8 +35,8 @@ const HOST = "127.0.0.1";
 const BACKEND_DIR = path.resolve(__dirname, "..", "backend");
 const READY_TIMEOUT_MS = 15000;
 const VIEWPORTS = [
-  { label: "desktop", width: 1440, height: 900, port: 8241, chipPort: 8341 },
-  { label: "phone", width: 390, height: 844, port: 8242, chipPort: 8342 },
+  { label: "desktop", width: 1440, height: 900, port: 8241, chipPort: 8341, reconPort: 8441 },
+  { label: "phone", width: 390, height: 844, port: 8242, chipPort: 8342, reconPort: 8442 },
 ];
 
 function encodeCtx(programId, seasonId) {
@@ -265,6 +270,108 @@ async function checkChip(browser, viewport) {
   }
 }
 
+// --- stale-options reconciliation (a concurrent lifecycle/scope change between
+//     GET /api/context/options and a successful POST must be reconciled from a
+//     FRESH options fetch before render — never rendered from the pre-POST rows,
+//     and WITHOUT reloading the page) ---
+async function checkReconcile(browser, viewport) {
+  const base = `http://${HOST}:${viewport.reconPort}`;
+  const server = startServer(viewport.reconPort, {});
+  let out = "";
+  server.stdout.on("data", (d) => { out += d.toString(); });
+  server.stderr.on("data", (d) => { out += d.toString(); });
+  const { context, page, errors } = await newPage(browser, viewport);   // the subject (viewer)
+  const admin = await newPage(browser, viewport);                       // a concurrent actor
+  const L = viewport.label;
+  try {
+    await waitForServer(`${base}/api/health`, READY_TIMEOUT_MS);
+    await page.goto(base, { waitUntil: "domcontentloaded" });
+    // Setup as League Admin on the subject page, read the ids, then hand the
+    // page to the Viewer. A SEPARATE admin context makes the concurrent
+    // lifecycle changes so the viewer's in-memory option set genuinely goes
+    // stale (the viewer never reloads after its deterministic starting state).
+    if ((await loginAs(page, "admin")).status !== 200) throw new Error(`[${L}] admin login failed`);
+    if ((await apiPost(page, "/api/demo/load", {})).status !== 200) throw new Error(`[${L}] demo load failed`);
+    const opts = (await apiGet(page, "/api/context/options")).json;
+    const programId = opts.programs[0].id;
+    const winterId = opts.programs[0].seasons[0].id;
+    const winter = programId + "|" + winterId;
+    const progOnly = programId + "|";
+
+    await admin.page.goto(base, { waitUntil: "domcontentloaded" });
+    if ((await loginAs(admin.page, "admin")).status !== 200) throw new Error(`[${L}] admin (actor) login failed`);
+
+    // Viewer, deterministic starting point: Program-only, options freshly
+    // loaded (Winter present + writable). No reloads past this line.
+    if ((await loginAs(page, "viewer")).status !== 200) throw new Error(`[${L}] viewer login failed`);
+    await apiPost(page, "/api/context", { program_id: programId, season_id: null });
+    await reloadShell(page);
+    await page.waitForFunction((v) => {
+      const s = document.getElementById("ctx-select");
+      return s && !s.hidden && s.value === v && s.options.length >= 2;
+    }, progOnly, { timeout: 10000 });
+
+    // (1) Archive BETWEEN options-load and POST: the viewer's row still says
+    //     Winter is writable; a concurrent archive + the viewer selecting Winter
+    //     must reconcile to read-only from a fresh GET — WITHOUT a reload.
+    if ((await apiPost(admin.page, `/api/v2/setup/seasons/${winterId}/archive`, { reason: "done" })).status !== 200) {
+      throw new Error(`[${L}] concurrent archive failed`);
+    }
+    await page.selectOption("#ctx-select", winter);
+    await page.waitForFunction(() => {
+      const ro = document.getElementById("ctx-ro");
+      return ro && !ro.hidden;
+    }, null, { timeout: 10000 });
+    const archivedLabel = await page.locator(`#ctx-select option[value="${winter}"]`).textContent();
+    if (!/archived|read-only/i.test(archivedLabel)) {
+      throw new Error(`[${L}] archived Season not reconciled without reload: "${archivedLabel}"`);
+    }
+    if ((await ctxSeason(page)) !== winterId) throw new Error(`[${L}] archived POST did not persist`);
+
+    // (2) Reopen: the reverse also reconciles without reload — badge clears, the
+    //     archived marker drops. Toggle away first so re-selecting Winter fires.
+    if ((await apiPost(admin.page, `/api/v2/setup/seasons/${winterId}/reopen`, { reason: "back" })).status !== 200) {
+      throw new Error(`[${L}] concurrent reopen failed`);
+    }
+    await page.selectOption("#ctx-select", progOnly);
+    await page.waitForFunction((v) => document.getElementById("ctx-select").value === v, progOnly, { timeout: 10000 });
+    await page.selectOption("#ctx-select", winter);
+    await page.waitForFunction(() => {
+      const ro = document.getElementById("ctx-ro");
+      return ro && ro.hidden;
+    }, null, { timeout: 10000 });
+    const reopenedLabel = await page.locator(`#ctx-select option[value="${winter}"]`).textContent();
+    if (/archived|read-only/i.test(reopenedLabel)) {
+      throw new Error(`[${L}] reopened Season still flagged read-only: "${reopenedLabel}"`);
+    }
+
+    // (3) A Season created AFTER options loaded must surface on the next POST's
+    //     fresh fetch — still WITHOUT reload — proving `selected` is always drawn
+    //     from a reconciled option set, not the stale one.
+    const created = await apiPost(admin.page, "/api/v2/setup/season", { program_id: programId, name: "Spring Cup" });
+    if (created.status !== 200 || !created.json.id) {
+      throw new Error(`[${L}] concurrent season create failed: ${JSON.stringify(created.json)}`);
+    }
+    const spring = programId + "|" + created.json.id;
+    await page.selectOption("#ctx-select", progOnly);
+    await page.waitForFunction((v) => {
+      const s = document.getElementById("ctx-select");
+      return Array.from(s.options).some((o) => o.value === v);
+    }, spring, { timeout: 10000 });
+    const springLabel = await page.locator(`#ctx-select option[value="${spring}"]`).textContent();
+    if (!/Spring Cup/.test(springLabel)) throw new Error(`[${L}] newly available Season not surfaced: "${springLabel}"`);
+
+    if (errors.length) throw new Error(`[${L}] console/page errors:\n${errors.join("\n")}`);
+    console.log(`[${L}] OK — no-reload reconciliation: archive→read-only, reopen→writable, newly-available Season surfaced.`);
+  } catch (error) {
+    throw new Error(`${error.message}\n--- server output ---\n${out}`);
+  } finally {
+    await admin.context.close();
+    await context.close();
+    await stopServer(server);
+  }
+}
+
 async function main() {
   let browser;
   try {
@@ -273,6 +380,7 @@ async function main() {
     for (const viewport of VIEWPORTS) {
       await checkSwitcher(browser, viewport);
       await checkChip(browser, viewport);
+      await checkReconcile(browser, viewport);
     }
     console.log("Context-switcher browser journey passed.");
   } catch (error) {

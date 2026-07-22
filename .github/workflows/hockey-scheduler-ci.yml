@@ -21,90 +21,7 @@ on:
       - ".github/workflows/hockey-scheduler-ci.yml"
 
 jobs:
-  # Change-based routing (requested optimization): a docs-only PR should not
-  # spin up two full test suites and four browser runners; a frontend-only PR
-  # should not re-run PostgreSQL, and a backend-only PR should not reinstall
-  # Chromium. This job diffs the PR against its base with plain git (no
-  # third-party action — the rest of this workflow uses only official actions)
-  # and emits booleans the heavy jobs gate on. On push to main we run
-  # everything, since there is no cheap base to diff and main is the gate of
-  # record.
-  #
-  # Routing (matches the requested table):
-  #   docs-only          -> nothing heavy (this job only)
-  #   frontend / e2e      -> frontend-check + browser-smoke
-  #   backend (any .py)   -> test (memory+SQLite) + postgres
-  #   migrations/concurrency is a subset of "backend" -> both DB backends,
-  #                          i.e. the full DB matrix, automatically.
-  # The workflow file changing forces the whole thing to run (fail-safe).
-  changes:
-    runs-on: ubuntu-latest
-    outputs:
-      backend: ${{ steps.filter.outputs.backend }}
-      frontend: ${{ steps.filter.outputs.frontend }}
-      e2e: ${{ steps.filter.outputs.e2e }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - name: Detect changed paths
-        id: filter
-        env:
-          EVENT: ${{ github.event_name }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          BEFORE_SHA: ${{ github.event.before }}
-        run: |
-          set -euo pipefail
-          # On push to main we cannot rely on a cheap base diff, and main is
-          # the gate of record — run every downstream job.
-          if [ "$EVENT" != "pull_request" ]; then
-            echo "run everything (event=$EVENT)"
-            echo "backend=true"  >> "$GITHUB_OUTPUT"
-            echo "frontend=true" >> "$GITHUB_OUTPUT"
-            echo "e2e=true"      >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          git fetch --no-tags --depth=1 origin "$BASE_SHA" || git fetch --no-tags origin "$BASE_SHA"
-          FILES="$(git diff --name-only "$BASE_SHA" HEAD)"
-          echo "Changed files:"; echo "$FILES"
-
-          # A workflow-file change is a fail-safe: run everything.
-          if echo "$FILES" | grep -qxF '.github/workflows/hockey-scheduler-ci.yml'; then
-            echo "workflow changed -> run everything"
-            echo "backend=true"  >> "$GITHUB_OUTPUT"
-            echo "frontend=true" >> "$GITHUB_OUTPUT"
-            echo "e2e=true"      >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          match() { echo "$FILES" | grep -qE "$1"; }
-
-          # Backend = any Python under the package or its tests. The static
-          # front-end assets live under web/static and are handled separately,
-          # so a pure JS/CSS/HTML edit does NOT count as a backend change.
-          if match '^hockey-scheduler/backend/.*\.py$'; then
-            echo "backend=true"  >> "$GITHUB_OUTPUT"
-          else
-            echo "backend=false" >> "$GITHUB_OUTPUT"
-          fi
-
-          # Front-end = the served static assets (JS/CSS/HTML) the browser runs.
-          if match '^hockey-scheduler/backend/hockey_scheduler/web/static/'; then
-            echo "frontend=true"  >> "$GITHUB_OUTPUT"
-          else
-            echo "frontend=false" >> "$GITHUB_OUTPUT"
-          fi
-
-          # e2e = the Playwright journeys / node-check scripts themselves.
-          if match '^hockey-scheduler/e2e/'; then
-            echo "e2e=true"  >> "$GITHUB_OUTPUT"
-          else
-            echo "e2e=false" >> "$GITHUB_OUTPUT"
-          fi
-
   test:
-    needs: changes
-    if: needs.changes.outputs.backend == 'true'
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -118,8 +35,6 @@ jobs:
         run: python -m unittest discover -s tests -v
 
   postgres:
-    needs: changes
-    if: needs.changes.outputs.backend == 'true'
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -151,8 +66,6 @@ jobs:
         run: python -m unittest discover -s tests -v
 
   frontend-check:
-    needs: changes
-    if: needs.changes.outputs.frontend == 'true' || needs.changes.outputs.e2e == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -199,8 +112,6 @@ jobs:
         run: node hockey-scheduler/e2e/season-fmt-unit.js
 
   browser-smoke:
-    needs: changes
-    if: needs.changes.outputs.frontend == 'true' || needs.changes.outputs.e2e == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     defaults:
@@ -235,35 +146,10 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
-      # Cache the Playwright browser bundle (~130 MB Chromium) keyed on the
-      # pinned playwright version, so the four shards — and every later run on
-      # the same version — restore it instead of each downloading Chromium from
-      # scratch. The OS-level shared-library deps are cheap and are (re)applied
-      # every run via `install-deps`, which is a no-op when already present.
-      - name: Resolve Playwright version
-        id: pw
-        working-directory: hockey-scheduler/e2e
+      - name: Install Playwright (#138)
         run: |
-          set -euo pipefail
-          # Read the pinned version from the committed lockfile — node_modules
-          # does not exist yet (npm ci runs after we restore the cache).
-          VERSION="$(node -p "require('./package-lock.json').packages['node_modules/playwright'].version")"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "Playwright $VERSION"
-      - name: Cache Playwright browsers
-        id: pw-cache
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/ms-playwright
-          key: playwright-${{ runner.os }}-${{ steps.pw.outputs.version }}
-      - name: Install e2e dependencies
-        run: npm ci
-      - name: Install Chromium (cache miss only)
-        if: steps.pw-cache.outputs.cache-hit != 'true'
-        run: npx playwright install --with-deps chromium
-      - name: Install Chromium OS deps (cache hit)
-        if: steps.pw-cache.outputs.cache-hit == 'true'
-        run: npx playwright install-deps chromium
+          npm ci
+          npx playwright install --with-deps chromium
       - name: Run shard ${{ matrix.shard }} journeys
         run: |
           set -e

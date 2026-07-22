@@ -6637,12 +6637,17 @@ async function restoreContextDeepLink() {
   const r = await post("/api/context",
     { program_id: link.program_id, season_id: link.season_id });
   if (r && !r.error) {
-    if (contextOptions) {
-      contextOptions.selected = { program_id: r.program_id,
-        season_id: r.season_id, read_only: !!r.read_only };
-    }
+    // Re-fetch the whole option set (not just patch `selected`): the Season we
+    // adopted may have been archived/reopened, or newly created/authorized,
+    // between the options load above and this POST. A fresh GET reconciles the
+    // canonical label/status/read-only rows AND the selection under the
+    // backend's serializable snapshot, so `selected` is always one of the
+    // rendered options with the correct badge — never a stale row.
+    await loadContextOptions();
     toast = "";
   } else {
+    // POST failed: the persisted context is unchanged, so the already-loaded
+    // options still describe it. Normalize with a generic message (no oracle).
     toast = "That shared context isn't available — showing your saved context.";
     toastIsError = true;
   }
@@ -6661,12 +6666,26 @@ async function setActiveContext(programId, seasonId) {
     render();
     return;
   }
+  // Reflect the canonical selection in the hash IMMEDIATELY from the POST echo,
+  // before the options refresh below. The refresh is a second round-trip; if we
+  // waited until after it to sync the hash, a very fast reload in that window
+  // could still observe a prior hash (e.g. the persisted default mirrored on
+  // load) and adopt it over what we just persisted.
   if (contextOptions) {
     contextOptions.selected = { program_id: r.program_id,
       season_id: r.season_id, read_only: !!r.read_only };
   }
-  toast = "";
   syncContextHash();
+  // Then reconcile the whole option set from a fresh GET so the label/status/
+  // read-only badge reflect canonical state at POST time — a Season may have
+  // been archived/reopened or newly authorized since options loaded. Rendering
+  // from the pre-POST rows would show a stale row (a now-archived Season shown
+  // as writable, or `selected` absent from the offered options). Re-sync after,
+  // in case the canonical selection differs from the POST echo (a concurrent
+  // change), so the hash always matches what is rendered.
+  await loadContextOptions();
+  syncContextHash();
+  toast = "";
   render();
 }
 // The switcher's flat option list: EVERY authorized Program is Program-only-
