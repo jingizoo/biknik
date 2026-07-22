@@ -618,6 +618,12 @@ class InMemoryStore:
     def get_rink(self, rink_id: str) -> Optional[Rink]:
         return self.rinks.get(rink_id)
 
+    def get_rink_for_update(self, rink_id: str) -> Optional[Rink]:
+        # No row locking needed: transaction() holds self._lock for its entire
+        # body, so ice-slot writes on a rink already serialize. Provided for
+        # interface parity with SqlStore (#158 review).
+        return self.rinks.get(rink_id)
+
     def add_ice_slot(self, slot: IceSlot) -> IceSlot:
         self.ice_slots[slot.id] = slot
         return slot

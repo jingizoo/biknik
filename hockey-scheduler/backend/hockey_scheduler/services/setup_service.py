@@ -2257,7 +2257,11 @@ class SetupService:
     def create_ice_slot(self, rink_id: str, start_time: datetime, end_time: datetime,
                         slot_type: IceSlotType = IceSlotType.GAME,
                         actor_id: Optional[str] = None) -> IceSlot:
-        if self.store.get_rink(rink_id) is None:
+        # Row-lock the rink (#158 review): serializes this create with a
+        # concurrent create or ice-availability commit on the same rink, so two
+        # writers can't both pass the overlap check below and then both insert
+        # an overlapping/duplicate slot.
+        if self.store.get_rink_for_update(rink_id) is None:
             raise NotFoundError(f"Rink {rink_id} not found.")
         start = self._require_utc(start_time, "start_time")
         end = self._require_utc(end_time, "end_time")
@@ -2346,15 +2350,15 @@ class SetupService:
                     {"reason": "invalid_exclusion_dates", "field": "exclusion_dates"})
         return out
 
-    def _resolve_ice_availability(self, *, season_id, rink_ids, weekdays,
-                                  start_local, end_local, start_date, end_date,
-                                  playable_minutes, turnover_minutes,
-                                  exclusion_dates):
-        """Side-effect-free core shared by preview and commit. Resolves the
-        Season timezone and date range, runs the pure planner, splits the
-        selected rinks by SeasonVenueAccess, and classifies every proposed slot
-        on each accessible rink against existing inventory as new / duplicate /
-        conflict. Returns an internal resolution (datetimes intact)."""
+    def _plan_ice_availability(self, *, season_id, rink_ids, weekdays,
+                               start_local, end_local, start_date, end_date,
+                               playable_minutes, turnover_minutes,
+                               exclusion_dates):
+        """Deterministic, side-effect-free planning shared by preview and commit:
+        resolve the Season timezone + date range, run the pure planner, and split
+        the (de-duplicated) selected rinks by SeasonVenueAccess. Does NOT read the
+        ice-slot inventory — classification against existing slots is a separate
+        step (_classify_ice_windows) so commit can run it under its write lock."""
         season = self.store.get_season(season_id) if season_id else None
         if season is None:
             raise NotFoundError(
@@ -2367,6 +2371,9 @@ class SetupService:
             raise ValidationError(
                 "Select at least one rink.",
                 {"reason": "no_rinks", "field": "rink_ids"})
+        # De-duplicate up front (#158 review): a repeated rink must never
+        # generate the same slot twice within one request.
+        rink_ids = list(dict.fromkeys(rink_ids))
 
         d_start, d_end = self._ice_avail_range(season, tz, start_date, end_date)
         window = ((parse_hhmm(start_local, "start_local")),
@@ -2405,19 +2412,31 @@ class SetupService:
             else:
                 accessible.append((rink, venue))
 
+        return {
+            "season": season, "tz": tz, "d_start": d_start, "d_end": d_end,
+            "weekday_set": weekday_set,
+            "window": {"start": start_local, "end": end_local},
+            "playable_minutes": playable_minutes,
+            "turnover_minutes": turnover_minutes,
+            "plan": plan, "accessible": accessible,
+            "access_missing": access_missing,
+        }
+
+    def _classify_ice_windows(self, accessible, plan):
+        """Classify each (accessible rink × planner window) against CURRENT ice
+        inventory as new / duplicate / conflict. Reads all_ice_slots(); the
+        commit path runs an equivalent pass INSIDE its write transaction (under
+        the Season + per-rink locks) so its decision can never go stale."""
         existing_by_rink = {}
         for existing in self.store.all_ice_slots():
             existing_by_rink.setdefault(existing.rink_id, []).append(existing)
-
         classified = []
         for rink, venue in accessible:
             existing = existing_by_rink.get(rink.id, [])
             for w in plan["windows"]:
                 start, end = w["start"], w["end"]
-                # Exact (rink, start, end) match => idempotent duplicate (a rerun
-                # of the same template, or a pre-existing slot at that instant):
-                # never re-created, never overwritten. An overlap that is NOT an
-                # exact match is a real conflict the operator must resolve.
+                # Exact (rink, start, end) match => idempotent duplicate; an
+                # overlap that is NOT exact is a real conflict to resolve.
                 exact = next((e for e in existing if e.start_time == start
                               and e.end_time == end), None)
                 if exact is not None:
@@ -2438,16 +2457,15 @@ class SetupService:
                     "status": status, "conflict_with": ref,
                     "conflict_has_game": has_game,
                 })
+        return classified
 
-        return {
-            "season": season, "tz": tz, "d_start": d_start, "d_end": d_end,
-            "weekdays": sorted(weekday_set),
-            "window": {"start": start_local, "end": end_local},
-            "playable_minutes": playable_minutes,
-            "turnover_minutes": turnover_minutes,
-            "plan": plan, "classified": classified,
-            "accessible": accessible, "access_missing": access_missing,
-        }
+    def _resolve_ice_availability(self, **kwargs):
+        """Plan + classify against current inventory — the PREVIEW path (no
+        writes). Commit re-runs classification under its write lock instead."""
+        base = self._plan_ice_availability(**kwargs)
+        return {**base, "weekdays": sorted(base["weekday_set"]),
+                "classified": self._classify_ice_windows(
+                    base["accessible"], base["plan"])}
 
     def _ice_availability_response(self, r):
         """Shape a resolution into the preview API response (datetimes -> ISO)."""
@@ -2517,49 +2535,93 @@ class SetupService:
                                 start_date=None, end_date=None,
                                 playable_minutes=None, turnover_minutes=None,
                                 exclusion_dates=None, actor_id=None):
-        """Create the AVAILABLE Game ice slots a template implies. Idempotent:
-        an exact-duplicate slot is skipped, never re-created; a conflicting
-        overlap is reported and skipped. Audited per slot plus a batch summary.
-        Requires an active Season (#159)."""
-        self._require_active_season(season_id)
-        r = self._resolve_ice_availability(
+        """Create the AVAILABLE Game ice slots a template implies (#158).
+
+        Idempotent and race-safe: planning is side-effect-free, but the
+        classify-then-write happens together INSIDE one transaction holding the
+        Season lock (serializes commit-vs-commit) and a per-rink row lock
+        (serializes commit-vs-manual-create), with the (rink, start, end) unique
+        index (migration 045) as the atomic backstop. So concurrent commits, or a
+        commit racing a manual/import write, can never create duplicate or
+        overlapping slots. An exact-duplicate window is skipped, an overlap is
+        reported, a rerun creates nothing. Audited per slot + a batch summary.
+        Requires an active Season (#159).
+        """
+        base = self._plan_ice_availability(
             season_id=season_id, rink_ids=rink_ids, weekdays=weekdays,
             start_local=start_local, end_local=end_local,
             start_date=start_date, end_date=end_date,
             playable_minutes=playable_minutes, turnover_minutes=turnover_minutes,
             exclusion_dates=exclusion_dates)
-        to_create = [c for c in r["classified"] if c["status"] == "new"]
-        counts = {
-            "created": 0,
-            "duplicate_skipped": sum(1 for c in r["classified"]
-                                     if c["status"] == "duplicate"),
-            "conflict_skipped": sum(1 for c in r["classified"]
-                                    if c["status"] == "conflict"),
-            "access_skipped_rinks": len(r["access_missing"]),
-        }
-        # Generated up front so every per-slot audit row is tagged with it, and
-        # a single batch-level row summarizes the run (mirrors the importer).
+        accessible = base["accessible"]
+        windows = base["plan"]["windows"]
+        access_skipped = len(base["access_missing"])
+        # Generated up front so every per-slot audit row is tagged with it.
         batch_id = self.store.next_id("iceavailbatch")
-        created = []
-        with self.store.transaction():
-            for c in to_create:
-                slot = IceSlot(
-                    id=self.store.next_id("slot"), rink_id=c["rink_id"],
-                    start_time=c["start"], end_time=c["end"],
-                    slot_type=IceSlotType.GAME, status=IceSlotStatus.AVAILABLE)
-                self.store.add_ice_slot(slot)
-                self._audit("ice_slot_created", "ice_slot", slot.id, actor_id,
-                            {"rink_id": c["rink_id"], "slot_type": "game",
-                             "ice_availability_batch_id": batch_id})
-                created.append(slot)
-            counts["created"] = len(created)
-            self._audit("ice_availability_committed", "ice_availability_batch",
+
+        created, counts = [], {}
+        # Retry the whole batch if the unique-index backstop rejects an INSERT —
+        # rare: the Season + per-rink locks already serialize commits and manual
+        # creates, so only the lock-free CSV import path can trigger it.
+        for attempt in range(3):
+            created, dup, conflict = [], 0, 0
+            try:
+                with self.store.transaction():
+                    # Fixed lock order (Season, then rinks by id) — two commits
+                    # can never deadlock; the locks are held to commit so the
+                    # classification below can't go stale under them.
+                    self._require_active_season(season_id)
+                    for rink in sorted((r for r, _v in accessible),
+                                       key=lambda r: r.id):
+                        self.store.get_rink_for_update(rink.id)
+                    existing_by_rink = {}
+                    for s in self.store.all_ice_slots():
+                        existing_by_rink.setdefault(s.rink_id, []).append(s)
+                    for rink, _venue in accessible:
+                        existing = existing_by_rink.setdefault(rink.id, [])
+                        for w in windows:
+                            start, end = w["start"], w["end"]
+                            if any(e.start_time == start and e.end_time == end
+                                   for e in existing):
+                                dup += 1
+                                continue
+                            if any(intervals_overlap(start, end, e.start_time,
+                                                     e.end_time) for e in existing):
+                                conflict += 1
+                                continue
+                            slot = IceSlot(
+                                id=self.store.next_id("slot"), rink_id=rink.id,
+                                start_time=start, end_time=end,
+                                slot_type=IceSlotType.GAME,
+                                status=IceSlotStatus.AVAILABLE)
+                            self.store.add_ice_slot(slot)
+                            existing.append(slot)  # a later window/rink sees it too
+                            self._audit(
+                                "ice_slot_created", "ice_slot", slot.id, actor_id,
+                                {"rink_id": rink.id, "slot_type": "game",
+                                 "ice_availability_batch_id": batch_id})
+                            created.append(slot)
+                    counts = {
+                        "created": len(created), "duplicate_skipped": dup,
+                        "conflict_skipped": conflict,
+                        "access_skipped_rinks": access_skipped}
+                    self._audit(
+                        "ice_availability_committed", "ice_availability_batch",
                         batch_id, actor_id, {
                             "season_id": season_id,
-                            "rink_ids": list(rink_ids or []),
-                            "weekdays": r["weekdays"], "window": r["window"],
+                            "rink_ids": [r.id for r, _v in accessible],
+                            "weekdays": sorted(base["weekday_set"]),
+                            "window": base["window"],
                             "playable_minutes": playable_minutes,
                             "turnover_minutes": turnover_minutes, **counts})
+                break  # committed cleanly
+            except IntegrityConflictError:
+                # A lock-free writer landed a slot our snapshot missed; the batch
+                # rolled back. Retry — the fresh classification will see it and
+                # treat it as a duplicate (a retry can only turn 'new' into
+                # 'duplicate', so it converges).
+                if attempt == 2:
+                    raise
         return {
             "committed": True, "batch_id": batch_id,
             "created": [self._ice_slot_dto(s) for s in created],

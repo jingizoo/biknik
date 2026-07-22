@@ -86,6 +86,7 @@ from .db_errors import (
     dependent_delete_conflict,
     translate_db_exception,
     translate_ice_slot_conflict_exception,
+    translate_ice_slot_time_conflict_exception,
     translate_player_jersey_exception,
     translate_program_org_fk_exception,
     translate_reassignment_fk_exception,
@@ -1282,10 +1283,23 @@ class SqlStore:
     def all_rinks(self): return self._query(Rink, order="id")
     def save_rink(self, rink): return self._write_rink(self._update, rink)
 
+    def get_rink_for_update(self, rink_id):
+        # Row-lock a rink so every ice-slot write on it serializes (#158 review):
+        # commit_ice_availability and create_ice_slot both take this before
+        # checking/writing, so two writers can't both pass an overlap/duplicate
+        # check and then both insert. Must run inside transaction().
+        return self._get_for_update(Rink, rink_id)
+
     def _write_ice_slot(self, write, slot):
         try:
             return write(slot)
         except Exception as exc:
+            # One physical slot per (rink, start, end) (migration 045): a
+            # race-losing INSERT is an idempotent duplicate, translated to a
+            # stable conflict rather than a raw driver error (#158 review).
+            dup = translate_ice_slot_time_conflict_exception(exc, slot.rink_id)
+            if dup is not None:
+                raise dup from exc
             # ice_slots.rink_id → rinks(id) (migration 041): a race-losing create
             # onto a concurrently-deleted rink surfaces as the same stable
             # conflict the service raises when it validates the rink (#201 Slice 3).

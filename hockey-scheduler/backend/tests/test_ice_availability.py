@@ -249,6 +249,35 @@ class IceAvailabilityContract:
         res = self.api.preview_ice_availability(**_template(season_id="nope"))
         self.assertIn("error", res)
 
+    # -- 12. idempotency / no duplicate rows (#158 review) ------------------
+    def test_repeated_rink_id_does_not_duplicate(self):
+        res = self.api.commit_ice_availability(
+            actor_id="a", **_template(rink_ids=["rink_1", "rink_1"]))
+        self.assertEqual(res["totals"]["created"], 6)   # de-duped, not 12
+        self.assertEqual(len(self._slots()), 6)
+        tuples = {(s.rink_id, s.start_time, s.end_time) for s in self._slots()}
+        self.assertEqual(len(tuples), 6)                # one physical slot / tuple
+
+    def test_commit_after_manual_slot_is_duplicate(self):
+        # A slot manually created at one window's exact tuple is an idempotent
+        # duplicate on commit — never a second physical row for that tuple.
+        self.store.add_ice_slot(IceSlot(
+            id=self.store.next_id("slot"), rink_id="rink_1",
+            start_time=datetime(2026, 9, 1, 22, tzinfo=timezone.utc),   # 18:00 EDT
+            end_time=datetime(2026, 9, 1, 23, tzinfo=timezone.utc),
+            slot_type=IceSlotType.GAME, status=IceSlotStatus.AVAILABLE))
+        res = self.api.commit_ice_availability(actor_id="a", **_template())
+        self.assertEqual(res["totals"]["created"], 5)
+        self.assertEqual(res["totals"]["duplicate_skipped"], 1)
+        slots = self._slots()
+        self.assertEqual(len(slots), 6)                 # 5 new + 1 pre-existing
+        tuples = {(s.rink_id, s.start_time, s.end_time) for s in slots}
+        self.assertEqual(len(tuples), 6)                # no duplicate tuple
+        # Only the committed slots are audited (not the pre-existing manual one).
+        created_audits = [a for a in self.store.all_setup_audit()
+                          if a.action == "ice_slot_created"]
+        self.assertEqual(len(created_audits), 5)
+
 
 class MemoryIceAvailabilityTest(IceAvailabilityContract, unittest.TestCase):
     def _store(self):
@@ -267,6 +296,94 @@ class PostgresIceAvailabilityTest(IceAvailabilityContract, unittest.TestCase):
         store = SqlStore(os.environ["TEST_DATABASE_URL"])
         store.clear_all_data()  # isolate from any prior run's rows
         return store
+
+
+@unittest.skipUnless(os.environ.get("TEST_DATABASE_URL"),
+                     "PostgreSQL required (set TEST_DATABASE_URL)")
+class PostgresIceAvailabilityConcurrencyTest(unittest.TestCase):
+    """Forced two-session races on real PostgreSQL (#158 review). Each session
+    is its own connection; a barrier releases both at once. The Season + per-rink
+    row locks and the (rink, start, end) unique index must guarantee, under any
+    interleaving, exactly one physical slot per tuple, no overlaps, and stable
+    created/duplicate totals — with audit rows only for slots actually created.
+    """
+
+    def setUp(self):
+        self.url = os.environ["TEST_DATABASE_URL"]
+        seed = SqlStore(self.url)
+        seed.clear_all_data()
+        s = SetupService(seed)
+        prog = s.create_program("AHL")
+        season = s.create_season(prog.id, "Fall 2026")
+        venue = s.create_venue("Main Arena", league_id=prog.id)
+        s.grant_season_venue_access(season.id, venue.id)
+        self.season_id = season.id
+        self.rink_id = s.create_rink(venue.id, "Rink A").id
+
+    def _template(self):
+        return dict(season_id=self.season_id, rink_ids=[self.rink_id],
+                    weekdays=[1, 3], start_local="18:00", end_local="22:00",
+                    start_date="2026-09-01", end_date="2026-09-07",
+                    playable_minutes=60, turnover_minutes=15)
+
+    def _slots(self):
+        return sorted((x for x in SqlStore(self.url).all_ice_slots()
+                       if x.rink_id == self.rink_id), key=lambda x: x.start_time)
+
+    def _assert_unique_and_non_overlapping(self):
+        slots = self._slots()
+        tuples = {(x.rink_id, x.start_time, x.end_time) for x in slots}
+        self.assertEqual(len(tuples), len(slots), "duplicate (rink, start, end)")
+        for a, b in zip(slots, slots[1:]):
+            self.assertLessEqual(a.end_time, b.start_time, "overlapping slots")
+        return slots
+
+    def _run(self, targets):
+        barrier = threading.Barrier(len(targets))
+        out = [None] * len(targets)
+
+        def wrap(i, fn):
+            store = SqlStore(self.url)
+            svc = SetupService(store)
+            barrier.wait()
+            try:
+                out[i] = fn(svc)
+            except Exception as exc:            # record; asserted by the caller
+                out[i] = exc
+
+        threads = [threading.Thread(target=wrap, args=(i, fn))
+                   for i, fn in enumerate(targets)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        return out
+
+    def test_commit_vs_commit(self):
+        commit = lambda svc: svc.commit_ice_availability(  # noqa: E731
+            actor_id="u", **self._template())
+        out = self._run([commit, commit])
+        for r in out:
+            self.assertNotIsInstance(r, Exception, f"commit raised: {r!r}")
+        slots = self._assert_unique_and_non_overlapping()
+        self.assertEqual(len(slots), 6)                       # one round-robin
+        self.assertEqual(sum(r["totals"]["created"] for r in out), 6)
+        self.assertEqual(sum(r["totals"]["duplicate_skipped"] for r in out), 6)
+
+    def test_commit_vs_manual(self):
+        # The other session manually creates a slot at one window's exact tuple.
+        commit = lambda svc: svc.commit_ice_availability(  # noqa: E731
+            actor_id="c", **self._template())
+        manual = lambda svc: svc.create_ice_slot(          # noqa: E731
+            self.rink_id, datetime(2026, 9, 1, 22, tzinfo=timezone.utc),
+            datetime(2026, 9, 1, 23, tzinfo=timezone.utc))
+        out = self._run([commit, manual])
+        # The commit always succeeds; the manual create either wins (its slot is
+        # one of the six) or loses the rink-lock race with a clean overlap
+        # conflict — never a partial write or a duplicate/overlapping tuple.
+        self.assertNotIsInstance(out[0], Exception, f"commit raised: {out[0]!r}")
+        slots = self._assert_unique_and_non_overlapping()
+        self.assertEqual(len(slots), 6)
 
 
 class PlannerUnitTest(unittest.TestCase):
