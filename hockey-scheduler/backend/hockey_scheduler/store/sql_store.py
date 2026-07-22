@@ -100,6 +100,7 @@ from .integrity_checks import (
     assert_reassignment_fks_ready,
     assert_regular_games_resolve_league_season,
     assert_no_duplicate_active_ice_slots,
+    assert_no_duplicate_ice_slot_times,
     assert_no_duplicate_result_games,
     assert_no_duplicate_roster_players,
     assert_result_games_exist,
@@ -376,6 +377,7 @@ _PRE_MIGRATION_CHECKS = {
     "040_reassignment_fks": assert_reassignment_fks_ready,
     "041_iceslot_venue_fks": assert_iceslot_venue_fks_ready,
     "042_program_org_fks": assert_program_org_fks_ready,
+    "045_ice_slot_unique_time": assert_no_duplicate_ice_slot_times,
 }
 
 
