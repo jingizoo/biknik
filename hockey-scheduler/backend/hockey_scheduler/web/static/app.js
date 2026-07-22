@@ -4056,16 +4056,52 @@ function renderScheduler(ov) {
   let previewBlock = "";
   if (pv) {
     const games = (pv.draft_games || pv.created || []);
-    const gRows = games.map((g) => `<div class="li">
-      <span class="li-time">${fmt(g.start_time)}</span>
-      <div class="li-main"><div class="li-title">${esc(g.home_team_name)} vs ${esc(g.away_team_name)}</div>
-        <div class="li-sub">${esc(g.rink_name || "")}</div></div></div>`).join("");
-    const uRows = (pv.unscheduled || []).map((u) => `<div class="li">
-      <div class="li-main"><div class="li-title">${esc(u.home_team_name)} vs ${esc(u.away_team_name)}</div>
-        <div class="li-sub conflict">⚠ ${esc(u.reason)}</div></div></div>`).join("");
-    previewBlock = `<div class="section-title">Preview — ${games.length} game(s), ${(pv.unscheduled || []).length} conflict(s)</div>
-      <div class="card">${gRows || '<div class="empty">No games generated.</div>'}${uRows}</div>
-      <div class="dq-actions"><button class="act primary" data-sched-commit>Commit as draft</button></div>`;
+    const unsched = (pv.unscheduled || []);
+    // The draft service reports how many eligible seasonal registrations it
+    // resolved (#311). A round robin needs at least two Teams, so team_count < 2
+    // can only ever yield 0 games / 0 conflicts — surface that explicitly rather
+    // than as a bare, misleading "0 game(s), 0 conflict(s)". Commit is gated on
+    // there being games to commit, so there is never an invalid commit path.
+    const teamCount = (typeof pv.team_count === "number") ? pv.team_count : null;
+    const notEnoughTeams = teamCount !== null && teamCount < 2;
+    const commitBtn = `<div class="dq-actions">
+      <button class="act primary" data-sched-commit ${games.length ? "" : "disabled"}>Commit as draft</button></div>`;
+
+    let head, cardBody;
+    if (notEnoughTeams) {
+      // Name the selected context (Division, and League when the overview
+      // carries it) so the operator can see exactly which Season/League/Division
+      // resolved too few registrations, and point at the corrective path — the
+      // same "Season participation" target the Setup tree already links to.
+      const selDiv = divs.find((d) => d.id === schedulerState.division);
+      const divName = selDiv ? selDiv.name : "the selected division";
+      const leagueName = selDiv && (selDiv.league_name || selDiv.level_name);
+      const ctx = leagueName ? `${esc(divName)} (${esc(leagueName)})` : esc(divName);
+      const lead = teamCount === 0
+        ? "No Teams are registered for this schedule yet."
+        : "Only one Team is registered — a schedule needs at least two.";
+      head = `<div class="section-title">Preview — not enough registered Teams</div>`;
+      cardBody = `<div class="sched-empty">
+        <div class="sched-empty-lead">${esc(lead)}</div>
+        <p>Generate found <strong>${teamCount}</strong> eligible Team${teamCount === 1 ? "" : "s"} for <strong>${ctx}</strong>.</p>
+        <p>Teams appear here only when they are <strong>actively registered</strong> for the selected Season, League, and Division — permanent Team or League membership is not enough.</p>
+        <p>Register at least two Teams under <button class="linklike" data-goto="setup">Setup → Season participation</button>, then Generate again.</p>
+      </div>`;
+    } else {
+      const gRows = games.map((g) => `<div class="li">
+        <span class="li-time">${fmt(g.start_time)}</span>
+        <div class="li-main"><div class="li-title">${esc(g.home_team_name)} vs ${esc(g.away_team_name)}</div>
+          <div class="li-sub">${esc(g.rink_name || "")}</div></div></div>`).join("");
+      const uRows = unsched.map((u) => `<div class="li">
+        <div class="li-main"><div class="li-title">${esc(u.home_team_name)} vs ${esc(u.away_team_name)}</div>
+          <div class="li-sub conflict">⚠ ${esc(u.reason)}</div></div></div>`).join("");
+      head = `<div class="section-title">Preview — ${games.length} game(s), ${unsched.length} conflict(s)</div>`;
+      cardBody = (gRows + uRows) || '<div class="empty">No games generated.</div>';
+    }
+    previewBlock = `<div id="sched-preview" class="sched-preview" data-team-count="${teamCount === null ? "" : teamCount}" data-games="${games.length}" data-conflicts="${unsched.length}" data-not-enough-teams="${notEnoughTeams ? "1" : "0"}">
+      ${head}
+      <div class="card">${cardBody}</div>
+      ${commitBtn}</div>`;
   }
 
   const allDrafts = schedulerState.drafts || [];
