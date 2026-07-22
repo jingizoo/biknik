@@ -2602,7 +2602,11 @@ function renderDay(ov, ctx, rinks) {
     const slots = ov.ice_slots.filter((s) => s.rink_id === r.id && onDay(s));
     const cards = slots.map((s) => slotCard(s, true, ctx)).join("")
       || `<div class="slot-card"><div class="s">No ice</div></div>`;
-    const addIce = canArena
+    // Demo-only quick-add: it posts to /api/demo/add-ice-slot, which is gated
+    // off in production (#303). Hide it in production — like the other demo
+    // controls — so operators use the real, attributed "＋ Add Ice" drawer
+    // (/api/v2/setup/ice-slot) instead of hitting a 403 (#305/#303 follow-up).
+    const addIce = (canArena && isDemo())
       ? `<div class="slot-card available" data-addslot="${esc(r.id)}"><div class="t">＋</div><div class="s">Add ice</div></div>` : "";
     return `<div class="cal-row"><div class="cal-rink">${esc(r.name)}</div>
       <div class="cal-slots">${cards}${addIce}</div></div>`;
