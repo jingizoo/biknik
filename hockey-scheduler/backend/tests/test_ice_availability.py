@@ -571,6 +571,33 @@ class PostgresIceAvailabilityConcurrencyTest(unittest.TestCase):
                       (datetime(2026, 9, 1, 22, tzinfo=timezone.utc),   # Toronto
                        datetime(2026, 9, 1, 18, tzinfo=timezone.utc)))  # UTC
 
+    def test_commit_vs_import_metadata_change_no_deadlock(self):
+        # A hierarchy re-import updates the Program timezone AND Season dates,
+        # taking the Program row lock, then the Season row lock (the importer's
+        # order). The commit now locks in the SAME Program-first order, so the two
+        # serialize instead of forming the Season<->Program cycle that raised
+        # PostgreSQL 40P01 (#158 review). Under either ordering: no deadlock / raw
+        # error, and the committed calendar is one coherent zone, never partial.
+        commit = lambda svc: svc.commit_ice_availability(  # noqa: E731
+            actor_id="c", **self._template())
+
+        def reimport(svc):
+            with svc.store.transaction():
+                prog = svc.store.get_program_for_update(self.program_id)
+                prog.timezone = "UTC"
+                svc.store.save_program(prog)
+                season = svc.store.get_season_for_update(self.season_id)
+                svc.store.save_season(season)          # dates touched too
+
+        out = self._run([commit, reimport])
+        self.assertNotIsInstance(out[0], Exception, f"commit raised: {out[0]!r}")
+        self.assertNotIsInstance(out[1], Exception, f"reimport raised: {out[1]!r}")
+        slots = self._assert_unique_and_non_overlapping()
+        self.assertEqual(len(slots), 6)           # one coherent calendar, no partial
+        self.assertIn(min(s.start_time for s in slots),
+                      (datetime(2026, 9, 1, 22, tzinfo=timezone.utc),   # Toronto
+                       datetime(2026, 9, 1, 18, tzinfo=timezone.utc)))  # UTC
+
 
 class PlannerUnitTest(unittest.TestCase):
     """The pure engine — no store, no timezone-of-record dependency."""

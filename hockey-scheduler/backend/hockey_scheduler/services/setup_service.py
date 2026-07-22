@@ -207,6 +207,13 @@ def _transactional(fn):
     return wrapper
 
 
+class _SeasonReparented(Exception):
+    """Internal retry signal (#158 review): a Season was moved to a different
+    Program between commit_ice_availability's pre-lock program_id read and its
+    Season lock, so the wrong Program was locked. Caught by the commit's bounded
+    retry loop, which re-reads and locks the correct Program first."""
+
+
 class SetupService:
     def __init__(self, store: InMemoryStore, clock: Callable[[], datetime] = _utcnow):
         self.store = store
@@ -2580,17 +2587,27 @@ class SetupService:
             created, dup, conflict = [], 0, 0
             try:
                 with self.store.transaction():
-                    # Fixed lock order (Season, Program, then rinks by id) —
-                    # shared with the other writers of these rows (a hierarchy
-                    # re-import updates Season dates / Program timezone; grant /
-                    # revoke and manual slot writes take the Season / rink locks),
-                    # so no deadlock. All are held to commit, so the plan built
-                    # under them is one consistent snapshot.
-                    season = self._require_active_season(season_id)
-                    if season.program_id:
-                        self.store.get_program_for_update(season.program_id)
+                    # Canonical lock order Program -> Rinks -> Season, matching
+                    # the hierarchy import (it saves Programs, then Rinks, then
+                    # upsert_imported_season takes the Season lock), so a
+                    # concurrent import changing a Program timezone / Season dates
+                    # and this commit can never deadlock (#158 review). program_id
+                    # comes from a pre-lock read, so revalidate the Season->Program
+                    # link under the Season lock and retry (bounded) if the Season
+                    # was re-parented to another Program in between.
+                    pre = self.store.get_season(season_id)
+                    if pre is None:
+                        raise NotFoundError(
+                            "Season not found.",
+                            details={"reason": "season_missing",
+                                     "season_id": season_id})
+                    if pre.program_id:
+                        self.store.get_program_for_update(pre.program_id)
                     for rid in sorted(requested_rink_ids):
                         self.store.get_rink_for_update(rid)
+                    season = self._require_active_season(season_id)
+                    if season.program_id != pre.program_id:
+                        raise _SeasonReparented()
                     # Build the ENTIRE plan UNDER the locks (#158 review): the
                     # Season boundaries, Program timezone and generated UTC
                     # windows can't be shifted out of range or to the wrong
@@ -2650,6 +2667,17 @@ class SetupService:
                             "playable_minutes": playable_minutes,
                             "turnover_minutes": turnover_minutes, **counts})
                 break  # committed cleanly
+            except _SeasonReparented:
+                # The Season was moved to a different Program between the pre-lock
+                # program read and the Season lock; the batch rolled back. Retry —
+                # the next pass reads the new program_id and locks that Program
+                # first, in canonical order. Converges immediately (the Season
+                # lock now pins the relationship), bounded by the loop.
+                if attempt == 2:
+                    raise ConcurrencyConflictError(
+                        "The Season was moved to a different Program while "
+                        "committing ice availability; please retry.",
+                        {"reason": "season_reparented", "season_id": season_id})
             except IntegrityConflictError:
                 # A lock-free writer landed a slot our snapshot missed; the batch
                 # rolled back. Retry — the fresh classification will see it and
