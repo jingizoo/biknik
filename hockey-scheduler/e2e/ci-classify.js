@@ -3,7 +3,10 @@
 // positively classify as skip-safe runs the FULL matrix. Concretely:
 //
 //   * an UNKNOWN path (anything not matched below), a DEPENDENCY/BUILD manifest,
-//     or a WORKFLOW change  -> the full matrix (test + postgres + frontend + browser);
+//     a WORKFLOW change, or a change to the CLASSIFIER ITSELF (ci-classify*.js —
+//     the code that decides routing, treated as CI infrastructure so a routing
+//     regression can't route around the full gate)  -> the full matrix
+//     (test + postgres + frontend + browser);
 //   * a backend API-contract change (the HTTP transport or the facade the
 //     browser/journeys consume) -> the DB matrix AND the browser/contract gate,
 //     because a response-shape change can break a journey with no front-end edit;
@@ -78,7 +81,15 @@ function categorize(file) {
   // 6. Front-end — the served static assets the browser actually runs.
   if (f.startsWith(BACKEND + "web/static/")) return "frontend";
 
-  // 7. e2e — the Playwright journeys / node scripts.
+  // 7a. The classifier itself (and its tests) is CI INFRASTRUCTURE: it is the
+  //     code that DECIDES routing, so a change to it gets the same full-matrix
+  //     treatment as a workflow change. It lives under e2e/, so this MUST be
+  //     checked before the generic e2e rule below — otherwise a classifier-only
+  //     PR would route to frontend+browser and skip the Python/DB suites, letting
+  //     an accidental routing regression self-suppress the very gate it governs.
+  if (f.startsWith(PROJECT + "e2e/ci-classify")) return "ci_infra";
+
+  // 7b. e2e — the ordinary Playwright journeys / node scripts.
   if (f.startsWith(PROJECT + "e2e/")) return "e2e";
 
   // 8. SQL migrations — DB-sensitive backend (kept on the full DB matrix).
@@ -115,6 +126,7 @@ function classify(files, eventName) {
 
   // Fail-closed triggers: any of these forces the whole matrix.
   if (set.has("unknown")) return full("unknown-path");
+  if (set.has("ci_infra")) return full("classifier-change");
   if (set.has("deps")) return full("dependency-manifest");
   if (set.has("workflow")) return full("workflow-change");
 

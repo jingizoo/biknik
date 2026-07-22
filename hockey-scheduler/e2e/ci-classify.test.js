@@ -41,7 +41,12 @@ assert.strictEqual(categorize(B + "services/context_service.py"), "backend_model
 assert.strictEqual(categorize(B + "store/migrations/044_x.sql"), "migration", "migration by path");
 assert.strictEqual(categorize("anything/foo.sql"), "migration", "any .sql is a migration");
 assert.strictEqual(categorize(E + "package.json"), "deps", "e2e manifest is a dependency file");
-assert.strictEqual(categorize(E + "context-switcher.js"), "e2e", "e2e journey");
+// The classifier itself is CI infrastructure, matched BEFORE the generic e2e
+// rule, so a routing regression can't route around the full gate.
+assert.strictEqual(categorize(E + "ci-classify.js"), "ci_infra", "the classifier impl is ci_infra");
+assert.strictEqual(categorize(E + "ci-classify.test.js"), "ci_infra", "classifier unit test is ci_infra");
+assert.strictEqual(categorize(E + "ci-classify.integration.test.js"), "ci_infra", "classifier integration test is ci_infra");
+assert.strictEqual(categorize(E + "context-switcher.js"), "e2e", "an ordinary journey is still e2e");
 assert.strictEqual(categorize(D + "x.md"), "docs", "hockey docs markdown");
 assert.strictEqual(categorize("Makefile"), "unknown", "unrecognized path is unknown");
 // Sibling monorepo project — skip-safe, checked before deps/docs so a ROOT
@@ -68,8 +73,15 @@ passed += 1;
 expect("docs-only", [D + "architecture/season-lifecycle.md", "README.md"], "pull_request", NONE);
 // 2. frontend-only -> frontend + browser
 expect("frontend-only", [B + "web/static/app.js", B + "web/static/styles.css"], "pull_request", WEB);
-// 3. e2e-only -> frontend + browser
-expect("e2e-only", [E + "context-switcher.js"], "pull_request", WEB);
+// 3. e2e-only (an ORDINARY journey) -> frontend + browser (lighter route kept)
+expect("e2e-journey-only", [E + "context-switcher.js"], "pull_request", WEB);
+expect("e2e-journey+add", [E + "smoke.js", E + "coach-scope.js"], "pull_request", WEB);
+// 3b. the classifier itself is CI-critical -> FULL matrix, even though it lives
+//     under e2e/. A routing regression must never self-suppress the full gate.
+expect("classifier-impl-only", [E + "ci-classify.js"], "pull_request", FULL);
+expect("classifier-unit-test-only", [E + "ci-classify.test.js"], "pull_request", FULL);
+expect("classifier-integration-test-only", [E + "ci-classify.integration.test.js"], "pull_request", FULL);
+expect("classifier+ordinary-journey", [E + "ci-classify.js", E + "context-switcher.js"], "pull_request", FULL);
 // 4. backend model-only -> DB matrix, no browser
 expect("backend-model-only", [B + "services/context_service.py", B + "domain/season.py"], "pull_request", DB);
 expect("backend-store-only", [B + "store/sql_store.py"], "pull_request", DB);
