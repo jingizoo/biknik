@@ -113,6 +113,27 @@ class SharedSlotCheckContract:
                                  self.bears.id, self.away.id, self.maint.id)
         self.assertEqual(cm.exception.details["reason"], "not_game_slot")
 
+    def test_insufficient_playable_time(self):
+        # #277: warm-up + resurfacing buffers that consume the whole reserved
+        # window leave no playable time, so no game can be placed there.
+        slot = self.store.get_ice_slot(self.slot_free.id)   # 20:30-22:00 = 90 min
+        slot.warmup_minutes = 60
+        slot.resurface_minutes = 40                         # 100 > 90 reserved
+        self.store.save_ice_slot(slot)
+        with self.assertRaises(ScheduleConflictError) as cm:
+            self._check(self.slot_free.id, self.bears.id, self.away.id)
+        self.assertEqual(cm.exception.details["reason"],
+                         "insufficient_playable_time")
+
+    def test_buffers_within_window_still_playable(self):
+        # Buffers that leave positive playable time don't block placement.
+        slot = self.store.get_ice_slot(self.slot_free.id)   # 90 reserved minutes
+        slot.warmup_minutes = 15
+        slot.resurface_minutes = 15                         # 30 -> 60 playable
+        self.store.save_ice_slot(slot)
+        got = self._check(self.slot_free.id, self.bears.id, self.away.id)
+        self.assertEqual(got.id, self.slot_free.id)
+
 
 class MemorySharedSlotCheckTest(SharedSlotCheckContract, unittest.TestCase):
     def _store(self):

@@ -2737,6 +2737,22 @@ class SetupService:
                 f"Ice slot {ice_slot_id} is already used by game {clash.id}.",
                 details={"reason": "slot_already_filled",
                          "conflict_game_id": clash.id})
+        # #277: a game's PLAYABLE window is the reserved slot minus its warm-up
+        # and resurfacing buffers ([start+warmup, end-resurface]). A slot whose
+        # buffers leave no playable time can't host a game. Buffers default to 0
+        # (migration 046), so every pre-#277 slot keeps its full window and this
+        # never trips for them.
+        reserved_minutes = (slot.end_time - slot.start_time).total_seconds() / 60
+        playable_minutes = (reserved_minutes - (slot.warmup_minutes or 0)
+                            - (slot.resurface_minutes or 0))
+        if playable_minutes <= 0:
+            raise ScheduleConflictError(
+                "This ice slot has no playable time left after its warm-up and "
+                "resurfacing buffers.",
+                details={"reason": "insufficient_playable_time",
+                         "reserved_minutes": int(reserved_minutes),
+                         "warmup_minutes": slot.warmup_minutes,
+                         "resurface_minutes": slot.resurface_minutes})
         for ex in self.store.all_games():
             if ex.id == exclude_game_id or ex.cancelled or ex.ice_slot_id is None:
                 continue
