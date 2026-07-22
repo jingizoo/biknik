@@ -183,6 +183,19 @@ because the selection grants nothing (a Viewer may record its own selection yet
 still gets 403 on an operator write). `user_id` is always the server-resolved
 session user; no client-supplied actor.
 
+**Snapshot-consistent rendering.** `ContextService.resolve`/`set` do every read
+inside one `store.transaction()` and return the *exact* Program/Season objects
+they validated — not scalar ids the API layer must independently re-fetch. The
+facade serializes those very objects and derives `read_only` from the returned
+Season, so the payload can never internally contradict itself even if a
+concurrent archive / reopen / Season-delete / Program-delete lands between two
+requests: a non-null `program_id`/`season_id` always carries its object (no
+dangling id), and `read_only` always agrees with the serialized Season `status`.
+For a `POST`, validation and the write share that transaction, so a concurrent
+parent delete is either seen (and rejected non-oracle) or lands after the row is
+written — where it is harmless, because a saved row pointing at a since-deleted
+parent is ignored (never rendered) by the next `resolve` and grants no authority.
+
 ## Scope / follow-ups
 
 Slice 1 (lifecycle) and Slice 2 (this backend selection foundation) are done.

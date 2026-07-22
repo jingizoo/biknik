@@ -11,8 +11,10 @@ Coverage: resolve/set behavior; the full authorization MATRIX (League Admin,
 Arena Manager, Viewer, Coach, Player, Official, Guardian, unknown role) on
 Memory/SQLite/PostgreSQL; a subject-resolution contract proving the context
 selector and the web scope guards resolve the SAME caller identity; concurrent
-last-write-wins; migration-044 durability; and the strict authenticated HTTP
-contract (including a genuinely scoped identity).
+last-write-wins; snapshot consistency (validation and rendering read one
+authoritative snapshot, so a concurrent archive/reopen/delete can never make the
+payload self-contradict); migration-044 durability; and the strict authenticated
+HTTP contract (including a genuinely scoped identity).
 """
 
 import json
@@ -94,6 +96,55 @@ def _archive(store, season_id):
     s = store.get_season(season_id)
     s.status = SeasonStatus.ARCHIVED
     store.save_season(s)
+
+
+def _reopen(store, season_id):
+    s = store.get_season(season_id)
+    s.status = SeasonStatus.ACTIVE
+    s.archived_at = None
+    store.save_season(s)
+
+
+def _delete_program_cascade(store, program_id, season_id):
+    with store.transaction():
+        store.delete_season(season_id)          # clear the dependent Season first
+        store.delete_program(program_id)
+
+
+def _mutation(store, program_id, season_id, kind):
+    """A concurrent-style commit against the selected context: archive/reopen the
+    Season, delete it, or delete its whole Program (Season first)."""
+    return {
+        "archive": lambda: _archive(store, season_id),
+        "reopen": lambda: _reopen(store, season_id),
+        "delete_season": lambda: store.delete_season(season_id),
+        "delete_program": lambda: _delete_program_cascade(
+            store, program_id, season_id),
+    }[kind]
+
+
+_MUTATIONS = ("archive", "reopen", "delete_season", "delete_program")
+
+
+def _assert_context_consistent(t, c, label):
+    """The rendered context payload is internally consistent: a non-null id
+    always has its serialized object (ids never dangle) and ``read_only`` always
+    agrees with the EXACT serialized Season status (#159 snapshot contract)."""
+    t.assertNotIn("error", c, (label, c))
+    if c["program_id"] is None:
+        t.assertIsNone(c["program"], (label, c))
+    else:
+        t.assertIsNotNone(c["program"], (label, c))          # id never dangles
+        t.assertEqual(c["program"]["id"], c["program_id"], (label, c))
+    if c["season_id"] is None:
+        t.assertIsNone(c["season"], (label, c))
+        t.assertFalse(c["read_only"], (label, c))            # no Season ⇒ writable
+    else:
+        t.assertIsNotNone(c["season"], (label, c))           # id never dangles
+        t.assertEqual(c["season"]["id"], c["season_id"], (label, c))
+        t.assertEqual(                                       # read_only ⟺ status
+            c["read_only"],
+            c["season"]["status"] == SeasonStatus.ARCHIVED.value, (label, c))
 
 
 class ContextResolveSetTest(unittest.TestCase):
@@ -422,6 +473,71 @@ class ContextSubjectContractTest(unittest.TestCase):
         self.assertEqual(api.get_active_context("u", *ADMIN)["season_id"], s2)  # reappears
 
 
+class ContextSnapshotConsistencyTest(unittest.TestCase):
+    """Validation and response rendering read ONE authoritative snapshot: a
+    concurrent archive / reopen / Season-delete / Program-delete landing in the
+    validate→render window can never make the payload self-contradict. The fix
+    returns the exact validated Program/Season objects from ``resolve``/``set``
+    and renders those (deriving ``read_only`` from the serialized Season), so a
+    naive re-fetch can no longer disagree. Deterministic Memory/SQLite parity:
+    the mutation is injected at the precise boundary between validation and
+    rendering (this would fail the old scalar-id + re-fetch implementation)."""
+
+    def _stores(self):
+        yield "memory", InMemoryStore()
+        yield "sqlite", SqlStore(":memory:")
+
+    def _mutate_after(self, api, method_name, mutate):
+        """Land ``mutate`` right after the validated snapshot is produced — the
+        exact window a re-fetch would have observed a concurrent commit."""
+        orig = getattr(api.context, method_name)
+
+        def wrapper(*a, **k):
+            r = orig(*a, **k)          # validated snapshot; its transaction closed
+            mutate()                   # concurrent-style commit lands NOW
+            return r
+
+        setattr(api.context, method_name, wrapper)
+
+    def test_get_is_snapshot_consistent_under_concurrent_mutation(self):
+        for kind in _MUTATIONS:
+            for label, store in self._stores():
+                with self.subTest(mutation=kind, backend=label):
+                    api = ApiService(store)
+                    pid, sid = _program_season(api, "P1", "S1")
+                    if kind == "reopen":
+                        _archive(store, sid)               # start archived → reopen
+                    api.set_active_context("u", *ADMIN, pid, sid)
+                    self._mutate_after(api, "resolve",
+                                       _mutation(store, pid, sid, kind))
+                    _assert_context_consistent(
+                        self, api.get_active_context("u", *ADMIN), (kind, label))
+                    _close(store)
+
+    def test_post_is_snapshot_consistent_and_grants_no_authority(self):
+        for kind in _MUTATIONS:
+            for label, store in self._stores():
+                with self.subTest(mutation=kind, backend=label):
+                    api = ApiService(store)
+                    pid, sid = _program_season(api, "P1", "S1")
+                    if kind == "reopen":
+                        _archive(store, sid)
+                    self._mutate_after(api, "set",
+                                       _mutation(store, pid, sid, kind))
+                    c = api.set_active_context("u", *ADMIN, pid, sid)
+                    _assert_context_consistent(self, c, (kind, label))
+                    # The stored preference is NOT rewritten by the race (it still
+                    # records the user's exact choice — a dangling row grants no
+                    # authority), and a later resolve renders a consistent view.
+                    saved = store.get_active_context("u")
+                    self.assertEqual((saved.program_id, saved.season_id),
+                                     (pid, sid), (kind, label))
+                    _assert_context_consistent(
+                        self, api.get_active_context("u", *ADMIN),
+                        (kind, label, "after"))
+                    _close(store)
+
+
 class ContextUpsertParityTest(unittest.TestCase):
     """set_active_context is last-write-wins on every backend: a repeat is
     idempotent (one row), and two threads racing one user leave exactly one row
@@ -573,6 +689,79 @@ class ContextConcurrencyPgTest(unittest.TestCase):
 
     def test_existing_row_race_last_commit_wins(self):
         self._assert_last_wins(self._controlled_race(seed=True))
+
+
+@unittest.skipUnless(os.environ.get("TEST_DATABASE_URL"),
+                     "PostgreSQL required (set TEST_DATABASE_URL)")
+class ContextSnapshotConsistencyPgTest(unittest.TestCase):
+    """Real two-connection PostgreSQL barrier for the snapshot contract:
+    connection A validates a context then PAUSES between validation and
+    rendering while connection B commits a concurrent archive / reopen / Season
+    delete / deletable-Program delete. A then renders. Because A renders the
+    exact objects it validated (never a re-fetch), the payload is internally
+    consistent every time — ``read_only`` agrees with the serialized Season
+    status and no id dangles — for both GET and POST."""
+
+    _TS = datetime(2027, 1, 1, tzinfo=timezone.utc)
+
+    def setUp(self):
+        self.url = os.environ["TEST_DATABASE_URL"]
+        SqlStore(self.url).clear_all_data()
+
+    def _seed(self, archived):
+        store = SqlStore(self.url)
+        api = ApiService(store)
+        pid, sid = _program_season(api, "P1", "S1")
+        if archived:
+            _archive(store, sid)
+        store.set_active_context(ActiveContext("u", pid, sid, self._TS))
+        store.close()
+        return pid, sid
+
+    def _race(self, verb, kind):
+        pid, sid = self._seed(archived=(kind == "reopen"))
+        reader = SqlStore(self.url)
+        mutator = SqlStore(self.url)
+        api = ApiService(reader)
+        paused = threading.Event()
+        release = threading.Event()
+        method = "resolve" if verb == "GET" else "set"
+        orig = getattr(api.context, method)
+
+        def paused_boundary(*a, **k):
+            r = orig(*a, **k)          # validated snapshot; its transaction closed
+            paused.set()
+            release.wait(15)
+            return r
+
+        setattr(api.context, method, paused_boundary)
+        out = {}
+
+        def run():
+            if verb == "GET":
+                out["c"] = api.get_active_context("u", *ADMIN)
+            else:
+                out["c"] = api.set_active_context("u", *ADMIN, pid, sid)
+
+        t = threading.Thread(target=run)
+        t.start()
+        self.assertTrue(paused.wait(15), (verb, kind))
+        _mutation(mutator, pid, sid, kind)()    # committed on connection B
+        release.set()
+        t.join(20)
+        reader.close()
+        mutator.close()
+        return out["c"]
+
+    def test_get_races_are_snapshot_consistent(self):
+        for kind in _MUTATIONS:
+            with self.subTest(verb="GET", mutation=kind):
+                _assert_context_consistent(self, self._race("GET", kind), kind)
+
+    def test_post_races_are_snapshot_consistent(self):
+        for kind in _MUTATIONS:
+            with self.subTest(verb="POST", mutation=kind):
+                _assert_context_consistent(self, self._race("POST", kind), kind)
 
 
 class ActiveContextMigrationTest(unittest.TestCase):

@@ -3,12 +3,22 @@
 Which Program + Season a user is currently working in. A VIEW selection only: it
 never grants authority. On EVERY resolve and set it is filtered through the
 caller's real role + account scope (`context_scope`), so a scoped account can
-neither select nor enumerate a Program/Season outside its scope, and a saved
-selection is dropped the instant the underlying record is deleted or the scope
-changes. Program-only selection (no Season) is supported for new/empty Programs;
-an archived Season is honored as a read-only HISTORICAL context (writes against
-it stay blocked by the Season read-only guard), never silently replaced by an
-unrelated active Season.
+neither select nor enumerate a Program/Season outside its scope. A saved
+selection whose underlying record is deleted or which falls outside the caller's
+current scope is IGNORED on resolve (a deterministic authorized fallback is
+returned) but is NOT rewritten, so if authorization is later restored the saved
+choice resolves again. Program-only selection (no Season) is supported for
+new/empty Programs; an archived Season is honored as a read-only HISTORICAL
+context (writes against it stay blocked by the Season read-only guard), never
+silently replaced by an unrelated active Season.
+
+**Snapshot consistency.** ``resolve`` / ``set`` do every read inside ONE
+``store.transaction()`` and return the *exact* Program/Season objects they
+validated — not scalar ids the caller must re-fetch. The HTTP layer serializes
+those very objects and derives ``read_only`` from the returned Season, so the
+rendered payload can never internally contradict itself (``read_only`` always
+agrees with the serialized Season status; a non-null id always has its object)
+even if a concurrent archive / reopen / delete lands between requests.
 """
 
 from datetime import datetime, timezone
@@ -18,7 +28,9 @@ from ..domain import ActiveContext, SeasonStatus
 from ..domain.errors import NotFoundError, ValidationError
 from . import context_scope
 
-_Resolved = Tuple[Optional[str], Optional[str], bool]
+# (program, season) — the exact validated objects (either may be None), read
+# within one transaction so the caller renders a single authoritative snapshot.
+_Resolved = Tuple[Optional[object], Optional[object]]
 
 
 def _utcnow() -> datetime:
@@ -45,32 +57,37 @@ class ContextService:
 
     # -- resolution --------------------------------------------------------
     def resolve(self, user_id: Optional[str], role, scope) -> _Resolved:
-        """The caller's effective ``(program_id, season_id, read_only)``:
+        """The caller's effective ``(program, season)`` — the exact objects to
+        render, read within ONE transaction:
 
         * the saved selection when its Program is still authorized+present and
           its Season (if any) is still authorized+present — an ARCHIVED saved
           Season is honored as a read-only historical context;
         * else a deterministic authorized fallback (an active Season when the
           scope has one, otherwise a Program-only context);
-        * else an empty context. ``read_only`` is True iff the Season is archived.
+        * else an empty context ``(None, None)``.
+
+        The caller derives ``read_only`` from the returned Season and serializes
+        these very objects, so the payload is snapshot-consistent by construction.
         """
-        programs = context_scope.authorized_program_ids(
-            self.store, role, scope, user_id)
-        saved = self.store.get_active_context(user_id) if user_id else None
-        if (saved and saved.program_id in programs
-                and self.store.get_program(saved.program_id) is not None):
-            if saved.season_id is None:
-                return saved.program_id, None, False          # program-only
-            season = self.store.get_season(saved.season_id)
-            seasons = context_scope.authorized_season_ids(
-                self.store, role, scope, saved.program_id, user_id)
-            if season is not None and saved.season_id in seasons:
-                return (saved.program_id, saved.season_id,
-                        season.status == SeasonStatus.ARCHIVED)
-            # Season deleted or no longer authorized → do not dangle and do not
-            # invent an unrelated active Season under the same Program; take the
-            # deterministic fallback below.
-        return self._fallback(role, scope, user_id, programs)
+        with self.store.transaction():
+            programs = context_scope.authorized_program_ids(
+                self.store, role, scope, user_id)
+            saved = self.store.get_active_context(user_id) if user_id else None
+            if saved and saved.program_id in programs:
+                program = self.store.get_program(saved.program_id)
+                if program is not None:
+                    if saved.season_id is None:
+                        return program, None                  # program-only
+                    season = self.store.get_season(saved.season_id)
+                    seasons = context_scope.authorized_season_ids(
+                        self.store, role, scope, saved.program_id, user_id)
+                    if season is not None and saved.season_id in seasons:
+                        return program, season
+                    # Season deleted or no longer authorized → do not dangle and
+                    # do not invent an unrelated active Season under the same
+                    # Program; take the deterministic fallback below.
+            return self._fallback(role, scope, user_id, programs)
 
     def _fallback(self, role, scope, user_id, programs) -> _Resolved:
         candidates = sorted(
@@ -84,44 +101,51 @@ class ContextService:
             active = [s for s in (self.store.get_season(sid) for sid in season_ids)
                       if s is not None and s.status != SeasonStatus.ARCHIVED]
             if active:
-                return program.id, max(active, key=_season_sort_key).id, False
+                return program, max(active, key=_season_sort_key)
         # No authorized active Season anywhere → a Program-only context on the
         # first authorized Program (supports new/empty Programs, #159 gate).
         if candidates:
-            return candidates[0].id, None, False
-        return None, None, False
+            return candidates[0], None
+        return None, None
 
     # -- mutation ----------------------------------------------------------
     def set(self, user_id: Optional[str], role, scope,
             program_id, season_id) -> _Resolved:
-        """Record a user's selection, filtered through their authorized scope.
-        An unauthorized OR non-existent Program/Season both return the SAME
-        generic not-found (no existence oracle). ``season_id`` may be None
-        (Program-only). An archived Season is accepted as a read-only historical
-        context; writes against it stay blocked by the Season read-only guard."""
+        """Record a user's selection, filtered through their authorized scope,
+        and return the exact ``(program, season)`` objects validated+written so
+        the caller renders a single authoritative snapshot. An unauthorized OR
+        non-existent Program/Season both return the SAME generic not-found (no
+        existence oracle). ``season_id`` may be None (Program-only). An archived
+        Season is accepted as a read-only historical context; writes against it
+        stay blocked by the Season read-only guard. Validation and the write run
+        in one transaction, so a concurrent parent delete either is seen (and
+        rejected) here or lands after the row is written — where it is harmless,
+        since a saved row pointing at a since-deleted parent is ignored (never
+        rendered) by ``resolve`` and grants no authority."""
         if not user_id:
             raise ValidationError(
                 "A signed-in user is required to set a working context.")
         if not program_id:
             raise ValidationError("A program_id is required.",
                                   {"reason": "field_required"})
-        programs = context_scope.authorized_program_ids(
-            self.store, role, scope, user_id)
-        if (program_id not in programs
-                or self.store.get_program(program_id) is None):
-            # Non-oracle: identical result whether it doesn't exist or isn't ours.
-            raise NotFoundError("Program not found or not accessible.",
-                                {"reason": "program_not_accessible"})
-        read_only = False
-        if season_id is not None:
-            seasons = context_scope.authorized_season_ids(
-                self.store, role, scope, program_id, user_id)
-            season = self.store.get_season(season_id)
-            if season_id not in seasons or season is None:
-                raise NotFoundError("Season not found or not accessible.",
-                                    {"reason": "season_not_accessible"})
-            read_only = (season.status == SeasonStatus.ARCHIVED)
-        self.store.set_active_context(ActiveContext(
-            id=user_id, program_id=program_id, season_id=season_id,
-            updated_at=self.clock()))
-        return program_id, season_id, read_only
+        with self.store.transaction():
+            programs = context_scope.authorized_program_ids(
+                self.store, role, scope, user_id)
+            program = (self.store.get_program(program_id)
+                       if program_id in programs else None)
+            if program is None:
+                # Non-oracle: identical whether it doesn't exist or isn't ours.
+                raise NotFoundError("Program not found or not accessible.",
+                                    {"reason": "program_not_accessible"})
+            season = None
+            if season_id is not None:
+                seasons = context_scope.authorized_season_ids(
+                    self.store, role, scope, program_id, user_id)
+                season = self.store.get_season(season_id)
+                if season_id not in seasons or season is None:
+                    raise NotFoundError("Season not found or not accessible.",
+                                        {"reason": "season_not_accessible"})
+            self.store.set_active_context(ActiveContext(
+                id=user_id, program_id=program_id, season_id=season_id,
+                updated_at=self.clock()))
+            return program, season
