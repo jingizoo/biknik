@@ -405,6 +405,79 @@ class ContextAuthorizationMatrixTest(unittest.TestCase):
                     label)
                 _close(store)
 
+    def test_transfer_drops_prior_league_season_but_preserves_history(self):
+        # DECIDED behavior (#159 follow-up deliberately deferred, per the review
+        # on PR #307): a scoped Coach / live Player / verified Guardian sees the
+        # Seasons its Team actively participates in under its CURRENT league. A
+        # same-league ARCHIVED Season stays SELECTABLE read-only; but once the
+        # Team TRANSFERS to a new league (#283 same-Program rule), the prior
+        # league's frozen Season leaves the scoped entitlement — while the
+        # registration itself is preserved. Only the VIEW entitlement narrows;
+        # widening it to prior-Team history is a separate, security-sensitive
+        # slice. Proven on Memory/SQLite/PostgreSQL.
+        for label, store in _backends():
+            with self.subTest(backend=label):
+                api = ApiService(store)
+                pid = api.create_program("P1", "US", "UTC")["id"]
+                s1 = api.create_season(pid, "S1")["id"]
+                la = api.create_league(s1, "LA")["id"]
+                da = api.create_division(s1, "DA", league_id=la)["id"]
+                club = api.create_club("Club")["id"]
+                team = api.create_team(club_id=club, name="Alpha",
+                                       league_id=la, division_id=da)["id"]
+                api.setup.register_team_for_season(s1, team, da, league_id=la)
+                la_ls = store.league_seasons_for_league(la)[0].id
+                reg_before = store.registration_for_team_in_league_season(
+                    la_ls, team)
+                coach = (Role.COACH, {"team_id": team})
+                _archive(store, s1)
+                # Same-league archived history IS selectable read-only (retained).
+                r = api.set_active_context("coach", *coach, pid, s1)
+                self.assertEqual(r["season_id"], s1, (label, r))
+                self.assertTrue(r["read_only"], (label, r))
+                # Transfer the Team to a new League LB (same Program) in S2. #283
+                # freezes the archived S1/LA registration (never moved).
+                s2 = api.create_season(pid, "S2")["id"]
+                lb = api.create_league(s2, "LB")["id"]
+                db = api.create_division(s2, "DB", league_id=lb)["id"]
+                moved = api.transfer_team_to_league(team, lb)
+                self.assertNotIn("error", moved, (label, moved))
+                api.setup.register_team_for_season(s2, team, db, league_id=lb)
+                player = api.create_player(team, "Pat", "forward")["id"]
+                junior = api.create_player(team, "Jun", "forward")["id"]
+                ts = datetime(2027, 1, 1, tzinfo=timezone.utc)
+                with store.transaction():
+                    store.add_guardian_link(GuardianLink(
+                        id="gl_t", guardian_user_id="guard", player_id=junior,
+                        created_at=ts, verified=True))
+                subjects = (("coach", coach), ("player",
+                            (Role.PLAYER, {"player_id": player})),
+                            ("guard", (Role.GUARDIAN, {})))
+                for uid, rs in subjects:
+                    cc = api.get_active_context(uid, *rs)
+                    # Same Program; fallback prefers the CURRENT active Season S2.
+                    self.assertEqual(cc["program_id"], pid, (label, uid, cc))
+                    self.assertEqual(cc["season_id"], s2, (label, uid, cc))
+                    self.assertFalse(cc["read_only"], (label, uid, cc))
+                    # The prior-league S1 is no longer selectable (decided loss),
+                    # as a non-oracle not_found; the current S2 still is.
+                    self.assertEqual(
+                        api.set_active_context(uid, *rs, pid, s1)["error"]["code"],
+                        "not_found", (label, uid))
+                    self.assertEqual(
+                        api.set_active_context(uid, *rs, pid, s2)["season_id"],
+                        s2, (label, uid))
+                # An unrelated identity is still denied the whole Program.
+                self.assertIsNone(api.get_active_context(
+                    "stranger", Role.COACH, {"team_id": "ghost"})["program_id"],
+                    label)
+                # History is preserved: the frozen S1/LA registration is intact.
+                reg_after = store.registration_for_team_in_league_season(
+                    la_ls, team)
+                self.assertIsNotNone(reg_after, label)
+                self.assertEqual(reg_after.id, reg_before.id, label)
+                _close(store)
+
     def test_genuinely_unknown_role_fails_closed(self):
         for label, store in _backends():
             with self.subTest(backend=label):

@@ -147,10 +147,23 @@ role + account scope (`services/context_scope.py`, the same #211/#266/#202 rules
 the rest of the app uses): the two global operators and the read-only Viewer see
 every Program (the current model has no org-scoped operator — when one lands,
 `context_scope` is the single place to narrow it); a Coach/Player sees only its
-team's Program and that team's participating Seasons; an Official only the
-Programs/Seasons of its assigned games; a Guardian only its verified juniors';
-an unbound/unknown role fails closed. So a scoped account can neither select nor
-*enumerate* an unrelated context. A saved selection outside the caller's *current*
+team's Program and the Seasons its team **actively participates in under its
+current League** (a same-league Season that is later archived stays selectable
+read-only); an Official only the Programs/Seasons of its assigned games; a
+Guardian only its verified juniors'; an unbound/unknown role fails closed. So a
+scoped account can neither select nor *enumerate* an unrelated context.
+
+**Prior-Team history is out of scope for this slice.** When a Team **transfers**
+to a new League, #283 freezes its prior registration under the *former*
+LeagueSeason. That Season leaves the scoped user's entitlement (their Team's
+current-league participation no longer includes it), so a scoped Coach/Player/
+Guardian loses selectable access to a *prior* Team Season after a transfer —
+even though the registration, Games, results and standings remain preserved and
+readable through the ordinary (id-scoped) history views. Restoring historical
+entitlement across a Team's prior registrations is a deliberate **#159
+follow-up** (below); it is deferred because it would widen a scoped user's view
+to Seasons under a League their Team has left, which warrants its own reviewed
+slice. This slice's tests assert the *current* (narrowed) behavior explicitly. A saved selection outside the caller's *current*
 authorized scope is **ignored** (a fallback is returned) but the row is **not
 rewritten**, so if authorization is later restored the saved choice resolves
 again. "Which team does this caller act for" is resolved by
@@ -207,4 +220,11 @@ Remaining #159 work, to be taken as separate slices: the authenticated-shell
 **switcher UI + deep-link restoration** consuming these endpoints; then
 **consumer-by-consumer cross-context isolation** (lists, counts, exports,
 background jobs resolving strictly through the selected Season); then
-**new-Season copy-forward preview**. #159 stays open.
+**new-Season copy-forward preview**; and **prior-Team historical entitlement**
+— letting a scoped Coach/Player/Guardian re-enter (read-only) a Season their
+Team was registered in under a League it has since **left** (resolving view
+entitlement from all of a Team's registrations, independent of its current
+`league_id`, kept separate from the active-work fallback). That last one is a
+security-sensitive scope widening — a scoped user would regain view access to a
+Season under a League their Team left — so it is intentionally its own slice.
+#159 stays open.

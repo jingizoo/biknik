@@ -30,7 +30,18 @@ _GLOBAL_ROLES = frozenset({Role.LEAGUE_ADMIN, Role.ARENA_MANAGER, Role.VIEWER})
 
 def _team_season_ids(store, team):
     """Season ids a Team actively participates in — its permanent League's
-    LeagueSeasons crossed with its active registrations (#283 permanent model)."""
+    LeagueSeasons crossed with its active registrations (#283 permanent model).
+
+    Scope note (#159): this is the Team's CURRENT-league active participation.
+    A same-league Season that is later ARCHIVED stays here (its registration is
+    still active), so a scoped user keeps read-only access to its own league's
+    history. But once a Team TRANSFERS to a new League, #283 freezes its prior
+    registration under the FORMER LeagueSeason — that Season is intentionally NOT
+    surfaced here, so a scoped Coach/Player/Guardian loses prior-Team history.
+    Restoring historical entitlement across a Team's prior registrations is a
+    deliberate #159 follow-up (see ``docs/architecture/season-lifecycle.md``);
+    it is deferred because it would widen a scoped user's view to Seasons under a
+    League their Team has left, which warrants its own reviewed slice."""
     out = set()
     if team is None:
         return out
