@@ -44,7 +44,6 @@ let newFeedUrl = null;             // freshly-minted feed URL, shown once (#82)
 // scoped user can neither select nor enumerate an unrelated context). A saved
 // DISPLAY context only — existing screens are not filtered by it yet.
 let contextOptions = null;         // {programs:[{id,name,seasons:[...]}], selected:{program_id,season_id,read_only}}
-let contextMenuOpen = false;       // switcher popover open state
 let publicState = { schedule: null, standings: null, division: null, game: null,
   feedUrl: null, feedLabel: null };  // feedUrl/feedLabel: freshly-minted public calendar subscription (#33)
 let publicTab = "schedule";        // "schedule" | "standings" (#83)
@@ -6574,20 +6573,29 @@ function renderDemoMenu() {
 }
 
 // -- active Program/Season context switcher (#159) -----------------------
-// A structured, ENCODED hash (versioned JSON, base64) rather than a plain
-// "#ctx=program:season" — it round-trips program/season without a fragile
-// delimiter and coexists with the existing "#public" guest route (different
-// prefix), which we never clobber.
+// A structured, ENCODED hash (versioned JSON in URL-safe Base64URL — RFC 4648
+// §5: +/ → -_, no "=" padding, so it needs no extra percent-encoding) rather
+// than a plain "#ctx=program:season". It round-trips program/season without a
+// fragile delimiter and coexists with the existing "#public" guest route
+// (different prefix), which we never clobber.
+function b64urlEncode(s) {
+  return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+function b64urlDecode(s) {
+  s = s.replace(/-/g, "+").replace(/_/g, "/");
+  while (s.length % 4) s += "=";
+  return atob(s);
+}
 function encodeContextHash(programId, seasonId) {
   try {
-    return "#ctx=" + encodeURIComponent(
-      btoa(JSON.stringify({ v: 1, p: programId || null, s: seasonId || null })));
+    return "#ctx=" + b64urlEncode(
+      JSON.stringify({ v: 1, p: programId || null, s: seasonId || null }));
   } catch (_) { return ""; }
 }
 function decodeContextHash(hash) {
   if (!hash || hash.indexOf("#ctx=") !== 0) return null;
   try {
-    const o = JSON.parse(atob(decodeURIComponent(hash.slice(5))));
+    const o = JSON.parse(b64urlDecode(hash.slice(5)));
     if (!o || o.v !== 1 || !o.p) return null;
     return { program_id: o.p, season_id: o.s || null };
   } catch (_) { return null; }
@@ -6642,7 +6650,6 @@ async function restoreContextDeepLink() {
 }
 // Persist a switcher pick, then reflect it in the hash and re-render.
 async function setActiveContext(programId, seasonId) {
-  contextMenuOpen = false;
   const r = await post("/api/context",
     { program_id: programId, season_id: seasonId || null });
   if (!r || r.error) {
@@ -6662,83 +6669,76 @@ async function setActiveContext(programId, seasonId) {
   syncContextHash();
   render();
 }
-// Paint the switcher for the current authorized options + selection. One
-// component for every role: a menu when there is a real choice, a static chip
-// when there is exactly one selectable context.
+// The switcher's flat option list: EVERY authorized Program is Program-only-
+// selectable (a "no season" entry, season_id=null), plus one entry per authorized
+// Season. Encoded as "program_id|season_id" (season blank ⇒ Program-only). This
+// is the single source for both the count (static-chip decision) and the markup.
+function contextEntries(opts) {
+  const multi = opts.programs.length > 1;
+  const out = [];
+  opts.programs.forEach((p) => {
+    out.push({ value: p.id + "|", label: "Program overview (no season)",
+      programId: p.id, seasonId: null, readOnly: false, programName: p.name });
+    p.seasons.forEach((s) => out.push({
+      value: p.id + "|" + s.id,
+      label: s.name + (s.read_only ? " · archived (read-only)" : ""),
+      programId: p.id, seasonId: s.id, readOnly: !!s.read_only,
+      programName: p.name }));
+  });
+  return { entries: out, multi };
+}
+// Paint the switcher for the current authorized options + selection. One native
+// <select> for every role (full keyboard/AT semantics for free); a static chip
+// only when there is a single selectable context. The read-only badge and the
+// persistent "display only" note reflect the current state in the CLOSED view.
 function renderContextSwitcher() {
   const wrap = document.getElementById("context-switcher");
-  const btn = document.getElementById("ctx-btn");
-  const dd = document.getElementById("ctx-dropdown");
-  if (!wrap || !btn || !dd) return;
+  const select = document.getElementById("ctx-select");
+  const chip = document.getElementById("ctx-static");
+  const roBadge = document.getElementById("ctx-ro");
+  if (!wrap || !select || !chip || !roBadge) return;
   const opts = contextOptions;
   const show = !!(currentUser && opts && opts.programs && opts.programs.length);
   wrap.hidden = !show;
-  if (!show) { contextMenuOpen = false; dd.hidden = true; return; }
+  if (!show) return;
+  const { entries, multi } = contextEntries(opts);
   const sel = opts.selected || {};
-  const prog = opts.programs.find((p) => p.id === sel.program_id) || null;
-  const season = (prog && sel.season_id)
-    ? (prog.seasons.find((s) => s.id === sel.season_id) || null) : null;
-  const ro = !!(season && season.read_only);
-  const label = prog ? (season ? `${prog.name} · ${season.name}` : prog.name)
-    : "No active context";
-  // A program with Seasons contributes one option per Season; a Season-less
-  // program contributes one (Program-only). One total ⇒ a static chip.
-  const count = opts.programs.reduce(
-    (n, p) => n + Math.max(1, p.seasons.length), 0);
-  const single = count <= 1;
-  btn.innerHTML = `<span class="ctx-caption">Context</span>`
-    + `<span class="ctx-label">${esc(label)}</span>`
-    + (ro ? `<span class="ctx-ro">read-only</span>` : "")
-    + (single ? "" : `<span class="ctx-caret" aria-hidden="true">▾</span>`);
-  btn.disabled = single;
-  btn.classList.toggle("is-static", single);
-  btn.setAttribute("aria-expanded", (!single && contextMenuOpen) ? "true" : "false");
-  btn.title = single
-    ? "Your active Program/Season (saved display context)"
-    : "Switch your active Program/Season — a saved display context";
-  if (single) { contextMenuOpen = false; dd.hidden = true; return; }
-  const multiProgram = opts.programs.length > 1;
-  const item = (pid, sid, text, isSel, badgeRo) =>
-    `<button class="ctx-item${isSel ? " sel" : ""}" role="menuitemradio"`
-    + ` aria-checked="${isSel ? "true" : "false"}"`
-    + ` data-ctx-p="${esc(pid)}" data-ctx-s="${esc(sid || "")}">`
-    + `<span>${esc(text)}</span>`
-    + (badgeRo ? `<span class="ctx-badge">archived · read-only</span>` : "")
-    + (isSel ? `<span class="ctx-check" aria-hidden="true">✓</span>` : "")
-    + `</button>`;
-  const rows = [`<div class="ctx-note">Saved display context — screens aren't`
-    + ` filtered by this yet.</div>`];
-  opts.programs.forEach((p) => {
-    if (multiProgram) rows.push(`<div class="ctx-prog">${esc(p.name)}</div>`);
-    if (!p.seasons.length) {
-      rows.push(item(p.id, "", multiProgram ? "No seasons yet"
-        : `${p.name} (no seasons yet)`, sel.program_id === p.id, false));
-    } else {
-      p.seasons.forEach((s) => rows.push(item(p.id, s.id, s.name,
-        sel.program_id === p.id && sel.season_id === s.id, s.read_only)));
-    }
-  });
-  dd.innerHTML = rows.join("");
-  dd.hidden = !contextMenuOpen;
+  const curValue = (sel.program_id || "") + "|" + (sel.season_id || "");
+  const curEntry = entries.find((e) => e.value === curValue) || null;
+  // Read-only badge is a persistent, always-visible reflection of the selection.
+  roBadge.hidden = !(curEntry && curEntry.readOnly);
+  const single = entries.length <= 1;
+  if (single) {
+    select.hidden = true; chip.hidden = false;
+    const e = entries[0];
+    chip.textContent = multi ? `${e.programName} · ${e.label}` : e.label;
+    return;
+  }
+  chip.hidden = true; select.hidden = false;
+  const optionTag = (e) => `<option value="${esc(e.value)}"`
+    + `${e.value === curValue ? " selected" : ""}>${esc(e.label)}</option>`;
+  if (multi) {
+    const groups = [];
+    opts.programs.forEach((p) => {
+      const items = entries.filter((e) => e.programId === p.id).map(optionTag);
+      groups.push(`<optgroup label="${esc(p.name)}">${items.join("")}</optgroup>`);
+    });
+    select.innerHTML = groups.join("");
+  } else {
+    select.innerHTML = entries.map(optionTag).join("");
+  }
 }
-// Wire the switcher once (mirrors the demo-menu wiring above).
-const ctxBtn = document.getElementById("ctx-btn");
-const ctxDropdown = document.getElementById("ctx-dropdown");
-if (ctxBtn) ctxBtn.onclick = (e) => {
-  e.stopPropagation();
-  if (ctxBtn.disabled) return;
-  contextMenuOpen = !contextMenuOpen;
-  renderContextSwitcher();
+// Wire the native select once. A native <select> gives the full keyboard /
+// screen-reader contract (focus, Arrow/Home/End, type-ahead, Enter/Escape) for
+// free, so no custom menu-radio handling is needed.
+const ctxSelect = document.getElementById("ctx-select");
+if (ctxSelect) ctxSelect.onchange = (e) => {
+  const raw = e.target.value || "";
+  const bar = raw.indexOf("|");
+  const p = bar >= 0 ? raw.slice(0, bar) : raw;
+  const s = bar >= 0 ? raw.slice(bar + 1) : "";
+  setActiveContext(p, s || null);
 };
-if (ctxDropdown) ctxDropdown.onclick = (e) => {
-  const item = e.target.closest("[data-ctx-p]");
-  if (!item) return;
-  e.stopPropagation();
-  setActiveContext(item.dataset.ctxP, item.dataset.ctxS || null);
-};
-document.addEventListener("click", () => {
-  if (contextMenuOpen) { contextMenuOpen = false; renderContextSwitcher(); }
-});
 
 // Sign out ends the server session and returns to the sign-in screen (#71).
 const signoutBtn = document.getElementById("signout-btn");
@@ -6749,7 +6749,7 @@ if (signoutBtn) signoutBtn.onclick = async () => {
   try { localStorage.setItem("hs_signed_out", "1"); } catch (_) {}
   setUser(null); toast = "";
   // Drop the active-context selection + its URL hash with the session (#159).
-  contextOptions = null; contextMenuOpen = false;
+  contextOptions = null;
   if (location.hash.indexOf("#ctx=") === 0) {
     history.replaceState(null, "", location.pathname + location.search);
   }

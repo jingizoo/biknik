@@ -233,8 +233,10 @@ grants no authority.
 The topbar Program/Season switcher (`web/static`: `#context-switcher` in
 `index.html`, `renderContextSwitcher`/`setActiveContext` in `app.js`) — a saved
 **display** context, consuming the Slice-2 endpoints. It grants no authority and
-**does not filter existing screens yet** (that is the isolation slice below); it
-is one consistent control for every role, and labels itself as such.
+**does not filter existing screens yet** (that is the isolation slice below), so
+a persistent, always-visible “display only · screens not filtered” note sits
+next to the control in its normal closed state (not hidden inside a dropdown or a
+hover tooltip). It is one consistent control for every role.
 
 - **`GET /api/context/options`** → `{programs: [{id, name, seasons: [{id, name,
   status, read_only, start_date}]}], selected: {program_id, season_id,
@@ -242,23 +244,33 @@ is one consistent control for every role, and labels itself as such.
   (`ContextService.options` runs under the same one serializable snapshot). So
   the switcher only ever offers a context the caller could actually select — it
   never enumerates an unrelated Program/Season from the (unfiltered) overview.
-  Each Program is Program-only-selectable and lists only its authorized Seasons
-  (archived ones flagged read-only). `selected` is guaranteed to be one of the
-  options. Session-only, like the other context endpoints.
-- **One control, every role.** The switcher renders as an interactive menu when
-  there is a real choice and as a **static chip** when there is exactly one
-  selectable context. It never hard-codes role logic in the browser — the
-  authorized option set comes entirely from the endpoint above. A `POST` of an
-  option the server rejects (a race) surfaces the same generic not-found, shown
-  as a generic message (no existence oracle).
+  A **Program-overview (no-season)** choice is offered for **every** authorized
+  Program — even when that Program has Seasons — in addition to one entry per
+  authorized Season (archived ones flagged read-only). `selected` is guaranteed
+  to be one of the options. Session-only, like the other context endpoints.
+- **One control, every role — a native `<select>`.** The switcher renders as a
+  native `<select>` (grouped by Program via `<optgroup>` when more than one
+  Program is authorized) so it gets the full keyboard / screen-reader contract —
+  focus, Arrow/Home/End, type-ahead, Enter/Escape — for free, with no custom
+  menu-radio handling. It collapses to a **static chip** only when there is
+  exactly one selectable context (a single Program with no Seasons). The
+  read-only badge is a persistent reflection of the current selection, visible
+  in the closed state. It never hard-codes role logic in the browser — the
+  option set comes entirely from the endpoint above. A `POST` of an option the
+  server rejects (a race) surfaces the same generic not-found, shown as a
+  generic message (no existence oracle).
 - **Deep-link restoration.** The selection is mirrored in a structured, encoded
-  URL hash (`#ctx=<base64url(JSON)>`, versioned) via `replaceState` — coexisting
-  with the existing `#public` guest route, never clobbering it. On load the
-  persisted context (from the endpoint) is applied first; if the URL carries a
-  *different* context, it is adopted by `POST` (the backend authorizes it — no
-  client-side role logic), and an unauthorized **or** non-existent link is
-  normalized to the persisted context with a generic message, then the hash is
-  rewritten to the resolved selection.
+  URL hash (`#ctx=<base64url(JSON)>` — a versioned `{v,p,s}` object encoded with
+  true Base64URL: `+`→`-`, `/`→`_`, `=` padding stripped, **no** percent-
+  encoding) via `replaceState` — coexisting with the existing `#public` guest
+  route (a different prefix), never clobbering it. On load the persisted context
+  (from the endpoint) is applied first; if the URL carries a *different* context,
+  it is adopted by `POST` (the backend authorizes it — no client-side role
+  logic), and an unauthorized **or** non-existent link is normalized to the
+  persisted context with a generic message, then the hash is rewritten to the
+  resolved selection (never the bogus id). Because the SPA has no `hashchange`
+  listener, a shared link is adopted on a full load of that URL (a new tab /
+  reload), matching the `#public` precedent.
 
 ## Scope / follow-ups
 
