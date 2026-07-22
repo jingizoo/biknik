@@ -2562,17 +2562,12 @@ class SetupService:
         reported, a rerun creates nothing. Audited per slot + a batch summary.
         Requires an active Season (#159).
         """
-        base = self._plan_ice_availability(
-            season_id=season_id, rink_ids=rink_ids, weekdays=weekdays,
-            start_local=start_local, end_local=end_local,
-            start_date=start_date, end_date=end_date,
-            playable_minutes=playable_minutes, turnover_minutes=turnover_minutes,
-            exclusion_dates=exclusion_dates)
-        windows = base["plan"]["windows"]
-        # De-duplicated selected rinks (same as planning). base's preview-time
-        # accessible / access_missing are deliberately NOT reused here: commit
-        # re-resolves venue access INSIDE the write transaction below so a
-        # revoke/move/delete that landed after the preview read can't leak ice.
+        # De-duplicated selected rinks (same as _plan_ice_availability does).
+        # NOTHING authoritative is resolved from mutable state out here: the
+        # entire plan — Season boundaries, Program timezone, generated windows
+        # AND venue access — is (re)built INSIDE the write transaction below,
+        # under the Season / Program / rink locks, so nothing it produces can be
+        # stale relative to committed state.
         requested_rink_ids = list(dict.fromkeys(rink_ids or []))
         # Generated up front so every per-slot audit row is tagged with it.
         batch_id = self.store.next_id("iceavailbatch")
@@ -2585,23 +2580,34 @@ class SetupService:
             created, dup, conflict = [], 0, 0
             try:
                 with self.store.transaction():
-                    # Fixed lock order (Season, then rinks by id) — two commits
-                    # can never deadlock; the locks are held to commit so the
-                    # access re-resolution and classification below can't go
-                    # stale under them.
-                    self._require_active_season(season_id)
+                    # Fixed lock order (Season, Program, then rinks by id) —
+                    # shared with the other writers of these rows (a hierarchy
+                    # re-import updates Season dates / Program timezone; grant /
+                    # revoke and manual slot writes take the Season / rink locks),
+                    # so no deadlock. All are held to commit, so the plan built
+                    # under them is one consistent snapshot.
+                    season = self._require_active_season(season_id)
+                    if season.program_id:
+                        self.store.get_program_for_update(season.program_id)
                     for rid in sorted(requested_rink_ids):
                         self.store.get_rink_for_update(rid)
-                    # Re-resolve venue access UNDER the locks (#158 review): a
-                    # SeasonVenueAccess revoked — or a rink moved to an
-                    # un-accessed venue — after the preview read is caught here,
-                    # so no Game ice is created for a venue the season no longer
-                    # reaches. grant/revoke both take the Season row lock this
-                    # commit already holds, so the decision is linearized against
-                    # them; a rink deleted meanwhile is the same stable
-                    # rink_missing NotFoundError, rolling the whole batch back.
-                    accessible, access_missing = self._split_rinks_by_access(
-                        season_id, requested_rink_ids)
+                    # Build the ENTIRE plan UNDER the locks (#158 review): the
+                    # Season boundaries, Program timezone and generated UTC
+                    # windows can't be shifted out of range or to the wrong
+                    # instants by a concurrent metadata edit, and venue access is
+                    # re-resolved so a revoke/move/delete after the preview read
+                    # can't leak ice (grant/revoke take the Season lock we hold; a
+                    # deleted rink is the same stable rink_missing, rolling back).
+                    base = self._plan_ice_availability(
+                        season_id=season_id, rink_ids=rink_ids,
+                        weekdays=weekdays, start_local=start_local,
+                        end_local=end_local, start_date=start_date,
+                        end_date=end_date, playable_minutes=playable_minutes,
+                        turnover_minutes=turnover_minutes,
+                        exclusion_dates=exclusion_dates)
+                    windows = base["plan"]["windows"]
+                    accessible = base["accessible"]
+                    access_missing = base["access_missing"]
                     access_skipped = len(access_missing)
                     existing_by_rink = {}
                     for s in self.store.all_ice_slots():

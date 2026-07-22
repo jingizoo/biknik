@@ -1042,6 +1042,12 @@ class SqlStore:
 
     def add_program(self, program): return self._write_program(self._insert, program)
     def get_program(self, program_id): return self._get(Program, program_id)
+
+    def get_program_for_update(self, program_id):
+        # Row lock (#158) so ice-availability commit reads the Program timezone
+        # under the same lock a concurrent import's timezone update contends for,
+        # keeping the generated calendar windows consistent with committed state.
+        return self._get_for_update(Program, program_id)
     def all_programs(self): return self._query(Program, order="id")
     def save_program(self, program): return self._write_program(self._update, program)
 

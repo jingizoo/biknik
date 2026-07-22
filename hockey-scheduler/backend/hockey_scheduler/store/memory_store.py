@@ -383,6 +383,12 @@ class InMemoryStore:
     def get_program(self, program_id: str) -> Optional[Program]:
         return self.programs.get(program_id)
 
+    def get_program_for_update(self, program_id: str) -> Optional[Program]:
+        # Interface parity with SqlStore (#158): transaction() holds self._lock
+        # for its whole body, so no row lock is needed to keep a concurrent
+        # timezone update from interleaving with the caller's read-then-write.
+        return self.programs.get(program_id)
+
     def add_season(self, season: Season) -> Season:
         self.seasons[season.id] = season
         return season

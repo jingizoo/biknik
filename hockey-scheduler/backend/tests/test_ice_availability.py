@@ -154,6 +154,65 @@ class IceAvailabilityContract:
         self.assertEqual([a for a in self.store.all_setup_audit()
                           if a.action == "ice_slot_created"], [])
 
+    def test_commit_reads_program_timezone_under_the_lock(self):
+        # #158 review: the calendar (Program timezone -> UTC windows) is built
+        # INSIDE the write transaction, so a timezone change (e.g. a hierarchy
+        # re-import) that lands before the plan is built is honored — slots never
+        # commit at stale UTC instants. Change the zone at the lock step (after
+        # the Program lock, before the plan) and assert the committed windows use
+        # the NEW zone, not the one a pre-transaction read would have captured.
+        orig = self.store.get_rink_for_update
+        fired = []
+
+        def retz_then_lock(rid):
+            if not fired:
+                fired.append(True)
+                prog = self.store.get_program("prog_1")
+                prog.timezone = "UTC"                 # was America/Toronto (EDT)
+                self.store.save_program(prog)
+            return orig(rid)
+
+        self.store.get_rink_for_update = retz_then_lock
+        res = self.api.commit_ice_availability(actor_id="a", **_template())
+        self.assertEqual(res["totals"]["created"], 6)
+        # 18:00 local is now 18:00 UTC, not 22:00 UTC (Toronto EDT) — proof the
+        # windows were generated from the zone read under the lock.
+        first = min(self._slots(), key=lambda s: s.start_time)
+        self.assertEqual(first.start_time,
+                         datetime(2026, 9, 1, 18, tzinfo=timezone.utc))
+
+    def test_commit_reads_season_range_under_the_lock(self):
+        # When the range is left to default, it comes from the Season boundaries
+        # — also read INSIDE the write transaction. Narrow the Season at the lock
+        # step and assert the committed windows honor the NEW (narrower) range, so
+        # no slot lands outside the Season a concurrent date edit just committed.
+        orig = self.store.get_rink_for_update
+        fired = []
+
+        def narrow_then_lock(rid):
+            if not fired:
+                fired.append(True)
+                season = self.store.get_season("season_1")
+                # End the Season at 2026-09-02 local midnight, so only the first
+                # Tuesday (2026-09-01) stays in range (2026-09-02 is a Wednesday).
+                season.end_date = datetime(2026, 9, 2, 4, tzinfo=timezone.utc)
+                self.store.save_season(season)
+            return orig(rid)
+
+        self.store.get_rink_for_update = narrow_then_lock
+        tmpl = _template()                      # default the range to the Season
+        tmpl.pop("start_date")
+        tmpl.pop("end_date")
+        res = self.api.commit_ice_availability(actor_id="a", **tmpl)
+        self.assertEqual(res["totals"]["created"], 3)     # only the first Tuesday
+        # No slot falls outside the narrowed Season range [start, end] (as the
+        # UTC instants the Season stores) — without reading the Season under the
+        # lock, the old 7-month range would have generated ~180 windows.
+        s_start = datetime(2026, 9, 1, 4, tzinfo=timezone.utc)
+        s_end = datetime(2026, 9, 2, 4, tzinfo=timezone.utc)
+        self.assertTrue(all(s_start <= s.start_time and s.end_time <= s_end
+                            for s in self._slots()))
+
     # -- 2. exclusion dates -------------------------------------------------
     def test_exclusion_dates_skipped_and_explained(self):
         pv = self.api.preview_ice_availability(
@@ -348,6 +407,7 @@ class PostgresIceAvailabilityConcurrencyTest(unittest.TestCase):
         season = s.create_season(prog.id, "Fall 2026")
         venue = s.create_venue("Main Arena", league_id=prog.id)
         self.access_id = s.grant_season_venue_access(season.id, venue.id).id
+        self.program_id = prog.id
         self.season_id = season.id
         self.rink_id = s.create_rink(venue.id, "Rink A").id
 
@@ -487,6 +547,29 @@ class PostgresIceAvailabilityConcurrencyTest(unittest.TestCase):
         self.assertEqual(len(slots), created)          # exactly what commit reported
         if created == 0:                               # revoke won the lock race
             self.assertEqual(out[0]["totals"]["access_skipped_rinks"], 1)
+
+    def test_commit_vs_timezone_change(self):
+        # commit reads the Program timezone (and generates its UTC windows) under
+        # a Program row lock; a concurrent raw timezone write contends for that
+        # lock, so they serialize. Under either ordering the committed windows are
+        # wholly ONE zone — all six at Toronto instants (first 22:00 UTC) or all
+        # six at UTC instants (first 18:00 UTC) — never a stale mix of both, and
+        # never a raw error.
+        commit = lambda svc: svc.commit_ice_availability(  # noqa: E731
+            actor_id="c", **self._template())
+
+        def change_tz(svc):
+            prog = svc.store.get_program(self.program_id)
+            prog.timezone = "UTC"
+            svc.store.save_program(prog)
+
+        out = self._run([commit, change_tz])
+        self.assertNotIsInstance(out[0], Exception, f"commit raised: {out[0]!r}")
+        slots = self._assert_unique_and_non_overlapping()
+        self.assertEqual(len(slots), 6)            # one zone's worth, never mixed
+        self.assertIn(min(s.start_time for s in slots),
+                      (datetime(2026, 9, 1, 22, tzinfo=timezone.utc),   # Toronto
+                       datetime(2026, 9, 1, 18, tzinfo=timezone.utc)))  # UTC
 
 
 class PlannerUnitTest(unittest.TestCase):
