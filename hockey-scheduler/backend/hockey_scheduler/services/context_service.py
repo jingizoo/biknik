@@ -19,6 +19,16 @@ those very objects and derives ``read_only`` from the returned Season, so the
 rendered payload can never internally contradict itself (``read_only`` always
 agrees with the serialized Season status; a non-null id always has its object)
 even if a concurrent archive / reopen / delete lands between requests.
+
+**Authorization is per-request-current, not linearizable.** The scope filter
+reflects the committed state each read sees (READ COMMITTED on PostgreSQL),
+recomputed every request — NOT a serializable snapshot taken atomically with a
+concurrent scope-changing write. A revocation (Official unassign, Player/Guardian
+reassignment) that commits mid-request may leave this one call resolving/persisting
+the caller's former Program(-only) context. That is low-impact and self-correcting
+by design: the selection grants no authority (every real op re-authorizes) and the
+next request sees the new scope. Strict linearizability is a tracked #159 follow-up
+(see ``docs/architecture/season-lifecycle.md``).
 """
 
 import copy
