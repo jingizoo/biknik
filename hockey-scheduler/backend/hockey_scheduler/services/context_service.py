@@ -21,6 +21,7 @@ agrees with the serialized Season status; a non-null id always has its object)
 even if a concurrent archive / reopen / delete lands between requests.
 """
 
+import copy
 from datetime import datetime, timezone
 from typing import Callable, Optional, Tuple
 
@@ -31,6 +32,17 @@ from . import context_scope
 # (program, season) — the exact validated objects (either may be None), read
 # within one transaction so the caller renders a single authoritative snapshot.
 _Resolved = Tuple[Optional[object], Optional[object]]
+
+
+def _detached(obj):
+    """A copy of ``obj`` detached from the store's live row. Response rendering
+    happens AFTER the transaction lock is released, and ``InMemoryStore`` hands
+    back its shared, mutable rows; returning a private copy means a concurrent
+    in-place archive/reopen can never mutate the object mid-render (so the two
+    reads ``_context_view`` makes of it — ``read_only`` then serialization —
+    always see one frozen value). ``SqlStore`` already materializes a fresh row
+    per read; the copy is a harmless no-op there."""
+    return copy.copy(obj) if obj is not None else None
 
 
 def _utcnow() -> datetime:
@@ -69,25 +81,33 @@ class ContextService:
 
         The caller derives ``read_only`` from the returned Season and serializes
         these very objects, so the payload is snapshot-consistent by construction.
+        The returned objects are DETACHED from the store's live rows before the
+        lock is released, so rendering cannot observe a concurrent in-place edit.
         """
         with self.store.transaction():
-            programs = context_scope.authorized_program_ids(
-                self.store, role, scope, user_id)
-            saved = self.store.get_active_context(user_id) if user_id else None
-            if saved and saved.program_id in programs:
-                program = self.store.get_program(saved.program_id)
-                if program is not None:
-                    if saved.season_id is None:
-                        return program, None                  # program-only
-                    season = self.store.get_season(saved.season_id)
-                    seasons = context_scope.authorized_season_ids(
-                        self.store, role, scope, saved.program_id, user_id)
-                    if season is not None and saved.season_id in seasons:
-                        return program, season
-                    # Season deleted or no longer authorized → do not dangle and
-                    # do not invent an unrelated active Season under the same
-                    # Program; take the deterministic fallback below.
-            return self._fallback(role, scope, user_id, programs)
+            program, season = self._resolve_locked(user_id, role, scope)
+            return _detached(program), _detached(season)
+
+    def _resolve_locked(self, user_id, role, scope) -> _Resolved:
+        """The validated ``(program, season)`` live rows — MUST run inside the
+        transaction; ``resolve`` detaches the result before the lock releases."""
+        programs = context_scope.authorized_program_ids(
+            self.store, role, scope, user_id)
+        saved = self.store.get_active_context(user_id) if user_id else None
+        if saved and saved.program_id in programs:
+            program = self.store.get_program(saved.program_id)
+            if program is not None:
+                if saved.season_id is None:
+                    return program, None                      # program-only
+                season = self.store.get_season(saved.season_id)
+                seasons = context_scope.authorized_season_ids(
+                    self.store, role, scope, saved.program_id, user_id)
+                if season is not None and saved.season_id in seasons:
+                    return program, season
+                # Season deleted or no longer authorized → do not dangle and do
+                # not invent an unrelated active Season under the same Program;
+                # take the deterministic fallback below.
+        return self._fallback(role, scope, user_id, programs)
 
     def _fallback(self, role, scope, user_id, programs) -> _Resolved:
         candidates = sorted(
@@ -112,8 +132,10 @@ class ContextService:
     def set(self, user_id: Optional[str], role, scope,
             program_id, season_id) -> _Resolved:
         """Record a user's selection, filtered through their authorized scope,
-        and return the exact ``(program, season)`` objects validated+written so
-        the caller renders a single authoritative snapshot. An unauthorized OR
+        and return the exact ``(program, season)`` objects validated+written
+        (DETACHED from the store's live rows) so the caller renders a single
+        authoritative snapshot that a concurrent edit cannot mutate. An
+        unauthorized OR
         non-existent Program/Season both return the SAME generic not-found (no
         existence oracle). ``season_id`` may be None (Program-only). An archived
         Season is accepted as a read-only historical context; writes against it
@@ -148,4 +170,4 @@ class ContextService:
             self.store.set_active_context(ActiveContext(
                 id=user_id, program_id=program_id, season_id=season_id,
                 updated_at=self.clock()))
-            return program, season
+            return _detached(program), _detached(season)

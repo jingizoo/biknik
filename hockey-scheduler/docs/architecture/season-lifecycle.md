@@ -185,16 +185,20 @@ session user; no client-supplied actor.
 
 **Snapshot-consistent rendering.** `ContextService.resolve`/`set` do every read
 inside one `store.transaction()` and return the *exact* Program/Season objects
-they validated — not scalar ids the API layer must independently re-fetch. The
-facade serializes those very objects and derives `read_only` from the returned
-Season, so the payload can never internally contradict itself even if a
-concurrent archive / reopen / Season-delete / Program-delete lands between two
-requests: a non-null `program_id`/`season_id` always carries its object (no
-dangling id), and `read_only` always agrees with the serialized Season `status`.
-For a `POST`, validation and the write share that transaction, so a concurrent
-parent delete is either seen (and rejected non-oracle) or lands after the row is
-written — where it is harmless, because a saved row pointing at a since-deleted
-parent is ignored (never rendered) by the next `resolve` and grants no authority.
+they validated — not scalar ids the API layer must independently re-fetch. Those
+objects are **detached** from the store's live rows (a copy) before the lock is
+released, because `InMemoryStore` hands back its shared, mutable rows; the facade
+then serializes each object **once** and derives every payload field
+(`program_id`/`season_id` and `read_only`) from that single serialized DTO. So
+the payload can never internally contradict itself — a non-null `program_id`/
+`season_id` always carries its object (no dangling id), and `read_only` always
+agrees with the serialized Season `status` — even if a concurrent archive /
+reopen / Season-delete / Program-delete lands between two requests *or in-place
+during rendering*. For a `POST`, validation and the write share that transaction,
+so a concurrent parent delete is either seen (and rejected non-oracle) or lands
+after the row is written — where it is harmless, because a saved row pointing at
+a since-deleted parent is ignored (never rendered) by the next `resolve` and
+grants no authority.
 
 ## Scope / follow-ups
 

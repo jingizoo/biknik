@@ -537,6 +537,48 @@ class ContextSnapshotConsistencyTest(unittest.TestCase):
                         (kind, label, "after"))
                     _close(store)
 
+    def test_render_uses_the_validated_snapshot_not_a_concurrent_inplace_edit(self):
+        # InMemoryStore hands back a live, shared, mutable Season. If a concurrent
+        # archive/reopen mutates that row *while* _context_view is serializing it
+        # (after read_only would be captured, before/inside serialization), the
+        # payload must still reflect the value the request VALIDATED — a detached
+        # snapshot — never a torn mid-render mix (read_only disagreeing with the
+        # serialized status). Barrier: fire the in-place edit against the store's
+        # LIVE row at the instant the Season is about to be serialized.
+        import hockey_scheduler.api.service as svc
+        cases = (("archive", SeasonStatus.ACTIVE.value, False),
+                 ("reopen", SeasonStatus.ARCHIVED.value, True))
+        for kind, expect_status, expect_ro in cases:
+            for label, store in self._stores():
+                with self.subTest(mutation=kind, backend=label):
+                    api = ApiService(store)
+                    pid, sid = _program_season(api, "P1", "S1")
+                    if kind == "reopen":
+                        _archive(store, sid)           # validated state = archived
+                    api.set_active_context("u", *ADMIN, pid, sid)
+                    orig_serialize = svc._serialize
+                    fired = {"done": False}
+
+                    def racing_serialize(obj):
+                        if not fired["done"] and getattr(obj, "id", None) == sid:
+                            fired["done"] = True       # concurrent in-place edit
+                            _mutation(store, pid, sid, kind)()   # hits LIVE row
+                        return orig_serialize(obj)
+
+                    svc._serialize = racing_serialize
+                    try:
+                        c = api.get_active_context("u", *ADMIN)
+                    finally:
+                        svc._serialize = orig_serialize
+                    self.assertTrue(fired["done"], (kind, label))  # race did fire
+                    _assert_context_consistent(self, c, (kind, label))
+                    # ...and the rendered value is the VALIDATED snapshot, proving
+                    # the mid-render live edit never reached the response object.
+                    self.assertEqual(c["season"]["status"], expect_status,
+                                     (kind, label, c))
+                    self.assertEqual(c["read_only"], expect_ro, (kind, label))
+                    _close(store)
+
 
 class ContextUpsertParityTest(unittest.TestCase):
     """set_active_context is last-write-wins on every backend: a repeat is

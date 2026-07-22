@@ -172,20 +172,24 @@ class ApiService:
 
     # -- active Program/Season context (#159) ------------------------------
     def _context_view(self, program, season) -> dict:
-        """Render the *exact* Program/Season objects the service validated in one
-        transactional snapshot — never a re-fetch. ``read_only`` is derived from
-        the same Season object that is serialized, and each id comes from its own
-        object, so the payload is snapshot-consistent by construction: a non-null
-        id always has its object, and ``read_only`` can never disagree with the
-        serialized Season status even if a concurrent archive/reopen/delete lands
-        between requests (#159)."""
-        read_only = season is not None and season.status == SeasonStatus.ARCHIVED
+        """Render the *exact* Program/Season the service validated in one
+        transactional snapshot — never a re-fetch. Each object is serialized
+        exactly ONCE, and every payload field (``program_id``/``season_id`` and
+        ``read_only``) is derived from that single serialized DTO, so they can
+        never disagree: a non-null id always has its object, and ``read_only``
+        always matches the serialized Season ``status``. The service also hands
+        back objects detached from the store's live rows, so even a concurrent
+        in-place archive/reopen cannot mutate them between these reads (#159)."""
+        program_dto = _serialize(program) if program else None
+        season_dto = _serialize(season) if season else None
+        read_only = (season_dto is not None
+                     and season_dto.get("status") == SeasonStatus.ARCHIVED.value)
         return {
-            "program_id": program.id if program else None,
-            "season_id": season.id if season else None,
+            "program_id": program_dto["id"] if program_dto else None,
+            "season_id": season_dto["id"] if season_dto else None,
             "read_only": read_only,
-            "program": _serialize(program) if program else None,
-            "season": _serialize(season) if season else None,
+            "program": program_dto,
+            "season": season_dto,
         }
 
     @catch
