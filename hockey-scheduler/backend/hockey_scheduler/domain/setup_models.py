@@ -42,6 +42,13 @@ class Program:
     # Official's external_ref (#93-#95): programs are matched across repeat
     # hierarchy uploads by this code (the sheet's league_code), not by name.
     external_ref: Optional[str] = None
+    # Program-wide ice-operations defaults (#277); a Rink overrides each with its
+    # own non-null value. ``None`` falls back to the system default (turnover 0,
+    # no curfew, buffers 0). Same field meanings as Rink's policy above.
+    turnover_minutes: Optional[int] = None
+    curfew_local: Optional[str] = None
+    warmup_minutes: Optional[int] = None
+    resurface_minutes: Optional[int] = None
 
 
 @dataclass
@@ -233,6 +240,16 @@ class Rink:
     # (#94): rinks are matched across repeat uploads by this code (the
     # sheet's rink_code), not by name.
     external_ref: Optional[str] = None
+    # Ice-operations policy (#277). ``None`` on a field means "inherit the
+    # Program-level default" (see services/ice_policy.effective_policy); the
+    # system default is turnover 0, no curfew, buffers 0. Turnover is the minimum
+    # gap enforced between two games at this rink; curfew_local is an HH:MM hard
+    # end-by (no game's playable window may run past it, in the Program tz);
+    # warmup/resurface are the default reserved buffers applied to new slots.
+    turnover_minutes: Optional[int] = None
+    curfew_local: Optional[str] = None
+    warmup_minutes: Optional[int] = None
+    resurface_minutes: Optional[int] = None
 
 
 @dataclass
@@ -243,6 +260,12 @@ class IceSlot:
     end_time: datetime
     slot_type: IceSlotType = IceSlotType.GAME
     status: IceSlotStatus = IceSlotStatus.AVAILABLE
+    # Ice turnover/curfew (#277): [start_time, end_time] is the RESERVED facility
+    # window; the PLAYABLE game window is [start+warmup, end-resurface]. Both
+    # default to 0 so every existing slot's playable window equals its reserved
+    # window — existing schedules never time-shift.
+    warmup_minutes: int = 0
+    resurface_minutes: int = 0
 
 
 @dataclass
