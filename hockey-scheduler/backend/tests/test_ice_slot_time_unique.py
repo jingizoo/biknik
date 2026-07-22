@@ -58,6 +58,20 @@ def _fresh(url):
     return store
 
 
+def _restore(store, url):
+    """Leave a shared PostgreSQL database CONSTRUCTABLE after a test that
+    downgraded migration 045 and planted duplicates: rebuild it to a clean,
+    fully migrated schema so the next ``SqlStore(url)`` — whose ``migrate()`` now
+    runs this PR's pre-migration duplicate check — doesn't abort over leftovers
+    (which would cascade into every later PostgreSQL test). A private ``:memory:``
+    database is discarded on close, so only ``close`` is needed there."""
+    try:
+        if url != ":memory:":
+            store.reset_schema()
+    finally:
+        store.close()
+
+
 def _downgrade_045(store):
     """Simulate a pre-045 database: drop the index and un-record the migration."""
     with store.transaction():
@@ -149,7 +163,7 @@ class Migration045UpgradeTest(unittest.TestCase):
                     store.add_ice_slot(_slot("s3"))
                 self.assertIsNotNone(store.get_ice_slot("s3"), label)
             finally:
-                store.close()
+                _restore(store, url)
 
     def test_clean_data_migrates_durably_and_then_enforces(self):
         for label, url in _sql_backends():
@@ -171,7 +185,7 @@ class Migration045UpgradeTest(unittest.TestCase):
                 self.assertEqual(ctx.exception.details["reason"],
                                  "ice_slot_time_taken", label)
             finally:
-                store.close()
+                _restore(store, url)
 
 
 class Migration045LedgerTest(unittest.TestCase):
