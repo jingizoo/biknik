@@ -64,6 +64,7 @@ _CONCURRENCY_MESSAGE = (
 _CONCURRENCY_REASONS = frozenset(_PG_CONCURRENCY.values())
 _ACTIVE_TEAM_JERSEY_CONSTRAINT = "ux_players_active_team_jersey"
 _ACTIVE_ICE_SLOT_CONSTRAINT = "ux_games_active_ice_slot"
+_ICE_SLOT_TIME_CONSTRAINT = "ux_ice_slots_rink_time"
 
 
 def translate_player_jersey_exception(
@@ -190,6 +191,28 @@ def translate_ice_slot_conflict_exception(
         details={"reason": "ice_slot_taken", "ice_slot_id": ice_slot_id})
 
 
+def translate_ice_slot_time_conflict_exception(
+        exc: BaseException, rink_id: str) -> Optional[DomainError]:
+    """Translate migration 045's one-slot-per-(rink, start, end) violation
+    (#158 review).
+
+    ux_ice_slots_rink_time is the atomic backstop that stops two ice-availability
+    commits — or a commit racing a manual create / CSV import — from landing
+    duplicate slots even when their pre-write classification snapshots overlap.
+    A race-losing INSERT surfaces the same stable IntegrityConflictError shape a
+    service pre-check would, with reason ``ice_slot_time_taken`` and the rink id;
+    the commit path treats it as an idempotent duplicate. Never leaks driver
+    text, SQL, or the constraint name.
+    """
+    if isinstance(exc, DomainError):
+        return None
+    if not _is_ice_slot_time_violation(exc):
+        return None
+    return IntegrityConflictError(
+        "An ice slot already exists at that rink and time.",
+        details={"reason": "ice_slot_time_taken", "rink_id": rink_id})
+
+
 class DependentDeleteConflict(Exception):
     """Internal signal — a parent delete was rejected by an INCOMING foreign key
     because a concurrent create committed a dependent in the pre-check→delete
@@ -261,6 +284,25 @@ def _is_active_ice_slot_violation(exc: BaseException) -> bool:
         text = str(exc)
         return ("UNIQUE constraint failed" in text
                 and "games.ice_slot_id" in text)
+    return False
+
+
+def _is_ice_slot_time_violation(exc: BaseException) -> bool:
+    """A unique violation of ``ux_ice_slots_rink_time`` specifically (migration
+    045). PostgreSQL carries the authoritative constraint name on ``.diag`` (a
+    23505 for a different index is not matched). SQLite names the index's columns
+    on ``UNIQUE constraint failed: ice_slots.rink_id, ice_slots.start_time,
+    ice_slots.end_time`` — ``start_time`` appears in no other ice_slots unique
+    index, so it disambiguates from the primary key (``ice_slots.id``)."""
+    sqlstate = getattr(exc, "sqlstate", None)
+    if sqlstate == "23505":
+        diag = getattr(exc, "diag", None)
+        return (getattr(diag, "constraint_name", None)
+                == _ICE_SLOT_TIME_CONSTRAINT)
+    if isinstance(exc, sqlite3.IntegrityError):
+        text = str(exc)
+        return ("UNIQUE constraint failed" in text
+                and "ice_slots.start_time" in text)
     return False
 
 
