@@ -2391,6 +2391,30 @@ class SetupService:
         # (that is a MANAGE_SETUP action) — a rink whose Venue is not available
         # to this Season is reported with a remediation route and produces no
         # slots, mirroring the scheduler's require_slot_belongs_to_season gate.
+        # commit re-runs this SAME split under its Season/rink write locks so a
+        # revoke/move/delete that lands after this preview read can't leak ice.
+        accessible, access_missing = self._split_rinks_by_access(
+            season_id, rink_ids)
+
+        return {
+            "season": season, "tz": tz, "d_start": d_start, "d_end": d_end,
+            "weekday_set": weekday_set,
+            "window": {"start": start_local, "end": end_local},
+            "playable_minutes": playable_minutes,
+            "turnover_minutes": turnover_minutes,
+            "plan": plan, "accessible": accessible,
+            "access_missing": access_missing,
+        }
+
+    def _split_rinks_by_access(self, season_id, rink_ids):
+        """Resolve each selected rink's current Venue + active SeasonVenueAccess
+        and split them into ``accessible`` [(rink, venue), ...] and
+        ``access_missing`` [report, ...]. Pure reads — no locks of its own — so
+        preview calls it directly, while commit calls it AGAIN inside its write
+        transaction (after the Season + per-rink locks) so a revoke/move/delete
+        that raced the preview read is caught before any slot or audit is
+        written (#158 review). A rink id that no longer resolves is the same
+        stable ``rink_missing`` NotFoundError the preview raises."""
         accessible, access_missing = [], []
         for rid in rink_ids:
             rink = self.store.get_rink(rid)
@@ -2411,16 +2435,7 @@ class SetupService:
                 })
             else:
                 accessible.append((rink, venue))
-
-        return {
-            "season": season, "tz": tz, "d_start": d_start, "d_end": d_end,
-            "weekday_set": weekday_set,
-            "window": {"start": start_local, "end": end_local},
-            "playable_minutes": playable_minutes,
-            "turnover_minutes": turnover_minutes,
-            "plan": plan, "accessible": accessible,
-            "access_missing": access_missing,
-        }
+        return accessible, access_missing
 
     def _classify_ice_windows(self, accessible, plan):
         """Classify each (accessible rink × planner window) against CURRENT ice
@@ -2553,9 +2568,12 @@ class SetupService:
             start_date=start_date, end_date=end_date,
             playable_minutes=playable_minutes, turnover_minutes=turnover_minutes,
             exclusion_dates=exclusion_dates)
-        accessible = base["accessible"]
         windows = base["plan"]["windows"]
-        access_skipped = len(base["access_missing"])
+        # De-duplicated selected rinks (same as planning). base's preview-time
+        # accessible / access_missing are deliberately NOT reused here: commit
+        # re-resolves venue access INSIDE the write transaction below so a
+        # revoke/move/delete that landed after the preview read can't leak ice.
+        requested_rink_ids = list(dict.fromkeys(rink_ids or []))
         # Generated up front so every per-slot audit row is tagged with it.
         batch_id = self.store.next_id("iceavailbatch")
 
@@ -2569,11 +2587,22 @@ class SetupService:
                 with self.store.transaction():
                     # Fixed lock order (Season, then rinks by id) — two commits
                     # can never deadlock; the locks are held to commit so the
-                    # classification below can't go stale under them.
+                    # access re-resolution and classification below can't go
+                    # stale under them.
                     self._require_active_season(season_id)
-                    for rink in sorted((r for r, _v in accessible),
-                                       key=lambda r: r.id):
-                        self.store.get_rink_for_update(rink.id)
+                    for rid in sorted(requested_rink_ids):
+                        self.store.get_rink_for_update(rid)
+                    # Re-resolve venue access UNDER the locks (#158 review): a
+                    # SeasonVenueAccess revoked — or a rink moved to an
+                    # un-accessed venue — after the preview read is caught here,
+                    # so no Game ice is created for a venue the season no longer
+                    # reaches. grant/revoke both take the Season row lock this
+                    # commit already holds, so the decision is linearized against
+                    # them; a rink deleted meanwhile is the same stable
+                    # rink_missing NotFoundError, rolling the whole batch back.
+                    accessible, access_missing = self._split_rinks_by_access(
+                        season_id, requested_rink_ids)
+                    access_skipped = len(access_missing)
                     existing_by_rink = {}
                     for s in self.store.all_ice_slots():
                         existing_by_rink.setdefault(s.rink_id, []).append(s)

@@ -128,6 +128,32 @@ class IceAvailabilityContract:
         self.assertTrue(all(s.slot_type == IceSlotType.GAME for s in slots))
         self.assertTrue(all(s.status == IceSlotStatus.AVAILABLE for s in slots))
 
+    def test_commit_reresolves_access_revoked_after_planning(self):
+        # #158 review: SeasonVenueAccess revoked AFTER planning but before the
+        # write locks must not leak Game ice. Simulate the revoke landing at the
+        # instant commit takes its first per-rink lock (which runs after
+        # _plan_ice_availability, so planning still saw the rink as accessible);
+        # the re-resolution under the lock must catch it and create nothing.
+        orig = self.store.get_rink_for_update
+        fired = []
+
+        def revoke_then_lock(rid):
+            if not fired:
+                fired.append(True)
+                acc = self.store.season_venue_access_for_pair("season_1", "venue_1")
+                acc.active = False
+                self.store.save_season_venue_access(acc)
+            return orig(rid)
+
+        self.store.get_rink_for_update = revoke_then_lock
+        res = self.api.commit_ice_availability(actor_id="arena", **_template())
+        self.assertNotIn("error", res)
+        self.assertEqual(res["totals"]["created"], 0)
+        self.assertEqual(res["totals"]["access_skipped_rinks"], 1)
+        self.assertEqual(self._slots(), [])                  # no unauthorized ice
+        self.assertEqual([a for a in self.store.all_setup_audit()
+                          if a.action == "ice_slot_created"], [])
+
     # -- 2. exclusion dates -------------------------------------------------
     def test_exclusion_dates_skipped_and_explained(self):
         pv = self.api.preview_ice_availability(
@@ -321,7 +347,7 @@ class PostgresIceAvailabilityConcurrencyTest(unittest.TestCase):
         prog = s.create_program("AHL", timezone_name=TZ)
         season = s.create_season(prog.id, "Fall 2026")
         venue = s.create_venue("Main Arena", league_id=prog.id)
-        s.grant_season_venue_access(season.id, venue.id)
+        self.access_id = s.grant_season_venue_access(season.id, venue.id).id
         self.season_id = season.id
         self.rink_id = s.create_rink(venue.id, "Rink A").id
 
@@ -441,6 +467,26 @@ class PostgresIceAvailabilityConcurrencyTest(unittest.TestCase):
         self.assertNotIsInstance(out[1], Exception, f"import raised: {out[1]!r}")
         slots = self._assert_unique_and_non_overlapping()
         self.assertEqual(len(slots), 6)
+
+    def test_commit_vs_access_revoke(self):
+        # commit and revoke_season_venue_access both take the Season row lock, so
+        # they serialize under either barrier ordering: commit wins -> its six
+        # windows are created while access is still live; revoke wins -> commit
+        # re-resolves access UNDER the lock and creates nothing (#158 review).
+        # Never a partial / unauthorized subset of ice, and never a raw error.
+        commit = lambda svc: svc.commit_ice_availability(  # noqa: E731
+            actor_id="c", **self._template())
+        revoke = lambda svc: svc.revoke_season_venue_access(  # noqa: E731
+            self.access_id, actor_id="r")
+        out = self._run([commit, revoke])
+        self.assertNotIsInstance(out[0], Exception, f"commit raised: {out[0]!r}")
+        self.assertNotIsInstance(out[1], Exception, f"revoke raised: {out[1]!r}")
+        created = out[0]["totals"]["created"]
+        self.assertIn(created, (0, 6), f"partial/unauthorized commit: {created}")
+        slots = self._assert_unique_and_non_overlapping()
+        self.assertEqual(len(slots), created)          # exactly what commit reported
+        if created == 0:                               # revoke won the lock race
+            self.assertEqual(out[0]["totals"]["access_skipped_rinks"], 1)
 
 
 class PlannerUnitTest(unittest.TestCase):
