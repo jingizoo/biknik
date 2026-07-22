@@ -24,7 +24,7 @@ import threading
 import unittest
 import urllib.error
 import urllib.request
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from http.cookiejar import CookieJar
 from http.server import ThreadingHTTPServer
 
@@ -572,31 +572,57 @@ class PostgresIceAvailabilityConcurrencyTest(unittest.TestCase):
                        datetime(2026, 9, 1, 18, tzinfo=timezone.utc)))  # UTC
 
     def test_commit_vs_import_metadata_change_no_deadlock(self):
-        # A hierarchy re-import updates the Program timezone AND Season dates,
-        # taking the Program row lock, then the Season row lock (the importer's
-        # order). The commit now locks in the SAME Program-first order, so the two
-        # serialize instead of forming the Season<->Program cycle that raised
-        # PostgreSQL 40P01 (#158 review). Under either ordering: no deadlock / raw
-        # error, and the committed calendar is one coherent zone, never partial.
+        # A hierarchy re-import updates BOTH the Program timezone AND the Season
+        # end_date, taking the Program row lock then the Season row lock (the
+        # importer's order). The commit DEFAULTS its range from the Season, so the
+        # date change really changes the calendar. The commit locks in the SAME
+        # Program-first order, so the two serialize instead of forming the
+        # Season<->Program cycle that raised PostgreSQL 40P01 (#158 review). Under
+        # either ordering: no deadlock/raw error, and the committed slots are ONE
+        # coherent snapshot -- old Toronto tz + wide Sep 1-8 range (9 windows), or
+        # new UTC tz + narrowed Sep 1-2 range (3 windows) -- never a stale mix,
+        # with nothing outside the winning range.
+        from zoneinfo import ZoneInfo
+        utc = timezone.utc
+        seed = SqlStore(self.url)
+        s0 = seed.get_season(self.season_id)
+        s0.start_date = datetime(2026, 9, 1, 4, tzinfo=utc)    # Sep 1 local (EDT)
+        s0.end_date = datetime(2026, 9, 8, 4, tzinfo=utc)      # Sep 8 local (wide)
+        seed.save_season(s0)
+
+        tmpl = dict(self._template())
+        tmpl.pop("start_date")
+        tmpl.pop("end_date")                                   # default the range
         commit = lambda svc: svc.commit_ice_availability(  # noqa: E731
-            actor_id="c", **self._template())
+            actor_id="c", **tmpl)
 
         def reimport(svc):
             with svc.store.transaction():
                 prog = svc.store.get_program_for_update(self.program_id)
                 prog.timezone = "UTC"
                 svc.store.save_program(prog)
-                season = svc.store.get_season_for_update(self.season_id)
-                svc.store.save_season(season)          # dates touched too
+                s = svc.store.get_season_for_update(self.season_id)
+                s.end_date = datetime(2026, 9, 2, 4, tzinfo=utc)   # narrow to Sep 1
+                svc.store.save_season(s)
 
         out = self._run([commit, reimport])
         self.assertNotIsInstance(out[0], Exception, f"commit raised: {out[0]!r}")
         self.assertNotIsInstance(out[1], Exception, f"reimport raised: {out[1]!r}")
         slots = self._assert_unique_and_non_overlapping()
-        self.assertEqual(len(slots), 6)           # one coherent calendar, no partial
-        self.assertIn(min(s.start_time for s in slots),
-                      (datetime(2026, 9, 1, 22, tzinfo=timezone.utc),   # Toronto
-                       datetime(2026, 9, 1, 18, tzinfo=timezone.utc)))  # UTC
+        n = len(slots)
+        self.assertIn(n, (9, 3), f"partial/mixed snapshot: {n} slots")
+        if n == 9:                                    # commit won: old tz + wide
+            self.assertEqual(min(s.start_time for s in slots),
+                             datetime(2026, 9, 1, 22, tzinfo=utc))     # Toronto
+            local = {s.start_time.astimezone(ZoneInfo(TZ)).date() for s in slots}
+            self.assertTrue(
+                local <= {date(2026, 9, 1), date(2026, 9, 3), date(2026, 9, 8)})
+        else:                                         # reimport won: new tz + narrow
+            self.assertEqual(min(s.start_time for s in slots),
+                             datetime(2026, 9, 1, 18, tzinfo=utc))     # UTC
+            self.assertEqual(
+                {s.start_time.astimezone(utc).date() for s in slots},
+                {date(2026, 9, 1)})
 
 
 class PlannerUnitTest(unittest.TestCase):
