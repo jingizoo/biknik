@@ -30,6 +30,7 @@ from ..domain import (
     OfficialRole,
     ResultStatus,
     RosterEntryStatus,
+    SeasonStatus,
     SlotType,
     SubstituteStatus,
     intervals_overlap,
@@ -43,6 +44,7 @@ from ..domain.errors import (
 from ..services import (
     ACTOR_TYPES,
     AccountService,
+    ContextService,
     FactoryResetService,
     GuardianService,
     DeliveryLoop,
@@ -166,6 +168,41 @@ class ApiService:
         self.factory_reset = FactoryResetService(
             self.store, self.accounts, self.roster.clock)
         self.guardians = GuardianService(self.store, self.roster.clock)
+        self.context = ContextService(self.store, self.roster.clock)
+
+    # -- active Program/Season context (#159) ------------------------------
+    def _context_view(self, program, season) -> dict:
+        """Render the *exact* Program/Season the service validated in one
+        transactional snapshot — never a re-fetch. Each object is serialized
+        exactly ONCE, and every payload field (``program_id``/``season_id`` and
+        ``read_only``) is derived from that single serialized DTO, so they can
+        never disagree: a non-null id always has its object, and ``read_only``
+        always matches the serialized Season ``status``. The service also hands
+        back objects detached from the store's live rows, so even a concurrent
+        in-place archive/reopen cannot mutate them between these reads (#159)."""
+        program_dto = _serialize(program) if program else None
+        season_dto = _serialize(season) if season else None
+        read_only = (season_dto is not None
+                     and season_dto.get("status") == SeasonStatus.ARCHIVED.value)
+        return {
+            "program_id": program_dto["id"] if program_dto else None,
+            "season_id": season_dto["id"] if season_dto else None,
+            "read_only": read_only,
+            "program": program_dto,
+            "season": season_dto,
+        }
+
+    @catch
+    def get_active_context(self, user_id, role, scope) -> dict:
+        program, season = self.context.resolve(user_id, role, scope)
+        return self._context_view(program, season)
+
+    @catch
+    def set_active_context(self, user_id, role, scope,
+                           program_id, season_id) -> dict:
+        program, season = self.context.set(
+            user_id, role, scope, program_id, season_id)
+        return self._context_view(program, season)
 
     # -- competition-hierarchy resolution (#283) ---------------------------
     # After the #283 model change a League is a permanent child of a Program

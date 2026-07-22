@@ -523,6 +523,29 @@ class UserAccount:
 
 
 @dataclass
+class ActiveContext:
+    """A user's currently-selected Program + Season working context (#159).
+
+    Operators run several Programs and Seasons; this is the one they are
+    *looking at* — persisted so future slices' screens/deep links can restore it.
+    It is a VIEW preference, NOT an authorization grant: switching context never
+    widens what a role/scope may do (roles are enforced independently, #211).
+    ``id`` is the owning ``user_id`` (one context per user). ``season_id`` may be
+    null (a Program-only context for new/empty Programs). A saved selection is
+    filtered through the caller's authorized scope on every resolve: an ARCHIVED
+    Season is honored as a read-only HISTORICAL context (never silently swapped
+    for an unrelated active one); a DELETED or no-longer-authorized Program/Season
+    is ignored in favor of a deterministic authorized fallback. The stored row is
+    NOT rewritten on resolve, so if authorization is later restored the saved
+    choice resolves again.
+    """
+    id: str
+    program_id: Optional[str]
+    season_id: Optional[str]
+    updated_at: datetime
+
+
+@dataclass
 class Session:
     """A persisted login session (#74).
 

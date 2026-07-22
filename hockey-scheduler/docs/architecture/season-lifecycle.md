@@ -132,9 +132,112 @@ registration in a Season that is archived under the lock is frozen history and
 never moved; a concurrent archive cannot slip between the status read and the
 registration rewrite.
 
+## Active-context selection (#159 Slice 2 — backend foundation)
+
+Which Program + Season a user is *working in*, persisted per user in
+`user_active_context` (one row, `id` = the `user_id`; migration 044) and served
+by `ContextService`. This is the backend **preference + resolution foundation**
+only — **not** the shell switcher/UI, **not** deep-link restoration, **not**
+cross-context isolation of existing reads/writes/workers/exports (they still take
+explicit ids), and **not** completion of #159 (which stays open).
+
+**Authorization on every request.** The selection is a VIEW preference, never
+authority. On every resolve and set it is filtered through the caller's real
+role + account scope (`services/context_scope.py`, the same #211/#266/#202 rules
+the rest of the app uses): the two global operators and the read-only Viewer see
+every Program (the current model has no org-scoped operator — when one lands,
+`context_scope` is the single place to narrow it); a Coach/Player sees only its
+team's Program and the Seasons its team **actively participates in under its
+current League** (a same-league Season that is later archived stays selectable
+read-only); an Official only the Programs/Seasons of its assigned games; a
+Guardian only its verified juniors'; an unbound/unknown role fails closed. So a
+scoped account can neither select nor *enumerate* an unrelated context.
+
+**Prior-Team history is out of scope for this slice.** When a Team **transfers**
+to a new League, #283 freezes its prior registration under the *former*
+LeagueSeason. That Season leaves the scoped user's entitlement (their Team's
+current-league participation no longer includes it), so a scoped Coach/Player/
+Guardian loses selectable access to a *prior* Team Season after a transfer —
+even though the registration, Games, results and standings remain preserved and
+readable through the ordinary (id-scoped) history views. Restoring historical
+entitlement across a Team's prior registrations is a deliberate **#159
+follow-up** (below); it is deferred because it would widen a scoped user's view
+to Seasons under a League their Team has left, which warrants its own reviewed
+slice. This slice's tests assert the *current* (narrowed) behavior explicitly. A saved selection outside the caller's *current*
+authorized scope is **ignored** (a fallback is returned) but the row is **not
+rewritten**, so if authorization is later restored the saved choice resolves
+again. "Which team does this caller act for" is resolved by
+`services/subject_scope.own_team_id` — the **same** resolver the web scope guards
+use, so the two gates can never drift; `context_scope` adds only the new
+Program/Season projection on top of that shared identity.
+
+- **`GET /api/context`** → the effective `{program_id, season_id, read_only,
+  program, season}`: the saved selection when its Program is still authorized+
+  present and its Season (if any) still authorized+present; else a deterministic
+  authorized fallback; else empty. Fallback prefers an authorized **active**
+  Season (chosen by **semantically parsed** start_date — latest wins, id
+  tiebreak, a null date never beats a dated one), and otherwise a **Program-only**
+  context (null Season) so new/empty Programs remain selectable. `read_only` is
+  true iff the resolved Season is archived.
+- **`POST /api/context`** `{program_id, season_id?}` (strict body: `program_id`
+  required, `season_id` optional/nullable, no unknown fields) records a
+  selection. `season_id` may be null (Program-only). An **archived** Season is
+  accepted as a **read-only historical** context — honored, never silently
+  swapped for an active one — while writes against it stay blocked by the Season
+  read-only guard above. An unauthorized **or** non-existent Program/Season both
+  return the *same* generic `not_found` (no existence oracle). `set_active_context`
+  is an atomic `INSERT .. ON CONFLICT (id) DO UPDATE`, so re-selecting the same
+  context is idempotent and two concurrent first writes for one user both succeed
+  (exactly one row, last-committed wins) rather than racing the primary key into a
+  500.
+
+Both endpoints need only a valid session — never the operator permission gate —
+because the selection grants nothing (a Viewer may record its own selection yet
+still gets 403 on an operator write). `user_id` is always the server-resolved
+session user; no client-supplied actor.
+
+**Authorization is linearizable with scope-changing writes.** The whole scope
+computation + selection (and, for `POST`, the write) runs under **one
+`SERIALIZABLE` snapshot** — a narrow, per-request isolation on the context
+transaction only, never a global connection change — with a bounded retry on a
+serialization conflict (`ContextService._snapshot` → `store.transaction(isolation=
+"SERIALIZABLE")`). So a concurrent scope revocation (an Official unassignment, a
+Player/Guardian reassignment) either orders **entirely before** the request (it
+sees the old scope) or **entirely after** it (it sees the new scope): the result
+always corresponds *wholly* to one authorization snapshot and can never be a
+hybrid — e.g. an old Program set paired with a now-empty Season set, or a
+Program-only fallback that matches no single snapshot. Errors stay non-oracle
+across the boundary. Memory/SQLite get the identical guarantee from their
+process-wide transaction lock, which already fully serializes writers, so the
+retry is a no-op there.
+
+**Snapshot-consistent rendering.** `ContextService.resolve`/`set` do every read
+inside one `store.transaction()` and return the *exact* Program/Season objects
+they validated — not scalar ids the API layer must independently re-fetch. Those
+objects are **detached** from the store's live rows (a copy) before the lock is
+released, because `InMemoryStore` hands back its shared, mutable rows; the facade
+then serializes each object **once** and derives every payload field
+(`program_id`/`season_id` and `read_only`) from that single serialized DTO. So
+the payload can never internally contradict itself — a non-null `program_id`/
+`season_id` always carries its object (no dangling id), and `read_only` always
+agrees with the serialized Season `status` — even if a concurrent archive /
+reopen / Season-delete / Program-delete lands between two requests *or in-place
+during rendering*. For a `POST`, validation and the write share that transaction,
+so a concurrent parent delete is either seen (and rejected non-oracle) or lands
+after the row is written — where it is harmless, because a saved row pointing at
+a since-deleted parent is ignored (never rendered) by the next `resolve` and
+grants no authority.
+
 ## Scope / follow-ups
 
-This slice is the lifecycle foundation for #159. Later slices add the active
-Program/Season context selection (persisted per user with an authorized
-deterministic fallback), the switcher UI, new-Season copy-forward preview, and
-cross-context isolation hardening.
+Slice 1 (lifecycle) and Slice 2 (this backend selection foundation) are done.
+Remaining #159 work, to be taken as separate slices: the authenticated-shell
+**switcher UI + deep-link restoration** consuming these endpoints; then
+**consumer-by-consumer cross-context isolation** (lists, counts, exports,
+background jobs resolving strictly through the selected Season); then
+**new-Season copy-forward preview**; and **prior-Team historical entitlement**
+— letting a scoped Coach/Player/Guardian re-enter (read-only) a Season their
+Team was registered in under a League it has since **left** (resolving view
+entitlement from all of a Team's registrations, independent of its current
+`league_id`, kept separate from the active-work fallback; a security-sensitive
+scope widening, so intentionally its own slice). #159 stays open.

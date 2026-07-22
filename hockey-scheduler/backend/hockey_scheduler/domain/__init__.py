@@ -65,6 +65,7 @@ from .models import (
     Team,
 )
 from .setup_models import (
+    ActiveContext,
     CalendarFeedToken,
     Club,
     ContactDestination,
@@ -162,6 +163,7 @@ __all__ = [
     "SubstituteEnrollment",
     "Team",
     # setup models
+    "ActiveContext",
     "Club",
     "Division",
     "GuardianLink",

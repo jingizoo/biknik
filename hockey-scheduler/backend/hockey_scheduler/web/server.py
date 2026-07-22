@@ -205,6 +205,7 @@ _GET_ROUTES = [re.compile(p) for p in (
     r"^/api/public/games/[^/]+$",
     r"^/api/scheduler/drafts$",
     r"^/api/auth/me$",
+    r"^/api/context$",
     r"^/api/games/[^/]+(?:/(?:board|lineups|roster-status|roster|substitutes"
     r"|substitute-candidates|substitute-addable|reschedule|officials"
     r"|availability-summary))?$",
@@ -229,6 +230,7 @@ _POST_ROUTES = [re.compile(p) for p in (
     r"^/api/demo/(?:reset|load|clear)$",
     r"^/api/admin/factory-reset/(?:preview|execute)$",
     r"^/api/demo/add-ice-slot$",
+    r"^/api/context$",
     # v1 setup writes (#271): EXACT routes transcribed from _handle_setup /
     # _handle_reassign — a broad `.+` over-claims POST on nonexistent paths
     # whose real POST is a 404, so the fallback would wrongly answer 405.
@@ -922,6 +924,22 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_ics(ics)
         if path == "/api/demo/overview":
             return self._send_api(api.get_demo_overview())
+        if path == "/api/context":
+            # The signed-in user's active Program/Season selection (#159),
+            # filtered through their real role/scope. Per-user, so it requires a
+            # real SESSION-backed account — never the operator permission gate
+            # (switching context grants nothing), but also never the identity-less
+            # demo X-Demo-Role / headerless-admin fallbacks (they have no user to
+            # own a context and must not enumerate one).
+            role, scope, user_id, err = self._resolve_role()
+            if err is not None:
+                code, payload = err
+                return self._send_json(payload, code)
+            if user_id is None:
+                return self._send_json({"error": {
+                    "code": "unauthorized",
+                    "message": "A signed-in account is required."}}, 401)
+            return self._send_api(api.get_active_context(user_id, role, scope))
         if path == "/api/setup/hierarchy":
             # Nested setup tree for the operator's mental model (#166 PR C).
             # It carries player_count leaves, so gate it like the player list
@@ -1800,6 +1818,33 @@ class Handler(BaseHTTPRequestHandler):
                     api.accept_substitute(gid, jid, actor_id=guid))
             return self._send_api(
                 api.decline_substitute(gid, jid, actor_id=guid))
+
+        if path == "/api/context":
+            # Set the signed-in user's active Program/Season (#159), filtered
+            # through their real role/scope. Per-user: requires a real SESSION-
+            # backed account (never the operator permission gate below, but also
+            # never the identity-less demo X-Demo-Role / headerless-admin
+            # fallbacks — they must fail authentication at the boundary, not reach
+            # the service with no identity). Strict body: program_id required,
+            # season_id optional and nullable (Program-only), no unknown fields.
+            role, scope, user_id, err = self._resolve_role()
+            if err is not None:
+                code, payload = err
+                return self._send_json(payload, code)
+            if user_id is None:
+                return self._send_json({"error": {
+                    "code": "unauthorized",
+                    "message": "A signed-in account is required."}}, 401)
+            try:
+                check_body(body, allowed={"program_id", "season_id"},
+                           required=("program_id",),
+                           types={"program_id": str,
+                                  "season_id": (str, type(None))})
+            except BodyError as exc:
+                return self._send_json(exc.payload, exc.status)
+            return self._send_api(api.set_active_context(
+                user_id, role, scope,
+                body.get("program_id"), body.get("season_id")))
 
         # Authorize the acting role at the HTTP boundary (#24/#50). A session
         # cookie is authoritative; the X-Demo-Role header is a dev fallback.

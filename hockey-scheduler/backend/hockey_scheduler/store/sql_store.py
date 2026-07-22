@@ -27,6 +27,7 @@ from ..domain import (
     IceSlot,
     IceSlotStatus,
     IceSlotType,
+    ActiveContext,
     GameResult,
     League,
     LeagueSeason,
@@ -256,6 +257,8 @@ SPECS = {
                        "scope": _jsonc(), "active": _bool()}),
     Session: Spec(Session, "sessions",
                   {"issued_at": _dt(), "expires_at": _dt(), "revoked_at": _dt()}),
+    ActiveContext: Spec(ActiveContext, "user_active_context",
+                        {"updated_at": _dt()}),
     GuardianLink: Spec(GuardianLink, "guardian_links",
                        {"created_at": _dt(), "verified": _bool(),
                         "consented_at": _dt()}),
@@ -283,6 +286,10 @@ _MIGRATIONS_DIR = os.path.join(os.path.dirname(__file__), "migrations")
 
 # A version given per-dialect must supply BOTH engines' files (never just one).
 _DIALECT_PAIR = {"sqlite", "postgres"}
+
+# Per-transaction isolation levels a caller may request (SQL is interpolated, so
+# this whitelist is the injection guard — never format an arbitrary string in).
+_ISOLATION_LEVELS = frozenset({"SERIALIZABLE", "REPEATABLE READ"})
 
 
 def _split_statements(raw):
@@ -509,15 +516,30 @@ class SqlStore:
         self._dependent_conflict_resolver = resolver
 
     @contextmanager
-    def transaction(self):
+    def transaction(self, isolation=None):
         """Atomic multi-write block: commit on success, roll back on error.
 
         Reentrant (#215): only the outermost ``transaction()`` opens and
         commits/rolls back the real database transaction; nested calls simply
         run inside it, so the whole nest succeeds or fails as one unit.
+
+        ``isolation`` (``"SERIALIZABLE"`` / ``"REPEATABLE READ"``) raises the
+        isolation of **this one** PostgreSQL transaction — a narrow, per-call
+        snapshot, never a global connection change — so all its reads observe a
+        single consistent snapshot (used by the context selector so an
+        authorization computation can't straddle a concurrent scope revocation,
+        #159). It must be requested on the OUTERMOST transaction (a nested join
+        cannot retro-raise the isolation of the already-open transaction). On
+        SQLite it is a no-op: the process-wide lock already serializes writers.
         """
+        if isolation is not None and isolation not in _ISOLATION_LEVELS:
+            raise ValueError(f"unsupported isolation level: {isolation!r}")
         with self._lock:
             if self._txn_depth > 0:  # already inside a transaction — just join it
+                if isolation is not None:
+                    raise RuntimeError(
+                        "transaction(isolation=...) must be the outermost "
+                        "transaction; a nested join cannot change isolation")
                 self._txn_depth += 1
                 try:
                     yield
@@ -529,8 +551,13 @@ class SqlStore:
                 try:
                     if self.dialect.paramstyle == "pyformat":  # psycopg manages it
                         with self.conn.transaction():
+                            if isolation is not None:
+                                # First statement in the txn (after BEGIN), before
+                                # any read — required for SET TRANSACTION to apply.
+                                self.conn.execute(
+                                    "SET TRANSACTION ISOLATION LEVEL " + isolation)
                             yield
-                    else:  # sqlite (autocommit) — explicit txn
+                    else:  # sqlite (autocommit) — explicit txn (isolation no-op)
                         try:
                             self.conn.execute("BEGIN")
                             yield
@@ -1621,3 +1648,28 @@ class SqlStore:
                 "(revoked_at IS NOT NULL AND revoked_at < ?) OR "
                 "(revoked_at IS NULL AND expires_at < ?)", (iso, iso))
         return cur.rowcount if cur.rowcount is not None else 0
+
+    # -- per-user active Program/Season context (#159) ---------------------
+    def get_active_context(self, user_id):
+        return self._get(ActiveContext, user_id)
+
+    def set_active_context(self, ctx):
+        """Persist a user's selected context (one row per user), last-write-wins.
+
+        An ATOMIC ``INSERT ... ON CONFLICT (id) DO UPDATE`` (portable, as
+        ``next_id`` already uses) — NOT a read-then-write upsert: two concurrent
+        first writes for the same user would both see "missing" and race the
+        PRIMARY KEY, one hitting a raw integrity error/500. Here one INSERTs and
+        the other DO-UPDATEs; both commit, exactly one row remains, and the
+        last-committed values win."""
+        with self.transaction():
+            self._exec(
+                "INSERT INTO user_active_context "
+                "(id, program_id, season_id, updated_at) VALUES (?, ?, ?, ?) "
+                "ON CONFLICT (id) DO UPDATE SET "
+                "program_id = excluded.program_id, "
+                "season_id = excluded.season_id, "
+                "updated_at = excluded.updated_at",
+                (ctx.id, ctx.program_id, ctx.season_id,
+                 ctx.updated_at.isoformat() if ctx.updated_at else None))
+        return ctx

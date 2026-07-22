@@ -12,6 +12,7 @@ import threading
 from typing import Dict, List, Optional
 
 from ..domain import (
+    ActiveContext,
     AuditLog,
     CalendarFeedToken,
     Club,
@@ -98,6 +99,7 @@ class InMemoryStore:
         self.installation_state: Dict[str, InstallationState] = {}
         self.user_accounts: Dict[str, UserAccount] = {}
         self.sessions: Dict[str, Session] = {}
+        self.user_active_context: Dict[str, ActiveContext] = {}
         self.guardian_links: Dict[str, GuardianLink] = {}
         self.reschedule_requests: Dict[str, RescheduleRequest] = {}
         self.setup_audit: List[SetupAuditLog] = []
@@ -206,8 +208,14 @@ class InMemoryStore:
                 value.clear()
 
     @contextmanager
-    def transaction(self):
+    def transaction(self, isolation=None):
         """Atomic, reentrant unit of work — the shared store transaction contract.
+
+        ``isolation`` (e.g. ``"SERIALIZABLE"``) is accepted for parity with
+        :class:`SqlStore` but is a **no-op** here: the process-wide re-entrant
+        lock already fully serializes every transaction, so all reads inside one
+        transaction observe a single consistent snapshot with no concurrent
+        interleaving — the strongest isolation, for free.
 
         Contract (identical observable behavior in every store implementation):
 
@@ -972,6 +980,14 @@ class InMemoryStore:
 
     def sessions_for_user(self, user_id: str) -> List[Session]:
         return [s for s in self.sessions.values() if s.user_id == user_id]
+
+    # -- per-user active Program/Season context (#159) ---------------------
+    def get_active_context(self, user_id: str) -> Optional[ActiveContext]:
+        return self.user_active_context.get(user_id)
+
+    def set_active_context(self, ctx: ActiveContext) -> ActiveContext:
+        self.user_active_context[ctx.id] = ctx
+        return ctx
 
     def delete_sessions_before(self, cutoff: datetime) -> int:
         """Delete finished sessions whose terminal time is before ``cutoff`` —
