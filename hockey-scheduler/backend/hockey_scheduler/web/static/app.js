@@ -8,8 +8,9 @@ let rosterTeamId = null;    // team_id of the currently shown lineup (for copy)
 let currentGame = null;     // game id whose roster we're viewing
 let pickedPlayer = null;
 let wizard = null;          // {slot_id, league_id, division_id, home_id, away_id} when scheduling
+let iceBuilder = null;      // {form, preview} when the Ice Availability Builder is open (#158)
 let calendarDate = "2026-09-05";  // YYYY-MM-DD shown on the arena calendar
-let calendarMode = "day";   // day | week
+let calendarMode = "day";   // day | week | month (#158)
 let calFilters = { venueId: "all", rinkId: "all", divisionId: "all", teamId: "all" };
 let toast = "";
 // Errors persist until the next interaction/close; success messages
@@ -115,6 +116,21 @@ function addDays(dateStr, n) {
   return d.toISOString().slice(0, 10);
 }
 function shiftDate(days) { calendarDate = addDays(calendarDate, days); }
+// Shift by whole months, clamping the day to the target month's length so
+// e.g. Jan 31 + 1 month lands on the last day of February, never overflows (#158).
+function addMonths(dateStr, n) {
+  const d = new Date(dateStr + "T00:00:00Z");
+  const day = d.getUTCDate();
+  d.setUTCDate(1);
+  d.setUTCMonth(d.getUTCMonth() + n);
+  const lastDay = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 0)).getUTCDate();
+  d.setUTCDate(Math.min(day, lastDay));
+  return d.toISOString().slice(0, 10);
+}
+function fmtMonth(dateStr) {
+  return new Date(dateStr + "T00:00:00Z").toLocaleDateString("en-GB",
+    { month: "long", year: "numeric", timeZone: "UTC" });
+}
 function startOfWeek(dateStr) {
   const d = new Date(dateStr + "T00:00:00Z");
   const dow = (d.getUTCDay() + 6) % 7;  // Monday = 0
@@ -2450,7 +2466,9 @@ function calToolbar(ov) {
     ov.divisions.map((d) => opt2(d.id, d.name, d.id === calFilters.divisionId)).join("");
   const teamOpts = `<option value="all">All teams</option>` +
     ov.teams.map((t) => opt2(t.id, t.name, t.id === calFilters.teamId)).join("");
-  const head = calendarMode === "week"
+  const head = calendarMode === "month"
+    ? esc(fmtMonth(calendarDate))
+    : calendarMode === "week"
     ? `Week of ${esc(fmtDate(startOfWeek(calendarDate)))}`
     : esc(fmtDate(calendarDate));
   return `
@@ -2460,10 +2478,12 @@ function calToolbar(ov) {
           <div class="cal-venue">${esc(calFilters.venueId === "all" ? "All venues" : (ov.venues.find((v) => v.id === calFilters.venueId) || {}).name || "Arena")}</div></div>
         <div class="cal-controls">
           <div class="seg-mini"><button class="segm ${calendarMode === "day" ? "active" : ""}" data-mode="day">Day</button>
-            <button class="segm ${calendarMode === "week" ? "active" : ""}" data-mode="week">Week</button></div>
+            <button class="segm ${calendarMode === "week" ? "active" : ""}" data-mode="week">Week</button>
+            <button class="segm ${calendarMode === "month" ? "active" : ""}" data-mode="month">Month</button></div>
           <div class="cal-nav"><button class="act ghost" data-cal="-1">‹</button>
             <button class="act ghost" data-cal="0">Today</button>
             <button class="act ghost" data-cal="1">›</button></div>
+          ${hasPerm("manage_arena") ? `<button class="act ghost cal-build-ice" data-ice-builder-open>🧊 Build ice</button>` : ""}
         </div>
       </div>
       <div class="cal-filters">
@@ -2575,10 +2595,13 @@ function movePanelHtml(ov) {
 }
 
 function renderCalendar(ov) {
+  if (iceBuilder) return renderIceBuilder(ov);
   if (wizard) return renderWizard(ov);
   const ctx = calContext(ov);
   const rinks = visibleRinks(ov);
-  const board = calendarMode === "week"
+  const board = calendarMode === "month"
+    ? renderMonth(ov, ctx, rinks)
+    : calendarMode === "week"
     ? renderWeek(ov, ctx, rinks)
     : renderDay(ov, ctx, rinks);
   return calToolbar(ov) +
@@ -2648,6 +2671,189 @@ function renderWeek(ov, ctx, rinks) {
   }).join("");
   return grid + `<div class="privacy-note">📅 Week view is read-only.
     <strong>Switch to Day view to move games</strong> (drag, or tap Move then a slot).</div>`;
+}
+
+// Month overview (#158): a read-only calendar grid of ice density per day. Tap a
+// day to open it in Day view. Six week-rows always cover any month.
+function renderMonth(ov, ctx, rinks) {
+  if (!rinks.length) return `<div class="empty">No rinks match the selected filters.</div>`;
+  const rinkIds = new Set(rinks.map((r) => r.id));
+  const byDay = {};
+  ov.ice_slots.forEach((s) => {
+    if (!rinkIds.has(s.rink_id) || !slotPasses(s, ctx)) return;
+    const day = (s.start_time || "").slice(0, 10);
+    if (!day) return;
+    const b = byDay[day] || (byDay[day] = { total: 0, allocated: 0 });
+    b.total += 1;
+    if (s.status === "allocated") b.allocated += 1;
+  });
+  const monthNum = calendarDate.slice(0, 7);
+  const gridStart = startOfWeek(monthNum + "-01");
+  const cells = Array.from({ length: 42 }, (_, i) => addDays(gridStart, i));
+  const dows = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+    .map((d) => `<div class="mo-dow">${d}</div>`).join("");
+  const body = cells.map((day) => {
+    const inMonth = day.slice(0, 7) === monthNum;
+    const b = byDay[day];
+    const isToday = day === calendarDate;
+    const badge = b
+      ? `<span class="mo-count${b.allocated ? " has-alloc" : ""}">${b.total} ice${b.allocated ? ` · ${b.allocated} booked` : ""}</span>`
+      : "";
+    return `<button class="mo-cell${inMonth ? "" : " mo-out"}${isToday ? " mo-today" : ""}" data-cal-day="${day}">
+      <span class="mo-num">${+day.slice(8, 10)}</span>${badge}</button>`;
+  }).join("");
+  return `<div class="mo-grid"><div class="mo-dows">${dows}</div><div class="mo-cells">${body}</div></div>
+    <div class="privacy-note">📅 Month view is read-only — tap a day to open it in Day view.
+    Counts are Available + booked Game/other ice on the visible rinks.</div>`;
+}
+
+/* ---------- Ice Availability Builder (#158) ----------
+   An arena operator builds a draft ice INVENTORY from a recurring weekly block,
+   previews the exact slots (with collisions, skipped exclusion dates, capacity,
+   and any venue not granted to the Season), then explicitly creates the
+   Available Game ice. No games or published schedule are created here — the
+   planner consumes this inventory later. Backend: /api/setup/ice-availability/
+   {preview,commit}. Weekdays follow the backend's Mon=0..Sun=6 convention. */
+const IB_WEEKDAYS = [[0, "Mon"], [1, "Tue"], [2, "Wed"], [3, "Thu"],
+                     [4, "Fri"], [5, "Sat"], [6, "Sun"]];
+
+function defaultIceForm(ov) {
+  const seasons = ov.seasons || [];
+  const active = seasons.find((s) => s.status === "active") || seasons[0] || null;
+  const rinks = ov.rinks || [];
+  return {
+    season_id: active ? active.id : "",
+    rink_ids: rinks.length === 1 ? [rinks[0].id] : [],
+    weekdays: [1, 3],                 // Tue/Thu — the common contracted block
+    start_local: "18:00", end_local: "22:00",
+    start_date: "", end_date: "",     // blank => backend uses the Season range
+    playable_minutes: 60, turnover_minutes: 15,
+    exclusion_dates: [],
+  };
+}
+
+function ibLocalTime(iso) { return (iso || "").slice(11, 16); }
+function ibDateOnly(v) { return v ? String(v).slice(0, 10) : "—"; }
+
+function renderIceBuilder(ov) {
+  const f = iceBuilder.form || (iceBuilder.form = defaultIceForm(ov));
+  const seasons = ov.seasons || [];
+  const season = seasons.find((s) => s.id === f.season_id) || null;
+  const seasonOpts = seasons.map((s) =>
+    `<option value="${esc(s.id)}" ${s.id === f.season_id ? "selected" : ""}>${esc(s.name)}</option>`).join("");
+  const venues = ov.venues || [];
+  const rinkCheck = (r) =>
+    `<label class="ib-check"><input type="checkbox" class="ib-rink" value="${esc(r.id)}" ${f.rink_ids.includes(r.id) ? "checked" : ""}> ${esc(r.name)}</label>`;
+  const venueGroups = venues.map((v) => {
+    const rs = (ov.rinks || []).filter((r) => r.venue_id === v.id);
+    return rs.length ? `<div class="ib-venue"><div class="ib-venue-name">${esc(v.name)}</div>${rs.map(rinkCheck).join("")}</div>` : "";
+  }).join("");
+  const orphans = (ov.rinks || []).filter((r) => !venues.some((v) => v.id === r.venue_id));
+  const orphanGroup = orphans.length ? `<div class="ib-venue">${orphans.map(rinkCheck).join("")}</div>` : "";
+  const weekdayChips = IB_WEEKDAYS.map(([n, lbl]) =>
+    `<label class="ib-day"><input type="checkbox" class="ib-weekday" value="${n}" ${f.weekdays.includes(n) ? "checked" : ""}>${lbl}</label>`).join("");
+  const exclusionChips = f.exclusion_dates.length
+    ? f.exclusion_dates.map((d) => `<span class="ib-chip">${esc(d)}<button class="ib-chip-x" data-ib-excl-remove="${esc(d)}" aria-label="Remove ${esc(d)}">×</button></span>`).join("")
+    : `<span class="ib-none">None</span>`;
+  const seasonHint = season
+    ? `<div class="ib-hint">Season runs ${esc(ibDateOnly(season.start_date))} → ${esc(ibDateOnly(season.end_date))}. Leave the date range blank to cover the whole Season. Times are in the Season's local timezone; Season dates are never changed here.</div>`
+    : `<div class="ib-hint">Select a Season — slots generate in its local timezone.</div>`;
+
+  return `<div class="ib-wrap">
+    <div class="ib-head"><h2>🧊 Build recurring ice</h2>
+      <button class="act ghost" data-ib-cancel>← Back to calendar</button></div>
+    <p class="ib-lead">Generate a draft ice inventory from a recurring weekly block, preview every slot,
+      then create the Available Game ice. Nothing is scheduled here.</p>
+    <div class="card ib-form">
+      <label class="ib-field"><span>Season</span>
+        <select id="ib-season">${seasonOpts || `<option value="">No seasons yet</option>`}</select></label>
+      ${seasonHint}
+      <div class="ib-field"><span>Rinks</span>
+        <div class="ib-rinks">${venueGroups}${orphanGroup}${(ov.rinks || []).length ? "" : `<div class="ib-none">No rinks yet — add rinks in Setup first.</div>`}</div></div>
+      <div class="ib-field"><span>Weekdays</span><div class="ib-days">${weekdayChips}</div></div>
+      <div class="ib-grid2">
+        <label class="ib-field"><span>Start time</span><input type="time" id="ib-start" value="${esc(f.start_local)}"></label>
+        <label class="ib-field"><span>End time</span><input type="time" id="ib-end" value="${esc(f.end_local)}"></label>
+        <label class="ib-field"><span>From date</span><input type="date" id="ib-from" value="${esc(f.start_date)}"></label>
+        <label class="ib-field"><span>To date</span><input type="date" id="ib-to" value="${esc(f.end_date)}"></label>
+        <label class="ib-field"><span>Playable minutes</span><input type="number" id="ib-playable" min="1" step="5" value="${f.playable_minutes}"></label>
+        <label class="ib-field"><span>Turnover minutes</span><input type="number" id="ib-turnover" min="0" step="5" value="${f.turnover_minutes}"></label>
+      </div>
+      <div class="ib-field"><span>Exclusion dates</span>
+        <div class="ib-excl-add"><input type="date" id="ib-excl"><button class="act ghost" data-ib-excl-add>Add</button></div>
+        <div class="ib-chips">${exclusionChips}</div></div>
+      <div class="dq-actions"><button class="act primary" data-ib-preview>Preview slots</button></div>
+    </div>
+    ${iceBuilder.preview ? renderIcePreview(iceBuilder.preview) : ""}
+  </div>`;
+}
+
+function renderIcePreview(pv) {
+  if (pv.error) {
+    return `<div class="banner warn"><h2>Couldn't preview</h2>
+      <p>${esc((pv.error && pv.error.message) || "Check the template inputs and try again.")}</p></div>`;
+  }
+  const t = pv.totals;
+  const hrs = (m) => `${(m / 60).toFixed(m % 60 ? 1 : 0)}h`;
+  const access = (pv.venue_access_missing || []);
+  const accessWarn = access.length
+    ? `<div class="ib-warn">⚠ ${access.length} rink(s) skipped — their venue isn't granted to this Season:
+        <strong>${access.map((m) => esc(m.rink_name || m.rink_id)).join(", ")}</strong>.
+        <button class="linklike" data-goto="setup">Grant Season participation → Venue access</button>, then preview again.</div>`
+    : "";
+  const conflictWarn = t.conflict
+    ? `<div class="ib-warn">⚠ ${t.conflict} slot(s) overlap existing ice or games — reported, never overwritten.</div>` : "";
+  const skips = (pv.skipped_dates || []).length
+    ? `<div class="ib-note">Skipped ${pv.skipped_dates.length} exclusion date(s): ${pv.skipped_dates.map((s) => esc(s.date)).join(", ")}.</div>` : "";
+  const short = (pv.too_short || []).length
+    ? `<div class="ib-note">${pv.too_short.length} day(s) too short for one ${pv.playable_minutes}-min game: ${pv.too_short.map((s) => esc(s.date)).join(", ")}.</div>` : "";
+  const rinkRows = (pv.rinks || []).map((r) =>
+    `<div class="ib-rink-row"><span>${esc(r.rink_name)}</span><span>${r.new} new · ${r.duplicate} exist · ${r.conflict} conflict</span></div>`).join("");
+  const byDate = {};
+  (pv.slots || []).filter((s) => s.status === "new").forEach((s) => {
+    (byDate[s.date] || (byDate[s.date] = [])).push(s);
+  });
+  const days = Object.keys(byDate).sort();
+  const slotList = days.slice(0, 60).map((d) =>
+    `<div class="ib-day-row"><div class="ib-day-date">${esc(d)}</div>
+      <div class="ib-day-slots">${byDate[d].map((s) => `<span class="ib-slot">${esc(ibLocalTime(s.start_local))}–${esc(ibLocalTime(s.end_local))} · ${esc(s.rink_name)}</span>`).join("")}</div></div>`).join("");
+  const truncated = days.length > 60 ? `<div class="ib-note">Showing the first 60 of ${days.length} days.</div>` : "";
+  return `<div class="card ib-preview" data-ib-new="${t.new}" data-ib-duplicate="${t.duplicate}" data-ib-conflict="${t.conflict}" data-ib-access-missing="${(pv.venue_access_missing || []).length}" data-ib-skipped="${(pv.skipped_dates || []).length}">
+    <div class="section-title" style="margin-top:0">Preview — ${t.capacity_games} game slot(s) to create</div>
+    <div class="ib-stats">
+      <div class="ib-stat"><b>${t.new}</b><span>new</span></div>
+      <div class="ib-stat"><b>${t.duplicate}</b><span>already exist</span></div>
+      <div class="ib-stat"><b>${t.conflict}</b><span>conflicts</span></div>
+      <div class="ib-stat"><b>${hrs(t.playable_minutes)}</b><span>playable</span></div>
+      <div class="ib-stat"><b>${hrs(t.reserved_minutes)}</b><span>reserved</span></div>
+    </div>
+    ${accessWarn}${conflictWarn}${skips}${short}
+    ${rinkRows ? `<div class="ib-rink-rows">${rinkRows}</div>` : ""}
+    <div class="ib-slot-list">${slotList || `<div class="empty">No new slots — adjust the template above.</div>`}${truncated}</div>
+    <div class="dq-actions">
+      <button class="act success" data-ib-commit ${t.new ? "" : "disabled"}>Create ${t.new} slot(s)</button>
+      <button class="act ghost" data-ib-preview>Re-preview</button>
+    </div>
+  </div>`;
+}
+
+// Read the builder form out of the DOM (weekday/rink checkboxes + inputs),
+// preserving exclusion_dates which are managed via chips on the state object.
+function readIceBuilderForm(c) {
+  const val = (sel) => { const el = c.querySelector(sel); return el ? el.value : ""; };
+  const num = (sel, dflt) => { const v = parseInt(val(sel), 10); return isNaN(v) ? dflt : v; };
+  return {
+    ...iceBuilder.form,
+    season_id: val("#ib-season"),
+    rink_ids: Array.from(c.querySelectorAll(".ib-rink:checked")).map((e) => e.value),
+    weekdays: Array.from(c.querySelectorAll(".ib-weekday:checked")).map((e) => +e.value),
+    start_local: val("#ib-start") || "18:00",
+    end_local: val("#ib-end") || "22:00",
+    start_date: val("#ib-from"),
+    end_date: val("#ib-to"),
+    playable_minutes: num("#ib-playable", 60),
+    turnover_minutes: num("#ib-turnover", 15),
+  };
 }
 
 // The venue of the SLOT being scheduled, not just the league's first venue
@@ -6443,10 +6649,49 @@ async function render() {
   c.querySelectorAll("[data-cal]").forEach((b) => b.onclick = () => {
     const v = +b.dataset.cal;
     if (v === 0) calendarDate = "2026-09-05";
+    else if (calendarMode === "month") calendarDate = addMonths(calendarDate, v);
     else shiftDate(v * (calendarMode === "week" ? 7 : 1));
     toast = ""; conflict = null; movingGameId = null; pendingMove = null; render();
   });
   c.querySelectorAll("[data-mode]").forEach((b) => b.onclick = () => { calendarMode = b.dataset.mode; toast = ""; conflict = null; movingGameId = null; pendingMove = null; render(); });
+  // Month-view day cell -> open that day in Day view (#158).
+  c.querySelectorAll("[data-cal-day]").forEach((b) => b.onclick = () => {
+    calendarDate = b.dataset.calDay; calendarMode = "day"; toast = ""; render();
+  });
+  // Ice Availability Builder (#158): open/cancel, preview, commit, exclusions.
+  const ibOpen = c.querySelector("[data-ice-builder-open]");
+  if (ibOpen) ibOpen.onclick = () => { iceBuilder = { form: null, preview: null }; toast = ""; render(); };
+  const ibCancel = c.querySelector("[data-ib-cancel]");
+  if (ibCancel) ibCancel.onclick = () => { iceBuilder = null; toast = ""; render(); };
+  c.querySelectorAll("[data-ib-preview]").forEach((b) => b.onclick = async () => {
+    toast = "";
+    iceBuilder.form = readIceBuilderForm(c);
+    iceBuilder.preview = await post("/api/setup/ice-availability/preview", iceBuilder.form);
+    render();
+  });
+  const ibCommit = c.querySelector("[data-ib-commit]");
+  if (ibCommit) ibCommit.onclick = async () => {
+    toast = "";
+    iceBuilder.form = readIceBuilderForm(c);
+    const res = await post("/api/setup/ice-availability/commit", iceBuilder.form);
+    if (res && !res.error) { toast = `Created ${res.totals.created} ice slot(s).`; iceBuilder = null; }
+    else { iceBuilder.preview = res; }
+    render();
+  };
+  const ibExclAdd = c.querySelector("[data-ib-excl-add]");
+  if (ibExclAdd) ibExclAdd.onclick = () => {
+    iceBuilder.form = readIceBuilderForm(c);
+    const el = c.querySelector("#ib-excl");
+    const d = el && el.value;
+    if (d && !iceBuilder.form.exclusion_dates.includes(d)) iceBuilder.form.exclusion_dates.push(d);
+    render();
+  };
+  c.querySelectorAll("[data-ib-excl-remove]").forEach((b) => b.onclick = () => {
+    iceBuilder.form = readIceBuilderForm(c);
+    iceBuilder.form.exclusion_dates =
+      iceBuilder.form.exclusion_dates.filter((x) => x !== b.dataset.ibExclRemove);
+    render();
+  });
   c.querySelectorAll("[data-filter]").forEach((sel) => sel.onchange = (e) => {
     const key = sel.dataset.filter;
     calFilters[key] = e.target.value;

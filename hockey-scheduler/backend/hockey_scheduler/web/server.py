@@ -281,6 +281,7 @@ _POST_ROUTES = [re.compile(p) for p in (
     r"^/api/scheduler/draft$",
     r"^/api/scheduler/commit$",
     r"^/api/scheduler/drafts/(?:publish|discard)$",
+    r"^/api/setup/ice-availability/(?:preview|commit)$",
     r"^/api/notifications/deliveries/process$",
     r"^/api/notifications/deliveries/[^/]+/(?:retry|ignore)$",
     r"^/api/notifications/contacts$",
@@ -2010,6 +2011,22 @@ class Handler(BaseHTTPRequestHandler):
         # prefix so /api/v2/setup/ never falls through to /api/setup/.
         if path.startswith("/api/v2/setup/"):
             return self._handle_setup_v2(path[len("/api/v2/setup/"):], body, user_id)
+
+        # Ice Availability Builder (#158): preview then idempotently commit a
+        # recurring block of AVAILABLE Game ice for a Season. Checked BEFORE the
+        # generic /api/setup/ dispatcher below, which would otherwise treat
+        # "ice-availability/preview" as an unknown single-entity create. Preview
+        # writes nothing; commit is server-attributed and audited. MANAGE_ARENA.
+        if path in ("/api/setup/ice-availability/preview",
+                    "/api/setup/ice-availability/commit"):
+            fields = ("season_id", "rink_ids", "weekdays", "start_local",
+                      "end_local", "start_date", "end_date", "playable_minutes",
+                      "turnover_minutes", "exclusion_dates")
+            kwargs = {k: body.get(k) for k in fields}
+            if path.endswith("/preview"):
+                return self._send_api(api.preview_ice_availability(**kwargs))
+            return self._send_api(
+                api.commit_ice_availability(actor_id=user_id, **kwargs))
 
         # Setup create endpoints — operator creates real records via the API.
         if path.startswith("/api/setup/"):

@@ -65,6 +65,7 @@ from ..domain.errors import (
 )
 from ..store import InMemoryStore
 from .import_validator import validate_import, validate_official_availability
+from .ice_availability import plan_ice_windows, parse_hhmm
 from .season_guard import require_active_season
 from .league_scope import (
     registered_team_ids_in_division as _registered_team_ids,
@@ -2281,6 +2282,289 @@ class SetupService:
         self._audit("ice_slot_created", "ice_slot", slot.id, actor_id,
                     {"rink_id": rink_id, "slot_type": slot_type.value})
         return slot
+
+    # -- recurring ice availability builder (#158) -------------------------
+    # An arena operator builds a draft ice INVENTORY from a recurring weekly
+    # template, previews the exact slots, then explicitly commits them as
+    # AVAILABLE Game ice. No games or published schedule are created here; the
+    # planner (#206) later consumes this inventory. The pure date/time math is
+    # in services/ice_availability.py; the store-aware resolution, SeasonVenueAccess
+    # gating, collision/duplicate classification, idempotent commit, and audit
+    # live here next to create_ice_slot and the rinks/ice-slots importer.
+
+    def _ice_avail_range(self, season, tz, start_date, end_date):
+        """Resolve the generation date range. Explicit YYYY-MM-DD wins; otherwise
+        default to the Season's own start/end rendered in the Program timezone.
+        The Season is never mutated."""
+        def to_date(value, field, fallback):
+            if value in (None, ""):
+                if fallback is None:
+                    raise ValidationError(
+                        f"{field} is required (the Season has no {field} to "
+                        "default from).",
+                        {"reason": f"missing_{field}", "field": field})
+                return fallback.astimezone(tz).date()
+            if isinstance(value, date) and not isinstance(value, datetime):
+                return value
+            try:
+                return date.fromisoformat(str(value).strip())
+            except ValueError:
+                raise ValidationError(
+                    f"Invalid {field}: {value!r}. Expected YYYY-MM-DD.",
+                    {"reason": f"invalid_{field}", "field": field})
+        return (to_date(start_date, "start_date", season.start_date),
+                to_date(end_date, "end_date", season.end_date))
+
+    def _ice_avail_weekdays(self, weekdays):
+        if not isinstance(weekdays, (list, tuple)) or not weekdays:
+            raise ValidationError(
+                "Select at least one weekday.",
+                {"reason": "no_weekdays", "field": "weekdays"})
+        out = set()
+        for wd in weekdays:
+            if isinstance(wd, bool) or not isinstance(wd, int) or wd not in range(7):
+                raise ValidationError(
+                    f"Invalid weekday {wd!r}; use 0 (Monday) through 6 (Sunday).",
+                    {"reason": "invalid_weekday", "field": "weekdays"})
+            out.add(wd)
+        return out
+
+    def _ice_avail_exclusions(self, exclusion_dates):
+        if exclusion_dates in (None, ""):
+            return set()
+        if not isinstance(exclusion_dates, (list, tuple)):
+            raise ValidationError(
+                "exclusion_dates must be a list of YYYY-MM-DD dates.",
+                {"reason": "invalid_exclusion_dates", "field": "exclusion_dates"})
+        out = set()
+        for value in exclusion_dates:
+            try:
+                out.add(date.fromisoformat(str(value).strip()))
+            except ValueError:
+                raise ValidationError(
+                    f"Invalid exclusion date {value!r}. Expected YYYY-MM-DD.",
+                    {"reason": "invalid_exclusion_dates", "field": "exclusion_dates"})
+        return out
+
+    def _resolve_ice_availability(self, *, season_id, rink_ids, weekdays,
+                                  start_local, end_local, start_date, end_date,
+                                  playable_minutes, turnover_minutes,
+                                  exclusion_dates):
+        """Side-effect-free core shared by preview and commit. Resolves the
+        Season timezone and date range, runs the pure planner, splits the
+        selected rinks by SeasonVenueAccess, and classifies every proposed slot
+        on each accessible rink against existing inventory as new / duplicate /
+        conflict. Returns an internal resolution (datetimes intact)."""
+        season = self.store.get_season(season_id) if season_id else None
+        if season is None:
+            raise NotFoundError(
+                "Season not found.",
+                details={"reason": "season_missing", "season_id": season_id})
+        program = self.store.get_program(season.program_id)
+        tz = resolve_timezone(program.timezone if program else None) or timezone.utc
+
+        if not isinstance(rink_ids, (list, tuple)) or not rink_ids:
+            raise ValidationError(
+                "Select at least one rink.",
+                {"reason": "no_rinks", "field": "rink_ids"})
+
+        d_start, d_end = self._ice_avail_range(season, tz, start_date, end_date)
+        window = ((parse_hhmm(start_local, "start_local")),
+                  (parse_hhmm(end_local, "end_local")))
+        weekday_set = self._ice_avail_weekdays(weekdays)
+        weekday_windows = {wd: window for wd in weekday_set}
+        exclusions = self._ice_avail_exclusions(exclusion_dates)
+
+        plan = plan_ice_windows(
+            weekday_windows=weekday_windows, start_date=d_start, end_date=d_end,
+            playable_minutes=playable_minutes, turnover_minutes=turnover_minutes,
+            exclusion_dates=exclusions, tz=tz)
+
+        # Split rinks by SeasonVenueAccess: the builder never grants access
+        # (that is a MANAGE_SETUP action) — a rink whose Venue is not available
+        # to this Season is reported with a remediation route and produces no
+        # slots, mirroring the scheduler's require_slot_belongs_to_season gate.
+        accessible, access_missing = [], []
+        for rid in rink_ids:
+            rink = self.store.get_rink(rid)
+            if rink is None:
+                raise NotFoundError(
+                    f"Rink {rid} not found.",
+                    details={"reason": "rink_missing", "rink_id": rid})
+            venue = self.store.get_venue(rink.venue_id) if rink.venue_id else None
+            access = (self.store.season_venue_access_for_pair(season_id, rink.venue_id)
+                      if venue else None)
+            if venue is None or access is None or not access.active:
+                access_missing.append({
+                    "rink_id": rid, "rink_name": rink.name,
+                    "venue_id": rink.venue_id,
+                    "venue_name": venue.name if venue else None,
+                    "remediation_route":
+                        f"/api/v2/setup/seasons/{season_id}/venue-access",
+                })
+            else:
+                accessible.append((rink, venue))
+
+        existing_by_rink = {}
+        for existing in self.store.all_ice_slots():
+            existing_by_rink.setdefault(existing.rink_id, []).append(existing)
+
+        classified = []
+        for rink, venue in accessible:
+            existing = existing_by_rink.get(rink.id, [])
+            for w in plan["windows"]:
+                start, end = w["start"], w["end"]
+                # Exact (rink, start, end) match => idempotent duplicate (a rerun
+                # of the same template, or a pre-existing slot at that instant):
+                # never re-created, never overwritten. An overlap that is NOT an
+                # exact match is a real conflict the operator must resolve.
+                exact = next((e for e in existing if e.start_time == start
+                              and e.end_time == end), None)
+                if exact is not None:
+                    status, ref, has_game = "duplicate", exact.id, False
+                else:
+                    clash = next((e for e in existing if intervals_overlap(
+                        start, end, e.start_time, e.end_time)), None)
+                    if clash is not None:
+                        status, ref = "conflict", clash.id
+                        has_game = self.store.game_using_ice_slot(clash.id) is not None
+                    else:
+                        status, ref, has_game = "new", None, False
+                classified.append({
+                    "rink_id": rink.id, "rink_name": rink.name,
+                    "venue_id": venue.id, "venue_name": venue.name,
+                    "date": w["date"], "start": start, "end": end,
+                    "start_local": w["start_local"], "end_local": w["end_local"],
+                    "status": status, "conflict_with": ref,
+                    "conflict_has_game": has_game,
+                })
+
+        return {
+            "season": season, "tz": tz, "d_start": d_start, "d_end": d_end,
+            "weekdays": sorted(weekday_set),
+            "window": {"start": start_local, "end": end_local},
+            "playable_minutes": playable_minutes,
+            "turnover_minutes": turnover_minutes,
+            "plan": plan, "classified": classified,
+            "accessible": accessible, "access_missing": access_missing,
+        }
+
+    def _ice_availability_response(self, r):
+        """Shape a resolution into the preview API response (datetimes -> ISO)."""
+        classified = r["classified"]
+        per_rink = {}
+        for c in classified:
+            row = per_rink.setdefault(c["rink_id"], {
+                "rink_id": c["rink_id"], "rink_name": c["rink_name"],
+                "venue_id": c["venue_id"], "venue_name": c["venue_name"],
+                "new": 0, "duplicate": 0, "conflict": 0})
+            row[c["status"]] += 1
+        new_n = sum(1 for c in classified if c["status"] == "new")
+        dup_n = sum(1 for c in classified if c["status"] == "duplicate")
+        con_n = sum(1 for c in classified if c["status"] == "conflict")
+        n_rinks = len(r["accessible"])
+        plan = r["plan"]
+        return {
+            "season_id": r["season"].id, "season_name": r["season"].name,
+            "timezone": str(r["tz"]),
+            "date_range": {"start": r["d_start"].isoformat(),
+                           "end": r["d_end"].isoformat()},
+            "weekdays": r["weekdays"], "window": r["window"],
+            "playable_minutes": r["playable_minutes"],
+            "turnover_minutes": r["turnover_minutes"],
+            "rinks": list(per_rink.values()),
+            "slots": [{
+                "rink_id": c["rink_id"], "rink_name": c["rink_name"],
+                "date": c["date"],
+                "start_time": c["start"].isoformat(),
+                "end_time": c["end"].isoformat(),
+                "start_local": c["start_local"], "end_local": c["end_local"],
+                "status": c["status"], "conflict_with": c["conflict_with"],
+                "conflict_has_game": c["conflict_has_game"],
+            } for c in classified],
+            "totals": {
+                "new": new_n, "duplicate": dup_n, "conflict": con_n,
+                "capacity_games": new_n,
+                "reserved_minutes": plan["reserved_minutes"] * n_rinks,
+                "playable_minutes": plan["playable_minutes_total"] * n_rinks,
+            },
+            "skipped_dates": plan["skipped_dates"],
+            "too_short": plan["too_short"],
+            "venue_access_missing": r["access_missing"],
+        }
+
+    def _ice_slot_dto(self, slot):
+        return {"id": slot.id, "rink_id": slot.rink_id,
+                "start_time": slot.start_time.isoformat(),
+                "end_time": slot.end_time.isoformat(),
+                "slot_type": slot.slot_type.value, "status": slot.status.value}
+
+    def preview_ice_availability(self, *, season_id=None, rink_ids=None,
+                                 weekdays=None, start_local=None, end_local=None,
+                                 start_date=None, end_date=None,
+                                 playable_minutes=None, turnover_minutes=None,
+                                 exclusion_dates=None):
+        """Preview the slots a recurring template would create. No writes."""
+        return self._ice_availability_response(self._resolve_ice_availability(
+            season_id=season_id, rink_ids=rink_ids, weekdays=weekdays,
+            start_local=start_local, end_local=end_local,
+            start_date=start_date, end_date=end_date,
+            playable_minutes=playable_minutes, turnover_minutes=turnover_minutes,
+            exclusion_dates=exclusion_dates))
+
+    def commit_ice_availability(self, *, season_id=None, rink_ids=None,
+                                weekdays=None, start_local=None, end_local=None,
+                                start_date=None, end_date=None,
+                                playable_minutes=None, turnover_minutes=None,
+                                exclusion_dates=None, actor_id=None):
+        """Create the AVAILABLE Game ice slots a template implies. Idempotent:
+        an exact-duplicate slot is skipped, never re-created; a conflicting
+        overlap is reported and skipped. Audited per slot plus a batch summary.
+        Requires an active Season (#159)."""
+        self._require_active_season(season_id)
+        r = self._resolve_ice_availability(
+            season_id=season_id, rink_ids=rink_ids, weekdays=weekdays,
+            start_local=start_local, end_local=end_local,
+            start_date=start_date, end_date=end_date,
+            playable_minutes=playable_minutes, turnover_minutes=turnover_minutes,
+            exclusion_dates=exclusion_dates)
+        to_create = [c for c in r["classified"] if c["status"] == "new"]
+        counts = {
+            "created": 0,
+            "duplicate_skipped": sum(1 for c in r["classified"]
+                                     if c["status"] == "duplicate"),
+            "conflict_skipped": sum(1 for c in r["classified"]
+                                    if c["status"] == "conflict"),
+            "access_skipped_rinks": len(r["access_missing"]),
+        }
+        # Generated up front so every per-slot audit row is tagged with it, and
+        # a single batch-level row summarizes the run (mirrors the importer).
+        batch_id = self.store.next_id("iceavailbatch")
+        created = []
+        with self.store.transaction():
+            for c in to_create:
+                slot = IceSlot(
+                    id=self.store.next_id("slot"), rink_id=c["rink_id"],
+                    start_time=c["start"], end_time=c["end"],
+                    slot_type=IceSlotType.GAME, status=IceSlotStatus.AVAILABLE)
+                self.store.add_ice_slot(slot)
+                self._audit("ice_slot_created", "ice_slot", slot.id, actor_id,
+                            {"rink_id": c["rink_id"], "slot_type": "game",
+                             "ice_availability_batch_id": batch_id})
+                created.append(slot)
+            counts["created"] = len(created)
+            self._audit("ice_availability_committed", "ice_availability_batch",
+                        batch_id, actor_id, {
+                            "season_id": season_id,
+                            "rink_ids": list(rink_ids or []),
+                            "weekdays": r["weekdays"], "window": r["window"],
+                            "playable_minutes": playable_minutes,
+                            "turnover_minutes": turnover_minutes, **counts})
+        return {
+            "committed": True, "batch_id": batch_id,
+            "created": [self._ice_slot_dto(s) for s in created],
+            "totals": {**counts, "capacity_games": counts["created"]},
+        }
 
     # -- shared season-registration guard (#180) ---------------------------
     # A team's participation in a (season, division) is resolved through its

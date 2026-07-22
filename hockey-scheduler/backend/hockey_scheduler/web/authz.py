@@ -137,6 +137,15 @@ def required_permission(path: str):
     # like their single-entity creation routes.
     if path == "/api/import/commit/rinks-ice-slots":
         return Permission.MANAGE_ARENA
+    # Ice Availability Builder (#158): preview + idempotent commit of recurring
+    # AVAILABLE Game ice. Arena-side like /api/setup/ice-slot and the
+    # rinks/ice-slots import commit above — MANAGE_ARENA, the one permission
+    # both League Admin and Arena Manager hold. (Granting a Season access to a
+    # Venue stays a separate MANAGE_SETUP action; the builder only reports when
+    # it is missing, never grants it.)
+    if path in ("/api/setup/ice-availability/preview",
+                "/api/setup/ice-availability/commit"):
+        return Permission.MANAGE_ARENA
     # Existing Program/League/Venue codes for the hierarchy import wizard's
     # pickers (#260 review Q2/Q3/Q6) — same League-Admin-only MANAGE_SETUP
     # gate as the hierarchy import commit itself, since it's read from the
