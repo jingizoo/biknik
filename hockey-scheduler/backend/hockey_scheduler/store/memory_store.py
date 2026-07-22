@@ -12,6 +12,7 @@ import threading
 from typing import Dict, List, Optional
 
 from ..domain import (
+    ActiveContext,
     AuditLog,
     CalendarFeedToken,
     Club,
@@ -98,6 +99,7 @@ class InMemoryStore:
         self.installation_state: Dict[str, InstallationState] = {}
         self.user_accounts: Dict[str, UserAccount] = {}
         self.sessions: Dict[str, Session] = {}
+        self.user_active_context: Dict[str, ActiveContext] = {}
         self.guardian_links: Dict[str, GuardianLink] = {}
         self.reschedule_requests: Dict[str, RescheduleRequest] = {}
         self.setup_audit: List[SetupAuditLog] = []
@@ -972,6 +974,14 @@ class InMemoryStore:
 
     def sessions_for_user(self, user_id: str) -> List[Session]:
         return [s for s in self.sessions.values() if s.user_id == user_id]
+
+    # -- per-user active Program/Season context (#159) ---------------------
+    def get_active_context(self, user_id: str) -> Optional[ActiveContext]:
+        return self.user_active_context.get(user_id)
+
+    def set_active_context(self, ctx: ActiveContext) -> ActiveContext:
+        self.user_active_context[ctx.id] = ctx
+        return ctx
 
     def delete_sessions_before(self, cutoff: datetime) -> int:
         """Delete finished sessions whose terminal time is before ``cutoff`` —

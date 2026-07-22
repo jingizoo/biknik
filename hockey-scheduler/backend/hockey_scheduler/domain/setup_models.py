@@ -523,6 +523,26 @@ class UserAccount:
 
 
 @dataclass
+class ActiveContext:
+    """A user's currently-selected Program + Season working context (#159).
+
+    Operators run several Programs and Seasons; this is the one they are
+    *looking at* — the selection the shell's switcher persists so every screen
+    resolves to the same context and deep links can restore it. It is a VIEW
+    preference, NOT an authorization grant: switching context never widens what
+    a role/scope may do (roles are enforced independently, #211). ``id`` is the
+    owning ``user_id`` (one context per user). A ``program_id``/``season_id``
+    that has since been deleted or archived is ignored at resolve time in favor
+    of a deterministic authorized fallback, so a stale selection never wedges a
+    user on a context that no longer exists.
+    """
+    id: str
+    program_id: Optional[str]
+    season_id: Optional[str]
+    updated_at: datetime
+
+
+@dataclass
 class Session:
     """A persisted login session (#74).
 

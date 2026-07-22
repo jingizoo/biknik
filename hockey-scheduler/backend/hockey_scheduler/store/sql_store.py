@@ -27,6 +27,7 @@ from ..domain import (
     IceSlot,
     IceSlotStatus,
     IceSlotType,
+    ActiveContext,
     GameResult,
     League,
     LeagueSeason,
@@ -256,6 +257,8 @@ SPECS = {
                        "scope": _jsonc(), "active": _bool()}),
     Session: Spec(Session, "sessions",
                   {"issued_at": _dt(), "expires_at": _dt(), "revoked_at": _dt()}),
+    ActiveContext: Spec(ActiveContext, "user_active_context",
+                        {"updated_at": _dt()}),
     GuardianLink: Spec(GuardianLink, "guardian_links",
                        {"created_at": _dt(), "verified": _bool(),
                         "consented_at": _dt()}),
@@ -1621,3 +1624,13 @@ class SqlStore:
                 "(revoked_at IS NOT NULL AND revoked_at < ?) OR "
                 "(revoked_at IS NULL AND expires_at < ?)", (iso, iso))
         return cur.rowcount if cur.rowcount is not None else 0
+
+    # -- per-user active Program/Season context (#159) ---------------------
+    def get_active_context(self, user_id):
+        return self._get(ActiveContext, user_id)
+
+    def set_active_context(self, ctx):
+        """Persist a user's selected context (one row per user; upsert)."""
+        with self.transaction():
+            self._upsert(ctx)
+        return ctx

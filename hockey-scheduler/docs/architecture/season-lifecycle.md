@@ -132,9 +132,53 @@ registration in a Season that is archived under the lock is frozen history and
 never moved; a concurrent archive cannot slip between the status read and the
 registration rewrite.
 
+## Active-context selection (#159 Slice 2 — backend foundation)
+
+Which Program + Season a user is *working in*, persisted per user in
+`user_active_context` (one row, `id` = the `user_id`; migration 044) and served
+by `ContextService`. This is the backend **preference + resolution foundation**
+only — **not** the shell switcher/UI, **not** deep-link restoration, **not**
+cross-context isolation of existing reads/writes/workers/exports (they still take
+explicit ids), and **not** completion of #159 (which stays open).
+
+**Authorization on every request.** The selection is a VIEW preference, never
+authority. On every resolve and set it is filtered through the caller's real
+role + account scope (`services/context_scope.py`, the same #211/#266/#202 rules
+the rest of the app uses): the two global operators and the read-only Viewer see
+every Program (the current model has no org-scoped operator — when one lands,
+`context_scope` is the single place to narrow it); a Coach/Player sees only its
+team's Program and that team's participating Seasons; an Official only the
+Programs/Seasons of its assigned games; a Guardian only its verified juniors'.
+So a scoped account can neither select nor *enumerate* an unrelated context, and
+a saved selection is dropped the instant the caller's scope changes.
+
+- **`GET /api/context`** → the effective `{program_id, season_id, read_only,
+  program, season}`: the saved selection when its Program is still authorized+
+  present and its Season (if any) still authorized+present; else a deterministic
+  authorized fallback; else empty. Fallback prefers an authorized **active**
+  Season (chosen by **semantically parsed** start_date — latest wins, id
+  tiebreak, a null date never beats a dated one), and otherwise a **Program-only**
+  context (null Season) so new/empty Programs remain selectable. `read_only` is
+  true iff the resolved Season is archived.
+- **`POST /api/context`** `{program_id, season_id?}` (strict body: `program_id`
+  required, `season_id` optional/nullable, no unknown fields) records a
+  selection. `season_id` may be null (Program-only). An **archived** Season is
+  accepted as a **read-only historical** context — honored, never silently
+  swapped for an active one — while writes against it stay blocked by the Season
+  read-only guard above. An unauthorized **or** non-existent Program/Season both
+  return the *same* generic `not_found` (no existence oracle). Setting a
+  selection is idempotent; concurrent sets are last-write-wins.
+
+Both endpoints need only a valid session — never the operator permission gate —
+because the selection grants nothing (a Viewer may record its own selection yet
+still gets 403 on an operator write). `user_id` is always the server-resolved
+session user; no client-supplied actor.
+
 ## Scope / follow-ups
 
-This slice is the lifecycle foundation for #159. Later slices add the active
-Program/Season context selection (persisted per user with an authorized
-deterministic fallback), the switcher UI, new-Season copy-forward preview, and
-cross-context isolation hardening.
+Slice 1 (lifecycle) and Slice 2 (this backend selection foundation) are done.
+Remaining #159 work, to be taken as separate slices: the authenticated-shell
+**switcher UI + deep-link restoration** consuming these endpoints; then
+**consumer-by-consumer cross-context isolation** (lists, counts, exports,
+background jobs resolving strictly through the selected Season); then
+**new-Season copy-forward preview**. #159 stays open.

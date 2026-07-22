@@ -43,6 +43,7 @@ from ..domain.errors import (
 from ..services import (
     ACTOR_TYPES,
     AccountService,
+    ContextService,
     FactoryResetService,
     GuardianService,
     DeliveryLoop,
@@ -166,6 +167,32 @@ class ApiService:
         self.factory_reset = FactoryResetService(
             self.store, self.accounts, self.roster.clock)
         self.guardians = GuardianService(self.store, self.roster.clock)
+        self.context = ContextService(self.store, self.roster.clock)
+
+    # -- active Program/Season context (#159) ------------------------------
+    def _context_view(self, program_id, season_id, read_only) -> dict:
+        program = self.store.get_program(program_id) if program_id else None
+        season = self.store.get_season(season_id) if season_id else None
+        return {
+            "program_id": program_id,
+            "season_id": season_id,
+            "read_only": read_only,
+            "program": _serialize(program) if program else None,
+            "season": _serialize(season) if season else None,
+        }
+
+    @catch
+    def get_active_context(self, user_id, role, scope) -> dict:
+        program_id, season_id, read_only = self.context.resolve(
+            user_id, role, scope)
+        return self._context_view(program_id, season_id, read_only)
+
+    @catch
+    def set_active_context(self, user_id, role, scope,
+                           program_id, season_id) -> dict:
+        program_id, season_id, read_only = self.context.set(
+            user_id, role, scope, program_id, season_id)
+        return self._context_view(program_id, season_id, read_only)
 
     # -- competition-hierarchy resolution (#283) ---------------------------
     # After the #283 model change a League is a permanent child of a Program

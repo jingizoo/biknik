@@ -1,4 +1,5 @@
 from .account_service import AccountService
+from .context_service import ContextService
 from .factory_reset_service import CONFIRMATION_PHRASE, FactoryResetService
 from .guardian_service import GuardianService
 from .calendar import (
@@ -61,7 +62,8 @@ __all__ = ["RosterService", "SetupService", "DeliveryWorker", "DeliveryLoop",
            "email_transport_from_env", "PushTransport", "DryRunPushTransport",
            "ProviderPushTransport", "push_transport_from_config",
            "push_config_from_env", "push_transport_from_env",
-           "AccountService", "GuardianService", "IMPORT_SHEET_NAMES",
+           "AccountService", "ContextService", "GuardianService",
+           "IMPORT_SHEET_NAMES",
            "parse_csv_text",
            "validate_import", "validate_official_availability",
            "FactoryResetService", "CONFIRMATION_PHRASE"]
