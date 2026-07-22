@@ -1015,6 +1015,50 @@ class IceSlotRaceTest(unittest.TestCase):
         trc.join(25); resume.set(); tv.join(25)
         return results
 
+    def _forced_delete_before_locked_create(self, create_store, create_fn,
+                                            delete_store, delete_fn):
+        """The mirror of _forced_delete_wins for a child that now ROW-LOCKS its
+        parent. create_ice_slot takes the rink's FOR UPDATE lock for the whole
+        create (#158 review), so a delete can no longer slip through the old
+        read-to-insert window. Force the one reachable delete-wins ordering:
+        pause the delete AFTER its DELETE statement (row exclusive-locked,
+        transaction still open), start the create and CONFIRM its exact backend
+        is blocked taking the rink lock, then release the delete to commit. The
+        create unblocks onto a now-deleted rink and must lose with a clean
+        not_found — never an orphan slot, a duplicate, or a raw driver error."""
+        orig = delete_store.delete_rink
+        deleted = threading.Event()
+        release = threading.Event()
+        calls = [0]
+
+        def instrumented(*a, **k):
+            result = orig(*a, **k)   # the DELETE takes the row's exclusive lock
+            calls[0] += 1
+            if calls[0] == 1:
+                deleted.set()
+                release.wait(15)
+            return result
+
+        delete_store.delete_rink = instrumented
+        results = {}
+        td = threading.Thread(target=lambda: self._record(results, "delete",
+                                                          delete_fn))
+        tc = threading.Thread(target=lambda: self._record(results, "child",
+                                                          create_fn))
+        create_pid = self._backend_pid(create_store)
+        td.start()
+        if not deleted.wait(15):
+            release.set(); td.join(15)
+            self.fail("delete never reached its DELETE statement")
+        tc.start()
+        self.assertTrue(self._wait_until_blocked_on_lock(create_pid),
+                        "create backend never blocked on the rink's row lock")
+        self.assertIsNone(results.get("child"),
+                          "create completed without blocking on the delete's lock")
+        release.set()
+        td.join(25); tc.join(25)
+        return results
+
     def _barrier(self, child_fn, delete_fn):
         barrier = threading.Barrier(2)
         results = {}
@@ -1357,19 +1401,28 @@ class IceSlotRaceTest(unittest.TestCase):
         return venue, rink
 
     def test_create_ice_slot_vs_delete_rink_forced(self):
+        # create_ice_slot now row-locks the rink for the whole create (#158
+        # review): it can no longer read the rink, pause, and then lose its
+        # INSERT to a delete that committed in between — that TOCTOU window is
+        # closed. The one reachable delete-wins ordering is the lock-serialized
+        # one: the create blocks on the delete's row lock, then unblocks onto a
+        # deleted rink and loses with a clean not_found (the store's FOR UPDATE
+        # returns no row). No orphan slot, no raw driver error.
         api0 = ApiService(SqlStore(self.url))
         _venue, rink = self._seed_venue_rink(api0)
-        victim_store = SqlStore(self.url)
-        api_v = ApiService(victim_store)
-        api_r = ApiService(SqlStore(self.url))
-        results = self._forced_delete_wins(
-            victim_store, "get_rink",
-            victim_fn=lambda: api_v.setup.create_ice_slot(
+        create_store = SqlStore(self.url)
+        api_c = ApiService(create_store)
+        delete_store = SqlStore(self.url)
+        api_d = ApiService(delete_store)
+        results = self._forced_delete_before_locked_create(
+            create_store,
+            create_fn=lambda: api_c.setup.create_ice_slot(
                 rink, datetime(2027, 1, 1, 18, tzinfo=UTC),
                 datetime(2027, 1, 1, 19, tzinfo=UTC), IceSlotType.GAME,
                 actor_id="c"),
-            racer_fn=lambda: api_r.setup.delete_rink(rink, actor_id="d"))
-        self.assertEqual(results, {"child": "rink_not_found", "delete": "ok"},
+            delete_store=delete_store,
+            delete_fn=lambda: api_d.setup.delete_rink(rink, actor_id="d"))
+        self.assertEqual(results, {"child": "not_found", "delete": "ok"},
                          results)
         check = SqlStore(self.url)
         self._no_orphan_slots(check)

@@ -313,7 +313,12 @@ class PostgresIceAvailabilityConcurrencyTest(unittest.TestCase):
         seed = SqlStore(self.url)
         seed.clear_all_data()
         s = SetupService(seed)
-        prog = s.create_program("AHL")
+        # The Program timezone is the anchor for the builder's local->UTC math,
+        # so it decides where the generated windows land. Toronto (EDT in
+        # September) puts the first 18:00-19:00 local window at 22:00-23:00 UTC —
+        # exactly the tuple test_commit_vs_manual creates by hand, so the manual
+        # slot collides with a generated window instead of becoming a 7th slot.
+        prog = s.create_program("AHL", timezone_name=TZ)
         season = s.create_season(prog.id, "Fall 2026")
         venue = s.create_venue("Main Arena", league_id=prog.id)
         s.grant_season_venue_access(season.id, venue.id)
