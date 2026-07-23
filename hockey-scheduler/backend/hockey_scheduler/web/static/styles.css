@@ -283,6 +283,17 @@ button.act:disabled { opacity: 0.45; cursor: default; }
 
 .empty { text-align: center; color: var(--muted); padding: 24px 12px; font-size: 14px; }
 
+/* Scheduler empty-state diagnostics (#311): when Generate resolves fewer than
+   two eligible seasonal registrations, the preview explains why and points at
+   the corrective path. Unlike .empty (centered, muted) this is a left-aligned,
+   readable explanation with an emphasized lead. */
+.sched-empty { padding: 16px 14px; color: var(--ink); font-size: 14px; line-height: 1.45; }
+.sched-empty-lead { font-weight: 700; font-size: 15px; margin-bottom: 8px; }
+.sched-empty p { margin: 8px 0 0; color: var(--muted); }
+.sched-empty p:last-child { margin-top: 12px; }
+.sched-empty strong { color: var(--ink); font-weight: 600; }
+.sched-empty .linklike { font-size: inherit; }
+
 select.player-picker {
   width: 100%; padding: 11px 12px; border-radius: 10px; border: 1px solid var(--sep);
   font-size: 15px; background: #fff; margin-bottom: 14px;

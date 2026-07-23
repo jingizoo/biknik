@@ -154,6 +154,7 @@ jobs:
           node --check hockey-scheduler/e2e/season-participation.js
           node --check hockey-scheduler/e2e/season-rollover.js
           node --check hockey-scheduler/e2e/team-division-participation.js
+          node --check hockey-scheduler/e2e/scheduler-empty-state.js
           node --check hockey-scheduler/e2e/permanent-teams.js
           node --check hockey-scheduler/e2e/safe-destructive.js
           node --check hockey-scheduler/e2e/destructive-surfaces.js
@@ -202,7 +203,7 @@ jobs:
           - shard: 1
             scripts: "smoke setup-claim onboarding-wizard hierarchy-import season-participation season-rollover season-dates"
           - shard: 2
-            scripts: "team-division-participation allowed-venues venue-access-cleanup venue-sharing permanent-teams player-edit"
+            scripts: "team-division-participation scheduler-empty-state allowed-venues venue-access-cleanup venue-sharing permanent-teams player-edit"
           - shard: 3
             scripts: "safe-destructive destructive-surfaces reset-visibility factory-reset demo-lifecycle api-error-resilience"
           - shard: 4
