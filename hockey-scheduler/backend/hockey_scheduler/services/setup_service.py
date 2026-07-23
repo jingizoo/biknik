@@ -2462,25 +2462,25 @@ class SetupService:
         accessible, access_missing = self._split_rinks_by_access(
             season_id, rink_ids)
 
-        # Fingerprint the operator-controllable template so commit can refuse a
-        # form edited after preview (#158 review): the create button re-reads
-        # the live form, so without this an operator could preview one template
-        # and commit a different one. Covers exactly the fields that shape the
-        # generated slots, normalized (deduped/sorted rinks, canonical per-
-        # weekday windows, sorted exclusions) so cosmetic input order doesn't
-        # change it; deterministic — no clock, no resolved season state, so
-        # preview and commit agree for an unedited template.
-        def _fp_date(value):
-            return None if value in (None, "") else str(value).strip()
+        # Fingerprint the RESOLVED preview snapshot so commit can only write the
+        # exact slots the operator reviewed (#158 review). Binding the raw form
+        # fields alone is not enough: a blank date range, or a concurrent
+        # Program-timezone / Season-boundary edit, would leave a form-only
+        # fingerprint unchanged while the resolved windows move — committing ice
+        # that was never shown. So bind the resolved timezone, the resolved date
+        # range, and the generated (rink, start, end) UTC tuples of the
+        # accessible rinks — exactly the proposed ice. Any resolved change flips
+        # it (forcing a re-preview); an unedited template over unchanged state is
+        # stable, so preview and commit agree. Deterministic — no clock.
+        proposed = sorted(
+            (rink.id, w["start"].isoformat(), w["end"].isoformat())
+            for rink, _venue in accessible
+            for w in plan["windows"])
         fingerprint = hashlib.sha256(json.dumps({
             "season_id": season_id,
-            "rink_ids": sorted(rink_ids),
-            "windows": windows_meta,
-            "start_date": _fp_date(start_date),
-            "end_date": _fp_date(end_date),
-            "playable_minutes": playable_minutes,
-            "turnover_minutes": turnover_minutes,
-            "exclusion_dates": sorted(d.isoformat() for d in exclusions),
+            "timezone": str(tz),
+            "date_range": [d_start.isoformat(), d_end.isoformat()],
+            "slots": proposed,
         }, sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:16]
 
         return {

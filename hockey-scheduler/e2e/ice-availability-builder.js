@@ -14,7 +14,9 @@
 //   * each selected weekday carries its OWN local start/end time (#158 flow):
 //     a narrower Thursday window yields fewer Thursday games than Tuesday;
 //   * commit is bound to the preview: editing the template after Preview drops
-//     the preview + Create, so an edited form can never be committed.
+//     the preview + Create, so an edited form can never be committed;
+//   * a stale preview (its resolved snapshot moved) is refused by the server
+//     and the UI re-previews the current proposal instead of writing it.
 //
 // September 2026 has Tuesdays 1,8,15,22,29 and Thursdays 3,10,17,24 = 9 days;
 // a 18:00-22:00 window with 60-minute games + 15-minute turnover yields 3 games
@@ -102,7 +104,15 @@ async function checkViewport(browser, viewport) {
   const page = await context.newPage();
   const errors = [];
   page.on("pageerror", (e) => errors.push(`[pageerror] ${e.message}`));
-  page.on("console", (m) => { if (m.type() === "error") errors.push(`[console] ${m.text()}`); });
+  page.on("console", (m) => {
+    if (m.type() !== "error") return;
+    const text = m.text();
+    // Browser network-status noise for a 4xx the app handles gracefully (e.g. a
+    // refused stale-preview commit in step H) is not a page bug — the functional
+    // assertions below catch real breakage. Keep genuine JS console errors.
+    if (/Failed to load resource/i.test(text)) return;
+    errors.push(`[console] ${text}`);
+  });
   const fail = (msg) => { throw new Error(`[${viewport.label}] ${msg}`); };
 
   try {
@@ -255,8 +265,46 @@ async function checkViewport(browser, viewport) {
     }, rink5);
     if (boundCommitted !== 0) fail(`an invalidated preview must commit nothing, got ${boundCommitted}`);
 
+    // (H) A STALE preview is refused and refreshed. Simulate the resolved
+    // snapshot moving under the operator (a concurrent Season/timezone edit
+    // invalidates the stored fingerprint) by staling it; the server rejects the
+    // commit and the UI re-previews the current proposal instead of writing the
+    // stale set. (The service/HTTP suites drive the real Season/tz change.)
+    const rink6 = await page.evaluate(async (season) => {
+      const post = async (p, b) => (await fetch(p, {
+        method: "POST", credentials: "same-origin",
+        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
+      })).json();
+      const venue = await post("/api/setup/venue", { name: "South", league_id: null });
+      await post(`/api/v2/setup/seasons/${season}/venue-access`, { venue_id: venue.id });
+      return (await post("/api/setup/rink", { venue_id: venue.id, name: "South Ice" })).id;
+    }, ids.season);
+    await page.click("[data-ib-cancel]");
+    await page.waitForSelector("[data-ice-builder-open]", { timeout: 10000 });
+    await page.click("[data-ice-builder-open]");
+    await page.waitForSelector(".ib-form", { timeout: 10000 });
+    await page.check(`.ib-rink[value="${rink6}"]`);
+    await preview(page);
+    s = await previewState(page);
+    if (s.commitDisabled !== false) fail(`refresh test needs an enabled Create: ${JSON.stringify(s)}`);
+    await page.evaluate(() => { iceBuilder.preview.template_fingerprint = "staledeadbeef00"; });
+    await page.click("[data-ib-commit]");
+    // The commit is refused and the UI re-previews the current proposal — its
+    // toast announces the refresh (only the preview_mismatch branch sets it).
+    await page.waitForFunction(
+      () => /changed since preview/i.test((document.querySelector(".toast-msg") || {}).textContent || ""),
+      null, { timeout: 10000 });
+    // Crucially, the stale commit wrote nothing, and the builder stayed open
+    // (a successful commit would have closed it back to the calendar).
+    await page.waitForSelector(".ib-form", { timeout: 10000 });
+    const staleCommitted = await page.evaluate(async (rink) => {
+      const ov = await (await fetch("/api/demo/overview", { credentials: "same-origin" })).json();
+      return (ov.ice_slots || []).filter((x) => x.rink_id === rink).length;
+    }, rink6);
+    if (staleCommitted !== 0) fail(`a refused stale commit must write nothing, got ${staleCommitted}`);
+
     if (errors.length) fail(`console/page errors:\n${errors.join("\n")}`);
-    console.log(`[${viewport.label}] OK — month grid renders; builder previews ${EXPECTED_NEW} slots, reports un-granted venue, commits idempotently, honors exclusions, applies per-weekday windows (narrow Thursday => 19), and binds commit to the preview (edit invalidates it).`);
+    console.log(`[${viewport.label}] OK — month grid renders; builder previews ${EXPECTED_NEW} slots, reports un-granted venue, commits idempotently, honors exclusions, applies per-weekday windows (narrow Thursday => 19), binds commit to the preview (edit invalidates it), and refuses+refreshes a stale preview.`);
   } catch (error) {
     throw new Error(`${error.message}\n--- demo server output ---\n${serverOutput}`);
   } finally {

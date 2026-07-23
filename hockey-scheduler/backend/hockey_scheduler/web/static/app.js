@@ -6737,8 +6737,19 @@ async function render() {
     iceBuilder.form = readIceBuilderForm(c);
     const res = await post("/api/setup/ice-availability/commit",
       { ...iceBuilder.form, template_fingerprint: fingerprint });
-    if (res && !res.error) { toast = `Created ${res.totals.created} ice slot(s).`; iceBuilder = null; }
-    else { iceBuilder.preview = res; }
+    const reason = res && res.error && res.error.details && res.error.details.reason;
+    if (res && !res.error) {
+      toast = `Created ${res.totals.created} ice slot(s).`; iceBuilder = null;
+    } else if (reason === "preview_mismatch") {
+      // The proposal changed since Preview — a slipped-through form edit, or a
+      // concurrent Season/timezone change moved the resolved slots. Refresh the
+      // preview so the operator reviews the CURRENT slots before creating again;
+      // never commit the stale set.
+      toast = "The schedule changed since preview — showing the updated proposal. Review, then create again.";
+      iceBuilder.preview = await post("/api/setup/ice-availability/preview", iceBuilder.form);
+    } else {
+      iceBuilder.preview = res;
+    }
     render();
   };
   const ibExclAdd = c.querySelector("[data-ib-excl-add]");

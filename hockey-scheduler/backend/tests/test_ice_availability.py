@@ -534,6 +534,52 @@ class IceAvailabilityContract:
         res = self.api.commit_ice_availability(actor_id="a", **_template())
         self.assertEqual(res["totals"]["created"], 6)
 
+    def test_commit_refused_when_default_season_dates_change_after_preview(self):
+        # The fingerprint binds the RESOLVED snapshot, not the raw form. With a
+        # blank date range (defaulted from the Season), a concurrent Season-end
+        # edit moves the resolved range — so a commit carrying the previewed
+        # fingerprint is refused (never writes the range the operator didn't see).
+        tmpl = _template(start_date=None, end_date=None)      # default from Season
+        fp = self.api.preview_ice_availability(**tmpl)["template_fingerprint"]
+        season = self.store.get_season("season_1")
+        season.end_date = datetime(2026, 9, 8, 4, tzinfo=timezone.utc)   # narrowed
+        self.store.save_season(season)
+        res = self.api.commit_ice_availability(
+            actor_id="a", template_fingerprint=fp, **tmpl)
+        self.assertIn("error", res)
+        self.assertEqual(res["error"]["details"]["reason"], "preview_mismatch")
+        self.assertEqual(self._slots(), [])
+        self.assertEqual([a for a in self.store.all_setup_audit()
+                          if a.action == "ice_slot_created"], [])
+
+    def test_commit_refused_when_program_timezone_changes_after_preview(self):
+        # A Program-timezone change moves every window's UTC instant. A commit
+        # bound to the previewed (Toronto) snapshot is refused after the zone
+        # flips to UTC — the reviewed slots and the would-be-written slots differ.
+        fp = self.api.preview_ice_availability(**_template())["template_fingerprint"]
+        prog = self.store.get_program("prog_1")
+        prog.timezone = "UTC"
+        self.store.save_program(prog)
+        res = self.api.commit_ice_availability(
+            actor_id="a", template_fingerprint=fp, **_template())
+        self.assertIn("error", res)
+        self.assertEqual(res["error"]["details"]["reason"], "preview_mismatch")
+        self.assertEqual(self._slots(), [])
+
+    def test_commit_after_repreview_of_the_new_snapshot_succeeds(self):
+        # After a Season change invalidates the old preview, re-previewing yields
+        # a fresh fingerprint that DOES commit — the refresh path is not a
+        # dead end.
+        prog = self.store.get_program("prog_1")
+        prog.timezone = "UTC"
+        self.store.save_program(prog)
+        pv = self.api.preview_ice_availability(**_template())   # fresh snapshot
+        res = self.api.commit_ice_availability(
+            actor_id="a", template_fingerprint=pv["template_fingerprint"],
+            **_template())
+        self.assertNotIn("error", res)
+        self.assertEqual(res["totals"]["created"], pv["totals"]["new"])
+
 
 class MemoryIceAvailabilityTest(IceAvailabilityContract, unittest.TestCase):
     def _store(self):
@@ -975,3 +1021,42 @@ class IceAvailabilityHttpAuthzTest(unittest.TestCase):
                           dict(template, template_fingerprint=fp))
         self.assertEqual(ok["totals"]["created"], 6)
         self.assertEqual(slot_count(), 6)
+
+    def test_commit_binding_rejects_resolved_snapshot_change_over_http(self):
+        # Over HTTP with a BLANK date range (defaulted from the Season): a
+        # concurrent Season-boundary change between preview and commit moves the
+        # resolved slots, so the commit is refused — proving the token binds the
+        # resolved snapshot, not just the submitted form fields.
+        svc = self.srv.STATE.api.setup
+        store = self.srv.STATE.api.store
+        prog = svc.create_program("HB2", timezone_name=TZ)
+        season = svc.create_season(prog.id, "Fall Binding 2")
+        # Pin a known wide range so the later narrowing is unambiguous.
+        s = store.get_season(season.id)
+        s.start_date = datetime(2026, 9, 1, 4, tzinfo=timezone.utc)
+        s.end_date = datetime(2027, 3, 31, 4, tzinfo=timezone.utc)
+        store.save_season(s)
+        venue = svc.create_venue("Rink House 2", league_id=prog.id)
+        svc.grant_season_venue_access(season.id, venue.id)
+        rink = svc.create_rink(venue.id, "Sheet 2")
+        template = {                                       # NO dates => Season range
+            "season_id": season.id, "rink_ids": [rink.id],
+            "weekdays": [1, 3], "start_local": "18:00", "end_local": "22:00",
+            "playable_minutes": 60, "turnover_minutes": 15}
+        c = self._client()
+        self._login(c, "arena")
+        _, pv = self._req(
+            c, "POST", "/api/setup/ice-availability/preview", template)
+        fp = pv["template_fingerprint"]
+        self.assertTrue(fp)
+        self.assertGreater(pv["totals"]["new"], 6)         # a whole season of ice
+        # Concurrent Season-boundary edit narrows the resolved range.
+        s = store.get_season(season.id)
+        s.end_date = datetime(2026, 9, 8, 4, tzinfo=timezone.utc)
+        store.save_season(s)
+        _, res = self._req(c, "POST", "/api/setup/ice-availability/commit",
+                           dict(template, template_fingerprint=fp))
+        self.assertIn("error", res)
+        self.assertEqual(res["error"]["details"]["reason"], "preview_mismatch")
+        self.assertEqual(
+            sum(1 for x in store.all_ice_slots() if x.rink_id == rink.id), 0)
