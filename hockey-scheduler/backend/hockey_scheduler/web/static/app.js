@@ -40,6 +40,11 @@ let newAccountError = "";
 let notifPrefs = null;             // signed-in user's own channel prefs (#81)
 let feedTokens = [];               // signed-in user's calendar feed tokens (#82)
 let newFeedUrl = null;             // freshly-minted feed URL, shown once (#82)
+// Active Program/Season context (#159): the AUTHORIZED options + the current
+// selection, from GET /api/context/options (never the unfiltered overview, so a
+// scoped user can neither select nor enumerate an unrelated context). A saved
+// DISPLAY context only — existing screens are not filtered by it yet.
+let contextOptions = null;         // {programs:[{id,name,seasons:[...]}], selected:{program_id,season_id,read_only}}
 let publicState = { schedule: null, standings: null, division: null, game: null,
   feedUrl: null, feedLabel: null };  // feedUrl/feedLabel: freshly-minted public calendar subscription (#33)
 let publicTab = "schedule";        // "schedule" | "standings" (#83)
@@ -5711,6 +5716,7 @@ async function render() {
     envStatus.demo_empty = !(ov.leagues || []).length && !(ov.teams || []).length;
   }
   renderDemoMenu();
+  renderContextSwitcher();  // active Program/Season switcher (#159), state-aware
   // Roster/Sheet expose private player data — a signed-in user outside the
   // game's scope gets a 403 (#73). Show a clear "restricted" state instead of
   // the generic backend-error banner.
@@ -7001,6 +7007,198 @@ function renderDemoMenu() {
     `<button class="demo-item" role="menuitem" data-demo-action="${a}">${esc(label)}</button>`).join("");
   dd.hidden = !demoMenuOpen;
 }
+
+// -- active Program/Season context switcher (#159) -----------------------
+// A structured, ENCODED hash (versioned JSON in URL-safe Base64URL — RFC 4648
+// §5: +/ → -_, no "=" padding, so it needs no extra percent-encoding) rather
+// than a plain "#ctx=program:season". It round-trips program/season without a
+// fragile delimiter and coexists with the existing "#public" guest route
+// (different prefix), which we never clobber.
+function b64urlEncode(s) {
+  return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+function b64urlDecode(s) {
+  s = s.replace(/-/g, "+").replace(/_/g, "/");
+  while (s.length % 4) s += "=";
+  return atob(s);
+}
+function encodeContextHash(programId, seasonId) {
+  try {
+    return "#ctx=" + b64urlEncode(
+      JSON.stringify({ v: 1, p: programId || null, s: seasonId || null }));
+  } catch (_) { return ""; }
+}
+function decodeContextHash(hash) {
+  if (!hash || hash.indexOf("#ctx=") !== 0) return null;
+  try {
+    const o = JSON.parse(b64urlDecode(hash.slice(5)));
+    if (!o || o.v !== 1 || !o.p) return null;
+    return { program_id: o.p, season_id: o.s || null };
+  } catch (_) { return null; }
+}
+// Reflect the current selection in the URL (replaceState, like the #public
+// precedent) so a reload/bookmark restores it; never touch the #public route.
+function syncContextHash() {
+  if (!currentUser || location.hash === "#public") return;
+  const sel = contextOptions && contextOptions.selected;
+  const want = (sel && sel.program_id)
+    ? encodeContextHash(sel.program_id, sel.season_id) : "";
+  if (location.hash !== want) {
+    history.replaceState(null, "", location.pathname + location.search + want);
+  }
+}
+// Load the caller's AUTHORIZED options + current selection. Session-only; a
+// signed-out user has no context.
+async function loadContextOptions() {
+  if (!currentUser) { contextOptions = null; return; }
+  const o = await getJSON("/api/context/options");
+  contextOptions = (o && !o.error) ? o : null;
+}
+// Restore on load: the persisted context is already loaded above; if the URL
+// carries a DIFFERENT context, adopt it — delegating the authorization decision
+// to the backend (no client-side role logic). An unauthorized OR non-existent
+// link both come back as the same generic not-found, which we normalize to the
+// persisted context with a generic message (no existence oracle), then rewrite
+// the hash to the resolved selection.
+async function restoreContextDeepLink() {
+  if (!currentUser) return;
+  const link = decodeContextHash(location.hash);
+  const sel = (contextOptions && contextOptions.selected) || {};
+  if (!link
+      || (link.program_id === sel.program_id
+          && (link.season_id || null) === (sel.season_id || null))) {
+    syncContextHash();
+    return;
+  }
+  const r = await post("/api/context",
+    { program_id: link.program_id, season_id: link.season_id });
+  if (r && !r.error) {
+    // Re-fetch the whole option set (not just patch `selected`): the Season we
+    // adopted may have been archived/reopened, or newly created/authorized,
+    // between the options load above and this POST. A fresh GET reconciles the
+    // canonical label/status/read-only rows AND the selection under the
+    // backend's serializable snapshot, so `selected` is always one of the
+    // rendered options with the correct badge — never a stale row.
+    await loadContextOptions();
+    toast = "";
+  } else {
+    // POST failed: the persisted context is unchanged, so the already-loaded
+    // options still describe it. Normalize with a generic message (no oracle).
+    toast = "That shared context isn't available — showing your saved context.";
+    toastIsError = true;
+  }
+  syncContextHash();
+}
+// Persist a switcher pick, then reflect it in the hash and re-render.
+async function setActiveContext(programId, seasonId) {
+  const r = await post("/api/context",
+    { program_id: programId, season_id: seasonId || null });
+  if (!r || r.error) {
+    // Generic, no existence oracle (the backend returns the same not-found
+    // whether it doesn't exist or isn't ours). Refresh options in case the
+    // authorized set shifted underneath us.
+    toast = "That Program/Season isn't available."; toastIsError = true;
+    await loadContextOptions();
+    render();
+    return;
+  }
+  // Reflect the canonical selection in the hash IMMEDIATELY from the POST echo,
+  // before the options refresh below. The refresh is a second round-trip; if we
+  // waited until after it to sync the hash, a very fast reload in that window
+  // could still observe a prior hash (e.g. the persisted default mirrored on
+  // load) and adopt it over what we just persisted.
+  if (contextOptions) {
+    contextOptions.selected = { program_id: r.program_id,
+      season_id: r.season_id, read_only: !!r.read_only };
+  }
+  syncContextHash();
+  // Then reconcile the whole option set from a fresh GET so the label/status/
+  // read-only badge reflect canonical state at POST time — a Season may have
+  // been archived/reopened or newly authorized since options loaded. Rendering
+  // from the pre-POST rows would show a stale row (a now-archived Season shown
+  // as writable, or `selected` absent from the offered options). Re-sync after,
+  // in case the canonical selection differs from the POST echo (a concurrent
+  // change), so the hash always matches what is rendered.
+  await loadContextOptions();
+  syncContextHash();
+  toast = "";
+  render();
+}
+// The switcher's flat option list: EVERY authorized Program is Program-only-
+// selectable (a "no season" entry, season_id=null), plus one entry per authorized
+// Season. Encoded as "program_id|season_id" (season blank ⇒ Program-only). This
+// is the single source for both the count (static-chip decision) and the markup.
+function contextEntries(opts) {
+  const multi = opts.programs.length > 1;
+  const out = [];
+  opts.programs.forEach((p) => {
+    out.push({ value: p.id + "|", label: "Program overview (no season)",
+      programId: p.id, seasonId: null, readOnly: false, programName: p.name });
+    p.seasons.forEach((s) => out.push({
+      value: p.id + "|" + s.id,
+      label: s.name + (s.read_only ? " · archived (read-only)" : ""),
+      programId: p.id, seasonId: s.id, readOnly: !!s.read_only,
+      programName: p.name }));
+  });
+  return { entries: out, multi };
+}
+// Paint the switcher for the current authorized options + selection. One native
+// <select> for every role (full keyboard/AT semantics for free); a static chip
+// only when there is a single selectable context. The read-only badge and the
+// persistent "display only" note reflect the current state in the CLOSED view.
+function renderContextSwitcher() {
+  const wrap = document.getElementById("context-switcher");
+  const select = document.getElementById("ctx-select");
+  const chip = document.getElementById("ctx-static");
+  const roBadge = document.getElementById("ctx-ro");
+  if (!wrap || !select || !chip || !roBadge) return;
+  const opts = contextOptions;
+  const show = !!(currentUser && opts && opts.programs && opts.programs.length);
+  wrap.hidden = !show;
+  if (!show) return;
+  const { entries, multi } = contextEntries(opts);
+  const sel = opts.selected || {};
+  const curValue = (sel.program_id || "") + "|" + (sel.season_id || "");
+  const curEntry = entries.find((e) => e.value === curValue) || null;
+  // Read-only badge is a persistent, always-visible reflection of the selection.
+  roBadge.hidden = !(curEntry && curEntry.readOnly);
+  const single = entries.length <= 1;
+  if (single) {
+    select.hidden = true; chip.hidden = false;
+    const e = entries[0];
+    // The chip is the only selected-context indicator in this state, so it
+    // must identify the Program even when only one Program is authorized.
+    // Omitting it left every seasonless single-Program account with the
+    // indistinguishable label "Program overview (no season)".
+    chip.textContent = `${e.programName} · ${e.label}`;
+    return;
+  }
+  chip.hidden = true; select.hidden = false;
+  const optionTag = (e) => `<option value="${esc(e.value)}"`
+    + `${e.value === curValue ? " selected" : ""}>${esc(e.label)}</option>`;
+  if (multi) {
+    const groups = [];
+    opts.programs.forEach((p) => {
+      const items = entries.filter((e) => e.programId === p.id).map(optionTag);
+      groups.push(`<optgroup label="${esc(p.name)}">${items.join("")}</optgroup>`);
+    });
+    select.innerHTML = groups.join("");
+  } else {
+    select.innerHTML = entries.map(optionTag).join("");
+  }
+}
+// Wire the native select once. A native <select> gives the full keyboard /
+// screen-reader contract (focus, Arrow/Home/End, type-ahead, Enter/Escape) for
+// free, so no custom menu-radio handling is needed.
+const ctxSelect = document.getElementById("ctx-select");
+if (ctxSelect) ctxSelect.onchange = (e) => {
+  const raw = e.target.value || "";
+  const bar = raw.indexOf("|");
+  const p = bar >= 0 ? raw.slice(0, bar) : raw;
+  const s = bar >= 0 ? raw.slice(bar + 1) : "";
+  setActiveContext(p, s || null);
+};
+
 // Sign out ends the server session and returns to the sign-in screen (#71).
 const signoutBtn = document.getElementById("signout-btn");
 if (signoutBtn) signoutBtn.onclick = async () => {
@@ -7009,6 +7207,11 @@ if (signoutBtn) signoutBtn.onclick = async () => {
   // zero-friction demo auto-login — logout must stick until the user signs in.
   try { localStorage.setItem("hs_signed_out", "1"); } catch (_) {}
   setUser(null); toast = "";
+  // Drop the active-context selection + its URL hash with the session (#159).
+  contextOptions = null;
+  if (location.hash.indexOf("#ctx=") === 0) {
+    history.replaceState(null, "", location.pathname + location.search);
+  }
   renderRoleSwitch();
   showLogin("You've been signed out.");
 };
@@ -7351,6 +7554,11 @@ async function signIn(username, password) {
   // pendingReassign is cleared for the same reason (#166).
   drawer = null; movingGameId = null; conflict = null; pendingMove = null; pendingReassign = null;
   hideLogin();
+  // Load this identity's authorized context (a persona switch re-scopes it),
+  // then reconcile the URL: adopt an authorized deep link, else reflect the
+  // persisted selection (#159).
+  await loadContextOptions();
+  await restoreContextDeepLink();
   renderRoleSwitch(); render();
   return true;
 }
@@ -7471,7 +7679,14 @@ async function bootstrap() {
   applyRolePerms();
   renderRoleSwitch();
   renderEnvChips();
-  if (currentUser) { hideLogin(); render(); }
+  if (currentUser) {
+    // Load the persisted active context first, then adopt a different authorized
+    // deep link if the URL carries one (#159).
+    await loadContextOptions();
+    await restoreContextDeepLink();
+    hideLogin();
+    render();
+  }
   // A bookmarked/shared #public link (#34) drops a signed-out visitor
   // straight into the guest schedule instead of the sign-in wall.
   else if (location.hash === "#public") { showPublicGuest(); }

@@ -168,6 +168,40 @@ class ContextService:
             return candidates[0], None
         return None, None
 
+    # -- enumeration (switcher options) ------------------------------------
+    def options(self, user_id: Optional[str], role, scope):
+        """The AUTHORIZED (Program, [Season]) options for the context switcher,
+        plus the currently-resolved ``(program, season)`` — everything computed
+        under ONE serializable snapshot (``_snapshot``), through the SAME
+        ``context_scope`` rules ``set`` enforces. So the switcher can only ever
+        offer a context the caller could actually select (no enumeration of an
+        unrelated Program/Season), and the offered list agrees with the current
+        selection. Every Program the caller may see is listed (Program-only is
+        always selectable); each carries only its authorized Seasons — active and
+        archived alike, the latter flagged read-only historical. Returns
+        ``(programs, selected_program, selected_season)`` where ``programs`` is a
+        list of ``(program, [season, ...])`` of DETACHED rows (safe to serialize
+        after the lock releases)."""
+        def work():
+            authorized = context_scope.authorized_program_ids(
+                self.store, role, scope, user_id)
+            programs = []
+            for pid in sorted(authorized):
+                program = self.store.get_program(pid)
+                if program is None:
+                    continue
+                season_ids = context_scope.authorized_season_ids(
+                    self.store, role, scope, pid, user_id)
+                seasons = sorted(
+                    (s for sid in season_ids
+                     if (s := self.store.get_season(sid)) is not None),
+                    key=_season_sort_key, reverse=True)   # latest first
+                programs.append((_detached(program),
+                                 [_detached(s) for s in seasons]))
+            sel_program, sel_season = self._resolve_locked(user_id, role, scope)
+            return programs, _detached(sel_program), _detached(sel_season)
+        return self._snapshot(work)
+
     # -- mutation ----------------------------------------------------------
     def set(self, user_id: Optional[str], role, scope,
             program_id, season_id) -> _Resolved:

@@ -85,6 +85,20 @@
           <div id="breadcrumb" class="crumbs"></div>
         </div>
         <div class="topbar-actions">
+          <!-- Active Program/Season switcher (#159): a saved DISPLAY context,
+               filtered to what the signed-in user is authorized to select. One
+               native <select> for every role (full keyboard/AT semantics), a
+               static chip only when there is a single option. The persistent
+               "display only" note is always visible: existing screens are NOT
+               filtered by this selection yet. -->
+          <div id="context-switcher" class="ctx-switcher" hidden>
+            <span class="ctx-caption" aria-hidden="true">Viewing</span>
+            <select id="ctx-select" class="ctx-select"
+                    aria-label="Active Program and Season — a saved display context; screens are not filtered by it"></select>
+            <span id="ctx-static" class="ctx-static" hidden></span>
+            <span id="ctx-ro" class="ctx-ro" hidden>read-only</span>
+            <span class="ctx-unfiltered">display only · screens not filtered</span>
+          </div>
           <button class="act ghost" data-open-drawer="ice-slot">＋ Add Ice</button>
           <button class="act primary" data-goto="calendar">＋ Schedule Game</button>
           <div id="demo-menu" class="demo-menu" hidden>

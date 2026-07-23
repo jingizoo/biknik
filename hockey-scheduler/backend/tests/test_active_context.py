@@ -526,6 +526,77 @@ class ContextAuthorizationMatrixTest(unittest.TestCase):
                 _close(store)
 
 
+class ContextOptionsTest(unittest.TestCase):
+    """GET /api/context/options enumerates ONLY the caller's authorized
+    Programs/Seasons (the SAME rules as get/set — never the unfiltered overview),
+    each Program carrying its authorized Seasons with archived-read-only metadata,
+    and a ``selected`` that is always one of the offered options."""
+
+    def _ids(self, opts):
+        return {p["id"]: {s["id"] for s in p["seasons"]}
+                for p in opts["programs"]}
+
+    def test_global_operator_sees_all_programs_and_seasons(self):
+        for label, store in _backends():
+            with self.subTest(backend=label):
+                api = ApiService(store)
+                p1, s1 = _program_season(api, "P1", "S1")
+                s1b = api.create_season(p1, "S1b")["id"]
+                p2, s2 = _program_season(api, "P2", "S2")
+                _archive(store, s1b)
+                o = api.get_context_options("u", *ADMIN)
+                self.assertNotIn("error", o, o)
+                ids = self._ids(o)
+                self.assertEqual(set(ids), {p1, p2}, (label, ids))
+                self.assertEqual(ids[p1], {s1, s1b}, label)
+                arch = [s for pr in o["programs"] if pr["id"] == p1
+                        for s in pr["seasons"] if s["id"] == s1b][0]
+                self.assertTrue(arch["read_only"], arch)         # archived → RO
+                self.assertEqual(arch["status"], "archived", arch)
+                self.assertIn(o["selected"]["program_id"], ids, o)  # within options
+                _close(store)
+
+    def test_coach_sees_only_own_program_and_participating_seasons(self):
+        for label, store in _backends():
+            with self.subTest(backend=label):
+                api = ApiService(store)
+                p1, s1 = _program_season(api, "P1", "S1")
+                # a second Season under the SAME program the team does NOT join
+                s1_other = api.create_season(p1, "S1-other")["id"]
+                team = _team_registered(api, s1)
+                _program_season(api, "P2", "S2")                 # unrelated program
+                o = api.get_context_options("c", Role.COACH, {"team_id": team})
+                ids = self._ids(o)
+                self.assertEqual(set(ids), {p1}, (label, ids))   # own program only
+                self.assertEqual(ids[p1], {s1}, label)           # participating only
+                self.assertNotIn(s1_other, ids[p1], label)       # non-participating out
+                _close(store)
+
+    def test_unbound_role_gets_empty_options(self):
+        for label, store in _backends():
+            with self.subTest(backend=label):
+                api = ApiService(store)
+                _program_season(api, "P1", "S1")
+                o = api.get_context_options("x", Role.COACH, {})
+                self.assertEqual(o["programs"], [], (label, o))
+                self.assertEqual(
+                    o["selected"],
+                    {"program_id": None, "season_id": None, "read_only": False},
+                    o)
+                _close(store)
+
+    def test_program_only_program_is_offered_with_no_seasons(self):
+        for label, store in _backends():
+            with self.subTest(backend=label):
+                api = ApiService(store)
+                pid = api.create_program("P", "US", "UTC")["id"]  # no Season yet
+                o = api.get_context_options("u", *ADMIN)
+                self.assertEqual(self._ids(o), {pid: set()}, (label, o))
+                self.assertEqual(o["selected"]["program_id"], pid, o)
+                self.assertIsNone(o["selected"]["season_id"], o)  # Program-only
+                _close(store)
+
+
 class ContextSubjectContractTest(unittest.TestCase):
     """The context selector and the web scope guards resolve the SAME caller
     identity (one shared resolver), after transfer and deactivate — proving the
@@ -1325,6 +1396,24 @@ class ActiveContextHttpTest(unittest.TestCase):
         s, b = self._req("POST", "/api/context", {"program_id": 5}, opener=admin)
         self.assertEqual(s, 400, b)
         self.assertEqual(b["error"]["details"]["reason"], "wrong_type")
+
+    def test_options_session_only_and_scoped(self):
+        # Identity-less callers are rejected exactly like /api/context.
+        self.assertEqual(self._req("GET", "/api/context/options")[0], 401)
+        self.assertEqual(
+            self._req("GET", "/api/context/options", role="league_admin")[0], 401)
+        # Admin sees options, and `selected` is one of the offered Programs.
+        admin = self._login("admin")
+        s, o = self._req("GET", "/api/context/options", opener=admin)
+        self.assertEqual(s, 200, o)
+        prog_ids = {p["id"] for p in o["programs"]}
+        self.assertTrue(prog_ids, o)
+        self.assertIn(o["selected"]["program_id"], prog_ids, o)
+        # A scoped coach only enumerates its own Program through the boundary.
+        coach = self._login("coach")
+        s, oc = self._req("GET", "/api/context/options", opener=coach)
+        self.assertEqual(s, 200, oc)
+        self.assertEqual(len({p["id"] for p in oc["programs"]}), 1, oc)
 
     def test_scoped_coach_context_after_transfer(self):
         # End-to-end through the authenticated HTTP boundary: after the seeded

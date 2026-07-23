@@ -204,6 +204,42 @@ class ApiService:
             user_id, role, scope, program_id, season_id)
         return self._context_view(program, season)
 
+    def _season_option(self, season) -> dict:
+        """A Season as the switcher needs it: id + name + lifecycle, with the
+        derived ``read_only`` for an archived (historical) Season."""
+        dto = _serialize(season)
+        return {
+            "id": dto["id"],
+            "name": dto["name"],
+            "start_date": dto.get("start_date"),
+            "status": dto.get("status"),
+            "read_only": dto.get("status") == SeasonStatus.ARCHIVED.value,
+        }
+
+    @catch
+    def get_context_options(self, user_id, role, scope) -> dict:
+        """The AUTHORIZED Program/Season options for the context switcher (#159),
+        filtered through the SAME scope rules as get/set — never the unfiltered
+        overview, so a scoped account can neither select nor enumerate an
+        unrelated context. Each Program lists only its authorized Seasons (active
+        + archived-as-read-only) and is itself Program-only-selectable. ``selected``
+        is the current resolved context, guaranteed to be one of these options."""
+        programs, sel_program, sel_season = self.context.options(
+            user_id, role, scope)
+        return {
+            "programs": [{
+                "id": _serialize(program)["id"],
+                "name": _serialize(program)["name"],
+                "seasons": [self._season_option(s) for s in seasons],
+            } for (program, seasons) in programs],
+            "selected": {
+                "program_id": sel_program.id if sel_program else None,
+                "season_id": sel_season.id if sel_season else None,
+                "read_only": (sel_season is not None
+                              and sel_season.status == SeasonStatus.ARCHIVED),
+            },
+        }
+
     # -- competition-hierarchy resolution (#283) ---------------------------
     # After the #283 model change a League is a permanent child of a Program
     # and its per-Season participation lives in a LeagueSeason; Divisions and

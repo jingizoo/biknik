@@ -206,6 +206,7 @@ _GET_ROUTES = [re.compile(p) for p in (
     r"^/api/scheduler/drafts$",
     r"^/api/auth/me$",
     r"^/api/context$",
+    r"^/api/context/options$",
     r"^/api/games/[^/]+(?:/(?:board|lineups|roster-status|roster|substitutes"
     r"|substitute-candidates|substitute-addable|reschedule|officials"
     r"|availability-summary))?$",
@@ -941,6 +942,21 @@ class Handler(BaseHTTPRequestHandler):
                     "code": "unauthorized",
                     "message": "A signed-in account is required."}}, 401)
             return self._send_api(api.get_active_context(user_id, role, scope))
+        if path == "/api/context/options":
+            # The AUTHORIZED Program/Season options for the switcher (#159),
+            # filtered through the same role/scope rules as /api/context — so a
+            # scoped account can neither select nor enumerate an unrelated
+            # context. Same session-only gate (no identity-less demo fallbacks).
+            role, scope, user_id, err = self._resolve_role()
+            if err is not None:
+                code, payload = err
+                return self._send_json(payload, code)
+            if user_id is None:
+                return self._send_json({"error": {
+                    "code": "unauthorized",
+                    "message": "A signed-in account is required."}}, 401)
+            return self._send_api(
+                api.get_context_options(user_id, role, scope))
         if path == "/api/setup/hierarchy":
             # Nested setup tree for the operator's mental model (#166 PR C).
             # It carries player_count leaves, so gate it like the player list

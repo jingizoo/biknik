@@ -918,6 +918,44 @@ details.tn > .tn-sum:hover { background: #f6f7fb; }
   background: transparent; font-size: 13px; color: var(--ink); cursor: pointer;
 }
 .demo-item:hover, .demo-item:focus-visible { background: #f0f0f3; outline: none; }
+
+/* ----- Active Program/Season switcher (#159) ----- */
+/* A native <select> (full keyboard/AT semantics for free) + a persistent
+   "display only" note that is ALWAYS visible, so the topbar selection never
+   implies the screens below it have been filtered (they haven't, yet). */
+.ctx-switcher { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.ctx-switcher[hidden] { display: none; }
+.ctx-caption {
+  font-size: 10px; letter-spacing: .04em; text-transform: uppercase; color: var(--muted);
+}
+.ctx-select {
+  max-width: 260px; padding: 6px 9px; border: 1px solid var(--line);
+  border-radius: 8px; background: var(--card); color: var(--ink); font-size: 13px;
+}
+.ctx-select:focus-visible { outline: none; border-color: var(--muted); box-shadow: 0 0 0 2px rgba(0,0,0,.12); }
+.ctx-select[hidden] { display: none; }
+/* A single-option (static) chip reads as a label, not a control. */
+.ctx-static {
+  font-weight: 600; font-size: 13px; padding: 6px 10px; border: 1px dashed var(--line);
+  border-radius: 8px; color: var(--ink); max-width: 260px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.ctx-static[hidden] { display: none; }
+.ctx-ro {
+  font-size: 10px; padding: 1px 6px; border-radius: 999px;
+  background: #fff0d6; color: #8a5a00; text-transform: uppercase; letter-spacing: .03em;
+}
+.ctx-ro[hidden] { display: none; }
+/* The persistent limitation notice — visible in the normal closed/static state,
+   not just inside an open menu or a (touch-invisible) title tooltip. */
+.ctx-unfiltered { font-size: 10px; color: var(--muted); letter-spacing: .02em; }
+/* Phone: keep the switcher usable without dominating the topbar; the "display
+   only" note stays visible (it is the whole point of this slice). */
+@media (max-width: 480px) {
+  .ctx-select, .ctx-static { max-width: 150px; font-size: 16px; }
+  .ctx-caption { display: none; }
+}
+
 .start-league .actions { margin-top: 12px; }
 
 /* ----- Safe destructive actions (#215): reset + delete ----- */
