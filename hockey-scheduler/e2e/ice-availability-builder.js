@@ -305,6 +305,66 @@ async function checkViewport(browser, viewport) {
     }, rink6);
     if (staleCommitted !== 0) fail(`a refused stale commit must write nothing, got ${staleCommitted}`);
 
+    // (H2) A same-slot-set template edit that slips past the frontend's
+    // invalidation listener is still caught by the SERVER token (#158 review):
+    // the token binds the whole reviewed payload, not just the generated tuples.
+    // Preview, then extend the window END by 5 min (22:00 -> 22:05) by setting the
+    // inputs' value WITHOUT firing `change` — so the stored preview/fingerprint
+    // survive as if the edit slipped the suspenders. The same three slots/day
+    // still fit, so a tuple-only token would have committed the unreviewed window;
+    // the full-payload binding moves the fingerprint, the server refuses the
+    // stale commit, and the UI re-previews the CURRENT (22:05) proposal — same
+    // slot count, new token — which then commits.
+    const rink6b = await page.evaluate(async (season) => {
+      const post = async (p, b) => (await fetch(p, {
+        method: "POST", credentials: "same-origin",
+        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
+      })).json();
+      const venue = await post("/api/setup/venue", { name: "West", league_id: null });
+      await post(`/api/v2/setup/seasons/${season}/venue-access`, { venue_id: venue.id });
+      return (await post("/api/setup/rink", { venue_id: venue.id, name: "West Ice" })).id;
+    }, ids.season);
+    await page.click("[data-ib-cancel]");
+    await page.waitForSelector("[data-ice-builder-open]", { timeout: 10000 });
+    await page.click("[data-ice-builder-open]");
+    await page.waitForSelector(".ib-form", { timeout: 10000 });
+    await page.check(`.ib-rink[value="${rink6b}"]`);
+    await preview(page);
+    const before = await previewState(page);
+    if (!(before.new >= 1) || before.commitDisabled !== false) {
+      fail(`same-slot edit test needs an enabled preview with slots: ${JSON.stringify(before)}`);
+    }
+    // Extend BOTH selected days' end time WITHOUT a change event (the listener
+    // that would drop the preview never fires), so the real fingerprint is stale.
+    await page.evaluate(() => {
+      for (const el of document.querySelectorAll(".ib-wd-end")) el.value = "22:05";
+    });
+    await page.click("[data-ib-commit]");
+    // Refused (same slots, but the reviewed window moved) -> refresh toast.
+    await page.waitForFunction(
+      () => /changed since preview/i.test((document.querySelector(".toast-msg") || {}).textContent || ""),
+      null, { timeout: 10000 });
+    const refreshed = await previewState(page);
+    if (refreshed.new !== before.new) {
+      fail(`the refreshed preview should show the SAME slot count (same tuples): ${before.new} -> ${refreshed.new}`);
+    }
+    if (refreshed.commitDisabled !== false) fail("Create should be enabled after the refresh");
+    // The refreshed token (for the 22:05 window) now commits exactly those slots.
+    await page.click("[data-ib-commit]");
+    await page.waitForSelector("[data-ice-builder-open]", { timeout: 10000 });
+    const editCommitted = await page.evaluate(async (rink) => {
+      const ov = await (await fetch("/api/demo/overview", { credentials: "same-origin" })).json();
+      return (ov.ice_slots || []).filter((x) => x.rink_id === rink).length;
+    }, rink6b);
+    if (editCommitted !== before.new) {
+      fail(`the re-previewed edit should commit its ${before.new} slots, got ${editCommitted}`);
+    }
+    // The successful commit closed the builder; reopen it so the next step starts
+    // from the shared "builder open" invariant (each step cancels the open builder
+    // then reopens with a fresh rink).
+    await page.click("[data-ice-builder-open]");
+    await page.waitForSelector(".ib-form", { timeout: 10000 });
+
     // (I) An exact-tuple collision with EXISTING incompatible ice is REPORTED as
     // a conflict, never hidden as duplicate capacity (#158 review). A
     // maintenance slot at the builder's first window (Sep 1 18:00-19:00, program
@@ -439,7 +499,7 @@ async function checkViewport(browser, viewport) {
     }
 
     if (errors.length) fail(`console/page errors:\n${errors.join("\n")}`);
-    console.log(`[${viewport.label}] OK — month grid renders; builder previews ${EXPECTED_NEW} slots, reports un-granted venue, commits idempotently, honors exclusions, applies per-weekday windows (narrow Thursday => 19), binds commit to the preview (edit invalidates it), refuses+refreshes a stale preview, reports an exact-tuple collision as a conflict WITH its target, and exposes every row of a >60-day template — the final day and a late Game collision's exact target — while committing the full previewed set.`);
+    console.log(`[${viewport.label}] OK — month grid renders; builder previews ${EXPECTED_NEW} slots, reports un-granted venue, commits idempotently, honors exclusions, applies per-weekday windows (narrow Thursday => 19), binds commit to the preview (edit invalidates it), refuses+refreshes a stale preview (both a bogus token and a same-slot-set window edit that slips the suspenders), reports an exact-tuple collision as a conflict WITH its target, and exposes every row of a >60-day template — the final day and a late Game collision's exact target — while committing the full previewed set.`);
   } catch (error) {
     throw new Error(`${error.message}\n--- demo server output ---\n${serverOutput}`);
   } finally {

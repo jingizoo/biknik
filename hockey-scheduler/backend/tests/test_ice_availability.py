@@ -354,6 +354,97 @@ class IceAvailabilityContract:
         clash2 = next(s for s in pv2["slots"] if s["status"] == "conflict")
         self.assertEqual(clash2["conflict_slot_type"], "public_skate")
 
+    # -- 1c. full-payload binding: operator-visible edits keeping the slot set --
+    # Each edit below leaves the generated (start, end) tuples IDENTICAL, so a
+    # tuple-only (or tuple+classification-only) token would accept the stale
+    # fingerprint and commit values the operator never reviewed. The full-payload
+    # binding must move the fingerprint, refuse the stale token (preview_mismatch)
+    # with ZERO slot/audit writes, and let the commit through only after a fresh
+    # preview of the edit (#158 review).
+    def _assert_no_ice_written(self):
+        self.assertEqual(self._slots(), [])
+        self.assertEqual([a for a in self.store.all_setup_audit()
+                          if a.action == "ice_slot_created"], [])
+
+    def test_commit_rejects_a_window_end_change_that_keeps_the_same_slots(self):
+        # Extend the window END past the last slot (18:00-22:00 -> 22:10): the
+        # same three slots/day still fit, but the reviewed window text changed.
+        pv = self.api.preview_ice_availability(actor_id="a", **_template())
+        edited = _template(end_local="22:10")
+        pv2 = self.api.preview_ice_availability(actor_id="a", **edited)
+        self.assertEqual([(s["start_time"], s["end_time"]) for s in pv2["slots"]],
+                         [(s["start_time"], s["end_time"]) for s in pv["slots"]])
+        self.assertNotEqual(pv2["template_fingerprint"],
+                            pv["template_fingerprint"])
+        res = self.api.commit_ice_availability(
+            actor_id="a", template_fingerprint=pv["template_fingerprint"],
+            **edited)
+        self.assertEqual(res["error"]["details"]["reason"], "preview_mismatch")
+        self._assert_no_ice_written()
+        ok = self.api.commit_ice_availability(
+            actor_id="a", template_fingerprint=pv2["template_fingerprint"],
+            **edited)
+        self.assertEqual(ok["totals"]["created"], 6)
+
+    def test_commit_rejects_a_turnover_change_that_keeps_the_same_slots(self):
+        # On a single-slot window (18:00-19:20) the buffer change 15 -> 10 leaves
+        # the SAME playable slot AND the same reserved-minutes total, so ONLY the
+        # directly-bound turnover_minutes differs — the case a tuple/totals-only
+        # binding misses entirely.
+        tmpl = _template(end_local="19:20")            # exactly one slot/day
+        pv = self.api.preview_ice_availability(actor_id="a", **tmpl)
+        self.assertEqual(pv["totals"]["new"], 2)       # one Tue + one Thu
+        edited = _template(end_local="19:20", turnover_minutes=10)
+        pv2 = self.api.preview_ice_availability(actor_id="a", **edited)
+        self.assertEqual([(s["start_time"], s["end_time"]) for s in pv2["slots"]],
+                         [(s["start_time"], s["end_time"]) for s in pv["slots"]])
+        self.assertEqual(pv2["totals"]["reserved_minutes"],
+                         pv["totals"]["reserved_minutes"])   # totals unchanged too
+        self.assertNotEqual(pv2["template_fingerprint"],
+                            pv["template_fingerprint"])
+        res = self.api.commit_ice_availability(
+            actor_id="a", template_fingerprint=pv["template_fingerprint"],
+            **edited)
+        self.assertEqual(res["error"]["details"]["reason"], "preview_mismatch")
+        self._assert_no_ice_written()
+        ok = self.api.commit_ice_availability(
+            actor_id="a", template_fingerprint=pv2["template_fingerprint"],
+            **edited)
+        self.assertEqual(ok["totals"]["created"], 2)
+
+    def test_commit_rejects_a_day_that_flips_too_short_to_skipped(self):
+        # A day that yields NO slots either way still changes the reviewed
+        # preview: give Tuesday a too-short window (0 slots, reported "too_short")
+        # and Thursday a normal one, then EXCLUDE that Tuesday instead — the same
+        # zero-slot day is now "skipped". Identical generated tuples, different
+        # operator-visible payload.
+        per_day = dict(
+            season_id="season_1", rink_ids=["rink_1"],
+            windows=[{"weekday": 1, "start_local": "18:00", "end_local": "18:40"},
+                     {"weekday": 3, "start_local": "18:00", "end_local": "22:00"}],
+            start_date="2026-09-01", end_date="2026-09-07",
+            playable_minutes=60, turnover_minutes=15)
+        pv = self.api.preview_ice_availability(actor_id="a", **per_day)
+        self.assertIn({"date": "2026-09-01", "window_minutes": 40},
+                      pv["too_short"])
+        edited = {**per_day, "exclusion_dates": ["2026-09-01"]}
+        pv2 = self.api.preview_ice_availability(actor_id="a", **edited)
+        self.assertIn({"date": "2026-09-01", "reason": "exclusion"},
+                      pv2["skipped_dates"])
+        self.assertEqual([(s["start_time"], s["end_time"]) for s in pv2["slots"]],
+                         [(s["start_time"], s["end_time"]) for s in pv["slots"]])
+        self.assertNotEqual(pv2["template_fingerprint"],
+                            pv["template_fingerprint"])
+        res = self.api.commit_ice_availability(
+            actor_id="a", template_fingerprint=pv["template_fingerprint"],
+            **edited)
+        self.assertEqual(res["error"]["details"]["reason"], "preview_mismatch")
+        self._assert_no_ice_written()
+        ok = self.api.commit_ice_availability(
+            actor_id="a", template_fingerprint=pv2["template_fingerprint"],
+            **edited)
+        self.assertEqual(ok["totals"]["created"], 3)      # only Thursday's slots
+
     # -- 2. exclusion dates -------------------------------------------------
     def test_exclusion_dates_skipped_and_explained(self):
         pv = self.api.preview_ice_availability(
@@ -1352,6 +1443,73 @@ class IceAvailabilityHttpAuthzTest(unittest.TestCase):
                           dict(template, template_fingerprint=fp))
         self.assertEqual(ok["totals"]["created"], 6)
         self.assertEqual(slot_count(), 6)
+
+    def _assert_same_slot_edit_refused_over_http(self, name, base_over, edit_over,
+                                                 expected_created):
+        """Authenticated HTTP: seed a rig, preview `base`, then prove an edit that
+        keeps the SAME generated slot tuples STILL moves the fingerprint, is
+        refused when committed with the stale token (preview_mismatch, zero ice),
+        and commits only after a fresh preview of the edit (#158 review — the token
+        binds the whole reviewed payload, not just the tuples)."""
+        svc = self.srv.STATE.api.setup
+        prog = svc.create_program(name, timezone_name=TZ)
+        season = svc.create_season(prog.id, name + " Season")
+        venue = svc.create_venue(name + " House", league_id=prog.id)
+        svc.grant_season_venue_access(season.id, venue.id)
+        rink = svc.create_rink(venue.id, name + " Sheet")
+        base = dict(season_id=season.id, rink_ids=[rink.id],
+                    start_date="2026-09-01", end_date="2026-09-07",
+                    playable_minutes=60, turnover_minutes=15, **base_over)
+        edited = dict(base, **edit_over)
+
+        def game_ice():
+            return [s.id for s in self.srv.STATE.api.store.all_ice_slots()
+                    if s.rink_id == rink.id]
+
+        c = self._client()
+        self._login(c, "arena")
+        _, pv = self._req(c, "POST", "/api/setup/ice-availability/preview", base)
+        _, pv2 = self._req(c, "POST", "/api/setup/ice-availability/preview", edited)
+        # Same generated tuples, moved fingerprint — the exact gap the tuple-only
+        # binding left open.
+        self.assertEqual([(s["start_time"], s["end_time"]) for s in pv2["slots"]],
+                         [(s["start_time"], s["end_time"]) for s in pv["slots"]])
+        self.assertNotEqual(pv2["template_fingerprint"],
+                            pv["template_fingerprint"])
+        # Stale token on the edit => refused, no Game ice.
+        _, bad = self._req(
+            c, "POST", "/api/setup/ice-availability/commit",
+            dict(edited, template_fingerprint=pv["template_fingerprint"]))
+        self.assertEqual(bad["error"]["details"]["reason"], "preview_mismatch")
+        self.assertEqual(game_ice(), [])
+        # Fresh preview of the edit => its fingerprint commits.
+        _, ok = self._req(
+            c, "POST", "/api/setup/ice-availability/commit",
+            dict(edited, template_fingerprint=pv2["template_fingerprint"]))
+        self.assertEqual(ok["totals"]["created"], expected_created)
+
+    def test_commit_binding_rejects_window_end_change_over_http(self):
+        # Extend the window end past the last slot (22:00 -> 22:10): same slots.
+        self._assert_same_slot_edit_refused_over_http(
+            "HB6", dict(weekdays=[1, 3], start_local="18:00", end_local="22:00"),
+            dict(end_local="22:10"), 6)
+
+    def test_commit_binding_rejects_turnover_change_over_http(self):
+        # Single-slot window (18:00-19:20): buffer 15 -> 10 keeps the slot AND the
+        # reserved total; only the bound turnover_minutes differs.
+        self._assert_same_slot_edit_refused_over_http(
+            "HB7", dict(weekdays=[1, 3], start_local="18:00", end_local="19:20"),
+            dict(turnover_minutes=10), 2)
+
+    def test_commit_binding_rejects_too_short_to_skipped_over_http(self):
+        # A zero-slot Tuesday flips from "too_short" to "skipped" when excluded —
+        # same generated tuples, different operator-visible payload.
+        self._assert_same_slot_edit_refused_over_http(
+            "HB8",
+            dict(windows=[
+                {"weekday": 1, "start_local": "18:00", "end_local": "18:40"},
+                {"weekday": 3, "start_local": "18:00", "end_local": "22:00"}]),
+            dict(exclusion_dates=["2026-09-01"]), 3)
 
     def test_commit_binding_rejects_reclassified_row_over_http(self):
         # Over HTTP: the token binds the reviewed CLASSIFICATION, not just the

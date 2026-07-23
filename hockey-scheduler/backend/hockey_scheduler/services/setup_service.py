@@ -2424,10 +2424,12 @@ class SetupService:
         resolve the Season timezone + date range, run the pure planner, split the
         (de-duplicated) selected rinks by SeasonVenueAccess, and classify the
         proposed windows against current inventory so the returned ``fingerprint``
-        binds the reviewed classification (#158 review — see the fingerprint block
-        below), not just the generated tuples. Reads inventory only for that
-        classification; commit calls this UNDER its write locks, so the bound
-        classification matches the one its write loop acts on."""
+        binds the ENTIRE reviewed preview payload — every commit-relevant input
+        and operator-visible resolved field, not just the generated tuples or
+        their classification (#158 review — see the fingerprint block below).
+        Reads inventory only for the classification/totals; commit calls this
+        UNDER its write locks, so the bound snapshot matches the one its write
+        loop acts on."""
         season = self.store.get_season(season_id) if season_id else None
         if season is None:
             raise NotFoundError(
@@ -2466,28 +2468,40 @@ class SetupService:
             season_id, rink_ids)
 
         # Classify the proposed windows against the CURRENT ice inventory and bind
-        # that classification INTO the fingerprint (#158 review). Binding the raw
-        # form fields alone is not enough (a blank date range, or a concurrent
-        # Program-timezone / Season-boundary edit, would leave a form-only
-        # fingerprint unchanged while the resolved windows move); binding just the
-        # generated (rink, start, end) tuples is ALSO not enough — a slot or Game
-        # added, removed, allocated, or booked after preview reclassifies a row
-        # (new <-> duplicate <-> conflict) or changes its conflict target WITHOUT
-        # changing the generated tuple, and the commit would then silently skip or
-        # create a row the operator never reviewed. So bind the resolved timezone,
-        # the resolved date range, AND, per generated window, its (rink, start,
-        # end) tuple, its reviewed status, and — for a conflict — EVERY
-        # operator-visible target field the preview renders: the colliding slot
-        # id, the Game id (if any), and the slot TYPE + STATUS. The last two
-        # matter because an exact persisted slot can be updated in place (e.g.
-        # maintenance -> public_skate, or blocked -> allocated) without changing
-        # its id: the row stays a `conflict` with the same id, but the target TEXT
-        # the operator reviewed changed, so the fingerprint must move (#158
-        # review). Any such change flips the fingerprint, forcing a re-preview of
-        # the exact changed target; an unedited template over unchanged inventory
-        # is stable, so preview and commit agree. Commit calls this UNDER its
-        # Season + per-rink write locks, so the bound classification is the very
-        # one the write loop then acts on. Deterministic — no clock.
+        # the WHOLE reviewed preview — every commit-relevant input AND every
+        # operator-visible resolved field — INTO the fingerprint (#158 review).
+        # Three progressively-rejected halves show why the payload must be this
+        # wide:
+        #   * the raw form fields alone miss a concurrent Program-timezone /
+        #     Season-boundary edit that moves the resolved windows under a stale
+        #     form;
+        #   * the generated (rink, start, end) tuples alone miss a slot or Game
+        #     added, removed, allocated, or booked after preview that reclassifies
+        #     a row (new <-> duplicate <-> conflict) or changes its conflict
+        #     target WITHOUT moving the tuple;
+        #   * the tuples + classification STILL miss an edit that changes what the
+        #     operator reviewed without changing any generated tuple — extend an
+        #     18:00-22:00 window to 22:10 (the same three slots still fit), retune
+        #     the playable / turnover minutes, add an exclusion that lands on an
+        #     already-empty day, or flip a day between "skipped" and "too_short" —
+        #     yet commit and its audit would then run values the operator never
+        #     saw.
+        # So hash the normalized resolved preview payload itself: EVERYTHING the
+        # preview response renders except the token — the resolved timezone + date
+        # range, the normalized per-weekday windows, the playable / turnover
+        # minutes, the resolved exclusions, the planner's skipped and too-short
+        # days, the access-skipped rinks, the reserved/playable + new/duplicate/
+        # conflict totals, and (retaining the classification/target binding) per
+        # generated window its (rink, start, end) tuple, reviewed status, and — for
+        # a conflict — EVERY operator-visible target field: colliding slot id, Game
+        # id (if any), slot TYPE + STATUS (an in-place slot edit keeps the id but
+        # changes the target text the operator read). Any operator-visible change
+        # flips the fingerprint and forces a re-preview of exactly what changed; an
+        # unedited template over unchanged inventory is stable, so preview and
+        # commit agree. The fields below MIRROR _ice_availability_response (keep
+        # them in sync), so the token binds precisely what the operator reviewed.
+        # Commit calls this UNDER its Season + per-rink write locks, so the bound
+        # snapshot is the very one the write loop acts on. Deterministic — no clock.
         classified = self._classify_ice_windows(accessible, plan)
 
         def _target(c):
@@ -2500,12 +2514,34 @@ class SetupService:
             (c["rink_id"], c["start"].isoformat(), c["end"].isoformat(),
              c["status"]) + _target(c)
             for c in classified)
-        fingerprint = hashlib.sha256(json.dumps({
+        # Counts + reserved/playable totals exactly as _ice_availability_response
+        # derives them, so the bound summary matches the reviewed one.
+        n_rinks = len(accessible)
+        new_n = sum(1 for c in classified if c["status"] == "new")
+        dup_n = sum(1 for c in classified if c["status"] == "duplicate")
+        con_n = sum(1 for c in classified if c["status"] == "conflict")
+        reviewed = {
             "season_id": season_id,
             "timezone": str(tz),
             "date_range": [d_start.isoformat(), d_end.isoformat()],
+            "weekdays": sorted(weekday_set),
+            "windows": windows_meta,
+            "playable_minutes": playable_minutes,
+            "turnover_minutes": turnover_minutes,
+            "exclusions": sorted(d.isoformat() for d in exclusions),
+            "skipped_dates": plan["skipped_dates"],
+            "too_short": plan["too_short"],
+            "venue_access_missing": sorted(a["rink_id"] for a in access_missing),
+            "totals": {
+                "new": new_n, "duplicate": dup_n, "conflict": con_n,
+                "reserved_minutes": plan["reserved_minutes"] * n_rinks,
+                "playable_minutes": plan["playable_minutes_total"] * n_rinks,
+            },
             "slots": proposed,
-        }, sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:16]
+        }
+        fingerprint = hashlib.sha256(json.dumps(
+            reviewed, sort_keys=True, separators=(",", ":")
+        ).encode()).hexdigest()[:16]
 
         return {
             "season": season, "tz": tz, "d_start": d_start, "d_end": d_end,
