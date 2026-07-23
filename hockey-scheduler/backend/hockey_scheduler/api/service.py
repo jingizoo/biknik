@@ -7,7 +7,7 @@ web framework) never see Python tracebacks across the boundary.
 """
 
 from dataclasses import asdict, is_dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Callable, List, Optional
 
@@ -3209,6 +3209,37 @@ class ApiService:
         game_by_slot = {g.ice_slot_id: g for g in self.store.all_games()
                         if g.ice_slot_id and not g.is_draft}
         slot_rows = []
+        # #277 Slice B — reserved-vs-playable visibility: a slot's stored span
+        # is PLAYABLE time; when a game occupies it, the effective
+        # Rink>Season>Program policy (resolved via the HOSTING game's season,
+        # cached per pair) may reserve warm-up before and resurfacing after.
+        # A free slot reserves nothing yet, so its fields stay null — the
+        # calendar shows real blocked facility time, never a guess about
+        # which season's policy a future booking would resolve.
+        _policy_cache = {}
+
+        def _reserved(slot, game):
+            # A cancelled game reserves nothing — the placement gate ignores
+            # it, so the calendar must not paint phantom facility time.
+            if game is None or game.cancelled or not game.season_id:
+                return None
+            key = (slot.rink_id, game.season_id)
+            if key not in _policy_cache:
+                _policy_cache[key] = self.setup._effective_policy(*key)[0]
+            values = _policy_cache[key]
+            warmup = values["warmup_minutes"] or 0
+            resurf = values["resurfacing_minutes"] or 0
+            if not warmup and not resurf:
+                return None
+            return {
+                "warmup_minutes": warmup,
+                "resurfacing_minutes": resurf,
+                "reserved_start_time":
+                    (slot.start_time - timedelta(minutes=warmup)).isoformat(),
+                "reserved_end_time":
+                    (slot.end_time + timedelta(minutes=resurf)).isoformat(),
+            }
+
         for s in sorted(self.store.all_ice_slots(),
                         key=lambda x: (x.rink_id, x.start_time)):
             g = game_by_slot.get(s.id)
@@ -3221,6 +3252,7 @@ class ApiService:
                 "game_id": g.id if g else None,
                 "game_label": f"{team_name(g.home_team_id)} vs "
                               f"{team_name(g.away_team_id)}" if g else None,
+                "reserved": _reserved(s, g),
             })
 
         schedule, public_fixtures = [], []

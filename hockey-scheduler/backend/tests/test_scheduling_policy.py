@@ -439,6 +439,281 @@ class _PolicyContract:
         self.assertEqual({row["ice_slot_id"] for row in prop["draft_games"]},
                          {"sA", "sB"}, prop)
 
+    # -- reserved-vs-playable visibility (#277 step 4) ---------------------
+    def test_overview_reserved_span_around_a_hosted_game(self):
+        self._buffer_policy()
+        g1 = self.api.create_game("se1", "d1", "t0", "t1", "sA",
+                                  league_id="lg")
+        self.assertNotIn("error", g1, g1)
+        ov = self.api.get_demo_overview()
+        rows = {s["id"]: s for s in ov["ice_slots"]}
+        hosted = rows["sA"]["reserved"]
+        self.assertIsNotNone(hosted, rows["sA"])
+        self.assertEqual(hosted["warmup_minutes"], 5)
+        self.assertEqual(hosted["resurfacing_minutes"], 10)
+        self.assertEqual(
+            hosted["reserved_start_time"],
+            (BASE - timedelta(minutes=5)).isoformat())
+        self.assertEqual(
+            hosted["reserved_end_time"],
+            (BASE + timedelta(minutes=70)).isoformat())
+        # A FREE slot reserves nothing yet — and with no policy at all,
+        # even a hosted slot's field stays null.
+        self.assertIsNone(rows["sB"]["reserved"], rows["sB"])
+
+    def test_overview_reserved_is_null_without_policy(self):
+        g1 = self.api.create_game("se1", "d1", "t0", "t1", "sA",
+                                  league_id="lg")
+        self.assertNotIn("error", g1, g1)
+        ov = self.api.get_demo_overview()
+        rows = {s["id"]: s for s in ov["ice_slots"]}
+        self.assertIsNone(rows["sA"]["reserved"], rows["sA"])
+        # A policy with ONLY a minimum-playable knob reserves no extra
+        # facility time either — the zero-buffer branch stays null.
+        self.api.set_scheduling_policy(
+            scope_type="season", scope_id="se1", min_playable_minutes=45,
+            actor_id="admin")
+        ov = self.api.get_demo_overview()
+        rows = {s["id"]: s for s in ov["ice_slots"]}
+        self.assertIsNone(rows["sA"]["reserved"], rows["sA"])
+
+    # -- builder preview policy note + fingerprint binding (#277 step 5) ---
+    def _preview(self):
+        return self.api.preview_ice_availability(
+            season_id="se1", rink_ids=["r1"], weekdays=[0],
+            start_local="12:00", end_local="14:00",
+            start_date="2026-02-02", end_date="2026-02-02",
+            playable_minutes=60, turnover_minutes=0)
+
+    def test_builder_commit_succeeds_with_matching_token_under_policy(self):
+        # The commit recomputes the reviewed payload under its own locks;
+        # policy_notes must be computed IDENTICALLY on both sides or every
+        # commit under a policy would false-mismatch its own preview.
+        self._buffer_policy()
+        kw = dict(season_id="se1", rink_ids=["r1"], weekdays=[0],
+                  start_local="12:00", end_local="14:00",
+                  start_date="2026-02-02", end_date="2026-02-02",
+                  playable_minutes=60, turnover_minutes=0, actor_id="admin")
+        pv = self.api.preview_ice_availability(**kw)
+        self.assertNotIn("error", pv, pv)
+        self.assertTrue(pv["policy_notes"], pv)
+        res = self.api.commit_ice_availability(
+            template_fingerprint=pv["template_fingerprint"], **kw)
+        self.assertNotIn("error", res, res)
+        self.assertEqual(res["totals"]["created"], 2, res)
+
+    def test_builder_preview_notes_sub_buffer_turnover_and_binds_token(self):
+        before = self._preview()
+        self.assertNotIn("error", before, before)
+        self.assertEqual(before["policy_notes"], [], before)
+        self._buffer_policy()
+        after = self._preview()
+        self.assertNotIn("error", after, after)
+        self.assertEqual(after["policy_notes"], [{
+            "rink_id": "r1", "rink_name": "Main",
+            "template_turnover_minutes": 0,
+            "policy_buffer_minutes": 15}], after)
+        # The note is part of the reviewed payload, so the token moved: a
+        # commit against the PRE-policy token is refused as a mismatch.
+        self.assertNotEqual(before["template_fingerprint"],
+                            after["template_fingerprint"])
+        stale = self.api.commit_ice_availability(
+            season_id="se1", rink_ids=["r1"], weekdays=[0],
+            start_local="12:00", end_local="14:00",
+            start_date="2026-02-02", end_date="2026-02-02",
+            playable_minutes=60, turnover_minutes=0,
+            template_fingerprint=before["template_fingerprint"])
+        self.assertEqual(_reason(stale), "preview_mismatch", stale)
+
+    # -- contracted-ice import advisories (#277 step 5) --------------------
+    def test_import_dry_run_warns_on_sliver_gap_and_curfew(self):
+        # Persist rink r1 with an external_ref the sheet can address, plus
+        # rink-scope policy knobs; contracted spans must import untouched,
+        # so all three findings are WARNINGS on an ok=True report.
+        rink = self.store.get_rink("r1")
+        rink.external_ref = "R1"
+        self.store.save_rink(rink)
+        self.api.set_scheduling_policy(
+            scope_type="rink", scope_id="r1", warmup_minutes=5,
+            resurfacing_minutes=10, min_playable_minutes=45,
+            curfew_local="22:00", actor_id="admin")
+        rows = [
+            # 40-minute sliver (min is 45).
+            "R1,2026-03-02T18:00:00+00:00,2026-03-02T18:40:00+00:00,game",
+            # 10-minute gap after the first row (buffer is 15).
+            "R1,2026-03-02T18:50:00+00:00,2026-03-02T19:50:00+00:00,game",
+            # Ends 23:30 local (curfew 22:00): 2026-03-03T05:30Z is 23:30
+            # America/Chicago (CST) on Mar 2.
+            "R1,2026-03-03T04:00:00+00:00,2026-03-03T05:30:00+00:00,game",
+        ]
+        report = self.api.get_import_dry_run({
+            "rinks_csv": "venue_name,rink_code,rink_name,address\n"
+                         "Arena,R1,Main,",
+            "ice_slots_csv":
+                "rink_code,start_time,end_time,slot_type\n" + "\n".join(rows)})
+        self.assertTrue(report["ok"], report)
+        text = " ".join(w["message"] for w in report["warnings"])
+        self.assertIn("only 40 playable minutes", text, report)
+        self.assertIn("turnover buffer", text, report)
+        self.assertIn("22:00 curfew", text, report)
+
+    def test_import_dry_run_warns_against_existing_committed_slots(self):
+        rink = self.store.get_rink("r1")
+        rink.external_ref = "R1"
+        self.store.save_rink(rink)
+        self.api.set_scheduling_policy(
+            scope_type="rink", scope_id="r1", warmup_minutes=5,
+            resurfacing_minutes=10, actor_id="admin")
+        # sA already exists in the store at BASE+60m end; a sheet row 10
+        # minutes after it is inside the 15-minute buffer.
+        csv_text = ("rink_code,start_time,end_time,slot_type\n"
+                    f"R1,{(BASE + timedelta(minutes=70)).isoformat()},"
+                    f"{(BASE + timedelta(minutes=130)).isoformat()},game")
+        report = self.api.get_import_dry_run({
+            "rinks_csv": "venue_name,rink_code,rink_name,address\n"
+                         "Arena,R1,Main,",
+            "ice_slots_csv": csv_text})
+        self.assertTrue(report["ok"], report)
+        text = " ".join(w["message"] for w in report["warnings"])
+        self.assertIn("existing slot sA", text, report)
+
+    def test_import_advisory_boundaries_match_the_gate(self):
+        # Advisory and enforcement must agree at the exact boundaries: a gap
+        # EXACTLY equal to warmup+resurfacing, and an end EXACTLY at curfew,
+        # are both compliant — no warning (#277 half-open rule).
+        rink = self.store.get_rink("r1")
+        rink.external_ref = "R1"
+        self.store.save_rink(rink)
+        self.api.set_scheduling_policy(
+            scope_type="rink", scope_id="r1", warmup_minutes=5,
+            resurfacing_minutes=10, curfew_local="22:00", actor_id="admin")
+        rows = [
+            "R1,2026-03-02T16:00:00+00:00,2026-03-02T17:00:00+00:00,game",
+            # Exactly 15 minutes after the first row ends.
+            "R1,2026-03-02T17:15:00+00:00,2026-03-02T18:15:00+00:00,game",
+            # Ends exactly AT the 22:00 America/Chicago curfew (04:00Z CST).
+            "R1,2026-03-03T03:00:00+00:00,2026-03-03T04:00:00+00:00,game",
+        ]
+        report = self.api.get_import_dry_run({
+            "rinks_csv": "venue_name,rink_code,rink_name,address\n"
+                         "Arena,R1,Main,",
+            "ice_slots_csv":
+                "rink_code,start_time,end_time,slot_type\n" + "\n".join(rows)})
+        self.assertTrue(report["ok"], report)
+        self.assertEqual(report["warnings"], [], report)
+
+    def test_import_advisory_ignores_non_game_ice_and_own_reimport_copy(self):
+        rink = self.store.get_rink("r1")
+        rink.external_ref = "R1"
+        self.store.save_rink(rink)
+        self.api.set_scheduling_policy(
+            scope_type="rink", scope_id="r1", warmup_minutes=5,
+            resurfacing_minutes=10, actor_id="admin")
+        # sA exists in the store (BASE..+60). A sheet row for sA's EXACT
+        # tuple is the documented idempotent re-import identity — no
+        # self-collision warning; a maintenance row 10 minutes later is not
+        # game ice — buffers don't apply to it in either direction.
+        rows = [
+            f"R1,{BASE.isoformat()},"
+            f"{(BASE + timedelta(minutes=60)).isoformat()},game",
+            f"R1,{(BASE + timedelta(minutes=70)).isoformat()},"
+            f"{(BASE + timedelta(minutes=100)).isoformat()},maintenance",
+        ]
+        report = self.api.get_import_dry_run({
+            "rinks_csv": "venue_name,rink_code,rink_name,address\n"
+                         "Arena,R1,Main,",
+            "ice_slots_csv":
+                "rink_code,start_time,end_time,slot_type\n" + "\n".join(rows)})
+        self.assertTrue(report["ok"], report)
+        text = " ".join(w["message"] for w in report["warnings"])
+        # The row's own persisted exact-tuple copy (sA) never self-collides,
+        # and nothing warns about (or on behalf of) the maintenance row —
+        # the seeded NEIGHBOR slot sB may legitimately warn, which is why
+        # these assertions target the two exclusions, not an empty list.
+        self.assertNotIn("existing slot sA", text, report)
+        self.assertNotIn("row 2", text, report)
+        self.assertFalse(any(w["row"] == 2 for w in report["warnings"]
+                             if "turnover buffer" in w["message"]), report)
+
+    def test_import_curfew_advisory_uses_program_tz_fallback(self):
+        # A venue with NO timezone falls back to the Program's clock —
+        # exactly like the gate — so the advisory and enforcement agree.
+        venue = self.store.get_venue("v")
+        venue.timezone = None
+        self.store.save_venue(venue)
+        rink = self.store.get_rink("r1")
+        rink.external_ref = "R1"
+        self.store.save_rink(rink)
+        self.api.set_scheduling_policy(
+            scope_type="rink", scope_id="r1", curfew_local="22:00",
+            actor_id="admin")
+        # 04:00-05:30Z = 22:00-23:30 America/Chicago (the Program tz).
+        report = self.api.get_import_dry_run({
+            "rinks_csv": "venue_name,rink_code,rink_name,address\n"
+                         "Arena,R1,Main,",
+            "ice_slots_csv":
+                "rink_code,start_time,end_time,slot_type\n"
+                "R1,2026-03-03T04:00:00+00:00,"
+                "2026-03-03T05:30:00+00:00,game"})
+        self.assertTrue(report["ok"], report)
+        text = " ".join(w["message"] for w in report["warnings"])
+        self.assertIn("22:00 curfew", text, report)
+
+    def test_commit_import_reports_the_same_advisories(self):
+        rink = self.store.get_rink("r1")
+        rink.external_ref = "R1"
+        self.store.save_rink(rink)
+        self.api.set_scheduling_policy(
+            scope_type="rink", scope_id="r1", min_playable_minutes=45,
+            actor_id="admin")
+        res = self.api.commit_rinks_ice_slots_import({
+            "rinks_csv": "venue_name,rink_code,rink_name,address\n"
+                         "Arena,R1,Main,",
+            "ice_slots_csv":
+                "rink_code,start_time,end_time,slot_type\n"
+                "R1,2026-03-02T18:00:00+00:00,"
+                "2026-03-02T18:40:00+00:00,game"}, actor_id="admin")
+        self.assertTrue(res.get("committed"), res)
+        text = " ".join(w["message"] for w in res.get("warnings", []))
+        self.assertIn("only 40 playable minutes", text, res)
+
+    def test_overview_reserved_null_for_cancelled_game(self):
+        self._buffer_policy()
+        g1 = self.api.create_game("se1", "d1", "t0", "t1", "sA",
+                                  league_id="lg")
+        self.assertNotIn("error", g1, g1)
+        self.api.cancel_game(g1["id"], actor_id="admin")
+        ov = self.api.get_demo_overview()
+        rows = {s["id"]: s for s in ov["ice_slots"]}
+        # A cancelled game reserves nothing — the gate ignores it too.
+        self.assertIsNone(rows["sA"]["reserved"], rows["sA"])
+
+    def test_builder_note_skipped_without_back_to_back_slots(self):
+        # A one-slot-per-day template has no adjacency for the buffer to
+        # bite on — no note, even with a policy set.
+        self._buffer_policy()
+        pv = self.api.preview_ice_availability(
+            season_id="se1", rink_ids=["r1"], weekdays=[0],
+            start_local="12:00", end_local="13:00",
+            start_date="2026-02-02", end_date="2026-02-02",
+            playable_minutes=60, turnover_minutes=0, actor_id="admin")
+        self.assertNotIn("error", pv, pv)
+        self.assertEqual(pv["policy_notes"], [], pv)
+
+    def test_import_dry_run_no_policy_no_warnings(self):
+        rink = self.store.get_rink("r1")
+        rink.external_ref = "R1"
+        self.store.save_rink(rink)
+        report = self.api.get_import_dry_run({
+            "rinks_csv": "venue_name,rink_code,rink_name,address\n"
+                         "Arena,R1,Main,",
+            "ice_slots_csv":
+                "rink_code,start_time,end_time,slot_type\n"
+                "R1,2026-03-02T18:00:00+00:00,"
+                "2026-03-02T18:40:00+00:00,game"})
+        self.assertTrue(report["ok"], report)
+        self.assertEqual(report["warnings"], [], report)
+
 
 class _DirectionalBufferContract:
     """#318 review — the required gap between two adjacent games is the

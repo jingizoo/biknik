@@ -2808,9 +2808,11 @@ class SetupService:
             tz = self._curfew_timezone(slot.rink_id, season_id)
             start_local = slot.start_time.astimezone(tz)
             # The anchor rule lives in ice_availability.curfew_instant — ONE
-            # implementation shared with the scheduler advisory, defining the
-            # operating day relative to the curfew itself (#318 review) and
-            # resolving spring-forward-skipped wall times deterministically.
+            # implementation shared with the scheduler advisory AND the
+            # import advisories (ingest warnings and placement enforcement
+            # can never disagree), defining the operating day relative to
+            # the curfew itself (#318 review) and resolving spring-forward-
+            # skipped wall times deterministically.
             curfew_at = curfew_instant(start_local, hour, minute)
             # Compare INSTANTS, not wall clocks: Python compares two aware
             # datetimes sharing one tzinfo by their naive values (fold
@@ -3069,6 +3071,33 @@ class SetupService:
         # order is fixed by the (identical) template + inventory, sort_keys
         # canonicalizes the rest.
         classified = self._classify_ice_windows(accessible, plan)
+        # #277 Slice B — advisory: a template whose between-slot turnover is
+        # smaller than a rink's effective warmup+resurfacing buffer will
+        # generate adjacent slots that cannot BOTH host games (the placement
+        # gate refuses the second). Surfaced per rink in the reviewed
+        # payload, so it is fingerprint-bound like every other reviewed
+        # field: setting or clearing such a policy after preview moves the
+        # token and forces a re-preview.
+        policy_notes = []
+        # Only a rink that actually generates BACK-TO-BACK slots (>= 2 on one
+        # date) can violate the between-games buffer with this template; a
+        # one-slot-per-day window has no adjacency to warn about.
+        _per_day = {}
+        for c in classified:
+            _per_day[(c["rink_id"], c["date"])] = \
+                _per_day.get((c["rink_id"], c["date"]), 0) + 1
+        _adjacent_rinks = {rid for (rid, _d), n in _per_day.items() if n >= 2}
+        for rink, _venue in accessible:
+            if rink.id not in _adjacent_rinks:
+                continue
+            values, _src = self._effective_policy(rink.id, season.id)
+            buffer_minutes = ((values["warmup_minutes"] or 0)
+                              + (values["resurfacing_minutes"] or 0))
+            if buffer_minutes > turnover_minutes:
+                policy_notes.append({
+                    "rink_id": rink.id, "rink_name": rink.name,
+                    "template_turnover_minutes": turnover_minutes,
+                    "policy_buffer_minutes": buffer_minutes})
         base = {
             "season": season, "tz": tz, "d_start": d_start, "d_end": d_end,
             "weekday_set": weekday_set,
@@ -3078,6 +3107,7 @@ class SetupService:
             "plan": plan, "accessible": accessible,
             "access_missing": access_missing,
             "classified": classified,
+            "policy_notes": policy_notes,
         }
         base["fingerprint"] = hashlib.sha256(json.dumps(
             self._reviewed_preview_payload(base),
@@ -3231,6 +3261,7 @@ class SetupService:
             "dst_skipped": plan["dst_skipped"],
             "dst_ambiguous": plan["dst_ambiguous"],
             "venue_access_missing": r["access_missing"],
+            "policy_notes": r["policy_notes"],
         }
 
     def _ice_availability_response(self, r):
@@ -6074,7 +6105,10 @@ class SetupService:
         22:30-23:30 against a committed 22:00-23:00) from leaving both rows
         alive (#158 review).
         """
-        result = validate_import(sheets)
+        # #277 Slice B: store-aware, so the ingest policy advisories
+        # (sliver / sub-buffer gap / past-curfew warnings) surface on COMMIT
+        # too, not just the dry-run — warnings never block the commit.
+        result = validate_import(sheets, store=self.store)
         if not result["ok"]:
             return {"committed": False, "summary": result["summary"],
                     "errors": result["errors"], "warnings": result["warnings"]}

@@ -2457,7 +2457,13 @@ function slotCard(s, draggable, ctx) {
     ? `<button class="icon-btn danger slot-del" data-del="ice-slot" data-del-id="${esc(s.id)}"
         data-del-name="${esc(slotLabel(s))}" title="Delete this ice slot"
         aria-label="Delete this ice slot">${ICONS.trash}</button>` : "";
-  return `<div class="slot-card ${cls}${extra}" ${dropClick} ${drag}><div class="t">${fmt(s.start_time)}–${fmt(s.end_time)}</div><div class="s">${slotLabel(s)}${state}${cta}</div>${moveBtn}${delSlot}</div>`;
+  // #277: playable span vs reserved facility time — when a hosted game's
+  // effective policy reserves warm-up before / resurfacing after, show the
+  // full blocked span so operators see what the building actually loses.
+  const rsv = s.reserved
+    ? `<div class="slot-reserved">reserved ${fmt(s.reserved.reserved_start_time)}–${fmt(s.reserved.reserved_end_time)} (+${s.reserved.warmup_minutes}m warm-up, +${s.reserved.resurfacing_minutes}m resurfacing)</div>`
+    : "";
+  return `<div class="slot-card ${cls}${extra}" ${dropClick} ${drag}><div class="t">${fmt(s.start_time)}–${fmt(s.end_time)}</div>${rsv}<div class="s">${slotLabel(s)}${state}${cta}</div>${moveBtn}${delSlot}</div>`;
 }
 
 function calToolbar(ov) {
@@ -2861,6 +2867,12 @@ function renderIcePreview(pv) {
   // window that resolves an ambiguous boundary is informational (the earlier
   // fold was used); the repeated-hour ROWS it can produce are disambiguated
   // below regardless of whether the WINDOW boundary itself was ambiguous.
+  // #277: template turnover below a rink's effective warm-up+resurfacing
+  // buffer — adjacent generated slots can't BOTH host games; warn per rink.
+  const policyNotes = (pv.policy_notes || []).length
+    ? pv.policy_notes.map((n) =>
+        `<div class="ib-warn">⚠ ${esc(n.rink_name)}: this template leaves ${n.template_turnover_minutes} min between slots, but the scheduling policy reserves ${n.policy_buffer_minutes} min of warm-up + resurfacing between games — back-to-back slots there cannot all host games.</div>`).join("")
+    : "";
   const dstSkips = (pv.dst_skipped || []).length
     ? `<div class="ib-warn">⚠ ${pv.dst_skipped.length} window(s) skipped — the local start/end time doesn't exist that day (a spring-forward gap): ${pv.dst_skipped.map((s) => esc(`${s.date} (${s.boundary})`)).join(", ")}. Adjust the window to fall outside the gap, then preview again.</div>`
     : "";
@@ -2945,7 +2957,7 @@ function renderIcePreview(pv) {
       <div class="ib-stat"><b>${hrs(t.playable_minutes)}</b><span>playable</span></div>
       <div class="ib-stat"><b>${hrs(t.reserved_minutes)}</b><span>reserved</span></div>
     </div>
-    ${accessWarn}${conflictWarn}${skips}${short}${dstSkips}${dstAmbig}
+    ${accessWarn}${conflictWarn}${skips}${short}${policyNotes}${dstSkips}${dstAmbig}
     ${rinkRows ? `<div class="ib-rink-rows">${rinkRows}</div>` : ""}
     <div class="ib-slot-list">${slotList || `<div class="empty">No slots generated — adjust the template above.</div>`}</div>
     ${listNote}

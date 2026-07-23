@@ -25,14 +25,19 @@ import io
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+from ..domain.errors import DomainError
 from ..domain import (
     IceSlotType,
     MAX_JERSEY_NUMBER,
     MIN_JERSEY_NUMBER,
     OfficialAvailabilityStatus,
+    PolicyScopeType,
     intervals_overlap,
     parse_jersey_cell,
 )
+from .ice_availability import curfew_instant, parse_hhmm
 
 IMPORT_SHEET_NAMES = ("teams", "players", "officials", "rinks", "ice_slots")
 
@@ -231,8 +236,12 @@ def _check_players(report: _Report, rows: List[dict], team_codes: set,
 
 def _check_ice_slots(report: _Report, rows: List[dict], rink_codes: set) -> None:
     """Field-level checks, returning the (row, rink_code, start, end) tuples
-    of slots that parsed cleanly enough to be worth an overlap check."""
+    of slots that parsed cleanly enough to be worth an overlap check, plus a
+    row-index -> slot_type map for the policy advisory's game-vs-game filter
+    (#277: buffers are a game rule; maintenance/practice ice never hosts
+    one, so it must not trigger 'games on both cannot coexist')."""
     parsed = []
+    slot_types = {}
     for i, row in enumerate(rows, start=1):
         rink_code = row.get("rink_code")
         rink_code = None if _blank(rink_code) else _clean(rink_code)
@@ -263,7 +272,138 @@ def _check_ice_slots(report: _Report, rows: List[dict], rink_codes: set) -> None
 
         if rink_code is not None and start is not None and end is not None:
             parsed.append((i, rink_code, start, end))
-    return parsed
+            # Blank defaults to "game", exactly like the commit path.
+            slot_types[i] = _clean(slot_type) if not _blank(slot_type) else "game"
+    return parsed, slot_types
+
+
+def _ingest_policy(store, rink):
+    """The scheduling policy an INGEST advisory can honestly resolve for a
+    persisted rink (#277 Slice B): the rink-scope row, field-merged over the
+    program-scope row via the venue's legacy one-venue-one-program bridge
+    (``Venue.league_id``). Season scope deliberately does NOT apply — an ice
+    slot is rink-scoped and belongs to no season at ingest, so a season-level
+    policy cannot be attributed to it here; placement-time enforcement (which
+    knows the game's season) remains authoritative. Returns the merged field
+    dict plus the venue timezone name (for curfew wall clocks)."""
+    rows = [store.find_scheduling_policy(PolicyScopeType.RINK, rink.id)]
+    venue = store.get_venue(rink.venue_id) if rink.venue_id else None
+    program_id = getattr(venue, "league_id", None)
+    if program_id and store.get_program(program_id) is not None:
+        rows.append(store.find_scheduling_policy(
+            PolicyScopeType.PROGRAM, program_id))
+    values = {}
+    for field in ("warmup_minutes", "resurfacing_minutes",
+                  "min_playable_minutes", "curfew_local"):
+        values[field] = next(
+            (getattr(r, field) for r in rows
+             if r is not None and getattr(r, field) is not None), None)
+    # Curfew wall-clock anchor: venue timezone, else the bridged Program's
+    # — the SAME fallback chain as the gate's _curfew_timezone, so an
+    # advisory can never disagree with enforcement about which clock a
+    # curfew uses (UTC last, in the caller).
+    program = store.get_program(program_id) if program_id else None
+    tz_name = (getattr(venue, "timezone", None)
+               or getattr(program, "timezone", None))
+    return values, tz_name
+
+
+def _check_policy_advisories(report: _Report, parsed_slots, slot_types,
+                             store) -> None:
+    """#277 Slice B ingest advisories — WARNINGS, never errors: contracted
+    start/end values import untouched (the issue's no-silent-time-shift
+    mandate), but a row the placement gate will later refuse a game is
+    flagged now, per persisted rink policy (see ``_ingest_policy`` for the
+    honest resolution scope). Three checks per row against rinks that
+    already exist in the store (a rink created by this same upload can have
+    no policy yet): playable span shorter than the minimum, same-rink gap
+    below warmup+resurfacing — against both this sheet's other rows and
+    already-committed slots — and end past curfew (venue timezone,
+    half-open exactly like enforcement via the shared curfew_instant)."""
+    rinks_by_ref = {r.external_ref: r for r in store.all_rinks()
+                    if r.external_ref}
+    policy_cache = {}
+    for row, rink_code, start, end in parsed_slots:
+        if slot_types.get(row) != "game":
+            continue  # maintenance/practice ice never hosts a game
+        rink = rinks_by_ref.get(rink_code)
+        if rink is None:
+            continue
+        if rink.id not in policy_cache:
+            policy_cache[rink.id] = _ingest_policy(store, rink)
+        values, tz_name = policy_cache[rink.id]
+        min_playable = values["min_playable_minutes"] or 0
+        slot_minutes = int((end - start).total_seconds() // 60)
+        if slot_minutes < min_playable:
+            report.warning(
+                "ice_slots", row,
+                f"Slot is only {slot_minutes} playable minutes; rink "
+                f"{rink_code}'s scheduling policy requires at least "
+                f"{min_playable} — it will be refused a game.")
+        buffer_minutes = ((values["warmup_minutes"] or 0)
+                          + (values["resurfacing_minutes"] or 0))
+        if buffer_minutes > 0:
+            # Same boundary rule as the gate: STRICTLY closer than the
+            # buffer conflicts; a gap exactly equal to it is compliant.
+            def _too_close(o_start, o_end):
+                if intervals_overlap(start, end, o_start, o_end):
+                    return True
+                if o_start >= end:
+                    gap = (o_start - end).total_seconds()
+                else:
+                    gap = (start - o_end).total_seconds()
+                return 0 <= gap < buffer_minutes * 60
+
+            near = []
+            for other_row, other_code, o_start, o_end in parsed_slots:
+                if other_row == row or other_code != rink_code:
+                    continue
+                if slot_types.get(other_row) != "game":
+                    continue  # buffers are game-vs-game, like the gate
+                if _too_close(o_start, o_end):
+                    near.append(f"row {other_row}")
+            for ex in store.all_ice_slots():
+                if ex.rink_id != rink.id:
+                    continue
+                if getattr(ex.slot_type, "value", ex.slot_type) != "game":
+                    continue  # buffers are game-vs-game, like the gate
+                if ex.start_time == start and ex.end_time == end:
+                    # The row's own persisted copy — a re-import updates
+                    # this exact tuple in place (the commit path's
+                    # documented identity), so warning against it would
+                    # falsely flag every idempotent re-import
+                    # (_check_players self-excludes for the same reason).
+                    continue
+                if _too_close(ex.start_time, ex.end_time):
+                    near.append(f"existing slot {ex.id}")
+            if near:
+                report.warning(
+                    "ice_slots", row,
+                    f"Slot sits closer than the {buffer_minutes}-minute "
+                    f"turnover buffer to {near[0]} on rink {rink_code}; "
+                    "games on both cannot coexist under the policy.")
+        curfew = values["curfew_local"]
+        if curfew:
+            try:
+                # Stored values are normalized "HH:MM" (set_scheduling_policy),
+                # but a dry-run must degrade to no-advisory on any corrupt
+                # legacy value, never 500.
+                hour, minute = parse_hhmm(curfew, "curfew_local")
+            except DomainError:
+                continue
+            try:
+                tz = ZoneInfo(tz_name) if tz_name else timezone.utc
+            except (ZoneInfoNotFoundError, ValueError, OSError):
+                tz = timezone.utc
+            start_local = start.astimezone(tz)
+            deadline = curfew_instant(start_local, hour, minute)
+            if end > deadline.astimezone(timezone.utc):
+                report.warning(
+                    "ice_slots", row,
+                    f"Slot ends at "
+                    f"{end.astimezone(tz).strftime('%H:%M')} local, past "
+                    f"rink {rink_code}'s {curfew} curfew — it will be "
+                    "refused a game.")
 
 
 def _check_overlaps(report: _Report, parsed_slots) -> None:
@@ -298,9 +438,11 @@ def validate_import(sheets: Dict[str, List[dict]], store=None) -> dict:
 
     _check_players(report, rows["players"],
                    _codes(rows["teams"], "team_code"), store=store)
-    parsed_slots = _check_ice_slots(report, rows["ice_slots"],
-                                    _codes(rows["rinks"], "rink_code"))
+    parsed_slots, slot_types = _check_ice_slots(
+        report, rows["ice_slots"], _codes(rows["rinks"], "rink_code"))
     _check_overlaps(report, parsed_slots)
+    if store is not None:
+        _check_policy_advisories(report, parsed_slots, slot_types, store)
 
     return {
         "ok": not report.errors,
