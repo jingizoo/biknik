@@ -2725,11 +2725,22 @@ function defaultIceForm(ov) {
     season_id: active ? active.id : "",
     rink_ids: rinks.length === 1 ? [rinks[0].id] : [],
     weekdays: [1, 3],                 // Tue/Thu — the common contracted block
-    start_local: "18:00", end_local: "22:00",
+    // Each selected weekday carries its OWN local start/end time (#158 flow):
+    // a real arena rarely runs identical hours every night. A single block is
+    // just the case where every selected day shares the same window.
+    windows: [{ weekday: 1, start_local: "18:00", end_local: "22:00" },
+              { weekday: 3, start_local: "18:00", end_local: "22:00" }],
     start_date: "", end_date: "",     // blank => backend uses the Season range
     playable_minutes: 60, turnover_minutes: 15,
     exclusion_dates: [],
   };
+}
+
+// The window (local start/end) currently entered for a weekday, defaulting to
+// the common evening block for a freshly-checked day.
+function ibWindowFor(f, wd) {
+  return (f.windows || []).find((w) => w.weekday === wd)
+    || { start_local: "18:00", end_local: "22:00" };
 }
 
 function ibLocalTime(iso) { return (iso || "").slice(11, 16); }
@@ -2752,6 +2763,18 @@ function renderIceBuilder(ov) {
   const orphanGroup = orphans.length ? `<div class="ib-venue">${orphans.map(rinkCheck).join("")}</div>` : "";
   const weekdayChips = IB_WEEKDAYS.map(([n, lbl]) =>
     `<label class="ib-day"><input type="checkbox" class="ib-weekday" value="${n}" ${f.weekdays.includes(n) ? "checked" : ""}>${lbl}</label>`).join("");
+  // One local start/end row per SELECTED weekday (sorted) — the #158 operator
+  // flow gives each day its own time. Freshly-checked days default to the block.
+  const perDayRows = f.weekdays.slice().sort((a, b) => a - b).map((wd) => {
+    const w = ibWindowFor(f, wd);
+    const lbl = (IB_WEEKDAYS.find(([n]) => n === wd) || [wd, "?"])[1];
+    return `<div class="ib-wd-row" data-weekday="${wd}">
+      <span class="ib-wd-name">${esc(lbl)}</span>
+      <input type="time" class="ib-wd-start" data-weekday="${wd}" id="ib-start-${wd}" value="${esc(w.start_local)}" aria-label="${esc(lbl)} start time">
+      <span class="ib-wd-sep">–</span>
+      <input type="time" class="ib-wd-end" data-weekday="${wd}" id="ib-end-${wd}" value="${esc(w.end_local)}" aria-label="${esc(lbl)} end time">
+    </div>`;
+  }).join("");
   const exclusionChips = f.exclusion_dates.length
     ? f.exclusion_dates.map((d) => `<span class="ib-chip">${esc(d)}<button class="ib-chip-x" data-ib-excl-remove="${esc(d)}" aria-label="Remove ${esc(d)}">×</button></span>`).join("")
     : `<span class="ib-none">None</span>`;
@@ -2771,9 +2794,9 @@ function renderIceBuilder(ov) {
       <div class="ib-field"><span>Rinks</span>
         <div class="ib-rinks">${venueGroups}${orphanGroup}${(ov.rinks || []).length ? "" : `<div class="ib-none">No rinks yet — add rinks in Setup first.</div>`}</div></div>
       <div class="ib-field"><span>Weekdays</span><div class="ib-days">${weekdayChips}</div></div>
+      <div class="ib-field"><span>Time per weekday</span>
+        <div class="ib-wd-times">${perDayRows || `<div class="ib-none">Select at least one weekday above.</div>`}</div></div>
       <div class="ib-grid2">
-        <label class="ib-field"><span>Start time</span><input type="time" id="ib-start" value="${esc(f.start_local)}"></label>
-        <label class="ib-field"><span>End time</span><input type="time" id="ib-end" value="${esc(f.end_local)}"></label>
         <label class="ib-field"><span>From date</span><input type="date" id="ib-from" value="${esc(f.start_date)}"></label>
         <label class="ib-field"><span>To date</span><input type="date" id="ib-to" value="${esc(f.end_date)}"></label>
         <label class="ib-field"><span>Playable minutes</span><input type="number" id="ib-playable" min="1" step="5" value="${f.playable_minutes}"></label>
@@ -2842,13 +2865,33 @@ function renderIcePreview(pv) {
 function readIceBuilderForm(c) {
   const val = (sel) => { const el = c.querySelector(sel); return el ? el.value : ""; };
   const num = (sel, dflt) => { const v = parseInt(val(sel), 10); return isNaN(v) ? dflt : v; };
+  const weekdays = Array.from(c.querySelectorAll(".ib-weekday:checked")).map((e) => +e.value);
+  // Preserve each weekday's previously-entered window across re-renders, then
+  // overlay whatever the currently-rendered per-day time inputs hold. A day
+  // that was just checked has no row yet and falls back to the default block.
+  const winByDay = {};
+  ((iceBuilder.form && iceBuilder.form.windows) || []).forEach((w) => {
+    winByDay[w.weekday] = { start_local: w.start_local, end_local: w.end_local };
+  });
+  c.querySelectorAll(".ib-wd-start").forEach((el) => {
+    const wd = +el.dataset.weekday;
+    (winByDay[wd] = winByDay[wd] || {}).start_local = el.value || "18:00";
+  });
+  c.querySelectorAll(".ib-wd-end").forEach((el) => {
+    const wd = +el.dataset.weekday;
+    (winByDay[wd] = winByDay[wd] || {}).end_local = el.value || "22:00";
+  });
+  const windows = weekdays.slice().sort((a, b) => a - b).map((wd) => ({
+    weekday: wd,
+    start_local: (winByDay[wd] && winByDay[wd].start_local) || "18:00",
+    end_local: (winByDay[wd] && winByDay[wd].end_local) || "22:00",
+  }));
   return {
     ...iceBuilder.form,
     season_id: val("#ib-season"),
     rink_ids: Array.from(c.querySelectorAll(".ib-rink:checked")).map((e) => e.value),
-    weekdays: Array.from(c.querySelectorAll(".ib-weekday:checked")).map((e) => +e.value),
-    start_local: val("#ib-start") || "18:00",
-    end_local: val("#ib-end") || "22:00",
+    weekdays,
+    windows,
     start_date: val("#ib-from"),
     end_date: val("#ib-to"),
     playable_minutes: num("#ib-playable", 60),
@@ -6663,6 +6706,13 @@ async function render() {
   if (ibOpen) ibOpen.onclick = () => { iceBuilder = { form: null, preview: null }; toast = ""; render(); };
   const ibCancel = c.querySelector("[data-ib-cancel]");
   if (ibCancel) ibCancel.onclick = () => { iceBuilder = null; toast = ""; render(); };
+  // Toggling a weekday shows/hides its per-day time row. Re-render off the
+  // current DOM so every other field — and each already-entered day's times —
+  // survives; a freshly-checked day appears with the default evening block.
+  c.querySelectorAll(".ib-weekday").forEach((cb) => cb.onchange = () => {
+    iceBuilder.form = readIceBuilderForm(c);
+    render();
+  });
   c.querySelectorAll("[data-ib-preview]").forEach((b) => b.onclick = async () => {
     toast = "";
     iceBuilder.form = readIceBuilderForm(c);

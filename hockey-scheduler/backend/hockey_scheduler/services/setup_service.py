@@ -65,7 +65,7 @@ from ..domain.errors import (
 )
 from ..store import InMemoryStore
 from .import_validator import validate_import, validate_official_availability
-from .ice_availability import plan_ice_windows, parse_hhmm
+from .ice_availability import plan_ice_windows, parse_hhmm, WEEKDAY_NAMES
 from .season_guard import require_active_season
 from .league_scope import (
     registered_team_ids_in_division as _registered_team_ids,
@@ -2340,6 +2340,63 @@ class SetupService:
             out.add(wd)
         return out
 
+    def _ice_avail_windows(self, *, weekdays, start_local, end_local, windows):
+        """Normalize the recurring template's per-weekday time windows.
+
+        #158's recorded operator flow gives each selected weekday its OWN local
+        start/end time ("local start and end time for each selected day"). The
+        canonical input is ``windows`` — a list of
+        ``{"weekday", "start_local", "end_local"}``, one entry per selected day.
+        The older uniform form (``weekdays`` + a single ``start_local`` /
+        ``end_local``) is still accepted and expands to the same window on every
+        selected day, so a single contracted block stays a two-field entry.
+
+        Returns ``(weekday_windows, windows_meta)`` where ``weekday_windows`` is
+        the ``{wd: ((sh, sm), (eh, em))}`` the pure planner consumes and
+        ``windows_meta`` is the ordered ``[{"weekday", "start", "end"}]`` echoed
+        back through the preview/commit response and the commit audit, so the
+        per-day windows are preserved verbatim across idempotent reruns.
+        """
+        if windows not in (None, ""):
+            if not isinstance(windows, (list, tuple)) or not windows:
+                raise ValidationError(
+                    "Select at least one weekday.",
+                    {"reason": "no_weekdays", "field": "weekdays"})
+            weekday_windows, meta, seen = {}, [], set()
+            for entry in windows:
+                if not isinstance(entry, dict):
+                    raise ValidationError(
+                        "Each window must be a {weekday, start_local, end_local} "
+                        "block.",
+                        {"reason": "invalid_window", "field": "windows"})
+                wd = entry.get("weekday")
+                if isinstance(wd, bool) or not isinstance(wd, int) \
+                        or wd not in range(7):
+                    raise ValidationError(
+                        f"Invalid weekday {wd!r}; use 0 (Monday) through 6 (Sunday).",
+                        {"reason": "invalid_weekday", "field": "weekdays"})
+                if wd in seen:
+                    raise ValidationError(
+                        f"{WEEKDAY_NAMES[wd]} is listed more than once; give each "
+                        "selected weekday a single time window.",
+                        {"reason": "duplicate_weekday", "field": "weekdays"})
+                seen.add(wd)
+                start = entry.get("start_local")
+                end = entry.get("end_local")
+                weekday_windows[wd] = (parse_hhmm(start, "start_local"),
+                                       parse_hhmm(end, "end_local"))
+                meta.append({"weekday": wd, "start": start, "end": end})
+            meta.sort(key=lambda m: m["weekday"])
+            return weekday_windows, meta
+        # Legacy uniform form: one window applied to every selected weekday.
+        weekday_set = self._ice_avail_weekdays(weekdays)
+        window = (parse_hhmm(start_local, "start_local"),
+                  parse_hhmm(end_local, "end_local"))
+        weekday_windows = {wd: window for wd in weekday_set}
+        meta = [{"weekday": wd, "start": start_local, "end": end_local}
+                for wd in sorted(weekday_set)]
+        return weekday_windows, meta
+
     def _ice_avail_exclusions(self, exclusion_dates):
         if exclusion_dates in (None, ""):
             return set()
@@ -2360,7 +2417,7 @@ class SetupService:
     def _plan_ice_availability(self, *, season_id, rink_ids, weekdays,
                                start_local, end_local, start_date, end_date,
                                playable_minutes, turnover_minutes,
-                               exclusion_dates):
+                               exclusion_dates, windows=None):
         """Deterministic, side-effect-free planning shared by preview and commit:
         resolve the Season timezone + date range, run the pure planner, and split
         the (de-duplicated) selected rinks by SeasonVenueAccess. Does NOT read the
@@ -2383,10 +2440,10 @@ class SetupService:
         rink_ids = list(dict.fromkeys(rink_ids))
 
         d_start, d_end = self._ice_avail_range(season, tz, start_date, end_date)
-        window = ((parse_hhmm(start_local, "start_local")),
-                  (parse_hhmm(end_local, "end_local")))
-        weekday_set = self._ice_avail_weekdays(weekdays)
-        weekday_windows = {wd: window for wd in weekday_set}
+        weekday_windows, windows_meta = self._ice_avail_windows(
+            weekdays=weekdays, start_local=start_local, end_local=end_local,
+            windows=windows)
+        weekday_set = set(weekday_windows)
         exclusions = self._ice_avail_exclusions(exclusion_dates)
 
         plan = plan_ice_windows(
@@ -2406,7 +2463,7 @@ class SetupService:
         return {
             "season": season, "tz": tz, "d_start": d_start, "d_end": d_end,
             "weekday_set": weekday_set,
-            "window": {"start": start_local, "end": end_local},
+            "windows_meta": windows_meta,
             "playable_minutes": playable_minutes,
             "turnover_minutes": turnover_minutes,
             "plan": plan, "accessible": accessible,
@@ -2509,7 +2566,7 @@ class SetupService:
             "timezone": str(r["tz"]),
             "date_range": {"start": r["d_start"].isoformat(),
                            "end": r["d_end"].isoformat()},
-            "weekdays": r["weekdays"], "window": r["window"],
+            "weekdays": r["weekdays"], "windows": r["windows_meta"],
             "playable_minutes": r["playable_minutes"],
             "turnover_minutes": r["turnover_minutes"],
             "rinks": list(per_rink.values()),
@@ -2543,20 +2600,20 @@ class SetupService:
                                  weekdays=None, start_local=None, end_local=None,
                                  start_date=None, end_date=None,
                                  playable_minutes=None, turnover_minutes=None,
-                                 exclusion_dates=None):
+                                 exclusion_dates=None, windows=None):
         """Preview the slots a recurring template would create. No writes."""
         return self._ice_availability_response(self._resolve_ice_availability(
             season_id=season_id, rink_ids=rink_ids, weekdays=weekdays,
             start_local=start_local, end_local=end_local,
             start_date=start_date, end_date=end_date,
             playable_minutes=playable_minutes, turnover_minutes=turnover_minutes,
-            exclusion_dates=exclusion_dates))
+            exclusion_dates=exclusion_dates, windows=windows))
 
     def commit_ice_availability(self, *, season_id=None, rink_ids=None,
                                 weekdays=None, start_local=None, end_local=None,
                                 start_date=None, end_date=None,
                                 playable_minutes=None, turnover_minutes=None,
-                                exclusion_dates=None, actor_id=None):
+                                exclusion_dates=None, windows=None, actor_id=None):
         """Create the AVAILABLE Game ice slots a template implies (#158).
 
         Idempotent and race-safe: planning is side-effect-free, but the
@@ -2621,8 +2678,12 @@ class SetupService:
                         end_local=end_local, start_date=start_date,
                         end_date=end_date, playable_minutes=playable_minutes,
                         turnover_minutes=turnover_minutes,
-                        exclusion_dates=exclusion_dates)
-                    windows = base["plan"]["windows"]
+                        exclusion_dates=exclusion_dates, windows=windows)
+                    # NB: keep the `windows` PARAMETER intact for the retry loop —
+                    # bind the generated planner windows to a distinct name, or a
+                    # second attempt would re-plan with generated rows instead of
+                    # the per-weekday input and raise.
+                    plan_windows = base["plan"]["windows"]
                     accessible = base["accessible"]
                     access_missing = base["access_missing"]
                     access_skipped = len(access_missing)
@@ -2631,7 +2692,7 @@ class SetupService:
                         existing_by_rink.setdefault(s.rink_id, []).append(s)
                     for rink, _venue in accessible:
                         existing = existing_by_rink.setdefault(rink.id, [])
-                        for w in windows:
+                        for w in plan_windows:
                             start, end = w["start"], w["end"]
                             if any(e.start_time == start and e.end_time == end
                                    for e in existing):
@@ -2663,7 +2724,7 @@ class SetupService:
                             "season_id": season_id,
                             "rink_ids": [r.id for r, _v in accessible],
                             "weekdays": sorted(base["weekday_set"]),
-                            "window": base["window"],
+                            "windows": base["windows_meta"],
                             "playable_minutes": playable_minutes,
                             "turnover_minutes": turnover_minutes, **counts})
                 break  # committed cleanly

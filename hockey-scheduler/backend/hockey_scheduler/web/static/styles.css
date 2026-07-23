@@ -747,6 +747,12 @@ button.act.danger { background: #ffe5e3; color: #c0271b; }
   border-radius: 999px; font-size: 13px; font-weight: 600; cursor: pointer; user-select: none; }
 .ib-day input { display: none; }
 .ib-day:has(input:checked) { background: var(--blue); border-color: var(--blue); color: #fff; }
+.ib-wd-times { display: flex; flex-direction: column; gap: 8px; }
+.ib-wd-row { display: flex; align-items: center; gap: 8px; }
+.ib-wd-name { min-width: 44px; font-size: 13px; font-weight: 700; color: var(--ink); }
+.ib-wd-row input[type="time"] { flex: 1; padding: 8px 10px; border: 1px solid var(--sep);
+  border-radius: 10px; font-size: 14px; background: var(--card); color: var(--ink); min-width: 0; }
+.ib-wd-sep { color: var(--muted); }
 .ib-excl-add { display: flex; gap: 8px; }
 .ib-excl-add input { flex: 1; }
 .ib-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }

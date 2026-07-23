@@ -32,7 +32,8 @@ from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
 
 from hockey_scheduler.api import ApiService
 from hockey_scheduler.domain import IceSlotStatus, IceSlotType
-from hockey_scheduler.domain.errors import ScheduleConflictError, ValidationError
+from hockey_scheduler.domain.errors import (
+    IntegrityConflictError, ScheduleConflictError, ValidationError)
 from hockey_scheduler.domain.setup_models import (
     IceSlot, Program, Rink, Season, SeasonStatus, SeasonVenueAccess, Venue)
 from hockey_scheduler.services import SetupService
@@ -363,6 +364,135 @@ class IceAvailabilityContract:
                           if a.action == "ice_slot_created"]
         self.assertEqual(len(created_audits), 5)
 
+    # -- 13. per-weekday windows (#158 flow; #313 review) -------------------
+    def _perday_template(self, **over):
+        """A per-weekday template: Tue 18:00-22:00 (3 games) + Thu 19:00-22:00
+        (2 games) over one week => 5 slots on one rink."""
+        base = dict(
+            season_id="season_1", rink_ids=["rink_1"],
+            start_date="2026-09-01", end_date="2026-09-07",
+            playable_minutes=60, turnover_minutes=15,
+            windows=[{"weekday": 1, "start_local": "18:00", "end_local": "22:00"},
+                     {"weekday": 3, "start_local": "19:00", "end_local": "22:00"}])
+        base.update(over)
+        return base
+
+    def test_preview_honors_per_weekday_windows(self):
+        pv = self.api.preview_ice_availability(**self._perday_template())
+        self.assertNotIn("error", pv)
+        self.assertEqual(pv["totals"]["new"], 5)          # 3 Tue + 2 Thu
+        tue = [s for s in pv["slots"] if s["date"] == "2026-09-01"]
+        thu = [s for s in pv["slots"] if s["date"] == "2026-09-03"]
+        self.assertEqual(len(tue), 3)
+        self.assertEqual(len(thu), 2)
+        # Each day starts at its OWN local time (18:00 EDT vs 19:00 EDT).
+        self.assertEqual(tue[0]["start_local"], "2026-09-01T18:00:00-04:00")
+        self.assertEqual(thu[0]["start_local"], "2026-09-03T19:00:00-04:00")
+        # The per-weekday windows are echoed back for the operator, sorted.
+        self.assertEqual(pv["windows"], [
+            {"weekday": 1, "start": "18:00", "end": "22:00"},
+            {"weekday": 3, "start": "19:00", "end": "22:00"}])
+        self.assertEqual(pv["weekdays"], [1, 3])
+
+    def test_commit_persists_and_audits_per_weekday_windows(self):
+        from zoneinfo import ZoneInfo
+        tz = ZoneInfo(TZ)
+        res = self.api.commit_ice_availability(
+            actor_id="arena", **self._perday_template())
+        self.assertEqual(res["totals"]["created"], 5)
+        slots = self._slots()
+        self.assertEqual(len(slots), 5)
+        # Group by LOCAL date (a late game crosses midnight in UTC): Tuesday
+        # keeps its 18:00 window (3 games), Thursday its own 19:00 (2 games).
+        by_local = {}
+        for s in slots:
+            local = s.start_time.astimezone(tz)
+            by_local.setdefault(local.date(), []).append(local)
+        tue = sorted(by_local[date(2026, 9, 1)])
+        thu = sorted(by_local[date(2026, 9, 3)])
+        self.assertEqual(len(tue), 3)
+        self.assertEqual(len(thu), 2)
+        self.assertEqual(tue[0].strftime("%H:%M"), "18:00")   # Tuesday's window
+        self.assertEqual(thu[0].strftime("%H:%M"), "19:00")   # Thursday's window
+        # The batch audit preserves the exact per-weekday windows.
+        batch = next(a for a in self.store.all_setup_audit()
+                     if a.action == "ice_availability_committed")
+        self.assertEqual(batch.detail["windows"], [
+            {"weekday": 1, "start": "18:00", "end": "22:00"},
+            {"weekday": 3, "start": "19:00", "end": "22:00"}])
+
+    def test_per_weekday_windows_survive_a_commit_retry(self):
+        # Guard the retry path (#313): the generated planner windows must not
+        # clobber the per-weekday `windows` INPUT, or the second attempt would
+        # re-plan with the wrong shape and raise. Force exactly one
+        # IntegrityConflictError (as a lock-free racing writer would), then let
+        # the retry succeed and confirm the per-weekday result is intact.
+        orig_add = self.store.add_ice_slot
+        tripped = []
+
+        def add_once_failing(slot):
+            if not tripped:
+                tripped.append(True)
+                raise IntegrityConflictError(
+                    "forced race", {"reason": "ice_slot_time_taken"})
+            return orig_add(slot)
+
+        self.store.add_ice_slot = add_once_failing
+        try:
+            res = self.api.commit_ice_availability(
+                actor_id="a", **self._perday_template())
+        finally:
+            self.store.add_ice_slot = orig_add
+        self.assertTrue(tripped, "the forced conflict never fired")
+        self.assertNotIn("error", res)
+        self.assertEqual(res["totals"]["created"], 5)     # retry re-planned OK
+        self.assertEqual(len(self._slots()), 5)
+
+    def test_per_weekday_rerun_is_idempotent(self):
+        first = self.api.commit_ice_availability(
+            actor_id="a", **self._perday_template())
+        self.assertEqual(first["totals"]["created"], 5)
+        again = self.api.commit_ice_availability(
+            actor_id="a", **self._perday_template())
+        self.assertEqual(again["totals"]["created"], 0)
+        self.assertEqual(again["totals"]["duplicate_skipped"], 5)
+        self.assertEqual(len(self._slots()), 5)           # unchanged
+
+    def test_windows_reject_duplicate_weekday(self):
+        res = self.api.preview_ice_availability(**self._perday_template(
+            windows=[{"weekday": 1, "start_local": "18:00", "end_local": "20:00"},
+                     {"weekday": 1, "start_local": "20:00", "end_local": "22:00"}]))
+        self.assertIn("error", res)
+        self.assertEqual(res["error"]["details"]["reason"], "duplicate_weekday")
+
+    def test_windows_reject_bad_time(self):
+        res = self.api.preview_ice_availability(**self._perday_template(
+            windows=[{"weekday": 1, "start_local": "25:00", "end_local": "22:00"}]))
+        self.assertIn("error", res)
+
+    def test_per_weekday_windows_honor_exclusion(self):
+        # Excluding the Tuesday leaves only Thursday's own 2-game window; the
+        # excluded date is reported, not created.
+        pv = self.api.preview_ice_availability(**self._perday_template(
+            exclusion_dates=["2026-09-01"]))
+        self.assertEqual(pv["totals"]["new"], 2)          # Thu only (3 Tue gone)
+        self.assertEqual({s["date"] for s in pv["slots"]}, {"2026-09-03"})
+        self.assertEqual([d["date"] for d in pv["skipped_dates"]], ["2026-09-01"])
+
+    def test_per_weekday_windows_report_conflict(self):
+        # An existing slot overlapping Thursday's 19:00 window (23:00-23:30 UTC
+        # on Sep 3, non-exact) is a conflict on THAT day only — Tuesday's three
+        # 18:00 windows are untouched. Proves classification runs per generated
+        # window regardless of which day's time produced it.
+        self._add_existing("rink_1", "2026-09-03T23:00:00+00:00",
+                           "2026-09-03T23:30:00+00:00")
+        pv = self.api.preview_ice_availability(**self._perday_template())
+        self.assertEqual(pv["totals"]["conflict"], 1)
+        self.assertEqual(pv["totals"]["new"], 4)          # 3 Tue + 1 Thu left
+        res = self.api.commit_ice_availability(actor_id="a", **self._perday_template())
+        self.assertEqual(res["totals"]["created"], 4)
+        self.assertEqual(res["totals"]["conflict_skipped"], 1)
+
 
 class MemoryIceAvailabilityTest(IceAvailabilityContract, unittest.TestCase):
     def _store(self):
@@ -669,6 +799,21 @@ class PlannerUnitTest(unittest.TestCase):
         per_day = [w for w in r["windows"] if w["date"] == "2026-09-01"]
         self.assertEqual(len(per_day), 4)
 
+    def test_per_weekday_windows_are_independent(self):
+        # #158 flow: each selected weekday carries its OWN local start/end time.
+        # Tue 18:00-22:00 hosts 3 games; Thu 19:00-22:00 hosts 2; the planner
+        # honors each day's window rather than one global block.
+        r = self._plan(weekday_windows={1: ((18, 0), (22, 0)),
+                                        3: ((19, 0), (22, 0))})
+        tue = [w for w in r["windows"] if w["date"] == "2026-09-01"]  # Tuesday
+        thu = [w for w in r["windows"] if w["date"] == "2026-09-03"]  # Thursday
+        self.assertEqual(len(tue), 3)
+        self.assertEqual(len(thu), 2)
+        self.assertEqual(len(r["windows"]), 5)
+        # Each day's first game starts at that day's own local start time.
+        self.assertEqual(tue[0]["start_local"], "2026-09-01T18:00:00-04:00")
+        self.assertEqual(thu[0]["start_local"], "2026-09-03T19:00:00-04:00")
+
 
 class IceAvailabilityHttpAuthzTest(unittest.TestCase):
     """The route is recognized and gated to MANAGE_ARENA over real HTTP."""
@@ -733,3 +878,20 @@ class IceAvailabilityHttpAuthzTest(unittest.TestCase):
             _template(season_id="does-not-exist"))
         self.assertNotEqual(status, 403)
         self.assertIn("error", body)
+
+    def test_per_weekday_windows_field_is_accepted_over_http(self):
+        # The per-weekday `windows` list survives the HTTP field allow-list and
+        # reaches the handler (not dropped, not a 403). A bogus season keeps this
+        # a routing proof without needing seeded inventory.
+        c = self._client()
+        self._login(c, "arena")
+        body = {
+            "season_id": "does-not-exist", "rink_ids": ["r"],
+            "playable_minutes": 60, "turnover_minutes": 15,
+            "windows": [
+                {"weekday": 1, "start_local": "18:00", "end_local": "22:00"},
+                {"weekday": 3, "start_local": "19:00", "end_local": "23:00"}]}
+        status, resp = self._req(
+            c, "POST", "/api/setup/ice-availability/preview", body)
+        self.assertNotEqual(status, 403)
+        self.assertIn("error", resp)                     # reached the handler

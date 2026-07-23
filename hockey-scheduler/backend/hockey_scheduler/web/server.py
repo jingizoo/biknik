@@ -2021,7 +2021,7 @@ class Handler(BaseHTTPRequestHandler):
                     "/api/setup/ice-availability/commit"):
             fields = ("season_id", "rink_ids", "weekdays", "start_local",
                       "end_local", "start_date", "end_date", "playable_minutes",
-                      "turnover_minutes", "exclusion_dates")
+                      "turnover_minutes", "exclusion_dates", "windows")
             kwargs = {k: body.get(k) for k in fields}
             if path.endswith("/preview"):
                 return self._send_api(api.preview_ice_availability(**kwargs))

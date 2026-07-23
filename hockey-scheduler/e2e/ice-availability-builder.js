@@ -10,7 +10,9 @@
 //   * committing creates exactly the previewed AVAILABLE Game ice;
 //   * re-running the same template is idempotent — zero new, all duplicates,
 //     and the create button is disabled;
-//   * an exclusion date is honored (fewer slots, and it is reported).
+//   * an exclusion date is honored (fewer slots, and it is reported);
+//   * each selected weekday carries its OWN local start/end time (#158 flow):
+//     a narrower Thursday window yields fewer Thursday games than Tuesday.
 //
 // September 2026 has Tuesdays 1,8,15,22,29 and Thursdays 3,10,17,24 = 9 days;
 // a 18:00-22:00 window with 60-minute games + 15-minute turnover yields 3 games
@@ -191,8 +193,35 @@ async function checkViewport(browser, viewport) {
     if (s.new !== EXPECTED_NEW - 3) fail(`exclusion should drop 3 slots (=> ${EXPECTED_NEW - 3}), got ${JSON.stringify(s)}`);
     if (s.skipped < 1) fail(`the excluded date should be reported as skipped: ${JSON.stringify(s)}`);
 
+    // (F) Per-weekday windows: each selected day carries its OWN local start/end
+    // time. Open a fresh builder on a clean rink, keep Tuesday 18:00-22:00 (3
+    // games) but narrow Thursday to 18:00-20:00 (1 game). September 2026 has 5
+    // Tuesdays + 4 Thursdays, so per-weekday windows yield 5*3 + 4*1 = 19 —
+    // where a single uniform block would be 27. Proves the per-day times reach
+    // the planner and are not collapsed into one global window.
+    const rink4 = await page.evaluate(async (season) => {
+      const post = async (p, b) => (await fetch(p, {
+        method: "POST", credentials: "same-origin",
+        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
+      })).json();
+      const venue = await post("/api/setup/venue", { name: "East", league_id: null });
+      await post(`/api/v2/setup/seasons/${season}/venue-access`, { venue_id: venue.id });
+      return (await post("/api/setup/rink", { venue_id: venue.id, name: "East Ice" })).id;
+    }, ids.season);
+    await page.click("[data-ib-cancel]");
+    await page.waitForSelector("[data-ice-builder-open]", { timeout: 10000 });
+    await page.click("[data-ice-builder-open]");
+    await page.waitForSelector(".ib-form", { timeout: 10000 });
+    await page.check(`.ib-rink[value="${rink4}"]`);
+    // Tue (weekday 1) and Thu (weekday 3) are checked by default; each renders
+    // its own start/end inputs. Narrow only Thursday's window.
+    await page.fill("#ib-end-3", "20:00");
+    await preview(page);
+    s = await previewState(page);
+    if (s.new !== 19) fail(`per-weekday windows should yield 19 new (5*3 Tue + 4*1 Thu), got ${JSON.stringify(s)}`);
+
     if (errors.length) fail(`console/page errors:\n${errors.join("\n")}`);
-    console.log(`[${viewport.label}] OK — month grid renders; builder previews ${EXPECTED_NEW} slots, reports un-granted venue, commits idempotently, honors exclusions.`);
+    console.log(`[${viewport.label}] OK — month grid renders; builder previews ${EXPECTED_NEW} slots, reports un-granted venue, commits idempotently, honors exclusions, and applies per-weekday windows (narrow Thursday => 19).`);
   } catch (error) {
     throw new Error(`${error.message}\n--- demo server output ---\n${serverOutput}`);
   } finally {
