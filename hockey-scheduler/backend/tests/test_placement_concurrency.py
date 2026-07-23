@@ -934,11 +934,18 @@ class _DraftParticipationRaceMixin(_ForcedRaceHarnessMixin):
                                 for a in store.all_setup_audit()))
 
         if part_ok:
-            self.assertTrue(draft_ok, repr(out))
-            self.assertNotIn(
-                "t0",
-                (active[0].home_team_id, active[0].away_team_id),
-                repr(out))
+            # Two valid transfer/unregister-first outcomes exist. A fresh
+            # proposal can exclude t0 and commit another pairing, while a
+            # proposal captured before the participation change is rejected
+            # by the locked exact-LeagueSeason recheck with zero Games.
+            if active:
+                self.assertTrue(draft_ok, repr(out))
+                self.assertNotIn(
+                    "t0",
+                    (active[0].home_team_id, active[0].away_team_id),
+                    repr(out))
+            else:
+                self.assertFalse(draft_ok, repr(out))
         else:
             self.assertTrue(draft_ok, repr(out))
             self.assertEqual(
