@@ -2744,6 +2744,14 @@ function ibWindowFor(f, wd) {
 }
 
 function ibLocalTime(iso) { return (iso || "").slice(11, 16); }
+// The preview's start_local/end_local ISO strings carry the resolved UTC
+// offset (e.g. "...T01:00:00-04:00"); reusing it — rather than a zone
+// abbreviation table — disambiguates two fall-back rows that read the same
+// local clock time, for free, from data the backend already computed.
+function ibLocalOffset(iso) {
+  const m = /([+-]\d{2}:\d{2})$/.exec(iso || "");
+  return m ? m[1] : "+00:00";
+}
 function ibDateOnly(v) { return v ? String(v).slice(0, 10) : "—"; }
 
 function renderIceBuilder(ov) {
@@ -2830,6 +2838,18 @@ function renderIcePreview(pv) {
     ? `<div class="ib-note">Skipped ${pv.skipped_dates.length} exclusion date(s): ${pv.skipped_dates.map((s) => esc(s.date)).join(", ")}.</div>` : "";
   const short = (pv.too_short || []).length
     ? `<div class="ib-note">${pv.too_short.length} day(s) too short for one ${pv.playable_minutes}-min game: ${pv.too_short.map((s) => esc(s.date)).join(", ")}.</div>` : "";
+  // DST (#315 review): a spring-forward window whose start/end falls in the
+  // nonexistent local hour generates NOTHING for that day — surfaced here as an
+  // actionable skip (which boundary, which day), never silent. A fall-back
+  // window that resolves an ambiguous boundary is informational (the earlier
+  // fold was used); the repeated-hour ROWS it can produce are disambiguated
+  // below regardless of whether the WINDOW boundary itself was ambiguous.
+  const dstSkips = (pv.dst_skipped || []).length
+    ? `<div class="ib-warn">⚠ ${pv.dst_skipped.length} window(s) skipped — the local start/end time doesn't exist that day (a spring-forward gap): ${pv.dst_skipped.map((s) => esc(`${s.date} (${s.boundary})`)).join(", ")}. Adjust the window to fall outside the gap, then preview again.</div>`
+    : "";
+  const dstAmbig = (pv.dst_ambiguous || []).length
+    ? `<div class="ib-note">${pv.dst_ambiguous.length} window(s) cross a repeated local hour (fall-back clocks change): ${pv.dst_ambiguous.map((s) => esc(`${s.date} (${s.boundary})`)).join(", ")}. The earlier occurrence is used; any rows below sharing a clock time show their UTC offset to tell them apart.</div>`
+    : "";
   const rinkRows = (pv.rinks || []).map((r) =>
     `<div class="ib-rink-row"><span>${esc(r.rink_name)}</span><span>${r.new} new · ${r.duplicate} exist · ${r.conflict} conflict</span></div>`).join("");
   // Every generated row is reviewable before commit (#158 review): new, duplicate
@@ -2845,25 +2865,47 @@ function renderIcePreview(pv) {
   const conflictTarget = (s) => s.conflict_has_game
     ? `game ${s.conflict_game_id || "?"}`
     : `${s.conflict_slot_type || "existing"} slot${s.conflict_slot_status ? ` (${s.conflict_slot_status})` : ""}`;
-  const slotSpan = (s) => {
-    const time = `${esc(ibLocalTime(s.start_local))}–${esc(ibLocalTime(s.end_local))}`;
+  // A fall-back day's repeated local hour means two distinct UTC slots can read
+  // the SAME wall-clock start or end (#315 review) — count each clock reading
+  // among the day's rows (start/end separately) so a repeated one is labeled
+  // with its UTC offset; a non-repeated reading stays the plain HH:MM it always
+  // was. data-ib-start-offset/-end-offset are always present (cheap, and let a
+  // reader confirm two same-clock rows are genuinely different instants).
+  const slotSpan = (s, startAmbiguous, endAmbiguous) => {
+    const startOffset = ibLocalOffset(s.start_local), endOffset = ibLocalOffset(s.end_local);
+    const startLbl = startAmbiguous
+      ? `${esc(ibLocalTime(s.start_local))} (UTC${esc(startOffset)})` : esc(ibLocalTime(s.start_local));
+    const endLbl = endAmbiguous
+      ? `${esc(ibLocalTime(s.end_local))} (UTC${esc(endOffset)})` : esc(ibLocalTime(s.end_local));
+    const time = `${startLbl}–${endLbl}`;
+    const clockAttrs = ` data-ib-start-clock="${esc(ibLocalTime(s.start_local))}" data-ib-start-offset="${esc(startOffset)}" data-ib-end-clock="${esc(ibLocalTime(s.end_local))}" data-ib-end-offset="${esc(endOffset)}"`;
     if (s.status === "conflict") {
       const target = conflictTarget(s);
-      return `<span class="ib-slot ib-slot-conflict" data-ib-slot-status="conflict"${s.conflict_game_id ? ` data-ib-conflict-game="${esc(s.conflict_game_id)}"` : ""} title="conflicts with ${esc(target)}">${time} · ${esc(s.rink_name)} · ⚠ ${esc(target)}</span>`;
+      return `<span class="ib-slot ib-slot-conflict" data-ib-slot-status="conflict"${clockAttrs}${s.conflict_game_id ? ` data-ib-conflict-game="${esc(s.conflict_game_id)}"` : ""} title="conflicts with ${esc(target)}">${time} · ${esc(s.rink_name)} · ⚠ ${esc(target)}</span>`;
     }
     if (s.status === "duplicate") {
-      return `<span class="ib-slot ib-slot-duplicate" data-ib-slot-status="duplicate">${time} · ${esc(s.rink_name)} · already exists</span>`;
+      return `<span class="ib-slot ib-slot-duplicate" data-ib-slot-status="duplicate"${clockAttrs}>${time} · ${esc(s.rink_name)} · already exists</span>`;
     }
-    return `<span class="ib-slot ib-slot-new" data-ib-slot-status="new">${time} · ${esc(s.rink_name)}</span>`;
+    return `<span class="ib-slot ib-slot-new" data-ib-slot-status="new"${clockAttrs}>${time} · ${esc(s.rink_name)}</span>`;
   };
-  const slotList = days.map((d, i) =>
-    `<div class="ib-day-row" data-ib-day="${esc(d)}"${i === days.length - 1 ? ' data-ib-last-day="1"' : ""}>
+  const slotList = days.map((d, i) => {
+    const daySlots = byDate[d];
+    const startCounts = {}, endCounts = {};
+    daySlots.forEach((s) => {
+      const sc = ibLocalTime(s.start_local), ec = ibLocalTime(s.end_local);
+      startCounts[sc] = (startCounts[sc] || 0) + 1;
+      endCounts[ec] = (endCounts[ec] || 0) + 1;
+    });
+    const rows = daySlots.map((s) => slotSpan(
+      s, startCounts[ibLocalTime(s.start_local)] > 1, endCounts[ibLocalTime(s.end_local)] > 1)).join("");
+    return `<div class="ib-day-row" data-ib-day="${esc(d)}"${i === days.length - 1 ? ' data-ib-last-day="1"' : ""}>
       <div class="ib-day-date">${esc(d)}</div>
-      <div class="ib-day-slots">${byDate[d].map(slotSpan).join("")}</div></div>`).join("");
+      <div class="ib-day-slots">${rows}</div></div>`;
+  }).join("");
   const listNote = days.length
     ? `<div class="ib-note">All ${days.length} generated day(s) listed (${(pv.slots || []).length} slot(s)) — scroll to review every day and conflict; the last day is ${esc(lastDay)}.</div>`
     : "";
-  return `<div class="card ib-preview" data-ib-new="${t.new}" data-ib-duplicate="${t.duplicate}" data-ib-conflict="${t.conflict}" data-ib-access-missing="${(pv.venue_access_missing || []).length}" data-ib-skipped="${(pv.skipped_dates || []).length}" data-ib-days="${days.length}" data-ib-slots="${(pv.slots || []).length}" data-ib-last-day-date="${esc(lastDay)}">
+  return `<div class="card ib-preview" data-ib-new="${t.new}" data-ib-duplicate="${t.duplicate}" data-ib-conflict="${t.conflict}" data-ib-access-missing="${(pv.venue_access_missing || []).length}" data-ib-skipped="${(pv.skipped_dates || []).length}" data-ib-dst-skipped="${(pv.dst_skipped || []).length}" data-ib-dst-ambiguous="${(pv.dst_ambiguous || []).length}" data-ib-days="${days.length}" data-ib-slots="${(pv.slots || []).length}" data-ib-last-day-date="${esc(lastDay)}">
     <div class="section-title" style="margin-top:0">Preview — ${t.capacity_games} game slot(s) to create</div>
     <div class="ib-stats">
       <div class="ib-stat"><b>${t.new}</b><span>new</span></div>
@@ -2872,7 +2914,7 @@ function renderIcePreview(pv) {
       <div class="ib-stat"><b>${hrs(t.playable_minutes)}</b><span>playable</span></div>
       <div class="ib-stat"><b>${hrs(t.reserved_minutes)}</b><span>reserved</span></div>
     </div>
-    ${accessWarn}${conflictWarn}${skips}${short}
+    ${accessWarn}${conflictWarn}${skips}${short}${dstSkips}${dstAmbig}
     ${rinkRows ? `<div class="ib-rink-rows">${rinkRows}</div>` : ""}
     <div class="ib-slot-list">${slotList || `<div class="empty">No slots generated — adjust the template above.</div>`}</div>
     ${listNote}

@@ -18,7 +18,13 @@
 //   * a stale preview (its resolved snapshot moved) is refused by the server
 //     and the UI re-previews the current proposal instead of writing it;
 //   * an exact-tuple collision with existing incompatible ice (e.g. a
-//     maintenance slot) is reported as a conflict, never hidden as capacity.
+//     maintenance slot) is reported as a conflict, never hidden as capacity;
+//   * in a DST-observing Program timezone (#315), a spring-forward window
+//     whose boundary falls in the nonexistent local hour is visibly reported
+//     and generates nothing; the same day's window widened to span the gap
+//     commits exactly its 2 real-duration slots; and a fall-back day's 4
+//     real-hour slots — two of which share a repeated local clock time — are
+//     each visibly distinguished (not shown as identical rows).
 //
 // September 2026 has Tuesdays 1,8,15,22,29 and Thursdays 3,10,17,24 = 9 days;
 // a 18:00-22:00 window with 60-minute games + 15-minute turnover yields 3 games
@@ -63,15 +69,20 @@ function stopServer(server) {
   });
 }
 
-// Fill the builder date range, then Preview and wait for the panel to reflect it.
-async function preview(page) {
-  await page.fill("#ib-from", "2026-09-01");
-  await page.fill("#ib-to", "2026-09-30");
-  // Drop any prior preview panel so the wait blocks for the FRESH render rather
-  // than matching a stale one (each Preview fully re-renders #content).
+// Preview using whatever date range is already in the form (each Preview fully
+// re-renders #content, so any prior panel is dropped first to make the wait
+// block for the FRESH render rather than matching a stale one).
+async function previewCurrent(page) {
   await page.evaluate(() => { const p = document.querySelector(".ib-preview"); if (p) p.remove(); });
   await page.click("[data-ib-preview]");
   await page.waitForSelector(".ib-preview, .banner.warn", { timeout: 15000 });
+}
+
+// Fill the builder date range to the September 2026 default, then Preview.
+async function preview(page) {
+  await page.fill("#ib-from", "2026-09-01");
+  await page.fill("#ib-to", "2026-09-30");
+  await previewCurrent(page);
 }
 
 function previewState(page) {
@@ -85,9 +96,24 @@ function previewState(page) {
       conflict: +p.getAttribute("data-ib-conflict"),
       accessMissing: +p.getAttribute("data-ib-access-missing"),
       skipped: +p.getAttribute("data-ib-skipped"),
+      dstSkipped: +p.getAttribute("data-ib-dst-skipped"),
+      dstAmbiguous: +p.getAttribute("data-ib-dst-ambiguous"),
       commitDisabled: commit ? commit.disabled : null,
     };
   });
+}
+
+// Check ONLY the given weekdays (unchecking every other one) via the visually-
+// hidden custom toggles, firing one change event so the builder's listener
+// re-renders each selected day's own time row (mirrors step (J)'s pattern).
+async function selectWeekdaysOnly(page, weekdays) {
+  await page.evaluate((wanted) => {
+    const desired = new Set(wanted);
+    const boxes = Array.from(document.querySelectorAll(".ib-weekday"));
+    boxes.forEach((cb) => { cb.checked = desired.has(+cb.value); });
+    if (boxes[0]) boxes[0].dispatchEvent(new Event("change", { bubbles: true }));
+  }, weekdays);
+  await page.waitForSelector(`.ib-wd-row[data-weekday="${weekdays[0]}"]`, { timeout: 10000 });
 }
 
 async function checkViewport(browser, viewport) {
@@ -498,8 +524,140 @@ async function checkViewport(browser, viewport) {
       fail(`commit must create the FULL previewed set (${lp.newCount}), got ${longCreated}`);
     }
 
+    // (K) DST safety is visibly reviewable, not just correct under the hood
+    // (#315 review). A fresh Program in a DST-observing timezone (America/
+    // Toronto), a season spanning both a spring-forward (2027-03-14) and a
+    // fall-back (2026-11-01) Sunday, one accessible rink, weekday narrowed to
+    // Sunday only, turnover zeroed so the real-hour math above (2 slots / 120
+    // reserved for spring, 4 slots / 240 reserved for fall) applies exactly.
+    const dstIds = await page.evaluate(async () => {
+      const post = async (p, b) => (await fetch(p, {
+        method: "POST", credentials: "same-origin",
+        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
+      })).json();
+      const league = await post("/api/setup/league", { name: "DST League", timezone: "America/Toronto" });
+      const season = await post("/api/setup/season", {
+        league_id: league.id, name: "DST Season",
+        start_date: "2026-08-01", end_date: "2027-06-01" });
+      const venue = await post("/api/setup/venue", { name: "DST Arena", league_id: league.id });
+      await post(`/api/v2/setup/seasons/${season.id}/venue-access`, { venue_id: venue.id });
+      const rink = await post("/api/setup/rink", { venue_id: venue.id, name: "DST Sheet" });
+      return { season: season.id, rink: rink.id };
+    });
+    // The previous step's commit already closed the builder back to the
+    // calendar (no cancel needed) — mirrors step (D) reopening after (C)'s
+    // successful commit.
+    await page.click("[data-ice-builder-open]");
+    await page.waitForSelector(".ib-form", { timeout: 10000 });
+    await page.selectOption("#ib-season", dstIds.season);
+    await page.waitForSelector(`.ib-rink[value="${dstIds.rink}"]`, { timeout: 10000 });
+    await page.check(`.ib-rink[value="${dstIds.rink}"]`);
+    await selectWeekdaysOnly(page, [6]);      // Sunday only
+    await page.fill("#ib-turnover", "0");
+
+    // (K1) A window whose START falls in the nonexistent spring-forward hour
+    // (2027-03-14, 02:00-03:00 does not exist) generates NOTHING for that day —
+    // and the preview must SAY SO, not just show an empty list.
+    await page.fill("#ib-from", "2027-03-14");
+    await page.fill("#ib-to", "2027-03-14");
+    await page.fill("#ib-start-6", "02:30");
+    await page.fill("#ib-end-6", "05:00");
+    await previewCurrent(page);
+    s = await previewState(page);
+    if (s.new !== 0 || s.dstSkipped !== 1) {
+      fail(`a spring-forward gap-start window must generate 0 slots and report 1 dst-skipped day, got ${JSON.stringify(s)}`);
+    }
+    if (s.commitDisabled !== true) fail(`commit should be disabled with zero new slots: ${JSON.stringify(s)}`);
+    const skipNotice = await page.$eval(".ib-preview", (el) => el.textContent);
+    if (!/2027-03-14/.test(skipNotice) || !/gap|nonexistent|doesn.?t exist/i.test(skipNotice)) {
+      fail(`the spring-forward skip must be visibly reported with the day and an actionable reason: ${JSON.stringify(skipNotice.slice(0, 300))}`);
+    }
+
+    // (K2) The SAME day's window, widened to span the gap (01:00-04:00), is 2
+    // REAL hours (not the wall-clock 3) => exactly 2 positive-duration slots,
+    // no dst-skip, and it commits + persists exactly what was previewed.
+    await page.fill("#ib-start-6", "01:00");
+    await page.fill("#ib-end-6", "04:00");
+    await previewCurrent(page);
+    s = await previewState(page);
+    if (s.new !== 2 || s.dstSkipped !== 0) {
+      fail(`a spring-forward gap-spanning window should generate exactly 2 real-duration slots and report no skip, got ${JSON.stringify(s)}`);
+    }
+    const springSlotCount = await page.$$eval(".ib-slot", (els) => els.length);
+    if (springSlotCount !== 2) fail(`expected 2 visible slot rows for the spring-forward window, got ${springSlotCount}`);
+    await page.click("[data-ib-commit]");
+    await page.waitForFunction(
+      () => document.body.dataset.view === "calendar" && !document.querySelector(".ib-form"),
+      null, { timeout: 10000 });
+    const springCreated = await page.evaluate(async (rink) => {
+      const ov = await (await fetch("/api/demo/overview", { credentials: "same-origin" })).json();
+      return (ov.ice_slots || []).filter((x) => x.rink_id === rink).length;
+    }, dstIds.rink);
+    if (springCreated !== 2) fail(`spring-forward commit should create exactly the 2 previewed slots, got ${springCreated}`);
+
+    // (K3) A fall-back day (2026-11-01, the repeated 01:00-02:00 hour) on a
+    // FRESH rink: 00:00-03:00 local is 4 REAL hours => 4 slots. The repeated
+    // hour means two distinct UTC slots read the SAME local clock time — the
+    // preview must visibly tell them apart (not just be correct server-side).
+    const dstRink2 = await page.evaluate(async (season) => {
+      const post = async (p, b) => (await fetch(p, {
+        method: "POST", credentials: "same-origin",
+        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
+      })).json();
+      const venue = await post("/api/setup/venue", { name: "DST Arena 2", league_id: null });
+      await post(`/api/v2/setup/seasons/${season}/venue-access`, { venue_id: venue.id });
+      return (await post("/api/setup/rink", { venue_id: venue.id, name: "DST Sheet 2" })).id;
+    }, dstIds.season);
+    await page.click("[data-ice-builder-open]");
+    await page.waitForSelector(".ib-form", { timeout: 10000 });
+    // A fresh open resets the form to its defaults (Tue/Thu, 15-min turnover,
+    // the first ACTIVE season overall) — reselect the DST season explicitly, or
+    // this rink's venue-access grant (scoped to dstIds.season) won't resolve.
+    await page.selectOption("#ib-season", dstIds.season);
+    await page.waitForSelector(`.ib-rink[value="${dstRink2}"]`, { timeout: 10000 });
+    await page.check(`.ib-rink[value="${dstRink2}"]`);
+    await selectWeekdaysOnly(page, [6]);      // Sunday only
+    await page.fill("#ib-turnover", "0");
+    await page.fill("#ib-from", "2026-11-01");
+    await page.fill("#ib-to", "2026-11-01");
+    await page.fill("#ib-start-6", "00:00");
+    await page.fill("#ib-end-6", "03:00");
+    await previewCurrent(page);
+    s = await previewState(page);
+    if (s.new !== 4) fail(`a fall-back 00:00-03:00 window should generate 4 real-hour slots, got ${JSON.stringify(s)}`);
+    const fallSlotCount = await page.$$eval(".ib-slot", (els) => els.length);
+    if (fallSlotCount !== 4) fail(`expected 4 visible slot rows for the fall-back window, got ${fallSlotCount}`);
+    // Two rows share the "01:00" start clock (the repeated hour) — their
+    // data-ib-start-offset must differ, proving the UI distinguishes the two
+    // real, different UTC instants rather than showing identical labels.
+    const startClocks = await page.$$eval(".ib-slot",
+      (els) => els.map((e) => ({ clock: e.getAttribute("data-ib-start-clock"),
+                                 offset: e.getAttribute("data-ib-start-offset") })));
+    const repeated = startClocks.filter((c) => c.clock === "01:00");
+    if (repeated.length !== 2) {
+      fail(`expected exactly 2 rows starting at the repeated 01:00 local hour, got ${JSON.stringify(startClocks)}`);
+    }
+    if (repeated[0].offset === repeated[1].offset) {
+      fail(`the two repeated-hour rows must carry DIFFERENT UTC offsets, got ${JSON.stringify(repeated)}`);
+    }
+    // The visible text itself must differ too (the offset is rendered, not just
+    // stashed in a data attribute) for at least one of the colliding pairs.
+    const fallSlotTexts = await page.$$eval(".ib-slot", (els) => els.map((e) => e.textContent));
+    if (new Set(fallSlotTexts).size !== fallSlotTexts.length) {
+      fail(`every fall-back row must render distinct text, got ${JSON.stringify(fallSlotTexts)}`);
+    }
+    await page.click("[data-ib-commit]");
+    await page.waitForFunction(
+      () => document.body.dataset.view === "calendar" && !document.querySelector(".ib-form"),
+      null, { timeout: 10000 });
+    const fallCreated = await page.evaluate(async (rink) => {
+      const ov = await (await fetch("/api/demo/overview", { credentials: "same-origin" })).json();
+      return (ov.ice_slots || []).filter((x) => x.rink_id === rink).length;
+    }, dstRink2);
+    if (fallCreated !== 4) fail(`fall-back commit should create exactly the 4 previewed slots, got ${fallCreated}`);
+
     if (errors.length) fail(`console/page errors:\n${errors.join("\n")}`);
-    console.log(`[${viewport.label}] OK — month grid renders; builder previews ${EXPECTED_NEW} slots, reports un-granted venue, commits idempotently, honors exclusions, applies per-weekday windows (narrow Thursday => 19), binds commit to the preview (edit invalidates it), refuses+refreshes a stale preview (both a bogus token and a same-slot-set window edit that slips the suspenders), reports an exact-tuple collision as a conflict WITH its target, and exposes every row of a >60-day template — the final day and a late Game collision's exact target — while committing the full previewed set.`);
+    console.log(`[${viewport.label}] OK — month grid renders; builder previews ${EXPECTED_NEW} slots, reports un-granted venue, commits idempotently, honors exclusions, applies per-weekday windows (narrow Thursday => 19), binds commit to the preview (edit invalidates it), refuses+refreshes a stale preview (both a bogus token and a same-slot-set window edit that slips the suspenders), reports an exact-tuple collision as a conflict WITH its target, exposes every row of a >60-day template — the final day and a late Game collision's exact target — while committing the full previewed set, and in a DST-observing Program timezone visibly reports a spring-forward gap skip, commits a gap-spanning window's 2 real-duration slots, and visibly distinguishes a fall-back day's 4 real-hour slots including the two that share a repeated local clock time.`);
   } catch (error) {
     throw new Error(`${error.message}\n--- demo server output ---\n${serverOutput}`);
   } finally {
