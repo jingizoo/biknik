@@ -2476,19 +2476,29 @@ class SetupService:
         # changing the generated tuple, and the commit would then silently skip or
         # create a row the operator never reviewed. So bind the resolved timezone,
         # the resolved date range, AND, per generated window, its (rink, start,
-        # end) tuple, its reviewed status, and — for a conflict — the stable
-        # identity it collides with (the existing slot id + any Game on it). Any
-        # such change flips the fingerprint, forcing a re-preview of the exact
-        # changed target; an unedited template over unchanged inventory is stable,
-        # so preview and commit agree. Commit calls this UNDER its Season +
-        # per-rink write locks, so the bound classification is the very one the
-        # write loop then acts on. Deterministic — no clock.
+        # end) tuple, its reviewed status, and — for a conflict — EVERY
+        # operator-visible target field the preview renders: the colliding slot
+        # id, the Game id (if any), and the slot TYPE + STATUS. The last two
+        # matter because an exact persisted slot can be updated in place (e.g.
+        # maintenance -> public_skate, or blocked -> allocated) without changing
+        # its id: the row stays a `conflict` with the same id, but the target TEXT
+        # the operator reviewed changed, so the fingerprint must move (#158
+        # review). Any such change flips the fingerprint, forcing a re-preview of
+        # the exact changed target; an unedited template over unchanged inventory
+        # is stable, so preview and commit agree. Commit calls this UNDER its
+        # Season + per-rink write locks, so the bound classification is the very
+        # one the write loop then acts on. Deterministic — no clock.
         classified = self._classify_ice_windows(accessible, plan)
+
+        def _target(c):
+            # The full conflict identity the operator saw; empty for non-conflicts.
+            if c["status"] != "conflict":
+                return ("", "", "", "")
+            return (c["conflict_with"] or "", c["conflict_game_id"] or "",
+                    c["conflict_slot_type"] or "", c["conflict_slot_status"] or "")
         proposed = sorted(
             (c["rink_id"], c["start"].isoformat(), c["end"].isoformat(),
-             c["status"],
-             (c["conflict_with"] or "") if c["status"] == "conflict" else "",
-             (c["conflict_game_id"] or "") if c["status"] == "conflict" else "")
+             c["status"]) + _target(c)
             for c in classified)
         fingerprint = hashlib.sha256(json.dumps({
             "season_id": season_id,
