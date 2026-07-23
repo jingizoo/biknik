@@ -41,6 +41,52 @@ def assert_no_duplicate_active_ice_slots(conn):
             f"{shown}{more}. Cancel or move the extra games before upgrading.")
 
 
+def find_duplicate_ice_slot_times(conn):
+    """``(rink_id, start_time, end_time, [slot_id, ...])`` for every fully
+    specified tuple that backs more than one ice slot — the exact duplicates
+    migration 045's unique index rejects. A row with a NULL anywhere in the
+    tuple is skipped: the index treats those NULLs as distinct, so they never
+    collide and must not be reported as a blocker."""
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT rink_id, start_time, end_time FROM ice_slots "
+        "WHERE rink_id IS NOT NULL AND start_time IS NOT NULL "
+        "AND end_time IS NOT NULL "
+        "GROUP BY rink_id, start_time, end_time HAVING COUNT(*) > 1")
+    dup_keys = {(r["rink_id"], r["start_time"], r["end_time"])
+                for r in cur.fetchall()}
+    if not dup_keys:
+        return []
+    cur.execute(
+        "SELECT id, rink_id, start_time, end_time FROM ice_slots "
+        "WHERE rink_id IS NOT NULL AND start_time IS NOT NULL "
+        "AND end_time IS NOT NULL")
+    grouped = {}
+    for r in cur.fetchall():
+        key = (r["rink_id"], r["start_time"], r["end_time"])
+        if key in dup_keys:
+            grouped.setdefault(key, []).append(r["id"])
+    return sorted((k[0], k[1], k[2], sorted(ids)) for k, ids in grouped.items())
+
+
+def assert_no_duplicate_ice_slot_times(conn):
+    """Abort migration 045 if any ``(rink, start, end)`` already backs more than
+    one ice slot (#158 review). The pre-fix concurrent write paths this PR
+    hardens could persist exact duplicates, so on a deployed database
+    ``CREATE UNIQUE INDEX`` might otherwise fail with an opaque driver error;
+    naming the conflicting tuple and slot ids lets an operator resolve it first."""
+    duplicates = find_duplicate_ice_slot_times(conn)
+    if duplicates:
+        shown = "; ".join(
+            f"rink {rink} [{start} - {end}]: slots {', '.join(ids)}"
+            for rink, start, end, ids in duplicates[:20])
+        more = "" if len(duplicates) <= 20 else f" (+{len(duplicates) - 20} more)"
+        raise MigrationDataError(
+            "Cannot enforce one ice slot per (rink, start, end): "
+            f"{len(duplicates)} time slot(s) are duplicated: {shown}{more}. "
+            "Delete or retime the extra slot(s) before upgrading.")
+
+
 def find_duplicate_roster_players(conn):
     """Concrete (game_id, player_id) pairs with more than one roster row.
 

@@ -256,12 +256,33 @@ async function checkChip(browser, viewport) {
       const sel = document.getElementById("ctx-select");
       return chip && !chip.hidden && sel && sel.hidden;
     }, null, { timeout: 10000 });
-    const chipText = await page.locator("#ctx-static").textContent();
-    if (!/Solo Program|no season/i.test(chipText)) throw new Error(`[${L}] chip text unexpected: "${chipText}"`);
+    const expectedChip = "Solo Program · Program overview (no season)";
+    let chipText = (await page.locator("#ctx-static").textContent()).trim();
+    if (chipText !== expectedChip) {
+      throw new Error(`[${L}] chip text must identify its Program exactly: "${chipText}"`);
+    }
     const note = await page.locator(".ctx-unfiltered");
     if (!(await note.isVisible())) throw new Error(`[${L}] "display only" notice missing on the chip`);
+    if (!page.url().includes("#ctx=")) {
+      throw new Error(`[${L}] Program-only context was not written to the deep-link hash`);
+    }
+
+    // Reload adopts the Program-only deep link and must restore the same exact
+    // visible context on both desktop and 390px, not fall back to the generic
+    // no-season wording.
+    await reloadShell(page);
+    await page.waitForFunction((expected) => {
+      const chip = document.getElementById("ctx-static");
+      const sel = document.getElementById("ctx-select");
+      return chip && !chip.hidden && chip.textContent.trim() === expected
+        && sel && sel.hidden;
+    }, expectedChip, { timeout: 10000 });
+    chipText = (await page.locator("#ctx-static").textContent()).trim();
+    if (chipText !== expectedChip || !(await page.locator(".ctx-unfiltered").isVisible())) {
+      throw new Error(`[${L}] chip/deep-link restoration lost the Program identity`);
+    }
     if (errors.length) throw new Error(`[${L}] console/page errors:\n${errors.join("\n")}`);
-    console.log(`[${L}] OK — seasonless Program renders a static chip with the display-only notice.`);
+    console.log(`[${L}] OK — seasonless Program chip names the Program and survives deep-link reload.`);
   } catch (error) {
     throw new Error(`${error.message}\n--- server output ---\n${out}`);
   } finally {

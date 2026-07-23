@@ -6,6 +6,8 @@ Pure logic over the store with an injected clock; every create is audited.
 """
 
 import functools
+import hashlib
+import json
 import re
 from datetime import date, datetime, timezone
 from typing import Callable, List, Optional
@@ -65,6 +67,7 @@ from ..domain.errors import (
 )
 from ..store import InMemoryStore
 from .import_validator import validate_import, validate_official_availability
+from .ice_availability import plan_ice_windows, parse_hhmm, WEEKDAY_NAMES
 from .season_guard import require_active_season
 from .league_scope import (
     registered_team_ids_in_division as _registered_team_ids,
@@ -204,6 +207,13 @@ def _transactional(fn):
         with self.store.transaction():
             return fn(self, *args, **kwargs)
     return wrapper
+
+
+class _SeasonReparented(Exception):
+    """Internal retry signal (#158 review): a Season was moved to a different
+    Program between commit_ice_availability's pre-lock program_id read and its
+    Season lock, so the wrong Program was locked. Caught by the commit's bounded
+    retry loop, which re-reads and locks the correct Program first."""
 
 
 class SetupService:
@@ -2256,7 +2266,11 @@ class SetupService:
     def create_ice_slot(self, rink_id: str, start_time: datetime, end_time: datetime,
                         slot_type: IceSlotType = IceSlotType.GAME,
                         actor_id: Optional[str] = None) -> IceSlot:
-        if self.store.get_rink(rink_id) is None:
+        # Row-lock the rink (#158 review): serializes this create with a
+        # concurrent create or ice-availability commit on the same rink, so two
+        # writers can't both pass the overlap check below and then both insert
+        # an overlapping/duplicate slot.
+        if self.store.get_rink_for_update(rink_id) is None:
             raise NotFoundError(f"Rink {rink_id} not found.")
         start = self._require_utc(start_time, "start_time")
         end = self._require_utc(end_time, "end_time")
@@ -2281,6 +2295,646 @@ class SetupService:
         self._audit("ice_slot_created", "ice_slot", slot.id, actor_id,
                     {"rink_id": rink_id, "slot_type": slot_type.value})
         return slot
+
+    # -- recurring ice availability builder (#158) -------------------------
+    # An arena operator builds a draft ice INVENTORY from a recurring weekly
+    # template, previews the exact slots, then explicitly commits them as
+    # AVAILABLE Game ice. No games or published schedule are created here; the
+    # planner (#206) later consumes this inventory. The pure date/time math is
+    # in services/ice_availability.py; the store-aware resolution, SeasonVenueAccess
+    # gating, collision/duplicate classification, idempotent commit, and audit
+    # live here next to create_ice_slot and the rinks/ice-slots importer.
+
+    def _ice_avail_range(self, season, tz, start_date, end_date):
+        """Resolve the generation date range. Explicit YYYY-MM-DD wins; otherwise
+        default to the Season's own start/end rendered in the Program timezone.
+        The Season is never mutated."""
+        def to_date(value, field, fallback):
+            if value in (None, ""):
+                if fallback is None:
+                    raise ValidationError(
+                        f"{field} is required (the Season has no {field} to "
+                        "default from).",
+                        {"reason": f"missing_{field}", "field": field})
+                return fallback.astimezone(tz).date()
+            if isinstance(value, date) and not isinstance(value, datetime):
+                return value
+            try:
+                return date.fromisoformat(str(value).strip())
+            except ValueError:
+                raise ValidationError(
+                    f"Invalid {field}: {value!r}. Expected YYYY-MM-DD.",
+                    {"reason": f"invalid_{field}", "field": field})
+        return (to_date(start_date, "start_date", season.start_date),
+                to_date(end_date, "end_date", season.end_date))
+
+    def _ice_avail_weekdays(self, weekdays):
+        if not isinstance(weekdays, (list, tuple)) or not weekdays:
+            raise ValidationError(
+                "Select at least one weekday.",
+                {"reason": "no_weekdays", "field": "weekdays"})
+        out = set()
+        for wd in weekdays:
+            if isinstance(wd, bool) or not isinstance(wd, int) or wd not in range(7):
+                raise ValidationError(
+                    f"Invalid weekday {wd!r}; use 0 (Monday) through 6 (Sunday).",
+                    {"reason": "invalid_weekday", "field": "weekdays"})
+            out.add(wd)
+        return out
+
+    def _ice_avail_windows(self, *, weekdays, start_local, end_local, windows):
+        """Normalize the recurring template's per-weekday time windows.
+
+        #158's recorded operator flow gives each selected weekday its OWN local
+        start/end time ("local start and end time for each selected day"). The
+        canonical input is ``windows`` — a list of
+        ``{"weekday", "start_local", "end_local"}``, one entry per selected day.
+        The older uniform form (``weekdays`` + a single ``start_local`` /
+        ``end_local``) is still accepted and expands to the same window on every
+        selected day, so a single contracted block stays a two-field entry.
+
+        Returns ``(weekday_windows, windows_meta)`` where ``weekday_windows`` is
+        the ``{wd: ((sh, sm), (eh, em))}`` the pure planner consumes and
+        ``windows_meta`` is the ordered ``[{"weekday", "start", "end"}]`` echoed
+        back through the preview/commit response and the commit audit, so the
+        per-day windows are preserved verbatim across idempotent reruns.
+        """
+        if windows not in (None, ""):
+            if not isinstance(windows, (list, tuple)) or not windows:
+                raise ValidationError(
+                    "Select at least one weekday.",
+                    {"reason": "no_weekdays", "field": "weekdays"})
+            weekday_windows, meta, seen = {}, [], set()
+            for entry in windows:
+                if not isinstance(entry, dict):
+                    raise ValidationError(
+                        "Each window must be a {weekday, start_local, end_local} "
+                        "block.",
+                        {"reason": "invalid_window", "field": "windows"})
+                wd = entry.get("weekday")
+                if isinstance(wd, bool) or not isinstance(wd, int) \
+                        or wd not in range(7):
+                    raise ValidationError(
+                        f"Invalid weekday {wd!r}; use 0 (Monday) through 6 (Sunday).",
+                        {"reason": "invalid_weekday", "field": "weekdays"})
+                if wd in seen:
+                    raise ValidationError(
+                        f"{WEEKDAY_NAMES[wd]} is listed more than once; give each "
+                        "selected weekday a single time window.",
+                        {"reason": "duplicate_weekday", "field": "weekdays"})
+                seen.add(wd)
+                start = entry.get("start_local")
+                end = entry.get("end_local")
+                weekday_windows[wd] = (parse_hhmm(start, "start_local"),
+                                       parse_hhmm(end, "end_local"))
+                meta.append({"weekday": wd, "start": start, "end": end})
+            meta.sort(key=lambda m: m["weekday"])
+            return weekday_windows, meta
+        # Legacy uniform form: one window applied to every selected weekday.
+        weekday_set = self._ice_avail_weekdays(weekdays)
+        window = (parse_hhmm(start_local, "start_local"),
+                  parse_hhmm(end_local, "end_local"))
+        weekday_windows = {wd: window for wd in weekday_set}
+        meta = [{"weekday": wd, "start": start_local, "end": end_local}
+                for wd in sorted(weekday_set)]
+        return weekday_windows, meta
+
+    def _ice_avail_exclusions(self, exclusion_dates):
+        if exclusion_dates in (None, ""):
+            return set()
+        if not isinstance(exclusion_dates, (list, tuple)):
+            raise ValidationError(
+                "exclusion_dates must be a list of YYYY-MM-DD dates.",
+                {"reason": "invalid_exclusion_dates", "field": "exclusion_dates"})
+        out = set()
+        for value in exclusion_dates:
+            try:
+                out.add(date.fromisoformat(str(value).strip()))
+            except ValueError:
+                raise ValidationError(
+                    f"Invalid exclusion date {value!r}. Expected YYYY-MM-DD.",
+                    {"reason": "invalid_exclusion_dates", "field": "exclusion_dates"})
+        return out
+
+    def _plan_ice_availability(self, *, season_id, rink_ids, weekdays,
+                               start_local, end_local, start_date, end_date,
+                               playable_minutes, turnover_minutes,
+                               exclusion_dates, windows=None):
+        """Deterministic, side-effect-free planning shared by preview and commit:
+        resolve the Season timezone + date range, run the pure planner, split the
+        (de-duplicated) selected rinks by SeasonVenueAccess, and classify the
+        proposed windows against current inventory so the returned ``fingerprint``
+        binds the ENTIRE reviewed preview payload — every commit-relevant input
+        and operator-visible resolved field, not just the generated tuples or
+        their classification (#158 review — see the fingerprint block below).
+        Reads inventory only for the classification/totals; commit calls this
+        UNDER its write locks, so the bound snapshot matches the one its write
+        loop acts on."""
+        season = self.store.get_season(season_id) if season_id else None
+        if season is None:
+            raise NotFoundError(
+                "Season not found.",
+                details={"reason": "season_missing", "season_id": season_id})
+        program = self.store.get_program(season.program_id)
+        tz = resolve_timezone(program.timezone if program else None) or timezone.utc
+
+        if not isinstance(rink_ids, (list, tuple)) or not rink_ids:
+            raise ValidationError(
+                "Select at least one rink.",
+                {"reason": "no_rinks", "field": "rink_ids"})
+        # De-duplicate up front (#158 review): a repeated rink must never
+        # generate the same slot twice within one request.
+        rink_ids = list(dict.fromkeys(rink_ids))
+
+        d_start, d_end = self._ice_avail_range(season, tz, start_date, end_date)
+        weekday_windows, windows_meta = self._ice_avail_windows(
+            weekdays=weekdays, start_local=start_local, end_local=end_local,
+            windows=windows)
+        weekday_set = set(weekday_windows)
+        exclusions = self._ice_avail_exclusions(exclusion_dates)
+
+        plan = plan_ice_windows(
+            weekday_windows=weekday_windows, start_date=d_start, end_date=d_end,
+            playable_minutes=playable_minutes, turnover_minutes=turnover_minutes,
+            exclusion_dates=exclusions, tz=tz)
+
+        # Split rinks by SeasonVenueAccess: the builder never grants access
+        # (that is a MANAGE_SETUP action) — a rink whose Venue is not available
+        # to this Season is reported with a remediation route and produces no
+        # slots, mirroring the scheduler's require_slot_belongs_to_season gate.
+        # commit re-runs this SAME split under its Season/rink write locks so a
+        # revoke/move/delete that lands after this preview read can't leak ice.
+        accessible, access_missing = self._split_rinks_by_access(
+            season_id, rink_ids)
+
+        # Classify the proposed windows against the CURRENT ice inventory, then
+        # bind the WHOLE reviewed preview INTO the fingerprint by hashing the exact
+        # operator-visible payload the preview response renders, minus the token
+        # itself (#158 review). Four progressively-rejected narrower bindings show
+        # why it must be the whole payload:
+        #   * the raw form fields alone miss a concurrent Program-timezone /
+        #     Season-boundary edit that moves the resolved windows under a stale
+        #     form;
+        #   * the generated (rink, start, end) tuples alone miss a slot or Game
+        #     added, removed, allocated, or booked after preview that reclassifies
+        #     a row (new <-> duplicate <-> conflict) or changes its conflict target
+        #     WITHOUT moving the tuple;
+        #   * tuples + classification STILL miss an edit that changes what the
+        #     operator reviewed without changing any tuple — extend a window past
+        #     the last slot, retune the playable / turnover minutes, add an
+        #     exclusion on an already-empty day, or flip a day skipped<->too_short;
+        #   * even a hand-maintained field list misses the reviewed RINK/VENUE
+        #     IDENTITY — rename a rink or reassign it to another Season-authorized
+        #     Venue after preview and the tuples/classifications/totals are
+        #     unchanged, yet the operator reviewed a different physical context.
+        # Rather than chase fields, derive the token STRUCTURALLY from
+        # _reviewed_preview_payload — the same builder _ice_availability_response
+        # uses — so every field the operator sees (per-rink {id, name, venue} rows,
+        # the full venue-access-missing rows, totals, skipped/too-short, the full
+        # conflict target, ...) is bound for free and adding a field to the
+        # response binds it automatically. Any change flips the token and forces a
+        # re-preview of exactly what changed; an unedited template over unchanged
+        # inventory is stable, so preview and commit agree. Commit recomputes this
+        # UNDER its Season + per-rink write locks, so the bound snapshot is the one
+        # its write loop acts on. Deterministic — no clock; the payload's list
+        # order is fixed by the (identical) template + inventory, sort_keys
+        # canonicalizes the rest.
+        classified = self._classify_ice_windows(accessible, plan)
+        base = {
+            "season": season, "tz": tz, "d_start": d_start, "d_end": d_end,
+            "weekday_set": weekday_set,
+            "windows_meta": windows_meta,
+            "playable_minutes": playable_minutes,
+            "turnover_minutes": turnover_minutes,
+            "plan": plan, "accessible": accessible,
+            "access_missing": access_missing,
+            "classified": classified,
+        }
+        base["fingerprint"] = hashlib.sha256(json.dumps(
+            self._reviewed_preview_payload(base),
+            sort_keys=True, separators=(",", ":"), default=str
+        ).encode()).hexdigest()[:16]
+        return base
+
+    def _split_rinks_by_access(self, season_id, rink_ids):
+        """Resolve each selected rink's current Venue + active SeasonVenueAccess
+        and split them into ``accessible`` [(rink, venue), ...] and
+        ``access_missing`` [report, ...]. Pure reads — no locks of its own — so
+        preview calls it directly, while commit calls it AGAIN inside its write
+        transaction (after the Season + per-rink locks) so a revoke/move/delete
+        that raced the preview read is caught before any slot or audit is
+        written (#158 review). A rink id that no longer resolves is the same
+        stable ``rink_missing`` NotFoundError the preview raises."""
+        accessible, access_missing = [], []
+        for rid in rink_ids:
+            rink = self.store.get_rink(rid)
+            if rink is None:
+                raise NotFoundError(
+                    f"Rink {rid} not found.",
+                    details={"reason": "rink_missing", "rink_id": rid})
+            venue = self.store.get_venue(rink.venue_id) if rink.venue_id else None
+            access = (self.store.season_venue_access_for_pair(season_id, rink.venue_id)
+                      if venue else None)
+            if venue is None or access is None or not access.active:
+                access_missing.append({
+                    "rink_id": rid, "rink_name": rink.name,
+                    "venue_id": rink.venue_id,
+                    "venue_name": venue.name if venue else None,
+                    "remediation_route":
+                        f"/api/v2/setup/seasons/{season_id}/venue-access",
+                })
+            else:
+                accessible.append((rink, venue))
+        return accessible, access_missing
+
+    def _slot_compatible_duplicate(self, slot):
+        """Whether an exact ``(rink, start, end)`` match is an idempotent
+        DUPLICATE — i.e. it is already compatible AVAILABLE Game ice with no
+        active Game on it. An ALLOCATED slot backing a Game, or a BLOCKED /
+        maintenance / non-Game slot at that exact tuple, is NOT a harmless
+        duplicate: it is a real collision the preview must report and the commit
+        must refuse to overwrite, not hidden capacity (#158 review)."""
+        return (slot.slot_type == IceSlotType.GAME
+                and slot.status == IceSlotStatus.AVAILABLE
+                and self.store.game_using_ice_slot(slot.id) is None)
+
+    def _classify_ice_windows(self, accessible, plan):
+        """Classify each (accessible rink × planner window) against CURRENT ice
+        inventory as new / duplicate / conflict. Reads all_ice_slots(); the
+        commit path runs an equivalent pass INSIDE its write transaction (under
+        the Season + per-rink locks) so its decision can never go stale."""
+        existing_by_rink = {}
+        for existing in self.store.all_ice_slots():
+            existing_by_rink.setdefault(existing.rink_id, []).append(existing)
+        classified = []
+        for rink, venue in accessible:
+            existing = existing_by_rink.get(rink.id, [])
+            for w in plan["windows"]:
+                start, end = w["start"], w["end"]
+                exact = next((e for e in existing if e.start_time == start
+                              and e.end_time == end), None)
+                # An exact tuple is an idempotent DUPLICATE only when it is
+                # compatible AVAILABLE Game ice; an occupied / blocked / non-Game
+                # slot at that tuple — or any non-exact overlap — is a conflict.
+                if exact is not None and self._slot_compatible_duplicate(exact):
+                    status, ref, clash = "duplicate", exact.id, None
+                else:
+                    clash = exact or next(
+                        (e for e in existing if intervals_overlap(
+                            start, end, e.start_time, e.end_time)), None)
+                    status = "conflict" if clash is not None else "new"
+                    ref = clash.id if clash is not None else None
+                game = (self.store.game_using_ice_slot(clash.id)
+                        if clash is not None else None)
+                classified.append({
+                    "rink_id": rink.id, "rink_name": rink.name,
+                    "venue_id": venue.id, "venue_name": venue.name,
+                    "date": w["date"], "start": start, "end": end,
+                    "start_local": w["start_local"], "end_local": w["end_local"],
+                    "status": status, "conflict_with": ref,
+                    "conflict_has_game": game is not None,
+                    "conflict_slot_type": clash.slot_type.value if clash else None,
+                    "conflict_slot_status": clash.status.value if clash else None,
+                    "conflict_game_id": game.id if game is not None else None,
+                })
+        return classified
+
+    def _resolve_ice_availability(self, **kwargs):
+        """Plan + classify against current inventory — the PREVIEW path (no
+        writes). _plan_ice_availability already classified (to bind the
+        fingerprint), so reuse that ``classified`` rather than re-running it."""
+        base = self._plan_ice_availability(**kwargs)
+        return {**base, "weekdays": sorted(base["weekday_set"])}
+
+    def _reviewed_preview_payload(self, r):
+        """The operator-visible preview payload — EVERYTHING the preview response
+        renders EXCEPT the token itself (#158 review). The fingerprint is the hash
+        of this (see ``_plan_ice_availability``) and ``_ice_availability_response``
+        returns this PLUS the token, so the token binds precisely what the operator
+        reviewed: any field added here is bound for free. Notably it carries each
+        rink's full ``{rink_id, rink_name, venue_id, venue_name}`` identity and the
+        full venue-access-missing rows, so a post-preview rename or venue
+        reassignment moves the token even when the generated tuples do not.
+        Deterministic — datetimes to ISO, list order fixed by the template +
+        inventory, no clock."""
+        classified = r["classified"]
+        plan = r["plan"]
+        n_rinks = len(r["accessible"])
+        per_rink = {}
+        for c in classified:
+            row = per_rink.setdefault(c["rink_id"], {
+                "rink_id": c["rink_id"], "rink_name": c["rink_name"],
+                "venue_id": c["venue_id"], "venue_name": c["venue_name"],
+                "new": 0, "duplicate": 0, "conflict": 0})
+            row[c["status"]] += 1
+        new_n = sum(1 for c in classified if c["status"] == "new")
+        dup_n = sum(1 for c in classified if c["status"] == "duplicate")
+        con_n = sum(1 for c in classified if c["status"] == "conflict")
+        return {
+            "season_id": r["season"].id, "season_name": r["season"].name,
+            "timezone": str(r["tz"]),
+            "date_range": {"start": r["d_start"].isoformat(),
+                           "end": r["d_end"].isoformat()},
+            "weekdays": sorted(r["weekday_set"]), "windows": r["windows_meta"],
+            "playable_minutes": r["playable_minutes"],
+            "turnover_minutes": r["turnover_minutes"],
+            "rinks": list(per_rink.values()),
+            "slots": [{
+                "rink_id": c["rink_id"], "rink_name": c["rink_name"],
+                "date": c["date"],
+                "start_time": c["start"].isoformat(),
+                "end_time": c["end"].isoformat(),
+                "start_local": c["start_local"], "end_local": c["end_local"],
+                "status": c["status"], "conflict_with": c["conflict_with"],
+                "conflict_has_game": c["conflict_has_game"],
+                "conflict_slot_type": c["conflict_slot_type"],
+                "conflict_slot_status": c["conflict_slot_status"],
+                "conflict_game_id": c["conflict_game_id"],
+            } for c in classified],
+            "totals": {
+                "new": new_n, "duplicate": dup_n, "conflict": con_n,
+                "capacity_games": new_n,
+                "reserved_minutes": plan["reserved_minutes"] * n_rinks,
+                "playable_minutes": plan["playable_minutes_total"] * n_rinks,
+            },
+            "skipped_dates": plan["skipped_dates"],
+            "too_short": plan["too_short"],
+            "dst_skipped": plan["dst_skipped"],
+            "dst_ambiguous": plan["dst_ambiguous"],
+            "venue_access_missing": r["access_missing"],
+        }
+
+    def _ice_availability_response(self, r):
+        """The preview API response: the reviewed payload (exactly what the token
+        binds) PLUS the token itself (#158 review)."""
+        return {**self._reviewed_preview_payload(r),
+                "template_fingerprint": r["fingerprint"]}
+
+    def _ice_slot_dto(self, slot):
+        return {"id": slot.id, "rink_id": slot.rink_id,
+                "start_time": slot.start_time.isoformat(),
+                "end_time": slot.end_time.isoformat(),
+                "slot_type": slot.slot_type.value, "status": slot.status.value}
+
+    def _has_matching_preview_audit(self, actor_id, fingerprint):
+        """True if ``actor_id`` recorded a successful ``ice_availability_previewed``
+        audit for exactly ``fingerprint`` — the commit preview gate (#158 review).
+
+        The preview fingerprint is a hash of the RESOLVED snapshot (Season
+        boundaries, Program timezone, generated UTC windows), and a successful
+        preview writes one server-attributed audit carrying that fingerprint and
+        the acting operator. Requiring a matching audit makes the fingerprint a
+        real, actor-bound preview capability rather than a value a caller can
+        fabricate or replay across operators. Setup-audit volume is low
+        (arena-setup actions), so the linear scan is not a hot path.
+        """
+        if actor_id is None or fingerprint is None:
+            return False
+        for entry in self.store.all_setup_audit():
+            if (entry.action == "ice_availability_previewed"
+                    and entry.actor_id == actor_id
+                    and entry.detail.get("template_fingerprint") == fingerprint):
+                return True
+        return False
+
+    def preview_ice_availability(self, *, season_id=None, rink_ids=None,
+                                 weekdays=None, start_local=None, end_local=None,
+                                 start_date=None, end_date=None,
+                                 playable_minutes=None, turnover_minutes=None,
+                                 exclusion_dates=None, windows=None,
+                                 actor_id=None):
+        """Preview the slots a recurring template would create (#158).
+
+        The planning itself is side-effect-free; a SUCCESSFUL preview by an
+        authenticated caller records one server-attributed
+        ``ice_availability_previewed`` audit carrying the ``template_fingerprint``
+        (so it correlates to the later commit), the Season, the deduplicated
+        Rinks, the resolved range/timezone, and the result totals — #158 audits
+        both halves of the flow. An invalid or not-found template raises before
+        the audit, and an unauthenticated caller (``actor_id`` None, e.g. a
+        programmatic reader) records nothing, so a failed or anonymous preview
+        never leaves an audit row.
+        """
+        resp = self._ice_availability_response(self._resolve_ice_availability(
+            season_id=season_id, rink_ids=rink_ids, weekdays=weekdays,
+            start_local=start_local, end_local=end_local,
+            start_date=start_date, end_date=end_date,
+            playable_minutes=playable_minutes, turnover_minutes=turnover_minutes,
+            exclusion_dates=exclusion_dates, windows=windows))
+        if actor_id is not None:
+            with self.store.transaction():
+                self._audit(
+                    "ice_availability_previewed", "season", resp["season_id"],
+                    actor_id, {
+                        "template_fingerprint": resp["template_fingerprint"],
+                        "season_id": resp["season_id"],
+                        "rink_ids": ([r["rink_id"] for r in resp["rinks"]]
+                                     + [m["rink_id"]
+                                        for m in resp["venue_access_missing"]]),
+                        "timezone": resp["timezone"],
+                        "date_range": resp["date_range"],
+                        "totals": resp["totals"],
+                    })
+        return resp
+
+    def commit_ice_availability(self, *, season_id=None, rink_ids=None,
+                                weekdays=None, start_local=None, end_local=None,
+                                start_date=None, end_date=None,
+                                playable_minutes=None, turnover_minutes=None,
+                                exclusion_dates=None, windows=None,
+                                template_fingerprint=None, actor_id=None):
+        """Create the AVAILABLE Game ice slots a template implies (#158).
+
+        Idempotent and race-safe: planning is side-effect-free, but the
+        classify-then-write happens together INSIDE one transaction holding the
+        Season lock (serializes commit-vs-commit) and a per-rink row lock
+        (serializes commit-vs-manual-create), with the (rink, start, end) unique
+        index (migration 045) as the atomic backstop. So concurrent commits, or a
+        commit racing a manual/import write, can never create duplicate or
+        overlapping slots. An exact-duplicate window is skipped, an overlap is
+        reported, a rerun creates nothing. Audited per slot + a batch summary.
+        Requires an active Season (#159).
+
+        Preview is REQUIRED (#158 review): the commit is refused before any
+        write unless ``template_fingerprint`` is supplied (``preview_required``),
+        equals the freshly-resolved snapshot's fingerprint (``preview_mismatch``
+        — an edited or stale template), AND matches a successful
+        ``ice_availability_previewed`` audit for ``actor_id`` (``preview_required``
+        — a fabricated or cross-operator token). So an authenticated caller can
+        never create the recurring inventory without first previewing exactly
+        this template; the fingerprint is a real preview capability tied to the
+        acting operator and the resolved snapshot, not an optional hint. A
+        refused commit mutates nothing (no slots, no batch audit).
+        """
+        # De-duplicated selected rinks (same as _plan_ice_availability does).
+        # NOTHING authoritative is resolved from mutable state out here: the
+        # entire plan — Season boundaries, Program timezone, generated windows
+        # AND venue access — is (re)built INSIDE the write transaction below,
+        # under the Season / Program / rink locks, so nothing it produces can be
+        # stale relative to committed state.
+        requested_rink_ids = list(dict.fromkeys(rink_ids or []))
+        # Generated up front so every per-slot audit row is tagged with it.
+        batch_id = self.store.next_id("iceavailbatch")
+
+        created, counts = [], {}
+        # Retry the whole batch if the unique-index backstop rejects an INSERT —
+        # rare: the Season + per-rink locks already serialize commits and manual
+        # creates, so only the lock-free CSV import path can trigger it.
+        for attempt in range(3):
+            created, dup, conflict = [], 0, 0
+            try:
+                with self.store.transaction():
+                    # Canonical lock order Program -> Rinks -> Season, matching
+                    # the hierarchy import (it saves Programs, then Rinks, then
+                    # upsert_imported_season takes the Season lock), so a
+                    # concurrent import changing a Program timezone / Season dates
+                    # and this commit can never deadlock (#158 review). program_id
+                    # comes from a pre-lock read, so revalidate the Season->Program
+                    # link under the Season lock and retry (bounded) if the Season
+                    # was re-parented to another Program in between.
+                    pre = self.store.get_season(season_id)
+                    if pre is None:
+                        raise NotFoundError(
+                            "Season not found.",
+                            details={"reason": "season_missing",
+                                     "season_id": season_id})
+                    if pre.program_id:
+                        self.store.get_program_for_update(pre.program_id)
+                    for rid in sorted(requested_rink_ids):
+                        self.store.get_rink_for_update(rid)
+                    season = self._require_active_season(season_id)
+                    if season.program_id != pre.program_id:
+                        raise _SeasonReparented()
+                    # Build the ENTIRE plan UNDER the locks (#158 review): the
+                    # Season boundaries, Program timezone and generated UTC
+                    # windows can't be shifted out of range or to the wrong
+                    # instants by a concurrent metadata edit, and venue access is
+                    # re-resolved so a revoke/move/delete after the preview read
+                    # can't leak ice (grant/revoke take the Season lock we hold; a
+                    # deleted rink is the same stable rink_missing, rolling back).
+                    base = self._plan_ice_availability(
+                        season_id=season_id, rink_ids=rink_ids,
+                        weekdays=weekdays, start_local=start_local,
+                        end_local=end_local, start_date=start_date,
+                        end_date=end_date, playable_minutes=playable_minutes,
+                        turnover_minutes=turnover_minutes,
+                        exclusion_dates=exclusion_dates, windows=windows)
+                    # Preview binding (#158 review): a commit MUST be preceded by
+                    # a preview of the SAME resolved template BY THE SAME actor.
+                    # The fingerprint alone is not a capability — a client can
+                    # omit or fabricate it — so all three of these must hold, and
+                    # they run BEFORE any write, so a refused commit mutates
+                    # nothing (no slots, no batch audit): the recurring inventory
+                    # can never be created without previewing exactly this
+                    # template first.
+                    #   1. a fingerprint was supplied at all (preview_required);
+                    #   2. it equals the freshly-resolved snapshot's fingerprint,
+                    #      deterministic over the same inputs so an unedited form
+                    #      always matches and an edited/stale one never does
+                    #      (preview_mismatch);
+                    #   3. it matches a successful ice_availability_previewed
+                    #      audit for THIS actor — rejecting a fabricated token or
+                    #      one previewed by a different operator (preview_required).
+                    if template_fingerprint is None:
+                        raise ValidationError(
+                            "Preview this template before creating slots.",
+                            details={"reason": "preview_required"})
+                    if template_fingerprint != base["fingerprint"]:
+                        raise ScheduleConflictError(
+                            "This template changed since it was previewed. "
+                            "Preview again before creating slots.",
+                            details={"reason": "preview_mismatch",
+                                     "expected": base["fingerprint"]})
+                    if not self._has_matching_preview_audit(
+                            actor_id, base["fingerprint"]):
+                        raise ValidationError(
+                            "No matching preview by this operator for this "
+                            "template. Preview it before creating slots.",
+                            details={"reason": "preview_required"})
+                    # NB: keep the `windows` PARAMETER intact for the retry loop —
+                    # bind the generated planner windows to a distinct name, or a
+                    # second attempt would re-plan with generated rows instead of
+                    # the per-weekday input and raise.
+                    plan_windows = base["plan"]["windows"]
+                    accessible = base["accessible"]
+                    access_missing = base["access_missing"]
+                    access_skipped = len(access_missing)
+                    existing_by_rink = {}
+                    for s in self.store.all_ice_slots():
+                        existing_by_rink.setdefault(s.rink_id, []).append(s)
+                    for rink, _venue in accessible:
+                        existing = existing_by_rink.setdefault(rink.id, [])
+                        for w in plan_windows:
+                            start, end = w["start"], w["end"]
+                            exact = next(
+                                (e for e in existing if e.start_time == start
+                                 and e.end_time == end), None)
+                            # Exact tuple is an idempotent skip ONLY when it is
+                            # compatible AVAILABLE Game ice; an occupied / blocked
+                            # / non-Game slot there is a conflict, never silently
+                            # counted as a duplicate (#158 review).
+                            if exact is not None \
+                                    and self._slot_compatible_duplicate(exact):
+                                dup += 1
+                                continue
+                            if exact is not None or any(
+                                    intervals_overlap(start, end, e.start_time,
+                                                      e.end_time)
+                                    for e in existing):
+                                conflict += 1
+                                continue
+                            slot = IceSlot(
+                                id=self.store.next_id("slot"), rink_id=rink.id,
+                                start_time=start, end_time=end,
+                                slot_type=IceSlotType.GAME,
+                                status=IceSlotStatus.AVAILABLE)
+                            self.store.add_ice_slot(slot)
+                            existing.append(slot)  # a later window/rink sees it too
+                            self._audit(
+                                "ice_slot_created", "ice_slot", slot.id, actor_id,
+                                {"rink_id": rink.id, "slot_type": "game",
+                                 "ice_availability_batch_id": batch_id})
+                            created.append(slot)
+                    counts = {
+                        "created": len(created), "duplicate_skipped": dup,
+                        "conflict_skipped": conflict,
+                        "access_skipped_rinks": access_skipped}
+                    self._audit(
+                        "ice_availability_committed", "ice_availability_batch",
+                        batch_id, actor_id, {
+                            "season_id": season_id,
+                            # Same fingerprint the preview audited, so the two
+                            # halves of the flow correlate (#158 review).
+                            "template_fingerprint": base["fingerprint"],
+                            "rink_ids": [r.id for r, _v in accessible],
+                            "weekdays": sorted(base["weekday_set"]),
+                            "windows": base["windows_meta"],
+                            "playable_minutes": playable_minutes,
+                            "turnover_minutes": turnover_minutes, **counts})
+                break  # committed cleanly
+            except _SeasonReparented:
+                # The Season was moved to a different Program between the pre-lock
+                # program read and the Season lock; the batch rolled back. Retry —
+                # the next pass reads the new program_id and locks that Program
+                # first, in canonical order. Converges immediately (the Season
+                # lock now pins the relationship), bounded by the loop.
+                if attempt == 2:
+                    raise ConcurrencyConflictError(
+                        "The Season was moved to a different Program while "
+                        "committing ice availability; please retry.",
+                        {"reason": "season_reparented", "season_id": season_id})
+            except IntegrityConflictError:
+                # A lock-free writer landed a slot our snapshot missed; the batch
+                # rolled back. Retry — the fresh classification will see it and
+                # treat it as a duplicate (a retry can only turn 'new' into
+                # 'duplicate', so it converges).
+                if attempt == 2:
+                    raise
+        return {
+            "committed": True, "batch_id": batch_id,
+            "created": [self._ice_slot_dto(s) for s in created],
+            "totals": {**counts, "capacity_games": counts["created"]},
+        }
 
     # -- shared season-registration guard (#180) ---------------------------
     # A team's participation in a (season, division) is resolved through its
@@ -4524,12 +5178,20 @@ class SetupService:
         guarantee as everything else here — if an incoming row would change
         the ``slot_type`` of a slot a game already uses.
 
-        Also unlike ``create_ice_slot``'s single-entity route, this does NOT
-        hard-block on overlapping ice times via ``ScheduleConflictError`` —
-        ``validate_import``'s overlap check is a WARNING only (mirroring
-        #94's own availability-overlap warning), so newly-created slots here
-        are allowed to overlap; the warning surfaces in the response instead
-        of aborting the whole commit.
+        Overlap handling is split by SOURCE. Overlaps WITHIN this upload
+        (two rows in the same ``ice_slots`` sheet) stay ``validate_import``'s
+        WARNING-only concern (mirroring #94's availability-overlap warning) —
+        both slots are created and the warning surfaces in the response,
+        never aborting the commit. But a new slot that would overlap ice
+        ALREADY PERSISTED on the rink by another writer — a concurrent
+        ``commit_ice_availability`` batch or an earlier import — IS a hard
+        conflict: the whole commit is rejected with a ``ScheduleConflictError``
+        and rolled back. Migration 045's ``(rink, start, end)`` unique index
+        only catches an exact-tuple duplicate (which takes the update path
+        here), so this write-boundary revalidation, under the per-rink row
+        lock taken below, is what stops a NON-exact overlap (e.g. an imported
+        22:30-23:30 against a committed 22:00-23:00) from leaving both rows
+        alive (#158 review).
         """
         result = validate_import(sheets)
         if not result["ok"]:
@@ -4578,6 +5240,59 @@ class SetupService:
         batch_id = self.store.next_id("importbatch")
 
         with self.store.transaction():
+            # Row-lock every rink this import already has (matched by
+            # external_ref), in ascending id order, before any slot read or
+            # write. commit_ice_availability locks its accessible rinks in the
+            # same order, so a concurrent builder commit (or a second import) on
+            # a shared rink serializes here instead of racing or deadlocking, and
+            # the overlap snapshot below then reads state no locked-out writer can
+            # still grow underneath it (#158 review).
+            _existing_rink_by_code = {r.external_ref: r
+                                      for r in self.store.all_rinks()
+                                      if r.external_ref}
+            _codes = {_clean(row.get("rink_code")) for row in rink_rows}
+            for _rid in sorted(_existing_rink_by_code[c].id for c in _codes
+                               if c in _existing_rink_by_code):
+                self.store.get_rink_for_update(_rid)
+
+            # Overlap gate, under the locks and BEFORE any write (mirrors the
+            # slot_type gate's all-or-nothing placement so it rolls back cleanly
+            # on every backend, including InMemoryStore's no-op transaction). A
+            # new slot on an EXISTING rink must not physically overlap ice already
+            # persisted there by another writer — a concurrent
+            # commit_ice_availability batch or an earlier import. Migration 045's
+            # (rink, start, end) unique index catches only an exact-tuple
+            # duplicate (which takes the update path below), so a NON-exact
+            # overlap (an imported 22:30-23:30 against a committed 22:00-23:00)
+            # would otherwise leave both rows alive. Slots on rinks this import
+            # is creating have no persisted ice to clash with; overlaps *within
+            # this upload* aren't persisted yet, so they stay validate_import's
+            # warning-only concern (#158 review).
+            _persisted_by_rink = {}
+            for _s in self.store.all_ice_slots():
+                _persisted_by_rink.setdefault(_s.rink_id, []).append(_s)
+            for row in slot_rows:
+                _rink = _existing_rink_by_code.get(_clean(row.get("rink_code")))
+                if _rink is None:
+                    continue  # a brand-new rink can't yet have persisted ice
+                _start = _parse_iso_utc(row.get("start_time"))
+                _end = _parse_iso_utc(row.get("end_time"))
+                _persisted = _persisted_by_rink.get(_rink.id, [])
+                if any(s.start_time == _start and s.end_time == _end
+                       for s in _persisted):
+                    continue  # exact tuple -> update path, not a new overlap
+                _clash = next((s for s in _persisted if intervals_overlap(
+                    _start, _end, s.start_time, s.end_time)), None)
+                if _clash is not None:
+                    raise ScheduleConflictError(
+                        f"Imported ice slot {_start.isoformat()} to "
+                        f"{_end.isoformat()} on rink_code "
+                        f"{_clean(row.get('rink_code'))} overlaps persisted slot "
+                        f"{_clash.id} on the same rink.",
+                        {"reason": "ice_slot_overlap", "rink_id": _rink.id,
+                         "rink_code": _clean(row.get("rink_code")),
+                         "conflict_slot_id": _clash.id})
+
             rink_code_to_id = {}
             for row in rink_rows:
                 rink_code = _clean(row.get("rink_code"))

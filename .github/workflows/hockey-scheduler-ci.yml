@@ -4,24 +4,85 @@ concurrency:
   group: hockey-ci-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
+# NO event-level `paths:` filter — that was fail-open: an unrecognized path
+# (Makefile, scripts/, a new root file, another .github/** file) never started
+# the workflow, so the fail-closed classifier could not turn it into a full
+# matrix. Every PR / main push now reaches the cheap classifier, which is the
+# sole gate; it skips only paths it positively recognizes as the sibling root
+# project (this is a monorepo) and fails closed on everything else.
 on:
   pull_request:
-    paths:
-      - "hockey-scheduler/backend/**"
-      - "hockey-scheduler/docs/**"
-      - "hockey-scheduler/e2e/**"
-      - ".github/workflows/hockey-scheduler-ci.yml"
   push:
     branches:
       - main
-    paths:
-      - "hockey-scheduler/backend/**"
-      - "hockey-scheduler/docs/**"
-      - "hockey-scheduler/e2e/**"
-      - ".github/workflows/hockey-scheduler-ci.yml"
 
 jobs:
+  # The classifier is CI-critical, so it is validated on EVERY run (cheap,
+  # node-only) — a broken router must never silently skip a heavy gate.
+  classifier-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Classifier syntax + unit + integration tests
+        run: |
+          node --check hockey-scheduler/e2e/ci-classify.js
+          node --check hockey-scheduler/e2e/ci-classify.test.js
+          node --check hockey-scheduler/e2e/ci-classify.integration.test.js
+          node hockey-scheduler/e2e/ci-classify.test.js
+          node hockey-scheduler/e2e/ci-classify.integration.test.js
+
+  # Change-based routing, FAIL-CLOSED. Diffs the PR against its base with plain
+  # git (no third-party action) and pipes the file list through the tested
+  # classifier (hockey-scheduler/e2e/ci-classify.js), which fails closed:
+  # unknown / dependency / workflow paths and non-PR events run the full matrix,
+  # and backend API-contract changes also run the browser gate. Downstream jobs
+  # gate on these outputs.
+  changes:
+    needs: classifier-test
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      test: ${{ steps.classify.outputs.test }}
+      postgres: ${{ steps.classify.outputs.postgres }}
+      frontend_check: ${{ steps.classify.outputs.frontend_check }}
+      browser_smoke: ${{ steps.classify.outputs.browser_smoke }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Classify changed paths (fail-closed)
+        id: classify
+        env:
+          CI_EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          FILES=""
+          if [ "$CI_EVENT_NAME" = "pull_request" ]; then
+            # Make sure the base tip is present, then diff with:
+            #   * three-dot (BASE...HEAD) — a MERGE-BASE diff, so changes the base
+            #     branch advanced with after the fork don't pollute the set;
+            #   * --no-renames — so BOTH sides of a rename surface; a move OUT of a
+            #     backend/API path must still classify as that change, not vanish
+            #     into its (possibly docs) destination.
+            # If the diff can't be computed we emit a sentinel that classifies as
+            # unknown -> full matrix (fail closed), never an empty skip.
+            git fetch --no-tags origin "$BASE_SHA" || true
+            FILES="$(git diff --name-only --no-renames "$BASE_SHA...$HEAD_SHA")" || FILES="__DIFF_ERROR__"
+          fi
+          printf '%s\n' "$FILES" | node hockey-scheduler/e2e/ci-classify.js
+
   test:
+    needs: changes
+    if: needs.changes.outputs.test == 'true'
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -35,6 +96,8 @@ jobs:
         run: python -m unittest discover -s tests -v
 
   postgres:
+    needs: changes
+    if: needs.changes.outputs.postgres == 'true'
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -66,6 +129,8 @@ jobs:
         run: python -m unittest discover -s tests -v
 
   frontend-check:
+    needs: changes
+    if: needs.changes.outputs.frontend_check == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -80,12 +145,17 @@ jobs:
           node --check hockey-scheduler/backend/hockey_scheduler/web/static/onboarding.js
           node --check hockey-scheduler/backend/hockey_scheduler/web/static/onboarding-bootstrap.js
           node --check hockey-scheduler/backend/hockey_scheduler/web/static/hierarchy-import.js
+          node --check hockey-scheduler/e2e/ci-classify.js
+          node --check hockey-scheduler/e2e/ci-classify.test.js
+          node --check hockey-scheduler/e2e/ci-classify.integration.test.js
           node --check hockey-scheduler/e2e/setup-claim.js
           node --check hockey-scheduler/e2e/onboarding-wizard.js
           node --check hockey-scheduler/e2e/hierarchy-import.js
           node --check hockey-scheduler/e2e/season-participation.js
           node --check hockey-scheduler/e2e/season-rollover.js
           node --check hockey-scheduler/e2e/team-division-participation.js
+          node --check hockey-scheduler/e2e/scheduler-empty-state.js
+          node --check hockey-scheduler/e2e/ice-availability-builder.js
           node --check hockey-scheduler/e2e/permanent-teams.js
           node --check hockey-scheduler/e2e/safe-destructive.js
           node --check hockey-scheduler/e2e/destructive-surfaces.js
@@ -112,6 +182,8 @@ jobs:
         run: node hockey-scheduler/e2e/season-fmt-unit.js
 
   browser-smoke:
+    needs: changes
+    if: needs.changes.outputs.browser_smoke == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     defaults:
@@ -133,9 +205,9 @@ jobs:
           - shard: 1
             scripts: "smoke setup-claim onboarding-wizard hierarchy-import season-participation season-rollover season-dates"
           - shard: 2
-            scripts: "team-division-participation allowed-venues venue-access-cleanup venue-sharing permanent-teams player-edit"
+            scripts: "team-division-participation scheduler-empty-state allowed-venues venue-access-cleanup venue-sharing permanent-teams player-edit"
           - shard: 3
-            scripts: "safe-destructive destructive-surfaces reset-visibility factory-reset demo-lifecycle api-error-resilience context-switcher"
+            scripts: "safe-destructive destructive-surfaces reset-visibility factory-reset demo-lifecycle api-error-resilience ice-availability-builder context-switcher"
           - shard: 4
             scripts: "v1-dependency-proof team-club-optional division-delete-cleanup registration-cleanup records-delete coach-scope player-lifecycle"
     steps:
@@ -146,10 +218,35 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
-      - name: Install Playwright (#138)
+      # Cache the Playwright browser bundle (~130 MB Chromium) keyed on the
+      # pinned playwright version, so the four shards — and every later run on
+      # the same version — restore it instead of each downloading Chromium from
+      # scratch. The OS-level shared-library deps are cheap and are (re)applied
+      # every run via `install-deps`, which is a no-op when already present.
+      - name: Resolve Playwright version
+        id: pw
+        working-directory: hockey-scheduler/e2e
         run: |
-          npm ci
-          npx playwright install --with-deps chromium
+          set -euo pipefail
+          # Read the pinned version from the committed lockfile — node_modules
+          # does not exist yet (npm ci runs after we restore the cache).
+          VERSION="$(node -p "require('./package-lock.json').packages['node_modules/playwright'].version")"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Playwright $VERSION"
+      - name: Cache Playwright browsers
+        id: pw-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ steps.pw.outputs.version }}
+      - name: Install e2e dependencies
+        run: npm ci
+      - name: Install Chromium (cache miss only)
+        if: steps.pw-cache.outputs.cache-hit != 'true'
+        run: npx playwright install --with-deps chromium
+      - name: Install Chromium OS deps (cache hit)
+        if: steps.pw-cache.outputs.cache-hit == 'true'
+        run: npx playwright install-deps chromium
       - name: Run shard ${{ matrix.shard }} journeys
         run: |
           set -e
