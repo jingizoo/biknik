@@ -911,24 +911,37 @@ class PostgresIceAvailabilityConcurrencyTest(unittest.TestCase):
 
     def test_commit_vs_commit(self):
         # Preview once up front (the required gate #158 review) so both racing
-        # commits carry a valid, matching token; no metadata changes here, so the
-        # resolved fingerprint is stable and both are admitted.
+        # commits carry the same valid token. The Season + per-rink locks
+        # serialize them: whoever wins the lock lands the six windows; the loser,
+        # re-classifying UNDER the lock, now sees those six as duplicates — a
+        # change from the previewed all-new snapshot — so the classification
+        # binding (#158 review) refuses it with preview_mismatch. Exactly one
+        # commit lands the six windows; the loser writes nothing. Never a
+        # duplicate or overlapping tuple, under either interleaving.
         fp = SetupService(SqlStore(self.url)).preview_ice_availability(
             actor_id="u", **self._template())["template_fingerprint"]
         commit = lambda svc: svc.commit_ice_availability(  # noqa: E731
             actor_id="u", template_fingerprint=fp, **self._template())
         out = self._run([commit, commit])
-        for r in out:
-            self.assertNotIsInstance(r, Exception, f"commit raised: {r!r}")
+        oks = [r for r in out if not isinstance(r, Exception)]
+        errs = [r for r in out if isinstance(r, Exception)]
+        self.assertEqual(len(oks), 1, f"exactly one commit should land: {out!r}")
+        self.assertEqual(len(errs), 1, f"the loser should be refused: {out!r}")
+        self.assertIsInstance(errs[0], ScheduleConflictError)
+        self.assertEqual(errs[0].details["reason"], "preview_mismatch")
+        self.assertEqual(oks[0]["totals"]["created"], 6)
         slots = self._assert_unique_and_non_overlapping()
         self.assertEqual(len(slots), 6)                       # one round-robin
-        self.assertEqual(sum(r["totals"]["created"] for r in out), 6)
-        self.assertEqual(sum(r["totals"]["duplicate_skipped"] for r in out), 6)
 
     def test_commit_vs_manual(self):
         # The other session manually creates a slot at one window's exact tuple.
-        # (A manual slot does not change Season/Program/access, so the resolved
-        # fingerprint is stable and the previewed token stays valid.)
+        # Serialized by the rink lock: if the commit wins it lands its six windows
+        # and the manual create then loses on the occupied tuple; if the manual
+        # create wins, the commit re-classifies that window as a compatible
+        # duplicate UNDER the lock — a change from the previewed all-new snapshot —
+        # and is refused with preview_mismatch (#158 review), leaving only the
+        # manual slot. Never a partial write or a duplicate/overlapping tuple,
+        # under either ordering.
         fp = SetupService(SqlStore(self.url)).preview_ice_availability(
             actor_id="c", **self._template())["template_fingerprint"]
         commit = lambda svc: svc.commit_ice_availability(  # noqa: E731
@@ -937,12 +950,16 @@ class PostgresIceAvailabilityConcurrencyTest(unittest.TestCase):
             self.rink_id, datetime(2026, 9, 1, 22, tzinfo=timezone.utc),
             datetime(2026, 9, 1, 23, tzinfo=timezone.utc))
         out = self._run([commit, manual])
-        # The commit always succeeds; the manual create either wins (its slot is
-        # one of the six) or loses the rink-lock race with a clean overlap
-        # conflict — never a partial write or a duplicate/overlapping tuple.
-        self.assertNotIsInstance(out[0], Exception, f"commit raised: {out[0]!r}")
         slots = self._assert_unique_and_non_overlapping()
-        self.assertEqual(len(slots), 6)
+        if isinstance(out[0], Exception):            # manual won the lock
+            self.assertIsInstance(out[0], ScheduleConflictError)
+            self.assertEqual(out[0].details["reason"], "preview_mismatch")
+            self.assertEqual(len(slots), 1)          # only the manual slot
+        else:                                        # commit won the lock
+            self.assertEqual(out[0]["totals"]["created"], 6)
+            self.assertEqual(len(slots), 6)
+            self.assertIsInstance(                   # manual lost the occupied tuple
+                out[1], (ScheduleConflictError, IntegrityConflictError))
 
     # -- builder vs CSV import (the lock-free sibling writer, #158 review) -----
     def _tag_rink_code(self, code):
@@ -976,18 +993,28 @@ class PostgresIceAvailabilityConcurrencyTest(unittest.TestCase):
             actor_id="c", template_fingerprint=fp, **self._template())
         out = self._run([commit, self._import("2026-09-01T22:30:00+00:00",
                                               "2026-09-01T23:30:00+00:00")])
-        self.assertNotIsInstance(out[0], Exception, f"commit raised: {out[0]!r}")
-        if isinstance(out[1], Exception):        # the import may lose the race
-            self.assertIsInstance(out[1], ScheduleConflictError,
-                                  f"import raised non-conflict: {out[1]!r}")
         self._assert_unique_and_non_overlapping()
+        if isinstance(out[0], Exception):        # import won the lock
+            # The commit re-classifies its first window as a CONFLICT (the
+            # import's slot overlaps it) UNDER the lock — a change from the
+            # previewed all-new snapshot — so it is refused with preview_mismatch.
+            self.assertIsInstance(out[0], ScheduleConflictError)
+            self.assertEqual(out[0].details["reason"], "preview_mismatch")
+        else:                                    # commit won the lock
+            self.assertEqual(out[0]["totals"]["created"], 6)
+            if isinstance(out[1], Exception):    # import lost -> clean conflict
+                self.assertIsInstance(out[1], ScheduleConflictError,
+                                      f"import raised non-conflict: {out[1]!r}")
 
     def test_commit_vs_import_exact_duplicate(self):
         # The import's 22:00-23:00 UTC is the builder's first window EXACTLY.
-        # Whichever writer lands first, the other treats the tuple as a duplicate
-        # (the builder skips it; the import takes its update path), so the slot
-        # never doubles and both operations complete cleanly -- always the
-        # builder's six windows, no more.
+        # Serialized by the rink lock: if the commit wins it lands its six windows
+        # and the import then treats the tuple as an existing row (its update
+        # path, no new slot); if the import wins, the commit re-classifies that
+        # window as a compatible duplicate UNDER the lock — a change from the
+        # previewed all-new snapshot — and is refused with preview_mismatch,
+        # leaving only the import's slot. The slot never doubles, under either
+        # ordering.
         self._tag_rink_code("RA")
         fp = SetupService(SqlStore(self.url)).preview_ice_availability(
             actor_id="c", **self._template())["template_fingerprint"]
@@ -995,10 +1022,15 @@ class PostgresIceAvailabilityConcurrencyTest(unittest.TestCase):
             actor_id="c", template_fingerprint=fp, **self._template())
         out = self._run([commit, self._import("2026-09-01T22:00:00+00:00",
                                               "2026-09-01T23:00:00+00:00")])
-        self.assertNotIsInstance(out[0], Exception, f"commit raised: {out[0]!r}")
         self.assertNotIsInstance(out[1], Exception, f"import raised: {out[1]!r}")
         slots = self._assert_unique_and_non_overlapping()
-        self.assertEqual(len(slots), 6)
+        if isinstance(out[0], Exception):            # import won the lock
+            self.assertIsInstance(out[0], ScheduleConflictError)
+            self.assertEqual(out[0].details["reason"], "preview_mismatch")
+            self.assertEqual(len(slots), 1)          # just the import's slot
+        else:                                        # commit won the lock
+            self.assertEqual(out[0]["totals"]["created"], 6)
+            self.assertEqual(len(slots), 6)
 
     def test_commit_vs_access_revoke(self):
         # commit and revoke_season_venue_access both take the Season row lock, so
