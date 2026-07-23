@@ -88,6 +88,50 @@ class DraftReviewServiceTest(unittest.TestCase):
         # ...and invisible to the public schedule.
         self.assertEqual(self.api.get_public_schedule()["fixtures"], [])
 
+    def test_commit_marks_the_ice_slots_allocated(self):
+        # #277: a committed draft occupies its ice — each backing slot flips to
+        # ALLOCATED (exactly as create_game/move_game do), so later scheduling
+        # and the shared checker read it as taken, not free.
+        self.api.commit_draft_schedule("d")
+        slot_ids = {g.ice_slot_id for g in self.store.all_games()
+                    if g.ice_slot_id}
+        self.assertEqual(len(slot_ids), 6)
+        for sid in slot_ids:
+            self.assertEqual(self.store.get_ice_slot(sid).status,
+                             IceSlotStatus.ALLOCATED, sid)
+
+    def test_commit_rejects_and_rolls_back_a_conflicting_proposal(self):
+        # #277: draft commit runs the SAME final slot/team conflict check as
+        # create_game / move_game, INSIDE its transaction. If a regenerated
+        # proposal references ice that is no longer free, the whole batch fails
+        # atomically — no partial fixture, no half-allocated ice — instead of
+        # silently persisting a double-booking.
+        proposal = self.api.draft_season_schedule("d")
+        rows = proposal["draft_games"]
+        self.assertEqual(len(rows), 6)
+        # Occupy the LAST proposed slot AFTER the proposal is captured, so the
+        # commit loop allocates the earlier slots first and only then hits the
+        # conflict. That proves the earlier allocations roll back — not merely
+        # that the bad row is skipped.
+        taken = rows[-1]["ice_slot_id"]
+        occupied = self.store.get_ice_slot(taken)
+        occupied.status = IceSlotStatus.ALLOCATED
+        self.store.save_ice_slot(occupied)
+        # Force the (now stale) proposal through commit unchanged, so the server
+        # regenerates the exact rows that reference the now-taken slot.
+        self.api.draft_season_schedule = lambda *a, **k: proposal
+        res = self.api.commit_draft_schedule("d")
+        # Rejected as a slot conflict...
+        self.assertIn("error", res)
+        self.assertEqual(res["error"]["details"]["reason"], "slot_unavailable")
+        # ...and nothing persisted: no draft games, and every earlier slot the
+        # loop had already flipped is back to AVAILABLE (atomic rollback).
+        self.assertEqual(self.store.all_games(), [])
+        for row in rows[:-1]:
+            self.assertEqual(
+                self.store.get_ice_slot(row["ice_slot_id"]).status,
+                IceSlotStatus.AVAILABLE, row["ice_slot_id"])
+
     def test_publish_makes_drafts_public(self):
         self.api.commit_draft_schedule("d")
         res = self.api.publish_draft_games(all_drafts=True)
@@ -157,11 +201,17 @@ class DraftReviewServiceTest(unittest.TestCase):
     def _slot_ids_of_drafts(self):
         return [g.ice_slot_id for g in self.store.all_games() if g.is_draft]
 
-    def test_commit_leaves_slots_available(self):
-        self.api.commit_draft_schedule("d")
-        # A draft must not claim its slot — the grid still shows it available.
-        self.assertTrue(all(s.status == IceSlotStatus.AVAILABLE
-                            for s in self.store.all_ice_slots()))
+    def test_commit_marks_slots_allocated_in_the_grid(self):
+        # #277: a committed draft occupies its ice immediately. The operator slot
+        # grid reads its backing slot as ALLOCATED (not an open drop target), so a
+        # later scheduling pass never re-offers the same occupied ice — even
+        # before the draft is published.
+        res = self.api.commit_draft_schedule("d")
+        draft_slots = set(self._slot_ids_of_drafts())
+        self.assertEqual(len(draft_slots), len(res["created"]))
+        grid = {s["id"]: s for s in self.api.get_demo_overview()["ice_slots"]}
+        for sid in draft_slots:
+            self.assertEqual(grid[sid]["status"], "allocated", sid)
 
     def test_publish_allocates_the_slot(self):
         self.api.commit_draft_schedule("d")
@@ -331,7 +381,8 @@ class DraftReviewHttpTest(unittest.TestCase):
         # #283 review: batch publish is all-or-nothing over HTTP. Commit a
         # division's drafts, break ONE (null league_season_id), then publish-all
         # must be rejected with NO partial publish — every draft stays a draft on
-        # an AVAILABLE slot and no game_published audit is written.
+        # its committed (ALLOCATED, #277) slot and no game_published audit is
+        # written.
         c = self._client()
         self._req(c, "POST", "/api/auth/login",
                   {"username": "admin", "password": "demo"})
@@ -359,8 +410,10 @@ class DraftReviewHttpTest(unittest.TestCase):
             self.assertTrue(g.is_draft, i)         # still a draft
             self.assertFalse(g.published, i)       # still unpublished
         for sid in slot_ids:
+            # #277: commit allocated these slots; a rolled-back publish leaves
+            # them in that committed ALLOCATED state (no partial deallocation).
             self.assertEqual(store.get_ice_slot(sid).status,
-                             IceSlotStatus.AVAILABLE)
+                             IceSlotStatus.ALLOCATED)
         self.assertEqual(len(store.all_setup_audit()), audit_before)
 
 

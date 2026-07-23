@@ -3007,22 +3007,25 @@ class SetupService:
                                     enforce_team_league=enforce_team_league)
 
     # -- manual game creation ---------------------------------------------
-    def _assert_slot_free_for_game(self, ice_slot_id, home_team_id, away_team_id,
-                                   *, exclude_game_id=None):
-        """Shared final conflict check for placing a game on an ice slot (#277).
+    def _assert_slot_free(self, ice_slot_id, *, exclude_game_id=None):
+        """Slot-scoped half of the game-placement check (#277).
 
-        create_game, move_game, and the draft-commit path all route through this
-        one function so they enforce identical rules — the slot exists, is a GAME
-        slot, is AVAILABLE, is not already used by another active game, and puts
-        neither team on an overlapping fixture. Returns the resolved slot on
-        success; raises a structured error carrying ``details["reason"]`` (the
-        machine-readable code the move panel and draft review already consume)
-        otherwise. ``exclude_game_id`` is the game being moved — excluded from the
-        slot-in-use and team-overlap checks so a move never conflicts with itself.
+        The slot exists, is a GAME slot, is AVAILABLE, and is not already used by
+        another active game. Returns the resolved slot on success; raises a
+        structured error carrying ``details["reason"]`` (``slot_missing`` /
+        ``not_game_slot`` / ``slot_unavailable`` / ``slot_already_filled``, the
+        machine-readable codes the move panel and draft review consume) otherwise.
+        ``exclude_game_id`` is the game being moved — excluded from the
+        slot-in-use check so a move never conflicts with itself.
+
+        This is what the draft-commit path uses: a committed draft OCCUPIES its
+        ice (its slot is allocated below), but a draft's team double-bookings are
+        surfaced in review (``list_draft_games`` issues), NOT rejected at commit,
+        so draft commit deliberately stops at the slot check. create_game and
+        move_game layer the team-overlap scan on top via
+        :meth:`_assert_slot_free_for_game`.
 
         Read-only (no transaction of its own) — callers run inside theirs.
-        Turnover-buffer and curfew enforcement layer onto this single choke point
-        in the #277 policy slice.
         """
         slot = self.store.get_ice_slot(ice_slot_id)
         if slot is None:
@@ -3045,6 +3048,25 @@ class SetupService:
                 f"Ice slot {ice_slot_id} is already used by game {clash.id}.",
                 details={"reason": "slot_already_filled",
                          "conflict_game_id": clash.id})
+        return slot
+
+    def _assert_slot_free_for_game(self, ice_slot_id, home_team_id, away_team_id,
+                                   *, exclude_game_id=None):
+        """Shared final conflict check for placing a game on an ice slot (#277).
+
+        create_game and move_game route through this one function so they enforce
+        identical rules — the slot is free (:meth:`_assert_slot_free`) AND the
+        placement puts neither team on an overlapping fixture. Returns the
+        resolved slot on success; raises a structured error carrying
+        ``details["reason"]`` (adds ``team_overlap`` to the slot codes) otherwise.
+        ``exclude_game_id`` is the game being moved — excluded from the slot-in-use
+        and team-overlap checks so a move never conflicts with itself.
+
+        Read-only (no transaction of its own) — callers run inside theirs.
+        Turnover-buffer and curfew enforcement layer onto this single choke point
+        in the #277 policy slice.
+        """
+        slot = self._assert_slot_free(ice_slot_id, exclude_game_id=exclude_game_id)
         for ex in self.store.all_games():
             if ex.id == exclude_game_id or ex.cancelled or ex.ice_slot_id is None:
                 continue

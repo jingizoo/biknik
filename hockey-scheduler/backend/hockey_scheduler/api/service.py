@@ -2750,12 +2750,15 @@ class ApiService:
             self._guard_active_seasons([resolved_season_id])
             created = []
             for d in proposal["draft_games"]:
-                # #277: the draft-commit path now runs the SAME final conflict
-                # check as create/move, so a regenerated proposal that would
-                # double-book a slot or a team fails atomically (the whole batch
-                # rolls back) instead of silently persisting a bad fixture.
-                self.setup._assert_slot_free_for_game(
-                    d["ice_slot_id"], d["home_team_id"], d["away_team_id"])
+                # #277: the draft-commit path runs the SAME slot-freeness check
+                # as create/move (the slot exists, is a GAME slot, is AVAILABLE,
+                # and is not already held by another active game), so a
+                # regenerated proposal that would double-book ICE fails
+                # atomically (the whole batch rolls back) instead of silently
+                # persisting onto an occupied slot. A draft's team double-bookings
+                # are surfaced in review, not rejected here (see _assert_slot_free).
+                # Returns the resolved slot to allocate below.
+                slot = self.setup._assert_slot_free(d["ice_slot_id"])
                 g = Game(
                     id=self.store.next_id("game"),
                     home_team_id=d["home_team_id"], away_team_id=d["away_team_id"],
@@ -2767,6 +2770,13 @@ class ApiService:
                     league_season_id=draft_ls_id,
                     published=False, is_draft=True)
                 self.store.add_game(g)
+                # Mark the slot ALLOCATED, exactly as create_game/move_game do
+                # (#277): a committed draft occupies its ice, so later scheduling
+                # and the shared checker read it as taken instead of offering the
+                # same slot again. The checker above already rejected any slot a
+                # game already holds, so this only ever flips AVAILABLE -> taken.
+                slot.status = IceSlotStatus.ALLOCATED
+                self.store.save_ice_slot(slot)
                 created.append(self._draft_game_dto(g))
             # Committing a draft creates real (unpublished) rows — a state change,
             # so it is audited (#86).
@@ -2921,6 +2931,16 @@ class ApiService:
                 self.setup._audit("draft_game_discarded", "game", g.id,
                                   actor_id, {"division_id": g.division_id,
                                              "ice_slot_id": g.ice_slot_id})
+                # #277: a committed draft occupied its ice (its slot was flipped
+                # to ALLOCATED at commit), so discarding it must release the slot
+                # back to AVAILABLE — otherwise a discarded draft strands ice the
+                # grid and scheduler would never offer again. Mirrors the slot
+                # release in setup.delete_game.
+                if g.ice_slot_id:
+                    slot = self.store.get_ice_slot(g.ice_slot_id)
+                    if slot is not None and slot.status == IceSlotStatus.ALLOCATED:
+                        slot.status = IceSlotStatus.AVAILABLE
+                        self.store.save_ice_slot(slot)
                 self.store.delete_game(g.id)
                 discarded += 1
         return {"discarded": discarded}

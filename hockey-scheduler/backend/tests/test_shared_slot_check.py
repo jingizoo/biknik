@@ -1,11 +1,14 @@
 """Shared final slot-conflict check (#277 Slice A).
 
-create_game, move_game, and the draft-commit path now all route through
-SetupService._assert_slot_free_for_game, so they enforce identical slot +
-team-overlap rules and emit the same machine-readable reason codes. This pins
-the checker's contract directly and confirms create_game now surfaces the same
-structured ``details["reason"]`` codes move_game already did. Runs on Memory /
-SQLite / PostgreSQL.
+create_game and move_game route through SetupService._assert_slot_free_for_game,
+so they enforce identical slot + team-overlap rules and emit the same
+machine-readable reason codes. The draft-commit path routes through its
+slot-scoped half, ._assert_slot_free (the slot exists, is a GAME slot, is
+AVAILABLE, and is not already held by another active game) — a committed draft
+occupies its ice, but a draft's team double-bookings are surfaced in review, not
+rejected at commit. This pins the checker's contract directly and confirms
+create_game now surfaces the same structured ``details["reason"]`` codes
+move_game already did. Runs on Memory / SQLite / PostgreSQL.
 """
 
 import os
@@ -82,7 +85,8 @@ class SharedSlotCheckContract:
 
     def test_slot_already_filled(self):
         # Force the defensive path: a slot still AVAILABLE but already backing a
-        # game (the state a not-yet-allocated draft game leaves behind).
+        # game (legacy/imported data, or a slot manually flipped back), which the
+        # status check alone would miss.
         slot = self.store.get_ice_slot(self.slot_a.id)
         slot.status = IceSlotStatus.AVAILABLE
         self.store.save_ice_slot(slot)
@@ -98,6 +102,22 @@ class SharedSlotCheckContract:
             self._check(self.slot_overlap.id, self.home.id, self.bears.id)
         self.assertEqual(cm.exception.details["reason"], "team_overlap")
         self.assertEqual(cm.exception.details["conflict_game_id"], self.game.id)
+
+    def test_slot_free_stops_at_slot_and_ignores_team_overlap(self):
+        # The slot-scoped half (what the draft-commit path uses) enforces slot
+        # freeness only: slot_overlap is a free GAME slot, so it returns even
+        # though `home` already plays an overlapping game. A draft's team
+        # double-booking is surfaced in review, not rejected at commit — the
+        # deliberate difference from the full create/move checker above.
+        got = self.svc._assert_slot_free(self.slot_overlap.id)
+        self.assertEqual(got.id, self.slot_overlap.id)
+
+    def test_slot_free_still_enforces_slot_rules(self):
+        # ...but it is not a no-op: the same slot_missing / not_game_slot /
+        # slot_unavailable / slot_already_filled codes still fire.
+        with self.assertRaises(ScheduleConflictError) as cm:
+            self.svc._assert_slot_free(self.slot_a.id)  # ALLOCATED by self.game
+        self.assertEqual(cm.exception.details["reason"], "slot_unavailable")
 
     def test_exclude_game_id_skips_self(self):
         # With the game excluded, its own overlap no longer blocks the slot.

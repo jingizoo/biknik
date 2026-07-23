@@ -7,7 +7,7 @@ stale or legacy row cannot bypass the same league-ice invariant.
 
 from datetime import datetime
 
-from ..domain import Game
+from ..domain import Game, IceSlotStatus
 from ..domain.errors import DomainError
 from ..services.league_scope import (
     require_game_league_id,
@@ -102,6 +102,18 @@ class ApiService(_BaseApiService):
         with self.store.transaction():
             self._guard_active_seasons([resolved_season_id])
             for row in proposal["draft_games"]:
+                # #277: run the SAME slot-freeness check as create_game /
+                # move_game before persisting (the slot exists, is a GAME slot,
+                # is AVAILABLE, and is not already held by another active game),
+                # so a regenerated proposal that would double-book ICE fails
+                # atomically (the whole batch rolls back) instead of silently
+                # persisting onto an occupied slot. A draft's team double-bookings
+                # are surfaced in review, not rejected here. Returns the resolved
+                # slot to allocate below. (The base facade's own
+                # commit_draft_schedule uses this same check; this override
+                # reimplements the commit body for league-scope validation, so it
+                # must enforce the identical slot invariant.)
+                slot = self.setup._assert_slot_free(row["ice_slot_id"])
                 game = Game(
                     id=self.store.next_id("game"),
                     home_team_id=row["home_team_id"],
@@ -118,6 +130,13 @@ class ApiService(_BaseApiService):
                     is_draft=True,
                 )
                 self.store.add_game(game)
+                # A committed draft occupies its ice: flip the backing slot to
+                # ALLOCATED (exactly as create_game / move_game do) so later
+                # scheduling and the shared checker read it as taken instead of
+                # offering the same occupied ice again. The check above already
+                # rejected any slot a game holds, so this only flips AVAILABLE.
+                slot.status = IceSlotStatus.ALLOCATED
+                self.store.save_ice_slot(slot)
                 created.append(self._draft_game_dto(game))
             if season_id and league_id:
                 scope_type, scope_id = "league", league_id
