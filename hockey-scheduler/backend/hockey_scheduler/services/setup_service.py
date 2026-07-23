@@ -7,7 +7,7 @@ Pure logic over the store with an injected clock; every create is audited.
 
 import functools
 import re
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Callable, List, Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -66,6 +66,7 @@ from ..domain.errors import (
 from ..store import InMemoryStore
 from .import_validator import validate_import, validate_official_availability
 from .ice_availability import plan_ice_windows, parse_hhmm
+from .ice_policy import effective_policy
 from .season_guard import require_active_season
 from .league_scope import (
     registered_team_ids_in_division as _registered_team_ids,
@@ -2700,21 +2701,28 @@ class SetupService:
 
     # -- manual game creation ---------------------------------------------
     def _assert_slot_free_for_game(self, ice_slot_id, home_team_id, away_team_id,
-                                   *, exclude_game_id=None):
+                                   *, exclude_game_id=None, program=None):
         """Shared final conflict check for placing a game on an ice slot (#277).
 
         create_game, move_game, and the draft-commit path all route through this
         one function so they enforce identical rules — the slot exists, is a GAME
-        slot, is AVAILABLE, is not already used by another active game, and puts
-        neither team on an overlapping fixture. Returns the resolved slot on
-        success; raises a structured error carrying ``details["reason"]`` (the
-        machine-readable code the move panel and draft review already consume)
-        otherwise. ``exclude_game_id`` is the game being moved — excluded from the
-        slot-in-use and team-overlap checks so a move never conflicts with itself.
+        slot, is AVAILABLE, is not already used by another active game, leaves
+        playable time after its buffers, ends by the rink's curfew, keeps the
+        rink's turnover gap from other games on that rink, and puts neither team
+        on an overlapping fixture. Returns the resolved slot on success; raises a
+        structured error carrying ``details["reason"]`` (the machine-readable
+        code the move panel and draft review already consume) otherwise.
+        ``exclude_game_id`` is the game being moved — excluded from the
+        slot-in-use, turnover, and team-overlap checks so a move never conflicts
+        with itself.
+
+        ``program`` is the game's Season's Program — the source of the timezone
+        the curfew wall-clock is read in and of the fallback turnover/curfew
+        defaults (via :func:`effective_policy`). When it is ``None`` (unknown),
+        curfew is not enforced and only the rink's own turnover value applies, so
+        callers that can't resolve it degrade safely rather than guess a zone.
 
         Read-only (no transaction of its own) — callers run inside theirs.
-        Turnover-buffer and curfew enforcement layer onto this single choke point
-        in the #277 policy slice.
         """
         slot = self.store.get_ice_slot(ice_slot_id)
         if slot is None:
@@ -2753,6 +2761,36 @@ class SetupService:
                          "reserved_minutes": int(reserved_minutes),
                          "warmup_minutes": slot.warmup_minutes,
                          "resurface_minutes": slot.resurface_minutes})
+
+        # #277 policy enforcement: resolve the rink's effective ice-operations
+        # policy — its own value, else the Program default, else the system
+        # default (turnover 0, no curfew). Both checks below no-op on that
+        # default, so pre-#277 rinks are unaffected.
+        rink = self.store.get_rink(slot.rink_id) if slot.rink_id else None
+        policy = effective_policy(rink, program)
+
+        # Curfew: the reserved ice must END on or before the rink's curfew
+        # wall-clock, read in the Program timezone. Enforced only when both a
+        # curfew and the Program (its zone) are known — no zone, no guess. The
+        # curfew is anchored to the game's START local date, so a game that runs
+        # past midnight still counts against that evening's curfew rather than
+        # sliding under the next day's.
+        if policy.curfew_local and program is not None:
+            tz = resolve_timezone(program.timezone) or timezone.utc
+            start_local = slot.start_time.astimezone(tz)
+            end_local = slot.end_time.astimezone(tz)
+            curfew_h, curfew_m = parse_hhmm(policy.curfew_local, "curfew_local")
+            curfew_at = start_local.replace(hour=curfew_h, minute=curfew_m,
+                                            second=0, microsecond=0)
+            if end_local > curfew_at:
+                raise ScheduleConflictError(
+                    f"This game runs past the rink's {policy.curfew_local} "
+                    "curfew.",
+                    details={"reason": "curfew_violation",
+                             "curfew_local": policy.curfew_local,
+                             "ends_local": end_local.isoformat()})
+
+        turnover = policy.turnover_minutes or 0
         for ex in self.store.all_games():
             if ex.id == exclude_game_id or ex.cancelled or ex.ice_slot_id is None:
                 continue
@@ -2767,6 +2805,25 @@ class SetupService:
                 raise ScheduleConflictError(
                     f"A team already has an overlapping game {ex.id}.",
                     details={"reason": "team_overlap", "conflict_game_id": ex.id})
+            # Turnover: two games on the SAME RINK need at least the turnover gap
+            # of idle ice between their reserved windows for a resurface. Same-
+            # rink overlaps are prevented at slot creation, so only the
+            # non-overlapping-but-too-close case can occur here.
+            if turnover and not overlaps and ex_slot.rink_id == slot.rink_id:
+                if slot.end_time <= ex_slot.start_time:
+                    gap = int((ex_slot.start_time - slot.end_time)
+                              .total_seconds() // 60)
+                else:
+                    gap = int((slot.start_time - ex_slot.end_time)
+                              .total_seconds() // 60)
+                if gap < turnover:
+                    raise ScheduleConflictError(
+                        f"This game leaves only {gap} min of turnover before or "
+                        f"after game {ex.id} on the same rink; {turnover} min is "
+                        "required.",
+                        details={"reason": "turnover_buffer_conflict",
+                                 "conflict_game_id": ex.id, "gap_minutes": gap,
+                                 "turnover_minutes": turnover})
         return slot
 
     @_transactional
@@ -2891,9 +2948,12 @@ class SetupService:
 
         # Shared final conflict check (#277): create/move/draft-commit all route
         # through the one checker so they enforce identical slot + team-overlap
-        # rules (and, in the policy slice, turnover + curfew).
+        # rules plus the rink's turnover + curfew policy. The Program (from the
+        # game's Season) supplies the curfew timezone and policy fallbacks.
+        program = (self.store.get_program(season.program_id)
+                   if season and season.program_id else None)
         slot = self._assert_slot_free_for_game(
-            ice_slot_id, home_team_id, away_team_id)
+            ice_slot_id, home_team_id, away_team_id, program=program)
 
         rink = self.store.get_rink(slot.rink_id)
         # #283 Slice E: a REGULAR game references its exact LeagueSeason (its
@@ -3003,9 +3063,15 @@ class SetupService:
                                   details={"reason": "same_slot"})
         # Shared final conflict check (#277) — identical rules to create +
         # draft-commit; excludes THIS game so a move never conflicts with itself.
+        # The Program (from the game's Season) supplies the curfew timezone and
+        # policy fallbacks for the turnover/curfew checks.
+        move_season = (self.store.get_season(game.season_id)
+                       if game.season_id else None)
+        move_program = (self.store.get_program(move_season.program_id)
+                        if move_season and move_season.program_id else None)
         new_slot = self._assert_slot_free_for_game(
             new_ice_slot_id, game.home_team_id, game.away_team_id,
-            exclude_game_id=game_id)
+            exclude_game_id=game_id, program=move_program)
 
         old_slot_id = game.ice_slot_id
         if old_slot_id:

@@ -134,6 +134,76 @@ class SharedSlotCheckContract:
         got = self._check(self.slot_free.id, self.bears.id, self.away.id)
         self.assertEqual(got.id, self.slot_free.id)
 
+    # -- #277 Slice B: curfew + turnover policy enforcement -----------------
+    def _program(self):
+        return self.store.get_program(self.season.program_id)
+
+    def test_curfew_violation(self):
+        # The Program timezone here is UTC, so slot_free ends 22:00 local; a
+        # 21:00 curfew rejects it with a stable code.
+        rink = self.store.get_rink(self.slot_free.rink_id)
+        rink.curfew_local = "21:00"
+        self.store.save_rink(rink)
+        with self.assertRaises(ScheduleConflictError) as cm:
+            self._check(self.slot_free.id, self.bears.id, self.away.id,
+                        program=self._program())
+        self.assertEqual(cm.exception.details["reason"], "curfew_violation")
+        self.assertEqual(cm.exception.details["curfew_local"], "21:00")
+
+    def test_curfew_met_exactly_is_allowed(self):
+        # Ending exactly at the curfew is fine; only running PAST it is blocked.
+        rink = self.store.get_rink(self.slot_free.rink_id)
+        rink.curfew_local = "22:00"                 # equals slot_free's end
+        self.store.save_rink(rink)
+        got = self._check(self.slot_free.id, self.bears.id, self.away.id,
+                          program=self._program())
+        self.assertEqual(got.id, self.slot_free.id)
+
+    def test_curfew_not_enforced_without_program(self):
+        # No Program => no zone to read the curfew in => not enforced (safe).
+        rink = self.store.get_rink(self.slot_free.rink_id)
+        rink.curfew_local = "21:00"
+        self.store.save_rink(rink)
+        got = self._check(self.slot_free.id, self.bears.id, self.away.id)
+        self.assertEqual(got.id, self.slot_free.id)
+
+    def test_turnover_buffer_conflict(self):
+        # self.game holds slot_a (18:30-20:00); slot_free starts 20:30 — a
+        # 30-min gap on the same rink. A 45-min turnover rejects the placement.
+        rink = self.store.get_rink(self.slot_free.rink_id)
+        rink.turnover_minutes = 45
+        self.store.save_rink(rink)
+        with self.assertRaises(ScheduleConflictError) as cm:
+            self._check(self.slot_free.id, self.bears.id, self.home.id,
+                        program=self._program())
+        self.assertEqual(cm.exception.details["reason"],
+                         "turnover_buffer_conflict")
+        self.assertEqual(cm.exception.details["gap_minutes"], 30)
+        self.assertEqual(cm.exception.details["conflict_game_id"], self.game.id)
+
+    def test_turnover_gap_met_is_allowed(self):
+        # The 30-min gap satisfies a 30-min turnover (>= is fine, not strictly >).
+        rink = self.store.get_rink(self.slot_free.rink_id)
+        rink.turnover_minutes = 30
+        self.store.save_rink(rink)
+        got = self._check(self.slot_free.id, self.bears.id, self.home.id,
+                          program=self._program())
+        self.assertEqual(got.id, self.slot_free.id)
+
+    def test_turnover_scoped_to_the_same_rink(self):
+        # A tight game on a DIFFERENT rink never triggers turnover. slot_overlap
+        # is on rink 2; use two teams not in self.game so no team-overlap masks
+        # the result.
+        s = self.svc
+        cats = s.create_team(s.create_club("CH").id, self.div.id, "Cats")
+        s.register_team_for_season(self.season.id, cats.id, self.div.id)
+        rink2 = self.store.get_rink(self.slot_overlap.rink_id)
+        rink2.turnover_minutes = 600
+        self.store.save_rink(rink2)
+        got = self._check(self.slot_overlap.id, self.bears.id, cats.id,
+                          program=self._program())
+        self.assertEqual(got.id, self.slot_overlap.id)
+
 
 class MemorySharedSlotCheckTest(SharedSlotCheckContract, unittest.TestCase):
     def _store(self):
@@ -152,6 +222,58 @@ class PostgresSharedSlotCheckTest(SharedSlotCheckContract, unittest.TestCase):
         store = SqlStore(os.environ["TEST_DATABASE_URL"])
         store.clear_all_data()
         return store
+
+
+class CurfewTimezoneTest(unittest.TestCase):
+    """The curfew is read in the Program's timezone and anchored to the game's
+    START local date, so a game running past midnight still counts against that
+    evening's curfew instead of sliding under the next day's (#277). Toronto is
+    EDT (UTC-4) in September — a DST offset, so this is a real local conversion,
+    not UTC pass-through."""
+
+    def setUp(self):
+        self.store = InMemoryStore()
+        s = self.svc = SetupService(self.store, clock=FakeClock())
+        self.program = s.create_program("Owls", timezone_name="America/Toronto")
+        self.season = s.create_season(self.program.id, "S")
+        self.div = s.create_division(self.season.id, "U16")
+        self.a = s.create_team(s.create_club("A").id, self.div.id, "Aces")
+        self.b = s.create_team(s.create_club("B").id, self.div.id, "Bees")
+        for t in (self.a, self.b):
+            s.register_team_for_season(self.season.id, t.id, self.div.id)
+        venue = s.create_venue("Arena", league_id=self.program.id)
+        s.grant_season_venue_access(self.season.id, venue.id)
+        self.rink = s.create_rink(venue.id, "Rink 1")
+
+    def _slot_with_curfew(self, start_utc, end_utc, curfew):
+        slot = self.svc.create_ice_slot(self.rink.id, start_utc, end_utc)
+        rink = self.store.get_rink(self.rink.id)
+        rink.curfew_local = curfew
+        self.store.save_rink(rink)
+        return slot
+
+    def _check(self, slot):
+        return self.svc._assert_slot_free_for_game(
+            slot.id, self.a.id, self.b.id, program=self.program)
+
+    def test_past_midnight_game_violates_that_evenings_curfew(self):
+        # 22:30-00:30 EDT == 02:30-04:30 UTC (Sep 2). Ends 00:30 EDT Sep 2 —
+        # past the Sep-1 23:00 curfew. A naive end-date anchor would place the
+        # curfew at 23:00 Sep 2 and wrongly allow it.
+        slot = self._slot_with_curfew(
+            datetime(2026, 9, 2, 2, 30, tzinfo=UTC),
+            datetime(2026, 9, 2, 4, 30, tzinfo=UTC), "23:00")
+        with self.assertRaises(ScheduleConflictError) as cm:
+            self._check(slot)
+        self.assertEqual(cm.exception.details["reason"], "curfew_violation")
+
+    def test_before_curfew_in_local_zone_is_allowed(self):
+        # 20:00-22:30 EDT == 00:00-02:30 UTC (Sep 2). Ends 22:30 EDT < 23:00,
+        # so it's allowed even though the UTC end instant is 02:30.
+        slot = self._slot_with_curfew(
+            datetime(2026, 9, 2, 0, 0, tzinfo=UTC),
+            datetime(2026, 9, 2, 2, 30, tzinfo=UTC), "23:00")
+        self.assertEqual(self._check(slot).id, slot.id)
 
 
 if __name__ == "__main__":
