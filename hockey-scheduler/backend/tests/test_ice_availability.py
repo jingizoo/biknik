@@ -54,6 +54,44 @@ def _template(**over):
     return base
 
 
+# -- DST fixtures (a DST-observing Program timezone) ------------------------
+# Both dates sit inside season_1's range (2026-09-01 .. 2027-03-31), so these
+# templates commit against the Contract seed with no extra setup.
+#
+# Spring forward: America/Toronto 2027-03-14 (a Sunday) — the 02:00-03:00 wall
+# hour does NOT exist. A 01:00-04:00 window is only 2 real hours, so a DST-naive
+# planner (attach tzinfo, advance by timedelta) would emit a 02:00-03:00 row
+# whose UTC start == end — a zero-length slot. The fix yields two 60-min games.
+#
+# Fall back: America/Toronto 2026-11-01 (a Sunday) — the 01:00-02:00 wall hour
+# REPEATS. A 00:00-03:00 window is 4 real hours (one hour longer than the wall
+# clock reads), so the truthful plan is four 60-min games, reserved 240 not 180.
+SPRING_DST_DATE = "2027-03-14"
+FALL_DST_DATE = "2026-11-01"
+
+
+def _spring_template(**over):
+    """Spring-forward Sunday, 01:00-04:00 local => two 60-min games (no zero-length
+    slot across the nonexistent 02:00-03:00 hour); reserved/playable both 120."""
+    base = dict(season_id="season_1", rink_ids=["rink_1"], weekdays=[6],
+                start_local="01:00", end_local="04:00",
+                start_date=SPRING_DST_DATE, end_date=SPRING_DST_DATE,
+                playable_minutes=60, turnover_minutes=0)
+    base.update(over)
+    return base
+
+
+def _fall_template(**over):
+    """Fall-back Sunday, 00:00-03:00 local => four 60-min games (the repeated
+    01:00-02:00 hour makes the day an hour longer); reserved/playable both 240."""
+    base = dict(season_id="season_1", rink_ids=["rink_1"], weekdays=[6],
+                start_local="00:00", end_local="03:00",
+                start_date=FALL_DST_DATE, end_date=FALL_DST_DATE,
+                playable_minutes=60, turnover_minutes=0)
+    base.update(over)
+    return base
+
+
 class IceAvailabilityContract:
     """Runs against every store backend (mirrors test_import_rinks_ice_slots)."""
 
@@ -994,6 +1032,97 @@ class IceAvailabilityContract:
         self.assertEqual(prev.detail["template_fingerprint"],
                          batch.detail["template_fingerprint"])
 
+    # -- DST safety (spring-forward / fall-back), across every backend -------
+    def _assert_no_zero_or_duplicate_utc_slots(self):
+        """The persisted Game ice never has a zero/negative-length or duplicate-UTC
+        slot — the exact corruption a DST-naive planner produces across a
+        transition."""
+        slots = self._slots()
+        starts = [s.start_time for s in slots]
+        self.assertEqual(len(set(starts)), len(starts), "duplicate UTC start")
+        for s in slots:
+            self.assertGreater(s.end_time, s.start_time, "zero/negative slot")
+
+    def _assert_preview_commit_dst_parity(self, tmpl, *, created, reserved,
+                                          ambiguous=(), skipped=()):
+        """Preview a DST template, assert its totals/reason-codes, commit it, and
+        prove the persisted UTC slots are EXACTLY the previewed ones (parity) with
+        no zero/negative/duplicate instants. reserved==playable because turnover is
+        0, so both totals prove the day's real length (an hour lost/gained)."""
+        pv = self.api.preview_ice_availability(actor_id="a", **tmpl)
+        self.assertNotIn("error", pv)
+        self.assertEqual(pv["totals"]["new"], created)
+        self.assertEqual(pv["totals"]["reserved_minutes"], reserved)
+        self.assertEqual(pv["totals"]["playable_minutes"], reserved)
+        self.assertEqual([d["date"] for d in pv["dst_ambiguous"]], list(ambiguous))
+        for d in pv["dst_ambiguous"]:
+            self.assertEqual(d["reason"], "dst_ambiguous_fold0")
+        self.assertEqual([d["date"] for d in pv["dst_skipped"]], list(skipped))
+        for d in pv["dst_skipped"]:
+            self.assertEqual(d["reason"], "dst_nonexistent_window")
+        previewed = [(s["start_time"], s["end_time"])
+                     for s in pv["slots"] if s["status"] == "new"]
+
+        res = self.api.commit_ice_availability(
+            actor_id="a", template_fingerprint=pv["template_fingerprint"], **tmpl)
+        self.assertEqual(res["totals"]["created"], created)
+        persisted = sorted((s.start_time.isoformat(), s.end_time.isoformat())
+                           for s in self._slots())
+        self.assertEqual(persisted, sorted(previewed))   # exact preview/commit parity
+        self._assert_no_zero_or_duplicate_utc_slots()
+        return pv, res
+
+    def test_spring_forward_generates_no_zero_length_slot(self):
+        # 01:00-04:00 across the nonexistent 02:00-03:00 hour is 2 REAL hours: two
+        # 60-min games, reserved 120 (not the wall-clock 180), no zero-length row.
+        pv, _ = self._assert_preview_commit_dst_parity(
+            _spring_template(), created=2, reserved=120)
+        # The gap-spanning first game reads 01:00->03:00 local but is 60 real min.
+        first = min(pv["slots"], key=lambda s: s["start_time"])
+        self.assertEqual(first["start_time"], "2027-03-14T06:00:00+00:00")
+        self.assertEqual(first["end_time"], "2027-03-14T07:00:00+00:00")
+        self.assertEqual(first["start_local"], "2027-03-14T01:00:00-05:00")
+        self.assertEqual(first["end_local"], "2027-03-14T03:00:00-04:00")
+
+    def test_spring_forward_window_starting_in_the_gap_is_skipped(self):
+        # A window whose START is a nonexistent wall time (02:30) has no instant:
+        # the day is skipped with a stable reason and creates zero ice.
+        self._assert_preview_commit_dst_parity(
+            _spring_template(start_local="02:30", end_local="05:00"),
+            created=0, reserved=0, skipped=[SPRING_DST_DATE])
+        self.assertEqual(self._slots(), [])
+
+    def test_fall_back_window_is_an_hour_longer(self):
+        # 00:00-03:00 across the repeated 01:00-02:00 hour is 4 REAL hours: four
+        # 60-min games, reserved 240 (not the wall-clock 180). Neither boundary is
+        # ambiguous (the repeat is interior), so no fold note.
+        self._assert_preview_commit_dst_parity(
+            _fall_template(), created=4, reserved=240)
+
+    def test_fall_back_ambiguous_boundary_uses_earlier_fold(self):
+        # A window whose START is the repeated hour (01:00) is ambiguous; the
+        # planner deterministically takes the EARLIER fold (05:00Z, still EDT) and
+        # flags it, so preview and commit always agree on the same instant.
+        pv, _ = self._assert_preview_commit_dst_parity(
+            _fall_template(start_local="01:00", end_local="04:00"),
+            created=4, reserved=240, ambiguous=[FALL_DST_DATE])
+        self.assertEqual(pv["dst_ambiguous"][0]["boundary"], "start")
+        first = min(pv["slots"], key=lambda s: s["start_time"])
+        self.assertEqual(first["start_time"], "2026-11-01T05:00:00+00:00")
+
+    def test_spring_forward_commit_is_idempotent(self):
+        # DST slots re-commit cleanly (the (rink, start, end) identity is the UTC
+        # instant, so a rerun is all-duplicate, never a second physical slot).
+        self._assert_preview_commit_dst_parity(_spring_template(),
+                                               created=2, reserved=120)
+        pv = self.api.preview_ice_availability(actor_id="a", **_spring_template())
+        res = self.api.commit_ice_availability(
+            actor_id="a", template_fingerprint=pv["template_fingerprint"],
+            **_spring_template())
+        self.assertEqual(res["totals"]["created"], 0)
+        self.assertEqual(res["totals"]["duplicate_skipped"], 2)
+        self.assertEqual(len(self._slots()), 2)
+
 
 class MemoryIceAvailabilityTest(IceAvailabilityContract, unittest.TestCase):
     def _store(self):
@@ -1375,6 +1504,82 @@ class PlannerUnitTest(unittest.TestCase):
         # Each day's first game starts at that day's own local start time.
         self.assertEqual(tue[0]["start_local"], "2026-09-01T18:00:00-04:00")
         self.assertEqual(thu[0]["start_local"], "2026-09-03T19:00:00-04:00")
+
+    # -- DST: the planner boundary defines deterministic semantics ----------
+    def _spring(self, **over):
+        from datetime import date
+        base = dict(weekday_windows={6: ((1, 0), (4, 0))},
+                    start_date=date(2027, 3, 14), end_date=date(2027, 3, 14),
+                    turnover_minutes=0)
+        base.update(over)
+        return self._plan(**base)
+
+    def _fall(self, **over):
+        from datetime import date
+        base = dict(weekday_windows={6: ((0, 0), (3, 0))},
+                    start_date=date(2026, 11, 1), end_date=date(2026, 11, 1),
+                    turnover_minutes=0)
+        base.update(over)
+        return self._plan(**base)
+
+    def test_spring_forward_no_zero_or_duplicate_utc_slots(self):
+        # America/Toronto 2027-03-14: 02:00-03:00 does not exist. A DST-naive
+        # planner (attach tzinfo, advance by timedelta) emits a 02:00-03:00 row
+        # whose UTC start == end. Advancing the cursor in UTC yields two real
+        # 60-min games instead; the day is an hour shorter, so reserved is 120.
+        r = self._spring()
+        self.assertEqual(len(r["windows"]), 2)
+        starts = [w["start"] for w in r["windows"]]
+        self.assertEqual(len(set(starts)), 2)                 # no duplicate instant
+        for w in r["windows"]:
+            self.assertGreater(w["end"], w["start"])          # no zero/negative
+        self.assertEqual(r["reserved_minutes"], 120)          # not the wall-clock 180
+        self.assertEqual(r["playable_minutes_total"], 120)
+        self.assertEqual(r["dst_skipped"], [])
+        self.assertEqual(r["dst_ambiguous"], [])
+        # The gap-spanning game is exactly 60 real minutes (01:00 EST -> 03:00 EDT).
+        self.assertEqual(r["windows"][0]["start"],
+                         datetime(2027, 3, 14, 6, tzinfo=timezone.utc))
+        self.assertEqual(r["windows"][0]["end"],
+                         datetime(2027, 3, 14, 7, tzinfo=timezone.utc))
+
+    def test_spring_forward_nonexistent_start_is_skipped_with_reason(self):
+        # A window START inside the gap (02:30) has NO instant: skip the day with a
+        # stable, actionable reason and generate nothing (never a fabricated time).
+        r = self._spring(weekday_windows={6: ((2, 30), (5, 0))})
+        self.assertEqual(r["windows"], [])
+        self.assertEqual(r["dst_skipped"], [{
+            "date": "2027-03-14", "reason": "dst_nonexistent_window",
+            "boundary": "start"}])
+        self.assertEqual(r["too_short"], [])                  # skipped, not too_short
+
+    def test_fall_back_window_is_an_hour_longer(self):
+        # America/Toronto 2026-11-01: 01:00-02:00 repeats. 00:00-03:00 is 4 REAL
+        # hours -> four 60-min games, reserved 240 (not the wall-clock 180). The
+        # repeat is interior to the window, so neither boundary is ambiguous.
+        r = self._fall()
+        self.assertEqual(len(r["windows"]), 4)
+        starts = [w["start"] for w in r["windows"]]
+        self.assertEqual(len(set(starts)), 4)
+        for w in r["windows"]:
+            self.assertGreater(w["end"], w["start"])
+        self.assertEqual(r["reserved_minutes"], 240)
+        self.assertEqual(r["playable_minutes_total"], 240)
+        self.assertEqual(r["dst_ambiguous"], [])
+        self.assertEqual(r["dst_skipped"], [])
+
+    def test_fall_back_ambiguous_boundary_is_flagged_and_uses_fold0(self):
+        # A window START on the repeated hour (01:00) is ambiguous; the planner
+        # deterministically takes the EARLIER fold (fold=0, still EDT = 05:00Z) and
+        # records it, so preview and commit never disagree on which instant it is.
+        r = self._fall(weekday_windows={6: ((1, 0), (4, 0))})
+        self.assertEqual(len(r["windows"]), 4)
+        self.assertEqual(r["dst_ambiguous"], [{
+            "date": "2026-11-01", "boundary": "start",
+            "reason": "dst_ambiguous_fold0"}])
+        self.assertEqual(r["windows"][0]["start"],            # the earlier fold
+                         datetime(2026, 11, 1, 5, tzinfo=timezone.utc))
+        self.assertEqual(r["reserved_minutes"], 240)
 
 
 class IceAvailabilityHttpAuthzTest(unittest.TestCase):
@@ -1898,3 +2103,75 @@ class IceAvailabilityHttpAuthzTest(unittest.TestCase):
         self.assertEqual(len(audits), 1)
         self.assertTrue(audits[0].actor_id)                   # threaded, not None
         self.assertEqual(audits[0].detail["totals"]["new"], 6)
+
+    def _assert_dst_commit_parity_over_http(self, name, window, dst_date, *,
+                                            created, reserved, ambiguous=(),
+                                            skipped=()):
+        """Authenticated HTTP end-to-end in a DST-observing Program timezone: seed
+        a rig, preview a spring-forward / fall-back template, assert its totals and
+        DST reason codes, then commit with the returned token and prove the
+        persisted UTC slots are EXACTLY the previewed ones with no zero/negative or
+        duplicate instants (#158 review — DST safety at the planner boundary)."""
+        svc = self.srv.STATE.api.setup
+        store = self.srv.STATE.api.store
+        prog = svc.create_program(name, timezone_name=TZ)     # a DST zone
+        season = svc.create_season(prog.id, name + " Season")
+        venue = svc.create_venue(name + " House", league_id=prog.id)
+        svc.grant_season_venue_access(season.id, venue.id)
+        rink = svc.create_rink(venue.id, name + " Sheet")
+        (sl, el) = window
+        template = {
+            "season_id": season.id, "rink_ids": [rink.id], "weekdays": [6],
+            "start_local": sl, "end_local": el,
+            "start_date": dst_date, "end_date": dst_date,
+            "playable_minutes": 60, "turnover_minutes": 0}
+
+        def game_ice():
+            return sorted((s.start_time.isoformat(), s.end_time.isoformat())
+                          for s in store.all_ice_slots() if s.rink_id == rink.id)
+
+        c = self._client()
+        self._login(c, "arena")
+        _, pv = self._req(c, "POST", "/api/setup/ice-availability/preview", template)
+        self.assertEqual(pv["totals"]["new"], created)
+        self.assertEqual(pv["totals"]["reserved_minutes"], reserved)
+        self.assertEqual(pv["totals"]["playable_minutes"], reserved)
+        self.assertEqual([d["date"] for d in pv["dst_ambiguous"]], list(ambiguous))
+        self.assertEqual([d["date"] for d in pv["dst_skipped"]], list(skipped))
+        previewed = sorted((s["start_time"], s["end_time"])
+                           for s in pv["slots"] if s["status"] == "new")
+        _, ok = self._req(c, "POST", "/api/setup/ice-availability/commit",
+                          dict(template, template_fingerprint=pv["template_fingerprint"]))
+        self.assertEqual(ok["totals"]["created"], created)
+        self.assertEqual(game_ice(), previewed)               # exact preview/commit parity
+        for s, e in game_ice():
+            self.assertGreater(e, s)                          # no zero/negative instant
+        self.assertEqual(len(game_ice()), len(set(game_ice())))  # no duplicate instant
+        return pv
+
+    def test_spring_forward_commit_parity_over_http(self):
+        # Spring-forward 01:00-04:00: two 60-min games across the nonexistent
+        # 02:00-03:00 hour, reserved 120, committed exactly as previewed.
+        self._assert_dst_commit_parity_over_http(
+            "HBDST1", ("01:00", "04:00"), SPRING_DST_DATE, created=2, reserved=120)
+
+    def test_spring_forward_gap_start_skipped_over_http(self):
+        # A window starting in the gap (02:30) creates no ice and reports the day
+        # skipped with a stable reason, end to end over HTTP.
+        self._assert_dst_commit_parity_over_http(
+            "HBDST2", ("02:30", "05:00"), SPRING_DST_DATE, created=0, reserved=0,
+            skipped=[SPRING_DST_DATE])
+
+    def test_fall_back_commit_parity_over_http(self):
+        # Fall-back 00:00-03:00: four 60-min games, reserved 240 (an hour longer
+        # than the wall clock reads), committed exactly as previewed.
+        self._assert_dst_commit_parity_over_http(
+            "HBDST3", ("00:00", "03:00"), FALL_DST_DATE, created=4, reserved=240)
+
+    def test_fall_back_ambiguous_start_fold_over_http(self):
+        # Fall-back 01:00-04:00: the ambiguous 01:00 start is flagged and resolved
+        # to the earlier fold, still four games committed exactly as previewed.
+        pv = self._assert_dst_commit_parity_over_http(
+            "HBDST4", ("01:00", "04:00"), FALL_DST_DATE, created=4, reserved=240,
+            ambiguous=[FALL_DST_DATE])
+        self.assertEqual(pv["dst_ambiguous"][0]["reason"], "dst_ambiguous_fold0")

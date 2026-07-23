@@ -52,6 +52,34 @@ def parse_hhmm(value, field_name):
     return hour, minute
 
 
+def _resolve_local_to_utc(naive, tz):
+    """Resolve a naive local wall-clock ``datetime`` to a UTC instant under DST.
+
+    ``datetime(..., tzinfo=ZoneInfo)`` is silently wrong across a DST transition:
+    a spring-forward gap time (e.g. America/Toronto 02:30 on the March change) has
+    NO real instant, and a fall-back repeated hour has two — attaching the zone and
+    advancing with ``timedelta`` can persist a zero-duration slot or misstate a
+    duration. Resolve explicitly instead. Returns ``(utc, status)``:
+
+      * ``"ok"`` — the wall time exists unambiguously;
+      * ``"ambiguous"`` — a fall-back repeated hour; the EARLIER instant (``fold=0``,
+        before the clocks go back) is chosen deterministically so preview and
+        commit always agree;
+      * ``"nonexistent"`` — a spring-forward gap; ``utc`` is ``None`` and the caller
+        skips the day with a structured reason.
+    """
+    local = naive.replace(tzinfo=tz)                       # fold=0
+    utc = local.astimezone(timezone.utc)
+    # A gap instant does not round-trip: converting to UTC and back lands on a
+    # DIFFERENT wall time than the one asked for.
+    if utc.astimezone(tz).replace(tzinfo=None) != naive:
+        return None, "nonexistent"
+    # A repeated hour is ambiguous when its two folds carry different UTC offsets.
+    if local.utcoffset() != local.replace(fold=1).utcoffset():
+        return utc, "ambiguous"
+    return utc, "ok"
+
+
 def plan_ice_windows(*, weekday_windows, start_date, end_date,
                      playable_minutes, turnover_minutes, exclusion_dates, tz):
     """Generate the per-rink game-ice windows a recurring template implies.
@@ -76,6 +104,12 @@ def plan_ice_windows(*, weekday_windows, start_date, end_date,
          "skipped_dates": [{date, reason: "exclusion"}],
          "too_short": [{date, window_minutes}],   # a selected day too short for
                                                    # even one playable game
+         "dst_skipped": [{date, reason: "dst_nonexistent_window", boundary}],
+                                                   # a window start/end in a
+                                                   # spring-forward gap (no instant)
+         "dst_ambiguous": [{date, boundary, reason: "dst_ambiguous_fold0"}],
+                                                   # a fall-back repeated boundary;
+                                                   # the earlier fold was used
          "reserved_minutes": int,          # single rink, sum of active windows
          "playable_minutes_total": int,    # single rink, sum of game lengths
          "game_days": int}
@@ -118,7 +152,9 @@ def plan_ice_windows(*, weekday_windows, start_date, end_date,
 
     step = playable_minutes + turnover_minutes
     playable = timedelta(minutes=playable_minutes)
+    step_td = timedelta(minutes=step)
     windows, skipped, too_short = [], [], []
+    dst_skipped, dst_ambiguous = [], []
     reserved_minutes = 0
     playable_total = 0
     game_days = 0
@@ -135,22 +171,47 @@ def plan_ice_windows(*, weekday_windows, start_date, end_date,
             day += one_day
             continue
         (sh, sm), (eh, em) = win
-        win_start = datetime(day.year, day.month, day.day, sh, sm, tzinfo=tz)
-        win_end = datetime(day.year, day.month, day.day, eh, em, tzinfo=tz)
-        window_minutes = int((win_end - win_start).total_seconds() // 60)
+        # Resolve the window's local start/end to real UTC instants (DST-safe).
+        # A boundary in a spring-forward gap has no instant -> skip the day with a
+        # structured reason; a fall-back repeated hour deterministically uses the
+        # earlier fold. Advancing the cursor in UTC below then guarantees real
+        # durations — never a zero/negative/duplicate slot across a transition, and
+        # a truthful window_minutes (a spring-forward day is an hour shorter, a
+        # fall-back day an hour longer).
+        start_utc, start_status = _resolve_local_to_utc(
+            datetime(day.year, day.month, day.day, sh, sm), tz)
+        end_utc, end_status = _resolve_local_to_utc(
+            datetime(day.year, day.month, day.day, eh, em), tz)
+        if start_utc is None or end_utc is None:
+            dst_skipped.append({
+                "date": day.isoformat(), "reason": "dst_nonexistent_window",
+                "boundary": "start" if start_utc is None else "end"})
+            day += one_day
+            continue
+        for boundary, status in (("start", start_status), ("end", end_status)):
+            if status == "ambiguous":
+                dst_ambiguous.append({
+                    "date": day.isoformat(), "boundary": boundary,
+                    "reason": "dst_ambiguous_fold0"})
+        window_minutes = int((end_utc - start_utc).total_seconds() // 60)
+        if window_minutes <= 0:
+            too_short.append({"date": day.isoformat(),
+                              "window_minutes": max(window_minutes, 0)})
+            day += one_day
+            continue
 
-        cursor = win_start
+        cursor = start_utc
         day_count = 0
-        while cursor + playable <= win_end:
+        while cursor + playable <= end_utc:
             playable_end = cursor + playable
-            reserved_end = min(cursor + timedelta(minutes=step), win_end)
+            reserved_end = min(cursor + step_td, end_utc)
             windows.append({
                 "date": day.isoformat(),
-                "start": cursor.astimezone(timezone.utc),
-                "end": playable_end.astimezone(timezone.utc),
-                "reserved_end": reserved_end.astimezone(timezone.utc),
-                "start_local": cursor.isoformat(),
-                "end_local": playable_end.isoformat(),
+                "start": cursor,
+                "end": playable_end,
+                "reserved_end": reserved_end,
+                "start_local": cursor.astimezone(tz).isoformat(),
+                "end_local": playable_end.astimezone(tz).isoformat(),
             })
             playable_total += playable_minutes
             day_count += 1
@@ -159,7 +220,7 @@ def plan_ice_windows(*, weekday_windows, start_date, end_date,
                     f"This template would generate more than {MAX_WINDOWS} "
                     "slots. Narrow the range, weekdays, or window.",
                     {"reason": "too_many_slots", "field": "end_date"})
-            cursor += timedelta(minutes=step)
+            cursor += step_td
 
         if day_count:
             reserved_minutes += window_minutes
@@ -175,6 +236,8 @@ def plan_ice_windows(*, weekday_windows, start_date, end_date,
         "windows": windows,
         "skipped_dates": skipped,
         "too_short": too_short,
+        "dst_skipped": dst_skipped,
+        "dst_ambiguous": dst_ambiguous,
         "reserved_minutes": reserved_minutes,
         "playable_minutes_total": playable_total,
         "game_days": game_days,

@@ -2659,6 +2659,8 @@ class SetupService:
             },
             "skipped_dates": plan["skipped_dates"],
             "too_short": plan["too_short"],
+            "dst_skipped": plan["dst_skipped"],
+            "dst_ambiguous": plan["dst_ambiguous"],
             "venue_access_missing": r["access_missing"],
         }
 
