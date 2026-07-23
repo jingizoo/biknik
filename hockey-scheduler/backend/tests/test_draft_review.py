@@ -124,13 +124,16 @@ class DraftReviewServiceTest(unittest.TestCase):
         # Rejected as a slot conflict...
         self.assertIn("error", res)
         self.assertEqual(res["error"]["details"]["reason"], "slot_unavailable")
-        # ...and nothing persisted: no draft games, and every earlier slot the
-        # loop had already flipped is back to AVAILABLE (atomic rollback).
+        # ...and nothing persisted: no draft games, every earlier slot the loop
+        # had already flipped is back to AVAILABLE, and the batch audit never
+        # lands — Games, slot states, AND audits all revert together (atomic).
         self.assertEqual(self.store.all_games(), [])
         for row in rows[:-1]:
             self.assertEqual(
                 self.store.get_ice_slot(row["ice_slot_id"]).status,
                 IceSlotStatus.AVAILABLE, row["ice_slot_id"])
+        self.assertEqual([a for a in self.store.all_setup_audit()
+                          if a.action == "draft_schedule_committed"], [])
 
     def test_publish_makes_drafts_public(self):
         self.api.commit_draft_schedule("d")
@@ -365,6 +368,50 @@ class DraftReviewHttpTest(unittest.TestCase):
                 self.assertEqual(status, 403, f"{who} {path}")
             status, _ = self._req(c, "GET", "/api/scheduler/drafts")
             self.assertEqual(status, 403, who)
+
+    def test_commit_rolls_back_over_http_on_a_slot_conflict(self):
+        # #277/#314: the authenticated draft-commit endpoint runs the shared
+        # physical-placement checker (_assert_slot_free — the same choke point
+        # create/move use, and the one turnover/curfew layer onto) per row inside
+        # ONE transaction. A regenerated proposal that lands on occupied ice is
+        # refused and the WHOLE batch rolls back — no Games, no flipped slot
+        # states, no batch audit — over HTTP exactly as at the service layer.
+        c = self._client()
+        self._req(c, "POST", "/api/auth/login",
+                  {"username": "admin", "password": "demo"})
+        api = srv.STATE.api
+        store = api.store
+        proposal = api.draft_season_schedule(division_id=self.div)
+        rows = proposal["draft_games"]
+        self.assertGreaterEqual(len(rows), 2, proposal)
+        # Occupy the LAST proposed slot so the loop allocates the earlier rows
+        # first and only then hits the conflict — proving earlier work rolls back.
+        taken = rows[-1]["ice_slot_id"]
+        borrowed = store.get_ice_slot(taken)
+        prev_status = borrowed.status
+        borrowed.status = IceSlotStatus.ALLOCATED
+        store.save_ice_slot(borrowed)
+        games_before = len(store.all_games())
+        audit_before = len(store.all_setup_audit())
+        orig = api.draft_season_schedule
+        api.draft_season_schedule = lambda *a, **k: proposal   # force the stale plan
+        try:
+            status, res = self._req(c, "POST", "/api/scheduler/commit",
+                                    {"division_id": self.div})
+        finally:
+            api.draft_season_schedule = orig
+            borrowed = store.get_ice_slot(taken)          # release the borrowed slot
+            borrowed.status = prev_status
+            store.save_ice_slot(borrowed)
+        self.assertNotEqual(status, 200, res)
+        self.assertEqual(res["error"]["details"]["reason"], "slot_unavailable")
+        # Atomic rollback: no new Games, no new audit, and no earlier slot left
+        # flipped to ALLOCATED.
+        self.assertEqual(len(store.all_games()), games_before)
+        self.assertEqual(len(store.all_setup_audit()), audit_before)
+        for row in rows[:-1]:
+            self.assertEqual(store.get_ice_slot(row["ice_slot_id"]).status,
+                             IceSlotStatus.AVAILABLE, row["ice_slot_id"])
 
     def test_operator_commit_and_discard_roundtrip(self):
         c = self._client()
