@@ -382,3 +382,30 @@ def slot_belongs_to_season(store, ice_slot_id: str, season_id: str) -> bool:
         return True
     except DomainError:
         return False
+
+
+def require_slots_belong_to_locked_season(store, ice_slot_ids, season_id):
+    """Re-run ``require_slot_belongs_to_season`` for every slot in
+    ``ice_slot_ids`` against ``season_id`` (#314 review) — the canonical
+    per-slot/Season eligibility check, shared by ``move_game`` and both
+    ``commit_draft_schedule`` implementations.
+
+    ``require_slot_belongs_to_season`` is a pure read with no lock of its own,
+    so calling it before the caller holds the relevant Rink(s) and Season lock
+    leaves a window: a concurrent ``SeasonVenueAccess`` revoke (which locks the
+    Season the same way ``_require_active_season``/``_guard_active_seasons``
+    does) or a Rink→Venue reassignment (whose write needs the very Rink row
+    lock ``_lock_rinks`` took) can commit in that gap, after which the caller's
+    write lands a Game onto ice that no longer serves the Season.
+
+    Callers MUST call this only AFTER already holding, for every slot checked
+    here, the Rink(s) (``_lock_rinks``) and Season (``_require_active_season``
+    / ``_guard_active_seasons``) locks — at that point a conflicting write has
+    either already committed (and this sees it) or is blocked waiting on our
+    lock (and cannot land until after we do), so the answer is race-free.
+    Called BEFORE any Game, slot-status, or audit write. A single-slot caller
+    (``move_game``) passes a length-1 iterable; a draft-commit batch passes
+    every proposed slot.
+    """
+    for ice_slot_id in ice_slot_ids:
+        require_slot_belongs_to_season(store, ice_slot_id, season_id)

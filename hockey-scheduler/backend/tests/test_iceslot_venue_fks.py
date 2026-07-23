@@ -1115,10 +1115,16 @@ class IceSlotRaceTest(unittest.TestCase):
 
     def _forced_double_book(self, first_store, first_fn, second_store, second_fn):
         """Two creates target the same slot. Pause the first AFTER its game insert
-        (holding the ux_games_active_ice_slot index entry, transaction open), start
-        the second and CONFIRM its exact backend is blocked on the index, then
-        release the first to commit. The second then loses with ice_slot_taken —
-        never a raw error, and never a second active game on the slot."""
+        (holding the target rink's FOR UPDATE lock AND the ux_games_active_ice_slot
+        index entry, transaction open), start the second and CONFIRM its exact
+        backend is blocked, then release the first to commit. Since #313 every
+        placement takes the target rink lock BEFORE its slot check (to serialize
+        with the ice-availability builder), so the second blocks on that rink lock
+        and, once the first commits, re-reads the slot as ALLOCATED and loses with a
+        clean slot_unavailable at the pre-check — never a raw error, and never a
+        second active game on the slot. (The DB index still backstops any insert
+        that bypasses the lock; see test_second_active_game_on_slot_is_ice_slot_taken.)
+        """
         orig = first_store.add_game
         written = threading.Event()
         release = threading.Event()
@@ -1145,9 +1151,9 @@ class IceSlotRaceTest(unittest.TestCase):
             self.fail("first create never reached its game insert")
         ts.start()
         self.assertTrue(self._wait_until_blocked_on_lock(second_pid),
-                        "second create never blocked on the ice-slot unique index")
+                        "second create never blocked on the target rink lock")
         self.assertIsNone(results.get("second"),
-                          "second create completed without blocking on the index")
+                          "second create completed without blocking on the lock")
         release.set()
         tf.join(25); ts.join(25)
         return results
@@ -1682,7 +1688,10 @@ class IceSlotRaceTest(unittest.TestCase):
             second_store=second_store,
             second_fn=lambda: api_2.setup.create_game(
                 s2[0], s2[1], s2[2], s2[3], slot, actor_id="g2"))
-        self.assertEqual(results, {"first": "ok", "second": "ice_slot_taken"},
+        # Since #313 the second create blocks on the target rink lock and, once the
+        # first commits, re-reads the slot as ALLOCATED -> stable slot_unavailable
+        # (the rink lock catches it at the pre-check, before the DB index would).
+        self.assertEqual(results, {"first": "ok", "second": "slot_unavailable"},
                          results)
         check = SqlStore(self.url)
         active = [g for g in check.all_games()
@@ -1712,17 +1721,16 @@ class IceSlotRaceTest(unittest.TestCase):
                   if g.ice_slot_id == slot and not g.cancelled]
         self.assertEqual(len(active), 1, results)   # exactly one wins the slot
         self.assertEqual(_audit_actions(check, "game_created"), 1, results)
-        # Exactly one create wins; the loser loses cleanly by EITHER path,
-        # depending on unsynchronised timing: it read the already-committed game
-        # at the service pre-check (-> schedule_conflict), or both passed the
-        # pre-check and it lost the insert race at the DB partial unique index
-        # (-> ice_slot_taken). Both are correct — never two games, never a raw
-        # error. (The forced sibling pins ice_slot_taken deterministically.)
+        # Exactly one create wins. Since #313 both creates take the target rink
+        # lock before their slot check, so the loser blocks, then re-reads the
+        # already-ALLOCATED slot under the lock and loses cleanly with
+        # slot_unavailable at the pre-check — never reaching the DB index, never two
+        # games, never a raw error. (The DB index still backstops any non-locking
+        # insert; see test_second_active_game_on_slot_is_ice_slot_taken.)
         self.assertIn("ok", results.values(), results)
         losers = [v for v in results.values() if v != "ok"]
         self.assertEqual(len(losers), 1, results)
-        self.assertIn(losers[0], ("ice_slot_taken", "schedule_conflict"),
-                      results)
+        self.assertEqual(losers[0], "slot_unavailable", results)
 
     # -- itemised has-dependencies payload assertion -----------------------
     def _assert_itemised(self, details, entity_type, entity_id, group_type,

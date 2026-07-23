@@ -216,6 +216,18 @@ class _SeasonReparented(Exception):
     retry loop, which re-reads and locks the correct Program first."""
 
 
+class _MoveGameRaced(Exception):
+    """Internal retry signal (#314 review): move_game's defensive post-lock
+    verify found the Rinks it holds don't match the Game's current source Rink
+    plus the target slot's Rink. Should not happen — move_game is the only
+    writer of an existing Game's ice_slot_id, and it always takes the Team lock
+    before reading the current slot — but the check is cheap insurance against
+    a future writer that skips that convention. Caught by
+    SetupService._retry_on_move_race, which rolls back and retries cleanly in
+    a fresh transaction rather than proceeding against an untrustworthy lock
+    set."""
+
+
 class SetupService:
     def __init__(self, store: InMemoryStore, clock: Callable[[], datetime] = _utcnow):
         self.store = store
@@ -374,6 +386,61 @@ class SetupService:
         caller's own not-found semantics); a Season-less legacy Game is a no-op."""
         if game is not None and game.season_id:
             require_active_season(self.store, game.season_id)
+
+    def _lock_teams(self, team_ids) -> None:
+        """Row-lock every distinct Team in canonical (sorted) order (#277).
+
+        The final placement check (:meth:`_assert_slot_free_for_game`) refuses a
+        game that would double-book a team, but that read-then-write is only
+        atomic if concurrent placements sharing a team serialize. Locking exactly
+        the game's two teams is sufficient: a ``team_overlap`` can exist only
+        between games that SHARE a team, so any racing placement able to conflict
+        must also touch — and block on — one of these very rows. Whoever wins the
+        lock writes its game; the loser, re-scanning ``all_games`` under the lock,
+        now sees that game and is refused with a stable ``team_overlap`` instead
+        of silently double-booking. The other half of the check — one active game
+        per slot — is guarded by :meth:`_lock_rinks` (which also serializes with
+        the ice-availability builder) plus the ``ux_games_active_ice_slot`` DB
+        index as a backstop.
+
+        Sorted order gives a total lock order, so two placements can never
+        deadlock each other; Teams are always locked BEFORE the Rink and Season
+        (matching ``transfer_team_to_league`` / ``copy_``/``move_season_teams``,
+        which lock Team→Season), so the global Team→Rink→Season order holds. A
+        no-op on the in-memory store (whose ``transaction()`` fully serializes for
+        free); a real ``SELECT ... FOR UPDATE`` on SQL. MUST run inside a
+        ``store.transaction()``, and before the caller's Rink/Season guards so the
+        ordering invariant holds."""
+        for tid in sorted({t for t in team_ids if t}):
+            self.store.get_team_for_update(tid)
+
+    def _lock_rinks(self, rink_ids) -> None:
+        """Row-lock every distinct Rink in canonical (sorted) order (#277 / #313).
+
+        The placement check reads a slot's status/occupancy and then allocates it,
+        and the ice-availability BUILDER (``commit_ice_availability``) revalidates
+        its preview token and creates/reconciles slots UNDER a per-rink
+        ``get_rink_for_update`` lock. Game placement must take that SAME rink lock
+        so the two serialize: otherwise a cross-Season create/move/draft can
+        allocate an exact AVAILABLE slot in the window between the builder's
+        under-lock token check and its writes, turning a reviewed new/duplicate row
+        into an allocated-Game conflict while the builder commit still succeeds.
+        With the lock the loser blocks and then either sees the change (the builder
+        recomputes ``preview_mismatch``, or the placement re-reads the slot as
+        ``slot_unavailable``) or runs cleanly after the winner commits. (The DB
+        index ``ux_games_active_ice_slot`` still backstops the pure game-vs-game
+        slot race; this lock additionally covers game-vs-builder, which the index
+        cannot.)
+
+        Locked AFTER the Teams but BEFORE the Season — the global Team→Rink→Season
+        order — because the builder locks Program→Rink→Season (Rink before Season);
+        locking Season first here would invert that and deadlock the builder.
+        Sorted order gives a total order between two multi-rink placements. A no-op
+        on the in-memory store; a real ``SELECT ... FOR UPDATE`` on SQL. MUST run
+        inside a ``store.transaction()``, after the Team locks and before the
+        Season guard."""
+        for rid in sorted({r for r in rink_ids if r}):
+            self.store.get_rink_for_update(rid)
 
     @staticmethod
     def _normalize_lifecycle_reason(reason, *, required: bool) -> Optional[str]:
@@ -761,7 +828,7 @@ class SetupService:
             return reg
         stranded = [
             g.id for g in self.store.all_games()
-            if not g.cancelled and not g.is_draft
+            if not g.cancelled
             and g.season_id == season_id and g.league_id == old_league
             and reg.team_id in (g.home_team_id, g.away_team_id)]
         if stranded:
@@ -1054,14 +1121,20 @@ class SetupService:
         return ls.season_id if ls else None
 
     def _games_scheduled_for_team_in_season(self, season_id, team_id):
-        """Ids of committed (non-cancelled, non-draft) games in ``season_id``
-        that ``team_id`` plays in — the games a removal or division change would
-        strand. Draft proposals aren't real games yet, so they don't block."""
+        """Ids of committed, non-cancelled games in ``season_id`` that
+        ``team_id`` plays in.
+
+        A generated proposal is still read-only and never appears here. Once an
+        operator commits that proposal, however, its ``is_draft`` Game rows own
+        allocated ice and are part of the review/publish workflow. Removing or
+        re-binding a participant underneath those rows would strand invalid
+        drafts, so committed drafts block the same participation changes as
+        published Games (#314 review).
+        """
         if not season_id:
             return []
         return [g.id for g in self.store.all_games()
                 if g.season_id == season_id and not g.cancelled
-                and not g.is_draft
                 and team_id in (g.home_team_id, g.away_team_id)]
 
     def _registration_program(self, reg):
@@ -1211,11 +1284,11 @@ class SetupService:
         registration that currently sits in a DIFFERENT League to the target
         League's LeagueSeason for that same Season (clearing its Division, which
         belonged to the old LeagueSeason). If any such active registration has
-        committed (non-draft, non-cancelled) games, moving it would strand
-        them, so the WHOLE transfer is rejected before any write — the operator
-        must resolve those games first. All checks run before any mutation, so a
-        rejected transfer changes nothing (zero Team/registration/audit
-        mutation).
+        committed, non-cancelled games (including committed draft rows), moving
+        it would strand them, so the WHOLE transfer is rejected before any
+        write — the operator must resolve those games first. All checks run
+        before any mutation, so a rejected transfer changes nothing (zero
+        Team/registration/audit mutation).
         """
         team = self.store.get_team_for_update(team_id)
         if team is None:
@@ -2983,6 +3056,106 @@ class SetupService:
              "season_id": season_id, "division_id": division_id,
              "registered_division_id": raw.division_id})
 
+    def _require_batch_team_participation(self, season_id, league_season_id,
+                                          rows):
+        """Require every proposed row to belong to one exact LeagueSeason.
+
+        ``draft_season_schedule`` only pairs currently-registered teams, but
+        that proposal is generated BEFORE the write transaction opens. Calling
+        this check right after acquiring the batch's Team/Rink/Season locks
+        (never before) closes the gap: a concurrent ``unregister_team_from_
+        season`` takes this same Season lock, and a team-to-league transfer
+        can move a registration to another LeagueSeason in the same Season.
+        Season-only validation would accept that moved row for a division-less
+        draft and persist a Game in the old League. Resolve the expected
+        LeagueSeason under the held locks, require both teams' active rows to
+        reference it exactly, require any Division to belong to it, and require
+        each Team's permanent League to match it. This is the same fail-closed
+        competition identity later enforced by publish/move.
+        """
+        league_season = (
+            self.store.get_league_season(league_season_id)
+            if league_season_id else None)
+        if league_season is None:
+            raise ValidationError(
+                "The draft's league-season no longer exists.",
+                {"reason": "draft_league_season_missing",
+                 "season_id": season_id,
+                 "league_season_id": league_season_id})
+        if league_season.season_id != season_id:
+            raise ValidationError(
+                "The draft's league-season belongs to a different season.",
+                {"reason": "draft_league_season_mismatch",
+                 "season_id": season_id,
+                 "league_season_id": league_season.id,
+                 "league_season_season_id": league_season.season_id})
+
+        active = {
+            r.team_id: r
+            for r in self.store.registrations_for_league_season(
+                league_season.id)
+            if r.active
+        }
+        for row in rows:
+            division_id = row.get("division_id")
+            if division_id is not None:
+                division = self.store.get_division(division_id)
+                if (division is None
+                        or division.league_season_id != league_season.id):
+                    raise DivisionMismatchError(
+                        "The draft Division does not belong to its "
+                        "league-season.",
+                        {"reason": "division_league_season_mismatch",
+                         "division_id": division_id,
+                         "league_season_id": league_season.id,
+                         "division_league_season_id": (
+                             division.league_season_id
+                             if division is not None else None)})
+
+            for team_id in (row["home_team_id"], row["away_team_id"]):
+                team = self.store.get_team(team_id)
+                label = team.name if team is not None else team_id
+                registration = active.get(team_id)
+                if registration is None:
+                    raw = next((
+                        r for r in self.store.registrations_for_season(
+                            season_id)
+                        if r.team_id == team_id and r.active), None)
+                    if raw is None:
+                        raise DivisionMismatchError(
+                            f"{label} is not registered in this season.",
+                            {"reason": "team_not_registered",
+                             "team_id": team_id, "season_id": season_id})
+                    raise DivisionMismatchError(
+                        f"{label} is not registered in this draft's "
+                        "league-season.",
+                        {"reason": "team_not_in_league_season",
+                         "team_id": team_id,
+                         "season_id": season_id,
+                         "league_season_id": league_season.id,
+                         "registered_league_season_id":
+                             raw.league_season_id})
+                if (team is None or not team.league_id
+                        or team.league_id != league_season.league_id):
+                    raise DivisionMismatchError(
+                        f"{label}'s registration does not match its permanent "
+                        "League.",
+                        {"reason": "registration_cross_league",
+                         "team_id": team_id,
+                         "league_season_id": league_season.id,
+                         "league_id": league_season.league_id,
+                         "team_league_id": (
+                             team.league_id if team is not None else None)})
+                if (division_id is not None
+                        and registration.division_id != division_id):
+                    raise DivisionMismatchError(
+                        f"{label} is not registered in this division.",
+                        {"reason": "team_wrong_division",
+                         "team_id": team_id, "season_id": season_id,
+                         "division_id": division_id,
+                         "registered_division_id":
+                             registration.division_id})
+
     def _team_participates(self, season, team_id: str,
                            division_id: Optional[str],
                            require_division: bool = True) -> bool:
@@ -3007,6 +3180,89 @@ class SetupService:
                                     enforce_team_league=enforce_team_league)
 
     # -- manual game creation ---------------------------------------------
+    def _assert_slot_free(self, ice_slot_id, *, exclude_game_id=None):
+        """Physical-placement half of the game-placement check (#277).
+
+        Checks that the slot exists, is a GAME slot, is AVAILABLE, and is not
+        already used by another active game. Returns the resolved slot on success;
+        raises a structured error carrying ``details["reason"]`` (``slot_missing``
+        / ``not_game_slot`` / ``slot_unavailable`` / ``slot_already_filled``, the
+        machine-readable codes the move panel and draft review consume) otherwise.
+        ``exclude_game_id`` is the game being moved — excluded from the slot-in-use
+        check so a move never conflicts with itself.
+
+        This is a decomposition of :meth:`_assert_slot_free_for_game`, not a
+        separate entry point: every placement path (create_game, move_game and the
+        draft-commit path) goes through the full checker, which calls this first.
+        The #277 turnover-buffer and curfew POLICIES layer onto THIS method in the
+        policy slice, so they apply uniformly to manual placement and committed
+        drafts alike.
+
+        Read-only (no transaction of its own) — callers run inside theirs.
+        """
+        slot = self.store.get_ice_slot(ice_slot_id)
+        if slot is None:
+            raise NotFoundError(f"Ice slot {ice_slot_id} not found.",
+                                details={"reason": "slot_missing"})
+        if slot.slot_type != IceSlotType.GAME:
+            raise ValidationError(
+                "Only game ice slots can host a game (not maintenance / "
+                "public skate / practice / tournament).",
+                details={"reason": "not_game_slot",
+                         "slot_type": slot.slot_type.value})
+        if slot.status != IceSlotStatus.AVAILABLE:
+            raise ScheduleConflictError(
+                f"Ice slot {ice_slot_id} is not available.",
+                details={"reason": "slot_unavailable",
+                         "slot_status": slot.status.value})
+        clash = self.store.game_using_ice_slot(ice_slot_id)
+        if clash is not None and clash.id != exclude_game_id:
+            raise ScheduleConflictError(
+                f"Ice slot {ice_slot_id} is already used by game {clash.id}.",
+                details={"reason": "slot_already_filled",
+                         "conflict_game_id": clash.id})
+        return slot
+
+    def _assert_slot_free_for_game(self, ice_slot_id, home_team_id, away_team_id,
+                                   *, exclude_game_id=None):
+        """Shared final conflict check for placing a game on an ice slot (#277).
+
+        THE single choke point that create_game, move_game, AND the draft-commit
+        path all route through, so a committed draft is held to exactly the same
+        rules as a manual placement (#277 acceptance: schedule commits run the
+        same final conflict check as manual moves — there is no draft-only
+        exception). Runs the physical-placement checker (:meth:`_assert_slot_free`,
+        where the #277 turnover/curfew policies layer) AND rejects placing either
+        team on an overlapping fixture. Returns the resolved slot on success;
+        raises a structured error carrying ``details["reason"]`` (adds
+        ``team_overlap`` to the physical codes) otherwise. ``exclude_game_id`` is
+        the game being moved — excluded from the slot-in-use and team-overlap
+        checks so a move never conflicts with itself.
+
+        A draft that would double-book a team is rejected atomically at commit,
+        exactly like a manual create/move; the draft-review issue flags
+        (``list_draft_games``) remain a pre-commit heads-up, not a substitute for
+        this final gate.
+
+        Read-only (no transaction of its own) — callers run inside theirs.
+        """
+        slot = self._assert_slot_free(ice_slot_id, exclude_game_id=exclude_game_id)
+        for ex in self.store.all_games():
+            if ex.id == exclude_game_id or ex.cancelled or ex.ice_slot_id is None:
+                continue
+            ex_slot = self.store.get_ice_slot(ex.ice_slot_id)
+            if ex_slot is None:
+                continue
+            overlaps = intervals_overlap(slot.start_time, slot.end_time,
+                                         ex_slot.start_time, ex_slot.end_time)
+            same_team = (ex.home_team_id in (home_team_id, away_team_id)
+                         or ex.away_team_id in (home_team_id, away_team_id))
+            if overlaps and same_team:
+                raise ScheduleConflictError(
+                    f"A team already has an overlapping game {ex.id}.",
+                    details={"reason": "team_overlap", "conflict_game_id": ex.id})
+        return slot
+
     @_transactional
     def create_game(self, season_id: str, division_id: str, home_team_id: str,
                     away_team_id: str, ice_slot_id: str,
@@ -3015,6 +3271,16 @@ class SetupService:
                     actor_id: Optional[str] = None,
                     league_id: Optional[str] = None,
                     game_type: str = GameType.REGULAR.value) -> Game:
+        # #277/#313 — lock both teams then the target slot's rink (Team→Rink→Season
+        # order) BEFORE the Season guard, so the final check is atomic against a
+        # concurrent placement sharing a team AND against the ice-availability
+        # builder, which revalidates its preview token under the same per-rink lock
+        # (Rink before Season matches the builder's Program→Rink→Season and avoids
+        # deadlocking it). See _lock_teams / _lock_rinks for the ordering contract.
+        self._lock_teams((home_team_id, away_team_id))
+        _target = self.store.get_ice_slot(ice_slot_id)
+        if _target is not None:
+            self._lock_rinks((_target.rink_id,))
         season = self._require_active_season(season_id)  # #159 read-only guard
 
         # #283 Slice D: a Game is REGULAR (counts toward standings, bound to one
@@ -3127,38 +3393,14 @@ class SetupService:
                          "expected_league_id": scoped_league_id,
                          "registered_league_id": reg_league_id})
 
-        slot = self.store.get_ice_slot(ice_slot_id)
-        if slot is None:
-            raise NotFoundError(f"Ice slot {ice_slot_id} not found.")
-        if slot.slot_type != IceSlotType.GAME:
-            raise ValidationError(
-                "Only game ice slots can host a game (not maintenance / "
-                "public skate / practice / tournament)."
-            )
-        if slot.status != IceSlotStatus.AVAILABLE:
-            raise ScheduleConflictError(
-                f"Ice slot {ice_slot_id} is not available."
-            )
-        clash = self.store.game_using_ice_slot(ice_slot_id)
-        if clash is not None:
-            raise ScheduleConflictError(
-                f"Ice slot {ice_slot_id} is already used by game {clash.id}."
-            )
-        # Neither team may already have an overlapping (non-cancelled) game.
-        for ex in self.store.all_games():
-            if ex.cancelled or ex.ice_slot_id is None:
-                continue
-            ex_slot = self.store.get_ice_slot(ex.ice_slot_id)
-            if ex_slot is None:
-                continue
-            overlaps = intervals_overlap(slot.start_time, slot.end_time,
-                                         ex_slot.start_time, ex_slot.end_time)
-            same_team = (ex.home_team_id in (home_team_id, away_team_id)
-                         or ex.away_team_id in (home_team_id, away_team_id))
-            if overlaps and same_team:
-                raise ScheduleConflictError(
-                    f"A team already has an overlapping game {ex.id}."
-                )
+        # Shared final conflict check (#277): create/move/draft-commit all route
+        # through the one checker so they enforce identical slot + team-overlap
+        # rules (and, in the policy slice, turnover + curfew). The team locks
+        # taken above make the team-overlap half atomic; the one-game-per-slot
+        # half is backstopped by the ux_games_active_ice_slot partial unique index
+        # (migration 022), so a race-losing insert fails with ice_slot_taken.
+        slot = self._assert_slot_free_for_game(
+            ice_slot_id, home_team_id, away_team_id)
 
         rink = self.store.get_rink(slot.rink_id)
         # #283 Slice E: a REGULAR game references its exact LeagueSeason (its
@@ -3233,23 +3475,107 @@ class SetupService:
                 f"{label} has been published.", include_public=True)
         return game
 
-    @_transactional
     def move_game(self, game_id: str, new_ice_slot_id: str, reason: str = "",
                   actor_id: Optional[str] = None) -> Game:
         """Move a game to another available game ice slot (drag/drop)."""
+        return self._retry_on_move_race(
+            lambda: self._move_game_locked(
+                game_id, new_ice_slot_id, reason=reason, actor_id=actor_id),
+            game_id=game_id)
+
+    def _retry_on_move_race(self, attempt_fn, *, game_id=None):
+        """Run ``attempt_fn`` inside a fresh transaction, up to 3 times,
+        converting the internal ``_MoveGameRaced`` retry signal into a stable
+        ``ConcurrencyConflictError`` once retries are exhausted (#314 review).
+
+        ``move_game``'s own transaction boundary lives here (not ``@_transactional``
+        on the public method) so a raced attempt can roll back — releasing every
+        lock it took — and retry clean in a NEW transaction, rather than trying to
+        widen an already-held lock set mid-transaction. The league-scoped override
+        shares this same helper so its own pre-check + the base's locked body run
+        as one attempt together. ``game_id`` is only for the exhausted-retry error
+        detail; callers that don't have one handy may omit it."""
+        for attempt in range(3):
+            try:
+                with self.store.transaction():
+                    return attempt_fn()
+            except _MoveGameRaced:
+                if attempt == 2:
+                    raise ConcurrencyConflictError(
+                        "This game's ice changed while processing the move; "
+                        "please retry.",
+                        {"reason": "move_raced", "game_id": game_id})
+
+    def _move_game_locked(self, game_id: str, new_ice_slot_id: str,
+                          reason: str = "",
+                          actor_id: Optional[str] = None,
+                          scope_check=None) -> Game:
+        """``move_game``'s locked body — runs inside the caller's transaction
+        (``move_game`` itself, or the league-scoped override's own attempt via
+        ``_retry_on_move_race``). Raises ``_MoveGameRaced`` to signal a clean
+        retry; the caller's transaction rolls back, so no partial write.
+
+        ``scope_check`` (#314 review) is an optional ``(game, new_slot) -> None``
+        hook the league-scoped override supplies to re-validate league-ice
+        eligibility (``require_game_league_id`` / ``require_slot_belongs_to_season``)
+        under the Team/Rink/Season locks just acquired above — called with the
+        FRESH, post-lock ``game`` and the resolved target slot, after the
+        same-slot no-op check (a no-op move never needs re-scoping) and before
+        the final conflict check or any write. The base class has no notion of
+        league scope itself, so this is a no-op unless a caller supplies one."""
         game = self.store.get_game(game_id)
         if game is None:
             raise NotFoundError(f"Game {game_id} not found.",
                                 details={"reason": "game_missing"})
+        # #277/#313 — lock both of the game's teams then the source AND target
+        # slots' rinks (Team→Rink→Season order) BEFORE the Season guard, so the
+        # release-old + allocate-new is atomic against a concurrent placement
+        # sharing a team AND against the ice-availability builder on either rink
+        # (Rink before Season matches the builder and avoids deadlocking it).
+        self._lock_teams((game.home_team_id, game.away_team_id))
+        # #314 review — re-read NOW that the Team lock is held, not the
+        # pre-lock locator above. move_game is the ONLY writer of an existing
+        # Game's ice_slot_id, and it always takes this same Team lock first, so
+        # THIS read is the definitive, stable current slot for the rest of this
+        # transaction. Locking rinks from the pre-lock snapshot instead was the
+        # bug: a move queued behind this same Team lock could still be holding
+        # a now-stale source Rink after the lock-holder it waited on already
+        # relocated the game — leaving the ACTUAL current Rink unlocked while
+        # this move frees a slot on it, reopening the exact builder-vs-move
+        # race the Rink lock (#313) was meant to close.
+        game = self.store.get_game(game_id)
+        if game is None:
+            raise NotFoundError(f"Game {game_id} not found.",
+                                details={"reason": "game_missing"})
+        _mv_rinks = set()
+        for _sid in (new_ice_slot_id, game.ice_slot_id):
+            _s = self.store.get_ice_slot(_sid) if _sid else None
+            if _s is not None:
+                _mv_rinks.add(_s.rink_id)
+        self._lock_rinks(_mv_rinks)
         self._guard_game_season(game)  # #159 read-only guard
         # #159 r15 — re-fetch under the Season lock (the pre-lock read was a
-        # locator). A concurrent move_game/publish_game commits under the same
-        # Season lock; acting on the stale object would release the WRONG old
-        # slot and clobber the game's current slot/time/published state.
+        # locator). A concurrent publish_game (which does not take the Team
+        # lock) commits under the same Season lock; acting on the stale object
+        # would clobber the game's current published/locked state.
         game = self.store.get_game(game_id)
         if game is None:
             raise NotFoundError(f"Game {game_id} not found.",
                                 details={"reason": "game_missing"})
+        # #314 review — defensive verify: the Rinks we hold MUST be exactly the
+        # game's CURRENT source Rink plus the target slot's Rink. Provably true
+        # given the Team lock makes ice_slot_id stable for this whole
+        # transaction (see above) — but cheap, explicit insurance against a
+        # future writer that skips the Team-lock convention beats silently
+        # trusting a lock set we can no longer prove is right; retry clean
+        # rather than proceed against it.
+        _now_rinks = set()
+        for _sid in (new_ice_slot_id, game.ice_slot_id):
+            _s = self.store.get_ice_slot(_sid) if _sid else None
+            if _s is not None:
+                _now_rinks.add(_s.rink_id)
+        if _now_rinks != _mv_rinks:
+            raise _MoveGameRaced()
         if game.cancelled:
             raise ValidationError("Cannot move a cancelled game.",
                                   details={"reason": "game_cancelled"})
@@ -3266,35 +3592,15 @@ class SetupService:
         if new_slot.id == game.ice_slot_id:
             raise ValidationError("Game is already in that ice slot.",
                                   details={"reason": "same_slot"})
-        if new_slot.slot_type != IceSlotType.GAME:
-            raise ValidationError(
-                "Only game ice slots can host a game (not maintenance / "
-                "public skate / practice / tournament).",
-                details={"reason": "not_game_slot",
-                         "slot_type": new_slot.slot_type.value},
-            )
-        if new_slot.status != IceSlotStatus.AVAILABLE:
-            raise ScheduleConflictError(
-                f"Ice slot {new_ice_slot_id} is not available.",
-                details={"reason": "slot_unavailable",
-                         "slot_status": new_slot.status.value},
-            )
-        # Neither team may already have an overlapping game (excluding this one).
-        for ex in self.store.all_games():
-            if ex.id == game_id or ex.cancelled or ex.ice_slot_id is None:
-                continue
-            ex_slot = self.store.get_ice_slot(ex.ice_slot_id)
-            if ex_slot is None:
-                continue
-            overlaps = intervals_overlap(new_slot.start_time, new_slot.end_time,
-                                         ex_slot.start_time, ex_slot.end_time)
-            same_team = (ex.home_team_id in (game.home_team_id, game.away_team_id)
-                         or ex.away_team_id in (game.home_team_id, game.away_team_id))
-            if overlaps and same_team:
-                raise ScheduleConflictError(
-                    f"A team already has an overlapping game {ex.id}.",
-                    details={"reason": "team_overlap", "conflict_game_id": ex.id},
-                )
+        if scope_check is not None:
+            scope_check(game, new_slot)
+        # Shared final conflict check (#277) — identical rules to create +
+        # draft-commit; excludes THIS game so a move never conflicts with itself.
+        # The team locks taken above make the team-overlap half atomic; the
+        # one-game-per-slot half is backstopped by ux_games_active_ice_slot.
+        new_slot = self._assert_slot_free_for_game(
+            new_ice_slot_id, game.home_team_id, game.away_team_id,
+            exclude_game_id=game_id)
 
         old_slot_id = game.ice_slot_id
         if old_slot_id:

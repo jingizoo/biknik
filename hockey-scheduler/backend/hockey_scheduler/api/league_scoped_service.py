@@ -7,11 +7,12 @@ stale or legacy row cannot bypass the same league-ice invariant.
 
 from datetime import datetime
 
-from ..domain import Game
-from ..domain.errors import DomainError
+from ..domain import Game, IceSlotStatus
+from ..domain.errors import DomainError, ValidationError
 from ..services.league_scope import (
     require_game_league_id,
     require_slot_belongs_to_season,
+    require_slots_belong_to_locked_season,
 )
 from .service import ApiService as _BaseApiService
 from .service import catch
@@ -68,13 +69,7 @@ class ApiService(_BaseApiService):
             slot_ids=slot_ids, constraints=constraints)
         if isinstance(proposal, dict) and proposal.get("error"):
             return proposal
-
-        # Revalidate every proposed slot before the first write. This closes the
-        # commit boundary even if inventory changed after an earlier preview.
         resolved_season_id = proposal["season_id"]
-        for row in proposal["draft_games"]:
-            require_slot_belongs_to_season(
-                self.store, row["ice_slot_id"], resolved_season_id)
 
         # The Division-only proposal's own "league_id" is this tenancy
         # layer's frozen Program-scoped vocabulary (league_scope.py's
@@ -100,8 +95,71 @@ class ApiService(_BaseApiService):
         # guard and the writes (autocommit would drop the FOR UPDATE lock at the
         # end of the check) and the batch stays all-or-nothing.
         with self.store.transaction():
-            self._guard_active_seasons([resolved_season_id])
+            # #277/#313 — lock every team the batch places, then every rink it
+            # places onto (Team→Rink→Season order, before the Season guard) so each
+            # per-row check + ALLOCATE is atomic against a concurrent placement
+            # sharing a team AND against the ice-availability builder on those rinks
+            # (Rink before Season matches the builder and avoids deadlocking it).
+            # One globally-sorted pre-pass fixes the lock order for the whole batch;
+            # see SetupService._lock_teams / _lock_rinks for the ordering contract.
+            self.setup._lock_teams(
+                t for row in proposal["draft_games"]
+                for t in (row["home_team_id"], row["away_team_id"]))
+            _batch_rinks = set()
             for row in proposal["draft_games"]:
+                _s = self.store.get_ice_slot(row["ice_slot_id"])
+                if _s is not None:
+                    _batch_rinks.add(_s.rink_id)
+            self.setup._lock_rinks(_batch_rinks)
+            self._guard_active_seasons([resolved_season_id])
+            # Resolve the exact LeagueSeason after the Season lock. A regular
+            # draft must carry this identity so publish/move can enforce the
+            # same competition scope, including league-wide rows with no
+            # Division.
+            draft_ls = self.store.league_season_for(
+                canonical_league_id, resolved_season_id
+            ) if canonical_league_id else None
+            if draft_ls is None:
+                raise ValidationError(
+                    "The draft's League is not linked to this Season.",
+                    {"reason": "draft_league_season_missing",
+                     "league_id": canonical_league_id,
+                     "season_id": resolved_season_id})
+            draft_ls_id = draft_ls.id
+            # #314 review — re-validate every proposed slot's Season eligibility
+            # HERE, under the Rink+Season locks just acquired, not before this
+            # transaction opened (as a stale prevalidation could leave a window
+            # for a concurrent SeasonVenueAccess revoke or Rink→Venue
+            # reassignment to commit and then be missed). Before ANY Game,
+            # slot-status, or audit write for the whole batch — a bad row rolls
+            # back everything, matching this commit's existing all-or-nothing
+            # contract; shared with move_game via the same locked helper.
+            require_slots_belong_to_locked_season(
+                self.store, [row["ice_slot_id"] for row in proposal["draft_games"]],
+                resolved_season_id)
+            # #314 review — also re-validate every proposed row's competition
+            # participation HERE, under the same locks: a concurrent
+            # unregister_team_from_season or a team-to-league transfer can
+            # commit in the SAME gap a stale pre-lock proposal would miss, after
+            # which the write would persist a Game for a team no longer a valid
+            # participant. Reuses the identical check create_game enforces.
+            self.setup._require_batch_team_participation(
+                resolved_season_id, draft_ls_id, proposal["draft_games"])
+            for row in proposal["draft_games"]:
+                # #277: run the SAME final conflict check as create_game /
+                # move_game before persisting — slot free (exists, GAME,
+                # AVAILABLE, not already held) AND neither team on an overlapping
+                # fixture — so a regenerated proposal that would double-book a
+                # slot OR a team fails atomically (the whole batch rolls back)
+                # instead of silently persisting a bad fixture. Per #277's
+                # acceptance, schedule commits enforce the identical check as
+                # manual moves; there is no draft-only exception. Returns the
+                # resolved slot to allocate below. (The base facade's own
+                # commit_draft_schedule uses this same check; this override
+                # reimplements the commit body for league-scope validation, so it
+                # must enforce the identical invariant.)
+                slot = self.setup._assert_slot_free_for_game(
+                    row["ice_slot_id"], row["home_team_id"], row["away_team_id"])
                 game = Game(
                     id=self.store.next_id("game"),
                     home_team_id=row["home_team_id"],
@@ -114,10 +172,18 @@ class ApiService(_BaseApiService):
                     league_id=canonical_league_id,
                     division_id=row.get("division_id"),
                     ice_slot_id=row.get("ice_slot_id"),
+                    league_season_id=draft_ls_id,
                     published=False,
                     is_draft=True,
                 )
                 self.store.add_game(game)
+                # A committed draft occupies its ice: flip the backing slot to
+                # ALLOCATED (exactly as create_game / move_game do) so later
+                # scheduling and the shared checker read it as taken instead of
+                # offering the same occupied ice again. The check above already
+                # rejected any slot a game holds, so this only flips AVAILABLE.
+                slot.status = IceSlotStatus.ALLOCATED
+                self.store.save_ice_slot(slot)
                 created.append(self._draft_game_dto(game))
             if season_id and league_id:
                 scope_type, scope_id = "league", league_id
