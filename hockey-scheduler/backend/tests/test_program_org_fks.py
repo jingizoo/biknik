@@ -96,10 +96,15 @@ def _downgrade_042(store):
             cur.execute("PRAGMA defer_foreign_keys = ON")
             cur.execute("CREATE TABLE programs_old (id TEXT PRIMARY KEY, name TEXT, "
                         "country TEXT, timezone TEXT, operator_organization_id TEXT, "
-                        "external_ref TEXT)")
+                        "external_ref TEXT, "
+                        # #277 policy columns (migration 046) so the full-SPEC
+                        # add_program insert still fits this pre-042 rebuild.
+                        "turnover_minutes INTEGER, curfew_local TEXT, "
+                        "warmup_minutes INTEGER, resurface_minutes INTEGER)")
             cur.execute("INSERT INTO programs_old SELECT id, name, country, "
-                        "timezone, operator_organization_id, external_ref "
-                        "FROM programs")
+                        "timezone, operator_organization_id, external_ref, "
+                        "turnover_minutes, curfew_local, warmup_minutes, "
+                        "resurface_minutes FROM programs")
             cur.execute("DROP TABLE programs")
             cur.execute("ALTER TABLE programs_old RENAME TO programs")
             cur.execute("CREATE INDEX IF NOT EXISTS ix_programs_operator_organization "

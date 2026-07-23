@@ -27,7 +27,10 @@ from hockey_scheduler.domain import SeasonTeamRegistration, Team
 
 # Canonical v2 JSON key sets (contrast with the legacy sets in the v1 contract).
 PROGRAM_KEYS = {"id", "name", "country", "timezone", "operator_organization_id",
-                "external_ref"}
+                "external_ref",
+                # #277: Program-level ice-operations policy defaults.
+                "turnover_minutes", "curfew_local",
+                "warmup_minutes", "resurface_minutes"}
 SEASON_KEYS = {"id", "program_id", "name", "start_date", "end_date",
                "external_ref", "status", "archived_at"}
 LEAGUE_KEYS = {"id", "season_id", "name", "sort_order", "external_ref"}

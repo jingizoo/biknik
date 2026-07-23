@@ -35,7 +35,10 @@ from hockey_scheduler.store import InMemoryStore
 # The exact legacy v1 JSON key set for each setup response (the frozen contract).
 ORG_KEYS = {"id", "name", "short_name", "external_ref"}
 PROGRAM_KEYS = {"id", "name", "country", "timezone", "organization_id",
-                "external_ref"}
+                "external_ref",
+                # #277: Program-level ice-operations policy defaults.
+                "turnover_minutes", "curfew_local",
+                "warmup_minutes", "resurface_minutes"}
 SEASON_KEYS = {"id", "league_id", "name", "start_date", "end_date", "external_ref"}
 LEVEL_KEYS = {"id", "season_id", "name", "sort_order", "external_ref"}
 DIVISION_KEYS = {"id", "season_id", "name", "age_group", "level_id", "external_ref"}
