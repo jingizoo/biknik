@@ -102,18 +102,20 @@ class ApiService(_BaseApiService):
         with self.store.transaction():
             self._guard_active_seasons([resolved_season_id])
             for row in proposal["draft_games"]:
-                # #277: run the SAME slot-freeness check as create_game /
-                # move_game before persisting (the slot exists, is a GAME slot,
-                # is AVAILABLE, and is not already held by another active game),
-                # so a regenerated proposal that would double-book ICE fails
-                # atomically (the whole batch rolls back) instead of silently
-                # persisting onto an occupied slot. A draft's team double-bookings
-                # are surfaced in review, not rejected here. Returns the resolved
-                # slot to allocate below. (The base facade's own
+                # #277: run the SAME final conflict check as create_game /
+                # move_game before persisting — slot free (exists, GAME,
+                # AVAILABLE, not already held) AND neither team on an overlapping
+                # fixture — so a regenerated proposal that would double-book a
+                # slot OR a team fails atomically (the whole batch rolls back)
+                # instead of silently persisting a bad fixture. Per #277's
+                # acceptance, schedule commits enforce the identical check as
+                # manual moves; there is no draft-only exception. Returns the
+                # resolved slot to allocate below. (The base facade's own
                 # commit_draft_schedule uses this same check; this override
                 # reimplements the commit body for league-scope validation, so it
-                # must enforce the identical slot invariant.)
-                slot = self.setup._assert_slot_free(row["ice_slot_id"])
+                # must enforce the identical invariant.)
+                slot = self.setup._assert_slot_free_for_game(
+                    row["ice_slot_id"], row["home_team_id"], row["away_team_id"])
                 game = Game(
                     id=self.store.next_id("game"),
                     home_team_id=row["home_team_id"],

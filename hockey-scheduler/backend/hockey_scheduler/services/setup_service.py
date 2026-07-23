@@ -3008,11 +3008,8 @@ class SetupService:
 
     # -- manual game creation ---------------------------------------------
     def _assert_slot_free(self, ice_slot_id, *, exclude_game_id=None):
-        """Shared physical-placement checker for putting a game on ice (#277).
+        """Physical-placement half of the game-placement check (#277).
 
-        THE single conflict choke point that create_game, move_game, AND the
-        draft-commit path all route through, so a committed draft occupies its ice
-        under exactly the same physical + policy rules as a manual placement.
         Checks that the slot exists, is a GAME slot, is AVAILABLE, and is not
         already used by another active game. Returns the resolved slot on success;
         raises a structured error carrying ``details["reason"]`` (``slot_missing``
@@ -3021,19 +3018,12 @@ class SetupService:
         ``exclude_game_id`` is the game being moved — excluded from the slot-in-use
         check so a move never conflicts with itself.
 
-        The #277 turnover-buffer and curfew POLICIES layer onto THIS method (the
-        shared checker) in the policy slice, so they apply to draft commits just
-        as they do to manual placement — NOT onto
-        :meth:`_assert_slot_free_for_game`, which adds only the team-overlap scan.
-
-        Team double-booking is the ONE deliberate exception (recorded here as the
-        product decision for #277 / #314): it is layered on for manual create/move
-        via :meth:`_assert_slot_free_for_game`, but a draft's team overlaps are
-        surfaced in review (``list_draft_games`` issues), NOT rejected at commit —
-        a committed draft is provisional, and re-drafting teams that already hold
-        fixtures is a normal review-then-resolve step (the demo seed does exactly
-        that). Draft commit therefore stops at this physical + policy check by
-        design; every other rule stays shared.
+        This is a decomposition of :meth:`_assert_slot_free_for_game`, not a
+        separate entry point: every placement path (create_game, move_game and the
+        draft-commit path) goes through the full checker, which calls this first.
+        The #277 turnover-buffer and curfew POLICIES layer onto THIS method in the
+        policy slice, so they apply uniformly to manual placement and committed
+        drafts alike.
 
         Read-only (no transaction of its own) — callers run inside theirs.
         """
@@ -3062,22 +3052,24 @@ class SetupService:
 
     def _assert_slot_free_for_game(self, ice_slot_id, home_team_id, away_team_id,
                                    *, exclude_game_id=None):
-        """Manual-placement check: the shared physical checker PLUS team overlap (#277).
+        """Shared final conflict check for placing a game on an ice slot (#277).
 
-        create_game and move_game route through this — it runs the shared physical
-        + policy checker (:meth:`_assert_slot_free`, which is where the #277
-        turnover/curfew policies live) AND additionally rejects placing either
+        THE single choke point that create_game, move_game, AND the draft-commit
+        path all route through, so a committed draft is held to exactly the same
+        rules as a manual placement (#277 acceptance: schedule commits run the
+        same final conflict check as manual moves — there is no draft-only
+        exception). Runs the physical-placement checker (:meth:`_assert_slot_free`,
+        where the #277 turnover/curfew policies layer) AND rejects placing either
         team on an overlapping fixture. Returns the resolved slot on success;
         raises a structured error carrying ``details["reason"]`` (adds
-        ``team_overlap`` to the shared checker's codes) otherwise.
-        ``exclude_game_id`` is the game being moved — excluded from the slot-in-use
-        and team-overlap checks so a move never conflicts with itself.
+        ``team_overlap`` to the physical codes) otherwise. ``exclude_game_id`` is
+        the game being moved — excluded from the slot-in-use and team-overlap
+        checks so a move never conflicts with itself.
 
-        The team-overlap scan is the ONE check the draft-commit path deliberately
-        does not run (see :meth:`_assert_slot_free` for the recorded product
-        decision); it is manual-placement-only, so committed drafts surface team
-        conflicts in review instead of failing the commit. Turnover and curfew do
-        NOT live here — they layer onto the shared checker so drafts get them too.
+        A draft that would double-book a team is rejected atomically at commit,
+        exactly like a manual create/move; the draft-review issue flags
+        (``list_draft_games``) remain a pre-commit heads-up, not a substitute for
+        this final gate.
 
         Read-only (no transaction of its own) — callers run inside theirs.
         """

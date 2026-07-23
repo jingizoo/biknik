@@ -1,13 +1,14 @@
 """Shared final slot-conflict check (#277 Slice A).
 
-create_game and move_game route through SetupService._assert_slot_free_for_game,
-so they enforce identical slot + team-overlap rules and emit the same
-machine-readable reason codes. The draft-commit path routes through its
-slot-scoped half, ._assert_slot_free (the slot exists, is a GAME slot, is
-AVAILABLE, and is not already held by another active game) — a committed draft
-occupies its ice, but a draft's team double-bookings are surfaced in review, not
-rejected at commit. This pins the checker's contract directly and confirms
-create_game now surfaces the same structured ``details["reason"]`` codes
+create_game, move_game AND the draft-commit path all route through
+SetupService._assert_slot_free_for_game, so they enforce identical slot +
+team-overlap rules and emit the same machine-readable reason codes (#277
+acceptance: schedule commits run the same final check as manual moves — no
+draft-only exception). ._assert_slot_free is the physical-placement half it
+decomposes into (slot exists, is a GAME slot, is AVAILABLE, not already held by
+another active game); the #277 turnover/curfew policies layer onto that half so
+they apply to every placement path. This pins the checker's contract directly
+and confirms create_game surfaces the same structured ``details["reason"]`` codes
 move_game already did. Runs on Memory / SQLite / PostgreSQL.
 """
 
@@ -103,12 +104,13 @@ class SharedSlotCheckContract:
         self.assertEqual(cm.exception.details["reason"], "team_overlap")
         self.assertEqual(cm.exception.details["conflict_game_id"], self.game.id)
 
-    def test_slot_free_stops_at_slot_and_ignores_team_overlap(self):
-        # The slot-scoped half (what the draft-commit path uses) enforces slot
-        # freeness only: slot_overlap is a free GAME slot, so it returns even
-        # though `home` already plays an overlapping game. A draft's team
-        # double-booking is surfaced in review, not rejected at commit — the
-        # deliberate difference from the full create/move checker above.
+    def test_slot_free_is_the_physical_half_without_team_overlap(self):
+        # _assert_slot_free is the physical-placement decomposition the full
+        # checker calls first: it enforces slot freeness ONLY (turnover/curfew
+        # layer here in the policy slice). slot_overlap is a free GAME slot, so it
+        # returns even though `home` already plays an overlapping game — the
+        # team-overlap scan lives in _assert_slot_free_for_game above, which every
+        # placement path (create/move/draft-commit) actually calls.
         got = self.svc._assert_slot_free(self.slot_overlap.id)
         self.assertEqual(got.id, self.slot_overlap.id)
 

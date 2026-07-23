@@ -2750,15 +2750,17 @@ class ApiService:
             self._guard_active_seasons([resolved_season_id])
             created = []
             for d in proposal["draft_games"]:
-                # #277: the draft-commit path runs the SAME slot-freeness check
-                # as create/move (the slot exists, is a GAME slot, is AVAILABLE,
-                # and is not already held by another active game), so a
-                # regenerated proposal that would double-book ICE fails
-                # atomically (the whole batch rolls back) instead of silently
-                # persisting onto an occupied slot. A draft's team double-bookings
-                # are surfaced in review, not rejected here (see _assert_slot_free).
-                # Returns the resolved slot to allocate below.
-                slot = self.setup._assert_slot_free(d["ice_slot_id"])
+                # #277: the draft-commit path runs the SAME final conflict check
+                # as create/move — the slot is free (exists, GAME, AVAILABLE, not
+                # already held) AND neither team is put on an overlapping fixture
+                # — so a regenerated proposal that would double-book a slot OR a
+                # team fails atomically (the whole batch rolls back) instead of
+                # silently persisting a bad fixture. Per #277's acceptance,
+                # schedule commits enforce the identical check as manual moves;
+                # there is no draft-only exception. Returns the resolved slot to
+                # allocate below.
+                slot = self.setup._assert_slot_free_for_game(
+                    d["ice_slot_id"], d["home_team_id"], d["away_team_id"])
                 g = Game(
                     id=self.store.next_id("game"),
                     home_team_id=d["home_team_id"], away_team_id=d["away_team_id"],

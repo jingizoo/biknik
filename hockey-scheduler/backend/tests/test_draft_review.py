@@ -135,6 +135,38 @@ class DraftReviewServiceTest(unittest.TestCase):
         self.assertEqual([a for a in self.store.all_setup_audit()
                           if a.action == "draft_schedule_committed"], [])
 
+    def test_commit_rejects_team_overlap_and_rolls_back(self):
+        # #277: draft commit runs the SAME final check as manual create/move,
+        # team-overlap included — a proposal that would put a team on a fixture
+        # overlapping one it already holds is REJECTED atomically at commit, not
+        # merely flagged in review. There is no draft-only exception: schedule
+        # commits and manual moves enforce the identical check.
+        proposal = self.api.draft_season_schedule("d")
+        rows = proposal["draft_games"]
+        self.assertTrue(rows)
+        row = rows[0]
+        slot0 = self.store.get_ice_slot(row["ice_slot_id"])
+        # Give that row's teams an existing game overlapping its slot time (a
+        # second rink, same instant — a team can't be two places at once).
+        self.store.add_rink(Rink(id="r2", venue_id="v", name="Aux"))
+        self.store.add_ice_slot(IceSlot(id="conflict_slot", rink_id="r2",
+                                        start_time=slot0.start_time,
+                                        end_time=slot0.end_time))
+        self.store.add_game(Game(
+            id="existing", home_team_id=row["home_team_id"],
+            away_team_id=row["away_team_id"], start_time=slot0.start_time,
+            end_time=slot0.end_time, ice_slot_id="conflict_slot",
+            division_id="d", season_id="se", league_id="lg"))
+        self.api.draft_season_schedule = lambda *a, **k: proposal
+        res = self.api.commit_draft_schedule("d")
+        self.assertIn("error", res)
+        self.assertEqual(res["error"]["details"]["reason"], "team_overlap")
+        # Atomic rollback: no draft games created, no batch audit written; only
+        # the pre-seeded existing game remains.
+        self.assertEqual([g for g in self.store.all_games() if g.is_draft], [])
+        self.assertEqual([a for a in self.store.all_setup_audit()
+                          if a.action == "draft_schedule_committed"], [])
+
     def test_publish_makes_drafts_public(self):
         self.api.commit_draft_schedule("d")
         res = self.api.publish_draft_games(all_drafts=True)
@@ -358,6 +390,22 @@ class DraftReviewHttpTest(unittest.TestCase):
         except urllib.error.HTTPError as e:
             return e.code, json.loads(e.read() or b"{}")
 
+    def _clear_schedule(self):
+        """#277: draft commit now runs the SAME final conflict check as manual
+        moves, team-overlap included. The demo seeds a full schedule, so
+        re-drafting a division would (correctly) fail team_overlap against those
+        existing fixtures. These tests exercise the commit/publish/discard
+        WORKFLOW, so start them from a clean slate — remove the pre-seeded games
+        and free their slots."""
+        store = srv.STATE.api.store
+        for g in list(store.all_games()):
+            if g.ice_slot_id:
+                slot = store.get_ice_slot(g.ice_slot_id)
+                if slot is not None and slot.status == IceSlotStatus.ALLOCATED:
+                    slot.status = IceSlotStatus.AVAILABLE
+                    store.save_ice_slot(slot)
+            store.delete_game(g.id)
+
     def test_only_operator_can_commit_publish_discard(self):
         for who in ("coach", "player", "viewer"):
             c = self._client()
@@ -369,9 +417,29 @@ class DraftReviewHttpTest(unittest.TestCase):
             status, _ = self._req(c, "GET", "/api/scheduler/drafts")
             self.assertEqual(status, 403, who)
 
+    def test_commit_rejects_team_overlap_over_http(self):
+        # #277: over HTTP too, draft commit runs the SAME final conflict check as
+        # manual moves — team-overlap included. The demo seeds a full schedule, so
+        # re-drafting its division proposes fixtures that overlap teams' existing
+        # games; the commit is refused with team_overlap and writes nothing (no
+        # draft games, no batch audit). No draft-only exception.
+        c = self._client()
+        self._req(c, "POST", "/api/auth/login",
+                  {"username": "admin", "password": "demo"})
+        store = srv.STATE.api.store
+        drafts_before = len([g for g in store.all_games() if g.is_draft])
+        audit_before = len(store.all_setup_audit())
+        status, res = self._req(c, "POST", "/api/scheduler/commit",
+                                {"division_id": self.div})
+        self.assertNotEqual(status, 200, res)
+        self.assertEqual(res["error"]["details"]["reason"], "team_overlap")
+        self.assertEqual(
+            len([g for g in store.all_games() if g.is_draft]), drafts_before)
+        self.assertEqual(len(store.all_setup_audit()), audit_before)
+
     def test_commit_rolls_back_over_http_on_a_slot_conflict(self):
-        # #277/#314: the authenticated draft-commit endpoint runs the shared
-        # physical-placement checker (_assert_slot_free — the same choke point
+        # #277/#314: the authenticated draft-commit endpoint runs the shared final
+        # conflict check (_assert_slot_free_for_game — the same choke point
         # create/move use, and the one turnover/curfew layer onto) per row inside
         # ONE transaction. A regenerated proposal that lands on occupied ice is
         # refused and the WHOLE batch rolls back — no Games, no flipped slot
@@ -379,6 +447,7 @@ class DraftReviewHttpTest(unittest.TestCase):
         c = self._client()
         self._req(c, "POST", "/api/auth/login",
                   {"username": "admin", "password": "demo"})
+        self._clear_schedule()          # isolate the SLOT conflict from team-overlap
         api = srv.STATE.api
         store = api.store
         proposal = api.draft_season_schedule(division_id=self.div)
@@ -416,6 +485,7 @@ class DraftReviewHttpTest(unittest.TestCase):
     def test_operator_commit_and_discard_roundtrip(self):
         c = self._client()
         self._req(c, "POST", "/api/auth/login", {"username": "admin", "password": "demo"})
+        self._clear_schedule()
         status, body = self._req(c, "POST", "/api/scheduler/commit",
                                  {"division_id": self.div})
         self.assertEqual(status, 200)
@@ -433,6 +503,7 @@ class DraftReviewHttpTest(unittest.TestCase):
         c = self._client()
         self._req(c, "POST", "/api/auth/login",
                   {"username": "admin", "password": "demo"})
+        self._clear_schedule()
         status, _ = self._req(c, "POST", "/api/scheduler/commit",
                               {"division_id": self.div})
         self.assertEqual(status, 200)
