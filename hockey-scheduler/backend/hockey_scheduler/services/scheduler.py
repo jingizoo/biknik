@@ -17,9 +17,13 @@ round-robin, so Gold only ever plays Gold.
 """
 
 from datetime import date, timedelta
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from ..domain import IceSlotStatus, IceSlotType
 from ..domain.errors import ValidationError
+from ..domain.time_utils import intervals_overlap
+from .ice_availability import parse_hhmm
+from .ice_policy import effective_policy
 from .league_scope import (
     registered_team_ids_in_division,
     registered_teams_by_division_in_league,
@@ -184,12 +188,46 @@ RINK_BLACKOUT = "rink_blackout"
 MAX_PER_DAY = "max_per_day"
 MIN_REST = "min_rest"
 NO_ICE_AVAILABLE = "no_ice_available"
+# #277: the same policy reason codes the shared checker emits, so a draft never
+# proposes ice the commit's _assert_slot_free_for_game would then reject.
+CURFEW_VIOLATION = "curfew_violation"
+TURNOVER_CONFLICT = "turnover_buffer_conflict"
 
 
-def _slot_reason(slot, home, away, con, team_slots):
+def _resolve_tz(program):
+    """The Program's ``tzinfo`` for curfew wall-clock math, or ``None`` when it
+    is unknown/invalid — in which case curfew is not enforced (no zone, no
+    guess), mirroring the shared checker."""
+    name = getattr(program, "timezone", None) if program is not None else None
+    if not name:
+        return None
+    try:
+        return ZoneInfo(name)
+    except (ZoneInfoNotFoundError, ValueError):
+        return None
+
+
+def _program_for_season(store, season_id):
+    season = store.get_season(season_id) if season_id else None
+    pid = getattr(season, "program_id", None) if season is not None else None
+    return store.get_program(pid) if pid else None
+
+
+def _season_id_for_division(store, division_id):
+    """A Division's Season resolves via its LeagueSeason (#283)."""
+    division = store.get_division(division_id) if division_id else None
+    ls_id = getattr(division, "league_season_id", None) if division else None
+    ls = store.get_league_season(ls_id) if ls_id else None
+    return getattr(ls, "season_id", None) if ls else None
+
+
+def _slot_reason(slot, home, away, con, team_slots,
+                 policy=None, tz=None, rink_slots=None):
     """Why ``slot`` can't host ``home`` vs ``away`` under the constraints, as
     ``(code, message)``, or ``(None, None)`` if it can. ``team_slots`` maps
-    team_id -> [assigned start_time]."""
+    team_id -> [assigned start_time]; ``rink_slots`` maps rink_id ->
+    [(start, end)] of ice already assigned in this draft; ``policy``/``tz`` are
+    the slot's rink policy and the Program timezone for #277 turnover/curfew."""
     day = slot.start_time.date().isoformat()
     if day in con["season_blackout_dates"]:
         return SEASON_BLACKOUT, "season blackout date"
@@ -200,6 +238,29 @@ def _slot_reason(slot, home, away, con, team_slots):
         return TEAM_BLACKOUT, "team blackout date"
     if day in con["rink_blackouts"].get(slot.rink_id, ()):
         return RINK_BLACKOUT, "rink blackout date"
+    # #277 curfew: the reserved slot must end by the rink's curfew wall-clock in
+    # the Program timezone, anchored to the slot's START local date (a game past
+    # midnight still counts against that evening's curfew). Only with a zone.
+    if policy is not None and policy.curfew_local and tz is not None:
+        start_local = slot.start_time.astimezone(tz)
+        end_local = slot.end_time.astimezone(tz)
+        curfew_h, curfew_m = parse_hhmm(policy.curfew_local, "curfew_local")
+        curfew_at = start_local.replace(hour=curfew_h, minute=curfew_m,
+                                        second=0, microsecond=0)
+        if end_local > curfew_at:
+            return CURFEW_VIOLATION, "past the rink's curfew"
+    # #277 turnover: keep the rink's turnover gap from games already assigned to
+    # this rink in this draft (same reserved-window rule as the shared checker).
+    if policy is not None and (policy.turnover_minutes or 0) > 0 \
+            and rink_slots is not None:
+        turnover = policy.turnover_minutes
+        for a_start, a_end in rink_slots.get(slot.rink_id, ()):
+            if intervals_overlap(slot.start_time, slot.end_time, a_start, a_end):
+                continue
+            gap = ((a_start - slot.end_time) if slot.end_time <= a_start
+                   else (slot.start_time - a_end)).total_seconds() / 60
+            if gap < turnover:
+                return TURNOVER_CONFLICT, "insufficient turnover gap on the rink"
     if con["max_per_day"] > 0:
         for tid in (home, away):
             same_day = sum(1 for t in team_slots.get(tid, [])
@@ -215,16 +276,25 @@ def _slot_reason(slot, home, away, con, team_slots):
     return None, None
 
 
-def _assign_ice(store, pairings, slots, constraints):
+def _assign_ice(store, pairings, slots, constraints, program=None):
     """Greedy earliest-slot-first assignment shared by every entry point.
 
     ``pairings`` is ``[(home_team_id, away_team_id, division_id_or_None), ...]``
     — a league-wide draft tags each pairing with the Division its two teams
     are actually registered in (or ``None``), so the resulting rows stay
     per-pairing accurate even though one draft can span several Divisions.
-    Returns ``(draft_games, unscheduled)``.
+    ``program`` (the draft's Season's Program) supplies the #277 turnover /
+    curfew policy + timezone so a draft never proposes ice the commit's shared
+    checker would then reject. Returns ``(draft_games, unscheduled)``.
     """
     con = _normalize_constraints(constraints)
+    tz = _resolve_tz(program)
+    # Resolve each slot's effective rink policy once (rink value, else Program
+    # default, else the system default of turnover 0 / no curfew).
+    policy_by_slot = {
+        s.id: effective_policy(
+            store.get_rink(s.rink_id) if s.rink_id else None, program)
+        for s in slots}
 
     def team_name(tid):
         t = store.get_team(tid)
@@ -233,12 +303,15 @@ def _assign_ice(store, pairings, slots, constraints):
     draft_games, unscheduled = [], []
     used = set()
     team_slots = {}  # team_id -> [assigned start_time]
+    rink_slots = {}  # rink_id -> [(start, end)] assigned in this draft (turnover)
     for home, away, division_id in pairings:
         chosen, messages, codes = None, [], []
         for s in slots:
             if s.id in used:
                 continue
-            code, message = _slot_reason(s, home, away, con, team_slots)
+            code, message = _slot_reason(
+                s, home, away, con, team_slots,
+                policy=policy_by_slot.get(s.id), tz=tz, rink_slots=rink_slots)
             if code is None:
                 chosen = s
                 break
@@ -248,6 +321,8 @@ def _assign_ice(store, pairings, slots, constraints):
             used.add(chosen.id)
             team_slots.setdefault(home, []).append(chosen.start_time)
             team_slots.setdefault(away, []).append(chosen.start_time)
+            rink_slots.setdefault(chosen.rink_id, []).append(
+                (chosen.start_time, chosen.end_time))
             rink = store.get_rink(chosen.rink_id) if chosen.rink_id else None
             draft_games.append({
                 "home_team_id": home, "away_team_id": away,
@@ -326,7 +401,9 @@ def draft_schedule(store, division_id, slot_ids=None, constraints=None):
     teams = sorted(registered_team_ids_in_division(store, division_id))
     pairings = [(h, a, division_id) for h, a in round_robin_pairings(teams)]
     slots = _available_game_slots(store, slot_ids)
-    draft_games, unscheduled = _assign_ice(store, pairings, slots, constraints)
+    program = _program_for_season(store, _season_id_for_division(store, division_id))
+    draft_games, unscheduled = _assign_ice(
+        store, pairings, slots, constraints, program=program)
     return {
         "division_id": division_id, "team_count": len(teams),
         "draft_games": draft_games, "unscheduled": unscheduled,
@@ -356,7 +433,9 @@ def draft_schedule_for_league(store, season_id, league_id, division_id=None,
         pairings.extend(
             (h, a, div_id) for h, a in round_robin_pairings(sorted(team_ids)))
     slots = _available_game_slots(store, slot_ids)
-    draft_games, unscheduled = _assign_ice(store, pairings, slots, constraints)
+    program = _program_for_season(store, season_id)
+    draft_games, unscheduled = _assign_ice(
+        store, pairings, slots, constraints, program=program)
     return {
         "season_id": season_id, "league_id": league_id,
         "division_id": division_id, "team_count": len(all_teams),

@@ -130,6 +130,66 @@ class ConstraintTest(unittest.TestCase):
             self.assertTrue(u["reason"])
 
 
+class PolicyConstraintTest(unittest.TestCase):
+    """#277: the draft respects the rink's turnover gap and curfew, so it never
+    proposes ice the commit's shared checker would then reject. The seed
+    Program timezone is UTC, so wall-clock == the slot's UTC time here."""
+
+    def _set_rink(self, store, **kw):
+        rink = store.get_rink("r1")
+        for key, value in kw.items():
+            setattr(rink, key, value)
+        store.save_rink(rink)
+
+    def _two_close_slots(self, gap_minutes):
+        """Two r1 slots one hour long, ``gap_minutes`` apart, on 3 teams."""
+        base = datetime(2026, 1, 5, 18, tzinfo=UTC)
+        s = _store(3, [])
+        s.add_ice_slot(IceSlot(id="sa", rink_id="r1", start_time=base,
+                               end_time=base + timedelta(hours=1)))
+        second = base + timedelta(hours=1, minutes=gap_minutes)
+        s.add_ice_slot(IceSlot(id="sb", rink_id="r1", start_time=second,
+                               end_time=second + timedelta(hours=1)))
+        return s
+
+    def test_curfew_blocks_a_slot_ending_past_it(self):
+        s = _store(2, _days(1))               # one slot 18:00-19:00
+        self._set_rink(s, curfew_local="18:30")
+        res = draft_schedule(s, "d")
+        self.assertEqual(res["draft_games"], [])
+        self.assertIn("curfew", res["unscheduled"][0]["reason"])
+        self.assertIn("curfew_violation", res["unscheduled"][0]["reason_codes"])
+
+    def test_curfew_allows_a_slot_ending_by_it(self):
+        s = _store(2, _days(1))               # 18:00-19:00, curfew exactly 19:00
+        self._set_rink(s, curfew_local="19:00")
+        res = draft_schedule(s, "d")
+        self.assertEqual(len(res["draft_games"]), 1)
+
+    def test_turnover_gap_blocks_a_too_close_second_game(self):
+        # Two slots 30 min apart; a 45-min turnover means only one can be used.
+        s = self._two_close_slots(30)
+        self._set_rink(s, turnover_minutes=45)
+        res = draft_schedule(s, "d")
+        self.assertEqual(len(res["draft_games"]), 1)
+        self.assertTrue(any("turnover" in u["reason"] for u in res["unscheduled"]))
+        self.assertTrue(any("turnover_buffer_conflict" in u["reason_codes"]
+                            for u in res["unscheduled"]))
+
+    def test_turnover_gap_met_allows_both_games(self):
+        # The same 30-min gap satisfies a 30-min turnover (>= is fine).
+        s = self._two_close_slots(30)
+        self._set_rink(s, turnover_minutes=30)
+        res = draft_schedule(s, "d")
+        self.assertEqual(len(res["draft_games"]), 2)
+
+    def test_no_policy_matches_baseline(self):
+        # Rinks with no policy (turnover 0 / no curfew) behave exactly as before.
+        s = self._two_close_slots(30)         # no policy set
+        res = draft_schedule(s, "d")
+        self.assertEqual(len(res["draft_games"]), 2)
+
+
 class ConstraintValidationTest(unittest.TestCase):
     """Malformed ``constraints`` input yields a structured validation_error, not
     a raw Python exception across the facade boundary (#85)."""
