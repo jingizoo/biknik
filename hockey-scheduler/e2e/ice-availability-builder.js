@@ -12,7 +12,9 @@
 //     and the create button is disabled;
 //   * an exclusion date is honored (fewer slots, and it is reported);
 //   * each selected weekday carries its OWN local start/end time (#158 flow):
-//     a narrower Thursday window yields fewer Thursday games than Tuesday.
+//     a narrower Thursday window yields fewer Thursday games than Tuesday;
+//   * commit is bound to the preview: editing the template after Preview drops
+//     the preview + Create, so an edited form can never be committed.
 //
 // September 2026 has Tuesdays 1,8,15,22,29 and Thursdays 3,10,17,24 = 9 days;
 // a 18:00-22:00 window with 60-minute games + 15-minute turnover yields 3 games
@@ -220,8 +222,41 @@ async function checkViewport(browser, viewport) {
     s = await previewState(page);
     if (s.new !== 19) fail(`per-weekday windows should yield 19 new (5*3 Tue + 4*1 Thu), got ${JSON.stringify(s)}`);
 
+    // (G) Commit is bound to the preview: editing the template AFTER Preview
+    // drops the preview and its Create button, so a form edited post-preview can
+    // never be committed (the server also rejects a mismatched fingerprint). All
+    // template fields share one invalidation listener; editing a weekday time
+    // exercises it. Use a fresh rink so "zero committed" is unambiguous.
+    const rink5 = await page.evaluate(async (season) => {
+      const post = async (p, b) => (await fetch(p, {
+        method: "POST", credentials: "same-origin",
+        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
+      })).json();
+      const venue = await post("/api/setup/venue", { name: "North", league_id: null });
+      await post(`/api/v2/setup/seasons/${season}/venue-access`, { venue_id: venue.id });
+      return (await post("/api/setup/rink", { venue_id: venue.id, name: "North Ice" })).id;
+    }, ids.season);
+    await page.click("[data-ib-cancel]");
+    await page.waitForSelector("[data-ice-builder-open]", { timeout: 10000 });
+    await page.click("[data-ice-builder-open]");
+    await page.waitForSelector(".ib-form", { timeout: 10000 });
+    await page.check(`.ib-rink[value="${rink5}"]`);
+    await preview(page);
+    s = await previewState(page);
+    if (s.new < 1) fail(`bind test needs a preview with slots, got ${JSON.stringify(s)}`);
+    if (s.commitDisabled !== false) fail(`Create should be enabled on a fresh preview: ${JSON.stringify(s)}`);
+    // Edit the Thursday end time AFTER previewing -> the preview (and Create) go.
+    await page.fill("#ib-end-3", "20:30");
+    await page.waitForSelector(".ib-preview", { state: "detached", timeout: 10000 });
+    if (await page.$("[data-ib-commit]")) fail("Create must be gone after editing the template post-preview");
+    const boundCommitted = await page.evaluate(async (rink) => {
+      const ov = await (await fetch("/api/demo/overview", { credentials: "same-origin" })).json();
+      return (ov.ice_slots || []).filter((x) => x.rink_id === rink).length;
+    }, rink5);
+    if (boundCommitted !== 0) fail(`an invalidated preview must commit nothing, got ${boundCommitted}`);
+
     if (errors.length) fail(`console/page errors:\n${errors.join("\n")}`);
-    console.log(`[${viewport.label}] OK — month grid renders; builder previews ${EXPECTED_NEW} slots, reports un-granted venue, commits idempotently, honors exclusions, and applies per-weekday windows (narrow Thursday => 19).`);
+    console.log(`[${viewport.label}] OK — month grid renders; builder previews ${EXPECTED_NEW} slots, reports un-granted venue, commits idempotently, honors exclusions, applies per-weekday windows (narrow Thursday => 19), and binds commit to the preview (edit invalidates it).`);
   } catch (error) {
     throw new Error(`${error.message}\n--- demo server output ---\n${serverOutput}`);
   } finally {

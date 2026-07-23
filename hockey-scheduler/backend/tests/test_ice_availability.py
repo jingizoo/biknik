@@ -493,6 +493,47 @@ class IceAvailabilityContract:
         self.assertEqual(res["totals"]["created"], 4)
         self.assertEqual(res["totals"]["conflict_skipped"], 1)
 
+    # -- 14. preview binding: commit refuses a form edited after preview ----
+    def test_preview_returns_a_stable_fingerprint(self):
+        fp = self.api.preview_ice_availability(**_template())["template_fingerprint"]
+        self.assertTrue(fp)
+        # Deterministic for identical inputs; different when the template changes.
+        self.assertEqual(
+            fp, self.api.preview_ice_availability(**_template())["template_fingerprint"])
+        self.assertNotEqual(fp, self.api.preview_ice_availability(
+            **_template(end_local="21:00"))["template_fingerprint"])
+        # Cosmetic input differences (rink order) do NOT change it.
+        self.assertEqual(fp, self.api.preview_ice_availability(
+            **_template(rink_ids=["rink_1", "rink_1"]))["template_fingerprint"])
+
+    def test_commit_with_matching_fingerprint_creates_the_previewed_slots(self):
+        pv = self.api.preview_ice_availability(**_template())
+        res = self.api.commit_ice_availability(
+            actor_id="a", template_fingerprint=pv["template_fingerprint"],
+            **_template())
+        self.assertNotIn("error", res)
+        self.assertEqual(res["totals"]["created"], pv["totals"]["new"])   # exactly displayed
+        self.assertEqual(len(self._slots()), 6)
+
+    def test_commit_with_stale_fingerprint_is_refused_with_zero_writes(self):
+        # Preview one template, then commit a DIFFERENT one carrying the previewed
+        # fingerprint — exactly the "edited the form after preview" attack.
+        pv = self.api.preview_ice_availability(**_template())
+        res = self.api.commit_ice_availability(
+            actor_id="a", template_fingerprint=pv["template_fingerprint"],
+            **_template(end_local="21:00"))             # window edited after preview
+        self.assertIn("error", res)
+        self.assertEqual(res["error"]["details"]["reason"], "preview_mismatch")
+        self.assertEqual(self._slots(), [])             # nothing created
+        self.assertEqual([a for a in self.store.all_setup_audit()
+                          if a.action == "ice_slot_created"], [])   # nothing audited
+
+    def test_commit_without_fingerprint_still_works(self):
+        # A direct programmatic caller may omit the binding; the idempotent write
+        # boundary still protects the data.
+        res = self.api.commit_ice_availability(actor_id="a", **_template())
+        self.assertEqual(res["totals"]["created"], 6)
+
 
 class MemoryIceAvailabilityTest(IceAvailabilityContract, unittest.TestCase):
     def _store(self):
@@ -895,3 +936,42 @@ class IceAvailabilityHttpAuthzTest(unittest.TestCase):
             c, "POST", "/api/setup/ice-availability/preview", body)
         self.assertNotEqual(status, 403)
         self.assertIn("error", resp)                     # reached the handler
+
+    def test_commit_binding_over_http(self):
+        # End-to-end over HTTP: seed real inventory through the service, preview
+        # to get the fingerprint, then prove a mismatched (edited) template is
+        # refused with zero slots while the previewed one commits exactly.
+        svc = self.srv.STATE.api.setup
+        prog = svc.create_program("HB", timezone_name=TZ)
+        season = svc.create_season(prog.id, "Fall Binding")
+        venue = svc.create_venue("Rink House", league_id=prog.id)
+        svc.grant_season_venue_access(season.id, venue.id)
+        rink = svc.create_rink(venue.id, "Sheet 1")
+        template = {
+            "season_id": season.id, "rink_ids": [rink.id],
+            "weekdays": [1, 3], "start_local": "18:00", "end_local": "22:00",
+            "start_date": "2026-09-01", "end_date": "2026-09-07",
+            "playable_minutes": 60, "turnover_minutes": 15}
+
+        def slot_count():
+            return sum(1 for s in self.srv.STATE.api.store.all_ice_slots()
+                       if s.rink_id == rink.id)
+
+        c = self._client()
+        self._login(c, "arena")
+        _, pv = self._req(
+            c, "POST", "/api/setup/ice-availability/preview", template)
+        fp = pv["template_fingerprint"]
+        self.assertTrue(fp)
+        self.assertEqual(pv["totals"]["new"], 6)
+        # Edited template carrying the previewed fingerprint => refused, no ice.
+        _, bad = self._req(c, "POST", "/api/setup/ice-availability/commit",
+                           dict(template, end_local="21:00", template_fingerprint=fp))
+        self.assertIn("error", bad)
+        self.assertEqual(bad["error"]["details"]["reason"], "preview_mismatch")
+        self.assertEqual(slot_count(), 0)
+        # Unedited template + fingerprint => commits exactly the 6 shown slots.
+        _, ok = self._req(c, "POST", "/api/setup/ice-availability/commit",
+                          dict(template, template_fingerprint=fp))
+        self.assertEqual(ok["totals"]["created"], 6)
+        self.assertEqual(slot_count(), 6)

@@ -6,6 +6,8 @@ Pure logic over the store with an injected clock; every create is audited.
 """
 
 import functools
+import hashlib
+import json
 import re
 from datetime import date, datetime, timezone
 from typing import Callable, List, Optional
@@ -2460,10 +2462,32 @@ class SetupService:
         accessible, access_missing = self._split_rinks_by_access(
             season_id, rink_ids)
 
+        # Fingerprint the operator-controllable template so commit can refuse a
+        # form edited after preview (#158 review): the create button re-reads
+        # the live form, so without this an operator could preview one template
+        # and commit a different one. Covers exactly the fields that shape the
+        # generated slots, normalized (deduped/sorted rinks, canonical per-
+        # weekday windows, sorted exclusions) so cosmetic input order doesn't
+        # change it; deterministic — no clock, no resolved season state, so
+        # preview and commit agree for an unedited template.
+        def _fp_date(value):
+            return None if value in (None, "") else str(value).strip()
+        fingerprint = hashlib.sha256(json.dumps({
+            "season_id": season_id,
+            "rink_ids": sorted(rink_ids),
+            "windows": windows_meta,
+            "start_date": _fp_date(start_date),
+            "end_date": _fp_date(end_date),
+            "playable_minutes": playable_minutes,
+            "turnover_minutes": turnover_minutes,
+            "exclusion_dates": sorted(d.isoformat() for d in exclusions),
+        }, sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:16]
+
         return {
             "season": season, "tz": tz, "d_start": d_start, "d_end": d_end,
             "weekday_set": weekday_set,
             "windows_meta": windows_meta,
+            "fingerprint": fingerprint,
             "playable_minutes": playable_minutes,
             "turnover_minutes": turnover_minutes,
             "plan": plan, "accessible": accessible,
@@ -2567,6 +2591,7 @@ class SetupService:
             "date_range": {"start": r["d_start"].isoformat(),
                            "end": r["d_end"].isoformat()},
             "weekdays": r["weekdays"], "windows": r["windows_meta"],
+            "template_fingerprint": r["fingerprint"],
             "playable_minutes": r["playable_minutes"],
             "turnover_minutes": r["turnover_minutes"],
             "rinks": list(per_rink.values()),
@@ -2613,7 +2638,8 @@ class SetupService:
                                 weekdays=None, start_local=None, end_local=None,
                                 start_date=None, end_date=None,
                                 playable_minutes=None, turnover_minutes=None,
-                                exclusion_dates=None, windows=None, actor_id=None):
+                                exclusion_dates=None, windows=None,
+                                template_fingerprint=None, actor_id=None):
         """Create the AVAILABLE Game ice slots a template implies (#158).
 
         Idempotent and race-safe: planning is side-effect-free, but the
@@ -2625,6 +2651,14 @@ class SetupService:
         overlapping slots. An exact-duplicate window is skipped, an overlap is
         reported, a rerun creates nothing. Audited per slot + a batch summary.
         Requires an active Season (#159).
+
+        ``template_fingerprint`` binds this commit to a specific preview (#158
+        review): when supplied it must equal the fingerprint the preview
+        returned for these exact inputs, else the commit is refused before any
+        write (``preview_mismatch``). The builder's create button re-reads the
+        live form, so this is what stops an operator previewing one template and
+        committing a different one. Omitted (a direct programmatic caller) skips
+        the check — the idempotent write boundary still protects the data.
         """
         # De-duplicated selected rinks (same as _plan_ice_availability does).
         # NOTHING authoritative is resolved from mutable state out here: the
@@ -2679,6 +2713,17 @@ class SetupService:
                         end_date=end_date, playable_minutes=playable_minutes,
                         turnover_minutes=turnover_minutes,
                         exclusion_dates=exclusion_dates, windows=windows)
+                    # Preview binding (#158 review): refuse — before any write —
+                    # a commit whose template no longer matches the one the
+                    # operator previewed. Deterministic over the same inputs, so
+                    # an unedited form always matches; an edited one never does.
+                    if template_fingerprint is not None \
+                            and template_fingerprint != base["fingerprint"]:
+                        raise ScheduleConflictError(
+                            "This template changed since it was previewed. "
+                            "Preview again before creating slots.",
+                            details={"reason": "preview_mismatch",
+                                     "expected": base["fingerprint"]})
                     # NB: keep the `windows` PARAMETER intact for the retry loop —
                     # bind the generated planner windows to a distinct name, or a
                     # second attempt would re-plan with generated rows instead of

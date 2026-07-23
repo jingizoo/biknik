@@ -2025,8 +2025,9 @@ class Handler(BaseHTTPRequestHandler):
             kwargs = {k: body.get(k) for k in fields}
             if path.endswith("/preview"):
                 return self._send_api(api.preview_ice_availability(**kwargs))
-            return self._send_api(
-                api.commit_ice_availability(actor_id=user_id, **kwargs))
+            return self._send_api(api.commit_ice_availability(
+                actor_id=user_id,
+                template_fingerprint=body.get("template_fingerprint"), **kwargs))
 
         # Setup create endpoints — operator creates real records via the API.
         if path.startswith("/api/setup/"):

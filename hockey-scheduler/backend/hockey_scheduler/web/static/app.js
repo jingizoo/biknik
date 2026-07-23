@@ -6706,12 +6706,20 @@ async function render() {
   if (ibOpen) ibOpen.onclick = () => { iceBuilder = { form: null, preview: null }; toast = ""; render(); };
   const ibCancel = c.querySelector("[data-ib-cancel]");
   if (ibCancel) ibCancel.onclick = () => { iceBuilder = null; toast = ""; render(); };
-  // Toggling a weekday shows/hides its per-day time row. Re-render off the
-  // current DOM so every other field — and each already-entered day's times —
-  // survives; a freshly-checked day appears with the default evening block.
-  c.querySelectorAll(".ib-weekday").forEach((cb) => cb.onchange = () => {
+  // Any change to the template (season, rinks, weekdays, per-day times, dates,
+  // buffers) INVALIDATES a shown preview, so Create can never post a form
+  // edited after Preview — the create button re-reads the live form, and the
+  // server rejects a mismatched fingerprint as the authoritative backstop. A
+  // weekday toggle additionally re-renders to show/hide its per-day time row.
+  const ibFormEl = c.querySelector(".ib-form");
+  if (ibFormEl) ibFormEl.addEventListener("change", (e) => {
+    if (!iceBuilder) return;
+    if (e.target && e.target.id === "ib-excl") return;  // staging input, not the template
+    const isWeekday = e.target.classList && e.target.classList.contains("ib-weekday");
+    const hadPreview = !!iceBuilder.preview;
     iceBuilder.form = readIceBuilderForm(c);
-    render();
+    if (hadPreview) { iceBuilder.preview = null; toast = ""; }
+    if (hadPreview || isWeekday) render();
   });
   c.querySelectorAll("[data-ib-preview]").forEach((b) => b.onclick = async () => {
     toast = "";
@@ -6722,8 +6730,13 @@ async function render() {
   const ibCommit = c.querySelector("[data-ib-commit]");
   if (ibCommit) ibCommit.onclick = async () => {
     toast = "";
+    // Bind the commit to the previewed template: send the fingerprint the
+    // preview returned so the server refuses a form edited since (belt to the
+    // frontend's suspenders, which already drops the preview on any edit).
+    const fingerprint = iceBuilder.preview && iceBuilder.preview.template_fingerprint;
     iceBuilder.form = readIceBuilderForm(c);
-    const res = await post("/api/setup/ice-availability/commit", iceBuilder.form);
+    const res = await post("/api/setup/ice-availability/commit",
+      { ...iceBuilder.form, template_fingerprint: fingerprint });
     if (res && !res.error) { toast = `Created ${res.totals.created} ice slot(s).`; iceBuilder = null; }
     else { iceBuilder.preview = res; }
     render();
@@ -6734,12 +6747,14 @@ async function render() {
     const el = c.querySelector("#ib-excl");
     const d = el && el.value;
     if (d && !iceBuilder.form.exclusion_dates.includes(d)) iceBuilder.form.exclusion_dates.push(d);
+    iceBuilder.preview = null;   // exclusions changed the template — re-preview
     render();
   };
   c.querySelectorAll("[data-ib-excl-remove]").forEach((b) => b.onclick = () => {
     iceBuilder.form = readIceBuilderForm(c);
     iceBuilder.form.exclusion_dates =
       iceBuilder.form.exclusion_dates.filter((x) => x !== b.dataset.ibExclRemove);
+    iceBuilder.preview = null;   // exclusions changed the template — re-preview
     render();
   });
   c.querySelectorAll("[data-filter]").forEach((sel) => sel.onchange = (e) => {
