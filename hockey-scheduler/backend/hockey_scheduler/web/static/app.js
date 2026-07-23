@@ -2871,22 +2871,36 @@ function renderIcePreview(pv) {
   // with its UTC offset; a non-repeated reading stays the plain HH:MM it always
   // was. data-ib-start-offset/-end-offset are always present (cheap, and let a
   // reader confirm two same-clock rows are genuinely different instants).
+  //
+  // A DIFFERENT case (#313 follow-up review): a single row can cross the DST
+  // change itself — its OWN start and end sit in different UTC offsets, so the
+  // clock-repeat check above never fires (nothing else that day repeats either
+  // boundary), yet the plain HH:MM misstates the real duration: a spring-
+  // forward 01:00-03:00 row is a real 60-minute slot (not 2h), and a fall-back
+  // 01:00-02:00 row can be a real 120-minute slot (not 1h). Qualify BOTH
+  // boundaries whenever a row's own start/end offsets differ, regardless of
+  // any repeat, and call out the transition explicitly rather than leaving the
+  // operator to notice two different offsets on their own.
   const slotSpan = (s, startAmbiguous, endAmbiguous) => {
     const startOffset = ibLocalOffset(s.start_local), endOffset = ibLocalOffset(s.end_local);
-    const startLbl = startAmbiguous
+    const crossesDst = startOffset !== endOffset;
+    const showStart = startAmbiguous || crossesDst;
+    const showEnd = endAmbiguous || crossesDst;
+    const startLbl = showStart
       ? `${esc(ibLocalTime(s.start_local))} (UTC${esc(startOffset)})` : esc(ibLocalTime(s.start_local));
-    const endLbl = endAmbiguous
+    const endLbl = showEnd
       ? `${esc(ibLocalTime(s.end_local))} (UTC${esc(endOffset)})` : esc(ibLocalTime(s.end_local));
     const time = `${startLbl}–${endLbl}`;
-    const clockAttrs = ` data-ib-start-clock="${esc(ibLocalTime(s.start_local))}" data-ib-start-offset="${esc(startOffset)}" data-ib-end-clock="${esc(ibLocalTime(s.end_local))}" data-ib-end-offset="${esc(endOffset)}"`;
+    const dstNote = crossesDst ? " ⏱ DST change mid-slot — see UTC offsets" : "";
+    const clockAttrs = ` data-ib-start-clock="${esc(ibLocalTime(s.start_local))}" data-ib-start-offset="${esc(startOffset)}" data-ib-end-clock="${esc(ibLocalTime(s.end_local))}" data-ib-end-offset="${esc(endOffset)}"${crossesDst ? ' data-ib-dst-cross="1"' : ""}`;
     if (s.status === "conflict") {
       const target = conflictTarget(s);
-      return `<span class="ib-slot ib-slot-conflict" data-ib-slot-status="conflict"${clockAttrs}${s.conflict_game_id ? ` data-ib-conflict-game="${esc(s.conflict_game_id)}"` : ""} title="conflicts with ${esc(target)}">${time} · ${esc(s.rink_name)} · ⚠ ${esc(target)}</span>`;
+      return `<span class="ib-slot ib-slot-conflict" data-ib-slot-status="conflict"${clockAttrs}${s.conflict_game_id ? ` data-ib-conflict-game="${esc(s.conflict_game_id)}"` : ""} title="conflicts with ${esc(target)}">${time}${dstNote} · ${esc(s.rink_name)} · ⚠ ${esc(target)}</span>`;
     }
     if (s.status === "duplicate") {
-      return `<span class="ib-slot ib-slot-duplicate" data-ib-slot-status="duplicate"${clockAttrs}>${time} · ${esc(s.rink_name)} · already exists</span>`;
+      return `<span class="ib-slot ib-slot-duplicate" data-ib-slot-status="duplicate"${clockAttrs}>${time}${dstNote} · ${esc(s.rink_name)} · already exists</span>`;
     }
-    return `<span class="ib-slot ib-slot-new" data-ib-slot-status="new"${clockAttrs}>${time} · ${esc(s.rink_name)}</span>`;
+    return `<span class="ib-slot ib-slot-new" data-ib-slot-status="new"${clockAttrs}>${time}${dstNote} · ${esc(s.rink_name)}</span>`;
   };
   const slotList = days.map((d, i) => {
     const daySlots = byDate[d];

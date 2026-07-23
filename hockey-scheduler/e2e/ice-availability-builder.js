@@ -24,7 +24,12 @@
 //     and generates nothing; the same day's window widened to span the gap
 //     commits exactly its 2 real-duration slots; and a fall-back day's 4
 //     real-hour slots — two of which share a repeated local clock time — are
-//     each visibly distinguished (not shown as identical rows).
+//     each visibly distinguished (not shown as identical rows);
+//   * a SINGLE row that itself crosses a DST offset change — nothing else
+//     that day repeats either boundary — is still visibly qualified with
+//     both UTC offsets and an explicit transition callout, in both
+//     directions, with the exact real UTC duration/tuple committed as
+//     previewed (#313 follow-up review).
 //
 // September 2026 has Tuesdays 1,8,15,22,29 and Thursdays 3,10,17,24 = 9 days;
 // a 18:00-22:00 window with 60-minute games + 15-minute turnover yields 3 games
@@ -656,8 +661,146 @@ async function checkViewport(browser, viewport) {
     }, dstRink2);
     if (fallCreated !== 4) fail(`fall-back commit should create exactly the 4 previewed slots, got ${fallCreated}`);
 
+    // (K4) A SINGLE row that itself crosses the spring-forward gap (#313
+    // follow-up review): window 01:00-03:00 is a real 60-minute slot, not the
+    // naive 2h the plain "01:00-03:00" clock reading implies. Nothing else
+    // that day repeats either boundary, so the row only gets qualified because
+    // ITS OWN start/end sit in different UTC offsets — the exact gap the
+    // repeated-clock-only check left open. A fresh rink keeps "exactly 1
+    // created" unambiguous.
+    const dstRink3 = await page.evaluate(async (season) => {
+      const post = async (p, b) => (await fetch(p, {
+        method: "POST", credentials: "same-origin",
+        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
+      })).json();
+      const venue = await post("/api/setup/venue", { name: "DST Arena 3", league_id: null });
+      await post(`/api/v2/setup/seasons/${season}/venue-access`, { venue_id: venue.id });
+      return (await post("/api/setup/rink", { venue_id: venue.id, name: "DST Sheet 3" })).id;
+    }, dstIds.season);
+    await page.click("[data-ice-builder-open]");
+    await page.waitForSelector(".ib-form", { timeout: 10000 });
+    await page.selectOption("#ib-season", dstIds.season);
+    await page.waitForSelector(`.ib-rink[value="${dstRink3}"]`, { timeout: 10000 });
+    await page.check(`.ib-rink[value="${dstRink3}"]`);
+    await selectWeekdaysOnly(page, [6]);
+    await page.fill("#ib-turnover", "0");
+    await page.fill("#ib-from", "2027-03-14");
+    await page.fill("#ib-to", "2027-03-14");
+    await page.fill("#ib-start-6", "01:00");
+    await page.fill("#ib-end-6", "03:00");
+    await previewCurrent(page);
+    s = await previewState(page);
+    if (s.new !== 1) fail(`the spring-crossing window should generate exactly 1 real-duration slot, got ${JSON.stringify(s)}`);
+    let crossSlotCount = await page.$$eval(".ib-slot", (els) => els.length);
+    if (crossSlotCount !== 1) fail(`expected exactly 1 visible slot row, got ${crossSlotCount}`);
+    let crossRow = await page.$eval(".ib-slot", (el) => ({
+      text: el.textContent,
+      startOffset: el.getAttribute("data-ib-start-offset"),
+      endOffset: el.getAttribute("data-ib-end-offset"),
+      crosses: el.getAttribute("data-ib-dst-cross"),
+    }));
+    if (crossRow.crosses !== "1") fail(`the spring-crossing row must be flagged data-ib-dst-cross: ${JSON.stringify(crossRow)}`);
+    if (crossRow.startOffset === crossRow.endOffset) {
+      fail(`a row crossing the gap must carry DIFFERENT start/end UTC offsets: ${JSON.stringify(crossRow)}`);
+    }
+    if (!crossRow.text.includes(`(UTC${crossRow.startOffset})`) || !crossRow.text.includes(`(UTC${crossRow.endOffset})`)) {
+      fail(`both offsets must be visibly rendered on the row: ${JSON.stringify(crossRow)}`);
+    }
+    if (!/DST/i.test(crossRow.text)) {
+      fail(`the DST transition must be called out explicitly on the row: ${JSON.stringify(crossRow)}`);
+    }
+    // Exact UTC duration/tuple: a real 60-minute slot (06:00Z-07:00Z), never
+    // the misleading 2h the "01:00-03:00" clock reading alone would suggest.
+    let crossPv = await page.evaluate(() => iceBuilder.preview.slots[0]);
+    if (crossPv.start_time !== "2027-03-14T06:00:00+00:00"
+        || crossPv.end_time !== "2027-03-14T07:00:00+00:00") {
+      fail(`unexpected UTC tuple for the spring-crossing slot: ${JSON.stringify(crossPv)}`);
+    }
+    await page.click("[data-ib-commit]");
+    await page.waitForFunction(
+      () => document.body.dataset.view === "calendar" && !document.querySelector(".ib-form"),
+      null, { timeout: 10000 });
+    let crossCommitted = await page.evaluate(async (rink) => {
+      const ov = await (await fetch("/api/demo/overview", { credentials: "same-origin" })).json();
+      return (ov.ice_slots || []).filter((x) => x.rink_id === rink)
+        .map((x) => ({ start: x.start_time, end: x.end_time }));
+    }, dstRink3);
+    if (crossCommitted.length !== 1 || crossCommitted[0].start !== crossPv.start_time
+        || crossCommitted[0].end !== crossPv.end_time) {
+      fail(`commit must persist exactly the previewed UTC tuple: ${JSON.stringify(crossCommitted)} vs preview ${JSON.stringify(crossPv)}`);
+    }
+
+    // (K5) A SINGLE row that itself crosses the fall-back repeated hour (#313
+    // follow-up review): window 01:00-02:00 with playable_minutes=120 is a
+    // real 120-minute slot — the plain "01:00-02:00" clock reading alone looks
+    // like an unremarkable 1-hour game, hiding the extra real hour the
+    // repeated clock adds. Same shape as K4, one rink further, on the OTHER
+    // DST direction and with a non-default playable_minutes.
+    const dstRink4 = await page.evaluate(async (season) => {
+      const post = async (p, b) => (await fetch(p, {
+        method: "POST", credentials: "same-origin",
+        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
+      })).json();
+      const venue = await post("/api/setup/venue", { name: "DST Arena 4", league_id: null });
+      await post(`/api/v2/setup/seasons/${season}/venue-access`, { venue_id: venue.id });
+      return (await post("/api/setup/rink", { venue_id: venue.id, name: "DST Sheet 4" })).id;
+    }, dstIds.season);
+    await page.click("[data-ice-builder-open]");
+    await page.waitForSelector(".ib-form", { timeout: 10000 });
+    await page.selectOption("#ib-season", dstIds.season);
+    await page.waitForSelector(`.ib-rink[value="${dstRink4}"]`, { timeout: 10000 });
+    await page.check(`.ib-rink[value="${dstRink4}"]`);
+    await selectWeekdaysOnly(page, [6]);
+    await page.fill("#ib-turnover", "0");
+    await page.fill("#ib-playable", "120");
+    await page.fill("#ib-from", "2026-11-01");
+    await page.fill("#ib-to", "2026-11-01");
+    await page.fill("#ib-start-6", "01:00");
+    await page.fill("#ib-end-6", "02:00");
+    await previewCurrent(page);
+    s = await previewState(page);
+    if (s.new !== 1) fail(`the fall-crossing window should generate exactly 1 real-duration slot, got ${JSON.stringify(s)}`);
+    crossSlotCount = await page.$$eval(".ib-slot", (els) => els.length);
+    if (crossSlotCount !== 1) fail(`expected exactly 1 visible slot row, got ${crossSlotCount}`);
+    crossRow = await page.$eval(".ib-slot", (el) => ({
+      text: el.textContent,
+      startOffset: el.getAttribute("data-ib-start-offset"),
+      endOffset: el.getAttribute("data-ib-end-offset"),
+      crosses: el.getAttribute("data-ib-dst-cross"),
+    }));
+    if (crossRow.crosses !== "1") fail(`the fall-crossing row must be flagged data-ib-dst-cross: ${JSON.stringify(crossRow)}`);
+    if (crossRow.startOffset === crossRow.endOffset) {
+      fail(`a row crossing the fall-back hour must carry DIFFERENT start/end UTC offsets: ${JSON.stringify(crossRow)}`);
+    }
+    if (!crossRow.text.includes(`(UTC${crossRow.startOffset})`) || !crossRow.text.includes(`(UTC${crossRow.endOffset})`)) {
+      fail(`both offsets must be visibly rendered on the row: ${JSON.stringify(crossRow)}`);
+    }
+    if (!/DST/i.test(crossRow.text)) {
+      fail(`the DST transition must be called out explicitly on the row: ${JSON.stringify(crossRow)}`);
+    }
+    // Exact UTC duration/tuple: a real 120-minute slot (05:00Z-07:00Z), never
+    // the misleading 1h the "01:00-02:00" clock reading alone would suggest.
+    crossPv = await page.evaluate(() => iceBuilder.preview.slots[0]);
+    if (crossPv.start_time !== "2026-11-01T05:00:00+00:00"
+        || crossPv.end_time !== "2026-11-01T07:00:00+00:00") {
+      fail(`unexpected UTC tuple for the fall-crossing slot: ${JSON.stringify(crossPv)}`);
+    }
+    await page.click("[data-ib-commit]");
+    await page.waitForFunction(
+      () => document.body.dataset.view === "calendar" && !document.querySelector(".ib-form"),
+      null, { timeout: 10000 });
+    crossCommitted = await page.evaluate(async (rink) => {
+      const ov = await (await fetch("/api/demo/overview", { credentials: "same-origin" })).json();
+      return (ov.ice_slots || []).filter((x) => x.rink_id === rink)
+        .map((x) => ({ start: x.start_time, end: x.end_time }));
+    }, dstRink4);
+    if (crossCommitted.length !== 1 || crossCommitted[0].start !== crossPv.start_time
+        || crossCommitted[0].end !== crossPv.end_time) {
+      fail(`commit must persist exactly the previewed UTC tuple: ${JSON.stringify(crossCommitted)} vs preview ${JSON.stringify(crossPv)}`);
+    }
+
     if (errors.length) fail(`console/page errors:\n${errors.join("\n")}`);
-    console.log(`[${viewport.label}] OK — month grid renders; builder previews ${EXPECTED_NEW} slots, reports un-granted venue, commits idempotently, honors exclusions, applies per-weekday windows (narrow Thursday => 19), binds commit to the preview (edit invalidates it), refuses+refreshes a stale preview (both a bogus token and a same-slot-set window edit that slips the suspenders), reports an exact-tuple collision as a conflict WITH its target, exposes every row of a >60-day template — the final day and a late Game collision's exact target — while committing the full previewed set, and in a DST-observing Program timezone visibly reports a spring-forward gap skip, commits a gap-spanning window's 2 real-duration slots, and visibly distinguishes a fall-back day's 4 real-hour slots including the two that share a repeated local clock time.`);
+    console.log(`[${viewport.label}] OK — month grid renders; builder previews ${EXPECTED_NEW} slots, reports un-granted venue, commits idempotently, honors exclusions, applies per-weekday windows (narrow Thursday => 19), binds commit to the preview (edit invalidates it), refuses+refreshes a stale preview (both a bogus token and a same-slot-set window edit that slips the suspenders), reports an exact-tuple collision as a conflict WITH its target, exposes every row of a >60-day template — the final day and a late Game collision's exact target — while committing the full previewed set, and in a DST-observing Program timezone visibly reports a spring-forward gap skip, commits a gap-spanning window's 2 real-duration slots, visibly distinguishes a fall-back day's 4 real-hour slots including the two that share a repeated local clock time, and — even with nothing else that day to collide against — visibly qualifies and explicitly calls out a single row that itself crosses the DST change, in both directions, with the exact real UTC duration/tuple committed as previewed.`);
   } catch (error) {
     throw new Error(`${error.message}\n--- demo server output ---\n${serverOutput}`);
   } finally {
