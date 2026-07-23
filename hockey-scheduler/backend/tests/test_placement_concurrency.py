@@ -59,6 +59,7 @@ def _seed(s):
                       league_id="pg"))
     s.add_rink(Rink(id="r1", venue_id="v", name="Main"))
     s.add_rink(Rink(id="r2", venue_id="v", name="Aux"))
+    s.add_rink(Rink(id="r3", venue_id="v", name="Annex"))
     for sid in ("se1", "se2"):
         s.add_season(Season(id=sid, program_id="pg", name=sid.upper()))
         s.add_season_venue_access(SeasonVenueAccess(
@@ -95,6 +96,12 @@ def _seed(s):
         gslot(f"s{i}", "r1", i)
     gslot("sB", "r2", 0)                     # same time as s0, different rink
     gslot("sX", "r1", 9)                     # spare, unused by the draft
+    # #314 — move-race fixtures: a game starts on mA (r1) and is moved through
+    # mB (r2) to mC (r3), one slot per rink so "which Rink is locked" is
+    # unambiguous. Same wall-clock time on all three, far from s0-s5/sX/sB.
+    gslot("mA", "r1", 100)
+    gslot("mB", "r2", 100)
+    gslot("mC", "r3", 100)
 
 
 def _slot_game_count(store, slot_id):
@@ -119,6 +126,18 @@ def _builder_template(season_id, rink_id):
     return dict(season_id=season_id, rink_ids=[rink_id], weekdays=[0],
                 start_local="18:00", end_local="19:00",
                 start_date="2026-01-05", end_date="2026-01-05",
+                playable_minutes=60, turnover_minutes=0)
+
+
+def _move_race_builder_template(season_id):
+    """A builder template whose single Wednesday 18:00-19:00 UTC window is
+    exactly slot mB's tuple (rink r2, day+100 => 2026-04-15), so the builder
+    classifies mB as a 'duplicate' — the reviewed row a queued move racing
+    move_game's own Team-lock queue must never turn into a corrupted read or an
+    unprotected write on rink r2 (#314 review)."""
+    return dict(season_id=season_id, rink_ids=["r2"], weekdays=[2],
+                start_local="18:00", end_local="19:00",
+                start_date="2026-04-15", end_date="2026-04-15",
                 playable_minutes=60, turnover_minutes=0)
 
 
@@ -172,6 +191,34 @@ class _PlacementParityMixin:
         pv2 = self.api.preview_ice_availability(actor_id="b", **tmpl)
         self.assertEqual(pv2["slots"][0]["status"], "conflict")
         self.assertEqual(pv2["slots"][0]["conflict_game_id"], g["id"])
+
+    def test_two_sequential_moves_then_builder_commit_on_b(self):
+        # #314 review parity: a game moves mA -> mB -> mC (two moves, matching
+        # the forced PostgreSQL race's shape), then the builder commits a
+        # template matching mB's exact tuple. Sequential here (no staleness is
+        # even possible — each move fully completes before the next reads), so
+        # the game passes through mB and back out, leaving it exactly as
+        # previewed: the builder's ORIGINAL fingerprint still matches, and it
+        # commits cleanly with zero new ice.
+        g = self.api.create_game("se1", "d1", "t0", "t1", "mA", league_id="lg")
+        self.assertNotIn("error", g)
+        gid = g["id"]
+        tmpl = _move_race_builder_template("se1")
+        pv = self.api.preview_ice_availability(actor_id="b", **tmpl)
+        self.assertEqual(pv["slots"][0]["status"], "duplicate")
+
+        m1 = self.api.move_game(gid, "mB")
+        self.assertNotIn("error", m1)
+        m2 = self.api.move_game(gid, "mC")
+        self.assertNotIn("error", m2)
+
+        res = self.api.commit_ice_availability(
+            actor_id="b", template_fingerprint=pv["template_fingerprint"], **tmpl)
+        self.assertNotIn("error", res)
+        self.assertEqual(res["totals"]["created"], 0)
+        self.assertEqual(_slot_game_count(self.store, "mA"), 0)
+        self.assertEqual(_slot_game_count(self.store, "mB"), 0)
+        self.assertEqual(_slot_game_count(self.store, "mC"), 1)
 
 
 class MemoryPlacementParityTest(_PlacementParityMixin, unittest.TestCase):
@@ -391,6 +438,67 @@ class PostgresPlacementConcurrencyTest(unittest.TestCase):
         self._builder_vs(
             "se1",
             lambda a: a.create_game("se1", "d1", "t0", "t1", "s0", league_id="lg"))
+
+    # (6) move A->B, a QUEUED move (its own pre-lock read still shows A) racing
+    # for the SAME Team lock intending B->C, and the ice-availability BUILDER
+    # committing a template matching slot mB's EXACT tuple on rink r2 — all
+    # three released at once (#314 review). move_game must lock the game's
+    # CURRENT source Rink, computed AFTER the Team lock is held, not from
+    # whatever snapshot it read before waiting for that lock: otherwise the
+    # queued move could mutate rink r2 (release/allocate slot mB) without ever
+    # holding r2's lock, letting it race the builder's classify-then-write
+    # cycle uncontrolled. Both moves always land (each targets a slot that is
+    # never "where it already is" once its Team-lock turn comes, whichever
+    # order that turn falls in); the builder either sees mB untouched (commits
+    # cleanly, 0 new — its reviewed 'duplicate' still holds) or catches it
+    # ALLOCATED mid-move (refused, preview_mismatch, zero writes) — never a
+    # corrupted state, and never double-booked.
+    def test_move_a_to_b_queued_move_b_to_c_vs_builder_commit_on_b(self):
+        api0 = ApiService(self._store())
+        g = api0.create_game("se1", "d1", "t0", "t1", "mA", league_id="lg")
+        gid = g["id"]
+        tmpl = _move_race_builder_template("se1")
+        fp = api0.preview_ice_availability(
+            actor_id="b", **tmpl)["template_fingerprint"]
+        self.assertEqual(
+            api0.preview_ice_availability(actor_id="b", **tmpl)["slots"][0]["status"],
+            "duplicate")
+
+        out = self._run([
+            lambda a: a.move_game(gid, "mB"),
+            lambda a: a.move_game(gid, "mC"),
+            lambda a: a.commit_ice_availability(
+                actor_id="b", template_fingerprint=fp, **tmpl),
+        ])
+        self._assert_no_crash(out)
+        store = self._store()
+
+        # Exactly one of {mB, mC} ends up hosting the game; mA is released;
+        # never double-booked across any pair.
+        self.assertEqual(_slot_game_count(store, "mA"), 0,
+                         f"the original slot must be released: {out!r}")
+        self.assertEqual(
+            _slot_game_count(store, "mB") + _slot_game_count(store, "mC"), 1,
+            f"exactly one of B/C should host the game: {out!r}")
+        self._assert_schedule_consistent(store)
+
+        # Both moves land: each one's FIXED target (mB / mC respectively) is
+        # never equal to wherever the game truly is when its Team-lock turn
+        # comes, in EITHER interleaving order, so neither can hit "same_slot",
+        # and nothing else contends for their unique dedicated targets.
+        move_a, move_b = out[0], out[1]
+        self.assertNotIn("error", move_a, f"move A->B should land: {out!r}")
+        self.assertNotIn("error", move_b, f"the queued move should land: {out!r}")
+
+        # The builder either committed the reviewed snapshot cleanly (it saw
+        # slot mB untouched) or was refused preview_mismatch with zero writes
+        # (it caught mB mid-move) — the only two consistent outcomes; the
+        # queued move never mutated mB outside its own Rink lock.
+        builder = out[2]
+        if isinstance(builder, dict) and "error" not in builder:
+            self.assertEqual(builder["totals"]["created"], 0, repr(out))
+        else:
+            self.assertEqual(_reason(builder), "preview_mismatch", repr(out))
 
 
 if __name__ == "__main__":

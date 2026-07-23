@@ -98,7 +98,7 @@ class SetupService(_BaseSetupService):
 
     def move_game(self, game_id: str, new_ice_slot_id: str, reason: str = "",
                   actor_id: Optional[str] = None):
-        with self.store.transaction():
+        def _attempt():
             game = self.store.get_game(game_id)
             # Preserve the base service's established same-slot error/reason
             # before running the new scope check.
@@ -110,9 +110,15 @@ class SetupService(_BaseSetupService):
                     require_game_league_id(self.store, game)
                 require_slot_belongs_to_season(
                     self.store, new_ice_slot_id, game.season_id)
-            return _BaseSetupService.move_game.__wrapped__(
+            # The base's raw locked body (not its public move_game, which would
+            # install its OWN retry loop/transaction) so this scope check and
+            # the base's Team/Rink/Season locking run as ONE attempt sharing
+            # ONE transaction (#314 review) — _retry_on_move_race below owns
+            # the transaction boundary and the retry-on-race loop for both.
+            return _BaseSetupService._move_game_locked(
                 self, game_id, new_ice_slot_id, reason=reason,
                 actor_id=actor_id)
+        return self._retry_on_move_race(_attempt, game_id=game_id)
 
     def publish_game(self, game_id: str, published: bool = True,
                      actor_id: Optional[str] = None):

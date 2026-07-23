@@ -216,6 +216,18 @@ class _SeasonReparented(Exception):
     retry loop, which re-reads and locks the correct Program first."""
 
 
+class _MoveGameRaced(Exception):
+    """Internal retry signal (#314 review): move_game's defensive post-lock
+    verify found the Rinks it holds don't match the Game's current source Rink
+    plus the target slot's Rink. Should not happen — move_game is the only
+    writer of an existing Game's ice_slot_id, and it always takes the Team lock
+    before reading the current slot — but the check is cheap insurance against
+    a future writer that skips that convention. Caught by
+    SetupService._retry_on_move_race, which rolls back and retries cleanly in
+    a fresh transaction rather than proceeding against an untrustworthy lock
+    set."""
+
+
 class SetupService:
     def __init__(self, store: InMemoryStore, clock: Callable[[], datetime] = _utcnow):
         self.store = store
@@ -3357,10 +3369,44 @@ class SetupService:
                 f"{label} has been published.", include_public=True)
         return game
 
-    @_transactional
     def move_game(self, game_id: str, new_ice_slot_id: str, reason: str = "",
                   actor_id: Optional[str] = None) -> Game:
         """Move a game to another available game ice slot (drag/drop)."""
+        return self._retry_on_move_race(
+            lambda: self._move_game_locked(
+                game_id, new_ice_slot_id, reason=reason, actor_id=actor_id),
+            game_id=game_id)
+
+    def _retry_on_move_race(self, attempt_fn, *, game_id=None):
+        """Run ``attempt_fn`` inside a fresh transaction, up to 3 times,
+        converting the internal ``_MoveGameRaced`` retry signal into a stable
+        ``ConcurrencyConflictError`` once retries are exhausted (#314 review).
+
+        ``move_game``'s own transaction boundary lives here (not ``@_transactional``
+        on the public method) so a raced attempt can roll back — releasing every
+        lock it took — and retry clean in a NEW transaction, rather than trying to
+        widen an already-held lock set mid-transaction. The league-scoped override
+        shares this same helper so its own pre-check + the base's locked body run
+        as one attempt together. ``game_id`` is only for the exhausted-retry error
+        detail; callers that don't have one handy may omit it."""
+        for attempt in range(3):
+            try:
+                with self.store.transaction():
+                    return attempt_fn()
+            except _MoveGameRaced:
+                if attempt == 2:
+                    raise ConcurrencyConflictError(
+                        "This game's ice changed while processing the move; "
+                        "please retry.",
+                        {"reason": "move_raced", "game_id": game_id})
+
+    def _move_game_locked(self, game_id: str, new_ice_slot_id: str,
+                          reason: str = "",
+                          actor_id: Optional[str] = None) -> Game:
+        """``move_game``'s locked body — runs inside the caller's transaction
+        (``move_game`` itself, or the league-scoped override's own attempt via
+        ``_retry_on_move_race``). Raises ``_MoveGameRaced`` to signal a clean
+        retry; the caller's transaction rolls back, so no partial write."""
         game = self.store.get_game(game_id)
         if game is None:
             raise NotFoundError(f"Game {game_id} not found.",
@@ -3369,10 +3415,22 @@ class SetupService:
         # slots' rinks (Team→Rink→Season order) BEFORE the Season guard, so the
         # release-old + allocate-new is atomic against a concurrent placement
         # sharing a team AND against the ice-availability builder on either rink
-        # (Rink before Season matches the builder and avoids deadlocking it). A
-        # game's teams and current slot are immutable, so locking from this locator
-        # read is safe; see _lock_teams / _lock_rinks.
+        # (Rink before Season matches the builder and avoids deadlocking it).
         self._lock_teams((game.home_team_id, game.away_team_id))
+        # #314 review — re-read NOW that the Team lock is held, not the
+        # pre-lock locator above. move_game is the ONLY writer of an existing
+        # Game's ice_slot_id, and it always takes this same Team lock first, so
+        # THIS read is the definitive, stable current slot for the rest of this
+        # transaction. Locking rinks from the pre-lock snapshot instead was the
+        # bug: a move queued behind this same Team lock could still be holding
+        # a now-stale source Rink after the lock-holder it waited on already
+        # relocated the game — leaving the ACTUAL current Rink unlocked while
+        # this move frees a slot on it, reopening the exact builder-vs-move
+        # race the Rink lock (#313) was meant to close.
+        game = self.store.get_game(game_id)
+        if game is None:
+            raise NotFoundError(f"Game {game_id} not found.",
+                                details={"reason": "game_missing"})
         _mv_rinks = set()
         for _sid in (new_ice_slot_id, game.ice_slot_id):
             _s = self.store.get_ice_slot(_sid) if _sid else None
@@ -3381,13 +3439,27 @@ class SetupService:
         self._lock_rinks(_mv_rinks)
         self._guard_game_season(game)  # #159 read-only guard
         # #159 r15 — re-fetch under the Season lock (the pre-lock read was a
-        # locator). A concurrent move_game/publish_game commits under the same
-        # Season lock; acting on the stale object would release the WRONG old
-        # slot and clobber the game's current slot/time/published state.
+        # locator). A concurrent publish_game (which does not take the Team
+        # lock) commits under the same Season lock; acting on the stale object
+        # would clobber the game's current published/locked state.
         game = self.store.get_game(game_id)
         if game is None:
             raise NotFoundError(f"Game {game_id} not found.",
                                 details={"reason": "game_missing"})
+        # #314 review — defensive verify: the Rinks we hold MUST be exactly the
+        # game's CURRENT source Rink plus the target slot's Rink. Provably true
+        # given the Team lock makes ice_slot_id stable for this whole
+        # transaction (see above) — but cheap, explicit insurance against a
+        # future writer that skips the Team-lock convention beats silently
+        # trusting a lock set we can no longer prove is right; retry clean
+        # rather than proceed against it.
+        _now_rinks = set()
+        for _sid in (new_ice_slot_id, game.ice_slot_id):
+            _s = self.store.get_ice_slot(_sid) if _sid else None
+            if _s is not None:
+                _now_rinks.add(_s.rink_id)
+        if _now_rinks != _mv_rinks:
+            raise _MoveGameRaced()
         if game.cancelled:
             raise ValidationError("Cannot move a cancelled game.",
                                   details={"reason": "game_cancelled"})
