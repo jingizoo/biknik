@@ -2503,9 +2503,26 @@ class SetupService:
     def _assert_slot_meets_policy(self, slot, season_id, *,
                                   exclude_game_id=None):
         """#277 Slice B enforcement, layered onto :meth:`_assert_slot_free`
-        exactly as its docstring reserved. Three checks against the effective
-        Rink>Season>Program policy, each a stable structured
-        ``ScheduleConflictError``:
+        exactly as its docstring reserved — raises the violation
+        :meth:`_slot_policy_violation` reports as a stable structured
+        ``ScheduleConflictError``."""
+        violation = self._slot_policy_violation(
+            slot, season_id, exclude_game_id=exclude_game_id)
+        if violation is not None:
+            message, details = violation
+            raise ScheduleConflictError(message, details=details)
+
+    def _slot_policy_violation(self, slot, season_id, *,
+                               exclude_game_id=None, extra_rink_spans=()):
+        """THE #277 Slice B policy evaluation — one implementation shared by
+        the placement gate (:meth:`_assert_slot_meets_policy`, which raises)
+        and the draft scheduler's advisory pass (which reports the same codes
+        in proposal ``reason_codes`` so a draft never offers a row the commit
+        gate would reject). Returns ``(message, details)`` for the first
+        violation, or ``None``. ``extra_rink_spans`` is the scheduler's
+        tentative same-run picks — ``(slot_id, start, end)`` tuples on this
+        slot's rink not yet persisted as Games. Three checks against the
+        effective Rink>Season>Program policy:
 
         * ``insufficient_playable_time`` — the slot's playable span
           ``[start_time, end_time]`` is shorter than ``min_playable_minutes``
@@ -2539,22 +2556,34 @@ class SetupService:
         same-rink scan is atomic against concurrent placements on this rink.
         """
         if season_id is None:
-            return
+            return None
         policy, _ = self._effective_policy(slot.rink_id, season_id)
         min_playable = policy["min_playable_minutes"] or 0
         slot_minutes = int(
             (slot.end_time - slot.start_time).total_seconds() // 60)
         if slot_minutes < min_playable:
-            raise ScheduleConflictError(
+            return (
                 f"Ice slot {slot.id} is only {slot_minutes} playable minutes; "
                 f"this competition requires at least {min_playable}.",
-                details={"reason": "insufficient_playable_time",
-                         "slot_minutes": slot_minutes,
-                         "required_minutes": min_playable})
+                {"reason": "insufficient_playable_time",
+                 "slot_minutes": slot_minutes,
+                 "required_minutes": min_playable})
         buffer_minutes = ((policy["warmup_minutes"] or 0)
                           + (policy["resurfacing_minutes"] or 0))
         if buffer_minutes > 0:
             pad = timedelta(minutes=buffer_minutes)
+
+            def _gap(other_start, other_end):
+                if other_start >= slot.end_time:
+                    gap = other_start - slot.end_time
+                else:
+                    gap = slot.start_time - other_end
+                # Physically overlapping slots (possible only via legacy/
+                # imported rows — create_ice_slot forbids new ones) would
+                # yield a negative gap; clamp to 0 so the detail reads as
+                # "no gap", not a nonsense negative.
+                return max(gap, timedelta(0))
+
             for ex in self.store.all_games():
                 if (ex.id == exclude_game_id or ex.cancelled
                         or ex.ice_slot_id is None
@@ -2566,25 +2595,32 @@ class SetupService:
                 if intervals_overlap(slot.start_time - pad,
                                      slot.end_time + pad,
                                      ex_slot.start_time, ex_slot.end_time):
-                    if ex_slot.start_time >= slot.end_time:
-                        gap = ex_slot.start_time - slot.end_time
-                    else:
-                        gap = slot.start_time - ex_slot.end_time
-                    # Physically overlapping slots (possible only via legacy/
-                    # imported rows — create_ice_slot forbids new ones) would
-                    # yield a negative gap; clamp to 0 so the detail reads as
-                    # "no gap", not a nonsense negative.
-                    gap = max(gap, timedelta(0))
-                    raise ScheduleConflictError(
+                    gap = _gap(ex_slot.start_time, ex_slot.end_time)
+                    return (
                         f"Ice slot {slot.id} is too close to game {ex.id} on "
                         f"the same rink for the required "
                         f"{buffer_minutes}-minute turnover.",
-                        details={
-                            "reason": "turnover_buffer_conflict",
-                            "conflict_game_id": ex.id,
-                            "conflict_slot_id": ex_slot.id,
-                            "required_gap_minutes": buffer_minutes,
-                            "gap_minutes": int(gap.total_seconds() // 60)})
+                        {"reason": "turnover_buffer_conflict",
+                         "conflict_game_id": ex.id,
+                         "conflict_slot_id": ex_slot.id,
+                         "required_gap_minutes": buffer_minutes,
+                         "gap_minutes": int(gap.total_seconds() // 60)})
+            for span_id, span_start, span_end in extra_rink_spans:
+                if span_id == slot.id:
+                    continue
+                if intervals_overlap(slot.start_time - pad,
+                                     slot.end_time + pad,
+                                     span_start, span_end):
+                    gap = _gap(span_start, span_end)
+                    return (
+                        f"Ice slot {slot.id} is too close to another proposed "
+                        f"game on the same rink for the required "
+                        f"{buffer_minutes}-minute turnover.",
+                        {"reason": "turnover_buffer_conflict",
+                         "conflict_game_id": None,
+                         "conflict_slot_id": span_id,
+                         "required_gap_minutes": buffer_minutes,
+                         "gap_minutes": int(gap.total_seconds() // 60)})
         curfew = policy["curfew_local"]
         if curfew:
             hour, minute = parse_hhmm(curfew, "curfew_local")
@@ -2610,13 +2646,14 @@ class SetupService:
             # violates, everything at/before it passes.
             end_local = slot.end_time.astimezone(tz)
             if slot.end_time > curfew_at.astimezone(timezone.utc):
-                raise ScheduleConflictError(
+                return (
                     f"Ice slot {slot.id} ends at "
                     f"{end_local.strftime('%H:%M')} local, past the "
                     f"{curfew} curfew.",
-                    details={"reason": "curfew_violation",
-                             "curfew_local": curfew,
-                             "slot_end_local": end_local.strftime("%H:%M")})
+                    {"reason": "curfew_violation",
+                     "curfew_local": curfew,
+                     "slot_end_local": end_local.strftime("%H:%M")})
+        return None
 
     @_transactional
     def create_ice_slot(self, rink_id: str, start_time: datetime, end_time: datetime,

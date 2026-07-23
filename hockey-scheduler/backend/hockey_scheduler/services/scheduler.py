@@ -24,6 +24,7 @@ from .league_scope import (
     registered_team_ids_in_division,
     registered_teams_by_division_in_league,
 )
+from .setup_service import SetupService as _PolicySetup
 
 
 def round_robin_pairings(team_ids):
@@ -184,6 +185,15 @@ RINK_BLACKOUT = "rink_blackout"
 MAX_PER_DAY = "max_per_day"
 MIN_REST = "min_rest"
 NO_ICE_AVAILABLE = "no_ice_available"
+# #277 Slice B — the scheduler's ADVISORY mirror of the commit gate's policy
+# checks (SetupService._slot_policy_violation, the single shared
+# implementation): a slot the gate would reject is skipped during assignment
+# and its code surfaces in unscheduled[].reason_codes, so a draft never
+# proposes a row commit_draft_schedule is guaranteed to refuse. The gate
+# stays authoritative — this is a preview courtesy, not the enforcement.
+TURNOVER_BUFFER_CONFLICT = "turnover_buffer_conflict"
+INSUFFICIENT_PLAYABLE_TIME = "insufficient_playable_time"
+CURFEW_VIOLATION = "curfew_violation"
 
 
 def _slot_reason(slot, home, away, con, team_slots):
@@ -215,7 +225,41 @@ def _slot_reason(slot, home, away, con, team_slots):
     return None, None
 
 
-def _assign_ice(store, pairings, slots, constraints):
+def _policy_advisor(store, season_id):
+    """Per-run advisory closure over the shared policy evaluation (#277
+    Slice B). Returns ``check(slot, tentative_spans) -> (code, message)`` or
+    ``(None, None)``; ``tentative_spans`` is this run's not-yet-persisted
+    same-rink picks as ``(slot_id, start, end)``. Plain reads only; policies
+    are resolved per rink and cached for the run, so a draft over N slots
+    doesn't re-walk the policy rows N times. With no season (legacy data) or
+    no policy rows at all it never reports anything — proposal output is
+    byte-identical to pre-Slice-B."""
+    if season_id is None or not store.all_scheduling_policies():
+        return None
+    setup = _PolicySetup(store)
+    _cache = {}
+
+    def check(slot, tentative_spans):
+        violation = setup._slot_policy_violation(
+            slot, season_id, extra_rink_spans=tentative_spans)
+        if violation is None:
+            return None, None
+        message, details = violation
+        return details["reason"], message
+
+    return check
+
+
+def _resolve_division_season_id(store, division_id):
+    """A Division's Season via its LeagueSeason (#283 chain), or ``None`` for
+    a dangling/legacy row — the advisory pass simply stays off then."""
+    division = store.get_division(division_id) if division_id else None
+    ls = (store.get_league_season(division.league_season_id)
+          if division is not None and division.league_season_id else None)
+    return ls.season_id if ls is not None else None
+
+
+def _assign_ice(store, pairings, slots, constraints, policy_check=None):
     """Greedy earliest-slot-first assignment shared by every entry point.
 
     ``pairings`` is ``[(home_team_id, away_team_id, division_id_or_None), ...]``
@@ -233,12 +277,16 @@ def _assign_ice(store, pairings, slots, constraints):
     draft_games, unscheduled = [], []
     used = set()
     team_slots = {}  # team_id -> [assigned start_time]
+    rink_spans = {}  # rink_id -> [(slot_id, start, end)] picked this run (#277)
     for home, away, division_id in pairings:
         chosen, messages, codes = None, [], []
         for s in slots:
             if s.id in used:
                 continue
             code, message = _slot_reason(s, home, away, con, team_slots)
+            if code is None and policy_check is not None:
+                code, message = policy_check(
+                    s, rink_spans.get(s.rink_id, ()))
             if code is None:
                 chosen = s
                 break
@@ -248,6 +296,8 @@ def _assign_ice(store, pairings, slots, constraints):
             used.add(chosen.id)
             team_slots.setdefault(home, []).append(chosen.start_time)
             team_slots.setdefault(away, []).append(chosen.start_time)
+            rink_spans.setdefault(chosen.rink_id, []).append(
+                (chosen.id, chosen.start_time, chosen.end_time))
             rink = store.get_rink(chosen.rink_id) if chosen.rink_id else None
             draft_games.append({
                 "home_team_id": home, "away_team_id": away,
@@ -326,7 +376,10 @@ def draft_schedule(store, division_id, slot_ids=None, constraints=None):
     teams = sorted(registered_team_ids_in_division(store, division_id))
     pairings = [(h, a, division_id) for h, a in round_robin_pairings(teams)]
     slots = _available_game_slots(store, slot_ids)
-    draft_games, unscheduled = _assign_ice(store, pairings, slots, constraints)
+    draft_games, unscheduled = _assign_ice(
+        store, pairings, slots, constraints,
+        policy_check=_policy_advisor(
+            store, _resolve_division_season_id(store, division_id)))
     return {
         "division_id": division_id, "team_count": len(teams),
         "draft_games": draft_games, "unscheduled": unscheduled,
@@ -356,7 +409,9 @@ def draft_schedule_for_league(store, season_id, league_id, division_id=None,
         pairings.extend(
             (h, a, div_id) for h, a in round_robin_pairings(sorted(team_ids)))
     slots = _available_game_slots(store, slot_ids)
-    draft_games, unscheduled = _assign_ice(store, pairings, slots, constraints)
+    draft_games, unscheduled = _assign_ice(
+        store, pairings, slots, constraints,
+        policy_check=_policy_advisor(store, season_id))
     return {
         "season_id": season_id, "league_id": league_id,
         "division_id": division_id, "team_count": len(all_teams),

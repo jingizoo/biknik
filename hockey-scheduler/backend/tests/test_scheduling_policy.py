@@ -326,21 +326,86 @@ class _PolicyContract:
         self.assertEqual(_reason(mv2), "turnover_buffer_conflict", mv2)
 
     def test_draft_commit_rejected_identically_with_full_rollback(self):
+        g1 = self.api.create_game("se1", "d1", "t0", "t1", "sA",
+                                  league_id="lg")
+        self.assertNotIn("error", g1, g1)
+        # Set the policy only AFTER the proposal-blind placement exists:
+        # the scheduler's own advisory (tested below) would otherwise stop
+        # sB from ever being proposed — this test pins the COMMIT GATE, so
+        # defeat the advisory by making it see no policy at generation...
+        # impossible sequentially; instead pin the gate directly through the
+        # shared checker with a hand-built row.
+        self._buffer_policy()
+        audits = len(self.store.all_setup_audit())
+        games = len(self.store.all_games())
+        # The advisory keeps sB out of a proposal now, so the commit result
+        # is "nothing schedulable" — never a Game the gate would refuse.
+        res = self.api.commit_draft_schedule("d1", slot_ids=["sB"])
+        if "error" in res:
+            self.assertEqual(_reason(res), "turnover_buffer_conflict", res)
+        else:
+            self.assertEqual(res["created"], [], res)
+            self.assertTrue(res["unscheduled"], res)
+        self.assertEqual(len(self.store.all_games()), games)
+        self.assertEqual(len(self.store.all_setup_audit()) - audits, 1
+                         if "error" not in res else 0)
+        self.assertEqual(self.store.get_ice_slot("sB").status,
+                         IceSlotStatus.AVAILABLE)
+        # The gate itself still refuses the identical stale row — pinned
+        # directly through the shared checker create/move/commit all use.
+        from hockey_scheduler.domain.errors import ScheduleConflictError
+        with self.assertRaises(ScheduleConflictError) as ctx:
+            self.api.setup._assert_slot_free_for_game(
+                "sB", "t2", "t3", season_id="se1")
+        self.assertEqual(ctx.exception.details["reason"],
+                         "turnover_buffer_conflict")
+
+    # -- scheduler advisory parity (#277 step 3) ---------------------------
+    def test_proposal_reports_buffer_conflict_instead_of_offering_the_slot(
+            self):
         self._buffer_policy()
         g1 = self.api.create_game("se1", "d1", "t0", "t1", "sA",
                                   league_id="lg")
         self.assertNotIn("error", g1, g1)
-        audits = len(self.store.all_setup_audit())
-        games = len(self.store.all_games())
-        # The regenerated proposal would place t2/t3 on sB — 10 < 15 minutes
-        # from the committed game on sA — so the whole batch is refused by
-        # the same gate reason, with zero Games/slot flips/audits.
-        res = self.api.commit_draft_schedule("d1", slot_ids=["sB"])
-        self.assertEqual(_reason(res), "turnover_buffer_conflict", res)
-        self.assertEqual(len(self.store.all_games()), games)
-        self.assertEqual(len(self.store.all_setup_audit()), audits)
-        self.assertEqual(self.store.get_ice_slot("sB").status,
-                         IceSlotStatus.AVAILABLE)
+        prop = self.api.draft_season_schedule("d1", slot_ids=["sB"])
+        self.assertNotIn("error", prop, prop)
+        self.assertEqual(prop["draft_games"], [], prop)
+        codes = {c for row in prop["unscheduled"]
+                 for c in row["reason_codes"]}
+        self.assertIn("turnover_buffer_conflict", codes, prop)
+
+    def test_proposal_reports_sliver_and_curfew_codes(self):
+        self._buffer_policy()
+        self.api.set_scheduling_policy(
+            scope_type="rink", scope_id="r1", curfew_local="22:00",
+            actor_id="admin")
+        prop = self.api.draft_season_schedule("d1", slot_ids=["sC", "sD"])
+        self.assertNotIn("error", prop, prop)
+        self.assertEqual(prop["draft_games"], [], prop)
+        codes = {c for row in prop["unscheduled"]
+                 for c in row["reason_codes"]}
+        self.assertIn("insufficient_playable_time", codes, prop)
+        self.assertIn("curfew_violation", codes, prop)
+
+    def test_proposal_respects_buffer_between_its_own_tentative_picks(self):
+        # No committed games at all: the greedy loop itself must not pick
+        # sA and then sB (10 < 15 min apart on one rink) in the same run.
+        self._buffer_policy()
+        prop = self.api.draft_season_schedule("d1", slot_ids=["sA", "sB"])
+        self.assertNotIn("error", prop, prop)
+        placed = {row["ice_slot_id"] for row in prop["draft_games"]}
+        self.assertNotEqual(placed, {"sA", "sB"}, prop)
+        self.assertEqual(len(prop["draft_games"]), 1, prop)
+        # And the losing pairings say why.
+        codes = {c for row in prop["unscheduled"]
+                 for c in row["reason_codes"]}
+        self.assertIn("turnover_buffer_conflict", codes, prop)
+
+    def test_proposal_without_policies_is_unchanged(self):
+        prop = self.api.draft_season_schedule("d1", slot_ids=["sA", "sB"])
+        self.assertNotIn("error", prop, prop)
+        self.assertEqual({row["ice_slot_id"] for row in prop["draft_games"]},
+                         {"sA", "sB"}, prop)
 
 
 class MemorySchedulingPolicyTest(_PolicyContract, unittest.TestCase):
