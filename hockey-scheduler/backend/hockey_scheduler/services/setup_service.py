@@ -828,7 +828,7 @@ class SetupService:
             return reg
         stranded = [
             g.id for g in self.store.all_games()
-            if not g.cancelled and not g.is_draft
+            if not g.cancelled
             and g.season_id == season_id and g.league_id == old_league
             and reg.team_id in (g.home_team_id, g.away_team_id)]
         if stranded:
@@ -1121,14 +1121,20 @@ class SetupService:
         return ls.season_id if ls else None
 
     def _games_scheduled_for_team_in_season(self, season_id, team_id):
-        """Ids of committed (non-cancelled, non-draft) games in ``season_id``
-        that ``team_id`` plays in — the games a removal or division change would
-        strand. Draft proposals aren't real games yet, so they don't block."""
+        """Ids of committed, non-cancelled games in ``season_id`` that
+        ``team_id`` plays in.
+
+        A generated proposal is still read-only and never appears here. Once an
+        operator commits that proposal, however, its ``is_draft`` Game rows own
+        allocated ice and are part of the review/publish workflow. Removing or
+        re-binding a participant underneath those rows would strand invalid
+        drafts, so committed drafts block the same participation changes as
+        published Games (#314 review).
+        """
         if not season_id:
             return []
         return [g.id for g in self.store.all_games()
                 if g.season_id == season_id and not g.cancelled
-                and not g.is_draft
                 and team_id in (g.home_team_id, g.away_team_id)]
 
     def _registration_program(self, reg):
@@ -1278,11 +1284,11 @@ class SetupService:
         registration that currently sits in a DIFFERENT League to the target
         League's LeagueSeason for that same Season (clearing its Division, which
         belonged to the old LeagueSeason). If any such active registration has
-        committed (non-draft, non-cancelled) games, moving it would strand
-        them, so the WHOLE transfer is rejected before any write — the operator
-        must resolve those games first. All checks run before any mutation, so a
-        rejected transfer changes nothing (zero Team/registration/audit
-        mutation).
+        committed, non-cancelled games (including committed draft rows), moving
+        it would strand them, so the WHOLE transfer is rejected before any
+        write — the operator must resolve those games first. All checks run
+        before any mutation, so a rejected transfer changes nothing (zero
+        Team/registration/audit mutation).
         """
         team = self.store.get_team_for_update(team_id)
         if team is None:
@@ -3050,30 +3056,105 @@ class SetupService:
              "season_id": season_id, "division_id": division_id,
              "registered_division_id": raw.division_id})
 
-    def _require_batch_team_participation(self, season_id, rows):
-        """Re-validate EVERY proposed row's home/away team participation in
-        ``season_id`` (#314 review) — the same registration check
-        ``create_game``/``_revalidate_game_participation`` enforce, shared by
-        both ``commit_draft_schedule`` implementations for a whole draft batch.
+    def _require_batch_team_participation(self, season_id, league_season_id,
+                                          rows):
+        """Require every proposed row to belong to one exact LeagueSeason.
 
         ``draft_season_schedule`` only pairs currently-registered teams, but
         that proposal is generated BEFORE the write transaction opens. Calling
         this check right after acquiring the batch's Team/Rink/Season locks
         (never before) closes the gap: a concurrent ``unregister_team_from_
         season`` takes this same Season lock, and a team-to-league transfer
-        invalidates ``team_registration_valid``'s own league-consistency rule,
-        so by the time we hold our locks, either change has already committed
-        (and this sees it) or is blocked waiting on our lock — never mid-flight.
-        Raises the identical ``DivisionMismatchError`` a fresh ``create_game``
-        would, before any Game, slot-status, or audit write for the batch."""
+        can move a registration to another LeagueSeason in the same Season.
+        Season-only validation would accept that moved row for a division-less
+        draft and persist a Game in the old League. Resolve the expected
+        LeagueSeason under the held locks, require both teams' active rows to
+        reference it exactly, require any Division to belong to it, and require
+        each Team's permanent League to match it. This is the same fail-closed
+        competition identity later enforced by publish/move.
+        """
+        league_season = (
+            self.store.get_league_season(league_season_id)
+            if league_season_id else None)
+        if league_season is None:
+            raise ValidationError(
+                "The draft's league-season no longer exists.",
+                {"reason": "draft_league_season_missing",
+                 "season_id": season_id,
+                 "league_season_id": league_season_id})
+        if league_season.season_id != season_id:
+            raise ValidationError(
+                "The draft's league-season belongs to a different season.",
+                {"reason": "draft_league_season_mismatch",
+                 "season_id": season_id,
+                 "league_season_id": league_season.id,
+                 "league_season_season_id": league_season.season_id})
+
+        active = {
+            r.team_id: r
+            for r in self.store.registrations_for_league_season(
+                league_season.id)
+            if r.active
+        }
         for row in rows:
-            require_division = row.get("division_id") is not None
-            self._require_team_registered(
-                season_id, row["home_team_id"], row.get("division_id"),
-                require_division=require_division)
-            self._require_team_registered(
-                season_id, row["away_team_id"], row.get("division_id"),
-                require_division=require_division)
+            division_id = row.get("division_id")
+            if division_id is not None:
+                division = self.store.get_division(division_id)
+                if (division is None
+                        or division.league_season_id != league_season.id):
+                    raise DivisionMismatchError(
+                        "The draft Division does not belong to its "
+                        "league-season.",
+                        {"reason": "division_league_season_mismatch",
+                         "division_id": division_id,
+                         "league_season_id": league_season.id,
+                         "division_league_season_id": (
+                             division.league_season_id
+                             if division is not None else None)})
+
+            for team_id in (row["home_team_id"], row["away_team_id"]):
+                team = self.store.get_team(team_id)
+                label = team.name if team is not None else team_id
+                registration = active.get(team_id)
+                if registration is None:
+                    raw = next((
+                        r for r in self.store.registrations_for_season(
+                            season_id)
+                        if r.team_id == team_id and r.active), None)
+                    if raw is None:
+                        raise DivisionMismatchError(
+                            f"{label} is not registered in this season.",
+                            {"reason": "team_not_registered",
+                             "team_id": team_id, "season_id": season_id})
+                    raise DivisionMismatchError(
+                        f"{label} is not registered in this draft's "
+                        "league-season.",
+                        {"reason": "team_not_in_league_season",
+                         "team_id": team_id,
+                         "season_id": season_id,
+                         "league_season_id": league_season.id,
+                         "registered_league_season_id":
+                             raw.league_season_id})
+                if (team is None or not team.league_id
+                        or team.league_id != league_season.league_id):
+                    raise DivisionMismatchError(
+                        f"{label}'s registration does not match its permanent "
+                        "League.",
+                        {"reason": "registration_cross_league",
+                         "team_id": team_id,
+                         "league_season_id": league_season.id,
+                         "league_id": league_season.league_id,
+                         "team_league_id": (
+                             team.league_id if team is not None else None)})
+                if (division_id is not None
+                        and registration.division_id != division_id):
+                    raise DivisionMismatchError(
+                        f"{label} is not registered in this division.",
+                        {"reason": "team_wrong_division",
+                         "team_id": team_id, "season_id": season_id,
+                         "division_id": division_id,
+                         "registered_division_id":
+                             registration.division_id})
 
     def _team_participates(self, season, team_id: str,
                            division_id: Optional[str],

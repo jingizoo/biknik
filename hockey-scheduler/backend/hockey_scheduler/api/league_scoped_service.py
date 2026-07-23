@@ -8,7 +8,7 @@ stale or legacy row cannot bypass the same league-ice invariant.
 from datetime import datetime
 
 from ..domain import Game, IceSlotStatus
-from ..domain.errors import DomainError
+from ..domain.errors import DomainError, ValidationError
 from ..services.league_scope import (
     require_game_league_id,
     require_slot_belongs_to_season,
@@ -112,6 +112,20 @@ class ApiService(_BaseApiService):
                     _batch_rinks.add(_s.rink_id)
             self.setup._lock_rinks(_batch_rinks)
             self._guard_active_seasons([resolved_season_id])
+            # Resolve the exact LeagueSeason after the Season lock. A regular
+            # draft must carry this identity so publish/move can enforce the
+            # same competition scope, including league-wide rows with no
+            # Division.
+            draft_ls = self.store.league_season_for(
+                canonical_league_id, resolved_season_id
+            ) if canonical_league_id else None
+            if draft_ls is None:
+                raise ValidationError(
+                    "The draft's League is not linked to this Season.",
+                    {"reason": "draft_league_season_missing",
+                     "league_id": canonical_league_id,
+                     "season_id": resolved_season_id})
+            draft_ls_id = draft_ls.id
             # #314 review — re-validate every proposed slot's Season eligibility
             # HERE, under the Rink+Season locks just acquired, not before this
             # transaction opened (as a stale prevalidation could leave a window
@@ -130,7 +144,7 @@ class ApiService(_BaseApiService):
             # which the write would persist a Game for a team no longer a valid
             # participant. Reuses the identical check create_game enforces.
             self.setup._require_batch_team_participation(
-                resolved_season_id, proposal["draft_games"])
+                resolved_season_id, draft_ls_id, proposal["draft_games"])
             for row in proposal["draft_games"]:
                 # #277: run the SAME final conflict check as create_game /
                 # move_game before persisting — slot free (exists, GAME,
@@ -158,6 +172,7 @@ class ApiService(_BaseApiService):
                     league_id=canonical_league_id,
                     division_id=row.get("division_id"),
                     ice_slot_id=row.get("ice_slot_id"),
+                    league_season_id=draft_ls_id,
                     published=False,
                     is_draft=True,
                 )

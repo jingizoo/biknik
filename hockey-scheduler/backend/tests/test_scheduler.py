@@ -366,6 +366,48 @@ class SchedulerContract:
         for g in games:
             self.assertEqual(g.season_id, "se1")
             self.assertEqual(g.league_id, "lg1")
+            self.assertEqual(g.league_season_id, "ls_lg1_se1")
+
+        # A league-wide draft may contain Division-less rows in production,
+        # so its exact competition identity cannot be inferred later from a
+        # Division. Prove the persisted LeagueSeason is accepted by both
+        # downstream integrity gates.
+        game = games[0]
+        published = self.api.publish_draft_games(
+            game_ids=[game.id], actor_id="admin")
+        self.assertNotIn("error", published, repr(published))
+        used = {g.ice_slot_id for g in self.store.all_games()}
+        spare = next(
+            slot for slot in self.store.all_ice_slots() if slot.id not in used)
+        moved = self.api.move_game(
+            game.id, spare.id, reason="Exact-scope regression",
+            actor_id="admin")
+        self.assertNotIn("error", moved, repr(moved))
+        self.assertEqual(
+            self.store.get_game(game.id).league_season_id,
+            "ls_lg1_se1")
+
+    def test_division_commit_persists_exact_league_season_for_publish_and_move(self):
+        self._division_fixture(n_teams=2, n_slots=3)
+        result = self.api.commit_draft_schedule(
+            "div1", actor_id="admin")
+        self.assertNotIn("error", result, repr(result))
+        game = self.store.all_games()[0]
+        self.assertEqual(game.league_season_id, "ls_lg1_se1")
+
+        published = self.api.publish_draft_games(
+            game_ids=[game.id], actor_id="admin")
+        self.assertNotIn("error", published, repr(published))
+        spare = next(
+            slot for slot in self.store.all_ice_slots()
+            if slot.id != game.ice_slot_id)
+        moved = self.api.move_game(
+            game.id, spare.id, reason="Exact-scope regression",
+            actor_id="admin")
+        self.assertNotIn("error", moved, repr(moved))
+        self.assertEqual(
+            self.store.get_game(game.id).league_season_id,
+            "ls_lg1_se1")
 
     def test_draft_requires_division_or_season_and_league(self):
         self._base()

@@ -2740,11 +2740,6 @@ class ApiService:
             # Division.league_id is now resolved through its LeagueSeason (#283).
             ls = self._resolve_ls(division.league_season_id) if division else None
             canonical_league_id = ls.league_id if ls else None
-        # #283 Slice E: draft games are regular games, so they reference the
-        # same LeagueSeason (canonical_league_id × resolved_season_id).
-        draft_ls = self.store.league_season_for(
-            canonical_league_id, resolved_season_id) if canonical_league_id else None
-        draft_ls_id = draft_ls.id if draft_ls else None
         # #159 — lock the target Season and do EVERY Game/audit write in one
         # transaction, so a concurrent archive cannot commit between the guard
         # and the writes (autocommit would release the FOR UPDATE lock at the
@@ -2767,6 +2762,19 @@ class ApiService:
                     _batch_rinks.add(_s.rink_id)
             self.setup._lock_rinks(_batch_rinks)
             self._guard_active_seasons([resolved_season_id])
+            # Resolve the exact competition identity only after the Season lock.
+            # If a concurrent unbind won first, fail closed; if it is queued
+            # behind us, its dependency scan will see the Games created below.
+            draft_ls = self.store.league_season_for(
+                canonical_league_id, resolved_season_id
+            ) if canonical_league_id else None
+            if draft_ls is None:
+                raise ValidationError(
+                    "The draft's League is not linked to this Season.",
+                    {"reason": "draft_league_season_missing",
+                     "league_id": canonical_league_id,
+                     "season_id": resolved_season_id})
+            draft_ls_id = draft_ls.id
             # #314 review — re-validate every proposed slot's Season eligibility
             # HERE, under the Rink+Season locks just acquired: a concurrent
             # SeasonVenueAccess revoke or Rink→Venue reassignment can only land
@@ -2785,7 +2793,7 @@ class ApiService:
             # which the write would persist a Game for a team no longer a valid
             # participant. Reuses the identical check create_game enforces.
             self.setup._require_batch_team_participation(
-                resolved_season_id, proposal["draft_games"])
+                resolved_season_id, draft_ls_id, proposal["draft_games"])
             created = []
             for d in proposal["draft_games"]:
                 # #277: the draft-commit path runs the SAME final conflict check

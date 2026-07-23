@@ -1019,7 +1019,6 @@ def _preflight_reassignment_safety(store, rows, now=None) -> List[dict]:
             stranded.extend(
                 g.id for g in all_games
                 if g.season_id == reg_ls.season_id and not g.cancelled
-                and not getattr(g, "is_draft", False)
                 and team.id in (g.home_team_id, g.away_team_id))
         if stranded:
             errors.append({
@@ -1057,7 +1056,6 @@ def _preflight_reassignment_safety(store, rows, now=None) -> List[dict]:
             continue
         stranded = [g.id for g in all_games
                     if g.season_id == season.id and not g.cancelled
-                    and not getattr(g, "is_draft", False)
                     and team.id in (g.home_team_id, g.away_team_id)]
         if stranded and league_changed:
             errors.append({

@@ -439,10 +439,13 @@ class DeletionContract:
         slot = self._slot(self._rink(self._venue(league_id=lg, season_id=s)))
         game = self._game(s, d, home, away, slot)
         self._make_draft(game)
-        # A draft game holds neither team's registration off "scheduled", so
-        # both can be deactivated even while the draft still references them.
-        self.api.unregister_team_from_season(home_reg, actor_id=self.ACTOR)
-        self.api.unregister_team_from_season(away_reg, actor_id=self.ACTOR)
+        # Normal lifecycle operations now reject deactivation while a committed
+        # draft references the registration. Put one row into the legacy/dirty
+        # inactive state directly so this lower-level deletion dependency test
+        # still proves the Game reference itself blocks permanent cleanup.
+        stored = self.store.get_season_team_registration(home_reg)
+        stored.active = False
+        self.store.save_season_team_registration(stored)
 
         blocked = self.api.delete_season_team_registration(
             home_reg, actor_id=self.ACTOR)

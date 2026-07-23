@@ -748,20 +748,24 @@ class RequireBatchTeamParticipationUnitTest(unittest.TestCase):
                      "division_id": "d1"}]
 
     def test_passes_for_a_fully_valid_batch(self):
-        self.api.setup._require_batch_team_participation("se1", self.rows)
+        self.api.setup._require_batch_team_participation(
+            "se1", "ls1", self.rows)
 
     def test_raises_for_an_unregistered_team(self):
         self.api.unregister_team_from_season("reg1_t0")
         with self.assertRaises(DomainError) as ctx:
-            self.api.setup._require_batch_team_participation("se1", self.rows)
+            self.api.setup._require_batch_team_participation(
+                "se1", "ls1", self.rows)
         self.assertEqual(ctx.exception.details["reason"], "team_not_registered")
 
     def test_raises_for_a_transferred_team(self):
         self.store.add_league(League(id="lg2", program_id="pg", name="League 2"))
         self.api.transfer_team_to_league("t0", "lg2")
         with self.assertRaises(DomainError) as ctx:
-            self.api.setup._require_batch_team_participation("se1", self.rows)
-        self.assertEqual(ctx.exception.details["reason"], "team_wrong_division")
+            self.api.setup._require_batch_team_participation(
+                "se1", "ls1", self.rows)
+        self.assertEqual(
+            ctx.exception.details["reason"], "team_not_in_league_season")
 
     def test_division_less_row_relaxes_to_season_only(self):
         # A League-wide draft row can carry no division (#233 Slice G) — the
@@ -770,8 +774,21 @@ class RequireBatchTeamParticipationUnitTest(unittest.TestCase):
         self.api.unregister_team_from_season("reg1_t0")
         rows = [{"home_team_id": "t0", "away_team_id": "t3", "division_id": None}]
         with self.assertRaises(DomainError) as ctx:
-            self.api.setup._require_batch_team_participation("se1", rows)
+            self.api.setup._require_batch_team_participation(
+                "se1", "ls1", rows)
         self.assertEqual(ctx.exception.details["reason"], "team_not_registered")
+
+    def test_division_less_row_still_requires_the_exact_league_season(self):
+        self.store.add_league(League(
+            id="lg2", program_id="pg", name="League 2"))
+        self.api.transfer_team_to_league("t0", "lg2")
+        rows = [{"home_team_id": "t0", "away_team_id": "t3",
+                 "division_id": None}]
+        with self.assertRaises(DomainError) as ctx:
+            self.api.setup._require_batch_team_participation(
+                "se1", "ls1", rows)
+        self.assertEqual(
+            ctx.exception.details["reason"], "team_not_in_league_season")
 
 
 class _DraftParticipationParityMixin:
@@ -815,6 +832,40 @@ class _DraftParticipationParityMixin:
         row = res["created"][0]
         self.assertNotIn("T0", (row["home_team_name"], row["away_team_name"]))
 
+    def test_committed_draft_blocks_unregister_that_would_strand_it(self):
+        res = self.api.commit_draft_schedule("d1", slot_ids=["s0"])
+        self.assertNotIn("error", res, repr(res))
+        game = _active_games(self.store)[0]
+        team_id = game.home_team_id
+        result = self.api.unregister_team_from_season(f"reg1_{team_id}")
+        self.assertEqual(_reason(result), "team_has_scheduled_games", repr(result))
+        self.assertTrue(
+            self.store.get_season_team_registration(
+                f"reg1_{team_id}").active)
+        self.assertFalse(any(
+            a.action == "season_team_unregistered"
+            and a.entity_id == f"reg1_{team_id}"
+            for a in self.store.all_setup_audit()))
+
+    def test_committed_draft_blocks_transfer_that_would_strand_it(self):
+        res = self.api.commit_draft_schedule("d1", slot_ids=["s0"])
+        self.assertNotIn("error", res, repr(res))
+        game = _active_games(self.store)[0]
+        team_id = game.home_team_id
+        self.store.add_league(League(
+            id="lg2", program_id="pg", name="League 2"))
+        result = self.api.transfer_team_to_league(team_id, "lg2")
+        self.assertEqual(
+            _reason(result), "team_transfer_strands_games", repr(result))
+        self.assertEqual(self.store.get_team(team_id).league_id, "lg")
+        self.assertEqual(
+            self.store.get_season_team_registration(
+                f"reg1_{team_id}").league_season_id,
+            "ls1")
+        self.assertFalse(any(
+            a.action == "team_league_transferred" and a.entity_id == team_id
+            for a in self.store.all_setup_audit()))
+
 
 class MemoryDraftParticipationParityTest(_DraftParticipationParityMixin,
                                          unittest.TestCase):
@@ -851,58 +902,131 @@ class _DraftParticipationRaceMixin(_ForcedRaceHarnessMixin):
     """Forced two-session race: commit_draft_schedule (its proposal generated
     while the team was still valid) vs. a concurrent unregister/transfer for
     that same team (#314 review). Whichever transaction acquires the Season
-    lock first wins:
+    lock first wins. If draft commit wins, the later participation change is
+    rejected because a committed draft owns allocated ice and must retain valid
+    participants. If unregister/transfer wins, the draft either regenerates
+    without that team or its under-lock exact-LeagueSeason check rejects the
+    stale proposal. Every successful Game must match both teams' current active
+    registration and permanent League."""
 
-      * the participation change ALWAYS succeeds — a draft (is_draft=True)
-        never counts as a "scheduled game" for the unregister/transfer
-        stranding guard (_games_scheduled_for_team_in_season's own docstring:
-        "Draft proposals aren't real games yet, so they don't block" — an
-        existing, intentional, verified design choice, not this fix's scope);
-      * the draft commit either lands cleanly — it ran first (or the
-        participation change hadn't landed by the time draft_season_schedule
-        read the roster, so the fresh proposal already excluded/included the
-        team correctly) — or is refused by the NEW _require_batch_team_
-        participation recheck with a stable structured reason and ZERO
-        partial Games, slot flips, or audits (it saw the now-excluded team).
-
-    Never a corrupted state, never a Game for a team that (by the time the
-    commit's own locks are held) is not a valid participant."""
-
-    def _assert_participation_race(self, participation_call, expected_reasons):
+    def _assert_participation_race(self, participation_call,
+                                   expected_draft_reasons,
+                                   expected_participation_reason):
         out = self._run([
             lambda a: a.commit_draft_schedule("d1", slot_ids=["s0"]),
             participation_call,
         ])
         self._assert_no_crash(out)
         draft_res, part_res = out
-        self.assertNotIn("error", part_res,
-                         f"the participation change should always succeed "
-                         f"(a draft never blocks it): {out!r}")
         store = self._store()
         active = _active_games(store)
-        if isinstance(draft_res, dict) and "error" not in draft_res:
+        draft_ok = isinstance(draft_res, dict) and "error" not in draft_res
+        part_ok = isinstance(part_res, dict) and "error" not in part_res
+        if draft_ok:
             self.assertEqual(len(draft_res["created"]), 1, repr(out))
             self.assertEqual(len(active), 1)
         else:
-            self.assertIn(_reason(draft_res), expected_reasons, repr(out))
+            self.assertIn(
+                _reason(draft_res), expected_draft_reasons, repr(out))
             self.assertEqual(len(active), 0)
             self.assertEqual(store.get_ice_slot("s0").status.value, "available")
             self.assertFalse(any(a.action == "draft_schedule_committed"
                                 for a in store.all_setup_audit()))
+
+        if part_ok:
+            self.assertTrue(draft_ok, repr(out))
+            self.assertNotIn(
+                "t0",
+                (active[0].home_team_id, active[0].away_team_id),
+                repr(out))
+        else:
+            self.assertTrue(draft_ok, repr(out))
+            self.assertEqual(
+                _reason(part_res), expected_participation_reason, repr(out))
+            self.assertIn(
+                "t0",
+                (active[0].home_team_id, active[0].away_team_id),
+                repr(out))
+
+        for game in active:
+            self.assertEqual(game.league_season_id, "ls1")
+            league_season = store.get_league_season(game.league_season_id)
+            for team_id in (game.home_team_id, game.away_team_id):
+                team = store.get_team(team_id)
+                registration = next((
+                    r for r in store.registrations_for_league_season("ls1")
+                    if r.team_id == team_id and r.active), None)
+                self.assertIsNotNone(registration, repr(out))
+                self.assertEqual(team.league_id, league_season.league_id)
         self._assert_schedule_consistent(store)
 
     def test_unregister_vs_draft_commit(self):
         self._assert_participation_race(
             lambda a: a.unregister_team_from_season("reg1_t0"),
-            ("team_not_registered",))
+            ("team_not_registered",),
+            "team_has_scheduled_games")
 
     def test_transfer_vs_draft_commit(self):
         self._store().add_league(
             League(id="lg2", program_id="pg", name="League 2"))
         self._assert_participation_race(
             lambda a: a.transfer_team_to_league("t0", "lg2"),
-            ("team_not_registered", "team_wrong_division",
-             "registration_cross_league"))
+            ("team_not_registered", "team_not_in_league_season",
+             "team_wrong_division", "registration_cross_league"),
+            "team_transfer_strands_games")
+
+    def test_divisionless_league_draft_vs_transfer_uses_exact_league_season(self):
+        """Force the stale-proposal interleaving that a Division check cannot
+        catch: every source registration is Division-less, and the proposal is
+        captured while its selected Team still belongs to League A. The write
+        then races that Team's transfer to League B in the same Season."""
+        seed = self._store()
+        for registration in seed.registrations_for_league_season("ls1"):
+            registration.division_id = None
+            seed.save_season_team_registration(registration)
+        seed.add_league(League(
+            id="lg2", program_id="pg", name="League 2"))
+        proposal = self._api_cls()(seed).draft_season_schedule(
+            season_id="se1", league_id="lg", slot_ids=["s0"])
+        self.assertNotIn("error", proposal, repr(proposal))
+        self.assertEqual(len(proposal["draft_games"]), 1)
+        self.assertIsNone(proposal["draft_games"][0]["division_id"])
+        selected_team = proposal["draft_games"][0]["home_team_id"]
+
+        def commit_stale_proposal(api):
+            api.draft_season_schedule = (
+                lambda *args, **kwargs: proposal)
+            return api.commit_draft_schedule(
+                season_id="se1", league_id="lg", slot_ids=["s0"])
+
+        out = self._run([
+            commit_stale_proposal,
+            lambda a: a.transfer_team_to_league(selected_team, "lg2"),
+        ])
+        self._assert_no_crash(out)
+        draft_res, transfer_res = out
+        store = self._store()
+        games = _active_games(store)
+        if "error" not in draft_res:
+            self.assertEqual(_reason(transfer_res),
+                             "team_transfer_strands_games", repr(out))
+            self.assertEqual(len(games), 1)
+            self.assertEqual(games[0].league_season_id, "ls1")
+            self.assertIsNone(games[0].division_id)
+            self.assertEqual(store.get_team(selected_team).league_id, "lg")
+        else:
+            self.assertIn(
+                _reason(draft_res),
+                ("team_not_in_league_season", "registration_cross_league",
+                 "team_not_registered"),
+                repr(out))
+            self.assertNotIn("error", transfer_res, repr(out))
+            self.assertEqual(games, [])
+            self.assertEqual(store.get_ice_slot("s0").status.value, "available")
+            self.assertEqual(store.get_team(selected_team).league_id, "lg2")
+            self.assertFalse(any(
+                audit.action == "draft_schedule_committed"
+                for audit in store.all_setup_audit()))
 
 
 @unittest.skipUnless(os.environ.get("TEST_DATABASE_URL"),
