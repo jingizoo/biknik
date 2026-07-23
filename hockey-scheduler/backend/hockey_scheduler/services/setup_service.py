@@ -2525,6 +2525,17 @@ class SetupService:
                 accessible.append((rink, venue))
         return accessible, access_missing
 
+    def _slot_compatible_duplicate(self, slot):
+        """Whether an exact ``(rink, start, end)`` match is an idempotent
+        DUPLICATE — i.e. it is already compatible AVAILABLE Game ice with no
+        active Game on it. An ALLOCATED slot backing a Game, or a BLOCKED /
+        maintenance / non-Game slot at that exact tuple, is NOT a harmless
+        duplicate: it is a real collision the preview must report and the commit
+        must refuse to overwrite, not hidden capacity (#158 review)."""
+        return (slot.slot_type == IceSlotType.GAME
+                and slot.status == IceSlotStatus.AVAILABLE
+                and self.store.game_using_ice_slot(slot.id) is None)
+
     def _classify_ice_windows(self, accessible, plan):
         """Classify each (accessible rink × planner window) against CURRENT ice
         inventory as new / duplicate / conflict. Reads all_ice_slots(); the
@@ -2538,27 +2549,31 @@ class SetupService:
             existing = existing_by_rink.get(rink.id, [])
             for w in plan["windows"]:
                 start, end = w["start"], w["end"]
-                # Exact (rink, start, end) match => idempotent duplicate; an
-                # overlap that is NOT exact is a real conflict to resolve.
                 exact = next((e for e in existing if e.start_time == start
                               and e.end_time == end), None)
-                if exact is not None:
-                    status, ref, has_game = "duplicate", exact.id, False
+                # An exact tuple is an idempotent DUPLICATE only when it is
+                # compatible AVAILABLE Game ice; an occupied / blocked / non-Game
+                # slot at that tuple — or any non-exact overlap — is a conflict.
+                if exact is not None and self._slot_compatible_duplicate(exact):
+                    status, ref, clash = "duplicate", exact.id, None
                 else:
-                    clash = next((e for e in existing if intervals_overlap(
-                        start, end, e.start_time, e.end_time)), None)
-                    if clash is not None:
-                        status, ref = "conflict", clash.id
-                        has_game = self.store.game_using_ice_slot(clash.id) is not None
-                    else:
-                        status, ref, has_game = "new", None, False
+                    clash = exact or next(
+                        (e for e in existing if intervals_overlap(
+                            start, end, e.start_time, e.end_time)), None)
+                    status = "conflict" if clash is not None else "new"
+                    ref = clash.id if clash is not None else None
+                game = (self.store.game_using_ice_slot(clash.id)
+                        if clash is not None else None)
                 classified.append({
                     "rink_id": rink.id, "rink_name": rink.name,
                     "venue_id": venue.id, "venue_name": venue.name,
                     "date": w["date"], "start": start, "end": end,
                     "start_local": w["start_local"], "end_local": w["end_local"],
                     "status": status, "conflict_with": ref,
-                    "conflict_has_game": has_game,
+                    "conflict_has_game": game is not None,
+                    "conflict_slot_type": clash.slot_type.value if clash else None,
+                    "conflict_slot_status": clash.status.value if clash else None,
+                    "conflict_game_id": game.id if game is not None else None,
                 })
         return classified
 
@@ -2603,6 +2618,9 @@ class SetupService:
                 "start_local": c["start_local"], "end_local": c["end_local"],
                 "status": c["status"], "conflict_with": c["conflict_with"],
                 "conflict_has_game": c["conflict_has_game"],
+                "conflict_slot_type": c["conflict_slot_type"],
+                "conflict_slot_status": c["conflict_slot_status"],
+                "conflict_game_id": c["conflict_game_id"],
             } for c in classified],
             "totals": {
                 "new": new_n, "duplicate": dup_n, "conflict": con_n,
@@ -2739,12 +2757,21 @@ class SetupService:
                         existing = existing_by_rink.setdefault(rink.id, [])
                         for w in plan_windows:
                             start, end = w["start"], w["end"]
-                            if any(e.start_time == start and e.end_time == end
-                                   for e in existing):
+                            exact = next(
+                                (e for e in existing if e.start_time == start
+                                 and e.end_time == end), None)
+                            # Exact tuple is an idempotent skip ONLY when it is
+                            # compatible AVAILABLE Game ice; an occupied / blocked
+                            # / non-Game slot there is a conflict, never silently
+                            # counted as a duplicate (#158 review).
+                            if exact is not None \
+                                    and self._slot_compatible_duplicate(exact):
                                 dup += 1
                                 continue
-                            if any(intervals_overlap(start, end, e.start_time,
-                                                     e.end_time) for e in existing):
+                            if exact is not None or any(
+                                    intervals_overlap(start, end, e.start_time,
+                                                      e.end_time)
+                                    for e in existing):
                                 conflict += 1
                                 continue
                             slot = IceSlot(

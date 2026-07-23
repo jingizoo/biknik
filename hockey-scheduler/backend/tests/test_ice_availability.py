@@ -580,6 +580,69 @@ class IceAvailabilityContract:
         self.assertNotIn("error", res)
         self.assertEqual(res["totals"]["created"], pv["totals"]["new"])
 
+    # -- 15. an exact tuple is a duplicate ONLY when compatible Game ice -----
+    # The first generated window is Tue Sep 1, 18:00 EDT = 22:00-23:00 UTC.
+    _FIRST = (datetime(2026, 9, 1, 22, tzinfo=timezone.utc),
+              datetime(2026, 9, 1, 23, tzinfo=timezone.utc))
+
+    def _slot_at_first_window(self, slot_type=IceSlotType.GAME,
+                              status=IceSlotStatus.AVAILABLE, game_id=None):
+        start, end = self._FIRST
+        slot = self._add_existing("rink_1", start.isoformat(), end.isoformat(),
+                                  slot_type=slot_type)
+        if status != IceSlotStatus.AVAILABLE:
+            slot.status = status
+            self.store.save_ice_slot(slot)
+        if game_id is not None:
+            from hockey_scheduler.domain.models import Game
+            self.store.add_game(Game(
+                id=game_id, home_team_id="h", away_team_id="a",
+                start_time=start, end_time=end, ice_slot_id=slot.id,
+                season_id="season_1"))
+        return slot
+
+    def _first_preview_slot(self, pv):
+        first = self._FIRST[0].isoformat()
+        return next(s for s in pv["slots"] if s["start_time"] == first)
+
+    def test_exact_available_game_slot_is_an_idempotent_duplicate(self):
+        self._slot_at_first_window()                       # AVAILABLE Game
+        pv = self.api.preview_ice_availability(**_template())
+        self.assertEqual(self._first_preview_slot(pv)["status"], "duplicate")
+        self.assertEqual(pv["totals"]["duplicate"], 1)
+        self.assertEqual(pv["totals"]["conflict"], 0)
+
+    def test_exact_allocated_slot_backing_a_game_is_a_conflict(self):
+        self._slot_at_first_window(status=IceSlotStatus.ALLOCATED,
+                                   game_id="g_occ")
+        pv = self.api.preview_ice_availability(**_template())
+        slot = self._first_preview_slot(pv)
+        self.assertEqual(slot["status"], "conflict")       # NOT hidden as capacity
+        self.assertTrue(slot["conflict_has_game"])
+        self.assertEqual(slot["conflict_game_id"], "g_occ")
+        self.assertEqual(slot["conflict_slot_status"], "allocated")
+        self.assertEqual(pv["totals"]["conflict"], 1)
+        self.assertEqual(pv["totals"]["duplicate"], 0)
+        # Commit skips it as a conflict, never counts it as idempotent capacity.
+        res = self.api.commit_ice_availability(actor_id="a", **_template())
+        self.assertEqual(res["totals"]["created"], 5)
+        self.assertEqual(res["totals"]["conflict_skipped"], 1)
+        self.assertEqual(res["totals"]["duplicate_skipped"], 0)
+
+    def test_exact_non_game_slot_is_a_conflict(self):
+        self._slot_at_first_window(slot_type=IceSlotType.MAINTENANCE)
+        pv = self.api.preview_ice_availability(**_template())
+        slot = self._first_preview_slot(pv)
+        self.assertEqual(slot["status"], "conflict")
+        self.assertEqual(slot["conflict_slot_type"], "maintenance")
+        self.assertFalse(slot["conflict_has_game"])
+        self.assertEqual(pv["totals"]["conflict"], 1)
+        self.assertEqual(pv["totals"]["duplicate"], 0)
+        res = self.api.commit_ice_availability(actor_id="a", **_template())
+        self.assertEqual(res["totals"]["created"], 5)
+        self.assertEqual(res["totals"]["conflict_skipped"], 1)
+        self.assertEqual(res["totals"]["duplicate_skipped"], 0)
+
 
 class MemoryIceAvailabilityTest(IceAvailabilityContract, unittest.TestCase):
     def _store(self):
@@ -1060,3 +1123,42 @@ class IceAvailabilityHttpAuthzTest(unittest.TestCase):
         self.assertEqual(res["error"]["details"]["reason"], "preview_mismatch")
         self.assertEqual(
             sum(1 for x in store.all_ice_slots() if x.rink_id == rink.id), 0)
+
+    def test_exact_game_collision_reported_over_http(self):
+        # Over HTTP: an ALLOCATED slot backing an active Game at a template's
+        # exact tuple is reported as a CONFLICT (with the Game id), never counted
+        # as idempotent duplicate capacity.
+        from hockey_scheduler.domain.models import Game
+        from hockey_scheduler.domain.setup_models import IceSlot
+        svc = self.srv.STATE.api.setup
+        store = self.srv.STATE.api.store
+        prog = svc.create_program("HB3", timezone_name="UTC")   # UTC: local==UTC
+        season = svc.create_season(prog.id, "Fall Collision")
+        venue = svc.create_venue("Rink House 3", league_id=prog.id)
+        svc.grant_season_venue_access(season.id, venue.id)
+        rink = svc.create_rink(venue.id, "Sheet 3")
+        start = datetime(2026, 9, 1, 18, tzinfo=timezone.utc)   # Sep 1 is a Tuesday
+        end = datetime(2026, 9, 1, 19, tzinfo=timezone.utc)
+        store.add_ice_slot(IceSlot(
+            id="occ_http", rink_id=rink.id, start_time=start, end_time=end,
+            slot_type=IceSlotType.GAME, status=IceSlotStatus.ALLOCATED))
+        store.add_game(Game(id="g_http", home_team_id="h", away_team_id="a",
+                            start_time=start, end_time=end, ice_slot_id="occ_http",
+                            season_id=season.id))
+        template = {                                       # one Tue window, exact tuple
+            "season_id": season.id, "rink_ids": [rink.id], "weekdays": [1],
+            "start_local": "18:00", "end_local": "19:00",
+            "start_date": "2026-09-01", "end_date": "2026-09-01",
+            "playable_minutes": 60, "turnover_minutes": 0}
+        c = self._client()
+        self._login(c, "arena")
+        _, pv = self._req(
+            c, "POST", "/api/setup/ice-availability/preview", template)
+        collision = next(s for s in pv["slots"]
+                         if s["start_time"] == start.isoformat())
+        self.assertEqual(collision["status"], "conflict")   # NOT duplicate
+        self.assertTrue(collision["conflict_has_game"])
+        self.assertEqual(collision["conflict_game_id"], "g_http")
+        self.assertEqual(pv["totals"]["conflict"], 1)
+        self.assertEqual(pv["totals"]["duplicate"], 0)
+        self.assertEqual(pv["totals"]["capacity_games"], 0)   # not hidden capacity
