@@ -100,6 +100,22 @@ class ApiService(_BaseApiService):
         # guard and the writes (autocommit would drop the FOR UPDATE lock at the
         # end of the check) and the batch stays all-or-nothing.
         with self.store.transaction():
+            # #277/#313 — lock every team the batch places, then every rink it
+            # places onto (Team→Rink→Season order, before the Season guard) so each
+            # per-row check + ALLOCATE is atomic against a concurrent placement
+            # sharing a team AND against the ice-availability builder on those rinks
+            # (Rink before Season matches the builder and avoids deadlocking it).
+            # One globally-sorted pre-pass fixes the lock order for the whole batch;
+            # see SetupService._lock_teams / _lock_rinks for the ordering contract.
+            self.setup._lock_teams(
+                t for row in proposal["draft_games"]
+                for t in (row["home_team_id"], row["away_team_id"]))
+            _batch_rinks = set()
+            for row in proposal["draft_games"]:
+                _s = self.store.get_ice_slot(row["ice_slot_id"])
+                if _s is not None:
+                    _batch_rinks.add(_s.rink_id)
+            self.setup._lock_rinks(_batch_rinks)
             self._guard_active_seasons([resolved_season_id])
             for row in proposal["draft_games"]:
                 # #277: run the SAME final conflict check as create_game /

@@ -28,6 +28,17 @@ class SetupService(_BaseSetupService):
         # method's undecorated body to avoid opening a nested SqlStore
         # transaction (SQLite rejects BEGIN inside BEGIN).
         with self.store.transaction():
+            # #313 — take the placement lock set (Team -> Rink -> Season) BEFORE the
+            # archived-Season guard, so this override matches the base body's order
+            # and the ice-availability builder's Program -> Rink -> Season. Locking
+            # the Season first here (as this override used to) inverts that order
+            # and deadlocks a concurrent same-Season builder commit. The base body
+            # re-takes these locks re-entrantly (no-ops); acquiring them here just
+            # pins the order at the true entry point.
+            self._lock_teams((home_team_id, away_team_id))
+            _slot = self.store.get_ice_slot(ice_slot_id)
+            if _slot is not None:
+                self._lock_rinks((_slot.rink_id,))
             # #159 — an archived (read-only) Season blocks game creation before
             # any slot/scope resolution, matching the base body's own guard.
             self._require_active_season(season_id)

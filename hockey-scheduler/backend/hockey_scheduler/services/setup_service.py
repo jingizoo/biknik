@@ -375,6 +375,61 @@ class SetupService:
         if game is not None and game.season_id:
             require_active_season(self.store, game.season_id)
 
+    def _lock_teams(self, team_ids) -> None:
+        """Row-lock every distinct Team in canonical (sorted) order (#277).
+
+        The final placement check (:meth:`_assert_slot_free_for_game`) refuses a
+        game that would double-book a team, but that read-then-write is only
+        atomic if concurrent placements sharing a team serialize. Locking exactly
+        the game's two teams is sufficient: a ``team_overlap`` can exist only
+        between games that SHARE a team, so any racing placement able to conflict
+        must also touch — and block on — one of these very rows. Whoever wins the
+        lock writes its game; the loser, re-scanning ``all_games`` under the lock,
+        now sees that game and is refused with a stable ``team_overlap`` instead
+        of silently double-booking. The other half of the check — one active game
+        per slot — is guarded by :meth:`_lock_rinks` (which also serializes with
+        the ice-availability builder) plus the ``ux_games_active_ice_slot`` DB
+        index as a backstop.
+
+        Sorted order gives a total lock order, so two placements can never
+        deadlock each other; Teams are always locked BEFORE the Rink and Season
+        (matching ``transfer_team_to_league`` / ``copy_``/``move_season_teams``,
+        which lock Team→Season), so the global Team→Rink→Season order holds. A
+        no-op on the in-memory store (whose ``transaction()`` fully serializes for
+        free); a real ``SELECT ... FOR UPDATE`` on SQL. MUST run inside a
+        ``store.transaction()``, and before the caller's Rink/Season guards so the
+        ordering invariant holds."""
+        for tid in sorted({t for t in team_ids if t}):
+            self.store.get_team_for_update(tid)
+
+    def _lock_rinks(self, rink_ids) -> None:
+        """Row-lock every distinct Rink in canonical (sorted) order (#277 / #313).
+
+        The placement check reads a slot's status/occupancy and then allocates it,
+        and the ice-availability BUILDER (``commit_ice_availability``) revalidates
+        its preview token and creates/reconciles slots UNDER a per-rink
+        ``get_rink_for_update`` lock. Game placement must take that SAME rink lock
+        so the two serialize: otherwise a cross-Season create/move/draft can
+        allocate an exact AVAILABLE slot in the window between the builder's
+        under-lock token check and its writes, turning a reviewed new/duplicate row
+        into an allocated-Game conflict while the builder commit still succeeds.
+        With the lock the loser blocks and then either sees the change (the builder
+        recomputes ``preview_mismatch``, or the placement re-reads the slot as
+        ``slot_unavailable``) or runs cleanly after the winner commits. (The DB
+        index ``ux_games_active_ice_slot`` still backstops the pure game-vs-game
+        slot race; this lock additionally covers game-vs-builder, which the index
+        cannot.)
+
+        Locked AFTER the Teams but BEFORE the Season — the global Team→Rink→Season
+        order — because the builder locks Program→Rink→Season (Rink before Season);
+        locking Season first here would invert that and deadlock the builder.
+        Sorted order gives a total order between two multi-rink placements. A no-op
+        on the in-memory store; a real ``SELECT ... FOR UPDATE`` on SQL. MUST run
+        inside a ``store.transaction()``, after the Team locks and before the
+        Season guard."""
+        for rid in sorted({r for r in rink_ids if r}):
+            self.store.get_rink_for_update(rid)
+
     @staticmethod
     def _normalize_lifecycle_reason(reason, *, required: bool) -> Optional[str]:
         """Validate + normalize a lifecycle ``reason`` BEFORE any mutation (#159).
@@ -3098,6 +3153,16 @@ class SetupService:
                     actor_id: Optional[str] = None,
                     league_id: Optional[str] = None,
                     game_type: str = GameType.REGULAR.value) -> Game:
+        # #277/#313 — lock both teams then the target slot's rink (Team→Rink→Season
+        # order) BEFORE the Season guard, so the final check is atomic against a
+        # concurrent placement sharing a team AND against the ice-availability
+        # builder, which revalidates its preview token under the same per-rink lock
+        # (Rink before Season matches the builder's Program→Rink→Season and avoids
+        # deadlocking it). See _lock_teams / _lock_rinks for the ordering contract.
+        self._lock_teams((home_team_id, away_team_id))
+        _target = self.store.get_ice_slot(ice_slot_id)
+        if _target is not None:
+            self._lock_rinks((_target.rink_id,))
         season = self._require_active_season(season_id)  # #159 read-only guard
 
         # #283 Slice D: a Game is REGULAR (counts toward standings, bound to one
@@ -3212,7 +3277,10 @@ class SetupService:
 
         # Shared final conflict check (#277): create/move/draft-commit all route
         # through the one checker so they enforce identical slot + team-overlap
-        # rules (and, in the policy slice, turnover + curfew).
+        # rules (and, in the policy slice, turnover + curfew). The team locks
+        # taken above make the team-overlap half atomic; the one-game-per-slot
+        # half is backstopped by the ux_games_active_ice_slot partial unique index
+        # (migration 022), so a race-losing insert fails with ice_slot_taken.
         slot = self._assert_slot_free_for_game(
             ice_slot_id, home_team_id, away_team_id)
 
@@ -3297,6 +3365,20 @@ class SetupService:
         if game is None:
             raise NotFoundError(f"Game {game_id} not found.",
                                 details={"reason": "game_missing"})
+        # #277/#313 — lock both of the game's teams then the source AND target
+        # slots' rinks (Team→Rink→Season order) BEFORE the Season guard, so the
+        # release-old + allocate-new is atomic against a concurrent placement
+        # sharing a team AND against the ice-availability builder on either rink
+        # (Rink before Season matches the builder and avoids deadlocking it). A
+        # game's teams and current slot are immutable, so locking from this locator
+        # read is safe; see _lock_teams / _lock_rinks.
+        self._lock_teams((game.home_team_id, game.away_team_id))
+        _mv_rinks = set()
+        for _sid in (new_ice_slot_id, game.ice_slot_id):
+            _s = self.store.get_ice_slot(_sid) if _sid else None
+            if _s is not None:
+                _mv_rinks.add(_s.rink_id)
+        self._lock_rinks(_mv_rinks)
         self._guard_game_season(game)  # #159 read-only guard
         # #159 r15 — re-fetch under the Season lock (the pre-lock read was a
         # locator). A concurrent move_game/publish_game commits under the same
@@ -3324,6 +3406,8 @@ class SetupService:
                                   details={"reason": "same_slot"})
         # Shared final conflict check (#277) — identical rules to create +
         # draft-commit; excludes THIS game so a move never conflicts with itself.
+        # The team locks taken above make the team-overlap half atomic; the
+        # one-game-per-slot half is backstopped by ux_games_active_ice_slot.
         new_slot = self._assert_slot_free_for_game(
             new_ice_slot_id, game.home_team_id, game.away_team_id,
             exclude_game_id=game_id)
