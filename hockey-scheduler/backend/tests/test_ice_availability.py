@@ -241,6 +241,91 @@ class IceAvailabilityContract:
         self.assertEqual(res["error"]["details"]["reason"], "preview_mismatch")
         self.assertEqual(self._slots(), [])
 
+    # -- 1b. preview binds the reviewed CLASSIFICATION, not just the tuples --
+    def test_commit_rejects_a_row_reclassified_to_conflict_after_preview(self):
+        # #158 review: the token binds each row's reviewed new/duplicate/conflict
+        # status, not only the generated (rink, start, end) tuple. Incompatible
+        # ice dropped onto a generated tuple AFTER preview reclassifies that row
+        # new -> conflict WITHOUT moving the tuple; committing the stale token is
+        # refused (preview_mismatch) with zero writes, and a re-preview exposes the
+        # exact new conflict target.
+        tmpl = _template()
+        pv = self.api.preview_ice_availability(actor_id="a", **tmpl)
+        self.assertEqual(pv["totals"]["new"], 6)
+        self.assertEqual(pv["totals"]["conflict"], 0)
+        blocker = self._add_existing(               # exact first tuple, incompatible
+            "rink_1", "2026-09-01T22:00:00+00:00", "2026-09-01T23:00:00+00:00",
+            slot_type=IceSlotType.MAINTENANCE)
+        res = self.api.commit_ice_availability(
+            actor_id="a", template_fingerprint=pv["template_fingerprint"], **tmpl)
+        self.assertEqual(res["error"]["details"]["reason"], "preview_mismatch")
+        self.assertEqual(                           # only the blocker; no Game ice
+            [s.id for s in self._slots() if s.slot_type == IceSlotType.GAME], [])
+        pv2 = self.api.preview_ice_availability(actor_id="a", **tmpl)
+        self.assertEqual(pv2["totals"]["conflict"], 1)
+        clash = next(s for s in pv2["slots"] if s["status"] == "conflict")
+        self.assertEqual(clash["conflict_with"], blocker.id)
+
+    def test_commit_rejects_a_row_that_became_a_duplicate_after_preview(self):
+        # Even a benign new -> compatible-duplicate transition is a classification
+        # change the operator did not review: the binding refuses the stale token
+        # (preview_mismatch), forcing a re-preview that shows the row already
+        # exists. (Strict binding — ANY classification change forces re-preview;
+        # the narrow idempotent optimization for this one transition is
+        # deliberately not taken, so nothing is created behind the operator.)
+        tmpl = _template()
+        pv = self.api.preview_ice_availability(actor_id="a", **tmpl)
+        self.assertEqual(pv["totals"]["new"], 6)
+        self._add_existing("rink_1", "2026-09-01T22:00:00+00:00",
+                           "2026-09-01T23:00:00+00:00")   # compatible Game/AVAILABLE
+        res = self.api.commit_ice_availability(
+            actor_id="a", template_fingerprint=pv["template_fingerprint"], **tmpl)
+        self.assertEqual(res["error"]["details"]["reason"], "preview_mismatch")
+        pv2 = self.api.preview_ice_availability(actor_id="a", **tmpl)
+        self.assertEqual(pv2["totals"]["duplicate"], 1)
+        self.assertEqual(pv2["totals"]["new"], 5)
+
+    def test_commit_rejects_a_game_collision_added_after_preview(self):
+        # A Game booked onto a generated tuple after preview turns the row into a
+        # conflict whose target is that Game; the stale token is refused with zero
+        # writes and a re-preview surfaces the exact Game id.
+        from hockey_scheduler.domain.models import Game
+        tmpl = _template()
+        pv = self.api.preview_ice_availability(actor_id="a", **tmpl)
+        self.assertEqual(pv["totals"]["new"], 6)
+        start = datetime.fromisoformat("2026-09-01T22:00:00+00:00")
+        end = datetime.fromisoformat("2026-09-01T23:00:00+00:00")
+        self.store.add_ice_slot(IceSlot(
+            id="occ", rink_id="rink_1", start_time=start, end_time=end,
+            slot_type=IceSlotType.GAME, status=IceSlotStatus.ALLOCATED))
+        self.store.add_game(Game(id="g_late", home_team_id="h", away_team_id="a",
+                                 start_time=start, end_time=end, ice_slot_id="occ",
+                                 season_id="season_1"))
+        res = self.api.commit_ice_availability(
+            actor_id="a", template_fingerprint=pv["template_fingerprint"], **tmpl)
+        self.assertEqual(res["error"]["details"]["reason"], "preview_mismatch")
+        self.assertEqual(                           # only the occupied slot; no new ice
+            sorted(s.id for s in self._slots()), ["occ"])
+        pv2 = self.api.preview_ice_availability(actor_id="a", **tmpl)
+        clash = next(s for s in pv2["slots"] if s["status"] == "conflict")
+        self.assertEqual(clash["conflict_game_id"], "g_late")
+
+    def test_commit_rejects_a_conflict_removed_after_preview(self):
+        # The reverse (duplicate/conflict -> new must force re-preview): a conflict
+        # the operator reviewed is deleted after preview, so committing the stale
+        # token would CREATE ice on a tuple reviewed as blocked. Refused.
+        blocker = self._add_existing(
+            "rink_1", "2026-09-01T22:00:00+00:00", "2026-09-01T23:00:00+00:00",
+            slot_type=IceSlotType.MAINTENANCE)
+        tmpl = _template()
+        pv = self.api.preview_ice_availability(actor_id="a", **tmpl)
+        self.assertEqual(pv["totals"]["conflict"], 1)
+        self.store.delete_ice_slot(blocker.id)      # conflict target removed
+        res = self.api.commit_ice_availability(
+            actor_id="a", template_fingerprint=pv["template_fingerprint"], **tmpl)
+        self.assertEqual(res["error"]["details"]["reason"], "preview_mismatch")
+        self.assertEqual(self._slots(), [])         # nothing created behind the operator
+
     # -- 2. exclusion dates -------------------------------------------------
     def test_exclusion_dates_skipped_and_explained(self):
         pv = self.api.preview_ice_availability(
@@ -1207,6 +1292,46 @@ class IceAvailabilityHttpAuthzTest(unittest.TestCase):
                           dict(template, template_fingerprint=fp))
         self.assertEqual(ok["totals"]["created"], 6)
         self.assertEqual(slot_count(), 6)
+
+    def test_commit_binding_rejects_reclassified_row_over_http(self):
+        # Over HTTP: the token binds the reviewed CLASSIFICATION, not just the
+        # tuples. Incompatible ice dropped onto a generated tuple AFTER preview
+        # reclassifies that row new -> conflict without moving the tuple; the
+        # previewed token is refused (preview_mismatch) with zero writes, and a
+        # re-preview surfaces the exact new conflict target.
+        svc = self.srv.STATE.api.setup
+        store = self.srv.STATE.api.store
+        prog = svc.create_program("HB4", timezone_name="UTC")     # local == UTC
+        season = svc.create_season(prog.id, "Fall Reclassify")
+        venue = svc.create_venue("Rink House 4", league_id=prog.id)
+        svc.grant_season_venue_access(season.id, venue.id)
+        rink = svc.create_rink(venue.id, "Sheet 4")
+        template = {                                    # one Tue window (Sep 1)
+            "season_id": season.id, "rink_ids": [rink.id], "weekdays": [1],
+            "start_local": "18:00", "end_local": "19:00",
+            "start_date": "2026-09-01", "end_date": "2026-09-01",
+            "playable_minutes": 60, "turnover_minutes": 0}
+        c = self._client()
+        self._login(c, "arena")
+        _, pv = self._req(c, "POST", "/api/setup/ice-availability/preview", template)
+        fp = pv["template_fingerprint"]
+        self.assertEqual(pv["totals"]["new"], 1)
+        # Concurrent write: incompatible ice on the exact generated tuple.
+        store.add_ice_slot(IceSlot(
+            id="block_http", rink_id=rink.id,
+            start_time=datetime(2026, 9, 1, 18, tzinfo=timezone.utc),
+            end_time=datetime(2026, 9, 1, 19, tzinfo=timezone.utc),
+            slot_type=IceSlotType.MAINTENANCE, status=IceSlotStatus.AVAILABLE))
+        _, res = self._req(c, "POST", "/api/setup/ice-availability/commit",
+                           dict(template, template_fingerprint=fp))
+        self.assertEqual(res["error"]["details"]["reason"], "preview_mismatch")
+        self.assertEqual(                               # no Game ice; only the blocker
+            [s.id for s in store.all_ice_slots()
+             if s.rink_id == rink.id and s.slot_type == IceSlotType.GAME], [])
+        _, pv2 = self._req(c, "POST", "/api/setup/ice-availability/preview", template)
+        self.assertEqual(pv2["totals"]["conflict"], 1)
+        clash = next(s for s in pv2["slots"] if s["status"] == "conflict")
+        self.assertEqual(clash["conflict_with"], "block_http")
 
     def test_commit_without_token_is_refused_over_http(self):
         # #158 review: preview is REQUIRED end-to-end. An authenticated

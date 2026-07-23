@@ -2421,10 +2421,13 @@ class SetupService:
                                playable_minutes, turnover_minutes,
                                exclusion_dates, windows=None):
         """Deterministic, side-effect-free planning shared by preview and commit:
-        resolve the Season timezone + date range, run the pure planner, and split
-        the (de-duplicated) selected rinks by SeasonVenueAccess. Does NOT read the
-        ice-slot inventory — classification against existing slots is a separate
-        step (_classify_ice_windows) so commit can run it under its write lock."""
+        resolve the Season timezone + date range, run the pure planner, split the
+        (de-duplicated) selected rinks by SeasonVenueAccess, and classify the
+        proposed windows against current inventory so the returned ``fingerprint``
+        binds the reviewed classification (#158 review — see the fingerprint block
+        below), not just the generated tuples. Reads inventory only for that
+        classification; commit calls this UNDER its write locks, so the bound
+        classification matches the one its write loop acts on."""
         season = self.store.get_season(season_id) if season_id else None
         if season is None:
             raise NotFoundError(
@@ -2462,20 +2465,31 @@ class SetupService:
         accessible, access_missing = self._split_rinks_by_access(
             season_id, rink_ids)
 
-        # Fingerprint the RESOLVED preview snapshot so commit can only write the
-        # exact slots the operator reviewed (#158 review). Binding the raw form
-        # fields alone is not enough: a blank date range, or a concurrent
+        # Classify the proposed windows against the CURRENT ice inventory and bind
+        # that classification INTO the fingerprint (#158 review). Binding the raw
+        # form fields alone is not enough (a blank date range, or a concurrent
         # Program-timezone / Season-boundary edit, would leave a form-only
-        # fingerprint unchanged while the resolved windows move — committing ice
-        # that was never shown. So bind the resolved timezone, the resolved date
-        # range, and the generated (rink, start, end) UTC tuples of the
-        # accessible rinks — exactly the proposed ice. Any resolved change flips
-        # it (forcing a re-preview); an unedited template over unchanged state is
-        # stable, so preview and commit agree. Deterministic — no clock.
+        # fingerprint unchanged while the resolved windows move); binding just the
+        # generated (rink, start, end) tuples is ALSO not enough — a slot or Game
+        # added, removed, allocated, or booked after preview reclassifies a row
+        # (new <-> duplicate <-> conflict) or changes its conflict target WITHOUT
+        # changing the generated tuple, and the commit would then silently skip or
+        # create a row the operator never reviewed. So bind the resolved timezone,
+        # the resolved date range, AND, per generated window, its (rink, start,
+        # end) tuple, its reviewed status, and — for a conflict — the stable
+        # identity it collides with (the existing slot id + any Game on it). Any
+        # such change flips the fingerprint, forcing a re-preview of the exact
+        # changed target; an unedited template over unchanged inventory is stable,
+        # so preview and commit agree. Commit calls this UNDER its Season +
+        # per-rink write locks, so the bound classification is the very one the
+        # write loop then acts on. Deterministic — no clock.
+        classified = self._classify_ice_windows(accessible, plan)
         proposed = sorted(
-            (rink.id, w["start"].isoformat(), w["end"].isoformat())
-            for rink, _venue in accessible
-            for w in plan["windows"])
+            (c["rink_id"], c["start"].isoformat(), c["end"].isoformat(),
+             c["status"],
+             (c["conflict_with"] or "") if c["status"] == "conflict" else "",
+             (c["conflict_game_id"] or "") if c["status"] == "conflict" else "")
+            for c in classified)
         fingerprint = hashlib.sha256(json.dumps({
             "season_id": season_id,
             "timezone": str(tz),
@@ -2492,6 +2506,7 @@ class SetupService:
             "turnover_minutes": turnover_minutes,
             "plan": plan, "accessible": accessible,
             "access_missing": access_missing,
+            "classified": classified,
         }
 
     def _split_rinks_by_access(self, season_id, rink_ids):
@@ -2579,11 +2594,10 @@ class SetupService:
 
     def _resolve_ice_availability(self, **kwargs):
         """Plan + classify against current inventory — the PREVIEW path (no
-        writes). Commit re-runs classification under its write lock instead."""
+        writes). _plan_ice_availability already classified (to bind the
+        fingerprint), so reuse that ``classified`` rather than re-running it."""
         base = self._plan_ice_availability(**kwargs)
-        return {**base, "weekdays": sorted(base["weekday_set"]),
-                "classified": self._classify_ice_windows(
-                    base["accessible"], base["plan"])}
+        return {**base, "weekdays": sorted(base["weekday_set"])}
 
     def _ice_availability_response(self, r):
         """Shape a resolution into the preview API response (datetimes -> ISO)."""
