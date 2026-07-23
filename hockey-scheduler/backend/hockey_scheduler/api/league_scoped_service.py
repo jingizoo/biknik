@@ -123,6 +123,14 @@ class ApiService(_BaseApiService):
             require_slots_belong_to_locked_season(
                 self.store, [row["ice_slot_id"] for row in proposal["draft_games"]],
                 resolved_season_id)
+            # #314 review — also re-validate every proposed row's competition
+            # participation HERE, under the same locks: a concurrent
+            # unregister_team_from_season or a team-to-league transfer can
+            # commit in the SAME gap a stale pre-lock proposal would miss, after
+            # which the write would persist a Game for a team no longer a valid
+            # participant. Reuses the identical check create_game enforces.
+            self.setup._require_batch_team_participation(
+                resolved_season_id, proposal["draft_games"])
             for row in proposal["draft_games"]:
                 # #277: run the SAME final conflict check as create_game /
                 # move_game before persisting — slot free (exists, GAME,

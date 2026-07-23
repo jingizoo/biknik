@@ -30,10 +30,12 @@ from datetime import datetime, timedelta, timezone
 from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
 
 from hockey_scheduler.api import ApiService
+from hockey_scheduler.api.service import ApiService as BaseApiService
 from hockey_scheduler.domain import (
     Organization, Program, Season, League, LeagueSeason, Division, Venue,
     SeasonVenueAccess, Rink, Team, SeasonTeamRegistration, IceSlot,
     IceSlotType, IceSlotStatus)
+from hockey_scheduler.domain.errors import DomainError
 from hockey_scheduler.store import InMemoryStore, SqlStore
 
 UTC = timezone.utc
@@ -309,15 +311,16 @@ class PostgresPlacementParityTest(_PlacementParityMixin, unittest.TestCase):
         return store
 
 
-@unittest.skipUnless(os.environ.get("TEST_DATABASE_URL"),
-                     "PostgreSQL required (set TEST_DATABASE_URL)")
-class PostgresPlacementConcurrencyTest(unittest.TestCase):
-    """Forced two-session placement races on real PostgreSQL (#277 / #316). A
-    barrier releases both sessions at once; each is its own connection. The races
-    are CROSS-season (se1 vs se2) so the Season lock does NOT serialize them — the
-    DB slot index and the Team lock must, guaranteeing at most one placement per
-    contested slot/team, a stable structured loser error, and zero partial
-    writes."""
+class _ForcedRaceHarnessMixin:
+    """Shared two-session PostgreSQL race harness (#277/#314): a barrier
+    releases every session at once, each its own connection/ApiService
+    instance. ``_api_cls`` defaults to the production league-scoped facade;
+    override it to exercise the base facade's own implementation instead
+    (#314 review — both must be race-safe, not just the one production
+    resolves to)."""
+
+    def _api_cls(self):
+        return ApiService
 
     def setUp(self):
         self.url = os.environ["TEST_DATABASE_URL"]
@@ -331,9 +334,10 @@ class PostgresPlacementConcurrencyTest(unittest.TestCase):
     def _run(self, targets):
         barrier = threading.Barrier(len(targets))
         out = [None] * len(targets)
+        api_cls = self._api_cls()
 
         def wrap(i, fn):
-            api = ApiService(SqlStore(self.url))
+            api = api_cls(SqlStore(self.url))
             barrier.wait()
             try:
                 out[i] = fn(api)
@@ -371,6 +375,17 @@ class PostgresPlacementConcurrencyTest(unittest.TestCase):
                     shared = ({gi.home_team_id, gi.away_team_id}
                               & {gj.home_team_id, gj.away_team_id})
                     self.assertFalse(shared, f"team double-booked: {gi} vs {gj}")
+
+
+@unittest.skipUnless(os.environ.get("TEST_DATABASE_URL"),
+                     "PostgreSQL required (set TEST_DATABASE_URL)")
+class PostgresPlacementConcurrencyTest(_ForcedRaceHarnessMixin, unittest.TestCase):
+    """Forced two-session placement races on real PostgreSQL (#277 / #316). A
+    barrier releases both sessions at once; each is its own connection. The races
+    are CROSS-season (se1 vs se2) so the Season lock does NOT serialize them — the
+    DB slot index and the Team lock must, guaranteeing at most one placement per
+    contested slot/team, a stable structured loser error, and zero partial
+    writes."""
 
     # (1) create-vs-create on ONE slot, DIFFERENT seasons -> physical slot race.
     # The Season locks differ (no serialization there), so the target Rink lock is
@@ -691,6 +706,226 @@ class PostgresPlacementConcurrencyTest(unittest.TestCase):
             self.assertFalse(any(a.action == "draft_schedule_committed"
                                 for a in store.all_setup_audit()))
         self._assert_schedule_consistent(store)
+
+
+# -- draft-commit must also revalidate TEAM PARTICIPATION under the lock
+# (#314 review, follow-up) ---------------------------------------------------
+#
+# draft_season_schedule (used to GENERATE a proposal) already excludes an
+# unregistered or league-transferred team from any FRESH pairing — verified
+# empirically, not assumed. So a purely sequential "unregister/transfer, THEN
+# call commit_draft_schedule" never reaches the new recheck at all: the
+# regenerated proposal is already correct, and the commit either succeeds with
+# a substitute pairing or (if no valid pairing remains) creates nothing — no
+# error, nothing for SetupService._require_batch_team_participation to catch.
+# The recheck's OWN value is closing the FORCED race: a proposal generated
+# WHILE the team was still valid, raced against a participation change that
+# commits before commit_draft_schedule's OWN Team/Rink/Season locks (and this
+# recheck) run. Only a forced two-thread PostgreSQL race can land in that
+# window, so it — not a sequential rewrite — is this fix's real regression
+# test; see PostgresDraftParticipationRaceMixin below. Memory/SQLite parity is
+# the OUTCOME-level invariant a sequential run CAN prove (never a Game for an
+# excluded team, whichever mechanism catches it) plus a direct unit test of
+# the new helper in isolation.
+def _active_games(store):
+    return [g for g in store.all_games() if not g.cancelled]
+
+
+class RequireBatchTeamParticipationUnitTest(unittest.TestCase):
+    """Direct, backend-agnostic coverage of the new shared helper: it must
+    raise the identical DivisionMismatchError create_game's own registration
+    check would, for a team that is unregistered or has since been
+    transferred to another league — and pass cleanly for a fully-valid batch.
+    Exercised directly (not only through commit_draft_schedule) so its
+    correctness doesn't depend on whether draft_season_schedule would ever
+    itself hand it a stale row (verified above: it wouldn't)."""
+
+    def setUp(self):
+        self.store = InMemoryStore()
+        _seed(self.store)
+        self.api = ApiService(self.store)
+        self.rows = [{"home_team_id": "t0", "away_team_id": "t3",
+                     "division_id": "d1"}]
+
+    def test_passes_for_a_fully_valid_batch(self):
+        self.api.setup._require_batch_team_participation("se1", self.rows)
+
+    def test_raises_for_an_unregistered_team(self):
+        self.api.unregister_team_from_season("reg1_t0")
+        with self.assertRaises(DomainError) as ctx:
+            self.api.setup._require_batch_team_participation("se1", self.rows)
+        self.assertEqual(ctx.exception.details["reason"], "team_not_registered")
+
+    def test_raises_for_a_transferred_team(self):
+        self.store.add_league(League(id="lg2", program_id="pg", name="League 2"))
+        self.api.transfer_team_to_league("t0", "lg2")
+        with self.assertRaises(DomainError) as ctx:
+            self.api.setup._require_batch_team_participation("se1", self.rows)
+        self.assertEqual(ctx.exception.details["reason"], "team_wrong_division")
+
+    def test_division_less_row_relaxes_to_season_only(self):
+        # A League-wide draft row can carry no division (#233 Slice G) — the
+        # check must still require an ACTIVE season registration, just not a
+        # division match.
+        self.api.unregister_team_from_season("reg1_t0")
+        rows = [{"home_team_id": "t0", "away_team_id": "t3", "division_id": None}]
+        with self.assertRaises(DomainError) as ctx:
+            self.api.setup._require_batch_team_participation("se1", rows)
+        self.assertEqual(ctx.exception.details["reason"], "team_not_registered")
+
+
+class _DraftParticipationParityMixin:
+    """Sequential Memory/SQLite/Postgres coverage of the OUTCOME-level
+    invariant: whichever of {unregister, transfer} runs before a
+    commit_draft_schedule call, the commit NEVER creates a Game for the
+    now-excluded team — proven here via draft_season_schedule's own fresh
+    exclusion (not this fix's new under-lock recheck; see the race mixin
+    below for that)."""
+
+    def _api_cls(self):
+        raise NotImplementedError
+
+    def _make_store(self):
+        raise NotImplementedError
+
+    def setUp(self):
+        self.store = self._make_store()
+        _seed(self.store)
+        self.api = self._api_cls()(self.store)
+
+    def test_draft_commit_excludes_a_team_unregistered_first(self):
+        r = self.api.unregister_team_from_season("reg1_t0")
+        self.assertNotIn("error", r)
+        res = self.api.commit_draft_schedule("d1", slot_ids=["s0"])
+        self.assertNotIn("error", res, repr(res))
+        self.assertEqual(len(res["created"]), 1, repr(res))
+        row = res["created"][0]
+        self.assertNotIn("T0", (row["home_team_name"], row["away_team_name"]))
+        self.assertTrue(all(
+            "t0" not in (g.home_team_id, g.away_team_id) for g in
+            _active_games(self.store)))
+
+    def test_draft_commit_excludes_a_team_transferred_first(self):
+        self.store.add_league(League(id="lg2", program_id="pg", name="League 2"))
+        r = self.api.transfer_team_to_league("t0", "lg2")
+        self.assertNotIn("error", r)
+        res = self.api.commit_draft_schedule("d1", slot_ids=["s0"])
+        self.assertNotIn("error", res, repr(res))
+        self.assertEqual(len(res["created"]), 1, repr(res))
+        row = res["created"][0]
+        self.assertNotIn("T0", (row["home_team_name"], row["away_team_name"]))
+
+
+class MemoryDraftParticipationParityTest(_DraftParticipationParityMixin,
+                                         unittest.TestCase):
+    def _api_cls(self):
+        return ApiService
+
+    def _make_store(self):
+        return InMemoryStore()
+
+
+class SqliteDraftParticipationParityTest(_DraftParticipationParityMixin,
+                                         unittest.TestCase):
+    def _api_cls(self):
+        return ApiService
+
+    def _make_store(self):
+        return SqlStore(":memory:")
+
+
+@unittest.skipUnless(os.environ.get("TEST_DATABASE_URL"),
+                     "PostgreSQL required (set TEST_DATABASE_URL)")
+class PostgresDraftParticipationParityTest(_DraftParticipationParityMixin,
+                                           unittest.TestCase):
+    def _api_cls(self):
+        return ApiService
+
+    def _make_store(self):
+        store = SqlStore(os.environ["TEST_DATABASE_URL"])
+        store.clear_all_data()
+        return store
+
+
+class _DraftParticipationRaceMixin(_ForcedRaceHarnessMixin):
+    """Forced two-session race: commit_draft_schedule (its proposal generated
+    while the team was still valid) vs. a concurrent unregister/transfer for
+    that same team (#314 review). Whichever transaction acquires the Season
+    lock first wins:
+
+      * the participation change ALWAYS succeeds — a draft (is_draft=True)
+        never counts as a "scheduled game" for the unregister/transfer
+        stranding guard (_games_scheduled_for_team_in_season's own docstring:
+        "Draft proposals aren't real games yet, so they don't block" — an
+        existing, intentional, verified design choice, not this fix's scope);
+      * the draft commit either lands cleanly — it ran first (or the
+        participation change hadn't landed by the time draft_season_schedule
+        read the roster, so the fresh proposal already excluded/included the
+        team correctly) — or is refused by the NEW _require_batch_team_
+        participation recheck with a stable structured reason and ZERO
+        partial Games, slot flips, or audits (it saw the now-excluded team).
+
+    Never a corrupted state, never a Game for a team that (by the time the
+    commit's own locks are held) is not a valid participant."""
+
+    def _assert_participation_race(self, participation_call, expected_reasons):
+        out = self._run([
+            lambda a: a.commit_draft_schedule("d1", slot_ids=["s0"]),
+            participation_call,
+        ])
+        self._assert_no_crash(out)
+        draft_res, part_res = out
+        self.assertNotIn("error", part_res,
+                         f"the participation change should always succeed "
+                         f"(a draft never blocks it): {out!r}")
+        store = self._store()
+        active = _active_games(store)
+        if isinstance(draft_res, dict) and "error" not in draft_res:
+            self.assertEqual(len(draft_res["created"]), 1, repr(out))
+            self.assertEqual(len(active), 1)
+        else:
+            self.assertIn(_reason(draft_res), expected_reasons, repr(out))
+            self.assertEqual(len(active), 0)
+            self.assertEqual(store.get_ice_slot("s0").status.value, "available")
+            self.assertFalse(any(a.action == "draft_schedule_committed"
+                                for a in store.all_setup_audit()))
+        self._assert_schedule_consistent(store)
+
+    def test_unregister_vs_draft_commit(self):
+        self._assert_participation_race(
+            lambda a: a.unregister_team_from_season("reg1_t0"),
+            ("team_not_registered",))
+
+    def test_transfer_vs_draft_commit(self):
+        self._store().add_league(
+            League(id="lg2", program_id="pg", name="League 2"))
+        self._assert_participation_race(
+            lambda a: a.transfer_team_to_league("t0", "lg2"),
+            ("team_not_registered", "team_wrong_division",
+             "registration_cross_league"))
+
+
+@unittest.skipUnless(os.environ.get("TEST_DATABASE_URL"),
+                     "PostgreSQL required (set TEST_DATABASE_URL)")
+class PostgresLeagueScopedDraftParticipationRaceTest(
+        _DraftParticipationRaceMixin, unittest.TestCase):
+    """Exercises the LEAGUE-SCOPED commit_draft_schedule (api/
+    league_scoped_service.py) — the implementation production actually runs."""
+    # _api_cls() inherited default (the league-scoped ApiService).
+
+
+@unittest.skipUnless(os.environ.get("TEST_DATABASE_URL"),
+                     "PostgreSQL required (set TEST_DATABASE_URL)")
+class PostgresBaseApiDraftParticipationRaceTest(
+        _DraftParticipationRaceMixin, unittest.TestCase):
+    """Exercises the BASE facade's OWN commit_draft_schedule (api/service.py)
+    — not reached in production (the league-scoped override always wins
+    method resolution), but directly instantiable/testable, and the review
+    asked for BOTH implementations to be race-safe, not just the one
+    production resolves to."""
+
+    def _api_cls(self):
+        return BaseApiService
 
 
 if __name__ == "__main__":

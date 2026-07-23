@@ -3050,6 +3050,31 @@ class SetupService:
              "season_id": season_id, "division_id": division_id,
              "registered_division_id": raw.division_id})
 
+    def _require_batch_team_participation(self, season_id, rows):
+        """Re-validate EVERY proposed row's home/away team participation in
+        ``season_id`` (#314 review) — the same registration check
+        ``create_game``/``_revalidate_game_participation`` enforce, shared by
+        both ``commit_draft_schedule`` implementations for a whole draft batch.
+
+        ``draft_season_schedule`` only pairs currently-registered teams, but
+        that proposal is generated BEFORE the write transaction opens. Calling
+        this check right after acquiring the batch's Team/Rink/Season locks
+        (never before) closes the gap: a concurrent ``unregister_team_from_
+        season`` takes this same Season lock, and a team-to-league transfer
+        invalidates ``team_registration_valid``'s own league-consistency rule,
+        so by the time we hold our locks, either change has already committed
+        (and this sees it) or is blocked waiting on our lock — never mid-flight.
+        Raises the identical ``DivisionMismatchError`` a fresh ``create_game``
+        would, before any Game, slot-status, or audit write for the batch."""
+        for row in rows:
+            require_division = row.get("division_id") is not None
+            self._require_team_registered(
+                season_id, row["home_team_id"], row.get("division_id"),
+                require_division=require_division)
+            self._require_team_registered(
+                season_id, row["away_team_id"], row.get("division_id"),
+                require_division=require_division)
+
     def _team_participates(self, season, team_id: str,
                            division_id: Optional[str],
                            require_division: bool = True) -> bool:
