@@ -12,11 +12,13 @@ use a Team's own permanent League. These pin, on both stores:
 
 import os
 import unittest
+from datetime import datetime, timezone
 
 from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
 
 import hierarchy_fixtures as fx
 from hockey_scheduler.api import ApiService
+from hockey_scheduler.domain import Game
 from hockey_scheduler.store import InMemoryStore, SqlStore
 
 
@@ -157,6 +159,44 @@ class _Contract:
         codes = {e["code"] for e in res["errors"]}
         self.assertIn("team_league_move_strands_games", codes)
         # Zero mutation: LIONS is still a permanent L1 team.
+        self.assertEqual(self._team("LIONS").league_id, self._league_id("L1"))
+
+    def test_reimport_permanent_league_move_stranding_a_committed_draft_rejected(
+            self):
+        # #314 review: a committed (is_draft=True) draft game now strands in
+        # the permanent-league-move preflight exactly like a published game —
+        # built directly (bypassing create_game/commit_draft_schedule) since
+        # only the flag, not the commit path, matters to this guard.
+        first = self.api.commit_hierarchy_import(fx.full_payload())
+        self.assertTrue(first["committed"], first.get("errors"))
+        season = self._by_ref(self.store.all_seasons(), "FALL26")
+        diva = self._by_ref(self.store.all_divisions(), "DIVA")
+        lions = self._team("LIONS")
+        bears = self._team("BEARS")
+        reg = next((r for r in self.store.registrations_for_season(season.id)
+                   if r.team_id == lions.id), None)
+        game = Game(
+            id=self.store.next_id("game"), home_team_id=lions.id,
+            away_team_id=bears.id,
+            start_time=datetime(2026, 9, 1, 18, tzinfo=timezone.utc),
+            season_id=season.id, division_id=diva.id,
+            league_season_id=reg.league_season_id, is_draft=True,
+            published=False)
+        self.store.add_game(game)
+
+        moved = fx.full_payload(
+            competition_csv=fx.competition_csv(rows=(
+                "OVER55,FALL26,Fall 2026,L1,Adult League,1,DIVA,Division A,Adult",
+                "OVER55,FALL26,Fall 2026,L2,Second League,2,,,")),
+            permanent_teams_csv=fx.permanent_teams_csv(rows=(
+                "OVER55,L2,LIONS,Lions,EAGLES",
+                "OVER55,L1,BEARS,Bears,")),
+            players_csv="",
+            registrations_csv="")
+        res = self.api.commit_hierarchy_import(moved)
+        self.assertFalse(res["committed"], res)
+        codes = {e["code"] for e in res["errors"]}
+        self.assertIn("team_league_move_strands_games", codes)
         self.assertEqual(self._team("LIONS").league_id, self._league_id("L1"))
 
     def test_commit_writes_team_permanent_league(self):

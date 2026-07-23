@@ -12,12 +12,13 @@ orphan registration history. Fixtures live in ``hierarchy_fixtures.py``.
 import contextlib
 import os
 import unittest
+from datetime import datetime, timezone
 
 from helpers import BACKEND  # noqa: F401
 
 import hierarchy_fixtures as fx
 from hockey_scheduler.api import ApiService
-from hockey_scheduler.domain import Division, League, LeagueSeason, Season
+from hockey_scheduler.domain import Division, Game, League, LeagueSeason, Season
 from hockey_scheduler.store import InMemoryStore, SqlStore
 
 by_ref = fx.by_ref
@@ -211,6 +212,45 @@ class ImportConvergenceContract:
         err = result["errors"][0]
         self.assertEqual(err["code"], "registration_division_move_strands_games")
         self.assertIn(game_id, err["affected_game_ids"])
+        self.assertEqual(
+            self.store.registration_for_team_in_season(season.id, lions.id)
+            .division_id, diva.id)
+        self.assertEqual(len(self.store.all_setup_audit()), audits_before)
+
+    def test_import_cannot_strand_a_committed_draft_by_moving_division(self):
+        # #314 review: a committed (is_draft=True) draft game now counts as
+        # stranding in the import's reassignment-safety preflight, exactly
+        # like a published game — built directly (bypassing create_game/
+        # commit_draft_schedule) since only the flag, not the commit path, is
+        # relevant to this guard.
+        self._commit_base(
+            permanent_teams_csv=fx.permanent_teams_csv(rows=(
+                "OVER55,L1,LIONS,Lions,", "OVER55,L1,BEARS,Bears,")),
+            registrations_csv=fx.registrations_csv(rows=(
+                "FALL26,LIONS,L1,DIVA", "FALL26,BEARS,L1,DIVA")))
+        season = by_ref(self.store.all_seasons(), "FALL26")
+        diva = by_ref(self.store.all_divisions(), "DIVA")
+        lions = self._team("LIONS")
+        bears = self._team("BEARS")
+        reg = self.store.registration_for_team_in_season(season.id, lions.id)
+        game = Game(
+            id=self.store.next_id("game"), home_team_id=lions.id,
+            away_team_id=bears.id,
+            start_time=datetime(2026, 11, 1, 18, tzinfo=timezone.utc),
+            season_id=season.id, division_id=diva.id,
+            league_season_id=reg.league_season_id, is_draft=True,
+            published=False)
+        self.store.add_game(game)
+        audits_before = len(self.store.all_setup_audit())
+        moved = base_payload(
+            competition_csv=fx.competition_csv(),
+            registrations_csv=fx.registrations_csv(rows=(
+                "FALL26,LIONS,L1,DIVB",)))
+        result = self.api.commit_hierarchy_import(moved, actor_id="admin")
+        self.assertFalse(result["committed"])
+        err = result["errors"][0]
+        self.assertEqual(err["code"], "registration_division_move_strands_games")
+        self.assertIn(game.id, err["affected_game_ids"])
         self.assertEqual(
             self.store.registration_for_team_in_season(season.id, lions.id)
             .division_id, diva.id)

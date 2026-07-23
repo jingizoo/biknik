@@ -34,7 +34,7 @@ from hockey_scheduler.api.service import ApiService as BaseApiService
 from hockey_scheduler.domain import (
     Organization, Program, Season, League, LeagueSeason, Division, Venue,
     SeasonVenueAccess, Rink, Team, SeasonTeamRegistration, IceSlot,
-    IceSlotType, IceSlotStatus)
+    IceSlotType, IceSlotStatus, Game)
 from hockey_scheduler.domain.errors import DomainError
 from hockey_scheduler.store import InMemoryStore, SqlStore
 
@@ -865,6 +865,50 @@ class _DraftParticipationParityMixin:
         self.assertFalse(any(
             a.action == "team_league_transferred" and a.entity_id == team_id
             for a in self.store.all_setup_audit()))
+
+    def test_committed_draft_blocks_division_reassign_that_would_strand_it(self):
+        # assign_season_team_division shares _games_scheduled_for_team_in_
+        # season, so the same committed-draft-counts rule applies (#314
+        # review) — clearing the division out from under a committed draft
+        # is refused with zero writes.
+        res = self.api.commit_draft_schedule("d1", slot_ids=["s0"])
+        self.assertNotIn("error", res, repr(res))
+        game = _active_games(self.store)[0]
+        team_id = game.home_team_id
+        result = self.api.assign_season_team_division(
+            f"reg1_{team_id}", division_id=None)
+        self.assertEqual(_reason(result), "team_has_scheduled_games",
+                         repr(result))
+        self.assertEqual(
+            self.store.get_season_team_registration(
+                f"reg1_{team_id}").division_id, "d1")
+
+    def test_committed_draft_blocks_league_reassign_that_would_strand_it(self):
+        # assign_season_team_league keeps its own inline duplicate of the
+        # stranding filter (league-scoped, not the shared helper) — the #314
+        # committed-draft rule was applied there too. Uses a dedicated
+        # permanent-League-less team, since a team WITH a permanent League
+        # fails the rule-7 mismatch check for any other target League before
+        # ever reaching the stranding guard.
+        self.store.add_team(Team(id="tL", name="TL", program_id="pg"))
+        self.store.add_season_team_registration(SeasonTeamRegistration(
+            id="regL_tL", league_season_id="ls1", team_id="tL", active=True))
+        self.store.add_league(League(id="lg2", program_id="pg", name="League 2"))
+        game = Game(
+            id=self.store.next_id("game"), home_team_id="tL",
+            away_team_id="t1", start_time=BASE, season_id="se1",
+            league_id="lg", league_season_id="ls1", is_draft=True,
+            published=False)
+        self.store.add_game(game)
+        result = self.api.assign_season_team_league("regL_tL", league_id="lg2")
+        self.assertEqual(_reason(result),
+                         "registration_league_change_strands_games",
+                         repr(result))
+        self.assertIn(game.id,
+                      result["error"]["details"]["affected_game_ids"])
+        self.assertEqual(
+            self.store.get_season_team_registration(
+                "regL_tL").league_season_id, "ls1")
 
 
 class MemoryDraftParticipationParityTest(_DraftParticipationParityMixin,
