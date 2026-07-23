@@ -2643,14 +2643,41 @@ class SetupService:
                                  weekdays=None, start_local=None, end_local=None,
                                  start_date=None, end_date=None,
                                  playable_minutes=None, turnover_minutes=None,
-                                 exclusion_dates=None, windows=None):
-        """Preview the slots a recurring template would create. No writes."""
-        return self._ice_availability_response(self._resolve_ice_availability(
+                                 exclusion_dates=None, windows=None,
+                                 actor_id=None):
+        """Preview the slots a recurring template would create (#158).
+
+        The planning itself is side-effect-free; a SUCCESSFUL preview by an
+        authenticated caller records one server-attributed
+        ``ice_availability_previewed`` audit carrying the ``template_fingerprint``
+        (so it correlates to the later commit), the Season, the deduplicated
+        Rinks, the resolved range/timezone, and the result totals — #158 audits
+        both halves of the flow. An invalid or not-found template raises before
+        the audit, and an unauthenticated caller (``actor_id`` None, e.g. a
+        programmatic reader) records nothing, so a failed or anonymous preview
+        never leaves an audit row.
+        """
+        resp = self._ice_availability_response(self._resolve_ice_availability(
             season_id=season_id, rink_ids=rink_ids, weekdays=weekdays,
             start_local=start_local, end_local=end_local,
             start_date=start_date, end_date=end_date,
             playable_minutes=playable_minutes, turnover_minutes=turnover_minutes,
             exclusion_dates=exclusion_dates, windows=windows))
+        if actor_id is not None:
+            with self.store.transaction():
+                self._audit(
+                    "ice_availability_previewed", "season", resp["season_id"],
+                    actor_id, {
+                        "template_fingerprint": resp["template_fingerprint"],
+                        "season_id": resp["season_id"],
+                        "rink_ids": ([r["rink_id"] for r in resp["rinks"]]
+                                     + [m["rink_id"]
+                                        for m in resp["venue_access_missing"]]),
+                        "timezone": resp["timezone"],
+                        "date_range": resp["date_range"],
+                        "totals": resp["totals"],
+                    })
+        return resp
 
     def commit_ice_availability(self, *, season_id=None, rink_ids=None,
                                 weekdays=None, start_local=None, end_local=None,
@@ -2794,6 +2821,9 @@ class SetupService:
                         "ice_availability_committed", "ice_availability_batch",
                         batch_id, actor_id, {
                             "season_id": season_id,
+                            # Same fingerprint the preview audited, so the two
+                            # halves of the flow correlate (#158 review).
+                            "template_fingerprint": base["fingerprint"],
                             "rink_ids": [r.id for r, _v in accessible],
                             "weekdays": sorted(base["weekday_set"]),
                             "windows": base["windows_meta"],

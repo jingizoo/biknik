@@ -643,6 +643,53 @@ class IceAvailabilityContract:
         self.assertEqual(res["totals"]["conflict_skipped"], 1)
         self.assertEqual(res["totals"]["duplicate_skipped"], 0)
 
+    # -- 16. the preview half is audited too (#158 review) ------------------
+    def _preview_audits(self):
+        return [a for a in self.store.all_setup_audit()
+                if a.action == "ice_availability_previewed"]
+
+    def test_authenticated_preview_is_audited(self):
+        pv = self.api.preview_ice_availability(actor_id="arena_boss",
+                                               **_template())
+        audits = self._preview_audits()
+        self.assertEqual(len(audits), 1)
+        a = audits[0]
+        self.assertEqual(a.actor_id, "arena_boss")             # the exact caller
+        self.assertEqual(a.entity_id, "season_1")
+        self.assertEqual(a.detail["template_fingerprint"],
+                         pv["template_fingerprint"])
+        self.assertEqual(a.detail["season_id"], "season_1")
+        self.assertEqual(a.detail["rink_ids"], ["rink_1"])
+        self.assertEqual(a.detail["totals"]["new"], 6)
+        self.assertEqual(a.detail["date_range"],
+                         {"start": "2026-09-01", "end": "2026-09-07"})
+        self.assertIn("timezone", a.detail)
+
+    def test_unauthenticated_preview_writes_no_audit(self):
+        # No actor => the server-attributed audit is not written (a programmatic
+        # reader), preserving the read-only preview for anonymous callers.
+        self.api.preview_ice_availability(**_template())       # no actor_id
+        self.assertEqual(self._preview_audits(), [])
+
+    def test_failed_preview_writes_no_audit(self):
+        # A not-found template raises before the audit => zero rows even with an
+        # actor. (Invalid input takes the same pre-audit failure path.)
+        res = self.api.preview_ice_availability(
+            actor_id="arena_boss", **_template(season_id="nope"))
+        self.assertIn("error", res)
+        self.assertEqual(self._preview_audits(), [])
+
+    def test_preview_and_commit_audits_correlate_by_fingerprint(self):
+        self.api.preview_ice_availability(actor_id="a", **_template())
+        self.api.commit_ice_availability(actor_id="a", **_template())
+        prev = next(a for a in self.store.all_setup_audit()
+                    if a.action == "ice_availability_previewed")
+        batch = next(a for a in self.store.all_setup_audit()
+                     if a.action == "ice_availability_committed")
+        self.assertTrue(prev.detail["template_fingerprint"])
+        self.assertEqual(prev.detail["template_fingerprint"],
+                         batch.detail["template_fingerprint"])
+
 
 class MemoryIceAvailabilityTest(IceAvailabilityContract, unittest.TestCase):
     def _store(self):
@@ -1162,3 +1209,42 @@ class IceAvailabilityHttpAuthzTest(unittest.TestCase):
         self.assertEqual(pv["totals"]["conflict"], 1)
         self.assertEqual(pv["totals"]["duplicate"], 0)
         self.assertEqual(pv["totals"]["capacity_games"], 0)   # not hidden capacity
+
+    def test_preview_is_audited_to_the_authenticated_caller_over_http(self):
+        # #158 audits BOTH halves: a successful preview by a MANAGE_ARENA caller
+        # records one server-attributed audit; a forbidden caller records none.
+        svc = self.srv.STATE.api.setup
+        store = self.srv.STATE.api.store
+        prog = svc.create_program("HB4", timezone_name=TZ)
+        season = svc.create_season(prog.id, "Fall Audit")
+        venue = svc.create_venue("Rink House 4", league_id=prog.id)
+        svc.grant_season_venue_access(season.id, venue.id)
+        rink = svc.create_rink(venue.id, "Sheet 4")
+        template = {
+            "season_id": season.id, "rink_ids": [rink.id], "weekdays": [1, 3],
+            "start_local": "18:00", "end_local": "22:00",
+            "start_date": "2026-09-01", "end_date": "2026-09-07",
+            "playable_minutes": 60, "turnover_minutes": 15}
+
+        def preview_audits():
+            return [a for a in store.all_setup_audit()
+                    if a.action == "ice_availability_previewed"
+                    and a.detail.get("season_id") == season.id]
+
+        # A coach lacks MANAGE_ARENA -> 403 before the handler -> no audit.
+        coach = self._client()
+        self._login(coach, "coach")
+        status, _ = self._req(
+            coach, "POST", "/api/setup/ice-availability/preview", template)
+        self.assertEqual(status, 403)
+        self.assertEqual(preview_audits(), [])
+
+        # The arena manager's preview records exactly one audit, attributed to a
+        # real (non-anonymous) authenticated user id, with the result totals.
+        c = self._client()
+        self._login(c, "arena")
+        self._req(c, "POST", "/api/setup/ice-availability/preview", template)
+        audits = preview_audits()
+        self.assertEqual(len(audits), 1)
+        self.assertTrue(audits[0].actor_id)                   # threaded, not None
+        self.assertEqual(audits[0].detail["totals"]["new"], 6)

@@ -4062,13 +4062,14 @@ class ApiService:
                                  end_local: str = None, start_date: str = None,
                                  end_date: str = None, playable_minutes=None,
                                  turnover_minutes=None, exclusion_dates=None,
-                                 windows=None) -> dict:
+                                 windows=None,
+                                 actor_id: Optional[str] = None) -> dict:
         return self.setup.preview_ice_availability(
             season_id=season_id, rink_ids=rink_ids, weekdays=weekdays,
             start_local=start_local, end_local=end_local,
             start_date=start_date, end_date=end_date,
             playable_minutes=playable_minutes, turnover_minutes=turnover_minutes,
-            exclusion_dates=exclusion_dates, windows=windows)
+            exclusion_dates=exclusion_dates, windows=windows, actor_id=actor_id)
 
     @catch
     def commit_ice_availability(self, season_id: str = None, rink_ids=None,
