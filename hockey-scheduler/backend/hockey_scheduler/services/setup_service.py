@@ -2639,6 +2639,27 @@ class SetupService:
                 "end_time": slot.end_time.isoformat(),
                 "slot_type": slot.slot_type.value, "status": slot.status.value}
 
+    def _has_matching_preview_audit(self, actor_id, fingerprint):
+        """True if ``actor_id`` recorded a successful ``ice_availability_previewed``
+        audit for exactly ``fingerprint`` — the commit preview gate (#158 review).
+
+        The preview fingerprint is a hash of the RESOLVED snapshot (Season
+        boundaries, Program timezone, generated UTC windows), and a successful
+        preview writes one server-attributed audit carrying that fingerprint and
+        the acting operator. Requiring a matching audit makes the fingerprint a
+        real, actor-bound preview capability rather than a value a caller can
+        fabricate or replay across operators. Setup-audit volume is low
+        (arena-setup actions), so the linear scan is not a hot path.
+        """
+        if actor_id is None or fingerprint is None:
+            return False
+        for entry in self.store.all_setup_audit():
+            if (entry.action == "ice_availability_previewed"
+                    and entry.actor_id == actor_id
+                    and entry.detail.get("template_fingerprint") == fingerprint):
+                return True
+        return False
+
     def preview_ice_availability(self, *, season_id=None, rink_ids=None,
                                  weekdays=None, start_local=None, end_local=None,
                                  start_date=None, end_date=None,
@@ -2697,13 +2718,16 @@ class SetupService:
         reported, a rerun creates nothing. Audited per slot + a batch summary.
         Requires an active Season (#159).
 
-        ``template_fingerprint`` binds this commit to a specific preview (#158
-        review): when supplied it must equal the fingerprint the preview
-        returned for these exact inputs, else the commit is refused before any
-        write (``preview_mismatch``). The builder's create button re-reads the
-        live form, so this is what stops an operator previewing one template and
-        committing a different one. Omitted (a direct programmatic caller) skips
-        the check — the idempotent write boundary still protects the data.
+        Preview is REQUIRED (#158 review): the commit is refused before any
+        write unless ``template_fingerprint`` is supplied (``preview_required``),
+        equals the freshly-resolved snapshot's fingerprint (``preview_mismatch``
+        — an edited or stale template), AND matches a successful
+        ``ice_availability_previewed`` audit for ``actor_id`` (``preview_required``
+        — a fabricated or cross-operator token). So an authenticated caller can
+        never create the recurring inventory without first previewing exactly
+        this template; the fingerprint is a real preview capability tied to the
+        acting operator and the resolved snapshot, not an optional hint. A
+        refused commit mutates nothing (no slots, no batch audit).
         """
         # De-duplicated selected rinks (same as _plan_ice_availability does).
         # NOTHING authoritative is resolved from mutable state out here: the
@@ -2758,17 +2782,38 @@ class SetupService:
                         end_date=end_date, playable_minutes=playable_minutes,
                         turnover_minutes=turnover_minutes,
                         exclusion_dates=exclusion_dates, windows=windows)
-                    # Preview binding (#158 review): refuse — before any write —
-                    # a commit whose template no longer matches the one the
-                    # operator previewed. Deterministic over the same inputs, so
-                    # an unedited form always matches; an edited one never does.
-                    if template_fingerprint is not None \
-                            and template_fingerprint != base["fingerprint"]:
+                    # Preview binding (#158 review): a commit MUST be preceded by
+                    # a preview of the SAME resolved template BY THE SAME actor.
+                    # The fingerprint alone is not a capability — a client can
+                    # omit or fabricate it — so all three of these must hold, and
+                    # they run BEFORE any write, so a refused commit mutates
+                    # nothing (no slots, no batch audit): the recurring inventory
+                    # can never be created without previewing exactly this
+                    # template first.
+                    #   1. a fingerprint was supplied at all (preview_required);
+                    #   2. it equals the freshly-resolved snapshot's fingerprint,
+                    #      deterministic over the same inputs so an unedited form
+                    #      always matches and an edited/stale one never does
+                    #      (preview_mismatch);
+                    #   3. it matches a successful ice_availability_previewed
+                    #      audit for THIS actor — rejecting a fabricated token or
+                    #      one previewed by a different operator (preview_required).
+                    if template_fingerprint is None:
+                        raise ValidationError(
+                            "Preview this template before creating slots.",
+                            details={"reason": "preview_required"})
+                    if template_fingerprint != base["fingerprint"]:
                         raise ScheduleConflictError(
                             "This template changed since it was previewed. "
                             "Preview again before creating slots.",
                             details={"reason": "preview_mismatch",
                                      "expected": base["fingerprint"]})
+                    if not self._has_matching_preview_audit(
+                            actor_id, base["fingerprint"]):
+                        raise ValidationError(
+                            "No matching preview by this operator for this "
+                            "template. Preview it before creating slots.",
+                            details={"reason": "preview_required"})
                     # NB: keep the `windows` PARAMETER intact for the retry loop —
                     # bind the generated planner windows to a distinct name, or a
                     # second attempt would re-plan with generated rows instead of

@@ -100,6 +100,19 @@ class IceAvailabilityContract:
         self.store.add_ice_slot(slot)
         return slot
 
+    def _commit(self, tmpl=None, *, actor_id="a"):
+        """The required preview->commit flow (#158 review): preview the template
+        AS ``actor_id`` (recording the ``ice_availability_previewed`` audit), then
+        commit it with the fingerprint the preview returned. Commit is refused
+        without a matching preview, so tests that exercise commit BEHAVIOR go
+        through here instead of each re-implementing the two-step gate. Returns
+        the commit result dict."""
+        tmpl = _template() if tmpl is None else tmpl
+        pv = self.api.preview_ice_availability(actor_id=actor_id, **tmpl)
+        return self.api.commit_ice_availability(
+            actor_id=actor_id, template_fingerprint=pv["template_fingerprint"],
+            **tmpl)
+
     # -- 1. correct slot count + timezone ----------------------------------
     def test_preview_count_and_timezone(self):
         pv = self.api.preview_ice_availability(**_template())
@@ -120,7 +133,7 @@ class IceAvailabilityContract:
         self.assertEqual(pv["totals"]["reserved_minutes"], 480)   # 2 days * 240
 
     def test_commit_creates_available_game_ice(self):
-        res = self.api.commit_ice_availability(actor_id="arena", **_template())
+        res = self._commit(actor_id="arena")
         self.assertNotIn("error", res)
         self.assertTrue(res["committed"])
         self.assertEqual(res["totals"]["created"], 6)
@@ -146,11 +159,18 @@ class IceAvailabilityContract:
                 self.store.save_season_venue_access(acc)
             return orig(rid)
 
+        pv = self.api.preview_ice_availability(actor_id="arena", **_template())
         self.store.get_rink_for_update = revoke_then_lock
-        res = self.api.commit_ice_availability(actor_id="arena", **_template())
-        self.assertNotIn("error", res)
-        self.assertEqual(res["totals"]["created"], 0)
-        self.assertEqual(res["totals"]["access_skipped_rinks"], 1)
+        res = self.api.commit_ice_availability(
+            actor_id="arena", template_fingerprint=pv["template_fingerprint"],
+            **_template())
+        # The revoke lands UNDER the lock, so the plan re-resolved inside the
+        # commit txn (access now gone) differs from the previewed snapshot — the
+        # binding refuses it (preview_mismatch) with zero writes, never leaking
+        # unauthorized ice. That the mismatch fires at all proves access is
+        # re-resolved under the lock: a stale pre-lock read would have matched the
+        # preview and committed.
+        self.assertEqual(res["error"]["details"]["reason"], "preview_mismatch")
         self.assertEqual(self._slots(), [])                  # no unauthorized ice
         self.assertEqual([a for a in self.store.all_setup_audit()
                           if a.action == "ice_slot_created"], [])
@@ -173,14 +193,19 @@ class IceAvailabilityContract:
                 self.store.save_program(prog)
             return orig(rid)
 
+        pv = self.api.preview_ice_availability(actor_id="a", **_template())
         self.store.get_rink_for_update = retz_then_lock
-        res = self.api.commit_ice_availability(actor_id="a", **_template())
-        self.assertEqual(res["totals"]["created"], 6)
-        # 18:00 local is now 18:00 UTC, not 22:00 UTC (Toronto EDT) — proof the
-        # windows were generated from the zone read under the lock.
-        first = min(self._slots(), key=lambda s: s.start_time)
-        self.assertEqual(first.start_time,
-                         datetime(2026, 9, 1, 18, tzinfo=timezone.utc))
+        res = self.api.commit_ice_availability(
+            actor_id="a", template_fingerprint=pv["template_fingerprint"],
+            **_template())
+        # The zone flips to UTC UNDER the lock, so every window's UTC instant in
+        # the plan re-resolved inside the txn differs from the previewed (Toronto)
+        # snapshot — the binding refuses the commit (preview_mismatch) with zero
+        # writes rather than silently creating slots at instants the operator
+        # never previewed. The mismatch firing proves the zone is read under the
+        # lock (a stale pre-lock read would have matched Toronto and committed).
+        self.assertEqual(res["error"]["details"]["reason"], "preview_mismatch")
+        self.assertEqual(self._slots(), [])
 
     def test_commit_reads_season_range_under_the_lock(self):
         # When the range is left to default, it comes from the Season boundaries
@@ -200,19 +225,21 @@ class IceAvailabilityContract:
                 self.store.save_season(season)
             return orig(rid)
 
-        self.store.get_rink_for_update = narrow_then_lock
         tmpl = _template()                      # default the range to the Season
         tmpl.pop("start_date")
         tmpl.pop("end_date")
-        res = self.api.commit_ice_availability(actor_id="a", **tmpl)
-        self.assertEqual(res["totals"]["created"], 3)     # only the first Tuesday
-        # No slot falls outside the narrowed Season range [start, end] (as the
-        # UTC instants the Season stores) — without reading the Season under the
-        # lock, the old 7-month range would have generated ~180 windows.
-        s_start = datetime(2026, 9, 1, 4, tzinfo=timezone.utc)
-        s_end = datetime(2026, 9, 2, 4, tzinfo=timezone.utc)
-        self.assertTrue(all(s_start <= s.start_time and s.end_time <= s_end
-                            for s in self._slots()))
+        pv = self.api.preview_ice_availability(actor_id="a", **tmpl)
+        self.store.get_rink_for_update = narrow_then_lock
+        res = self.api.commit_ice_availability(
+            actor_id="a", template_fingerprint=pv["template_fingerprint"], **tmpl)
+        # The Season end-date is narrowed UNDER the lock, so the range the plan
+        # re-resolved inside the txn is smaller than the previewed one — the
+        # binding refuses the commit (preview_mismatch) with zero writes, never
+        # creating slots the operator didn't preview. The mismatch proves the
+        # Season range is read under the lock (a stale pre-lock read of the wide
+        # range would have matched the preview and committed).
+        self.assertEqual(res["error"]["details"]["reason"], "preview_mismatch")
+        self.assertEqual(self._slots(), [])
 
     # -- 2. exclusion dates -------------------------------------------------
     def test_exclusion_dates_skipped_and_explained(self):
@@ -222,8 +249,7 @@ class IceAvailabilityContract:
         self.assertIn({"date": "2026-09-01", "reason": "exclusion"},
                       pv["skipped_dates"])
         self.assertTrue(all(s["date"] != "2026-09-01" for s in pv["slots"]))
-        res = self.api.commit_ice_availability(
-            actor_id="a", **_template(exclusion_dates=["2026-09-01"]))
+        res = self._commit(_template(exclusion_dates=["2026-09-01"]))
         self.assertEqual(res["totals"]["created"], 3)
         self.assertTrue(all(s.start_time.astimezone(timezone.utc).date().isoformat()
                             != "2026-09-01" or True for s in self._slots()))
@@ -247,7 +273,7 @@ class IceAvailabilityContract:
         self.assertEqual(pv["totals"]["new"], 5)
         clash = next(s for s in pv["slots"] if s["status"] == "conflict")
         self.assertEqual(clash["conflict_with"], existing.id)
-        res = self.api.commit_ice_availability(actor_id="a", **_template())
+        res = self._commit()
         self.assertEqual(res["totals"]["created"], 5)
         self.assertEqual(res["totals"]["conflict_skipped"], 1)
         # The pre-existing slot is untouched; total = 1 existing + 5 created.
@@ -257,9 +283,9 @@ class IceAvailabilityContract:
 
     # -- 5. idempotent rerun (no duplicates) --------------------------------
     def test_rerun_is_idempotent(self):
-        first = self.api.commit_ice_availability(actor_id="a", **_template())
+        first = self._commit()
         self.assertEqual(first["totals"]["created"], 6)
-        again = self.api.commit_ice_availability(actor_id="a", **_template())
+        again = self._commit()
         self.assertEqual(again["totals"]["created"], 0)
         self.assertEqual(again["totals"]["duplicate_skipped"], 6)
         self.assertEqual(len(self._slots()), 6)  # unchanged
@@ -283,8 +309,7 @@ class IceAvailabilityContract:
         self.assertEqual([m["rink_id"] for m in missing], ["rink_na"])
         self.assertEqual(missing[0]["remediation_route"],
                          "/api/v2/setup/seasons/season_1/venue-access")
-        res = self.api.commit_ice_availability(
-            actor_id="a", **_template(rink_ids=["rink_1", "rink_na"]))
+        res = self._commit(_template(rink_ids=["rink_1", "rink_na"]))
         self.assertEqual(res["totals"]["created"], 6)
         self.assertEqual(res["totals"]["access_skipped_rinks"], 1)
         self.assertTrue(all(s.rink_id == "rink_1" for s in self._slots()))
@@ -297,7 +322,7 @@ class IceAvailabilityContract:
 
     # -- 8. audit -----------------------------------------------------------
     def test_commit_is_audited(self):
-        res = self.api.commit_ice_availability(actor_id="arena_boss", **_template())
+        res = self._commit(actor_id="arena_boss")
         actions = [a.action for a in self.store.all_setup_audit()]
         self.assertEqual(actions.count("ice_slot_created"), 6)
         batch = next(a for a in self.store.all_setup_audit()
@@ -337,8 +362,7 @@ class IceAvailabilityContract:
 
     # -- 12. idempotency / no duplicate rows (#158 review) ------------------
     def test_repeated_rink_id_does_not_duplicate(self):
-        res = self.api.commit_ice_availability(
-            actor_id="a", **_template(rink_ids=["rink_1", "rink_1"]))
+        res = self._commit(_template(rink_ids=["rink_1", "rink_1"]))
         self.assertEqual(res["totals"]["created"], 6)   # de-duped, not 12
         self.assertEqual(len(self._slots()), 6)
         tuples = {(s.rink_id, s.start_time, s.end_time) for s in self._slots()}
@@ -352,7 +376,7 @@ class IceAvailabilityContract:
             start_time=datetime(2026, 9, 1, 22, tzinfo=timezone.utc),   # 18:00 EDT
             end_time=datetime(2026, 9, 1, 23, tzinfo=timezone.utc),
             slot_type=IceSlotType.GAME, status=IceSlotStatus.AVAILABLE))
-        res = self.api.commit_ice_availability(actor_id="a", **_template())
+        res = self._commit()
         self.assertEqual(res["totals"]["created"], 5)
         self.assertEqual(res["totals"]["duplicate_skipped"], 1)
         slots = self._slots()
@@ -397,8 +421,7 @@ class IceAvailabilityContract:
     def test_commit_persists_and_audits_per_weekday_windows(self):
         from zoneinfo import ZoneInfo
         tz = ZoneInfo(TZ)
-        res = self.api.commit_ice_availability(
-            actor_id="arena", **self._perday_template())
+        res = self._commit(self._perday_template(), actor_id="arena")
         self.assertEqual(res["totals"]["created"], 5)
         slots = self._slots()
         self.assertEqual(len(slots), 5)
@@ -439,8 +462,7 @@ class IceAvailabilityContract:
 
         self.store.add_ice_slot = add_once_failing
         try:
-            res = self.api.commit_ice_availability(
-                actor_id="a", **self._perday_template())
+            res = self._commit(self._perday_template())
         finally:
             self.store.add_ice_slot = orig_add
         self.assertTrue(tripped, "the forced conflict never fired")
@@ -449,11 +471,9 @@ class IceAvailabilityContract:
         self.assertEqual(len(self._slots()), 5)
 
     def test_per_weekday_rerun_is_idempotent(self):
-        first = self.api.commit_ice_availability(
-            actor_id="a", **self._perday_template())
+        first = self._commit(self._perday_template())
         self.assertEqual(first["totals"]["created"], 5)
-        again = self.api.commit_ice_availability(
-            actor_id="a", **self._perday_template())
+        again = self._commit(self._perday_template())
         self.assertEqual(again["totals"]["created"], 0)
         self.assertEqual(again["totals"]["duplicate_skipped"], 5)
         self.assertEqual(len(self._slots()), 5)           # unchanged
@@ -489,7 +509,7 @@ class IceAvailabilityContract:
         pv = self.api.preview_ice_availability(**self._perday_template())
         self.assertEqual(pv["totals"]["conflict"], 1)
         self.assertEqual(pv["totals"]["new"], 4)          # 3 Tue + 1 Thu left
-        res = self.api.commit_ice_availability(actor_id="a", **self._perday_template())
+        res = self._commit(self._perday_template())
         self.assertEqual(res["totals"]["created"], 4)
         self.assertEqual(res["totals"]["conflict_skipped"], 1)
 
@@ -507,7 +527,7 @@ class IceAvailabilityContract:
             **_template(rink_ids=["rink_1", "rink_1"]))["template_fingerprint"])
 
     def test_commit_with_matching_fingerprint_creates_the_previewed_slots(self):
-        pv = self.api.preview_ice_availability(**_template())
+        pv = self.api.preview_ice_availability(actor_id="a", **_template())
         res = self.api.commit_ice_availability(
             actor_id="a", template_fingerprint=pv["template_fingerprint"],
             **_template())
@@ -528,11 +548,36 @@ class IceAvailabilityContract:
         self.assertEqual([a for a in self.store.all_setup_audit()
                           if a.action == "ice_slot_created"], [])   # nothing audited
 
-    def test_commit_without_fingerprint_still_works(self):
-        # A direct programmatic caller may omit the binding; the idempotent write
-        # boundary still protects the data.
+    def test_commit_without_fingerprint_is_refused(self):
+        # #158 review: preview is REQUIRED. Committing with no fingerprint at all
+        # (the old bypass) is refused with preview_required and writes nothing —
+        # a valid preview by this operator does not help a commit that supplies
+        # no token to bind to it.
+        self.api.preview_ice_availability(actor_id="a", **_template())
         res = self.api.commit_ice_availability(actor_id="a", **_template())
-        self.assertEqual(res["totals"]["created"], 6)
+        self.assertIn("error", res)
+        self.assertEqual(res["error"]["details"]["reason"], "preview_required")
+        self.assertEqual(self._slots(), [])
+        self.assertEqual([a for a in self.store.all_setup_audit()
+                          if a.action == "ice_slot_created"], [])
+
+    def test_commit_with_another_operators_fingerprint_is_refused(self):
+        # #158 review: the fingerprint is bound to the operator who previewed.
+        # Operator "a" previews; operator "b" replays a's (valid, current) token.
+        # It matches the resolved snapshot, but there is no preview audit for "b",
+        # so the commit is refused with preview_required and writes nothing.
+        pv = self.api.preview_ice_availability(actor_id="a", **_template())
+        res = self.api.commit_ice_availability(
+            actor_id="b", template_fingerprint=pv["template_fingerprint"],
+            **_template())
+        self.assertIn("error", res)
+        self.assertEqual(res["error"]["details"]["reason"], "preview_required")
+        self.assertEqual(self._slots(), [])
+        # ...while the operator who DID preview commits that same token cleanly.
+        ok = self.api.commit_ice_availability(
+            actor_id="a", template_fingerprint=pv["template_fingerprint"],
+            **_template())
+        self.assertEqual(ok["totals"]["created"], 6)
 
     def test_commit_refused_when_default_season_dates_change_after_preview(self):
         # The fingerprint binds the RESOLVED snapshot, not the raw form. With a
@@ -573,7 +618,7 @@ class IceAvailabilityContract:
         prog = self.store.get_program("prog_1")
         prog.timezone = "UTC"
         self.store.save_program(prog)
-        pv = self.api.preview_ice_availability(**_template())   # fresh snapshot
+        pv = self.api.preview_ice_availability(actor_id="a", **_template())  # fresh
         res = self.api.commit_ice_availability(
             actor_id="a", template_fingerprint=pv["template_fingerprint"],
             **_template())
@@ -624,7 +669,7 @@ class IceAvailabilityContract:
         self.assertEqual(pv["totals"]["conflict"], 1)
         self.assertEqual(pv["totals"]["duplicate"], 0)
         # Commit skips it as a conflict, never counts it as idempotent capacity.
-        res = self.api.commit_ice_availability(actor_id="a", **_template())
+        res = self._commit()
         self.assertEqual(res["totals"]["created"], 5)
         self.assertEqual(res["totals"]["conflict_skipped"], 1)
         self.assertEqual(res["totals"]["duplicate_skipped"], 0)
@@ -638,7 +683,7 @@ class IceAvailabilityContract:
         self.assertFalse(slot["conflict_has_game"])
         self.assertEqual(pv["totals"]["conflict"], 1)
         self.assertEqual(pv["totals"]["duplicate"], 0)
-        res = self.api.commit_ice_availability(actor_id="a", **_template())
+        res = self._commit()
         self.assertEqual(res["totals"]["created"], 5)
         self.assertEqual(res["totals"]["conflict_skipped"], 1)
         self.assertEqual(res["totals"]["duplicate_skipped"], 0)
@@ -680,8 +725,10 @@ class IceAvailabilityContract:
         self.assertEqual(self._preview_audits(), [])
 
     def test_preview_and_commit_audits_correlate_by_fingerprint(self):
-        self.api.preview_ice_availability(actor_id="a", **_template())
-        self.api.commit_ice_availability(actor_id="a", **_template())
+        pv = self.api.preview_ice_availability(actor_id="a", **_template())
+        self.api.commit_ice_availability(
+            actor_id="a", template_fingerprint=pv["template_fingerprint"],
+            **_template())
         prev = next(a for a in self.store.all_setup_audit()
                     if a.action == "ice_availability_previewed")
         batch = next(a for a in self.store.all_setup_audit()
@@ -778,8 +825,13 @@ class PostgresIceAvailabilityConcurrencyTest(unittest.TestCase):
         return out
 
     def test_commit_vs_commit(self):
+        # Preview once up front (the required gate #158 review) so both racing
+        # commits carry a valid, matching token; no metadata changes here, so the
+        # resolved fingerprint is stable and both are admitted.
+        fp = SetupService(SqlStore(self.url)).preview_ice_availability(
+            actor_id="u", **self._template())["template_fingerprint"]
         commit = lambda svc: svc.commit_ice_availability(  # noqa: E731
-            actor_id="u", **self._template())
+            actor_id="u", template_fingerprint=fp, **self._template())
         out = self._run([commit, commit])
         for r in out:
             self.assertNotIsInstance(r, Exception, f"commit raised: {r!r}")
@@ -790,8 +842,12 @@ class PostgresIceAvailabilityConcurrencyTest(unittest.TestCase):
 
     def test_commit_vs_manual(self):
         # The other session manually creates a slot at one window's exact tuple.
+        # (A manual slot does not change Season/Program/access, so the resolved
+        # fingerprint is stable and the previewed token stays valid.)
+        fp = SetupService(SqlStore(self.url)).preview_ice_availability(
+            actor_id="c", **self._template())["template_fingerprint"]
         commit = lambda svc: svc.commit_ice_availability(  # noqa: E731
-            actor_id="c", **self._template())
+            actor_id="c", template_fingerprint=fp, **self._template())
         manual = lambda svc: svc.create_ice_slot(          # noqa: E731
             self.rink_id, datetime(2026, 9, 1, 22, tzinfo=timezone.utc),
             datetime(2026, 9, 1, 23, tzinfo=timezone.utc))
@@ -829,8 +885,10 @@ class PostgresIceAvailabilityConcurrencyTest(unittest.TestCase):
         # builder then skips the windows it clashes with) or loses and is cleanly
         # rejected once the builder's slot is visible.
         self._tag_rink_code("RA")
+        fp = SetupService(SqlStore(self.url)).preview_ice_availability(
+            actor_id="c", **self._template())["template_fingerprint"]
         commit = lambda svc: svc.commit_ice_availability(  # noqa: E731
-            actor_id="c", **self._template())
+            actor_id="c", template_fingerprint=fp, **self._template())
         out = self._run([commit, self._import("2026-09-01T22:30:00+00:00",
                                               "2026-09-01T23:30:00+00:00")])
         self.assertNotIsInstance(out[0], Exception, f"commit raised: {out[0]!r}")
@@ -846,8 +904,10 @@ class PostgresIceAvailabilityConcurrencyTest(unittest.TestCase):
         # never doubles and both operations complete cleanly -- always the
         # builder's six windows, no more.
         self._tag_rink_code("RA")
+        fp = SetupService(SqlStore(self.url)).preview_ice_availability(
+            actor_id="c", **self._template())["template_fingerprint"]
         commit = lambda svc: svc.commit_ice_availability(  # noqa: E731
-            actor_id="c", **self._template())
+            actor_id="c", template_fingerprint=fp, **self._template())
         out = self._run([commit, self._import("2026-09-01T22:00:00+00:00",
                                               "2026-09-01T23:00:00+00:00")])
         self.assertNotIsInstance(out[0], Exception, f"commit raised: {out[0]!r}")
@@ -859,21 +919,26 @@ class PostgresIceAvailabilityConcurrencyTest(unittest.TestCase):
         # commit and revoke_season_venue_access both take the Season row lock, so
         # they serialize under either barrier ordering: commit wins -> its six
         # windows are created while access is still live; revoke wins -> commit
-        # re-resolves access UNDER the lock and creates nothing (#158 review).
-        # Never a partial / unauthorized subset of ice, and never a raw error.
+        # re-resolves access UNDER the lock, its snapshot no longer matches the
+        # previewed one, and it is refused (preview_mismatch, #158 review). Never
+        # a partial / unauthorized subset of ice, and never a raw (non-domain)
+        # error.
+        fp = SetupService(SqlStore(self.url)).preview_ice_availability(
+            actor_id="c", **self._template())["template_fingerprint"]
         commit = lambda svc: svc.commit_ice_availability(  # noqa: E731
-            actor_id="c", **self._template())
+            actor_id="c", template_fingerprint=fp, **self._template())
         revoke = lambda svc: svc.revoke_season_venue_access(  # noqa: E731
             self.access_id, actor_id="r")
         out = self._run([commit, revoke])
-        self.assertNotIsInstance(out[0], Exception, f"commit raised: {out[0]!r}")
         self.assertNotIsInstance(out[1], Exception, f"revoke raised: {out[1]!r}")
-        created = out[0]["totals"]["created"]
-        self.assertIn(created, (0, 6), f"partial/unauthorized commit: {created}")
-        slots = self._assert_unique_and_non_overlapping()
-        self.assertEqual(len(slots), created)          # exactly what commit reported
-        if created == 0:                               # revoke won the lock race
-            self.assertEqual(out[0]["totals"]["access_skipped_rinks"], 1)
+        r = out[0]
+        if isinstance(r, ScheduleConflictError):       # revoke won the lock race
+            self.assertEqual(r.details["reason"], "preview_mismatch")
+            self.assertEqual(self._slots(), [])        # zero unauthorized ice
+        else:                                          # commit won
+            self.assertNotIsInstance(r, Exception, f"commit raised: {r!r}")
+            self.assertEqual(r["totals"]["created"], 6)
+            self.assertEqual(len(self._assert_unique_and_non_overlapping()), 6)
 
     def test_commit_vs_timezone_change(self):
         # commit reads the Program timezone (and generates its UTC windows) under
@@ -882,8 +947,10 @@ class PostgresIceAvailabilityConcurrencyTest(unittest.TestCase):
         # wholly ONE zone — all six at Toronto instants (first 22:00 UTC) or all
         # six at UTC instants (first 18:00 UTC) — never a stale mix of both, and
         # never a raw error.
+        fp = SetupService(SqlStore(self.url)).preview_ice_availability(
+            actor_id="c", **self._template())["template_fingerprint"]
         commit = lambda svc: svc.commit_ice_availability(  # noqa: E731
-            actor_id="c", **self._template())
+            actor_id="c", template_fingerprint=fp, **self._template())
 
         def change_tz(svc):
             prog = svc.store.get_program(self.program_id)
@@ -891,12 +958,18 @@ class PostgresIceAvailabilityConcurrencyTest(unittest.TestCase):
             svc.store.save_program(prog)
 
         out = self._run([commit, change_tz])
-        self.assertNotIsInstance(out[0], Exception, f"commit raised: {out[0]!r}")
-        slots = self._assert_unique_and_non_overlapping()
-        self.assertEqual(len(slots), 6)            # one zone's worth, never mixed
-        self.assertIn(min(s.start_time for s in slots),
-                      (datetime(2026, 9, 1, 22, tzinfo=timezone.utc),   # Toronto
-                       datetime(2026, 9, 1, 18, tzinfo=timezone.utc)))  # UTC
+        r = out[0]
+        if isinstance(r, ScheduleConflictError):   # tz change won the Program lock
+            # the commit re-resolved every window to UTC under the lock, no longer
+            # matching the previewed (Toronto) snapshot -> refused, zero ice.
+            self.assertEqual(r.details["reason"], "preview_mismatch")
+            self.assertEqual(self._slots(), [])
+        else:                                      # commit won: all Toronto
+            self.assertNotIsInstance(r, Exception, f"commit raised: {r!r}")
+            slots = self._assert_unique_and_non_overlapping()
+            self.assertEqual(len(slots), 6)        # one zone's worth, never mixed
+            self.assertEqual(min(s.start_time for s in slots),
+                             datetime(2026, 9, 1, 22, tzinfo=timezone.utc))
 
     def test_commit_vs_import_metadata_change_no_deadlock(self):
         # A hierarchy re-import updates BOTH the Program timezone AND the Season
@@ -920,8 +993,10 @@ class PostgresIceAvailabilityConcurrencyTest(unittest.TestCase):
         tmpl = dict(self._template())
         tmpl.pop("start_date")
         tmpl.pop("end_date")                                   # default the range
+        fp = SetupService(SqlStore(self.url)).preview_ice_availability(
+            actor_id="c", **tmpl)["template_fingerprint"]
         commit = lambda svc: svc.commit_ice_availability(  # noqa: E731
-            actor_id="c", **tmpl)
+            actor_id="c", template_fingerprint=fp, **tmpl)
 
         def reimport(svc):
             with svc.store.transaction():
@@ -933,23 +1008,24 @@ class PostgresIceAvailabilityConcurrencyTest(unittest.TestCase):
                 svc.store.save_season(s)
 
         out = self._run([commit, reimport])
-        self.assertNotIsInstance(out[0], Exception, f"commit raised: {out[0]!r}")
         self.assertNotIsInstance(out[1], Exception, f"reimport raised: {out[1]!r}")
-        slots = self._assert_unique_and_non_overlapping()
-        n = len(slots)
-        self.assertIn(n, (9, 3), f"partial/mixed snapshot: {n} slots")
-        if n == 9:                                    # commit won: old tz + wide
+        r = out[0]
+        if isinstance(r, ScheduleConflictError):      # reimport won the lock race
+            # the commit re-resolved the NEW tz + narrowed range under the lock
+            # (no deadlock — the Program-first order holds), which no longer
+            # matched the previewed snapshot -> refused (preview_mismatch), zero
+            # ice. The clean domain rejection, not a 40P01, is the deadlock proof.
+            self.assertEqual(r.details["reason"], "preview_mismatch")
+            self.assertEqual(self._slots(), [])
+        else:                                         # commit won: old tz + wide
+            self.assertNotIsInstance(r, Exception, f"commit raised: {r!r}")
+            slots = self._assert_unique_and_non_overlapping()
+            self.assertEqual(len(slots), 9)           # whole previewed snapshot
             self.assertEqual(min(s.start_time for s in slots),
                              datetime(2026, 9, 1, 22, tzinfo=utc))     # Toronto
             local = {s.start_time.astimezone(ZoneInfo(TZ)).date() for s in slots}
             self.assertTrue(
                 local <= {date(2026, 9, 1), date(2026, 9, 3), date(2026, 9, 8)})
-        else:                                         # reimport won: new tz + narrow
-            self.assertEqual(min(s.start_time for s in slots),
-                             datetime(2026, 9, 1, 18, tzinfo=utc))     # UTC
-            self.assertEqual(
-                {s.start_time.astimezone(utc).date() for s in slots},
-                {date(2026, 9, 1)})
 
 
 class PlannerUnitTest(unittest.TestCase):
@@ -1128,6 +1204,82 @@ class IceAvailabilityHttpAuthzTest(unittest.TestCase):
         self.assertEqual(slot_count(), 0)
         # Unedited template + fingerprint => commits exactly the 6 shown slots.
         _, ok = self._req(c, "POST", "/api/setup/ice-availability/commit",
+                          dict(template, template_fingerprint=fp))
+        self.assertEqual(ok["totals"]["created"], 6)
+        self.assertEqual(slot_count(), 6)
+
+    def test_commit_without_token_is_refused_over_http(self):
+        # #158 review: preview is REQUIRED end-to-end. An authenticated
+        # MANAGE_ARENA caller who POSTs /commit with NO template_fingerprint (the
+        # old bypass) is refused with preview_required and creates zero ice — even
+        # right after previewing. Only a commit carrying the token is admitted.
+        svc = self.srv.STATE.api.setup
+        prog = svc.create_program("HBN", timezone_name=TZ)
+        season = svc.create_season(prog.id, "Fall NoToken")
+        venue = svc.create_venue("Rink House N", league_id=prog.id)
+        svc.grant_season_venue_access(season.id, venue.id)
+        rink = svc.create_rink(venue.id, "Sheet N")
+        template = {
+            "season_id": season.id, "rink_ids": [rink.id],
+            "weekdays": [1, 3], "start_local": "18:00", "end_local": "22:00",
+            "start_date": "2026-09-01", "end_date": "2026-09-07",
+            "playable_minutes": 60, "turnover_minutes": 15}
+
+        def slot_count():
+            return sum(1 for s in self.srv.STATE.api.store.all_ice_slots()
+                       if s.rink_id == rink.id)
+
+        c = self._client()
+        self._login(c, "arena")
+        self._req(c, "POST", "/api/setup/ice-availability/preview", template)
+        status, res = self._req(
+            c, "POST", "/api/setup/ice-availability/commit", template)  # no token
+        self.assertEqual(status, 400)
+        self.assertEqual(res["error"]["details"]["reason"], "preview_required")
+        self.assertEqual(slot_count(), 0)
+
+    def test_commit_with_another_operators_token_is_refused_over_http(self):
+        # #158 review: the fingerprint is bound to the operator who previewed. The
+        # arena manager previews; the league admin (also MANAGE_ARENA) replays the
+        # arena manager's valid, current token. It matches the resolved snapshot
+        # but has no preview audit for the admin, so the commit is refused
+        # (preview_required) with zero ice — while the operator who DID preview
+        # commits that same token cleanly.
+        svc = self.srv.STATE.api.setup
+        prog = svc.create_program("HBX", timezone_name=TZ)
+        season = svc.create_season(prog.id, "Fall CrossActor")
+        venue = svc.create_venue("Rink House X", league_id=prog.id)
+        svc.grant_season_venue_access(season.id, venue.id)
+        rink = svc.create_rink(venue.id, "Sheet X")
+        template = {
+            "season_id": season.id, "rink_ids": [rink.id],
+            "weekdays": [1, 3], "start_local": "18:00", "end_local": "22:00",
+            "start_date": "2026-09-01", "end_date": "2026-09-07",
+            "playable_minutes": 60, "turnover_minutes": 15}
+
+        def slot_count():
+            return sum(1 for s in self.srv.STATE.api.store.all_ice_slots()
+                       if s.rink_id == rink.id)
+
+        arena = self._client()
+        self._login(arena, "arena")
+        _, pv = self._req(
+            arena, "POST", "/api/setup/ice-availability/preview", template)
+        fp = pv["template_fingerprint"]
+        self.assertTrue(fp)
+
+        # A DIFFERENT MANAGE_ARENA operator (admin) replays arena's token.
+        admin = self._client()
+        self._login(admin, "admin")
+        status, res = self._req(
+            admin, "POST", "/api/setup/ice-availability/commit",
+            dict(template, template_fingerprint=fp))
+        self.assertEqual(status, 400)
+        self.assertEqual(res["error"]["details"]["reason"], "preview_required")
+        self.assertEqual(slot_count(), 0)
+
+        # The operator who actually previewed commits that same token cleanly.
+        _, ok = self._req(arena, "POST", "/api/setup/ice-availability/commit",
                           dict(template, template_fingerprint=fp))
         self.assertEqual(ok["totals"]["created"], 6)
         self.assertEqual(slot_count(), 6)
