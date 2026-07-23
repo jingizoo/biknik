@@ -59,7 +59,10 @@ from ..services import (
     parse_csv_text,
     validate_import,
 )
-from ..services.league_scope import team_registration_valid
+from ..services.league_scope import (
+    require_slots_belong_to_locked_season,
+    team_registration_valid,
+)
 from ..services.notifier import push as _push_notification
 from ..store import InMemoryStore
 from .v1_setup_adapter import program_to_v1, season_to_v1, team_to_v1
@@ -2764,6 +2767,17 @@ class ApiService:
                     _batch_rinks.add(_s.rink_id)
             self.setup._lock_rinks(_batch_rinks)
             self._guard_active_seasons([resolved_season_id])
+            # #314 review — re-validate every proposed slot's Season eligibility
+            # HERE, under the Rink+Season locks just acquired: a concurrent
+            # SeasonVenueAccess revoke or Rink→Venue reassignment can only land
+            # before these locks or after we release them (never during, since
+            # its own write needs the very locks we hold), so this recheck is
+            # the definitive, race-free answer. Before ANY Game, slot-status,
+            # or audit write for the whole batch — shared with move_game and
+            # the league-scoped commit via the same locked helper.
+            require_slots_belong_to_locked_season(
+                self.store, [d["ice_slot_id"] for d in proposal["draft_games"]],
+                resolved_season_id)
             created = []
             for d in proposal["draft_games"]:
                 # #277: the draft-commit path runs the SAME final conflict check

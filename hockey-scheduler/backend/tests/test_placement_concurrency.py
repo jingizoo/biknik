@@ -220,6 +220,75 @@ class _PlacementParityMixin:
         self.assertEqual(_slot_game_count(self.store, "mB"), 0)
         self.assertEqual(_slot_game_count(self.store, "mC"), 1)
 
+    # -- slot/Season eligibility is re-validated under the lock, not from a
+    # stale pre-lock read (#314 review) ------------------------------------
+    def test_move_refused_after_venue_access_revoked(self):
+        # Sequential parity: revoke se1's access to venue "v" (hosting mB's
+        # rink r2), THEN attempt to move a game onto mB. The recheck must run
+        # under the lock this commits acquires (not a stale pre-lock read
+        # taken before any lock existed) — a stable venue_access_missing
+        # refusal, the game untouched on its original slot, and ZERO partial
+        # writes (no slot flip, no audit for this move).
+        g = self.api.create_game("se1", "d1", "t0", "t1", "sX", league_id="lg")
+        self.assertNotIn("error", g)
+        gid = g["id"]
+        r = self.api.revoke_season_venue_access("sva_se1")
+        self.assertNotIn("error", r)
+        res = self.api.move_game(gid, "mB")
+        self.assertEqual(_reason(res), "venue_access_missing", repr(res))
+        game_now = next(gm for gm in self.store.all_games() if gm.id == gid)
+        self.assertEqual(game_now.ice_slot_id, "sX")
+        self.assertEqual(_slot_game_count(self.store, "mB"), 0)
+        self.assertEqual(self.store.get_ice_slot("mB").status.value, "available")
+        self.assertFalse(any(
+            au.action == "game_moved" and au.entity_id == gid
+            for au in self.store.all_setup_audit()))
+
+    def test_move_refused_after_rink_reparented(self):
+        # Same shape, the OTHER race trigger: reassign mC's rink (r3) to a
+        # venue with no access for se1, then attempt to move onto mC.
+        self.store.add_venue(Venue(id="v2", name="No Access",
+                                   organization_id="org", league_id="pg"))
+        g = self.api.create_game("se1", "d1", "t0", "t1", "sX", league_id="lg")
+        self.assertNotIn("error", g)
+        gid = g["id"]
+        reassigned = self.api.assign_rink_venue("r3", "v2")
+        self.assertNotIn("error", reassigned)
+        res = self.api.move_game(gid, "mC")
+        self.assertEqual(_reason(res), "venue_access_missing", repr(res))
+        game_now = next(gm for gm in self.store.all_games() if gm.id == gid)
+        self.assertEqual(game_now.ice_slot_id, "sX")
+        self.assertEqual(_slot_game_count(self.store, "mC"), 0)
+        self.assertEqual(self.store.get_ice_slot("mC").status.value, "available")
+
+    def test_draft_commit_refused_after_venue_access_revoked(self):
+        # Same shape for commit_draft_schedule: revoke first, then commit a
+        # single-slot draft targeting mB — refused under the SAME locks the
+        # batch acquires, zero Games/slot-flips/audit, not the stale
+        # pre-transaction prevalidation this review found insufficient.
+        r = self.api.revoke_season_venue_access("sva_se1")
+        self.assertNotIn("error", r)
+        res = self.api.commit_draft_schedule("d1", slot_ids=["mB"])
+        self.assertEqual(_reason(res), "venue_access_missing", repr(res))
+        self.assertEqual(
+            len([g for g in self.store.all_games() if not g.cancelled]), 0)
+        self.assertEqual(self.store.get_ice_slot("mB").status.value, "available")
+        self.assertFalse(any(a.action == "draft_schedule_committed"
+                            for a in self.store.all_setup_audit()))
+
+    def test_draft_commit_refused_after_rink_reparented(self):
+        self.store.add_venue(Venue(id="v2", name="No Access",
+                                   organization_id="org", league_id="pg"))
+        reassigned = self.api.assign_rink_venue("r3", "v2")
+        self.assertNotIn("error", reassigned)
+        res = self.api.commit_draft_schedule("d1", slot_ids=["mC"])
+        self.assertEqual(_reason(res), "venue_access_missing", repr(res))
+        self.assertEqual(
+            len([g for g in self.store.all_games() if not g.cancelled]), 0)
+        self.assertEqual(self.store.get_ice_slot("mC").status.value, "available")
+        self.assertFalse(any(a.action == "draft_schedule_committed"
+                            for a in self.store.all_setup_audit()))
+
 
 class MemoryPlacementParityTest(_PlacementParityMixin, unittest.TestCase):
     def _make_store(self):
@@ -499,6 +568,129 @@ class PostgresPlacementConcurrencyTest(unittest.TestCase):
             self.assertEqual(builder["totals"]["created"], 0, repr(out))
         else:
             self.assertEqual(_reason(builder), "preview_mismatch", repr(out))
+
+    # (7) A concurrent SeasonVenueAccess revoke or Rink→Venue reparent racing
+    # move_game / commit_draft_schedule (#314 review). require_slot_belongs_to_
+    # season is a pure read with no lock of its own; checking it before the
+    # Team/Rink/Season locks (move_game) or entirely before the transaction
+    # opens (commit_draft_schedule) leaves a window where the revoke/reparent
+    # can commit in between, after which the write would land a Game onto ice
+    # that no longer serves the Season. Both sides serialize via a lock they
+    # ALREADY take for another reason — revoke via the Season lock
+    # (_require_active_season, matching _guard_game_season/_guard_active_
+    # seasons); reparent via the implicit row lock its own UPDATE needs on the
+    # SAME Rink row _lock_rinks holds — so whichever commits first is seen by
+    # the other's now-locked recheck, deterministically. The revoke/reassign
+    # itself always succeeds (neither checks for existing Games); the
+    # move/commit either lands cleanly (it ran first) or is refused with a
+    # stable venue_access_missing and ZERO partial Games, slot flips, or
+    # audits (it saw the now-ineligible ice) — never a corrupted state.
+    def test_revoke_venue_access_vs_move(self):
+        api0 = ApiService(self._store())
+        g = api0.create_game("se1", "d1", "t0", "t1", "sX", league_id="lg")
+        gid = g["id"]
+        out = self._run([
+            lambda a: a.move_game(gid, "mB"),
+            lambda a: a.revoke_season_venue_access("sva_se1"),
+        ])
+        self._assert_no_crash(out)
+        move_res, revoke_res = out
+        self.assertNotIn("error", revoke_res,
+                         f"the revoke should always succeed: {out!r}")
+        store = self._store()
+        game_now = next(gm for gm in store.all_games() if gm.id == gid)
+        if isinstance(move_res, dict) and "error" not in move_res:
+            self.assertEqual(game_now.ice_slot_id, "mB")
+            self.assertEqual(_slot_game_count(store, "mB"), 1)
+            self.assertEqual(_slot_game_count(store, "sX"), 0)
+        else:
+            self.assertEqual(_reason(move_res), "venue_access_missing", repr(out))
+            self.assertEqual(game_now.ice_slot_id, "sX")
+            self.assertEqual(_slot_game_count(store, "mB"), 0)
+            self.assertEqual(store.get_ice_slot("mB").status.value, "available")
+            self.assertFalse(any(
+                au.action == "game_moved" and au.entity_id == gid
+                for au in store.all_setup_audit()))
+        self._assert_schedule_consistent(store)
+
+    def test_reparent_rink_vs_move(self):
+        self._store().add_venue(Venue(id="v2", name="No Access",
+                                      organization_id="org", league_id="pg"))
+        api0 = ApiService(self._store())
+        g = api0.create_game("se1", "d1", "t0", "t1", "sX", league_id="lg")
+        gid = g["id"]
+        out = self._run([
+            lambda a: a.move_game(gid, "mC"),
+            lambda a: a.assign_rink_venue("r3", "v2"),
+        ])
+        self._assert_no_crash(out)
+        move_res, reassign_res = out
+        self.assertNotIn("error", reassign_res,
+                         f"the reassignment should always succeed: {out!r}")
+        store = self._store()
+        game_now = next(gm for gm in store.all_games() if gm.id == gid)
+        if isinstance(move_res, dict) and "error" not in move_res:
+            self.assertEqual(game_now.ice_slot_id, "mC")
+            self.assertEqual(_slot_game_count(store, "mC"), 1)
+        else:
+            self.assertEqual(_reason(move_res), "venue_access_missing", repr(out))
+            self.assertEqual(game_now.ice_slot_id, "sX")
+            self.assertEqual(_slot_game_count(store, "mC"), 0)
+            self.assertEqual(store.get_ice_slot("mC").status.value, "available")
+            self.assertFalse(any(
+                au.action == "game_moved" and au.entity_id == gid
+                for au in store.all_setup_audit()))
+        self._assert_schedule_consistent(store)
+
+    def test_revoke_venue_access_vs_draft_commit(self):
+        out = self._run([
+            lambda a: a.commit_draft_schedule("d1", slot_ids=["mB"]),
+            lambda a: a.revoke_season_venue_access("sva_se1"),
+        ])
+        self._assert_no_crash(out)
+        draft_res, revoke_res = out
+        self.assertNotIn("error", revoke_res,
+                         f"the revoke should always succeed: {out!r}")
+        store = self._store()
+        if isinstance(draft_res, dict) and "error" not in draft_res:
+            self.assertEqual(len(draft_res["created"]), 1, repr(out))
+            self.assertEqual(_slot_game_count(store, "mB"), 1)
+            self.assertTrue(any(a.action == "draft_schedule_committed"
+                               for a in store.all_setup_audit()))
+        else:
+            self.assertEqual(_reason(draft_res), "venue_access_missing", repr(out))
+            self.assertEqual(
+                len([g for g in store.all_games() if not g.cancelled]), 0)
+            self.assertEqual(store.get_ice_slot("mB").status.value, "available")
+            self.assertFalse(any(a.action == "draft_schedule_committed"
+                                for a in store.all_setup_audit()))
+        self._assert_schedule_consistent(store)
+
+    def test_reparent_rink_vs_draft_commit(self):
+        self._store().add_venue(Venue(id="v2", name="No Access",
+                                      organization_id="org", league_id="pg"))
+        out = self._run([
+            lambda a: a.commit_draft_schedule("d1", slot_ids=["mC"]),
+            lambda a: a.assign_rink_venue("r3", "v2"),
+        ])
+        self._assert_no_crash(out)
+        draft_res, reassign_res = out
+        self.assertNotIn("error", reassign_res,
+                         f"the reassignment should always succeed: {out!r}")
+        store = self._store()
+        if isinstance(draft_res, dict) and "error" not in draft_res:
+            self.assertEqual(len(draft_res["created"]), 1, repr(out))
+            self.assertEqual(_slot_game_count(store, "mC"), 1)
+            self.assertTrue(any(a.action == "draft_schedule_committed"
+                               for a in store.all_setup_audit()))
+        else:
+            self.assertEqual(_reason(draft_res), "venue_access_missing", repr(out))
+            self.assertEqual(
+                len([g for g in store.all_games() if not g.cancelled]), 0)
+            self.assertEqual(store.get_ice_slot("mC").status.value, "available")
+            self.assertFalse(any(a.action == "draft_schedule_committed"
+                                for a in store.all_setup_audit()))
+        self._assert_schedule_consistent(store)
 
 
 if __name__ == "__main__":

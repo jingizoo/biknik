@@ -10,6 +10,7 @@ from typing import Optional
 from .league_scope import (
     require_game_league_id,
     require_slot_belongs_to_season,
+    require_slots_belong_to_locked_season,
 )
 from .setup_service import SetupService as _BaseSetupService
 
@@ -98,26 +99,30 @@ class SetupService(_BaseSetupService):
 
     def move_game(self, game_id: str, new_ice_slot_id: str, reason: str = "",
                   actor_id: Optional[str] = None):
+        def _scope_check(game, new_slot):
+            # #314 review — called from INSIDE _move_game_locked, after the
+            # Team/Rink/Season locks are held and the same-slot no-op check
+            # has already passed (a no-op move never needs re-scoping): this
+            # is the game's fresh, post-lock state and the resolved target
+            # slot, so a concurrent SeasonVenueAccess revoke or Rink→Venue
+            # reassignment can never land in the gap between this check and
+            # the write below. Previously this ran before ANY lock was taken.
+            # #283 Slice D/E: an exhibition has no owning League, so only a
+            # regular game needs the league-ice-isolation check; both kinds
+            # still need their new slot's venue to serve the game's Season.
+            if game.game_type != "exhibition":
+                require_game_league_id(self.store, game)
+            require_slots_belong_to_locked_season(
+                self.store, [new_slot.id], game.season_id)
         def _attempt():
-            game = self.store.get_game(game_id)
-            # Preserve the base service's established same-slot error/reason
-            # before running the new scope check.
-            if game is not None and new_ice_slot_id != game.ice_slot_id:
-                # #283 Slice D/E: an exhibition has no owning League, so only a
-                # regular game needs the league-ice-isolation check; both kinds
-                # still need their new slot's venue to serve the game's Season.
-                if game.game_type != "exhibition":
-                    require_game_league_id(self.store, game)
-                require_slot_belongs_to_season(
-                    self.store, new_ice_slot_id, game.season_id)
             # The base's raw locked body (not its public move_game, which would
-            # install its OWN retry loop/transaction) so this scope check and
+            # install its OWN retry loop/transaction) so the scope hook and
             # the base's Team/Rink/Season locking run as ONE attempt sharing
             # ONE transaction (#314 review) — _retry_on_move_race below owns
             # the transaction boundary and the retry-on-race loop for both.
             return _BaseSetupService._move_game_locked(
                 self, game_id, new_ice_slot_id, reason=reason,
-                actor_id=actor_id)
+                actor_id=actor_id, scope_check=_scope_check)
         return self._retry_on_move_race(_attempt, game_id=game_id)
 
     def publish_game(self, game_id: str, published: bool = True,

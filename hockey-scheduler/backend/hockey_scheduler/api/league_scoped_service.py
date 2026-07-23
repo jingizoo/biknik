@@ -12,6 +12,7 @@ from ..domain.errors import DomainError
 from ..services.league_scope import (
     require_game_league_id,
     require_slot_belongs_to_season,
+    require_slots_belong_to_locked_season,
 )
 from .service import ApiService as _BaseApiService
 from .service import catch
@@ -68,13 +69,7 @@ class ApiService(_BaseApiService):
             slot_ids=slot_ids, constraints=constraints)
         if isinstance(proposal, dict) and proposal.get("error"):
             return proposal
-
-        # Revalidate every proposed slot before the first write. This closes the
-        # commit boundary even if inventory changed after an earlier preview.
         resolved_season_id = proposal["season_id"]
-        for row in proposal["draft_games"]:
-            require_slot_belongs_to_season(
-                self.store, row["ice_slot_id"], resolved_season_id)
 
         # The Division-only proposal's own "league_id" is this tenancy
         # layer's frozen Program-scoped vocabulary (league_scope.py's
@@ -117,6 +112,17 @@ class ApiService(_BaseApiService):
                     _batch_rinks.add(_s.rink_id)
             self.setup._lock_rinks(_batch_rinks)
             self._guard_active_seasons([resolved_season_id])
+            # #314 review — re-validate every proposed slot's Season eligibility
+            # HERE, under the Rink+Season locks just acquired, not before this
+            # transaction opened (as a stale prevalidation could leave a window
+            # for a concurrent SeasonVenueAccess revoke or Rink→Venue
+            # reassignment to commit and then be missed). Before ANY Game,
+            # slot-status, or audit write for the whole batch — a bad row rolls
+            # back everything, matching this commit's existing all-or-nothing
+            # contract; shared with move_game via the same locked helper.
+            require_slots_belong_to_locked_season(
+                self.store, [row["ice_slot_id"] for row in proposal["draft_games"]],
+                resolved_season_id)
             for row in proposal["draft_games"]:
                 # #277: run the SAME final conflict check as create_game /
                 # move_game before persisting — slot free (exists, GAME,

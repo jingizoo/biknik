@@ -3402,11 +3402,21 @@ class SetupService:
 
     def _move_game_locked(self, game_id: str, new_ice_slot_id: str,
                           reason: str = "",
-                          actor_id: Optional[str] = None) -> Game:
+                          actor_id: Optional[str] = None,
+                          scope_check=None) -> Game:
         """``move_game``'s locked body — runs inside the caller's transaction
         (``move_game`` itself, or the league-scoped override's own attempt via
         ``_retry_on_move_race``). Raises ``_MoveGameRaced`` to signal a clean
-        retry; the caller's transaction rolls back, so no partial write."""
+        retry; the caller's transaction rolls back, so no partial write.
+
+        ``scope_check`` (#314 review) is an optional ``(game, new_slot) -> None``
+        hook the league-scoped override supplies to re-validate league-ice
+        eligibility (``require_game_league_id`` / ``require_slot_belongs_to_season``)
+        under the Team/Rink/Season locks just acquired above — called with the
+        FRESH, post-lock ``game`` and the resolved target slot, after the
+        same-slot no-op check (a no-op move never needs re-scoping) and before
+        the final conflict check or any write. The base class has no notion of
+        league scope itself, so this is a no-op unless a caller supplies one."""
         game = self.store.get_game(game_id)
         if game is None:
             raise NotFoundError(f"Game {game_id} not found.",
@@ -3476,6 +3486,8 @@ class SetupService:
         if new_slot.id == game.ice_slot_id:
             raise ValidationError("Game is already in that ice slot.",
                                   details={"reason": "same_slot"})
+        if scope_check is not None:
+            scope_check(game, new_slot)
         # Shared final conflict check (#277) — identical rules to create +
         # draft-commit; excludes THIS game so a move never conflicts with itself.
         # The team locks taken above make the team-overlap half atomic; the
