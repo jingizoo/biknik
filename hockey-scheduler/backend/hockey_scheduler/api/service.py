@@ -4054,6 +4054,39 @@ class ApiService:
             _parse_dt(end_time, "end_time"),
             _parse_enum(IceSlotType, slot_type, "slot_type"), actor_id))
 
+    # Ice Availability Builder (#158): preview then idempotently commit a
+    # recurring block of AVAILABLE Game ice. The service returns plain dicts.
+    @catch
+    def preview_ice_availability(self, season_id: str = None, rink_ids=None,
+                                 weekdays=None, start_local: str = None,
+                                 end_local: str = None, start_date: str = None,
+                                 end_date: str = None, playable_minutes=None,
+                                 turnover_minutes=None, exclusion_dates=None,
+                                 windows=None,
+                                 actor_id: Optional[str] = None) -> dict:
+        return self.setup.preview_ice_availability(
+            season_id=season_id, rink_ids=rink_ids, weekdays=weekdays,
+            start_local=start_local, end_local=end_local,
+            start_date=start_date, end_date=end_date,
+            playable_minutes=playable_minutes, turnover_minutes=turnover_minutes,
+            exclusion_dates=exclusion_dates, windows=windows, actor_id=actor_id)
+
+    @catch
+    def commit_ice_availability(self, season_id: str = None, rink_ids=None,
+                                weekdays=None, start_local: str = None,
+                                end_local: str = None, start_date: str = None,
+                                end_date: str = None, playable_minutes=None,
+                                turnover_minutes=None, exclusion_dates=None,
+                                windows=None, template_fingerprint: str = None,
+                                actor_id: Optional[str] = None) -> dict:
+        return self.setup.commit_ice_availability(
+            season_id=season_id, rink_ids=rink_ids, weekdays=weekdays,
+            start_local=start_local, end_local=end_local,
+            start_date=start_date, end_date=end_date,
+            playable_minutes=playable_minutes, turnover_minutes=turnover_minutes,
+            exclusion_dates=exclusion_dates, windows=windows,
+            template_fingerprint=template_fingerprint, actor_id=actor_id)
+
     @catch
     def create_player(self, team_id: str, name: str, position: str,
                       jersey_number: Optional[int] = None,

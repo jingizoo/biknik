@@ -179,6 +179,36 @@ class ImportRinksIceSlotsCommitServiceContract:
         self.assertTrue(res["warnings"])
         self.assertEqual(len(self.store.all_ice_slots()), 2)
 
+    # -- 6b. a new slot overlapping ALREADY-PERSISTED ice is rejected ---------
+    def test_import_overlapping_persisted_slot_is_rejected_and_rolls_back(self):
+        # Same-sheet overlaps stay warning-only (above), but a new slot that
+        # would overlap ice a PRIOR write already persisted is a hard conflict:
+        # the whole import is rejected and fully rolled back on every backend
+        # (#158 review). A first import persists R1's 18:00-19:30 game slot.
+        first = self.api.commit_rinks_ice_slots_import(
+            _valid_sheets_csv(), actor_id="admin")
+        self.assertTrue(first["committed"])
+        slots_before = {s.id for s in self.store.all_ice_slots()}
+        audits_before = len(self.store.all_setup_audit())
+
+        # A second import brings a NON-exact overlapping slot on the same rink
+        # (19:00-20:00 overlaps the persisted 18:00-19:30) -- the case migration
+        # 045's exact-tuple unique index cannot catch.
+        overlap_csv = (
+            "rink_code,start_time,end_time,slot_type\n"
+            "R1,2026-09-01T19:00:00+00:00,2026-09-01T20:00:00+00:00,game\n"
+        )
+        res = self.api.commit_rinks_ice_slots_import(
+            {"rinks_csv": RINKS_CSV, "ice_slots_csv": overlap_csv},
+            actor_id="admin")
+        self.assertIn("error", res)
+        self.assertEqual(res["error"]["code"], "schedule_conflict")
+        # Full rollback: no new slot landed, the persisted slot is untouched,
+        # and the rejected batch wrote NO audit rows (not even the rink_updated
+        # rows its rink sheet would have produced) -- Memory and SQLite alike.
+        self.assertEqual({s.id for s in self.store.all_ice_slots()}, slots_before)
+        self.assertEqual(len(self.store.all_setup_audit()), audits_before)
+
     # -- 7. audit trail --------------------------------------------------------
     def test_audit_trail_on_first_commit(self):
         res = self.api.commit_rinks_ice_slots_import(
