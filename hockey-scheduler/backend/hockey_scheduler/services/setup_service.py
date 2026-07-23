@@ -2467,93 +2467,54 @@ class SetupService:
         accessible, access_missing = self._split_rinks_by_access(
             season_id, rink_ids)
 
-        # Classify the proposed windows against the CURRENT ice inventory and bind
-        # the WHOLE reviewed preview — every commit-relevant input AND every
-        # operator-visible resolved field — INTO the fingerprint (#158 review).
-        # Three progressively-rejected halves show why the payload must be this
-        # wide:
+        # Classify the proposed windows against the CURRENT ice inventory, then
+        # bind the WHOLE reviewed preview INTO the fingerprint by hashing the exact
+        # operator-visible payload the preview response renders, minus the token
+        # itself (#158 review). Four progressively-rejected narrower bindings show
+        # why it must be the whole payload:
         #   * the raw form fields alone miss a concurrent Program-timezone /
         #     Season-boundary edit that moves the resolved windows under a stale
         #     form;
         #   * the generated (rink, start, end) tuples alone miss a slot or Game
         #     added, removed, allocated, or booked after preview that reclassifies
-        #     a row (new <-> duplicate <-> conflict) or changes its conflict
-        #     target WITHOUT moving the tuple;
-        #   * the tuples + classification STILL miss an edit that changes what the
-        #     operator reviewed without changing any generated tuple — extend an
-        #     18:00-22:00 window to 22:10 (the same three slots still fit), retune
-        #     the playable / turnover minutes, add an exclusion that lands on an
-        #     already-empty day, or flip a day between "skipped" and "too_short" —
-        #     yet commit and its audit would then run values the operator never
-        #     saw.
-        # So hash the normalized resolved preview payload itself: EVERYTHING the
-        # preview response renders except the token — the resolved timezone + date
-        # range, the normalized per-weekday windows, the playable / turnover
-        # minutes, the resolved exclusions, the planner's skipped and too-short
-        # days, the access-skipped rinks, the reserved/playable + new/duplicate/
-        # conflict totals, and (retaining the classification/target binding) per
-        # generated window its (rink, start, end) tuple, reviewed status, and — for
-        # a conflict — EVERY operator-visible target field: colliding slot id, Game
-        # id (if any), slot TYPE + STATUS (an in-place slot edit keeps the id but
-        # changes the target text the operator read). Any operator-visible change
-        # flips the fingerprint and forces a re-preview of exactly what changed; an
-        # unedited template over unchanged inventory is stable, so preview and
-        # commit agree. The fields below MIRROR _ice_availability_response (keep
-        # them in sync), so the token binds precisely what the operator reviewed.
-        # Commit calls this UNDER its Season + per-rink write locks, so the bound
-        # snapshot is the very one the write loop acts on. Deterministic — no clock.
+        #     a row (new <-> duplicate <-> conflict) or changes its conflict target
+        #     WITHOUT moving the tuple;
+        #   * tuples + classification STILL miss an edit that changes what the
+        #     operator reviewed without changing any tuple — extend a window past
+        #     the last slot, retune the playable / turnover minutes, add an
+        #     exclusion on an already-empty day, or flip a day skipped<->too_short;
+        #   * even a hand-maintained field list misses the reviewed RINK/VENUE
+        #     IDENTITY — rename a rink or reassign it to another Season-authorized
+        #     Venue after preview and the tuples/classifications/totals are
+        #     unchanged, yet the operator reviewed a different physical context.
+        # Rather than chase fields, derive the token STRUCTURALLY from
+        # _reviewed_preview_payload — the same builder _ice_availability_response
+        # uses — so every field the operator sees (per-rink {id, name, venue} rows,
+        # the full venue-access-missing rows, totals, skipped/too-short, the full
+        # conflict target, ...) is bound for free and adding a field to the
+        # response binds it automatically. Any change flips the token and forces a
+        # re-preview of exactly what changed; an unedited template over unchanged
+        # inventory is stable, so preview and commit agree. Commit recomputes this
+        # UNDER its Season + per-rink write locks, so the bound snapshot is the one
+        # its write loop acts on. Deterministic — no clock; the payload's list
+        # order is fixed by the (identical) template + inventory, sort_keys
+        # canonicalizes the rest.
         classified = self._classify_ice_windows(accessible, plan)
-
-        def _target(c):
-            # The full conflict identity the operator saw; empty for non-conflicts.
-            if c["status"] != "conflict":
-                return ("", "", "", "")
-            return (c["conflict_with"] or "", c["conflict_game_id"] or "",
-                    c["conflict_slot_type"] or "", c["conflict_slot_status"] or "")
-        proposed = sorted(
-            (c["rink_id"], c["start"].isoformat(), c["end"].isoformat(),
-             c["status"]) + _target(c)
-            for c in classified)
-        # Counts + reserved/playable totals exactly as _ice_availability_response
-        # derives them, so the bound summary matches the reviewed one.
-        n_rinks = len(accessible)
-        new_n = sum(1 for c in classified if c["status"] == "new")
-        dup_n = sum(1 for c in classified if c["status"] == "duplicate")
-        con_n = sum(1 for c in classified if c["status"] == "conflict")
-        reviewed = {
-            "season_id": season_id,
-            "timezone": str(tz),
-            "date_range": [d_start.isoformat(), d_end.isoformat()],
-            "weekdays": sorted(weekday_set),
-            "windows": windows_meta,
-            "playable_minutes": playable_minutes,
-            "turnover_minutes": turnover_minutes,
-            "exclusions": sorted(d.isoformat() for d in exclusions),
-            "skipped_dates": plan["skipped_dates"],
-            "too_short": plan["too_short"],
-            "venue_access_missing": sorted(a["rink_id"] for a in access_missing),
-            "totals": {
-                "new": new_n, "duplicate": dup_n, "conflict": con_n,
-                "reserved_minutes": plan["reserved_minutes"] * n_rinks,
-                "playable_minutes": plan["playable_minutes_total"] * n_rinks,
-            },
-            "slots": proposed,
-        }
-        fingerprint = hashlib.sha256(json.dumps(
-            reviewed, sort_keys=True, separators=(",", ":")
-        ).encode()).hexdigest()[:16]
-
-        return {
+        base = {
             "season": season, "tz": tz, "d_start": d_start, "d_end": d_end,
             "weekday_set": weekday_set,
             "windows_meta": windows_meta,
-            "fingerprint": fingerprint,
             "playable_minutes": playable_minutes,
             "turnover_minutes": turnover_minutes,
             "plan": plan, "accessible": accessible,
             "access_missing": access_missing,
             "classified": classified,
         }
+        base["fingerprint"] = hashlib.sha256(json.dumps(
+            self._reviewed_preview_payload(base),
+            sort_keys=True, separators=(",", ":"), default=str
+        ).encode()).hexdigest()[:16]
+        return base
 
     def _split_rinks_by_access(self, season_id, rink_ids):
         """Resolve each selected rink's current Venue + active SeasonVenueAccess
@@ -2645,9 +2606,20 @@ class SetupService:
         base = self._plan_ice_availability(**kwargs)
         return {**base, "weekdays": sorted(base["weekday_set"])}
 
-    def _ice_availability_response(self, r):
-        """Shape a resolution into the preview API response (datetimes -> ISO)."""
+    def _reviewed_preview_payload(self, r):
+        """The operator-visible preview payload — EVERYTHING the preview response
+        renders EXCEPT the token itself (#158 review). The fingerprint is the hash
+        of this (see ``_plan_ice_availability``) and ``_ice_availability_response``
+        returns this PLUS the token, so the token binds precisely what the operator
+        reviewed: any field added here is bound for free. Notably it carries each
+        rink's full ``{rink_id, rink_name, venue_id, venue_name}`` identity and the
+        full venue-access-missing rows, so a post-preview rename or venue
+        reassignment moves the token even when the generated tuples do not.
+        Deterministic — datetimes to ISO, list order fixed by the template +
+        inventory, no clock."""
         classified = r["classified"]
+        plan = r["plan"]
+        n_rinks = len(r["accessible"])
         per_rink = {}
         for c in classified:
             row = per_rink.setdefault(c["rink_id"], {
@@ -2658,15 +2630,12 @@ class SetupService:
         new_n = sum(1 for c in classified if c["status"] == "new")
         dup_n = sum(1 for c in classified if c["status"] == "duplicate")
         con_n = sum(1 for c in classified if c["status"] == "conflict")
-        n_rinks = len(r["accessible"])
-        plan = r["plan"]
         return {
             "season_id": r["season"].id, "season_name": r["season"].name,
             "timezone": str(r["tz"]),
             "date_range": {"start": r["d_start"].isoformat(),
                            "end": r["d_end"].isoformat()},
-            "weekdays": r["weekdays"], "windows": r["windows_meta"],
-            "template_fingerprint": r["fingerprint"],
+            "weekdays": sorted(r["weekday_set"]), "windows": r["windows_meta"],
             "playable_minutes": r["playable_minutes"],
             "turnover_minutes": r["turnover_minutes"],
             "rinks": list(per_rink.values()),
@@ -2692,6 +2661,12 @@ class SetupService:
             "too_short": plan["too_short"],
             "venue_access_missing": r["access_missing"],
         }
+
+    def _ice_availability_response(self, r):
+        """The preview API response: the reviewed payload (exactly what the token
+        binds) PLUS the token itself (#158 review)."""
+        return {**self._reviewed_preview_payload(r),
+                "template_fingerprint": r["fingerprint"]}
 
     def _ice_slot_dto(self, slot):
         return {"id": slot.id, "rink_id": slot.rink_id,

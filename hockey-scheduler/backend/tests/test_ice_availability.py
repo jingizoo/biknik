@@ -445,6 +445,59 @@ class IceAvailabilityContract:
             **edited)
         self.assertEqual(ok["totals"]["created"], 3)      # only Thursday's slots
 
+    def test_commit_rejects_a_rink_renamed_after_preview(self):
+        # #158 review: the token binds each rink's FULL identity, not just its id.
+        # Renaming rink_1 after preview leaves the generated tuples, classification
+        # and totals identical, but the operator reviewed a different rink name; the
+        # stale token is refused (preview_mismatch) with zero writes, and a
+        # re-preview shows the new name and then commits.
+        pv = self.api.preview_ice_availability(actor_id="a", **_template())
+        self.assertEqual(pv["rinks"][0]["rink_name"], "Rink A")
+        rink = self.store.get_rink("rink_1")
+        rink.name = "Rink A (renamed)"
+        self.store.save_rink(rink)
+        res = self.api.commit_ice_availability(
+            actor_id="a", template_fingerprint=pv["template_fingerprint"],
+            **_template())
+        self.assertEqual(res["error"]["details"]["reason"], "preview_mismatch")
+        self._assert_no_ice_written()
+        pv2 = self.api.preview_ice_availability(actor_id="a", **_template())
+        self.assertEqual(pv2["rinks"][0]["rink_name"], "Rink A (renamed)")
+        self.assertEqual([(s["start_time"], s["end_time"]) for s in pv2["slots"]],
+                         [(s["start_time"], s["end_time"]) for s in pv["slots"]])
+        ok = self.api.commit_ice_availability(
+            actor_id="a", template_fingerprint=pv2["template_fingerprint"],
+            **_template())
+        self.assertEqual(ok["totals"]["created"], 6)
+
+    def test_commit_rejects_a_rink_reassigned_to_another_venue_after_preview(self):
+        # #158 review: reassigning rink_1 to another SEASON-AUTHORIZED venue after
+        # preview keeps it accessible with the SAME generated tuples, but the
+        # operator reviewed a different venue identity; the token binds venue_id /
+        # venue_name, so the stale commit is refused (preview_mismatch) with zero
+        # writes, and a re-preview shows the new venue and then commits.
+        self.store.add_season_venue_access(SeasonVenueAccess(
+            id="sva_2", season_id="season_1", venue_id="venue_2", active=True))
+        pv = self.api.preview_ice_availability(actor_id="a", **_template())
+        self.assertEqual(pv["rinks"][0]["venue_id"], "venue_1")
+        rink = self.store.get_rink("rink_1")
+        rink.venue_id = "venue_2"
+        self.store.save_rink(rink)
+        res = self.api.commit_ice_availability(
+            actor_id="a", template_fingerprint=pv["template_fingerprint"],
+            **_template())
+        self.assertEqual(res["error"]["details"]["reason"], "preview_mismatch")
+        self._assert_no_ice_written()
+        pv2 = self.api.preview_ice_availability(actor_id="a", **_template())
+        self.assertEqual(pv2["rinks"][0]["venue_id"], "venue_2")
+        self.assertEqual(pv2["rinks"][0]["venue_name"], "Annex")
+        self.assertEqual([(s["start_time"], s["end_time"]) for s in pv2["slots"]],
+                         [(s["start_time"], s["end_time"]) for s in pv["slots"]])
+        ok = self.api.commit_ice_availability(
+            actor_id="a", template_fingerprint=pv2["template_fingerprint"],
+            **_template())
+        self.assertEqual(ok["totals"]["created"], 6)
+
     # -- 2. exclusion dates -------------------------------------------------
     def test_exclusion_dates_skipped_and_explained(self):
         pv = self.api.preview_ice_availability(
@@ -1510,6 +1563,65 @@ class IceAvailabilityHttpAuthzTest(unittest.TestCase):
                 {"weekday": 1, "start_local": "18:00", "end_local": "18:40"},
                 {"weekday": 3, "start_local": "18:00", "end_local": "22:00"}]),
             dict(exclusion_dates=["2026-09-01"]), 3)
+
+    def _assert_rink_identity_edit_refused_over_http(self, name, mutate, expect):
+        """Authenticated HTTP: seed a rig, preview, then MUTATE the rink's identity
+        (not the template) via `mutate(store, rink_id)` — a rename or a reassignment
+        to another Season-authorized venue. The generated tuples stay identical, but
+        the reviewed rink/venue identity changed, so the stale token is refused
+        (preview_mismatch, zero ice); a re-preview shows the new identity via
+        `expect(pv2["rinks"][0])` and then commits (#158 review)."""
+        svc = self.srv.STATE.api.setup
+        store = self.srv.STATE.api.store
+        prog = svc.create_program(name, timezone_name=TZ)
+        season = svc.create_season(prog.id, name + " Season")
+        venue = svc.create_venue(name + " House", league_id=prog.id)
+        svc.grant_season_venue_access(season.id, venue.id)
+        rink = svc.create_rink(venue.id, name + " Sheet")
+        template = {
+            "season_id": season.id, "rink_ids": [rink.id],
+            "weekdays": [1, 3], "start_local": "18:00", "end_local": "22:00",
+            "start_date": "2026-09-01", "end_date": "2026-09-07",
+            "playable_minutes": 60, "turnover_minutes": 15}
+
+        def game_ice():
+            return [s.id for s in store.all_ice_slots() if s.rink_id == rink.id]
+
+        c = self._client()
+        self._login(c, "arena")
+        _, pv = self._req(c, "POST", "/api/setup/ice-availability/preview", template)
+        fp = pv["template_fingerprint"]
+        self.assertEqual(pv["totals"]["new"], 6)
+        mutate(svc, store, season, rink.id)          # rename / reassign after preview
+        _, bad = self._req(c, "POST", "/api/setup/ice-availability/commit",
+                           dict(template, template_fingerprint=fp))
+        self.assertEqual(bad["error"]["details"]["reason"], "preview_mismatch")
+        self.assertEqual(game_ice(), [])
+        _, pv2 = self._req(c, "POST", "/api/setup/ice-availability/preview", template)
+        expect(pv2["rinks"][0])
+        _, ok = self._req(c, "POST", "/api/setup/ice-availability/commit",
+                          dict(template, template_fingerprint=pv2["template_fingerprint"]))
+        self.assertEqual(ok["totals"]["created"], 6)
+
+    def test_commit_binding_rejects_rink_rename_over_http(self):
+        def rename(svc, store, season, rid):
+            r = store.get_rink(rid)
+            r.name = "Sheet 9 (renamed)"
+            store.save_rink(r)
+        self._assert_rink_identity_edit_refused_over_http(
+            "HB9", rename,
+            lambda row: self.assertEqual(row["rink_name"], "Sheet 9 (renamed)"))
+
+    def test_commit_binding_rejects_venue_reassignment_over_http(self):
+        def reassign(svc, store, season, rid):
+            v2 = svc.create_venue("HB10 House B", league_id=None)
+            svc.grant_season_venue_access(season.id, v2.id)   # keep it accessible
+            r = store.get_rink(rid)
+            r.venue_id = v2.id
+            store.save_rink(r)
+        self._assert_rink_identity_edit_refused_over_http(
+            "HB10", reassign,
+            lambda row: self.assertEqual(row["venue_name"], "HB10 House B"))
 
     def test_commit_binding_rejects_reclassified_row_over_http(self):
         # Over HTTP: the token binds the reviewed CLASSIFICATION, not just the
