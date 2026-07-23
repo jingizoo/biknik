@@ -2825,23 +2825,45 @@ function renderIcePreview(pv) {
         <button class="linklike" data-goto="setup">Grant Season participation → Venue access</button>, then preview again.</div>`
     : "";
   const conflictWarn = t.conflict
-    ? `<div class="ib-warn">⚠ ${t.conflict} slot(s) overlap existing ice or games — reported, never overwritten.</div>` : "";
+    ? `<div class="ib-warn">⚠ ${t.conflict} slot(s) overlap existing ice or games — each is listed below with its target, never overwritten.</div>` : "";
   const skips = (pv.skipped_dates || []).length
     ? `<div class="ib-note">Skipped ${pv.skipped_dates.length} exclusion date(s): ${pv.skipped_dates.map((s) => esc(s.date)).join(", ")}.</div>` : "";
   const short = (pv.too_short || []).length
     ? `<div class="ib-note">${pv.too_short.length} day(s) too short for one ${pv.playable_minutes}-min game: ${pv.too_short.map((s) => esc(s.date)).join(", ")}.</div>` : "";
   const rinkRows = (pv.rinks || []).map((r) =>
     `<div class="ib-rink-row"><span>${esc(r.rink_name)}</span><span>${r.new} new · ${r.duplicate} exist · ${r.conflict} conflict</span></div>`).join("");
+  // Every generated row is reviewable before commit (#158 review): new, duplicate
+  // AND conflict, across the WHOLE range — no day cap, so a season-long template
+  // can't hide later days or exact collisions. The list scrolls (CSS) instead of
+  // truncating; the commit stays bound to the full resolved snapshot regardless
+  // of what is scrolled into view. Conflicts carry their exact target (the
+  // colliding Game id, or the existing slot's type/status).
   const byDate = {};
-  (pv.slots || []).filter((s) => s.status === "new").forEach((s) => {
-    (byDate[s.date] || (byDate[s.date] = [])).push(s);
-  });
+  (pv.slots || []).forEach((s) => { (byDate[s.date] || (byDate[s.date] = [])).push(s); });
   const days = Object.keys(byDate).sort();
-  const slotList = days.slice(0, 60).map((d) =>
-    `<div class="ib-day-row"><div class="ib-day-date">${esc(d)}</div>
-      <div class="ib-day-slots">${byDate[d].map((s) => `<span class="ib-slot">${esc(ibLocalTime(s.start_local))}–${esc(ibLocalTime(s.end_local))} · ${esc(s.rink_name)}</span>`).join("")}</div></div>`).join("");
-  const truncated = days.length > 60 ? `<div class="ib-note">Showing the first 60 of ${days.length} days.</div>` : "";
-  return `<div class="card ib-preview" data-ib-new="${t.new}" data-ib-duplicate="${t.duplicate}" data-ib-conflict="${t.conflict}" data-ib-access-missing="${(pv.venue_access_missing || []).length}" data-ib-skipped="${(pv.skipped_dates || []).length}">
+  const lastDay = days.length ? days[days.length - 1] : "";
+  const conflictTarget = (s) => s.conflict_has_game
+    ? `game ${s.conflict_game_id || "?"}`
+    : `${s.conflict_slot_type || "existing"} slot${s.conflict_slot_status ? ` (${s.conflict_slot_status})` : ""}`;
+  const slotSpan = (s) => {
+    const time = `${esc(ibLocalTime(s.start_local))}–${esc(ibLocalTime(s.end_local))}`;
+    if (s.status === "conflict") {
+      const target = conflictTarget(s);
+      return `<span class="ib-slot ib-slot-conflict" data-ib-slot-status="conflict"${s.conflict_game_id ? ` data-ib-conflict-game="${esc(s.conflict_game_id)}"` : ""} title="conflicts with ${esc(target)}">${time} · ${esc(s.rink_name)} · ⚠ ${esc(target)}</span>`;
+    }
+    if (s.status === "duplicate") {
+      return `<span class="ib-slot ib-slot-duplicate" data-ib-slot-status="duplicate">${time} · ${esc(s.rink_name)} · already exists</span>`;
+    }
+    return `<span class="ib-slot ib-slot-new" data-ib-slot-status="new">${time} · ${esc(s.rink_name)}</span>`;
+  };
+  const slotList = days.map((d, i) =>
+    `<div class="ib-day-row" data-ib-day="${esc(d)}"${i === days.length - 1 ? ' data-ib-last-day="1"' : ""}>
+      <div class="ib-day-date">${esc(d)}</div>
+      <div class="ib-day-slots">${byDate[d].map(slotSpan).join("")}</div></div>`).join("");
+  const listNote = days.length
+    ? `<div class="ib-note">All ${days.length} generated day(s) listed (${(pv.slots || []).length} slot(s)) — scroll to review every day and conflict; the last day is ${esc(lastDay)}.</div>`
+    : "";
+  return `<div class="card ib-preview" data-ib-new="${t.new}" data-ib-duplicate="${t.duplicate}" data-ib-conflict="${t.conflict}" data-ib-access-missing="${(pv.venue_access_missing || []).length}" data-ib-skipped="${(pv.skipped_dates || []).length}" data-ib-days="${days.length}" data-ib-slots="${(pv.slots || []).length}" data-ib-last-day-date="${esc(lastDay)}">
     <div class="section-title" style="margin-top:0">Preview — ${t.capacity_games} game slot(s) to create</div>
     <div class="ib-stats">
       <div class="ib-stat"><b>${t.new}</b><span>new</span></div>
@@ -2852,7 +2874,8 @@ function renderIcePreview(pv) {
     </div>
     ${accessWarn}${conflictWarn}${skips}${short}
     ${rinkRows ? `<div class="ib-rink-rows">${rinkRows}</div>` : ""}
-    <div class="ib-slot-list">${slotList || `<div class="empty">No new slots — adjust the template above.</div>`}${truncated}</div>
+    <div class="ib-slot-list">${slotList || `<div class="empty">No slots generated — adjust the template above.</div>`}</div>
+    ${listNote}
     <div class="dq-actions">
       <button class="act success" data-ib-commit ${t.new ? "" : "disabled"}>Create ${t.new} slot(s)</button>
       <button class="act ghost" data-ib-preview>Re-preview</button>

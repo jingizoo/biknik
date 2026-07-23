@@ -781,6 +781,10 @@ button.act.danger { background: #ffe5e3; color: #c0271b; }
 .ib-day-date { font-size: 12px; font-weight: 700; color: var(--ink); min-width: 92px; }
 .ib-day-slots { display: flex; flex-wrap: wrap; gap: 6px; }
 .ib-slot { font-size: 12px; background: #eef6ff; color: #0a5bbf; border-radius: 6px; padding: 2px 7px; }
+/* New slots keep the default blue; duplicates read as muted, conflicts as a
+   warning so an operator can scan the full list and spot every collision. */
+.ib-slot-duplicate { background: #f0f0f2; color: #6b6b76; }
+.ib-slot-conflict { background: #fdecec; color: #b3261e; font-weight: 600; }
 @media (max-width: 460px) {
   .ib-grid2 { grid-template-columns: 1fr; }
   .ib-day-row { flex-direction: column; gap: 4px; }
