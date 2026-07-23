@@ -146,6 +146,14 @@ def required_permission(path: str):
     if path in ("/api/setup/ice-availability/preview",
                 "/api/setup/ice-availability/commit"):
         return Permission.MANAGE_ARENA
+    # Scheduling policy (#277 Slice B): turnover/warm-up/resurfacing buffers,
+    # minimum playable time, and curfew are operational FACILITY rules — how
+    # the building turns its ice around — even when scoped to a Program or
+    # Season rather than one Rink. Arena-side like the ice-availability
+    # builder above: MANAGE_ARENA, the one permission both League Admin and
+    # Arena Manager hold. Same gate for the read (the config carries no PII).
+    if path == "/api/setup/scheduling-policy":
+        return Permission.MANAGE_ARENA
     # Existing Program/League/Venue codes for the hierarchy import wizard's
     # pickers (#260 review Q2/Q3/Q6) — same League-Admin-only MANAGE_SETUP
     # gate as the hierarchy import commit itself, since it's read from the

@@ -159,7 +159,8 @@ class ApiService(_BaseApiService):
                 # reimplements the commit body for league-scope validation, so it
                 # must enforce the identical invariant.)
                 slot = self.setup._assert_slot_free_for_game(
-                    row["ice_slot_id"], row["home_team_id"], row["away_team_id"])
+                    row["ice_slot_id"], row["home_team_id"], row["away_team_id"],
+                    season_id=resolved_season_id)
                 game = Game(
                     id=self.store.next_id("game"),
                     home_team_id=row["home_team_id"],

@@ -9,7 +9,7 @@ import functools
 import hashlib
 import json
 import re
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Callable, List, Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -41,7 +41,9 @@ from ..domain import (
     RescheduleRequest,
     RescheduleStatus,
     Organization,
+    PolicyScopeType,
     Rink,
+    SchedulingPolicy,
     Season,
     SeasonStatus,
     SeasonTeamRegistration,
@@ -2335,6 +2337,287 @@ class SetupService:
         self._audit("rink_created", "rink", rink.id, actor_id, {"venue_id": venue_id})
         return rink
 
+    # -- scheduling policy (#277 Slice B) --------------------------------
+    #
+    # Operational turnover/curfew knobs for game placement, configurable per
+    # Program / Season / Rink and resolved field by field with Rink overriding
+    # Season overriding Program. Enforcement lives in _assert_slot_meets_policy
+    # (layered onto _assert_slot_free, THE shared placement gate), so
+    # create_game, move_game, and both draft-commit implementations inherit it
+    # uniformly — the same no-draft-exception contract as the rest of the gate.
+
+    _POLICY_MINUTE_FIELDS = ("warmup_minutes", "resurfacing_minutes",
+                             "min_playable_minutes")
+    _POLICY_FIELDS = _POLICY_MINUTE_FIELDS + ("curfew_local",)
+
+    def _require_policy_scope(self, scope_type, scope_id, *, lock=False):
+        """Validate ``scope_type`` and that its target entity exists; return
+        the parsed :class:`PolicyScopeType`. With ``lock=True`` the scope row
+        is read FOR UPDATE — the write path's serialization point, so two
+        concurrent ``set_scheduling_policy`` calls for one scope can't race
+        past each other into the unique index (single-row lock: cannot
+        deadlock the multi-lock placement paths)."""
+        try:
+            st = PolicyScopeType(scope_type)
+        except ValueError:
+            raise ValidationError(
+                "Unknown scheduling-policy scope.",
+                {"reason": "unknown_policy_scope", "scope_type": scope_type})
+        getter = {
+            PolicyScopeType.PROGRAM: (self.store.get_program_for_update
+                                      if lock else self.store.get_program),
+            PolicyScopeType.SEASON: (self.store.get_season_for_update
+                                     if lock else self.store.get_season),
+            PolicyScopeType.RINK: (self.store.get_rink_for_update
+                                   if lock else self.store.get_rink),
+        }[st]
+        if getter(scope_id) is None:
+            raise NotFoundError(
+                f"{st.value.capitalize()} {scope_id} not found.",
+                details={"reason": "policy_scope_missing",
+                         "scope_type": st.value, "scope_id": scope_id})
+        return st
+
+    @_transactional
+    def set_scheduling_policy(self, scope_type, scope_id,
+                              warmup_minutes=None, resurfacing_minutes=None,
+                              min_playable_minutes=None, curfew_local=None,
+                              actor_id: Optional[str] = None):
+        """Upsert the scheduling policy for one scope (#277 Slice B).
+
+        The passed values REPLACE the row wholesale (this is a settings form,
+        not a patch): a ``None`` field means "inherit from the next scope up",
+        and all-``None`` deletes the row entirely (audited as a clear). Values
+        never rewrite any stored IceSlot/Game — enforcement is read-time only,
+        so setting a policy cannot time-shift existing data (#277).
+
+        Returns the stored row, or ``None`` after a clear.
+        """
+        st = self._require_policy_scope(scope_type, scope_id, lock=True)
+        for field, value in (("warmup_minutes", warmup_minutes),
+                             ("resurfacing_minutes", resurfacing_minutes),
+                             ("min_playable_minutes", min_playable_minutes)):
+            if value is None:
+                continue
+            if not isinstance(value, int) or isinstance(value, bool) \
+                    or value < 0:
+                raise ValidationError(
+                    f"{field} must be an integer >= 0.",
+                    {"reason": f"invalid_{field}", "field": field})
+        if curfew_local is not None:
+            hour, minute = parse_hhmm(curfew_local, "curfew_local")
+            curfew_local = f"{hour:02d}:{minute:02d}"  # store normalized
+
+        existing = self.store.find_scheduling_policy(st, scope_id)
+        values = {"warmup_minutes": warmup_minutes,
+                  "resurfacing_minutes": resurfacing_minutes,
+                  "min_playable_minutes": min_playable_minutes,
+                  "curfew_local": curfew_local}
+        if all(v is None for v in values.values()):
+            if existing is not None:
+                self.store.delete_scheduling_policy(existing.id)
+                self._audit("scheduling_policy_cleared", st.value, scope_id,
+                            actor_id, {"policy_id": existing.id})
+            return None
+        if existing is None:
+            policy = self.store.add_scheduling_policy(SchedulingPolicy(
+                id=self.store.next_id("schedpolicy"),
+                scope_type=st, scope_id=scope_id, **values))
+        else:
+            for field, value in values.items():
+                setattr(existing, field, value)
+            policy = self.store.save_scheduling_policy(existing)
+        self._audit("scheduling_policy_set", st.value, scope_id, actor_id,
+                    {"policy_id": policy.id, **values})
+        return policy
+
+    def get_scheduling_policy(self, scope_type, scope_id):
+        """The raw stored policy row for one scope, or ``None`` (read-only;
+        validates the scope exists so a typo'd id is a 404, not a null)."""
+        st = self._require_policy_scope(scope_type, scope_id)
+        return self.store.find_scheduling_policy(st, scope_id)
+
+    def _cascade_scheduling_policy(self, scope_type, scope_id, actor_id):
+        """Delete (and audit) a scope's policy row when the scope entity
+        itself is deleted (#277 Slice B review): migration 046 carries no FK
+        to its polymorphic scope, and every API read/write validates the
+        scope exists first — so a row surviving its scope would be permanent
+        dead data no operator could ever view or clear."""
+        row = self.store.find_scheduling_policy(scope_type, scope_id)
+        if row is not None:
+            self.store.delete_scheduling_policy(row.id)
+            self._audit("scheduling_policy_cleared", scope_type.value,
+                        scope_id, actor_id,
+                        {"policy_id": row.id,
+                         "cascade": f"{scope_type.value}_deleted"})
+
+    def _effective_policy(self, rink_id, season_id):
+        """Resolve the EFFECTIVE scheduling policy for placing a game on
+        ``rink_id`` in ``season_id``: field by field, first non-``None`` of
+        Rink -> Season -> Program wins. Returns ``(values, sources)`` where
+        ``values`` maps every policy field to its resolved value (still
+        ``None`` when unset at every scope — the no-op default) and
+        ``sources`` maps each SET field to the scope_type string it came
+        from. Plain reads only (no locks): runs inside the caller's
+        transaction after its own Team/Rink/Season locks, so a concurrent
+        policy edit either committed before those locks or waits — the
+        resolved values are stable for the caller's write."""
+        season = self.store.get_season(season_id) if season_id else None
+        rows = []
+        if rink_id:
+            rows.append(self.store.find_scheduling_policy(
+                PolicyScopeType.RINK, rink_id))
+        if season_id:
+            rows.append(self.store.find_scheduling_policy(
+                PolicyScopeType.SEASON, season_id))
+        if season is not None and season.program_id:
+            rows.append(self.store.find_scheduling_policy(
+                PolicyScopeType.PROGRAM, season.program_id))
+        values, sources = {}, {}
+        for field in self._POLICY_FIELDS:
+            values[field] = None
+            for row in rows:
+                v = getattr(row, field, None) if row is not None else None
+                if v is not None:
+                    values[field] = v
+                    sources[field] = getattr(row.scope_type, "value",
+                                             row.scope_type)
+                    break
+        return values, sources
+
+    def _curfew_timezone(self, rink_id, season_id):
+        """The wall-clock anchor for curfew_local: the slot's venue timezone
+        (a curfew is a building rule), falling back to the Season's Program
+        timezone, then UTC. Total — unknown/legacy tz names fall through."""
+        rink = self.store.get_rink(rink_id) if rink_id else None
+        venue = (self.store.get_venue(rink.venue_id)
+                 if rink is not None and rink.venue_id else None)
+        tz = resolve_timezone(getattr(venue, "timezone", None))
+        if tz is None:
+            season = self.store.get_season(season_id) if season_id else None
+            program = (self.store.get_program(season.program_id)
+                       if season is not None and season.program_id else None)
+            tz = resolve_timezone(getattr(program, "timezone", None))
+        return tz or timezone.utc
+
+    def _assert_slot_meets_policy(self, slot, season_id, *,
+                                  exclude_game_id=None):
+        """#277 Slice B enforcement, layered onto :meth:`_assert_slot_free`
+        exactly as its docstring reserved. Three checks against the effective
+        Rink>Season>Program policy, each a stable structured
+        ``ScheduleConflictError``:
+
+        * ``insufficient_playable_time`` — the slot's playable span
+          ``[start_time, end_time]`` is shorter than ``min_playable_minutes``
+          (imported contracted slivers are preserved as-is at ingest; this is
+          where they are refused a GAME, per #277).
+        * ``turnover_buffer_conflict`` — another active game's slot on the
+          SAME rink sits closer than ``warmup + resurfacing`` minutes.
+          Boundary rule (product decision, half-open like
+          ``intervals_overlap``): a gap EXACTLY equal to the required buffer
+          is compliant. Game-vs-game only — buffers against non-game slots
+          (maintenance/public skate) are #189's event model, not this gate.
+        * ``curfew_violation`` — the slot's playable end lands after the
+          curfew instant in the venue's timezone (Program fallback). The
+          instant is deterministic and policy-controlled, never inferred
+          from the slot: an afternoon/evening curfew (wall clock >= 12:00)
+          is HH:MM on the slot's LOCAL START DATE — so a slot that merely
+          STARTS past it already ends past it and violates — while a
+          small-hours curfew (< 12:00, e.g. an 01:00 building close) means
+          the morning AFTER an afternoon/evening start (a 22:00-00:30
+          overnight slot is judged against the following 01:00) but THAT
+          SAME morning for a slot that itself starts in the small hours (a
+          00:30-02:00 slot violates tonight's 01:00 close). Ending exactly
+          AT curfew is compliant. Ambiguous fall-back wall clocks resolve with
+          fold=0, matching ``_resolve_local_to_utc``'s deterministic
+          choice.
+
+        A ``season_id`` of ``None`` (no competition scope to resolve a policy
+        from) skips enforcement — every real placement path passes it.
+        All-``None`` policies short-circuit to today's behavior. Read-only;
+        runs inside the caller's transaction under its Rink lock, so the
+        same-rink scan is atomic against concurrent placements on this rink.
+        """
+        if season_id is None:
+            return
+        policy, _ = self._effective_policy(slot.rink_id, season_id)
+        min_playable = policy["min_playable_minutes"] or 0
+        slot_minutes = int(
+            (slot.end_time - slot.start_time).total_seconds() // 60)
+        if slot_minutes < min_playable:
+            raise ScheduleConflictError(
+                f"Ice slot {slot.id} is only {slot_minutes} playable minutes; "
+                f"this competition requires at least {min_playable}.",
+                details={"reason": "insufficient_playable_time",
+                         "slot_minutes": slot_minutes,
+                         "required_minutes": min_playable})
+        buffer_minutes = ((policy["warmup_minutes"] or 0)
+                          + (policy["resurfacing_minutes"] or 0))
+        if buffer_minutes > 0:
+            pad = timedelta(minutes=buffer_minutes)
+            for ex in self.store.all_games():
+                if (ex.id == exclude_game_id or ex.cancelled
+                        or ex.ice_slot_id is None
+                        or ex.ice_slot_id == slot.id):
+                    continue
+                ex_slot = self.store.get_ice_slot(ex.ice_slot_id)
+                if ex_slot is None or ex_slot.rink_id != slot.rink_id:
+                    continue
+                if intervals_overlap(slot.start_time - pad,
+                                     slot.end_time + pad,
+                                     ex_slot.start_time, ex_slot.end_time):
+                    if ex_slot.start_time >= slot.end_time:
+                        gap = ex_slot.start_time - slot.end_time
+                    else:
+                        gap = slot.start_time - ex_slot.end_time
+                    # Physically overlapping slots (possible only via legacy/
+                    # imported rows — create_ice_slot forbids new ones) would
+                    # yield a negative gap; clamp to 0 so the detail reads as
+                    # "no gap", not a nonsense negative.
+                    gap = max(gap, timedelta(0))
+                    raise ScheduleConflictError(
+                        f"Ice slot {slot.id} is too close to game {ex.id} on "
+                        f"the same rink for the required "
+                        f"{buffer_minutes}-minute turnover.",
+                        details={
+                            "reason": "turnover_buffer_conflict",
+                            "conflict_game_id": ex.id,
+                            "conflict_slot_id": ex_slot.id,
+                            "required_gap_minutes": buffer_minutes,
+                            "gap_minutes": int(gap.total_seconds() // 60)})
+        curfew = policy["curfew_local"]
+        if curfew:
+            hour, minute = parse_hhmm(curfew, "curfew_local")
+            tz = self._curfew_timezone(slot.rink_id, season_id)
+            start_local = slot.start_time.astimezone(tz)
+            curfew_at = start_local.replace(hour=hour, minute=minute,
+                                            second=0, microsecond=0, fold=0)
+            if hour < 12 and start_local.hour >= 12:
+                # A small-hours curfew for an afternoon/evening slot names
+                # the morning AFTER the slot's start date (an overnight slot
+                # against an 01:00 building close). A slot that itself
+                # STARTS in the small hours is judged against THAT morning's
+                # curfew — a 00:30-02:00 slot violates tonight's 01:00 close
+                # rather than being waved through to tomorrow's.
+                curfew_at += timedelta(days=1)
+            # Compare INSTANTS, not wall clocks: Python compares two aware
+            # datetimes sharing one tzinfo by their naive values (fold
+            # ignored), which on a fall-back night would accept a later real
+            # end with a smaller repeated wall clock and reject an earlier
+            # one — non-monotonic in real time. Converting the fold=0 curfew
+            # to UTC makes the documented earlier-occurrence choice operative
+            # and the check monotonic: everything after that instant
+            # violates, everything at/before it passes.
+            end_local = slot.end_time.astimezone(tz)
+            if slot.end_time > curfew_at.astimezone(timezone.utc):
+                raise ScheduleConflictError(
+                    f"Ice slot {slot.id} ends at "
+                    f"{end_local.strftime('%H:%M')} local, past the "
+                    f"{curfew} curfew.",
+                    details={"reason": "curfew_violation",
+                             "curfew_local": curfew,
+                             "slot_end_local": end_local.strftime("%H:%M")})
+
     @_transactional
     def create_ice_slot(self, rink_id: str, start_time: datetime, end_time: datetime,
                         slot_type: IceSlotType = IceSlotType.GAME,
@@ -3180,7 +3463,8 @@ class SetupService:
                                     enforce_team_league=enforce_team_league)
 
     # -- manual game creation ---------------------------------------------
-    def _assert_slot_free(self, ice_slot_id, *, exclude_game_id=None):
+    def _assert_slot_free(self, ice_slot_id, *, season_id=None,
+                          exclude_game_id=None):
         """Physical-placement half of the game-placement check (#277).
 
         Checks that the slot exists, is a GAME slot, is AVAILABLE, and is not
@@ -3221,10 +3505,15 @@ class SetupService:
                 f"Ice slot {ice_slot_id} is already used by game {clash.id}.",
                 details={"reason": "slot_already_filled",
                          "conflict_game_id": clash.id})
+        # #277 Slice B: the turnover/curfew policy layer this docstring
+        # reserved — min-playable, same-rink turnover buffer, and curfew,
+        # resolved Rink>Season>Program. No-op until a policy is configured.
+        self._assert_slot_meets_policy(slot, season_id,
+                                       exclude_game_id=exclude_game_id)
         return slot
 
     def _assert_slot_free_for_game(self, ice_slot_id, home_team_id, away_team_id,
-                                   *, exclude_game_id=None):
+                                   *, season_id=None, exclude_game_id=None):
         """Shared final conflict check for placing a game on an ice slot (#277).
 
         THE single choke point that create_game, move_game, AND the draft-commit
@@ -3246,7 +3535,8 @@ class SetupService:
 
         Read-only (no transaction of its own) — callers run inside theirs.
         """
-        slot = self._assert_slot_free(ice_slot_id, exclude_game_id=exclude_game_id)
+        slot = self._assert_slot_free(ice_slot_id, season_id=season_id,
+                                      exclude_game_id=exclude_game_id)
         for ex in self.store.all_games():
             if ex.id == exclude_game_id or ex.cancelled or ex.ice_slot_id is None:
                 continue
@@ -3400,7 +3690,21 @@ class SetupService:
         # half is backstopped by the ux_games_active_ice_slot partial unique index
         # (migration 022), so a race-losing insert fails with ice_slot_taken.
         slot = self._assert_slot_free_for_game(
-            ice_slot_id, home_team_id, away_team_id)
+            ice_slot_id, home_team_id, away_team_id, season_id=season_id)
+        # #277 Slice B review — the rink lock above was taken from a PRE-lock
+        # locator read; if that read missed (the slot materialized between the
+        # locator and the gate's own re-read — e.g. a concurrent builder
+        # commit landing a predictable next id) this whole placement,
+        # including the turnover-buffer scan (which unlike slot occupancy has
+        # NO DB backstop), would run with no rink lock at all. Mirror
+        # move_game's defensive re-verify: refuse with a stable retryable
+        # conflict instead of writing unserialized. A rink mismatch (slot
+        # replaced under the same id) is the same unlocked condition.
+        if _target is None or slot.rink_id != _target.rink_id:
+            raise ConcurrencyConflictError(
+                "This ice slot changed while processing the request; "
+                "please retry.",
+                {"reason": "placement_raced", "ice_slot_id": ice_slot_id})
 
         rink = self.store.get_rink(slot.rink_id)
         # #283 Slice E: a REGULAR game references its exact LeagueSeason (its
@@ -3600,7 +3904,7 @@ class SetupService:
         # one-game-per-slot half is backstopped by ux_games_active_ice_slot.
         new_slot = self._assert_slot_free_for_game(
             new_ice_slot_id, game.home_team_id, game.away_team_id,
-            exclude_game_id=game_id)
+            season_id=game.season_id, exclude_game_id=game_id)
 
         old_slot_id = game.ice_slot_id
         if old_slot_id:
@@ -6293,6 +6597,8 @@ class SetupService:
         # post-rollback path.
         self._block_if_dependents("league", program_id, "program",
                                   self._program_dependent_groups(program_id))
+        self._cascade_scheduling_policy(
+            PolicyScopeType.PROGRAM, program_id, actor_id)
         self.store.delete_program(program_id)
         self._audit("league_deleted", "league", program_id, actor_id,
                     {"name": program.name})
@@ -6339,6 +6645,8 @@ class SetupService:
             self._dep_group("game", games, self._matchup),
             self._dep_group("venue access", venue_access,
                             lambda a: self._venue_name(a.venue_id))])
+        self._cascade_scheduling_policy(
+            PolicyScopeType.SEASON, season_id, actor_id)
         self.store.delete_season(season_id)
         self._audit("season_deleted", "season", season_id, actor_id,
                     {"name": season.name, "league_id": season.program_id})
@@ -6620,6 +6928,7 @@ class SetupService:
             raise NotFoundError(f"Rink {rink_id} not found.")
         self._block_if_dependents("rink", rink_id, "rink",
                                   self._rink_dependent_groups(rink_id))
+        self._cascade_scheduling_policy(PolicyScopeType.RINK, rink_id, actor_id)
         self.store.delete_rink(rink_id)
         self._audit("rink_deleted", "rink", rink_id, actor_id,
                     {"name": rink.name, "venue_id": rink.venue_id})

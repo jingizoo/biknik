@@ -2842,7 +2842,8 @@ class ApiService:
                 # there is no draft-only exception. Returns the resolved slot to
                 # allocate below.
                 slot = self.setup._assert_slot_free_for_game(
-                    d["ice_slot_id"], d["home_team_id"], d["away_team_id"])
+                    d["ice_slot_id"], d["home_team_id"], d["away_team_id"],
+                    season_id=resolved_season_id)
                 g = Game(
                     id=self.store.next_id("game"),
                     home_team_id=d["home_team_id"], away_team_id=d["away_team_id"],
@@ -4196,6 +4197,41 @@ class ApiService:
             playable_minutes=playable_minutes, turnover_minutes=turnover_minutes,
             exclusion_dates=exclusion_dates, windows=windows,
             template_fingerprint=template_fingerprint, actor_id=actor_id)
+
+    @catch
+    def set_scheduling_policy(self, scope_type=None, scope_id=None,
+                              warmup_minutes=None, resurfacing_minutes=None,
+                              min_playable_minutes=None, curfew_local=None,
+                              actor_id: Optional[str] = None) -> dict:
+        """Upsert (or, with every value ``None``, clear) one scope's
+        scheduling policy (#277 Slice B). The response echoes the stored row
+        (``policy: None`` after a clear) so the settings form can re-render
+        from the write's own result."""
+        policy = self.setup.set_scheduling_policy(
+            scope_type, scope_id,
+            warmup_minutes=warmup_minutes,
+            resurfacing_minutes=resurfacing_minutes,
+            min_playable_minutes=min_playable_minutes,
+            curfew_local=curfew_local, actor_id=actor_id)
+        return {"scope_type": scope_type, "scope_id": scope_id,
+                "policy": _serialize(policy) if policy is not None else None}
+
+    @catch
+    def get_scheduling_policy(self, scope_type=None, scope_id=None,
+                              season_id=None) -> dict:
+        """One scope's stored policy row plus, for a RINK scope with a
+        ``season_id``, the RESOLVED effective values with each set field's
+        source scope — the "inherited from Season" affordance the settings
+        UI renders (#277 Slice B)."""
+        policy = self.setup.get_scheduling_policy(scope_type, scope_id)
+        out = {"scope_type": scope_type, "scope_id": scope_id,
+               "policy": _serialize(policy) if policy is not None else None}
+        if scope_type == "rink":
+            values, sources = self.setup._effective_policy(
+                scope_id, season_id)
+            out["effective"] = values
+            out["effective_sources"] = sources
+        return out
 
     @catch
     def create_player(self, team_id: str, name: str, position: str,

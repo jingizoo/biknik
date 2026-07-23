@@ -19,6 +19,7 @@ from .enums import (
     OfficialAssignmentStatus,
     OfficialAvailabilityStatus,
     OfficialRole,
+    PolicyScopeType,
     RescheduleStatus,
     ResultStatus,
     SeasonStatus,
@@ -243,6 +244,34 @@ class IceSlot:
     end_time: datetime
     slot_type: IceSlotType = IceSlotType.GAME
     status: IceSlotStatus = IceSlotStatus.AVAILABLE
+
+
+@dataclass
+class SchedulingPolicy:
+    """Operational turnover/curfew policy for game placement (#277 Slice B).
+
+    One row per ``(scope_type, scope_id)`` — a Program, Season, or Rink. A
+    placement resolves its EFFECTIVE policy field by field with Rink
+    overriding Season overriding Program; a ``None`` field always means
+    "inherit from the next scope up", and a field unset at every scope
+    falls back to the no-op default (no buffer, no minimum, no curfew), so
+    installs that never configure a policy keep today's behavior exactly.
+
+    An ``IceSlot``'s stored ``[start_time, end_time]`` remains the PLAYABLE
+    span; ``warmup_minutes`` (pre-game ice reservation) and
+    ``resurfacing_minutes`` (post-game resurfacing/bench turnover) extend it
+    to the RESERVED facility span at read/check time only — imported
+    contracted-ice rows are never rewritten (#277: no silent time shifts).
+    ``curfew_local`` is a "HH:MM" wall-clock end-by bound evaluated in the
+    slot's venue timezone (Program timezone fallback).
+    """
+    id: str
+    scope_type: PolicyScopeType
+    scope_id: str
+    warmup_minutes: Optional[int] = None
+    resurfacing_minutes: Optional[int] = None
+    min_playable_minutes: Optional[int] = None
+    curfew_local: Optional[str] = None
 
 
 @dataclass

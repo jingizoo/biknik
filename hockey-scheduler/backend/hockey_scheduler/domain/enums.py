@@ -172,6 +172,19 @@ class IceSlotStatus(str, Enum):
     BLOCKED = "blocked"
 
 
+class PolicyScopeType(str, Enum):
+    """Which entity a :class:`SchedulingPolicy` row attaches to (#277).
+
+    Precedence when resolving the effective policy for a placement is
+    RINK over SEASON over PROGRAM, field by field — an unset (None) field
+    inherits from the next scope up, so a Rink can override only its curfew
+    while buffers keep coming from the Season/Program defaults.
+    """
+    PROGRAM = "program"
+    SEASON = "season"
+    RINK = "rink"
+
+
 class RescheduleStatus(str, Enum):
     """A reschedule request's approval state (#29).
 
