@@ -21,6 +21,8 @@ this requirements package (#324)
   → validated by @jingizoo
   → PR 1: Home/Tasks + guided Setup hub
   → PR 2: Schedule/Facilities UX
+  → bounded #287 substitute PR (design/UX/policy/state-machine only —
+    no runtime seasonal-eligibility implementation; preserves the #205 gate)
   → #206 (Planner v2) resumes
 ```
 
@@ -353,13 +355,17 @@ different from the default.
 
   | Token | Value | Replaces | Rationale |
   | --- | --- | --- | --- |
-  | `--bp-phone` | **480px** | 460 (Ice Builder 2-col→1-col), 480 (drawer full-width, icon-btn 40×40 touch target, context-switcher compact mode, the dedicated "#100: responsive pass" block, iOS 16px input fix), 520 (setup.css) | 480 is already the dominant, most-used value (5 of 8 sites); 460 and 520 are the same "phone-density" concern authored at slightly different times — folding both into 480 changes behavior by at most 40px either way, with no visible regression, and keeps a safety margin above the 390px test viewport |
-  | `--bp-tablet` | **720px** | 680 (Game Sheet grids → 1-col), 720 (Arena Calendar `.cal-layout` row→column, kept as-is), 760 (onboarding) | 720 already serves the single most content-dense of the three (the Calendar); folding 680→720 delays Game Sheet's 1-col collapse by 40px (negligible), folding 760→720 triggers onboarding's collapse 40px earlier (negligible, arguably earlier is safer) |
-  | `--bp-nav-flip` | **880px** | 880 (unchanged) | The one true structural layout change (sidebar → horizontal scrollable top nav) stays isolated from the two content-collapse tokens above so nav layout and content density can vary independently |
-  | `--bp-wide` | **1040px** | 1040 (unchanged) | A distinct, wider concern (dashboard/report grid de-densifies pre-emptively while the sidebar is still full-width, i.e. *before* the 880px nav flip) — kept as its own token rather than force-merged into 880, since it fires at a meaningfully different width for a different reason |
+  | `--bp-phone` | **480px** | 460 (Ice Builder 2-col→1-col), 480 (drawer full-width, icon-btn 40×40 touch target, context-switcher compact mode, the dedicated "#100: responsive pass" block, iOS 16px input fix), 520 (setup.css) | 480 is already the dominant, most-used value (5 of 8 sites); 460 and 520 are the same "phone-density" concern authored at slightly different times, so consolidating onto 480 is the target choice — **not yet visually verified**: folding 460→480 and 520→480 moves each affected layout's collapse point by up to 40px, and must be checked at the affected widths plus desktop/390px before this token ships |
+  | `--bp-tablet` | **720px** | 680 (Game Sheet grids → 1-col), 720 (Arena Calendar `.cal-layout` row→column, kept as-is), 760 (onboarding) | 720 already serves the single most content-dense of the three (the Calendar), making it the target consolidation point — **not yet visually verified**: folding 680→720 and 760→720 must be checked at those exact widths (and desktop/390px) as part of the first implementation PR, not assumed negligible from the pixel delta alone |
+  | `--bp-nav-flip` | **880px** | 880 (unchanged) | The one true structural layout change (sidebar → horizontal scrollable top nav) stays isolated from the two content-collapse tokens above so nav layout and content density can vary independently — unchanged, so no new verification needed here |
+  | `--bp-wide` | **1040px** | 1040 (unchanged) | A distinct, wider concern (dashboard/report grid de-densifies pre-emptively while the sidebar is still full-width, i.e. *before* the 880px nav flip) — kept as its own token rather than force-merged into 880, since it fires at a meaningfully different width for a different reason; unchanged, so no new verification needed here |
 
   New hub CSS uses these four tokens exclusively — it must not add a fifth
-  magic number.
+  magic number. **The two consolidations above are a target decision, not a
+  demonstrated non-regression** — the first implementation PR must visually
+  verify Game Sheet, Ice Builder, onboarding, and setup.css's affected
+  layouts at their old and new breakpoints (plus the standard desktop/390px
+  pair) before relying on the new tokens.
 - **Requirement**: the redesigned nav (7 areas instead of 5 groups) states
   its own mobile collapse behavior explicitly. Today's 880px flip
   (`web.css:271-289`) turns the sidebar into a horizontal scrollable tab
@@ -376,8 +382,9 @@ different from the default.
 conformance to **every applicable Level A and Level AA success criterion**
 under the [official W3C standard](https://www.w3.org/TR/WCAG22/) — not a
 hand-picked subset. An earlier version of this section named seven SCs as
-if they were the scope; that was wrong. Those seven remain valid — they map
-to real, currently-failing gaps this app has today — but they are now
+if they were the scope; that was wrong. Those seven (plus per-view page
+titling, identified during the full-matrix audit below) remain valid — they
+map to real, currently-failing gaps this app has today — but they are now
 correctly framed as a **priority regression list**, subordinate to the
 **full conformance matrix** below, which is the actual target.
 
@@ -413,6 +420,12 @@ screen):
 - **Bypass blocks** (SC 2.4.1): no "skip to main content" link exists in
   `index.html` today, despite a persistent sidebar repeated on every view.
   **Currently failing** — add one as part of the nav rebuild.
+- **Per-view page titling** (SC 2.4.2): the `<title>` (`index.html:6`) is
+  static across every view of this single-page app. W3C's own guidance for
+  SPAs calls for the title (or an equivalent programmatic announcement) to
+  change with each distinct view. **Currently failing** — update
+  `document.title` (or use a live-region view-change announcement) on
+  `switchTab()`.
 - **Dragging alternative** (SC 2.5.7, new in 2.2): the draggable ice slot
   interaction (`app.js:2437`) needs a confirmed non-drag alternative (e.g.
   a "Move" menu action) — not confirmed present in the current codebase.
@@ -437,10 +450,15 @@ screen):
 **Full A + AA conformance matrix** — every applicable Level A/AA success
 criterion in WCAG 2.2 (Level AAA criteria, including 2.4.12, are excluded —
 listed separately below as voluntary). Status is honest about what can be
-asserted today: **Met** (verified against cited evidence), **Partial**
-(some coverage, a named gap remains), **Gap** (a known, currently-failing
-requirement), **Verify** (applicable, not yet audited — mostly screens that
-don't exist yet), or **N/A** (genuinely inapplicable to this app, with why).
+asserted today, held to a strict evidentiary bar: **Met** means specific,
+verifiable evidence was checked and satisfies the criterion (a grep
+confirming an absence, a cited code rule, a directly-read markup fact) —
+"no known violation" alone does not qualify and is marked **Verify**
+instead. **Partial** means real, cited coverage exists but doesn't reach
+every case the criterion requires. **Gap** is a known, currently-failing
+requirement. **Verify** covers both existing screens whose conformance
+hasn't actually been tested and new screens that don't exist yet. **N/A**
+is genuinely inapplicable, with why.
 
 *Perceivable*
 
@@ -455,13 +473,13 @@ don't exist yet), or **N/A** (genuinely inapplicable to this app, with why).
 | 1.3.1 | Info and Relationships | A | Partial — see labeling-convention gap above |
 | 1.3.2 | Meaningful Sequence | A | Verify — no known violation; audit new card/grid layouts for DOM-vs-visual order |
 | 1.3.3 | Sensory Characteristics | A | Verify — no known violation, not explicitly audited |
-| 1.3.4 | Orientation | AA | Met — single responsive layout, no orientation lock observed |
+| 1.3.4 | Orientation | AA | Met — grep-confirmed zero orientation-lock code anywhere in `web/static/` (no `orientation` references); the criterion is a prohibition, and its absence is verified, not assumed |
 | 1.3.5 | Identify Input Purpose | AA | Verify — `autocomplete` attributes on common fields (email, name) not confirmed present |
 | 1.4.1 | Use of Color | A | Partial — conflict/status styling already pairs color with text/weight; no systematic audit done |
 | 1.4.2 | Audio Control | A | N/A — no auto-playing audio |
 | 1.4.3 | Contrast (Minimum) | AA | Verify — no automated contrast check exists today (see automated-gate note above) |
-| 1.4.4 | Resize Text | AA | Met — no fixed/`user-scalable=no` viewport meta (`index.html:5`); verify 200% reflow holds for new screens |
-| 1.4.5 | Images of Text | AA | Met — text renders as text/CSS throughout, no text-as-image pattern observed |
+| 1.4.4 | Resize Text | AA | Verify — no `user-scalable=no`/fixed viewport meta blocks zoom (`index.html:5`), but that only shows zoom isn't *disabled*; it doesn't prove text reaches 200% without loss of content or functionality. Needs an actual 200%-zoom test, not inferred from viewport markup |
+| 1.4.5 | Images of Text | AA | Met — grep-confirmed zero `<img>`/`background-image` usage anywhere in `web/static/`; all text renders as text/CSS by construction, not by absence of a known violation |
 | 1.4.10 | Reflow | AA | Gap — see priority list above (390px convention doesn't prove the 320px target) |
 | 1.4.11 | Non-text Contrast | AA | Verify — the `:focus-visible` ring exists (`styles.css:907-908`) but its contrast ratio is unmeasured |
 | 1.4.12 | Text Spacing | AA | Verify — no test for user style overrides today |
@@ -471,17 +489,17 @@ don't exist yet), or **N/A** (genuinely inapplicable to this app, with why).
 
 | SC | Name | Level | Status |
 | --- | --- | --- | --- |
-| 2.1.1 | Keyboard | A | Met — `role="button" tabindex="0"` retrofits + global Enter/Space activator; native controls used specifically for this |
+| 2.1.1 | Keyboard | A | Partial — `role="button" tabindex="0"` retrofits + global Enter/Space activator cover most controls, but the draggable ice slot's keyboard-equivalent is unconfirmed (see 2.5.1/2.5.7 below), so not *all* functionality is verified keyboard-operable yet |
 | 2.1.2 | No Keyboard Trap | A | Gap — see priority list (correct citation for dialog escapability) |
 | 2.1.4 | Character Key Shortcuts | A | N/A — no single-key shortcuts today; constraint if the redesign adds any |
 | 2.2.1 | Timing Adjustable | A | Verify — session/auth timeout extension mechanism not audited here |
 | 2.2.2 | Pause, Stop, Hide | A | N/A — no auto-advancing/continuously auto-refreshing content observed |
 | 2.3.1 | Three Flashes | A | N/A — no flashing content anywhere |
 | 2.4.1 | Bypass Blocks | A | Gap — see priority list (no skip-to-content link) |
-| 2.4.2 | Page Titled | A | Met — `<title>` present (`index.html:6`); per-view title updates are a nice-to-have, not required for this SPA |
+| 2.4.2 | Page Titled | A | Gap — `<title>Hockey Scheduler — Operator Console</title>` (`index.html:6`) is static across every view; W3C's own guidance for single-page apps calls for the title (or an equivalent programmatic announcement) to change with each distinct view, which this app does not do today. Added to the priority regression list above |
 | 2.4.3 | Focus Order | A | Gap — see priority list (dialog focus management) |
 | 2.4.4 | Link Purpose (In Context) | A | Verify — icon-only links' `aria-label` needs to read sensibly out of context |
-| 2.4.5 | Multiple Ways | AA | Met — sidebar nav plus URL-hash deep-linking already provide two paths |
+| 2.4.5 | Multiple Ways | AA | Verify — the sidebar nav is one way to locate content; URL-hash deep-linking is a state-restoration mechanism, not a second user-facing way to *find* content, so it doesn't independently satisfy this SC. A genuine second locating mechanism (search, a site-map-style index) is not confirmed to exist — name one or accept single-path status pending review |
 | 2.4.6 | Headings and Labels | AA | Verify — needs a heading-level audit once the new hub/workflow screens exist |
 | 2.4.7 | Focus Visible | AA | Met — `:focus-visible` rings never left bare (`styles.css:907-908`); new screens must preserve this |
 | 2.4.11 | Focus Not Obscured (Minimum) | AA | Verify — the fixed toast root and any sticky topbar/sidebar elements must never obscure a focused control; not yet audited |
@@ -500,15 +518,15 @@ don't exist yet), or **N/A** (genuinely inapplicable to this app, with why).
 | 3.1.2 | Language of Parts | AA | N/A — no mixed-language content today |
 | 3.2.1 | On Focus | A | Verify — no control should trigger a context change merely on receiving focus; no known violation |
 | 3.2.2 | On Input | A | Reviewed exception — the context switcher's `<select>` intentionally changes context on selection; this is an SC-permitted, documented behavior (#159), not an accidental violation |
-| 3.2.3 | Consistent Navigation | AA | Met — single persistent sidebar, consistent order across views; redesign must preserve this |
-| 3.2.4 | Consistent Identification | AA | Met — shared `pageIntro`/`.empty`/icon+label conventions; new components must reuse them |
+| 3.2.3 | Consistent Navigation | AA | Met — one static `<nav class="side-nav">` block (`index.html:25-60`) renders for every view; `render()` toggles visibility/active state per role but never reorders or regenerates the DOM per view, so order is structurally guaranteed, not merely observed; redesign must preserve this |
+| 3.2.4 | Consistent Identification | AA | Partial — the shared `pageIntro`/`.empty`/icon+label helper functions guarantee consistency for the screens that call them, but not every icon/control in the app has been confirmed to route through those helpers rather than a one-off implementation |
 | 3.2.6 | Consistent Help | A | N/A today — no persistent help/contact mechanism exists; constraint if one is added (same location every screen) |
-| 3.3.1 | Error Identification | A | Met — the normalized `{error:{code,message}}` envelope + inline `role="alert"` validation |
+| 3.3.1 | Error Identification | A | Partial — the normalized `{error:{code,message}}` envelope + inline `role="alert"` validation identify errors at the API/form-submit level; field-level identification (which specific input is wrong, on every form) is not confirmed comprehensive across the app |
 | 3.3.2 | Labels or Instructions | A | Partial — see labeling-convention gap above |
-| 3.3.3 | Error Suggestion | AA | Met — the #311 empty-state recipe is exactly this SC done right; the bar for all new copy (§5) |
-| 3.3.4 | Error Prevention (Legal, Financial, Data) | AA | Met — the named-resource confirmation-modal convention for deletions |
+| 3.3.3 | Error Suggestion | AA | Partial — the #311 empty-state recipe is a genuine, verified example of this SC done right for that one flow; it is the required bar for all new copy (§5), but doesn't by itself prove every existing form gives a correction suggestion, not just an error label |
+| 3.3.4 | Error Prevention (Legal, Financial, Data) | AA | Partial — the named-resource confirmation-modal convention covers deletions specifically; not every in-scope legal/financial/data-modifying submission in the app has been confirmed to have an equivalent reversible/checked/confirmed step |
 | 3.3.7 | Redundant Entry | A | Verify — confirm wizard steps (onboarding, Ice Availability Builder) never require re-entering already-given data; extend to the redesigned Setup workflows |
-| 3.3.8 | Accessible Authentication (Minimum) | AA | Met (likely) — no CAPTCHA/cognitive-function-test observed on login; not exhaustively confirmed absent |
+| 3.3.8 | Accessible Authentication (Minimum) | AA | Verify — no CAPTCHA/cognitive-function-test observed on login, but paste/autofill behavior and every authentication step (not just the primary login form) have not been audited; "likely" is not a verified status |
 
 *Robust*
 
@@ -608,6 +626,15 @@ looking — the bar that PR must clear once it ships):
 
 ## Product decisions requiring sign-off
 
+**Signed off by @jingizoo (2026-07-24)**: decisions 1–7 accepted as written.
+Decision 8 (#158 closure) resolved below — #158's own four acceptance
+bullets (recurring weekly ice block + preview; exclusion dates honored and
+conflicts reported, not silently created; a month view renders; zero
+console errors desktop+phone with backend tests) are each satisfied by
+#313's delivered scope, with no unmet item identified — #158 is closed as
+functionally complete, citing #313 (closing #315) and #277's policy
+integration (#318/#319).
+
 Eight decisions this package resolves or proposes an answer for, gathered
 here so they can be reviewed and checked off in one place rather than
 hunting through each section. All eight now have a concrete, stated answer
@@ -642,16 +669,15 @@ hunting through each section. All eight now have a concrete, stated answer
    `--bp-tablet: 720px`, `--bp-nav-flip: 880px`, `--bp-wide: 1040px` —
    chosen by inspecting what each of today's eight ad hoc values actually
    does, not left as an abstract category.
-8. **#158 status** (recurring ice templates/month view): #313 (closing
-   #315) delivered the builder mechanics; #313's own text explicitly held
-   #158 open until #277's warm-up/resurfacing/curfew policy items landed.
-   Those items are now merged (#318/#319). Per #313's own stated
-   condition, #158's scoped work is now functionally complete — but #313
-   also explicitly reserved the actual issue-close action for "a
-   product/roadmap-owner decision," so this package does not close #158
-   itself. **Sign-off needed**: confirm #158 should now be closed (citing
-   #313, #315, #318, #319), or name the specific remaining gap if one
-   exists that this package missed.
+8. **#158 status** (recurring ice templates/month view): **resolved —
+   closed**. #313 (closing #315) delivered the builder mechanics; #313's
+   own text explicitly held #158 open until #277's warm-up/resurfacing/
+   curfew policy items landed. Those items are now merged (#318/#319).
+   #158's own four acceptance bullets are each satisfied by #313's
+   delivered scope (recurring weekly ice block + preview; exclusion dates
+   honored and conflicts reported; a month view renders; zero console
+   errors desktop+phone with backend tests) — no unmet item identified.
+   Closed per @jingizoo's sign-off above, citing #313, #315, #318, #319.
 
 ## Out of scope for this package
 
@@ -659,12 +685,17 @@ hunting through each section. All eight now have a concrete, stated answer
   Setup hub) is separate and starts only after this package is validated.
 - Schedule/Facilities UX — explicitly deferred to the PR after Home/Tasks +
   Setup hub, per the reordered plan.
-- Planner v2 (#206) — resumes after both of the above land.
+- The bounded #287 substitute PR (design/UX/policy/state-machine only) —
+  sequenced after Schedule/Facilities UX, before #206 resumes; its full
+  runtime workflow stays gated on #205 regardless of this package.
+- Planner v2 (#206) — resumes after all of the above land.
 - A native mobile app, rebranding, or new business features before existing
   workflows are understandable — already out of scope per #204 itself.
 
 ## Relationships
 
 Child of epic #204 (issue #324). Blocks the first implementation PR
-(Home/Tasks + guided Setup hub). The Schedule/Facilities UX PR follows that.
-#206 (Planner v2) resumes once both land.
+(Home/Tasks + guided Setup hub). The Schedule/Facilities UX PR follows that,
+then the bounded #287 substitute PR (design/UX/policy/state-machine only —
+the #205 gate on its full runtime workflow is unaffected by this package).
+#206 (Planner v2) resumes once all of the above land.

@@ -192,12 +192,9 @@ publish-gated and privacy-safe.
 1. **#277** — warm-up, resurfacing, turnover and curfew rules shared by manual
    moves and generated schedules. **Done** (PR #318/#319, merged).
 2. **#158** — recurring ice templates, conflict preview and month view.
-   Builder mechanics done via #313 (closing #315); #313 explicitly held
-   #158 open until #277's warm-up/resurfacing/curfew policy items landed —
-   those are now merged (#318/#319), so #158's scoped work is functionally
-   complete. #313 reserved the actual close decision for the product/
-   roadmap owner (not automatic) — closing #158 is a pending sign-off item
-   on the #204 requirements package (#324), not decided here.
+   **Done and closed** (#313, closing #315, plus #277's policy integration
+   via #318/#319 — closed per @jingizoo's sign-off on the #204 requirements
+   package, #324, confirming all four of #158's acceptance bullets are met).
 3. **#204** — task-oriented operator UX, accessibility and design consistency,
    built on the permanent-hierarchy context and the new Player/Game workflows.
    **Reordered ahead of #206** (plan update): the first deliverable is a
@@ -259,24 +256,31 @@ identity, Game Sheet and context contracts stabilize).
 
 ---
 
-## Exact next implementation queue
+## Currently active sequencing
 
-```text
-1. #160 — Player private-read scope        (NEXT)
-2. #271 — strict write/API contracts
-3. #269 — jersey constraints
-4. #268 — Player edit workflow
-5. #270 — Player deactivate/reactivate
-6. #272 — Season date-only boundaries
-7. #159 / #124 / #273 — design and privacy foundation
-8. #205 — seasonal athlete membership (on the permanent Team→League spine)
-9. #287 — substitute matching engine (after #205; design of slices 1–3 may
-          start earlier once its five open questions are settled)
-```
+The single static queue previously here drifted out of sync with actual
+execution — it never listed #277, #158, or #204, all of which were the
+Release-4 items actually being built, and still asserted #160 as the sole
+"NEXT" item after those had already landed. Removed rather than patched
+again: cross-Release execution order is directed by the product owner per
+work session, not a static file that goes stale between sessions. The
+authoritative **per-Release** order remains the numbered lists in
+Releases 0–4 above.
 
-Done: #267 (login security, PR #286). Production security first; Player
-invariants before the #205 migration; no new broad model change before its
-privacy and history rules are locked.
+**Currently active** (Release 4, UX-first per plan update): #204
+requirements package (#324, in review) → Home/Tasks + guided Setup hub PR
+→ Schedule/Facilities UX PR → bounded #287 substitute PR
+(design/UX/policy/state-machine only, no runtime seasonal-eligibility —
+the #205 gate is unaffected) → #206 resumes.
+
+Done since this section was last accurate: #267 (login security, PR #286);
+#277 (turnover/curfew policy, PR #318/#319); #313/#315 (recurring ice
+templates + month view, closing #158). Release 0's #160/#271 security gate
+and Release 1–2's Player-identity track (#269/#268/#270/#272/#159/#124/
+#273/#205) remain queued per their Release sections above — their relative
+priority against the now-active Release 4 UX-first thread is a product-
+owner call to make explicitly when that work resumes, not implied by this
+file.
 
 ## Delivery rules
 
