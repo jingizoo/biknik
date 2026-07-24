@@ -190,14 +190,47 @@ publish-gated and privacy-safe.
 ## Release 4 — rink-real scheduling and operator UX
 
 1. **#277** — warm-up, resurfacing, turnover and curfew rules shared by manual
-   moves and generated schedules.
+   moves and generated schedules. **All six acceptance criteria satisfied**
+   (PR #318, closing bounded child #320; PR #319, closing bounded child
+   #321; both merged) — see #277 for the criterion-by-criterion evidence.
+   **#277 itself remains open**: merging those PRs closed their own bounded
+   children, not the parent epic; closing #277 is a pending product-owner
+   decision, not automatic.
 2. **#158** — recurring ice templates, conflict preview and month view.
-3. **#206** — planner scenarios, fairness, locks, repair and explanations
-   (realigned: schedule within a `LeagueSeason`/Division; regular Games never
-   cross Leagues).
-4. **#204** — task-oriented operator UX, accessibility and design consistency,
+   **Done and closed** (#313, closing #315, plus #277's policy integration
+   via #318/#319 — closed per @jingizoo's sign-off on the #204 requirements
+   package, #324, confirming all four of #158's acceptance bullets are met).
+3. **#204** — task-oriented operator UX, accessibility and design consistency,
    built on the permanent-hierarchy context and the new Player/Game workflows.
-5. **#146** — remaining bounded UX polish where it does not conflict with #204.
+   **Reordered ahead of #206** (plan update): the first deliverable is a
+   bounded requirements package (#324) — role-specific operator journeys,
+   task-oriented IA, persistent Program/Season/League context, one primary
+   action per screen, loading/empty/stale/error/retry/confirmation states,
+   desktop + 390px behavior, a full WCAG 2.2 AA conformance matrix, and
+   operator validation + measurable success criteria — landing before any
+   implementation code. Home/Tasks plus a guided Setup hub is the first
+   implementation PR once that package is validated; Schedule/Facilities UX
+   follows.
+4. **#287** — substitute matching engine, **bounded pre-#205 deliverable**:
+   **documentation and design artifacts only, plus a non-production UX
+   prototype** (mockups/clickable prototype of the policy-config screen and
+   the offer/accept/decline/timeout flow) — matching Release 2's own bar
+   exactly: "policy and state-machine **design** (slices 1–3) may begin
+   earlier, but **implementation must not land ahead of #205**." This is
+   design/UX work product, not a landed feature: **no schema or migration,
+   no persistence, no API mutations, no notifications, and no runtime state
+   transitions** of any kind — a real, working offer/accept/decline/timeout
+   state machine (even with eligibility resolution stubbed out) is
+   implementation, not design, and stays barred until #205. Any bounded PR
+   delivering this must assert in its own test plan that it touches no
+   `store/`, migration, or persistence-layer path. The full production
+   workflow (all six slices, wired to real `SeasonRosterMembership`
+   eligibility) waits for #205, per Release 2 above.
+5. **#206** — planner scenarios, fairness, locks, repair and explanations
+   (realigned: schedule within a `LeagueSeason`/Division; regular Games never
+   cross Leagues). Resumes after #204's requirements package, its first
+   implementation PR, and the bounded #287 substitute PR land.
+6. **#146** — remaining bounded UX polish where it does not conflict with #204.
 
 **Exit gate:** a DB-valid schedule is physically operable at the rink; operators
 compare/repair scenarios without regenerating published Games; desktop and 390px
@@ -236,24 +269,32 @@ identity, Game Sheet and context contracts stabilize).
 
 ---
 
-## Exact next implementation queue
+## Currently active sequencing
 
-```text
-1. #160 — Player private-read scope        (NEXT)
-2. #271 — strict write/API contracts
-3. #269 — jersey constraints
-4. #268 — Player edit workflow
-5. #270 — Player deactivate/reactivate
-6. #272 — Season date-only boundaries
-7. #159 / #124 / #273 — design and privacy foundation
-8. #205 — seasonal athlete membership (on the permanent Team→League spine)
-9. #287 — substitute matching engine (after #205; design of slices 1–3 may
-          start earlier once its five open questions are settled)
-```
+The single static queue previously here drifted out of sync with actual
+execution — it never listed #277, #158, or #204, all of which were the
+Release-4 items actually being built, and still asserted #160 as the sole
+"NEXT" item after those had already landed. Removed rather than patched
+again: cross-Release execution order is directed by the product owner per
+work session, not a static file that goes stale between sessions. The
+authoritative **per-Release** order remains the numbered lists in
+Releases 0–4 above.
 
-Done: #267 (login security, PR #286). Production security first; Player
-invariants before the #205 migration; no new broad model change before its
-privacy and history rules are locked.
+**Currently active** (Release 4, UX-first per plan update): #204
+requirements package (#324, in review) → Home/Tasks + guided Setup hub PR
+→ Schedule/Facilities UX PR → bounded #287 pre-#205 deliverable
+(documentation/design + a non-production UX prototype only — no schema,
+persistence, API mutations, notifications, or runtime state transitions;
+see Release 4 above for the exact boundary) → #206 resumes.
+
+Done since this section was last accurate: #267 (login security, PR #286);
+#277 (turnover/curfew policy, PR #318/#319); #313/#315 (recurring ice
+templates + month view, closing #158). Release 0's #160/#271 security gate
+and Release 1–2's Player-identity track (#269/#268/#270/#272/#159/#124/
+#273/#205) remain queued per their Release sections above — their relative
+priority against the now-active Release 4 UX-first thread is a product-
+owner call to make explicitly when that work resumes, not implied by this
+file.
 
 ## Delivery rules
 
