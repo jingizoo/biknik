@@ -190,13 +190,22 @@ publish-gated and privacy-safe.
 ## Release 4 — rink-real scheduling and operator UX
 
 1. **#277** — warm-up, resurfacing, turnover and curfew rules shared by manual
-   moves and generated schedules.
+   moves and generated schedules. **Done** (PR #318/#319, merged).
 2. **#158** — recurring ice templates, conflict preview and month view.
-3. **#206** — planner scenarios, fairness, locks, repair and explanations
-   (realigned: schedule within a `LeagueSeason`/Division; regular Games never
-   cross Leagues).
-4. **#204** — task-oriented operator UX, accessibility and design consistency,
+3. **#204** — task-oriented operator UX, accessibility and design consistency,
    built on the permanent-hierarchy context and the new Player/Game workflows.
+   **Reordered ahead of #206** (plan update): the first deliverable is a
+   bounded requirements package (#324) — role-specific operator journeys,
+   task-oriented IA, persistent Program/Season context, one primary action
+   per screen, loading/empty/stale/error/retry/confirmation states, desktop
+   + 390px behavior, WCAG 2.2 AA requirements, and operator validation +
+   measurable success criteria — landing before any implementation code.
+   Home/Tasks plus a guided Setup hub is the first implementation PR once
+   that package is validated; Schedule/Facilities UX follows.
+4. **#206** — planner scenarios, fairness, locks, repair and explanations
+   (realigned: schedule within a `LeagueSeason`/Division; regular Games never
+   cross Leagues). Resumes after #204's requirements package and its first
+   implementation PR land.
 5. **#146** — remaining bounded UX polish where it does not conflict with #204.
 
 **Exit gate:** a DB-valid schedule is physically operable at the rink; operators
