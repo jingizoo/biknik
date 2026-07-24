@@ -194,6 +194,9 @@ NO_ICE_AVAILABLE = "no_ice_available"
 TURNOVER_BUFFER_CONFLICT = "turnover_buffer_conflict"
 INSUFFICIENT_PLAYABLE_TIME = "insufficient_playable_time"
 CURFEW_VIOLATION = "curfew_violation"
+# #318 review — physical overlap is refused by the gate UNCONDITIONALLY
+# (zero/absent policies change nothing), so the advisory mirrors it too.
+SLOT_OVERLAP_CONFLICT = "slot_overlap_conflict"
 
 
 def _slot_reason(slot, home, away, con, team_slots):
@@ -229,19 +232,27 @@ def _policy_advisor(store, season_id):
     """Per-run advisory closure over the shared policy evaluation (#277
     Slice B). Returns ``check(slot, tentative_spans) -> (code, message)`` or
     ``(None, None)``; ``tentative_spans`` is this run's not-yet-persisted
-    same-rink picks as ``(slot_id, start, end)``. Plain reads only; policies
-    are resolved per rink and cached for the run, so a draft over N slots
-    doesn't re-walk the policy rows N times. With no season (legacy data) or
-    no policy rows at all it never reports anything — proposal output is
-    byte-identical to pre-Slice-B."""
-    if season_id is None or not store.all_scheduling_policies():
-        return None
+    same-rink picks as ``(slot_id, start, end)``. Plain reads only. ALWAYS
+    active (#318 review): the gate's slot_overlap_conflict is unconditional
+    — it binds with zero policy rows and even when no season resolves
+    (season-less legacy divisions) — so the advisory mirrors it through the
+    same shared implementation. The active-game inventory is snapshotted
+    ONCE per run and handed down, so a draft over N candidate slots never
+    re-scans the game table N times; with no policies and no overlapping
+    candidates the proposal output remains byte-identical to pre-Slice-B."""
     setup = _PolicySetup(store)
-    _cache = {}
+    pairs = []
+    for g in store.all_games():
+        if g.cancelled or not g.ice_slot_id:
+            continue
+        s = store.get_ice_slot(g.ice_slot_id)
+        if s is not None:
+            pairs.append((g, s))
 
     def check(slot, tentative_spans):
         violation = setup._slot_policy_violation(
-            slot, season_id, extra_rink_spans=tentative_spans)
+            slot, season_id, extra_rink_spans=tentative_spans,
+            rink_games=pairs)
         if violation is None:
             return None, None
         message, details = violation

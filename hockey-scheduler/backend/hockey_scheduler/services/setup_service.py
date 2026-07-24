@@ -2613,7 +2613,8 @@ class SetupService:
             raise ScheduleConflictError(message, details=details)
 
     def _slot_policy_violation(self, slot, season_id, *,
-                               exclude_game_id=None, extra_rink_spans=()):
+                               exclude_game_id=None, extra_rink_spans=(),
+                               rink_games=None):
         """THE #277 Slice B policy evaluation — one implementation shared by
         the placement gate (:meth:`_assert_slot_meets_policy`, which raises)
         and the draft scheduler's advisory pass (which reports the same codes
@@ -2621,13 +2622,26 @@ class SetupService:
         gate would reject). Returns ``(message, details)`` for the first
         violation, or ``None``. ``extra_rink_spans`` is the scheduler's
         tentative same-run picks — ``(slot_id, start, end)`` tuples on this
-        slot's rink not yet persisted as Games. Three checks against the
-        effective Rink>Season>Program policy:
+        slot's rink not yet persisted as Games. ``rink_games`` optionally
+        supplies a pre-resolved ``(game, slot)`` inventory (the scheduler
+        advisory snapshots it ONCE per run instead of re-scanning the game
+        table per candidate); the commit paths omit it and scan fresh under
+        their locks. Four checks — ``slot_overlap_conflict`` is
+        UNCONDITIONAL (it binds even when no season, hence no policy scope,
+        resolves — season-less legacy games included), the other three come
+        from the effective Rink>Season>Program policy:
 
         * ``insufficient_playable_time`` — the slot's playable span
           ``[start_time, end_time]`` is shorter than ``min_playable_minutes``
           (imported contracted slivers are preserved as-is at ingest; this is
           where they are refused a GAME, per #277).
+        * ``slot_overlap_conflict`` — the candidate slot physically overlaps
+          another active game's slot on the SAME rink. Refused REGARDLESS of
+          any configured turnover (#318 review — a zero/absent policy
+          changes nothing): the import path deliberately persists
+          overlapping contracted rows as warnings, so this gate is where
+          physical exclusivity is enforced. Exact adjacency (end == start)
+          is NOT overlap and stays compliant even at a zero requirement.
         * ``turnover_buffer_conflict`` — another active game's slot on the
           SAME rink sits closer than the DIRECTIONAL requirement: the
           EARLIER game's resurfacing plus the LATER game's warm-up, each
@@ -2654,7 +2668,8 @@ class SetupService:
           time.
 
         A ``season_id`` of ``None`` (no competition scope to resolve a policy
-        from) skips enforcement — every real placement path passes it.
+        from — a season-less legacy game) skips the three POLICY checks; the
+        unconditional overlap rule still binds.
         All-``None`` policies short-circuit to today's behavior. Read-only;
         the COMMIT paths run it inside the caller's transaction under its
         Rink lock (making the same-rink scan atomic against concurrent
@@ -2665,29 +2680,35 @@ class SetupService:
         placement. The scheduler ADVISORY calls it lock-free; the gate stays
         authoritative.
         """
-        if season_id is None:
-            return None
-        policy, _ = self._effective_policy(slot.rink_id, season_id)
-        min_playable = policy["min_playable_minutes"] or 0
-        slot_minutes = int(
-            (slot.end_time - slot.start_time).total_seconds() // 60)
-        if slot_minutes < min_playable:
-            return (
-                f"Ice slot {slot.id} is only {slot_minutes} playable minutes; "
-                f"this competition requires at least {min_playable}.",
-                {"reason": "insufficient_playable_time",
-                 "slot_minutes": slot_minutes,
-                 "required_minutes": min_playable})
-        # -- turnover buffer, DIRECTIONAL per game (#318 review) ----------
-        # The required gap between two adjacent games is the EARLIER game's
-        # resurfacing plus the LATER game's warm-up, each resolved from that
-        # game's OWN effective policy (an existing game keeps the policy of
-        # ITS season — policies inherit per Program/Season/Rink, so two
-        # seasons sharing a rink can differ). The candidate's irrelevant-side
-        # buffer never blocks: a huge candidate resurfacing does not apply
-        # BEFORE the candidate. This also preserves the documented reserved
-        # span [start - warmup, end + resurfacing] per game.
-        _policy_cache = {(slot.rink_id, season_id): policy}
+        # The overlap rule is UNCONDITIONAL (#318 review round 2): it binds
+        # even for season-less legacy games, where no policy scope resolves
+        # at all — so it must not hide behind the season gate that the three
+        # policy checks legitimately live behind.
+        seasoned = season_id is not None
+        policy = (self._effective_policy(slot.rink_id, season_id)[0]
+                  if seasoned else None)
+        if seasoned:
+            min_playable = policy["min_playable_minutes"] or 0
+            slot_minutes = int(
+                (slot.end_time - slot.start_time).total_seconds() // 60)
+            if slot_minutes < min_playable:
+                return (
+                    f"Ice slot {slot.id} is only {slot_minutes} playable "
+                    f"minutes; this competition requires at least "
+                    f"{min_playable}.",
+                    {"reason": "insufficient_playable_time",
+                     "slot_minutes": slot_minutes,
+                     "required_minutes": min_playable})
+        # -- physical overlap (unconditional) + DIRECTIONAL turnover -------
+        # Overlap first, policy-free: two games can never share rink time no
+        # matter what turnover is configured (the import path deliberately
+        # persists overlapping contracted rows, making this gate the
+        # physical-exclusivity enforcement point). The buffer's required gap
+        # between two adjacent games is the EARLIER game's resurfacing plus
+        # the LATER game's warm-up, each resolved from that game's OWN
+        # effective policy (two seasons sharing a rink can differ); the
+        # candidate's irrelevant-side buffer never blocks.
+        _policy_cache = {(slot.rink_id, season_id): policy} if seasoned else {}
 
         def _policy_for(rink_id, sid):
             key = (rink_id, sid)
@@ -2695,73 +2716,92 @@ class SetupService:
                 _policy_cache[key] = self._effective_policy(rink_id, sid)[0]
             return _policy_cache[key]
 
-        def _directional_conflict(other_start, other_end, other_policy):
-            """(required, gap) when the pair violates, else None. Half-open:
-            a gap EXACTLY equal to the requirement is compliant. Physical
-            overlap (legacy/imported rows) clamps the gap to 0."""
+        def _buffer_conflict(other_start, other_end, other_policy):
+            """(required, gap) when the DIRECTIONAL requirement is violated,
+            else None. Half-open: a gap EXACTLY equal to the requirement is
+            compliant — exact adjacency stays legal even at a zero
+            requirement. Callers test physical overlap FIRST, so the spans
+            here never overlap and exactly one ordering holds."""
             if other_start >= slot.end_time:
                 # Candidate is earlier: its resurfacing + the other's warmup.
                 required = ((policy["resurfacing_minutes"] or 0)
                             + (other_policy["warmup_minutes"] or 0))
                 gap = other_start - slot.end_time
-            elif slot.start_time >= other_end:
+            else:
                 # Candidate is later: the other's resurfacing + its warmup.
                 required = ((other_policy["resurfacing_minutes"] or 0)
                             + (policy["warmup_minutes"] or 0))
                 gap = slot.start_time - other_end
-            else:
-                # Physically overlapping spans: judge under the larger
-                # directional requirement with a zero gap.
-                required = max(
-                    (policy["resurfacing_minutes"] or 0)
-                    + (other_policy["warmup_minutes"] or 0),
-                    (other_policy["resurfacing_minutes"] or 0)
-                    + (policy["warmup_minutes"] or 0))
-                gap = timedelta(0)
-            gap = max(gap, timedelta(0))
             if required > 0 and gap < timedelta(minutes=required):
                 return required, gap
             return None
 
-        for ex in self.store.all_games():
+        if rink_games is None:
+            rink_games = ((g, self.store.get_ice_slot(g.ice_slot_id))
+                          for g in self.store.all_games()
+                          if g.ice_slot_id is not None)
+        for ex, ex_slot in rink_games:
             if (ex.id == exclude_game_id or ex.cancelled
                     or ex.ice_slot_id is None
                     or ex.ice_slot_id == slot.id):
                 continue
-            ex_slot = self.store.get_ice_slot(ex.ice_slot_id)
             if ex_slot is None or ex_slot.rink_id != slot.rink_id:
                 continue
-            hit = _directional_conflict(
+            if intervals_overlap(slot.start_time, slot.end_time,
+                                 ex_slot.start_time, ex_slot.end_time):
+                return (
+                    f"Ice slot {slot.id} overlaps ice slot {ex_slot.id} "
+                    f"hosting game {ex.id} on the same rink.",
+                    {"reason": "slot_overlap_conflict",
+                     "conflict_game_id": ex.id,
+                     "conflict_slot_id": ex_slot.id})
+            if not seasoned:
+                continue
+            hit = _buffer_conflict(
                 ex_slot.start_time, ex_slot.end_time,
                 _policy_for(ex_slot.rink_id, ex.season_id))
-            if hit is not None:
-                required, gap = hit
-                return (
-                    f"Ice slot {slot.id} is too close to game {ex.id} on "
-                    f"the same rink for the required "
-                    f"{required}-minute turnover.",
-                    {"reason": "turnover_buffer_conflict",
-                     "conflict_game_id": ex.id,
-                     "conflict_slot_id": ex_slot.id,
-                     "required_gap_minutes": required,
-                     "gap_minutes": int(gap.total_seconds() // 60)})
+            if hit is None:
+                continue
+            required, gap = hit
+            return (
+                f"Ice slot {slot.id} is too close to game {ex.id} on "
+                f"the same rink for the required "
+                f"{required}-minute turnover.",
+                {"reason": "turnover_buffer_conflict",
+                 "conflict_game_id": ex.id,
+                 "conflict_slot_id": ex_slot.id,
+                 "required_gap_minutes": required,
+                 "gap_minutes": int(gap.total_seconds() // 60)})
         for span_id, span_start, span_end in extra_rink_spans:
             if span_id == slot.id:
                 continue
+            if intervals_overlap(slot.start_time, slot.end_time,
+                                 span_start, span_end):
+                return (
+                    f"Ice slot {slot.id} overlaps another proposed game's "
+                    f"slot on the same rink.",
+                    {"reason": "slot_overlap_conflict",
+                     "conflict_game_id": None,
+                     "conflict_slot_id": span_id})
+            if not seasoned:
+                continue
             # A tentative same-run pick shares the candidate's own season,
             # so both directions resolve from the same policy.
-            hit = _directional_conflict(span_start, span_end, policy)
-            if hit is not None:
-                required, gap = hit
-                return (
-                    f"Ice slot {slot.id} is too close to another proposed "
-                    f"game on the same rink for the required "
-                    f"{required}-minute turnover.",
-                    {"reason": "turnover_buffer_conflict",
-                     "conflict_game_id": None,
-                     "conflict_slot_id": span_id,
-                     "required_gap_minutes": required,
-                     "gap_minutes": int(gap.total_seconds() // 60)})
+            hit = _buffer_conflict(span_start, span_end, policy)
+            if hit is None:
+                continue
+            required, gap = hit
+            return (
+                f"Ice slot {slot.id} is too close to another proposed "
+                f"game on the same rink for the required "
+                f"{required}-minute turnover.",
+                {"reason": "turnover_buffer_conflict",
+                 "conflict_game_id": None,
+                 "conflict_slot_id": span_id,
+                 "required_gap_minutes": required,
+                 "gap_minutes": int(gap.total_seconds() // 60)})
+        if not seasoned:
+            return None
         curfew = policy["curfew_local"]
         if curfew:
             hour, minute = parse_hhmm(curfew, "curfew_local")

@@ -4,11 +4,15 @@ A SchedulingPolicy row per Program/Season/Rink scope, resolved field by field
 (Rink > Season > Program, ``None`` = inherit) and enforced inside
 ``SetupService._assert_slot_free`` — THE shared placement gate — so
 create_game, move_game, and both draft-commit implementations reject
-``insufficient_playable_time`` / ``turnover_buffer_conflict`` /
-``curfew_violation`` identically, with no draft-only exception. All-``None``
-policies (every pre-Slice-B install) short-circuit to the exact previous
-behavior, and enforcement is read-time only: no stored IceSlot/Game is ever
-rewritten by setting a policy (#277: zero silent time shifts).
+``insufficient_playable_time`` / ``slot_overlap_conflict`` /
+``turnover_buffer_conflict`` / ``curfew_violation`` identically, with no
+draft-only exception. All-``None`` policies (every pre-Slice-B install)
+short-circuit to the exact previous behavior — with one deliberate
+exception: physically overlapping same-rink slots can never both host
+games (``slot_overlap_conflict``), a rule that binds regardless of any
+policy and even for season-less legacy games. Enforcement is read-time
+only: no stored IceSlot/Game is ever rewritten by setting a policy (#277:
+zero silent time shifts).
 
 Curfew semantics pinned here (deterministic, policy-controlled — see
 ``ice_availability.curfew_instant``): the deadline is HH:MM in the slot's
@@ -33,11 +37,14 @@ from http.server import ThreadingHTTPServer
 from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
 
 from hockey_scheduler.api import ApiService
+from hockey_scheduler.api.service import ApiService as BaseFacadeApiService
+from hockey_scheduler.services.scheduler import _policy_advisor
 from hockey_scheduler.domain import (
     Organization, Program, Season, League, LeagueSeason, Division, Venue,
     SeasonVenueAccess, Rink, Team, SeasonTeamRegistration, IceSlot,
     IceSlotType, IceSlotStatus)
-from hockey_scheduler.domain.errors import ConcurrencyConflictError
+from hockey_scheduler.domain.errors import (ConcurrencyConflictError,
+                                            ScheduleConflictError)
 from hockey_scheduler.services.setup_service import (
     SetupService as BaseSetupService,
 )
@@ -297,9 +304,11 @@ class _PolicyContract:
         self.assertEqual(_reason(g), "curfew_violation", g)
         self.assertEqual(g["error"]["details"]["slot_end_local"], "02:00")
 
-    def test_overlapping_legacy_slots_report_zero_gap_not_negative(self):
+    def test_overlapping_legacy_slots_refused_as_overlap_not_buffer(self):
         # create_ice_slot forbids same-rink overlap, but legacy/imported rows
-        # can hold it; the buffer detail clamps to a 0-minute gap.
+        # can hold it; a game onto such a slot is refused with the DEDICATED
+        # unconditional reason (#318 review) — never bent into a zero-gap
+        # buffer conflict — naming the hosting game and its slot.
         self._buffer_policy()
         self.store.add_ice_slot(IceSlot(
             id="sOV", rink_id="r1",
@@ -311,8 +320,10 @@ class _PolicyContract:
         self.assertNotIn("error", g1, g1)
         g2 = self.api.create_game("se1", "d1", "t2", "t3", "sOV",
                                   league_id="lg")
-        self.assertEqual(_reason(g2), "turnover_buffer_conflict", g2)
-        self.assertEqual(g2["error"]["details"]["gap_minutes"], 0, g2)
+        self.assertEqual(_reason(g2), "slot_overlap_conflict", g2)
+        d = g2["error"]["details"]
+        self.assertEqual((d["conflict_game_id"], d["conflict_slot_id"]),
+                         (g1["id"], "sA"), g2)
 
     def test_clearing_the_policy_restores_placement(self):
         self.api.set_scheduling_policy(
@@ -578,6 +589,205 @@ class SqliteDirectionalBufferTest(_DirectionalBufferContract,
                      "PostgreSQL required (set TEST_DATABASE_URL)")
 class PostgresDirectionalBufferTest(_DirectionalBufferContract,
                                     unittest.TestCase):
+    def _make_store(self):
+        store = SqlStore(os.environ["TEST_DATABASE_URL"])
+        store.clear_all_data()
+        return store
+
+
+class _SlotOverlapContract:
+    """#318 review — two games can NEVER share physically overlapping slots
+    on one rink, regardless of configured turnover: the import path
+    deliberately persists overlapping contracted rows (warnings only), so
+    the placement gate is the physical-exclusivity enforcement point.
+    Overlapping GAME rows are seeded through that real import; the gate
+    must refuse the second game through create, move, BOTH draft-commit
+    facades, and the scheduler advisory — under NO policy and under an
+    EXPLICIT all-zero policy — while exact adjacency stays legal at a zero
+    requirement and a refused/empty batch allocates nothing."""
+
+    _T0 = datetime(2026, 1, 20, 18, 0, tzinfo=UTC)
+
+    def _make_store(self):
+        raise NotImplementedError
+
+    def setUp(self):
+        self.store = self._make_store()
+        _seed(self.store)
+        self.api = ApiService(self.store)
+
+    def tearDown(self):
+        conn = getattr(self.store, "conn", None)
+        if conn is not None:
+            conn.close()
+
+    def _import_overlapping_pair(self):
+        """Two OVERLAPPING game rows in ONE upload on rink r1 (persisted
+        with warnings — the import's documented no-silent-rewrite
+        contract), far from every seeded slot; returns
+        (earlier_slot_id, later_slot_id)."""
+        rink = self.store.get_rink("r1")
+        rink.external_ref = "R1"
+        self.store.save_rink(rink)
+        res = self.api.commit_rinks_ice_slots_import({
+            "rinks_csv": "venue_name,rink_code,rink_name,address\n"
+                         "Arena,R1,Main,",
+            "ice_slots_csv":
+                "rink_code,start_time,end_time,slot_type\n"
+                f"R1,{self._T0.isoformat()},"
+                f"{(self._T0 + timedelta(minutes=60)).isoformat()},game\n"
+                f"R1,{(self._T0 + timedelta(minutes=30)).isoformat()},"
+                f"{(self._T0 + timedelta(minutes=90)).isoformat()},game"},
+            actor_id="admin")
+        self.assertTrue(res.get("committed"), res)
+        pair = sorted((s for s in self.store.all_ice_slots()
+                       if s.rink_id == "r1" and s.start_time >= self._T0),
+                      key=lambda s: s.start_time)
+        self.assertEqual(len(pair), 2, pair)
+        return pair[0].id, pair[1].id
+
+    def _placement_state(self):
+        return (
+            sorted((g.id, g.ice_slot_id) for g in self.store.all_games()
+                   if not g.cancelled),
+            sorted((s.id, s.status.value)
+                   for s in self.store.all_ice_slots()),
+        )
+
+    def _assert_overlap_refused_everywhere(self):
+        sx, sy = self._import_overlapping_pair()
+        g1 = self.api.create_game("se1", "d1", "t0", "t1", sx,
+                                  league_id="lg")
+        self.assertNotIn("error", g1, g1)
+        # create — refused with games, slot statuses, AND audits untouched.
+        audit_len = len(self.store.all_setup_audit())
+        state = self._placement_state()
+        g2 = self.api.create_game("se1", "d1", "t2", "t3", sy,
+                                  league_id="lg")
+        self.assertEqual(_reason(g2), "slot_overlap_conflict", g2)
+        self.assertEqual(self._placement_state(), state, g2)
+        self.assertEqual(len(self.store.all_setup_audit()), audit_len,
+                         "a refused create must not audit-write")
+        # move: an se2 game parked on another rink refuses to move onto
+        # the overlapping slot (cross-season — the rule is season-blind),
+        # again leaving state and audits untouched.
+        g3 = self.api.create_game("se2", "d2", "u0", "u1", "sE",
+                                  league_id="lg")
+        self.assertNotIn("error", g3, g3)
+        audit_len = len(self.store.all_setup_audit())
+        state = self._placement_state()
+        mv = self.api.move_game(g3["id"], sy)
+        self.assertEqual(_reason(mv), "slot_overlap_conflict", mv)
+        self.assertEqual(self._placement_state(), state, mv)
+        self.assertEqual(len(self.store.all_setup_audit()), audit_len,
+                         "a refused move must not audit-write")
+        # Scheduler advisory: the shared implementation reports the same
+        # code instead of proposing the doomed row — even with ZERO policy
+        # rows in the store.
+        prop = self.api.draft_season_schedule("d2", slot_ids=[sy])
+        self.assertNotIn("error", prop, prop)
+        self.assertEqual(prop["draft_games"], [], prop)
+        codes = {c for row in prop["unscheduled"]
+                 for c in row["reason_codes"]}
+        self.assertIn("slot_overlap_conflict", codes, prop)
+        # ...and BOTH draft-commit facades allocate nothing. Because the
+        # commit regenerates its proposal through the SAME shared
+        # evaluation, the advisory deterministically empties the batch
+        # before the per-row gate could fire — created stays [], and games
+        # + slot statuses are untouched (the empty commit's own audit row
+        # is its documented, legitimate write).
+        for facade in (self.api, BaseFacadeApiService(self.store)):
+            before = self._placement_state()
+            res = facade.commit_draft_schedule("d2", slot_ids=[sy])
+            self.assertNotIn("error", res, res)
+            self.assertEqual(res["created"], [], res)
+            self.assertEqual(self._placement_state(), before,
+                             "a refused batch must allocate nothing")
+
+    def test_seasonless_legacy_game_move_refused(self):
+        # The rule binds even when NO season — hence no policy scope —
+        # resolves (#318 review round 2): a legacy exhibition whose
+        # season_id was never backfilled still cannot land on ice that
+        # overlaps an active game.
+        sx, sy = self._import_overlapping_pair()
+        g1 = self.api.create_game("se1", "d1", "t0", "t1", sx,
+                                  league_id="lg")
+        self.assertNotIn("error", g1, g1)
+        gx = self.api.create_game("se2", None, "u0", "u1", "sE",
+                                  league_id=None, game_type="exhibition")
+        self.assertNotIn("error", gx, gx)
+        legacy = self.store.get_game(gx["id"])
+        legacy.season_id = None
+        self.store.save_game(legacy)
+        # The PRODUCTION league-scoped path fails closed even earlier —
+        # season-less game ice is refused outright before any assignment.
+        mv = self.api.move_game(gx["id"], sy)
+        self.assertEqual(_reason(mv), "season_missing", mv)
+        # The base service (a deployment without the league-scope layer)
+        # reaches the shared gate — where the unconditional overlap rule
+        # now binds despite season_id=None.
+        setup = BaseSetupService(self.store)
+        with self.assertRaises(ScheduleConflictError) as ctx:
+            setup.move_game(gx["id"], sy)
+        self.assertEqual(ctx.exception.details["reason"],
+                         "slot_overlap_conflict")
+
+    def test_advisory_reports_overlap_without_a_season(self):
+        # The advisory closure mirrors the gate even for a season-less
+        # (legacy-division) run: same shared implementation, same code.
+        sx, sy = self._import_overlapping_pair()
+        g1 = self.api.create_game("se1", "d1", "t0", "t1", sx,
+                                  league_id="lg")
+        self.assertNotIn("error", g1, g1)
+        check = _policy_advisor(self.store, None)
+        code, _msg = check(self.store.get_ice_slot(sy), ())
+        self.assertEqual(code, "slot_overlap_conflict")
+
+    def test_overlap_refused_without_any_policy(self):
+        self.assertEqual(self.store.all_scheduling_policies(), [])
+        self._assert_overlap_refused_everywhere()
+
+    def test_overlap_refused_with_explicit_zero_policy(self):
+        for sid in ("se1", "se2"):
+            r = self.api.set_scheduling_policy(
+                scope_type="season", scope_id=sid, warmup_minutes=0,
+                resurfacing_minutes=0, actor_id="admin")
+            self.assertNotIn("error", r, r)
+        self._assert_overlap_refused_everywhere()
+
+    def test_exact_adjacency_at_zero_requirement_stays_legal(self):
+        # end == start is NOT overlap: with explicit zeros the touching
+        # pair hosts two games (half-open boundary, like the buffers).
+        r = self.api.set_scheduling_policy(
+            scope_type="season", scope_id="se1", warmup_minutes=0,
+            resurfacing_minutes=0, actor_id="admin")
+        self.assertNotIn("error", r, r)
+        self.store.add_ice_slot(IceSlot(
+            id="sT", rink_id="r1",
+            start_time=BASE + timedelta(minutes=60),
+            end_time=BASE + timedelta(minutes=70),
+            slot_type=IceSlotType.GAME, status=IceSlotStatus.AVAILABLE))
+        g1 = self.api.create_game("se1", "d1", "t0", "t1", "sA",
+                                  league_id="lg")
+        self.assertNotIn("error", g1, g1)
+        g2 = self.api.create_game("se1", "d1", "t2", "t3", "sT",
+                                  league_id="lg")
+        self.assertNotIn("error", g2, g2)
+
+
+class MemorySlotOverlapTest(_SlotOverlapContract, unittest.TestCase):
+    def _make_store(self):
+        return InMemoryStore()
+
+
+class SqliteSlotOverlapTest(_SlotOverlapContract, unittest.TestCase):
+    def _make_store(self):
+        return SqlStore(":memory:")
+
+
+@unittest.skipUnless(os.environ.get("TEST_DATABASE_URL"),
+                     "PostgreSQL required (set TEST_DATABASE_URL)")
+class PostgresSlotOverlapTest(_SlotOverlapContract, unittest.TestCase):
     def _make_store(self):
         store = SqlStore(os.environ["TEST_DATABASE_URL"])
         store.clear_all_data()

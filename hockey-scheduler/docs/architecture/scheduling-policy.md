@@ -7,7 +7,10 @@ curfew. One optional `SchedulingPolicy` row per **Program**, **Season**, or
 with Rink overriding Season overriding Program. A `null` field always means
 "inherit from the next scope up", and a field unset at every scope is the
 no-op default — installs that never configure a policy behave exactly as
-before this feature existed.
+before this feature existed, with one deliberate exception: two games can
+never share physically overlapping slots on one rink
+(`slot_overlap_conflict` below), a rule that binds regardless of any
+policy.
 
 ## Model
 
@@ -25,7 +28,7 @@ never rewritten, and setting a policy never time-shifts existing data.
 
 ## Enforcement
 
-All three checks run inside `SetupService._assert_slot_free` — the single
+All four checks run inside `SetupService._assert_slot_free` — the single
 shared placement gate — so `create_game`, `move_game`, and both
 `commit_draft_schedule` implementations reject identically (no draft-only
 exception), each with a stable machine-readable `details["reason"]`:
@@ -33,6 +36,16 @@ exception), each with a stable machine-readable `details["reason"]`:
 * `insufficient_playable_time` — the slot's playable span is shorter than
   the effective minimum. Contracted slivers import untouched (with
   validation warnings); they are refused a *game* here instead.
+* `slot_overlap_conflict` — the candidate slot **physically overlaps**
+  another active game's slot on the same rink. Refused **unconditionally**
+  — a zero or absent policy changes nothing, and the rule binds even for
+  season-less legacy games where no policy scope resolves at all — because
+  the import path deliberately persists overlapping contracted rows
+  (warnings, never silent rewrites), making this gate the
+  physical-exclusivity enforcement point. Exact adjacency (`end == start`)
+  is *not* overlap and stays compliant even at a zero requirement. This is
+  the one rule that applies even in installs that never configured a
+  policy.
 * `turnover_buffer_conflict` — another active game's slot on the **same
   rink** sits closer than the **directional** requirement: the required gap
   between two games is the *earlier* game's `resurfacing_minutes` plus the
@@ -44,10 +57,9 @@ exception), each with a stable machine-readable `details["reason"]`:
   huge `warmup_minutes`, only for the neighbor's resurfacing plus its own
   warm-up. Committed drafts count. Half-open boundary: a gap **exactly
   equal** to the requirement is compliant. Physically overlapping spans
-  (already refused by the overlap gate) defensively use the larger of the
-  two directional requirements. Game-vs-game only; buffers against
-  non-game slots (maintenance, public skate) belong to the #189 event
-  model.
+  never reach this check — `slot_overlap_conflict` above refuses them
+  first. Game-vs-game only; buffers against non-game slots (maintenance,
+  public skate) belong to the #189 event model.
 * `curfew_violation` — the playable end passes the curfew instant,
   compared as true UTC instants (deterministic across DST; the ambiguous
   fall-back wall clock resolves to its earlier occurrence, and a curfew
