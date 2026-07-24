@@ -197,7 +197,14 @@ class DraftReviewServiceTest(unittest.TestCase):
         self.api.draft_season_schedule = lambda *a, **k: proposal
         res = self.api.commit_draft_schedule("d")
         self.assertIn("error", res)
-        self.assertEqual(res["error"]["details"]["reason"], "placement_raced")
+        # #328 review round 2: terminal, not retried -- the operator
+        # reviewed a specific proposal, and a winning write already changed
+        # what "missing" means, so this must never silently substitute a
+        # different pairing into the same commit.
+        self.assertEqual(res["error"]["details"]["reason"],
+                         "pairing_already_scheduled")
+        self.assertEqual(res["error"]["details"]["existing_game_id"],
+                         "existing")
         # Atomic rollback: no draft games created, no batch audit written,
         # every slot the loop had already flipped is back to AVAILABLE; only
         # the pre-seeded existing game remains.

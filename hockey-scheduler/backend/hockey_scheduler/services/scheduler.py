@@ -376,20 +376,30 @@ def _unschedulable_teams(store, team_ids, pairings, unscheduled):
 
 
 def _existing_pairing_games(store, division_scope):
-    """``{frozenset({home_team_id, away_team_id}): existing_game_id}`` for
-    every non-cancelled REGULAR Game already in any of ``division_scope``
-    (#206 slice 1 — preserve existing Games, generate only missing
-    round-robin matchups). ``division_scope`` is an iterable of
-    ``(league_season_id, division_id)`` tuples, not bare division ids
-    (#328 review): a league-wide draft's "no Division" group is keyed by
-    ``division_id=None``, and Teams are permanent, so scoping by
-    ``division_id`` alone would let a division-less Regular Game from a
-    completely different Season/League — the same two team ids reused
-    later — wrongly suppress a pairing that has never actually been played
-    in THIS League+Season. A real (non-``None``) ``division_id`` is already
-    unique to one ``LeagueSeason``, so this only changes behavior for the
-    ``None`` bucket, but every caller builds the same tuple shape for
-    consistency.
+    """``{(league_season_id, division_id, frozenset({home_team_id,
+    away_team_id})): existing_game_id}`` for every non-cancelled REGULAR
+    Game already in any of ``division_scope`` (#206 slice 1 — preserve
+    existing Games, generate only missing round-robin matchups).
+    ``division_scope`` is an iterable of ``(league_season_id, division_id)``
+    tuples, not bare division ids (#328 review): a league-wide draft's "no
+    Division" group is keyed by ``division_id=None``, and Teams are
+    permanent, so scoping by ``division_id`` alone would let a
+    division-less Regular Game from a completely different Season/League
+    — the same two team ids reused later — wrongly suppress a pairing that
+    has never actually been played in THIS League+Season.
+
+    The returned mapping is keyed by the FULL ``(league_season_id,
+    division_id, pairing)`` tuple, not by pairing alone (#328 review round
+    2): a league-wide call can have SEVERAL Divisions in scope at once
+    (all sharing one League+Season), and a bare pairing key would let a
+    real Game that only ever qualified for Division A's scope wrongly
+    match a lookup for Division B's fresh pairing — exactly the bug this
+    keying closes for a team pair reassigned between Divisions, leaving a
+    stale Game behind in the Division they left. Callers must look up with
+    the SAME full tuple (:func:`_split_already_scheduled` takes the call's
+    single ``league_season_id`` — every pairing in one ``draft_schedule``
+    or ``draft_schedule_for_league`` call shares it — plus each pairing's
+    own ``division_id``).
 
     Draft or committed, published or not, roster-locked or not all count —
     the risk this closes is re-running Generate silently proposing (and
@@ -404,24 +414,28 @@ def _existing_pairing_games(store, division_scope):
     for g in store.all_games():
         if g.cancelled:
             continue
-        if (g.league_season_id, g.division_id) not in wanted:
+        scope = (g.league_season_id, g.division_id)
+        if scope not in wanted:
             continue
         if g.game_type != GameType.REGULAR.value:
             continue
-        found[frozenset((g.home_team_id, g.away_team_id))] = g.id
+        found[scope + (frozenset((g.home_team_id, g.away_team_id)),)] = g.id
     return found
 
 
-def _split_already_scheduled(store, pairings, existing):
+def _split_already_scheduled(store, pairings, existing, league_season_id):
     """Partition ``pairings`` (``home, away, division_id`` triples) into
     ``(remaining, already_scheduled)`` against ``existing`` (from
     :func:`_existing_pairing_games`) — #206 slice 1: a pairing that already
     has a real Game is reported by name, not silently dropped (which would
     look identical to "not asked for") or silently re-proposed (the
-    production risk this slice fixes)."""
+    production risk this slice fixes). ``league_season_id`` is the single
+    constant identity shared by every pairing in this call (#328 review
+    round 2 — the lookup key must match Division, not just pairing)."""
     remaining, already = [], []
     for home, away, division_id in pairings:
-        existing_game_id = existing.get(frozenset((home, away)))
+        existing_game_id = existing.get(
+            (league_season_id, division_id, frozenset((home, away))))
         if existing_game_id is not None:
             already.append({
                 "home_team_id": home, "away_team_id": away,
@@ -457,9 +471,10 @@ def draft_schedule(store, division_id, slot_ids=None, constraints=None):
     # #328 review — scope the exclusion by this Division's own LeagueSeason,
     # not division_id alone (see _existing_pairing_games).
     division = store.get_division(division_id) if division_id else None
-    scope = {(division.league_season_id if division else None, division_id)}
+    ls_id = division.league_season_id if division else None
+    scope = {(ls_id, division_id)}
     pairings, already_scheduled = _split_already_scheduled(
-        store, all_pairings, _existing_pairing_games(store, scope))
+        store, all_pairings, _existing_pairing_games(store, scope), ls_id)
     slots = _available_game_slots(store, slot_ids)
     draft_games, unscheduled = _assign_ice(
         store, pairings, slots, constraints,
@@ -504,7 +519,7 @@ def draft_schedule_for_league(store, season_id, league_id, division_id=None,
     ls_id = league_season.id if league_season is not None else None
     scope = {(ls_id, div_id) for div_id in groups.keys()}
     pairings, already_scheduled = _split_already_scheduled(
-        store, all_pairings, _existing_pairing_games(store, scope))
+        store, all_pairings, _existing_pairing_games(store, scope), ls_id)
     slots = _available_game_slots(store, slot_ids)
     draft_games, unscheduled = _assign_ice(
         store, pairings, slots, constraints,

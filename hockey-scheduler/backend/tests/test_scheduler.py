@@ -584,6 +584,75 @@ class SchedulerContract:
              res["draft_games"][0]["away_team_id"]},
             {"t0", "t1"})
 
+    def test_league_wide_draft_excludes_by_division_not_pairing_alone(self):
+        # #328 review round 2: the scope FILTER is (league_season_id,
+        # division_id), but the returned map must also be KEYED by that
+        # full tuple, not by pairing alone -- otherwise a league-wide call
+        # with several Divisions in scope (all one LeagueSeason) could let
+        # a real Game that only ever qualified for Gold's scope wrongly
+        # match a lookup for Silver's fresh pairing. Proves BOTH directions
+        # at once: Gold has its OWN current pairing (t2 vs t3) with a real
+        # Game, correctly reported as already-scheduled for GOLD; t0/t1
+        # have a STALE Game tagged to Gold from before they moved to
+        # Silver (their CURRENT registration), which must NOT suppress
+        # their fresh Silver pairing -- so the key is precise in both
+        # directions, not just permissive in one.
+        self._base()
+        self.store.add_league(League(id="lg1", program_id="prog1", name="League"))
+        self.store.add_league_season(LeagueSeason(
+            id="ls_lg1_se1", league_id="lg1", season_id="se1"))
+        self.store.add_division(Division(
+            id="gold", league_season_id="ls_lg1_se1", name="Gold"))
+        self.store.add_division(Division(
+            id="silver", league_season_id="ls_lg1_se1", name="Silver"))
+        for tid in ("t0", "t1", "t2", "t3"):
+            self.store.add_team(Team(id=tid, name=tid, program_id="prog1",
+                                     league_id="lg1"))
+        # t2/t3 stay in Gold with their own CURRENT, genuinely
+        # already-played pairing.
+        for tid in ("t2", "t3"):
+            self.store.add_season_team_registration(SeasonTeamRegistration(
+                id=f"streg_{tid}", league_season_id="ls_lg1_se1",
+                team_id=tid, division_id="gold", active=True))
+        # t0/t1 have moved to Silver -- their CURRENT registration.
+        for tid in ("t0", "t1"):
+            self.store.add_season_team_registration(SeasonTeamRegistration(
+                id=f"streg_{tid}", league_season_id="ls_lg1_se1",
+                team_id=tid, division_id="silver", active=True))
+        self._slots(2, start=BASE_TIME + timedelta(days=30))
+        # Gold's OWN, current, genuinely already-scheduled pairing.
+        self.store.add_game(Game(
+            id="gold_real_game", home_team_id="t2", away_team_id="t3",
+            start_time=BASE_TIME - timedelta(days=1),
+            division_id="gold", season_id="se1", league_id="lg1",
+            league_season_id="ls_lg1_se1"))
+        # A STALE Game from when t0/t1 were in Gold, before they moved to
+        # Silver -- Silver has never played this pairing, and Gold no
+        # longer has these two teams at all.
+        self.store.add_game(Game(
+            id="stale_gold_game", home_team_id="t0", away_team_id="t1",
+            start_time=BASE_TIME - timedelta(days=100),
+            division_id="gold", season_id="se1", league_id="lg1",
+            league_season_id="ls_lg1_se1"))
+        res = draft_schedule_for_league(self.store, "se1", "lg1")
+        # Silver's t0-vs-t1 must be freshly generated -- NOT suppressed by
+        # Gold's stale Game for the identical pairing.
+        self.assertEqual(len(res["draft_games"]), 1)
+        self.assertEqual(res["draft_games"][0]["division_id"], "silver")
+        self.assertEqual(
+            {res["draft_games"][0]["home_team_id"],
+             res["draft_games"][0]["away_team_id"]},
+            {"t0", "t1"})
+        # Gold's t2-vs-t3 must STILL be correctly reported already-scheduled
+        # -- proving the key correctly excludes Gold's own real pairing
+        # too, not just permissively skipping everything.
+        self.assertEqual(len(res["already_scheduled"]), 1)
+        entry = res["already_scheduled"][0]
+        self.assertEqual({entry["home_team_id"], entry["away_team_id"]},
+                         {"t2", "t3"})
+        self.assertEqual(entry["division_id"], "gold")
+        self.assertEqual(entry["existing_game_id"], "gold_real_game")
+
 
 class MemorySchedulerTest(SchedulerContract, unittest.TestCase):
     def make_store(self):

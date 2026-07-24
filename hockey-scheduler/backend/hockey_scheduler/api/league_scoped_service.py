@@ -178,11 +178,18 @@ class ApiService(_BaseApiService):
             # concurrent write between this proposal's generation and this
             # commit (the proposal already excluded pairings that existed AT
             # PREVIEW time — scheduler.py's already_scheduled split — so
-            # only such a race can slip one through here). A hit is the same
-            # kind of staleness `placement_raced` already covers: the base
-            # facade's retry shell (inherited, undecorated here) regenerates
-            # a fresh proposal that correctly excludes the now-existing
-            # pairing.
+            # only such a race can slip one through here). #328 review
+            # round 2 — this is a TERMINAL fact, not transient contention:
+            # the operator reviewed a specific proposal, and a winning
+            # commit already changed what "missing" means, so silently
+            # substituting a different pairing into the SAME commit would
+            # diverge from what was reviewed. The batch rolls back
+            # atomically (raising inside this transaction) and the caller
+            # must regenerate and re-review before retrying —
+            # `pairing_already_scheduled` is deliberately NOT
+            # `placement_raced` (the base facade's inherited retry shell
+            # only retries that one reason), so this reaches the caller
+            # unretried.
             _existing_now = _existing_pairing_games(
                 self.store,
                 {(draft_ls_id, row.get("division_id"))
@@ -203,15 +210,17 @@ class ApiService(_BaseApiService):
                 slot = self.setup._assert_slot_free_for_game(
                     row["ice_slot_id"], row["home_team_id"], row["away_team_id"],
                     season_id=resolved_season_id)
-                if frozenset((row["home_team_id"], row["away_team_id"])) \
-                        in _existing_now:
+                _pairing_key = (draft_ls_id, row.get("division_id"),
+                                frozenset((row["home_team_id"], row["away_team_id"])))
+                if _pairing_key in _existing_now:
                     raise ConcurrencyConflictError(
-                        "This pairing was scheduled by another request "
-                        "while this draft was being committed; please "
-                        "retry.",
-                        {"reason": "placement_raced",
+                        "This pairing already has a real Game; the draft "
+                        "you reviewed is stale. Regenerate and review a "
+                        "fresh proposal before committing again.",
+                        {"reason": "pairing_already_scheduled",
                          "home_team_id": row["home_team_id"],
-                         "away_team_id": row["away_team_id"]})
+                         "away_team_id": row["away_team_id"],
+                         "existing_game_id": _existing_now[_pairing_key]})
                 game = Game(
                     id=self.store.next_id("game"),
                     home_team_id=row["home_team_id"],

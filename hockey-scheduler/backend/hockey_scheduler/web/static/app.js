@@ -6479,7 +6479,18 @@ async function render() {
   if (schedCommit) schedCommit.onclick = async () => {
     toast = "";
     const res = await post("/api/scheduler/commit", { division_id: schedulerState.division });
-    if (res && !res.error) { schedulerState.preview = null; toast = `Committed ${res.created.length} draft game(s).`; }
+    if (res && !res.error) {
+      schedulerState.preview = null;
+      toast = `Committed ${res.created.length} draft game(s).`;
+    } else if (res && res.error && res.error.details
+               && res.error.details.reason === "pairing_already_scheduled") {
+      // #328 review round 2: a concurrent commit already scheduled one of
+      // this batch's pairings — the reviewed preview is stale (post()'s
+      // generic toast already names the pairing/existing Game). Clear it
+      // rather than leave a now-wrong proposal on screen; the operator
+      // generates a fresh one to review before committing again.
+      schedulerState.preview = null;
+    }
     await render();
   };
   // Review filters (#106) — re-render() like every other interaction in this

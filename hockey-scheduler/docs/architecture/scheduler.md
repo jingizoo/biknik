@@ -42,9 +42,11 @@ slice 1 fixes: **existing Games — published or draft, roster-locked or
 not — are always preserved untouched, and generation fills in only the
 matchups that are genuinely still missing.**
 
-`_existing_pairing_games(store, division_ids)` scans every Game already in
-the target Division(s) and indexes `frozenset({home_team_id,
-away_team_id}) -> existing_game_id`, with two deliberate exemptions:
+`_existing_pairing_games(store, division_scope)` scans every Game already
+in `division_scope` — an iterable of `(league_season_id, division_id)`
+tuples, never bare division ids — and indexes `(league_season_id,
+division_id, frozenset({home_team_id, away_team_id})) -> existing_game_id`,
+with two deliberate exemptions:
 
 * a **cancelled** Game does not count — a cancelled fixture is not "on the
   calendar" and its pairing is eligible for regeneration;
@@ -52,21 +54,30 @@ away_team_id}) -> existing_game_id`, with two deliberate exemptions:
   (#283) — a friendly is not a standings fixture, so it never satisfies a
   Regular pairing.
 
-The index is flat across whichever Division(s) one call is scoped to — a
-single Division for `draft_schedule`, or every Division a league-wide
-`draft_schedule_for_league` call spans. It does not additionally check that
-an existing Game's own `division_id` matches the specific pairing's
-assigned Division; it only asks "does a real Game already exist for these
-two team ids among the Divisions this call is looking at." For a
-league-wide draft this is provably correct **as long as team ids are
-unique to their current Division** (the normal case: `draft_schedule_for_league`
-groups registrations by current Division, so the same two team ids are
-only ever a live pairing candidate in one group). It would over-exclude in
-a data-anomaly edge case a review flagged but no fixture reaches today — a
-stale Game between the same two team ids, tagged to a *different*
-in-scope Division from before one or both teams were reassigned — which
-is out of this slice's bounded scope (tracked as a follow-up rather than
-blocking here).
+Both the filter (which Games are even considered) and the returned map's
+key are scoped by the full `(league_season_id, division_id)` tuple, not by
+`division_id` or pairing alone (#328 review, two rounds):
+
+* **Round 1** — a league-wide draft's "no Division" group is keyed by
+  `division_id=None` for every League/Season, and Teams are permanent, so
+  scoping the *filter* by `division_id` alone let a division-less Regular
+  Game from a completely unrelated Season/League — the same two team ids
+  reused later — wrongly suppress a pairing never actually played in THIS
+  League+Season.
+* **Round 2** — scoping the filter alone was not enough: the returned map
+  was still *keyed* by pairing alone, so a league-wide call with several
+  Divisions in scope at once (all sharing one League+Season — the normal
+  case for `draft_schedule_for_league`) could let a real Game that only
+  ever qualified for Division A's scope wrongly match a lookup for
+  Division B's fresh pairing — reachable whenever a team pair is
+  reassigned from one Division to another and a stale Game is left behind
+  in the Division they left. Keying the map by the full `(league_season_id,
+  division_id, pairing)` tuple, and looking it up with the SAME tuple
+  (`_split_already_scheduled` takes the call's single `league_season_id` —
+  every pairing in one `draft_schedule` or `draft_schedule_for_league` call
+  shares it — plus each pairing's own `division_id`), closes this
+  precisely: Division A's stale Game can never satisfy a lookup keyed to
+  Division B.
 
 `_split_already_scheduled` partitions the full computed pairing list
 against that index *before* `_assign_ice` ever runs: a pairing with a real
@@ -113,37 +124,49 @@ priority when a row happens to trip both, since it is the more specific,
 still-valid answer; the new check only ever catches the residual case those
 checks structurally cannot see.
 
-A hit does not invent a new terminal error — it raises the existing
-retryable `ConcurrencyConflictError` with `reason: "placement_raced"`, the
-same signal #313/#314/#318 already use for a pre-lock scope locator
-invalidated by a concurrent write. `commit_draft_schedule`'s retry shell
-(inherited by both facades) already retries up to three times on exactly
-this reason, regenerating a fresh proposal each attempt — and because
-generation itself now excludes already-scheduled pairings (above), the
-regenerated proposal correctly omits the now-real pairing and fills the
-freed slot with a genuinely still-missing one instead. No bespoke recovery
-path was needed; reusing the existing signal and the existing retry shell
-was sufficient.
+A hit is deliberately **terminal**, not retried (#328 review round 2,
+product-owner decision): it raises `ConcurrencyConflictError` with
+`reason: "pairing_already_scheduled"`, naming `home_team_id`,
+`away_team_id`, and the winning `existing_game_id`. This is a different
+reason from `placement_raced` on purpose — `commit_draft_schedule`'s retry
+shell (inherited by both facades) only retries that one specific reason,
+so anything else, including this one, reaches the caller unretried on the
+first attempt, with the whole batch rolled back atomically (the exception
+propagates out of the same transaction the commit runs in).
+
+The reason this does not auto-retry, unlike `placement_raced`: a winning
+commit already changed what "missing" means, so a fresh proposal generated
+mid-retry can genuinely differ from the one the operator reviewed — a
+different pairing could fill the freed slot, silently substituting a
+different batch into the commit the operator approved. That would break
+the draft → review → commit contract (the operator must review what they
+are about to commit). The caller must explicitly regenerate and re-review
+before committing again, exactly like any other stale-preview case.
 
 This is pinned by *forced* two-session races on real PostgreSQL
 (`test_placement_concurrency.py`,
 `_PairingDuplicationRaceMixin` and its two concrete subclasses covering
 both facades): two draft commits for the same Division, each restricted to
 its own single, non-conflicting ice slot, so both independently target the
-same first pairing before either transaction opens. The loser's recheck is
-proven load-bearing by neutering it directly (falsifiable, not
-timing-dependent): with the check removed, the loser silently persists a
-second Game for the identical pairing; with generation's exclusion removed
-instead, the loser's every retry reproduces the same conflict and exhausts
-the retry shell, surfacing a raw `placement_raced` error instead of
-resolving automatically. Both facades are tested independently since
-neither delegates to the other.
+same first pairing before either transaction opens. Exactly one commit
+succeeds; the other is refused with the terminal reason, and only the
+winner's Game ever exists. The loser's recheck is proven load-bearing by
+neutering it directly (falsifiable, not timing-dependent): with the check
+removed, the loser silently persists a second Game for the identical
+pairing (both assertions fail); reverting the reason back to
+`placement_raced` instead of the terminal one lets the loser be silently
+retried to a DIFFERENT success instead of a named terminal error (the
+"exactly one error" assertion fails). Both facades are tested independently
+since neither delegates to the other.
 
 ## Reason codes referenced here
 
 Unscheduled-pairing codes are generation-time (`services/scheduler.py`,
-listed above under Model). `placement_raced` is a commit-time
-`ConcurrencyConflictError` reason, defined and retried in
-`api/service.py`/`api/league_scoped_service.py`, not scheduler-specific —
+listed above under Model). `pairing_already_scheduled` is the commit-time
+`ConcurrencyConflictError` reason for this guard, defined in
+`api/service.py`/`api/league_scoped_service.py` — deliberately distinct
+from `placement_raced` (the pre-lock scope-locator staleness reason
+#313/#314/#318 use, which the retry shell DOES retry) precisely so this
+one is never retried. Neither is scheduler-specific; `placement_raced` is
 shared with every other placement path that re-verifies a pre-lock locator
 under its locks.

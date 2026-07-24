@@ -1108,29 +1108,31 @@ class PostgresBaseApiDraftParticipationRaceTest(
 
 
 class _PairingDuplicationRaceMixin(_ForcedRaceHarnessMixin):
-    """Forced two-session race (#206 slice 1): two draft commits for the SAME
-    Division, each restricted (via ``slot_ids``) to its own single ice slot,
-    the two slots far enough apart in time that they never conflict. Both
-    proposals are generated before either transaction opens, so both
-    independently target the SAME first round-robin pairing — one on each
-    session's own slot. Whichever session acquires the shared Team lock
-    first commits that pairing normally; the loser's per-row check
+    """Forced two-session race (#206 slice 1, terminal contract per #328
+    review round 2): two draft commits for the SAME Division, each
+    restricted (via ``slot_ids``) to its own single ice slot, the two slots
+    far enough apart in time that they never conflict. Both proposals are
+    generated before either transaction opens, so both independently
+    target the SAME first round-robin pairing — one on each session's own
+    slot. Whichever session acquires the shared Team lock first commits
+    that pairing normally; the loser's per-row check
     (``_assert_slot_free_for_game``) sees a genuinely free, non-conflicting
     slot and would have silently persisted a SECOND Game for the identical
     pairing were it not for the fresh commit-time recheck added by #206 —
-    that recheck raises ``placement_raced``, and the retry shell's automatic
-    regeneration (which now excludes the newly-real pairing via scheduler.py's
-    ``already_scheduled`` split) fills the loser's slot with a genuinely
-    still-missing pairing instead.
+    that recheck raises the TERMINAL ``pairing_already_scheduled`` (not
+    ``placement_raced``, so the retry shell does not retry it): the loser's
+    whole batch rolls back atomically and the caller must regenerate and
+    re-review, rather than the commit silently substituting a different
+    pairing into the batch the operator already reviewed.
 
     Falsifiable both ways: drop the commit-time recheck in
-    ``_commit_draft_schedule_attempt`` and the loser silently duplicates the
-    winner's pairing on its own slot (this test's "2 distinct pairings"
-    assertion fails); drop the ``already_scheduled`` exclusion in
-    scheduler.py and the loser's every retry reproduces the identical
-    conflict, exhausting the retry shell's 3 attempts and surfacing a raw
-    ``placement_raced`` error instead of resolving automatically (this
-    test's "no error" assertion fails)."""
+    ``_commit_draft_schedule_attempt`` and the loser silently duplicates
+    the winner's pairing on its own slot (this test's "exactly one commit
+    succeeds" and "exactly one Game exists" assertions fail); revert the
+    reason to ``placement_raced`` instead of the terminal
+    ``pairing_already_scheduled`` and the loser is silently retried to a
+    DIFFERENT success instead of a named terminal error (this test's
+    "exactly one error" assertion fails)."""
 
     def test_two_single_slot_draft_commits_never_duplicate_a_pairing(self):
         out = self._run([
@@ -1138,16 +1140,23 @@ class _PairingDuplicationRaceMixin(_ForcedRaceHarnessMixin):
             lambda a: a.commit_draft_schedule("d1", slot_ids=["s3"]),
         ])
         self._assert_no_crash(out)
-        for res in out:
-            self.assertNotIn("error", res, repr(out))
-            self.assertEqual(len(res["created"]), 1, repr(out))
+        oks = [r for r in out if isinstance(r, dict) and "error" not in r]
+        errs = [r for r in out if isinstance(r, dict) and "error" in r]
+        self.assertEqual(len(oks), 1,
+                         f"exactly one commit should succeed: {out!r}")
+        self.assertEqual(len(errs), 1,
+                         f"the loser must be refused, not silently "
+                         f"retried to a different pairing: {out!r}")
+        self.assertEqual(errs[0]["error"]["details"]["reason"],
+                         "pairing_already_scheduled", repr(out))
+        self.assertIn("existing_game_id", errs[0]["error"]["details"],
+                      repr(out))
+        self.assertEqual(len(oks[0]["created"]), 1, repr(out))
         store = self._store()
         games = [g for g in store.all_games()
                  if not g.cancelled and g.division_id == "d1"]
-        self.assertEqual(len(games), 2, repr(out))
-        pairings = {frozenset((g.home_team_id, g.away_team_id)) for g in games}
-        self.assertEqual(len(pairings), 2,
-                         f"same pairing scheduled twice: {out!r}")
+        self.assertEqual(len(games), 1,
+                         f"only the winner's Game may exist: {out!r}")
         self._assert_schedule_consistent(store)
 
 
