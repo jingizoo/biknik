@@ -137,8 +137,16 @@ class ApiService(_BaseApiService):
             _plan = self.setup._policy_scope_lock_plan(
                 _pre_rinks, (resolved_season_id,))
             self.setup._lock_programs(_plan["programs"])
+            # #328 review round 8/9 -- also lock every already_scheduled
+            # row's Teams, not just draft_games': the revalidation below
+            # (whether that row's existing_game_id is still the current
+            # non-cancelled Game for its pairing) is only genuinely
+            # race-free, not just incidentally so, if a concurrent write
+            # touching one of those Teams (a cancel, a re-pairing) is
+            # forced to serialize against this transaction the same way
+            # draft_games' own teams already are.
             self.setup._lock_teams(
-                t for row in proposal["draft_games"]
+                t for row in proposal["draft_games"] + proposal["already_scheduled"]
                 for t in (row["home_team_id"], row["away_team_id"]))
             _batch_rinks = set()
             for row in proposal["draft_games"]:
@@ -218,7 +226,36 @@ class ApiService(_BaseApiService):
             _existing_now = _existing_pairing_games(
                 self.store,
                 {(draft_ls_id, row.get("division_id"))
-                 for row in proposal["draft_games"]})
+                 for row in proposal["draft_games"]}
+                | {(draft_ls_id, a.get("division_id"))
+                   for a in proposal["already_scheduled"]})
+            # #328 review round 8 finding 1 -- an already_scheduled row's
+            # Game is not part of this batch's writes, so nothing else ever
+            # re-examines it under the lock: the wide draft_fingerprint gate
+            # above only catches a cancellation that already happened by the
+            # time THIS method's own regeneration ran, and the per-row loop
+            # below only rechecks pairings that are actually in the batch.
+            # If the blocking Game for an already_scheduled row is cancelled
+            # in the narrow gap between that regeneration/fingerprint compare
+            # and here, this batch is what the operator reviewed BEFORE that
+            # cancellation -- it no longer reflects reality (that pairing is
+            # now genuinely open too), and committing it anyway would persist
+            # an incomplete schedule with no error. Reusing the SAME
+            # `_existing_now` snapshot the per-row loop below relies on keeps
+            # this race-free against the same locks; a mismatch means the
+            # reviewed premise "this pairing already has Game G" no longer
+            # holds, so refuse before any write exactly like any other form
+            # of staleness.
+            for a in proposal["already_scheduled"]:
+                _as_key = (draft_ls_id, a.get("division_id"),
+                           frozenset((a["home_team_id"], a["away_team_id"])))
+                if _existing_now.get(_as_key) != a["existing_game_id"]:
+                    raise ConcurrencyConflictError(
+                        "This preview is out of date — a game may have "
+                        "been added, cancelled, or otherwise changed since "
+                        "you generated it. Generate a fresh preview and "
+                        "review it before committing.",
+                        {"reason": "preview_stale"})
             for row in proposal["draft_games"]:
                 # #328 review round 4 -- checked BEFORE the physical gate
                 # below, not after: a row whose pairing already has a real

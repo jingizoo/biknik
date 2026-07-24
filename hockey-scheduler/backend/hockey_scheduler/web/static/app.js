@@ -53,6 +53,15 @@ let schedulerState = {
   filters: { division: "all", rink: "all", issue: "all" },  // (#106)
   selected: new Set(),  // game_ids picked for publish/discard (#106)
 };  // (#86)
+// #328 review round 8 finding 4 -- a terminal commit refusal
+// (pairing_already_scheduled/preview_stale) clears the preview and forces
+// a fresh Generate, but render() replaces #content wholesale, so the
+// focused Commit button is simply gone -- nothing moves focus anywhere,
+// silently dropping a keyboard user back to the document body. Set by
+// schedCommit's error branch, consumed once by the scheduler wiring below
+// right after the fresh content (with a Generate button again) is in the
+// DOM.
+let schedFocusGenerateAfterRender = false;
 let officialAvailability = [];      // signed-in official's windows (#88)
 let availSummary = null;            // roster availability rollup (#89)
 let subCandidates = null;           // coach substitute outreach queue (#112)
@@ -6469,6 +6478,15 @@ async function render() {
   const schedDiv = c.querySelector("#sched-div");
   if (schedDiv) schedDiv.onchange = () => { schedulerState.division = schedDiv.value; };
   const schedGen = c.querySelector("[data-sched-generate]");
+  // #328 review round 8 finding 4 -- consume the flag set by the PREVIOUS
+  // render's Commit error branch below, now that this render's fresh
+  // content (with a live Generate button again) is in the DOM. A stale
+  // preview always disables Commit and re-enables Generate, so this
+  // control exists whenever the flag does.
+  if (schedFocusGenerateAfterRender) {
+    schedFocusGenerateAfterRender = false;
+    if (schedGen) schedGen.focus();
+  }
   if (schedGen) schedGen.onclick = async () => {
     toast = "";
     const res = await post("/api/scheduler/draft", { division_id: schedulerState.division });
@@ -6506,6 +6524,14 @@ async function render() {
       // is now stale; clear it rather than leave a now-wrong proposal on
       // screen, so Commit cannot be retried without a fresh Generate.
       schedulerState.preview = null;
+      // #328 review round 8 finding 4 -- render() below replaces #content
+      // wholesale, so the just-focused Commit button is simply gone;
+      // nothing otherwise moves focus anywhere, silently dropping a
+      // keyboard user back to the document body even though the toast
+      // (a live region OUTSIDE #content, so it survives) told them what
+      // to do next. Move focus to Generate once the fresh content render
+      // completes, below.
+      schedFocusGenerateAfterRender = true;
     }
     await render();
   };

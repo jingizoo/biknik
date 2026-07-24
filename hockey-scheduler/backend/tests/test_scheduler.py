@@ -38,6 +38,7 @@ from hockey_scheduler.domain import (
     Team,
     Venue,
 )
+from hockey_scheduler.domain.errors import ScheduleConflictError
 from hockey_scheduler.store import InMemoryStore, SqlStore
 from hockey_scheduler.services import (
     draft_schedule,
@@ -765,6 +766,83 @@ class SchedulerContract:
     def test_base_facade_pairing_race_wins_over_non_overlapping_slot(self):
         self._pairing_race_wins_over_physical_conflict(BaseApiService, "none")
 
+    # -- direct proof of mid-transaction rollback (#328 review round 8
+    # finding 2) --------------------------------------------------------
+    def _later_row_failure_rolls_back_earlier_writes(self, api_cls):
+        """Shared assertion: the forced PostgreSQL races above prove the
+        OUTCOME (loser's whole batch absent) under genuine two-session
+        concurrency, but by construction they cannot directly observe
+        WHY -- both facades lock every batch Team upfront via
+        ``_lock_teams``, so a losing session's ``get_team_for_update``
+        blocks and only returns once the winner commits and releases the
+        lock; the losing session's per-row loop (including its own earlier
+        rows' writes) only ever executes AFTER that point. That's a claim
+        about the CODE, not something the black-box final-state assertion
+        alone demonstrates.
+
+        This test proves the mechanism directly instead, with no threads
+        needed: it injects a failure on the LAST of six rows, and the
+        injection point itself queries the SAME store/transaction to
+        confirm each of the five EARLIER rows' Games and slot flips are
+        already visible -- BEFORE raising the error that unwinds the whole
+        transaction. This is a direct, in-transaction observation of
+        "written, then rolled back," not an inference from the final state
+        (which alone cannot distinguish "written then rolled back" from
+        "never attempted")."""
+        self._division_fixture(4, 6)
+        api = api_cls(self.store)
+        preview = api.draft_season_schedule("div1")
+        rows = preview["draft_games"]
+        self.assertEqual(len(rows), 6, repr(preview))
+        earlier_rows, last_row = rows[:-1], rows[-1]
+        real_assert = api.setup._assert_slot_free_for_game
+        observed_before_injection = {}
+
+        def _spy(ice_slot_id, home_team_id, away_team_id, **kwargs):
+            if ice_slot_id == last_row["ice_slot_id"]:
+                for r in earlier_rows:
+                    games = [
+                        g for g in self.store.all_games()
+                        if not g.cancelled
+                        and {g.home_team_id, g.away_team_id}
+                        == {r["home_team_id"], r["away_team_id"]}]
+                    slot = self.store.get_ice_slot(r["ice_slot_id"])
+                    observed_before_injection[r["ice_slot_id"]] = (
+                        len(games) == 1
+                        and slot.status == IceSlotStatus.ALLOCATED)
+                raise ScheduleConflictError(
+                    "Injected failure -- observing mid-transaction state "
+                    "before unwinding (#328 review round 8 finding 2).",
+                    details={"reason": "test_injected_after_earlier_rows_written"})
+            return real_assert(ice_slot_id, home_team_id, away_team_id, **kwargs)
+
+        api.setup._assert_slot_free_for_game = _spy
+        res = commit_fresh_draft(api, "div1")
+        self.assertEqual(len(earlier_rows), 5, repr(rows))
+        self.assertTrue(
+            all(observed_before_injection.values()),
+            f"every earlier row's Game/slot must be visible in-transaction "
+            f"BEFORE the injected failure: {observed_before_injection!r}")
+        self.assertIn("error", res, repr(res))
+        self.assertEqual(
+            res["error"]["details"]["reason"],
+            "test_injected_after_earlier_rows_written", repr(res))
+        # And now the direct proof of ROLLBACK: what was just observed as
+        # written, mid-transaction, is gone once the transaction unwinds.
+        self.assertEqual(self.store.all_games(), [], repr(res))
+        for r in earlier_rows + [last_row]:
+            self.assertEqual(
+                self.store.get_ice_slot(r["ice_slot_id"]).status,
+                IceSlotStatus.AVAILABLE, r["ice_slot_id"])
+        self.assertFalse(any(a.action == "draft_schedule_committed"
+                             for a in self.store.all_setup_audit()))
+
+    def test_league_scoped_later_row_failure_rolls_back_earlier_writes(self):
+        self._later_row_failure_rolls_back_earlier_writes(ApiService)
+
+    def test_base_facade_later_row_failure_rolls_back_earlier_writes(self):
+        self._later_row_failure_rolls_back_earlier_writes(BaseApiService)
+
     # -- stale-preview TOCTOU gate (#328 review round 5) --------------------
     def _stale_preview_refused(self, api_cls, change):
         """Shared assertion: a Game created or cancelled in the window
@@ -918,6 +996,68 @@ class SchedulerContract:
             self):
         self._stale_preview_refused_on_placement_change(
             BaseApiService, "scope_changed")
+
+    # -- already_scheduled revalidation under the lock (#328 review round 8
+    # finding 1) -----------------------------------------------------------
+    def _already_scheduled_cancelled_after_regen_refused(self, api_cls):
+        """Shared assertion: an already_scheduled row's blocking Game being
+        cancelled AFTER this method's own internal proposal regeneration (and
+        its fingerprint compare) but BEFORE the locked recheck must still
+        refuse the whole commit -- that row is not part of the batch's
+        writes, so nothing else ever re-examines it. Without this check the
+        5 genuinely-missing rows would commit anyway (a real bug found by
+        review): the reviewed batch silently persists as reviewed even
+        though the world moved a moment after the wide gate already passed,
+        leaving the pairing that just opened up unscheduled with no error.
+
+        Modeled by monkeypatching ``draft_season_schedule`` to return a
+        FROZEN pre-cancellation proposal (so the fingerprint compare
+        matches, exactly as it would if the cancellation lands a moment
+        after that regeneration completes) and cancelling the blocking Game
+        in the store before calling commit -- the locked recheck this test
+        targets reads the store fresh, so it sees the cancellation
+        regardless of when the mocked regeneration itself "ran"."""
+        self._division_fixture(4, 6)
+        home, away = round_robin_pairings(["t0", "t1", "t2", "t3"])[0]
+        self.store.add_game(Game(
+            id="blocking_game", home_team_id=home, away_team_id=away,
+            start_time=BASE_TIME - timedelta(days=100),
+            end_time=BASE_TIME - timedelta(days=100) + timedelta(hours=1),
+            division_id="div1", season_id="se1", league_id="lg1",
+            league_season_id="ls_lg1_se1"))
+        api = api_cls(self.store)
+        preview = api.draft_season_schedule("div1")
+        self.assertEqual(len(preview["draft_games"]), 5, repr(preview))
+        self.assertEqual(len(preview["already_scheduled"]), 1, repr(preview))
+        stale_fingerprint = preview["draft_fingerprint"]
+        # Freeze the regeneration commit performs internally to this
+        # pre-cancellation snapshot -- its fingerprint still matches
+        # ``stale_fingerprint`` below, exactly as if the cancellation lands
+        # in the gap after that regeneration but before the locked recheck.
+        api.draft_season_schedule = lambda *a, **k: preview
+        blocking = self.store.get_game("blocking_game")
+        blocking.cancelled = True
+        self.store.save_game(blocking)
+        games_before = len(self.store.all_games())
+        audits_before = len(self.store.all_setup_audit())
+        res = api.commit_draft_schedule(
+            "div1", draft_fingerprint=stale_fingerprint)
+        self.assertIn("error", res, repr(res))
+        self.assertEqual(
+            res["error"]["details"]["reason"], "preview_stale", repr(res))
+        # Zero writes: none of the 5 genuinely-missing rows committed either
+        # -- the whole reviewed batch is stale, not just the cancelled row.
+        self.assertEqual(len(self.store.all_games()), games_before, repr(res))
+        self.assertEqual(
+            len(self.store.all_setup_audit()), audits_before, repr(res))
+
+    def test_league_scoped_commit_refuses_when_already_scheduled_game_cancelled_after_regen(
+            self):
+        self._already_scheduled_cancelled_after_regen_refused(ApiService)
+
+    def test_base_facade_commit_refuses_when_already_scheduled_game_cancelled_after_regen(
+            self):
+        self._already_scheduled_cancelled_after_regen_refused(BaseApiService)
 
 
 class MemorySchedulerTest(SchedulerContract, unittest.TestCase):

@@ -20,6 +20,12 @@
 // stale preview invalidated by a Game created/cancelled after Generate
 // (preview_stale, #328 review round 5) -- both show an actionable message,
 // clear the stale preview, and require a fresh Generate before retrying.
+// Both stubs also capture and assert the real request body's
+// draft_fingerprint against the preceding Generate response (#328 review
+// round 8 finding 3), and the stale-preview one is triggered via keyboard
+// Enter and asserts focus lands on the newly rendered Generate control
+// rather than silently dropping to the document body (#328 review round 8
+// finding 4).
 //
 // Fails on any browser console/page error.
 const { chromium } = require("playwright");
@@ -283,37 +289,63 @@ async function checkViewport(browser, viewport) {
     // test in test_placement_concurrency.py). The message must be
     // actionable on its own: post()'s generic toast surfaces
     // error.message alone, never error.details.
+    //
+    // #328 review round 8 finding 3: the stub must not just answer any
+    // request that arrives -- it must prove app.js actually SENT the
+    // previewed draft_fingerprint. Without capturing and asserting the real
+    // request body, removing or renaming that field in app.js would leave
+    // this journey green while production returns preview_required.
     await generateFor(page, ids.dMixed,
       '#sched-preview[data-games="4"][data-already-scheduled="2"]');
     s = await previewState(page);
     if (s.commitDisabled !== false) {
       fail(`race stub: needs an enabled Commit to click: ${JSON.stringify(s)}`);
     }
-    await page.route("**/api/scheduler/commit", (r) => r.fulfill({
-      status: 409,
-      contentType: "application/json",
-      body: JSON.stringify({
-        error: {
-          code: "concurrency_conflict",
-          message: "Mixed 0 vs Mixed 1 is already scheduled as Game "
-            + "game_stub_race — generate a fresh preview before "
-            + "committing again.",
-          details: {
-            reason: "pairing_already_scheduled",
-            home_team_id: "stub_home", away_team_id: "stub_away",
-            existing_game_id: "game_stub_race",
+    let expectedFingerprint = await page.evaluate(
+      () => schedulerState.preview && schedulerState.preview.draft_fingerprint);
+    if (!expectedFingerprint) {
+      fail(`race stub: no draft_fingerprint on the Generate response to compare against: ${expectedFingerprint}`);
+    }
+    let sentFingerprint;
+    await page.route("**/api/scheduler/commit", (r) => {
+      const body = r.request().postDataJSON();
+      sentFingerprint = body && body.draft_fingerprint;
+      return r.fulfill({
+        status: 409,
+        contentType: "application/json",
+        body: JSON.stringify({
+          error: {
+            code: "concurrency_conflict",
+            message: "Mixed 0 vs Mixed 1 is already scheduled as Game "
+              + "game_stub_race — generate a fresh preview before "
+              + "committing again.",
+            details: {
+              reason: "pairing_already_scheduled",
+              home_team_id: "stub_home", away_team_id: "stub_away",
+              existing_game_id: "game_stub_race",
+            },
           },
-        },
-      }),
-    }));
+        }),
+      });
+    });
     await page.click("[data-sched-commit]");
     await page.waitForFunction(
       () => /Mixed 0 vs Mixed 1 is already scheduled as Game game_stub_race/
         .test((document.querySelector(".toast-msg") || {}).textContent || ""),
       null, { timeout: 10000 });
-    await page.waitForSelector("#sched-preview", { state: "detached", timeout: 10000 });
-    if (await page.locator("[data-sched-commit]").count()) {
-      fail("race stub: Commit must not be retryable without a fresh Generate");
+    // render() wipes #content to a loading skeleton SYNCHRONOUSLY, then does
+    // several awaited fetches before the real content replaces it -- so
+    // "#sched-preview detached" alone fires the moment the skeleton
+    // appears, not once the real re-render (with a fresh, uncommittable
+    // Generate-only state) has actually landed. Wait for that settled state
+    // directly instead.
+    await page.waitForFunction(
+      () => !document.querySelector("[data-sched-commit]")
+        && !!document.querySelector("[data-sched-generate]"),
+      null, { timeout: 10000 });
+    if (sentFingerprint !== expectedFingerprint) {
+      fail(`race stub: Commit must POST the exact previewed draft_fingerprint `
+        + `(${JSON.stringify(expectedFingerprint)}), got ${JSON.stringify(sentFingerprint)}`);
     }
     await page.unroute("**/api/scheduler/commit");
 
@@ -328,34 +360,81 @@ async function checkViewport(browser, viewport) {
     // message is actionable on its own (post()'s generic toast surfaces
     // error.message alone, never error.details), the stale preview is
     // cleared, and Commit cannot be retried without a fresh Generate.
+    //
+    // #328 review round 8 finding 3: same request-capture requirement as
+    // scenario (3) above -- prove app.js actually sent the previewed
+    // draft_fingerprint, not just that SOME request arrived.
+    //
+    // #328 review round 8 finding 4: triggered with a keyboard Enter (not a
+    // pointer click) on the focused Commit button, then asserts focus lands
+    // on Generate once the terminal error clears the stale preview --
+    // render() replaces #content wholesale, so the focused Commit button
+    // is simply removed from the DOM; nothing otherwise moves focus
+    // anywhere, silently dropping a keyboard user back to the document
+    // body even though the live-region toast (outside #content, so it
+    // survives) announced what to do next.
     await generateFor(page, ids.dMixed,
       '#sched-preview[data-games="4"][data-already-scheduled="2"]');
     s = await previewState(page);
     if (s.commitDisabled !== false) {
       fail(`stale-preview stub: needs an enabled Commit to click: ${JSON.stringify(s)}`);
     }
-    await page.route("**/api/scheduler/commit", (r) => r.fulfill({
-      status: 409,
-      contentType: "application/json",
-      body: JSON.stringify({
-        error: {
-          code: "concurrency_conflict",
-          message: "This preview is out of date — a game may have been "
-            + "added, cancelled, or otherwise changed since you "
-            + "generated it. Generate a fresh preview and review it "
-            + "before committing.",
-          details: { reason: "preview_stale" },
-        },
-      }),
-    }));
-    await page.click("[data-sched-commit]");
+    expectedFingerprint = await page.evaluate(
+      () => schedulerState.preview && schedulerState.preview.draft_fingerprint);
+    if (!expectedFingerprint) {
+      fail(`stale-preview stub: no draft_fingerprint on the Generate response to compare against: ${expectedFingerprint}`);
+    }
+    await page.route("**/api/scheduler/commit", (r) => {
+      const body = r.request().postDataJSON();
+      sentFingerprint = body && body.draft_fingerprint;
+      return r.fulfill({
+        status: 409,
+        contentType: "application/json",
+        body: JSON.stringify({
+          error: {
+            code: "concurrency_conflict",
+            message: "This preview is out of date — a game may have been "
+              + "added, cancelled, or otherwise changed since you "
+              + "generated it. Generate a fresh preview and review it "
+              + "before committing.",
+            details: { reason: "preview_stale" },
+          },
+        }),
+      });
+    });
+    await page.focus("[data-sched-commit]");
+    if (!(await page.evaluate(
+        () => document.activeElement.hasAttribute("data-sched-commit")))) {
+      fail("stale-preview stub: Commit must be focusable to trigger it via keyboard");
+    }
+    await page.keyboard.press("Enter");
     await page.waitForFunction(
       () => /This preview is out of date/
         .test((document.querySelector(".toast-msg") || {}).textContent || ""),
       null, { timeout: 10000 });
-    await page.waitForSelector("#sched-preview", { state: "detached", timeout: 10000 });
-    if (await page.locator("[data-sched-commit]").count()) {
-      fail("stale-preview stub: Commit must not be retryable without a fresh Generate");
+    // render() wipes #content to a loading skeleton SYNCHRONOUSLY, then does
+    // several awaited fetches before the real content (and the focus-restore
+    // this scenario checks for) replaces it -- so "#sched-preview detached"
+    // fires the moment the skeleton appears, long before the real re-render
+    // completes. Waiting for the fresh Generate-only state directly (no
+    // Commit button, since the preview was cleared) is true in neither the
+    // pre-click nor the skeleton DOM, only once the real re-render lands.
+    await page.waitForFunction(
+      () => !document.querySelector("[data-sched-commit]")
+        && !!document.querySelector("[data-sched-generate]"),
+      null, { timeout: 10000 });
+    if (sentFingerprint !== expectedFingerprint) {
+      fail(`stale-preview stub: Commit must POST the exact previewed draft_fingerprint `
+        + `(${JSON.stringify(expectedFingerprint)}), got ${JSON.stringify(sentFingerprint)}`);
+    }
+    const focusAfter = await page.evaluate(() => ({
+      hasGenerateAttr: document.activeElement
+        ? document.activeElement.hasAttribute("data-sched-generate") : false,
+      tag: document.activeElement ? document.activeElement.tagName : null,
+    }));
+    if (!focusAfter.hasGenerateAttr) {
+      fail(`stale-preview stub: focus must land on Generate after terminal `
+        + `recovery, not silently drop to <${focusAfter.tag}>: ${JSON.stringify(focusAfter)}`);
     }
     await page.unroute("**/api/scheduler/commit");
 

@@ -220,6 +220,92 @@ way as before (reverting the check order fails same-slot/overlapping-slot
 only; removing the pairing-identity guard entirely fails all three), and
 stress-run dozens of times with no flakiness observed.
 
+### Proving the rollback mechanism directly, not by inference (#328 review round 8 finding 2)
+
+Round 6's two-row batches (above) argue that the loser's own unique row
+gets tentatively written before the contested row fails: both facades lock
+every batch Team upfront via `_lock_teams`, *before* the per-row loop, so
+the losing side's `get_team_for_update` on the contested Team **blocks**
+(PostgreSQL `SELECT ... FOR UPDATE` waits — it does not fail) until the
+winner commits and releases it; only once unblocked does the loser's
+transaction proceed into its own per-row loop, where it necessarily reaches
+and writes its own unique row before reaching the contested one. That is a
+correct argument about the code's lock semantics, but the forced-race
+test's final-state assertion (the loser's unique slot back to `AVAILABLE`)
+cannot, by itself, distinguish "written, then rolled back" from "never
+attempted" — both look identical from outside a transaction that never
+commits.
+
+`test_scheduler.py`'s `test_league_scoped_later_row_failure_rolls_back_earlier_writes`
+(and its base-facade sibling) closes this by proving the mechanism
+directly instead of arguing it from lock semantics: it injects a failure
+on the *last* of six rows, and the injection point itself — running inside
+the very same transaction — queries the store to confirm each of the five
+earlier rows' Games and slot flips are already visible *before* raising the
+error that unwinds the whole transaction. No threads are needed for this;
+it is a direct, in-transaction observation of "written, then rolled back,"
+verified (by a throwaway probe during development, checking rows that
+provably had NOT yet been written) to correctly report absence when
+something genuinely isn't there yet, ruling out a vacuously-true check.
+
+### Revalidating `already_scheduled` under the lock (#328 review round 8/9)
+
+Everything above rechecks pairings in `proposal["draft_games"]` — the rows
+this commit is about to *write*. Nothing re-examined a row already
+classified `already_scheduled`, because the commit never writes it. That
+was a genuine gap: the wide `draft_fingerprint` gate (below) only catches
+drift that had *already happened* by the moment this method's own
+`draft_season_schedule()` regeneration ran, at the very top of the
+function, before any lock. If the Game blocking an `already_scheduled` row
+was cancelled in the narrow window *after* that regeneration/fingerprint
+compare but *before* this transaction's locks were taken, the commit
+proceeded — the reviewed batch it wrote was accurate as of a moment that
+had already passed, and the pairing that just became genuinely open was
+silently left unscheduled with no error.
+
+The fix mirrors the existing `_existing_now` recheck rather than adding a
+new mechanism: `_existing_pairing_games`'s scope now also covers every
+`already_scheduled` row's `(league_season_id, division_id)`, and — using
+that same locked snapshot — each `already_scheduled` row's
+`existing_game_id` is compared against what the fresh read actually finds
+for its pairing. A mismatch (the Game vanished — cancelled — or a
+different Game now occupies that pairing) raises the terminal
+`preview_stale`, exactly like any other form of drift, **before** the
+per-row `draft_games` loop below it runs — so this check is fail-fast:
+zero rows are ever written on this path, not a partial batch that then
+rolls back.
+
+This recheck is only genuinely race-free, not just incidentally so, if a
+concurrent write touching an `already_scheduled` row's Teams is forced to
+serialize against it. The existing Team lock (`_lock_teams`) previously
+covered only `draft_games`' teams; it now also covers `already_scheduled`
+rows' teams, so a Team that appears *exclusively* in an `already_scheduled`
+row (never in any `draft_games` row) is locked by this commit too, matching
+the same guarantee `draft_games` teams already had.
+
+Pinned by a forced two-session PostgreSQL race
+(`test_placement_concurrency.py`,
+`_AlreadyScheduledCancelRaceMixin` and its two facade subclasses): one
+session cancels the `already_scheduled` row's blocking Game; the other
+commits a frozen mixed proposal (two genuinely-missing rows plus that one
+`already_scheduled` row) whose blocked pairing's Teams appear in no
+`draft_games` row at all — the specific shape the review asked for,
+proving the Team-lock gap directly. A plain barrier-released race is not
+enough to prove this: `cancel_game`'s path to its lock is far shorter than
+`commit_draft_schedule`'s, so in practice the cancellation always finishes
+first regardless of whether the fix is present — a build with the
+revalidation removed entirely still passed a naively-asserted version of
+this race every time, because "commit succeeds" looks identical whether
+that success was legitimately fresh or blindly unconditional. The race
+therefore forces the ordering explicitly: the commit thread's own
+`_existing_pairing_games` call is monkeypatched to wait on an event the
+cancel thread sets only after its cancellation has committed, guaranteeing
+the commit's locked read happens strictly after. With that forced, exactly
+one outcome is correct — terminal `preview_stale`, zero writes — and the
+test asserts precisely that. Falsifiable: with the revalidation loop
+removed, this forced version fails 100% of the time (confirmed
+repeatedly), where the unforced version incorrectly passed every time.
+
 ## Preview binding: the commit-to-preview staleness gate (#328 review round 5)
 
 The commit-time recheck above closes a *narrow* race: the gap between this

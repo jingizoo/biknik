@@ -31,6 +31,8 @@ from helpers import BACKEND, commit_fresh_draft  # noqa: F401  (BACKEND: sys.pat
 
 from hockey_scheduler.api import ApiService
 from hockey_scheduler.api.service import ApiService as BaseApiService
+import hockey_scheduler.api.service as base_service_module
+import hockey_scheduler.api.league_scoped_service as league_scoped_service_module
 from hockey_scheduler.domain import (
     Organization, Program, Season, League, LeagueSeason, Division, Venue,
     SeasonVenueAccess, Rink, Team, SeasonTeamRegistration, IceSlot,
@@ -1176,15 +1178,30 @@ def _multi_row_proposal(store, unique_pairing, unique_slot, contested_slot,
                         token):
     """Two-row frozen proposal (#328 review round 6): row[0] a pairing
     UNIQUE to this side (never touched by the other side), row[1] the
-    pairing BOTH sides contest, on ``contested_slot``. Whichever side loses
-    the Team-lock race for the contested pairing has therefore ALREADY
-    tentatively created row[0]'s Game within the SAME (about-to-roll-back)
-    transaction -- proving the loser's rollback covers the whole batch, not
-    merely the contested row -- symmetrically, regardless of which side
-    actually loses. ``token`` is an arbitrary fingerprint: both the
-    monkeypatched ``draft_season_schedule`` and the ``commit_draft_schedule``
-    call below use the SAME frozen object, so the round-5 preview-binding
-    check trivially matches without needing a real hash."""
+    pairing BOTH sides contest, on ``contested_slot``.
+
+    Both facades lock every batch Team upfront via ``_lock_teams``, BEFORE
+    entering the per-row loop -- so the losing side's ``get_team_for_update``
+    on the contested Team blocks (PostgreSQL ``SELECT ... FOR UPDATE`` waits,
+    it does not fail) until the winner commits and releases it. Once
+    unblocked, the loser's transaction proceeds through the REST of its lock
+    acquisition and then its own per-row loop exactly as any other commit
+    would -- so it reaches and tentatively writes row[0] (its own unique
+    pairing, never touched by the winner) before reaching the contested
+    row[1] and failing there. This test's final-state assertion (row[0]'s
+    slot back to AVAILABLE) is consistent with -- and, given the blocking
+    (not failing) lock semantics above, can only be explained by -- that
+    write having happened and then rolled back; #328 review round 8 finding
+    2 asked for this to be shown directly rather than argued from final
+    state alone, which ``test_scheduler.py``'s
+    ``test_league_scoped_later_row_failure_rolls_back_earlier_writes`` (and
+    its base-facade sibling) now does, by observing an earlier row's
+    Game/slot from WITHIN the same transaction immediately before an
+    injected failure unwinds it. ``token`` is an arbitrary fingerprint: both
+    the monkeypatched ``draft_season_schedule`` and the
+    ``commit_draft_schedule`` call below use the SAME frozen object, so the
+    round-5 preview-binding check trivially matches without needing a real
+    hash."""
     row0 = _hand_row(store, unique_pairing[0], unique_pairing[1], "d1",
                      unique_slot)
     row1 = _hand_row(store, "t0", "t3", "d1", contested_slot)
@@ -1432,6 +1449,178 @@ class PostgresBaseApiPairingRaceOverlappingSlotTest(
     """Exercises the BASE facade's OWN commit_draft_schedule — not reached
     in production, but both implementations fully reimplement the commit
     body, so both must independently enforce the same priority."""
+
+    def _api_cls(self):
+        return BaseApiService
+
+
+# -- already_scheduled revalidation vs a concurrent cancel (#328 review
+# round 8/9) -----------------------------------------------------------
+def _already_scheduled_cancel_race_proposal(store):
+    """Mixed frozen proposal: two hand-built MISSING rows (t0-vs-t3 on s0,
+    t1-vs-t2 on s1) plus one ALREADY-SCHEDULED entry (t4-vs-t5, Game
+    "blocking_game" on s4) whose Teams (t4, t5) are entirely ABSENT from
+    the draft_games rows above -- before the round 8/9 Team-lock fix,
+    neither Team would have been locked by this commit at all, per the
+    review's specific ask for a fixture proving that gap."""
+    row0 = _hand_row(store, "t0", "t3", "d1", "s0")
+    row1 = _hand_row(store, "t1", "t2", "d1", "s1")
+    already = [{
+        "home_team_id": "t4", "away_team_id": "t5",
+        "home_team_name": store.get_team("t4").name,
+        "away_team_name": store.get_team("t5").name,
+        "division_id": "d1", "existing_game_id": "blocking_game",
+    }]
+    return {
+        "division_id": "d1", "season_id": "se1", "league_id": "lg",
+        "team_count": 6, "draft_games": [row0, row1], "unscheduled": [],
+        "already_scheduled": already, "unschedulable_teams": [],
+        "draft_fingerprint": "token-already-scheduled-cancel-race",
+    }
+
+
+def _run_already_scheduled_cancel_vs_commit_race(testcase):
+    """Forced two-session race: one session cancels the already_scheduled
+    row's blocking Game; the other commits the frozen proposal above, which
+    reviewed that Game as still active.
+
+    A plain barrier-released race is NOT enough here: ``cancel_game``'s
+    code path to its Season lock is far shorter than
+    ``commit_draft_schedule``'s (Program/Team/Rink locks, policy-scope
+    verification, LeagueSeason resolution all run first), so in practice
+    the cancellation always finishes long before the commit even attempts
+    its own locks -- empirically confirmed 20/20 with the round 8/9 fix
+    applied. Observing the final state alone then CANNOT distinguish "the
+    commit correctly detected the already-landed cancellation" from "the
+    commit never looks at the already_scheduled row at all" -- both look
+    like an unconditional refusal from outside, and a broken build with
+    the revalidation loop removed entirely still passed this race 5/5 times
+    when it only asserted on whichever outcome happened to occur.
+
+    So the ordering is FORCED explicitly: ``run_cancel`` sets
+    ``cancel_committed`` only after its cancellation call returns (i.e.
+    after it has committed), and the commit thread's OWN
+    ``_existing_pairing_games`` call -- the exact read the round 8/9
+    revalidation depends on -- is monkeypatched to wait on that event
+    before running for real. This guarantees the commit's locked read
+    happens strictly after the cancellation, so the ONLY correct outcome
+    is a refusal; any success proves the revalidation is missing or
+    reading stale state."""
+    store = testcase._store()
+    _add_extra_teams(store)
+    slot4 = store.get_ice_slot("s4")
+    store.add_game(Game(
+        id="blocking_game", home_team_id="t4", away_team_id="t5",
+        start_time=slot4.start_time, end_time=slot4.end_time,
+        ice_slot_id="s4", division_id="d1", season_id="se1", league_id="lg",
+        league_season_id="ls1"))
+    slot4.status = IceSlotStatus.ALLOCATED
+    store.save_ice_slot(slot4)
+    proposal = _already_scheduled_cancel_race_proposal(store)
+
+    target_module = (
+        league_scoped_service_module if testcase._api_cls() is ApiService
+        else base_service_module)
+    real_existing_pairing_games = target_module._existing_pairing_games
+    cancel_committed = threading.Event()
+
+    def _synced_existing_pairing_games(*args, **kwargs):
+        if not cancel_committed.wait(timeout=10):
+            raise AssertionError(
+                "cancel_game never completed -- race harness stalled")
+        return real_existing_pairing_games(*args, **kwargs)
+
+    def run_commit(a):
+        target_module._existing_pairing_games = _synced_existing_pairing_games
+        a.draft_season_schedule = lambda *args, **kw: proposal
+        try:
+            return a.commit_draft_schedule(
+                division_id="d1",
+                draft_fingerprint=proposal["draft_fingerprint"])
+        finally:
+            target_module._existing_pairing_games = real_existing_pairing_games
+
+    def run_cancel(a):
+        result = a.cancel_game("blocking_game")
+        cancel_committed.set()
+        return result
+
+    out = testcase._run([run_commit, run_cancel])
+    return out, proposal
+
+
+def _assert_already_scheduled_cancel_race_terminal(testcase, out, proposal):
+    """Shared assertion: the cancellation is FORCED (see
+    ``_run_already_scheduled_cancel_vs_commit_race``) to commit before the
+    commit thread's locked already_scheduled revalidation reads current
+    state, so there is exactly one correct outcome -- the commit MUST
+    refuse with terminal ``preview_stale`` and write nothing at all (that
+    check runs before either row is written, so this is a fail-fast
+    guarantee, stronger than write-then-rollback, not a substitute for it).
+    The cancellation itself always succeeds regardless (nothing blocks an
+    idempotent state flip on a valid Game).
+
+    Falsifiable: with the round 8/9 already_scheduled revalidation loop
+    removed, this test fails -- the commit succeeds unconditionally
+    (creates both rows) even though the forced ordering guarantees the
+    cancellation had already landed, because nothing re-examines the
+    already_scheduled row at all. Confirmed by temporarily disabling that
+    loop: this test fails 5/5 where the unforced version above (accepting
+    either outcome) incorrectly passed 5/5."""
+    testcase._assert_no_crash(out)
+    commit_result, cancel_result = out[0], out[1]
+    testcase.assertNotIn("error", cancel_result, repr(out))
+    store = testcase._store()
+    blocking = store.get_game("blocking_game")
+    testcase.assertTrue(blocking.cancelled, repr(out))
+    testcase.assertIn("error", commit_result, repr(out))
+    testcase.assertEqual(
+        commit_result["error"]["details"]["reason"], "preview_stale",
+        repr(out))
+    d1_games = [g for g in store.all_games() if g.division_id == "d1"]
+    testcase.assertEqual([g.id for g in d1_games], ["blocking_game"],
+                        repr(out))
+    for row in proposal["draft_games"]:
+        testcase.assertEqual(
+            store.get_ice_slot(row["ice_slot_id"]).status.value,
+            "available", repr(out))
+    committed_audits = [a for a in store.all_setup_audit()
+                        if a.action == "draft_schedule_committed"]
+    testcase.assertEqual(len(committed_audits), 0, repr(out))
+    testcase._assert_schedule_consistent(store)
+
+
+class _AlreadyScheduledCancelRaceMixin(_ForcedRaceHarnessMixin):
+    """Forced two-session race (#328 review round 8/9): a concurrent cancel
+    of an already_scheduled row's blocking Game, forced to commit BEFORE
+    the commit thread's own locked revalidation reads current state, so the
+    only correct outcome is a refusal. See
+    ``_run_already_scheduled_cancel_vs_commit_race`` for the fixture and
+    why a plain (unforced) barrier race can't distinguish this from a
+    missing check, and ``_assert_already_scheduled_cancel_race_terminal``
+    for the single required outcome."""
+
+    def test_cancel_vs_commit_never_persists_a_stale_already_scheduled_batch(
+            self):
+        out, proposal = _run_already_scheduled_cancel_vs_commit_race(self)
+        _assert_already_scheduled_cancel_race_terminal(self, out, proposal)
+
+
+@unittest.skipUnless(os.environ.get("TEST_DATABASE_URL"),
+                     "PostgreSQL required (set TEST_DATABASE_URL)")
+class PostgresLeagueScopedAlreadyScheduledCancelRaceTest(
+        _AlreadyScheduledCancelRaceMixin, unittest.TestCase):
+    """Exercises the LEAGUE-SCOPED commit_draft_schedule."""
+    # _api_cls() inherited default (the league-scoped ApiService).
+
+
+@unittest.skipUnless(os.environ.get("TEST_DATABASE_URL"),
+                     "PostgreSQL required (set TEST_DATABASE_URL)")
+class PostgresBaseApiAlreadyScheduledCancelRaceTest(
+        _AlreadyScheduledCancelRaceMixin, unittest.TestCase):
+    """Exercises the BASE facade's OWN commit_draft_schedule — not reached
+    in production, but both implementations fully reimplement the commit
+    body, so both must independently enforce the same guarantee."""
 
     def _api_cls(self):
         return BaseApiService
