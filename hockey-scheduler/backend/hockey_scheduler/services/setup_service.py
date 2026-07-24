@@ -2808,9 +2808,11 @@ class SetupService:
             tz = self._curfew_timezone(slot.rink_id, season_id)
             start_local = slot.start_time.astimezone(tz)
             # The anchor rule lives in ice_availability.curfew_instant — ONE
-            # implementation shared with the scheduler advisory, defining the
-            # operating day relative to the curfew itself (#318 review) and
-            # resolving spring-forward-skipped wall times deterministically.
+            # implementation shared with the scheduler advisory AND the
+            # import advisories (ingest warnings and placement enforcement
+            # can never disagree), defining the operating day relative to
+            # the curfew itself (#318 review) and resolving spring-forward-
+            # skipped wall times deterministically.
             curfew_at = curfew_instant(start_local, hour, minute)
             # Compare INSTANTS, not wall clocks: Python compares two aware
             # datetimes sharing one tzinfo by their naive values (fold
@@ -3069,6 +3071,50 @@ class SetupService:
         # order is fixed by the (identical) template + inventory, sort_keys
         # canonicalizes the rest.
         classified = self._classify_ice_windows(accessible, plan)
+        # #277 Slice B — advisory: warn per rink only when this template
+        # ACTUALLY generates a consecutive pair whose real gap is below the
+        # rink's effective directional requirement (the earlier row's
+        # resurfacing + the later row's warm-up — one policy, the builder's
+        # own Season, governs both generated rows), naming the worst
+        # offending pair and its gap so the operator can fix the template
+        # before committing ice the placement gate will half-refuse.
+        # Computed from the REAL sorted generated intervals per rink/date —
+        # two far-apart windows on one day stay silent, and a gap exactly
+        # equal to the requirement is compliant (half-open, like the gate).
+        # Lives inside the reviewed payload, so it is fingerprint-bound like
+        # every other reviewed field: setting or clearing such a policy
+        # after preview moves the token and forces a re-preview.
+        policy_notes = []
+        _by_rink_day = {}
+        for c in classified:
+            _by_rink_day.setdefault((c["rink_id"], c["date"]), []).append(c)
+        for rink, _venue in accessible:
+            values, _src = self._effective_policy(rink.id, season.id)
+            required = ((values["resurfacing_minutes"] or 0)
+                        + (values["warmup_minutes"] or 0))
+            if required <= 0:
+                continue
+            worst = None
+            for (rid, _d), rows in _by_rink_day.items():
+                if rid != rink.id or len(rows) < 2:
+                    continue
+                rows = sorted(rows, key=lambda r: r["start"])
+                for prev, nxt in zip(rows, rows[1:]):
+                    gap = int((nxt["start"] - prev["end"]).total_seconds()
+                              // 60)
+                    if 0 <= gap < required and (worst is None
+                                                or gap < worst["gap"]):
+                        worst = {"gap": gap, "prev": prev, "nxt": nxt}
+            if worst is not None:
+                policy_notes.append({
+                    "rink_id": rink.id, "rink_name": rink.name,
+                    "date": worst["prev"]["date"],
+                    "pair_end_local": worst["prev"]["end_local"],
+                    "pair_next_start_local": worst["nxt"]["start_local"],
+                    "gap_minutes": worst["gap"],
+                    "required_gap_minutes": required,
+                    "template_turnover_minutes": turnover_minutes,
+                    "policy_buffer_minutes": required})
         base = {
             "season": season, "tz": tz, "d_start": d_start, "d_end": d_end,
             "weekday_set": weekday_set,
@@ -3078,6 +3124,7 @@ class SetupService:
             "plan": plan, "accessible": accessible,
             "access_missing": access_missing,
             "classified": classified,
+            "policy_notes": policy_notes,
         }
         base["fingerprint"] = hashlib.sha256(json.dumps(
             self._reviewed_preview_payload(base),
@@ -3231,6 +3278,7 @@ class SetupService:
             "dst_skipped": plan["dst_skipped"],
             "dst_ambiguous": plan["dst_ambiguous"],
             "venue_access_missing": r["access_missing"],
+            "policy_notes": r["policy_notes"],
         }
 
     def _ice_availability_response(self, r):
@@ -6074,7 +6122,10 @@ class SetupService:
         22:30-23:30 against a committed 22:00-23:00) from leaving both rows
         alive (#158 review).
         """
-        result = validate_import(sheets)
+        # #277 Slice B: store-aware, so the ingest policy advisories
+        # (sliver / sub-buffer gap / past-curfew warnings) surface on COMMIT
+        # too, not just the dry-run — warnings never block the commit.
+        result = validate_import(sheets, store=self.store)
         if not result["ok"]:
             return {"committed": False, "summary": result["summary"],
                     "errors": result["errors"], "warnings": result["warnings"]}

@@ -33,6 +33,7 @@
     "player-edit": "node player-edit.js",
     "player-lifecycle": "node player-lifecycle.js",
     "season-dates": "node season-dates.js",
+    "scheduling-policy": "node scheduling-policy.js",
     "season-fmt-unit": "node season-fmt-unit.js"
   },
   "devDependencies": {

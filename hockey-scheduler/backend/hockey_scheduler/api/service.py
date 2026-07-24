@@ -7,7 +7,7 @@ web framework) never see Python tracebacks across the boundary.
 """
 
 from dataclasses import asdict, is_dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Callable, List, Optional
 
@@ -2687,15 +2687,53 @@ class ApiService:
                 "start_time": g.start_time.isoformat() if g.start_time else None,
                 "is_draft": g.is_draft, "published": g.published}
 
+    def _reserved_span(self, slot, game, policy_cache) -> Optional[dict]:
+        """#277 Slice B — the derived reserved facility span around a slot
+        HOSTING a game: warm-up before + resurfacing after, from the
+        effective Rink>Season>Program policy resolved via the hosting
+        game's OWN season (cached per (rink, season) in the caller's
+        per-request dict). Committed drafts reserve ice exactly like
+        published games — the placement gate counts them — while a free
+        slot, a cancelled game, and a zero-buffer policy all stay ``None``:
+        the calendar and the review views paint real blocked ice, never a
+        guess about a future booking's season. ONE derivation shared by the
+        operator calendar, the schedule rows, and the draft-review rows, so
+        the surfaces cannot disagree."""
+        if (slot is None or game is None or game.cancelled
+                or not game.season_id):
+            return None
+        key = (slot.rink_id, game.season_id)
+        if key not in policy_cache:
+            policy_cache[key] = self.setup._effective_policy(*key)[0]
+        values = policy_cache[key]
+        warmup = values["warmup_minutes"] or 0
+        resurf = values["resurfacing_minutes"] or 0
+        if not warmup and not resurf:
+            return None
+        return {
+            "warmup_minutes": warmup,
+            "resurfacing_minutes": resurf,
+            "reserved_start_time":
+                (slot.start_time - timedelta(minutes=warmup)).isoformat(),
+            "reserved_end_time":
+                (slot.end_time + timedelta(minutes=resurf)).isoformat(),
+        }
+
     # A roster in either of these states is ready to play — the same bar the
     # operator dashboard's gameTriage() already holds games to client-side;
     # kept here as the single source of truth for the review issue below.
     _ROSTER_READY_STATUSES = frozenset({"roster_confirmed", "locked"})
 
-    def _draft_review_row(self, g, slot_games: dict, double_booked: bool) -> dict:
+    def _draft_review_row(self, g, slot_games: dict, double_booked: bool,
+                          policy_cache=None) -> dict:
         """Enriched per-draft-game row for the scheduler review screen (#106):
         officials/roster posture and any review issues, so an operator can
-        spot problems before publishing rather than discovering them after."""
+        spot problems before publishing rather than discovering them after.
+        Carries the same derived ``reserved`` span as the operator calendar
+        (#277 Slice B) — a committed draft physically blocks warm-up +
+        resurfacing ice, and the review screen must show it."""
+        if policy_cache is None:
+            policy_cache = {}
         div = self.store.get_division(g.division_id) if g.division_id else None
         slot = self.store.get_ice_slot(g.ice_slot_id) if g.ice_slot_id else None
         active = self._active_officials(g.id)
@@ -2726,6 +2764,7 @@ class ApiService:
             "is_draft": g.is_draft, "published": g.published,
             "officials_assigned": len(active), "officials_accepted": accepted,
             "roster_status": roster_status, "issues": issues,
+            "reserved": self._reserved_span(slot, g, policy_cache),
         }
 
     def _guard_active_seasons(self, season_ids) -> None:
@@ -2965,7 +3004,9 @@ class ApiService:
                         return True
             return False
 
-        rows = [self._draft_review_row(g, slot_games, is_double_booked(g))
+        _pcache = {}  # (rink, season) -> effective policy, one per request
+        rows = [self._draft_review_row(g, slot_games, is_double_booked(g),
+                                       policy_cache=_pcache)
                 for g in drafts]
         rows.sort(key=lambda r: r["start_time"] or "")
 
@@ -3205,10 +3246,25 @@ class ApiService:
 
         # Draft games (#86) are proposals under review — they must never surface
         # in the operator slot grid / schedule / calendar until published, so
-        # they are excluded here. The dedicated draft-review view lists them.
+        # they are excluded from the LABELS here. The dedicated draft-review
+        # view lists them.
         game_by_slot = {g.ice_slot_id: g for g in self.store.all_games()
                         if g.ice_slot_id and not g.is_draft}
+        # Reserved ice, however, is PHYSICAL (#277 Slice B review): an active
+        # committed draft blocks warm-up/resurfacing facility time exactly
+        # like a published game — the placement gate counts it — so the
+        # reserved derivation looks at EVERY active occupant while the grid
+        # label above stays published-only.
+        occupant_by_slot = {g.ice_slot_id: g for g in self.store.all_games()
+                            if g.ice_slot_id and not g.cancelled}
         slot_rows = []
+        # #277 Slice B — reserved-vs-playable visibility: a slot's stored span
+        # is PLAYABLE time; the derived reserved facility span around a
+        # hosting game comes from ONE shared helper (_reserved_span, also
+        # used by the schedule and draft-review rows below/elsewhere), so
+        # the operator surfaces cannot disagree.
+        _policy_cache = {}
+
         for s in sorted(self.store.all_ice_slots(),
                         key=lambda x: (x.rink_id, x.start_time)):
             g = game_by_slot.get(s.id)
@@ -3221,6 +3277,8 @@ class ApiService:
                 "game_id": g.id if g else None,
                 "game_label": f"{team_name(g.home_team_id)} vs "
                               f"{team_name(g.away_team_id)}" if g else None,
+                "reserved": self._reserved_span(
+                    s, occupant_by_slot.get(s.id), _policy_cache),
             })
 
         schedule, public_fixtures = [], []
@@ -3256,6 +3314,9 @@ class ApiService:
                     1 for a in g_active if a.status.value == "accepted"),
                 # Result lifecycle for the operations checklist (#31): None/draft/final.
                 "result_status": g_result.status.value if g_result else None,
+                # #277 Slice B — the schedule review shows the same derived
+                # reserved span as the calendar (one shared derivation).
+                "reserved": self._reserved_span(slot, g, _policy_cache),
             })
             # PUBLIC: only PUBLISHED games, fixture info only — no players/PII.
             if g.published and not g.cancelled:

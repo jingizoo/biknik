@@ -554,6 +554,13 @@ select.player-picker {
 
 /* Users / sessions admin (#78). */
 p.muted { color: var(--muted); font-size: 13px; }
+
+/* #277: a hosted slot's reserved facility span (warm-up + resurfacing)
+   around its playable time — on the Day board's slot cards, the scheduler
+   review rows, and the Games review detail (one backend derivation). */
+.slot-card .slot-reserved, .li .slot-reserved,
+.games-detail .slot-reserved {
+  color: var(--muted); font-size: 12px; }
 .row-list { display: flex; flex-direction: column; gap: 6px; }
 .row-btn { display: flex; flex-direction: column; align-items: flex-start; gap: 2px;
   background: #fff; border: 1px solid var(--line); border-radius: 8px;

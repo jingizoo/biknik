@@ -31,8 +31,9 @@ class ApiService(_BaseApiService):
         return row
 
     def _draft_review_row(self, game, slot_games: dict,
-                          double_booked: bool) -> dict:
-        row = super()._draft_review_row(game, slot_games, double_booked)
+                          double_booked: bool, policy_cache=None) -> dict:
+        row = super()._draft_review_row(game, slot_games, double_booked,
+                                        policy_cache=policy_cache)
         try:
             require_game_league_id(self.store, game)
             require_slot_belongs_to_season(
