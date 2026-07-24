@@ -1107,5 +1107,73 @@ class PostgresBaseApiDraftParticipationRaceTest(
         return BaseApiService
 
 
+class _PairingDuplicationRaceMixin(_ForcedRaceHarnessMixin):
+    """Forced two-session race (#206 slice 1): two draft commits for the SAME
+    Division, each restricted (via ``slot_ids``) to its own single ice slot,
+    the two slots far enough apart in time that they never conflict. Both
+    proposals are generated before either transaction opens, so both
+    independently target the SAME first round-robin pairing — one on each
+    session's own slot. Whichever session acquires the shared Team lock
+    first commits that pairing normally; the loser's per-row check
+    (``_assert_slot_free_for_game``) sees a genuinely free, non-conflicting
+    slot and would have silently persisted a SECOND Game for the identical
+    pairing were it not for the fresh commit-time recheck added by #206 —
+    that recheck raises ``placement_raced``, and the retry shell's automatic
+    regeneration (which now excludes the newly-real pairing via scheduler.py's
+    ``already_scheduled`` split) fills the loser's slot with a genuinely
+    still-missing pairing instead.
+
+    Falsifiable both ways: drop the commit-time recheck in
+    ``_commit_draft_schedule_attempt`` and the loser silently duplicates the
+    winner's pairing on its own slot (this test's "2 distinct pairings"
+    assertion fails); drop the ``already_scheduled`` exclusion in
+    scheduler.py and the loser's every retry reproduces the identical
+    conflict, exhausting the retry shell's 3 attempts and surfacing a raw
+    ``placement_raced`` error instead of resolving automatically (this
+    test's "no error" assertion fails)."""
+
+    def test_two_single_slot_draft_commits_never_duplicate_a_pairing(self):
+        out = self._run([
+            lambda a: a.commit_draft_schedule("d1", slot_ids=["s0"]),
+            lambda a: a.commit_draft_schedule("d1", slot_ids=["s3"]),
+        ])
+        self._assert_no_crash(out)
+        for res in out:
+            self.assertNotIn("error", res, repr(out))
+            self.assertEqual(len(res["created"]), 1, repr(out))
+        store = self._store()
+        games = [g for g in store.all_games()
+                 if not g.cancelled and g.division_id == "d1"]
+        self.assertEqual(len(games), 2, repr(out))
+        pairings = {frozenset((g.home_team_id, g.away_team_id)) for g in games}
+        self.assertEqual(len(pairings), 2,
+                         f"same pairing scheduled twice: {out!r}")
+        self._assert_schedule_consistent(store)
+
+
+@unittest.skipUnless(os.environ.get("TEST_DATABASE_URL"),
+                     "PostgreSQL required (set TEST_DATABASE_URL)")
+class PostgresLeagueScopedPairingDuplicationRaceTest(
+        _PairingDuplicationRaceMixin, unittest.TestCase):
+    """Exercises the LEAGUE-SCOPED commit_draft_schedule (api/
+    league_scoped_service.py) — the implementation production actually
+    runs."""
+    # _api_cls() inherited default (the league-scoped ApiService).
+
+
+@unittest.skipUnless(os.environ.get("TEST_DATABASE_URL"),
+                     "PostgreSQL required (set TEST_DATABASE_URL)")
+class PostgresBaseApiPairingDuplicationRaceTest(
+        _PairingDuplicationRaceMixin, unittest.TestCase):
+    """Exercises the BASE facade's OWN commit_draft_schedule (api/
+    service.py) — not reached in production (the league-scoped override
+    always wins method resolution), but both implementations fully
+    reimplement the commit body, so both must independently enforce the
+    same #206 slice 1 invariant."""
+
+    def _api_cls(self):
+        return BaseApiService
+
+
 if __name__ == "__main__":
     unittest.main()

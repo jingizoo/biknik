@@ -8,7 +8,8 @@ stale or legacy row cannot bypass the same league-ice invariant.
 from datetime import datetime
 
 from ..domain import Game, IceSlotStatus
-from ..domain.errors import DomainError, ValidationError
+from ..domain.errors import ConcurrencyConflictError, DomainError, ValidationError
+from ..services.scheduler import _existing_pairing_games
 from ..services.league_scope import (
     require_game_league_id,
     require_slot_belongs_to_season,
@@ -164,6 +165,27 @@ class ApiService(_BaseApiService):
             # participant. Reuses the identical check create_game enforces.
             self.setup._require_batch_team_participation(
                 resolved_season_id, draft_ls_id, proposal["draft_games"])
+            # #206 slice 1 — freshly computed HERE, under the Team locks just
+            # acquired, so the read is race-free against any other writer
+            # touching these exact teams. Checked per row BELOW, only after
+            # that row's own slot/team-overlap check succeeds: those existing
+            # checks (physical feasibility — can these teams+ice coexist
+            # right now) keep priority when a row happens to trip both, same
+            # as the base facade's commit override and manual create/move;
+            # this is a residual check for what they structurally can't see
+            # — a genuinely free, non-conflicting slot proposed for a
+            # pairing that already has a real Game elsewhere, created by a
+            # concurrent write between this proposal's generation and this
+            # commit (the proposal already excluded pairings that existed AT
+            # PREVIEW time — scheduler.py's already_scheduled split — so
+            # only such a race can slip one through here). A hit is the same
+            # kind of staleness `placement_raced` already covers: the base
+            # facade's retry shell (inherited, undecorated here) regenerates
+            # a fresh proposal that correctly excludes the now-existing
+            # pairing.
+            _existing_now = _existing_pairing_games(
+                self.store,
+                {row.get("division_id") for row in proposal["draft_games"]})
             for row in proposal["draft_games"]:
                 # #277: run the SAME final conflict check as create_game /
                 # move_game before persisting — slot free (exists, GAME,
@@ -180,6 +202,15 @@ class ApiService(_BaseApiService):
                 slot = self.setup._assert_slot_free_for_game(
                     row["ice_slot_id"], row["home_team_id"], row["away_team_id"],
                     season_id=resolved_season_id)
+                if frozenset((row["home_team_id"], row["away_team_id"])) \
+                        in _existing_now:
+                    raise ConcurrencyConflictError(
+                        "This pairing was scheduled by another request "
+                        "while this draft was being committed; please "
+                        "retry.",
+                        {"reason": "placement_raced",
+                         "home_team_id": row["home_team_id"],
+                         "away_team_id": row["away_team_id"]})
                 game = Game(
                     id=self.store.next_id("game"),
                     home_team_id=row["home_team_id"],

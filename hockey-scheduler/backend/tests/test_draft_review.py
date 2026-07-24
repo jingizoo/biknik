@@ -167,6 +167,48 @@ class DraftReviewServiceTest(unittest.TestCase):
         self.assertEqual([a for a in self.store.all_setup_audit()
                           if a.action == "draft_schedule_committed"], [])
 
+    def test_commit_rejects_a_pairing_that_already_has_a_real_game(self):
+        # #206 slice 1: the commit-time guard catches the residual case the
+        # existing team_overlap/slot checks structurally can't see -- a
+        # genuinely free, non-conflicting slot proposed for a pairing that
+        # already has a real Game elsewhere on the schedule (created by a
+        # concurrent commit between this proposal's generation and this
+        # one). Picking the LAST row (not the first) proves the earlier
+        # rows' slot allocations roll back too -- not merely that the bad
+        # row itself is skipped -- matching
+        # test_commit_rejects_and_rolls_back_a_conflicting_proposal above.
+        proposal = self.api.draft_season_schedule("d")
+        rows = proposal["draft_games"]
+        self.assertEqual(len(rows), 6)
+        row = rows[-1]
+        # An existing Game for the SAME pairing, on a different rink far from
+        # any proposed slot's time -- so the older team_overlap/slot checks
+        # stay silent and only the new pairing-existence guard fires.
+        far_start = datetime(2025, 1, 1, 18, tzinfo=UTC)
+        self.store.add_rink(Rink(id="r2", venue_id="v", name="Aux"))
+        self.store.add_ice_slot(IceSlot(id="far_slot", rink_id="r2",
+                                        start_time=far_start,
+                                        end_time=far_start + timedelta(hours=1)))
+        self.store.add_game(Game(
+            id="existing", home_team_id=row["home_team_id"],
+            away_team_id=row["away_team_id"], start_time=far_start,
+            end_time=far_start + timedelta(hours=1), ice_slot_id="far_slot",
+            division_id="d", season_id="se", league_id="lg"))
+        self.api.draft_season_schedule = lambda *a, **k: proposal
+        res = self.api.commit_draft_schedule("d")
+        self.assertIn("error", res)
+        self.assertEqual(res["error"]["details"]["reason"], "placement_raced")
+        # Atomic rollback: no draft games created, no batch audit written,
+        # every slot the loop had already flipped is back to AVAILABLE; only
+        # the pre-seeded existing game remains.
+        self.assertEqual([g for g in self.store.all_games() if g.is_draft], [])
+        for r in rows:
+            self.assertEqual(
+                self.store.get_ice_slot(r["ice_slot_id"]).status,
+                IceSlotStatus.AVAILABLE, r["ice_slot_id"])
+        self.assertEqual([a for a in self.store.all_setup_audit()
+                          if a.action == "draft_schedule_committed"], [])
+
     def test_publish_makes_drafts_public(self):
         self.api.commit_draft_schedule("d")
         res = self.api.publish_draft_games(all_drafts=True)

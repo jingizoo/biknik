@@ -1456,6 +1456,15 @@ class _DirectionalBufferContract:
         self.assertNotIn("error", g2, g2)
         mv = self.api.move_game(g2["id"], "sB")
         self.assertEqual(_reason(mv), "turnover_buffer_conflict", mv)
+        # A third team (#206 slice 1): d2's only pairing (u0 vs u1) already
+        # has a real game (g2), so the scheduler would otherwise find
+        # nothing left to (re)propose against sB -- a genuinely open pairing
+        # is needed to exercise the advisory/commit gate below.
+        self.store.add_team(Team(id="u2", name="U2", division_id="d2",
+                                 program_id="pg", league_id="lg"))
+        self.store.add_season_team_registration(SeasonTeamRegistration(
+            id="reg2_u2", league_season_id="ls2", team_id="u2",
+            division_id="d2", active=True))
         # draft-commit + scheduler advisory (same shared implementation):
         # an se2 draft over sB reports the code instead of proposing it.
         prop = self.api.draft_season_schedule("d2", slot_ids=["sB"])
@@ -1572,6 +1581,15 @@ class _SlotOverlapContract:
         g3 = self.api.create_game("se2", "d2", "u0", "u1", "sE",
                                   league_id="lg")
         self.assertNotIn("error", g3, g3)
+        # A third team (#206 slice 1): d2's only pairing (u0 vs u1) already
+        # has a real game (g3), so the scheduler would otherwise find
+        # nothing left to (re)propose against sy -- a genuinely open pairing
+        # is needed to exercise the advisory/commit gate below.
+        self.store.add_team(Team(id="u2", name="U2", division_id="d2",
+                                 program_id="pg", league_id="lg"))
+        self.store.add_season_team_registration(SeasonTeamRegistration(
+            id="reg2_u2", league_season_id="ls2", team_id="u2",
+            division_id="d2", active=True))
         audit_len = len(self.store.all_setup_audit())
         state = self._placement_state()
         mv = self.api.move_game(g3["id"], sy)

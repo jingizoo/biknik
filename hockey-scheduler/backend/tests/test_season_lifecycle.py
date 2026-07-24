@@ -332,6 +332,11 @@ class SeasonArchivedRegistrationDivisionGuardTest(unittest.TestCase):
             fx = SeasonArchivedGameWriteGuardTest()._game_fixture(api)
             sid = fx["sid"]
             notifs0 = len(store.all_notifications_feed())
+            # A third team (#206 slice 1): the fixture's only pairing (t1 vs
+            # t2) already has a real game, so the scheduler would otherwise
+            # find nothing left to (re)propose onto the fresh slot below.
+            t3 = api.create_team(name="Charlie", division_id=fx["did"])["id"]
+            api.register_team_for_season(sid, t3, division_id=fx["did"])
             # The fixture's only slot is taken by its manual game, so give the
             # scheduler a free slot; otherwise the draft is empty and the batch
             # guards would have nothing to act on (a vacuous pass).

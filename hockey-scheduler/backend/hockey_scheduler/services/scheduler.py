@@ -14,11 +14,18 @@ narrowed to one Division — #233 Slice G). A league-wide draft never pairs
 teams across different Divisions of that League: registrations are grouped by
 their own Division (or "no Division") and each group gets its own
 round-robin, so Gold only ever plays Gold.
+
+A pairing that already has a real Game (draft or committed, published or
+not, roster-locked or not — a CANCELLED or EXHIBITION game does not count)
+is reported in ``already_scheduled``, never re-proposed and never silently
+dropped (#206 slice 1) — re-running Generate against a Division that
+already has some Games fills in only the missing matchups; it never
+duplicates the ones that exist.
 """
 
 from datetime import date, timedelta
 
-from ..domain import IceSlotStatus, IceSlotType
+from ..domain import GameType, IceSlotStatus, IceSlotType
 from ..domain.errors import ValidationError
 from .league_scope import (
     registered_team_ids_in_division,
@@ -69,6 +76,11 @@ def _available_game_slots(store, slot_ids=None):
         slots.append(s)
     slots.sort(key=lambda s: (s.start_time, s.id))
     return slots
+
+
+def _team_name(store, tid):
+    t = store.get_team(tid)
+    return t.name if t else tid
 
 
 def _validate_day(value, field):
@@ -280,11 +292,6 @@ def _assign_ice(store, pairings, slots, constraints, policy_check=None):
     Returns ``(draft_games, unscheduled)``.
     """
     con = _normalize_constraints(constraints)
-
-    def team_name(tid):
-        t = store.get_team(tid)
-        return t.name if t else tid
-
     draft_games, unscheduled = [], []
     used = set()
     team_slots = {}  # team_id -> [assigned start_time]
@@ -312,7 +319,8 @@ def _assign_ice(store, pairings, slots, constraints, policy_check=None):
             rink = store.get_rink(chosen.rink_id) if chosen.rink_id else None
             draft_games.append({
                 "home_team_id": home, "away_team_id": away,
-                "home_team_name": team_name(home), "away_team_name": team_name(away),
+                "home_team_name": _team_name(store, home),
+                "away_team_name": _team_name(store, away),
                 "division_id": division_id,
                 "ice_slot_id": chosen.id,
                 "rink_id": chosen.rink_id,
@@ -331,7 +339,8 @@ def _assign_ice(store, pairings, slots, constraints, policy_check=None):
                 reason_codes = sorted(set(codes))
             unscheduled.append({
                 "home_team_id": home, "away_team_id": away,
-                "home_team_name": team_name(home), "away_team_name": team_name(away),
+                "home_team_name": _team_name(store, home),
+                "away_team_name": _team_name(store, away),
                 "division_id": division_id, "reason": reason,
                 "reason_codes": reason_codes,
             })
@@ -356,28 +365,73 @@ def _unschedulable_teams(store, team_ids, pairings, unscheduled):
             blocked_count[tid] = blocked_count.get(tid, 0) + 1
             blocked_codes.setdefault(tid, set()).update(row["reason_codes"])
 
-    def team_name(tid):
-        t = store.get_team(tid)
-        return t.name if t else tid
-
     rollup = []
     for tid in sorted(team_ids):
         if total.get(tid, 0) > 0 and blocked_count.get(tid, 0) == total[tid]:
             rollup.append({
-                "team_id": tid, "team_name": team_name(tid),
+                "team_id": tid, "team_name": _team_name(store, tid),
                 "reason_codes": sorted(blocked_codes.get(tid, ())),
             })
     return rollup
+
+
+def _existing_pairing_games(store, division_ids):
+    """``{frozenset({home_team_id, away_team_id}): existing_game_id}`` for
+    every non-cancelled REGULAR Game already in any of ``division_ids``
+    (#206 slice 1 — preserve existing Games, generate only missing
+    round-robin matchups). Draft or committed, published or not,
+    roster-locked or not all count — the risk this closes is re-running
+    Generate silently proposing (and Commit silently creating) a duplicate
+    for a pairing that already has ANY real Game, not only a published one.
+    A CANCELLED game does not count (that is exactly the signal the
+    pairing needs re-scheduling); an EXHIBITION game does not count either
+    (#283: it never affects standings and was never the round-robin
+    obligation) — only a Regular game satisfies a Regular pairing."""
+    wanted = set(division_ids)
+    found = {}
+    for g in store.all_games():
+        if g.cancelled or g.division_id not in wanted:
+            continue
+        if g.game_type != GameType.REGULAR.value:
+            continue
+        found[frozenset((g.home_team_id, g.away_team_id))] = g.id
+    return found
+
+
+def _split_already_scheduled(store, pairings, existing):
+    """Partition ``pairings`` (``home, away, division_id`` triples) into
+    ``(remaining, already_scheduled)`` against ``existing`` (from
+    :func:`_existing_pairing_games`) — #206 slice 1: a pairing that already
+    has a real Game is reported by name, not silently dropped (which would
+    look identical to "not asked for") or silently re-proposed (the
+    production risk this slice fixes)."""
+    remaining, already = [], []
+    for home, away, division_id in pairings:
+        existing_game_id = existing.get(frozenset((home, away)))
+        if existing_game_id is not None:
+            already.append({
+                "home_team_id": home, "away_team_id": away,
+                "home_team_name": _team_name(store, home),
+                "away_team_name": _team_name(store, away),
+                "division_id": division_id,
+                "existing_game_id": existing_game_id,
+            })
+        else:
+            remaining.append((home, away, division_id))
+    return remaining, already
 
 
 def draft_schedule(store, division_id, slot_ids=None, constraints=None):
     """Generate a draft round-robin schedule for a division (#84/#85).
 
     Returns ``{division_id, team_count, draft_games, unscheduled,
-    unschedulable_teams}``. Each pairing takes the earliest available slot
-    that satisfies the optional constraints; a pairing with no valid slot is
-    returned in ``unscheduled`` with the reason(s) that blocked it. Nothing is
-    persisted.
+    already_scheduled, unschedulable_teams}``. Each pairing takes the
+    earliest available slot that satisfies the optional constraints; a
+    pairing with no valid slot is returned in ``unscheduled`` with the
+    reason(s) that blocked it. A pairing that already has a real Game (#206
+    slice 1 — see :func:`_existing_pairing_games`) is reported in
+    ``already_scheduled`` instead of being re-proposed or silently dropped.
+    Nothing is persisted.
     """
     # A division's teams are those validly registered in it this season (#180),
     # via the shared resolver — active rows whose Team exists and whose league
@@ -385,7 +439,9 @@ def draft_schedule(store, division_id, slot_ids=None, constraints=None):
     # draft (#199/#200 review). Same source of truth game creation, moves,
     # publishing, and standings use.
     teams = sorted(registered_team_ids_in_division(store, division_id))
-    pairings = [(h, a, division_id) for h, a in round_robin_pairings(teams)]
+    all_pairings = [(h, a, division_id) for h, a in round_robin_pairings(teams)]
+    pairings, already_scheduled = _split_already_scheduled(
+        store, all_pairings, _existing_pairing_games(store, (division_id,)))
     slots = _available_game_slots(store, slot_ids)
     draft_games, unscheduled = _assign_ice(
         store, pairings, slots, constraints,
@@ -394,6 +450,7 @@ def draft_schedule(store, division_id, slot_ids=None, constraints=None):
     return {
         "division_id": division_id, "team_count": len(teams),
         "draft_games": draft_games, "unscheduled": unscheduled,
+        "already_scheduled": already_scheduled,
         "unschedulable_teams": _unschedulable_teams(
             store, teams, pairings, unscheduled),
     }
@@ -413,12 +470,14 @@ def draft_schedule_for_league(store, season_id, league_id, division_id=None,
     """
     groups = registered_teams_by_division_in_league(
         store, season_id, league_id, division_id)
-    pairings = []
+    all_pairings = []
     all_teams = set()
     for div_id, team_ids in groups.items():
         all_teams |= team_ids
-        pairings.extend(
+        all_pairings.extend(
             (h, a, div_id) for h, a in round_robin_pairings(sorted(team_ids)))
+    pairings, already_scheduled = _split_already_scheduled(
+        store, all_pairings, _existing_pairing_games(store, groups.keys()))
     slots = _available_game_slots(store, slot_ids)
     draft_games, unscheduled = _assign_ice(
         store, pairings, slots, constraints,
@@ -427,6 +486,7 @@ def draft_schedule_for_league(store, season_id, league_id, division_id=None,
         "season_id": season_id, "league_id": league_id,
         "division_id": division_id, "team_count": len(all_teams),
         "draft_games": draft_games, "unscheduled": unscheduled,
+        "already_scheduled": already_scheduled,
         "unschedulable_teams": _unschedulable_teams(
             store, all_teams, pairings, unscheduled),
     }

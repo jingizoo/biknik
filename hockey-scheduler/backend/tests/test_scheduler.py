@@ -22,6 +22,8 @@ from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
 
 from hockey_scheduler.domain import (
     Division,
+    Game,
+    GameType,
     IceSlot,
     IceSlotStatus,
     IceSlotType,
@@ -459,6 +461,77 @@ class SchedulerContract:
             self.assertEqual(g.league_id, "lg1")
             self.assertIn(g.division_id, (None, "div1"))
             self.assertNotIn("bad", (g.home_team_id, g.away_team_id))
+
+    # -- preserve existing Games, generate only missing pairings (#206 slice 1)
+    def test_already_scheduled_reports_existing_pairing_and_skips_it(self):
+        self._division_fixture(4, 6)
+        home, away = round_robin_pairings(["t0", "t1", "t2", "t3"])[0]
+        self.store.add_game(Game(
+            id="existing1", home_team_id=home, away_team_id=away,
+            start_time=BASE_TIME - timedelta(days=100),
+            end_time=BASE_TIME - timedelta(days=100) + timedelta(hours=1),
+            division_id="div1", season_id="se1", league_id="lg1"))
+        res = draft_schedule(self.store, "div1")
+        # 6 pairings total, 1 already exists -> 5 genuinely missing.
+        self.assertEqual(len(res["draft_games"]), 5)
+        self.assertEqual(len(res["already_scheduled"]), 1)
+        entry = res["already_scheduled"][0]
+        self.assertEqual({entry["home_team_id"], entry["away_team_id"]},
+                         {home, away})
+        self.assertEqual(entry["existing_game_id"], "existing1")
+        self.assertEqual(entry["division_id"], "div1")
+        self.assertIn("home_team_name", entry)
+        self.assertIn("away_team_name", entry)
+        # Never re-proposed alongside the genuinely missing pairings.
+        for d in res["draft_games"]:
+            self.assertNotEqual(
+                frozenset((d["home_team_id"], d["away_team_id"])),
+                frozenset((home, away)))
+        # And the pre-existing Game itself is untouched.
+        self.assertEqual(len(self.store.all_games()), 1)
+
+    def test_already_scheduled_exempts_cancelled_games(self):
+        self._division_fixture(4, 6)
+        home, away = round_robin_pairings(["t0", "t1", "t2", "t3"])[0]
+        self.store.add_game(Game(
+            id="cancelled1", home_team_id=home, away_team_id=away,
+            start_time=BASE_TIME, cancelled=True,
+            division_id="div1", season_id="se1", league_id="lg1"))
+        res = draft_schedule(self.store, "div1")
+        self.assertEqual(res["already_scheduled"], [])
+        self.assertEqual(len(res["draft_games"]), 6)  # regenerated, not skipped
+
+    def test_already_scheduled_exempts_exhibition_games(self):
+        self._division_fixture(4, 6)
+        home, away = round_robin_pairings(["t0", "t1", "t2", "t3"])[0]
+        self.store.add_game(Game(
+            id="exhib1", home_team_id=home, away_team_id=away,
+            start_time=BASE_TIME, game_type=GameType.EXHIBITION.value,
+            division_id="div1", season_id="se1", league_id="lg1"))
+        res = draft_schedule(self.store, "div1")
+        self.assertEqual(res["already_scheduled"], [])
+        self.assertEqual(len(res["draft_games"]), 6)  # a friendly isn't a fixture
+
+    def test_league_wide_draft_reports_already_scheduled_per_division(self):
+        self._league_two_divisions_fixture(per_division=2, n_slots=8)
+        # Gold has exactly one pairing (g0 vs g1) -- pre-seed it as an
+        # existing Game so only Silver's pairing remains genuinely missing.
+        self.store.add_game(Game(
+            id="existing_gold", home_team_id="g0", away_team_id="g1",
+            start_time=BASE_TIME - timedelta(days=100),
+            division_id="gold", season_id="se1", league_id="lg1"))
+        res = draft_schedule_for_league(self.store, "se1", "lg1")
+        self.assertEqual(len(res["draft_games"]), 1)  # only Silver's pairing
+        self.assertEqual(len(res["already_scheduled"]), 1)
+        entry = res["already_scheduled"][0]
+        self.assertEqual({entry["home_team_id"], entry["away_team_id"]},
+                         {"g0", "g1"})
+        self.assertEqual(entry["division_id"], "gold")
+        self.assertEqual(entry["existing_game_id"], "existing_gold")
+        for d in res["draft_games"]:
+            self.assertNotEqual(
+                frozenset((d["home_team_id"], d["away_team_id"])),
+                frozenset({"g0", "g1"}))
 
 
 class MemorySchedulerTest(SchedulerContract, unittest.TestCase):
