@@ -381,6 +381,81 @@ and its cancel/base-facade/missing-fingerprint siblings): with the check
 disabled, a stale commit through either facade proceeds and creates a Game
 instead of being refused.
 
+### This is an intentional breaking change to the Commit request contract (#328 review round 9)
+
+`draft_fingerprint` is **required**, not optional or additive: a request to
+`POST /api/scheduler/commit` that omits it — the entire payload shape any
+caller could send before this change — is unconditionally refused, never
+silently accepted. This is a breaking change to the *request* contract, not
+merely an additive change to the *response* shape (the new
+`already_scheduled`/`draft_fingerprint` response keys genuinely are
+additive — a caller that doesn't read them is unaffected by their
+presence). Concretely:
+
+* **Required sequence.** A caller MUST call `POST /api/scheduler/draft`
+  (or `draft_season_schedule` directly) first, and MUST pass the exact
+  `draft_fingerprint` from that response's body to the following
+  `POST /api/scheduler/commit` call. There is no way to commit a draft
+  schedule without first previewing it — by design, matching the
+  ice-availability builder's identical, already-shipped
+  `template_fingerprint` requirement (`SetupService.commit_ice_availability`,
+  #313); this feature is held to the same contract, not a looser one.
+* **Error/status contract** (`ERROR_HTTP_STATUS` in `web/server.py`, keyed
+  by the `DomainError` subclass's `code`, not its `reason` — see "Reason
+  codes referenced here" below for the full reason-code list):
+  - `draft_fingerprint` omitted entirely → `ValidationError`
+    (`code: "validation_error"`, HTTP **400**), `reason: "preview_required"`.
+  - `draft_fingerprint` present but not matching the fresh regeneration
+    (or a pairing already scheduled by a race) →
+    `ConcurrencyConflictError` (`code: "concurrency_conflict"`, HTTP
+    **409**), `reason: "preview_stale"` or `"pairing_already_scheduled"`.
+  - The exact fingerprint from the immediately-preceding Generate
+    response → HTTP **200**, the commit proceeds normally.
+  In every refusal case, zero Games, slot allocations, or audit rows are
+  written — the refusal happens before the transaction opens (the
+  `preview_required`/`preview_stale` checks) or is rolled back atomically
+  within it (`pairing_already_scheduled`).
+* **Affected consumers.** This is a demo/operator application with no
+  external/third-party API consumers. The only two real callers are the
+  Scheduler UI (`web/static/app.js`'s `schedCommit.onclick`, which already
+  sends `schedulerState.preview.draft_fingerprint` — the exact value from
+  its own most recent Generate response) and this repository's own test
+  suite (backend service/HTTP tests, e2e browser journeys). A full
+  repository audit (every `/api/scheduler/commit` HTTP call site and every
+  `commit_draft_schedule(` Python call site) found no caller that violates
+  the new contract: every real caller supplies a fingerprint sourced from
+  a genuine, immediately-preceding `draft_season_schedule`/
+  `POST /api/scheduler/draft` response. The only exceptions are tests
+  written specifically to prove the refusal contract itself (omitting or
+  staling the fingerprint on purpose), and two forced-concurrency unit
+  tests in `test_placement_concurrency.py` that use a hardcoded-but-
+  self-consistent token (fed identically to both the monkeypatched
+  `draft_season_schedule` stub and the `commit_draft_schedule` call) to
+  isolate a Team-lock ordering race unrelated to fingerprint freshness —
+  documented as such in their own docstrings, and never reaching the real
+  HTTP route.
+* **No versioned/legacy bypass.** The requirement applies unconditionally
+  to both the base and league-scoped facades, with no opt-out flag and no
+  parallel legacy route. Given there are no external consumers to break
+  and the alternative (an unauthenticated legacy path that skips the
+  preview-binding safety gate this whole section exists to add) would
+  reopen exactly the silent-staleness risk described above, versioning the
+  endpoint was rejected in favor of documenting this plainly as an
+  intentional breaking change.
+
+Pinned by HTTP-level contract regressions (`test_scheduler.py`,
+`SchedulerHttpTest`) that exercise the real route end-to-end, not just the
+service method directly: `test_commit_without_fingerprint_is_preview_required_via_http`
+(the legacy no-fingerprint payload → 400, zero writes),
+`test_commit_with_exact_fingerprint_succeeds_via_http` (the documented
+sequence → 200, real Games created), and
+`test_commit_with_stale_fingerprint_is_preview_stale_via_http` (a
+fingerprint valid at Generate time but no longer current → 409, zero
+writes beyond the change that made it stale). Each verified falsifiable by
+neutering the corresponding check in the league-scoped facade (the one the
+HTTP route actually resolves to) and confirming only the matching test
+fails.
+
 ## Reason codes referenced here
 
 Unscheduled-pairing codes are generation-time (`services/scheduler.py`,

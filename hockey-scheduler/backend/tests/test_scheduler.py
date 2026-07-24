@@ -1150,6 +1150,112 @@ class SchedulerHttpTest(unittest.TestCase):
         status, body = self._req(c, "POST", "/api/scheduler/draft", {})
         self.assertEqual(body["error"]["code"], "validation_error")
 
+    # -- draft_fingerprint IS a breaking change to the Commit request
+    # contract, over real HTTP (#328 review round 9) ------------------------
+    def _build_committable_division(self, c):
+        """A small Division with two Teams and one open ice slot, built
+        entirely through real setup HTTP calls (not direct store writes) --
+        every id these routes hand back is freshly sequential, so repeated
+        calls across tests in this class never collide."""
+        def post(path, body):
+            status, resp = self._req(c, "POST", path, body)
+            self.assertEqual(status, 200, repr(resp))
+            return resp
+        league = post("/api/setup/league", {"name": "HTTP Commit Contract"})
+        season = post("/api/setup/season",
+                      {"league_id": league["id"], "name": "HCC Season"})
+        level = post("/api/setup/level",
+                     {"season_id": season["id"], "name": "HCC Level"})
+        division = post("/api/setup/division", {
+            "season_id": season["id"], "level_id": level["id"],
+            "name": "HCC Division"})
+        club = post("/api/setup/club", {"name": "HCC Club"})
+        t0 = post("/api/v2/setup/team",
+                  {"club_id": club["id"], "league_id": level["id"], "name": "HCC A"})
+        t1 = post("/api/v2/setup/team",
+                  {"club_id": club["id"], "league_id": level["id"], "name": "HCC B"})
+        for team in (t0, t1):
+            post(f"/api/setup/seasons/{season['id']}/team-registrations",
+                 {"team_id": team["id"], "division_id": division["id"]})
+        venue = post("/api/setup/venue",
+                     {"name": "HCC Arena", "league_id": league["id"]})
+        post(f"/api/v2/setup/seasons/{season['id']}/venue-access",
+             {"venue_id": venue["id"]})
+        rink = post("/api/setup/rink", {"venue_id": venue["id"], "name": "HCC Rink"})
+        post("/api/setup/ice-slot", {
+            "rink_id": rink["id"], "start_time": "2026-09-12T08:00:00+00:00",
+            "end_time": "2026-09-12T09:00:00+00:00", "slot_type": "game"})
+        return division["id"]
+
+    def test_commit_without_fingerprint_is_preview_required_via_http(self):
+        """#328 review round 9 -- draft_fingerprint is a REQUIRED field on
+        the real HTTP route, not an additive response-only change: the
+        legacy payload a pre-round-5 caller would have sent (scope only, no
+        fingerprint) must be refused with the documented terminal reason
+        and write nothing, not silently accepted."""
+        c = self._client()
+        self._req(c, "POST", "/api/auth/login", {"username": "admin", "password": "demo"})
+        div = self._build_committable_division(c)
+        games_before = len(srv.STATE.api.store.all_games())
+        status, body = self._req(
+            c, "POST", "/api/scheduler/commit", {"division_id": div})
+        self.assertEqual(status, 400, repr(body))
+        self.assertEqual(body["error"]["code"], "validation_error", repr(body))
+        self.assertEqual(
+            body["error"]["details"]["reason"], "preview_required", repr(body))
+        self.assertEqual(
+            len(srv.STATE.api.store.all_games()), games_before, repr(body))
+
+    def test_commit_with_exact_fingerprint_succeeds_via_http(self):
+        """#328 review round 9 -- the documented, supported sequence (real
+        Generate, then Commit with its exact returned fingerprint) works
+        end-to-end over real HTTP, proving the new contract is usable, not
+        just the legacy one refused."""
+        c = self._client()
+        self._req(c, "POST", "/api/auth/login", {"username": "admin", "password": "demo"})
+        div = self._build_committable_division(c)
+        status, preview = self._req(
+            c, "POST", "/api/scheduler/draft", {"division_id": div})
+        self.assertEqual(status, 200, repr(preview))
+        self.assertEqual(len(preview["draft_games"]), 1, repr(preview))
+        status, body = self._req(c, "POST", "/api/scheduler/commit", {
+            "division_id": div,
+            "draft_fingerprint": preview["draft_fingerprint"]})
+        self.assertEqual(status, 200, repr(body))
+        self.assertEqual(len(body["created"]), 1, repr(body))
+
+    def test_commit_with_stale_fingerprint_is_preview_stale_via_http(self):
+        """#328 review round 9 -- a fingerprint that was valid at Generate
+        time but no longer matches current state (a Game created for the
+        reviewed pairing in the meantime) is refused with the documented
+        terminal conflict and writes nothing beyond the change that made it
+        stale, over real HTTP."""
+        c = self._client()
+        self._req(c, "POST", "/api/auth/login", {"username": "admin", "password": "demo"})
+        div = self._build_committable_division(c)
+        status, preview = self._req(
+            c, "POST", "/api/scheduler/draft", {"division_id": div})
+        self.assertEqual(status, 200, repr(preview))
+        stale_fingerprint = preview["draft_fingerprint"]
+        row = preview["draft_games"][0]
+        season_id = srv.STATE.api.store.get_division(div).league_season_id
+        season_id = srv.STATE.api.store.get_league_season(season_id).season_id
+        status, seeded = self._req(c, "POST", "/api/setup/game", {
+            "season_id": season_id, "division_id": div,
+            "home_team_id": row["home_team_id"],
+            "away_team_id": row["away_team_id"],
+            "ice_slot_id": row["ice_slot_id"]})
+        self.assertEqual(status, 200, repr(seeded))
+        games_before = len(srv.STATE.api.store.all_games())
+        status, body = self._req(c, "POST", "/api/scheduler/commit", {
+            "division_id": div, "draft_fingerprint": stale_fingerprint})
+        self.assertEqual(status, 409, repr(body))
+        self.assertEqual(body["error"]["code"], "concurrency_conflict", repr(body))
+        self.assertEqual(
+            body["error"]["details"]["reason"], "preview_stale", repr(body))
+        self.assertEqual(
+            len(srv.STATE.api.store.all_games()), games_before, repr(body))
+
     def test_league_wide_draft_rejects_cross_league_division_via_http(self):
         div = srv.STATE.api.store.all_divisions()[0].id
         ls = srv.STATE.api.store.get_league_season(
