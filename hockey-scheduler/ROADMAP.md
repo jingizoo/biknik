@@ -190,7 +190,12 @@ publish-gated and privacy-safe.
 ## Release 4 — rink-real scheduling and operator UX
 
 1. **#277** — warm-up, resurfacing, turnover and curfew rules shared by manual
-   moves and generated schedules. **Done** (PR #318/#319, merged).
+   moves and generated schedules. **All six acceptance criteria satisfied**
+   (PR #318, closing bounded child #320; PR #319, closing bounded child
+   #321; both merged) — see #277 for the criterion-by-criterion evidence.
+   **#277 itself remains open**: merging those PRs closed their own bounded
+   children, not the parent epic; closing #277 is a pending product-owner
+   decision, not automatic.
 2. **#158** — recurring ice templates, conflict preview and month view.
    **Done and closed** (#313, closing #315, plus #277's policy integration
    via #318/#319 — closed per @jingizoo's sign-off on the #204 requirements

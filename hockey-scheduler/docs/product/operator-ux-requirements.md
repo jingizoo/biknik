@@ -558,25 +558,30 @@ acceptance.
 ### 8. Operator validation and measurable success criteria
 
 **This package's own acceptance criteria** (narrower than epic #204's, which
-cover the eventual shipped redesign — these gate *this document*):
+cover the eventual shipped redesign — these gate *this document*). **All
+nine satisfied and signed off by @jingizoo (2026-07-24)** — see the sign-off
+note under "Product decisions requiring sign-off" below for the decision-
+by-decision record:
 
-- [ ] Every one of sections 1–7 above has concrete, testable requirements —
+- [x] Every one of sections 1–7 above has concrete, testable requirements —
       no item left open as "TBD."
-- [ ] The role → journey coverage table (§1) is complete for all 7 roles.
-- [ ] The IA crosswalk (§2) accounts for 100% of today's reachable tabs, each
+- [x] The role → journey coverage table (§1) is complete for all 7 roles.
+- [x] The IA crosswalk (§2) accounts for 100% of today's reachable tabs, each
       mapped to one specific new screen.
-- [ ] The per-screen primary-action table (§4) is complete for the
+- [x] The per-screen primary-action table (§4) is complete for the
       Home/Tasks hub and all six Setup workflows.
-- [ ] The states matrix (§5) is filled in for every screen in the proposed
+- [x] The states matrix (§5) is filled in for every screen in the proposed
       IA — not left as an empty template.
-- [ ] The WCAG 2.2 AA conformance matrix (§7) covers every applicable A/AA
+- [x] The WCAG 2.2 AA conformance matrix (§7) covers every applicable A/AA
       success criterion, not a curated subset; the priority regression list
       is subordinate to it, not a substitute for it.
-- [ ] The eight product decisions below are resolved and signed off by
+- [x] The eight product decisions below are resolved and signed off by
       @jingizoo.
-- [ ] Real operator validation is scheduled — owner, participants, tasks,
-      evidence, and milestone (see below) — not deferred indefinitely.
-- [ ] No application code changes are included in this deliverable.
+- [x] Real operator validation is **scheduled** (owner, participants, tasks,
+      evidence, and milestone below) — the sessions themselves run against
+      the first implementation PR's prototype, per the stated milestone;
+      "scheduled" is satisfied now, "conducted" is that PR's own gate.
+- [x] No application code changes are included in this deliverable.
 
 **Operator validation plan**: a moderated usability walkthrough of the
 Home/Tasks + guided Setup hub prototype, run before that PR is considered
