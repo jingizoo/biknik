@@ -470,7 +470,8 @@ class SchedulerContract:
             id="existing1", home_team_id=home, away_team_id=away,
             start_time=BASE_TIME - timedelta(days=100),
             end_time=BASE_TIME - timedelta(days=100) + timedelta(hours=1),
-            division_id="div1", season_id="se1", league_id="lg1"))
+            division_id="div1", season_id="se1", league_id="lg1",
+            league_season_id="ls_lg1_se1"))
         res = draft_schedule(self.store, "div1")
         # 6 pairings total, 1 already exists -> 5 genuinely missing.
         self.assertEqual(len(res["draft_games"]), 5)
@@ -519,7 +520,8 @@ class SchedulerContract:
         self.store.add_game(Game(
             id="existing_gold", home_team_id="g0", away_team_id="g1",
             start_time=BASE_TIME - timedelta(days=100),
-            division_id="gold", season_id="se1", league_id="lg1"))
+            division_id="gold", season_id="se1", league_id="lg1",
+            league_season_id="ls_lg1_se1"))
         res = draft_schedule_for_league(self.store, "se1", "lg1")
         self.assertEqual(len(res["draft_games"]), 1)  # only Silver's pairing
         self.assertEqual(len(res["already_scheduled"]), 1)
@@ -532,6 +534,55 @@ class SchedulerContract:
             self.assertNotEqual(
                 frozenset((d["home_team_id"], d["away_team_id"])),
                 frozenset({"g0", "g1"}))
+
+    def test_league_wide_no_division_group_excludes_only_the_current_league_season(self):
+        # #328 review: a league-wide draft's "no Division" group is keyed
+        # by division_id=None for EVERY League/Season -- scoping the
+        # exclusion by division_id alone would let a division-less Regular
+        # Game from a DIFFERENT Season (teams are permanent, so the same
+        # two ids can be registered again later) wrongly suppress a
+        # pairing that has never actually been played in the CURRENT
+        # Season+League.
+        self._base()
+        self.store.add_league(League(id="lg1", program_id="prog1", name="League"))
+        self.store.add_season(Season(id="seB", program_id="prog1", name="Season B"))
+        # test_scheduler.py's draft_schedule_for_league is the league-scoped
+        # wrapper (services/league_scoped_scheduler.py), which restricts
+        # candidate ice to Venues with active SeasonVenueAccess for the
+        # target Season -- Season B needs its own grant on the shared venue.
+        self.store.add_season_venue_access(SeasonVenueAccess(
+            id="sva_seB", season_id="seB", venue_id="v1", active=True))
+        self.store.add_league_season(LeagueSeason(
+            id="ls_lg1_se1", league_id="lg1", season_id="se1"))
+        self.store.add_league_season(LeagueSeason(
+            id="ls_lg1_seB", league_id="lg1", season_id="seB"))
+        for tid in ("t0", "t1"):
+            self.store.add_team(Team(id=tid, name=tid, program_id="prog1",
+                                     league_id="lg1"))
+        # t0/t1 registered directly at the League level (no Division) in
+        # BOTH Seasons -- permanent Teams re-registering in a later Season
+        # is the normal case, not an anomaly.
+        for ls_id, reg_prefix in (("ls_lg1_se1", "seA"), ("ls_lg1_seB", "seB")):
+            for tid in ("t0", "t1"):
+                self.store.add_season_team_registration(SeasonTeamRegistration(
+                    id=f"streg_{reg_prefix}_{tid}", league_season_id=ls_id,
+                    team_id=tid, division_id=None, active=True))
+        self._slots(2, start=BASE_TIME + timedelta(days=30))
+        # Season A's Game for t0-vs-t1: division-less, tagged to ls_lg1_se1.
+        self.store.add_game(Game(
+            id="seasonA_game", home_team_id="t0", away_team_id="t1",
+            start_time=BASE_TIME - timedelta(days=100),
+            division_id=None, season_id="se1", league_id="lg1",
+            league_season_id="ls_lg1_se1"))
+        res = draft_schedule_for_league(self.store, "seB", "lg1")
+        # Season B has never played this pairing -- it must be freshly
+        # generated, not silently suppressed by Season A's leftover Game.
+        self.assertEqual(res["already_scheduled"], [])
+        self.assertEqual(len(res["draft_games"]), 1)
+        self.assertEqual(
+            {res["draft_games"][0]["home_team_id"],
+             res["draft_games"][0]["away_team_id"]},
+            {"t0", "t1"})
 
 
 class MemorySchedulerTest(SchedulerContract, unittest.TestCase):

@@ -4457,17 +4457,37 @@ function renderScheduler(ov) {
         <p>Register at least two Teams under <button class="linklike" data-goto="setup">Setup → Season participation</button>, then Generate again.</p>
       </div>`;
     } else {
+      // #328 review — a pairing that already has a real Game (#206 slice 1)
+      // is neither a proposed game nor a conflict; it must still be named,
+      // not silently folded into a misleading "No games generated." when
+      // every pairing in the round robin is already on the calendar.
+      const already = (pv.already_scheduled || []);
       const gRows = games.map((g) => `<div class="li">
         <span class="li-time">${fmt(g.start_time)}</span>
         <div class="li-main"><div class="li-title">${esc(g.home_team_name)} vs ${esc(g.away_team_name)}</div>
           <div class="li-sub">${esc(g.rink_name || "")}</div></div></div>`).join("");
+      const aRows = already.map((a) => `<div class="li">
+        <div class="li-main"><div class="li-title">${esc(a.home_team_name)} vs ${esc(a.away_team_name)}</div>
+          <div class="li-sub">✓ Already scheduled — Game ${esc(a.existing_game_id)}</div></div></div>`).join("");
       const uRows = unsched.map((u) => `<div class="li">
         <div class="li-main"><div class="li-title">${esc(u.home_team_name)} vs ${esc(u.away_team_name)}</div>
           <div class="li-sub conflict">⚠ ${esc(u.reason)}</div></div></div>`).join("");
-      head = `<div class="section-title">Preview — ${games.length} game(s), ${unsched.length} conflict(s)</div>`;
-      cardBody = (gRows + uRows) || '<div class="empty">No games generated.</div>';
+      const alreadyPart = already.length
+        ? `, ${already.length} already scheduled` : "";
+      head = `<div class="section-title">Preview — ${games.length} game(s), ${unsched.length} conflict(s)${alreadyPart}</div>`;
+      // "Nothing missing" only when there is also nothing genuinely
+      // blocked (unsched) -- a mixed batch that is partly already-scheduled
+      // and partly conflicted still has something missing, just not free
+      // yet, so it must not claim victory.
+      const nothingMissing = !games.length && !unsched.length && already.length > 0;
+      const intro = nothingMissing
+        ? '<div class="li"><div class="li-main"><div class="li-sub">Every pairing is already scheduled — nothing missing to generate.</div></div></div>'
+        : "";
+      const rows = intro + gRows + aRows + uRows;
+      cardBody = rows || '<div class="empty">No games generated.</div>';
     }
-    previewBlock = `<div id="sched-preview" class="sched-preview" data-team-count="${teamCount === null ? "" : teamCount}" data-games="${games.length}" data-conflicts="${unsched.length}" data-not-enough-teams="${notEnoughTeams ? "1" : "0"}">
+    const alreadyCount = (pv.already_scheduled || []).length;
+    previewBlock = `<div id="sched-preview" class="sched-preview" data-team-count="${teamCount === null ? "" : teamCount}" data-games="${games.length}" data-conflicts="${unsched.length}" data-already-scheduled="${alreadyCount}" data-not-enough-teams="${notEnoughTeams ? "1" : "0"}">
       ${head}
       <div class="card">${cardBody}</div>
       ${commitBtn}</div>`;

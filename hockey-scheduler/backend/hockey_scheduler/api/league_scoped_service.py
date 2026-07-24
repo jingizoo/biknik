@@ -185,7 +185,8 @@ class ApiService(_BaseApiService):
             # pairing.
             _existing_now = _existing_pairing_games(
                 self.store,
-                {row.get("division_id") for row in proposal["draft_games"]})
+                {(draft_ls_id, row.get("division_id"))
+                 for row in proposal["draft_games"]})
             for row in proposal["draft_games"]:
                 # #277: run the SAME final conflict check as create_game /
                 # move_game before persisting — slot free (exists, GAME,

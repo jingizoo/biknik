@@ -2933,7 +2933,8 @@ class ApiService:
             # manual re-click needed.
             _existing_now = _existing_pairing_games(
                 self.store,
-                {d.get("division_id") for d in proposal["draft_games"]})
+                {(draft_ls_id, d.get("division_id"))
+                 for d in proposal["draft_games"]})
             created = []
             for d in proposal["draft_games"]:
                 # #277: the draft-commit path runs the SAME final conflict check
