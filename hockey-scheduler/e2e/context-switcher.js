@@ -176,7 +176,19 @@ async function checkSwitcher(browser, viewport) {
     await page.waitForFunction((b) => document.getElementById("ctx-select").value !== b, before, { timeout: 10000 });
     const afterKb = await selectValue(page);
     const kbSeason = afterKb.slice(afterKb.indexOf("|") + 1) || null;
-    if ((await ctxSeason(page)) !== kbSeason) throw new Error(`[${L}] keyboard change did not persist`);
+    // The change handler persists through an async POST /api/context; the
+    // select VALUE flips synchronously with the keystroke, so asserting the
+    // server state in the same tick races the in-flight POST (observed as a
+    // rare CI-only failure). Await the persisted state with a bounded poll —
+    // the same grace step (B) gets implicitly from its #ctx= hash wait —
+    // keeping the assertion (must persist, within the standard timeout)
+    // while removing the race.
+    const kbDeadline = Date.now() + 10000;
+    for (;;) {
+      if ((await ctxSeason(page)) === kbSeason) break;
+      if (Date.now() > kbDeadline) throw new Error(`[${L}] keyboard change did not persist`);
+      await new Promise((r) => setTimeout(r, 100));
+    }
 
     // (D) Deep-link ADOPTION: persist Winter via the API, but leave a Program-
     //     only hash in the URL; on reload the hash must WIN (POST rewrites the
