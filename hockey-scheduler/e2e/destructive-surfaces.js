@@ -125,7 +125,14 @@ async function checkViewport(browser, viewport) {
       await post(`/api/games/${game.id}/publish`, {});
 
       // A real scheduler-created draft game on its own slot (offers Delete).
-      await post("/api/scheduler/commit", { division_id: dB.id, slot_ids: [slotDraft] });
+      // #328 review round 5: Commit is bound to the exact preview it
+      // reviewed, so a direct API call must Generate first.
+      const draftPreview = await post(
+        "/api/scheduler/draft", { division_id: dB.id, slot_ids: [slotDraft] });
+      await post("/api/scheduler/commit", {
+        division_id: dB.id, slot_ids: [slotDraft],
+        draft_fingerprint: draftPreview.draft_fingerprint,
+      });
       const drafts = await get("/api/scheduler/drafts");
       const draft = (drafts.draft_games || drafts.drafts || []).find((g) => g.division_id === dB.id);
 

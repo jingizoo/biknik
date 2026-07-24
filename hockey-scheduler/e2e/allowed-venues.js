@@ -219,7 +219,15 @@ async function checkViewport(browser, viewport) {
         method: "POST", credentials: "same-origin",
         headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
       })).json();
-      return post("/api/scheduler/commit", { division_id: i.division, slot_ids: [i.draftSlot] });
+      // #328 review round 5: Commit is now bound to the exact preview it
+      // reviewed, so a direct API call must Generate first, same as the
+      // real Scheduler UI does.
+      const preview = await post(
+        "/api/scheduler/draft", { division_id: i.division, slot_ids: [i.draftSlot] });
+      return post("/api/scheduler/commit", {
+        division_id: i.division, slot_ids: [i.draftSlot],
+        draft_fingerprint: preview.draft_fingerprint,
+      });
     }, { division: division.id, draftSlot: draftSlot.id });
     if (draft.error || !draft.created || !draft.created.length) {
       throw new Error(`[${viewport.label}] scheduler commit produced no draft game: ${JSON.stringify(draft)}`);

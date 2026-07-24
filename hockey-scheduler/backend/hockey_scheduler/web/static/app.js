@@ -6478,21 +6478,33 @@ async function render() {
   const schedCommit = c.querySelector("[data-sched-commit]");
   if (schedCommit) schedCommit.onclick = async () => {
     toast = "";
-    const res = await post("/api/scheduler/commit", { division_id: schedulerState.division });
+    // #328 review round 5 -- bind Commit to the exact preview on screen:
+    // the backend re-derives its own proposal fresh at commit time and
+    // refuses (rather than silently diverging from what was reviewed) if
+    // this fingerprint no longer matches that fresh regeneration.
+    const res = await post("/api/scheduler/commit", {
+      division_id: schedulerState.division,
+      draft_fingerprint: schedulerState.preview && schedulerState.preview.draft_fingerprint,
+    });
     if (res && !res.error) {
       schedulerState.preview = null;
       toast = `Committed ${res.created.length} draft game(s).`;
     } else if (res && res.error && res.error.details
-               && res.error.details.reason === "pairing_already_scheduled") {
+               && (res.error.details.reason === "pairing_already_scheduled"
+                   || res.error.details.reason === "preview_stale")) {
       // #328 review round 3 -- a concurrent commit already scheduled one
       // of this batch's pairings. post()'s generic toast surfaces
       // error.message alone (never error.details), so the backend builds
       // that message itself with both team names and the winning Game id
       // ("Team A vs Team B is already scheduled as Game G123 -- generate
-      // a fresh preview...") -- nothing further to extract here. The
-      // reviewed preview is now stale; clear it rather than leave a
-      // now-wrong proposal on screen, so Commit cannot be retried without
-      // a fresh Generate.
+      // a fresh preview...") -- nothing further to extract here.
+      // #328 review round 5 -- a Game was created or cancelled somewhere
+      // in the (possibly long) gap between Generate and this click,
+      // silently changing what "missing" means; the backend's own
+      // generic-but-actionable message ("Generate a fresh preview...")
+      // is likewise complete on its own. Either way the reviewed preview
+      // is now stale; clear it rather than leave a now-wrong proposal on
+      // screen, so Commit cannot be retried without a fresh Generate.
       schedulerState.preview = null;
     }
     await render();

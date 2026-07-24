@@ -215,7 +215,14 @@ async function checkViewport(browser, viewport) {
         method: "POST", credentials: "same-origin",
         headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
       })).json();
-      return post("/api/scheduler/commit", { division_id: division, slot_ids: [slot4] });
+      // #328 review round 5: Commit is bound to the exact preview it
+      // reviewed, so a direct API call must Generate first.
+      const preview = await post(
+        "/api/scheduler/draft", { division_id: division, slot_ids: [slot4] });
+      return post("/api/scheduler/commit", {
+        division_id: division, slot_ids: [slot4],
+        draft_fingerprint: preview.draft_fingerprint,
+      });
     }, { division: ids.division, slot4: ids.slot4 });
     if (commit.error || (commit.created || []).length !== 1)
       fail(`draft commit should create exactly one game: ${JSON.stringify(commit)}`);

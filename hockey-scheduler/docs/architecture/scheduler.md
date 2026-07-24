@@ -117,12 +117,18 @@ Both commit implementations close this gap with a second, freshly-computed
 `_existing_pairing_games` read, taken under the same Team lock the commit
 already acquires (the canonical **Program → Team → Rink → Season** order
 established by #277/#313/#314/#318 — no new lock was added for this). Per
-row, inside the same loop as `_assert_slot_free_for_game`, checked **after**
-that call succeeds: the existing physical-feasibility diagnosis
-(`team_overlap`, `slot_unavailable`, and the #277 policy reasons) keeps
-priority when a row happens to trip both, since it is the more specific,
-still-valid answer; the new check only ever catches the residual case those
-checks structurally cannot see.
+row, inside the same loop as `_assert_slot_free_for_game`, checked **before**
+that call runs (#328 review round 4 — reversed from the original design):
+a row whose exact pairing already has a real Game is a terminal,
+product-confirmed fact regardless of whether that same row would *also*
+fail the physical check — for example the winning Game happens to sit on
+the row's own slot, or on a slot that overlaps it. `pairing_already_scheduled`
+names the specific pairing and the winning Game; the physical-feasibility
+diagnoses (`team_overlap`, `slot_unavailable`, and the #277 policy reasons)
+cannot. An *unrelated* pairing's physical conflict — a different pairing
+merely sharing one team, or an unrelated slot collision — is not in the
+freshly-computed index for that row's own key, so it still falls through to
+the unchanged physical check below.
 
 A hit is deliberately **terminal**, not retried (#328 review round 2,
 product-owner decision): it raises `ConcurrencyConflictError` with
@@ -159,14 +165,140 @@ retried to a DIFFERENT success instead of a named terminal error (the
 "exactly one error" assertion fails). Both facades are tested independently
 since neither delegates to the other.
 
+The check-ordering priority (#328 review round 4 — pairing-identity before
+the physical gate, not after) is pinned the same way with two further
+forced-race scenarios per facade: the winning Game lands on the loser's
+*own* slot, and on a *different* slot that physically overlaps it. Both
+must still return `pairing_already_scheduled`, never `slot_unavailable` /
+`team_overlap`. Falsifiable by reverting the check order alone (leaving the
+terminal reason and the retry-shell distinction untouched): the loser then
+gets the physical-conflict reason instead, failing exactly these two new
+scenarios while the original non-overlapping-slot scenario (and everything
+else in this section) still passes — isolating the ordering claim from the
+terminal-vs-retry claim above it. Six deterministic Memory/SQLite tests
+(same-slot / overlapping-slot / non-overlapping-slot × both facades, in
+`test_scheduler.py`) cover the same three scenarios without needing real
+concurrency, since a single thread can construct "a winning commit already
+landed" directly — inserted directly rather than via a second real commit,
+picking the LAST of six rows (not the first, #328 review round 6) so the
+loser's own transaction has already tentatively created five earlier
+rows before reaching the contested one, proving the WHOLE batch — not
+merely the bad row — rolls back.
+
+### Hardening the forced races against timing (#328 review round 6)
+
+Two rigor gaps were found in the forced two-session PostgreSQL races
+(`test_placement_concurrency.py`) after round 4 landed:
+
+1. **Not forced at the critical boundary.** `_ForcedRaceHarnessMixin._run()`
+   only barrier-synchronizes *entry* into each thread's target function.
+   The original design had each side call the REAL `commit_draft_schedule`,
+   whose own `draft_season_schedule()` regeneration runs AFTER that
+   barrier — unsynchronized. A side whose regeneration happened to run
+   after the other side had already committed could see an empty or
+   different proposal, never exercising the locked `_existing_now` recheck
+   this suite exists to prove. The fix: both sides' proposals are now
+   hand-constructed and frozen (via the same monkeypatch technique the
+   single-threaded stale-proposal tests already used) BEFORE the barrier
+   releases either thread. The barrier's synchronization point is then
+   exactly where the two committed batches are decided; the only race left
+   is the one under test — which side's transaction acquires the shared
+   Team lock for the contested pairing first.
+2. **Only ever proved a one-row batch.** Each side's frozen proposal is TWO
+   rows: a pairing UNIQUE to that side (never touched by the other) plus
+   the SAME contested pairing both sides race for. Whichever side loses
+   has therefore already tentatively created its own unique row within the
+   same (about-to-roll-back) transaction before reaching the contested
+   row — symmetrically, regardless of which side actually loses — so the
+   assertions prove the loser's OWN earlier row rolls back to AVAILABLE,
+   not merely that the contested row itself is refused.
+
+`_run_multi_row_pairing_race` / `_assert_multi_row_pairing_race_terminal`
+(shared by all three forced-race mixins: duplication/non-overlapping,
+same-slot, overlapping-slot) implement this. Verified falsifiable the same
+way as before (reverting the check order fails same-slot/overlapping-slot
+only; removing the pairing-identity guard entirely fails all three), and
+stress-run dozens of times with no flakiness observed.
+
+## Preview binding: the commit-to-preview staleness gate (#328 review round 5)
+
+The commit-time recheck above closes a *narrow* race: the gap between this
+commit's own proposal regeneration and the moment it takes its locks,
+typically milliseconds. It does not close the *wide* gap between the
+operator's Generate click — which may sit on screen for seconds or
+minutes while they review it — and their later Commit click:
+`commit_draft_schedule` previously took only the scope (`division_id` /
+`season_id`+`league_id`, `slot_ids`, `constraints`) and regenerated its own
+proposal fresh, with no memory of what the operator actually reviewed. A
+Game created for one of the reviewed pairings in that wider window would
+silently shrink the committed batch (quietly reclassified into
+`already_scheduled` by the fresh regeneration); a Game that had been
+blocking a pairing, if cancelled in that window, would silently grow it (a
+pairing the operator never reviewed newly appears and gets committed) —
+either way, the batch actually committed could silently diverge from the
+one the operator reviewed and approved.
+
+`draft_season_schedule` now returns a `draft_fingerprint` alongside
+`draft_games`/`already_scheduled` — a SHA-256 hash (`services/scheduler.py`,
+`_draft_fingerprint`) over the *identity* of every pairing in each list
+(`league_season_id`, `division_id`, team ids, and — for `already_scheduled`
+— the existing Game id), sorted for order-independence. This mirrors the
+ice-availability builder's `template_fingerprint`
+(`SetupService.commit_ice_availability`): recompute the same deterministic
+function fresh and compare, rather than store a server-side session. It
+deliberately excludes slot/time assignment — that dimension is already
+re-validated fresh and atomically by `_assert_slot_free_for_game` at commit
+time, so binding it here too would reject a preview over mere
+ice-availability churn this fingerprint isn't meant to guard against.
+
+`commit_draft_schedule` (both facades) now requires a `draft_fingerprint`
+argument, checked immediately after regenerating the proposal and BEFORE
+any lock is taken or write happens:
+
+* missing entirely → `ValidationError`, `reason: "preview_required"` (a
+  caller error — mirrors the ice-availability builder's identical
+  requirement that a commit can never proceed without first previewing);
+* present but not equal to the freshly-regenerated proposal's own
+  fingerprint → `ConcurrencyConflictError`, `reason: "preview_stale"` — the
+  world has moved since this was previewed; regenerate and review again.
+
+Both checks precede — and are independent of — the narrower
+`_existing_now` recheck described above: this fingerprint check is the
+coarse, wide-window gate (the whole preview-to-commit-click gap); the
+narrower recheck remains responsible for the sub-millisecond gap between
+THIS call's own regeneration and taking its locks. A caller that races
+another commit may still see either reason fire, depending on precisely
+when the drift happened, and both are equally terminal, atomic-rollback
+outcomes.
+
+The Scheduler UI (`web/static/app.js`) sends the fingerprint from the
+displayed preview automatically; on either `preview_stale` or
+`pairing_already_scheduled` it clears the stale preview client-side so
+Commit cannot be retried without a fresh Generate — the same reaction
+already established for the narrower race in round 3. Verified falsifiable
+by neutering each check in turn (`test_scheduler.py`,
+`test_league_scoped_commit_refuses_stale_preview_after_pairing_created`
+and its cancel/base-facade/missing-fingerprint siblings): with the check
+disabled, a stale commit through either facade proceeds and creates a Game
+instead of being refused.
+
 ## Reason codes referenced here
 
 Unscheduled-pairing codes are generation-time (`services/scheduler.py`,
-listed above under Model). `pairing_already_scheduled` is the commit-time
-`ConcurrencyConflictError` reason for this guard, defined in
-`api/service.py`/`api/league_scoped_service.py` — deliberately distinct
-from `placement_raced` (the pre-lock scope-locator staleness reason
-#313/#314/#318 use, which the retry shell DOES retry) precisely so this
-one is never retried. Neither is scheduler-specific; `placement_raced` is
-shared with every other placement path that re-verifies a pre-lock locator
-under its locks.
+listed above under Model). `pairing_already_scheduled`, `preview_required`,
+and `preview_stale` are commit-time reasons defined in
+`api/service.py`/`api/league_scoped_service.py`:
+
+* `pairing_already_scheduled` (`ConcurrencyConflictError`) — the narrow,
+  under-lock recheck above; names the pairing and winning
+  `existing_game_id`.
+* `preview_required` (`ValidationError`) — the wide preview-binding gate,
+  no fingerprint supplied at all.
+* `preview_stale` (`ConcurrencyConflictError`) — the wide preview-binding
+  gate, fingerprint supplied but no longer matches current state.
+
+All three are deliberately distinct from `placement_raced` (the pre-lock
+scope-locator staleness reason #313/#314/#318 use, which the retry shell
+DOES retry) precisely so none of them are ever retried. `placement_raced`
+is not scheduler-specific; it is shared with every other placement path
+that re-verifies a pre-lock locator under its locks.

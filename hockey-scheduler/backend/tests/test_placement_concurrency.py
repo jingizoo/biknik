@@ -27,7 +27,7 @@ import threading
 import unittest
 from datetime import datetime, timedelta, timezone
 
-from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
+from helpers import BACKEND, commit_fresh_draft  # noqa: F401  (BACKEND: sys.path)
 
 from hockey_scheduler.api import ApiService
 from hockey_scheduler.api.service import ApiService as BaseApiService
@@ -270,7 +270,7 @@ class _PlacementParityMixin:
         # pre-transaction prevalidation this review found insufficient.
         r = self.api.revoke_season_venue_access("sva_se1")
         self.assertNotIn("error", r)
-        res = self.api.commit_draft_schedule("d1", slot_ids=["mB"])
+        res = commit_fresh_draft(self.api, "d1", slot_ids=["mB"])
         self.assertEqual(_reason(res), "venue_access_missing", repr(res))
         self.assertEqual(
             len([g for g in self.store.all_games() if not g.cancelled]), 0)
@@ -283,7 +283,7 @@ class _PlacementParityMixin:
                                    organization_id="org", league_id="pg"))
         reassigned = self.api.assign_rink_venue("r3", "v2")
         self.assertNotIn("error", reassigned)
-        res = self.api.commit_draft_schedule("d1", slot_ids=["mC"])
+        res = commit_fresh_draft(self.api, "d1", slot_ids=["mC"])
         self.assertEqual(_reason(res), "venue_access_missing", repr(res))
         self.assertEqual(
             len([g for g in self.store.all_games() if not g.cancelled]), 0)
@@ -427,8 +427,8 @@ class PostgresPlacementConcurrencyTest(_ForcedRaceHarnessMixin, unittest.TestCas
     # double-booking (the Season lock serializes; the batch rolls back whole).
     def test_draft_vs_draft(self):
         out = self._run([
-            lambda a: a.commit_draft_schedule("d1"),
-            lambda a: a.commit_draft_schedule("d1"),
+            lambda a: commit_fresh_draft(a, "d1"),
+            lambda a: commit_fresh_draft(a, "d1"),
         ])
         self._assert_no_crash(out)
         # Exactly one full round-robin exists; the other batch created nothing —
@@ -440,11 +440,16 @@ class PostgresPlacementConcurrencyTest(_ForcedRaceHarnessMixin, unittest.TestCas
                 # pairing the winner already committed onto the identical
                 # slot, so the pairing-identity guard (checked first) now
                 # correctly wins with the more specific terminal reason
-                # instead of a generic physical-conflict one.
+                # instead of a generic physical-conflict one. #328 review
+                # round 5: each side's own preview-then-commit (both now
+                # required) can likewise straddle the other's write, so the
+                # loser may instead see its OWN external preview go stale
+                # relative to its internal regeneration -- an equally valid
+                # terminal outcome.
                 self.assertIn(_reason(r),
                               ("ice_slot_taken", "slot_unavailable",
                                "slot_already_filled", "team_overlap",
-                               "pairing_already_scheduled"))
+                               "pairing_already_scheduled", "preview_stale"))
         store = self._store()
         self.assertEqual(
             sum(1 for g in store.all_games() if not g.cancelled), 6)
@@ -460,7 +465,7 @@ class PostgresPlacementConcurrencyTest(_ForcedRaceHarnessMixin, unittest.TestCas
         gid = g["id"]
         out = self._run([
             lambda a: a.move_game(gid, "s0"),
-            lambda a: a.commit_draft_schedule("d1"),
+            lambda a: commit_fresh_draft(a, "d1"),
         ])
         self._assert_no_crash(out)
         store = self._store()
@@ -521,7 +526,7 @@ class PostgresPlacementConcurrencyTest(_ForcedRaceHarnessMixin, unittest.TestCas
         # The se1/d1 draft allocates s0 (t0 vs t3 -> s0); the builder previews the
         # OTHER season (se2) on the same rink so the Season locks differ and only
         # the rink lock serializes them.
-        self._builder_vs("se2", lambda a: a.commit_draft_schedule("d1"))
+        self._builder_vs("se2", lambda a: commit_fresh_draft(a, "d1"))
 
     def test_builder_commit_vs_same_season_create(self):
         # SAME season as the builder: builder and create both lock rink r1 AND
@@ -669,7 +674,7 @@ class PostgresPlacementConcurrencyTest(_ForcedRaceHarnessMixin, unittest.TestCas
 
     def test_revoke_venue_access_vs_draft_commit(self):
         out = self._run([
-            lambda a: a.commit_draft_schedule("d1", slot_ids=["mB"]),
+            lambda a: commit_fresh_draft(a, "d1", slot_ids=["mB"]),
             lambda a: a.revoke_season_venue_access("sva_se1"),
         ])
         self._assert_no_crash(out)
@@ -695,7 +700,7 @@ class PostgresPlacementConcurrencyTest(_ForcedRaceHarnessMixin, unittest.TestCas
         self._store().add_venue(Venue(id="v2", name="No Access",
                                       organization_id="org", league_id="pg"))
         out = self._run([
-            lambda a: a.commit_draft_schedule("d1", slot_ids=["mC"]),
+            lambda a: commit_fresh_draft(a, "d1", slot_ids=["mC"]),
             lambda a: a.assign_rink_venue("r3", "v2"),
         ])
         self._assert_no_crash(out)
@@ -823,7 +828,7 @@ class _DraftParticipationParityMixin:
     def test_draft_commit_excludes_a_team_unregistered_first(self):
         r = self.api.unregister_team_from_season("reg1_t0")
         self.assertNotIn("error", r)
-        res = self.api.commit_draft_schedule("d1", slot_ids=["s0"])
+        res = commit_fresh_draft(self.api, "d1", slot_ids=["s0"])
         self.assertNotIn("error", res, repr(res))
         self.assertEqual(len(res["created"]), 1, repr(res))
         row = res["created"][0]
@@ -836,14 +841,14 @@ class _DraftParticipationParityMixin:
         self.store.add_league(League(id="lg2", program_id="pg", name="League 2"))
         r = self.api.transfer_team_to_league("t0", "lg2")
         self.assertNotIn("error", r)
-        res = self.api.commit_draft_schedule("d1", slot_ids=["s0"])
+        res = commit_fresh_draft(self.api, "d1", slot_ids=["s0"])
         self.assertNotIn("error", res, repr(res))
         self.assertEqual(len(res["created"]), 1, repr(res))
         row = res["created"][0]
         self.assertNotIn("T0", (row["home_team_name"], row["away_team_name"]))
 
     def test_committed_draft_blocks_unregister_that_would_strand_it(self):
-        res = self.api.commit_draft_schedule("d1", slot_ids=["s0"])
+        res = commit_fresh_draft(self.api, "d1", slot_ids=["s0"])
         self.assertNotIn("error", res, repr(res))
         game = _active_games(self.store)[0]
         team_id = game.home_team_id
@@ -858,7 +863,7 @@ class _DraftParticipationParityMixin:
             for a in self.store.all_setup_audit()))
 
     def test_committed_draft_blocks_transfer_that_would_strand_it(self):
-        res = self.api.commit_draft_schedule("d1", slot_ids=["s0"])
+        res = commit_fresh_draft(self.api, "d1", slot_ids=["s0"])
         self.assertNotIn("error", res, repr(res))
         game = _active_games(self.store)[0]
         team_id = game.home_team_id
@@ -881,7 +886,7 @@ class _DraftParticipationParityMixin:
         # season, so the same committed-draft-counts rule applies (#314
         # review) — clearing the division out from under a committed draft
         # is refused with zero writes.
-        res = self.api.commit_draft_schedule("d1", slot_ids=["s0"])
+        res = commit_fresh_draft(self.api, "d1", slot_ids=["s0"])
         self.assertNotIn("error", res, repr(res))
         game = _active_games(self.store)[0]
         team_id = game.home_team_id
@@ -967,7 +972,7 @@ class _DraftParticipationRaceMixin(_ForcedRaceHarnessMixin):
                                    expected_draft_reasons,
                                    expected_participation_reason):
         out = self._run([
-            lambda a: a.commit_draft_schedule("d1", slot_ids=["s0"]),
+            lambda a: commit_fresh_draft(a, "d1", slot_ids=["s0"]),
             participation_call,
         ])
         self._assert_no_crash(out)
@@ -1024,7 +1029,13 @@ class _DraftParticipationRaceMixin(_ForcedRaceHarnessMixin):
     def test_unregister_vs_draft_commit(self):
         self._assert_participation_race(
             lambda a: a.unregister_team_from_season("reg1_t0"),
-            ("team_not_registered",),
+            # #328 review round 5: an unregister that lands between this
+            # call's own external preview and its internal regeneration
+            # changes which pairings are even eligible, which can trip the
+            # new preview-fingerprint gate before ever reaching the
+            # participation recheck below -- an equally valid terminal
+            # outcome (zero writes either way).
+            ("team_not_registered", "preview_stale"),
             "team_has_scheduled_games")
 
     def test_transfer_vs_draft_commit(self):
@@ -1033,7 +1044,8 @@ class _DraftParticipationRaceMixin(_ForcedRaceHarnessMixin):
         self._assert_participation_race(
             lambda a: a.transfer_team_to_league("t0", "lg2"),
             ("team_not_registered", "team_not_in_league_season",
-             "team_wrong_division", "registration_cross_league"),
+             "team_wrong_division", "registration_cross_league",
+             "preview_stale"),
             "team_transfer_strands_games")
 
     def test_divisionless_league_draft_vs_transfer_uses_exact_league_season(self):
@@ -1057,8 +1069,8 @@ class _DraftParticipationRaceMixin(_ForcedRaceHarnessMixin):
         def commit_stale_proposal(api):
             api.draft_season_schedule = (
                 lambda *args, **kwargs: proposal)
-            return api.commit_draft_schedule(
-                season_id="se1", league_id="lg", slot_ids=["s0"])
+            return commit_fresh_draft(
+                api, season_id="se1", league_id="lg", slot_ids=["s0"])
 
         out = self._run([
             commit_stale_proposal,
@@ -1113,57 +1125,193 @@ class PostgresBaseApiDraftParticipationRaceTest(
         return BaseApiService
 
 
+def _add_extra_teams(store):
+    """Two more teams for d1 (#328 review round 6): the multi-row races
+    below need each racing side's own team-disjoint "earlier" pairing
+    alongside the pairing both sides actually contest, and d1's original 4
+    teams supply only ONE pairing ((t1, t2)) disjoint from the contested
+    (t0, t3) -- not the two independent ones each side needs."""
+    store.add_team(Team(id="t4", name="T4", division="D1", division_id="d1",
+                        program_id="pg", league_id="lg"))
+    store.add_season_team_registration(SeasonTeamRegistration(
+        id="reg1_t4", league_season_id="ls1", team_id="t4",
+        division_id="d1", active=True))
+    store.add_team(Team(id="t5", name="T5", division="D1", division_id="d1",
+                        program_id="pg", league_id="lg"))
+    store.add_season_team_registration(SeasonTeamRegistration(
+        id="reg1_t5", league_season_id="ls1", team_id="t5",
+        division_id="d1", active=True))
+
+
+def _hand_row(store, home, away, division_id, slot_id):
+    """A draft_games row built directly from CURRENT store state, matching
+    ``_assign_ice``'s own shape exactly (#328 review round 6) -- lets the
+    races below hand-construct a specific pairing onto a specific slot
+    without depending on round-robin generation order, which always tries
+    pairing[0] first regardless of which slot is targeted."""
+    slot = store.get_ice_slot(slot_id)
+    rink = store.get_rink(slot.rink_id) if slot.rink_id else None
+    return {
+        "home_team_id": home, "away_team_id": away,
+        "home_team_name": store.get_team(home).name,
+        "away_team_name": store.get_team(away).name,
+        "division_id": division_id, "ice_slot_id": slot_id,
+        "rink_id": slot.rink_id, "rink_name": rink.name if rink else None,
+        "start_time": slot.start_time.isoformat(),
+        "end_time": slot.end_time.isoformat(),
+    }
+
+
+def _multi_row_proposal(store, unique_pairing, unique_slot, contested_slot,
+                        token):
+    """Two-row frozen proposal (#328 review round 6): row[0] a pairing
+    UNIQUE to this side (never touched by the other side), row[1] the
+    pairing BOTH sides contest, on ``contested_slot``. Whichever side loses
+    the Team-lock race for the contested pairing has therefore ALREADY
+    tentatively created row[0]'s Game within the SAME (about-to-roll-back)
+    transaction -- proving the loser's rollback covers the whole batch, not
+    merely the contested row -- symmetrically, regardless of which side
+    actually loses. ``token`` is an arbitrary fingerprint: both the
+    monkeypatched ``draft_season_schedule`` and the ``commit_draft_schedule``
+    call below use the SAME frozen object, so the round-5 preview-binding
+    check trivially matches without needing a real hash."""
+    row0 = _hand_row(store, unique_pairing[0], unique_pairing[1], "d1",
+                     unique_slot)
+    row1 = _hand_row(store, "t0", "t3", "d1", contested_slot)
+    return {
+        "division_id": "d1", "season_id": "se1", "league_id": "lg",
+        "team_count": 6, "draft_games": [row0, row1], "unscheduled": [],
+        "already_scheduled": [], "unschedulable_teams": [],
+        "draft_fingerprint": token,
+    }
+
+
+def _run_multi_row_pairing_race(testcase, side_a_slot, side_b_slot):
+    """Forced two-session race (#328 review round 6): BOTH racing sides
+    commit a hand-constructed, PRE-CAPTURED two-row batch (their own
+    team-disjoint earlier pairing, then the shared contested t0-vs-t3
+    pairing on ``side_a_slot`` / ``side_b_slot``) -- captured and frozen
+    BEFORE the barrier releases either thread. Unlike each side calling its
+    own real ``commit_draft_schedule()`` (whose internal
+    ``draft_season_schedule()`` regeneration is NOT itself synchronized by
+    the barrier), neither side's reviewed batch can be affected by which
+    side happens to reach its own regeneration first — the only remaining
+    race is exactly the one under test: which side's transaction acquires
+    the shared Team lock for (t0, t3) first."""
+    store = testcase._store()
+    _add_extra_teams(store)
+    proposal_a = _multi_row_proposal(
+        store, ("t1", "t2"), "s1", side_a_slot, "token-a")
+    proposal_b = _multi_row_proposal(
+        store, ("t4", "t5"), "s4", side_b_slot, "token-b")
+
+    def attempt(proposal):
+        def run(a):
+            a.draft_season_schedule = lambda *args, **kw: proposal
+            return a.commit_draft_schedule(
+                division_id="d1",
+                draft_fingerprint=proposal["draft_fingerprint"])
+        return run
+
+    out = testcase._run([attempt(proposal_a), attempt(proposal_b)])
+    return out, proposal_a, proposal_b
+
+
+def _assert_multi_row_pairing_race_terminal(testcase, out, proposal_a,
+                                            proposal_b):
+    """Shared assertion (#328 review round 4, hardened round 6): exactly
+    one side wins (BOTH its rows land), the other is refused with the
+    terminal ``pairing_already_scheduled`` reason (never
+    ``slot_unavailable``/``team_overlap``, which the SAME row would ALSO
+    trip physically), naming the winning Game. Because each side's own
+    earlier row was tentatively created within its own transaction before
+    the shared row was reached, the LOSER's rows -- both of them, not just
+    the contested one -- must roll back to AVAILABLE with no audit,
+    proving the whole batch, not merely the bad row, rolls back."""
+    testcase._assert_no_crash(out)
+    oks = [r for r in out if isinstance(r, dict) and "error" not in r]
+    errs = [r for r in out if isinstance(r, dict) and "error" in r]
+    testcase.assertEqual(len(oks), 1,
+                         f"exactly one side should win: {out!r}")
+    testcase.assertEqual(len(errs), 1,
+                         f"the loser must be refused with the terminal "
+                         f"pairing reason, not a physical-conflict one: "
+                         f"{out!r}")
+    testcase.assertEqual(len(oks[0]["created"]), 2, repr(out))
+    testcase.assertEqual(errs[0]["error"]["details"]["reason"],
+                         "pairing_already_scheduled", repr(out))
+    winning_contested = next(
+        g for g in oks[0]["created"]
+        if {g["home_team_name"], g["away_team_name"]} == {"T0", "T3"})
+    testcase.assertEqual(errs[0]["error"]["details"]["existing_game_id"],
+                         winning_contested["game_id"], repr(out))
+    store = testcase._store()
+    games = [g for g in store.all_games()
+             if not g.cancelled and g.division_id == "d1"]
+    testcase.assertEqual(len(games), 2,
+                         f"only the winner's two Games may exist: {out!r}")
+    committed_audits = [a for a in store.all_setup_audit()
+                        if a.action == "draft_schedule_committed"]
+    testcase.assertEqual(len(committed_audits), 1,
+                         f"only the winner's commit may audit-write: {out!r}")
+    # out[i] pairs with the i-th proposal by construction (_run preserves
+    # index order regardless of completion order) -- so this identifies the
+    # LOSING side's own two-row batch, not just "whichever error happened".
+    lost_proposal = proposal_a if "error" in out[0] else proposal_b
+    # Only the loser's OWN unique row (row[0]) is checked here: it is
+    # NEVER touched by the winner in any scenario, so it must always be
+    # back to AVAILABLE, proving the earlier row's tentative Game/slot-flip
+    # rolled back with the rest of the loser's batch. The loser's contested
+    # row (row[1]) is deliberately NOT checked the same way -- in the
+    # same-slot scenario its slot is the WINNER's own slot and is correctly
+    # left ALLOCATED, so "available" would be the wrong assertion there;
+    # the "only 2 Games total, both the winner's" check above already rules
+    # out any orphaned write from the loser's contested row.
+    unique_row = lost_proposal["draft_games"][0]
+    testcase.assertEqual(
+        store.get_ice_slot(unique_row["ice_slot_id"]).status.value,
+        "available",
+        f"loser's own earlier row {unique_row['ice_slot_id']} must roll "
+        f"back: {out!r}")
+    testcase._assert_schedule_consistent(store)
+
+
 class _PairingDuplicationRaceMixin(_ForcedRaceHarnessMixin):
     """Forced two-session race (#206 slice 1, terminal contract per #328
     review round 2): two draft commits for the SAME Division, each
-    restricted (via ``slot_ids``) to its own single ice slot, the two slots
-    far enough apart in time that they never conflict. Both proposals are
-    generated before either transaction opens, so both independently
-    target the SAME first round-robin pairing — one on each session's own
-    slot. Whichever session acquires the shared Team lock first commits
-    that pairing normally; the loser's per-row check
-    (``_assert_slot_free_for_game``) sees a genuinely free, non-conflicting
-    slot and would have silently persisted a SECOND Game for the identical
-    pairing were it not for the fresh commit-time recheck added by #206 —
-    that recheck raises the TERMINAL ``pairing_already_scheduled`` (not
-    ``placement_raced``, so the retry shell does not retry it): the loser's
-    whole batch rolls back atomically and the caller must regenerate and
-    re-review, rather than the commit silently substituting a different
-    pairing into the batch the operator already reviewed.
+    targeting the SAME contested pairing on its own single ice slot, the
+    two slots far enough apart in time that they never conflict — proving
+    the pairing-identity recheck alone (not any physical check) catches
+    this case. Whichever session acquires the shared Team lock first
+    commits normally; the loser's per-row physical check
+    (``_assert_slot_free_for_game``) would see a genuinely free,
+    non-conflicting slot and silently persist a SECOND Game for the
+    identical pairing were it not for the fresh commit-time recheck added
+    by #206 — that recheck raises the TERMINAL ``pairing_already_scheduled``
+    (not ``placement_raced``, so the retry shell does not retry it): the
+    loser's whole batch (both its own earlier, uncontested row AND the
+    contested one) rolls back atomically and the caller must regenerate
+    and re-review, rather than the commit silently substituting a
+    different pairing into the batch the operator already reviewed. See
+    ``_run_multi_row_pairing_race`` for how both sides' batches are
+    pre-captured and frozen before the race (#328 review round 6), and why
+    each is two rows (proving whole-batch rollback, not just the
+    contested row).
 
     Falsifiable both ways: drop the commit-time recheck in
     ``_commit_draft_schedule_attempt`` and the loser silently duplicates
     the winner's pairing on its own slot (this test's "exactly one commit
-    succeeds" and "exactly one Game exists" assertions fail); revert the
-    reason to ``placement_raced`` instead of the terminal
+    succeeds" and "exactly one winning pair of Games exists" assertions
+    fail); revert the reason to ``placement_raced`` instead of the terminal
     ``pairing_already_scheduled`` and the loser is silently retried to a
     DIFFERENT success instead of a named terminal error (this test's
     "exactly one error" assertion fails)."""
 
     def test_two_single_slot_draft_commits_never_duplicate_a_pairing(self):
-        out = self._run([
-            lambda a: a.commit_draft_schedule("d1", slot_ids=["s0"]),
-            lambda a: a.commit_draft_schedule("d1", slot_ids=["s3"]),
-        ])
-        self._assert_no_crash(out)
-        oks = [r for r in out if isinstance(r, dict) and "error" not in r]
-        errs = [r for r in out if isinstance(r, dict) and "error" in r]
-        self.assertEqual(len(oks), 1,
-                         f"exactly one commit should succeed: {out!r}")
-        self.assertEqual(len(errs), 1,
-                         f"the loser must be refused, not silently "
-                         f"retried to a different pairing: {out!r}")
-        self.assertEqual(errs[0]["error"]["details"]["reason"],
-                         "pairing_already_scheduled", repr(out))
-        self.assertIn("existing_game_id", errs[0]["error"]["details"],
-                      repr(out))
-        self.assertEqual(len(oks[0]["created"]), 1, repr(out))
-        store = self._store()
-        games = [g for g in store.all_games()
-                 if not g.cancelled and g.division_id == "d1"]
-        self.assertEqual(len(games), 1,
-                         f"only the winner's Game may exist: {out!r}")
-        self._assert_schedule_consistent(store)
+        out, proposal_a, proposal_b = _run_multi_row_pairing_race(
+            self, "s0", "s3")
+        _assert_multi_row_pairing_race_terminal(
+            self, out, proposal_a, proposal_b)
 
 
 @unittest.skipUnless(os.environ.get("TEST_DATABASE_URL"),
@@ -1190,80 +1338,53 @@ class PostgresBaseApiPairingDuplicationRaceTest(
         return BaseApiService
 
 
-def _assert_pairing_race_terminal(testcase, out):
-    """Shared assertion for the two mixins below (#328 review round 4):
-    exactly one commit succeeds, the other is refused with the terminal
-    pairing_already_scheduled reason (never slot_unavailable/team_overlap,
-    which the SAME row would ALSO trip physically), naming the winning
-    Game, with only the winner's Game ever persisted."""
-    testcase._assert_no_crash(out)
-    oks = [r for r in out if isinstance(r, dict) and "error" not in r]
-    errs = [r for r in out if isinstance(r, dict) and "error" in r]
-    testcase.assertEqual(len(oks), 1,
-                         f"exactly one commit should succeed: {out!r}")
-    testcase.assertEqual(len(errs), 1,
-                         f"the loser must be refused with the terminal "
-                         f"pairing reason, not a physical-conflict one: "
-                         f"{out!r}")
-    testcase.assertEqual(errs[0]["error"]["details"]["reason"],
-                         "pairing_already_scheduled", repr(out))
-    testcase.assertIn("existing_game_id", errs[0]["error"]["details"],
-                      repr(out))
-    testcase.assertEqual(len(oks[0]["created"]), 1, repr(out))
-    store = testcase._store()
-    games = [g for g in store.all_games()
-             if not g.cancelled and g.division_id == "d1"]
-    testcase.assertEqual(len(games), 1,
-                         f"only the winner's Game may exist: {out!r}")
-    testcase._assert_schedule_consistent(store)
-
-
 class _PairingRaceSameSlotMixin(_ForcedRaceHarnessMixin):
-    """Forced two-session race (#328 review round 4): two draft commits for
-    the SAME Division, BOTH restricted to the IDENTICAL single ice slot, so
-    both independently target the SAME first round-robin pairing on the
-    SAME slot. The loser's per-row physical check (``_assert_slot_free_for_game``)
-    would find the slot itself already ALLOCATED — a genuine
-    ``slot_unavailable`` case — were the pairing-identity check not now
-    checked FIRST: the loser must get the terminal
-    ``pairing_already_scheduled`` naming the winning Game, not
-    ``slot_unavailable``.
+    """Forced two-session race (#328 review round 4, hardened round 6):
+    two draft commits for the SAME Division, BOTH targeting the SAME
+    contested pairing on the IDENTICAL single ice slot. The loser's per-row
+    physical check (``_assert_slot_free_for_game``) would find the slot
+    itself already ALLOCATED — a genuine ``slot_unavailable`` case — were
+    the pairing-identity check not now checked FIRST: the loser must get
+    the terminal ``pairing_already_scheduled`` naming the winning Game, not
+    ``slot_unavailable``. See ``_run_multi_row_pairing_race`` for how both
+    sides' batches are pre-captured and frozen before the race, and why
+    each is two rows (proving whole-batch rollback, not just the
+    contested row).
 
     Falsifiable: revert the check order (physical gate before the pairing
-    check, as both facades had before this round) and the loser gets
+    check, as both facades had before round 4) and the loser gets
     ``slot_unavailable`` instead (this test's "exactly one error, reason
     pairing_already_scheduled" assertion fails)."""
 
     def test_same_slot_pairing_race_wins_with_terminal_reason(self):
-        out = self._run([
-            lambda a: a.commit_draft_schedule("d1", slot_ids=["s0"]),
-            lambda a: a.commit_draft_schedule("d1", slot_ids=["s0"]),
-        ])
-        _assert_pairing_race_terminal(self, out)
+        out, proposal_a, proposal_b = _run_multi_row_pairing_race(
+            self, "s0", "s0")
+        _assert_multi_row_pairing_race_terminal(
+            self, out, proposal_a, proposal_b)
 
 
 class _PairingRaceOverlappingSlotMixin(_ForcedRaceHarnessMixin):
-    """Forced two-session race (#328 review round 4): two draft commits for
-    the SAME Division, restricted to DIFFERENT single ice slots that
-    physically OVERLAP in time (``s0`` on ``r1``, ``sB`` on ``r2`` — the
-    same instant per ``_seed``), so both independently target the SAME
-    first round-robin pairing on physically-conflicting ice. The loser's
-    per-row physical check would find ``team_overlap`` — a genuine
-    diagnosis, but for the SAME pairing that raced, not an unrelated one —
-    were the pairing-identity check not now checked FIRST: the loser must
-    get the terminal ``pairing_already_scheduled`` naming the winning Game,
-    not ``team_overlap``.
+    """Forced two-session race (#328 review round 4, hardened round 6):
+    two draft commits for the SAME Division, targeting the SAME contested
+    pairing on DIFFERENT single ice slots that physically OVERLAP in time
+    (``s0`` on ``r1``, ``sB`` on ``r2`` — the same instant per ``_seed``).
+    The loser's per-row physical check would find ``team_overlap`` — a
+    genuine diagnosis, but for the SAME pairing that raced, not an
+    unrelated one — were the pairing-identity check not now checked FIRST:
+    the loser must get the terminal ``pairing_already_scheduled`` naming
+    the winning Game, not ``team_overlap``. See
+    ``_run_multi_row_pairing_race`` for how both sides' batches are
+    pre-captured and frozen before the race, and why each is two rows.
 
     Falsifiable: revert the check order and the loser gets ``team_overlap``
     instead (this test's "exactly one error, reason
     pairing_already_scheduled" assertion fails)."""
 
     def test_overlapping_slot_pairing_race_wins_with_terminal_reason(self):
-        out = self._run([
-            lambda a: a.commit_draft_schedule("d1", slot_ids=["s0"]),
-            lambda a: a.commit_draft_schedule("d1", slot_ids=["sB"]),
-        ])
-        _assert_pairing_race_terminal(self, out)
+        out, proposal_a, proposal_b = _run_multi_row_pairing_race(
+            self, "s0", "sB")
+        _assert_multi_row_pairing_race_terminal(
+            self, out, proposal_a, proposal_b)
 
 
 @unittest.skipUnless(os.environ.get("TEST_DATABASE_URL"),

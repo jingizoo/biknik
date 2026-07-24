@@ -16,7 +16,7 @@ import urllib.error
 import urllib.request
 from http.server import ThreadingHTTPServer
 
-from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
+from helpers import BACKEND, commit_fresh_draft  # noqa: F401  (BACKEND: sys.path)
 
 from hockey_scheduler.api import ApiService
 from hockey_scheduler.domain.enums import SeasonStatus
@@ -345,7 +345,7 @@ class SeasonArchivedRegistrationDivisionGuardTest(unittest.TestCase):
                 rink_id, "2026-10-08T18:00:00+00:00",
                 "2026-10-08T19:00:00+00:00")
             # A draft exists to discard/commit-race; build one while active.
-            draft = api.commit_draft_schedule(division_id=fx["did"], actor_id="a")
+            draft = commit_fresh_draft(api, division_id=fx["did"], actor_id="a")
             self.assertNotIn("error", draft, (label, draft))
             self.assertTrue(draft["created"], (label, "expected a draft game"))
             games_after_draft = len(store.all_games())
@@ -355,7 +355,7 @@ class SeasonArchivedRegistrationDivisionGuardTest(unittest.TestCase):
             r1 = api.remind_unresponded(fx["game"], fx["t1"], actor_id="a")
             self.assertEqual(r1["error"]["details"]["reason"], "season_archived",
                              label)
-            r2 = api.commit_draft_schedule(division_id=fx["did"], actor_id="a")
+            r2 = commit_fresh_draft(api, division_id=fx["did"], actor_id="a")
             self.assertEqual(r2["error"]["details"]["reason"], "season_archived",
                              label)
             r3 = api.discard_draft_games(all_drafts=True, actor_id="a")

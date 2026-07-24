@@ -54,6 +54,7 @@ class ApiService(_BaseApiService):
                                        season_id: str = None,
                                        league_id: str = None,
                                        slot_ids=None, constraints=None,
+                                       draft_fingerprint: str = None,
                                        actor_id=None) -> dict:
         """One attempt of the base facade's ``commit_draft_schedule`` retry
         shell (#318) — the shell (with ``@catch``) is inherited; overriding
@@ -71,12 +72,29 @@ class ApiService(_BaseApiService):
         the stranding guards in ``assign_season_team_league``/
         ``move_division_to_league`` (#233 Slice G review) for every
         scheduler-created game.
+
+        #328 review round 5 — ``draft_fingerprint`` must match the fresh
+        regeneration below (``preview_stale`` if not, ``preview_required``
+        if omitted): this override reimplements the whole commit body
+        independently of the base facade, so it needs the identical
+        preview-binding check. See the base facade's
+        ``_commit_draft_schedule_attempt`` for the full rationale.
         """
         proposal = self.draft_season_schedule(
             division_id=division_id, season_id=season_id, league_id=league_id,
             slot_ids=slot_ids, constraints=constraints)
         if isinstance(proposal, dict) and proposal.get("error"):
             return proposal
+        if draft_fingerprint is None:
+            raise ValidationError(
+                "Generate a preview before committing this schedule.",
+                {"reason": "preview_required"})
+        if draft_fingerprint != proposal.get("draft_fingerprint"):
+            raise ConcurrencyConflictError(
+                "This preview is out of date — a game may have been added, "
+                "cancelled, or otherwise changed since you generated it. "
+                "Generate a fresh preview and review it before committing.",
+                {"reason": "preview_stale"})
         resolved_season_id = proposal["season_id"]
 
         # The Division-only proposal's own "league_id" is this tenancy
@@ -167,25 +185,32 @@ class ApiService(_BaseApiService):
                 resolved_season_id, draft_ls_id, proposal["draft_games"])
             # #206 slice 1 — freshly computed HERE, under the Team locks just
             # acquired, so the read is race-free against any other writer
-            # touching these exact teams. Checked per row BELOW, only after
-            # that row's own slot/team-overlap check succeeds: those existing
-            # checks (physical feasibility — can these teams+ice coexist
-            # right now) keep priority when a row happens to trip both, same
-            # as the base facade's commit override and manual create/move;
-            # this is a residual check for what they structurally can't see
+            # touching these exact teams. Checked per row BELOW, BEFORE that
+            # row's own slot/team-overlap check runs (#328 review round 4 —
+            # reversed from the original design): a row whose exact pairing
+            # already has a real Game is a terminal, product-confirmed fact
+            # that must win regardless of whether the SAME row would ALSO
+            # fail the physical check — the winning Game happens to sit on
+            # this row's own slot, or a slot that overlaps it — because
+            # `pairing_already_scheduled` names the specific pairing and
+            # winning Game, which the physical-feasibility diagnoses
+            # (`team_overlap`, `slot_unavailable`) cannot. This is a residual
+            # check for what those checks structurally can't see either way
             # — a genuinely free, non-conflicting slot proposed for a
             # pairing that already has a real Game elsewhere, created by a
             # concurrent write between this proposal's generation and this
             # commit (the proposal already excluded pairings that existed AT
             # PREVIEW time — scheduler.py's already_scheduled split — so
-            # only such a race can slip one through here). #328 review
-            # round 2 — this is a TERMINAL fact, not transient contention:
-            # the operator reviewed a specific proposal, and a winning
-            # commit already changed what "missing" means, so silently
-            # substituting a different pairing into the SAME commit would
-            # diverge from what was reviewed. The batch rolls back
-            # atomically (raising inside this transaction) and the caller
-            # must regenerate and re-review before retrying —
+            # only such a race can slip one through here). An UNRELATED
+            # pairing's physical conflict is not in this index for that
+            # row's own key, so it still falls through to the unchanged
+            # physical check below. #328 review round 2 — this is a TERMINAL
+            # fact, not transient contention: the operator reviewed a
+            # specific proposal, and a winning commit already changed what
+            # "missing" means, so silently substituting a different pairing
+            # into the SAME commit would diverge from what was reviewed. The
+            # batch rolls back atomically (raising inside this transaction)
+            # and the caller must regenerate and re-review before retrying —
             # `pairing_already_scheduled` is deliberately NOT
             # `placement_raced` (the base facade's inherited retry shell
             # only retries that one reason), so this reaches the caller

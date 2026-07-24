@@ -15,7 +15,7 @@ from datetime import datetime, timedelta, timezone
 from http.cookiejar import CookieJar
 from http.server import ThreadingHTTPServer
 
-from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
+from helpers import BACKEND, commit_fresh_draft  # noqa: F401  (BACKEND: sys.path)
 
 from hockey_scheduler.api import ApiService
 from hockey_scheduler.domain import (
@@ -79,7 +79,7 @@ class DraftReviewServiceTest(unittest.TestCase):
         self.api, self.store = _seeded_api()
 
     def test_commit_persists_drafts_not_public(self):
-        res = self.api.commit_draft_schedule("d")
+        res = commit_fresh_draft(self.api, "d")
         self.assertEqual(len(res["created"]), 6)
         # Persisted as draft games...
         self.assertEqual(len(self.api.list_draft_games()["draft_games"]), 6)
@@ -92,7 +92,7 @@ class DraftReviewServiceTest(unittest.TestCase):
         # #277: a committed draft occupies its ice — each backing slot flips to
         # ALLOCATED (exactly as create_game/move_game do), so later scheduling
         # and the shared checker read it as taken, not free.
-        self.api.commit_draft_schedule("d")
+        commit_fresh_draft(self.api, "d")
         slot_ids = {g.ice_slot_id for g in self.store.all_games()
                     if g.ice_slot_id}
         self.assertEqual(len(slot_ids), 6)
@@ -120,7 +120,7 @@ class DraftReviewServiceTest(unittest.TestCase):
         # Force the (now stale) proposal through commit unchanged, so the server
         # regenerates the exact rows that reference the now-taken slot.
         self.api.draft_season_schedule = lambda *a, **k: proposal
-        res = self.api.commit_draft_schedule("d")
+        res = commit_fresh_draft(self.api, "d")
         # Rejected as a slot conflict...
         self.assertIn("error", res)
         self.assertEqual(res["error"]["details"]["reason"], "slot_unavailable")
@@ -167,7 +167,7 @@ class DraftReviewServiceTest(unittest.TestCase):
             end_time=slot0.end_time, ice_slot_id="conflict_slot",
             division_id="d", season_id="se", league_id="lg"))
         self.api.draft_season_schedule = lambda *a, **k: proposal
-        res = self.api.commit_draft_schedule("d")
+        res = commit_fresh_draft(self.api, "d")
         self.assertIn("error", res)
         self.assertEqual(res["error"]["details"]["reason"], "team_overlap")
         # Atomic rollback: no draft games created, no batch audit written; only
@@ -204,7 +204,7 @@ class DraftReviewServiceTest(unittest.TestCase):
             end_time=far_start + timedelta(hours=1), ice_slot_id="far_slot",
             division_id="d", season_id="se", league_id="lg"))
         self.api.draft_season_schedule = lambda *a, **k: proposal
-        res = self.api.commit_draft_schedule("d")
+        res = commit_fresh_draft(self.api, "d")
         self.assertIn("error", res)
         # #328 review round 2: terminal, not retried -- the operator
         # reviewed a specific proposal, and a winning write already changed
@@ -232,7 +232,7 @@ class DraftReviewServiceTest(unittest.TestCase):
                           if a.action == "draft_schedule_committed"], [])
 
     def test_publish_makes_drafts_public(self):
-        self.api.commit_draft_schedule("d")
+        commit_fresh_draft(self.api, "d")
         res = self.api.publish_draft_games(all_drafts=True)
         self.assertEqual(res["published"], 6)
         self.assertEqual(self.api.list_draft_games()["draft_games"], [])
@@ -241,13 +241,13 @@ class DraftReviewServiceTest(unittest.TestCase):
                             for g in self.store.all_games()))
 
     def test_discard_removes_drafts(self):
-        self.api.commit_draft_schedule("d")
+        commit_fresh_draft(self.api, "d")
         res = self.api.discard_draft_games(all_drafts=True)
         self.assertEqual(res["discarded"], 6)
         self.assertEqual(self.store.all_games(), [])
 
     def test_publish_selected_only(self):
-        self.api.commit_draft_schedule("d")
+        commit_fresh_draft(self.api, "d")
         drafts = self.api.list_draft_games()["draft_games"]
         one = drafts[0]["game_id"]
         self.api.publish_draft_games(game_ids=[one])
@@ -255,7 +255,7 @@ class DraftReviewServiceTest(unittest.TestCase):
         self.assertEqual(len(self.api.list_draft_games()["draft_games"]), 5)
 
     def test_discard_never_touches_published_games(self):
-        self.api.commit_draft_schedule("d")
+        commit_fresh_draft(self.api, "d")
         self.api.publish_draft_games(all_drafts=True)  # all now real
         self.api.discard_draft_games(all_drafts=True)  # nothing is a draft
         self.assertEqual(len(self.store.all_games()), 6)
@@ -263,7 +263,7 @@ class DraftReviewServiceTest(unittest.TestCase):
     def test_committed_drafts_stay_out_of_operator_overview(self):
         # The leak: draft games must not appear in the operator schedule or
         # claim a slot in the grid until they are published (#86).
-        self.api.commit_draft_schedule("d")
+        commit_fresh_draft(self.api, "d")
         ov = self.api.get_demo_overview()
         self.assertEqual(ov["schedule"], [])
         self.assertTrue(all(s["game_id"] is None for s in ov["ice_slots"]))
@@ -273,7 +273,7 @@ class DraftReviewServiceTest(unittest.TestCase):
         self.assertEqual(len(ov2["schedule"]), 6)
 
     def test_commit_and_discard_are_audited(self):
-        self.api.commit_draft_schedule("d", actor_id="user_admin")
+        commit_fresh_draft(self.api, "d", actor_id="user_admin")
         commit = [a for a in self.store.all_setup_audit()
                   if a.action == "draft_schedule_committed"]
         self.assertEqual(len(commit), 1)
@@ -285,7 +285,7 @@ class DraftReviewServiceTest(unittest.TestCase):
         self.assertEqual(len(discarded), 6)
 
     def test_publish_uses_the_audited_single_game_publish_path(self):
-        self.api.commit_draft_schedule("d", actor_id="user_admin")
+        commit_fresh_draft(self.api, "d", actor_id="user_admin")
         before = sum(1 for a in self.store.all_setup_audit()
                      if a.action == "game_published")
         self.api.publish_draft_games(all_drafts=True, actor_id="user_admin")
@@ -305,7 +305,7 @@ class DraftReviewServiceTest(unittest.TestCase):
         # grid reads its backing slot as ALLOCATED (not an open drop target), so a
         # later scheduling pass never re-offers the same occupied ice — even
         # before the draft is published.
-        res = self.api.commit_draft_schedule("d")
+        res = commit_fresh_draft(self.api, "d")
         draft_slots = set(self._slot_ids_of_drafts())
         self.assertEqual(len(draft_slots), len(res["created"]))
         grid = {s["id"]: s for s in self.api.get_demo_overview()["ice_slots"]}
@@ -313,7 +313,7 @@ class DraftReviewServiceTest(unittest.TestCase):
             self.assertEqual(grid[sid]["status"], "allocated", sid)
 
     def test_publish_allocates_the_slot(self):
-        self.api.commit_draft_schedule("d")
+        commit_fresh_draft(self.api, "d")
         slot_ids = self._slot_ids_of_drafts()
         self.assertTrue(slot_ids)
         self.api.publish_draft_games(all_drafts=True)
@@ -322,7 +322,7 @@ class DraftReviewServiceTest(unittest.TestCase):
                              IceSlotStatus.ALLOCATED)
 
     def test_discard_leaves_slots_available(self):
-        self.api.commit_draft_schedule("d")
+        commit_fresh_draft(self.api, "d")
         self.api.discard_draft_games(all_drafts=True)
         self.assertTrue(all(s.status == IceSlotStatus.AVAILABLE
                             for s in self.store.all_ice_slots()))
@@ -331,7 +331,7 @@ class DraftReviewServiceTest(unittest.TestCase):
         # Regression: after publish, the operator slot grid shows the game AND
         # marks the slot allocated — exactly like a manually-created game, so
         # the calendar no longer treats an occupied slot as an open drop target.
-        res = self.api.commit_draft_schedule("d")
+        res = commit_fresh_draft(self.api, "d")
         self.api.publish_draft_games(all_drafts=True)
         ov = self.api.get_demo_overview()
         occupied = [s for s in ov["ice_slots"] if s["game_id"]]
@@ -347,7 +347,7 @@ class SchedulerReviewIssuesTest(unittest.TestCase):
         self.api, self.store = _seeded_api()
 
     def test_summary_counts_and_default_issues(self):
-        self.api.commit_draft_schedule("d")
+        commit_fresh_draft(self.api, "d")
         res = self.api.list_draft_games()
         summary = res["summary"]
         self.assertEqual(summary["draft_count"], 6)
@@ -363,7 +363,7 @@ class SchedulerReviewIssuesTest(unittest.TestCase):
 
     def test_officials_pending_until_accepted(self):
         self.store.add_official(Official(id="o1", name="Ref One"))
-        self.api.commit_draft_schedule("d")
+        commit_fresh_draft(self.api, "d")
         gid = self.api.list_draft_games()["draft_games"][0]["game_id"]
         assignment = self.api.assign_official(gid, "o1", "referee")
         row = next(r for r in self.api.list_draft_games()["draft_games"]
@@ -382,7 +382,7 @@ class SchedulerReviewIssuesTest(unittest.TestCase):
         self.assertIn("roster_not_ready", row["issues"])
 
     def test_published_count_reflects_publish(self):
-        self.api.commit_draft_schedule("d")
+        commit_fresh_draft(self.api, "d")
         drafts = self.api.list_draft_games()["draft_games"]
         self.api.publish_draft_games(game_ids=[drafts[0]["game_id"]])
         summary = self.api.list_draft_games()["summary"]
@@ -393,7 +393,7 @@ class SchedulerReviewIssuesTest(unittest.TestCase):
         # The generator itself never proposes an already-used slot; this
         # simulates data mutated out of band so the review screen still
         # surfaces it rather than silently publishing a clash.
-        self.api.commit_draft_schedule("d")
+        commit_fresh_draft(self.api, "d")
         drafts = self.api.list_draft_games()["draft_games"]
         clashing_slot = drafts[0]["game_id"]
         slot_id = next(g.ice_slot_id for g in self.store.all_games()
@@ -408,7 +408,7 @@ class SchedulerReviewIssuesTest(unittest.TestCase):
         self.assertIn("slot_conflict", row["issues"])
 
     def test_team_double_booking_flagged_defensively(self):
-        self.api.commit_draft_schedule("d")
+        commit_fresh_draft(self.api, "d")
         drafts = self.api.list_draft_games()["draft_games"]
         target = drafts[0]
         overlap_start = datetime.fromisoformat(target["start_time"])
@@ -493,8 +493,11 @@ class DraftReviewHttpTest(unittest.TestCase):
         store = srv.STATE.api.store
         drafts_before = len([g for g in store.all_games() if g.is_draft])
         audit_before = len(store.all_setup_audit())
+        _, preview = self._req(c, "POST", "/api/scheduler/draft",
+                               {"division_id": self.div})
         status, res = self._req(c, "POST", "/api/scheduler/commit",
-                                {"division_id": self.div})
+                                {"division_id": self.div,
+                                 "draft_fingerprint": preview["draft_fingerprint"]})
         self.assertNotEqual(status, 200, res)
         self.assertEqual(res["error"]["details"]["reason"], "team_overlap")
         self.assertEqual(
@@ -530,7 +533,8 @@ class DraftReviewHttpTest(unittest.TestCase):
         api.draft_season_schedule = lambda *a, **k: proposal   # force the stale plan
         try:
             status, res = self._req(c, "POST", "/api/scheduler/commit",
-                                    {"division_id": self.div})
+                                    {"division_id": self.div,
+                                     "draft_fingerprint": proposal["draft_fingerprint"]})
         finally:
             api.draft_season_schedule = orig
             borrowed = store.get_ice_slot(taken)          # release the borrowed slot
@@ -550,8 +554,11 @@ class DraftReviewHttpTest(unittest.TestCase):
         c = self._client()
         self._req(c, "POST", "/api/auth/login", {"username": "admin", "password": "demo"})
         self._clear_schedule()
+        _, preview = self._req(c, "POST", "/api/scheduler/draft",
+                               {"division_id": self.div})
         status, body = self._req(c, "POST", "/api/scheduler/commit",
-                                 {"division_id": self.div})
+                                 {"division_id": self.div,
+                                  "draft_fingerprint": preview["draft_fingerprint"]})
         self.assertEqual(status, 200)
         _, listed = self._req(c, "GET", "/api/scheduler/drafts")
         self.assertEqual(len(listed["draft_games"]), len(body["created"]))
@@ -568,8 +575,11 @@ class DraftReviewHttpTest(unittest.TestCase):
         self._req(c, "POST", "/api/auth/login",
                   {"username": "admin", "password": "demo"})
         self._clear_schedule()
+        _, preview = self._req(c, "POST", "/api/scheduler/draft",
+                               {"division_id": self.div})
         status, _ = self._req(c, "POST", "/api/scheduler/commit",
-                              {"division_id": self.div})
+                              {"division_id": self.div,
+                               "draft_fingerprint": preview["draft_fingerprint"]})
         self.assertEqual(status, 200)
         _, listed = self._req(c, "GET", "/api/scheduler/drafts")
         draft_ids = [r["game_id"] for r in listed["draft_games"]]

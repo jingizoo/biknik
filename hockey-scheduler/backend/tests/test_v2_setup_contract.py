@@ -994,9 +994,13 @@ class V2SetupContractTest(unittest.TestCase):
         # one AFTER revoke is correctly rejected by the same eligibility gate
         # this whole PR added, so it must exist before revoke to exercise the
         # cleanup-blocking behavior below.
+        _, draft_preview = self._req(
+            c, "POST", "/api/scheduler/draft",
+            {"division_id": division["id"], "slot_ids": [slot2["id"]]})
         status, draft = self._req(
             c, "POST", "/api/scheduler/commit",
-            {"division_id": division["id"], "slot_ids": [slot2["id"]]})
+            {"division_id": division["id"], "slot_ids": [slot2["id"]],
+             "draft_fingerprint": draft_preview["draft_fingerprint"]})
         self.assertEqual(status, 200, draft)
         self.assertTrue(draft["created"], draft)
         draft_game_id = draft["created"][0]["game_id"]

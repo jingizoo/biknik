@@ -18,7 +18,7 @@ from datetime import datetime, timedelta, timezone
 from http.cookiejar import CookieJar
 from http.server import ThreadingHTTPServer
 
-from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
+from helpers import BACKEND, commit_fresh_draft  # noqa: F401  (BACKEND: sys.path)
 
 from hockey_scheduler.domain import (
     Division,
@@ -240,8 +240,8 @@ class SchedulerContract:
         # key is this tenancy layer's separate, pre-existing Program-scoped
         # vocabulary; see the implementation's own comment for why).
         self._division_fixture(4, 6)
-        result = self.api.commit_draft_schedule(
-            division_id="div1", actor_id="admin")
+        result = commit_fresh_draft(
+            self.api, division_id="div1", actor_id="admin")
         self.assertNotIn("error", result)
         self.assertEqual(result["season_id"], "se1")
         games = self.store.all_games()
@@ -357,8 +357,8 @@ class SchedulerContract:
 
     def test_league_wide_commit_stamps_league_and_per_row_division(self):
         self._league_two_divisions_fixture(per_division=2, n_slots=8)
-        result = self.api.commit_draft_schedule(
-            season_id="se1", league_id="lg1", actor_id="admin")
+        result = commit_fresh_draft(
+            self.api, season_id="se1", league_id="lg1", actor_id="admin")
         self.assertNotIn("error", result)
         self.assertEqual(result["season_id"], "se1")
         self.assertEqual(result["league_id"], "lg1")
@@ -392,8 +392,8 @@ class SchedulerContract:
 
     def test_division_commit_persists_exact_league_season_for_publish_and_move(self):
         self._division_fixture(n_teams=2, n_slots=3)
-        result = self.api.commit_draft_schedule(
-            "div1", actor_id="admin")
+        result = commit_fresh_draft(
+            self.api, "div1", actor_id="admin")
         self.assertNotIn("error", result, repr(result))
         game = self.store.all_games()[0]
         self.assertEqual(game.league_season_id, "ls_lg1_se1")
@@ -425,8 +425,9 @@ class SchedulerContract:
 
     def test_league_wide_commit_rejects_cross_league_division_zero_mutation(self):
         self._two_leagues_fixture()
-        result = self.api.commit_draft_schedule(
-            season_id="se1", league_id="lg1", division_id="div2", actor_id="admin")
+        result = commit_fresh_draft(
+            self.api, season_id="se1", league_id="lg1", division_id="div2",
+            actor_id="admin")
         self.assertEqual(result.get("error", {}).get("code"), "not_found")
         self.assertEqual(self.store.all_games(), [])
         self.assertEqual(self.store.all_setup_audit(), [])
@@ -453,8 +454,8 @@ class SchedulerContract:
         self.store.add_season_team_registration(SeasonTeamRegistration(
             id="streg_bad", league_season_id="ls_lg1_se1", team_id="bad",
             division_id="div2", active=True))
-        result = self.api.commit_draft_schedule(
-            season_id="se1", league_id="lg1", actor_id="admin")
+        result = commit_fresh_draft(
+            self.api, season_id="se1", league_id="lg1", actor_id="admin")
         self.assertNotIn("error", result)
         games = self.store.all_games()
         self.assertEqual(len(games), 1)  # only t0 vs t1
@@ -493,23 +494,32 @@ class SchedulerContract:
         self.assertEqual(len(self.store.all_games()), 1)
 
     def test_already_scheduled_exempts_cancelled_games(self):
+        # #328 review: league_season_id must be set to the fixture's OWN
+        # ls_lg1_se1, or _existing_pairing_games' (league_season_id,
+        # division_id) scope filter rejects this Game before `cancelled` is
+        # ever evaluated -- a vacuous proof (still green with the exemption
+        # predicate deleted entirely).
         self._division_fixture(4, 6)
         home, away = round_robin_pairings(["t0", "t1", "t2", "t3"])[0]
         self.store.add_game(Game(
             id="cancelled1", home_team_id=home, away_team_id=away,
             start_time=BASE_TIME, cancelled=True,
-            division_id="div1", season_id="se1", league_id="lg1"))
+            division_id="div1", season_id="se1", league_id="lg1",
+            league_season_id="ls_lg1_se1"))
         res = draft_schedule(self.store, "div1")
         self.assertEqual(res["already_scheduled"], [])
         self.assertEqual(len(res["draft_games"]), 6)  # regenerated, not skipped
 
     def test_already_scheduled_exempts_exhibition_games(self):
+        # #328 review: same scope-matching requirement as the cancelled
+        # case above -- league_season_id must reach the type predicate.
         self._division_fixture(4, 6)
         home, away = round_robin_pairings(["t0", "t1", "t2", "t3"])[0]
         self.store.add_game(Game(
             id="exhib1", home_team_id=home, away_team_id=away,
             start_time=BASE_TIME, game_type=GameType.EXHIBITION.value,
-            division_id="div1", season_id="se1", league_id="lg1"))
+            division_id="div1", season_id="se1", league_id="lg1",
+            league_season_id="ls_lg1_se1"))
         res = draft_schedule(self.store, "div1")
         self.assertEqual(res["already_scheduled"], [])
         self.assertEqual(len(res["draft_games"]), 6)  # a friendly isn't a fixture
@@ -666,13 +676,27 @@ class SchedulerContract:
         slot never conflicts with the stale row's own slot at all -- the
         original #206 scenario). ``api_cls`` selects which commit facade to
         exercise; both must independently enforce the same priority since
-        neither delegates to the other."""
+        neither delegates to the other.
+
+        #328 review round 6: the raced pairing is the LAST of 6 rows, not
+        the first (mirrors test_commit_rejects_a_pairing_that_already_has_a_
+        real_game's established technique) -- proving the loser's own
+        transaction tentatively creates the five EARLIER rows' Games and
+        flips their slots ALLOCATED before reaching the contested one, and
+        that the WHOLE batch (not merely the bad row) rolls back. The
+        winning Game is inserted directly rather than via a second real
+        commit -- what matters here is only that a real Game exists for
+        this exact pairing on this exact ice, not which code path created
+        it (a genuine concurrent commit is what the forced PostgreSQL races
+        in test_placement_concurrency.py additionally prove)."""
         self._division_fixture(4, 6)
         api = api_cls(self.store)
         stale_proposal = api.draft_season_schedule("div1")
-        row = stale_proposal["draft_games"][0]
+        rows = stale_proposal["draft_games"]
+        self.assertEqual(len(rows), 6, repr(stale_proposal))
+        row = rows[-1]
         if physical == "same_slot":
-            winner_slot_ids = [row["ice_slot_id"]]
+            winner_slot_id = row["ice_slot_id"]
         elif physical == "overlapping_slot":
             slot0 = self.store.get_ice_slot(row["ice_slot_id"])
             self.store.add_rink(Rink(
@@ -680,7 +704,7 @@ class SchedulerContract:
             self.store.add_ice_slot(IceSlot(
                 id="overlap_slot", rink_id="r_overlap",
                 start_time=slot0.start_time, end_time=slot0.end_time))
-            winner_slot_ids = ["overlap_slot"]
+            winner_slot_id = "overlap_slot"
         else:
             assert physical == "none"
             far_start = BASE_TIME - timedelta(days=100)
@@ -688,21 +712,20 @@ class SchedulerContract:
             self.store.add_ice_slot(IceSlot(
                 id="far_slot", rink_id="r_far", start_time=far_start,
                 end_time=far_start + timedelta(hours=1)))
-            winner_slot_ids = ["far_slot"]
-        # A REAL commit wins row's exact pairing -- the greedy assigner
-        # always tries round-robin pairing[0] (== row) first, so
-        # restricting to one slot deterministically wins it that pairing.
-        win = api.commit_draft_schedule("div1", slot_ids=winner_slot_ids)
-        self.assertNotIn("error", win, repr(win))
-        self.assertEqual(len(win["created"]), 1, repr(win))
-        winning = win["created"][0]
-        self.assertEqual(
-            {winning["home_team_name"], winning["away_team_name"]},
-            {row["home_team_name"], row["away_team_name"]})
-        winning_game_id = winning["game_id"]
+            winner_slot_id = "far_slot"
+        winner_slot = self.store.get_ice_slot(winner_slot_id)
+        winning_game_id = "winning_game"
+        self.store.add_game(Game(
+            id=winning_game_id, home_team_id=row["home_team_id"],
+            away_team_id=row["away_team_id"],
+            start_time=winner_slot.start_time, end_time=winner_slot.end_time,
+            ice_slot_id=winner_slot_id, division_id="div1", season_id="se1",
+            league_id="lg1", league_season_id="ls_lg1_se1"))
+        winner_slot.status = IceSlotStatus.ALLOCATED
+        self.store.save_ice_slot(winner_slot)
         # Force the stale (pre-win) proposal through commit unchanged.
         api.draft_season_schedule = lambda *a, **k: stale_proposal
-        res = api.commit_draft_schedule("div1")
+        res = commit_fresh_draft(api, "div1")
         self.assertIn("error", res, repr(res))
         self.assertEqual(res["error"]["details"]["reason"],
                          "pairing_already_scheduled", repr(res))
@@ -710,9 +733,16 @@ class SchedulerContract:
                          winning_game_id, repr(res))
         self.assertIn(row["home_team_name"], res["error"]["message"])
         self.assertIn(row["away_team_name"], res["error"]["message"])
-        # Atomic rollback: only the winner's Game exists -- the losing
-        # attempt left zero partial writes.
+        # Atomic rollback: only the winning Game exists -- the five EARLIER
+        # rows the loser's own transaction tentatively created/allocated
+        # are back to AVAILABLE, and no batch audit landed.
         self.assertEqual(len(self.store.all_games()), 1, repr(res))
+        for r in rows[:-1]:
+            self.assertEqual(
+                self.store.get_ice_slot(r["ice_slot_id"]).status,
+                IceSlotStatus.AVAILABLE, r["ice_slot_id"])
+        self.assertFalse(any(a.action == "draft_schedule_committed"
+                             for a in self.store.all_setup_audit()))
 
     def test_league_scoped_pairing_race_wins_over_same_slot_conflict(self):
         self._pairing_race_wins_over_physical_conflict(ApiService, "same_slot")
@@ -734,6 +764,97 @@ class SchedulerContract:
 
     def test_base_facade_pairing_race_wins_over_non_overlapping_slot(self):
         self._pairing_race_wins_over_physical_conflict(BaseApiService, "none")
+
+    # -- stale-preview TOCTOU gate (#328 review round 5) --------------------
+    def _stale_preview_refused(self, api_cls, change):
+        """Shared assertion: a Game created or cancelled in the window
+        between Generate and Commit must invalidate the reviewed preview's
+        fingerprint -- the commit is refused with the terminal
+        ``preview_stale`` reason and writes nothing, rather than silently
+        committing a batch that quietly grew or shrank relative to what the
+        operator reviewed. ``change`` is ``"create"`` (a real Game appears
+        for a pairing the stale preview still lists as missing -- the
+        committed batch would otherwise silently shrink) or ``"cancel"``
+        (the Game blocking a pairing the stale preview still lists as
+        already-scheduled gets cancelled, so it's newly missing -- the
+        committed batch would otherwise silently grow with a pairing the
+        operator never reviewed). ``api_cls`` selects which commit facade
+        to exercise; both independently reimplement the commit body, so
+        both need the check."""
+        self._division_fixture(4, 6)
+        home, away = round_robin_pairings(["t0", "t1", "t2", "t3"])[0]
+        if change == "cancel":
+            # Seed the pairing's blocking Game BEFORE the preview, so the
+            # preview reports it already-scheduled; cancelling it below
+            # then makes that same pairing newly missing.
+            self.store.add_game(Game(
+                id="blocking_game", home_team_id=home, away_team_id=away,
+                start_time=BASE_TIME - timedelta(days=100),
+                end_time=BASE_TIME - timedelta(days=100) + timedelta(hours=1),
+                division_id="div1", season_id="se1", league_id="lg1",
+                league_season_id="ls_lg1_se1"))
+        api = api_cls(self.store)
+        preview = api.draft_season_schedule("div1")
+        stale_fingerprint = preview["draft_fingerprint"]
+        if change == "create":
+            self.assertEqual(preview["already_scheduled"], [], repr(preview))
+            # A Game for the pairing appears in the window after Generate --
+            # simulating a concurrent commit, or any other write path, that
+            # the operator's on-screen preview never saw.
+            self.store.add_game(Game(
+                id="drift_game", home_team_id=home, away_team_id=away,
+                start_time=BASE_TIME - timedelta(days=100),
+                end_time=BASE_TIME - timedelta(days=100) + timedelta(hours=1),
+                division_id="div1", season_id="se1", league_id="lg1",
+                league_season_id="ls_lg1_se1"))
+        else:
+            assert change == "cancel"
+            self.assertEqual(len(preview["already_scheduled"]), 1, repr(preview))
+            blocking = self.store.get_game("blocking_game")
+            blocking.cancelled = True
+            self.store.save_game(blocking)
+        games_before = len(self.store.all_games())
+        audits_before = len(self.store.all_setup_audit())
+        res = api.commit_draft_schedule(
+            "div1", draft_fingerprint=stale_fingerprint)
+        self.assertIn("error", res, repr(res))
+        self.assertEqual(
+            res["error"]["details"]["reason"], "preview_stale", repr(res))
+        self.assertEqual(len(self.store.all_games()), games_before, repr(res))
+        self.assertEqual(
+            len(self.store.all_setup_audit()), audits_before, repr(res))
+
+    def test_league_scoped_commit_refuses_stale_preview_after_pairing_created(
+            self):
+        self._stale_preview_refused(ApiService, "create")
+
+    def test_league_scoped_commit_refuses_stale_preview_after_blocking_game_cancelled(
+            self):
+        self._stale_preview_refused(ApiService, "cancel")
+
+    def test_base_facade_commit_refuses_stale_preview_after_pairing_created(
+            self):
+        self._stale_preview_refused(BaseApiService, "create")
+
+    def test_base_facade_commit_refuses_stale_preview_after_blocking_game_cancelled(
+            self):
+        self._stale_preview_refused(BaseApiService, "cancel")
+
+    def _commit_requires_a_preview_fingerprint(self, api_cls):
+        self._division_fixture(4, 6)
+        api = api_cls(self.store)
+        games_before = len(self.store.all_games())
+        res = api.commit_draft_schedule("div1")  # no draft_fingerprint at all
+        self.assertIn("error", res, repr(res))
+        self.assertEqual(
+            res["error"]["details"]["reason"], "preview_required", repr(res))
+        self.assertEqual(len(self.store.all_games()), games_before, repr(res))
+
+    def test_league_scoped_commit_requires_a_preview_fingerprint(self):
+        self._commit_requires_a_preview_fingerprint(ApiService)
+
+    def test_base_facade_commit_requires_a_preview_fingerprint(self):
+        self._commit_requires_a_preview_fingerprint(BaseApiService)
 
 
 class MemorySchedulerTest(SchedulerContract, unittest.TestCase):

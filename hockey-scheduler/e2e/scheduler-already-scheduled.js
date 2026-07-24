@@ -15,6 +15,11 @@
 //     real Game: the preview shows 0 games, 0 conflicts, 1 already
 //     scheduled, an explanatory "already scheduled" message instead of the
 //     generic empty state, and commit stays DISABLED.
+// It also proves the operator-facing reaction to two stubbed commit-time
+// refusals: a concurrent-commit race (pairing_already_scheduled) and a
+// stale preview invalidated by a Game created/cancelled after Generate
+// (preview_stale, #328 review round 5) -- both show an actionable message,
+// clear the stale preview, and require a fresh Generate before retrying.
 //
 // Fails on any browser console/page error.
 const { chromium } = require("playwright");
@@ -66,16 +71,31 @@ function previewState(page) {
     const pv = document.querySelector("#sched-preview");
     if (!pv) return null;
     const commit = document.querySelector("[data-sched-commit]");
+    // #328 review: structured per-row text (not just aggregate counts/text),
+    // so callers can assert the EXACT pairing name + Game id a specific row
+    // shows, not merely that the right number of rows exist.
+    const rows = Array.from(pv.querySelectorAll(".card .li")).map((li) => ({
+      title: ((li.querySelector(".li-title") || {}).textContent || "").trim(),
+      sub: ((li.querySelector(".li-sub") || {}).textContent || "").trim(),
+    }));
     return {
       games: pv.getAttribute("data-games"),
       conflicts: pv.getAttribute("data-conflicts"),
       alreadyScheduled: pv.getAttribute("data-already-scheduled"),
       commitPresent: !!commit,
       commitDisabled: commit ? commit.disabled : null,
-      liRows: pv.querySelectorAll(".card .li").length,
+      rows,
       text: pv.textContent.replace(/\s+/g, " ").trim(),
     };
   });
+}
+
+// Exact-match row lookup (#328 review): a pairing's rendered title must be
+// EXACTLY "Home vs Away" and its sub-line must contain the given substring
+// (e.g. naming its specific existing Game id) -- proves the right row, not
+// merely that some row somewhere mentions "already scheduled".
+function hasRow(rows, title, subIncludes) {
+  return rows.some((r) => r.title === title && r.sub.includes(subIncludes));
 }
 
 async function checkViewport(browser, viewport) {
@@ -149,15 +169,24 @@ async function checkViewport(browser, viewport) {
       // Ask the scheduler which pairings the Mixed round robin actually
       // produces (no ice yet, so all six land in unscheduled) instead of
       // re-implementing the circle method here; pre-seed real Games for
-      // the first two so the NEXT preview is genuinely mixed.
+      // the first two so the NEXT preview is genuinely mixed. Capture each
+      // seeded pairing's names + Game id (#328 review) so the caller can
+      // assert the EXACT already-scheduled rows the preview renders, not
+      // just their count.
       const bare = await post("/api/scheduler/draft", { division_id: dMixed.id });
       const toSeed = bare.unscheduled.slice(0, 2);
+      const seededMixed = [];
       for (const pairing of toSeed) {
         const seedSlot = await slot(6 + toSeed.indexOf(pairing));
-        await post("/api/setup/game", {
+        const g = await post("/api/setup/game", {
           season_id: season.id, division_id: dMixed.id,
           home_team_id: pairing.home_team_id, away_team_id: pairing.away_team_id,
           ice_slot_id: seedSlot,
+        });
+        seededMixed.push({
+          home_team_name: pairing.home_team_name,
+          away_team_name: pairing.away_team_name,
+          game_id: g.id,
         });
       }
       // Ice for the four still-missing Mixed pairings.
@@ -166,12 +195,16 @@ async function checkViewport(browser, viewport) {
       // AllDone's one pairing already has a real Game — no ice slot is
       // even needed for it to be picked up as already-scheduled.
       const allDoneSlot = await slot(20);
-      await post("/api/setup/game", {
+      const allDoneGame = await post("/api/setup/game", {
         season_id: season.id, division_id: dAllDone.id,
         home_team_id: a0, away_team_id: a1, ice_slot_id: allDoneSlot,
       });
 
-      return { dMixed: dMixed.id, dAllDone: dAllDone.id };
+      return {
+        dMixed: dMixed.id, dAllDone: dAllDone.id, seededMixed,
+        allDone: { home_team_name: "AllDone 0", away_team_name: "AllDone 1",
+                  game_id: allDoneGame.id },
+      };
     }, ICE_DAY);
 
     await page.waitForSelector('.tab[data-tab="scheduler"]', { state: "visible", timeout: 10000 });
@@ -191,8 +224,27 @@ async function checkViewport(browser, viewport) {
     if (!/4 game\(s\), 0 conflict\(s\), 2 already scheduled/.test(s.text)) {
       fail(`mixed: header should name the already-scheduled count: ${s.text}`);
     }
-    if (!/Already scheduled — Game/.test(s.text)) {
-      fail(`mixed: already-scheduled pairings must reference their existing Game: ${s.text}`);
+    // #328 review: assert the EXACT two seeded pairings, each naming its OWN
+    // existing Game id -- not just that some row somewhere says "already
+    // scheduled" and the counts add up (which a duplicated or misattributed
+    // row could also satisfy).
+    for (const seeded of ids.seededMixed) {
+      const title = `${seeded.home_team_name} vs ${seeded.away_team_name}`;
+      if (!hasRow(s.rows, title, `Already scheduled — Game ${seeded.game_id}`)) {
+        fail(`mixed: missing exact already-scheduled row "${title}" naming Game ${seeded.game_id}: ${JSON.stringify(s.rows)}`);
+      }
+    }
+    const alreadyRows = s.rows.filter((r) => r.sub.includes("Already scheduled"));
+    if (alreadyRows.length !== 2) {
+      fail(`mixed: expected exactly 2 already-scheduled rows, got ${JSON.stringify(alreadyRows)}`);
+    }
+    // The two seeded pairings must never ALSO appear as proposed games.
+    const gameRows = s.rows.filter((r) => !r.sub.includes("Already scheduled"));
+    for (const seeded of ids.seededMixed) {
+      const title = `${seeded.home_team_name} vs ${seeded.away_team_name}`;
+      if (gameRows.some((r) => r.title === title)) {
+        fail(`mixed: seeded pairing "${title}" must not also appear as a proposed game: ${JSON.stringify(gameRows)}`);
+      }
     }
     if (s.commitPresent !== true || s.commitDisabled !== false) {
       fail(`mixed: commit must stay enabled with 4 real missing games: ${JSON.stringify(s)}`);
@@ -212,6 +264,11 @@ async function checkViewport(browser, viewport) {
     }
     if (!/already scheduled/i.test(s.text) || !/nothing missing/i.test(s.text)) {
       fail(`all-done: missing explanatory "already scheduled" message: ${s.text}`);
+    }
+    // #328 review: assert the exact row, not just the aggregate count/text.
+    const allDoneTitle = `${ids.allDone.home_team_name} vs ${ids.allDone.away_team_name}`;
+    if (!hasRow(s.rows, allDoneTitle, `Already scheduled — Game ${ids.allDone.game_id}`)) {
+      fail(`all-done: missing exact already-scheduled row "${allDoneTitle}" naming Game ${ids.allDone.game_id}: ${JSON.stringify(s.rows)}`);
     }
     if (s.commitDisabled !== true) {
       fail(`all-done: commit must stay disabled with nothing missing: ${JSON.stringify(s)}`);
@@ -260,10 +317,52 @@ async function checkViewport(browser, viewport) {
     }
     await page.unroute("**/api/scheduler/commit");
 
+    // (4) Stale-preview TOCTOU gate, stubbed (#328 review round 5): a Game
+    // created or cancelled in the window between Generate and Commit
+    // invalidates the reviewed preview's fingerprint. Genuinely reproducing
+    // that gap in a single browser page isn't practical either (the
+    // backend regressions in test_scheduler.py cover the real
+    // create/cancel-between-preview-and-commit scenarios directly against
+    // the store), so /api/scheduler/commit is stubbed with the exact shape
+    // a real preview_stale refusal returns -- proving the UI reaction: the
+    // message is actionable on its own (post()'s generic toast surfaces
+    // error.message alone, never error.details), the stale preview is
+    // cleared, and Commit cannot be retried without a fresh Generate.
+    await generateFor(page, ids.dMixed,
+      '#sched-preview[data-games="4"][data-already-scheduled="2"]');
+    s = await previewState(page);
+    if (s.commitDisabled !== false) {
+      fail(`stale-preview stub: needs an enabled Commit to click: ${JSON.stringify(s)}`);
+    }
+    await page.route("**/api/scheduler/commit", (r) => r.fulfill({
+      status: 409,
+      contentType: "application/json",
+      body: JSON.stringify({
+        error: {
+          code: "concurrency_conflict",
+          message: "This preview is out of date — a game may have been "
+            + "added, cancelled, or otherwise changed since you "
+            + "generated it. Generate a fresh preview and review it "
+            + "before committing.",
+          details: { reason: "preview_stale" },
+        },
+      }),
+    }));
+    await page.click("[data-sched-commit]");
+    await page.waitForFunction(
+      () => /This preview is out of date/
+        .test((document.querySelector(".toast-msg") || {}).textContent || ""),
+      null, { timeout: 10000 });
+    await page.waitForSelector("#sched-preview", { state: "detached", timeout: 10000 });
+    if (await page.locator("[data-sched-commit]").count()) {
+      fail("stale-preview stub: Commit must not be retryable without a fresh Generate");
+    }
+    await page.unroute("**/api/scheduler/commit");
+
     if (errors.length) {
       fail(`console/page errors:\n${errors.join("\n")}`);
     }
-    console.log(`[${viewport.label}] OK — mixed and all-already-scheduled previews both name already-scheduled pairings distinctly from proposed games and conflicts, and a commit-time race refusal shows both teams and the winning Game id then requires a fresh Generate.`);
+    console.log(`[${viewport.label}] OK — mixed and all-already-scheduled previews both name already-scheduled pairings distinctly from proposed games and conflicts, and both a commit-time race refusal (naming the winning Game) and a stale-preview refusal show an actionable message then require a fresh Generate.`);
   } catch (error) {
     throw new Error(`${error.message}\n--- demo server output ---\n${serverOutput}`);
   } finally {

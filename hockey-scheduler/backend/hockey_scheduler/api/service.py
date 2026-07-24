@@ -2779,6 +2779,7 @@ class ApiService:
     def commit_draft_schedule(self, division_id: str = None,
                               season_id: str = None, league_id: str = None,
                               slot_ids=None, constraints=None,
+                              draft_fingerprint: str = None,
                               actor_id=None) -> dict:
         """Retry shell (#318): ``placement_raced`` marks the batch's
         pre-lock scope locator invalidated by a concurrent commit; each
@@ -2787,13 +2788,21 @@ class ApiService:
         ``create_game``'s loop and ``move_game``'s ``_retry_on_move_race``.
         The whole body lives in ``_commit_draft_schedule_attempt``; the
         league-scoped facade overrides the attempt and inherits this
-        shell."""
+        shell.
+
+        ``draft_fingerprint`` (#328 review round 5) must be the
+        ``draft_fingerprint`` returned by the ``draft_season_schedule`` call
+        the caller actually reviewed — see ``_commit_draft_schedule_attempt``
+        for what it guards against. It is passed through unchanged on every
+        retry: a retry only re-runs the SAME reviewed commit against a fresh
+        transaction, it does not re-open review of a new proposal."""
         for _attempt in range(3):
             try:
                 return self._commit_draft_schedule_attempt(
                     division_id=division_id, season_id=season_id,
                     league_id=league_id, slot_ids=slot_ids,
-                    constraints=constraints, actor_id=actor_id)
+                    constraints=constraints,
+                    draft_fingerprint=draft_fingerprint, actor_id=actor_id)
             except ConcurrencyConflictError as exc:
                 if ((exc.details or {}).get("reason") != "placement_raced"
                         or _attempt == 2):
@@ -2803,6 +2812,7 @@ class ApiService:
                                        season_id: str = None,
                                        league_id: str = None,
                                        slot_ids=None, constraints=None,
+                                       draft_fingerprint: str = None,
                                        actor_id=None) -> dict:
         """Persist a generated draft as draft games (is_draft=True, unpublished),
         so they can be reviewed and then published (#86). Regenerates the
@@ -2819,12 +2829,45 @@ class ApiService:
         whole batch (#233 Slice G — previously these were left unset
         entirely, so a committed draft game had no queryable competition
         scope of its own).
+
+        #328 review round 5 — ``draft_fingerprint`` binds this commit to the
+        EXACT ``already_scheduled``/``draft_games`` split the caller
+        reviewed via a prior ``draft_season_schedule`` call, mirroring the
+        ice-availability builder's preview-token binding
+        (``SetupService.commit_ice_availability``). Scope+constraints alone
+        are not enough: the operator may review a preview on screen for
+        seconds or minutes before clicking Commit, and this method's own
+        regeneration below only ever reflects the CURRENT instant — without
+        this check, a Game created for one of the reviewed pairings in that
+        window would silently shrink the committed batch (quietly moved
+        into ``already_scheduled``), and a previously-blocking Game
+        cancelled in that window would silently grow it (a pairing the
+        operator never reviewed newly appears and gets committed). Missing
+        entirely is a caller error (``preview_required``, mirroring
+        ice-availability); present but not matching the freshly regenerated
+        proposal's own fingerprint means the world moved and the reviewed
+        batch is no longer valid (``preview_stale``) — both refuse before
+        any lock or write. This is deliberately checked BEFORE the
+        transaction: it is a coarse, wide-window gate (the whole
+        preview-to-commit-click gap); the narrower race in the gap between
+        THIS regeneration and taking the locks below remains
+        ``_existing_now``'s job, unaffected by this check.
         """
         proposal = self.draft_season_schedule(
             division_id=division_id, season_id=season_id, league_id=league_id,
             slot_ids=slot_ids, constraints=constraints)
         if isinstance(proposal, dict) and proposal.get("error"):
             return proposal
+        if draft_fingerprint is None:
+            raise ValidationError(
+                "Generate a preview before committing this schedule.",
+                {"reason": "preview_required"})
+        if draft_fingerprint != proposal.get("draft_fingerprint"):
+            raise ConcurrencyConflictError(
+                "This preview is out of date — a game may have been added, "
+                "cancelled, or otherwise changed since you generated it. "
+                "Generate a fresh preview and review it before committing.",
+                {"reason": "preview_stale"})
         resolved_season_id = proposal["season_id"]
         # The Division-only proposal's own "league_id" is this tenancy
         # layer's frozen Program-scoped vocabulary (league_scope.py's
@@ -2914,24 +2957,32 @@ class ApiService:
                 resolved_season_id, draft_ls_id, proposal["draft_games"])
             # #206 slice 1 — freshly computed HERE, under the Team locks just
             # acquired, so the read is race-free against any other writer
-            # touching these exact teams. Checked per row BELOW, only after
-            # that row's own slot/team-overlap check succeeds: those existing
-            # checks (physical feasibility — can these teams+ice coexist
-            # right now) keep priority when a row happens to trip both, same
-            # as manual create/move; this is a residual check for what they
-            # structurally can't see — a genuinely free, non-conflicting slot
-            # proposed for a pairing that already has a real Game elsewhere,
-            # created by a concurrent write between this proposal's
-            # generation and this commit (the proposal already excluded
-            # pairings that existed AT PREVIEW time — scheduler.py's
-            # already_scheduled split — so only such a race can slip one
-            # through here). #328 review round 2 — this is a TERMINAL fact,
-            # not transient contention: the operator reviewed a specific
-            # proposal, and a winning commit already changed what "missing"
-            # means, so silently substituting a different pairing into the
-            # SAME commit would diverge from what was reviewed. The batch
-            # rolls back atomically (raising inside this transaction) and
-            # the caller must regenerate and re-review before retrying —
+            # touching these exact teams. Checked per row BELOW, BEFORE that
+            # row's own slot/team-overlap check runs (#328 review round 4 —
+            # reversed from the original design): a row whose exact pairing
+            # already has a real Game is a terminal, product-confirmed fact
+            # that must win regardless of whether the SAME row would ALSO
+            # fail the physical check — the winning Game happens to sit on
+            # this row's own slot, or a slot that overlaps it — because
+            # `pairing_already_scheduled` names the specific pairing and
+            # winning Game, which the physical-feasibility diagnoses
+            # (`team_overlap`, `slot_unavailable`) cannot. This is a residual
+            # check for what those checks structurally can't see either way
+            # — a genuinely free, non-conflicting slot proposed for a
+            # pairing that already has a real Game elsewhere, created by a
+            # concurrent write between this proposal's generation and this
+            # commit (the proposal already excluded pairings that existed AT
+            # PREVIEW time — scheduler.py's already_scheduled split — so
+            # only such a race can slip one through here). An UNRELATED
+            # pairing's physical conflict is not in this index for that
+            # row's own key, so it still falls through to the unchanged
+            # physical check below. #328 review round 2 — this is a TERMINAL
+            # fact, not transient contention: the operator reviewed a
+            # specific proposal, and a winning commit already changed what
+            # "missing" means, so silently substituting a different pairing
+            # into the SAME commit would diverge from what was reviewed. The
+            # batch rolls back atomically (raising inside this transaction)
+            # and the caller must regenerate and re-review before retrying —
             # `pairing_already_scheduled` is deliberately NOT
             # `placement_raced` (the retry shell only retries that one
             # reason), so this reaches the caller unretried.

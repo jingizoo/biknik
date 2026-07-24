@@ -23,6 +23,8 @@ already has some Games fills in only the missing matchups; it never
 duplicates the ones that exist.
 """
 
+import hashlib
+import json
 from datetime import date, timedelta
 
 from ..domain import GameType, IceSlotStatus, IceSlotType
@@ -449,17 +451,49 @@ def _split_already_scheduled(store, pairings, existing, league_season_id):
     return remaining, already
 
 
+def _draft_fingerprint(league_season_id, draft_games, already_scheduled):
+    """Deterministic identity of exactly which pairings this proposal found
+    missing vs. already scheduled (and by which existing Game) — #328
+    review round 5. Bound into the response so the commit path can prove,
+    right before writing, that this fact hasn't changed since: a Regular
+    Game silently created or cancelled in the gap between the operator's
+    preview and clicking Commit changes this fingerprint, and the commit
+    is refused rather than silently committing a different batch than the
+    one reviewed.
+
+    Deliberately excludes slot/time assignment: that dimension is already
+    re-validated fresh and atomically by the per-row physical placement
+    check at commit time (#277), so binding it here too would also reject
+    a preview over mere ice-availability churn this fingerprint isn't
+    meant to guard against.
+    """
+    missing = sorted(
+        f"{d.get('division_id')}|{d['home_team_id']}|{d['away_team_id']}"
+        for d in draft_games)
+    scheduled = sorted(
+        f"{a.get('division_id')}|{a['home_team_id']}|{a['away_team_id']}|"
+        f"{a['existing_game_id']}"
+        for a in already_scheduled)
+    payload = {"league_season_id": league_season_id, "missing": missing,
+               "already_scheduled": scheduled}
+    return hashlib.sha256(json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), default=str
+    ).encode()).hexdigest()[:16]
+
+
 def draft_schedule(store, division_id, slot_ids=None, constraints=None):
     """Generate a draft round-robin schedule for a division (#84/#85).
 
     Returns ``{division_id, team_count, draft_games, unscheduled,
-    already_scheduled, unschedulable_teams}``. Each pairing takes the
-    earliest available slot that satisfies the optional constraints; a
-    pairing with no valid slot is returned in ``unscheduled`` with the
-    reason(s) that blocked it. A pairing that already has a real Game (#206
-    slice 1 — see :func:`_existing_pairing_games`) is reported in
+    already_scheduled, unschedulable_teams, draft_fingerprint}``. Each
+    pairing takes the earliest available slot that satisfies the optional
+    constraints; a pairing with no valid slot is returned in ``unscheduled``
+    with the reason(s) that blocked it. A pairing that already has a real
+    Game (#206 slice 1 — see :func:`_existing_pairing_games`) is reported in
     ``already_scheduled`` instead of being re-proposed or silently dropped.
-    Nothing is persisted.
+    ``draft_fingerprint`` (#328 review round 5 — see :func:`_draft_fingerprint`)
+    binds this exact missing/already-scheduled split so a later commit can
+    detect drift. Nothing is persisted.
     """
     # A division's teams are those validly registered in it this season (#180),
     # via the shared resolver — active rows whose Team exists and whose league
@@ -486,6 +520,8 @@ def draft_schedule(store, division_id, slot_ids=None, constraints=None):
         "already_scheduled": already_scheduled,
         "unschedulable_teams": _unschedulable_teams(
             store, teams, pairings, unscheduled),
+        "draft_fingerprint": _draft_fingerprint(
+            ls_id, draft_games, already_scheduled),
     }
 
 
@@ -531,4 +567,6 @@ def draft_schedule_for_league(store, season_id, league_id, division_id=None,
         "already_scheduled": already_scheduled,
         "unschedulable_teams": _unschedulable_teams(
             store, all_teams, pairings, unscheduled),
+        "draft_fingerprint": _draft_fingerprint(
+            ls_id, draft_games, already_scheduled),
     }
