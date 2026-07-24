@@ -2963,6 +2963,37 @@ class ApiService:
             # participant. Reuses the identical check create_game enforces.
             self.setup._require_batch_team_participation(
                 resolved_season_id, draft_ls_id, proposal["draft_games"])
+            # #328 review round 11 finding 2 -- the checks immediately
+            # above and below only revalidate draft_games/already_scheduled
+            # row identity and participation; a team's ELIGIBILITY changing
+            # in the narrow gap between this method's own pre-lock
+            # regeneration/fingerprint compare and the locks just acquired
+            # is invisible to all of them, since a newly-registered (or
+            # newly-unregistered) team need not touch any row actually in
+            # this batch to change what a fresh preview would show.
+            # Regenerating the complete current proposal HERE -- now that
+            # every lock a proposal's inputs depend on (Program/Team/Rink/
+            # Season) is held -- and comparing its own fingerprint against
+            # the one the operator's Generate call actually returned is one
+            # general check covering every fingerprint-bound dimension at
+            # once (current and future), rather than hand-listing each one.
+            # A concurrent register_team_for_season/
+            # unregister_team_from_season also locks the Season row
+            # (require_active_season), so by the time this transaction
+            # holds it, any such write has either already committed (and
+            # this regeneration observes it) or is blocked behind this
+            # transaction (and cannot land before the writes below).
+            _locked_proposal = self.draft_season_schedule(
+                division_id=division_id, season_id=season_id,
+                league_id=league_id, slot_ids=slot_ids,
+                constraints=constraints)
+            if _locked_proposal.get("draft_fingerprint") != draft_fingerprint:
+                raise ConcurrencyConflictError(
+                    "This preview is out of date — a game may have been "
+                    "added, cancelled, or otherwise changed since you "
+                    "generated it. Generate a fresh preview and review it "
+                    "before committing.",
+                    {"reason": "preview_stale"})
             # #206 slice 1 — freshly computed HERE, under the Team locks just
             # acquired, so the read is race-free against any other writer
             # touching these exact teams. Checked per row BELOW, BEFORE that

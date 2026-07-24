@@ -120,6 +120,25 @@ class DraftFingerprintTest(unittest.TestCase):
                                  reason_codes=["team_rest_violation"])]
         self.assertNotEqual(_draft_fingerprint(**a), _draft_fingerprint(**b))
 
+    def test_changed_unscheduled_reason_text_changes_fingerprint(self):
+        """#328 review round 11 finding 1: a policy THRESHOLD change (e.g.
+        min_playable_minutes) can rewrite the human-readable `reason` text
+        embedded with the current value while `reason_codes` -- a fixed
+        category -- stays identical. The fingerprint must still catch it."""
+        a = self._base_args()
+        b = self._base_args()
+        a["unscheduled"] = [dict(a["unscheduled"][0], reason_codes=[
+            "insufficient_playable_time"],
+            reason="No slot satisfies constraints: Ice slot s9 is only 30 "
+                   "playable minutes; this competition requires at least "
+                   "45.")]
+        b["unscheduled"] = [dict(b["unscheduled"][0], reason_codes=[
+            "insufficient_playable_time"],
+            reason="No slot satisfies constraints: Ice slot s9 is only 30 "
+                   "playable minutes; this competition requires at least "
+                   "50.")]
+        self.assertNotEqual(_draft_fingerprint(**a), _draft_fingerprint(**b))
+
     def test_changed_unschedulable_teams_changes_fingerprint(self):
         a = self._base_args()
         b = self._base_args()
@@ -1189,6 +1208,181 @@ class SchedulerContract:
     def test_base_facade_commit_refuses_stale_preview_after_team_unregisters(
             self):
         self._stale_preview_refused_on_team_eligibility_change(
+            BaseApiService, "unregister")
+
+    # -- fingerprint must bind the unscheduled reason TEXT, not just its
+    # code (#328 review round 11 finding 1) -----------------------------
+    def _stale_preview_refused_on_unscheduled_reason_change(self, api_cls):
+        """Shared assertion: a scheduling-POLICY threshold change between
+        Generate and Commit can rewrite the human-readable `reason` an
+        unscheduled row shows -- the number embedded in the message -- even
+        though `reason_codes` (a fixed category) and every placed/
+        already-scheduled row stay byte-for-byte identical. #328 review
+        round 11: a 4-team division with one 60-minute slot (always
+        playable) and one 30-minute slot (never, at either threshold used
+        here) places exactly one pairing on the 60-minute slot and leaves
+        the other five citing `insufficient_playable_time` against the
+        30-minute slot. Raising `min_playable_minutes` from 45 to 50
+        changes each of those five rows' displayed "requires at least N"
+        text without moving the placed row, changing which pairings are
+        unscheduled, or changing any reason CODE -- exactly the gap round
+        10's `reason_codes`-only binding left open."""
+        self._division_fixture(4, 0)
+        self.store.add_ice_slot(IceSlot(
+            id="slot_60", rink_id="r1", start_time=BASE_TIME,
+            end_time=BASE_TIME + timedelta(minutes=60)))
+        self.store.add_ice_slot(IceSlot(
+            id="slot_30", rink_id="r1",
+            start_time=BASE_TIME + timedelta(days=1),
+            end_time=BASE_TIME + timedelta(days=1, minutes=30)))
+        api = api_cls(self.store)
+        r = api.set_scheduling_policy(
+            scope_type="season", scope_id="se1", min_playable_minutes=45,
+            actor_id="admin")
+        self.assertNotIn("error", r, repr(r))
+        preview = api.draft_season_schedule("div1")
+        self.assertEqual(len(preview["draft_games"]), 1, repr(preview))
+        self.assertEqual(preview["draft_games"][0]["ice_slot_id"], "slot_60",
+                         repr(preview))
+        self.assertEqual(len(preview["unscheduled"]), 5, repr(preview))
+        for u in preview["unscheduled"]:
+            self.assertEqual(
+                u["reason_codes"], ["insufficient_playable_time"], repr(u))
+            self.assertIn("at least 45", u["reason"], repr(u))
+        stale_fingerprint = preview["draft_fingerprint"]
+        r = api.set_scheduling_policy(
+            scope_type="season", scope_id="se1", min_playable_minutes=50,
+            actor_id="admin")
+        self.assertNotIn("error", r, repr(r))
+        # Confirm the fresh regeneration really does keep the placed row
+        # and every identity/code unchanged -- otherwise this fixture
+        # wouldn't isolate the reason-TEXT axis from the (already
+        # separately covered) placement/eligibility axes.
+        fresh = api.draft_season_schedule("div1")
+        self.assertEqual(len(fresh["draft_games"]), 1, repr(fresh))
+        self.assertEqual(
+            fresh["draft_games"][0]["ice_slot_id"], "slot_60", repr(fresh))
+        self.assertEqual(len(fresh["unscheduled"]), 5, repr(fresh))
+        for u in fresh["unscheduled"]:
+            self.assertEqual(
+                u["reason_codes"], ["insufficient_playable_time"], repr(u))
+            self.assertIn("at least 50", u["reason"], repr(u))
+        games_before = len(self.store.all_games())
+        audits_before = len(self.store.all_setup_audit())
+        res = api.commit_draft_schedule(
+            "div1", draft_fingerprint=stale_fingerprint)
+        self.assertIn("error", res, repr(res))
+        self.assertEqual(
+            res["error"]["details"]["reason"], "preview_stale", repr(res))
+        self.assertEqual(len(self.store.all_games()), games_before, repr(res))
+        self.assertEqual(
+            len(self.store.all_setup_audit()), audits_before, repr(res))
+
+    def test_league_scoped_commit_refuses_stale_preview_after_unscheduled_reason_text_changes(
+            self):
+        self._stale_preview_refused_on_unscheduled_reason_change(ApiService)
+
+    def test_base_facade_commit_refuses_stale_preview_after_unscheduled_reason_text_changes(
+            self):
+        self._stale_preview_refused_on_unscheduled_reason_change(
+            BaseApiService)
+
+    # -- ALL fingerprint-bound state must be revalidated under the lock, not
+    # just draft_games/already_scheduled row identity (#328 review round 11
+    # finding 2) -------------------------------------------------------------
+    def _team_eligibility_change_after_internal_regen_refused(
+            self, api_cls, change):
+        """Shared assertion: a team registering or unregistering AFTER
+        commit's OWN internal pre-lock regeneration (the call the wide
+        `draft_fingerprint` gate compares against) but BEFORE its locked
+        regeneration (the round-11-added general recheck) is invisible to
+        every check that only re-examines `draft_games`/`already_scheduled`
+        row identity -- the wide gate only ever compares against ITS OWN
+        regeneration (which ran before the change), and the changed team
+        need not appear in either bucket at all (it only affects the
+        `unscheduled` portion).
+
+        Forces this exact ordering deterministically, without threads: a
+        monkeypatched `draft_season_schedule` returns the SAME frozen
+        proposal on its first call (modeling the wide gate's regeneration
+        running BEFORE the registration change lands), applies the
+        registration change on the second call, then delegates to the REAL
+        function from then on -- so commit's own locked regeneration (its
+        second internal call) is the first one to observe the new state,
+        exactly reproducing the gap the finding describes."""
+        self._division_fixture(4, 1)  # t0..t3, 1 slot: places (t0, t3)
+        if change == "unregister":
+            self.store.add_team(Team(id="a_extra", name="Extra",
+                                     program_id="prog1", league_id="lg1"))
+            self.store.add_season_team_registration(SeasonTeamRegistration(
+                id="streg_a_extra", league_season_id="ls_lg1_se1",
+                team_id="a_extra", division_id="div1", active=True))
+        api = api_cls(self.store)
+        frozen_preview = api.draft_season_schedule("div1")
+        self.assertEqual(len(frozen_preview["draft_games"]), 1,
+                         repr(frozen_preview))
+        self.assertEqual(
+            (frozen_preview["draft_games"][0]["home_team_id"],
+             frozen_preview["draft_games"][0]["away_team_id"]), ("t0", "t3"),
+            repr(frozen_preview))
+        stale_fingerprint = frozen_preview["draft_fingerprint"]
+
+        real_draft_season_schedule = api.draft_season_schedule
+        calls = [0]
+
+        def _apply_change_then_delegate(*args, **kwargs):
+            calls[0] += 1
+            if calls[0] == 1:
+                return frozen_preview
+            if calls[0] == 2:
+                if change == "register":
+                    self.store.add_team(Team(
+                        id="a_extra", name="Extra",
+                        program_id="prog1", league_id="lg1"))
+                    self.store.add_season_team_registration(
+                        SeasonTeamRegistration(
+                            id="streg_a_extra",
+                            league_season_id="ls_lg1_se1",
+                            team_id="a_extra", division_id="div1",
+                            active=True))
+                else:
+                    reg = self.store.get_season_team_registration(
+                        "streg_a_extra")
+                    reg.active = False
+                    self.store.save_season_team_registration(reg)
+            return real_draft_season_schedule(*args, **kwargs)
+
+        api.draft_season_schedule = _apply_change_then_delegate
+        games_before = len(self.store.all_games())
+        audits_before = len(self.store.all_setup_audit())
+        res = api.commit_draft_schedule(
+            "div1", draft_fingerprint=stale_fingerprint)
+        self.assertEqual(calls[0], 2, repr(calls))
+        self.assertIn("error", res, repr(res))
+        self.assertEqual(
+            res["error"]["details"]["reason"], "preview_stale", repr(res))
+        self.assertEqual(len(self.store.all_games()), games_before, repr(res))
+        self.assertEqual(
+            len(self.store.all_setup_audit()), audits_before, repr(res))
+
+    def test_league_scoped_commit_refuses_when_team_registers_after_internal_regen(
+            self):
+        self._team_eligibility_change_after_internal_regen_refused(
+            ApiService, "register")
+
+    def test_league_scoped_commit_refuses_when_team_unregisters_after_internal_regen(
+            self):
+        self._team_eligibility_change_after_internal_regen_refused(
+            ApiService, "unregister")
+
+    def test_base_facade_commit_refuses_when_team_registers_after_internal_regen(
+            self):
+        self._team_eligibility_change_after_internal_regen_refused(
+            BaseApiService, "register")
+
+    def test_base_facade_commit_refuses_when_team_unregisters_after_internal_regen(
+            self):
+        self._team_eligibility_change_after_internal_regen_refused(
             BaseApiService, "unregister")
 
     # -- already_scheduled revalidation under the lock (#328 review round 8

@@ -562,6 +562,79 @@ be trusted:
   Memory store's transaction snapshot and confirming the assertion catches
   the resulting id leak.
 
+### Binding the reason TEXT, and revalidating everything bound under the lock (#328 review round 11)
+
+Round 10 widened `_draft_fingerprint` to cover the eligible-team set and
+each unscheduled pairing's `reason_codes`, but two gaps remained:
+
+1. **The fingerprint bound `reason_codes` but not `reason`.** A scheduling
+   policy's THRESHOLD (`min_playable_minutes`, a turnover buffer, a
+   curfew) can change between Generate and Commit and rewrite the
+   human-readable `reason` text an unscheduled row shows — the number
+   embedded in the message — while the reason CODE, a fixed category,
+   stays identical. A 4-team Division with a 60-minute slot (always
+   playable) and a 30-minute slot (never, at either threshold) places one
+   pairing on the 60-minute slot and leaves the other five citing
+   `insufficient_playable_time` against the 30-minute one; raising
+   `min_playable_minutes` from 45 to 50 rewrites each of those five rows'
+   "requires at least N" text without moving the placed row or changing
+   any code — invisible to a fingerprint that only hashed the code.
+   `_draft_fingerprint` now also binds `reason` for exactly this reason:
+   the operator reviewed the specific explanation on screen, not just its
+   category.
+
+2. **Only `draft_games`/`already_scheduled` row identity was revalidated
+   under the lock, not the newly fingerprint-bound dimensions.** A team
+   registering or unregistering in the narrow gap between commit's own
+   pre-lock regeneration (the one the wide `draft_fingerprint` gate
+   compares against) and the locks it then acquires is invisible to every
+   existing check: the wide gate only compares against its OWN
+   regeneration, which ran before the change, and the changed team need
+   not appear in `draft_games`/`already_scheduled` at all if it only
+   affects the `unscheduled` portion.
+
+   Rather than hand-list this as one more narrow, dimension-specific
+   check, both facades now regenerate the COMPLETE current proposal a
+   second time, once every lock the proposal's inputs depend on
+   (Program/Team/Rink/Season) is held, and compare its own
+   `draft_fingerprint` against the one the operator's Generate call
+   returned — a single general check covering every fingerprint-bound
+   dimension at once, current and future, rather than one hand-written
+   recheck per field. This is sound because `register_team_for_season`
+   and `unregister_team_from_season` both lock the Season row too (the
+   same `require_active_season` guard `cancel_game` uses, per round 8's
+   revalidation): by the time this transaction holds that lock, any such
+   concurrent write has either already committed — and this regeneration
+   observes it — or is blocked behind this transaction and cannot land
+   before its writes. The pre-existing narrower checks (already_scheduled
+   revalidation, the per-row `pairing_already_scheduled` guard) are left
+   in place unchanged: they give a more specific, actionable error for the
+   scenarios they were built for, and are simply redundant-but-harmless
+   for a commit this new general check has already passed.
+
+Pinned two ways. Finding 1: a direct `DraftFingerprintTest` unit test
+(identical `reason_codes`, different `reason` text → different
+fingerprints) plus a both-facade Memory/SQLite/PostgreSQL regression that
+raises `min_playable_minutes` between Generate and Commit while confirming
+the placed row, pairing identities, and reason codes all stay unchanged —
+isolating the reason-TEXT axis from the (separately covered) placement
+axis — then asserting terminal `preview_stale` and zero writes. Finding 2:
+a both-facade Memory/SQLite/PostgreSQL regression that forces the exact
+ordering deterministically, without threads — a monkeypatched
+`draft_season_schedule` returns the SAME frozen (pre-change) proposal on
+its first call (modeling the wide gate's own regeneration running before
+the registration change), applies the registration/unregistration change
+on the second call, then delegates to the real function — so commit's own
+locked regeneration is the first call to observe the new state, exactly
+reproducing the narrow window the finding describes; the test also asserts
+the mock was called exactly twice, since if it is not, the whole scenario
+the fix protects against was never even modeled. Both findings verified
+falsifiable: reverting the `reason` binding lets the stale threshold-change
+commit silently succeed; removing the locked full regeneration collapses
+the mock to a single call (the registration/unregistration mutation is
+never even applied), directly demonstrating the narrow window is
+unguarded.
+
 ## Reason codes referenced here
 
 Unscheduled-pairing codes are generation-time (`services/scheduler.py`,

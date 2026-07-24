@@ -494,6 +494,18 @@ def _draft_fingerprint(league_season_id, team_ids, draft_games, unscheduled,
     or altered unscheduled diagnosis between Generate and Commit now
     invalidates the preview even when the placed/already-scheduled rows
     are byte-for-byte identical.
+
+    #328 review round 11 correction: round 10 bound each unscheduled
+    row's `reason_codes` but not its `reason` — the human-readable text
+    the Scheduler UI actually renders. A scheduling-policy THRESHOLD
+    change (`min_playable_minutes`, a turnover buffer, a curfew) between
+    Generate and Commit can rewrite that text (e.g. "requires at least
+    45" becoming "requires at least 50") while the reason CODE
+    (`insufficient_playable_time`) and every other field stay identical,
+    since the code is a fixed category but the message embeds the
+    current policy value. Binding `reason` too closes that gap: the
+    operator reviewed the specific explanation on screen, not just its
+    category.
     """
     missing = sorted(
         f"{d.get('division_id')}|{d['home_team_id']}|{d['away_team_id']}|"
@@ -505,7 +517,8 @@ def _draft_fingerprint(league_season_id, team_ids, draft_games, unscheduled,
         for a in already_scheduled)
     unresolved = sorted(
         f"{u.get('division_id')}|{u['home_team_id']}|{u['away_team_id']}|"
-        + ",".join(sorted(u.get("reason_codes") or ()))
+        + ",".join(sorted(u.get("reason_codes") or ())) + "|"
+        + (u.get("reason") or "")
         for u in unscheduled)
     blocked_teams = sorted(
         f"{t['team_id']}|" + ",".join(sorted(t.get("reason_codes") or ()))
