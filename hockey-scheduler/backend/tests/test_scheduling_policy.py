@@ -1238,6 +1238,25 @@ class _PolicyContract:
                                  league_id="lg")
         self.assertEqual(_reason(g), "curfew_violation", g)
 
+    def test_import_preview_malformed_row_never_claims_program_fallback(
+            self):
+        # Adversarial-review corner (#319): a malformed end<=start row with
+        # NO policy resolved anywhere (source None, not "program") must not
+        # fabricate a "Program-level advisory ... program fallback minimum"
+        # claim — there is no Program policy to advise about. The row's
+        # only warranted finding is the pre-existing end_time error.
+        self.assertEqual(self.store.all_scheduling_policies(), [])
+        start = datetime(2026, 1, 6, 18, tzinfo=UTC)
+        sheets = self._r1_sheets([
+            f"R1,{start.isoformat()},"
+            f"{(start - timedelta(minutes=60)).isoformat()},game",
+        ])
+        report = self.api.get_import_dry_run(sheets)
+        self.assertFalse(report["ok"], report)
+        self.assertTrue(any(e["message"] == "end_time must be after start_time."
+                            for e in report["errors"]), report)
+        self.assertEqual(report["warnings"], [], report)
+
     def test_reserved_shown_for_committed_draft_and_discard_removes(self):
         # #319 review — a committed draft physically reserves warm-up +
         # resurfacing ice: the operator calendar AND the draft-review rows

@@ -432,7 +432,7 @@ def _check_policy_advisories(report: _Report, parsed_slots, slot_types,
                     f"Slot is only {slot_minutes} playable minutes; rink "
                     f"{rink_code}'s scheduling policy requires at least "
                     f"{min_playable} — it will be refused a game.")
-            else:
+            elif sources["min_playable_minutes"] == "program":
                 report.warning(
                     "ice_slots", row,
                     f"Program-level advisory: slot is only {slot_minutes} "
@@ -441,6 +441,11 @@ def _check_policy_advisories(report: _Report, parsed_slots, slot_types,
                     "outcome depends on the future game's season, whose own "
                     "policy may override the program, so it may still be "
                     "schedulable.")
+            # else: no policy resolved this field at all (source is None,
+            # min_playable defaults to 0) — the only way to still trip the
+            # check is a malformed end<=start row, already error-reported
+            # above; there is no actual Program (or any) minimum to advise
+            # about, so it must not fabricate a "program fallback" claim.
         # -- turnover proximity, DIRECTIONAL per side (#319 review): the
         # required gap is the EARLIER side's resurfacing + the LATER side's
         # warm-up, same boundary rule as the gate (STRICTLY closer
