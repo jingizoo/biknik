@@ -285,19 +285,30 @@ def _ingest_policy(store, rink):
     slot is rink-scoped and belongs to no season at ingest, so a season-level
     policy cannot be attributed to it here; placement-time enforcement (which
     knows the game's season) remains authoritative. Returns the merged field
-    dict plus the venue timezone name (for curfew wall clocks)."""
-    rows = [store.find_scheduling_policy(PolicyScopeType.RINK, rink.id)]
+    dict, the venue timezone name (for curfew wall clocks), and a per-field
+    SOURCE map ("rink" | "program" | None) — the wording hinge (#319
+    review): the gate resolves Rink > Season > Program, so a rink-sourced
+    value binds whatever season a future game brings, while a
+    program-sourced value is only a fallback that game's own Season may
+    override, and an advisory must not promise refusal from it."""
+    rink_row = store.find_scheduling_policy(PolicyScopeType.RINK, rink.id)
     venue = store.get_venue(rink.venue_id) if rink.venue_id else None
     program_id = getattr(venue, "league_id", None)
+    program_row = None
     if program_id and store.get_program(program_id) is not None:
-        rows.append(store.find_scheduling_policy(
-            PolicyScopeType.PROGRAM, program_id))
-    values = {}
+        program_row = store.find_scheduling_policy(
+            PolicyScopeType.PROGRAM, program_id)
+    values, sources = {}, {}
     for field in ("warmup_minutes", "resurfacing_minutes",
                   "min_playable_minutes", "curfew_local"):
-        values[field] = next(
-            (getattr(r, field) for r in rows
-             if r is not None and getattr(r, field) is not None), None)
+        rv = getattr(rink_row, field, None) if rink_row else None
+        pv = getattr(program_row, field, None) if program_row else None
+        if rv is not None:
+            values[field], sources[field] = rv, "rink"
+        elif pv is not None:
+            values[field], sources[field] = pv, "program"
+        else:
+            values[field], sources[field] = None, None
     # Curfew wall-clock anchor: venue timezone, else the bridged Program's
     # — the SAME fallback chain as the gate's _curfew_timezone, so an
     # advisory can never disagree with enforcement about which clock a
@@ -305,7 +316,7 @@ def _ingest_policy(store, rink):
     program = store.get_program(program_id) if program_id else None
     tz_name = (getattr(venue, "timezone", None)
                or getattr(program, "timezone", None))
-    return values, tz_name
+    return values, tz_name, sources
 
 
 def _hosted_effective_policy(store, rink, season_id):
@@ -335,10 +346,17 @@ def _check_policy_advisories(report: _Report, parsed_slots, slot_types,
                              store) -> None:
     """#277 Slice B ingest advisories — WARNINGS, never errors: contracted
     start/end values import untouched (the issue's no-silent-time-shift
-    mandate), but a row the placement gate will later refuse a game is
-    flagged now. Three checks per row against rinks that already exist in
-    the store (a rink created by this same upload can have no policy yet):
-    playable span shorter than the minimum, same-rink DIRECTIONAL turnover
+    mandate), but a row the commit or the placement gate will later refuse
+    is flagged now. Four checks per row against rinks that already exist
+    in the store (a rink created by this same upload can have no policy
+    yet): physical overlap with any PERSISTED slot (#319 review —
+    definitive for EVERY slot-type combination, mirroring the commit's
+    slot_type-agnostic overlap refusal, with the exact-tuple re-import
+    identity excluded), playable span shorter than the minimum (#319
+    review — worded as a definitive refusal only when the minimum is
+    RINK-sourced, which no future game's season can override; a
+    program-sourced fallback is labeled a Program-level advisory whose
+    outcome the game's own Season decides), same-rink DIRECTIONAL turnover
     proximity (#319 review — the earlier side's resurfacing plus the later
     side's warm-up, each from that side's honest resolution: an existing
     slot HOSTING an active game contributes its game's full effective
@@ -349,9 +367,42 @@ def _check_policy_advisories(report: _Report, parsed_slots, slot_types,
     every violation that depends on the incoming row's rink-level guess is
     LABELED a rink-level advisory instead, since a future game's season
     can shadow that guess), and end past curfew (venue timezone, half-open
-    exactly like enforcement via the shared curfew_instant)."""
+    exactly like enforcement via the shared curfew_instant; the same
+    rink-sourced-definitive vs program-fallback-advisory wording split as
+    the minimum)."""
     rinks_by_ref = {r.external_ref: r for r in store.all_rinks()
                     if r.external_ref}
+    # -- physical overlap with PERSISTED ice: definitive for EVERY row and
+    # every slot type (#319 review). The commit's overlap gate is
+    # slot_type-agnostic, so the preview must be too — a practice row over
+    # persisted game ice (or a game row over persisted practice ice) is
+    # hard-refused at commit and must never preview clean. Mirrors that
+    # gate exactly: a row whose exact (rink, start, end) tuple is already
+    # persisted takes the commit's in-place update path and is never an
+    # overlap — even against OTHER persisted ice, because the gate
+    # short-circuits the same way; intervals_overlap is half-open, so
+    # exact adjacency never lands here. Same-upload row-vs-row overlap is
+    # _check_overlaps' separate unconditional warning — such pairs COMMIT
+    # (nothing is persisted yet), so they must not claim refusal here.
+    persisted_by_rink = {}
+    for ex in store.all_ice_slots():
+        persisted_by_rink.setdefault(ex.rink_id, []).append(ex)
+    for row, rink_code, start, end in parsed_slots:
+        rink = rinks_by_ref.get(rink_code)
+        if rink is None:
+            continue  # a brand-new rink can't yet have persisted ice
+        persisted = persisted_by_rink.get(rink.id, [])
+        if any(ex.start_time == start and ex.end_time == end
+               for ex in persisted):
+            continue  # exact tuple -> the commit's update path, no overlap
+        clash = next((ex for ex in persisted if intervals_overlap(
+            start, end, ex.start_time, ex.end_time)), None)
+        if clash is not None:
+            report.warning(
+                "ice_slots", row,
+                f"Slot physically overlaps existing slot {clash.id} on "
+                f"rink {rink_code} — persisted ice is never silently "
+                "rewritten, so the commit will refuse this row.")
     policy_cache = {}
     hosted_policy_cache = {}  # (rink_id, season_id) -> effective fields
     # An active game — committed drafts count, exactly like the gate —
@@ -366,15 +417,30 @@ def _check_policy_advisories(report: _Report, parsed_slots, slot_types,
             continue
         if rink.id not in policy_cache:
             policy_cache[rink.id] = _ingest_policy(store, rink)
-        values, tz_name = policy_cache[rink.id]
+        values, tz_name, sources = policy_cache[rink.id]
         min_playable = values["min_playable_minutes"] or 0
         slot_minutes = int((end - start).total_seconds() // 60)
         if slot_minutes < min_playable:
-            report.warning(
-                "ice_slots", row,
-                f"Slot is only {slot_minutes} playable minutes; rink "
-                f"{rink_code}'s scheduling policy requires at least "
-                f"{min_playable} — it will be refused a game.")
+            # Definitive ONLY when rink-sourced (#319 review): Rink outranks
+            # Season at the gate, so no future game's season can soften it.
+            # A program-sourced minimum is a fallback the game's own Season
+            # (or its season's different Program) may override — promising
+            # refusal from it would be false.
+            if sources["min_playable_minutes"] == "rink":
+                report.warning(
+                    "ice_slots", row,
+                    f"Slot is only {slot_minutes} playable minutes; rink "
+                    f"{rink_code}'s scheduling policy requires at least "
+                    f"{min_playable} — it will be refused a game.")
+            else:
+                report.warning(
+                    "ice_slots", row,
+                    f"Program-level advisory: slot is only {slot_minutes} "
+                    f"playable minutes against the program fallback minimum "
+                    f"of {min_playable} on rink {rink_code} — the exact "
+                    "outcome depends on the future game's season, whose own "
+                    "policy may override the program, so it may still be "
+                    "schedulable.")
         # -- turnover proximity, DIRECTIONAL per side (#319 review): the
         # required gap is the EARLIER side's resurfacing + the LATER side's
         # warm-up, same boundary rule as the gate (STRICTLY closer
@@ -387,15 +453,11 @@ def _check_policy_advisories(report: _Report, parsed_slots, slot_types,
             """(gap, required, other_side): the directional pair math plus
             the COUNTERPART's own contribution alone — the only part a
             hosted advisory may treat as certain, since the incoming row's
-            side is a rink-level guess a future season can shadow.
-            ``other_side`` is None for a physical overlap (refused by the
-            gate on occupancy grounds regardless of any policy)."""
-            if intervals_overlap(start, end, o_start, o_end):
-                return 0, max(
-                    (values["resurfacing_minutes"] or 0)
-                    + (other_values["warmup_minutes"] or 0),
-                    (other_values["resurfacing_minutes"] or 0)
-                    + (values["warmup_minutes"] or 0)), None
+            side is a rink-level guess a future season can shadow. Both
+            callers exclude physically overlapping pairs before the call
+            (overlap is reported definitively elsewhere and must never
+            reach buffer math), so the spans are strictly disjoint here.
+            """
             if o_start >= end:   # incoming earlier: its resurfacing +
                 gap = (o_start - end).total_seconds() // 60
                 other_side = other_values["warmup_minutes"] or 0
@@ -414,6 +476,11 @@ def _check_policy_advisories(report: _Report, parsed_slots, slot_types,
                 continue
             if slot_types.get(other_row) != "game":
                 continue  # buffers are game-vs-game, like the gate
+            if intervals_overlap(start, end, o_start, o_end):
+                # Same-upload overlap is _check_overlaps' unconditional
+                # warning; overlapping spans must never reach the
+                # directional buffer math below.
+                continue
             gap, required, _side = _gap_required_split(o_start, o_end,
                                                        values)
             if required > 0 and 0 <= gap < required:
@@ -430,6 +497,11 @@ def _check_policy_advisories(report: _Report, parsed_slots, slot_types,
                 # falsely flag every idempotent re-import
                 # (_check_players self-excludes for the same reason).
                 continue
+            if intervals_overlap(start, end, ex.start_time, ex.end_time):
+                # Already reported by the dedicated slot_type-agnostic
+                # overlap pass above; overlapping spans must never reach
+                # the directional buffer math below.
+                continue
             host = hosted.get(ex.id)
             if host is not None:
                 hkey = (rink.id, host.season_id)
@@ -444,14 +516,12 @@ def _check_policy_advisories(report: _Report, parsed_slots, slot_types,
             if required > 0 and 0 <= gap < required:
                 # DEFINITIVE only when the hosting game's OWN side alone
                 # already exceeds the gap (then the gate refuses whatever
-                # season the imported row's future game resolves) or the
-                # spans physically overlap; a violation that needs the
-                # incoming row's rink-level guess stays an advisory.
-                if host is not None and (host_side is None
-                                         or gap < host_side):
+                # season the imported row's future game resolves); a
+                # violation that needs the incoming row's rink-level guess
+                # stays an advisory.
+                if host is not None and gap < host_side:
                     near_hosted.append(
-                        (f"existing slot {ex.id}", gap,
-                         required if host_side is None else host_side))
+                        (f"existing slot {ex.id}", gap, host_side))
                 else:
                     near_rink_level.append(
                         (f"existing slot {ex.id}", gap, required))
@@ -489,12 +559,24 @@ def _check_policy_advisories(report: _Report, parsed_slots, slot_types,
             start_local = start.astimezone(tz)
             deadline = curfew_instant(start_local, hour, minute)
             if end > deadline.astimezone(timezone.utc):
-                report.warning(
-                    "ice_slots", row,
-                    f"Slot ends at "
-                    f"{end.astimezone(tz).strftime('%H:%M')} local, past "
-                    f"rink {rink_code}'s {curfew} curfew — it will be "
-                    "refused a game.")
+                # Same sourcing hinge as the minimum above (#319 review).
+                if sources["curfew_local"] == "rink":
+                    report.warning(
+                        "ice_slots", row,
+                        f"Slot ends at "
+                        f"{end.astimezone(tz).strftime('%H:%M')} local, past "
+                        f"rink {rink_code}'s {curfew} curfew — it will be "
+                        "refused a game.")
+                else:
+                    report.warning(
+                        "ice_slots", row,
+                        f"Program-level advisory: slot ends at "
+                        f"{end.astimezone(tz).strftime('%H:%M')} local, past "
+                        f"the program fallback curfew {curfew} on rink "
+                        f"{rink_code} — the exact outcome depends on the "
+                        "future game's season, whose own policy may "
+                        "override the program, so it may still be "
+                        "schedulable.")
 
 
 def _check_overlaps(report: _Report, parsed_slots) -> None:

@@ -907,6 +907,337 @@ class _PolicyContract:
         self.assertTrue(any(m.startswith("Rink-level advisory")
                             for m in commit_by_row.get(2, [])), res)
 
+    def _overlap_preview_fixture(self):
+        """A hosted slot (game on sA), a free slot (sB), and three upload
+        rows: one overlapping each, plus one EXACTLY adjacent to sB's end
+        (never an overlap — must stay silent at a zero requirement)."""
+        rink = self.store.get_rink("r1")
+        rink.external_ref = "R1"
+        self.store.save_rink(rink)
+        g = self.api.create_game("se1", "d1", "t0", "t1", "sA",
+                                 league_id="lg")
+        self.assertNotIn("error", g, g)
+        rows = [
+            f"R1,{(BASE + timedelta(minutes=30)).isoformat()},"
+            f"{(BASE + timedelta(minutes=55)).isoformat()},game",
+            f"R1,{(BASE + timedelta(minutes=80)).isoformat()},"
+            f"{(BASE + timedelta(minutes=100)).isoformat()},game",
+            f"R1,{(BASE + timedelta(minutes=130)).isoformat()},"
+            f"{(BASE + timedelta(minutes=150)).isoformat()},game",
+        ]
+        return {
+            "rinks_csv": "venue_name,rink_code,rink_name,address\n"
+                         "Arena,R1,Main,",
+            "ice_slots_csv":
+                "rink_code,start_time,end_time,slot_type\n" + "\n".join(rows)}
+
+    def _assert_overlap_previewed_and_commit_writes_nothing(self, sheets):
+        # Preview surfaces BOTH persisted overlaps (hosted sA, free sB) as
+        # definitive findings — independent of any configured gap (#319
+        # review) — while the exactly-adjacent row stays silent.
+        report = self.api.get_import_dry_run(sheets)
+        self.assertTrue(report["ok"], report)
+        by_row = {}
+        for w in report["warnings"]:
+            by_row.setdefault(w["row"], []).append(w["message"])
+        self.assertTrue(any("physically overlaps existing slot sA" in m
+                            for m in by_row.get(1, [])), report)
+        self.assertTrue(any("physically overlaps existing slot sB" in m
+                            for m in by_row.get(2, [])), report)
+        self.assertNotIn(3, by_row, report)
+        # The commit hard-refuses the overlapping rows — with ZERO writes.
+        slots_before = sorted(s.id for s in self.store.all_ice_slots())
+        games_before = sorted(g.id for g in self.store.all_games())
+        audit_before = len(self.store.all_setup_audit())
+        res = self.api.commit_rinks_ice_slots_import(sheets,
+                                                     actor_id="admin")
+        self.assertEqual(_reason(res), "ice_slot_overlap", res)
+        self.assertEqual(
+            sorted(s.id for s in self.store.all_ice_slots()), slots_before)
+        self.assertEqual(
+            sorted(g.id for g in self.store.all_games()), games_before)
+        self.assertEqual(len(self.store.all_setup_audit()), audit_before,
+                         "a refused import must not audit-write")
+
+    def test_import_preview_surfaces_persisted_overlap_without_policy(self):
+        # The pre-fix advisory recorded overlap only when required > 0, so
+        # with NO policy rows these persisted overlaps vanished from the
+        # preview while the commit (and the placement gate) refused them.
+        self.assertEqual(self.store.all_scheduling_policies(), [])
+        sheets = self._overlap_preview_fixture()
+        self._assert_overlap_previewed_and_commit_writes_nothing(sheets)
+
+    def test_import_preview_overlap_is_slot_type_agnostic(self):
+        # The commit's overlap gate ignores slot types entirely — so must
+        # the preview (#319 review): a PRACTICE row over persisted GAME
+        # ice, and a GAME row over persisted PRACTICE ice, both surface as
+        # definitive findings with no policy anywhere, and the commit
+        # refuses the sheet with zero writes.
+        rink = self.store.get_rink("r1")
+        rink.external_ref = "R1"
+        self.store.save_rink(rink)
+        self.store.add_ice_slot(IceSlot(
+            id="sPr", rink_id="r1",
+            start_time=BASE + timedelta(minutes=400),
+            end_time=BASE + timedelta(minutes=460),
+            slot_type=IceSlotType.PRACTICE,
+            status=IceSlotStatus.AVAILABLE))
+        rows = [
+            f"R1,{(BASE + timedelta(minutes=30)).isoformat()},"
+            f"{(BASE + timedelta(minutes=55)).isoformat()},practice",
+            f"R1,{(BASE + timedelta(minutes=410)).isoformat()},"
+            f"{(BASE + timedelta(minutes=440)).isoformat()},game",
+        ]
+        sheets = {
+            "rinks_csv": "venue_name,rink_code,rink_name,address\n"
+                         "Arena,R1,Main,",
+            "ice_slots_csv":
+                "rink_code,start_time,end_time,slot_type\n" + "\n".join(rows)}
+        report = self.api.get_import_dry_run(sheets)
+        self.assertTrue(report["ok"], report)
+        by_row = {}
+        for w in report["warnings"]:
+            by_row.setdefault(w["row"], []).append(w["message"])
+        self.assertTrue(any("physically overlaps existing slot sA" in m
+                            for m in by_row.get(1, [])), report)
+        self.assertTrue(any("physically overlaps existing slot sPr" in m
+                            for m in by_row.get(2, [])), report)
+        slots_before = sorted(s.id for s in self.store.all_ice_slots())
+        res = self.api.commit_rinks_ice_slots_import(sheets,
+                                                     actor_id="admin")
+        self.assertEqual(_reason(res), "ice_slot_overlap", res)
+        self.assertEqual(
+            sorted(s.id for s in self.store.all_ice_slots()), slots_before)
+
+    def test_import_preview_surfaces_persisted_overlap_at_zero_policy(self):
+        r = self.api.set_scheduling_policy(
+            scope_type="season", scope_id="se1", warmup_minutes=0,
+            resurfacing_minutes=0, actor_id="admin")
+        self.assertNotIn("error", r, r)
+        sheets = self._overlap_preview_fixture()
+        self._assert_overlap_previewed_and_commit_writes_nothing(sheets)
+
+    def test_import_preview_reimport_identity_not_flagged_against_third_slot(
+            self):
+        # Mirror-fidelity corner (#319 review): a row whose exact
+        # (rink, start, end) tuple is already persisted takes the commit's
+        # in-place update path — the commit never overlap-checks it against
+        # OTHER persisted ice, so the preview must not claim "the commit
+        # will refuse this row" even when such ice overlaps it.
+        # (Overlapping persisted pairs are reachable state: same-upload
+        # overlaps commit by design and stay _check_overlaps' warning-only
+        # concern.)
+        rink = self.store.get_rink("r1")
+        rink.external_ref = "R1"
+        self.store.save_rink(rink)
+        self.store.add_ice_slot(IceSlot(
+            id="sOv", rink_id="r1",
+            start_time=BASE + timedelta(minutes=15),
+            end_time=BASE + timedelta(minutes=45),
+            slot_type=IceSlotType.GAME,
+            status=IceSlotStatus.AVAILABLE))
+        sheets = {
+            "rinks_csv": "venue_name,rink_code,rink_name,address\n"
+                         "Arena,R1,Main,",
+            "ice_slots_csv":
+                "rink_code,start_time,end_time,slot_type\n"
+                f"R1,{BASE.isoformat()},"
+                f"{(BASE + timedelta(minutes=60)).isoformat()},game"}
+        report = self.api.get_import_dry_run(sheets)
+        self.assertTrue(report["ok"], report)
+        self.assertFalse(
+            [w for w in report["warnings"]
+             if "physically overlaps" in w["message"]], report)
+        slots_before = sorted(s.id for s in self.store.all_ice_slots())
+        res = self.api.commit_rinks_ice_slots_import(sheets,
+                                                     actor_id="admin")
+        self.assertTrue(res.get("committed"), res)
+        self.assertEqual(
+            sorted(s.id for s in self.store.all_ice_slots()), slots_before)
+
+    def test_import_preview_surfaces_persisted_overlap_under_positive_policy(
+            self):
+        # With a REAL buffer policy configured, an overlap must still be
+        # reported as the definitive commit refusal — not mislabeled as a
+        # gap-0 directional-buffer advisory (the pre-fix behavior whenever
+        # required > 0). The adjacent row also proves positive buffers
+        # don't false-positive: sB is unhosted so its side resolves at
+        # rink level (season policy invisible to _ingest_policy), and the
+        # hosted sA game sits 70 min clear of its 15-min side.
+        r = self.api.set_scheduling_policy(
+            scope_type="season", scope_id="se1", warmup_minutes=15,
+            resurfacing_minutes=15, actor_id="admin")
+        self.assertNotIn("error", r, r)
+        sheets = self._overlap_preview_fixture()
+        self._assert_overlap_previewed_and_commit_writes_nothing(sheets)
+
+    def _r1_sheets(self, rows):
+        rink = self.store.get_rink("r1")
+        rink.external_ref = "R1"
+        self.store.save_rink(rink)
+        return {
+            "rinks_csv": "venue_name,rink_code,rink_name,address\n"
+                         "Arena,R1,Main,",
+            "ice_slots_csv":
+                "rink_code,start_time,end_time,slot_type\n" + "\n".join(rows)}
+
+    def test_import_preview_program_minimum_is_advisory_season_can_override(
+            self):
+        # #319 review — the gate resolves Rink > Season > Program, so a
+        # PROGRAM-sourced minimum is only a fallback the future game's
+        # season may override. Promising refusal here would be a lie —
+        # proven by actually scheduling a game on the imported slot under
+        # se1's softer minimum.
+        for scope_type, scope_id, minimum in (("program", "pg", 60),
+                                              ("season", "se1", 20)):
+            r = self.api.set_scheduling_policy(
+                scope_type=scope_type, scope_id=scope_id,
+                min_playable_minutes=minimum, actor_id="admin")
+            self.assertNotIn("error", r, r)
+        day = BASE + timedelta(minutes=1440)
+        sheets = self._r1_sheets([
+            f"R1,{day.isoformat()},"
+            f"{(day + timedelta(minutes=30)).isoformat()},game",
+            # Exactly the 60-minute program fallback: boundary stays silent.
+            f"R1,{(day + timedelta(minutes=120)).isoformat()},"
+            f"{(day + timedelta(minutes=180)).isoformat()},game",
+        ])
+        report = self.api.get_import_dry_run(sheets)
+        self.assertTrue(report["ok"], report)
+        row1 = [w["message"] for w in report["warnings"] if w["row"] == 1]
+        self.assertTrue(any("Program-level advisory" in m
+                            and "program fallback minimum of 60" in m
+                            for m in row1), report)
+        self.assertFalse(any("will be refused" in m for m in row1), report)
+        self.assertFalse([w for w in report["warnings"] if w["row"] == 2],
+                         report)
+        res = self.api.commit_rinks_ice_slots_import(sheets,
+                                                     actor_id="admin")
+        self.assertTrue(res.get("committed"), res)
+        self.assertTrue(any("Program-level advisory" in w["message"]
+                            for w in res.get("warnings", [])
+                            if w["row"] == 1), res)
+        slot = next(s for s in self.store.all_ice_slots()
+                    if s.rink_id == "r1" and s.start_time == day)
+        g = self.api.create_game("se1", "d1", "t0", "t1", slot.id,
+                                 league_id="lg")
+        self.assertNotIn("error", g,
+                         ("the season override makes the slot legal — the "
+                          "preview was right not to promise refusal", g))
+
+    def test_import_preview_rink_minimum_stays_definitive_despite_season(
+            self):
+        # A RINK-sourced minimum outranks every season at the gate, so the
+        # definitive "will be refused a game" wording stays — proven by the
+        # gate refusing even under se1's softer season policy.
+        for scope_type, scope_id, minimum in (("rink", "r1", 60),
+                                              ("season", "se1", 20)):
+            r = self.api.set_scheduling_policy(
+                scope_type=scope_type, scope_id=scope_id,
+                min_playable_minutes=minimum, actor_id="admin")
+            self.assertNotIn("error", r, r)
+        day = BASE + timedelta(minutes=1440)
+        sheets = self._r1_sheets([
+            f"R1,{day.isoformat()},"
+            f"{(day + timedelta(minutes=30)).isoformat()},game",
+            f"R1,{(day + timedelta(minutes=120)).isoformat()},"
+            f"{(day + timedelta(minutes=180)).isoformat()},game",
+        ])
+        report = self.api.get_import_dry_run(sheets)
+        self.assertTrue(report["ok"], report)
+        row1 = [w["message"] for w in report["warnings"] if w["row"] == 1]
+        self.assertTrue(any("will be refused a game" in m for m in row1),
+                        report)
+        self.assertFalse(any("Program-level advisory" in m for m in row1),
+                         report)
+        self.assertFalse([w for w in report["warnings"] if w["row"] == 2],
+                         report)
+        res = self.api.commit_rinks_ice_slots_import(sheets,
+                                                     actor_id="admin")
+        self.assertTrue(res.get("committed"), res)
+        slot = next(s for s in self.store.all_ice_slots()
+                    if s.rink_id == "r1" and s.start_time == day)
+        g = self.api.create_game("se1", "d1", "t0", "t1", slot.id,
+                                 league_id="lg")
+        self.assertEqual(_reason(g), "insufficient_playable_time", g)
+
+    def test_import_preview_program_curfew_is_advisory_season_can_override(
+            self):
+        # Same sourcing hinge for curfew: program fallback 21:00, but se1
+        # allows 23:30 — the imported 20:30-22:00 local slot is advisory
+        # only, and a se1 game on it is legal.
+        for scope_type, scope_id, curfew in (("program", "pg", "21:00"),
+                                             ("season", "se1", "23:30")):
+            r = self.api.set_scheduling_policy(
+                scope_type=scope_type, scope_id=scope_id,
+                curfew_local=curfew, actor_id="admin")
+            self.assertNotIn("error", r, r)
+        start = datetime(2026, 1, 7, 2, 30, tzinfo=UTC)   # Jan 6 20:30 local
+        sheets = self._r1_sheets([
+            f"R1,{start.isoformat()},"
+            f"{(start + timedelta(minutes=90)).isoformat()},game",
+            # Ends exactly AT the 21:00 fallback curfew: boundary silent.
+            f"R1,{datetime(2026, 1, 9, 1, 30, tzinfo=UTC).isoformat()},"
+            f"{datetime(2026, 1, 9, 3, 0, tzinfo=UTC).isoformat()},game",
+        ])
+        report = self.api.get_import_dry_run(sheets)
+        self.assertTrue(report["ok"], report)
+        row1 = [w["message"] for w in report["warnings"] if w["row"] == 1]
+        self.assertTrue(any("Program-level advisory" in m
+                            and "program fallback curfew 21:00" in m
+                            and "22:00" in m for m in row1), report)
+        self.assertFalse(any("will be refused" in m for m in row1), report)
+        self.assertFalse([w for w in report["warnings"] if w["row"] == 2],
+                         report)
+        res = self.api.commit_rinks_ice_slots_import(sheets,
+                                                     actor_id="admin")
+        self.assertTrue(res.get("committed"), res)
+        self.assertTrue(any("Program-level advisory" in w["message"]
+                            for w in res.get("warnings", [])
+                            if w["row"] == 1), res)
+        slot = next(s for s in self.store.all_ice_slots()
+                    if s.rink_id == "r1" and s.start_time == start)
+        g = self.api.create_game("se1", "d1", "t0", "t1", slot.id,
+                                 league_id="lg")
+        self.assertNotIn("error", g, g)
+
+    def test_import_preview_rink_curfew_stays_definitive_despite_season(
+            self):
+        # A RINK-sourced curfew binds whatever season the game brings —
+        # se1's later 23:30 cannot soften it, so the definitive wording
+        # stays and the gate indeed refuses.
+        for scope_type, scope_id, curfew in (("rink", "r1", "21:00"),
+                                             ("season", "se1", "23:30")):
+            r = self.api.set_scheduling_policy(
+                scope_type=scope_type, scope_id=scope_id,
+                curfew_local=curfew, actor_id="admin")
+            self.assertNotIn("error", r, r)
+        start = datetime(2026, 1, 7, 2, 30, tzinfo=UTC)   # Jan 6 20:30 local
+        sheets = self._r1_sheets([
+            f"R1,{start.isoformat()},"
+            f"{(start + timedelta(minutes=90)).isoformat()},game",
+            f"R1,{datetime(2026, 1, 9, 1, 30, tzinfo=UTC).isoformat()},"
+            f"{datetime(2026, 1, 9, 3, 0, tzinfo=UTC).isoformat()},game",
+        ])
+        report = self.api.get_import_dry_run(sheets)
+        self.assertTrue(report["ok"], report)
+        row1 = [w["message"] for w in report["warnings"] if w["row"] == 1]
+        self.assertTrue(any("past rink R1's 21:00 curfew" in m
+                            and "will be refused a game" in m
+                            for m in row1), report)
+        self.assertFalse(any("Program-level advisory" in m for m in row1),
+                         report)
+        self.assertFalse([w for w in report["warnings"] if w["row"] == 2],
+                         report)
+        res = self.api.commit_rinks_ice_slots_import(sheets,
+                                                     actor_id="admin")
+        self.assertTrue(res.get("committed"), res)
+        slot = next(s for s in self.store.all_ice_slots()
+                    if s.rink_id == "r1" and s.start_time == start)
+        g = self.api.create_game("se1", "d1", "t0", "t1", slot.id,
+                                 league_id="lg")
+        self.assertEqual(_reason(g), "curfew_violation", g)
+
     def test_reserved_shown_for_committed_draft_and_discard_removes(self):
         # #319 review — a committed draft physically reserves warm-up +
         # resurfacing ice: the operator calendar AND the draft-review rows
