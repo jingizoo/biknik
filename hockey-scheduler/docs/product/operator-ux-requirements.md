@@ -141,26 +141,50 @@ create one:
 | Official | Accept/decline my own assignments | *(none named — inbox tab exists but hidden by default, `index.html:31`)* | **New journey needed** |
 | Viewer | Read schedule/roster/standings with zero mutation surface | `smoke` (partial coverage only) | Confirm no primary action ever renders enabled for Viewer; needs an explicit assertion, not incidental coverage |
 
-**Requirement**: before the first implementation PR starts, Player, Guardian,
-and Official each get a real e2e journey (even a thin one) — three of seven
-roles currently have zero scripted acceptance coverage, and a redesign that
-only re-validates the four already-covered roles would silently ship
-regressions to the other three.
+**Requirement**: Player, Guardian, and Official each get a real e2e journey
+(even a thin one) as part of the **first implementation PR's own test
+plan** — not a prerequisite gate before that PR starts. This is not a docs-
+vs-code conflict: Player Home, Guardian Home ("My Players"), and Official
+Inbox ("My Assignments") are themselves part of the Home/Tasks area (§2),
+so their journeys are naturally in scope for the PR that builds Home/Tasks,
+same as any other screen it touches needing its own acceptance test. Three
+of seven roles currently have zero scripted acceptance coverage, and a
+Home/Tasks PR that only re-validates the two roles already covered
+(League Admin's Dashboard, and indirectly Coach via `coach-scope`) would
+silently ship regressions to the other three — so this package requires
+the PR's test plan name all three explicitly, rather than treat "Home/Tasks
+built and desktop looks right" as sufficient.
 
 ### 2. Task-oriented navigation and setup
 
-**IA crosswalk** — every currently-reachable tab must land somewhere in the
-new 7-area IA #204 already proposed (Home/Tasks, Schedule, Teams & People,
-Facilities, Communications, Reports, Administration). Nothing today's five
-groups can reach may become unreachable:
+**IA crosswalk** — every currently-reachable tab maps to exactly one new
+screen (not just an area) in the 7-area IA #204 already proposed (Home/
+Tasks, Schedule, Teams & People, Facilities, Communications, Reports,
+Administration), so nothing today's five groups can reach becomes
+unreachable, and nothing is left as "lands somewhere in Facilities"
+without saying where:
 
-| Today's group (#145) | Today's tabs | Proposed new area |
-| --- | --- | --- |
-| Home | Dashboard, Home (player), My Players (guardian), My Assignments (official), Activity | **Home/Tasks** — becomes the task-oriented landing hub (§ below), not just a dashboard |
-| Schedule | Arena Calendar, Games, Scheduler, Standings, Game Sheet, Public | **Schedule** — unchanged grouping, refined states/actions only |
-| People | Roster, Users | **Teams & People** — renamed/expanded per #204; Users (account admin) may belong under Administration instead — **flagged as an open placement question**, not decided by this package |
-| Operations | Notifications, Delivery, Pilot Readiness, Import | Splits: Notifications/Delivery → **Communications**; Pilot Readiness → **Reports**; Import → folds into the Setup hub's "Imports and onboarding" workflow (§ below) |
-| Admin Setup | Initial Setup (onboarding), Setup | Setup's six sub-workflows split across **Facilities** (venues/rinks/ice) and **Administration** (league profile/seasons, permanent teams, season participation/divisions, clubs/players/staff, imports/onboarding) |
+| Today's group (#145) | Today's tab | New area | New screen (final destination) |
+| --- | --- | --- | --- |
+| Home | Dashboard | Home/Tasks | Home/Tasks hub (replaces Dashboard as the League Admin/Arena Manager landing) |
+| Home | Home (player) | Home/Tasks | Player Home |
+| Home | My Players (guardian) | Home/Tasks | Guardian Home |
+| Home | My Assignments (official) | Home/Tasks | Official Inbox |
+| Home | Activity | Home/Tasks | Activity |
+| Schedule | Arena Calendar | Schedule | Arena Calendar (unchanged) |
+| Schedule | Games | Schedule | Games (unchanged) |
+| Schedule | Scheduler | Schedule | Scheduler (unchanged) |
+| Schedule | Standings | Schedule | Standings (unchanged) |
+| Schedule | Game Sheet | Schedule | Game Sheet (unchanged) |
+| Schedule | Public | Schedule | Public (unchanged) |
+| People | Roster | Teams & People | Roster (unchanged) |
+| People | Users | **Administration** | Users — **resolved** (was open): account/login lifecycle (activate/deactivate, `MANAGE_USERS`) is a one-time administrative concern distinct from roster/team-membership, and sits with the other one-time configuration workflows, not with Teams & People's day-to-day roster concerns |
+| Operations | Notifications | Communications | Notifications (unchanged) |
+| Operations | Delivery | Communications | Delivery (unchanged) |
+| Operations | Pilot Readiness | Reports | Pilot Readiness / Reports |
+| Operations | Import | Administration | Folds into the "Imports and onboarding" Setup workflow (no standalone Import screen) |
+| Admin Setup | Initial Setup (onboarding) | Administration | Folds into the "Imports and onboarding" Setup workflow |
+| Admin Setup | Setup | Facilities + Administration | Splits across the six named Setup workflows below: "Venues, rinks and ice" → Facilities; the other five → Administration |
 
 **Setup hub decomposition** — #204 already names the six focused workflows
 the current single Setup page must split into; this package makes each one
@@ -200,13 +224,18 @@ mechanism. What it does with the selection is the open gap:
   "display only · screens not filtered" caption (`index.html:100`) is
   removed for that screen's context, or narrowed to name only the still-
   unwired exceptions — the caption must never silently become a stale lie.
-- **Requirement**: League and Division selection — currently local to each
-  screen (e.g. the Scheduler's own Division picker) — get an explicit
-  decision: promoted into the persistent context bar alongside Program/
-  Season, or intentionally left screen-local with a stated reason (e.g.
-  "Division is a Scheduler-only refinement of the Season already selected
-  above, not a global axis"). Undecided today; must not stay undecided after
-  this package is signed off.
+- **Resolved** (was open): **League** is promoted into the persistent
+  context bar alongside Program/Season. Structurally, `League` and `Season`
+  are both direct children of `Program` (a `LeagueSeason` join pairs a
+  specific League with a specific Season, and Divisions/registrations key
+  off that pairing) — League is a first-class axis most screens need, not a
+  refinement of Season, so it belongs beside Season in the persistent bar.
+  **Division** stays screen-local (e.g. the Scheduler's own Division
+  picker): it is a narrower slice *within* an already-selected League+Season,
+  used by only a minority of screens (Scheduler, some Reports), so promoting
+  it would add a persistent control most screens ignore. This mirrors #204's
+  own "keep one selected League and Season context visible throughout the
+  app" principle literally, while Division correctly stays local.
 - **Constraint**: whatever is decided must preserve the reviewed #159/#322/
   #323 mechanics (native control, session-gated authorization, deep-link
   reconciliation) — this is a filtering-behavior change, not a rebuild.
@@ -220,13 +249,19 @@ replaced with the specific verb #204 already names as the standard — e.g.
 "Move" becomes "Change club," "Change venue," or "Assign division"
 depending on what is actually changing.
 
-**Requirement**: before the first implementation PR, produce a per-screen
-table (screen → today's competing actions → the one designated primary
-action → what every other action becomes) for at least the Setup mega-page
-(explicitly named in #204 as the current offender) and the Home/Tasks hub.
-This table is a required artifact of *this* package, not deferred to the
-implementation PR, so that PR has a checklist rather than a design decision
-to make mid-implementation.
+**Primary-action audit** — completed here, for the Home/Tasks hub and each
+of the six Setup workflows, so the implementation PR executes a checklist
+rather than making a design decision mid-implementation:
+
+| Screen | Today's competing actions | Designated primary action | Every other action becomes |
+| --- | --- | --- | --- |
+| Home/Tasks hub | Doesn't exist as such today (today's Dashboard has no single action hierarchy) | "Continue setup" — a dynamic label naming the actual next incomplete step, deep-linking straight into it | Viewing activity, jumping directly to any specific workflow, dismissing/reordering tasks → a secondary task list below the primary card, never competing for primary styling |
+| League profile and seasons | Today: "Add Season" competes visually with inline league-profile edit fields inside the single Setup page | "Add Season" (the action that creates new schedulable time) | League-profile edits, venue-access grants, season history → secondary/tertiary controls inside the season-detail drill-in |
+| Permanent teams | Today: "Add Team" competes with inline "Move" (ambiguous re-parenting) and delete controls | "Add Team" | "Change club" (renamed from "Move"), deactivate/reactivate, delete → secondary actions on each team's row/detail; delete is confirmation-gated (§5) |
+| Season participation/divisions | Today: "Register Team" and "Assign division" render as similar-weight buttons | "Register Team" (the entry action) | "Assign division" becomes a secondary follow-up prompt surfaced right after registration, not a permanently-competing button; unregister/deactivate → tertiary, confirmation-gated |
+| Clubs, players and staff | Today: "Add Player," "Add Staff," "Import" all render with equal visual weight | "Add Player" (the highest-frequency action) | "Add Staff," "Import roster," edit → secondary/tertiary; deactivate/delete → confirmation-gated |
+| Venues, rinks and ice | Today: "Add Venue," "Add Rink," "Add Ice Slot," and the Ice Availability Builder's "Generate" all compete | "Add Ice" (opens the Ice Availability Builder — the highest-leverage action, since it bulk-generates recurring slots) | "Add Venue"/"Add Rink" → secondary (rare, mostly one-time); a single ad hoc "Add Ice Slot" → tertiary, for the rare exception the recurring builder doesn't cover |
+| Imports and onboarding | Today: the onboarding wizard's own step "Next" and the separate Import tab's upload control aren't unified | "Import data" — one entry point unifying the onboarding wizard's bulk-import step and the standalone Import tab | Manual single-record entry (the alternative to bulk import) → a secondary "or add one at a time" link, not a second primary button |
 
 ### 5. Loading, empty, stale, error, retry, and confirmation states
 
@@ -238,15 +273,72 @@ new screen the redesign introduces:
 | Loading | Skeleton placeholder before first paint (as today, `app.js:5441`) — every new hub/screen gets one; no blank white flash. |
 | Empty | The `.empty` + `pageIntro` convention, with the full #311 recipe as the bar: name the real count/scope, explain the cause in operator vocabulary, give an in-place remediation link, disable any action that would operate on the empty set. A bare "No data" is a regression, not an acceptable empty state. |
 | Stale | The existing "stale-response guard" pattern (discard out-of-date async results) extends to every new async view — required, not optional, for any screen with more than one in-flight request source (e.g. context switch mid-load). |
-| Error | **Decision needed** (see Product decisions below): today is whole-pane-only (one banner replaces all content). The new hub/multi-card screens must state, per screen, whether a single card's failure blanks the whole screen or degrades just that card — this package requires the decision be made and stated per screen, not left as an accident of implementation order. |
+| Error | **Resolved** (see Product decisions): today is whole-pane-only. Going forward, hub/dashboard-shaped screens (Home/Tasks, Setup workflow landings) use per-card error boundaries — one card's failure never blanks the rest; single-purpose detail screens keep the existing whole-pane pattern. The states matrix below states which applies per screen. |
 | Retry | An explicit retry affordance at every failure point, matching today's granularity options (page-level `#retry-btn`, row-level retry as in dead-letter notification rows) — no error state without a next action. |
 | Confirmation | Every destructive action (delete/reset/cleanup) uses a modal that names the specific resource being affected — never a generic "Are you sure?" — matching the existing `destructive-surfaces`/`safe-destructive`/`factory-reset`/`records-delete`/`division-delete-cleanup`/`registration-cleanup`/`venue-access-cleanup` journeys. Every new destructive action introduced by the redesign must have an equivalent e2e journey before it ships. |
 
-**Requirement**: produce a states matrix — rows are every screen in the
-proposed 7-area IA, columns are {loading, empty, stale, error, retry,
-confirm} — filled in (not left blank) as part of this package's validation,
-so the implementation PR is executing a checklist, not improvising per
-screen.
+**States matrix** — every screen in the proposed 7-area IA (per the §2
+crosswalk), filled in rather than left as a template. "Skeleton"/"stale-
+guard"/"named-resource modal" refer to the existing patterns described
+above; entries only add detail where a screen's behavior is genuinely
+different from the default.
+
+*Home/Tasks*
+
+| Screen | Loading | Empty | Stale | Error | Retry | Confirm |
+| --- | --- | --- | --- | --- | --- | --- |
+| Home/Tasks hub | Skeleton task-card list | "All setup steps complete" success state + link into Schedule (a success state, not a failure) | Stale-guard on context switch / task completion mid-view | Per-card (§ decision above) | Row-level, on the failed card | n/a — no destructive action lives here |
+| Player Home | Skeleton | "No upcoming games" + link to team schedule | Stale-guard on context/role switch | Per-card | Row-level | n/a |
+| Guardian Home | Skeleton | "No linked players yet" + contact-league-admin guidance | Stale-guard on linked-player list refresh | Per-card | Row-level | n/a |
+| Official Inbox | Skeleton | "No open assignments" | Stale-guard (assignment list can change server-side between polls) | Per-card | Row-level | Accept/decline get a lightweight inline confirm naming the specific game (not a full modal — low-risk, reversible-until-deadline action) |
+| Activity | Skeleton | "No recent activity" | Stale-guard on feed refresh | Whole-pane (single-purpose feed, not multi-card) | Page-level `#retry-btn` | n/a |
+
+*Schedule*
+
+| Screen | Loading | Empty | Stale | Error | Retry | Confirm |
+| --- | --- | --- | --- | --- | --- | --- |
+| Arena Calendar | Skeleton | "No ice scheduled this range" + "Add Ice" link | Stale-guard on month/context navigation (existing, keep) | Whole-pane | Page-level | Deleting/cancelling ice → named-resource modal |
+| Games | Skeleton | #311-style: names the real count/scope | Stale-guard (existing) | Whole-pane | Page-level | Cancelling a game → named-resource modal |
+| Scheduler | Skeleton | The existing #311 empty-state recipe (already built — keep verbatim) | Stale-guard (existing, keep) | Whole-pane | Page-level | Discarding a draft → named-resource modal |
+| Standings | Skeleton | "No completed games yet" | Stale-guard on context switch | Whole-pane | Page-level | n/a (read-only) |
+| Game Sheet | Skeleton | n/a — only reachable for an existing game; no meaningful empty state | Stale-guard on live score updates | Whole-pane | Page-level | Finalizing/correcting a score → named-resource modal |
+| Public | Skeleton | "No public schedule available" | Stale-guard (existing `#public-retry-btn`, keep) | Whole-pane (existing) | Page-level `#public-retry-btn` (existing) | n/a — read-only, unauthenticated |
+
+*Teams & People*
+
+| Screen | Loading | Empty | Stale | Error | Retry | Confirm |
+| --- | --- | --- | --- | --- | --- | --- |
+| Roster | Skeleton | "No players on this roster yet" + add link | Stale-guard on team/context switch | Whole-pane | Page-level | Removing a player → named-resource modal |
+
+*Facilities*
+
+| Screen | Loading | Empty | Stale | Error | Retry | Confirm |
+| --- | --- | --- | --- | --- | --- | --- |
+| Venues, rinks & ice | Skeleton | Landing: "No venues yet" + "Add Venue"; drill-in: "No ice on this rink yet" + "Add Ice" | Stale-guard on builder preview-vs-commit (existing, keep) | Per-card on the landing summary (independent venue cards); whole-pane on a single venue/rink drill-in | Row-level (summary) / page-level (drill-in) | Deleting a venue/rink/ice slot → named-resource modal (existing `destructive-surfaces` pattern, keep) |
+
+*Communications*
+
+| Screen | Loading | Empty | Stale | Error | Retry | Confirm |
+| --- | --- | --- | --- | --- | --- | --- |
+| Notifications | Skeleton | "No notifications" | Stale-guard (existing) | Whole-pane | Page-level + existing row-level retry/ignore on dead-letter rows | Clearing/dismissing → lightweight inline confirm, not a full modal |
+| Delivery | Skeleton | "No delivery activity yet" | Stale-guard | Whole-pane | Page-level + row-level (existing dead-letter retry) | n/a |
+
+*Reports*
+
+| Screen | Loading | Empty | Stale | Error | Retry | Confirm |
+| --- | --- | --- | --- | --- | --- | --- |
+| Pilot Readiness / Reports | Skeleton | "No data for this range yet" | Stale-guard on date-range/context change | Per-card (independent report widgets) | Row-level, per widget | n/a (read-only) |
+
+*Administration*
+
+| Screen | Loading | Empty | Stale | Error | Retry | Confirm |
+| --- | --- | --- | --- | --- | --- | --- |
+| League profile and seasons | Skeleton | "No seasons yet" + "Add Season" link | Stale-guard on season list after edit | Per-card (season list can grow long) | Row-level | Archiving/deleting a season → named-resource modal |
+| Permanent teams | Skeleton | "No teams yet" + "Add Team" link | Stale-guard | Per-card (independent team rows) | Row-level | Delete/deactivate → named-resource modal (existing `records-delete`/`safe-destructive` pattern) |
+| Season participation/divisions | Skeleton | The existing #311 recipe, reused verbatim | Stale-guard (existing) | Whole-pane | Page-level | Unregistering a team → named-resource modal (existing `registration-cleanup` pattern) |
+| Clubs, players and staff | Skeleton | "No players yet" + "Add Player" link | Stale-guard | Per-card (player/staff lists can grow long) | Row-level | Deactivate/delete → named-resource modal (existing `player-lifecycle` pattern) |
+| Users | Skeleton | "No user accounts yet" (rare — at least one admin always exists post-claim) | Stale-guard on role/permission edits | Whole-pane | Page-level | Deactivating a login → named-resource modal |
+| Imports and onboarding | Skeleton during file parse/validation | "No import in progress — upload a file to begin" | Stale-guard (existing dry-run-vs-commit pattern, keep) | Whole-pane (a wizard, single-purpose per step) | Page-level | Committing an import with warnings → a named-resource-style refusal naming exactly which rows are affected (existing `ice_slot_overlap`-style copy, keep) |
 
 ### 6. Desktop and 390px behavior
 
@@ -254,11 +346,20 @@ screen.
   (already used in 10+ specs) — do not introduce a second phone size.
   Desktop stays whatever each existing spec already uses (commonly
   `1280×800`).
-- **Requirement**: consolidate today's eight ad hoc breakpoint values
-  (460/480/520/680/720/760/880/1040) into a small set of named tokens as
-  part of the design-system deliverable #204 already scopes (e.g. a phone
-  breakpoint, the 880px structural nav-flip, and at most one intermediate
-  tablet-ish breakpoint) — new hub CSS must not add a ninth magic number.
+- **Resolved** (was open — exact values, not a category): today's eight ad
+  hoc breakpoints consolidate into four named tokens, chosen by inspecting
+  what each one actually does (`styles.css:342-343,795-799,899,913,961-964,
+  1079-1082,1153-1167`; `web.css:267-289,292+`):
+
+  | Token | Value | Replaces | Rationale |
+  | --- | --- | --- | --- |
+  | `--bp-phone` | **480px** | 460 (Ice Builder 2-col→1-col), 480 (drawer full-width, icon-btn 40×40 touch target, context-switcher compact mode, the dedicated "#100: responsive pass" block, iOS 16px input fix), 520 (setup.css) | 480 is already the dominant, most-used value (5 of 8 sites); 460 and 520 are the same "phone-density" concern authored at slightly different times — folding both into 480 changes behavior by at most 40px either way, with no visible regression, and keeps a safety margin above the 390px test viewport |
+  | `--bp-tablet` | **720px** | 680 (Game Sheet grids → 1-col), 720 (Arena Calendar `.cal-layout` row→column, kept as-is), 760 (onboarding) | 720 already serves the single most content-dense of the three (the Calendar); folding 680→720 delays Game Sheet's 1-col collapse by 40px (negligible), folding 760→720 triggers onboarding's collapse 40px earlier (negligible, arguably earlier is safer) |
+  | `--bp-nav-flip` | **880px** | 880 (unchanged) | The one true structural layout change (sidebar → horizontal scrollable top nav) stays isolated from the two content-collapse tokens above so nav layout and content density can vary independently |
+  | `--bp-wide` | **1040px** | 1040 (unchanged) | A distinct, wider concern (dashboard/report grid de-densifies pre-emptively while the sidebar is still full-width, i.e. *before* the 880px nav flip) — kept as its own token rather than force-merged into 880, since it fires at a meaningfully different width for a different reason |
+
+  New hub CSS uses these four tokens exclusively — it must not add a fifth
+  magic number.
 - **Requirement**: the redesigned nav (7 areas instead of 5 groups) states
   its own mobile collapse behavior explicitly. Today's 880px flip
   (`web.css:271-289`) turns the sidebar into a horizontal scrollable tab
@@ -271,46 +372,170 @@ screen.
 
 ### 7. WCAG 2.2 AA — keyboard, focus, labeling, screen-reader
 
-Target is **WCAG 2.2 AA** specifically (not 2.0 or 2.1) — the following are
-concrete, testable requirements closing today's real, named gaps rather than
-citing "AA" as a slogan:
+**Correction from initial draft**: WCAG 2.2 Level AA conformance means
+conformance to **every applicable Level A and Level AA success criterion**
+under the [official W3C standard](https://www.w3.org/TR/WCAG22/) — not a
+hand-picked subset. An earlier version of this section named seven SCs as
+if they were the scope; that was wrong. Those seven remain valid — they map
+to real, currently-failing gaps this app has today — but they are now
+correctly framed as a **priority regression list**, subordinate to the
+**full conformance matrix** below, which is the actual target.
 
-- **Keyboard**: every interactive control in the new IA must be reachable by
-  Tab/Shift+Tab in DOM/visual order (SC 2.1.1, 2.4.3). The existing global
-  Escape-closes and Enter/Space-activates-`role="button"` handlers must
-  extend to every new dialog/menu/hub surface — an audit is required because
-  the redesign adds dialog-shaped surfaces beyond today's two (`.modal`,
-  `.drawer`).
-- **Focus**: every surface marked `aria-modal="true"` must implement a real
+**Also corrected**: **SC 2.4.12 "Focus Not Obscured (Enhanced)" is Level
+AAA**, not AA — it is not part of the required matrix and is called out
+separately, below, as a voluntary stretch goal. **SC 2.4.11 "Focus Not
+Obscured (Minimum)" is the correct AA criterion**, and it covers a
+*different* concern (a sticky header/toolbar visually covering the
+currently-focused element) than dialog focus trapping, which is properly
+governed by **SC 2.1.2 "No Keyboard Trap"** and **SC 2.4.3 "Focus Order"**
+— the priority list below cites the correct SCs for each concern.
+
+**Automated tooling is one gate, not proof of conformance.** Axe-core (or
+equivalent) catches a meaningful subset of failures automatically — mostly
+markup-detectable ones (missing labels, contrast ratios, missing landmarks)
+— but most of the matrix below requires manual review (keyboard-only
+walkthroughs, screen-reader testing, judgment calls like "is this sensory
+characteristic description ambiguous"). Both are required; neither replaces
+the other.
+
+**Priority regressions** (known, currently-failing today — fix these first,
+without waiting for the full matrix below to be worked through screen by
+screen):
+
+- **Dialog focus management** (SC 2.1.2 No Keyboard Trap, SC 2.4.3 Focus
+  Order): every surface marked `aria-modal="true"` must implement a real
   focus trap — Tab/Shift+Tab cycles only within the dialog, initial focus
   lands on the first control or a heading, and focus returns to the
-  triggering element on close (SC 2.4.3, 2.4.11 focus-not-obscured). This is
-  a **currently-failing requirement**: neither existing dialog shape does
-  this today (the drawer sets initial focus only; nothing traps or returns
-  it). New dialogs in the redesign must not repeat the gap.
-- **Labeling**: unify today's two divergent conventions behind one explicit
-  rule — prefer a real, bound `<label for="...">` wherever the control's
-  markup is static enough to support it; reserve `aria-label` for genuinely
-  dynamic/JS-templated or icon-only controls (SC 1.3.1, 4.1.2). State this
-  rule in the design system so it is a decision, not an accident of which
-  screen a given control happened to ship on first.
-- **Screen-reader**: extend the existing `aria-live="polite"` toast pattern
-  to any new async confirmation surface; empty/error copy must remain
-  conveyed through readable text, never through icon or color alone
-  (SC 1.4.1); every icon-only control keeps the existing `title` +
-  `aria-label` pairing convention.
-- **Target size** (new in 2.2, SC 2.5.8): icon buttons already grow to 40×40
-  at the 480px phone breakpoint (`styles.css:913`) — the redesign must carry
-  this forward to every new touch target, including any newly introduced
-  icon-only controls in the Home/Tasks hub and Setup workflows.
-- **Automated gate**: add an automated accessibility check (e.g. axe-core)
-  to CI. `ROADMAP.md:217` (#208) already anticipates this; this package
-  treats it as one of *its own* closeable acceptance items (see §8), not an
-  indefinitely deferred aspiration.
-- **Manual acceptance**: automated checks catch violations, not usability —
-  a manual keyboard-only and screen-reader pass on the Home/Tasks hub and
+  triggering element on close. **Currently failing**: neither existing
+  dialog shape (`.modal`, the Setup `.drawer`) does this — the drawer sets
+  initial focus only; nothing cycles or returns it. New dialogs in the
+  redesign must not repeat the gap.
+- **Bypass blocks** (SC 2.4.1): no "skip to main content" link exists in
+  `index.html` today, despite a persistent sidebar repeated on every view.
+  **Currently failing** — add one as part of the nav rebuild.
+- **Dragging alternative** (SC 2.5.7, new in 2.2): the draggable ice slot
+  interaction (`app.js:2437`) needs a confirmed non-drag alternative (e.g.
+  a "Move" menu action) — not confirmed present in the current codebase.
+- **Labeling convention** (SC 1.3.1, 3.3.2, 4.1.2): unify today's two
+  divergent conventions — bound `<label for="...">` on static HTML,
+  `aria-label` on JS-templated controls — behind one explicit rule: prefer
+  a real, bound label wherever the markup is static enough to support it;
+  reserve `aria-label` for genuinely dynamic/JS-templated or icon-only
+  controls. State this rule in the design system so it is a decision, not
+  an accident of which screen a control happened to ship on first.
+- **Reflow at 320px** (SC 1.4.10): this package's 390×844 phone test
+  convention (§6) does not by itself prove compliance at WCAG's 320 CSS px
+  reflow target — a narrower check is needed, at least for the new hub/
+  Setup screens.
+- **Contrast and target-size audit at desktop width** (SC 1.4.3, 2.5.8):
+  icon buttons already meet the 24×24 CSS px minimum at the 480px phone
+  breakpoint (`styles.css:913`), but 2.5.8 applies at every viewport size —
+  desktop-width icon buttons are unverified. No automated contrast check
+  exists today (the axe-core gate below is meant to catch this class of
+  issue going forward).
+
+**Full A + AA conformance matrix** — every applicable Level A/AA success
+criterion in WCAG 2.2 (Level AAA criteria, including 2.4.12, are excluded —
+listed separately below as voluntary). Status is honest about what can be
+asserted today: **Met** (verified against cited evidence), **Partial**
+(some coverage, a named gap remains), **Gap** (a known, currently-failing
+requirement), **Verify** (applicable, not yet audited — mostly screens that
+don't exist yet), or **N/A** (genuinely inapplicable to this app, with why).
+
+*Perceivable*
+
+| SC | Name | Level | Status |
+| --- | --- | --- | --- |
+| 1.1.1 | Non-text Content | A | Partial — icon-only controls pair `title`+`aria-label` (existing convention); new screens verify at implementation |
+| 1.2.1 | Audio-only/Video-only (Prerecorded) | A | N/A — no audio/video content anywhere in the app |
+| 1.2.2 | Captions (Prerecorded) | A | N/A — no video content |
+| 1.2.3 | Audio Description or Media Alternative | A | N/A — no video content |
+| 1.2.4 | Captions (Live) | AA | N/A — no live audio/video |
+| 1.2.5 | Audio Description (Prerecorded) | AA | N/A — no video content |
+| 1.3.1 | Info and Relationships | A | Partial — see labeling-convention gap above |
+| 1.3.2 | Meaningful Sequence | A | Verify — no known violation; audit new card/grid layouts for DOM-vs-visual order |
+| 1.3.3 | Sensory Characteristics | A | Verify — no known violation, not explicitly audited |
+| 1.3.4 | Orientation | AA | Met — single responsive layout, no orientation lock observed |
+| 1.3.5 | Identify Input Purpose | AA | Verify — `autocomplete` attributes on common fields (email, name) not confirmed present |
+| 1.4.1 | Use of Color | A | Partial — conflict/status styling already pairs color with text/weight; no systematic audit done |
+| 1.4.2 | Audio Control | A | N/A — no auto-playing audio |
+| 1.4.3 | Contrast (Minimum) | AA | Verify — no automated contrast check exists today (see automated-gate note above) |
+| 1.4.4 | Resize Text | AA | Met — no fixed/`user-scalable=no` viewport meta (`index.html:5`); verify 200% reflow holds for new screens |
+| 1.4.5 | Images of Text | AA | Met — text renders as text/CSS throughout, no text-as-image pattern observed |
+| 1.4.10 | Reflow | AA | Gap — see priority list above (390px convention doesn't prove the 320px target) |
+| 1.4.11 | Non-text Contrast | AA | Verify — the `:focus-visible` ring exists (`styles.css:907-908`) but its contrast ratio is unmeasured |
+| 1.4.12 | Text Spacing | AA | Verify — no test for user style overrides today |
+| 1.4.13 | Content on Hover or Focus | AA | N/A today (only native `title` tooltips, exempt); verify if new hover-triggered content is added |
+
+*Operable*
+
+| SC | Name | Level | Status |
+| --- | --- | --- | --- |
+| 2.1.1 | Keyboard | A | Met — `role="button" tabindex="0"` retrofits + global Enter/Space activator; native controls used specifically for this |
+| 2.1.2 | No Keyboard Trap | A | Gap — see priority list (correct citation for dialog escapability) |
+| 2.1.4 | Character Key Shortcuts | A | N/A — no single-key shortcuts today; constraint if the redesign adds any |
+| 2.2.1 | Timing Adjustable | A | Verify — session/auth timeout extension mechanism not audited here |
+| 2.2.2 | Pause, Stop, Hide | A | N/A — no auto-advancing/continuously auto-refreshing content observed |
+| 2.3.1 | Three Flashes | A | N/A — no flashing content anywhere |
+| 2.4.1 | Bypass Blocks | A | Gap — see priority list (no skip-to-content link) |
+| 2.4.2 | Page Titled | A | Met — `<title>` present (`index.html:6`); per-view title updates are a nice-to-have, not required for this SPA |
+| 2.4.3 | Focus Order | A | Gap — see priority list (dialog focus management) |
+| 2.4.4 | Link Purpose (In Context) | A | Verify — icon-only links' `aria-label` needs to read sensibly out of context |
+| 2.4.5 | Multiple Ways | AA | Met — sidebar nav plus URL-hash deep-linking already provide two paths |
+| 2.4.6 | Headings and Labels | AA | Verify — needs a heading-level audit once the new hub/workflow screens exist |
+| 2.4.7 | Focus Visible | AA | Met — `:focus-visible` rings never left bare (`styles.css:907-908`); new screens must preserve this |
+| 2.4.11 | Focus Not Obscured (Minimum) | AA | Verify — the fixed toast root and any sticky topbar/sidebar elements must never obscure a focused control; not yet audited |
+| 2.5.1 | Pointer Gestures | A | Verify — the draggable ice slot needs a confirmed single-pointer alternative |
+| 2.5.2 | Pointer Cancellation | A | Verify — click handlers should fire on up-event, not down-event; not audited |
+| 2.5.3 | Label in Name | A | Verify — check specifically where `aria-label` text differs from visible label text |
+| 2.5.4 | Motion Actuation | A | N/A — no device-motion-triggered controls |
+| 2.5.7 | Dragging Movements | AA | Gap — see priority list (draggable ice slot alternative) |
+| 2.5.8 | Target Size (Minimum) | AA | Partial — met at the 480px phone breakpoint (`styles.css:913`); desktop-width icon buttons unverified (see priority list) |
+
+*Understandable*
+
+| SC | Name | Level | Status |
+| --- | --- | --- | --- |
+| 3.1.1 | Language of Page | A | Met — `<html lang="en">` (`index.html:2`) |
+| 3.1.2 | Language of Parts | AA | N/A — no mixed-language content today |
+| 3.2.1 | On Focus | A | Verify — no control should trigger a context change merely on receiving focus; no known violation |
+| 3.2.2 | On Input | A | Reviewed exception — the context switcher's `<select>` intentionally changes context on selection; this is an SC-permitted, documented behavior (#159), not an accidental violation |
+| 3.2.3 | Consistent Navigation | AA | Met — single persistent sidebar, consistent order across views; redesign must preserve this |
+| 3.2.4 | Consistent Identification | AA | Met — shared `pageIntro`/`.empty`/icon+label conventions; new components must reuse them |
+| 3.2.6 | Consistent Help | A | N/A today — no persistent help/contact mechanism exists; constraint if one is added (same location every screen) |
+| 3.3.1 | Error Identification | A | Met — the normalized `{error:{code,message}}` envelope + inline `role="alert"` validation |
+| 3.3.2 | Labels or Instructions | A | Partial — see labeling-convention gap above |
+| 3.3.3 | Error Suggestion | AA | Met — the #311 empty-state recipe is exactly this SC done right; the bar for all new copy (§5) |
+| 3.3.4 | Error Prevention (Legal, Financial, Data) | AA | Met — the named-resource confirmation-modal convention for deletions |
+| 3.3.7 | Redundant Entry | A | Verify — confirm wizard steps (onboarding, Ice Availability Builder) never require re-entering already-given data; extend to the redesigned Setup workflows |
+| 3.3.8 | Accessible Authentication (Minimum) | AA | Met (likely) — no CAPTCHA/cognitive-function-test observed on login; not exhaustively confirmed absent |
+
+*Robust*
+
+| SC | Name | Level | Status |
+| --- | --- | --- | --- |
+| 4.1.2 | Name, Role, Value | A | Partial — see labeling-convention gap; the dialog focus-management gap is partly behavioral, not markup, here |
+| 4.1.3 | Status Messages | AA | Met — the `aria-live="polite"` toast root and modal `role="alert"` validation; new async confirmations must reuse this |
+
+*(SC 4.1.1 Parsing was removed in WCAG 2.2 and is not part of this matrix.)*
+
+**Voluntary AAA stretch goals** (not required for AA conformance, listed
+only so they are never mistaken for AA requirements): SC 2.4.12 Focus Not
+Obscured (Enhanced), SC 2.4.13 Focus Appearance, SC 3.3.9 Accessible
+Authentication (Enhanced). If the redesign happens to satisfy any of these,
+that's a bonus — none gate this package's or the first implementation PR's
+acceptance.
+
+**Automated + manual gates**:
+
+- Add an automated accessibility check (e.g. axe-core) to CI, catching the
+  markup-detectable subset of the matrix above. `ROADMAP.md:217` (#208)
+  already anticipates this; this package treats it as one of *its own*
+  closeable acceptance items (§8).
+- A manual keyboard-only and screen-reader pass on the Home/Tasks hub and
   guided Setup hub is required before that PR is considered done, per
-  #204's own "manual keyboard/screen-reader acceptance" line.
+  #204's own "manual keyboard/screen-reader acceptance" line — this is what
+  catches everything the automated gate structurally cannot.
 
 ### 8. Operator validation and measurable success criteria
 
@@ -320,26 +545,47 @@ cover the eventual shipped redesign — these gate *this document*):
 - [ ] Every one of sections 1–7 above has concrete, testable requirements —
       no item left open as "TBD."
 - [ ] The role → journey coverage table (§1) is complete for all 7 roles.
-- [ ] The IA crosswalk (§2) accounts for 100% of today's reachable tabs.
-- [ ] The per-screen primary-action table (§4) exists for at least the
-      Setup mega-page and the Home/Tasks hub.
+- [ ] The IA crosswalk (§2) accounts for 100% of today's reachable tabs, each
+      mapped to one specific new screen.
+- [ ] The per-screen primary-action table (§4) is complete for the
+      Home/Tasks hub and all six Setup workflows.
 - [ ] The states matrix (§5) is filled in for every screen in the proposed
       IA — not left as an empty template.
-- [ ] The WCAG 2.2 AA checklist (§7) names specific success-criterion
-      numbers, not just "AA."
-- [ ] The five product decisions below are resolved and signed off by
+- [ ] The WCAG 2.2 AA conformance matrix (§7) covers every applicable A/AA
+      success criterion, not a curated subset; the priority regression list
+      is subordinate to it, not a substitute for it.
+- [ ] The eight product decisions below are resolved and signed off by
       @jingizoo.
-- [ ] Real operator validation is scheduled — who and by what method — not
-      deferred indefinitely (see below).
+- [ ] Real operator validation is scheduled — owner, participants, tasks,
+      evidence, and milestone (see below) — not deferred indefinitely.
 - [ ] No application code changes are included in this deliverable.
 
-**Operator validation plan** (proposed, for sign-off): a moderated
-walkthrough of the Home/Tasks + guided Setup hub prototype, once built,
-against this package's requirements — with at minimum a League Admin and an
-Arena Manager (the two heaviest-permission roles) and a Coach (the most
-common day-to-day operator), matching #204's own "user testing with
-representative league/arena operators is documented before final rollout"
-line. Exact participants/scheduling are a sign-off item, not decided here.
+**Operator validation plan**: a moderated usability walkthrough of the
+Home/Tasks + guided Setup hub prototype, run before that PR is considered
+done — not deferred to "sometime before final rollout":
+
+- **Owner**: @jingizoo (product owner), as the accountable party for
+  commissioning and running the sessions — consistent with every other
+  product decision in this doc requiring their sign-off.
+- **Participants**: three sessions minimum, one per role — a League Admin,
+  an Arena Manager, and a Coach (the two heaviest-permission roles plus the
+  most common day-to-day operator), ~30–45 minutes each.
+- **Moderated tasks** (concrete, not "walk through the hub"):
+  - League Admin: starting from the Home/Tasks hub with no prompting, find
+    and complete the next incomplete setup step.
+  - Arena Manager: using Facilities, add a week of recurring ice via the
+    Ice Availability Builder without consulting help text.
+  - Coach: confirm the team's roster for the next game and identify any
+    open slot, using only Home/Tasks + Schedule.
+- **Evidence to capture per session**: task completion (yes/no), time-on-
+  task, number of moderator interventions/hints needed, a post-task 1–5
+  ease rating, and verbatim quotes on any confusion point. Recorded as
+  session notes (recording optional, moderator's call).
+- **Milestone**: sessions run, and their results documented, **before the
+  first implementation PR (Home/Tasks + guided Setup hub) is merged** —
+  this gates that PR's completion, not a later "final rollout" checkpoint,
+  matching #204's own "documented before final rollout" line applied to the
+  earliest point it can actually be tested.
 
 **Measurable success criteria for the first implementation PR** (forward-
 looking — the bar that PR must clear once it ships):
@@ -362,29 +608,50 @@ looking — the bar that PR must clear once it ships):
 
 ## Product decisions requiring sign-off
 
-Five open decisions this package proposes an answer for, gathered here so
-they can be reviewed and checked off in one place rather than hunting
-through each section:
+Eight decisions this package resolves or proposes an answer for, gathered
+here so they can be reviewed and checked off in one place rather than
+hunting through each section. All eight now have a concrete, stated answer
+— none is left as a bare open question:
 
-1. **Context filtering** (§3): does the Program/Season context bar become
-   filtering-by-default for every screen, or does it keep an explicit,
-   documented exception list? *Proposed: filtering-by-default; exceptions
-   must be named, not silent.*
-2. **Error granularity** (§5): whole-pane (today's behavior) or per-card
-   error boundaries for the new multi-card hub screens? *Proposed:
-   per-card for hub/dashboard-shaped screens (Home/Tasks, Setup hub
-   landings); whole-pane remains correct for single-purpose detail screens.*
-3. **WCAG 2.2 success criteria in scope** (§7): are the named SCs (2.1.1,
-   2.4.3, 2.4.11, 1.3.1, 4.1.2, 1.4.1, 2.5.8) the complete relevant set, or
-   does review add/remove any? *Proposed: as listed in §7.*
-4. **Operator validation participants/method** (§8): who and how? *Proposed:
-   a moderated walkthrough with a League Admin, an Arena Manager, and a
-   Coach.*
-5. **Breakpoint token values** (§6): what are the new named breakpoints,
-   replacing today's eight ad hoc values? *Proposed: one phone breakpoint
-   (consolidating 460/480/520), the existing 880px structural nav-flip kept
-   as-is, and at most one intermediate/tablet breakpoint (consolidating
-   680/720/760/1040) — exact values are a sign-off item, not fixed here.*
+1. **Users placement** (§2): Administration, not Teams & People — account/
+   login lifecycle is a one-time administrative concern, distinct from
+   day-to-day roster/team-membership management.
+2. **League/Division context placement** (§3): League is promoted into the
+   persistent context bar alongside Program/Season (structurally a peer of
+   Season under Program, needed by most screens); Division stays
+   screen-local (a narrower slice within an already-selected League+Season,
+   needed by only a minority of screens).
+3. **Context filtering** (§3): the Program/Season(/League) context bar
+   becomes filtering-by-default for every screen; exceptions must be named
+   and justified, never silent.
+4. **Error granularity** (§5): per-card error boundaries for hub/dashboard-
+   shaped screens (Home/Tasks, Setup workflow landings); whole-pane remains
+   correct for single-purpose detail screens. Applied per screen in the §5
+   states matrix.
+5. **WCAG 2.2 conformance scope** (§7): **corrected** — conformance means
+   every applicable Level A and AA success criterion (the full matrix in
+   §7), not a curated subset. The originally-proposed seven-item list is
+   retained as a priority regression list, not the scope itself. SC 2.4.12
+   is Level AAA and is explicitly excluded from the AA target (listed only
+   as a voluntary stretch goal).
+6. **Operator validation** (§8): owner (@jingizoo), participants (League
+   Admin, Arena Manager, Coach — 3 sessions), moderated tasks, evidence, and
+   milestone (before the first implementation PR merges) are all specified
+   in §8 — reviewed here for confirmation, not decided from scratch.
+7. **Breakpoint token values** (§6): four exact tokens — `--bp-phone: 480px`,
+   `--bp-tablet: 720px`, `--bp-nav-flip: 880px`, `--bp-wide: 1040px` —
+   chosen by inspecting what each of today's eight ad hoc values actually
+   does, not left as an abstract category.
+8. **#158 status** (recurring ice templates/month view): #313 (closing
+   #315) delivered the builder mechanics; #313's own text explicitly held
+   #158 open until #277's warm-up/resurfacing/curfew policy items landed.
+   Those items are now merged (#318/#319). Per #313's own stated
+   condition, #158's scoped work is now functionally complete — but #313
+   also explicitly reserved the actual issue-close action for "a
+   product/roadmap-owner decision," so this package does not close #158
+   itself. **Sign-off needed**: confirm #158 should now be closed (citing
+   #313, #315, #318, #319), or name the specific remaining gap if one
+   exists that this package missed.
 
 ## Out of scope for this package
 

@@ -192,21 +192,35 @@ publish-gated and privacy-safe.
 1. **#277** — warm-up, resurfacing, turnover and curfew rules shared by manual
    moves and generated schedules. **Done** (PR #318/#319, merged).
 2. **#158** — recurring ice templates, conflict preview and month view.
+   Builder mechanics done via #313 (closing #315); #313 explicitly held
+   #158 open until #277's warm-up/resurfacing/curfew policy items landed —
+   those are now merged (#318/#319), so #158's scoped work is functionally
+   complete. #313 reserved the actual close decision for the product/
+   roadmap owner (not automatic) — closing #158 is a pending sign-off item
+   on the #204 requirements package (#324), not decided here.
 3. **#204** — task-oriented operator UX, accessibility and design consistency,
    built on the permanent-hierarchy context and the new Player/Game workflows.
    **Reordered ahead of #206** (plan update): the first deliverable is a
    bounded requirements package (#324) — role-specific operator journeys,
-   task-oriented IA, persistent Program/Season context, one primary action
-   per screen, loading/empty/stale/error/retry/confirmation states, desktop
-   + 390px behavior, WCAG 2.2 AA requirements, and operator validation +
-   measurable success criteria — landing before any implementation code.
-   Home/Tasks plus a guided Setup hub is the first implementation PR once
-   that package is validated; Schedule/Facilities UX follows.
-4. **#206** — planner scenarios, fairness, locks, repair and explanations
+   task-oriented IA, persistent Program/Season/League context, one primary
+   action per screen, loading/empty/stale/error/retry/confirmation states,
+   desktop + 390px behavior, a full WCAG 2.2 AA conformance matrix, and
+   operator validation + measurable success criteria — landing before any
+   implementation code. Home/Tasks plus a guided Setup hub is the first
+   implementation PR once that package is validated; Schedule/Facilities UX
+   follows.
+4. **#287** — substitute matching engine, **bounded substitute PR**: design,
+   UX, League policy configuration, and the offer/accept/decline/timeout
+   *state machine* only — explicitly **no runtime seasonal-eligibility
+   implementation**, preserving the **#205 gate** (#287's own text: "the
+   policy and state-machine design may begin earlier, but the full workflow
+   must not land ahead of #205"). The full production workflow, wired to
+   real `SeasonRosterMembership` eligibility, waits for #205.
+5. **#206** — planner scenarios, fairness, locks, repair and explanations
    (realigned: schedule within a `LeagueSeason`/Division; regular Games never
-   cross Leagues). Resumes after #204's requirements package and its first
-   implementation PR land.
-5. **#146** — remaining bounded UX polish where it does not conflict with #204.
+   cross Leagues). Resumes after #204's requirements package, its first
+   implementation PR, and the bounded #287 substitute PR land.
+6. **#146** — remaining bounded UX polish where it does not conflict with #204.
 
 **Exit gate:** a DB-valid schedule is physically operable at the rink; operators
 compare/repair scenarios without regenerating published Games; desktop and 390px
