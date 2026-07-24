@@ -452,23 +452,34 @@ def _split_already_scheduled(store, pairings, existing, league_season_id):
 
 
 def _draft_fingerprint(league_season_id, draft_games, already_scheduled):
-    """Deterministic identity of exactly which pairings this proposal found
-    missing vs. already scheduled (and by which existing Game) — #328
-    review round 5. Bound into the response so the commit path can prove,
-    right before writing, that this fact hasn't changed since: a Regular
-    Game silently created or cancelled in the gap between the operator's
-    preview and clicking Commit changes this fingerprint, and the commit
-    is refused rather than silently committing a different batch than the
-    one reviewed.
+    """Deterministic identity of exactly what this proposal reviewed — #328
+    review round 5, widened round 7. Bound into the response so the commit
+    path can prove, right before writing, that this fact hasn't changed
+    since: a Regular Game silently created or cancelled in the gap between
+    the operator's preview and clicking Commit changes this fingerprint
+    (via the already-scheduled split below), and so does the SAME pairing
+    silently landing on a different `ice_slot_id`/time — whether because
+    the reviewed slot became unavailable and another was chosen instead,
+    or because `slot_ids`/`constraints` differed between the preview call
+    and the commit's own regeneration. Either way the commit is refused
+    (terminal `preview_stale`) rather than silently persisting a different
+    placement than the one reviewed and approved.
 
-    Deliberately excludes slot/time assignment: that dimension is already
-    re-validated fresh and atomically by the per-row physical placement
-    check at commit time (#277), so binding it here too would also reject
-    a preview over mere ice-availability churn this fingerprint isn't
-    meant to guard against.
+    #328 review round 7 correction: an earlier version of this fingerprint
+    deliberately left placement out, reasoning that the per-row physical
+    check at commit time (#277) already re-validates slot freedom fresh.
+    That check proves the NEW placement is physically legal; it does not
+    prove it is the placement the operator actually reviewed — a
+    genuinely free, non-conflicting *different* slot for the identical
+    pairing sails through it unnoticed. Binding `ice_slot_id` plus
+    `start_time` here closes that gap; a slot's own time is included
+    alongside its id as defense in depth against the (currently
+    unsupported) possibility of a slot's time being edited in place
+    without changing its id.
     """
     missing = sorted(
-        f"{d.get('division_id')}|{d['home_team_id']}|{d['away_team_id']}"
+        f"{d.get('division_id')}|{d['home_team_id']}|{d['away_team_id']}|"
+        f"{d.get('ice_slot_id')}|{d.get('start_time')}"
         for d in draft_games)
     scheduled = sorted(
         f"{a.get('division_id')}|{a['home_team_id']}|{a['away_team_id']}|"
@@ -491,9 +502,10 @@ def draft_schedule(store, division_id, slot_ids=None, constraints=None):
     with the reason(s) that blocked it. A pairing that already has a real
     Game (#206 slice 1 — see :func:`_existing_pairing_games`) is reported in
     ``already_scheduled`` instead of being re-proposed or silently dropped.
-    ``draft_fingerprint`` (#328 review round 5 — see :func:`_draft_fingerprint`)
-    binds this exact missing/already-scheduled split so a later commit can
-    detect drift. Nothing is persisted.
+    ``draft_fingerprint`` (#328 review round 5, widened round 7 — see
+    :func:`_draft_fingerprint`) binds this exact missing/already-scheduled
+    split AND each missing pairing's placement (slot, time) so a later
+    commit can detect drift in either. Nothing is persisted.
     """
     # A division's teams are those validly registered in it this season (#180),
     # via the shared resolver — active rows whose Team exists and whose league

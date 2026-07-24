@@ -245,11 +245,24 @@ one the operator reviewed and approved.
 — the existing Game id), sorted for order-independence. This mirrors the
 ice-availability builder's `template_fingerprint`
 (`SetupService.commit_ice_availability`): recompute the same deterministic
-function fresh and compare, rather than store a server-side session. It
-deliberately excludes slot/time assignment — that dimension is already
-re-validated fresh and atomically by `_assert_slot_free_for_game` at commit
-time, so binding it here too would reject a preview over mere
-ice-availability churn this fingerprint isn't meant to guard against.
+function fresh and compare, rather than store a server-side session.
+
+**#328 review round 7 correction:** the fingerprint also binds each
+`draft_games` row's `ice_slot_id` and `start_time` — an earlier version
+deliberately left placement out, reasoning that the per-row physical check
+(`_assert_slot_free_for_game`) at commit time already re-validates slot
+freedom fresh. That reasoning conflated two different properties: the
+physical check proves a placement is *legal* (free, non-conflicting); it
+does not prove it is the *same* placement the operator reviewed. If the
+reviewed slot became unavailable between Generate and Commit and a
+different, still-valid slot was chosen instead for the identical pairing —
+or if `slot_ids`/`constraints` simply differed between the preview call
+and the commit's own regeneration — the pairing/already-scheduled identity
+alone would still match, and the commit would silently persist a
+placement the operator never saw. Binding placement closes this: any
+change to which slot (or its time) a still-missing pairing resolves to
+now changes the fingerprint, and the commit is refused
+(`preview_stale`) rather than silently substituting it.
 
 `commit_draft_schedule` (both facades) now requires a `draft_fingerprint`
 argument, checked immediately after regenerating the proposal and BEFORE

@@ -856,6 +856,69 @@ class SchedulerContract:
     def test_base_facade_commit_requires_a_preview_fingerprint(self):
         self._commit_requires_a_preview_fingerprint(BaseApiService)
 
+    # -- fingerprint must bind PLACEMENT too, not just pairing identity
+    # (#328 review round 7) -----------------------------------------------
+    def _stale_preview_refused_on_placement_change(self, api_cls, change):
+        """Shared assertion: the SAME still-missing pairing silently
+        resolving to a DIFFERENT ice_slot_id/time between Generate and
+        Commit must invalidate the preview -- the commit-time physical
+        gate (``_assert_slot_free_for_game``) proves the new placement is
+        LEGAL, not that it is the placement the operator actually
+        reviewed. ``change`` is ``"slot_removed"`` (the reviewed slot
+        becomes unavailable in the window, but a different slot still
+        exists, so the pairing itself remains genuinely missing -- just
+        onto different ice) or ``"scope_changed"`` (the commit call is
+        given a different ``slot_ids`` restriction than the preview used,
+        so its own regeneration resolves the same pairing onto different
+        ice even though nothing in the store itself changed)."""
+        self._division_fixture(2, 2)  # 1 pairing, 2 candidate slots
+        api = api_cls(self.store)
+        preview = api.draft_season_schedule("div1")
+        self.assertEqual(len(preview["draft_games"]), 1, repr(preview))
+        original_slot_id = preview["draft_games"][0]["ice_slot_id"]
+        stale_fingerprint = preview["draft_fingerprint"]
+        commit_kwargs = {}
+        if change == "slot_removed":
+            slot = self.store.get_ice_slot(original_slot_id)
+            slot.status = IceSlotStatus.BLOCKED
+            self.store.save_ice_slot(slot)
+        else:
+            assert change == "scope_changed"
+            other_slot_id = next(
+                s.id for s in self.store.all_ice_slots()
+                if s.id != original_slot_id)
+            commit_kwargs["slot_ids"] = [other_slot_id]
+        games_before = len(self.store.all_games())
+        audits_before = len(self.store.all_setup_audit())
+        res = api.commit_draft_schedule(
+            "div1", draft_fingerprint=stale_fingerprint, **commit_kwargs)
+        self.assertIn("error", res, repr(res))
+        self.assertEqual(
+            res["error"]["details"]["reason"], "preview_stale", repr(res))
+        self.assertEqual(len(self.store.all_games()), games_before, repr(res))
+        self.assertEqual(
+            len(self.store.all_setup_audit()), audits_before, repr(res))
+
+    def test_league_scoped_commit_refuses_stale_preview_after_reviewed_slot_becomes_unavailable(
+            self):
+        self._stale_preview_refused_on_placement_change(
+            ApiService, "slot_removed")
+
+    def test_league_scoped_commit_refuses_stale_preview_when_commit_scope_differs_from_preview(
+            self):
+        self._stale_preview_refused_on_placement_change(
+            ApiService, "scope_changed")
+
+    def test_base_facade_commit_refuses_stale_preview_after_reviewed_slot_becomes_unavailable(
+            self):
+        self._stale_preview_refused_on_placement_change(
+            BaseApiService, "slot_removed")
+
+    def test_base_facade_commit_refuses_stale_preview_when_commit_scope_differs_from_preview(
+            self):
+        self._stale_preview_refused_on_placement_change(
+            BaseApiService, "scope_changed")
+
 
 class MemorySchedulerTest(SchedulerContract, unittest.TestCase):
     def make_store(self):

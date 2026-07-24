@@ -472,9 +472,19 @@ class PostgresPlacementConcurrencyTest(_ForcedRaceHarnessMixin, unittest.TestCas
         self.assertLessEqual(_slot_game_count(store, "s0"), 1)   # never two
         for r in out:
             if _reason(r) is not None:
+                # #328 review round 7: d1 has exactly 6 slots (s0-s5) for its 6
+                # round-robin pairings, so once the move lands on s0 the
+                # draft's OWN internal regeneration shifts every later
+                # pairing's slot down by one instead of just the s0 pairing's.
+                # If that regeneration runs after the move but the draft's
+                # outer preview captured the pre-move (all-on-original-slots)
+                # layout, the widened draft_fingerprint (round 7) correctly
+                # sees a changed placement and refuses as stale rather than
+                # silently committing a schedule the operator never reviewed.
                 self.assertIn(_reason(r),
                               ("ice_slot_taken", "slot_unavailable",
-                               "slot_already_filled", "team_overlap"))
+                               "slot_already_filled", "team_overlap",
+                               "preview_stale"))
         self._assert_schedule_consistent(store)
 
     # (5) ice-availability BUILDER preview->commit vs a cross-Season placement on
