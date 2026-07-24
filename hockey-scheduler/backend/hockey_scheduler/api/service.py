@@ -36,6 +36,7 @@ from ..domain import (
     intervals_overlap,
 )
 from ..domain.errors import (
+    ConcurrencyConflictError,
     DomainError,
     NotAuthorizedError,
     NotFoundError,
@@ -2739,6 +2740,30 @@ class ApiService:
                               season_id: str = None, league_id: str = None,
                               slot_ids=None, constraints=None,
                               actor_id=None) -> dict:
+        """Retry shell (#318): ``placement_raced`` marks the batch's
+        pre-lock scope locator invalidated by a concurrent commit; each
+        retry regenerates the proposal and re-plans in a FRESH transaction,
+        so callers receive the precise terminal answer — mirroring
+        ``create_game``'s loop and ``move_game``'s ``_retry_on_move_race``.
+        The whole body lives in ``_commit_draft_schedule_attempt``; the
+        league-scoped facade overrides the attempt and inherits this
+        shell."""
+        for _attempt in range(3):
+            try:
+                return self._commit_draft_schedule_attempt(
+                    division_id=division_id, season_id=season_id,
+                    league_id=league_id, slot_ids=slot_ids,
+                    constraints=constraints, actor_id=actor_id)
+            except ConcurrencyConflictError as exc:
+                if ((exc.details or {}).get("reason") != "placement_raced"
+                        or _attempt == 2):
+                    raise
+
+    def _commit_draft_schedule_attempt(self, division_id: str = None,
+                                       season_id: str = None,
+                                       league_id: str = None,
+                                       slot_ids=None, constraints=None,
+                                       actor_id=None) -> dict:
         """Persist a generated draft as draft games (is_draft=True, unpublished),
         so they can be reviewed and then published (#86). Regenerates the
         proposal server-side (deterministic) and returns the created drafts +
@@ -2781,13 +2806,27 @@ class ApiService:
         # and the writes (autocommit would release the FOR UPDATE lock at the
         # end of the check) and the batch stays all-or-nothing.
         with self.store.transaction():
-            # #277/#313 — lock every team the batch places, then every rink it
-            # places onto (Team→Rink→Season order, before the Season guard) so each
-            # per-row check + ALLOCATE is atomic against a concurrent placement
-            # sharing a team AND against the ice-availability builder on those rinks
-            # (Rink before Season matches the builder and avoids deadlocking it);
-            # one globally-sorted pre-pass fixes the batch's lock order. See
-            # SetupService._lock_teams / _lock_rinks for the ordering contract.
+            # #277/#313/#318 — the global Program→Team→Rink→Season lock
+            # order: the Program rows (policy scopes the per-row gate reads —
+            # the batch's own and every neighbor's on the target rinks) come
+            # FIRST, matching the ice-availability builder's
+            # Program→Rink→Season (Program-last was an ABBA deadlock against
+            # it); then every team the batch places, every target rink, and
+            # every involved Season in one sorted batch, so each per-row
+            # check + ALLOCATE is atomic against a concurrent placement
+            # sharing a team, against the builder on those rinks, and
+            # against any scheduling-policy edit the gate would read. The
+            # scope locator is a plain pre-lock read, re-verified under the
+            # locks. See SetupService._policy_scope_lock_plan / _lock_teams /
+            # _lock_rinks for the ordering contract.
+            _pre_rinks = set()
+            for d in proposal["draft_games"]:
+                _s = self.store.get_ice_slot(d["ice_slot_id"])
+                if _s is not None:
+                    _pre_rinks.add(_s.rink_id)
+            _plan = self.setup._policy_scope_lock_plan(
+                _pre_rinks, (resolved_season_id,))
+            self.setup._lock_programs(_plan["programs"])
             self.setup._lock_teams(
                 t for d in proposal["draft_games"]
                 for t in (d["home_team_id"], d["away_team_id"]))
@@ -2797,7 +2836,10 @@ class ApiService:
                 if _s is not None:
                     _batch_rinks.add(_s.rink_id)
             self.setup._lock_rinks(_batch_rinks)
+            self.setup._lock_seasons(_plan["seasons"])
             self._guard_active_seasons([resolved_season_id])
+            self.setup._verify_policy_scope_plan(
+                _plan, _batch_rinks, season_ids=(resolved_season_id,))
             # Resolve the exact competition identity only after the Season lock.
             # If a concurrent unbind won first, fail closed; if it is queued
             # behind us, its dependency scan will see the Games created below.
@@ -4303,11 +4345,22 @@ class ApiService:
         # (v1) division_id stays mandatory and the league is derived from it.
         # ``game_type`` (#283 Slice D): "regular" (standings, one LeagueSeason)
         # or "exhibition" (a cross-League-allowed friendly, never in standings).
-        return _serialize(self.setup.create_game(
-            season_id, division_id, home_team_id, away_team_id, ice_slot_id,
-            target_goalies, target_skaters, max_skaters,
-            allow_division_override, actor_id, league_id=league_id,
-            game_type=game_type))
+        # #318 — ``placement_raced`` marks a pre-lock locator (slot rink or
+        # policy-scope plan) invalidated by a concurrent commit; each retry is
+        # a FRESH transaction (the setup method owns the boundary) that
+        # re-plans against the new topology and reports the precise terminal
+        # answer, mirroring move_game's _retry_on_move_race.
+        for _attempt in range(3):
+            try:
+                return _serialize(self.setup.create_game(
+                    season_id, division_id, home_team_id, away_team_id,
+                    ice_slot_id, target_goalies, target_skaters, max_skaters,
+                    allow_division_override, actor_id, league_id=league_id,
+                    game_type=game_type))
+            except ConcurrencyConflictError as exc:
+                if ((exc.details or {}).get("reason") != "placement_raced"
+                        or _attempt == 2):
+                    raise
 
     # ====================================================================
     # Pilot onboarding import — dry-run validator (#92)

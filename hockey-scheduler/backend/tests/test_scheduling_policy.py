@@ -10,12 +10,15 @@ policies (every pre-Slice-B install) short-circuit to the exact previous
 behavior, and enforcement is read-time only: no stored IceSlot/Game is ever
 rewritten by setting a policy (#277: zero silent time shifts).
 
-Curfew semantics pinned here (deterministic, policy-controlled): the curfew
-instant is HH:MM in the slot's VENUE timezone (Program fallback), on the
-slot's local start date for an afternoon/evening curfew (>= 12:00) or the
-following morning for a small-hours one (< 12:00); ending exactly AT curfew —
-and a same-rink gap exactly EQUAL to warmup+resurfacing — are compliant
-(half-open boundaries, matching ``intervals_overlap``).
+Curfew semantics pinned here (deterministic, policy-controlled — see
+``ice_availability.curfew_instant``): the deadline is HH:MM in the slot's
+VENUE timezone (Program fallback); the operating day is defined relative to
+the curfew itself — an evening curfew binds the start date, a small-hours
+curfew binds a start at/before its wall clock to THAT date and any later
+start to the FOLLOWING date. Buffers are DIRECTIONAL per game (earlier
+resurfacing + later warm-up, each from that game's own effective policy).
+Ending exactly AT curfew — and a gap exactly EQUAL to the directional
+requirement — are compliant (half-open, matching ``intervals_overlap``).
 """
 import json
 import os
@@ -37,6 +40,9 @@ from hockey_scheduler.domain import (
 from hockey_scheduler.domain.errors import ConcurrencyConflictError
 from hockey_scheduler.services.setup_service import (
     SetupService as BaseSetupService,
+)
+from hockey_scheduler.services.league_scoped_setup_service import (
+    SetupService as LeagueSetupService,
 )
 from hockey_scheduler.store import InMemoryStore, SqlStore
 from hockey_scheduler.web import server as srv
@@ -81,6 +87,21 @@ def _seed(s):
     gslot("sC", "r1", BASE + timedelta(minutes=300), 40)
     gslot("sD", "r1", datetime(2026, 1, 6, 4, 30, tzinfo=UTC))  # 22:30 local
     gslot("sE", "r2", BASE + timedelta(minutes=70))
+    # A SECOND season sharing rink r1 via the same venue access (#318
+    # directional-buffer review): policies inherit per Season, so a game in
+    # se2 adjacent to a game in se1 exercises two DIFFERENT effective
+    # policies on one rink.
+    s.add_season(Season(id="se2", program_id="pg", name="SE2"))
+    s.add_season_venue_access(SeasonVenueAccess(
+        id="sva2", season_id="se2", venue_id="v", active=True))
+    s.add_league_season(LeagueSeason(id="ls2", league_id="lg", season_id="se2"))
+    s.add_division(Division(id="d2", league_season_id="ls2", name="D2"))
+    for i in range(2):
+        s.add_team(Team(id=f"u{i}", name=f"U{i}", division_id="d2",
+                        program_id="pg", league_id="lg"))
+        s.add_season_team_registration(SeasonTeamRegistration(
+            id=f"reg2_u{i}", league_season_id="ls2", team_id=f"u{i}",
+            division_id="d2", active=True))
     return s
 
 
@@ -408,6 +429,279 @@ class _PolicyContract:
                          {"sA", "sB"}, prop)
 
 
+class _DirectionalBufferContract:
+    """#318 review — the required gap between two adjacent games is the
+    EARLIER game's resurfacing + the LATER game's warm-up, each from that
+    game's OWN effective policy (two seasons sharing a rink can differ).
+    The candidate's irrelevant-side buffer never blocks."""
+
+    def _make_store(self):
+        raise NotImplementedError
+
+    def setUp(self):
+        self.store = self._make_store()
+        _seed(self.store)
+        self.api = ApiService(self.store)
+
+    def tearDown(self):
+        conn = getattr(self.store, "conn", None)
+        if conn is not None:
+            conn.close()
+
+    def _seasons(self, se1=None, se2=None):
+        for sid, knobs in (("se1", se1), ("se2", se2)):
+            if knobs:
+                r = self.api.set_scheduling_policy(
+                    scope_type="season", scope_id=sid, actor_id="admin",
+                    **knobs)
+                assert "error" not in r, r
+
+    def test_existing_earlier_games_resurfacing_blocks_the_candidate(self):
+        # Existing se1 game on sA needs 15m resurfacing AFTER it; the se2
+        # candidate has an all-None policy. The old candidate-only sum (0)
+        # would have under-enforced.
+        self._seasons(se1={"resurfacing_minutes": 15})
+        g1 = self.api.create_game("se1", "d1", "t0", "t1", "sA",
+                                  league_id="lg")
+        self.assertNotIn("error", g1, g1)
+        g2 = self.api.create_game("se2", "d2", "u0", "u1", "sB",
+                                  league_id="lg")
+        self.assertEqual(_reason(g2), "turnover_buffer_conflict", g2)
+        d = g2["error"]["details"]
+        self.assertEqual((d["required_gap_minutes"], d["gap_minutes"]),
+                         (15, 10), g2)
+
+    def test_existing_later_games_warmup_blocks_an_earlier_candidate(self):
+        # Existing se1 game on sB needs 15m warm-up BEFORE it; the se2
+        # candidate placed EARLIER on sA has an all-None policy.
+        self._seasons(se1={"warmup_minutes": 15})
+        g1 = self.api.create_game("se1", "d1", "t0", "t1", "sB",
+                                  league_id="lg")
+        self.assertNotIn("error", g1, g1)
+        g2 = self.api.create_game("se2", "d2", "u0", "u1", "sA",
+                                  league_id="lg")
+        self.assertEqual(_reason(g2), "turnover_buffer_conflict", g2)
+        self.assertEqual(
+            g2["error"]["details"]["required_gap_minutes"], 15, g2)
+
+    def test_candidates_irrelevant_side_buffer_never_blocks(self):
+        # The LATER candidate carries a huge resurfacing (applies AFTER it,
+        # not before) and no warm-up; the earlier existing game requires
+        # nothing — the pair is compliant. The old symmetric sum (60) would
+        # have over-enforced.
+        self._seasons(se2={"resurfacing_minutes": 60})
+        g1 = self.api.create_game("se1", "d1", "t0", "t1", "sA",
+                                  league_id="lg")
+        self.assertNotIn("error", g1, g1)
+        g2 = self.api.create_game("se2", "d2", "u0", "u1", "sB",
+                                  league_id="lg")
+        self.assertNotIn("error", g2, g2)
+
+    def test_earlier_games_irrelevant_warmup_never_blocks(self):
+        # The mirror pin: the EARLIER existing game carries a huge warm-up
+        # (it applies BEFORE that game, not between the pair) and no
+        # resurfacing; the later candidate needs nothing on its side either
+        # — compliant. A formula that wrongly folded the neighbor's
+        # irrelevant side into the requirement (e.g. earlier.resurfacing +
+        # earlier.warmup + later.warmup) would block this pair.
+        self._seasons(se1={"warmup_minutes": 60})
+        g1 = self.api.create_game("se1", "d1", "t0", "t1", "sA",
+                                  league_id="lg")
+        self.assertNotIn("error", g1, g1)
+        g2 = self.api.create_game("se2", "d2", "u0", "u1", "sB",
+                                  league_id="lg")
+        self.assertNotIn("error", g2, g2)
+
+    def test_candidates_own_resurfacing_applies_when_it_is_earlier(self):
+        # Same policies as above, but the candidate goes EARLIER: now its
+        # 60m resurfacing applies between it and the existing later game.
+        self._seasons(se2={"resurfacing_minutes": 60})
+        g1 = self.api.create_game("se1", "d1", "t0", "t1", "sB",
+                                  league_id="lg")
+        self.assertNotIn("error", g1, g1)
+        g2 = self.api.create_game("se2", "d2", "u0", "u1", "sA",
+                                  league_id="lg")
+        self.assertEqual(_reason(g2), "turnover_buffer_conflict", g2)
+        self.assertEqual(
+            g2["error"]["details"]["required_gap_minutes"], 60, g2)
+
+    def test_directional_gap_exactly_equal_is_compliant(self):
+        # required = earlier(se1).resurfacing 10 + later(se2).warmup 0 = 10
+        # == the actual 10-minute sA->sB gap: compliant, half-open.
+        self._seasons(se1={"resurfacing_minutes": 10})
+        g1 = self.api.create_game("se1", "d1", "t0", "t1", "sA",
+                                  league_id="lg")
+        self.assertNotIn("error", g1, g1)
+        g2 = self.api.create_game("se2", "d2", "u0", "u1", "sB",
+                                  league_id="lg")
+        self.assertNotIn("error", g2, g2)
+
+    def test_move_and_draft_commit_and_advisory_share_the_direction(self):
+        self._seasons(se1={"resurfacing_minutes": 15})
+        g1 = self.api.create_game("se1", "d1", "t0", "t1", "sA",
+                                  league_id="lg")
+        self.assertNotIn("error", g1, g1)
+        # move: an se2 game parked far away refuses to move next to it.
+        g2 = self.api.create_game("se2", "d2", "u0", "u1", "sC",
+                                  league_id="lg")
+        self.assertNotIn("error", g2, g2)
+        mv = self.api.move_game(g2["id"], "sB")
+        self.assertEqual(_reason(mv), "turnover_buffer_conflict", mv)
+        # draft-commit + scheduler advisory (same shared implementation):
+        # an se2 draft over sB reports the code instead of proposing it.
+        prop = self.api.draft_season_schedule("d2", slot_ids=["sB"])
+        self.assertNotIn("error", prop, prop)
+        self.assertEqual(prop["draft_games"], [], prop)
+        codes = {c for row in prop["unscheduled"]
+                 for c in row["reason_codes"]}
+        self.assertIn("turnover_buffer_conflict", codes, prop)
+        res = self.api.commit_draft_schedule("d2", slot_ids=["sB"])
+        if "error" in res:
+            self.assertEqual(_reason(res), "turnover_buffer_conflict", res)
+        else:
+            self.assertEqual(res["created"], [], res)
+
+
+class MemoryDirectionalBufferTest(_DirectionalBufferContract,
+                                  unittest.TestCase):
+    def _make_store(self):
+        return InMemoryStore()
+
+
+class SqliteDirectionalBufferTest(_DirectionalBufferContract,
+                                  unittest.TestCase):
+    def _make_store(self):
+        return SqlStore(":memory:")
+
+
+@unittest.skipUnless(os.environ.get("TEST_DATABASE_URL"),
+                     "PostgreSQL required (set TEST_DATABASE_URL)")
+class PostgresDirectionalBufferTest(_DirectionalBufferContract,
+                                    unittest.TestCase):
+    def _make_store(self):
+        store = SqlStore(os.environ["TEST_DATABASE_URL"])
+        store.clear_all_data()
+        return store
+
+
+class _CurfewOperatingDayContract:
+    """#318 review — the operating day is defined relative to the curfew
+    itself: a small-hours start at/before the curfew uses that date's
+    deadline; any start after the curfew (morning, midday, evening) uses
+    the following date's. Spring-forward-skipped curfew wall times pin to
+    the normalized instant."""
+
+    def _make_store(self):
+        raise NotImplementedError
+
+    def setUp(self):
+        self.store = self._make_store()
+        _seed(self.store)
+        self.api = ApiService(self.store)
+        r = self.api.set_scheduling_policy(
+            scope_type="rink", scope_id="r1", curfew_local="01:00",
+            actor_id="admin")
+        assert "error" not in r, r
+
+    def tearDown(self):
+        conn = getattr(self.store, "conn", None)
+        if conn is not None:
+            conn.close()
+
+    def _slot(self, sid, start_utc, minutes=60):
+        self.store.add_ice_slot(IceSlot(
+            id=sid, rink_id="r1", start_time=start_utc,
+            end_time=start_utc + timedelta(minutes=minutes),
+            slot_type=IceSlotType.GAME, status=IceSlotStatus.AVAILABLE))
+        return sid
+
+    def _place(self, sid):
+        return self.api.create_game("se1", "d1", "t0", "t1", sid,
+                                    league_id="lg")
+
+    def test_small_hours_slot_violates_that_nights_close(self):
+        # 00:30-02:00 local (06:30Z) vs 01:00 -> tonight's close, rejected.
+        self._slot("cur1", datetime(2026, 1, 6, 6, 30, tzinfo=UTC), 90)
+        self.assertEqual(_reason(self._place("cur1")), "curfew_violation")
+
+    def test_slot_starting_exactly_at_the_curfew_violates(self):
+        # A non-zero slot starting AT 01:00 necessarily ends past it —
+        # bound to that date's deadline (pinned boundary rule).
+        self._slot("cur2", datetime(2026, 1, 6, 7, 0, tzinfo=UTC))
+        self.assertEqual(_reason(self._place("cur2")), "curfew_violation")
+
+    def test_morning_and_midday_slots_are_not_falsely_rejected(self):
+        # 08:00 and 11:30 local starts belong to the NEXT operating day.
+        self._slot("cur3", datetime(2026, 1, 6, 14, 0, tzinfo=UTC))
+        self._slot("cur4", datetime(2026, 1, 7, 17, 30, tzinfo=UTC))
+        g = self._place("cur3")
+        self.assertNotIn("error", g, g)
+        g = self.api.create_game("se1", "d1", "t2", "t3", "cur4",
+                                 league_id="lg")
+        self.assertNotIn("error", g, g)
+
+    def test_evening_overnight_slot_uses_the_following_morning(self):
+        # 22:30-23:30 local (sD): following 01:00 -> compliant; a longer
+        # 22:30-01:30 overnight slot violates it.
+        g = self._place("sD")
+        self.assertNotIn("error", g, g)
+        self._slot("cur5", datetime(2026, 1, 8, 4, 30, tzinfo=UTC), 180)
+        g = self.api.create_game("se1", "d1", "t2", "t3", "cur5",
+                                 league_id="lg")
+        self.assertEqual(_reason(g), "curfew_violation", g)
+
+    def test_spring_forward_skipped_curfew_pins_to_normalized_instant(self):
+        # 2026-03-08 America/Chicago springs 02:00->03:00; a 02:30 curfew
+        # resolves to 03:30 CDT (08:30Z). A 01:45-03:00 CDT slot (ends
+        # 08:00Z) passes; extending to 04:00 CDT (09:00Z) violates.
+        r = self.api.set_scheduling_policy(
+            scope_type="rink", scope_id="r1", curfew_local="02:30",
+            actor_id="admin")
+        self.assertNotIn("error", r, r)
+        # A 01:00 CST start (07:00Z) is at/before the curfew wall clock, so
+        # tonight's deadline applies; 105 minutes lands at 03:45 CDT
+        # (08:45Z) — past the pinned 03:30 CDT (08:30Z) — and violates,
+        # while a 01:45 CST start ending 03:00 CDT (08:00Z) is compliant.
+        self._slot("dst2", datetime(2026, 3, 8, 7, 0, tzinfo=UTC), 105)
+        g = self.api.create_game("se1", "d1", "t2", "t3", "dst2",
+                                 league_id="lg")
+        self.assertEqual(_reason(g), "curfew_violation", g)
+        self._slot("dst1", datetime(2026, 3, 8, 7, 45, tzinfo=UTC), 15)
+        g = self._place("dst1")
+        self.assertNotIn("error", g, g)
+
+    def test_scheduler_advisory_shares_the_operating_day_rule(self):
+        self._slot("cur6", datetime(2026, 1, 6, 6, 30, tzinfo=UTC), 90)
+        prop = self.api.draft_season_schedule("d1", slot_ids=["cur6"])
+        self.assertNotIn("error", prop, prop)
+        self.assertEqual(prop["draft_games"], [], prop)
+        codes = {c for row in prop["unscheduled"]
+                 for c in row["reason_codes"]}
+        self.assertIn("curfew_violation", codes, prop)
+
+
+class MemoryCurfewOperatingDayTest(_CurfewOperatingDayContract,
+                                   unittest.TestCase):
+    def _make_store(self):
+        return InMemoryStore()
+
+
+class SqliteCurfewOperatingDayTest(_CurfewOperatingDayContract,
+                                   unittest.TestCase):
+    def _make_store(self):
+        return SqlStore(":memory:")
+
+
+@unittest.skipUnless(os.environ.get("TEST_DATABASE_URL"),
+                     "PostgreSQL required (set TEST_DATABASE_URL)")
+class PostgresCurfewOperatingDayTest(_CurfewOperatingDayContract,
+                                     unittest.TestCase):
+    def _make_store(self):
+        store = SqlStore(os.environ["TEST_DATABASE_URL"])
+        store.clear_all_data()
+        return store
+
+
 class MemorySchedulingPolicyTest(_PolicyContract, unittest.TestCase):
     def _make_store(self):
         return InMemoryStore()
@@ -480,12 +774,13 @@ class _ScopeDeletionCascadeContract:
 
 
 class CreateGameRinkLockRaceTest(unittest.TestCase):
-    """A slot that materializes between create_game's pre-lock locator read
-    (which decides WHETHER to take the rink lock) and the gate's own re-read
-    would otherwise run the whole placement — including the turnover-buffer
-    scan, which has no DB backstop — with no rink lock held. The defensive
-    post-gate re-verify refuses it with a stable retryable conflict instead
-    (#277 Slice B review; mirrors move_game's _MoveGameRaced re-check)."""
+    """A slot that materializes between create_game's pre-lock locator reads
+    (the scope-plan locator and the slot locator, which decide WHETHER to
+    take the rink lock) and the gate's own re-read would otherwise run the
+    whole placement — including the turnover-buffer scan, which has no DB
+    backstop — with no rink lock held. The defensive post-gate re-verify
+    refuses it with a stable retryable conflict instead (#277 Slice B
+    review; mirrors move_game's _MoveGameRaced re-check)."""
 
     def test_slot_materializing_after_locator_read_is_refused(self):
         store = InMemoryStore()
@@ -497,8 +792,43 @@ class CreateGameRinkLockRaceTest(unittest.TestCase):
         def locator_miss(slot_id):
             if slot_id == "sA":
                 calls["n"] += 1
-                if calls["n"] == 1:
-                    return None  # the locator ran before the slot existed
+                if calls["n"] <= 2:
+                    return None  # BOTH pre-lock locators ran before it existed
+            return real(slot_id)
+
+        store.get_ice_slot = locator_miss
+        with self.assertRaises(ConcurrencyConflictError) as ctx:
+            setup.create_game("se1", "d1", "t0", "t1", "sA", league_id="lg")
+        self.assertEqual(ctx.exception.details["reason"], "placement_raced")
+        # Zero writes: no game, slot untouched.
+        self.assertEqual([g for g in store.all_games() if not g.cancelled], [])
+        self.assertEqual(store.get_ice_slot("sA").status,
+                         IceSlotStatus.AVAILABLE)
+
+
+class LeagueScopedCreateLocatorRaceTest(unittest.TestCase):
+    """The PRODUCTION create path (the league-scoped override) pins the
+    lock order at its entry point; when BOTH of its pre-lock slot reads
+    miss (the slot materializes mid-flight — a builder/import commit
+    landing between them) the base body may see the slot afterwards but
+    must NOT take a fresh Rink lock after the override's Season locks
+    (Rink-before-Season would invert against the builder, #318 round-2
+    review). It refuses with the retryable ``placement_raced`` instead;
+    the API facade's retry loop then re-plans in canonical order on a
+    fresh attempt."""
+
+    def test_slot_materializing_after_override_locators_is_refused(self):
+        store = InMemoryStore()
+        _seed(store)
+        setup = LeagueSetupService(store)
+        real = store.get_ice_slot
+        calls = {"n": 0}
+
+        def locator_miss(slot_id):
+            if slot_id == "sA":
+                calls["n"] += 1
+                if calls["n"] <= 2:      # both OVERRIDE locators miss
+                    return None
             return real(slot_id)
 
         store.get_ice_slot = locator_miss
@@ -633,6 +963,437 @@ class SchedulingPolicyHttpTest(unittest.TestCase):
         allow = {m.strip() for m in headers.get("Allow", "").split(",")}
         self.assertIn("GET", allow)
         self.assertIn("POST", allow)
+
+
+class _PolicyPgRaceHarness:
+    """Shared PostgreSQL harness for the forced policy races: a per-test
+    seeded database, connection-TRACKED stores (every store any thread
+    opens is registered and closed in tearDown — the pause hooks create
+    instance->closure->instance cycles that would otherwise keep psycopg
+    connections alive until a cyclic GC), and the GRACE window a paused
+    writer holds open. A plain mixin, NOT a TestCase — the two race
+    classes stay unrelated so neither collects the other's tests."""
+
+    GRACE = 1.5  # seconds the paused rival window stays open
+
+    def setUp(self):
+        self.url = os.environ["TEST_DATABASE_URL"]
+        self._opened = []
+        seed = self._store()
+        seed.clear_all_data()
+        _seed(seed)
+
+    def tearDown(self):
+        for s in self._opened:
+            conn = getattr(s, "conn", None)
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    def _store(self):
+        s = SqlStore(self.url)
+        self._opened.append(s)  # GIL-atomic; threads register here too
+        return s
+
+
+@unittest.skipUnless(os.environ.get("TEST_DATABASE_URL"),
+                     "PostgreSQL required (set TEST_DATABASE_URL)")
+class PostgresPolicyEditPlacementRaceTest(_PolicyPgRaceHarness,
+                                          unittest.TestCase):
+    """#318 review — placement snapshots must CONTEND with policy edits at
+    EVERY scope the gate reads: the candidate's chain AND each same-rink
+    neighbor game's Season/Program (the directional buffer resolves the
+    neighbor's own policy). Placements lock Program -> Team -> Rink ->
+    Season (the ice-availability builder's Program-first canonical order —
+    builder-vs-placement ordering itself is pinned by
+    test_placement_concurrency's _builder_vs races), planned by a pre-lock
+    locator and re-verified under the locks; set_scheduling_policy holds
+    its single scope row FOR UPDATE.
+
+    The FORCED tests interleave deterministically: the placement's own
+    store pauses at its FIRST Game write — every policy read done, every
+    lock held — and only then wakes the editor, recording whether the edit
+    finished inside that window. Serialized code makes that impossible (the
+    edit blocks on a locked scope row until the placement commits), so an
+    edit-finished-inside-the-window run that still placed its game is
+    exactly the stale-policy acceptance this class exists to refuse — the
+    unfixed code fails these tests deterministically. A barrier storm then
+    proves the whole order deadlock-free."""
+
+    def _run(self, targets):
+        barrier = threading.Barrier(len(targets))
+        out = [None] * len(targets)
+
+        def wrap(i, fn):
+            api = ApiService(self._store())
+            barrier.wait()
+            try:
+                out[i] = fn(api)
+            except Exception as exc:  # surfaced by the caller's asserts
+                out[i] = exc
+        threads = [threading.Thread(target=wrap, args=(i, fn))
+                   for i, fn in enumerate(targets)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        for r in out:
+            self.assertFalse(isinstance(r, Exception), out)
+        return out
+
+    def _forced(self, place, edit):
+        """Deterministic interleaving: run ``place`` on a store whose first
+        Game write (add_game/save_game) pauses — policy reads done, locks
+        held — wakes the editor, and holds the window ``GRACE`` seconds.
+        Returns (place_res, edit_res, edit_in_window, paused): whether the
+        edit COMPLETED inside the window, and whether the pause fired at
+        all (a placement refused before writing never pauses)."""
+        reads_done = threading.Event()
+        edit_done = threading.Event()
+        res = {}
+
+        def _place():
+            store = self._store()
+            fired = []
+
+            def _pause(orig):
+                def inner(*a, **kw):
+                    if not fired:
+                        fired.append(1)
+                        reads_done.set()
+                        res["edit_in_window"] = edit_done.wait(self.GRACE)
+                    return orig(*a, **kw)
+                return inner
+            for name in ("add_game", "save_game"):
+                setattr(store, name, _pause(getattr(store, name)))
+            api = ApiService(store)
+            try:
+                res["place"] = place(api)
+            except Exception as exc:  # surfaced by the caller's asserts
+                res["place"] = exc
+            finally:
+                res["paused"] = bool(fired)
+                reads_done.set()  # a refused placement still frees the editor
+
+        def _edit():
+            api = ApiService(self._store())
+            reads_done.wait(15)
+            try:
+                res["edit"] = edit(api)
+            except Exception as exc:
+                res["edit"] = exc
+            edit_done.set()
+
+        tp = threading.Thread(target=_place)
+        te = threading.Thread(target=_edit)
+        tp.start()
+        te.start()
+        tp.join()
+        te.join()
+        self.assertFalse(isinstance(res["place"], Exception), res)
+        self.assertFalse(isinstance(res["edit"], Exception), res)
+        return (res["place"], res["edit"],
+                res.get("edit_in_window", False), res["paused"])
+
+    def _assert_forced_serialized(self, place_res, edit_res, edit_in_window,
+                                  paused, refusal_reason):
+        self.assertTrue(paused, (place_res, edit_res))
+        self.assertNotIn("error", edit_res, (place_res, edit_res))
+        if edit_in_window:
+            # The edit committed while the placement's policy reads were
+            # already behind it — the only consistent continuation is the
+            # placement enforcing the NEW policy. Unserialized code lands
+            # here WITH a placed game (its transaction never saw the row it
+            # raced) and fails; serialized code never lands here at all,
+            # because the edit blocks on the scope row until the placement
+            # commits.
+            self.assertIn("error", place_res, (place_res, edit_res))
+            self.assertEqual(_reason(place_res), refusal_reason, place_res)
+        else:
+            self.assertNotIn("error", place_res, (place_res, edit_res))
+
+    def test_create_vs_program_policy_set_forced(self):
+        place, edit, in_window, paused = self._forced(
+            lambda a: a.create_game("se1", "d1", "t0", "t1", "sC",
+                                    league_id="lg"),
+            lambda a: a.set_scheduling_policy(
+                scope_type="program", scope_id="pg",
+                min_playable_minutes=999, actor_id="admin"))
+        self._assert_forced_serialized(place, edit, in_window, paused,
+                                       "insufficient_playable_time")
+        games = [g for g in self._store().all_games() if not g.cancelled]
+        if isinstance(place, dict) and "error" in place:
+            self.assertEqual(games, [], place)
+        else:
+            self.assertEqual(len(games), 1, place)
+
+    def test_create_vs_neighbor_season_policy_set_forced(self):
+        # The directional gate reads the NEIGHBOR game's own scopes, so an
+        # edit to the neighbor's Season must serialize with a candidate
+        # from ANOTHER season (#318 review round 2): the se2 placement's
+        # lock plan includes se1 — the season of the game already on the
+        # rink — precisely so this edit blocks.
+        api0 = ApiService(self._store())
+        g = api0.create_game("se1", "d1", "t0", "t1", "sA", league_id="lg")
+        self.assertNotIn("error", g, g)
+        place, edit, in_window, paused = self._forced(
+            lambda a: a.create_game("se2", "d2", "u0", "u1", "sB",
+                                    league_id="lg"),
+            lambda a: a.set_scheduling_policy(
+                scope_type="season", scope_id="se1",
+                resurfacing_minutes=15, actor_id="admin"))
+        self._assert_forced_serialized(place, edit, in_window, paused,
+                                       "turnover_buffer_conflict")
+
+    def test_move_vs_program_policy_set_forced(self):
+        api0 = ApiService(self._store())
+        g = api0.create_game("se1", "d1", "t0", "t1", "sA", league_id="lg")
+        self.assertNotIn("error", g, g)
+        place, edit, in_window, paused = self._forced(
+            lambda a: a.move_game(g["id"], "sC"),
+            lambda a: a.set_scheduling_policy(
+                scope_type="program", scope_id="pg",
+                min_playable_minutes=999, actor_id="admin"))
+        self._assert_forced_serialized(place, edit, in_window, paused,
+                                       "insufficient_playable_time")
+
+    def test_draft_commit_vs_program_policy_set_forced(self):
+        place, edit, in_window, paused = self._forced(
+            lambda a: a.commit_draft_schedule("d2", slot_ids=["sC"]),
+            lambda a: a.set_scheduling_policy(
+                scope_type="program", scope_id="pg",
+                min_playable_minutes=999, actor_id="admin"))
+        self._assert_forced_serialized(place, edit, in_window, paused,
+                                       "insufficient_playable_time")
+        games = [g for g in self._store().all_games() if not g.cancelled]
+        if isinstance(place, dict) and "error" in place:
+            self.assertEqual(games, [], place)
+        else:
+            self.assertEqual([g.ice_slot_id for g in games], ["sC"], place)
+
+    def test_create_vs_program_policy_clear(self):
+        # Barrier race (both orderings legitimate, run-to-run): clear-first
+        # -> the create passes; create-first -> refused under the still-set
+        # policy. Either way both complete and the outcome pair is one of
+        # the two serializations.
+        api0 = ApiService(self._store())
+        r = api0.set_scheduling_policy(
+            scope_type="program", scope_id="pg", min_playable_minutes=999,
+            actor_id="admin")
+        self.assertNotIn("error", r, r)
+        out = self._run([
+            lambda a: a.create_game("se1", "d1", "t0", "t1", "sC",
+                                    league_id="lg"),
+            lambda a: a.set_scheduling_policy(
+                scope_type="program", scope_id="pg", actor_id="admin"),
+        ])
+        self.assertNotIn("error", out[1], out)
+        store = self._store()
+        games = [g for g in store.all_games() if not g.cancelled]
+        if isinstance(out[0], dict) and "error" not in out[0]:
+            self.assertEqual(len(games), 1, out)
+        else:
+            self.assertEqual(_reason(out[0]),
+                             "insufficient_playable_time", out)
+            self.assertEqual(games, [], out)
+
+    def test_builder_commit_vs_create_lock_order_forced(self):
+        # Deterministic Program-first ordering pin against the
+        # ice-availability builder (round 1's Program-LAST placement chain
+        # ABBA-deadlocked it; the barrier-start builder races in
+        # test_placement_concurrency catch an inversion only sometimes).
+        # The builder pauses BETWEEN its Program lock and its Rink lock
+        # and wakes the placement: correctly ordered code parks the
+        # placement on the Program row for the whole window, so both
+        # serialize cleanly; an inverted placement instead acquires
+        # Rink+Season inside the window and then requests the Program —
+        # the cycle Postgres aborts, which the no-deadlock asserts below
+        # turn into a deterministic failure.
+        tmpl = dict(season_id="se1", rink_ids=["r1"], weekdays=[0],
+                    start_local="12:00", end_local="13:00",
+                    start_date="2026-01-05", end_date="2026-01-05",
+                    playable_minutes=60, turnover_minutes=0)
+        fp = ApiService(self._store()).preview_ice_availability(
+            actor_id="b", **tmpl)["template_fingerprint"]
+        prog_locked = threading.Event()
+        place_done = threading.Event()
+        res = {}
+
+        def _builder():
+            store = self._store()
+            real = store.get_rink_for_update
+
+            def hooked(rid):
+                if not prog_locked.is_set():
+                    prog_locked.set()            # Program row held NOW
+                    place_done.wait(self.GRACE)  # the placement's window
+                return real(rid)
+            store.get_rink_for_update = hooked
+            api = ApiService(store)
+            try:
+                res["builder"] = api.commit_ice_availability(
+                    actor_id="b", template_fingerprint=fp, **tmpl)
+            except Exception as exc:
+                res["builder"] = exc
+            finally:
+                prog_locked.set()
+
+        def _place():
+            api = ApiService(self._store())
+            prog_locked.wait(15)
+            try:
+                res["place"] = api.create_game("se1", "d1", "t0", "t1",
+                                               "sA", league_id="lg")
+            except Exception as exc:
+                res["place"] = exc
+            place_done.set()
+
+        tb = threading.Thread(target=_builder)
+        tp = threading.Thread(target=_place)
+        tb.start()
+        tp.start()
+        tb.join()
+        tp.join()
+        self.assertFalse(isinstance(res["builder"], Exception), res)
+        self.assertFalse(isinstance(res["place"], Exception), res)
+        for r in (res["builder"], res["place"]):
+            self.assertNotEqual(_reason(r), "deadlock_detected", res)
+        self.assertNotIn("error", res["builder"], res)
+        self.assertNotIn("error", res["place"], res)
+
+    def test_mixed_scope_edit_storm_is_deadlock_free(self):
+        # Placements + policy edits at all three scopes at once: every call
+        # completes and none is aborted by the database's deadlock detector
+        # (the builder-vs-placement half of the ordering is stormed by
+        # test_placement_concurrency's _builder_vs races).
+        out = self._run([
+            lambda a: a.create_game("se1", "d1", "t0", "t1", "sA",
+                                    league_id="lg"),
+            lambda a: a.create_game("se2", "d2", "u0", "u1", "sB",
+                                    league_id="lg"),
+            lambda a: a.set_scheduling_policy(
+                scope_type="program", scope_id="pg", warmup_minutes=1,
+                actor_id="admin"),
+            lambda a: a.set_scheduling_policy(
+                scope_type="season", scope_id="se1", resurfacing_minutes=1,
+                actor_id="admin"),
+            lambda a: a.set_scheduling_policy(
+                scope_type="rink", scope_id="r1", curfew_local="23:59",
+                actor_id="admin"),
+        ])
+        for r in out:
+            self.assertNotEqual(_reason(r), "deadlock_detected", out)
+        for r in out[2:]:
+            self.assertNotIn("error", r, out)
+
+
+@unittest.skipUnless(os.environ.get("TEST_DATABASE_URL"),
+                     "PostgreSQL required (set TEST_DATABASE_URL)")
+class PostgresPolicyScopeDeleteRaceTest(_PolicyPgRaceHarness,
+                                        unittest.TestCase):
+    """#318 review — a Program/Rink policy set racing that scope's delete
+    must never strand an unreachable orphan row: the delete row-locks the
+    scope FIRST and holds it through the cascade, so either the set commits
+    first (the cascade removes the row) or the delete commits first (the
+    set fails policy_scope_missing). FORCED here like the placement races:
+    the deleter's own store pauses right AFTER the cascade's policy-row
+    read — the scope row lock held, the cascade's view of "what to delete"
+    frozen — and wakes the setter. Serialized code makes the setter block
+    until the delete commits; unserialized code lets it insert a row the
+    already-past cascade can no longer see, and the zero-rows assertion
+    fails on exactly that orphan."""
+
+    def _forced_delete(self, scope_type, scope_id, delete):
+        reads_done = threading.Event()
+        set_done = threading.Event()
+        res = {}
+
+        def _del():
+            store = self._store()
+            orig = store.find_scheduling_policy
+            fired = []
+
+            def hooked(st, sid):
+                row = orig(st, sid)
+                if (not fired
+                        and getattr(st, "value", st) == scope_type
+                        and sid == scope_id):
+                    fired.append(1)
+                    reads_done.set()
+                    res["set_in_window"] = set_done.wait(self.GRACE)
+                return row
+            store.find_scheduling_policy = hooked
+            api = ApiService(store)
+            try:
+                res["delete"] = delete(api)
+            except Exception as exc:  # surfaced by the caller's asserts
+                res["delete"] = exc
+            finally:
+                res["paused"] = bool(fired)
+                reads_done.set()
+
+        def _set():
+            api = ApiService(self._store())
+            reads_done.wait(15)
+            try:
+                res["set"] = api.set_scheduling_policy(
+                    scope_type=scope_type, scope_id=scope_id,
+                    warmup_minutes=5, actor_id="admin")
+            except Exception as exc:
+                res["set"] = exc
+            set_done.set()
+
+        td = threading.Thread(target=_del)
+        ts = threading.Thread(target=_set)
+        td.start()
+        ts.start()
+        td.join()
+        ts.join()
+        self.assertFalse(isinstance(res["delete"], Exception), res)
+        self.assertFalse(isinstance(res["set"], Exception), res)
+        return res
+
+    def _assert_no_orphan(self, res, scope_type, scope_id):
+        store = self._store()
+        self.assertEqual(
+            [p for p in store.all_scheduling_policies()
+             if getattr(p.scope_type, "value", p.scope_type) == scope_type
+             and p.scope_id == scope_id],
+            [], res)
+        self.assertNotIn("error", res["delete"], res)
+        self.assertTrue(res["paused"], res)
+        if res.get("set_in_window"):
+            # Only an unserialized delete lets the set finish mid-cascade —
+            # and then the zero-rows assertion above has already caught the
+            # orphan. Serialized code holds the setter until the scope is
+            # gone, so it must have failed policy_scope_missing.
+            self.assertEqual(_reason(res["set"]), "policy_scope_missing",
+                             res)
+        elif isinstance(res["set"], dict) and "error" in res["set"]:
+            self.assertEqual(_reason(res["set"]), "policy_scope_missing",
+                             res)
+
+    def test_program_policy_set_vs_delete_forced(self):
+        api0 = ApiService(self._store())
+        pg2 = api0.create_program("Doomed", actor_id="admin")
+        pid = pg2["id"]
+        res = self._forced_delete(
+            "program", pid,
+            lambda a: a.delete_program(pid, actor_id="admin"))
+        self.assertIsNone(self._store().get_program(pid))
+        self._assert_no_orphan(res, "program", pid)
+
+    def test_rink_policy_set_vs_delete_forced(self):
+        api0 = ApiService(self._store())
+        rk = api0.create_rink("v", "Doomed Rink", actor_id="admin")
+        rid = rk["id"]
+        res = self._forced_delete(
+            "rink", rid,
+            lambda a: a.delete_rink(rid, actor_id="admin"))
+        self.assertIsNone(self._store().get_rink(rid))
+        self._assert_no_orphan(res, "rink", rid)
 
 
 if __name__ == "__main__":

@@ -34,18 +34,36 @@ exception), each with a stable machine-readable `details["reason"]`:
   the effective minimum. Contracted slivers import untouched (with
   validation warnings); they are refused a *game* here instead.
 * `turnover_buffer_conflict` — another active game's slot on the **same
-  rink** sits closer than `warmup + resurfacing` minutes. Committed drafts
-  count. Half-open boundary: a gap **exactly equal** to the buffer is
-  compliant. Game-vs-game only; buffers against non-game slots
-  (maintenance, public skate) belong to the #189 event model.
+  rink** sits closer than the **directional** requirement: the required gap
+  between two games is the *earlier* game's `resurfacing_minutes` plus the
+  *later* game's `warmup_minutes`, each resolved from **that game's own**
+  effective policy (its rink + its season — neighbors from another season
+  sharing the rink contribute their own side). The two fields on the
+  irrelevant side never block: a candidate placed *after* an existing game
+  is never refused for its own `resurfacing_minutes` or the neighbor's
+  huge `warmup_minutes`, only for the neighbor's resurfacing plus its own
+  warm-up. Committed drafts count. Half-open boundary: a gap **exactly
+  equal** to the requirement is compliant. Physically overlapping spans
+  (already refused by the overlap gate) defensively use the larger of the
+  two directional requirements. Game-vs-game only; buffers against
+  non-game slots (maintenance, public skate) belong to the #189 event
+  model.
 * `curfew_violation` — the playable end passes the curfew instant,
   compared as true UTC instants (deterministic across DST; the ambiguous
-  fall-back wall clock resolves to its earlier occurrence). Anchoring: an
-  afternoon/evening curfew (`>= 12:00`) is a deadline on the slot's local
-  start date — a slot that merely *starts* past it violates; a small-hours
-  curfew (`< 12:00`, e.g. an `01:00` building close) means the morning
-  after an afternoon/evening start, but **that same** morning for a slot
-  itself starting in the small hours. Ending exactly at curfew is
+  fall-back wall clock resolves to its earlier occurrence, and a curfew
+  wall time skipped by spring-forward pins to its normalized instant —
+  e.g. an `02:30` curfew on the US spring-forward night means 03:30 CDT).
+  Anchoring is per **operating day**: an afternoon/evening curfew
+  (`>= 12:00`) is a deadline on the slot's local start date — a slot that
+  merely *starts* past it violates. A small-hours curfew (`< 12:00`, e.g.
+  an `01:00` building close) ends the operating day that began the
+  *previous* evening: a slot starting **at or before** the curfew wall
+  clock is in that closing night's small hours and is bound to **that**
+  date's instance (a `00:30` start violates tonight's `01:00` close;
+  starting exactly at curfew violates), while a slot starting **after**
+  the curfew wall clock (a morning practice, an evening game) belongs to
+  the operating day ending at the **following** date's instance — so an
+  `01:00` close never outlaws daytime ice. Ending exactly at curfew is
   compliant.
 
 The draft scheduler mirrors the same checks as an **advisory** during slot
@@ -56,13 +74,40 @@ same-rink picks. The gate stays authoritative.
 
 ## Concurrency
 
-Policy reads are plain reads inside the placing transaction, after its
-existing Team→Rink→Season locks — no new lock, no new deadlock shape; the
-same-rink buffer scan is serialized by the rink row lock every placement
-already holds. The write path (`set_scheduling_policy`) serializes racing
-upserts on the scope row's own `FOR UPDATE` lock, with the
-`(scope_type, scope_id)` unique index as a belt-and-braces backstop.
-Deleting a Program/Season/Rink cascade-deletes (and audits) its policy row.
+Every policy **scope row** a placement's gate reads is locked before the
+read — the candidate's chain AND each same-rink neighbor game's Season and
+Program (the directional buffer resolves the neighbor's own policy). The
+global lock order is **Program → Team → Rink → Season**, agreeing with the
+ice-availability builder and hierarchy import (both lock
+Program → Rink → Season; taking the Program after the Rink instead is a
+real ABBA deadlock against a concurrent builder commit — reproduced on
+PostgreSQL and pinned by `test_placement_concurrency`'s
+builder-vs-placement races). Because the full scope set (neighbor seasons
+included) is only *discoverable* by reading, each placement runs a plain
+**pre-lock locator** (`_policy_scope_lock_plan`), locks the planned
+Programs first and every involved Season in one sorted batch, then
+**re-verifies the plan under the locks** — any drift (a game landing on
+the rink mid-flight, a Season reparented to an unlocked Program) refuses
+with the retryable `placement_raced` instead of reading a scope row the
+transaction does not hold; `create_game` retries that signal in a fresh
+transaction (as `move_game`'s existing race harness already does), so
+callers still receive the precise terminal answer.
+
+The write path (`set_scheduling_policy`) serializes on the scope row's own
+`FOR UPDATE` lock, so a policy edit and an in-flight placement reading
+that scope — either side of the candidate/neighbor split — are strictly
+ordered: one sees the other's outcome, never a torn read. A policy writer
+holds exactly **one** row of the chain, so it can never deadlock the
+multi-lock placement path; the `(scope_type, scope_id)` unique index
+backstops racing upserts. The draft scheduler's *advisory* runs lock-free
+by design — the commit gate stays authoritative. Deleting a
+Program/Season/Rink locks the scope row first and holds it through the
+cascade (serializing with any racing `set_scheduling_policy`), then
+cascade-deletes (and audits) its policy row — a policy row can never
+orphan-survive its scope. All of the above is pinned by *forced* races on
+PostgreSQL: the racing thread is released only while the placement/delete
+provably holds its locks, so the serialization claims are falsifiable, not
+timing-dependent.
 
 ## API
 

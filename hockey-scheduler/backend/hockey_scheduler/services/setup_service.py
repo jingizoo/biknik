@@ -69,7 +69,8 @@ from ..domain.errors import (
 )
 from ..store import InMemoryStore
 from .import_validator import validate_import, validate_official_availability
-from .ice_availability import plan_ice_windows, parse_hhmm, WEEKDAY_NAMES
+from .ice_availability import (plan_ice_windows, parse_hhmm,
+                               curfew_instant, WEEKDAY_NAMES)
 from .season_guard import require_active_season
 from .league_scope import (
     registered_team_ids_in_division as _registered_team_ids,
@@ -389,6 +390,101 @@ class SetupService:
         if game is not None and game.season_id:
             require_active_season(self.store, game.season_id)
 
+    def _policy_scope_lock_plan(self, rink_ids, season_ids) -> dict:
+        """#318 review — pre-lock LOCATOR for every policy scope the placement
+        gate will read: the candidate Season(s), the season of every active
+        slotted game on the target rink(s) (the directional turnover buffer
+        resolves each neighbor game's OWN effective policy), and each such
+        season's Program. Plain reads only — the caller locks the returned
+        rows in the canonical global order (:meth:`_lock_programs` FIRST,
+        then Teams, Rinks, :meth:`_lock_seasons`) and then re-verifies the
+        snapshot under those locks with :meth:`_verify_policy_scope_plan`;
+        any drift refuses with the retryable ``placement_raced``, exactly
+        like create_game's slot-locator defense."""
+        rinks = {r for r in rink_ids if r}
+        seasons = {s for s in season_ids if s}
+        for ex in self.store.all_games():
+            if ex.cancelled or not ex.ice_slot_id or not ex.season_id:
+                continue
+            ex_slot = self.store.get_ice_slot(ex.ice_slot_id)
+            if ex_slot is not None and ex_slot.rink_id in rinks:
+                seasons.add(ex.season_id)
+        programs = set()
+        for sid in seasons:
+            season = self.store.get_season(sid)
+            if season is not None and season.program_id:
+                programs.add(season.program_id)
+        return {"seasons": seasons, "programs": programs}
+
+    def _lock_programs(self, program_ids) -> None:
+        """Row-lock every distinct Program in canonical (sorted) order —
+        FIRST in the global Program -> Team -> Rink -> Season chain, matching
+        the ice-availability builder and hierarchy import (both lock
+        Program -> Rink -> Season). Taking the Program AFTER the Rink/Season
+        (as #318 round 1 did) is an ABBA inversion against the builder that
+        Postgres aborts with deadlock_detected — reproduced by
+        test_placement_concurrency's builder-vs-placement races. A no-op on
+        the in-memory store; a real ``SELECT ... FOR UPDATE`` on SQL. MUST
+        run inside a ``store.transaction()``, before the Team locks."""
+        for pid in sorted({p for p in program_ids if p}):
+            self.store.get_program_for_update(pid)
+
+    def _lock_seasons(self, season_ids) -> None:
+        """Row-lock every distinct Season in canonical (sorted) order, after
+        the Rink locks (the global Program -> Team -> Rink -> Season chain).
+        A placement locks EVERY season whose policy rows its gate may read —
+        the candidate's plus each same-rink neighbor game's — in ONE sorted
+        batch, so two placements with overlapping season sets cannot ABBA
+        each other and a season-scope ``set_scheduling_policy`` (which locks
+        only that Season row) strictly serializes with any placement that
+        would read it. Idempotent re-locks (e.g. the #159 active-season
+        guard re-taking the candidate row) are harmless."""
+        for sid in sorted({s for s in season_ids if s}):
+            self.store.get_season_for_update(sid)
+
+    def _verify_policy_scope_plan(self, plan, rink_ids, season_ids=(),
+                                  exclude_slot_ids=(),
+                                  exclude_game_id=None) -> None:
+        """Re-verify the pre-lock scope locator UNDER the placement's locks:
+        the candidate season(s) and every same-rink neighbor's season must be
+        in the locked set, and every locked season must still belong to a
+        locked Program (a Season reparented between the locator read and its
+        row lock would otherwise smuggle an unlocked Program scope past the
+        gate). Any drift — e.g. a game landed on the rink between the
+        locator and our Rink lock — refuses with the retryable
+        ``placement_raced`` rather than running the gate against scope rows
+        this transaction does not hold.
+
+        ``exclude_slot_ids``/``exclude_game_id`` mirror the gate's OWN
+        read-set exclusions: the occupant of the candidate slot itself (the
+        gate refuses ``slot_unavailable`` without ever resolving that game's
+        policy) and the moving game (excluded from its own scan) need no
+        scope lock — exempting them keeps a plain same-slot race on its
+        precise pinned refusal instead of a spurious ``placement_raced``."""
+        def _raced(detail):
+            raise ConcurrencyConflictError(
+                "A scheduling-policy scope changed while processing the "
+                "request; please retry.",
+                {"reason": "placement_raced", **detail})
+        for sid in season_ids:
+            if sid and sid not in plan["seasons"]:
+                _raced({"season_id": sid})
+        rinks = {r for r in rink_ids if r}
+        for ex in self.store.all_games():
+            if (ex.cancelled or not ex.ice_slot_id or not ex.season_id
+                    or ex.id == exclude_game_id
+                    or ex.ice_slot_id in exclude_slot_ids):
+                continue
+            ex_slot = self.store.get_ice_slot(ex.ice_slot_id)
+            if (ex_slot is not None and ex_slot.rink_id in rinks
+                    and ex.season_id not in plan["seasons"]):
+                _raced({"season_id": ex.season_id})
+        for sid in plan["seasons"]:
+            season = self.store.get_season(sid)
+            if (season is not None and season.program_id
+                    and season.program_id not in plan["programs"]):
+                _raced({"program_id": season.program_id})
+
     def _lock_teams(self, team_ids) -> None:
         """Row-lock every distinct Team in canonical (sorted) order (#277).
 
@@ -406,13 +502,15 @@ class SetupService:
         index as a backstop.
 
         Sorted order gives a total lock order, so two placements can never
-        deadlock each other; Teams are always locked BEFORE the Rink and Season
-        (matching ``transfer_team_to_league`` / ``copy_``/``move_season_teams``,
-        which lock Team→Season), so the global Team→Rink→Season order holds. A
-        no-op on the in-memory store (whose ``transaction()`` fully serializes for
-        free); a real ``SELECT ... FOR UPDATE`` on SQL. MUST run inside a
-        ``store.transaction()``, and before the caller's Rink/Season guards so the
-        ordering invariant holds."""
+        deadlock each other; Teams are always locked AFTER the Program rows
+        (:meth:`_lock_programs` — the builder's Program-first order) and BEFORE
+        the Rink and Season (matching ``transfer_team_to_league`` /
+        ``copy_``/``move_season_teams``, which lock Team→Season), so the global
+        Program→Team→Rink→Season order holds. A no-op on the in-memory store
+        (whose ``transaction()`` fully serializes for free); a real
+        ``SELECT ... FOR UPDATE`` on SQL. MUST run inside a
+        ``store.transaction()``, and before the caller's Rink/Season guards so
+        the ordering invariant holds."""
         for tid in sorted({t for t in team_ids if t}):
             self.store.get_team_for_update(tid)
 
@@ -434,13 +532,15 @@ class SetupService:
         slot race; this lock additionally covers game-vs-builder, which the index
         cannot.)
 
-        Locked AFTER the Teams but BEFORE the Season — the global Team→Rink→Season
-        order — because the builder locks Program→Rink→Season (Rink before Season);
-        locking Season first here would invert that and deadlock the builder.
-        Sorted order gives a total order between two multi-rink placements. A no-op
-        on the in-memory store; a real ``SELECT ... FOR UPDATE`` on SQL. MUST run
-        inside a ``store.transaction()``, after the Team locks and before the
-        Season guard."""
+        Locked AFTER the Programs and Teams but BEFORE the Seasons — the global
+        Program→Team→Rink→Season order — because the builder locks
+        Program→Rink→Season (Program first, Rink before Season); inverting
+        either pair here would ABBA-deadlock the builder (#318 round 1 proved
+        it for Program-last). Sorted order gives a total order between two
+        multi-rink placements. A no-op on the in-memory store; a real
+        ``SELECT ... FOR UPDATE`` on SQL. MUST run inside a
+        ``store.transaction()``, after the Team locks and before the Season
+        locks/guard."""
         for rid in sorted({r for r in rink_ids if r}):
             self.store.get_rink_for_update(rid)
 
@@ -2529,31 +2629,41 @@ class SetupService:
           (imported contracted slivers are preserved as-is at ingest; this is
           where they are refused a GAME, per #277).
         * ``turnover_buffer_conflict`` — another active game's slot on the
-          SAME rink sits closer than ``warmup + resurfacing`` minutes.
-          Boundary rule (product decision, half-open like
-          ``intervals_overlap``): a gap EXACTLY equal to the required buffer
-          is compliant. Game-vs-game only — buffers against non-game slots
-          (maintenance/public skate) are #189's event model, not this gate.
+          SAME rink sits closer than the DIRECTIONAL requirement: the
+          EARLIER game's resurfacing plus the LATER game's warm-up, each
+          resolved from that game's OWN effective policy (#318 review — two
+          seasons sharing a rink can carry different policies; the
+          candidate's irrelevant-side buffer never blocks). Boundary rule
+          (product decision, half-open like ``intervals_overlap``): a gap
+          EXACTLY equal to the requirement is compliant. Game-vs-game only —
+          buffers against non-game slots (maintenance/public skate) are
+          #189's event model, not this gate.
         * ``curfew_violation`` — the slot's playable end lands after the
           curfew instant in the venue's timezone (Program fallback). The
-          instant is deterministic and policy-controlled, never inferred
-          from the slot: an afternoon/evening curfew (wall clock >= 12:00)
-          is HH:MM on the slot's LOCAL START DATE — so a slot that merely
-          STARTS past it already ends past it and violates — while a
-          small-hours curfew (< 12:00, e.g. an 01:00 building close) means
-          the morning AFTER an afternoon/evening start (a 22:00-00:30
-          overnight slot is judged against the following 01:00) but THAT
-          SAME morning for a slot that itself starts in the small hours (a
-          00:30-02:00 slot violates tonight's 01:00 close). Ending exactly
-          AT curfew is compliant. Ambiguous fall-back wall clocks resolve with
-          fold=0, matching ``_resolve_local_to_utc``'s deterministic
-          choice.
+          full operating-day anchor rule — defined relative to the curfew
+          itself, never a hard-coded clock boundary — lives in
+          :func:`ice_availability.curfew_instant` (#318 review): an
+          afternoon/evening curfew is the start-date deadline; a
+          small-hours curfew binds a slot starting AT/BEFORE its wall clock
+          to THAT date (a 00:30-02:00 slot violates tonight's 01:00 close)
+          and a slot starting AFTER it (an 08:00 practice, a 22:00 evening
+          fixture) to the FOLLOWING date. Ending exactly AT curfew is
+          compliant; spring-forward-skipped curfew wall times resolve
+          deterministically; fall-back ambiguity resolves fold=0 and the
+          comparison is instant-based so acceptance is monotonic in real
+          time.
 
         A ``season_id`` of ``None`` (no competition scope to resolve a policy
         from) skips enforcement — every real placement path passes it.
         All-``None`` policies short-circuit to today's behavior. Read-only;
-        runs inside the caller's transaction under its Rink lock, so the
-        same-rink scan is atomic against concurrent placements on this rink.
+        the COMMIT paths run it inside the caller's transaction under its
+        Rink lock (making the same-rink scan atomic against concurrent
+        placements) AND under the FOR UPDATE locks of every policy scope row
+        it reads — candidate and neighbor Seasons/Programs alike, planned by
+        ``_policy_scope_lock_plan`` — so a racing ``set_scheduling_policy``
+        on ANY scope this gate resolves strictly serializes with the
+        placement. The scheduler ADVISORY calls it lock-free; the gate stays
+        authoritative.
         """
         if season_id is None:
             return None
@@ -2568,74 +2678,100 @@ class SetupService:
                 {"reason": "insufficient_playable_time",
                  "slot_minutes": slot_minutes,
                  "required_minutes": min_playable})
-        buffer_minutes = ((policy["warmup_minutes"] or 0)
-                          + (policy["resurfacing_minutes"] or 0))
-        if buffer_minutes > 0:
-            pad = timedelta(minutes=buffer_minutes)
+        # -- turnover buffer, DIRECTIONAL per game (#318 review) ----------
+        # The required gap between two adjacent games is the EARLIER game's
+        # resurfacing plus the LATER game's warm-up, each resolved from that
+        # game's OWN effective policy (an existing game keeps the policy of
+        # ITS season — policies inherit per Program/Season/Rink, so two
+        # seasons sharing a rink can differ). The candidate's irrelevant-side
+        # buffer never blocks: a huge candidate resurfacing does not apply
+        # BEFORE the candidate. This also preserves the documented reserved
+        # span [start - warmup, end + resurfacing] per game.
+        _policy_cache = {(slot.rink_id, season_id): policy}
 
-            def _gap(other_start, other_end):
-                if other_start >= slot.end_time:
-                    gap = other_start - slot.end_time
-                else:
-                    gap = slot.start_time - other_end
-                # Physically overlapping slots (possible only via legacy/
-                # imported rows — create_ice_slot forbids new ones) would
-                # yield a negative gap; clamp to 0 so the detail reads as
-                # "no gap", not a nonsense negative.
-                return max(gap, timedelta(0))
+        def _policy_for(rink_id, sid):
+            key = (rink_id, sid)
+            if key not in _policy_cache:
+                _policy_cache[key] = self._effective_policy(rink_id, sid)[0]
+            return _policy_cache[key]
 
-            for ex in self.store.all_games():
-                if (ex.id == exclude_game_id or ex.cancelled
-                        or ex.ice_slot_id is None
-                        or ex.ice_slot_id == slot.id):
-                    continue
-                ex_slot = self.store.get_ice_slot(ex.ice_slot_id)
-                if ex_slot is None or ex_slot.rink_id != slot.rink_id:
-                    continue
-                if intervals_overlap(slot.start_time - pad,
-                                     slot.end_time + pad,
-                                     ex_slot.start_time, ex_slot.end_time):
-                    gap = _gap(ex_slot.start_time, ex_slot.end_time)
-                    return (
-                        f"Ice slot {slot.id} is too close to game {ex.id} on "
-                        f"the same rink for the required "
-                        f"{buffer_minutes}-minute turnover.",
-                        {"reason": "turnover_buffer_conflict",
-                         "conflict_game_id": ex.id,
-                         "conflict_slot_id": ex_slot.id,
-                         "required_gap_minutes": buffer_minutes,
-                         "gap_minutes": int(gap.total_seconds() // 60)})
-            for span_id, span_start, span_end in extra_rink_spans:
-                if span_id == slot.id:
-                    continue
-                if intervals_overlap(slot.start_time - pad,
-                                     slot.end_time + pad,
-                                     span_start, span_end):
-                    gap = _gap(span_start, span_end)
-                    return (
-                        f"Ice slot {slot.id} is too close to another proposed "
-                        f"game on the same rink for the required "
-                        f"{buffer_minutes}-minute turnover.",
-                        {"reason": "turnover_buffer_conflict",
-                         "conflict_game_id": None,
-                         "conflict_slot_id": span_id,
-                         "required_gap_minutes": buffer_minutes,
-                         "gap_minutes": int(gap.total_seconds() // 60)})
+        def _directional_conflict(other_start, other_end, other_policy):
+            """(required, gap) when the pair violates, else None. Half-open:
+            a gap EXACTLY equal to the requirement is compliant. Physical
+            overlap (legacy/imported rows) clamps the gap to 0."""
+            if other_start >= slot.end_time:
+                # Candidate is earlier: its resurfacing + the other's warmup.
+                required = ((policy["resurfacing_minutes"] or 0)
+                            + (other_policy["warmup_minutes"] or 0))
+                gap = other_start - slot.end_time
+            elif slot.start_time >= other_end:
+                # Candidate is later: the other's resurfacing + its warmup.
+                required = ((other_policy["resurfacing_minutes"] or 0)
+                            + (policy["warmup_minutes"] or 0))
+                gap = slot.start_time - other_end
+            else:
+                # Physically overlapping spans: judge under the larger
+                # directional requirement with a zero gap.
+                required = max(
+                    (policy["resurfacing_minutes"] or 0)
+                    + (other_policy["warmup_minutes"] or 0),
+                    (other_policy["resurfacing_minutes"] or 0)
+                    + (policy["warmup_minutes"] or 0))
+                gap = timedelta(0)
+            gap = max(gap, timedelta(0))
+            if required > 0 and gap < timedelta(minutes=required):
+                return required, gap
+            return None
+
+        for ex in self.store.all_games():
+            if (ex.id == exclude_game_id or ex.cancelled
+                    or ex.ice_slot_id is None
+                    or ex.ice_slot_id == slot.id):
+                continue
+            ex_slot = self.store.get_ice_slot(ex.ice_slot_id)
+            if ex_slot is None or ex_slot.rink_id != slot.rink_id:
+                continue
+            hit = _directional_conflict(
+                ex_slot.start_time, ex_slot.end_time,
+                _policy_for(ex_slot.rink_id, ex.season_id))
+            if hit is not None:
+                required, gap = hit
+                return (
+                    f"Ice slot {slot.id} is too close to game {ex.id} on "
+                    f"the same rink for the required "
+                    f"{required}-minute turnover.",
+                    {"reason": "turnover_buffer_conflict",
+                     "conflict_game_id": ex.id,
+                     "conflict_slot_id": ex_slot.id,
+                     "required_gap_minutes": required,
+                     "gap_minutes": int(gap.total_seconds() // 60)})
+        for span_id, span_start, span_end in extra_rink_spans:
+            if span_id == slot.id:
+                continue
+            # A tentative same-run pick shares the candidate's own season,
+            # so both directions resolve from the same policy.
+            hit = _directional_conflict(span_start, span_end, policy)
+            if hit is not None:
+                required, gap = hit
+                return (
+                    f"Ice slot {slot.id} is too close to another proposed "
+                    f"game on the same rink for the required "
+                    f"{required}-minute turnover.",
+                    {"reason": "turnover_buffer_conflict",
+                     "conflict_game_id": None,
+                     "conflict_slot_id": span_id,
+                     "required_gap_minutes": required,
+                     "gap_minutes": int(gap.total_seconds() // 60)})
         curfew = policy["curfew_local"]
         if curfew:
             hour, minute = parse_hhmm(curfew, "curfew_local")
             tz = self._curfew_timezone(slot.rink_id, season_id)
             start_local = slot.start_time.astimezone(tz)
-            curfew_at = start_local.replace(hour=hour, minute=minute,
-                                            second=0, microsecond=0, fold=0)
-            if hour < 12 and start_local.hour >= 12:
-                # A small-hours curfew for an afternoon/evening slot names
-                # the morning AFTER the slot's start date (an overnight slot
-                # against an 01:00 building close). A slot that itself
-                # STARTS in the small hours is judged against THAT morning's
-                # curfew — a 00:30-02:00 slot violates tonight's 01:00 close
-                # rather than being waved through to tomorrow's.
-                curfew_at += timedelta(days=1)
+            # The anchor rule lives in ice_availability.curfew_instant — ONE
+            # implementation shared with the scheduler advisory, defining the
+            # operating day relative to the curfew itself (#318 review) and
+            # resolving spring-forward-skipped wall times deterministically.
+            curfew_at = curfew_instant(start_local, hour, minute)
             # Compare INSTANTS, not wall clocks: Python compares two aware
             # datetimes sharing one tzinfo by their naive values (fold
             # ignored), which on a fall-back night would accept a later real
@@ -3597,18 +3733,47 @@ class SetupService:
                     max_skaters: int = 18, allow_division_override: bool = False,
                     actor_id: Optional[str] = None,
                     league_id: Optional[str] = None,
-                    game_type: str = GameType.REGULAR.value) -> Game:
-        # #277/#313 — lock both teams then the target slot's rink (Team→Rink→Season
-        # order) BEFORE the Season guard, so the final check is atomic against a
-        # concurrent placement sharing a team AND against the ice-availability
-        # builder, which revalidates its preview token under the same per-rink lock
-        # (Rink before Season matches the builder's Program→Rink→Season and avoids
-        # deadlocking it). See _lock_teams / _lock_rinks for the ordering contract.
+                    game_type: str = GameType.REGULAR.value,
+                    _scope_plan: Optional[dict] = None) -> Game:
+        # #277/#313/#318 — the global Program→Team→Rink→Season lock order:
+        # Programs are policy scopes the gate reads, and the ice-availability
+        # builder already locks Program→Rink→Season, so the Program rows MUST
+        # come first here (Program-last was an ABBA deadlock against the
+        # builder). The scope locator below is a plain pre-lock read,
+        # re-verified under the locks; see _policy_scope_lock_plan /
+        # _lock_teams / _lock_rinks for the ordering contract. A caller that
+        # already pinned the order at ITS entry (the league-scoped override)
+        # passes its plan via ``_scope_plan``; re-locking the SAME held rows
+        # below is a no-op, and re-planning here instead could discover — and
+        # lock — a fresh Program/Season row AFTER the Rink, re-creating the
+        # very inversion this order exists to prevent (drift is refused by
+        # the verify instead).
+        _plan = _scope_plan
+        if _plan is None:
+            _pre_slot = self.store.get_ice_slot(ice_slot_id)  # locator only
+            _plan = self._policy_scope_lock_plan(
+                (_pre_slot.rink_id,) if _pre_slot is not None else (),
+                (season_id,))
+        self._lock_programs(_plan["programs"])
         self._lock_teams((home_team_id, away_team_id))
         _target = self.store.get_ice_slot(ice_slot_id)
         if _target is not None:
+            if (_scope_plan is not None and _target.rink_id
+                    not in _scope_plan.get("locked_rinks", ())):
+                # The caller (league-scoped override) already locked its
+                # Seasons; taking a FRESH Rink lock here would invert
+                # Rink-before-Season against the builder. Refuse-and-retry
+                # instead — the fresh attempt re-plans and locks in order.
+                raise ConcurrencyConflictError(
+                    "This ice slot changed while processing the request; "
+                    "please retry.",
+                    {"reason": "placement_raced", "ice_slot_id": ice_slot_id})
             self._lock_rinks((_target.rink_id,))
+        self._lock_seasons(_plan["seasons"])
         season = self._require_active_season(season_id)  # #159 read-only guard
+        self._verify_policy_scope_plan(
+            _plan, (_target.rink_id,) if _target is not None else (),
+            season_ids=(season_id,), exclude_slot_ids=(ice_slot_id,))
 
         # #283 Slice D: a Game is REGULAR (counts toward standings, bound to one
         # LeagueSeason) or EXHIBITION (a friendly that may cross League lines and
@@ -3868,11 +4033,23 @@ class SetupService:
         if game is None:
             raise NotFoundError(f"Game {game_id} not found.",
                                 details={"reason": "game_missing"})
-        # #277/#313 — lock both of the game's teams then the source AND target
-        # slots' rinks (Team→Rink→Season order) BEFORE the Season guard, so the
-        # release-old + allocate-new is atomic against a concurrent placement
-        # sharing a team AND against the ice-availability builder on either rink
-        # (Rink before Season matches the builder and avoids deadlocking it).
+        # #277/#313/#318 — the global Program→Team→Rink→Season lock order:
+        # the Program rows (policy scopes the gate reads — the game's own and
+        # every neighbor's on either candidate rink) come FIRST, matching the
+        # ice-availability builder's Program→Rink→Season; then both teams,
+        # then the source AND target slots' rinks, then every involved
+        # Season, so the release-old + allocate-new is atomic against a
+        # concurrent placement sharing a team, against the builder on either
+        # rink, and against any scheduling-policy edit the gate would read.
+        # The scope locator is a plain pre-lock read, re-verified under the
+        # locks below.
+        _pre_rinks = set()
+        for _sid in (new_ice_slot_id, game.ice_slot_id):
+            _s = self.store.get_ice_slot(_sid) if _sid else None
+            if _s is not None:
+                _pre_rinks.add(_s.rink_id)
+        _plan = self._policy_scope_lock_plan(_pre_rinks, (game.season_id,))
+        self._lock_programs(_plan["programs"])
         self._lock_teams((game.home_team_id, game.away_team_id))
         # #314 review — re-read NOW that the Team lock is held, not the
         # pre-lock locator above. move_game is the ONLY writer of an existing
@@ -3894,6 +4071,11 @@ class SetupService:
             if _s is not None:
                 _mv_rinks.add(_s.rink_id)
         self._lock_rinks(_mv_rinks)
+        # Seasons in ONE sorted batch BEFORE the candidate-season guard (the
+        # guard's own FOR UPDATE is then an idempotent re-lock) — guarding
+        # first would take the candidate row out of sorted order and let two
+        # moves with overlapping season sets ABBA each other.
+        self._lock_seasons(_plan["seasons"])
         self._guard_game_season(game)  # #159 read-only guard
         # #159 r15 — re-fetch under the Season lock (the pre-lock read was a
         # locator). A concurrent publish_game (which does not take the Team
@@ -3916,6 +4098,18 @@ class SetupService:
             if _s is not None:
                 _now_rinks.add(_s.rink_id)
         if _now_rinks != _mv_rinks:
+            raise _MoveGameRaced()
+        # #318 — the policy-scope snapshot must hold under the locks too: the
+        # definitive game/rinks may have drifted from the pre-lock locator
+        # the Program locks were planned from. Signal the caller's retry
+        # harness rather than surfacing: a fresh attempt re-plans and locks
+        # the drifted scopes, then reports the PRECISE terminal error.
+        try:
+            self._verify_policy_scope_plan(
+                _plan, _mv_rinks, season_ids=(game.season_id,),
+                exclude_slot_ids=(new_ice_slot_id,),
+                exclude_game_id=game.id)
+        except ConcurrencyConflictError:
             raise _MoveGameRaced()
         if game.cancelled:
             raise ValidationError("Cannot move a cancelled game.",
@@ -6623,15 +6817,21 @@ class SetupService:
 
     @_transactional
     def delete_program(self, program_id: str, actor_id: Optional[str] = None) -> Program:
-        program = self.store.get_program(program_id)
+        # #318 review — row-lock the Program FIRST and hold it through the
+        # policy cascade + delete: set_scheduling_policy locks this same row,
+        # so a concurrent Program-scope policy set either committed before
+        # this lock (the cascade below removes it) or blocks until the delete
+        # commits (then fails policy_scope_missing) — never an unreachable
+        # orphan policy row surviving its scope.
+        program = self.store.get_program_for_update(program_id)
         if program is None:
             raise NotFoundError(f"Program {program_id} not found.")
         # #201 Slice 4: seasons.program_id / leagues.program_id / venues.league_id
         # now have foreign keys onto programs, so a permanent League is a real
         # dependent (added to the itemised block below, no longer silently
-        # orphaned). The delete takes no row lock; the incoming FKs backstop the
-        # create-child-vs-delete race and the block is re-resolved on the
-        # post-rollback path.
+        # orphaned). The incoming FKs backstop the create-child-vs-delete race
+        # (the row lock above serializes only same-row writers, i.e. policy
+        # sets) and the block is re-resolved on the post-rollback path.
         self._block_if_dependents("league", program_id, "program",
                                   self._program_dependent_groups(program_id))
         self._cascade_scheduling_policy(
@@ -6960,7 +7160,10 @@ class SetupService:
 
     @_transactional
     def delete_rink(self, rink_id: str, actor_id: Optional[str] = None) -> Rink:
-        rink = self.store.get_rink(rink_id)
+        # #318 review — row-lock the Rink first, exactly like delete_program
+        # above (delete_season already holds its row lock), closing the
+        # set-policy-vs-delete orphan window.
+        rink = self.store.get_rink_for_update(rink_id)
         if rink is None:
             raise NotFoundError(f"Rink {rink_id} not found.")
         self._block_if_dependents("rink", rink_id, "rink",

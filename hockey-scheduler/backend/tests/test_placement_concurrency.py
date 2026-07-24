@@ -488,6 +488,10 @@ class PostgresPlacementConcurrencyTest(_ForcedRaceHarnessMixin, unittest.TestCas
         self._assert_no_crash(out)
         store = self._store()
         self.assertLessEqual(_slot_game_count(store, "s0"), 1)   # never double-booked
+        # Two-sided (#318 round 2): Postgres may victimize EITHER side of a
+        # lock-order inversion; a deadlock surfacing on the placement must
+        # fail this race just as loudly as one on the builder.
+        self.assertNotEqual(_reason(out[1]), "deadlock_detected", out)
         builder = out[0]
         if isinstance(builder, dict) and "error" not in builder:
             self.assertEqual(builder["totals"]["created"], 0)    # no partial write
