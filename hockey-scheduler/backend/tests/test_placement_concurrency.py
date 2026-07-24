@@ -436,9 +436,15 @@ class PostgresPlacementConcurrencyTest(_ForcedRaceHarnessMixin, unittest.TestCas
         self.assertEqual(sum(_created(r) for r in out), 6, repr(out))
         for r in out:
             if _reason(r) is not None:
+                # #328 review round 4: the loser's first row is the SAME
+                # pairing the winner already committed onto the identical
+                # slot, so the pairing-identity guard (checked first) now
+                # correctly wins with the more specific terminal reason
+                # instead of a generic physical-conflict one.
                 self.assertIn(_reason(r),
                               ("ice_slot_taken", "slot_unavailable",
-                               "slot_already_filled", "team_overlap"))
+                               "slot_already_filled", "team_overlap",
+                               "pairing_already_scheduled"))
         store = self._store()
         self.assertEqual(
             sum(1 for g in store.all_games() if not g.cancelled), 6)
@@ -1179,6 +1185,122 @@ class PostgresBaseApiPairingDuplicationRaceTest(
     always wins method resolution), but both implementations fully
     reimplement the commit body, so both must independently enforce the
     same #206 slice 1 invariant."""
+
+    def _api_cls(self):
+        return BaseApiService
+
+
+def _assert_pairing_race_terminal(testcase, out):
+    """Shared assertion for the two mixins below (#328 review round 4):
+    exactly one commit succeeds, the other is refused with the terminal
+    pairing_already_scheduled reason (never slot_unavailable/team_overlap,
+    which the SAME row would ALSO trip physically), naming the winning
+    Game, with only the winner's Game ever persisted."""
+    testcase._assert_no_crash(out)
+    oks = [r for r in out if isinstance(r, dict) and "error" not in r]
+    errs = [r for r in out if isinstance(r, dict) and "error" in r]
+    testcase.assertEqual(len(oks), 1,
+                         f"exactly one commit should succeed: {out!r}")
+    testcase.assertEqual(len(errs), 1,
+                         f"the loser must be refused with the terminal "
+                         f"pairing reason, not a physical-conflict one: "
+                         f"{out!r}")
+    testcase.assertEqual(errs[0]["error"]["details"]["reason"],
+                         "pairing_already_scheduled", repr(out))
+    testcase.assertIn("existing_game_id", errs[0]["error"]["details"],
+                      repr(out))
+    testcase.assertEqual(len(oks[0]["created"]), 1, repr(out))
+    store = testcase._store()
+    games = [g for g in store.all_games()
+             if not g.cancelled and g.division_id == "d1"]
+    testcase.assertEqual(len(games), 1,
+                         f"only the winner's Game may exist: {out!r}")
+    testcase._assert_schedule_consistent(store)
+
+
+class _PairingRaceSameSlotMixin(_ForcedRaceHarnessMixin):
+    """Forced two-session race (#328 review round 4): two draft commits for
+    the SAME Division, BOTH restricted to the IDENTICAL single ice slot, so
+    both independently target the SAME first round-robin pairing on the
+    SAME slot. The loser's per-row physical check (``_assert_slot_free_for_game``)
+    would find the slot itself already ALLOCATED — a genuine
+    ``slot_unavailable`` case — were the pairing-identity check not now
+    checked FIRST: the loser must get the terminal
+    ``pairing_already_scheduled`` naming the winning Game, not
+    ``slot_unavailable``.
+
+    Falsifiable: revert the check order (physical gate before the pairing
+    check, as both facades had before this round) and the loser gets
+    ``slot_unavailable`` instead (this test's "exactly one error, reason
+    pairing_already_scheduled" assertion fails)."""
+
+    def test_same_slot_pairing_race_wins_with_terminal_reason(self):
+        out = self._run([
+            lambda a: a.commit_draft_schedule("d1", slot_ids=["s0"]),
+            lambda a: a.commit_draft_schedule("d1", slot_ids=["s0"]),
+        ])
+        _assert_pairing_race_terminal(self, out)
+
+
+class _PairingRaceOverlappingSlotMixin(_ForcedRaceHarnessMixin):
+    """Forced two-session race (#328 review round 4): two draft commits for
+    the SAME Division, restricted to DIFFERENT single ice slots that
+    physically OVERLAP in time (``s0`` on ``r1``, ``sB`` on ``r2`` — the
+    same instant per ``_seed``), so both independently target the SAME
+    first round-robin pairing on physically-conflicting ice. The loser's
+    per-row physical check would find ``team_overlap`` — a genuine
+    diagnosis, but for the SAME pairing that raced, not an unrelated one —
+    were the pairing-identity check not now checked FIRST: the loser must
+    get the terminal ``pairing_already_scheduled`` naming the winning Game,
+    not ``team_overlap``.
+
+    Falsifiable: revert the check order and the loser gets ``team_overlap``
+    instead (this test's "exactly one error, reason
+    pairing_already_scheduled" assertion fails)."""
+
+    def test_overlapping_slot_pairing_race_wins_with_terminal_reason(self):
+        out = self._run([
+            lambda a: a.commit_draft_schedule("d1", slot_ids=["s0"]),
+            lambda a: a.commit_draft_schedule("d1", slot_ids=["sB"]),
+        ])
+        _assert_pairing_race_terminal(self, out)
+
+
+@unittest.skipUnless(os.environ.get("TEST_DATABASE_URL"),
+                     "PostgreSQL required (set TEST_DATABASE_URL)")
+class PostgresLeagueScopedPairingRaceSameSlotTest(
+        _PairingRaceSameSlotMixin, unittest.TestCase):
+    """Exercises the LEAGUE-SCOPED commit_draft_schedule."""
+    # _api_cls() inherited default (the league-scoped ApiService).
+
+
+@unittest.skipUnless(os.environ.get("TEST_DATABASE_URL"),
+                     "PostgreSQL required (set TEST_DATABASE_URL)")
+class PostgresBaseApiPairingRaceSameSlotTest(
+        _PairingRaceSameSlotMixin, unittest.TestCase):
+    """Exercises the BASE facade's OWN commit_draft_schedule — not reached
+    in production, but both implementations fully reimplement the commit
+    body, so both must independently enforce the same priority."""
+
+    def _api_cls(self):
+        return BaseApiService
+
+
+@unittest.skipUnless(os.environ.get("TEST_DATABASE_URL"),
+                     "PostgreSQL required (set TEST_DATABASE_URL)")
+class PostgresLeagueScopedPairingRaceOverlappingSlotTest(
+        _PairingRaceOverlappingSlotMixin, unittest.TestCase):
+    """Exercises the LEAGUE-SCOPED commit_draft_schedule."""
+    # _api_cls() inherited default (the league-scoped ApiService).
+
+
+@unittest.skipUnless(os.environ.get("TEST_DATABASE_URL"),
+                     "PostgreSQL required (set TEST_DATABASE_URL)")
+class PostgresBaseApiPairingRaceOverlappingSlotTest(
+        _PairingRaceOverlappingSlotMixin, unittest.TestCase):
+    """Exercises the BASE facade's OWN commit_draft_schedule — not reached
+    in production, but both implementations fully reimplement the commit
+    body, so both must independently enforce the same priority."""
 
     def _api_cls(self):
         return BaseApiService

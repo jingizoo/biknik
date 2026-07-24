@@ -146,15 +146,24 @@ class DraftReviewServiceTest(unittest.TestCase):
         self.assertTrue(rows)
         row = rows[0]
         slot0 = self.store.get_ice_slot(row["ice_slot_id"])
-        # Give that row's teams an existing game overlapping its slot time (a
-        # second rink, same instant — a team can't be two places at once).
+        # Give that row's HOME team an existing game overlapping its slot
+        # time, against a DIFFERENT opponent (#328 review round 4: the
+        # pairing-identity guard now wins over a physical conflict for the
+        # row's OWN exact pairing, so this must stay a genuinely different
+        # pairing -- sharing one team, never row's own away team -- to
+        # keep testing team_overlap in isolation; the exact-pairing case is
+        # covered separately by
+        # test_commit_rejects_a_pairing_that_already_has_a_real_game).
+        other_opponent = next(
+            t for t in ("t0", "t1", "t2", "t3")
+            if t not in (row["home_team_id"], row["away_team_id"]))
         self.store.add_rink(Rink(id="r2", venue_id="v", name="Aux"))
         self.store.add_ice_slot(IceSlot(id="conflict_slot", rink_id="r2",
                                         start_time=slot0.start_time,
                                         end_time=slot0.end_time))
         self.store.add_game(Game(
             id="existing", home_team_id=row["home_team_id"],
-            away_team_id=row["away_team_id"], start_time=slot0.start_time,
+            away_team_id=other_opponent, start_time=slot0.start_time,
             end_time=slot0.end_time, ice_slot_id="conflict_slot",
             division_id="d", season_id="se", league_id="lg"))
         self.api.draft_season_schedule = lambda *a, **k: proposal

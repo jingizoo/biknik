@@ -2941,18 +2941,19 @@ class ApiService:
                  for d in proposal["draft_games"]})
             created = []
             for d in proposal["draft_games"]:
-                # #277: the draft-commit path runs the SAME final conflict check
-                # as create/move — the slot is free (exists, GAME, AVAILABLE, not
-                # already held) AND neither team is put on an overlapping fixture
-                # — so a regenerated proposal that would double-book a slot OR a
-                # team fails atomically (the whole batch rolls back) instead of
-                # silently persisting a bad fixture. Per #277's acceptance,
-                # schedule commits enforce the identical check as manual moves;
-                # there is no draft-only exception. Returns the resolved slot to
-                # allocate below.
-                slot = self.setup._assert_slot_free_for_game(
-                    d["ice_slot_id"], d["home_team_id"], d["away_team_id"],
-                    season_id=resolved_season_id)
+                # #328 review round 4 -- checked BEFORE the physical gate
+                # below, not after: a row whose pairing already has a real
+                # Game is a terminal, product-confirmed fact (#326) that
+                # must win regardless of whether the SAME row would also
+                # fail the physical check (e.g. the winning Game happens to
+                # sit on this row's own slot, or a slot that overlaps it) —
+                # `pairing_already_scheduled` names the specific pairing and
+                # winning Game, which `slot_unavailable`/`team_overlap`
+                # cannot. An UNRELATED pairing's physical conflict (a
+                # different pairing merely sharing one team, or an
+                # unrelated slot collision) is not in `_existing_now` for
+                # THIS row's key and so still falls through to the
+                # unchanged physical check below.
                 _pairing_key = (draft_ls_id, d.get("division_id"),
                                 frozenset((d["home_team_id"], d["away_team_id"])))
                 if _pairing_key in _existing_now:
@@ -2971,6 +2972,18 @@ class ApiService:
                          "home_team_id": d["home_team_id"],
                          "away_team_id": d["away_team_id"],
                          "existing_game_id": _existing_gid})
+                # #277: the draft-commit path runs the SAME final conflict check
+                # as create/move — the slot is free (exists, GAME, AVAILABLE, not
+                # already held) AND neither team is put on an overlapping fixture
+                # — so a regenerated proposal that would double-book a slot OR a
+                # team fails atomically (the whole batch rolls back) instead of
+                # silently persisting a bad fixture. Per #277's acceptance,
+                # schedule commits enforce the identical check as manual moves;
+                # there is no draft-only exception. Returns the resolved slot to
+                # allocate below.
+                slot = self.setup._assert_slot_free_for_game(
+                    d["ice_slot_id"], d["home_team_id"], d["away_team_id"],
+                    season_id=resolved_season_id)
                 g = Game(
                     id=self.store.next_id("game"),
                     home_team_id=d["home_team_id"], away_team_id=d["away_team_id"],

@@ -45,6 +45,7 @@ from hockey_scheduler.services import (
     round_robin_pairings,
 )
 from hockey_scheduler.api import ApiService
+from hockey_scheduler.api.service import ApiService as BaseApiService
 from hockey_scheduler.web import server as srv
 
 UTC = timezone.utc
@@ -652,6 +653,87 @@ class SchedulerContract:
                          {"t2", "t3"})
         self.assertEqual(entry["division_id"], "gold")
         self.assertEqual(entry["existing_game_id"], "gold_real_game")
+
+    # -- pairing-identity priority over physical conflicts (#328 review round 4)
+    def _pairing_race_wins_over_physical_conflict(self, api_cls, physical):
+        """Shared assertion: a same-pairing existing Game must win with the
+        terminal ``pairing_already_scheduled`` reason (naming the winning
+        Game) regardless of whether the SAME row would ALSO fail the
+        physical placement gate. ``physical`` is one of ``"same_slot"``
+        (the winner takes the identical slot the stale proposal's row
+        references), ``"overlapping_slot"`` (the winner takes a DIFFERENT
+        slot, same instant, different rink), or ``"none"`` (the winner's
+        slot never conflicts with the stale row's own slot at all -- the
+        original #206 scenario). ``api_cls`` selects which commit facade to
+        exercise; both must independently enforce the same priority since
+        neither delegates to the other."""
+        self._division_fixture(4, 6)
+        api = api_cls(self.store)
+        stale_proposal = api.draft_season_schedule("div1")
+        row = stale_proposal["draft_games"][0]
+        if physical == "same_slot":
+            winner_slot_ids = [row["ice_slot_id"]]
+        elif physical == "overlapping_slot":
+            slot0 = self.store.get_ice_slot(row["ice_slot_id"])
+            self.store.add_rink(Rink(
+                id="r_overlap", venue_id="v1", name="Overlap"))
+            self.store.add_ice_slot(IceSlot(
+                id="overlap_slot", rink_id="r_overlap",
+                start_time=slot0.start_time, end_time=slot0.end_time))
+            winner_slot_ids = ["overlap_slot"]
+        else:
+            assert physical == "none"
+            far_start = BASE_TIME - timedelta(days=100)
+            self.store.add_rink(Rink(id="r_far", venue_id="v1", name="Far"))
+            self.store.add_ice_slot(IceSlot(
+                id="far_slot", rink_id="r_far", start_time=far_start,
+                end_time=far_start + timedelta(hours=1)))
+            winner_slot_ids = ["far_slot"]
+        # A REAL commit wins row's exact pairing -- the greedy assigner
+        # always tries round-robin pairing[0] (== row) first, so
+        # restricting to one slot deterministically wins it that pairing.
+        win = api.commit_draft_schedule("div1", slot_ids=winner_slot_ids)
+        self.assertNotIn("error", win, repr(win))
+        self.assertEqual(len(win["created"]), 1, repr(win))
+        winning = win["created"][0]
+        self.assertEqual(
+            {winning["home_team_name"], winning["away_team_name"]},
+            {row["home_team_name"], row["away_team_name"]})
+        winning_game_id = winning["game_id"]
+        # Force the stale (pre-win) proposal through commit unchanged.
+        api.draft_season_schedule = lambda *a, **k: stale_proposal
+        res = api.commit_draft_schedule("div1")
+        self.assertIn("error", res, repr(res))
+        self.assertEqual(res["error"]["details"]["reason"],
+                         "pairing_already_scheduled", repr(res))
+        self.assertEqual(res["error"]["details"]["existing_game_id"],
+                         winning_game_id, repr(res))
+        self.assertIn(row["home_team_name"], res["error"]["message"])
+        self.assertIn(row["away_team_name"], res["error"]["message"])
+        # Atomic rollback: only the winner's Game exists -- the losing
+        # attempt left zero partial writes.
+        self.assertEqual(len(self.store.all_games()), 1, repr(res))
+
+    def test_league_scoped_pairing_race_wins_over_same_slot_conflict(self):
+        self._pairing_race_wins_over_physical_conflict(ApiService, "same_slot")
+
+    def test_league_scoped_pairing_race_wins_over_overlapping_slot_conflict(self):
+        self._pairing_race_wins_over_physical_conflict(
+            ApiService, "overlapping_slot")
+
+    def test_league_scoped_pairing_race_wins_over_non_overlapping_slot(self):
+        self._pairing_race_wins_over_physical_conflict(ApiService, "none")
+
+    def test_base_facade_pairing_race_wins_over_same_slot_conflict(self):
+        self._pairing_race_wins_over_physical_conflict(
+            BaseApiService, "same_slot")
+
+    def test_base_facade_pairing_race_wins_over_overlapping_slot_conflict(self):
+        self._pairing_race_wins_over_physical_conflict(
+            BaseApiService, "overlapping_slot")
+
+    def test_base_facade_pairing_race_wins_over_non_overlapping_slot(self):
+        self._pairing_race_wins_over_physical_conflict(BaseApiService, "none")
 
 
 class MemorySchedulerTest(SchedulerContract, unittest.TestCase):
