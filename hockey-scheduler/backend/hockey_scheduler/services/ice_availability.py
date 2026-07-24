@@ -244,5 +244,49 @@ def plan_ice_windows(*, weekday_windows, start_date, end_date,
     }
 
 
-__all__ = ["plan_ice_windows", "parse_hhmm", "WEEKDAY_NAMES",
+def curfew_instant(start_local, hour, minute):
+    """THE #277 curfew anchor rule, shared by the placement gate and the
+    scheduler advisory (one implementation — the semantics cannot drift).
+    Given a slot's timezone-aware LOCAL start and a parsed curfew wall
+    clock, return the aware curfew deadline.
+
+    The operating day is defined relative to the CURFEW itself (#318
+    review) — never a hard-coded clock boundary:
+
+    * an afternoon/evening curfew (hour >= 12) is HH:MM on the slot's local
+      START DATE — a slot merely starting past it already violates;
+    * a small-hours curfew (hour < 12, e.g. an 01:00 building close)
+      belongs to the operating day that ENDS at it: a slot starting AT or
+      BEFORE the curfew wall clock (still inside that closing night) is
+      judged against THAT date's deadline — so a 00:30-02:00 slot violates
+      tonight's 01:00 close, and a slot STARTING exactly at the curfew
+      necessarily ends past it and violates — while a slot starting AFTER
+      the curfew wall clock (an 08:00 practice, an 11:30 game, a 22:00
+      evening fixture) belongs to the NEXT operating day and is judged
+      against the FOLLOWING date's HH:MM.
+
+    A curfew wall time skipped by a spring-forward jump resolves
+    DETERMINISTICALLY to the fold=0-normalized instant — the wall clock
+    pushed forward by exactly the skipped interval (a 02:30 curfew on a US
+    spring-forward night means 03:30 CDT) — made explicit below rather than
+    left to replace() normalization. Ambiguous fall-back wall clocks
+    resolve to their EARLIER occurrence (fold=0); compare the result AS AN
+    INSTANT (convert to UTC) so acceptance stays monotonic in real time
+    across the fold."""
+    at = start_local.replace(hour=hour, minute=minute,
+                             second=0, microsecond=0, fold=0)
+    if hour < 12 and (start_local.hour, start_local.minute,
+                      start_local.second) > (hour, minute, 0):
+        at += timedelta(days=1)
+    # Explicit nonexistent-wall-time handling: if the wall clock we just
+    # built was skipped by spring-forward, its UTC image maps back to a
+    # DIFFERENT wall clock. Pin the deadline to that normalized instant.
+    utc = at.astimezone(timezone.utc)
+    back = utc.astimezone(at.tzinfo)
+    if back.replace(tzinfo=None, fold=0) != at.replace(tzinfo=None, fold=0):
+        at = back
+    return at
+
+
+__all__ = ["plan_ice_windows", "parse_hhmm", "curfew_instant", "WEEKDAY_NAMES",
            "MAX_RANGE_DAYS", "MAX_WINDOWS"]

@@ -29,17 +29,34 @@ class SetupService(_BaseSetupService):
         # method's undecorated body to avoid opening a nested SqlStore
         # transaction (SQLite rejects BEGIN inside BEGIN).
         with self.store.transaction():
-            # #313 — take the placement lock set (Team -> Rink -> Season) BEFORE the
-            # archived-Season guard, so this override matches the base body's order
-            # and the ice-availability builder's Program -> Rink -> Season. Locking
-            # the Season first here (as this override used to) inverts that order
-            # and deadlocks a concurrent same-Season builder commit. The base body
-            # re-takes these locks re-entrantly (no-ops); acquiring them here just
-            # pins the order at the true entry point.
+            # #313/#318 — take the FULL placement lock set in the canonical
+            # global order (Program -> Team -> Rink -> Season, matching the
+            # ice-availability builder's Program -> Rink -> Season) BEFORE the
+            # archived-Season guard. This override is the true entry point, so
+            # the order is pinned HERE: the scope plan (candidate + same-rink
+            # neighbor Seasons and their Programs — every policy scope the
+            # placement gate reads) is computed by a plain pre-lock locator
+            # and handed down to the base body, which then only re-locks
+            # already-held rows (no-ops) and re-verifies the plan under the
+            # locks — it never takes a NEW Program/Season lock after the Rink,
+            # which is exactly the inversion that deadlocked the builder.
+            _slot = self.store.get_ice_slot(ice_slot_id)  # scope locator only
+            _plan = self._policy_scope_lock_plan(
+                (_slot.rink_id,) if _slot is not None else (), (season_id,))
+            self._lock_programs(_plan["programs"])
             self._lock_teams((home_team_id, away_team_id))
             _slot = self.store.get_ice_slot(ice_slot_id)
             if _slot is not None:
                 self._lock_rinks((_slot.rink_id,))
+            # Record exactly which Rink rows this entry point locked: the
+            # base body must never take a FRESH Rink lock after the Season
+            # locks below (Rink-before-Season would invert against the
+            # builder), so it refuses placement_raced on any rink outside
+            # this set instead of locking late.
+            _plan["locked_rinks"] = (
+                frozenset((_slot.rink_id,)) if _slot is not None
+                else frozenset())
+            self._lock_seasons(_plan["seasons"])
             # #159 — an archived (read-only) Season blocks game creation before
             # any slot/scope resolution, matching the base body's own guard.
             self._require_active_season(season_id)
@@ -95,6 +112,7 @@ class SetupService(_BaseSetupService):
                 target_skaters=target_skaters, max_skaters=max_skaters,
                 allow_division_override=allow_division_override,
                 actor_id=actor_id, league_id=league_id, game_type=game_type,
+                _scope_plan=_plan,
             )
 
     def move_game(self, game_id: str, new_ice_slot_id: str, reason: str = "",

@@ -27,6 +27,8 @@ from ..domain import (
     IceSlot,
     IceSlotStatus,
     IceSlotType,
+    SchedulingPolicy,
+    PolicyScopeType,
     ActiveContext,
     GameResult,
     League,
@@ -189,6 +191,8 @@ SPECS = {
     IceSlot: Spec(IceSlot, "ice_slots",
                   {"start_time": _dt(), "end_time": _dt(),
                    "slot_type": _enum(IceSlotType), "status": _enum(IceSlotStatus)}),
+    SchedulingPolicy: Spec(SchedulingPolicy, "scheduling_policies",
+                           {"scope_type": _enum(PolicyScopeType)}),
     Game: Spec(Game, "games",
                {"start_time": _dt(), "end_time": _dt(), "roster_lock_time": _dt(),
                 "locked": _bool(), "cancelled": _bool(), "published": _bool(),
@@ -1323,6 +1327,18 @@ class SqlStore:
     def get_ice_slot(self, slot_id): return self._get(IceSlot, slot_id)
     def all_ice_slots(self): return self._query(IceSlot, order="id")
     def save_ice_slot(self, slot): return self._write_ice_slot(self._update, slot)
+
+    def add_scheduling_policy(self, policy): return self._insert(policy)
+    def get_scheduling_policy(self, policy_id):
+        return self._get(SchedulingPolicy, policy_id)
+    def save_scheduling_policy(self, policy): return self._update(policy)
+    def delete_scheduling_policy(self, policy_id):
+        self._delete(SchedulingPolicy, policy_id)
+    def all_scheduling_policies(self):
+        return self._query(SchedulingPolicy, order="id")
+    def find_scheduling_policy(self, scope_type, scope_id):
+        return self._first(SchedulingPolicy, "scope_type = ? AND scope_id = ?",
+                           (getattr(scope_type, "value", scope_type), scope_id))
 
     def add_setup_audit(self, entry): return self._insert(entry)
     def all_setup_audit(self): return self._query(SetupAuditLog, order="id")

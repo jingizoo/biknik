@@ -172,6 +172,7 @@ _GET_ROUTES = [re.compile(p) for p in (
     r"^/api/v2/setup/programs/[^/]+/teams$",
     r"^/api/v2/setup/seasons/[^/]+/team-registrations$",
     r"^/api/v2/setup/seasons/[^/]+/venue-access$",
+    r"^/api/setup/scheduling-policy$",
     r"^/api/v2/onboarding/status$",
     r"^/api/bootstrap/status$",
     r"^/api/status$",
@@ -283,6 +284,7 @@ _POST_ROUTES = [re.compile(p) for p in (
     r"^/api/scheduler/commit$",
     r"^/api/scheduler/drafts/(?:publish|discard)$",
     r"^/api/setup/ice-availability/(?:preview|commit)$",
+    r"^/api/setup/scheduling-policy$",
     r"^/api/notifications/deliveries/process$",
     r"^/api/notifications/deliveries/[^/]+/(?:retry|ignore)$",
     r"^/api/notifications/contacts$",
@@ -1006,6 +1008,20 @@ class Handler(BaseHTTPRequestHandler):
         # Canonical v2 setup reads (#233 Slice C2). Same MANAGE_SETUP operator
         # gate as their v1 siblings, but canonical keys and shapes — no v1
         # adapter mapping.
+        # Scheduling policy read (#277 Slice B): one scope's stored row,
+        # plus (rink scope + season_id) the resolved effective values with
+        # per-field source scopes. Operator-only, same MANAGE_ARENA gate as
+        # its POST (authz.py); no PII in the payload.
+        if path == "/api/setup/scheduling-policy":
+            if self._operator_only("/api/setup/scheduling-policy"):
+                return
+            from urllib.parse import parse_qs, urlparse
+            qs = parse_qs(urlparse(self.path).query)
+            return self._send_api(api.get_scheduling_policy(
+                scope_type=(qs.get("scope_type") or [None])[0],
+                scope_id=(qs.get("scope_id") or [None])[0],
+                season_id=(qs.get("season_id") or [None])[0]))
+
         if path == "/api/v2/setup/overview":
             # Canonical flat setup-entity lists for the Setup/Records UI (#233
             # Slice B2a). Gated MANAGE_ARENA (not MANAGE_SETUP like hierarchy)
@@ -2045,6 +2061,36 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_api(api.commit_ice_availability(
                 actor_id=user_id,
                 template_fingerprint=body.get("template_fingerprint"), **kwargs))
+
+        # Scheduling policy (#277 Slice B): upsert/clear one Program/Season/
+        # Rink scope's turnover + curfew knobs. Checked BEFORE the generic
+        # /api/setup/ dispatcher (like ice-availability above, which would
+        # otherwise treat "scheduling-policy" as an unknown single-entity
+        # create). The STRICT schema matters doubly here: a set replaces the
+        # row wholesale (None = inherit), so a typo'd knob key would
+        # otherwise silently clear that knob rather than 400. Server-
+        # attributed and audited; MANAGE_ARENA (authz.py).
+        if path == "/api/setup/scheduling-policy":
+            try:
+                check_body(
+                    body,
+                    allowed={"scope_type", "scope_id", "warmup_minutes",
+                             "resurfacing_minutes", "min_playable_minutes",
+                             "curfew_local"},
+                    required=("scope_type", "scope_id"),
+                    types={"scope_type": str, "scope_id": str,
+                           "warmup_minutes": int, "resurfacing_minutes": int,
+                           "min_playable_minutes": int, "curfew_local": str})
+            except BodyError as exc:
+                return self._send_json(exc.payload, exc.status)
+            return self._send_api(api.set_scheduling_policy(
+                scope_type=body.get("scope_type"),
+                scope_id=body.get("scope_id"),
+                warmup_minutes=body.get("warmup_minutes"),
+                resurfacing_minutes=body.get("resurfacing_minutes"),
+                min_playable_minutes=body.get("min_playable_minutes"),
+                curfew_local=body.get("curfew_local"),
+                actor_id=user_id))
 
         # Setup create endpoints — operator creates real records via the API.
         if path.startswith("/api/setup/"):

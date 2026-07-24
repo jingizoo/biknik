@@ -22,6 +22,7 @@ from ..domain import (
     GameAvailability,
     GameRosterEntry,
     IceSlot,
+    SchedulingPolicy,
     GameResult,
     ContactDestination,
     DeliveryStatus,
@@ -85,6 +86,7 @@ class InMemoryStore:
         self.venues: Dict[str, Venue] = {}
         self.rinks: Dict[str, Rink] = {}
         self.ice_slots: Dict[str, IceSlot] = {}
+        self.scheduling_policies: Dict[str, SchedulingPolicy] = {}
         self.officials: Dict[str, Official] = {}
         self.official_assignments: Dict[str, OfficialAssignment] = {}
         self.game_results: Dict[str, GameResult] = {}
@@ -633,6 +635,30 @@ class InMemoryStore:
     def add_ice_slot(self, slot: IceSlot) -> IceSlot:
         self.ice_slots[slot.id] = slot
         return slot
+
+    def add_scheduling_policy(self, policy: SchedulingPolicy) -> SchedulingPolicy:
+        self.scheduling_policies[policy.id] = policy
+        return policy
+
+    def get_scheduling_policy(self, policy_id: str) -> Optional[SchedulingPolicy]:
+        return self.scheduling_policies.get(policy_id)
+
+    def save_scheduling_policy(self, policy: SchedulingPolicy) -> SchedulingPolicy:
+        self.scheduling_policies[policy.id] = policy
+        return policy
+
+    def delete_scheduling_policy(self, policy_id: str) -> None:
+        self.scheduling_policies.pop(policy_id, None)
+
+    def all_scheduling_policies(self) -> List[SchedulingPolicy]:
+        return list(self.scheduling_policies.values())
+
+    def find_scheduling_policy(self, scope_type, scope_id):
+        scope_type = getattr(scope_type, "value", scope_type)
+        return next(
+            (p for p in self.scheduling_policies.values()
+             if getattr(p.scope_type, "value", p.scope_type) == scope_type
+             and p.scope_id == scope_id), None)
 
     def get_ice_slot(self, slot_id: str) -> Optional[IceSlot]:
         return self.ice_slots.get(slot_id)

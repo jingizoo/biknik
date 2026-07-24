@@ -2539,6 +2539,18 @@ function buildConflict(res, ov, gameId, slotId) {
       game_cancelled: ["Game cancelled", ["A cancelled game can't be moved."]],
       game_missing: ["Game not found", ["That game no longer exists — refresh the calendar."]],
       slot_missing: ["Slot not found", ["That ice slot no longer exists — refresh the calendar."]],
+      insufficient_playable_time: ["Slot too short",
+        [`${target} offers only ${d.slot_minutes} playable minutes; this competition requires at least ${d.required_minutes}.`,
+         "Pick a longer slot, or adjust the scheduling policy's minimum playable time."]],
+      turnover_buffer_conflict: ["Turnover buffer conflict",
+        [`${target} is too close to ${d.conflict_game_id ? gameName(d.conflict_game_id) : "another proposed game"} on the same rink.`,
+         `The rink needs ${d.required_gap_minutes} minutes between games for warm-up and resurfacing; this gap is ${d.gap_minutes}.`]],
+      slot_overlap_conflict: ["Overlapping ice",
+        [`${target} overlaps ${d.conflict_game_id ? gameName(d.conflict_game_id) + "'s" : "another proposed game's"} slot on the same rink.`,
+         "Two games can never share the same ice time, whatever the turnover policy — pick a slot that does not overlap."]],
+      curfew_violation: ["Past curfew",
+        [`${target} ends at ${d.slot_end_local} local time, past the ${d.curfew_local} curfew.`,
+         "Pick an earlier slot, or adjust the curfew in the scheduling policy."]],
     };
     const [title, lines] = MAP[reason] || ["Move blocked", [res.error.message]];
     return { ok: false, title, lines };
