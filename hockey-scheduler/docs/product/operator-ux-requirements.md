@@ -21,8 +21,10 @@ this requirements package (#324)
   → validated by @jingizoo
   → PR 1: Home/Tasks + guided Setup hub
   → PR 2: Schedule/Facilities UX
-  → bounded #287 substitute PR (design/UX/policy/state-machine only —
-    no runtime seasonal-eligibility implementation; preserves the #205 gate)
+  → bounded #287 pre-#205 deliverable (documentation/design + a
+    non-production UX prototype only — no schema, persistence, API
+    mutations, notifications, or runtime state transitions; matches
+    Release 2's own bar, corrected per review — see ROADMAP.md)
   → #206 (Planner v2) resumes
 ```
 
@@ -690,9 +692,13 @@ hunting through each section. All eight now have a concrete, stated answer
   Setup hub) is separate and starts only after this package is validated.
 - Schedule/Facilities UX — explicitly deferred to the PR after Home/Tasks +
   Setup hub, per the reordered plan.
-- The bounded #287 substitute PR (design/UX/policy/state-machine only) —
-  sequenced after Schedule/Facilities UX, before #206 resumes; its full
-  runtime workflow stays gated on #205 regardless of this package.
+- The bounded #287 pre-#205 deliverable — documentation/design plus a
+  non-production UX prototype only (no schema, persistence, API
+  mutations, notifications, or runtime state transitions; matches
+  Release 2's "implementation must not land ahead of #205" bar exactly,
+  not a narrower carve-out for eligibility logic specifically) —
+  sequenced after Schedule/Facilities UX, before #206 resumes; the full
+  production workflow (all six slices) stays gated on #205.
 - Planner v2 (#206) — resumes after all of the above land.
 - A native mobile app, rebranding, or new business features before existing
   workflows are understandable — already out of scope per #204 itself.
@@ -701,6 +707,7 @@ hunting through each section. All eight now have a concrete, stated answer
 
 Child of epic #204 (issue #324). Blocks the first implementation PR
 (Home/Tasks + guided Setup hub). The Schedule/Facilities UX PR follows that,
-then the bounded #287 substitute PR (design/UX/policy/state-machine only —
-the #205 gate on its full runtime workflow is unaffected by this package).
-#206 (Planner v2) resumes once all of the above land.
+then the bounded #287 pre-#205 deliverable (documentation/design plus a
+non-production UX prototype only — no schema, persistence, API mutations,
+notifications, or runtime state transitions, matching Release 2's bar
+exactly). #206 (Planner v2) resumes once all of the above land.

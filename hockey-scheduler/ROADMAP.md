@@ -211,13 +211,21 @@ publish-gated and privacy-safe.
    implementation code. Home/Tasks plus a guided Setup hub is the first
    implementation PR once that package is validated; Schedule/Facilities UX
    follows.
-4. **#287** — substitute matching engine, **bounded substitute PR**: design,
-   UX, League policy configuration, and the offer/accept/decline/timeout
-   *state machine* only — explicitly **no runtime seasonal-eligibility
-   implementation**, preserving the **#205 gate** (#287's own text: "the
-   policy and state-machine design may begin earlier, but the full workflow
-   must not land ahead of #205"). The full production workflow, wired to
-   real `SeasonRosterMembership` eligibility, waits for #205.
+4. **#287** — substitute matching engine, **bounded pre-#205 deliverable**:
+   **documentation and design artifacts only, plus a non-production UX
+   prototype** (mockups/clickable prototype of the policy-config screen and
+   the offer/accept/decline/timeout flow) — matching Release 2's own bar
+   exactly: "policy and state-machine **design** (slices 1–3) may begin
+   earlier, but **implementation must not land ahead of #205**." This is
+   design/UX work product, not a landed feature: **no schema or migration,
+   no persistence, no API mutations, no notifications, and no runtime state
+   transitions** of any kind — a real, working offer/accept/decline/timeout
+   state machine (even with eligibility resolution stubbed out) is
+   implementation, not design, and stays barred until #205. Any bounded PR
+   delivering this must assert in its own test plan that it touches no
+   `store/`, migration, or persistence-layer path. The full production
+   workflow (all six slices, wired to real `SeasonRosterMembership`
+   eligibility) waits for #205, per Release 2 above.
 5. **#206** — planner scenarios, fairness, locks, repair and explanations
    (realigned: schedule within a `LeagueSeason`/Division; regular Games never
    cross Leagues). Resumes after #204's requirements package, its first
@@ -274,9 +282,10 @@ Releases 0–4 above.
 
 **Currently active** (Release 4, UX-first per plan update): #204
 requirements package (#324, in review) → Home/Tasks + guided Setup hub PR
-→ Schedule/Facilities UX PR → bounded #287 substitute PR
-(design/UX/policy/state-machine only, no runtime seasonal-eligibility —
-the #205 gate is unaffected) → #206 resumes.
+→ Schedule/Facilities UX PR → bounded #287 pre-#205 deliverable
+(documentation/design + a non-production UX prototype only — no schema,
+persistence, API mutations, notifications, or runtime state transitions;
+see Release 4 above for the exact boundary) → #206 resumes.
 
 Done since this section was last accurate: #267 (login security, PR #286);
 #277 (turnover/curfew policy, PR #318/#319); #313/#315 (recurring ice
