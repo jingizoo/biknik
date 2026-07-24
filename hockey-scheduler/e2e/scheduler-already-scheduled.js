@@ -94,7 +94,16 @@ async function checkViewport(browser, viewport) {
   const page = await context.newPage();
   const errors = [];
   page.on("pageerror", (e) => errors.push(`[pageerror] ${e.message}`));
-  page.on("console", (m) => { if (m.type() === "error") errors.push(`[console] ${m.text()}`); });
+  page.on("console", (m) => {
+    // The stubbed 409 in scenario (3) below deliberately triggers the
+    // browser's own benign resource-load log for that response; it is not
+    // an application error, so it must not fail the strict zero-error bar
+    // the other two scenarios still enforce (mirrors api-error-resilience.js's
+    // pageerror-only approach for its own intentional error responses).
+    if (m.type() === "error" && !/Failed to load resource.*409/.test(m.text())) {
+      errors.push(`[console] ${m.text()}`);
+    }
+  });
 
   const fail = (msg) => { throw new Error(`[${viewport.label}] ${msg}`); };
 
@@ -208,10 +217,53 @@ async function checkViewport(browser, viewport) {
       fail(`all-done: commit must stay disabled with nothing missing: ${JSON.stringify(s)}`);
     }
 
+    // (3) Commit-time race, stubbed (#328 review round 3): genuinely
+    // reproducing the concurrent-commit race in a single browser page
+    // isn't practical, so /api/scheduler/commit is stubbed with the exact
+    // shape a real pairing_already_scheduled refusal returns
+    // (DomainError.to_dict(), HTTP 409) -- proving the UI reaction, not
+    // the backend race itself (that is the forced two-session PostgreSQL
+    // test in test_placement_concurrency.py). The message must be
+    // actionable on its own: post()'s generic toast surfaces
+    // error.message alone, never error.details.
+    await generateFor(page, ids.dMixed,
+      '#sched-preview[data-games="4"][data-already-scheduled="2"]');
+    s = await previewState(page);
+    if (s.commitDisabled !== false) {
+      fail(`race stub: needs an enabled Commit to click: ${JSON.stringify(s)}`);
+    }
+    await page.route("**/api/scheduler/commit", (r) => r.fulfill({
+      status: 409,
+      contentType: "application/json",
+      body: JSON.stringify({
+        error: {
+          code: "concurrency_conflict",
+          message: "Mixed 0 vs Mixed 1 is already scheduled as Game "
+            + "game_stub_race — generate a fresh preview before "
+            + "committing again.",
+          details: {
+            reason: "pairing_already_scheduled",
+            home_team_id: "stub_home", away_team_id: "stub_away",
+            existing_game_id: "game_stub_race",
+          },
+        },
+      }),
+    }));
+    await page.click("[data-sched-commit]");
+    await page.waitForFunction(
+      () => /Mixed 0 vs Mixed 1 is already scheduled as Game game_stub_race/
+        .test((document.querySelector(".toast-msg") || {}).textContent || ""),
+      null, { timeout: 10000 });
+    await page.waitForSelector("#sched-preview", { state: "detached", timeout: 10000 });
+    if (await page.locator("[data-sched-commit]").count()) {
+      fail("race stub: Commit must not be retryable without a fresh Generate");
+    }
+    await page.unroute("**/api/scheduler/commit");
+
     if (errors.length) {
       fail(`console/page errors:\n${errors.join("\n")}`);
     }
-    console.log(`[${viewport.label}] OK — mixed and all-already-scheduled previews both name already-scheduled pairings distinctly from proposed games and conflicts.`);
+    console.log(`[${viewport.label}] OK — mixed and all-already-scheduled previews both name already-scheduled pairings distinctly from proposed games and conflicts, and a commit-time race refusal shows both teams and the winning Game id then requires a fresh Generate.`);
   } catch (error) {
     throw new Error(`${error.message}\n--- demo server output ---\n${serverOutput}`);
   } finally {

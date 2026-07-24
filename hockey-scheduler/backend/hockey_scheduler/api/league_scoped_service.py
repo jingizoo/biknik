@@ -213,14 +213,21 @@ class ApiService(_BaseApiService):
                 _pairing_key = (draft_ls_id, row.get("division_id"),
                                 frozenset((row["home_team_id"], row["away_team_id"])))
                 if _pairing_key in _existing_now:
+                    # #328 review round 3 -- the message itself (not just
+                    # details) must be actionable: post()'s generic toast in
+                    # app.js surfaces error.message alone, never
+                    # error.details, so a vague message here would leave the
+                    # operator with no idea which pairing/Game raced. The
+                    # proposal row already carries both team names.
+                    _existing_gid = _existing_now[_pairing_key]
                     raise ConcurrencyConflictError(
-                        "This pairing already has a real Game; the draft "
-                        "you reviewed is stale. Regenerate and review a "
-                        "fresh proposal before committing again.",
+                        f"{row['home_team_name']} vs {row['away_team_name']} "
+                        f"is already scheduled as Game {_existing_gid} — "
+                        "generate a fresh preview before committing again.",
                         {"reason": "pairing_already_scheduled",
                          "home_team_id": row["home_team_id"],
                          "away_team_id": row["away_team_id"],
-                         "existing_game_id": _existing_now[_pairing_key]})
+                         "existing_game_id": _existing_gid})
                 game = Game(
                     id=self.store.next_id("game"),
                     home_team_id=row["home_team_id"],

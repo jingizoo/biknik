@@ -205,6 +205,12 @@ class DraftReviewServiceTest(unittest.TestCase):
                          "pairing_already_scheduled")
         self.assertEqual(res["error"]["details"]["existing_game_id"],
                          "existing")
+        # #328 review round 3: the message ITSELF must be actionable, not
+        # just details -- the Scheduler UI's generic toast surfaces
+        # error.message alone, never error.details.
+        self.assertIn(row["home_team_name"], res["error"]["message"])
+        self.assertIn(row["away_team_name"], res["error"]["message"])
+        self.assertIn("existing", res["error"]["message"])
         # Atomic rollback: no draft games created, no batch audit written,
         # every slot the loop had already flipped is back to AVAILABLE; only
         # the pre-seeded existing game remains.

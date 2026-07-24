@@ -6484,11 +6484,15 @@ async function render() {
       toast = `Committed ${res.created.length} draft game(s).`;
     } else if (res && res.error && res.error.details
                && res.error.details.reason === "pairing_already_scheduled") {
-      // #328 review round 2: a concurrent commit already scheduled one of
-      // this batch's pairings — the reviewed preview is stale (post()'s
-      // generic toast already names the pairing/existing Game). Clear it
-      // rather than leave a now-wrong proposal on screen; the operator
-      // generates a fresh one to review before committing again.
+      // #328 review round 3 -- a concurrent commit already scheduled one
+      // of this batch's pairings. post()'s generic toast surfaces
+      // error.message alone (never error.details), so the backend builds
+      // that message itself with both team names and the winning Game id
+      // ("Team A vs Team B is already scheduled as Game G123 -- generate
+      // a fresh preview...") -- nothing further to extract here. The
+      // reviewed preview is now stale; clear it rather than leave a
+      // now-wrong proposal on screen, so Commit cannot be retried without
+      // a fresh Generate.
       schedulerState.preview = null;
     }
     await render();
