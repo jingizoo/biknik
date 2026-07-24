@@ -45,6 +45,7 @@ from hockey_scheduler.services import (
     draft_schedule_for_league,
     round_robin_pairings,
 )
+from hockey_scheduler.services.scheduler import _draft_fingerprint
 from hockey_scheduler.api import ApiService
 from hockey_scheduler.api.service import ApiService as BaseApiService
 from hockey_scheduler.web import server as srv
@@ -78,6 +79,66 @@ class RoundRobinTest(unittest.TestCase):
         self.assertEqual(round_robin_pairings([]), [])
         self.assertEqual(round_robin_pairings(["a"]), [])
         self.assertEqual(round_robin_pairings(["a", "b"]), [("a", "b")])
+
+
+class DraftFingerprintTest(unittest.TestCase):
+    """Direct, deterministic proof that _draft_fingerprint is sensitive to
+    every field it now binds (#328 review round 10 finding 1) -- tested
+    against the pure function itself rather than an end-to-end scenario,
+    since the eligible-team-set axis already gets full both-facade
+    Generate-then-mutate-then-Commit coverage in SchedulerContract below,
+    and organically reproducing a changed UNSCHEDULED reason code through
+    the whole constraint-evaluation stack while keeping every other field
+    byte-for-byte identical is far more fragile to construct than simply
+    calling the function twice with one field varied."""
+
+    def _base_args(self):
+        return dict(
+            league_season_id="ls1", team_ids=["t0", "t1", "t2", "t3"],
+            draft_games=[{
+                "division_id": "d1", "home_team_id": "t0", "away_team_id": "t3",
+                "ice_slot_id": "s0", "start_time": "2026-09-12T08:00:00+00:00",
+            }],
+            unscheduled=[{
+                "division_id": "d1", "home_team_id": "t1", "away_team_id": "t2",
+                "reason_codes": ["no_ice_available"],
+            }],
+            unschedulable_teams=[],
+            already_scheduled=[],
+        )
+
+    def test_changed_team_ids_changes_fingerprint(self):
+        a = self._base_args()
+        b = self._base_args()
+        b["team_ids"] = a["team_ids"] + ["t4"]
+        self.assertNotEqual(_draft_fingerprint(**a), _draft_fingerprint(**b))
+
+    def test_changed_unscheduled_reason_codes_changes_fingerprint(self):
+        a = self._base_args()
+        b = self._base_args()
+        b["unscheduled"] = [dict(a["unscheduled"][0],
+                                 reason_codes=["team_rest_violation"])]
+        self.assertNotEqual(_draft_fingerprint(**a), _draft_fingerprint(**b))
+
+    def test_changed_unschedulable_teams_changes_fingerprint(self):
+        a = self._base_args()
+        b = self._base_args()
+        a["unschedulable_teams"] = [
+            {"team_id": "t1", "reason_codes": ["no_ice_available"]}]
+        b["unschedulable_teams"] = [
+            {"team_id": "t1", "reason_codes": ["team_rest_violation"]}]
+        self.assertNotEqual(_draft_fingerprint(**a), _draft_fingerprint(**b))
+
+    def test_identical_inputs_are_deterministic(self):
+        a = self._base_args()
+        b = self._base_args()
+        self.assertEqual(_draft_fingerprint(**a), _draft_fingerprint(**b))
+
+    def test_team_ids_order_does_not_matter(self):
+        a = self._base_args()
+        b = self._base_args()
+        b["team_ids"] = list(reversed(a["team_ids"]))
+        self.assertEqual(_draft_fingerprint(**a), _draft_fingerprint(**b))
 
 
 class SchedulerContract:
@@ -788,7 +849,22 @@ class SchedulerContract:
         transaction. This is a direct, in-transaction observation of
         "written, then rolled back," not an inference from the final state
         (which alone cannot distinguish "written then rolled back" from
-        "never attempted")."""
+        "never attempted").
+
+        #328 review round 10 finding 3: rows/slots/audit disappearing is
+        not the whole rollback contract -- a rollback that restores those
+        but leaks the five ``next_id("game")`` increments would still pass
+        every assertion above, permanently burning five ids and leaking
+        the Memory ``_counters``/SQL ``counters`` mutation out of the
+        transaction it belongs to (a real backend-parity gap: the Memory
+        store's own comment on ``_counters`` says it must roll back like
+        any other state; nothing previously proved the SQL ``counters``
+        table does the same). So the injection point also captures each
+        earlier row's actual allocated Game id, in allocation order, and
+        once the transaction has unwound, a fresh ``next_id("game")`` call
+        must return exactly the FIRST of those -- proving the counter
+        itself rolled back to its pre-transaction value, not just the
+        rows built on top of it."""
         self._division_fixture(4, 6)
         api = api_cls(self.store)
         preview = api.draft_season_schedule("div1")
@@ -797,6 +873,7 @@ class SchedulerContract:
         earlier_rows, last_row = rows[:-1], rows[-1]
         real_assert = api.setup._assert_slot_free_for_game
         observed_before_injection = {}
+        tentative_game_ids = []
 
         def _spy(ice_slot_id, home_team_id, away_team_id, **kwargs):
             if ice_slot_id == last_row["ice_slot_id"]:
@@ -810,6 +887,8 @@ class SchedulerContract:
                     observed_before_injection[r["ice_slot_id"]] = (
                         len(games) == 1
                         and slot.status == IceSlotStatus.ALLOCATED)
+                    if games:
+                        tentative_game_ids.append(games[0].id)
                 raise ScheduleConflictError(
                     "Injected failure -- observing mid-transaction state "
                     "before unwinding (#328 review round 8 finding 2).",
@@ -823,6 +902,7 @@ class SchedulerContract:
             all(observed_before_injection.values()),
             f"every earlier row's Game/slot must be visible in-transaction "
             f"BEFORE the injected failure: {observed_before_injection!r}")
+        self.assertEqual(len(tentative_game_ids), 5, repr(tentative_game_ids))
         self.assertIn("error", res, repr(res))
         self.assertEqual(
             res["error"]["details"]["reason"],
@@ -836,6 +916,16 @@ class SchedulerContract:
                 IceSlotStatus.AVAILABLE, r["ice_slot_id"])
         self.assertFalse(any(a.action == "draft_schedule_committed"
                              for a in self.store.all_setup_audit()))
+        # #328 review round 10 finding 3: the id COUNTER must roll back
+        # too, not just the rows built on it -- next_id("game") must hand
+        # out the SAME id the failed transaction first tentatively
+        # allocated, proving the counter mutation was part of the rolled
+        # back transaction rather than escaping it.
+        self.assertEqual(
+            self.store.next_id("game"), tentative_game_ids[0],
+            "next_id(\"game\") must return the id the failed transaction "
+            "first tentatively allocated -- a different (higher) value "
+            "means the counter update escaped the rollback")
 
     def test_league_scoped_later_row_failure_rolls_back_earlier_writes(self):
         self._later_row_failure_rolls_back_earlier_writes(ApiService)
@@ -996,6 +1086,110 @@ class SchedulerContract:
             self):
         self._stale_preview_refused_on_placement_change(
             BaseApiService, "scope_changed")
+
+    # -- fingerprint must bind team eligibility too, not just placed/
+    # already-scheduled rows (#328 review round 10 finding 1) --------------
+    def _stale_preview_refused_on_team_eligibility_change(self, api_cls, change):
+        """Shared assertion: the ELIGIBLE-TEAM set changing between Generate
+        and Commit must invalidate the preview even when the placed row and
+        its own fingerprint-bound placement stay byte-for-byte identical --
+        #326 review round 10: a 4-team division with exactly one ice slot
+        places one pairing (the circle method's `fixed` team vs the last
+        team in sort order -- see round_robin_pairings) and leaves five
+        unscheduled. ``change`` exploits the SAME circle-method mechanic in
+        both directions to keep that one placed row unchanged while
+        team_count/the unscheduled set silently change size:
+
+        * ``"register"`` -- a NEW team sorting alphabetically BEFORE every
+          existing team joins the division. It becomes the new `fixed`
+          team and byes in round 0 (the total goes 4 -> 5, even -> odd), so
+          the original four teams merely shift up one array position each
+          and t0-vs-t3 remains round 0's first real pairing -- unchanged on
+          the wire, yet the reviewed batch silently grew four new pairings
+          the operator never saw.
+        * ``"unregister"`` -- the fixture starts with that same extra team
+          already registered (so t0-vs-t3 is again round 0's first real
+          pairing, the extra team byeing instead), then removes it. The
+          placed row is unaffected by the SAME mechanic in reverse, but
+          team_count/unscheduled shrink -- pairings the operator reviewed
+          as genuinely missing may no longer be real obligations at all.
+
+        Without round 10's team_ids/unscheduled binding, both directions
+        leave `missing`/`already_scheduled` -- and so the fingerprint --
+        completely unchanged, and Commit would silently persist a batch the
+        operator never actually reviewed."""
+        self._division_fixture(4, 1)  # t0..t3, 1 slot
+        if change == "unregister":
+            self.store.add_team(Team(id="a_extra", name="Extra",
+                                     program_id="prog1", league_id="lg1"))
+            self.store.add_season_team_registration(SeasonTeamRegistration(
+                id="streg_a_extra", league_season_id="ls_lg1_se1",
+                team_id="a_extra", division_id="div1", active=True))
+        api = api_cls(self.store)
+        preview = api.draft_season_schedule("div1")
+        self.assertEqual(len(preview["draft_games"]), 1, repr(preview))
+        placed = preview["draft_games"][0]
+        self.assertEqual(
+            (placed["home_team_id"], placed["away_team_id"]), ("t0", "t3"),
+            repr(preview))
+        if change == "register":
+            self.assertEqual(preview["team_count"], 4, repr(preview))
+            self.assertEqual(len(preview["unscheduled"]), 5, repr(preview))
+        else:
+            assert change == "unregister"
+            self.assertEqual(preview["team_count"], 5, repr(preview))
+            self.assertEqual(len(preview["unscheduled"]), 9, repr(preview))
+        stale_fingerprint = preview["draft_fingerprint"]
+        if change == "register":
+            self.store.add_team(Team(id="a_extra", name="Extra",
+                                     program_id="prog1", league_id="lg1"))
+            self.store.add_season_team_registration(SeasonTeamRegistration(
+                id="streg_a_extra", league_season_id="ls_lg1_se1",
+                team_id="a_extra", division_id="div1", active=True))
+        else:
+            reg = self.store.get_season_team_registration("streg_a_extra")
+            reg.active = False
+            self.store.save_season_team_registration(reg)
+        # Confirm the fresh regeneration really does still place the exact
+        # same row -- otherwise this fixture wouldn't isolate the
+        # eligibility axis from the (already separately covered) placement
+        # axis, and the OLD fingerprint would differ for an unrelated reason.
+        fresh = api.draft_season_schedule("div1")
+        self.assertEqual(len(fresh["draft_games"]), 1, repr(fresh))
+        self.assertEqual(
+            (fresh["draft_games"][0]["home_team_id"],
+             fresh["draft_games"][0]["away_team_id"]), ("t0", "t3"),
+            repr(fresh))
+        games_before = len(self.store.all_games())
+        audits_before = len(self.store.all_setup_audit())
+        res = api.commit_draft_schedule(
+            "div1", draft_fingerprint=stale_fingerprint)
+        self.assertIn("error", res, repr(res))
+        self.assertEqual(
+            res["error"]["details"]["reason"], "preview_stale", repr(res))
+        self.assertEqual(len(self.store.all_games()), games_before, repr(res))
+        self.assertEqual(
+            len(self.store.all_setup_audit()), audits_before, repr(res))
+
+    def test_league_scoped_commit_refuses_stale_preview_after_team_registers(
+            self):
+        self._stale_preview_refused_on_team_eligibility_change(
+            ApiService, "register")
+
+    def test_league_scoped_commit_refuses_stale_preview_after_team_unregisters(
+            self):
+        self._stale_preview_refused_on_team_eligibility_change(
+            ApiService, "unregister")
+
+    def test_base_facade_commit_refuses_stale_preview_after_team_registers(
+            self):
+        self._stale_preview_refused_on_team_eligibility_change(
+            BaseApiService, "register")
+
+    def test_base_facade_commit_refuses_stale_preview_after_team_unregisters(
+            self):
+        self._stale_preview_refused_on_team_eligibility_change(
+            BaseApiService, "unregister")
 
     # -- already_scheduled revalidation under the lock (#328 review round 8
     # finding 1) -----------------------------------------------------------

@@ -456,6 +456,112 @@ neutering the corresponding check in the league-scoped facade (the one the
 HTTP route actually resolves to) and confirming only the matching test
 fails.
 
+### The fingerprint must bind team eligibility, not just placed/already-scheduled rows (#328 review round 10 finding 1)
+
+`_draft_fingerprint` originally hashed only `draft_games` (the missing
+pairings, with placement — round 7) and `already_scheduled`. That leaves a
+real gap: the circle method's round-robin (`round_robin_pairings`) can add
+or remove a team from a Division and leave the exact SAME pairing placed on
+the exact SAME slot, because the new/removed team only reshuffles *other*
+pairings' bye/mirror positions. With exactly one open ice slot, for
+example, registering a new team can grow `team_count` and the
+`unscheduled` set from 4/5 to 5/9 while `draft_games` and
+`already_scheduled` stay byte-for-byte identical on Commit's own
+regeneration — invisible to a fingerprint that never looked at either
+field, so Commit would silently persist a batch reviewed under a
+DIFFERENT, now-stale roster.
+
+`_draft_fingerprint` now also binds the full eligible `team_ids` set
+(order-independent — sorted before hashing) and, per unscheduled pairing,
+its own `division_id`/pairing/`reason_codes`, plus the `unschedulable_teams`
+rollup. Any team registration change, or any change to WHY a pairing is
+unscheduled (not just WHICH pairings are), between Generate and Commit's
+own regeneration now invalidates the preview (terminal `preview_stale`,
+zero writes) even when every placed/already-scheduled row is unchanged.
+
+Pinned two ways:
+
+* **Direct, deterministic proof of the fingerprint function itself**
+  (`test_scheduler.py`, `DraftFingerprintTest`) — calls `_draft_fingerprint`
+  directly with identical `draft_games`/`already_scheduled` but a varied
+  `team_ids`, `unscheduled` reason code, or `unschedulable_teams` entry, and
+  asserts the hash changes; plus determinism and team-id-order-independence
+  checks. This isolates the property precisely without depending on any
+  particular round-robin fixture.
+* **End-to-end regressions through both commit facades**
+  (`_stale_preview_refused_on_team_eligibility_change` in
+  `SchedulerContract`, covering Memory/SQLite/PostgreSQL depending on how
+  the suite is invoked) that exploit the SAME circle-method mechanic
+  organically: a 4-team Division with exactly one ice slot places `t0` vs
+  `t3` (the circle method's `fixed` team against the last team in sort
+  order) and leaves five pairings unscheduled. Registering a 5th team that
+  sorts alphabetically *before* every existing team gives that new team
+  the round-0 bye instead, shifting the original four teams up by exactly
+  one array position each and leaving `t0` vs `t3` placed identically —
+  `team_count`/`unscheduled` change size, `draft_games` does not.
+  Unregistering runs the same fixture in reverse. Both directions assert
+  terminal `preview_stale` and zero Games/audit rows written.
+* **A real (unstubbed) browser round trip**
+  (`scheduler-already-scheduled.js`, scenario 5, desktop and 390px): unlike
+  every other refusal scenario in that journey, Commit here is NOT
+  intercepted — a genuine `POST /api/scheduler/commit` reaches the real
+  backend. A 2-team Division's one pairing is previewed and placed; a 3rd
+  team (engineered, via one unregistered decoy team, to sort alphabetically
+  before the other two — `team_N` ids compare as strings, so a `team_9` →
+  `team_10` boundary crossing would otherwise silently sort the new team
+  in the wrong position) registers afterward, byeing itself in round 0 and
+  leaving the original pairing/slot unchanged. Clicking Commit shows the
+  same actionable toast and stale-preview recovery as the stubbed
+  scenarios, and a follow-up Generate confirms both zero Games were created
+  AND the placed row is still exactly the one originally previewed —
+  proving the refusal fired despite nothing about the reviewed placement
+  having changed.
+
+All three verified falsifiable together: reverting the fingerprint to its
+pre-round-10 shape breaks the direct unit tests, both `SchedulerContract`
+regressions (Commit silently succeeds and creates the previewed Game), and
+the browser scenario (the follow-up Generate shows the pairing as
+already-scheduled — a real Game the refused-in-appearance Commit actually
+created).
+
+### Test-harness correctness is part of the contract too (#328 review round 10 findings 2/3)
+
+Two further round 10 findings were not about the product code at all, but
+about whether the EXISTING regressions proving earlier rounds' fixes could
+be trusted:
+
+* **A forced-race harness that could deadlock.** The already_scheduled
+  cancel-vs-commit PostgreSQL race
+  (`_run_already_scheduled_cancel_vs_commit_race`,
+  `test_placement_concurrency.py`) originally monkeypatched the commit
+  thread's own `_existing_pairing_games` call — which runs AFTER
+  `commit_draft_schedule` has already acquired its Season lock — to wait on
+  a `cancel_committed` event set only once `cancel_game` (which needs that
+  SAME Season lock) returns. If the commit thread reached the Season lock
+  first, the two sides deadlocked: commit holding the lock while waiting
+  for an event only the (now permanently blocked) cancellation could set.
+  Bounded only by a 10s `wait(timeout=...)`, which side lock first was
+  scheduling luck, not something the harness controlled. Fixed by moving
+  the wait to BEFORE `commit_draft_schedule` is called at all, while the
+  commit thread holds no locks whatsoever — `cancel_game` then always runs
+  unimpeded, and the commit's own (now unpatched) locked read naturally
+  observes the already-committed cancellation. Stress-run 10x (20 test
+  executions) against real PostgreSQL with no hangs or failures.
+* **Rollback proof that stopped short of the id counter.** The direct
+  in-transaction rollback proof (`_later_row_failure_rolls_back_earlier_writes`,
+  `test_scheduler.py`, covering Memory/SQLite/PostgreSQL) observed that
+  five tentatively-written Games and their `ALLOCATED` slots vanish after
+  the injected failure unwinds the transaction, but never checked the five
+  `next_id("game")` increments themselves — a rollback that restored every
+  row but left the Memory `_counters`/SQL `counters` mutation outside the
+  rolled-back transaction would still have passed. The test now captures
+  each earlier row's actual allocated Game id and asserts a fresh
+  `next_id("game")` call after rollback returns exactly the first one —
+  proving the counter itself rolled back, not just the rows built on it.
+  Verified falsifiable by temporarily excluding `_counters` from the
+  Memory store's transaction snapshot and confirming the assertion catches
+  the resulting id leak.
+
 ## Reason codes referenced here
 
 Unscheduled-pairing codes are generation-time (`services/scheduler.py`,

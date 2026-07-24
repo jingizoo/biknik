@@ -31,8 +31,6 @@ from helpers import BACKEND, commit_fresh_draft  # noqa: F401  (BACKEND: sys.pat
 
 from hockey_scheduler.api import ApiService
 from hockey_scheduler.api.service import ApiService as BaseApiService
-import hockey_scheduler.api.service as base_service_module
-import hockey_scheduler.api.league_scoped_service as league_scoped_service_module
 from hockey_scheduler.domain import (
     Organization, Program, Season, League, LeagueSeason, Division, Venue,
     SeasonVenueAccess, Rink, Team, SeasonTeamRegistration, IceSlot,
@@ -1497,15 +1495,33 @@ def _run_already_scheduled_cancel_vs_commit_race(testcase):
     the revalidation loop removed entirely still passed this race 5/5 times
     when it only asserted on whichever outcome happened to occur.
 
-    So the ordering is FORCED explicitly: ``run_cancel`` sets
-    ``cancel_committed`` only after its cancellation call returns (i.e.
-    after it has committed), and the commit thread's OWN
-    ``_existing_pairing_games`` call -- the exact read the round 8/9
-    revalidation depends on -- is monkeypatched to wait on that event
-    before running for real. This guarantees the commit's locked read
-    happens strictly after the cancellation, so the ONLY correct outcome
-    is a refusal; any success proves the revalidation is missing or
-    reading stale state."""
+    So the ordering is FORCED explicitly -- but #328 review round 10
+    finding 2 caught a genuine circular-wait bug in how an earlier version
+    of this harness forced it: that version monkeypatched the commit
+    thread's OWN ``_existing_pairing_games`` call (the exact read the
+    round 8/9 revalidation depends on) to wait on ``cancel_committed``
+    before running for real. That call happens AFTER
+    ``commit_draft_schedule`` has already acquired its own Season lock
+    (``_lock_seasons`` runs, then the revalidation reads
+    ``_existing_pairing_games`` under it) -- and ``cancel_game`` needs
+    that SAME Season lock (via ``_guard_active_season`` /
+    ``require_active_season``) to complete and set the event. If the
+    commit thread reached its Season lock before the cancel thread did,
+    the commit would sit holding that lock waiting for an event that can
+    only be set by a cancellation which itself cannot proceed until the
+    commit releases the very lock it is waiting on -- a real deadlock,
+    bounded only by the 10s ``wait(timeout=...)``, and which side "wins"
+    the lock race was pure scheduling luck, not something this harness
+    controlled.
+
+    The fix: wait on the event BEFORE calling ``commit_draft_schedule`` at
+    all, while the commit thread holds no locks whatsoever. That lets
+    ``cancel_game`` run unimpeded (nothing on the commit side contends for
+    the Season lock yet), finish, and set the event; only then does the
+    commit thread call the real, unpatched ``commit_draft_schedule``,
+    whose own locked ``_existing_pairing_games`` read naturally observes
+    the now-committed cancellation with no artificial wait needed inside
+    it at all. No module-level monkeypatching is required any more."""
     store = testcase._store()
     _add_extra_teams(store)
     slot4 = store.get_ice_slot("s4")
@@ -1517,28 +1533,15 @@ def _run_already_scheduled_cancel_vs_commit_race(testcase):
     slot4.status = IceSlotStatus.ALLOCATED
     store.save_ice_slot(slot4)
     proposal = _already_scheduled_cancel_race_proposal(store)
-
-    target_module = (
-        league_scoped_service_module if testcase._api_cls() is ApiService
-        else base_service_module)
-    real_existing_pairing_games = target_module._existing_pairing_games
     cancel_committed = threading.Event()
 
-    def _synced_existing_pairing_games(*args, **kwargs):
+    def run_commit(a):
+        a.draft_season_schedule = lambda *args, **kw: proposal
         if not cancel_committed.wait(timeout=10):
             raise AssertionError(
                 "cancel_game never completed -- race harness stalled")
-        return real_existing_pairing_games(*args, **kwargs)
-
-    def run_commit(a):
-        target_module._existing_pairing_games = _synced_existing_pairing_games
-        a.draft_season_schedule = lambda *args, **kw: proposal
-        try:
-            return a.commit_draft_schedule(
-                division_id="d1",
-                draft_fingerprint=proposal["draft_fingerprint"])
-        finally:
-            target_module._existing_pairing_games = real_existing_pairing_games
+        return a.commit_draft_schedule(
+            division_id="d1", draft_fingerprint=proposal["draft_fingerprint"])
 
     def run_cancel(a):
         result = a.cancel_game("blocking_game")

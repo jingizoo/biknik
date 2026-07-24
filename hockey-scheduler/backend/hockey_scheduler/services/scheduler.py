@@ -451,19 +451,21 @@ def _split_already_scheduled(store, pairings, existing, league_season_id):
     return remaining, already
 
 
-def _draft_fingerprint(league_season_id, draft_games, already_scheduled):
+def _draft_fingerprint(league_season_id, team_ids, draft_games, unscheduled,
+                        unschedulable_teams, already_scheduled):
     """Deterministic identity of exactly what this proposal reviewed — #328
-    review round 5, widened round 7. Bound into the response so the commit
-    path can prove, right before writing, that this fact hasn't changed
-    since: a Regular Game silently created or cancelled in the gap between
-    the operator's preview and clicking Commit changes this fingerprint
-    (via the already-scheduled split below), and so does the SAME pairing
-    silently landing on a different `ice_slot_id`/time — whether because
-    the reviewed slot became unavailable and another was chosen instead,
-    or because `slot_ids`/`constraints` differed between the preview call
-    and the commit's own regeneration. Either way the commit is refused
-    (terminal `preview_stale`) rather than silently persisting a different
-    placement than the one reviewed and approved.
+    review round 5, widened round 7 and round 10. Bound into the response
+    so the commit path can prove, right before writing, that this fact
+    hasn't changed since: a Regular Game silently created or cancelled in
+    the gap between the operator's preview and clicking Commit changes
+    this fingerprint (via the already-scheduled split below), and so does
+    the SAME pairing silently landing on a different `ice_slot_id`/time —
+    whether because the reviewed slot became unavailable and another was
+    chosen instead, or because `slot_ids`/`constraints` differed between
+    the preview call and the commit's own regeneration. Either way the
+    commit is refused (terminal `preview_stale`) rather than silently
+    persisting a different placement, or a different reviewed BATCH, than
+    the one reviewed and approved.
 
     #328 review round 7 correction: an earlier version of this fingerprint
     deliberately left placement out, reasoning that the per-row physical
@@ -476,6 +478,22 @@ def _draft_fingerprint(league_season_id, draft_games, already_scheduled):
     alongside its id as defense in depth against the (currently
     unsupported) possibility of a slot's time being edited in place
     without changing its id.
+
+    #328 review round 10 correction: an earlier version bound only
+    `draft_games`/`already_scheduled` — the two buckets a commit actually
+    writes from. But the eligible-team set and the `unscheduled`/
+    `unschedulable_teams` diagnosis are also part of what the operator
+    reviewed, and the circle method's round-robin can leave the exact
+    SAME pairing placed on the exact SAME slot even after a team
+    registers or unregisters in the Division (the new/removed team
+    reshuffles which OTHER pairings are missing/unscheduled without
+    disturbing this one) — invisible to a fingerprint that never looked
+    at `team_ids`/`unscheduled`. Binding the full eligible `team_ids` set
+    plus each unscheduled pairing's own reason codes and the
+    `unschedulable_teams` rollup closes that gap: any registration change
+    or altered unscheduled diagnosis between Generate and Commit now
+    invalidates the preview even when the placed/already-scheduled rows
+    are byte-for-byte identical.
     """
     missing = sorted(
         f"{d.get('division_id')}|{d['home_team_id']}|{d['away_team_id']}|"
@@ -485,8 +503,21 @@ def _draft_fingerprint(league_season_id, draft_games, already_scheduled):
         f"{a.get('division_id')}|{a['home_team_id']}|{a['away_team_id']}|"
         f"{a['existing_game_id']}"
         for a in already_scheduled)
-    payload = {"league_season_id": league_season_id, "missing": missing,
-               "already_scheduled": scheduled}
+    unresolved = sorted(
+        f"{u.get('division_id')}|{u['home_team_id']}|{u['away_team_id']}|"
+        + ",".join(sorted(u.get("reason_codes") or ()))
+        for u in unscheduled)
+    blocked_teams = sorted(
+        f"{t['team_id']}|" + ",".join(sorted(t.get("reason_codes") or ()))
+        for t in unschedulable_teams)
+    payload = {
+        "league_season_id": league_season_id,
+        "team_ids": sorted(team_ids),
+        "missing": missing,
+        "already_scheduled": scheduled,
+        "unscheduled": unresolved,
+        "unschedulable_teams": blocked_teams,
+    }
     return hashlib.sha256(json.dumps(
         payload, sort_keys=True, separators=(",", ":"), default=str
     ).encode()).hexdigest()[:16]
@@ -526,14 +557,16 @@ def draft_schedule(store, division_id, slot_ids=None, constraints=None):
         store, pairings, slots, constraints,
         policy_check=_policy_advisor(
             store, _resolve_division_season_id(store, division_id)))
+    unschedulable_teams = _unschedulable_teams(
+        store, teams, pairings, unscheduled)
     return {
         "division_id": division_id, "team_count": len(teams),
         "draft_games": draft_games, "unscheduled": unscheduled,
         "already_scheduled": already_scheduled,
-        "unschedulable_teams": _unschedulable_teams(
-            store, teams, pairings, unscheduled),
+        "unschedulable_teams": unschedulable_teams,
         "draft_fingerprint": _draft_fingerprint(
-            ls_id, draft_games, already_scheduled),
+            ls_id, teams, draft_games, unscheduled, unschedulable_teams,
+            already_scheduled),
     }
 
 
@@ -572,13 +605,15 @@ def draft_schedule_for_league(store, season_id, league_id, division_id=None,
     draft_games, unscheduled = _assign_ice(
         store, pairings, slots, constraints,
         policy_check=_policy_advisor(store, season_id))
+    unschedulable_teams = _unschedulable_teams(
+        store, all_teams, pairings, unscheduled)
     return {
         "season_id": season_id, "league_id": league_id,
         "division_id": division_id, "team_count": len(all_teams),
         "draft_games": draft_games, "unscheduled": unscheduled,
         "already_scheduled": already_scheduled,
-        "unschedulable_teams": _unschedulable_teams(
-            store, all_teams, pairings, unscheduled),
+        "unschedulable_teams": unschedulable_teams,
         "draft_fingerprint": _draft_fingerprint(
-            ls_id, draft_games, already_scheduled),
+            ls_id, all_teams, draft_games, unscheduled, unschedulable_teams,
+            already_scheduled),
     }

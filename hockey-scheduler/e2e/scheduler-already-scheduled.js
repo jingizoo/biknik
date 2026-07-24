@@ -26,6 +26,11 @@
 // Enter and asserts focus lands on the newly rendered Generate control
 // rather than silently dropping to the document body (#328 review round 8
 // finding 4).
+// Finally, an UNSTUBBED scenario proves the real backend, not just a canned
+// response: a brand-new team registers in a division after Generate but
+// before Commit, and the real commit_draft_schedule refusal (preview_stale)
+// is surfaced the same way, with zero Games created (#328 review round 10
+// finding 1).
 //
 // Fails on any browser console/page error.
 const { chromium } = require("playwright");
@@ -195,8 +200,11 @@ async function checkViewport(browser, viewport) {
           game_id: g.id,
         });
       }
-      // Ice for the four still-missing Mixed pairings.
-      for (let h = 8; h < 8 + 4; h++) await slot(h);
+      // Ice for the four still-missing Mixed pairings -- these stay
+      // AVAILABLE for the rest of the run (scenarios (3)/(4) only ever
+      // stub the commit response, so nothing here ever really commits).
+      const mixedOpenSlotIds = [];
+      for (let h = 8; h < 8 + 4; h++) mixedOpenSlotIds.push(await slot(h));
 
       // AllDone's one pairing already has a real Game — no ice slot is
       // even needed for it to be picked up as already-scheduled.
@@ -210,6 +218,8 @@ async function checkViewport(browser, viewport) {
         dMixed: dMixed.id, dAllDone: dAllDone.id, seededMixed,
         allDone: { home_team_name: "AllDone 0", away_team_name: "AllDone 1",
                   game_id: allDoneGame.id },
+        seasonId: season.id, levelId: level.id, leagueId: league.id,
+        mixedOpenSlotIds,
       };
     }, ICE_DAY);
 
@@ -438,10 +448,155 @@ async function checkViewport(browser, viewport) {
     }
     await page.unroute("**/api/scheduler/commit");
 
+    // (5) Real (UNSTUBBED) end-to-end proof that a team-eligibility change
+    // between Generate and Commit is caught by the REAL backend and
+    // correctly surfaced by the UI (#328 review round 10 finding 1).
+    // Unlike scenarios (3)/(4) above, Commit here is NOT intercepted --
+    // this is a genuine round trip through commit_draft_schedule's own
+    // regeneration and fingerprint comparison, not a canned response.
+    //
+    // The fixture starts with an EVEN (2) team count -- round_robin_pairings'
+    // circle method has no bye at all there, so with exactly one ice slot
+    // the two teams' single pairing is what gets placed. Registering a
+    // THIRD team that sorts alphabetically FIRST makes the round robin ODD
+    // and gives THAT new team the round-0 bye, while the two original teams
+    // shift up by exactly one array position each -- preserving their
+    // mutual pairing byte-for-byte on Commit's own regeneration (the same
+    // circle-method mechanic proven directly, with hand-picked ids, in
+    // test_scheduler.py's `_stale_preview_refused_on_team_eligibility_change`
+    // "register" case). This isolates the eligibility axis from the
+    // (separately covered) placement axis: a fingerprint that only hashed
+    // draft_games/already_scheduled would see no difference at all and let
+    // Commit silently persist a batch the operator never reviewed the
+    // three-team version of.
+    //
+    // Two setup quirks this depends on:
+    // - /api/scheduler/draft draws game slots from the WHOLE store, not
+    //   just this division's own rink -- the four still-AVAILABLE Mixed
+    //   slots from setup above (scenarios (1)/(3)/(4) only ever preview or
+    //   stub-fail Commit for that division, so they were never actually
+    //   consumed) would otherwise leak into this fixture's round robin.
+    // - Team ids are assigned sequentially as "team_N" and compared as
+    //   STRINGS, not numbers: crossing from single- to double-digit (e.g.
+    //   "team_9" -> "team_10") sorts the new double-digit id FIRST (its
+    //   first differing character, '1', is less than '9'). One
+    //   unregistered decoy team is created between the two original teams
+    //   and the late third team specifically to land that crossing exactly
+    //   where the new team needs to sort first.
+    const elig = await page.evaluate(async ({ seasonId, levelId, leagueId, day, openSlotIds }) => {
+      const post = async (p, b) => (await fetch(p, {
+        method: "POST", credentials: "same-origin",
+        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
+      })).json();
+      for (const id of openSlotIds) {
+        await post(`/api/setup/ice-slot/${id}/delete`, {});
+      }
+      const division = await post("/api/setup/division",
+        { season_id: seasonId, level_id: levelId, name: "TeamEligibility" });
+      const club = await post("/api/setup/club", { name: "Eligibility Club" });
+      const team = async (n) => (await post("/api/v2/setup/team",
+        { club_id: club.id, league_id: levelId, name: n })).id;
+      const e0 = await team("Eligibility 0");
+      const e1 = await team("Eligibility 1");
+      const register = (teamId) => post(
+        `/api/setup/seasons/${seasonId}/team-registrations`,
+        { team_id: teamId, division_id: division.id });
+      await register(e0);
+      await register(e1);
+      const venue = await post("/api/setup/venue",
+        { name: "Eligibility Arena", league_id: leagueId });
+      await post(`/api/v2/setup/seasons/${seasonId}/venue-access`,
+        { venue_id: venue.id });
+      const rink = await post("/api/setup/rink",
+        { venue_id: venue.id, name: "Eligibility Rink" });
+      await post("/api/setup/ice-slot", {
+        rink_id: rink.id, start_time: `${day}T23:00:00+00:00`,
+        end_time: `${day}T23:59:00+00:00`, slot_type: "game",
+      });
+      return { divisionId: division.id, clubId: club.id };
+    }, {
+      seasonId: ids.seasonId, levelId: ids.levelId, leagueId: ids.leagueId,
+      day: ICE_DAY, openSlotIds: ids.mixedOpenSlotIds,
+    });
+
+    // The Scheduler tab's division list is captured at render time, not
+    // re-fetched on every action -- switch away and back to force a fresh
+    // render that picks up the just-created division.
+    await page.click('.tab[data-tab="dashboard"]');
+    await page.waitForSelector('.tab[data-tab="scheduler"]', { state: "visible", timeout: 10000 });
+    await page.click('.tab[data-tab="scheduler"]');
+    await page.waitForSelector("#sched-div", { timeout: 10000 });
+    await page.waitForFunction(
+      (id) => !!document.querySelector(`#sched-div option[value="${id}"]`),
+      elig.divisionId, { timeout: 10000 });
+    await generateFor(page, elig.divisionId,
+      '#sched-preview[data-games="1"][data-already-scheduled="0"]');
+    s = await previewState(page);
+    if (s.commitDisabled !== false) {
+      fail(`team-eligibility staleness: needs an enabled Commit to click: ${JSON.stringify(s)}`);
+    }
+    const placedRowBefore = s.rows.find((r) => !r.sub.includes("Already scheduled"));
+    if (!placedRowBefore) {
+      fail(`team-eligibility staleness: expected exactly one placed row: ${JSON.stringify(s)}`);
+    }
+
+    // One unregistered decoy team (see the digit-boundary note above), then
+    // a third team that registers in the SAME division after Generate --
+    // no stub, no interception, just a real backend write in the gap
+    // between the operator's preview and clicking Commit.
+    await page.evaluate(async ({ seasonId, divisionId, clubId, levelId }) => {
+      const post = async (p, b) => (await fetch(p, {
+        method: "POST", credentials: "same-origin",
+        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
+      })).json();
+      await post("/api/v2/setup/team",
+        { club_id: clubId, league_id: levelId, name: "(decoy)" });
+      const e2 = await post("/api/v2/setup/team",
+        { club_id: clubId, league_id: levelId, name: "Eligibility 2 (late)" });
+      await post(`/api/setup/seasons/${seasonId}/team-registrations`,
+        { team_id: e2.id, division_id: divisionId });
+    }, {
+      seasonId: ids.seasonId, divisionId: elig.divisionId,
+      clubId: elig.clubId, levelId: ids.levelId,
+    });
+
+    await page.click("[data-sched-commit]");
+    await page.waitForFunction(
+      () => /out of date/i.test((document.querySelector(".toast-msg") || {}).textContent || ""),
+      null, { timeout: 10000 });
+    await page.waitForFunction(
+      () => !document.querySelector("[data-sched-commit]")
+        && !!document.querySelector("[data-sched-generate]"),
+      null, { timeout: 10000 });
+
+    // Zero side effects: a fresh Generate for the SAME (now 3-team)
+    // division must still show nothing already-scheduled -- if the
+    // refused commit had silently persisted anyway, the previously
+    // previewed pairing would show up as already-scheduled here. It must
+    // also still place the EXACT SAME pairing on the exact same slot
+    // (confirming the fixture really did isolate the eligibility axis --
+    // Commit was refused despite the placed row being unchanged, not
+    // because the round robin happened to reshuffle it too).
+    await generateFor(page, elig.divisionId,
+      '#sched-preview[data-already-scheduled="0"]');
+    s = await previewState(page);
+    if (s.alreadyScheduled !== "0") {
+      fail(`team-eligibility staleness: refused commit must not have created `
+        + `any Game (would show as already-scheduled on the next preview): ${JSON.stringify(s)}`);
+    }
+    const placedRowAfter = s.rows.find((r) => !r.sub.includes("Already scheduled"));
+    if (!placedRowAfter || placedRowAfter.title !== placedRowBefore.title
+        || placedRowAfter.sub !== placedRowBefore.sub) {
+      fail(`team-eligibility staleness: expected the late third team's `
+        + `registration to leave the originally placed row unchanged `
+        + `(proving this fixture isolates the eligibility axis): `
+        + `before=${JSON.stringify(placedRowBefore)} after=${JSON.stringify(placedRowAfter)}`);
+    }
+
     if (errors.length) {
       fail(`console/page errors:\n${errors.join("\n")}`);
     }
-    console.log(`[${viewport.label}] OK — mixed and all-already-scheduled previews both name already-scheduled pairings distinctly from proposed games and conflicts, and both a commit-time race refusal (naming the winning Game) and a stale-preview refusal show an actionable message then require a fresh Generate.`);
+    console.log(`[${viewport.label}] OK — mixed and all-already-scheduled previews both name already-scheduled pairings distinctly from proposed games and conflicts, both a commit-time race refusal (naming the winning Game) and a stale-preview refusal show an actionable message then require a fresh Generate, and a real (unstubbed) team-registration change between Generate and Commit is refused by the real backend with zero Games created.`);
   } catch (error) {
     throw new Error(`${error.message}\n--- demo server output ---\n${serverOutput}`);
   } finally {
