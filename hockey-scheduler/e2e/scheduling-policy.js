@@ -98,7 +98,8 @@ async function checkViewport(browser, viewport) {
     // Seed: one Division with two registered teams, one rink with a hosted
     // game slot and a second free slot 10 minutes after it, and a rink-scope
     // policy of 5m warm-up + 10m resurfacing (required gap 15 > actual 10).
-    const ids = await page.evaluate(async ({ s1s, s1e, s2s, s2e, s3s, s3e }) => {
+    const ids = await page.evaluate(async ({ s1s, s1e, s2s, s2e, s3s, s3e,
+                                             s4s, s4e }) => {
       const post = async (p, b) => (await fetch(p, {
         method: "POST", credentials: "same-origin",
         headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
@@ -125,6 +126,9 @@ async function checkViewport(browser, viewport) {
       const slot1 = await post("/api/setup/ice-slot", { rink_id: rink.id, start_time: s1s, end_time: s1e });
       const slot2 = await post("/api/setup/ice-slot", { rink_id: rink.id, start_time: s2s, end_time: s2e });
       const slot3 = await post("/api/setup/ice-slot", { rink_id: rink.id, start_time: s3s, end_time: s3e });
+      // Far from every other slot (>= 50 min), so a committed draft here
+      // passes the turnover gate cleanly.
+      const slot4 = await post("/api/setup/ice-slot", { rink_id: rink.id, start_time: s4s, end_time: s4e });
       const game = await post("/api/setup/game", {
         season_id: season.id, division_id: division.id,
         home_team_id: teamA.id, away_team_id: teamB.id, ice_slot_id: slot1.id });
@@ -139,12 +143,14 @@ async function checkViewport(browser, viewport) {
         scope_type: "rink", scope_id: rink.id,
         warmup_minutes: 5, resurfacing_minutes: 10 });
       return { rink: rink.id, slot1: slot1.id, slot2: slot2.id,
+               slot4: slot4.id, division: division.id,
                game: game.id, gameError: game.error || null,
                game2: game2.id, game2Error: game2.error || null,
                policyError: policy.error || null };
     }, { s1s: iso(t0), s1e: iso(plusMin(t0, 60)),
          s2s: iso(plusMin(t0, 70)), s2e: iso(plusMin(t0, 130)),
-         s3s: iso(plusMin(t0, 300)), s3e: iso(plusMin(t0, 360)) });
+         s3s: iso(plusMin(t0, 300)), s3e: iso(plusMin(t0, 360)),
+         s4s: iso(plusMin(t0, 180)), s4e: iso(plusMin(t0, 240)) });
     if (ids.gameError) fail(`seed game failed: ${JSON.stringify(ids.gameError)}`);
     if (ids.game2Error) fail(`seed game 2 failed: ${JSON.stringify(ids.game2Error)}`);
     if (ids.policyError) fail(`seed policy failed: ${JSON.stringify(ids.policyError)}`);
@@ -194,10 +200,61 @@ async function checkViewport(browser, viewport) {
     await page.waitForSelector(".ib-preview, .banner.warn", { timeout: 15000 });
     const warnText = await page.$$eval(".ib-warn", (els) =>
       els.map((el) => el.textContent.replace(/\s+/g, " ").trim()).join(" | "));
-    if (!warnText.includes("warm-up + resurfacing"))
-      fail(`builder should warn about the sub-buffer turnover, got: ${warnText}`);
-    if (!/reserves 15 min/.test(warnText))
-      fail(`builder warning should name the policy buffer, got: ${warnText}`);
+    if (!warnText.includes("resurfacing + warm-up"))
+      fail(`builder should warn about the sub-requirement pair, got: ${warnText}`);
+    if (!/needs 15 min/.test(warnText))
+      fail(`builder warning should name the requirement, got: ${warnText}`);
+    if (!/only 0 min apart/.test(warnText))
+      fail(`builder warning should name the offending pair's real gap, got: ${warnText}`);
+
+    // (D) A committed DRAFT physically reserves ice: the calendar card and
+    // the scheduler review row show the same derived span, and discarding
+    // the draft frees it everywhere (#319 review).
+    const commit = await page.evaluate(async ({ division, slot4 }) => {
+      const post = async (p, b) => (await fetch(p, {
+        method: "POST", credentials: "same-origin",
+        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
+      })).json();
+      return post("/api/scheduler/commit", { division_id: division, slot_ids: [slot4] });
+    }, { division: ids.division, slot4: ids.slot4 });
+    if (commit.error || (commit.created || []).length !== 1)
+      fail(`draft commit should create exactly one game: ${JSON.stringify(commit)}`);
+    const openDay = async () => {
+      await page.click('.tab[data-tab="calendar"]');
+      await page.waitForSelector('[data-mode="month"]', { state: "visible", timeout: 10000 });
+      await page.click('[data-mode="month"]');
+      await page.waitForSelector(`[data-cal-day="${dayKey}"]`, { timeout: 10000 });
+      await page.click(`[data-cal-day="${dayKey}"]`);
+      await page.waitForSelector(".slot-card", { timeout: 10000 });
+      return page.$$eval(".slot-card", (els) =>
+        els.map((el) => el.textContent.replace(/\s+/g, " ").trim()));
+    };
+    await page.reload({ waitUntil: "domcontentloaded" });
+    await page.waitForSelector("#content > *", { timeout: 10000 });
+    const cardsAfterDraft = await openDay();
+    const reservedAfterDraft = cardsAfterDraft.filter((t) => t.includes("reserved"));
+    if (reservedAfterDraft.length !== 3)
+      fail(`the committed draft's slot should add a third reserved card, got ${JSON.stringify(cardsAfterDraft)}`);
+    await page.click('.tab[data-tab="scheduler"]');
+    await page.waitForSelector(".li .slot-reserved", { timeout: 10000 });
+    const reviewReserved = await page.$$eval(".li .slot-reserved", (els) =>
+      els.map((el) => el.textContent.replace(/\s+/g, " ").trim()));
+    if (!reviewReserved.some((t) => /\+5m warm-up, \+10m resurfacing/.test(t)))
+      fail(`the review row should show the same reserved span: ${JSON.stringify(reviewReserved)}`);
+    const discard = await page.evaluate(async () => {
+      const r = await fetch("/api/scheduler/drafts/discard", {
+        method: "POST", credentials: "same-origin",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ all: true }) });
+      return r.json();
+    });
+    if (discard.error) fail(`discard failed: ${JSON.stringify(discard)}`);
+    await page.reload({ waitUntil: "domcontentloaded" });
+    await page.waitForSelector("#content > *", { timeout: 10000 });
+    const cardsAfterDiscard = await openDay();
+    const reservedAfterDiscard = cardsAfterDiscard.filter((t) => t.includes("reserved"));
+    if (reservedAfterDiscard.length !== 2)
+      fail(`discard should free the draft's reserved span, got ${JSON.stringify(cardsAfterDiscard)}`);
 
     if (errors.length) fail(`browser errors: ${errors.join(" ;; ")}`);
     console.log(`[${viewport.label}] scheduling-policy journey OK`);

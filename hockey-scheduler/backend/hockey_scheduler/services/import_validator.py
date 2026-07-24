@@ -308,21 +308,56 @@ def _ingest_policy(store, rink):
     return values, tz_name
 
 
+def _hosted_effective_policy(store, rink, season_id):
+    """The placement gate's exact Rink > Season > Program field merge for a
+    game whose season the store already knows (#319 review): the season's
+    OWN program — not the venue bridge — supplies the Program scope, so an
+    advisory about an existing HOSTED slot predicts precisely what the
+    gate will enforce."""
+    rows = [store.find_scheduling_policy(PolicyScopeType.RINK, rink.id)]
+    season = store.get_season(season_id) if season_id else None
+    if season is not None:
+        rows.append(store.find_scheduling_policy(
+            PolicyScopeType.SEASON, season.id))
+        if season.program_id:
+            rows.append(store.find_scheduling_policy(
+                PolicyScopeType.PROGRAM, season.program_id))
+    values = {}
+    for field in ("warmup_minutes", "resurfacing_minutes",
+                  "min_playable_minutes", "curfew_local"):
+        values[field] = next(
+            (getattr(r, field) for r in rows
+             if r is not None and getattr(r, field) is not None), None)
+    return values
+
+
 def _check_policy_advisories(report: _Report, parsed_slots, slot_types,
                              store) -> None:
     """#277 Slice B ingest advisories — WARNINGS, never errors: contracted
     start/end values import untouched (the issue's no-silent-time-shift
     mandate), but a row the placement gate will later refuse a game is
-    flagged now, per persisted rink policy (see ``_ingest_policy`` for the
-    honest resolution scope). Three checks per row against rinks that
-    already exist in the store (a rink created by this same upload can have
-    no policy yet): playable span shorter than the minimum, same-rink gap
-    below warmup+resurfacing — against both this sheet's other rows and
-    already-committed slots — and end past curfew (venue timezone,
-    half-open exactly like enforcement via the shared curfew_instant)."""
+    flagged now. Three checks per row against rinks that already exist in
+    the store (a rink created by this same upload can have no policy yet):
+    playable span shorter than the minimum, same-rink DIRECTIONAL turnover
+    proximity (#319 review — the earlier side's resurfacing plus the later
+    side's warm-up, each from that side's honest resolution: an existing
+    slot HOSTING an active game contributes its game's full effective
+    Rink/Season/Program policy exactly like the gate, while the incoming
+    row and any season-less counterpart resolve at rink level via
+    ``_ingest_policy``; a warning is worded as a DEFINITIVE gate refusal
+    only when the hosting game's own side alone already exceeds the gap —
+    every violation that depends on the incoming row's rink-level guess is
+    LABELED a rink-level advisory instead, since a future game's season
+    can shadow that guess), and end past curfew (venue timezone, half-open
+    exactly like enforcement via the shared curfew_instant)."""
     rinks_by_ref = {r.external_ref: r for r in store.all_rinks()
                     if r.external_ref}
     policy_cache = {}
+    hosted_policy_cache = {}  # (rink_id, season_id) -> effective fields
+    # An active game — committed drafts count, exactly like the gate —
+    # pins its slot's side of the buffer to ITS season's effective policy.
+    hosted = {g.ice_slot_id: g for g in store.all_games()
+              if g.ice_slot_id and not g.cancelled}
     for row, rink_code, start, end in parsed_slots:
         if slot_types.get(row) != "game":
             continue  # maintenance/practice ice never hosts a game
@@ -340,48 +375,104 @@ def _check_policy_advisories(report: _Report, parsed_slots, slot_types,
                 f"Slot is only {slot_minutes} playable minutes; rink "
                 f"{rink_code}'s scheduling policy requires at least "
                 f"{min_playable} — it will be refused a game.")
-        buffer_minutes = ((values["warmup_minutes"] or 0)
-                          + (values["resurfacing_minutes"] or 0))
-        if buffer_minutes > 0:
-            # Same boundary rule as the gate: STRICTLY closer than the
-            # buffer conflicts; a gap exactly equal to it is compliant.
-            def _too_close(o_start, o_end):
-                if intervals_overlap(start, end, o_start, o_end):
-                    return True
-                if o_start >= end:
-                    gap = (o_start - end).total_seconds()
-                else:
-                    gap = (start - o_end).total_seconds()
-                return 0 <= gap < buffer_minutes * 60
+        # -- turnover proximity, DIRECTIONAL per side (#319 review): the
+        # required gap is the EARLIER side's resurfacing + the LATER side's
+        # warm-up, same boundary rule as the gate (STRICTLY closer
+        # conflicts; a gap exactly equal is compliant and silent). The
+        # incoming row's side always resolves at rink level (an ice slot
+        # belongs to no season at ingest); the counterpart's side resolves
+        # from its hosting active game's effective policy when there is
+        # one, else at rink level too.
+        def _gap_required_split(o_start, o_end, other_values):
+            """(gap, required, other_side): the directional pair math plus
+            the COUNTERPART's own contribution alone — the only part a
+            hosted advisory may treat as certain, since the incoming row's
+            side is a rink-level guess a future season can shadow.
+            ``other_side`` is None for a physical overlap (refused by the
+            gate on occupancy grounds regardless of any policy)."""
+            if intervals_overlap(start, end, o_start, o_end):
+                return 0, max(
+                    (values["resurfacing_minutes"] or 0)
+                    + (other_values["warmup_minutes"] or 0),
+                    (other_values["resurfacing_minutes"] or 0)
+                    + (values["warmup_minutes"] or 0)), None
+            if o_start >= end:   # incoming earlier: its resurfacing +
+                gap = (o_start - end).total_seconds() // 60
+                other_side = other_values["warmup_minutes"] or 0
+                required = ((values["resurfacing_minutes"] or 0)
+                            + other_side)
+            else:                # incoming later: counterpart's resurfacing
+                gap = (start - o_end).total_seconds() // 60
+                other_side = other_values["resurfacing_minutes"] or 0
+                required = (other_side
+                            + (values["warmup_minutes"] or 0))
+            return int(gap), required, other_side
 
-            near = []
-            for other_row, other_code, o_start, o_end in parsed_slots:
-                if other_row == row or other_code != rink_code:
-                    continue
-                if slot_types.get(other_row) != "game":
-                    continue  # buffers are game-vs-game, like the gate
-                if _too_close(o_start, o_end):
-                    near.append(f"row {other_row}")
-            for ex in store.all_ice_slots():
-                if ex.rink_id != rink.id:
-                    continue
-                if getattr(ex.slot_type, "value", ex.slot_type) != "game":
-                    continue  # buffers are game-vs-game, like the gate
-                if ex.start_time == start and ex.end_time == end:
-                    # The row's own persisted copy — a re-import updates
-                    # this exact tuple in place (the commit path's
-                    # documented identity), so warning against it would
-                    # falsely flag every idempotent re-import
-                    # (_check_players self-excludes for the same reason).
-                    continue
-                if _too_close(ex.start_time, ex.end_time):
-                    near.append(f"existing slot {ex.id}")
-            if near:
-                report.warning(
-                    "ice_slots", row,
-                    f"Slot sits closer than the {buffer_minutes}-minute "
-                    f"turnover buffer to {near[0]} on rink {rink_code}; "
-                    "games on both cannot coexist under the policy.")
+        near_hosted, near_rink_level = [], []
+        for other_row, other_code, o_start, o_end in parsed_slots:
+            if other_row == row or other_code != rink_code:
+                continue
+            if slot_types.get(other_row) != "game":
+                continue  # buffers are game-vs-game, like the gate
+            gap, required, _side = _gap_required_split(o_start, o_end,
+                                                       values)
+            if required > 0 and 0 <= gap < required:
+                near_rink_level.append((f"row {other_row}", gap, required))
+        for ex in store.all_ice_slots():
+            if ex.rink_id != rink.id:
+                continue
+            if getattr(ex.slot_type, "value", ex.slot_type) != "game":
+                continue  # buffers are game-vs-game, like the gate
+            if ex.start_time == start and ex.end_time == end:
+                # The row's own persisted copy — a re-import updates
+                # this exact tuple in place (the commit path's
+                # documented identity), so warning against it would
+                # falsely flag every idempotent re-import
+                # (_check_players self-excludes for the same reason).
+                continue
+            host = hosted.get(ex.id)
+            if host is not None:
+                hkey = (rink.id, host.season_id)
+                if hkey not in hosted_policy_cache:
+                    hosted_policy_cache[hkey] = _hosted_effective_policy(
+                        store, rink, host.season_id)
+                other_values = hosted_policy_cache[hkey]
+            else:
+                other_values = values
+            gap, required, host_side = _gap_required_split(
+                ex.start_time, ex.end_time, other_values)
+            if required > 0 and 0 <= gap < required:
+                # DEFINITIVE only when the hosting game's OWN side alone
+                # already exceeds the gap (then the gate refuses whatever
+                # season the imported row's future game resolves) or the
+                # spans physically overlap; a violation that needs the
+                # incoming row's rink-level guess stays an advisory.
+                if host is not None and (host_side is None
+                                         or gap < host_side):
+                    near_hosted.append(
+                        (f"existing slot {ex.id}", gap,
+                         required if host_side is None else host_side))
+                else:
+                    near_rink_level.append(
+                        (f"existing slot {ex.id}", gap, required))
+        if near_hosted:
+            what, gap, needed = near_hosted[0]
+            report.warning(
+                "ice_slots", row,
+                f"Slot sits only {gap} min from {what} on rink "
+                f"{rink_code}, which hosts a game whose scheduling policy "
+                f"needs {needed} min on its side of the pair — the "
+                "placement gate will refuse a game here whatever season "
+                "the new row's games belong to.")
+        elif near_rink_level:
+            what, gap, required = near_rink_level[0]
+            report.warning(
+                "ice_slots", row,
+                f"Rink-level advisory: slot sits only {gap} min from "
+                f"{what} on rink {rink_code}; the effective policies need "
+                f"{required} min of resurfacing + warm-up between games, "
+                "so games on both may not coexist (the games' seasons "
+                "decide the exact requirement).")
         curfew = values["curfew_local"]
         if curfew:
             try:

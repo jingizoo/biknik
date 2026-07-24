@@ -3071,33 +3071,50 @@ class SetupService:
         # order is fixed by the (identical) template + inventory, sort_keys
         # canonicalizes the rest.
         classified = self._classify_ice_windows(accessible, plan)
-        # #277 Slice B — advisory: a template whose between-slot turnover is
-        # smaller than a rink's effective warmup+resurfacing buffer will
-        # generate adjacent slots that cannot BOTH host games (the placement
-        # gate refuses the second). Surfaced per rink in the reviewed
-        # payload, so it is fingerprint-bound like every other reviewed
-        # field: setting or clearing such a policy after preview moves the
-        # token and forces a re-preview.
+        # #277 Slice B — advisory: warn per rink only when this template
+        # ACTUALLY generates a consecutive pair whose real gap is below the
+        # rink's effective directional requirement (the earlier row's
+        # resurfacing + the later row's warm-up — one policy, the builder's
+        # own Season, governs both generated rows), naming the worst
+        # offending pair and its gap so the operator can fix the template
+        # before committing ice the placement gate will half-refuse.
+        # Computed from the REAL sorted generated intervals per rink/date —
+        # two far-apart windows on one day stay silent, and a gap exactly
+        # equal to the requirement is compliant (half-open, like the gate).
+        # Lives inside the reviewed payload, so it is fingerprint-bound like
+        # every other reviewed field: setting or clearing such a policy
+        # after preview moves the token and forces a re-preview.
         policy_notes = []
-        # Only a rink that actually generates BACK-TO-BACK slots (>= 2 on one
-        # date) can violate the between-games buffer with this template; a
-        # one-slot-per-day window has no adjacency to warn about.
-        _per_day = {}
+        _by_rink_day = {}
         for c in classified:
-            _per_day[(c["rink_id"], c["date"])] = \
-                _per_day.get((c["rink_id"], c["date"]), 0) + 1
-        _adjacent_rinks = {rid for (rid, _d), n in _per_day.items() if n >= 2}
+            _by_rink_day.setdefault((c["rink_id"], c["date"]), []).append(c)
         for rink, _venue in accessible:
-            if rink.id not in _adjacent_rinks:
-                continue
             values, _src = self._effective_policy(rink.id, season.id)
-            buffer_minutes = ((values["warmup_minutes"] or 0)
-                              + (values["resurfacing_minutes"] or 0))
-            if buffer_minutes > turnover_minutes:
+            required = ((values["resurfacing_minutes"] or 0)
+                        + (values["warmup_minutes"] or 0))
+            if required <= 0:
+                continue
+            worst = None
+            for (rid, _d), rows in _by_rink_day.items():
+                if rid != rink.id or len(rows) < 2:
+                    continue
+                rows = sorted(rows, key=lambda r: r["start"])
+                for prev, nxt in zip(rows, rows[1:]):
+                    gap = int((nxt["start"] - prev["end"]).total_seconds()
+                              // 60)
+                    if 0 <= gap < required and (worst is None
+                                                or gap < worst["gap"]):
+                        worst = {"gap": gap, "prev": prev, "nxt": nxt}
+            if worst is not None:
                 policy_notes.append({
                     "rink_id": rink.id, "rink_name": rink.name,
+                    "date": worst["prev"]["date"],
+                    "pair_end_local": worst["prev"]["end_local"],
+                    "pair_next_start_local": worst["nxt"]["start_local"],
+                    "gap_minutes": worst["gap"],
+                    "required_gap_minutes": required,
                     "template_turnover_minutes": turnover_minutes,
-                    "policy_buffer_minutes": buffer_minutes})
+                    "policy_buffer_minutes": required})
         base = {
             "season": season, "tz": tz, "d_start": d_start, "d_end": d_end,
             "weekday_set": weekday_set,

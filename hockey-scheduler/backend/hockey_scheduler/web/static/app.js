@@ -2867,11 +2867,12 @@ function renderIcePreview(pv) {
   // window that resolves an ambiguous boundary is informational (the earlier
   // fold was used); the repeated-hour ROWS it can produce are disambiguated
   // below regardless of whether the WINDOW boundary itself was ambiguous.
-  // #277: template turnover below a rink's effective warm-up+resurfacing
-  // buffer — adjacent generated slots can't BOTH host games; warn per rink.
+  // #277: a generated consecutive pair sits closer than the rink's
+  // effective warm-up+resurfacing requirement — those two slots can't BOTH
+  // host games; warn per rink, naming the offending pair and its real gap.
   const policyNotes = (pv.policy_notes || []).length
     ? pv.policy_notes.map((n) =>
-        `<div class="ib-warn">⚠ ${esc(n.rink_name)}: this template leaves ${n.template_turnover_minutes} min between slots, but the scheduling policy reserves ${n.policy_buffer_minutes} min of warm-up + resurfacing between games — back-to-back slots there cannot all host games.</div>`).join("")
+        `<div class="ib-warn">⚠ ${esc(n.rink_name)}: on ${esc(n.date)} the slot ending ${esc(n.pair_end_local)} and the next starting ${esc(n.pair_next_start_local)} are only ${n.gap_minutes} min apart, but the scheduling policy needs ${n.required_gap_minutes} min of resurfacing + warm-up between games — both cannot host games.</div>`).join("")
     : "";
   const dstSkips = (pv.dst_skipped || []).length
     ? `<div class="ib-warn">⚠ ${pv.dst_skipped.length} window(s) skipped — the local start/end time doesn't exist that day (a spring-forward gap): ${pv.dst_skipped.map((s) => esc(`${s.date} (${s.boundary})`)).join(", ")}. Adjust the window to fall outside the gap, then preview again.</div>`
@@ -3139,8 +3140,13 @@ function gamesRow(g) {
   const confirmed = g.roster_status === "roster_confirmed" || g.roster_status === "locked";
   const ck = (ok, lbl, meta) => `<div class="check ${ok ? "ok" : "todo"}"><span class="ic">${ok ? "✓" : "○"}</span>
     <span class="lbl">${lbl}</span>${meta ? `<span class="meta">${meta}</span>` : ""}</div>`;
+  // #277: the schedule review shows the same derived reserved span as the
+  // calendar and the scheduler's draft rows (one backend derivation).
+  const rsv = g.reserved
+    ? `<div class="slot-reserved">reserved ${fmt(g.reserved.reserved_start_time)}–${fmt(g.reserved.reserved_end_time)} (+${g.reserved.warmup_minutes}m warm-up, +${g.reserved.resurfacing_minutes}m resurfacing)</div>`
+    : "";
   const detail = `<div class="games-detail">
-    ${ck(true, "Ice slot allocated")}
+    ${ck(true, "Ice slot allocated")}${rsv}
     ${ck(confirmed, "Roster", prettyStatus(g.roster_status))}
     ${ck((g.officials_assigned || 0) > 0 && (g.officials_accepted || 0) === g.officials_assigned, "Officials",
          g.officials_assigned ? `${g.officials_accepted}/${g.officials_assigned} accepted` : "None assigned")}
@@ -4393,11 +4399,17 @@ function schedDraftRow(g) {
   const checked = schedulerState.selected.has(g.game_id);
   const badges = g.issues.map((i) =>
     `<span class="badge ${SCHED_ISSUE_SEVERE.has(i) ? "red" : "orange"}">${esc(SCHED_ISSUE_LABEL[i] || i)}</span>`).join(" ");
+  // #277: a committed draft physically blocks warm-up/resurfacing facility
+  // time — the review row shows the same derived reserved span the
+  // calendar's slot card does (one backend derivation feeds both).
+  const rsv = g.reserved
+    ? `<div class="slot-reserved">reserved ${fmt(g.reserved.reserved_start_time)}–${fmt(g.reserved.reserved_end_time)} (+${g.reserved.warmup_minutes}m warm-up, +${g.reserved.resurfacing_minutes}m resurfacing)</div>`
+    : "";
   return `<div class="li">
     <input type="checkbox" class="sched-pick" data-sched-pick="${esc(g.game_id)}" ${checked ? "checked" : ""} />
     <span class="li-time">${fmt(g.start_time)}</span>
     <div class="li-main"><div class="li-title">${esc(g.home_team_name)} vs ${esc(g.away_team_name)}</div>
-      <div class="li-sub">${esc(g.division_name || "")} · ${esc(g.rink_name || "")}${badges ? " · " + badges : ""}</div></div>
+      <div class="li-sub">${esc(g.division_name || "")} · ${esc(g.rink_name || "")}${badges ? " · " + badges : ""}</div>${rsv}</div>
     <span class="pill gray">Draft</span>${delBtn("game", g.game_id,
       g.home_team_name + " vs " + g.away_team_name, "Delete draft")}</div>`;
 }
