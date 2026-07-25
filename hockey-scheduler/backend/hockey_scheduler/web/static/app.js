@@ -7199,9 +7199,22 @@ async function render() {
     // response's report to the NEW sample text and misreport it as
     // already-validated).
     const requestKey = importSnapshotKey(type);
+    // Snapshot the context generation too (#331 review round 9): the checks
+    // above only ever detected the SHEETS changing under a slow response,
+    // never a context switch -- importState.report/validatedKey are cleared
+    // at switch time (invalidateContextScopedMutations()), but nothing
+    // stopped an ALREADY-IN-FLIGHT Validate that started before the switch
+    // from landing afterward and reattaching a report/validatedKey the
+    // operator never reviewed under the NEW context, silently re-enabling
+    // Commit with no fresh B validation. type/text are deliberately still
+    // checked too: a context switch clears report/validatedKey/committed
+    // only, not sheetsText or the type selector, so either kind of
+    // staleness needs its own check.
+    const requestRevision = contextRevision;
     importState.committed = null;
     const res = await post("/api/import/dry-run", body);
-    if (importState.type !== type.key || importSnapshotKey(type) !== requestKey) return;
+    if (importState.type !== type.key || importSnapshotKey(type) !== requestKey
+        || contextRevision !== requestRevision) return;
     toast = "";
     importState.report = res;
     importState.validatedKey = (res && !res.error) ? requestKey : null;
@@ -7220,14 +7233,19 @@ async function render() {
       toastIsError = true;
       return render();
     }
+    const requestRevision = contextRevision;  // #331 review round 9, consistency with Validate above
     const body = buildImportBody(type);
     if (type.needsSeason) body.season_id = importState.seasonId;
     const res = await post(type.commitPath, body);
     // Same stale-response guard as Validate above — discard this response
-    // if the sheets or the selected type changed while the request was in
-    // flight, rather than showing a commit result for content that's no
-    // longer what's on screen.
-    if (importState.type !== type.key || importSnapshotKey(type) !== requestKey) return;
+    // if the sheets, the selected type, or the context changed while the
+    // request was in flight, rather than showing a commit result for
+    // content that's no longer what's on screen (#331 review round 9 added
+    // the context leg -- the commit ITSELF already went to whichever
+    // season_id this click actually captured, so this only guards what the
+    // client does with the RESPONSE, same as the others below it).
+    if (importState.type !== type.key || importSnapshotKey(type) !== requestKey
+        || contextRevision !== requestRevision) return;
     toast = "";
     importState.committed = res;
     if (res && res.committed) { importState.report = null; importState.validatedKey = null; }
@@ -7431,8 +7449,20 @@ async function render() {
     // `change` listener above already does.
     if (!iceBuilder) return;
     toast = "";
+    // Snapshot the context generation (#331 review round 9): unlike the
+    // guard above, this one covers the AWAIT below, not just the click.
+    // iceBuilder.preview was previously assigned straight from the response
+    // with no staleness check at all -- a held preview held across a switch
+    // and then released restores stale (even other-context) slots into a
+    // preview that looks live, re-enabling Create. Re-check `iceBuilder`
+    // itself too: an identity switch nulls it wholesale, and a plain context
+    // switch could in principle let a new builder exist by the time this
+    // resolves.
+    const requestRevision = contextRevision;
     iceBuilder.form = readIceBuilderForm(c);
-    iceBuilder.preview = await post("/api/setup/ice-availability/preview", iceBuilder.form);
+    const preview = await post("/api/setup/ice-availability/preview", iceBuilder.form);
+    if (!iceBuilder || contextRevision !== requestRevision) return;
+    iceBuilder.preview = preview;
     render();
   });
   const ibCommit = c.querySelector("[data-ib-commit]");
@@ -7455,9 +7485,23 @@ async function render() {
       toastIsError = true;
       return render();
     }
+    // Snapshot the context generation (#331 review round 9): the commit
+    // itself is already correctly bound to whatever template this click
+    // captured -- the fingerprint check above is the authoritative guard for
+    // THAT, and the server independently rejects a mismatched fingerprint --
+    // but the RESPONSE handling below reaches into the live `iceBuilder`,
+    // including nulling it out on success or writing a fresh preview into it
+    // on a mismatch. If a context or identity switch happened while this
+    // request was in flight, the operator may already be looking at a
+    // brand-new B-context builder by the time it resolves; without this
+    // check an A-context commit's late response would wipe out that
+    // in-progress B builder, attach an A-context re-preview onto it, or
+    // crash outright against a `null` left by an identity switch.
+    const requestRevision = contextRevision;
     iceBuilder.form = readIceBuilderForm(c);
     const res = await post("/api/setup/ice-availability/commit",
       { ...iceBuilder.form, template_fingerprint: fingerprint });
+    if (!iceBuilder || contextRevision !== requestRevision) return;
     const reason = res && res.error && res.error.details && res.error.details.reason;
     if (res && !res.error) {
       toast = `Created ${res.totals.created} ice slot(s).`; iceBuilder = null;
@@ -7467,7 +7511,13 @@ async function render() {
       // preview so the operator reviews the CURRENT slots before creating again;
       // never commit the stale set.
       toast = "The schedule changed since preview — showing the updated proposal. Review, then create again.";
-      iceBuilder.preview = await post("/api/setup/ice-availability/preview", iceBuilder.form);
+      // Same guard around this second await (#331 review round 9) -- a
+      // switch could just as easily land during the re-preview as during
+      // the commit above.
+      const rePreviewRevision = contextRevision;
+      const rePreview = await post("/api/setup/ice-availability/preview", iceBuilder.form);
+      if (!iceBuilder || contextRevision !== rePreviewRevision) return;
+      iceBuilder.preview = rePreview;
     } else {
       iceBuilder.preview = res;
     }
@@ -7768,10 +7818,33 @@ function invalidateContextScopedMutations() {
     drawer = null; drawerError = ""; drawerValues = {};
   }
 }
+// Coalescing queue for context-switch POSTs (#331 review round 9): every
+// setActiveContext() call used to send its own /api/context POST
+// immediately, so a rapid A->B->C could leave all three genuinely in flight
+// at once. contextSwitchSeq (above) already makes the BROWSER ignore a
+// superseded response, but each POST still reaches ContextService.set(),
+// which persists ActiveContext as a plain unconditional last-write-wins
+// with no generation/ordering guard at all -- whichever of the three
+// requests the SERVER happens to finish processing last wins there,
+// regardless of which one the browser ends up displaying. The operator
+// could see C in the header while the server -- and everything that reads
+// its OWN persisted context, starting with /api/v2/setup/progress -- is
+// scoped to a completely different Program. Fixed by never letting more
+// than one /api/context POST be in flight at once: a switch requested
+// while one is already outstanding is queued (overwriting any earlier
+// still-queued one, since only the LATEST intent is ever worth sending),
+// and is sent immediately once the in-flight one settles, before that
+// response gets any chance to reconcile anything. With at most one such
+// POST ever in flight, the server's own last-write-wins persistence is
+// trivially equivalent to "last intent wins" -- there is no window left
+// for the two to disagree, on any backend.
+let contextSwitchInFlight = false;
+let contextSwitchQueued = null;  // {programId, seasonId, mySeq} -- the one pending switch not yet sent, if any
+
 // Persist a switcher pick, then reflect it in the hash and re-render.
 async function setActiveContext(programId, seasonId) {
   const mySeq = ++contextSwitchSeq;
-  // Invalidate SYNCHRONOUSLY, before the await below (#331 review round 8) --
+  // Invalidate SYNCHRONOUSLY, before anything below (#331 review round 8) --
   // see invalidateContextScopedMutations()'s own comment for why.
   // contextRevision bumps here too, not just after success further down:
   // contextSeededDrawerValues()'s own in-flight-hierarchy-fetch guard and
@@ -7780,18 +7853,44 @@ async function setActiveContext(programId, seasonId) {
   // only once it's confirmed.
   invalidateContextScopedMutations();
   contextRevision += 1;
+  if (contextSwitchInFlight) {
+    contextSwitchQueued = { programId, seasonId, mySeq };
+    return;
+  }
+  await sendContextSwitch(mySeq, programId, seasonId);
+}
+async function sendContextSwitch(mySeq, programId, seasonId) {
+  contextSwitchInFlight = true;
   const r = await post("/api/context",
     { program_id: programId, season_id: seasonId || null });
-  if (mySeq !== contextSwitchSeq) return;  // superseded by a newer switch
+  contextSwitchInFlight = false;
+  // A newer intent queued while this POST was in flight is strictly more
+  // current than whatever this response says -- send it immediately, before
+  // doing ANYTHING with this response (including reconciling a failure), so
+  // the server only ever receives requests in the operator's own real order
+  // (#331 review round 9). resetTransientUiState() clears this on an
+  // identity change, so an old identity's pending switch can never fire
+  // under a new one.
+  if (contextSwitchQueued) {
+    const next = contextSwitchQueued;
+    contextSwitchQueued = null;
+    return sendContextSwitch(next.mySeq, next.programId, next.seasonId);
+  }
+  // Superseded some other way -- e.g. resetTransientUiState() bumped
+  // contextSwitchSeq directly on an identity change while this POST (the
+  // OLD identity's own) was still in flight.
+  if (mySeq !== contextSwitchSeq) return;
   if (!r || r.error) {
     // Generic, no existence oracle (the backend returns the same not-found
     // whether it doesn't exist or isn't ours). Refresh options in case the
     // authorized set shifted underneath us. Everything invalidated above
     // STAYS invalidated -- reconciling the canonical context on failure must
-    // never restore a stale enabled action (#331 review round 8).
+    // never restore a stale enabled action (#331 review round 8), and must
+    // converge on whatever the server actually has, never a context this
+    // failed POST never got the server to accept (#331 review round 9).
     toast = "That Program/Season isn't available."; toastIsError = true;
     await loadContextOptions();
-    if (mySeq !== contextSwitchSeq) return;
+    if (mySeq !== contextSwitchSeq || contextSwitchQueued) return;
     render();
     return;
   }
@@ -8099,6 +8198,17 @@ function resetTransientUiState() {
     drawer = null; drawerError = ""; drawerValues = {};
   }
   contextRevision += 1;
+  // A context switch this identity initiated but had not yet gotten a POST
+  // out for (queued behind one already in flight, see setActiveContext()'s
+  // own comment) belongs to nobody now -- discard it rather than letting it
+  // fire against the NEXT signed-in identity's session once the in-flight
+  // request settles (#331 review round 9). Bumping contextSwitchSeq too
+  // means that in-flight request's OWN completion -- necessarily still the
+  // OLD identity's -- recognizes on arrival that it's been superseded and
+  // skips its own reconciliation entirely, the same way an ordinary
+  // superseded switch already does.
+  contextSwitchQueued = null;
+  contextSwitchSeq += 1;
 }
 function setUser(user) {
   const prevId = currentUser ? currentUser.username : null;

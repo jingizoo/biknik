@@ -1975,7 +1975,11 @@ async function checkRoleScenarios(browser, viewport) {
     // switch is attempted, not once its own /api/context POST resolves
     // (#331 review round 8): validatedKey used to stay live for the WHOLE
     // round trip, so a Commit landing in that window would still target J1
-    // even though the switcher already shows J2.
+    // even though the switcher already shows J2. J3 (below) is for (J2)'s
+    // own straggling-response coverage further down -- created here,
+    // before this scenario's own freshLoad(), so it is already a
+    // selectable #ctx-select option when needed (same requirement (I)'s
+    // own comment documents for H2 above).
     const j = await page.evaluate(async () => {
       const post = async (p, b) => (await fetch(p, {
         method: "POST", credentials: "same-origin",
@@ -1989,8 +1993,25 @@ async function checkRoleScenarios(browser, viewport) {
         { name: "Round8J2 Program", country: "US" });
       const seasonJ2 = await post("/api/v2/setup/season",
         { program_id: progJ2.id, name: "Season J2" });
+      const progJ3 = await post("/api/v2/setup/program",
+        { name: "Round9J3 Program", country: "US" });
+      const seasonJ3 = await post("/api/v2/setup/season",
+        { program_id: progJ3.id, name: "Season J3" });
+      // J4/J5 are for (J3)'s own straggling-COMMIT-response coverage
+      // further down -- same pre-existence requirement as J3 above.
+      const progJ4 = await post("/api/v2/setup/program",
+        { name: "Round9J4 Program", country: "US" });
+      const seasonJ4 = await post("/api/v2/setup/season",
+        { program_id: progJ4.id, name: "Season J4" });
+      const progJ5 = await post("/api/v2/setup/program",
+        { name: "Round9J5 Program", country: "US" });
+      const seasonJ5 = await post("/api/v2/setup/season",
+        { program_id: progJ5.id, name: "Season J5" });
       return { progJ1: progJ1.id, seasonJ1: seasonJ1.id,
-        progJ2: progJ2.id, seasonJ2: seasonJ2.id };
+        progJ2: progJ2.id, seasonJ2: seasonJ2.id,
+        progJ3: progJ3.id, seasonJ3: seasonJ3.id,
+        progJ4: progJ4.id, seasonJ4: seasonJ4.id,
+        progJ5: progJ5.id, seasonJ5: seasonJ5.id };
     });
     await apiPost(page, "/api/context", { program_id: j.progJ1, season_id: j.seasonJ1 });
     await freshLoad();
@@ -2051,6 +2072,98 @@ async function checkRoleScenarios(browser, viewport) {
         + "switch settled, not stay enabled from J1's stale review");
     }
 
+    // ---- (J2) A Validate response that straggles in AFTER a switch has
+    // FULLY SETTLED must not resurrect report/validatedKey under the new
+    // context either (#331 review round 9 finding B) -- a DIFFERENT
+    // window than (J) above: that one closes the gap while the switch is
+    // still PENDING; this one closes the later gap where the switch has
+    // already completed by the time a request that started BEFORE it
+    // finally resolves. Reusing J2's still-pasted text on purpose (type
+    // and text are both UNCHANGED from the click above) is exactly what
+    // defeats importSnapshotKey()'s own pre-existing check, proving this
+    // needs its own contextRevision guard rather than piggybacking on
+    // that one.
+    let releaseValidateJ2;
+    const validateHoldJ2 = new Promise((resolve) => { releaseValidateJ2 = resolve; });
+    await page.route("**/api/import/dry-run", async (route) => {
+      await validateHoldJ2; await route.continue();
+    });
+    await page.click("[data-import-validate]");
+    await new Promise((r) => setTimeout(r, 200));  // let the stale Validate request actually leave
+    const switchToJ3 = `${j.progJ3}|${j.seasonJ3}`;
+    await page.selectOption("#ctx-select", switchToJ3);
+    await page.waitForFunction((v) => document.getElementById("ctx-select").value === v,
+      switchToJ3, { timeout: 10000 });
+    // Wait for the Import view's OWN re-render to bind J3, not just
+    // #ctx-select's value (same gap steps F/G/K's own comments document
+    // elsewhere in this file), so the switch is genuinely FULLY SETTLED
+    // before the stale response below is released.
+    await page.waitForFunction(
+      (v) => (document.getElementById("import-season") || {}).value === v,
+      j.seasonJ3, { timeout: 10000 });
+    await page.waitForLoadState("networkidle").catch(() => {});
+    releaseValidateJ2();
+    await page.unroute("**/api/import/dry-run");
+    await new Promise((r) => setTimeout(r, 300));  // let the stale response's own (discarded) handler run
+    const jCommitEnabledAfterStraggler = await page.evaluate(() => {
+      const btn = document.querySelector("[data-import-commit]");
+      return btn ? !btn.disabled : null;
+    });
+    if (jCommitEnabledAfterStraggler) {
+      fail("(J2) expected a Validate response straggling in after the "
+        + "switch to J3 fully settled to NOT re-enable Commit");
+    }
+
+    // ---- (J3) A COMMIT response that straggles in AFTER a switch has
+    // FULLY SETTLED must not paint a stale result under the new context
+    // either (#331 review round 9 finding B): Commit's own click-time
+    // fingerprint/validatedKey check already means the WRITE this request
+    // performs is correctly bound to whatever was reviewed at click time --
+    // this guard is about what the CLIENT does with the response, not the
+    // write itself. Without it, a straggling "Committed" result would
+    // paint a misleading banner under a context the operator never
+    // committed anything in, and -- more seriously -- `res.committed`
+    // being true also nulls out report/validatedKey, which would silently
+    // wipe out a genuinely fresh validation the operator had ALREADY
+    // completed under the new context by the time this stale response
+    // landed.
+    const switchToJ4 = `${j.progJ4}|${j.seasonJ4}`;
+    await page.selectOption("#ctx-select", switchToJ4);
+    await page.waitForFunction(
+      (v) => (document.getElementById("import-season") || {}).value === v,
+      j.seasonJ4, { timeout: 10000 });
+    await page.click("[data-import-sample]");
+    const j4ValidateResp = page.waitForResponse((r) =>
+      r.url() === `${base}/api/import/dry-run` && r.request().method() === "POST");
+    await page.click("[data-import-validate]");
+    await j4ValidateResp;
+    await page.waitForFunction(() => {
+      const btn = document.querySelector("[data-import-commit]");
+      return !!(btn && !btn.disabled);
+    }, null, { timeout: 10000 });
+    let releaseCommitJ4;
+    const commitHoldJ4 = new Promise((resolve) => { releaseCommitJ4 = resolve; });
+    await page.route("**/api/import/commit/teams-players", async (route) => {
+      await commitHoldJ4; await route.continue();
+    });
+    await page.click("[data-import-commit]");
+    await new Promise((r) => setTimeout(r, 200));  // let the stale Commit request actually leave
+    const switchToJ5 = `${j.progJ5}|${j.seasonJ5}`;
+    await page.selectOption("#ctx-select", switchToJ5);
+    await page.waitForFunction((v) => document.getElementById("ctx-select").value === v,
+      switchToJ5, { timeout: 10000 });
+    await page.waitForFunction(
+      (v) => (document.getElementById("import-season") || {}).value === v,
+      j.seasonJ5, { timeout: 10000 });
+    await page.waitForLoadState("networkidle").catch(() => {});
+    releaseCommitJ4();
+    await page.unroute("**/api/import/commit/teams-players");
+    await new Promise((r) => setTimeout(r, 300));  // let the stale response's own (discarded) handler run
+    if (await page.$(".import-report")) {
+      fail("(J3) expected a Commit response straggling in after the "
+        + "switch to J5 fully settled to NOT paint a result banner there");
+    }
+
     // ---- (K) Ice Builder Create must be uncommittable the INSTANT a
     // context switch is attempted too (#331 review round 8) -- the
     // identical gap as Import's own Commit above, closed the same way
@@ -2079,8 +2192,47 @@ async function checkRoleScenarios(browser, viewport) {
         { name: "Round8K2 Program", country: "US" });
       const seasonK2 = await post("/api/v2/setup/season", { program_id: progK2.id,
         name: "Season K2", start_date: "2026-09-01", end_date: "2027-03-31" });
+      // K3 is for (K2)'s own straggling-response coverage further down --
+      // created here, before this scenario's own freshLoad(), so it is
+      // already a selectable #ctx-select option when needed (same
+      // requirement (I)'s own comment documents for H2 above).
+      const progK3 = await post("/api/v2/setup/program",
+        { name: "Round9K3 Program", country: "US" });
+      const seasonK3 = await post("/api/v2/setup/season", { program_id: progK3.id,
+        name: "Season K3", start_date: "2026-09-01", end_date: "2027-03-31" });
+      const venueK3 = await post("/api/v2/setup/venue",
+        { name: "VK3", organization_id: null });
+      const rinkK3 = await post("/api/v2/setup/rink",
+        { venue_id: venueK3.id, name: "RK3" });
+      await post(`/api/v2/setup/seasons/${seasonK3.id}/venue-access`,
+        { venue_id: venueK3.id });
+      // K4/K5 are for (K3)'s own straggling-COMMIT-response coverage
+      // further down -- same pre-existence requirement as K3 above.
+      const progK4 = await post("/api/v2/setup/program",
+        { name: "Round9K4 Program", country: "US" });
+      const seasonK4 = await post("/api/v2/setup/season", { program_id: progK4.id,
+        name: "Season K4", start_date: "2026-09-01", end_date: "2027-03-31" });
+      const venueK4 = await post("/api/v2/setup/venue",
+        { name: "VK4", organization_id: null });
+      const rinkK4 = await post("/api/v2/setup/rink",
+        { venue_id: venueK4.id, name: "RK4" });
+      await post(`/api/v2/setup/seasons/${seasonK4.id}/venue-access`,
+        { venue_id: venueK4.id });
+      const progK5 = await post("/api/v2/setup/program",
+        { name: "Round9K5 Program", country: "US" });
+      const seasonK5 = await post("/api/v2/setup/season", { program_id: progK5.id,
+        name: "Season K5", start_date: "2026-09-01", end_date: "2027-03-31" });
+      const venueK5 = await post("/api/v2/setup/venue",
+        { name: "VK5", organization_id: null });
+      const rinkK5 = await post("/api/v2/setup/rink",
+        { venue_id: venueK5.id, name: "RK5" });
+      await post(`/api/v2/setup/seasons/${seasonK5.id}/venue-access`,
+        { venue_id: venueK5.id });
       return { progK1: progK1.id, seasonK1: seasonK1.id, rinkK1: rinkK1.id,
-        progK2: progK2.id, seasonK2: seasonK2.id };
+        progK2: progK2.id, seasonK2: seasonK2.id,
+        progK3: progK3.id, seasonK3: seasonK3.id, rinkK3: rinkK3.id,
+        progK4: progK4.id, seasonK4: seasonK4.id, rinkK4: rinkK4.id,
+        progK5: progK5.id, seasonK5: seasonK5.id, rinkK5: rinkK5.id };
     });
     await apiPost(page, "/api/context", { program_id: k.progK1, season_id: k.seasonK1 });
     await freshLoad();
@@ -2149,72 +2301,340 @@ async function checkRoleScenarios(browser, viewport) {
         + `Program-only context, got ${ibSeasonAfterProgramOnly}`);
     }
 
-    // ---- (L) Rapid A->B->C with DELIBERATELY REVERSED response order:
-    // only the LATEST switch attempt may ever apply its own
-    // POST/refresh/render result (#331 review round 8's contextSwitchSeq),
-    // regardless of which response happens to arrive first over the wire.
+    // ---- (K2) A Preview response that straggles in AFTER a switch has
+    // FULLY SETTLED must not resurrect iceBuilder.preview under the new
+    // context either (#331 review round 9 finding B) -- the same
+    // straggling-response class as (J2) above, for Ice Builder's Preview
+    // instead of Import's Validate. Preview had NO staleness check of any
+    // kind before this fix -- iceBuilder.preview = await post(...) simply
+    // overwrote whatever was live by the time it resolved, so a held
+    // response completing after the operator had already moved on to a
+    // different Season/rink could silently re-enable Create there with
+    // another context's slots.
+    const switchToK3 = `${k.progK3}|${k.seasonK3}`;
+    await page.selectOption("#ctx-select", switchToK3);
+    await page.waitForFunction(
+      (v) => (document.getElementById("ib-season") || {}).value === v,
+      k.seasonK3, { timeout: 10000 });
+    await page.click(`.ib-rink[value="${k.rinkK3}"]`);
+    let releasePreviewK3;
+    const previewHoldK3 = new Promise((resolve) => { releasePreviewK3 = resolve; });
+    await page.route("**/api/setup/ice-availability/preview", async (route) => {
+      await previewHoldK3; await route.continue();
+    });
+    await page.click("[data-ib-preview]");
+    await new Promise((r) => setTimeout(r, 200));  // let the stale Preview request actually leave
+    const switchToK1Again = `${k.progK1}|${k.seasonK1}`;
+    await page.selectOption("#ctx-select", switchToK1Again);
+    await page.waitForFunction(
+      (v) => (document.getElementById("ib-season") || {}).value === v,
+      k.seasonK1, { timeout: 10000 });
+    await page.waitForLoadState("networkidle").catch(() => {});  // the switch itself fully settles first
+    releasePreviewK3();
+    await page.unroute("**/api/setup/ice-availability/preview");
+    await new Promise((r) => setTimeout(r, 300));  // let the stale response's own (discarded) handler run
+    if (await page.$("[data-ib-commit]")) {
+      fail("(K2) expected a Preview response straggling in after the "
+        + "switch to K1 fully settled to NOT resurrect a committable "
+        + "stale preview");
+    }
+
+    // ---- (K3) A COMMIT response that straggles in AFTER a switch has
+    // FULLY SETTLED must not paint a stale result under the new context
+    // either (#331 review round 9 finding B) -- the same class as (J3)
+    // above, for Ice Builder's Commit instead of Import's. Commit's own
+    // click-time fingerprint check already means the WRITE this request
+    // performs is correctly bound to whatever was previewed at click time
+    // -- this guard is about what the CLIENT does with the response.
+    // Without it, a straggling "Created N ice slot(s)" success would null
+    // out iceBuilder under the new context, silently closing a brand-new
+    // builder the operator may have already opened there.
+    const switchToK4 = `${k.progK4}|${k.seasonK4}`;
+    await page.selectOption("#ctx-select", switchToK4);
+    await page.waitForFunction(
+      (v) => (document.getElementById("ib-season") || {}).value === v,
+      k.seasonK4, { timeout: 10000 });
+    await page.click(`.ib-rink[value="${k.rinkK4}"]`);
+    const k4PreviewResp = page.waitForResponse((r) =>
+      r.url() === `${base}/api/setup/ice-availability/preview` && r.request().method() === "POST");
+    await page.click("[data-ib-preview]");
+    await k4PreviewResp;
+    await page.waitForSelector("[data-ib-commit]", { timeout: 10000 });
+    let releaseCommitK4;
+    const commitHoldK4 = new Promise((resolve) => { releaseCommitK4 = resolve; });
+    await page.route("**/api/setup/ice-availability/commit", async (route) => {
+      await commitHoldK4; await route.continue();
+    });
+    await page.click("[data-ib-commit]");
+    await new Promise((r) => setTimeout(r, 200));  // let the stale Commit request actually leave
+    const switchToK5 = `${k.progK5}|${k.seasonK5}`;
+    await page.selectOption("#ctx-select", switchToK5);
+    await page.waitForFunction(
+      (v) => (document.getElementById("ib-season") || {}).value === v,
+      k.seasonK5, { timeout: 10000 });
+    await page.waitForLoadState("networkidle").catch(() => {});
+    releaseCommitK4();
+    await page.unroute("**/api/setup/ice-availability/commit");
+    await new Promise((r) => setTimeout(r, 300));  // let the stale response's own (discarded) handler run
+    if (!(await page.$(".ib-form"))) {
+      fail("(K3) expected the Ice Builder to remain open under K5 after a "
+        + "stale K4 Commit response landed -- it must never null out a "
+        + "different context's builder");
+    }
+    const k3ToastAfter = await page.evaluate(() =>
+      (document.querySelector("#toast-root .toast-msg") || {}).textContent || "");
+    if (/created/i.test(k3ToastAfter)) {
+      fail(`(K3) expected no stale "Created" toast to appear under K5 `
+        + `after a straggling K4 Commit response, got: `
+        + `${JSON.stringify(k3ToastAfter)}`);
+    }
+
+    // ---- (L) Rapid A->B->C must reach the SERVER as "last INTENT wins",
+    // not merely "last response wins" (#331 review round 9 finding A):
+    // contextSwitchSeq (round 8) only ever governed which RESPONSE the
+    // client honors -- it never stopped the underlying POSTs themselves
+    // from reaching the server out of order, and ContextService.set()'s
+    // persistence is a plain last-write-wins overwrite with no
+    // generation/version guard of its own. Three independently-fired POSTs
+    // used to mean whichever one the SERVER happened to finish processing
+    // LAST decided what was actually persisted, regardless of which
+    // response the client chose to render. The fix coalesces client-side:
+    // at most one /api/context POST is ever in flight for this session at
+    // a time, and only the single latest pending target survives being
+    // superseded, so an intermediate pick can be dropped without ever
+    // reaching the network at all. Proven three ways below: the network
+    // traffic itself shows the coalescing (not just the eventual UI
+    // value), the SERVER's own persisted row (not just the client's
+    // hash/DOM) agrees with the client once it settles, and that agreement
+    // survives a hash-free reload (proving real server persistence, not a
+    // client-side or URL-hash artifact) -- plus a failure-convergence case
+    // for when the one request that IS sent comes back rejected.
     const l = await page.evaluate(async () => {
       const post = async (p, b) => (await fetch(p, {
         method: "POST", credentials: "same-origin",
         headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
       })).json();
-      const progL1 = await post("/api/v2/setup/program", { name: "Round8L1 Program", country: "US" });
-      const progL2 = await post("/api/v2/setup/program", { name: "Round8L2 Program", country: "US" });
-      const progL3 = await post("/api/v2/setup/program", { name: "Round8L3 Program", country: "US" });
-      return { progL1: progL1.id, progL2: progL2.id, progL3: progL3.id };
+      const progL1 = await post("/api/v2/setup/program", { name: "Round9L1 Program", country: "US" });
+      const progL2 = await post("/api/v2/setup/program", { name: "Round9L2 Program", country: "US" });
+      const progL3 = await post("/api/v2/setup/program", { name: "Round9L3 Program", country: "US" });
+      const progL4 = await post("/api/v2/setup/program", { name: "Round9L4 Program", country: "US" });
+      return { progL1: progL1.id, progL2: progL2.id, progL3: progL3.id, progL4: progL4.id };
     });
     await apiPost(page, "/api/context", { program_id: l.progL1, season_id: null });
     await freshLoad();
-    const holdsL = {}; const releasersL = {};
-    [l.progL1, l.progL2, l.progL3].forEach((pid) => {
-      holdsL[pid] = new Promise((resolve) => { releasersL[pid] = resolve; });
-    });
-    await page.route("**/api/context", async (route) => {
-      let pid = null;
-      try { pid = JSON.parse(route.request().postData() || "{}").program_id; } catch (_) {}
-      if (holdsL[pid]) await holdsL[pid];
-      await route.continue();
-    });
     const switchToL1 = `${l.progL1}|`;
     const switchToL2 = `${l.progL2}|`;
     const switchToL3 = `${l.progL3}|`;
+    const switchToL4 = `${l.progL4}|`;
+
+    // Track every /api/context POST that actually leaves the page during
+    // the burst -- the coalescing claim is specifically that L1 never gets
+    // one of its own, not just that the UI eventually shows L3.
+    const seenRequestsL = [];
+    const trackL = (req) => {
+      if (req.url() === `${base}/api/context` && req.method() === "POST") {
+        let pid = null;
+        try { pid = JSON.parse(req.postData() || "{}").program_id; } catch (_) {}
+        seenRequestsL.push(pid);
+      }
+    };
+    page.on("request", trackL);
+    // Hold only L2 and L3's own POSTs by identity -- L1 must never reach
+    // this route handler at all if coalescing works, since it is
+    // superseded client-side (by L3 overwriting the pending queue) before
+    // its own request would ever be sent.
+    let releaseL2, releaseL3;
+    const holdL2 = new Promise((resolve) => { releaseL2 = resolve; });
+    const holdL3 = new Promise((resolve) => { releaseL3 = resolve; });
+    await page.route("**/api/context", async (route) => {
+      if (route.request().method() !== "POST") { await route.continue(); return; }
+      let pid = null;
+      try { pid = JSON.parse(route.request().postData() || "{}").program_id; } catch (_) {}
+      if (pid === l.progL2) await holdL2;
+      else if (pid === l.progL3) await holdL3;
+      await route.continue();
+    });
     await page.selectOption("#ctx-select", switchToL2);
+    await new Promise((r) => setTimeout(r, 200));  // let L2's own POST actually leave (contextSwitchInFlight latches true)
     await page.selectOption("#ctx-select", switchToL1);
+    await new Promise((r) => setTimeout(r, 100));  // L1 only ever gets queued -- nothing should reach the network for it
     await page.selectOption("#ctx-select", switchToL3);
-    // Reversed release order: L3 (the LATEST attempt) resolves first, then
-    // L1, then L2 (the two SUPERSEDED attempts) -- deliberately the
-    // opposite of the order they were initiated in.
-    releasersL[l.progL3]();
-    await new Promise((r) => setTimeout(r, 150));
-    releasersL[l.progL1]();
-    await new Promise((r) => setTimeout(r, 150));
-    releasersL[l.progL2]();
+    await new Promise((r) => setTimeout(r, 100));  // L3 overwrites the queued L1, which is now gone for good
+    if (seenRequestsL.length !== 1 || seenRequestsL[0] !== l.progL2) {
+      fail(`(L) expected exactly one /api/context POST so far, for L2 only `
+        + `(L1 coalesced away before it could ever be sent), got `
+        + `${JSON.stringify(seenRequestsL)}`);
+    }
+    releaseL2();
+    await new Promise((r) => setTimeout(r, 400));  // let L2 settle AND the dequeued L3 POST actually leave
+    if (seenRequestsL.length !== 2 || seenRequestsL[1] !== l.progL3) {
+      fail(`(L) expected L3's own POST to fire immediately once L2's `
+        + `request settled (the coalesced queue dequeuing, not a fresh `
+        + `pick), got ${JSON.stringify(seenRequestsL)}`);
+    }
+    releaseL3();
+    await page.unroute("**/api/context");
+    page.off("request", trackL);
+    await page.waitForFunction((v) => document.getElementById("ctx-select").value === v,
+      switchToL3, { timeout: 10000 });
+    await page.waitForLoadState("networkidle").catch(() => {});
+    if (seenRequestsL.length !== 2 || seenRequestsL.includes(l.progL1)) {
+      fail(`(L) expected L1 to NEVER reach the network across the whole `
+        + `burst, got ${JSON.stringify(seenRequestsL)}`);
+    }
+
+    // The client's own hash/DOM agreeing with itself proves nothing about
+    // what actually got PERSISTED -- that gap is exactly finding A. Read
+    // the server's own view back directly instead.
+    const lServerContext = await apiGet(page, "/api/context");
+    if (!lServerContext || lServerContext.program_id !== l.progL3) {
+      fail(`(L) expected the SERVER's own persisted active context to be `
+        + `L3 (${l.progL3}) once the burst settled, got `
+        + `${JSON.stringify(lServerContext)}`);
+    }
+    const lServerOptions = await apiGet(page, "/api/context/options");
+    if (!lServerOptions || !lServerOptions.selected
+        || lServerOptions.selected.program_id !== l.progL3) {
+      fail(`(L) expected /api/context/options.selected to agree on L3 `
+        + `(${l.progL3}) too, got `
+        + `${JSON.stringify(lServerOptions && lServerOptions.selected)}`);
+    }
+
+    // Persistence must survive a genuinely hash-free reload -- freshLoad()
+    // navigates to the bare origin with no #ctx fragment at all, so the
+    // switcher below can ONLY be restored from the server's own
+    // ActiveContext row via loadContextOptions(), never from
+    // restoreContextDeepLink() adopting a URL-encoded selection (proving
+    // this is real server persistence, not a client-side or hash
+    // artifact).
+    await freshLoad();
+    const lReloadedValue = await page.$eval("#ctx-select", (el) => el.value);
+    if (lReloadedValue !== switchToL3) {
+      fail(`(L) expected L3 (${switchToL3}) to survive a hash-free reload, `
+        + `got ${lReloadedValue}`);
+    }
+
+    // ---- (L, failure convergence) If the one request the coalescing fix
+    // DOES send comes back rejected, the client must converge on whatever
+    // the server's TRUE current context actually is (re-fetched via
+    // loadContextOptions()), not get stuck showing the failed target as if
+    // it had been accepted.
+    await page.route("**/api/context", async (route) => {
+      if (route.request().method() !== "POST") { await route.continue(); return; }
+      await route.fulfill({
+        status: 500, contentType: "application/json",
+        body: JSON.stringify({ error: { code: "not_found",
+          message: "That Program no longer exists." } }),
+      });
+    });
+    await page.selectOption("#ctx-select", switchToL4);
+    await page.waitForFunction(
+      () => /isn't available/i.test(
+        (document.querySelector("#toast-root .toast-msg") || {}).textContent || ""),
+      null, { timeout: 10000 });
     await page.unroute("**/api/context");
     await page.waitForFunction((v) => document.getElementById("ctx-select").value === v,
       switchToL3, { timeout: 10000 });
-    await new Promise((r) => setTimeout(r, 300));  // let any superseded response's own handler return
-    const lFinalValue = await page.$eval("#ctx-select", (el) => el.value);
-    if (lFinalValue !== switchToL3) {
-      fail(`(L) expected the switcher to settle on L3 (${switchToL3}) `
-        + `regardless of response order, got ${lFinalValue}`);
+    const lServerContextAfterFailure = await apiGet(page, "/api/context");
+    if (!lServerContextAfterFailure || lServerContextAfterFailure.program_id !== l.progL3) {
+      fail(`(L, failure convergence) expected the server's own context to `
+        + `still be L3 (${l.progL3}) after L4's switch failed -- a `
+        + `rejected POST must never be treated as accepted -- got `
+        + `${JSON.stringify(lServerContextAfterFailure)}`);
     }
-    const lFinalHash = await page.evaluate(() => location.hash);
-    if (lFinalHash.indexOf(encodeURIComponent(l.progL3).slice(0, 6)) === -1
-        && lFinalHash.indexOf(l.progL3) === -1) {
-      // The hash is base64url-encoded JSON, not the raw id -- decode it
-      // properly rather than substring-matching the id, which would never
-      // actually appear verbatim.
-      const decoded = await page.evaluate(() => {
-        try {
-          const b64 = location.hash.slice(5).replace(/-/g, "+").replace(/_/g, "/");
-          return JSON.parse(atob(b64));
-        } catch (_) { return null; }
-      });
-      if (!decoded || decoded.p !== l.progL3) {
-        fail(`(L) expected the URL hash to encode L3 (${l.progL3}), got `
-          + `${JSON.stringify(decoded)} from ${lFinalHash}`);
+    // The deliberately-fulfilled 500 above is expected to log a browser
+    // resource-load console error the same way the hierarchy-fetch-error
+    // scenario's own comment documents further up in this file -- require
+    // at least one, proving the mock actually fired, then drop every
+    // matching message so any other, genuinely unexpected error still
+    // fails the gate at the end of this scenario.
+    const unexpectedL = errors.filter((e) => !/responded with a status of 500/.test(e));
+    if (unexpectedL.length === errors.length) {
+      fail("(L, failure convergence) expected the deliberately failed "
+        + `switch to log a resource error, got:\n${errors.join("\n")}`);
+    }
+    errors.length = 0;
+    errors.push(...unexpectedL);
+
+    // ---- (L, identity supersession) A switch QUEUED (not yet sent to the
+    // server, per the coalescing fix above) when an identity change
+    // happens must never fire under the NEW identity (#331 review round
+    // 9): resetTransientUiState()'s own `contextSwitchQueued = null;
+    // contextSwitchSeq += 1;` closes this. Without it, the OLD identity's
+    // queued intent would still be sitting in contextSwitchQueued when the
+    // in-flight POST it was queued behind eventually settles, and
+    // sendContextSwitch()'s own dequeue would fire it as if the NEW
+    // identity had asked for it.
+    const li = await page.evaluate(async () => {
+      const post = async (p, b) => (await fetch(p, {
+        method: "POST", credentials: "same-origin",
+        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
+      })).json();
+      const progLI1 = await post("/api/v2/setup/program", { name: "Round9LI1 Program", country: "US" });
+      const progLI2 = await post("/api/v2/setup/program", { name: "Round9LI2 Program", country: "US" });
+      const progLI3 = await post("/api/v2/setup/program", { name: "Round9LI3 Program", country: "US" });
+      return { progLI1: progLI1.id, progLI2: progLI2.id, progLI3: progLI3.id };
+    });
+    await apiPost(page, "/api/context", { program_id: li.progLI1, season_id: null });
+    await freshLoad();
+    const seenRequestsLI = [];
+    const trackLI = (req) => {
+      if (req.url() === `${base}/api/context` && req.method() === "POST") {
+        let pid = null;
+        try { pid = JSON.parse(req.postData() || "{}").program_id; } catch (_) {}
+        seenRequestsLI.push(pid);
       }
+    };
+    page.on("request", trackLI);
+    let releaseLI2;
+    const holdLI2 = new Promise((resolve) => { releaseLI2 = resolve; });
+    // Hold ONLY the LI2 POST by identity, the same way (L)'s own burst
+    // route does above -- an indiscriminate hold on every /api/context
+    // POST would also catch whatever the identity switch below's own boot
+    // sequence fires (e.g. loadContextOptions()/restoreContextDeepLink()'s
+    // own reconciliation), deadlocking this scenario against itself since
+    // that POST settling may be exactly what the identity switch is
+    // waiting on.
+    await page.route("**/api/context", async (route) => {
+      if (route.request().method() !== "POST") { await route.continue(); return; }
+      let pid = null;
+      try { pid = JSON.parse(route.request().postData() || "{}").program_id; } catch (_) {}
+      if (pid === li.progLI2) await holdLI2;
+      await route.continue();
+    });
+    const switchToLI2 = `${li.progLI2}|`;
+    const switchToLI3 = `${li.progLI3}|`;
+    await page.selectOption("#ctx-select", switchToLI2);
+    await new Promise((r) => setTimeout(r, 200));  // let LI2's own POST actually leave (contextSwitchInFlight latches true)
+    await page.selectOption("#ctx-select", switchToLI3);
+    await new Promise((r) => setTimeout(r, 100));  // LI3 only ever gets queued while LI2's POST is still in flight
+    // The identity switch below must discard LI3 from the queue BEFORE
+    // LI2's own held response is released -- the whole point of this
+    // scenario is that the queued switch never gets a chance to be sent
+    // under the identity that queued it, let alone the one it lands under.
+    await page.selectOption("#role-switch", "arena");
+    await page.waitForFunction(
+      () => (document.getElementById("user-name") || {}).textContent === "arena",
+      null, { timeout: 10000 });
+    releaseLI2();
+    await page.unroute("**/api/context");
+    page.off("request", trackLI);
+    await page.waitForLoadState("networkidle").catch(() => {});
+    await new Promise((r) => setTimeout(r, 300));  // let LI2's own (discarded) reconciliation handler return
+    if (seenRequestsLI.includes(li.progLI3)) {
+      fail(`(L, identity supersession) expected LI3's queued switch to `
+        + `NEVER reach the network once the identity changed, got `
+        + `${JSON.stringify(seenRequestsLI)}`);
     }
+    const liServerContext = await apiGet(page, "/api/context");
+    if (liServerContext && liServerContext.program_id === li.progLI3) {
+      fail(`(L, identity supersession) expected the arena identity's own `
+        + `context to NOT be LI3 (the admin identity's discarded, queued `
+        + `pick), got ${JSON.stringify(liServerContext)}`);
+    }
+    // Restore the admin session this file's remaining teardown expects.
+    await logout(page);
+    await loginAs(page, "admin", "demo");
 
     // ---- (M) A no-reload IDENTITY switch must clear the SAME
     // context-scoped mutation state a Program/Season switch does (#331
@@ -2225,6 +2645,13 @@ async function checkRoleScenarios(browser, viewport) {
     // a different sign-in could hand the NEXT identity an in-progress paste
     // (real player names/emails), a validated report, or a live Ice
     // preview/Create action the FIRST identity never meant to share.
+    // Legs 1/2 below now seed a REAL validated report (not just pasted
+    // text) and check Commit's own enabled state, not only the textarea
+    // (#331 review round 9: text alone doesn't prove report/validatedKey
+    // were cleared too). Leg 3 adds a genuinely LOWER-privilege transition
+    // -- admin/arena both hold manage_arena, so that pair alone only ever
+    // proves resetTransientUiState() itself works, never that a role with
+    // no business seeing this could not reach it some other way.
     const m = await page.evaluate(async () => {
       const post = async (p, b) => (await fetch(p, {
         method: "POST", credentials: "same-origin",
@@ -2261,12 +2688,29 @@ async function checkRoleScenarios(browser, viewport) {
       await page.click('.tab[data-tab="import"]');
       await hierarchyCodesResp;
       await page.waitForSelector("[data-import-sample]", { timeout: 10000 });
-      const fieldId = await page.evaluate(() => {
-        const el = document.querySelector('textarea[id^="import-"]');
-        return el ? el.id : null;
-      });
-      if (!fieldId) fail("(M) expected at least one Import sheet textarea to seed a paste into");
-      await page.fill(`#${fieldId}`, "name,position\nAlice PII-Example,forward\nalice-pii@example.test,forward");
+      // Wait for the Import view's OWN re-render to bind M1's Season, same
+      // gap steps F/G/J/K/L's own comments document elsewhere in this file
+      // -- needed here now (round 9) because Commit's own enabled state
+      // below additionally requires importState.seasonId, not just a valid
+      // report.
+      await page.waitForFunction(
+        (v) => (document.getElementById("import-season") || {}).value === v,
+        m.seasonM1, { timeout: 10000 });
+      // Load the app's own known-valid sample (same proven flow as step
+      // J's own Validate coverage above) rather than hand-typed text, so
+      // Commit reliably becomes enabled below -- it still reads as
+      // realistic pasted roster data (real-looking names/emails) for the
+      // disclosure risk this step exists to cover, not just placeholder
+      // text.
+      await page.click("[data-import-sample]");
+      const mValidateResp = page.waitForResponse((r) =>
+        r.url() === `${base}/api/import/dry-run` && r.request().method() === "POST");
+      await page.click("[data-import-validate]");
+      await mValidateResp;
+      await page.waitForFunction(() => {
+        const btn = document.querySelector("[data-import-commit]");
+        return !!(btn && !btn.disabled);
+      }, null, { timeout: 10000 });
       await page.click('.tab[data-tab="calendar"]');
       await page.waitForFunction(() => document.body.dataset.view === "calendar",
         null, { timeout: 10000 });
@@ -2299,6 +2743,49 @@ async function checkRoleScenarios(browser, viewport) {
       if (textAfter) {
         fail(`(M, ${label}) expected Import's pasted text to be gone for `
           + `the newly signed-in identity, got: ${JSON.stringify(textAfter)}`);
+      }
+      // Text alone doesn't prove report/validatedKey were cleared too
+      // (#331 review round 9) -- seedImportAndIceForM() now actually
+      // validates (not just pastes), so Commit would stay live here if
+      // only sheetsText, and not report/validatedKey, were being cleared
+      // on the identity switch.
+      const commitEnabledAfter = await page.evaluate(() => {
+        const btn = document.querySelector("[data-import-commit]");
+        return btn ? !btn.disabled : null;
+      });
+      if (commitEnabledAfter) {
+        fail(`(M, ${label}) expected Commit to require fresh validation for `
+          + `the newly signed-in identity, not stay enabled from the prior `
+          + `identity's validated report`);
+      }
+    };
+    // Distinct from assertMClearedFor() above: a role with no manage_arena
+    // at all (coach) must never reach a leftover Ice Builder or the Import
+    // wizard in the first place -- the ordinary permission gate (#233
+    // review r2's nav toggle; the calendar's own hasPerm-gated "Build ice"
+    // entry point) is a second, independent guarantee alongside
+    // resetTransientUiState()'s own clearing, worth proving on its own
+    // since Legs 1/2's admin<->arena pair (both manage_arena) can never
+    // exercise it.
+    const assertMHiddenForLowerPrivilege = async (label) => {
+      await page.waitForFunction(() => !document.querySelector(".skeleton"),
+        null, { timeout: 10000 });
+      if (await page.$("[data-ib-commit]") || await page.$(".ib-form")) {
+        fail(`(M, ${label}) expected no leftover Ice Builder form/preview `
+          + `to be reachable by a role without manage_arena`);
+      }
+      if (await page.$("[data-ice-builder-open]")) {
+        fail(`(M, ${label}) expected no Ice Builder entry point to be `
+          + `offered to a role without manage_arena`);
+      }
+      // gateChrome() hides an unauthorized tab via style.display = "none",
+      // not by removing it from the DOM -- a bare presence check (page.$)
+      // would still find it and always pass regardless of whether the gate
+      // actually ran, so this must check VISIBILITY specifically.
+      if (await page.isVisible('.tab[data-tab="import"]')) {
+        fail(`(M, ${label}) expected the Import tab itself to be hidden `
+          + `from a role without manage_arena, not merely showing cleared `
+          + `content`);
       }
     };
 
@@ -2334,6 +2821,26 @@ async function checkRoleScenarios(browser, viewport) {
       () => (document.getElementById("user-name") || {}).textContent === "arena",
       null, { timeout: 10000 });
     await assertMClearedFor("sign-out/sign-in");
+    // Restore the admin session this file's remaining teardown expects.
+    await logout(page);
+    await loginAs(page, "admin", "demo");
+
+    // -- Leg 3 (#331 review round 9): sign-out then sign-in as a
+    // GENUINELY lower-privilege identity -- coach holds no manage_arena at
+    // all, unlike arena above -- proving the disclosure risk is closed
+    // even for a role that could never independently open its own Import
+    // wizard or Ice Builder to compare notes.
+    await apiPost(page, "/api/context", { program_id: m.progM1, season_id: m.seasonM1 });
+    await freshLoad();
+    await seedImportAndIceForM();
+    await page.waitForLoadState("networkidle").catch(() => {});
+    await page.click("#signout-btn");
+    await page.waitForSelector('[data-persona="coach"]', { state: "visible", timeout: 10000 });
+    await page.click('[data-persona="coach"]');
+    await page.waitForFunction(
+      () => (document.getElementById("user-name") || {}).textContent === "coach",
+      null, { timeout: 10000 });
+    await assertMHiddenForLowerPrivilege("sign-out/sign-in to lower privilege");
     // Restore the admin session this file's remaining teardown expects.
     await logout(page);
     await loginAs(page, "admin", "demo");

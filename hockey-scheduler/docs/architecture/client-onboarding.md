@@ -350,6 +350,108 @@ applied to an unrelated `logout()` race in the same test file (see that
 function's own comment in `home-tasks-hub.js`), just not yet generalized to
 this render-level race until it produced a real false negative here.
 
+Round 8's fix still left one gap open (#331 review round 9): `contextSwitchSeq`
+only ever governs which RESPONSE the browser honors — it never stopped the
+underlying POSTs themselves from reaching the server out of order, and
+`ContextService.set()`'s own persistence (both store backends) is a plain
+last-write-wins overwrite with no generation/version guard at all. A rapid
+A→B→C used to fire three independent `/api/context` POSTs; whichever one the
+SERVER happened to finish processing last decided what was actually
+persisted, regardless of which response the client chose to render — the
+switcher (and the URL hash) could show C while the server, and everything
+that reads its own persisted context afterward starting with
+`/api/v2/setup/progress`, stayed on B. The fix coalesces client-side instead
+of adding server-side ordering: `setActiveContext()` now only ever has ONE
+`/api/context` POST in flight at a time (`contextSwitchInFlight`); a switch
+requested while one is already outstanding is queued
+(`contextSwitchQueued`), overwriting any earlier still-queued one since only
+the LATEST intent is ever worth sending, and is dispatched immediately once
+the in-flight one settles — before that response gets any chance to
+reconcile anything. With at most one such POST ever in flight, the server's
+own last-write-wins persistence becomes trivially equivalent to "last intent
+wins," on either backend, since there is no window left for the two to
+disagree; an intermediate pick in a rapid burst can be — and typically is —
+dropped without ever reaching the network at all.
+`resetTransientUiState()`'s identity-transition hook discards a still-queued
+switch outright (`contextSwitchQueued = null`) and bumps `contextSwitchSeq`
+again, so a switch the OLD identity initiated but never got a POST out for
+can never fire against the NEXT signed-in identity's session once the
+in-flight request it was queued behind finally settles; that in-flight
+request's own completion recognizes the same way an ordinary superseded
+switch already does, via the pre-existing `contextSwitchSeq` check, that it
+has nothing left to reconcile either. `restoreContextDeepLink()` (the
+separate boot/sign-in-time resolver) is deliberately NOT part of this queue —
+it cannot race a user-initiated switch, since the switcher is not yet
+interactive when it runs.
+
+A second, distinct gap in the same lifecycle (also round 9): neither Import's
+Validate handler nor the Ice Builder's Preview handler had ever checked
+`contextRevision` on their OWN async completion, only on the click-time setup
+their round-7/8 predecessors already covered. `invalidateContextScopedMutations()`
+clears `importState.report`/`validatedKey` and `iceBuilder.preview` the
+instant a switch is attempted, but a Validate or Preview request already
+in flight BEFORE that moment can still resolve well AFTER the switch has
+fully settled — with the pasted sheet text and selected type both unchanged,
+which is exactly what defeats Import's own pre-existing
+`importSnapshotKey()` staleness check, since that only ever detected the
+SHEETS changing, never a context change underneath them. Landing
+un-guarded, a straggling Validate response would silently reattach a
+report/validatedKey the operator never reviewed under the new context,
+re-enabling Commit with no fresh review; a straggling Preview response —
+which had no staleness check of any kind — would directly overwrite
+`iceBuilder.preview` with a DIFFERENT context's stale slots, re-enabling
+Create. Both now snapshot `contextRevision` into a local immediately before
+the vulnerable `await` and recheck it after, the same snapshot-before-await,
+recheck-after idiom `contextSeededDrawerValues()`'s own `stillCurrent` check
+already established in round 8. The Commit/Create counterparts of both
+handlers already have a pre-await guard (a fingerprint or `validatedKey`
+check) that makes a deliberate click a genuinely-authorized write at click
+time regardless — the write itself is not at risk — but their own
+post-await RESPONSE handling reaches into the same live, shared
+`importState`/`iceBuilder` objects a brand-new context's own action may
+already be using by the time a stale response lands: an unguarded success
+would paint a misleading "Committed"/"Created" result under a context the
+operator never acted in, and — more seriously for Ice Builder's Commit,
+whose success path unconditionally nulls `iceBuilder` to close the form —
+would silently discard a different context's own brand-new, still-open
+builder out from under the operator. Both Commit handlers gained the
+identical snapshot-and-recheck guard for this reason, closing the whole
+lifecycle class (attempt-time, pending-response, and settled-but-straggling)
+in one pass across all four handlers.
+
+Verifying finding A's coalescing design meant redesigning the existing rapid
+A→B→C regression, not just re-running it: its original mechanics (independently
+holding and releasing three separate POSTs by program id) no longer describe
+what the fixed client actually does, since coalescing means an intermediate
+pick may never reach the network as its own request at all. The rebuilt
+version tracks every `/api/context` POST that leaves the page during the
+burst and asserts the coalescing directly — exactly one request for the
+first pick, then the LATEST pick's own request firing the instant the first
+settles, with the superseded middle pick never appearing on the wire at
+all — then reads the server's own persisted context back via a real `GET`
+(never inferring persistence from the client's own hash/DOM, which is
+exactly the gap finding A exploited), then re-confirms that same persisted
+value survives a genuinely hash-free reload (proving real server
+persistence, not a client-side or URL-hash artifact), then forces the one
+request the fix DOES send to come back rejected and confirms the client
+converges on the server's true prior context rather than getting stuck
+showing a target that was never accepted. A companion regression holds a
+switch in the queue across an identity change specifically, proving
+`resetTransientUiState()`'s own discard rather than assuming it from the
+identity-clearing coverage above, which never exercises a queued (as
+opposed to already-settled) switch. New regressions for finding B hold a
+Validate, a Preview, and each Commit response across a FULLY SETTLED switch
+(not merely a still-pending one, which the existing coverage already
+proved) before releasing them, and the existing identity-transition
+coverage was strengthened to check Commit's own enabled state — not only
+that pasted text was gone, which alone would not have caught a bug in
+clearing `report`/`validatedKey` specifically — and extended with a leg
+that signs in as a role holding no `manage_arena` at all, proving the
+disclosure risk closed even for an identity that could never open its own
+Import wizard or Ice Builder to compare notes; the two admin/arena legs
+alone can only ever prove `resetTransientUiState()` itself runs, since both
+roles share every permission the state in question is gated behind.
+
 The card's async states carry real accessibility semantics, not just visual
 ones (#331 review round 5 finding 5): `#sp-card-slot` (the wrapper
 `loadSetupProgressCard()` swaps content into, itself painted once by
