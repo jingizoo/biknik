@@ -508,7 +508,16 @@ function nextUpcomingGame(games) {
 // is done (`complete`); renders nothing if there's simply nothing left for
 // THIS role to act on while other, not-this-role's workflows remain (those
 // two are different claims — see get_setup_progress's docstring).
-function renderSetupProgressCard(progress, hadError) {
+function renderSetupProgressCard(progress, hadError, loading) {
+  // Per-card loading boundary (#331 review round 2 finding 3): the caller
+  // paints this skeleton immediately, before the real fetch even starts, so
+  // a slow setup-progress request only delays this one card, never the rest
+  // of the Dashboard (see loadSetupProgressCard()).
+  if (loading) {
+    return `<div class="dash-card" style="margin-bottom:16px">
+      <div class="skeleton"></div>
+    </div>`;
+  }
   if (hadError) {
     return `<div class="dash-card" style="margin-bottom:16px">
       <div class="dash-card-head"><h3>Setup progress unavailable</h3></div>
@@ -520,11 +529,20 @@ function renderSetupProgressCard(progress, hadError) {
   }
   if (!progress || !progress.program_id) return "";
   if (progress.complete) {
+    // "Imports and onboarding" stays reachable even once every REQUIRED
+    // workflow is done (#331 review round 2 finding 2) -- it's an
+    // always-available alternative entry point (decision 9), not something
+    // that should vanish once its own "optional" status is the only one
+    // left. "Go to Schedule" stays the single primary action per #204's
+    // one-primary-action-per-screen principle; Import data is secondary.
+    const importWf = progress.workflows.find((w) => w.key === "import");
     return `<div class="dash-card" style="margin-bottom:16px">
       <div class="dash-card-head"><h3>✓ All setup steps complete</h3></div>
       <p class="muted">Every Setup workflow is done for ${esc(progress.program.name)}.</p>
       <div class="actions">
         <button class="act primary" data-goto="calendar">Go to Schedule</button>
+        <button class="act ghost" data-setup-progress-action="import"
+          >${esc(importWf ? importWf.primary_action : "Import data")}</button>
       </div>
     </div>`;
   }
@@ -559,6 +577,35 @@ function renderSetupProgressCard(progress, hadError) {
     ${rows}
   </div>`;
 }
+// Fetches and paints the setup-progress card independently of the rest of
+// the Dashboard (#331 review round 2 finding 3): render() paints an
+// immediate loading skeleton into #sp-card-slot and calls this
+// fire-and-forget rather than awaiting the fetch inline, so a slow request
+// only delays this one card's own content, never the Dashboard's first
+// paint. Also the card's own Retry action, so retrying only re-fetches
+// this one thing instead of the whole Dashboard (overview/standings too).
+async function loadSetupProgressCard() {
+  const mySeq = ++setupProgressFetchSeq;
+  const sp = await getJSON("/api/v2/setup/progress");
+  if (mySeq !== setupProgressFetchSeq) return;  // a newer load already won
+  if (sp && !sp.error) { setupProgress = sp; setupProgressError = false; }
+  else { setupProgress = null; setupProgressError = true; }
+  const slot = document.getElementById("sp-card-slot");
+  if (!slot) return;  // navigated away from Dashboard before this resolved
+  slot.innerHTML = renderSetupProgressCard(setupProgress, setupProgressError, false);
+  const spAction = slot.querySelector("[data-setup-progress-action]");
+  if (spAction) spAction.onclick = () =>
+    goToSetupWorkflow(spAction.dataset.setupProgressAction);
+  const spRetry = slot.querySelector("[data-setup-progress-retry]");
+  if (spRetry) spRetry.onclick = () => loadSetupProgressCard();
+  // The complete state's "Go to Schedule" button uses the generic
+  // data-goto convention (c.querySelectorAll("[data-goto]") in render()),
+  // which only wires elements present at render()'s OWN paint -- this slot
+  // didn't have this button yet then (it was still the loading skeleton),
+  // so it needs the same wiring here too.
+  slot.querySelectorAll("[data-goto]").forEach((b) =>
+    b.onclick = () => switchTab(b.dataset.goto));
+}
 // Each workflow's real entry point (#330 review round 1 finding 3), not the
 // generic Setup tab: season/team/player open the matching create drawer
 // directly (mirrors the existing topbar "jump to Setup and open a drawer"
@@ -589,7 +636,7 @@ function goToSetupWorkflow(key) {
   if (key === "participation") {
     setupView = "hierarchy";
     switchTab("setup");
-    focusContentHeading();
+    focusParticipationRegisterControl();
     return;
   }
   if (key === "import") {
@@ -623,6 +670,33 @@ function focusContentHeading(attempt) {
     return;
   }
   if ((attempt || 0) < 40) setTimeout(() => focusContentHeading((attempt || 0) + 1), 50);
+}
+
+// Destination focus for "participation" (#331 review round 2 finding 4):
+// landing generically on the Setup hierarchy tree isn't enough -- focus
+// must reach the ACTUAL registration control for the currently-selected
+// Season (contextOptions.selected.season_id, #159), the same "Register" add
+// row renderSetupHierarchy's league sections render per (season, league)
+// (data-reg-add/data-reg-add-season). Same poll-while-loading shape as
+// focusContentHeading() (switchTab()'s render() is async, so neither
+// target necessarily exists yet on the next tick), but once loading has
+// genuinely finished with no matching control -- no league yet, or every
+// permanent team is already registered for this Season -- falls back to
+// focusContentHeading()'s generic content-region landing rather than
+// polling forever for something that will never appear.
+function focusParticipationRegisterControl(attempt) {
+  const seasonId = contextOptions && contextOptions.selected
+    && contextOptions.selected.season_id;
+  const btn = seasonId && document.querySelector(
+    `[data-reg-add][data-reg-add-season="${CSS.escape(seasonId)}"]`);
+  if (btn) { btn.focus(); return; }
+  const content = document.getElementById("content");
+  const stillLoading = !content || content.querySelector(".skeleton");
+  if (stillLoading && (attempt || 0) < 40) {
+    setTimeout(() => focusParticipationRegisterControl((attempt || 0) + 1), 50);
+    return;
+  }
+  focusContentHeading();
 }
 
 function renderDashboard(ov, standings) {
@@ -5900,17 +5974,12 @@ async function render() {
     }
     // Home/Tasks hub setup-progress card (#330) — only for a role that can
     // act on Setup (League Admin/Arena Manager); a Coach also lands on
-    // "dashboard" (canSeeOpsConsole) but has nothing to do with this.
+    // "dashboard" (canSeeOpsConsole) but has nothing to do with this. The
+    // fetch itself happens independently, in loadSetupProgressCard() below
+    // (#331 review round 2 finding 3) — not awaited inline here, so it
+    // never blocks the rest of the Dashboard from painting.
     setupProgress = null;
     setupProgressError = false;
-    if (view === "dashboard" && (hasPerm("manage_setup") || hasPerm("manage_arena"))) {
-      const mySeq = ++setupProgressFetchSeq;
-      const sp = await getJSON("/api/v2/setup/progress");
-      if (mySeq === setupProgressFetchSeq) {  // else a newer fetch already won
-        if (sp && !sp.error) setupProgress = sp;
-        else setupProgressError = true;
-      }
-    }
   } catch (e) {
     setChrome(ov);
     c.innerHTML = `<div class="banner alert"><h2>Could not load data</h2>
@@ -5942,8 +6011,17 @@ async function render() {
         || "You don't have access to this game's roster.")}</p></div>`;
     return;
   }
+  // Per-card loading boundary (#331 review round 2 finding 3): the card's
+  // own fetch is NOT part of this render() cycle's await chain (see
+  // loadSetupProgressCard()) -- paint an immediate loading skeleton into
+  // its slot here, in step with the rest of the Dashboard, then let that
+  // fetch fill the slot in on its own schedule.
+  const showSetupCard = view === "dashboard"
+    && (hasPerm("manage_setup") || hasPerm("manage_arena"));
   c.innerHTML =
-    view === "dashboard" ? renderSetupProgressCard(setupProgress, setupProgressError) + renderDashboard(ov, standings)
+    view === "dashboard" ? (showSetupCard
+        ? `<div id="sp-card-slot">${renderSetupProgressCard(null, false, true)}</div>` : "")
+      + renderDashboard(ov, standings)
     : view === "setup" ? renderSetup(sv, hv, ov)
     : view === "import" ? renderImport(ov)
     : view === "calendar" ? renderCalendar(ov)
@@ -5968,13 +6046,12 @@ async function render() {
 
   wireModal(c);
   c.querySelectorAll("[data-goto]").forEach((b) => b.onclick = () => switchTab(b.dataset.goto));
-  // Home/Tasks hub setup-progress card (#330): each workflow's own precise
-  // entry point, and a retry for a failed progress fetch.
-  const spAction = c.querySelector("[data-setup-progress-action]");
-  if (spAction) spAction.onclick = () =>
-    goToSetupWorkflow(spAction.dataset.setupProgressAction);
-  const spRetry = c.querySelector("[data-setup-progress-retry]");
-  if (spRetry) spRetry.onclick = () => render();
+  // Home/Tasks hub setup-progress card (#330): its own fetch, content, and
+  // click-handler wiring all happen independently in loadSetupProgressCard
+  // (#331 review round 2 finding 3) -- the slot painted above is only ever
+  // the loading skeleton at this point, so there's nothing of the card's
+  // own to wire here yet.
+  if (showSetupCard) loadSetupProgressCard();
   // Administration → Danger zone (#256): opens the guarded factory-reset modal.
   const frBtn = c.querySelector("[data-factory-reset]");
   if (frBtn) frBtn.onclick = () => { if (canFactoryReset()) startFactoryReset(); };

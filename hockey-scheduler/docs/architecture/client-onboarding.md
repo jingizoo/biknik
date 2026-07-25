@@ -174,8 +174,10 @@ made this workflow impossible to ever surface as `next`. `"optional"` is
 never a candidate for `next` and never blocks `complete`, but the workflow
 stays fully visible on the card and independently reachable at all times via
 the persistent Import nav tab both League Admin and Arena Manager hold.
-Recorded as decision 9 in `docs/product/operator-ux-requirements.md`'s
-"Product decisions requiring sign-off" section.
+Proposed as decision 9 in `docs/product/operator-ux-requirements.md`'s
+"Product decisions requiring sign-off" section — implemented as the working
+assumption in PR #331, but not yet confirmed by the product owner and
+reversible pending that confirmation.
 
 ## Authorization and privacy invariants
 

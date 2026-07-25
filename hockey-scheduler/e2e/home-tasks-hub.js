@@ -1,4 +1,4 @@
-// Home/Tasks hub setup-progress card (#204/#330; #331 review round 1).
+// Home/Tasks hub setup-progress card (#204/#330; #331 review rounds 1-2).
 //
 // At desktop and 390px: a League Admin whose Program has nothing configured
 // yet lands on the existing Initial Setup wizard (#174) first — dismissing
@@ -7,14 +7,19 @@
 // seasons -> permanent teams -> season participation/divisions -> clubs/
 // players/staff -> venues/rinks/ice -> imports/onboarding), with the other
 // five listed below as a non-competing secondary list, each with an
-// accessible (visible-text, not icon-only) Done/To do status. The primary
-// action opens that workflow's REAL entry point (a create drawer, the Ice
-// Availability Builder, or the relevant tab) — never a generic Setup
-// landing. Once every workflow is done the card shows the required success
-// state with a keyboard-operable Schedule link. A failed progress fetch
-// shows an error with a working Retry, and out-of-order responses (e.g. a
-// slow fetch resolving after a faster, newer one already rendered) never
-// clobber the fresher result.
+// accessible (visible-text, not icon-only) Done/To do/Optional status. The
+// primary action opens that workflow's REAL entry point (a create drawer,
+// the Ice Availability Builder, the exact Register control for the active
+// Season, or the relevant tab) — never a generic Setup landing. Once every
+// REQUIRED workflow is done the card shows the required success state with
+// a keyboard-operable Schedule link, alongside a secondary Import action so
+// the always-optional sixth workflow stays reachable even then. The card's
+// own fetch loads independently of the rest of the Dashboard (a loading
+// skeleton in its own slot, never blocking the rest of the page) and an
+// automated accessibility scan gates its three states. A failed progress
+// fetch shows an error with a working Retry, and out-of-order responses
+// (e.g. a slow fetch resolving after a faster, newer one already rendered)
+// never clobber the fresher result.
 //
 // Fails on any browser console/page error.
 const { chromium } = require("playwright");
@@ -157,9 +162,26 @@ async function reachDashboard(page) {
 // once setup is fully done, for the plain Dashboard content with no card.
 async function waitForCardSettled(page) {
   await page.waitForFunction(() => {
-    if (document.querySelector(".dash-card h3")) return true;
-    return !!document.querySelector(".dash-stats");  // settled with no card
+    // #331 review round 2 finding 3: the card now loads independently of
+    // the rest of the Dashboard, so ".dash-stats" existing no longer means
+    // the card's own fetch has resolved too -- check its slot specifically.
+    const slot = document.getElementById("sp-card-slot");
+    if (slot) return !slot.querySelector(".skeleton");
+    return !!document.querySelector(".dash-stats");  // no slot at all (no permission) -- Dashboard itself settled
   }, null, { timeout: 10000 });
+}
+
+// Waits specifically for the complete-state heading, rather than relying on
+// waitForCardSettled(): that only proves the card's OWN loading skeleton is
+// gone, which is already true before a retry/reload even starts if the
+// PRIOR state (e.g. the error state) had no skeleton of its own either --
+// this waits for the actual expected outcome instead of a proxy for it.
+async function waitForCompleteHeading(page) {
+  await page.waitForFunction((headings) => {
+    const h3 = Array.from(document.querySelectorAll(".dash-card h3")).find(
+      (el) => headings.some((h) => el.textContent.trim().startsWith(h)));
+    return !!(h3 && h3.textContent.includes("All setup steps complete"));
+  }, KNOWN_CARD_HEADINGS, { timeout: 10000 });
 }
 
 // Destination focus management (#331 review round 1 finding 4): a non-drawer
@@ -331,27 +353,66 @@ async function checkViewport(browser, viewport) {
 
     // (5) "Season participation" has no dedicated drawer (it's an inline
     // action inside the Setup hierarchy tree) — its primary action must
-    // still land precisely on that tree, not merely "somewhere in Setup".
+    // route directly to the REAL Register control for the active Season,
+    // not merely land "somewhere in Setup" (#331 review round 2 finding 4:
+    // the generic content-region landing this used to fall back to was not
+    // enough). Proven with a genuine click-through: select the team the UI
+    // already offers, then activate the control via the KEYBOARD from where
+    // focus actually landed -- both confirming it's focused and that it's
+    // immediately actionable, not just visible.
     await page.click("[data-setup-progress-action]");
     await page.waitForFunction(
       () => document.body.dataset.view === "setup", null, { timeout: 10000 });
     // The Setup hierarchy tree loads its own overview data after the view
-    // switch — wait for the real tree, not the moment view flips.
+    // switch -- wait for the exact Register control for this Season, not
+    // just the moment the view flips or any generic tree content.
     await page.waitForFunction(
-      () => !!document.querySelector("[data-reg-add]")
-        || document.body.textContent.includes("Season participation"),
-      null, { timeout: 10000 });
-    // Destination focus management (#331 review round 1 finding 4): a plain
-    // view switch with no drawer of its own to auto-focus must still land
-    // keyboard focus somewhere real, not leave it on the (now-gone) card.
-    await assertFocusLandedInContent(page);
+      (seasonId) => !!document.querySelector(
+        `[data-reg-add][data-reg-add-season="${seasonId}"]`),
+      ids.seasonId, { timeout: 10000 });
+    // Poll rather than a single immediate check: focusParticipationRegister
+    // Control() does its own bounded polling in app.js (the register control
+    // may not exist in the DOM the instant the view flips), so the test must
+    // give it the same room rather than racing it.
+    try {
+      await page.waitForFunction(
+        (seasonId) => {
+          const active = document.activeElement;
+          return !!(active && active.getAttribute("data-reg-add-season") === seasonId);
+        }, ids.seasonId, { timeout: 5000 });
+    } catch (e) {
+      const active = await page.evaluate(() =>
+        (document.activeElement || {}).outerHTML || null);
+      fail(`expected focus on the Register control for this season, `
+        + `got focus on: ${active}`);
+    }
+    const regFocus = await page.evaluate((seasonId) => {
+      const active = document.activeElement;
+      return { disabled: !!(active && active.disabled) };
+    }, ids.seasonId);
+    if (regFocus.disabled) {
+      fail("expected the focused Register control to be immediately actionable, not disabled");
+    }
+    await page.selectOption(`#reg-team-${ids.leagueId}`, ids.teamId);
+    // Re-focus: selecting an option in Chromium can shift focus to the
+    // <select> itself -- the assertion above already proved the button
+    // received focus on arrival, this proves it (and only it, no click)
+    // completes the registration.
+    await page.focus(`[data-reg-add][data-reg-add-season="${ids.seasonId}"]`);
+    await page.keyboard.press("Enter");
+    // A successful registration removes this add-control entirely (the
+    // team we just registered was the only one available) -- wait for that
+    // rather than a fixed delay.
+    await page.waitForFunction(
+      (seasonId) => !document.querySelector(
+        `[data-reg-add][data-reg-add-season="${seasonId}"]`),
+      ids.seasonId, { timeout: 10000 });
     await page.click('.tab[data-tab="dashboard"]');
     await reachDashboard(page);
 
-    // (6) Register the team, add a player -> roster becomes next; its
-    // primary action opens the Player create drawer directly.
-    await apiPost(page, `/api/v2/setup/seasons/${ids.seasonId}/team-registrations`,
-      { team_id: ids.teamId, league_id: ids.leagueId });
+    // (6) Add a player -> roster becomes next; its primary action opens the
+    // Player create drawer directly. (Team registration above already
+    // happened via the real UI in step 5.)
     await page.goto(base, { waitUntil: "domcontentloaded" });
     await reachDashboard(page);
     await waitForCardSettled(page);
@@ -438,6 +499,25 @@ async function checkViewport(browser, viewport) {
       fail(`expected the "Go to Schedule" action, got ${JSON.stringify(s)}`);
     }
     await assertCardHasNoA11yViolations(page, viewport.label, "complete state");
+    // "Imports and onboarding" stays reachable even once every required
+    // workflow is done (#331 review round 2 finding 2) -- a secondary
+    // action alongside the one primary "Go to Schedule", proven keyboard-
+    // operable the same way: focus it directly and activate with Enter.
+    const importSecondaryLabel = await page.evaluate(() =>
+      ((document.querySelector('[data-setup-progress-action="import"]') || {})
+        .textContent || "").trim());
+    if (importSecondaryLabel !== "Import data") {
+      fail(`expected a secondary "Import data" action in the complete state, `
+        + `got "${importSecondaryLabel}"`);
+    }
+    await page.focus('[data-setup-progress-action="import"]');
+    await page.keyboard.press("Enter");
+    await page.waitForFunction(
+      () => document.body.dataset.view === "import", null, { timeout: 10000 });
+    await page.click('.tab[data-tab="dashboard"]');
+    await reachDashboard(page);
+    await waitForCardSettled(page);
+
     // Keyboard-operable: Tab to it and activate with Enter, not just click.
     await page.evaluate(() => {
       const b = Array.from(document.querySelectorAll(".dash-card .act.primary"))
@@ -449,6 +529,37 @@ async function checkViewport(browser, viewport) {
       () => document.body.dataset.view === "calendar", null, { timeout: 10000 });
     await page.click('.tab[data-tab="dashboard"]');
     await reachDashboard(page);
+
+    // (8.5) Per-card loading boundary (#331 review round 2 finding 3): a
+    // slow setup-progress response must never block the rest of the
+    // Dashboard from painting -- only the card's own slot shows a loading
+    // placeholder while its fetch is still in flight. route.continue()
+    // (not .fulfill()) lets the real backend answer for real once released,
+    // so this exercises the actual complete-state response, not a mock.
+    let releaseDelay;
+    const delayPromise = new Promise((resolve) => { releaseDelay = resolve; });
+    await page.route("**/api/v2/setup/progress", async (route) => {
+      await delayPromise;
+      await route.continue();
+    });
+    await page.goto(base, { waitUntil: "domcontentloaded" });
+    await reachDashboard(page);
+    // The rest of the Dashboard (unrelated to this card) must already be
+    // painted and present while the card's own fetch is still deliberately
+    // held open.
+    await page.waitForSelector(".dash-stats", { timeout: 10000 });
+    const midFlight = await page.evaluate(() => {
+      const slot = document.getElementById("sp-card-slot");
+      return { slotShowsSkeleton: !!(slot && slot.querySelector(".skeleton")),
+        dashboardReady: !!document.querySelector(".dash-stats") };
+    });
+    if (!midFlight.slotShowsSkeleton || !midFlight.dashboardReady) {
+      fail(`expected the card's own loading skeleton while the rest of the `
+        + `Dashboard is already ready, got ${JSON.stringify(midFlight)}`);
+    }
+    releaseDelay();
+    await page.unroute("**/api/v2/setup/progress");
+    await waitForCompleteHeading(page);
 
     // (9) Error + retry: a failed fetch shows the error state with a
     // working Retry, not a silently-vanished card (#331 review round 1
@@ -469,7 +580,12 @@ async function checkViewport(browser, viewport) {
     await assertCardHasNoA11yViolations(page, viewport.label, "error state");
     await page.unroute("**/api/v2/setup/progress");
     await page.click("[data-setup-progress-retry]");
-    await waitForCardSettled(page);
+    // waitForCardSettled's "no .skeleton" check is already true on the
+    // error state BEFORE this click (the error state has no skeleton of its
+    // own -- retry re-fetches without showing one), so it would resolve
+    // immediately without ever waiting for the retry's own fetch to finish.
+    // Wait for the specific expected outcome instead.
+    await waitForCompleteHeading(page);
     s = await cardState(page);
     if (!s || s.heading !== "✓ All setup steps complete") {
       fail(`expected Retry to recover the real (complete) state, got ${JSON.stringify(s)}`);
