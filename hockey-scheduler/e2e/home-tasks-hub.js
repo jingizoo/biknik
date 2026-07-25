@@ -538,6 +538,46 @@ async function checkViewport(browser, viewport) {
     // Builder is not a drawer, so it gets no auto-focus for free — its own
     // heading must still receive keyboard focus explicitly.
     await assertFocusLandedInContent(page);
+
+    // goToSetupWorkflow("facilities") is a SECOND site that opens a fresh
+    // Ice Builder instance, distinct from the manual "Build ice" button
+    // (#331 review round 10 finding 2) -- it must bump iceOperationSeq too,
+    // or a Preview held from THIS hub-driven open, then abandoned by
+    // navigating back to the Dashboard and re-triggering this exact same
+    // hub action again (still "facilities", since nothing below has
+    // completed it yet), would land on the freshly-reopened builder as if
+    // it belonged there. Reuses the rink/venue-access already granted above.
+    await page.waitForSelector(`.ib-rink[value="${rink.id}"]`, { timeout: 10000 });
+    await page.check(`.ib-rink[value="${rink.id}"]`);
+    // This scenario's own Season ("Fall 2026", created way above with no
+    // start_date/end_date) has no range for the backend to default the
+    // template from, so -- same as a real operator would have to -- fill an
+    // explicit range in rather than rely on the form's normal blank-means-
+    // Season-range default.
+    await page.fill("#ib-from", "2026-09-01");
+    await page.fill("#ib-to", "2026-12-31");
+    let releaseFacilitiesPreview;
+    const holdFacilitiesPreview = new Promise((resolve) => { releaseFacilitiesPreview = resolve; });
+    await page.route("**/api/setup/ice-availability/preview", async (route) => {
+      await holdFacilitiesPreview; await route.continue();
+    });
+    await page.click("[data-ib-preview]");
+    await new Promise((r) => setTimeout(r, 200));  // let the request actually leave
+    await page.click('.tab[data-tab="dashboard"]');
+    await reachDashboard(page);
+    await waitForCardSettled(page);
+    await page.click("[data-setup-progress-action]");  // still "facilities" -- opens a FRESH builder
+    await page.waitForFunction(() => document.body.dataset.view === "calendar", null, { timeout: 10000 });
+    await page.waitForSelector(".ib-wrap", { timeout: 10000 });
+    releaseFacilitiesPreview();
+    await page.unroute("**/api/setup/ice-availability/preview");
+    await new Promise((r) => setTimeout(r, 300));  // let the stale response's own (discarded) handler run
+    if (await page.$(".ib-preview")) {
+      fail("expected the Preview response held from the FIRST "
+        + "goToSetupWorkflow(\"facilities\") open to be discarded, not "
+        + "painted onto the SECOND, freshly-reopened builder instance");
+    }
+
     await page.click('.tab[data-tab="dashboard"]');
     await reachDashboard(page);
 
@@ -2164,6 +2204,216 @@ async function checkRoleScenarios(browser, viewport) {
         + "switch to J5 fully settled to NOT paint a result banner there");
     }
 
+    // ---- (J, same-input reorder) Two Validate requests for IDENTICAL
+    // input, released newest-failure-then-older-success, must let only
+    // the LATEST issued survive (#331 review round 10 finding 2): type,
+    // pasted text, and context are all unchanged between the two clicks
+    // here -- neither importSnapshotKey() nor contextRevision can tell
+    // them apart, only importOperationSeq (bumped by each Validate click)
+    // can. Without it, the OLDER but successful response landing after
+    // the newer but failed one would re-enable Commit against a review
+    // the operator's own latest click already said no to.
+    await page.click("[data-import-sample]");
+    let jReorderCalls = 0;
+    let releaseOlderValidate, releaseNewerValidate;
+    const holdOlderValidate = new Promise((resolve) => { releaseOlderValidate = resolve; });
+    const holdNewerValidate = new Promise((resolve) => { releaseNewerValidate = resolve; });
+    await page.route("**/api/import/dry-run", async (route) => {
+      jReorderCalls += 1;
+      if (jReorderCalls === 1) {
+        // Older request: let the REAL server answer -- the sample data is
+        // known-good, so this is a genuine success.
+        await holdOlderValidate;
+        await route.continue();
+      } else {
+        // Newer request: force a failure. The real server would also
+        // succeed on identical input, so there is no NATURAL way to make
+        // the two calls disagree; this stands in for any transient
+        // failure, which would look identical to the client either way.
+        await holdNewerValidate;
+        await route.fulfill({
+          status: 500, contentType: "application/json",
+          body: JSON.stringify({ error: { code: "server_unavailable",
+            message: "The server is temporarily unavailable." } }),
+        });
+      }
+    });
+    await page.click("[data-import-validate]");  // older request (call #1)
+    await new Promise((r) => setTimeout(r, 200));
+    await page.click("[data-import-validate]");  // newer request (call #2), identical input
+    await new Promise((r) => setTimeout(r, 100));
+    // Reversed release order: the NEWER (failing) request's response
+    // arrives FIRST, the OLDER (succeeding) one LAST.
+    releaseNewerValidate();
+    await page.waitForFunction(() => {
+      const btn = document.querySelector("[data-import-commit]");
+      return !!(btn && btn.disabled);
+    }, null, { timeout: 10000 });  // the newer failure correctly leaves Commit disabled
+    releaseOlderValidate();
+    await page.unroute("**/api/import/dry-run");
+    await new Promise((r) => setTimeout(r, 300));  // let the older, now-stale success's own (discarded) handler run
+    const jReorderCommitEnabled = await page.evaluate(() => {
+      const btn = document.querySelector("[data-import-commit]");
+      return btn ? !btn.disabled : null;
+    });
+    if (jReorderCommitEnabled) {
+      fail("(J, same-input reorder) expected the OLDER, stale Validate "
+        + "success (released last) to be discarded and NOT re-enable "
+        + "Commit after the NEWER identical-input request had already "
+        + "failed");
+    }
+    // Same deliberate-500 error-log allowance as (L, failure convergence)
+    // above.
+    const unexpectedJReorder = errors.filter((e) => !/responded with a status of 500/.test(e));
+    if (unexpectedJReorder.length === errors.length) {
+      fail("(J, same-input reorder) expected the deliberately failed "
+        + `newer Validate to log a resource error, got:\n${errors.join("\n")}`);
+    }
+    errors.length = 0;
+    errors.push(...unexpectedJReorder);
+
+    // ---- (J, commit reorder) Same class as (J, same-input reorder) above,
+    // but for Import's Commit instead of Validate (#331 review round 10
+    // finding 2): the Commit button has no synchronous disable-on-click of
+    // its own (only the reactive `disabled` importCommitState() computes on
+    // render), so a rapid double-click before the first response lands
+    // genuinely fires two overlapping Commit requests. Both responses are
+    // mocked here (not just the newer one, unlike the Validate case above)
+    // since this is purely a client-side response-ordering question, not a
+    // backend-correctness one -- that half is already covered by the
+    // real-server tests in test_ice_availability.py and friends.
+    await page.click("[data-import-sample]");
+    const jCommitReorderValidateResp = page.waitForResponse((r) =>
+      /\/api\/import\/dry-run$/.test(r.url()) && r.request().method() === "POST");
+    await page.click("[data-import-validate]");
+    await jCommitReorderValidateResp;
+    await page.waitForFunction(() => {
+      const btn = document.querySelector("[data-import-commit]");
+      return !!(btn && !btn.disabled);
+    }, null, { timeout: 10000 });
+    let jCommitReorderCalls = 0;
+    let releaseOlderCommit, releaseNewerCommit;
+    const holdOlderCommit = new Promise((resolve) => { releaseOlderCommit = resolve; });
+    const holdNewerCommit = new Promise((resolve) => { releaseNewerCommit = resolve; });
+    await page.route("**/api/import/commit/**", async (route) => {
+      jCommitReorderCalls += 1;
+      if (jCommitReorderCalls === 1) {
+        await holdOlderCommit;
+        await route.fulfill({
+          status: 200, contentType: "application/json",
+          body: JSON.stringify({ committed: true, summary: {} }),
+        });
+      } else {
+        await holdNewerCommit;
+        await route.fulfill({
+          status: 500, contentType: "application/json",
+          body: JSON.stringify({ error: { code: "server_unavailable",
+            message: "The server is temporarily unavailable." } }),
+        });
+      }
+    });
+    await page.click("[data-import-commit]");  // older request (call #1)
+    await new Promise((r) => setTimeout(r, 200));
+    await page.click("[data-import-commit]");  // newer request (call #2), identical input
+    await new Promise((r) => setTimeout(r, 100));
+    // Reversed release order: the NEWER (failing) request's response
+    // arrives FIRST, the OLDER (succeeding) one LAST.
+    releaseNewerCommit();
+    await page.waitForFunction(() =>
+      Array.from(document.querySelectorAll(".banner h2")).some((h) => h.textContent === "Commit failed"),
+      null, { timeout: 10000 });
+    releaseOlderCommit();
+    await page.unroute("**/api/import/commit/**");
+    await new Promise((r) => setTimeout(r, 300));  // let the older, now-stale success's own (discarded) handler run
+    const jCommitReorderHeadings = await page.evaluate(() =>
+      Array.from(document.querySelectorAll(".banner h2")).map((h) => h.textContent));
+    if (jCommitReorderHeadings.includes("Committed") || !jCommitReorderHeadings.includes("Commit failed")) {
+      fail("(J, commit reorder) expected the OLDER, stale Commit success "
+        + "(released last) to be discarded and NOT overwrite the NEWER "
+        + `Commit's own failure banner, got: ${JSON.stringify(jCommitReorderHeadings)}`);
+    }
+    // Same deliberate-500 error-log allowance as (J, same-input reorder)
+    // above.
+    const unexpectedJCommitReorder = errors.filter((e) => !/responded with a status of 500/.test(e));
+    if (unexpectedJCommitReorder.length === errors.length) {
+      fail("(J, commit reorder) expected the deliberately failed newer "
+        + `Commit to log a resource error, got:\n${errors.join("\n")}`);
+    }
+    errors.length = 0;
+    errors.push(...unexpectedJCommitReorder);
+
+    // ---- (J, type-switch reorder) A Validate held across a type switch
+    // AWAY and back must still be recognized as stale, even though both the
+    // type key and the (empty, freshly-reset) sheets trivially match again
+    // afterward (#331 review round 10 finding 2): unlike a monotonic counter,
+    // `importState.type` and the pasted sheet text can both cycle back to a
+    // value an in-flight request's own snapshot already had, so only
+    // importOperationSeq (bumped on every type switch) can tell them apart.
+    await page.click('[data-import-type="teams_players"]');  // guarantees empty sheets for this type
+    let releaseTypeSwitchValidate;
+    const holdTypeSwitchValidate = new Promise((resolve) => { releaseTypeSwitchValidate = resolve; });
+    await page.route("**/api/import/dry-run", async (route) => {
+      await holdTypeSwitchValidate;
+      await route.fulfill({
+        status: 200, contentType: "application/json",
+        body: JSON.stringify({ ok: true, errors: [], warnings: [], summary: {} }),
+      });
+    });
+    await page.click("[data-import-validate]");
+    await new Promise((r) => setTimeout(r, 200));  // let the request actually leave
+    await page.click('[data-import-type="officials_availability"]');  // switch away
+    await page.click('[data-import-type="teams_players"]');  // switch back -- empty sheets again, same type
+    await new Promise((r) => setTimeout(r, 100));
+    releaseTypeSwitchValidate();
+    await page.unroute("**/api/import/dry-run");
+    await new Promise((r) => setTimeout(r, 300));  // let the stale response's own (discarded) handler run
+    const typeSwitchCommitEnabled = await page.evaluate(() => {
+      const btn = document.querySelector("[data-import-commit]");
+      return btn ? !btn.disabled : null;
+    });
+    if (typeSwitchCommitEnabled) {
+      fail("(J, type-switch reorder) expected the Validate response held "
+        + "across a type switch away and back to still be recognized as "
+        + "stale and NOT re-enable Commit, even though the type and the "
+        + "(empty) sheets both trivially match again");
+    }
+
+    // ---- (J, sample-reload reorder) Same class as (J, type-switch reorder)
+    // above, but for a second "Load sample data" click instead of a type
+    // switch (#331 review round 10 finding 2): the sample data is a FIXED
+    // string, so reloading it a second time trivially reproduces content
+    // identical to the first load -- neither the type nor
+    // importSnapshotKey() can tell the two loads apart, only
+    // importOperationSeq (bumped by each sample-data click) can.
+    await page.click('[data-import-type="teams_players"]');
+    await page.click("[data-import-sample]");
+    let releaseSampleReloadValidate;
+    const holdSampleReloadValidate = new Promise((resolve) => { releaseSampleReloadValidate = resolve; });
+    await page.route("**/api/import/dry-run", async (route) => {
+      await holdSampleReloadValidate;
+      await route.fulfill({
+        status: 200, contentType: "application/json",
+        body: JSON.stringify({ ok: true, errors: [], warnings: [], summary: {} }),
+      });
+    });
+    await page.click("[data-import-validate]");
+    await new Promise((r) => setTimeout(r, 200));  // let the request actually leave
+    await page.click("[data-import-sample]");  // reload -- identical content, same type
+    await new Promise((r) => setTimeout(r, 100));
+    releaseSampleReloadValidate();
+    await page.unroute("**/api/import/dry-run");
+    await new Promise((r) => setTimeout(r, 300));  // let the stale response's own (discarded) handler run
+    const sampleReloadCommitEnabled = await page.evaluate(() => {
+      const btn = document.querySelector("[data-import-commit]");
+      return btn ? !btn.disabled : null;
+    });
+    if (sampleReloadCommitEnabled) {
+      fail("(J, sample-reload reorder) expected the Validate response held "
+        + "across a second \"Load sample data\" click to still be recognized "
+        + "as stale and NOT re-enable Commit, even though the reloaded "
+        + "content trivially matches the first load");
+    }
+
     // ---- (K) Ice Builder Create must be uncommittable the INSTANT a
     // context switch is attempted too (#331 review round 8) -- the
     // identical gap as Import's own Commit above, closed the same way
@@ -2389,6 +2639,314 @@ async function checkRoleScenarios(browser, viewport) {
         + `${JSON.stringify(k3ToastAfter)}`);
     }
 
+    // ---- (K, cancel-reopen preview) Response ownership is
+    // OPERATION-scoped, not just context-scoped (#331 review round 10
+    // finding 2): holding a Preview, canceling that builder, reopening a
+    // DIFFERENT one in the SAME context, then releasing the held response
+    // must not resurrect it onto the new builder. contextRevision alone
+    // cannot tell these apart -- the context never changes here.
+    await page.click("[data-ib-cancel]");
+    await page.waitForFunction(() => !document.querySelector(".ib-form"),
+      null, { timeout: 10000 });
+    await page.click("[data-ice-builder-open]");  // builder A
+    await page.waitForFunction(
+      (v) => (document.getElementById("ib-season") || {}).value === v,
+      k.seasonK5, { timeout: 10000 });
+    await page.click(`.ib-rink[value="${k.rinkK5}"]`);
+    let releasePreviewA;
+    const previewHoldA = new Promise((resolve) => { releasePreviewA = resolve; });
+    await page.route("**/api/setup/ice-availability/preview", async (route) => {
+      await previewHoldA; await route.continue();
+    });
+    await page.click("[data-ib-preview]");
+    await new Promise((r) => setTimeout(r, 200));  // let builder A's own Preview request actually leave
+    await page.click("[data-ib-cancel]");
+    await page.waitForFunction(() => !document.querySelector(".ib-form"),
+      null, { timeout: 10000 });
+    await page.click("[data-ice-builder-open]");  // builder B, same context
+    await page.waitForFunction(
+      (v) => (document.getElementById("ib-season") || {}).value === v,
+      k.seasonK5, { timeout: 10000 });
+    releasePreviewA();
+    await page.unroute("**/api/setup/ice-availability/preview");
+    await new Promise((r) => setTimeout(r, 300));  // let the stale response's own (discarded) handler run
+    if (await page.$("[data-ib-commit]")) {
+      fail("(K, cancel-reopen preview) expected builder A's held Preview "
+        + "response, released after cancel/reopen into builder B in the "
+        + "SAME context, to NOT resurrect a committable preview onto B");
+    }
+
+    // ---- (K, cancel-reopen commit) Same class as the above, for Ice
+    // Builder's Commit instead of Preview (#331 review round 10 finding
+    // 2): holding builder A's Commit response, canceling, reopening B in
+    // the same context, then releasing must not close B
+    // (`iceBuilder = null`) or show A's stale "Created" toast under it.
+    await page.click("[data-ib-cancel]");
+    await page.waitForFunction(() => !document.querySelector(".ib-form"),
+      null, { timeout: 10000 });
+    await page.click("[data-ice-builder-open]");  // builder A for this test
+    await page.waitForFunction(
+      (v) => (document.getElementById("ib-season") || {}).value === v,
+      k.seasonK5, { timeout: 10000 });
+    await page.click(`.ib-rink[value="${k.rinkK5}"]`);
+    const kCrPreviewResp = page.waitForResponse((r) =>
+      r.url() === `${base}/api/setup/ice-availability/preview` && r.request().method() === "POST");
+    await page.click("[data-ib-preview]");
+    await kCrPreviewResp;
+    await page.waitForSelector("[data-ib-commit]", { timeout: 10000 });
+    let releaseCommitA;
+    const commitHoldA = new Promise((resolve) => { releaseCommitA = resolve; });
+    await page.route("**/api/setup/ice-availability/commit", async (route) => {
+      await commitHoldA; await route.continue();
+    });
+    await page.click("[data-ib-commit]");
+    await new Promise((r) => setTimeout(r, 200));  // let builder A's own Commit request actually leave
+    await page.click("[data-ib-cancel]");
+    await page.waitForFunction(() => !document.querySelector(".ib-form"),
+      null, { timeout: 10000 });
+    await page.click("[data-ice-builder-open]");  // builder B, same context
+    await page.waitForFunction(
+      (v) => (document.getElementById("ib-season") || {}).value === v,
+      k.seasonK5, { timeout: 10000 });
+    releaseCommitA();
+    await page.unroute("**/api/setup/ice-availability/commit");
+    await new Promise((r) => setTimeout(r, 300));  // let the stale response's own (discarded) handler run
+    if (!(await page.$(".ib-form"))) {
+      fail("(K, cancel-reopen commit) expected builder B to remain open "
+        + "after builder A's held Commit response, released post "
+        + "cancel/reopen in the SAME context, landed -- it must never "
+        + "null out a DIFFERENT builder instance");
+    }
+    const kCrToastAfter = await page.evaluate(() =>
+      (document.querySelector("#toast-root .toast-msg") || {}).textContent || "");
+    if (/created/i.test(kCrToastAfter)) {
+      fail(`(K, cancel-reopen commit) expected no stale "Created" toast `
+        + `under builder B after builder A's stale Commit response `
+        + `landed, got: ${JSON.stringify(kCrToastAfter)}`);
+    }
+
+    // ---- (K, same-builder reorder) Two Preview requests for the SAME
+    // builder instance, released in REVERSE order, must let only the
+    // LATEST issued survive (#331 review round 10 finding 2): neither
+    // iceBuilder identity nor contextRevision changes here -- only
+    // iceOperationSeq (bumped by each Preview click, and by the weekday
+    // edit between them) can tell the two apart.
+    await page.click("[data-ib-cancel]");
+    await page.waitForFunction(() => !document.querySelector(".ib-form"),
+      null, { timeout: 10000 });
+    await page.click("[data-ice-builder-open]");
+    await page.waitForFunction(
+      (v) => (document.getElementById("ib-season") || {}).value === v,
+      k.seasonK5, { timeout: 10000 });
+    await page.click(`.ib-rink[value="${k.rinkK5}"]`);
+    const kReorderBaselineResp = page.waitForResponse((r) =>
+      r.url() === `${base}/api/setup/ice-availability/preview` && r.request().method() === "POST");
+    await page.click("[data-ib-preview]");
+    await kReorderBaselineResp;
+    await page.waitForSelector(".ib-preview", { timeout: 10000 });
+    const kReorderDaysBaseline = await page.$eval(".ib-preview", (el) => el.dataset.ibDays);
+    let releaseOlderPreview, releaseNewerPreview;
+    const holdOlderPreview = new Promise((resolve) => { releaseOlderPreview = resolve; });
+    const holdNewerPreview = new Promise((resolve) => { releaseNewerPreview = resolve; });
+    let kReorderCalls = 0;
+    await page.route("**/api/setup/ice-availability/preview", async (route) => {
+      kReorderCalls += 1;
+      if (kReorderCalls === 1) { await holdOlderPreview; } else { await holdNewerPreview; }
+      await route.continue();
+    });
+    await page.click("[data-ib-preview]");  // older request (call #1), full weekday set still
+    await new Promise((r) => setTimeout(r, 200));
+    // .ib-weekday is visually hidden (a custom-styled toggle sits over
+    // it) -- ice-availability-builder.js's own selectWeekdaysOnly() helper
+    // flips it via a direct DOM .checked write + dispatched change event
+    // rather than a Playwright click, for the same reason.
+    const kReorderHadWeekday = await page.evaluate(() => {
+      const cb = document.querySelector(".ib-weekday");
+      if (!cb) return false;
+      cb.checked = !cb.checked;
+      cb.dispatchEvent(new Event("change", { bubbles: true }));
+      return true;
+    });
+    if (!kReorderHadWeekday) fail("(K, same-builder reorder) expected at least one weekday toggle in the Ice Builder form");
+    await new Promise((r) => setTimeout(r, 100));  // edits the form -- bumps iceOperationSeq, changes the day count
+    await page.click("[data-ib-preview]");  // newer request (call #2), different weekday set
+    await new Promise((r) => setTimeout(r, 100));
+    // Reversed release order: the OLDER request's response arrives LAST.
+    releaseNewerPreview();
+    await new Promise((r) => setTimeout(r, 300));
+    const kReorderDaysAfterNewer = await page.$eval(".ib-preview", (el) => el.dataset.ibDays).catch(() => null);
+    if (kReorderDaysAfterNewer === null || kReorderDaysAfterNewer === kReorderDaysBaseline) {
+      fail(`(K, same-builder reorder) expected the NEWER Preview's own `
+        + `different weekday set to actually land (days != baseline `
+        + `${kReorderDaysBaseline}), got ${JSON.stringify(kReorderDaysAfterNewer)}`);
+    }
+    releaseOlderPreview();
+    await page.unroute("**/api/setup/ice-availability/preview");
+    await new Promise((r) => setTimeout(r, 300));  // let the stale response's own (discarded) handler run
+    const kReorderDaysAfterOlder = await page.$eval(".ib-preview", (el) => el.dataset.ibDays).catch(() => null);
+    if (kReorderDaysAfterOlder !== kReorderDaysAfterNewer) {
+      fail(`(K, same-builder reorder) expected the OLDER, stale Preview `
+        + `response (released last) to be discarded and NOT overwrite `
+        + `the newer one -- days went from ${kReorderDaysAfterNewer} to `
+        + `${kReorderDaysAfterOlder}`);
+    }
+
+    // ---- (K, cancel-reopen re-preview) Same class as the two cases above,
+    // but for the NESTED re-preview a preview_mismatch Commit rejection
+    // triggers on its own (#331 review round 10 finding 2): that path snapshots
+    // its OWN `rePreviewOp` (a fresh ++, not a re-read of the Commit's
+    // `requestOp`) specifically because a cancel/reopen can land during the
+    // re-preview just as easily as during the Commit itself. Forces a real
+    // preview_mismatch by corrupting the fingerprint (same technique as
+    // ice-availability-builder.js's own (H) test), then cancels/reopens
+    // while the re-preview it auto-triggers is still held in flight. Uses a
+    // FRESH rink under K5's own Program/Season, not k.rinkK5 itself -- the
+    // preceding (K, cancel-reopen commit) case above deliberately lets its
+    // own held Commit actually reach the server, so k.rinkK5 already carries
+    // real committed slots by this point and a same-template preview against
+    // it would show 0 creatable slots (a permanently-disabled Commit button)
+    // regardless of anything this case is actually testing.
+    const kRp = await page.evaluate(async (seasonId) => {
+      const post = async (p, b) => (await fetch(p, {
+        method: "POST", credentials: "same-origin",
+        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
+      })).json();
+      const venueKRp = await post("/api/v2/setup/venue", { name: "VKRp", organization_id: null });
+      const rinkKRp = await post("/api/v2/setup/rink", { venue_id: venueKRp.id, name: "RKRp" });
+      await post(`/api/v2/setup/seasons/${seasonId}/venue-access`, { venue_id: venueKRp.id });
+      return { rinkKRp: rinkKRp.id };
+    }, k.seasonK5);
+    await page.click("[data-ib-cancel]");
+    await page.waitForFunction(() => !document.querySelector(".ib-form"),
+      null, { timeout: 10000 });
+    await page.click("[data-ice-builder-open]");  // builder A for this test
+    await page.waitForFunction(
+      (v) => (document.getElementById("ib-season") || {}).value === v,
+      k.seasonK5, { timeout: 10000 });
+    await page.click(`.ib-rink[value="${kRp.rinkKRp}"]`);
+    const kRpPreviewResp = page.waitForResponse((r) =>
+      r.url() === `${base}/api/setup/ice-availability/preview` && r.request().method() === "POST");
+    await page.click("[data-ib-preview]");
+    await kRpPreviewResp;
+    await page.waitForSelector("[data-ib-commit]", { timeout: 10000 });
+    await page.evaluate(() => { iceBuilder.preview.template_fingerprint = "staledeadbeef01"; });
+    let releaseRepreviewA;
+    const repreviewHoldA = new Promise((resolve) => { releaseRepreviewA = resolve; });
+    await page.route("**/api/setup/ice-availability/preview", async (route) => {
+      await repreviewHoldA; await route.continue();
+    });
+    await page.click("[data-ib-commit]");
+    await new Promise((r) => setTimeout(r, 200));  // let the Commit resolve and its auto re-preview actually leave
+    await page.click("[data-ib-cancel]");
+    await page.waitForFunction(() => !document.querySelector(".ib-form"),
+      null, { timeout: 10000 });
+    await page.click("[data-ice-builder-open]");  // builder B, same context
+    await page.waitForFunction(
+      (v) => (document.getElementById("ib-season") || {}).value === v,
+      k.seasonK5, { timeout: 10000 });
+    releaseRepreviewA();
+    await page.unroute("**/api/setup/ice-availability/preview");
+    await new Promise((r) => setTimeout(r, 300));  // let the stale response's own (discarded) handler run
+    if (await page.$(".ib-preview")) {
+      fail("(K, cancel-reopen re-preview) expected builder A's held "
+        + "re-preview response -- auto-triggered by its own preview_mismatch "
+        + "Commit rejection, released after cancel/reopen into builder B in "
+        + "the SAME context -- to NOT paint a preview onto B");
+    }
+    // The deliberately-corrupted fingerprint above makes the server refuse
+    // the Commit (preview_mismatch), which _send_api maps to an HTTP 400 --
+    // Chromium logs that as a resource-load console error regardless of app
+    // code handling it gracefully, same as the deliberate-500 cases
+    // elsewhere in this file. Require at least one, proving the mismatch
+    // actually fired, then drop every matching message so any other,
+    // genuinely unexpected error still fails the gate at the end.
+    const unexpectedKRp = errors.filter((e) => !/responded with a status of 400/.test(e));
+    if (unexpectedKRp.length === errors.length) {
+      fail("(K, cancel-reopen re-preview) expected the deliberately "
+        + `mismatched Commit to log a resource error, got:\n${errors.join("\n")}`);
+    }
+    errors.length = 0;
+    errors.push(...unexpectedKRp);
+
+    // ---- (K, edit-during-preview) Editing the form while a Preview is in
+    // flight must obsolete that Preview even when there was NO existing
+    // preview yet to clear (#331 review round 10 finding 2): the form-change
+    // listener bumps iceOperationSeq unconditionally, not only when it also
+    // nulls out `iceBuilder.preview` -- a Preview issued before the edit but
+    // still in flight when it lands must still be recognized as stale, or it
+    // would silently paint its now-outdated slots onto the freshly-edited
+    // form the operator is looking at. This is the ONE case none of the
+    // other (K) cases above exercise: they all edit/click AFTER a preview
+    // has already landed once.
+    await page.click("[data-ib-cancel]");
+    await page.waitForFunction(() => !document.querySelector(".ib-form"),
+      null, { timeout: 10000 });
+    await page.click("[data-ice-builder-open]");
+    await page.waitForFunction(
+      (v) => (document.getElementById("ib-season") || {}).value === v,
+      k.seasonK5, { timeout: 10000 });
+    await page.click(`.ib-rink[value="${k.rinkK5}"]`);
+    let releaseEditPreview;
+    const holdEditPreview = new Promise((resolve) => { releaseEditPreview = resolve; });
+    await page.route("**/api/setup/ice-availability/preview", async (route) => {
+      await holdEditPreview; await route.continue();
+    });
+    await page.click("[data-ib-preview]");  // no existing preview to clear -- hadPreview is false
+    await new Promise((r) => setTimeout(r, 200));  // let the request actually leave
+    const kEditHadWeekday = await page.evaluate(() => {
+      const cb = document.querySelector(".ib-weekday");
+      if (!cb) return false;
+      cb.checked = !cb.checked;
+      cb.dispatchEvent(new Event("change", { bubbles: true }));
+      return true;
+    });
+    if (!kEditHadWeekday) fail("(K, edit-during-preview) expected at least one weekday toggle in the Ice Builder form");
+    await new Promise((r) => setTimeout(r, 100));
+    releaseEditPreview();
+    await page.unroute("**/api/setup/ice-availability/preview");
+    await new Promise((r) => setTimeout(r, 300));  // let the stale response's own (discarded) handler run
+    if (await page.$(".ib-preview")) {
+      fail("(K, edit-during-preview) expected the Preview response issued "
+        + "BEFORE the weekday edit -- with no existing preview yet to clear "
+        + "-- to still be recognized as stale and NOT painted onto the "
+        + "freshly-edited form");
+    }
+
+    // ---- (K, exclusion-during-preview) Same class as (K, edit-during-preview)
+    // above, but for adding an exclusion date instead of a weekday edit
+    // (#331 review round 10 finding 2): the exclusion add/remove handlers
+    // bump iceOperationSeq too, for the identical reason -- a Preview issued
+    // before the exclusion but still in flight when it lands must still be
+    // recognized as stale, or it would silently paint slots that ignore the
+    // operator's own just-added exclusion.
+    await page.click("[data-ib-cancel]");
+    await page.waitForFunction(() => !document.querySelector(".ib-form"),
+      null, { timeout: 10000 });
+    await page.click("[data-ice-builder-open]");
+    await page.waitForFunction(
+      (v) => (document.getElementById("ib-season") || {}).value === v,
+      k.seasonK5, { timeout: 10000 });
+    await page.click(`.ib-rink[value="${k.rinkK5}"]`);
+    let releaseExclPreview;
+    const holdExclPreview = new Promise((resolve) => { releaseExclPreview = resolve; });
+    await page.route("**/api/setup/ice-availability/preview", async (route) => {
+      await holdExclPreview; await route.continue();
+    });
+    await page.click("[data-ib-preview]");  // no existing preview to clear -- hadPreview is false
+    await new Promise((r) => setTimeout(r, 200));  // let the request actually leave
+    await page.fill("#ib-excl", "2026-09-08");
+    await page.click("[data-ib-excl-add]");
+    await new Promise((r) => setTimeout(r, 100));
+    releaseExclPreview();
+    await page.unroute("**/api/setup/ice-availability/preview");
+    await new Promise((r) => setTimeout(r, 300));  // let the stale response's own (discarded) handler run
+    if (await page.$(".ib-preview")) {
+      fail("(K, exclusion-during-preview) expected the Preview response "
+        + "issued BEFORE the exclusion add -- with no existing preview yet "
+        + "to clear -- to still be recognized as stale and NOT painted onto "
+        + "the form with the new exclusion applied");
+    }
+
     // ---- (L) Rapid A->B->C must reach the SERVER as "last INTENT wins",
     // not merely "last response wins" (#331 review round 9 finding A):
     // contextSwitchSeq (round 8) only ever governed which RESPONSE the
@@ -2555,6 +3113,139 @@ async function checkRoleScenarios(browser, viewport) {
     }
     errors.length = 0;
     errors.push(...unexpectedL);
+
+    // ---- (L, queued-then-rejected hash sync) An intermediate switch
+    // accepted by the server, with ANOTHER queued behind it, must still
+    // leave the URL hash in sync once that queued switch is itself
+    // rejected (#331 review round 10): sendContextSwitch()'s own success
+    // branch -- including its syncContextHash() call -- is skipped
+    // entirely for the intermediate one when something is queued behind
+    // it, since dequeuing straight to the queued switch takes priority
+    // over reconciling a response that's already about to be superseded.
+    // If that LATER, queued switch's own request is then rejected, the
+    // failure branch used to reconcile contextOptions/#ctx-select from
+    // truth without ever touching the hash -- leaving it pointing at
+    // whatever was live before the whole burst, even though the server
+    // and everything else now agree on the intermediate switch. A reload
+    // then runs restoreContextDeepLink(), treats that stale hash as an
+    // intentional deep link, and silently rolls the persisted context
+    // back. The earlier (L, failure convergence) case above cannot catch
+    // this: it rejects a single DIRECT switch, at a point where the
+    // server and hash already agree before the rejected attempt even
+    // starts.
+    const lh = await page.evaluate(async () => {
+      const post = async (p, b) => (await fetch(p, {
+        method: "POST", credentials: "same-origin",
+        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
+      })).json();
+      const progLH1 = await post("/api/v2/setup/program", { name: "Round10LH1 Program", country: "US" });
+      const progLH2 = await post("/api/v2/setup/program", { name: "Round10LH2 Program", country: "US" });
+      const progLH3 = await post("/api/v2/setup/program", { name: "Round10LH3 Program", country: "US" });
+      return { progLH1: progLH1.id, progLH2: progLH2.id, progLH3: progLH3.id };
+    });
+    await apiPost(page, "/api/context", { program_id: lh.progLH1, season_id: null });
+    await freshLoad();
+    let releaseLH2;
+    const holdLH2 = new Promise((resolve) => { releaseLH2 = resolve; });
+    await page.route("**/api/context", async (route) => {
+      if (route.request().method() !== "POST") { await route.continue(); return; }
+      let pid = null;
+      try { pid = JSON.parse(route.request().postData() || "{}").program_id; } catch (_) {}
+      if (pid === lh.progLH2) { await holdLH2; await route.continue(); return; }
+      if (pid === lh.progLH3) {
+        await route.fulfill({
+          status: 500, contentType: "application/json",
+          body: JSON.stringify({ error: { code: "not_found", message: "gone" } }),
+        });
+        return;
+      }
+      await route.continue();
+    });
+    const switchToLH2 = `${lh.progLH2}|`;
+    const switchToLH3 = `${lh.progLH3}|`;
+    await page.selectOption("#ctx-select", switchToLH2);
+    await new Promise((r) => setTimeout(r, 200));  // let LH2's own POST actually leave
+    await page.selectOption("#ctx-select", switchToLH3);
+    await new Promise((r) => setTimeout(r, 100));  // LH3 only ever gets queued while LH2's POST is still in flight
+    releaseLH2();  // LH2 succeeds server-side, but sendContextSwitch() skips reconciling it and dequeues straight to LH3
+    await page.waitForFunction(
+      () => /isn't available/i.test(
+        (document.querySelector("#toast-root .toast-msg") || {}).textContent || ""),
+      null, { timeout: 10000 });  // LH3's own dequeued request lands and is rejected
+    await page.unroute("**/api/context");
+    await page.waitForFunction((v) => document.getElementById("ctx-select").value === v,
+      switchToLH2, { timeout: 10000 });
+    const lhServerContext = await apiGet(page, "/api/context");
+    if (!lhServerContext || lhServerContext.program_id !== lh.progLH2) {
+      fail(`(L, hash sync) expected the server's own context to be LH2 `
+        + `(${lh.progLH2}) after LH2 was accepted and the queued LH3 was `
+        + `rejected, got ${JSON.stringify(lhServerContext)}`);
+    }
+    const lhServerOptions = await apiGet(page, "/api/context/options");
+    if (!lhServerOptions || !lhServerOptions.selected
+        || lhServerOptions.selected.program_id !== lh.progLH2) {
+      fail(`(L, hash sync) expected /api/context/options.selected to agree `
+        + `on LH2 (${lh.progLH2}) too, got `
+        + `${JSON.stringify(lhServerOptions && lhServerOptions.selected)}`);
+    }
+    const lhSetupProgress = await apiGet(page, "/api/v2/setup/progress");
+    if (!lhSetupProgress || lhSetupProgress.program_id !== lh.progLH2) {
+      fail(`(L, hash sync) expected /api/v2/setup/progress to also read `
+        + `LH2's own context (${lh.progLH2}), got `
+        + `${JSON.stringify(lhSetupProgress && lhSetupProgress.program_id)}`);
+    }
+    const lhDecodedHash = await page.evaluate(() => {
+      try {
+        const b64 = location.hash.slice(5).replace(/-/g, "+").replace(/_/g, "/");
+        return JSON.parse(atob(b64));
+      } catch (_) { return null; }
+    });
+    if (!lhDecodedHash || lhDecodedHash.p !== lh.progLH2) {
+      fail(`(L, hash sync) expected the URL hash to encode LH2 `
+        + `(${lh.progLH2}), got ${JSON.stringify(lhDecodedHash)} from `
+        + `${await page.evaluate(() => location.hash)}`);
+    }
+    // Reload with the SAME hash intact this time (not freshLoad()'s bare
+    // origin) -- this is the specific reload that exercises
+    // restoreContextDeepLink() against the very hash finding 10 is about.
+    // Track every /api/context POST across it: a correct client sends
+    // NONE (the hash already names the server's own canonical selection,
+    // so there is nothing to "restore"); the bug this guards against would
+    // send one for LH1, rolling the persisted context back.
+    const lhReloadUrl = await page.evaluate(() => location.href);
+    const seenReloadRequests = [];
+    const trackReload = (req) => {
+      if (req.url() === `${base}/api/context` && req.method() === "POST") {
+        let pid = null;
+        try { pid = JSON.parse(req.postData() || "{}").program_id; } catch (_) {}
+        seenReloadRequests.push(pid);
+      }
+    };
+    page.on("request", trackReload);
+    await page.goto(lhReloadUrl, { waitUntil: "domcontentloaded" });
+    await reachDashboard(page);
+    await waitForCardSettled(page);
+    await page.waitForLoadState("networkidle").catch(() => {});
+    page.off("request", trackReload);
+    if (seenReloadRequests.includes(lh.progLH1)) {
+      fail(`(L, hash sync) expected NO compensating /api/context POST to `
+        + `LH1 (${lh.progLH1}) on a hash-intact reload, got `
+        + `${JSON.stringify(seenReloadRequests)}`);
+    }
+    const lhReloadedValue = await page.$eval("#ctx-select", (el) => el.value);
+    if (lhReloadedValue !== switchToLH2) {
+      fail(`(L, hash sync) expected LH2 (${switchToLH2}) to survive a `
+        + `hash-INTACT reload, got ${lhReloadedValue}`);
+    }
+    // Same deliberate-500 error-log allowance as (L, failure convergence)
+    // above.
+    const unexpectedLH = errors.filter((e) => !/responded with a status of 500/.test(e));
+    if (unexpectedLH.length === errors.length) {
+      fail("(L, hash sync) expected the deliberately rejected LH3 switch "
+        + `to log a resource error, got:\n${errors.join("\n")}`);
+    }
+    errors.length = 0;
+    errors.push(...unexpectedLH);
 
     // ---- (L, identity supersession) A switch QUEUED (not yet sent to the
     // server, per the coalescing fix above) when an identity change

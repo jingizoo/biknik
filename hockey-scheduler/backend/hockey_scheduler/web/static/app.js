@@ -63,6 +63,25 @@ let contextRevision = 0;
 // result; an earlier one that resolves later must recognize it's been
 // superseded and do nothing further, on success OR failure.
 let contextSwitchSeq = 0;
+// Monotonic op tokens for Import/Ice Builder's own async operations (#331
+// review round 10), distinct from contextRevision/contextSwitchSeq above:
+// those only ever detect the ACTIVE CONTEXT changing underneath a request.
+// A stale response can just as easily be wrong within the SAME context --
+// canceling and reopening the Ice Builder, editing its form (or an
+// exclusion) while a Preview/Commit is in flight, or simply firing two
+// Validates/Previews back to back and having them resolve out of order --
+// none of which touch contextRevision at all. Each bumps on EVERY event
+// that makes a not-yet-resolved Preview/Validate/Commit response
+// obsolete -- issuing a newer one of the same kind, opening/canceling the
+// builder, or editing the live form/exclusions/sheets -- and each handler
+// snapshots the current value immediately before its own vulnerable
+// `await` and rechecks it after, the exact same idiom contextRevision
+// itself already uses. A single global counter per surface is enough:
+// there is only ever one live `iceBuilder`/`importState` at a time, so
+// nothing here needs a per-instance identity separate from "the latest
+// token issued."
+let iceOperationSeq = 0;
+let importOperationSeq = 0;
 let publicState = { schedule: null, standings: null, division: null, game: null,
   feedUrl: null, feedLabel: null };  // feedUrl/feedLabel: freshly-minted public calendar subscription (#33)
 let publicTab = "schedule";        // "schedule" | "standings" (#83)
@@ -700,6 +719,12 @@ async function loadSetupProgressCard() {
 // meaningful, not silently at the top of the page.
 async function goToSetupWorkflow(key) {
   if (key === "facilities") {
+    // Bump here too (#331 review round 10), same reasoning as the manual
+    // "Build ice" button's own onclick: this is a SECOND place a fresh
+    // builder instance gets created, and a Preview/Commit held from a
+    // PREVIOUS one (canceled, or left over from before this hub-driven
+    // navigation) must not be mistaken for belonging to this new one.
+    iceOperationSeq += 1;
     iceBuilder = { form: null, preview: null };
     switchTab("calendar");
     focusContentHeading();
@@ -7123,6 +7148,15 @@ async function render() {
     importState.report = null;
     importState.validatedKey = null;
     importState.committed = null;
+    // #331 review round 10: importState.type is a small, reusable string (not
+    // a monotonic counter like contextRevision), so switching away and back
+    // to the SAME type before a stale Validate/Commit resolves would make
+    // `importState.type !== type.key` coincidentally pass again -- and if the
+    // freshly re-rendered sheets happen to hold the same text too (e.g. both
+    // empty), importSnapshotKey() could coincidentally match as well. Bump
+    // unconditionally so a type switch is always recognized as a fresh
+    // operation, the same as it would be for the Ice Builder.
+    importOperationSeq += 1;
     toast = "";
     render();
   });
@@ -7138,6 +7172,12 @@ async function render() {
     importState.report = null;
     importState.validatedKey = null;
     importState.committed = null;
+    // #331 review round 10, same reasoning as the type switch above: loading
+    // sample data resets the sheets to a fixed, reusable string, so a second
+    // load (or a load that lands on content matching an earlier snapshot)
+    // must still be treated as a fresh operation, not left to chance on
+    // whether importSnapshotKey() happens to differ.
+    importOperationSeq += 1;
     toast = "Sample data loaded — click Validate to preview it.";
     toastIsError = true;  // instructional, not a completed action — don't auto-clear
     render();
@@ -7211,10 +7251,17 @@ async function render() {
     // only, not sheetsText or the type selector, so either kind of
     // staleness needs its own check.
     const requestRevision = contextRevision;
+    // A newer identical-input Validate click (#331 review round 10) changes
+    // none of the checks above -- same type, same text, same context -- so
+    // without its own token an OLDER response released after a NEWER one
+    // could still overwrite it (e.g. the newer click's own request failed
+    // and THIS one happens to succeed, silently re-enabling Commit against
+    // a review the operator's own latest click already superseded).
+    const requestOp = ++importOperationSeq;
     importState.committed = null;
     const res = await post("/api/import/dry-run", body);
     if (importState.type !== type.key || importSnapshotKey(type) !== requestKey
-        || contextRevision !== requestRevision) return;
+        || contextRevision !== requestRevision || requestOp !== importOperationSeq) return;
     toast = "";
     importState.report = res;
     importState.validatedKey = (res && !res.error) ? requestKey : null;
@@ -7234,18 +7281,20 @@ async function render() {
       return render();
     }
     const requestRevision = contextRevision;  // #331 review round 9, consistency with Validate above
+    const requestOp = ++importOperationSeq;  // #331 review round 10, same reasoning as Validate above
     const body = buildImportBody(type);
     if (type.needsSeason) body.season_id = importState.seasonId;
     const res = await post(type.commitPath, body);
     // Same stale-response guard as Validate above — discard this response
-    // if the sheets, the selected type, or the context changed while the
-    // request was in flight, rather than showing a commit result for
-    // content that's no longer what's on screen (#331 review round 9 added
-    // the context leg -- the commit ITSELF already went to whichever
-    // season_id this click actually captured, so this only guards what the
-    // client does with the RESPONSE, same as the others below it).
+    // if the sheets, the selected type, the context, or a newer operation
+    // superseded it while the request was in flight, rather than showing a
+    // commit result for content that's no longer what's on screen (#331
+    // review round 9 added the context leg, round 10 the operation leg --
+    // the commit ITSELF already went to whichever season_id this click
+    // actually captured, so this only guards what the client does with the
+    // RESPONSE, same as the others below it).
     if (importState.type !== type.key || importSnapshotKey(type) !== requestKey
-        || contextRevision !== requestRevision) return;
+        || contextRevision !== requestRevision || requestOp !== importOperationSeq) return;
     toast = "";
     importState.committed = res;
     if (res && res.committed) { importState.report = null; importState.validatedKey = null; }
@@ -7423,9 +7472,20 @@ async function render() {
   });
   // Ice Availability Builder (#158): open/cancel, preview, commit, exclusions.
   const ibOpen = c.querySelector("[data-ice-builder-open]");
-  if (ibOpen) ibOpen.onclick = () => { iceBuilder = { form: null, preview: null }; toast = ""; render(); };
+  // Opening a builder bumps iceOperationSeq (#331 review round 10): a
+  // Preview/Commit issued by a PRIOR builder instance -- canceled, then
+  // this one opened fresh -- must never be mistaken for current just
+  // because contextRevision hasn't changed (same context throughout) and
+  // `iceBuilder` is non-null again by the time it resolves.
+  if (ibOpen) ibOpen.onclick = () => {
+    iceOperationSeq += 1;
+    iceBuilder = { form: null, preview: null }; toast = ""; render();
+  };
   const ibCancel = c.querySelector("[data-ib-cancel]");
-  if (ibCancel) ibCancel.onclick = () => { iceBuilder = null; toast = ""; render(); };
+  if (ibCancel) ibCancel.onclick = () => {
+    iceOperationSeq += 1;
+    iceBuilder = null; toast = ""; render();
+  };
   // Any change to the template (season, rinks, weekdays, per-day times, dates,
   // buffers) INVALIDATES a shown preview, so Create can never post a form
   // edited after Preview — the create button re-reads the live form, and the
@@ -7437,6 +7497,12 @@ async function render() {
     if (e.target && e.target.id === "ib-excl") return;  // staging input, not the template
     const isWeekday = e.target.classList && e.target.classList.contains("ib-weekday");
     const hadPreview = !!iceBuilder.preview;
+    // Bump unconditionally, not only when clearing an existing preview
+    // (#331 review round 10): a Preview issued BEFORE this edit but still
+    // in flight when it lands must be recognized as stale even if no
+    // preview existed yet to clear -- otherwise it would still write its
+    // now-outdated slots onto the freshly-edited form once it resolves.
+    iceOperationSeq += 1;
     iceBuilder.form = readIceBuilderForm(c);
     if (hadPreview) { iceBuilder.preview = null; toast = ""; }
     if (hadPreview || isWeekday) render();
@@ -7459,9 +7525,16 @@ async function render() {
     // switch could in principle let a new builder exist by the time this
     // resolves.
     const requestRevision = contextRevision;
+    // Snapshot the op token too (#331 review round 10): contextRevision
+    // alone only catches a CONTEXT change, not e.g. canceling and
+    // reopening the builder, editing the form, or a second Preview click
+    // -- all same-context events that must also obsolete this one. Each of
+    // those bumps iceOperationSeq at the point it happens; a mismatch here
+    // means one of them happened while this request was in flight.
+    const requestOp = ++iceOperationSeq;
     iceBuilder.form = readIceBuilderForm(c);
     const preview = await post("/api/setup/ice-availability/preview", iceBuilder.form);
-    if (!iceBuilder || contextRevision !== requestRevision) return;
+    if (!iceBuilder || contextRevision !== requestRevision || requestOp !== iceOperationSeq) return;
     iceBuilder.preview = preview;
     render();
   });
@@ -7498,10 +7571,17 @@ async function render() {
     // in-progress B builder, attach an A-context re-preview onto it, or
     // crash outright against a `null` left by an identity switch.
     const requestRevision = contextRevision;
+    // #331 review round 10, same reasoning as Preview above: contextRevision
+    // alone doesn't catch a same-context cancel/reopen of the builder --
+    // without this, a stale Commit success landing after the operator
+    // canceled and reopened a fresh builder in the SAME context would still
+    // pass the guard below and null out that brand-new builder out from
+    // under them.
+    const requestOp = ++iceOperationSeq;
     iceBuilder.form = readIceBuilderForm(c);
     const res = await post("/api/setup/ice-availability/commit",
       { ...iceBuilder.form, template_fingerprint: fingerprint });
-    if (!iceBuilder || contextRevision !== requestRevision) return;
+    if (!iceBuilder || contextRevision !== requestRevision || requestOp !== iceOperationSeq) return;
     const reason = res && res.error && res.error.details && res.error.details.reason;
     if (res && !res.error) {
       toast = `Created ${res.totals.created} ice slot(s).`; iceBuilder = null;
@@ -7511,12 +7591,16 @@ async function render() {
       // preview so the operator reviews the CURRENT slots before creating again;
       // never commit the stale set.
       toast = "The schedule changed since preview — showing the updated proposal. Review, then create again.";
-      // Same guard around this second await (#331 review round 9) -- a
-      // switch could just as easily land during the re-preview as during
-      // the commit above.
+      // Same guard around this second await (#331 review round 9/10) -- a
+      // switch, cancel/reopen, or edit could just as easily land during the
+      // re-preview as during the commit above. This re-preview counts as
+      // its own fresh operation (a new ++, not a re-read of requestOp):
+      // a genuinely independent Preview click racing it must still be able
+      // to supersede it.
       const rePreviewRevision = contextRevision;
+      const rePreviewOp = ++iceOperationSeq;
       const rePreview = await post("/api/setup/ice-availability/preview", iceBuilder.form);
-      if (!iceBuilder || contextRevision !== rePreviewRevision) return;
+      if (!iceBuilder || contextRevision !== rePreviewRevision || rePreviewOp !== iceOperationSeq) return;
       iceBuilder.preview = rePreview;
     } else {
       iceBuilder.preview = res;
@@ -7531,6 +7615,7 @@ async function render() {
     const d = el && el.value;
     if (d && !iceBuilder.form.exclusion_dates.includes(d)) iceBuilder.form.exclusion_dates.push(d);
     iceBuilder.preview = null;   // exclusions changed the template — re-preview
+    iceOperationSeq += 1;  // #331 review round 10, same reasoning as the form change listener above
     render();
   };
   c.querySelectorAll("[data-ib-excl-remove]").forEach((b) => b.onclick = () => {
@@ -7539,6 +7624,7 @@ async function render() {
     iceBuilder.form.exclusion_dates =
       iceBuilder.form.exclusion_dates.filter((x) => x !== b.dataset.ibExclRemove);
     iceBuilder.preview = null;   // exclusions changed the template — re-preview
+    iceOperationSeq += 1;  // #331 review round 10, same reasoning as the form change listener above
     render();
   });
   c.querySelectorAll("[data-filter]").forEach((sel) => sel.onchange = (e) => {
@@ -7817,6 +7903,12 @@ function invalidateContextScopedMutations() {
     document.querySelectorAll(".drawer-scrim, .drawer").forEach((el) => el.remove());
     drawer = null; drawerError = ""; drawerValues = {};
   }
+  // Belt-and-suspenders alongside the contextRevision bump the caller does
+  // separately (#331 review round 10): a context switch is itself one of
+  // the events that should obsolete any in-flight Validate/Preview/Commit,
+  // same as an in-context edit or a newer request of the same kind does.
+  iceOperationSeq += 1;
+  importOperationSeq += 1;
 }
 // Coalescing queue for context-switch POSTs (#331 review round 9): every
 // setActiveContext() call used to send its own /api/context POST
@@ -7891,6 +7983,18 @@ async function sendContextSwitch(mySeq, programId, seasonId) {
     toast = "That Program/Season isn't available."; toastIsError = true;
     await loadContextOptions();
     if (mySeq !== contextSwitchSeq || contextSwitchQueued) return;
+    // loadContextOptions() just proved canonical truth -- sync the hash to
+    // it even on THIS failure path (#331 review round 10). This request's
+    // own target was rejected, but that does not mean the hash is already
+    // correct: if an EARLIER sibling in the same coalesced burst succeeded
+    // (this one was queued behind it and its own success reconciliation
+    // was skipped in favor of dequeuing straight to this one, per the
+    // comment above), the server is already sitting on THAT sibling's
+    // context while the hash still shows whatever was live before the
+    // whole burst started. Without this, a reload runs
+    // restoreContextDeepLink(), treats the stale hash as an intentional
+    // deep link, and silently POSTs the persisted context back to it.
+    syncContextHash();
     render();
     return;
   }

@@ -452,6 +452,75 @@ Import wizard or Ice Builder to compare notes; the two admin/arena legs
 alone can only ever prove `resetTransientUiState()` itself runs, since both
 roles share every permission the state in question is gated behind.
 
+Round 9's fixes still left two gaps open in the same lifecycle (#331 review
+round 10). The first was in `sendContextSwitch()`'s own failure branch: when
+an intermediate switch in a coalesced burst succeeds while another is
+already queued behind it, the function dequeues straight to the queued pick
+and returns, so the success branch's own `syncContextHash()` call — which
+only runs on that branch — never fires for the intermediate pick at all. If
+the queued pick's own request is then rejected, the failure branch already
+reconciles `contextOptions` and `#ctx-select` from a real
+`loadContextOptions()` call, but never synced the hash to match — so the
+server, the options list, and the selector all correctly converge on the
+intermediate pick while the hash keeps showing whatever was live before the
+whole burst started. A reload then runs `restoreContextDeepLink()`, reads
+that stale hash as an intentional deep link, and silently POSTs the
+original context back, rolling back a switch the server had already
+persisted. The existing "(L, failure convergence)" regression could not
+have caught this, since it only ever rejects a single direct switch at a
+point where the hash and server already agree beforehand — never a switch
+that both succeeded AND had its own hash reconciliation skipped by the
+coalescing path. The fix is a single added `syncContextHash()` call in the
+failure branch, right after `loadContextOptions()` — always safe to call
+there, since it is a no-op whenever the hash already matches. A new
+regression, "(L, queued-then-rejected hash sync)", holds one switch in
+flight, queues a second behind it, lets the first succeed and the second
+(now dequeued) get rejected, then confirms the selector, three independent
+backend reads (`/api/context`, `/api/context/options`,
+`/api/v2/setup/progress`), and the decoded hash all agree on the first
+switch's target — then, unlike every prior reload regression, reloads with
+the hash left INTACT rather than stripped, tracking every `/api/context`
+POST the reload itself issues to prove no compensating rollback request
+goes out.
+
+The second gap was broader: every staleness guard through round 9 —
+`contextRevision`, `contextSwitchSeq`, the snapshot-before-await/recheck-
+after idiom itself — detects only the ACTIVE CONTEXT changing under an
+in-flight request, never a same-context event that should just as validly
+obsolete it. Canceling and reopening the Ice Builder, editing its form or
+an exclusion while a Preview or Commit is in flight, or simply firing two
+Previews (or two identical-input Validates) back to back and letting them
+resolve out of order all leave `contextRevision` untouched and `iceBuilder`
+non-null throughout, so none of round 9's checks fire. Two new
+module-level monotonic counters, `iceOperationSeq` and `importOperationSeq`,
+close this the same way `contextSwitchSeq` already closes its own class:
+each bumps on every event that should obsolete a not-yet-resolved
+Preview/Validate/Commit response for that surface — opening or canceling
+the Ice Builder, editing its live form or an exclusion, switching Import's
+type, loading Import's sample data, or issuing a newer request of the same
+kind — and each handler snapshots the current value immediately before its
+own vulnerable `await` and rechecks it after, alongside the existing
+`contextRevision` check rather than in place of it. A single global counter
+per surface is enough, since only one `iceBuilder`/`importState` is ever
+live at a time — no per-instance identity is needed beyond "the latest
+token issued." Four new regressions cover the reviewer's own scenarios
+directly: canceling and reopening the Ice Builder across a held Preview and
+across a held Commit (each proving a stale response cannot resurrect or
+discard the WRONG builder instance), two Previews on the same still-open
+builder released in reverse order (proving the older response cannot
+overwrite the newer one's already-painted slots), and two identical-input
+Import Validates released in reverse order (proving a stale success cannot
+re-enable Commit after a newer failure already disabled it). The audit
+that followed caught a second, previously-missed Ice Builder "open" site —
+`goToSetupWorkflow("facilities")`'s own hub-driven entry point, distinct
+from the manual "Build ice" button — constructing a fresh builder without
+bumping `iceOperationSeq`, and two Import handlers (type switch, sample-
+data load) resetting reusable string state rather than a monotonic value,
+both fixed for the same reason: `importState.type` and the pasted sheet
+text can coincidentally cycle back to a value an in-flight request's own
+snapshot already matches, unlike `contextRevision`, which — being
+append-only — never can.
+
 The card's async states carry real accessibility semantics, not just visual
 ones (#331 review round 5 finding 5): `#sp-card-slot` (the wrapper
 `loadSetupProgressCard()` swaps content into, itself painted once by
