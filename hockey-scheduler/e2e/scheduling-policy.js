@@ -142,6 +142,17 @@ async function checkViewport(browser, viewport) {
       const policy = await post("/api/setup/scheduling-policy", {
         scope_type: "rink", scope_id: rink.id,
         warmup_minutes: 5, resurfacing_minutes: 10 });
+      // The legacy v1 "league" IS a v2 Program under the shim (server.py's
+      // POST /api/setup/league routes straight to api.create_program(), and
+      // /api/setup/season passes its own league_id through as
+      // create_season()'s program_id) -- select it as the active #159
+      // context so defaultIceForm() resolves this Season without needing
+      // its own now-removed global-first fallback (#331 review round 8:
+      // defaultIceForm() fails CLOSED, the same way Import's own Season
+      // select already does, when no Season is actively selected -- this
+      // fixture must actively select one, not rely on a silent global
+      // default that no longer exists).
+      await post("/api/context", { program_id: league.id, season_id: season.id });
       return { rink: rink.id, slot1: slot1.id, slot2: slot2.id,
                slot4: slot4.id, division: division.id,
                game: game.id, gameError: game.error || null,
@@ -154,6 +165,15 @@ async function checkViewport(browser, viewport) {
     if (ids.gameError) fail(`seed game failed: ${JSON.stringify(ids.gameError)}`);
     if (ids.game2Error) fail(`seed game 2 failed: ${JSON.stringify(ids.game2Error)}`);
     if (ids.policyError) fail(`seed policy failed: ${JSON.stringify(ids.policyError)}`);
+    // The /api/context call above is a bare fetch, bypassing
+    // setActiveContext() (the real switcher's own handler) entirely -- it
+    // moves the SERVER's active context but leaves the already-loaded
+    // page's own client-side contextOptions (fetched once, before this
+    // fixture's Program even existed) none the wiser. A reload re-runs the
+    // boot sequence's own loadContextOptions() so defaultIceForm() sees the
+    // real selection below.
+    await page.reload({ waitUntil: "domcontentloaded" });
+    await page.waitForSelector("#content > *", { timeout: 10000 });
 
     // (A) Day board: hosted slot card shows the reserved facility span;
     // the free slot card shows none.

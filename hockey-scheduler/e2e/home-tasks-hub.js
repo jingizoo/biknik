@@ -1837,6 +1837,507 @@ async function checkRoleScenarios(browser, viewport) {
         + `${JSON.stringify(commitResult2)}`);
     }
 
+    // ---- (H) contextSeededDrawerValues()'s own in-flight-hierarchy-fetch
+    // race must close the moment a switch is ATTEMPTED, not once it's
+    // CONFIRMED (#331 review round 8): its stillCurrent check used to
+    // compare against contextOptions.selected.program_id, which
+    // setActiveContext() doesn't update until ITS OWN /api/context POST
+    // succeeds -- a switch merely INITIATED (not yet confirmed) while this
+    // fetch was in flight used to still read as "unchanged" and let a
+    // stale seed win. Proven with BOTH possible response orders, since
+    // neither may open a drawer with H1's seed once H2 was even attempted.
+    const h = await page.evaluate(async () => {
+      const post = async (p, b) => (await fetch(p, {
+        method: "POST", credentials: "same-origin",
+        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
+      })).json();
+      const progH1 = await post("/api/v2/setup/program",
+        { name: "Round8H1 Program", country: "US" });
+      const seasonH1 = await post("/api/v2/setup/season",
+        { program_id: progH1.id, name: "Season H1" });
+      const leagueH1 = await post("/api/v2/setup/league",
+        { season_id: seasonH1.id, name: "League H1" });
+      const progH2 = await post("/api/v2/setup/program",
+        { name: "Round8H2 Program", country: "US" });
+      return { progH1: progH1.id, seasonH1: seasonH1.id,
+        leagueH1: leagueH1.id, progH2: progH2.id };
+    });
+    const switchToH2 = `${h.progH2}|`;
+    const openH1TeamDrawer = async () => {
+      await apiPost(page, "/api/context", { program_id: h.progH1, season_id: h.seasonH1 });
+      await freshLoad();
+      s = await cardState(page);
+      if (!s || s.nextTitle !== "Permanent teams") {
+        fail(`(H) Program H1: expected next = "Permanent teams", got ${JSON.stringify(s)}`);
+      }
+    };
+
+    // Sub-case 1: the hierarchy fetch resolves BEFORE the context POST.
+    await openH1TeamDrawer();
+    let releaseHierarchyH1, releaseContextH1;
+    const hierarchyHoldH1 = new Promise((resolve) => { releaseHierarchyH1 = resolve; });
+    const contextHoldH1 = new Promise((resolve) => { releaseContextH1 = resolve; });
+    await page.route("**/api/v2/setup/hierarchy", async (route) => { await hierarchyHoldH1; await route.continue(); });
+    await page.route("**/api/context", async (route) => { await contextHoldH1; await route.continue(); });
+    await page.click("[data-setup-progress-action]");
+    await new Promise((r) => setTimeout(r, 200));  // let the click's own fetch actually start
+    await page.selectOption("#ctx-select", switchToH2);
+    await new Promise((r) => setTimeout(r, 200));  // let setActiveContext's synchronous Phase 1 run
+    releaseHierarchyH1();
+    await new Promise((r) => setTimeout(r, 200));
+    releaseContextH1();
+    await page.unroute("**/api/v2/setup/hierarchy");
+    await page.unroute("**/api/context");
+    await page.waitForFunction((v) => document.getElementById("ctx-select").value === v,
+      switchToH2, { timeout: 10000 });
+    // #ctx-select's own value is an EARLY signal within a render() cycle
+    // (renderContextSwitcher() runs partway through it, same gap steps
+    // F/G/K's own comments document elsewhere in this file) -- but here BOTH
+    // goToSetupWorkflow()'s own switchTab("setup")-triggered render() and
+    // setActiveContext()'s own completion render() can be in flight
+    // together, and only the LAST one to actually finish painting decides
+    // what #content shows. Checking .drawer right after the switcher's own
+    // value settles caught this mid-flight and missed a real stale-drawer
+    // paint entirely in testing -- wait for the network to actually go
+    // quiet (both renders' own fetch chains fully drained) before asserting.
+    await page.waitForLoadState("networkidle").catch(() => {});
+    if (await page.$(".drawer")) {
+      fail("(H, hierarchy-first) expected NO drawer to open with H1's stale "
+        + "seed after a switch to H2 was merely ATTEMPTED while the seed "
+        + "fetch was still in flight");
+    }
+
+    // Sub-case 2: the context POST resolves BEFORE the hierarchy fetch.
+    await openH1TeamDrawer();
+    let releaseHierarchyH2b, releaseContextH2b;
+    const hierarchyHoldH2b = new Promise((resolve) => { releaseHierarchyH2b = resolve; });
+    const contextHoldH2b = new Promise((resolve) => { releaseContextH2b = resolve; });
+    await page.route("**/api/v2/setup/hierarchy", async (route) => { await hierarchyHoldH2b; await route.continue(); });
+    await page.route("**/api/context", async (route) => { await contextHoldH2b; await route.continue(); });
+    await page.click("[data-setup-progress-action]");
+    await new Promise((r) => setTimeout(r, 200));
+    await page.selectOption("#ctx-select", switchToH2);
+    await new Promise((r) => setTimeout(r, 200));
+    releaseContextH2b();
+    await new Promise((r) => setTimeout(r, 200));
+    releaseHierarchyH2b();
+    await page.unroute("**/api/v2/setup/hierarchy");
+    await page.unroute("**/api/context");
+    await page.waitForFunction((v) => document.getElementById("ctx-select").value === v,
+      switchToH2, { timeout: 10000 });
+    // Same reasoning as sub-case 1 above: wait for the network (both
+    // renders' own fetch chains) to actually go quiet, not a fixed delay,
+    // before asserting against #content.
+    await page.waitForLoadState("networkidle").catch(() => {});
+    if (await page.$(".drawer")) {
+      fail("(H, context-first) expected NO drawer to open with H1's stale "
+        + "seed after H2 was already confirmed by the time the seed fetch "
+        + "resolved");
+    }
+
+    // ---- (I) An ALREADY-OPEN, already-seeded drawer must not survive a
+    // context switch reached via keyboard (#331 review round 8): with no
+    // dialog focus trap (#113, tracked separately as post-critical), a
+    // keyboard user can tab out of an open drawer to the switcher behind
+    // it -- exactly how this finding is reachable without a mouse. h.progH2
+    // already exists as a selectable #ctx-select option (created in H's own
+    // fixture above, before any freshLoad in this scenario), so no extra
+    // reload is needed here to make it choosable while the drawer is open.
+    await openH1TeamDrawer();
+    await page.click("[data-setup-progress-action]");
+    await page.waitForSelector("#f-team-perm-league", { timeout: 10000 });
+    const iSelected = await page.$eval("#f-team-perm-league", (el) => el.value);
+    if (iSelected !== h.leagueH1) {
+      fail(`(I) drawer must default to H1's own League (${h.leagueH1}), got ${iSelected}`);
+    }
+    // Start with focus INSIDE the drawer (proving it was really there), then
+    // land it on the switcher -- standing in for "tabbed out, no trap
+    // stopped it" without a brittle full Tab-order walk through this
+    // drawer's exact field count.
+    await page.focus("#f-team-perm-league");
+    await page.focus("#ctx-select");
+    await page.selectOption("#ctx-select", switchToH2);
+    await page.waitForFunction((v) => document.getElementById("ctx-select").value === v,
+      switchToH2, { timeout: 10000 });
+    if (await page.$(".drawer") || await page.$(".drawer-scrim")) {
+      fail("(I) expected the open drawer to be DISMISSED immediately after "
+        + "a keyboard-driven context switch, not still present");
+    }
+    const focusedAfterI = await page.evaluate(() =>
+      document.activeElement && document.activeElement.id);
+    if (focusedAfterI !== "ctx-select") {
+      fail(`(I) expected focus to land/stay on #ctx-select after the switch `
+        + `dismissed the drawer (never left stranded in removed content), `
+        + `got ${JSON.stringify(focusedAfterI)}`);
+    }
+
+    // ---- (J) Import Commit must be uncommittable the INSTANT a context
+    // switch is attempted, not once its own /api/context POST resolves
+    // (#331 review round 8): validatedKey used to stay live for the WHOLE
+    // round trip, so a Commit landing in that window would still target J1
+    // even though the switcher already shows J2.
+    const j = await page.evaluate(async () => {
+      const post = async (p, b) => (await fetch(p, {
+        method: "POST", credentials: "same-origin",
+        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
+      })).json();
+      const progJ1 = await post("/api/v2/setup/program",
+        { name: "Round8J1 Program", country: "US" });
+      const seasonJ1 = await post("/api/v2/setup/season",
+        { program_id: progJ1.id, name: "Season J1" });
+      const progJ2 = await post("/api/v2/setup/program",
+        { name: "Round8J2 Program", country: "US" });
+      const seasonJ2 = await post("/api/v2/setup/season",
+        { program_id: progJ2.id, name: "Season J2" });
+      return { progJ1: progJ1.id, seasonJ1: seasonJ1.id,
+        progJ2: progJ2.id, seasonJ2: seasonJ2.id };
+    });
+    await apiPost(page, "/api/context", { program_id: j.progJ1, season_id: j.seasonJ1 });
+    await freshLoad();
+    // hierarchy-import.js's own one-time-PER-PAGE-LOAD hierarchy-codes race
+    // (see seedImportAndIceForM()'s identical comment further below) --
+    // this Import visit is the first since the freshLoad() just above, so
+    // it applies here too.
+    const jHierarchyCodesResp = page.waitForResponse((r) =>
+      r.url() === `${base}/api/import/hierarchy-codes` && r.request().method() === "GET")
+      .catch(() => null);
+    await page.click('.tab[data-tab="import"]');
+    await jHierarchyCodesResp;
+    await page.waitForFunction(
+      (v) => (document.getElementById("import-season") || {}).value === v,
+      j.seasonJ1, { timeout: 10000 });
+    await page.click("[data-import-sample]");
+    const jValidateResp = page.waitForResponse((r) =>
+      r.url() === `${base}/api/import/dry-run` && r.request().method() === "POST");
+    await page.click("[data-import-validate]");
+    await jValidateResp;
+    await page.waitForFunction(() => {
+      const btn = document.querySelector("[data-import-commit]");
+      return !!(btn && !btn.disabled);
+    }, null, { timeout: 10000 });
+
+    let releaseContextJ;
+    const contextHoldJ = new Promise((resolve) => { releaseContextJ = resolve; });
+    await page.route("**/api/context", async (route) => { await contextHoldJ; await route.continue(); });
+    const switchToJ2 = `${j.progJ2}|${j.seasonJ2}`;
+    await page.selectOption("#ctx-select", switchToJ2);
+    await new Promise((r) => setTimeout(r, 200));  // let Phase 1's synchronous clear actually run
+
+    const seenCommitsJ = [];
+    const trackJ = (req) => {
+      if (req.url() === `${base}/api/import/commit/teams-players` && req.method() === "POST") {
+        seenCommitsJ.push(req.url());
+      }
+    };
+    page.on("request", trackJ);
+    await page.click("[data-import-commit]").catch(() => {});
+    await new Promise((r) => setTimeout(r, 300));
+    page.off("request", trackJ);
+    if (seenCommitsJ.length) {
+      fail("(J) expected no Import commit request while the switch to J2 "
+        + "was still pending");
+    }
+    releaseContextJ();
+    await page.unroute("**/api/context");
+    await page.waitForFunction(
+      (v) => (document.getElementById("import-season") || {}).value === v,
+      j.seasonJ2, { timeout: 10000 });
+    const jCommitStillEnabled = await page.evaluate(() => {
+      const btn = document.querySelector("[data-import-commit]");
+      return btn ? !btn.disabled : null;
+    });
+    if (jCommitStillEnabled) {
+      fail("(J) expected Commit to require fresh J2 validation once the "
+        + "switch settled, not stay enabled from J1's stale review");
+    }
+
+    // ---- (K) Ice Builder Create must be uncommittable the INSTANT a
+    // context switch is attempted too (#331 review round 8) -- the
+    // identical gap as Import's own Commit above, closed the same way
+    // (clearing iceBuilder.preview synchronously, before
+    // setActiveContext()'s POST). Season dates are explicit (#158's own
+    // generation-range requirement, learned in round 7): a Season with
+    // neither its own dates nor the builder's own date fields set is
+    // correctly rejected by the backend, which would read here as "no
+    // [data-ib-commit]" for an unrelated reason.
+    const k = await page.evaluate(async () => {
+      const post = async (p, b) => (await fetch(p, {
+        method: "POST", credentials: "same-origin",
+        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
+      })).json();
+      const progK1 = await post("/api/v2/setup/program",
+        { name: "Round8K1 Program", country: "US" });
+      const seasonK1 = await post("/api/v2/setup/season", { program_id: progK1.id,
+        name: "Season K1", start_date: "2026-09-01", end_date: "2027-03-31" });
+      const venueK1 = await post("/api/v2/setup/venue",
+        { name: "VK1", organization_id: null });
+      const rinkK1 = await post("/api/v2/setup/rink",
+        { venue_id: venueK1.id, name: "RK1" });
+      await post(`/api/v2/setup/seasons/${seasonK1.id}/venue-access`,
+        { venue_id: venueK1.id });
+      const progK2 = await post("/api/v2/setup/program",
+        { name: "Round8K2 Program", country: "US" });
+      const seasonK2 = await post("/api/v2/setup/season", { program_id: progK2.id,
+        name: "Season K2", start_date: "2026-09-01", end_date: "2027-03-31" });
+      return { progK1: progK1.id, seasonK1: seasonK1.id, rinkK1: rinkK1.id,
+        progK2: progK2.id, seasonK2: seasonK2.id };
+    });
+    await apiPost(page, "/api/context", { program_id: k.progK1, season_id: k.seasonK1 });
+    await freshLoad();
+    await page.click('.tab[data-tab="calendar"]');
+    await page.waitForFunction(() => document.body.dataset.view === "calendar",
+      null, { timeout: 10000 });
+    await page.waitForSelector("[data-ice-builder-open]", { timeout: 10000 });
+    await page.click("[data-ice-builder-open]");
+    await page.waitForFunction(
+      (v) => (document.getElementById("ib-season") || {}).value === v,
+      k.seasonK1, { timeout: 10000 });
+    await page.click(`.ib-rink[value="${k.rinkK1}"]`);
+    const kPreviewResp = page.waitForResponse((r) =>
+      r.url() === `${base}/api/setup/ice-availability/preview` && r.request().method() === "POST");
+    await page.click("[data-ib-preview]");
+    await kPreviewResp;
+    await page.waitForSelector("[data-ib-commit]", { timeout: 10000 });
+
+    let releaseContextK;
+    const contextHoldK = new Promise((resolve) => { releaseContextK = resolve; });
+    await page.route("**/api/context", async (route) => { await contextHoldK; await route.continue(); });
+    const switchToK2 = `${k.progK2}|${k.seasonK2}`;
+    await page.selectOption("#ctx-select", switchToK2);
+    await new Promise((r) => setTimeout(r, 200));
+
+    const seenCreatesK = [];
+    const trackK = (req) => {
+      if (req.url() === `${base}/api/setup/ice-availability/commit` && req.method() === "POST") {
+        seenCreatesK.push(req.url());
+      }
+    };
+    page.on("request", trackK);
+    await page.click("[data-ib-commit]").catch(() => {});
+    await new Promise((r) => setTimeout(r, 300));
+    page.off("request", trackK);
+    if (seenCreatesK.length) {
+      fail("(K) expected no Ice Builder create request while the switch to "
+        + "K2 was still pending");
+    }
+    releaseContextK();
+    await page.unroute("**/api/context");
+    await page.waitForFunction(
+      (v) => (document.getElementById("ib-season") || {}).value === v,
+      k.seasonK2, { timeout: 10000 });
+    if (await page.$("[data-ib-commit]")) {
+      fail("(K) expected Create to require a fresh K2 preview once the "
+        + "switch settled, not stay committable from K1's stale one");
+    }
+    // -- Program-only context remains fail-closed, re-confirmed here under
+    // a PREVIOUSLY-live builder (step G's own coverage only opened it
+    // fresh): select K2's Program-only entry (no Season) and the builder's
+    // Season select must show no real selection (#331 review round 8's own
+    // defaultIceForm()/renderIceBuilder() fix).
+    const switchToK2ProgramOnly = `${k.progK2}|`;
+    await page.selectOption("#ctx-select", switchToK2ProgramOnly);
+    // Wait for the Ice Builder's OWN re-render, not #ctx-select's value --
+    // the switcher and #content are painted by the same render() call but
+    // not necessarily at the same instant within it (same gap documented
+    // throughout steps F/G above).
+    await page.waitForFunction(
+      () => (document.getElementById("ib-season") || {}).value === "",
+      null, { timeout: 10000 });
+    const ibSeasonAfterProgramOnly = await page.$eval("#ib-season", (el) => el.value).catch(() => null);
+    if (ibSeasonAfterProgramOnly) {
+      fail(`(K) expected no Season selected in the builder under a `
+        + `Program-only context, got ${ibSeasonAfterProgramOnly}`);
+    }
+
+    // ---- (L) Rapid A->B->C with DELIBERATELY REVERSED response order:
+    // only the LATEST switch attempt may ever apply its own
+    // POST/refresh/render result (#331 review round 8's contextSwitchSeq),
+    // regardless of which response happens to arrive first over the wire.
+    const l = await page.evaluate(async () => {
+      const post = async (p, b) => (await fetch(p, {
+        method: "POST", credentials: "same-origin",
+        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
+      })).json();
+      const progL1 = await post("/api/v2/setup/program", { name: "Round8L1 Program", country: "US" });
+      const progL2 = await post("/api/v2/setup/program", { name: "Round8L2 Program", country: "US" });
+      const progL3 = await post("/api/v2/setup/program", { name: "Round8L3 Program", country: "US" });
+      return { progL1: progL1.id, progL2: progL2.id, progL3: progL3.id };
+    });
+    await apiPost(page, "/api/context", { program_id: l.progL1, season_id: null });
+    await freshLoad();
+    const holdsL = {}; const releasersL = {};
+    [l.progL1, l.progL2, l.progL3].forEach((pid) => {
+      holdsL[pid] = new Promise((resolve) => { releasersL[pid] = resolve; });
+    });
+    await page.route("**/api/context", async (route) => {
+      let pid = null;
+      try { pid = JSON.parse(route.request().postData() || "{}").program_id; } catch (_) {}
+      if (holdsL[pid]) await holdsL[pid];
+      await route.continue();
+    });
+    const switchToL1 = `${l.progL1}|`;
+    const switchToL2 = `${l.progL2}|`;
+    const switchToL3 = `${l.progL3}|`;
+    await page.selectOption("#ctx-select", switchToL2);
+    await page.selectOption("#ctx-select", switchToL1);
+    await page.selectOption("#ctx-select", switchToL3);
+    // Reversed release order: L3 (the LATEST attempt) resolves first, then
+    // L1, then L2 (the two SUPERSEDED attempts) -- deliberately the
+    // opposite of the order they were initiated in.
+    releasersL[l.progL3]();
+    await new Promise((r) => setTimeout(r, 150));
+    releasersL[l.progL1]();
+    await new Promise((r) => setTimeout(r, 150));
+    releasersL[l.progL2]();
+    await page.unroute("**/api/context");
+    await page.waitForFunction((v) => document.getElementById("ctx-select").value === v,
+      switchToL3, { timeout: 10000 });
+    await new Promise((r) => setTimeout(r, 300));  // let any superseded response's own handler return
+    const lFinalValue = await page.$eval("#ctx-select", (el) => el.value);
+    if (lFinalValue !== switchToL3) {
+      fail(`(L) expected the switcher to settle on L3 (${switchToL3}) `
+        + `regardless of response order, got ${lFinalValue}`);
+    }
+    const lFinalHash = await page.evaluate(() => location.hash);
+    if (lFinalHash.indexOf(encodeURIComponent(l.progL3).slice(0, 6)) === -1
+        && lFinalHash.indexOf(l.progL3) === -1) {
+      // The hash is base64url-encoded JSON, not the raw id -- decode it
+      // properly rather than substring-matching the id, which would never
+      // actually appear verbatim.
+      const decoded = await page.evaluate(() => {
+        try {
+          const b64 = location.hash.slice(5).replace(/-/g, "+").replace(/_/g, "/");
+          return JSON.parse(atob(b64));
+        } catch (_) { return null; }
+      });
+      if (!decoded || decoded.p !== l.progL3) {
+        fail(`(L) expected the URL hash to encode L3 (${l.progL3}), got `
+          + `${JSON.stringify(decoded)} from ${lFinalHash}`);
+      }
+    }
+
+    // ---- (M) A no-reload IDENTITY switch must clear the SAME
+    // context-scoped mutation state a Program/Season switch does (#331
+    // review round 8): resetTransientUiState() -- already the
+    // identity-transition hook setUser() calls -- used to leave
+    // importState and iceBuilder completely untouched, so a persona swap
+    // (the demo role-switch dropdown) or a sign-out immediately followed by
+    // a different sign-in could hand the NEXT identity an in-progress paste
+    // (real player names/emails), a validated report, or a live Ice
+    // preview/Create action the FIRST identity never meant to share.
+    const m = await page.evaluate(async () => {
+      const post = async (p, b) => (await fetch(p, {
+        method: "POST", credentials: "same-origin",
+        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
+      })).json();
+      const progM1 = await post("/api/v2/setup/program",
+        { name: "Round8M1 Program", country: "US" });
+      const seasonM1 = await post("/api/v2/setup/season", { program_id: progM1.id,
+        name: "Season M1", start_date: "2026-09-01", end_date: "2027-03-31" });
+      const venueM1 = await post("/api/v2/setup/venue",
+        { name: "VM1", organization_id: null });
+      const rinkM1 = await post("/api/v2/setup/rink",
+        { venue_id: venueM1.id, name: "RM1" });
+      await post(`/api/v2/setup/seasons/${seasonM1.id}/venue-access`,
+        { venue_id: venueM1.id });
+      return { progM1: progM1.id, seasonM1: seasonM1.id, rinkM1: rinkM1.id };
+    });
+    const seedImportAndIceForM = async () => {
+      // hierarchy-import.js monkey-patches render() and, the FIRST time
+      // view === "import" is reached AFTER EACH PAGE LOAD -- not just once
+      // ever in the whole run, as step F's own original comment assumed;
+      // hierarchyExistingCodes is a plain JS variable, reset by every
+      // freshLoad() -- fires its own unawaited follow-up render() (after
+      // fetching /api/import/hierarchy-codes) right after the first paint,
+      // which briefly wipes #content back to a loading skeleton before
+      // repainting. seedImportAndIceForM() is always called right after its
+      // own freshLoad() above, so this IS always such a first visit. Wait
+      // for that specific fetch explicitly (registered before the
+      // triggering click) rather than racing a value-poll against an
+      // unbounded second render.
+      const hierarchyCodesResp = page.waitForResponse((r) =>
+        r.url() === `${base}/api/import/hierarchy-codes` && r.request().method() === "GET")
+        .catch(() => null);
+      await page.click('.tab[data-tab="import"]');
+      await hierarchyCodesResp;
+      await page.waitForSelector("[data-import-sample]", { timeout: 10000 });
+      const fieldId = await page.evaluate(() => {
+        const el = document.querySelector('textarea[id^="import-"]');
+        return el ? el.id : null;
+      });
+      if (!fieldId) fail("(M) expected at least one Import sheet textarea to seed a paste into");
+      await page.fill(`#${fieldId}`, "name,position\nAlice PII-Example,forward\nalice-pii@example.test,forward");
+      await page.click('.tab[data-tab="calendar"]');
+      await page.waitForFunction(() => document.body.dataset.view === "calendar",
+        null, { timeout: 10000 });
+      await page.waitForSelector("[data-ice-builder-open]", { timeout: 10000 });
+      await page.click("[data-ice-builder-open]");
+      await page.waitForFunction(
+        (v) => (document.getElementById("ib-season") || {}).value === v,
+        m.seasonM1, { timeout: 10000 });
+      await page.click(`.ib-rink[value="${m.rinkM1}"]`);
+      const previewResp = page.waitForResponse((r) =>
+        r.url() === `${base}/api/setup/ice-availability/preview` && r.request().method() === "POST");
+      await page.click("[data-ib-preview]");
+      await previewResp;
+      await page.waitForSelector("[data-ib-commit]", { timeout: 10000 });
+    };
+    const assertMClearedFor = async (label) => {
+      await page.waitForFunction(() => !document.querySelector(".skeleton"),
+        null, { timeout: 10000 });
+      if (await page.$("[data-ib-commit]") || await page.$(".ib-form")) {
+        fail(`(M, ${label}) expected the Ice Builder to be fully closed for `
+          + `the newly signed-in identity, not still showing the prior `
+          + `identity's open form/preview`);
+      }
+      await page.click('.tab[data-tab="import"]');
+      await page.waitForSelector("[data-import-sample]", { timeout: 10000 });
+      const textAfter = await page.evaluate(() => {
+        const el = document.querySelector('textarea[id^="import-"]');
+        return el ? el.value : null;
+      });
+      if (textAfter) {
+        fail(`(M, ${label}) expected Import's pasted text to be gone for `
+          + `the newly signed-in identity, got: ${JSON.stringify(textAfter)}`);
+      }
+    };
+
+    // -- Leg 1: the in-app persona switch (demo role-switch dropdown), no
+    // sign-out, no reload -- "arena" also carries manage_arena, so this is
+    // the actual disclosure risk (same-or-higher privilege seeing a prior
+    // operator's live state), not merely an authorization gap redaction
+    // elsewhere already covers.
+    await apiPost(page, "/api/context", { program_id: m.progM1, season_id: m.seasonM1 });
+    await freshLoad();
+    await seedImportAndIceForM();
+    await page.selectOption("#role-switch", "arena");
+    await page.waitForFunction(
+      () => (document.getElementById("user-name") || {}).textContent === "arena",
+      null, { timeout: 10000 });
+    await assertMClearedFor("persona switch");
+
+    // -- Leg 2: a real sign-out immediately followed by a DIFFERENT
+    // identity's sign-in through the actual login screen -- not this
+    // file's own raw-fetch logout()/loginAs() helpers, which bypass
+    // signIn()/setUser() entirely and so would prove nothing about the fix
+    // under test here.
+    await logout(page);
+    await loginAs(page, "admin", "demo");
+    await apiPost(page, "/api/context", { program_id: m.progM1, season_id: m.seasonM1 });
+    await freshLoad();
+    await seedImportAndIceForM();
+    await page.waitForLoadState("networkidle").catch(() => {});
+    await page.click("#signout-btn");
+    await page.waitForSelector('[data-persona="arena"]', { state: "visible", timeout: 10000 });
+    await page.click('[data-persona="arena"]');
+    await page.waitForFunction(
+      () => (document.getElementById("user-name") || {}).textContent === "arena",
+      null, { timeout: 10000 });
+    await assertMClearedFor("sign-out/sign-in");
+    // Restore the admin session this file's remaining teardown expects.
+    await logout(page);
+    await loginAs(page, "admin", "demo");
+
     if (errors.length) {
       fail(`console/page errors:\n${errors.join("\n")}`);
     }

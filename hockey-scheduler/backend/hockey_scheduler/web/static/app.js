@@ -55,6 +55,14 @@ let contextOptions = null;         // {programs:[{id,name,seasons:[...]}], selec
 // bound under, and a mismatch against the current one is unambiguous proof
 // something needs rebinding, however many switches happened in between.
 let contextRevision = 0;
+// Monotonic count of context-SWITCH ATTEMPTS (#331 review round 8), distinct
+// from contextRevision above: this bumps on every CALL to setActiveContext(),
+// whether or not its POST ultimately succeeds, so a rapid A->B->C (each
+// started before the previous one's round trip resolved) can tell which is
+// the LATEST attempt -- only it may apply its eventual POST/refresh/render
+// result; an earlier one that resolves later must recognize it's been
+// superseded and do nothing further, on success OR failure.
+let contextSwitchSeq = 0;
 let publicState = { schedule: null, standings: null, division: null, game: null,
   feedUrl: null, feedLabel: null };  // feedUrl/feedLabel: freshly-minted public calendar subscription (#33)
 let publicTab = "schedule";        // "schedule" | "standings" (#83)
@@ -792,11 +800,18 @@ let drawerSeedFetchSeq = 0;
 async function contextSeededDrawerValues(kind) {
   const programId = contextOptions && contextOptions.selected
     && contextOptions.selected.program_id;
+  // Captured BEFORE the await below (#331 review round 8), compared after it
+  // against contextRevision -- not contextOptions.selected.program_id, which
+  // setActiveContext() doesn't update until ITS OWN POST succeeds. A switch
+  // merely ATTEMPTED (not yet confirmed) while this fetch was in flight used
+  // to still read as "unchanged" here and let this seed win; contextRevision
+  // now bumps the instant a switch is attempted (setActiveContext()'s own
+  // first bump, before its POST), so comparing against it closes that gap.
+  const seededRevision = contextRevision;
   if (!programId) return { ok: true, values: {} };
   if (kind === "season") return { ok: true, values: { "f-season-league": programId } };
   const hvr = await getJSON("/api/v2/setup/hierarchy");
-  const stillCurrent = !!(contextOptions && contextOptions.selected
-    && contextOptions.selected.program_id === programId);
+  const stillCurrent = contextRevision === seededRevision;
   if (!hvr || hvr.error || !stillCurrent) return { ok: false };
   const program = (hvr.programs || []).find((p) => p.id === programId);
   if (!program) return { ok: true, values: {} };
@@ -3133,15 +3148,22 @@ function defaultIceForm(ov) {
   // status==="active" row could default the builder onto a DIFFERENT
   // Program's Season than the one the Home/Tasks hub CTA was scoped to. A
   // committed submit against that silent wrong default would generate ice
-  // for the wrong Program. Falls back to the old global-first behavior only
-  // when no Season is actively selected (a Program-only context, or no
-  // context at all) or the selected id no longer resolves (a stale/deleted
-  // Season) -- never left unset when a real active/global one exists.
+  // for the wrong Program.
+  //
+  // Fails CLOSED, not to that same global-first Season, when none is
+  // actively selected -- a Program-only context, or no context at all
+  // (#331 review round 8: this used to fall back to `seasons.find(active)
+  // || seasons[0]` for exactly that case, the identical unsafe default
+  // Import's own Season select was already fixed to refuse in round 7).
+  // renderIceBuilder()'s own <select> below renders an explicit disabled
+  // placeholder rather than letting a native <select> silently pick its
+  // first option when none is marked `selected`, the same fail-closed
+  // pairing Import already uses. A stale/deleted selected id ALSO resolves
+  // to nothing here (`selected` stays undefined), never a silent fallback.
   const selectedId = contextOptions && contextOptions.selected
     && contextOptions.selected.season_id;
   const selected = selectedId ? seasons.find((s) => s.id === selectedId) : null;
-  const active = selected
-    || seasons.find((s) => s.status === "active") || seasons[0] || null;
+  const active = selected || null;
   const rinks = ov.rinks || [];
   return {
     season_id: active ? active.id : "",
@@ -3198,7 +3220,15 @@ function renderIceBuilder(ov) {
   const f = iceBuilder.form;
   const seasons = ov.seasons || [];
   const season = seasons.find((s) => s.id === f.season_id) || null;
-  const seasonOpts = seasons.map((s) =>
+  // No selected `<option>` (#331 review round 8, mirroring Import's own
+  // round 7 fix) when f.season_id is unset -- fails CLOSED to an explicit,
+  // disabled placeholder rather than the native <select>'s own "no option
+  // marked selected -> pick the first one" default, which would silently
+  // reintroduce a global-first Season exactly like defaultIceForm() now
+  // deliberately omits above.
+  const seasonOpts = (!f.season_id
+      ? `<option value="" selected disabled>— select a season —</option>` : "")
+    + seasons.map((s) =>
     `<option value="${esc(s.id)}" ${s.id === f.season_id ? "selected" : ""}>${esc(s.name)}</option>`).join("");
   const venues = ov.venues || [];
   const rinkCheck = (r) =>
@@ -7394,6 +7424,12 @@ async function render() {
     if (hadPreview || isWeekday) render();
   });
   c.querySelectorAll("[data-ib-preview]").forEach((b) => b.onclick = async () => {
+    // A context/identity switch invalidated (round 8) or fully closed
+    // (identity switch, round 8) the builder between this button's last
+    // render and this click -- see invalidateContextScopedMutations()'s and
+    // resetTransientUiState()'s own comments. Guards the same way the form
+    // `change` listener above already does.
+    if (!iceBuilder) return;
     toast = "";
     iceBuilder.form = readIceBuilderForm(c);
     iceBuilder.preview = await post("/api/setup/ice-availability/preview", iceBuilder.form);
@@ -7401,11 +7437,24 @@ async function render() {
   });
   const ibCommit = c.querySelector("[data-ib-commit]");
   if (ibCommit) ibCommit.onclick = async () => {
+    if (!iceBuilder) return;
     toast = "";
     // Bind the commit to the previewed template: send the fingerprint the
     // preview returned so the server refuses a form edited since (belt to the
     // frontend's suspenders, which already drops the preview on any edit).
     const fingerprint = iceBuilder.preview && iceBuilder.preview.template_fingerprint;
+    // No preview to bind to -- a context switch cleared it since this button
+    // was rendered (#331 review round 8: invalidateContextScopedMutations()
+    // clears iceBuilder.preview the instant a switch is even attempted, well
+    // before this button's own DOM node is removed by the next render). Bail
+    // out client-side rather than sending a doomed request with a null
+    // fingerprint and relying on the server's own rejection of it — the same
+    // belt-and-suspenders Import's own Commit handler already applies below.
+    if (!fingerprint) {
+      toast = "The preview changed — refresh it before creating.";
+      toastIsError = true;
+      return render();
+    }
     iceBuilder.form = readIceBuilderForm(c);
     const res = await post("/api/setup/ice-availability/commit",
       { ...iceBuilder.form, template_fingerprint: fingerprint });
@@ -7426,6 +7475,7 @@ async function render() {
   };
   const ibExclAdd = c.querySelector("[data-ib-excl-add]");
   if (ibExclAdd) ibExclAdd.onclick = () => {
+    if (!iceBuilder) return;
     iceBuilder.form = readIceBuilderForm(c);
     const el = c.querySelector("#ib-excl");
     const d = el && el.value;
@@ -7434,6 +7484,7 @@ async function render() {
     render();
   };
   c.querySelectorAll("[data-ib-excl-remove]").forEach((b) => b.onclick = () => {
+    if (!iceBuilder) return;
     iceBuilder.form = readIceBuilderForm(c);
     iceBuilder.form.exclusion_dates =
       iceBuilder.form.exclusion_dates.filter((x) => x !== b.dataset.ibExclRemove);
@@ -7676,16 +7727,71 @@ async function restoreContextDeepLink() {
   }
   syncContextHash();
 }
+// Make every context-scoped mutation control uncommittable the instant a
+// context switch is even ATTEMPTED (#331 review round 8), not once its own
+// POST resolves -- the native <select> already shows the new choice before
+// setActiveContext()'s very first line runs, so a drawer submit, an Import
+// Commit, or an Ice Builder Create landing in the gap before that POST
+// settles must find nothing left to send, not race the network to get there
+// first. Also called from resetTransientUiState() (a no-reload sign-out/
+// sign-in/persona switch is the identity-bound flavor of the identical gap).
+//
+// Import's Commit handler already re-checks importState.validatedKey fresh
+// against the live DOM at click time (pre-existing belt-and-suspenders, see
+// its own comment below); clearing it here is enough on its own to make that
+// handler bail out with no request sent, however the click landed. Ice
+// Builder's Create gets the identical treatment (clearing iceBuilder.preview,
+// the source of the fingerprint its own handler now refuses to commit
+// without, below).
+//
+// An open drawer is different: submitSetup() does not re-verify anything
+// about the drawer before posting, so the only airtight guard is removing
+// its submit control from the DOM before a click can reach it -- directly,
+// not via the full render() pipeline, which would also rebuild #ctx-select's
+// own option list from the STILL-OLD contextOptions.selected (not updated
+// until setActiveContext()'s POST succeeds) and visibly snap the switcher
+// back to the prior choice for the duration of the round trip.
+//
+// importState.seasonId and iceBuilder.form are deliberately left alone here:
+// round 7's existing contextRevision-mismatch check in render() and
+// renderIceBuilder() already re-seeds both once the NEW canonical context is
+// confirmed (setActiveContext()'s second bump, below) -- reseeding them here
+// too would only seed from the STILL-OLD selection this function runs
+// before that POST updates.
+function invalidateContextScopedMutations() {
+  importState.report = null;
+  importState.validatedKey = null;
+  importState.committed = null;
+  if (iceBuilder) iceBuilder.preview = null;
+  if (drawer) {
+    document.querySelectorAll(".drawer-scrim, .drawer").forEach((el) => el.remove());
+    drawer = null; drawerError = ""; drawerValues = {};
+  }
+}
 // Persist a switcher pick, then reflect it in the hash and re-render.
 async function setActiveContext(programId, seasonId) {
+  const mySeq = ++contextSwitchSeq;
+  // Invalidate SYNCHRONOUSLY, before the await below (#331 review round 8) --
+  // see invalidateContextScopedMutations()'s own comment for why.
+  // contextRevision bumps here too, not just after success further down:
+  // contextSeededDrawerValues()'s own in-flight-hierarchy-fetch guard and
+  // round 7's render()-time rebind checks both compare against this counter,
+  // which must already read "changed" the instant a switch is ATTEMPTED, not
+  // only once it's confirmed.
+  invalidateContextScopedMutations();
+  contextRevision += 1;
   const r = await post("/api/context",
     { program_id: programId, season_id: seasonId || null });
+  if (mySeq !== contextSwitchSeq) return;  // superseded by a newer switch
   if (!r || r.error) {
     // Generic, no existence oracle (the backend returns the same not-found
     // whether it doesn't exist or isn't ours). Refresh options in case the
-    // authorized set shifted underneath us.
+    // authorized set shifted underneath us. Everything invalidated above
+    // STAYS invalidated -- reconciling the canonical context on failure must
+    // never restore a stale enabled action (#331 review round 8).
     toast = "That Program/Season isn't available."; toastIsError = true;
     await loadContextOptions();
+    if (mySeq !== contextSwitchSeq) return;
     render();
     return;
   }
@@ -7698,10 +7804,12 @@ async function setActiveContext(programId, seasonId) {
     contextOptions.selected = { program_id: r.program_id,
       season_id: r.season_id, read_only: !!r.read_only };
   }
-  // Bump BEFORE render() below (#331 review round 7) so any view painted by
-  // this same cycle -- the Import wizard, an open Ice Builder -- already
-  // sees the new generation and rebinds instead of reusing what it cached
-  // under the selection this call just moved away from.
+  // Second bump (#331 review round 8): the FIRST bump above only made the
+  // PRIOR selection's mutations uncommittable at intent time, before
+  // contextOptions.selected itself had changed. A SECOND bump, now that the
+  // canonical NEW selection is known, is what makes the render() below
+  // actually rebind Import/Ice Builder to it instead of finding its own
+  // stamp already "current" (from the first bump) and skipping the reseed.
   contextRevision += 1;
   syncContextHash();
   // Then reconcile the whole option set from a fresh GET so the label/status/
@@ -7712,6 +7820,7 @@ async function setActiveContext(programId, seasonId) {
   // in case the canonical selection differs from the POST echo (a concurrent
   // change), so the hash always matches what is rendered.
   await loadContextOptions();
+  if (mySeq !== contextSwitchSeq) return;  // superseded during the refetch
   syncContextHash();
   toast = "";
   render();
@@ -7957,6 +8066,39 @@ function resetTransientUiState() {
   // shouldn't survive an identity switch regardless. Never held a password.
   newAccountForm = { username: "", role: "", team_id: "", player_id: "", official_id: "" };
   newAccountError = "";
+  // Import wizard / Ice Availability Builder / hub create-drawer (#331
+  // review round 8): round 7 bound these to contextRevision, which closes a
+  // Program/Season switch under the SAME identity, but this function's own
+  // job is the identity switching -- a persona swap via the demo role-switch
+  // dropdown, or a sign-out immediately followed by a different sign-in,
+  // with no page reload in between. An in-progress paste (sheetsText can
+  // hold real player names/emails), a validated Import report, or a live
+  // Ice preview/Create action must not survive into the next signed-in
+  // identity, lower-privileged or not -- resetTransientUiState() already
+  // fires on exactly this transition (the prevId !== nextId guard in
+  // setUser() below), so it's the correct, already-identity-gated place for
+  // this too. Reset importState to its own module-level initial shape
+  // (mirrored here, not imported, since it's a plain object literal) and
+  // fully CLOSE the Ice Builder (iceBuilder = null, its own "not open"
+  // sentinel — see its declaration comment) rather than just clearing its
+  // preview: the next identity, even if equally privileged, didn't open it.
+  // Both Ice Builder click handlers guard against iceBuilder being null
+  // (round 8) for exactly this reason. The drawer gets the identical
+  // synchronous DOM removal invalidateContextScopedMutations() uses and for
+  // the identical reason: submitSetup() doesn't itself re-check anything
+  // about the drawer before posting, so the only airtight guard is removing
+  // its submit control from the DOM before a click can reach it. Bumping
+  // contextRevision last means a render() of either view (if the NEXT
+  // identity can even reach it) re-seeds fresh rather than finding an
+  // already-"current" stamp and skipping the reseed.
+  importState = { type: "teams_players", seasonId: null, sheetsText: {},
+    report: null, validatedKey: null, committed: null, contextRevision: null };
+  iceBuilder = null;
+  if (drawer) {
+    document.querySelectorAll(".drawer-scrim, .drawer").forEach((el) => el.remove());
+    drawer = null; drawerError = ""; drawerValues = {};
+  }
+  contextRevision += 1;
 }
 function setUser(user) {
   const prevId = currentUser ? currentUser.username : null;
@@ -8005,6 +8147,13 @@ function setUser(user) {
   // otherwise leave a viewer/coach/player/official staring at a Setup screen
   // whose tab gateChrome just hid out from under them.
   if (view === "setup" && !(hasPerm("manage_setup") || hasPerm("manage_arena"))) view = "dashboard";
+  // #331 review round 8: same reasoning for Import — renderImport() already
+  // self-guards with its own "Operators only" banner rather than the
+  // previous operator's actual state (importState is cleared regardless,
+  // above), but bouncing off the view entirely is still correct so a
+  // lower-privileged persona lands on ITS OWN home/dashboard instead of a
+  // dead-end banner for a nav item its own sidebar no longer shows.
+  if (view === "import" && !hasPerm("manage_arena")) view = "dashboard";
   if (isPlayerUser && view === "dashboard") view = "player_home";
   else if (isGuardianUser && view === "dashboard") view = "guardian_home";
   else if (isOfficialUser && view === "dashboard") view = "inbox";

@@ -292,6 +292,64 @@ the preview alone is what makes a stale one uncommittable, since Create is
 already bound to a previewed template's own fingerprint and renders only
 when a preview exists.
 
+Round 7's own fix still had a gap (#331 review round 8): `contextRevision`
+only bumped AFTER `setActiveContext()`'s `/api/context` POST succeeded, not
+when the switch was merely ATTEMPTED — the native `<select>` already shows
+the new choice, and any other in-flight async work (a hub drawer's own
+hierarchy fetch, a Commit/Create click) already reads the PRIOR selection,
+well before that round trip can complete. A drawer seed racing the switch
+could still open with a stale value; an Import Commit or Ice Builder Create
+clicked in that window still targeted the Program the switcher no longer
+showed. `setActiveContext()` now invalidates synchronously, in the same
+tick as the switch intent, before its own `await`:
+`invalidateContextScopedMutations()` clears `importState.report`/
+`validatedKey`/`committed` and `iceBuilder.preview` outright (both
+Commit/Create handlers already re-check these fresh at click time, so
+clearing them is enough on its own — Ice Builder's own Create handler
+gained the identical belt-and-suspenders bail-out Import's already had,
+rather than trusting the server's fingerprint rejection alone), and
+surgically removes any open hub drawer's DOM node directly (not via a full
+render(), which would also re-paint `#ctx-select`'s own option list from
+the still-stale `contextOptions.selected` and visibly snap the switcher
+back for the round trip's duration). `contextRevision` itself bumps TWICE
+per switch now — once at intent, so `contextSeededDrawerValues()`'s own
+in-flight-fetch guard and the render()-time rebind checks above already
+read "changed"; again once the canonical new selection is confirmed, so
+that same rebind logic actually re-seeds against it rather than finding its
+own stamp already "current" from the first bump and skipping the reseed. A
+second counter, `contextSwitchSeq`, bumps on every call regardless of
+outcome so a rapid A→B→C — however its three responses happen to race back
+over the wire — only ever lets the LATEST attempt apply its own
+POST/refresh/render result; a superseded one recognizes that and does
+nothing further, on success or failure alike. None of this is scoped to a
+Program/Season switch alone: `resetTransientUiState()` — already
+`setUser()`'s identity-transition hook, firing on sign-out, sign-in, and
+the demo persona-switch dropdown alike — now resets `importState` to its
+own initial shape and fully closes the Ice Builder (`iceBuilder = null`,
+its own "not open" sentinel) the same way, since a no-reload identity
+change can hand an in-progress paste (real player names/emails), a
+validated report, or a live preview to a completely different signed-in
+person, lower-privileged or not. Separately, `defaultIceForm()`'s own
+Program-only fallback — `seasons.find(active) || seasons[0]`, global and
+unfiltered, when no Season is actively selected — was the identical unsafe
+default Import's own Season field was already fixed to refuse in round 7,
+just never extended to the Ice Builder; it now fails closed the same way,
+with the matching disabled-placeholder treatment in its own `<select>`.
+Writing the regression coverage for the drawer-race case surfaced a real
+false-negative in the test itself, not the fix: checking `#ctx-select`'s
+own value is an early signal within a render() cycle (the same gap the
+rebind checks above already had to account for), but here TWO independent
+render() calls can be genuinely in flight together — the drawer CTA's own
+`switchTab("setup")`-triggered one, and `setActiveContext()`'s own
+completion one — and only whichever finishes painting LAST decides what
+`#content` actually shows; a bare wait on the switcher's own value could
+observe a still-mid-flight paint and miss a real stale-drawer render
+entirely. The regression now waits for the network to actually go quiet
+before asserting against `#content` — the same class of fix round 7 already
+applied to an unrelated `logout()` race in the same test file (see that
+function's own comment in `home-tasks-hub.js`), just not yet generalized to
+this render-level race until it produced a real false negative here.
+
 The card's async states carry real accessibility semantics, not just visual
 ones (#331 review round 5 finding 5): `#sp-card-slot` (the wrapper
 `loadSetupProgressCard()` swaps content into, itself painted once by

@@ -168,8 +168,28 @@ async function checkViewport(browser, viewport) {
       // A second venue with NO season access.
       const venue2 = await post("/api/setup/venue", { name: "Annex", league_id: league.id });
       const rink2 = await post("/api/setup/rink", { venue_id: venue2.id, name: "Annex Ice" });
+      // The legacy v1 "league" IS a v2 Program under the shim (server.py's
+      // POST /api/setup/league routes straight to api.create_program(), and
+      // /api/setup/season passes its own league_id through as create_season()'s
+      // program_id) -- select it as the active #159 context so defaultIceForm()
+      // resolves this Season without needing its own now-removed global-first
+      // fallback (#331 review round 8: defaultIceForm() fails CLOSED, the same
+      // way Import's own Season select already does, when no Season is
+      // actively selected -- this fixture must actively select one, not rely
+      // on a silent global default that no longer exists).
+      await post("/api/context", { program_id: league.id, season_id: season.id });
       return { league: league.id, season: season.id, rink: rink.id, rink2: rink2.id };
     });
+    // The /api/context call above is a bare fetch, bypassing setActiveContext()
+    // (the real switcher's own handler) entirely -- it moves the SERVER's
+    // active context but leaves the already-loaded page's own client-side
+    // contextOptions (fetched once, before this fixture's Program even
+    // existed) none the wiser. A reload re-runs the boot sequence's own
+    // loadContextOptions() so defaultIceForm() sees the real selection below,
+    // the same requirement round 6/7's own bare-fetch fixtures already
+    // documented for a freshly-created Program's #ctx-select option.
+    await page.reload({ waitUntil: "domcontentloaded" });
+    await page.waitForSelector("#content > *", { timeout: 10000 });
 
     await page.click('.tab[data-tab="calendar"]');
     await page.waitForSelector('[data-mode="month"]', { state: "visible", timeout: 10000 });
