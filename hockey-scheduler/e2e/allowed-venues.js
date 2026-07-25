@@ -121,6 +121,13 @@ async function checkViewport(browser, viewport) {
     const team2 = await createViaDrawer("team",
       { "f-team-club": club.id, "f-team-perm-league": league.id, "f-team": "Team Two" },
       "/api/v2/setup/team");
+    // A third team (#206 slice 1): the manual wizard game below (step 4)
+    // takes the division's only pairing if just two teams are registered,
+    // so the scheduler draft in step 5 would then have nothing genuinely
+    // missing left to place. A third team keeps a pairing open for it.
+    const team3 = await createViaDrawer("team",
+      { "f-team-club": club.id, "f-team-perm-league": league.id, "f-team": "Team Three" },
+      "/api/v2/setup/team");
     const venue = await createViaDrawer("venue",
       { "f-venue": "Allowed Venue", "f-venue-org": org.id }, "/api/v2/setup/venue");
     const rink = await createViaDrawer("rink",
@@ -146,7 +153,10 @@ async function checkViewport(browser, viewport) {
         { team_id: i.team1, league_id: i.league, division_id: i.division });
       await post(`/api/v2/setup/seasons/${i.season}/team-registrations`,
         { team_id: i.team2, league_id: i.league, division_id: i.division });
-    }, { season: season.id, league: league.id, division: division.id, team1: team1.id, team2: team2.id });
+      await post(`/api/v2/setup/seasons/${i.season}/team-registrations`,
+        { team_id: i.team3, league_id: i.league, division_id: i.division });
+    }, { season: season.id, league: league.id, division: division.id,
+         team1: team1.id, team2: team2.id, team3: team3.id });
 
     // (2) Grant the Season access to the Venue — the actual workflow under
     // regression — through the real "Allowed venues" control in Season
@@ -209,7 +219,15 @@ async function checkViewport(browser, viewport) {
         method: "POST", credentials: "same-origin",
         headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
       })).json();
-      return post("/api/scheduler/commit", { division_id: i.division, slot_ids: [i.draftSlot] });
+      // #328 review round 5: Commit is now bound to the exact preview it
+      // reviewed, so a direct API call must Generate first, same as the
+      // real Scheduler UI does.
+      const preview = await post(
+        "/api/scheduler/draft", { division_id: i.division, slot_ids: [i.draftSlot] });
+      return post("/api/scheduler/commit", {
+        division_id: i.division, slot_ids: [i.draftSlot],
+        draft_fingerprint: preview.draft_fingerprint,
+      });
     }, { division: division.id, draftSlot: draftSlot.id });
     if (draft.error || !draft.created || !draft.created.length) {
       throw new Error(`[${viewport.label}] scheduler commit produced no draft game: ${JSON.stringify(draft)}`);

@@ -2152,7 +2152,9 @@ class Handler(BaseHTTPRequestHandler):
                 division_id=body.get("division_id"),
                 season_id=body.get("season_id"), league_id=body.get("league_id"),
                 slot_ids=body.get("slot_ids"),
-                constraints=body.get("constraints"), actor_id=user_id))
+                constraints=body.get("constraints"),
+                draft_fingerprint=body.get("draft_fingerprint"),
+                actor_id=user_id))
         if path == "/api/scheduler/drafts/publish":
             return self._send_api(api.publish_draft_games(
                 game_ids=body.get("game_ids"), all_drafts=bool(body.get("all")),

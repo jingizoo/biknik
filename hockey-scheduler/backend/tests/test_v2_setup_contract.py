@@ -962,6 +962,17 @@ class V2SetupContractTest(unittest.TestCase):
                 c, "POST", f"/api/v2/setup/seasons/{season['id']}/team-registrations",
                 {"team_id": team["id"], "league_id": league["id"], "division_id": division["id"]})
             self.assertEqual(status, 200, reg)
+        # A third team (#206 slice 1): the division's home-vs-away pairing
+        # already has a real game (created below), so the scheduler would
+        # otherwise find nothing left to (re)propose onto slot2 -- a
+        # genuinely open pairing is needed to produce the committed draft
+        # this test's cleanup-blocking assertions depend on.
+        extra = self._v2(c, "team",
+                        {"league_id": league["id"], "club_id": club["id"], "name": "Extra"})
+        status, reg = self._req(
+            c, "POST", f"/api/v2/setup/seasons/{season['id']}/team-registrations",
+            {"team_id": extra["id"], "league_id": league["id"], "division_id": division["id"]})
+        self.assertEqual(status, 200, reg)
         slot = self._v2(c, "ice-slot", {
             "rink_id": rink["id"], "start_time": "2027-03-01T18:00:00+00:00",
             "end_time": "2027-03-01T19:30:00+00:00", "slot_type": "game"})
@@ -983,9 +994,13 @@ class V2SetupContractTest(unittest.TestCase):
         # one AFTER revoke is correctly rejected by the same eligibility gate
         # this whole PR added, so it must exist before revoke to exercise the
         # cleanup-blocking behavior below.
+        _, draft_preview = self._req(
+            c, "POST", "/api/scheduler/draft",
+            {"division_id": division["id"], "slot_ids": [slot2["id"]]})
         status, draft = self._req(
             c, "POST", "/api/scheduler/commit",
-            {"division_id": division["id"], "slot_ids": [slot2["id"]]})
+            {"division_id": division["id"], "slot_ids": [slot2["id"]],
+             "draft_fingerprint": draft_preview["draft_fingerprint"]})
         self.assertEqual(status, 200, draft)
         self.assertTrue(draft["created"], draft)
         draft_game_id = draft["created"][0]["game_id"]

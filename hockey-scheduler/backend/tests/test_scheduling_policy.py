@@ -34,7 +34,7 @@ from datetime import datetime, timedelta, timezone
 from http.cookiejar import CookieJar
 from http.server import ThreadingHTTPServer
 
-from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
+from helpers import BACKEND, commit_fresh_draft  # noqa: F401  (BACKEND: sys.path)
 
 from hockey_scheduler.api import ApiService
 from hockey_scheduler.api.service import ApiService as BaseFacadeApiService
@@ -372,7 +372,7 @@ class _PolicyContract:
         games = len(self.store.all_games())
         # The advisory keeps sB out of a proposal now, so the commit result
         # is "nothing schedulable" — never a Game the gate would refuse.
-        res = self.api.commit_draft_schedule("d1", slot_ids=["sB"])
+        res = commit_fresh_draft(self.api, "d1", slot_ids=["sB"])
         if "error" in res:
             self.assertEqual(_reason(res), "turnover_buffer_conflict", res)
         else:
@@ -1263,7 +1263,7 @@ class _PolicyContract:
         # must show the same derived span, and discarding the draft frees
         # it everywhere.
         self._buffer_policy()
-        res = self.api.commit_draft_schedule("d1", slot_ids=["sA"])
+        res = commit_fresh_draft(self.api, "d1", slot_ids=["sA"])
         self.assertNotIn("error", res, res)
         self.assertEqual(len(res["created"]), 1, res)
         ov = self.api.get_demo_overview()
@@ -1456,6 +1456,15 @@ class _DirectionalBufferContract:
         self.assertNotIn("error", g2, g2)
         mv = self.api.move_game(g2["id"], "sB")
         self.assertEqual(_reason(mv), "turnover_buffer_conflict", mv)
+        # A third team (#206 slice 1): d2's only pairing (u0 vs u1) already
+        # has a real game (g2), so the scheduler would otherwise find
+        # nothing left to (re)propose against sB -- a genuinely open pairing
+        # is needed to exercise the advisory/commit gate below.
+        self.store.add_team(Team(id="u2", name="U2", division_id="d2",
+                                 program_id="pg", league_id="lg"))
+        self.store.add_season_team_registration(SeasonTeamRegistration(
+            id="reg2_u2", league_season_id="ls2", team_id="u2",
+            division_id="d2", active=True))
         # draft-commit + scheduler advisory (same shared implementation):
         # an se2 draft over sB reports the code instead of proposing it.
         prop = self.api.draft_season_schedule("d2", slot_ids=["sB"])
@@ -1464,7 +1473,7 @@ class _DirectionalBufferContract:
         codes = {c for row in prop["unscheduled"]
                  for c in row["reason_codes"]}
         self.assertIn("turnover_buffer_conflict", codes, prop)
-        res = self.api.commit_draft_schedule("d2", slot_ids=["sB"])
+        res = commit_fresh_draft(self.api, "d2", slot_ids=["sB"])
         if "error" in res:
             self.assertEqual(_reason(res), "turnover_buffer_conflict", res)
         else:
@@ -1572,6 +1581,15 @@ class _SlotOverlapContract:
         g3 = self.api.create_game("se2", "d2", "u0", "u1", "sE",
                                   league_id="lg")
         self.assertNotIn("error", g3, g3)
+        # A third team (#206 slice 1): d2's only pairing (u0 vs u1) already
+        # has a real game (g3), so the scheduler would otherwise find
+        # nothing left to (re)propose against sy -- a genuinely open pairing
+        # is needed to exercise the advisory/commit gate below.
+        self.store.add_team(Team(id="u2", name="U2", division_id="d2",
+                                 program_id="pg", league_id="lg"))
+        self.store.add_season_team_registration(SeasonTeamRegistration(
+            id="reg2_u2", league_season_id="ls2", team_id="u2",
+            division_id="d2", active=True))
         audit_len = len(self.store.all_setup_audit())
         state = self._placement_state()
         mv = self.api.move_game(g3["id"], sy)
@@ -1596,7 +1614,7 @@ class _SlotOverlapContract:
         # is its documented, legitimate write).
         for facade in (self.api, BaseFacadeApiService(self.store)):
             before = self._placement_state()
-            res = facade.commit_draft_schedule("d2", slot_ids=[sy])
+            res = commit_fresh_draft(facade, "d2", slot_ids=[sy])
             self.assertNotIn("error", res, res)
             self.assertEqual(res["created"], [], res)
             self.assertEqual(self._placement_state(), before,
@@ -2269,7 +2287,7 @@ class PostgresPolicyEditPlacementRaceTest(_PolicyPgRaceHarness,
 
     def test_draft_commit_vs_program_policy_set_forced(self):
         place, edit, in_window, paused = self._forced(
-            lambda a: a.commit_draft_schedule("d2", slot_ids=["sC"]),
+            lambda a: commit_fresh_draft(a, "d2", slot_ids=["sC"]),
             lambda a: a.set_scheduling_policy(
                 scope_type="program", scope_id="pg",
                 min_playable_minutes=999, actor_id="admin"))

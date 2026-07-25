@@ -245,8 +245,14 @@ async function checkViewport(browser, viewport) {
         method: "POST", credentials: "same-origin",
         headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
       })).json();
-      const commit = await post("/api/scheduler/commit",
+      // #328 review round 5: Commit is bound to the exact preview it
+      // reviewed, so a direct API call must Generate first.
+      const preview = await post("/api/scheduler/draft",
         { division_id: i.division, slot_ids: [i.draftSlot] });
+      const commit = await post("/api/scheduler/commit", {
+        division_id: i.division, slot_ids: [i.draftSlot],
+        draft_fingerprint: preview.draft_fingerprint,
+      });
       if (commit.error) return { error: commit.error };
       const drafts = await (await fetch("/api/scheduler/drafts",
         { credentials: "same-origin" })).json();

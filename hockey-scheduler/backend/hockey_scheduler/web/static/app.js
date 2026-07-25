@@ -53,6 +53,15 @@ let schedulerState = {
   filters: { division: "all", rink: "all", issue: "all" },  // (#106)
   selected: new Set(),  // game_ids picked for publish/discard (#106)
 };  // (#86)
+// #328 review round 8 finding 4 -- a terminal commit refusal
+// (pairing_already_scheduled/preview_stale) clears the preview and forces
+// a fresh Generate, but render() replaces #content wholesale, so the
+// focused Commit button is simply gone -- nothing moves focus anywhere,
+// silently dropping a keyboard user back to the document body. Set by
+// schedCommit's error branch, consumed once by the scheduler wiring below
+// right after the fresh content (with a Generate button again) is in the
+// DOM.
+let schedFocusGenerateAfterRender = false;
 let officialAvailability = [];      // signed-in official's windows (#88)
 let availSummary = null;            // roster availability rollup (#89)
 let subCandidates = null;           // coach substitute outreach queue (#112)
@@ -4457,17 +4466,37 @@ function renderScheduler(ov) {
         <p>Register at least two Teams under <button class="linklike" data-goto="setup">Setup → Season participation</button>, then Generate again.</p>
       </div>`;
     } else {
+      // #328 review — a pairing that already has a real Game (#206 slice 1)
+      // is neither a proposed game nor a conflict; it must still be named,
+      // not silently folded into a misleading "No games generated." when
+      // every pairing in the round robin is already on the calendar.
+      const already = (pv.already_scheduled || []);
       const gRows = games.map((g) => `<div class="li">
         <span class="li-time">${fmt(g.start_time)}</span>
         <div class="li-main"><div class="li-title">${esc(g.home_team_name)} vs ${esc(g.away_team_name)}</div>
           <div class="li-sub">${esc(g.rink_name || "")}</div></div></div>`).join("");
+      const aRows = already.map((a) => `<div class="li">
+        <div class="li-main"><div class="li-title">${esc(a.home_team_name)} vs ${esc(a.away_team_name)}</div>
+          <div class="li-sub">✓ Already scheduled — Game ${esc(a.existing_game_id)}</div></div></div>`).join("");
       const uRows = unsched.map((u) => `<div class="li">
         <div class="li-main"><div class="li-title">${esc(u.home_team_name)} vs ${esc(u.away_team_name)}</div>
           <div class="li-sub conflict">⚠ ${esc(u.reason)}</div></div></div>`).join("");
-      head = `<div class="section-title">Preview — ${games.length} game(s), ${unsched.length} conflict(s)</div>`;
-      cardBody = (gRows + uRows) || '<div class="empty">No games generated.</div>';
+      const alreadyPart = already.length
+        ? `, ${already.length} already scheduled` : "";
+      head = `<div class="section-title">Preview — ${games.length} game(s), ${unsched.length} conflict(s)${alreadyPart}</div>`;
+      // "Nothing missing" only when there is also nothing genuinely
+      // blocked (unsched) -- a mixed batch that is partly already-scheduled
+      // and partly conflicted still has something missing, just not free
+      // yet, so it must not claim victory.
+      const nothingMissing = !games.length && !unsched.length && already.length > 0;
+      const intro = nothingMissing
+        ? '<div class="li"><div class="li-main"><div class="li-sub">Every pairing is already scheduled — nothing missing to generate.</div></div></div>'
+        : "";
+      const rows = intro + gRows + aRows + uRows;
+      cardBody = rows || '<div class="empty">No games generated.</div>';
     }
-    previewBlock = `<div id="sched-preview" class="sched-preview" data-team-count="${teamCount === null ? "" : teamCount}" data-games="${games.length}" data-conflicts="${unsched.length}" data-not-enough-teams="${notEnoughTeams ? "1" : "0"}">
+    const alreadyCount = (pv.already_scheduled || []).length;
+    previewBlock = `<div id="sched-preview" class="sched-preview" data-team-count="${teamCount === null ? "" : teamCount}" data-games="${games.length}" data-conflicts="${unsched.length}" data-already-scheduled="${alreadyCount}" data-not-enough-teams="${notEnoughTeams ? "1" : "0"}">
       ${head}
       <div class="card">${cardBody}</div>
       ${commitBtn}</div>`;
@@ -6449,6 +6478,15 @@ async function render() {
   const schedDiv = c.querySelector("#sched-div");
   if (schedDiv) schedDiv.onchange = () => { schedulerState.division = schedDiv.value; };
   const schedGen = c.querySelector("[data-sched-generate]");
+  // #328 review round 8 finding 4 -- consume the flag set by the PREVIOUS
+  // render's Commit error branch below, now that this render's fresh
+  // content (with a live Generate button again) is in the DOM. A stale
+  // preview always disables Commit and re-enables Generate, so this
+  // control exists whenever the flag does.
+  if (schedFocusGenerateAfterRender) {
+    schedFocusGenerateAfterRender = false;
+    if (schedGen) schedGen.focus();
+  }
   if (schedGen) schedGen.onclick = async () => {
     toast = "";
     const res = await post("/api/scheduler/draft", { division_id: schedulerState.division });
@@ -6458,8 +6496,43 @@ async function render() {
   const schedCommit = c.querySelector("[data-sched-commit]");
   if (schedCommit) schedCommit.onclick = async () => {
     toast = "";
-    const res = await post("/api/scheduler/commit", { division_id: schedulerState.division });
-    if (res && !res.error) { schedulerState.preview = null; toast = `Committed ${res.created.length} draft game(s).`; }
+    // #328 review round 5 -- bind Commit to the exact preview on screen:
+    // the backend re-derives its own proposal fresh at commit time and
+    // refuses (rather than silently diverging from what was reviewed) if
+    // this fingerprint no longer matches that fresh regeneration.
+    const res = await post("/api/scheduler/commit", {
+      division_id: schedulerState.division,
+      draft_fingerprint: schedulerState.preview && schedulerState.preview.draft_fingerprint,
+    });
+    if (res && !res.error) {
+      schedulerState.preview = null;
+      toast = `Committed ${res.created.length} draft game(s).`;
+    } else if (res && res.error && res.error.details
+               && (res.error.details.reason === "pairing_already_scheduled"
+                   || res.error.details.reason === "preview_stale")) {
+      // #328 review round 3 -- a concurrent commit already scheduled one
+      // of this batch's pairings. post()'s generic toast surfaces
+      // error.message alone (never error.details), so the backend builds
+      // that message itself with both team names and the winning Game id
+      // ("Team A vs Team B is already scheduled as Game G123 -- generate
+      // a fresh preview...") -- nothing further to extract here.
+      // #328 review round 5 -- a Game was created or cancelled somewhere
+      // in the (possibly long) gap between Generate and this click,
+      // silently changing what "missing" means; the backend's own
+      // generic-but-actionable message ("Generate a fresh preview...")
+      // is likewise complete on its own. Either way the reviewed preview
+      // is now stale; clear it rather than leave a now-wrong proposal on
+      // screen, so Commit cannot be retried without a fresh Generate.
+      schedulerState.preview = null;
+      // #328 review round 8 finding 4 -- render() below replaces #content
+      // wholesale, so the just-focused Commit button is simply gone;
+      // nothing otherwise moves focus anywhere, silently dropping a
+      // keyboard user back to the document body even though the toast
+      // (a live region OUTSIDE #content, so it survives) told them what
+      // to do next. Move focus to Generate once the fresh content render
+      // completes, below.
+      schedFocusGenerateAfterRender = true;
+    }
     await render();
   };
   // Review filters (#106) — re-render() like every other interaction in this

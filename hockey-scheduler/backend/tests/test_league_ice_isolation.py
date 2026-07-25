@@ -6,7 +6,7 @@ explicitly granted access, independent of any Venue<->Program ownership."""
 import unittest
 from datetime import datetime, timezone
 
-from helpers import FakeClock
+from helpers import FakeClock, commit_fresh_draft
 
 from hockey_scheduler.api import ApiService
 from hockey_scheduler.domain import Game, IceSlotStatus
@@ -148,8 +148,8 @@ class LeagueIceIsolationTest(unittest.TestCase):
 
     def test_draft_commit_persists_season_and_league_context(self):
         api = ApiService(self.store)
-        result = api.commit_draft_schedule(
-            self.div_a.id, slot_ids=[self.same_1.id])
+        result = commit_fresh_draft(
+            api, self.div_a.id, slot_ids=[self.same_1.id])
         self.assertNotIn("error", result)
         self.assertEqual(result["season_id"], self.season_a.id)
         self.assertEqual(result["league_id"], self.league_a.id)
