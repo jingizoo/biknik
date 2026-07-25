@@ -244,6 +244,25 @@ convenience, not a sitewide data filter); it only fixes what they default
 to, so a silent submit against the wrong Program can no longer happen from
 this hub's own navigation.
 
+That seeding fails CLOSED, not open (#331 review round 6):
+`contextSeededDrawerValues()` returns a discriminated `{ok, values}` rather
+than a bare values object, and re-checks the active Program's id AFTER its
+own `await` against the value captured BEFORE it. Either a failed hierarchy
+fetch or a context mismatch — the operator using the unrelated #159 context
+switcher while that fetch is still in flight — returns `{ok: false}`;
+`goToSetupWorkflow()` then shows an error toast and returns without opening
+the drawer or switching tabs, leaving the operator on Home/Tasks with the
+CTA itself standing in as the retry. Without this, either failure mode
+reopens exactly the risk the paragraph above closed: an empty seed (`{}` on
+fetch failure) or a stale one (the OLD Program's values, resolved after a
+NEWER Program already won the switch) both fall straight into the shared
+field's own first-global-option fallback, once again risking a write under
+the wrong Program. A second, narrower guard (`drawerSeedFetchSeq`, mirroring
+`loadSetupProgressCard()`'s own `setupProgressFetchSeq`) covers a different
+trigger — a second, faster click on the same CTA superseding an in-flight
+first one — by discarding the older call's result outright rather than
+letting it race the newer one to paint.
+
 The card's async states carry real accessibility semantics, not just visual
 ones (#331 review round 5 finding 5): `#sp-card-slot` (the wrapper
 `loadSetupProgressCard()` swaps content into, itself painted once by

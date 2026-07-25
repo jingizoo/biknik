@@ -700,8 +700,27 @@ async function goToSetupWorkflow(key) {
     // caches, which are only populated as a side effect of the Setup
     // view's OWN last render and can be stale or entirely unpopulated at
     // the moment this hub CTA is clicked straight from the Dashboard.
-    const values = await contextSeededDrawerValues(kind);
-    drawer = { kind }; drawerError = ""; drawerValues = values;
+    //
+    // Fail CLOSED, not open (#331 review round 6): a hierarchy-fetch
+    // failure, or the active Program changing mid-flight (the operator
+    // uses the unrelated context switcher while this await is still
+    // resolving), must never open the drawer with drawerValues left at
+    // {} -- that's exactly what re-triggers drawerField()'s own first-
+    // GLOBAL-option fallback, recreating the wrong-Program write risk
+    // this whole fix exists to close. mySeq guards against a NEWER
+    // goToSetupWorkflow call (a rapid re-click) superseding this one;
+    // contextSeededDrawerValues() itself separately guards against the
+    // context SWITCHER changing contextOptions.selected while its own
+    // fetch is in flight (a different trigger, so a different check).
+    const mySeq = ++drawerSeedFetchSeq;
+    const seeded = await contextSeededDrawerValues(kind);
+    if (mySeq !== drawerSeedFetchSeq) return;  // a newer navigation already won
+    if (!seeded.ok) {
+      toast = "Couldn't load what's needed to open that — try again.";
+      toastIsError = true;
+      return render();
+    }
+    drawer = { kind }; drawerError = ""; drawerValues = seeded.values;
     switchTab("setup");
     return;
   }
@@ -719,6 +738,12 @@ async function goToSetupWorkflow(key) {
   switchTab("setup");
   focusContentHeading();
 }
+// Monotonic guard for the two async drawer-seeding steps below (#331 review
+// round 6), mirroring setupProgressFetchSeq's own pattern for the same
+// class of problem: a rapid re-click of a hub CTA before its first
+// in-flight seed fetch resolves must never let the OLDER call's result win
+// and open a (by then stale) drawer after a newer navigation already did.
+let drawerSeedFetchSeq = 0;
 // The correct parent-field seed for a hub-driven create drawer (#331 review
 // round 5 finding 4), scoped to the ACTIVE Program (#159's
 // contextOptions.selected) via a FRESH, targeted fetch of the canonical
@@ -732,31 +757,46 @@ async function goToSetupWorkflow(key) {
 // "existing screens are not filtered by it yet"). Seeding only the DEFAULT
 // selected value is enough to close the actual bug -- a silent wrong-
 // Program default on first open -- while an operator who deliberately wants
-// a different Program can still change the select same as always. Empty
-// when no active Program is selected, or the active Program has no
-// candidate of its own yet (a fresh Program with zero permanent
-// Leagues/Teams so far); drawerField() falls back to its ordinary
-// first-option behavior in that case, same as any other entry point into
-// the same drawer.
+// a different Program can still change the select same as always.
+//
+// Returns {ok, values}, not a bare values object (#331 review round 6):
+// {ok: true, values: {}} means "resolved cleanly, nothing to seed" (a
+// legitimate empty state -- no active Program, or the active Program
+// genuinely has no candidate of its own yet, e.g. a fresh Program with zero
+// permanent Leagues/Teams so far; drawerField() falls back to its ordinary
+// first-option behavior, or its own "create one first" empty state, same as
+// any other entry point into the same drawer). {ok: false} means "do NOT
+// open the drawer at all" -- either the hierarchy fetch itself failed
+// (network/server error, surfaced via getJSON's own {error} shape), or the
+// active Program changed while this fetch was in flight (the operator used
+// the context switcher mid-request): re-checking programId AFTER the await,
+// against the value captured BEFORE it, is the point -- that captured value
+// is exactly what could have gone stale out from under this call. Silently
+// falling through to {} in either failure case would open the drawer with
+// nothing seeded, hitting drawerField()'s own first-GLOBAL-option fallback
+// -- exactly the wrong-Program write risk this whole fix exists to close,
+// just moved one layer deeper.
 async function contextSeededDrawerValues(kind) {
   const programId = contextOptions && contextOptions.selected
     && contextOptions.selected.program_id;
-  if (!programId) return {};
-  if (kind === "season") return { "f-season-league": programId };
+  if (!programId) return { ok: true, values: {} };
+  if (kind === "season") return { ok: true, values: { "f-season-league": programId } };
   const hvr = await getJSON("/api/v2/setup/hierarchy");
-  const program = hvr && !hvr.error
-    && (hvr.programs || []).find((p) => p.id === programId);
-  if (!program) return {};
+  const stillCurrent = !!(contextOptions && contextOptions.selected
+    && contextOptions.selected.program_id === programId);
+  if (!hvr || hvr.error || !stillCurrent) return { ok: false };
+  const program = (hvr.programs || []).find((p) => p.id === programId);
+  if (!program) return { ok: true, values: {} };
   if (kind === "team") {
     const lgs = program.leagues || [];
-    return lgs.length ? { "f-team-perm-league": lgs[0].id } : {};
+    return { ok: true, values: lgs.length ? { "f-team-perm-league": lgs[0].id } : {} };
   }
   if (kind === "player") {
     const teams = (program.leagues || []).flatMap((lg) => lg.teams || [])
       .concat(program.teams_without_league || []);
-    return teams.length ? { "f-player-team": teams[0].id } : {};
+    return { ok: true, values: teams.length ? { "f-player-team": teams[0].id } : {} };
   }
-  return {};
+  return { ok: true, values: {} };
 }
 // Best-effort focus landing for a plain view switch (no drawer of its own to
 // auto-focus) — the first heading-ish element in the freshly rendered view,

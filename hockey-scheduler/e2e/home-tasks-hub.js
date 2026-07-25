@@ -1321,6 +1321,238 @@ async function checkRoleScenarios(browser, viewport) {
         + `(Season A is ${d.seasonA})`);
     }
 
+    // ---- (E) Two Programs, fail-closed + race-safe drawer seeding (#331
+    // review round 6): a hierarchy-fetch failure, or the active Program
+    // changing while that fetch is still in flight, must never open the
+    // drawer with a stale/empty seed -- that re-triggers the exact
+    // wrong-Program fallback (D) above just closed. Scoped to "team" only
+    // (not "player" too): both kinds share the identical async/race-
+    // guarding code in contextSeededDrawerValues() before their own
+    // branch, so covering "team" exhaustively covers the actual fix.
+    await logout(page);
+    await loginAs(page, "admin", "demo");
+    const e = await page.evaluate(async () => {
+      const post = async (p, b) => (await fetch(p, {
+        method: "POST", credentials: "same-origin",
+        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
+      })).json();
+      const progE1 = await post("/api/v2/setup/program",
+        { name: "Round6 Program E1", country: "US" });
+      const seasonE1 = await post("/api/v2/setup/season",
+        { program_id: progE1.id, name: "Season E1" });
+      const leagueE1 = await post("/api/v2/setup/league",
+        { season_id: seasonE1.id, name: "League E1" });
+      const progE2 = await post("/api/v2/setup/program",
+        { name: "Round6 Program E2", country: "US" });
+      const seasonE2 = await post("/api/v2/setup/season",
+        { program_id: progE2.id, name: "Season E2" });
+      const leagueE2 = await post("/api/v2/setup/league",
+        { season_id: seasonE2.id, name: "League E2" });
+      return { progE1: progE1.id, leagueE1: leagueE1.id,
+        progE2: progE2.id, leagueE2: leagueE2.id };
+    });
+
+    // -- (E1) Hierarchy 500: no drawer, an error toast, no wrong-default
+    // write; a retry (once unmocked) succeeds correctly scoped.
+    await apiPost(page, "/api/context", { program_id: e.progE2, season_id: null });
+    await page.route("**/api/v2/setup/hierarchy", (route) => route.fulfill({
+      status: 500, contentType: "application/json",
+      body: JSON.stringify({ error: { code: "server_unavailable",
+        message: "The server is temporarily unavailable." } }),
+    }));
+    await freshLoad();
+    s = await cardState(page);
+    if (!s || s.nextTitle !== "Permanent teams") {
+      fail(`Program E2: expected next = "Permanent teams", got ${JSON.stringify(s)}`);
+    }
+    await page.click("[data-setup-progress-action]");
+    await page.waitForFunction(
+      () => (document.getElementById("toast-root") || {}).classList
+        && document.getElementById("toast-root").classList.contains("error"),
+      null, { timeout: 10000 });
+    if (await page.$(".drawer")) {
+      fail("expected NO drawer to open when the hierarchy fetch fails");
+    }
+    await page.unroute("**/api/v2/setup/hierarchy");
+    await page.click("[data-setup-progress-action]");
+    await page.waitForSelector("#f-team-perm-league", { timeout: 10000 });
+    let retrySelected = await page.$eval("#f-team-perm-league", (el) => el.value);
+    if (retrySelected !== e.leagueE2) {
+      fail(`retry: expected the Permanent league select to default to `
+        + `Program E2's own League (${e.leagueE2}), got ${retrySelected}`);
+    }
+    // The retry's successfully-opened drawer must land keyboard focus, not
+    // just the correct value (#331 review round 6 comment 2's explicit
+    // "include keyboard focus after retry"). This is pre-existing,
+    // unconditional behavior (the drawer-wiring autofocus at app.js's
+    // "if (drawer) { const first = ... .focus(); }") -- asserted here for
+    // the first time on THIS specific path since it was never previously
+    // exercised by a genuine fetch-failure-then-retry drawer open.
+    const retryFocusId = await page.evaluate(() => (document.activeElement || {}).id);
+    if (retryFocusId !== "f-team-club") {
+      fail(`retry: expected keyboard focus on the drawer's first field `
+        + `(#f-team-club), got #${retryFocusId}`);
+    }
+    await page.keyboard.press("Escape");
+    await page.waitForFunction(() => !document.querySelector(".drawer"),
+      null, { timeout: 10000 });
+    // The deliberately-injected hierarchy 500 above is expected to log a
+    // browser resource-load console error the same way checkViewport's own
+    // (9) does for /api/v2/setup/progress -- require at least one, proving
+    // the mock actually fired, then drop every matching message so any
+    // other, genuinely unexpected error still fails the gate below.
+    const unexpectedE1 = errors.filter((e) => !/responded with a status of 500/.test(e));
+    if (unexpectedE1.length === errors.length) {
+      fail("expected the deliberately failed hierarchy request to log a "
+        + `resource error, got:\n${errors.join("\n")}`);
+    }
+    errors.length = 0;
+    errors.push(...unexpectedE1);
+    // The successful retry's own goToSetupWorkflow() call switchTab()'d to
+    // "setup" to host the drawer (E1's earlier, FAILED attempt never did --
+    // it stayed on Home/Tasks) -- Escape only dismisses the drawer overlay,
+    // it does not navigate back. #sp-card-slot, and the CTA (E2) clicks
+    // next, exist only on the Dashboard, so land back there first.
+    await freshLoad();
+    s = await cardState(page);
+    if (!s || s.nextTitle !== "Permanent teams") {
+      fail(`Program E2 after returning to Dashboard: expected next = `
+        + `"Permanent teams", got ${JSON.stringify(s)}`);
+    }
+
+    // -- (E2) Delayed hierarchy response + a Program switch mid-flight:
+    // the stale (Program E2) seed must never be applied once the context
+    // has already moved to Program E1 by the time it resolves.
+    let releaseHierarchy;
+    const hierarchyDelay = new Promise((resolve) => { releaseHierarchy = resolve; });
+    await page.route("**/api/v2/setup/hierarchy", async (route) => {
+      await hierarchyDelay;
+      await route.continue();
+    });
+    await page.click("[data-setup-progress-action]");
+    // Give the click's own handler a moment to actually start the fetch
+    // (and lose the race deliberately) before switching context out from
+    // under it. The switch itself MUST go through the real context-switcher
+    // control (context-switcher.js's own established idiom), not a bare
+    // apiPost: contextSeededDrawerValues()'s stillCurrent recheck reads the
+    // CLIENT-side `contextOptions.selected`, which setActiveContext() (the
+    // switcher's onchange handler) updates as part of handling the pick --
+    // an apiPost bypasses that entirely and only moves the SERVER'S active
+    // context, leaving the client's own cached selection (and so the
+    // mismatch check) none the wiser, which would silently defeat this
+    // exact regression.
+    await new Promise((r) => setTimeout(r, 200));
+    const switchValue = `${e.progE1}|`;
+    await page.selectOption("#ctx-select", switchValue);
+    await page.waitForFunction((v) => document.getElementById("ctx-select").value === v,
+      switchValue, { timeout: 10000 });
+    releaseHierarchy();
+    await page.unroute("**/api/v2/setup/hierarchy");
+    await page.waitForFunction(
+      () => (document.getElementById("toast-root") || {}).classList
+        && document.getElementById("toast-root").classList.contains("error"),
+      null, { timeout: 10000 });
+    if (await page.$(".drawer")) {
+      fail("expected NO drawer to open with a stale seed after the active "
+        + "Program changed mid-flight");
+    }
+    // A fresh click, now that the context switch has fully landed, opens
+    // correctly scoped to the CURRENT Program (E1) and its OWN League --
+    // proof the drawer never silently seeded from E2's now-stale one.
+    await freshLoad();
+    s = await cardState(page);
+    if (!s || s.nextTitle !== "Permanent teams") {
+      fail(`Program E1: expected next = "Permanent teams", got ${JSON.stringify(s)}`);
+    }
+    await page.click("[data-setup-progress-action]");
+    await page.waitForSelector("#f-team-perm-league", { timeout: 10000 });
+    const e1Selected = await page.$eval("#f-team-perm-league", (el) => el.value);
+    if (e1Selected !== e.leagueE1) {
+      fail(`Program E1's drawer must default to E1's own League `
+        + `(${e.leagueE1}), never E2's stale one (${e.leagueE2}), got `
+        + `${e1Selected}`);
+    }
+
+    // -- (E3) A second, faster click supersedes an in-flight first one
+    // (drawerSeedFetchSeq, #331 review round 6): the SAME stale-response
+    // guard idiom as loadSetupProgressCard()'s own setupProgressFetchSeq
+    // (checkViewport's (10) above), applied here to drawer seeding. Neither
+    // E1 nor E2 exercises this specific trigger (a rapid re-click, not a
+    // fetch error or a Program switch), so it needs its own regression.
+    await page.keyboard.press("Escape");
+    await page.waitForFunction(() => !document.querySelector(".drawer"),
+      null, { timeout: 10000 });
+    await freshLoad();
+    const e3 = await page.evaluate(async () => {
+      const post = async (p, b) => (await fetch(p, {
+        method: "POST", credentials: "same-origin",
+        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
+      })).json();
+      const progE3 = await post("/api/v2/setup/program",
+        { name: "Round6 Program E3", country: "US" });
+      const seasonE3 = await post("/api/v2/setup/season",
+        { program_id: progE3.id, name: "Season E3" });
+      const leagueE3 = await post("/api/v2/setup/league",
+        { season_id: seasonE3.id, name: "League E3" });
+      return { progE3: progE3.id, leagueE3: leagueE3.id };
+    });
+    // The switcher's own <option> list comes from contextOptions, loaded at
+    // boot -- Program E3 was just created via a bare fetch, bypassing that,
+    // so a reload is required before its option even exists to select.
+    await freshLoad();
+    const switchToE3 = `${e3.progE3}|`;
+    await page.selectOption("#ctx-select", switchToE3);
+    await page.waitForFunction((v) => document.getElementById("ctx-select").value === v,
+      switchToE3, { timeout: 10000 });
+    await freshLoad();
+    s = await cardState(page);
+    if (!s || s.nextTitle !== "Permanent teams") {
+      fail(`Program E3: expected next = "Permanent teams", got ${JSON.stringify(s)}`);
+    }
+    // The FIRST intercepted hierarchy request is held, then answered with a
+    // FABRICATED, otherwise-impossible League id -- unambiguous proof of
+    // which click's own result actually painted, since (unlike E1/E2) both
+    // clicks would otherwise resolve identical, indistinguishable real data.
+    // The second request is passed straight through, real and fast, so it
+    // both wins the race AND is the one that must be seen.
+    let hierarchyReqCount = 0;
+    await page.route("**/api/v2/setup/hierarchy", async (route) => {
+      hierarchyReqCount += 1;
+      if (hierarchyReqCount !== 1) return route.continue();
+      await new Promise((r) => setTimeout(r, 1500));
+      await route.fulfill({
+        status: 200, contentType: "application/json",
+        body: JSON.stringify({ programs: [{ id: e3.progE3,
+          leagues: [{ id: "STALE-LEAGUE-MUST-NOT-APPEAR", name: "stale" }] }] }),
+      });
+    });
+    await page.click("[data-setup-progress-action]");
+    // Re-click immediately, before the first request's own delay elapses --
+    // its own hierarchy request is unmocked (fast), so it wins the race and
+    // must be the one that actually paints the drawer.
+    await page.click("[data-setup-progress-action]");
+    await page.waitForSelector("#f-team-perm-league", { timeout: 10000 });
+    const e3Selected = await page.$eval("#f-team-perm-league", (el) => el.value);
+    if (e3Selected !== e3.leagueE3) {
+      fail(`Program E3: expected the second (winning) click's own result `
+        + `to seed the drawer from League E3 (${e3.leagueE3}), got `
+        + `${e3Selected}`);
+    }
+    // Give the stale first click's own delayed response its full window to
+    // land and confirm it did NOT reopen/reset/clobber what the second,
+    // superseding click already painted.
+    await new Promise((r) => setTimeout(r, 1700));
+    const stillSelected = await page.$eval("#f-team-perm-league", (el) => el.value);
+    if (stillSelected !== e3.leagueE3) {
+      fail(`a late-arriving, superseded first click's own result clobbered `
+        + `the drawer the second click already painted, got `
+        + `${stillSelected}`);
+    }
+    await page.unroute("**/api/v2/setup/hierarchy");
+    await page.keyboard.press("Escape");
+    await page.waitForFunction(() => !document.querySelector(".drawer"),
+      null, { timeout: 10000 });
+
     if (errors.length) {
       fail(`console/page errors:\n${errors.join("\n")}`);
     }
@@ -1328,8 +1560,11 @@ async function checkRoleScenarios(browser, viewport) {
       + `focused Season even when another Season shares its League, Arena `
       + `Manager's setup-progress view is redacted to only what they can `
       + `manage and gets actionable guidance instead of a dead-end CTA when `
-      + `blocked, and the complete-state Import action is withheld from a `
-      + `role that cannot use it.`);
+      + `blocked, the complete-state Import action is withheld from a role `
+      + `that cannot use it, hub-driven create drawers seed from the active `
+      + `Program/Season rather than falling through to a global default, `
+      + `and that seeding fails closed (no drawer, an actionable retry) on `
+      + `a hierarchy-fetch error or a Program switch mid-flight.`);
   } catch (error) {
     throw new Error(`${error.message}\n--- demo server output ---\n${serverOutput}`);
   } finally {
