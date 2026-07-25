@@ -295,37 +295,64 @@ class ApiService:
         League-Admin-only completion signals or exact team/registration/
         player counts — that crosses the same role/privacy boundary
         ``next``'s own permission filter exists to hold. ``complete`` and
-        ``next`` are still derived from the FULL, unfiltered internal list
+        ``next`` are still DERIVED from the FULL, unfiltered internal list
         computed below, BEFORE that filtering step: ``complete`` means the
         WHOLE Program's setup is done, independent of role, and must not
         flip true just because the one workflow a caller can see happens to
-        be done. A caller with nothing left THEY can act on (e.g. an Arena
-        Manager once facilities is done, while League-Admin-only workflows
-        remain) gets ``next: None`` without ``complete`` being true — the
-        caller distinguishes "genuinely done" from "nothing more for you" by
-        checking ``complete``.
+        be done.
+
+        Whether that derived value is actually EXPOSED, though, depends on
+        whether this caller's role can see the full list it was derived
+        from (#331 review round 5 finding 3): a role whose ``workflows`` is
+        narrower than the full set (today, Arena Manager) can never
+        truthfully verify a whole-Program claim, so it receives ``None``
+        rather than the real boolean — exposing the real value
+        unconditionally let a change to a workflow this caller cannot even
+        see flip a bit in their own response, leaking through the same
+        redaction boundary ``workflows`` itself exists to hold. ``None`` is
+        neither an overclaimed ``true`` (round 3's bug) nor an
+        independently meaningful ``false`` (round 5's bug) — it is constant
+        regardless of invisible state, so by construction it carries none
+        of it. A role that CAN see everything (today, only League Admin)
+        is unaffected and keeps receiving the real value. A caller with
+        nothing left THEY can act on (e.g. an Arena Manager once facilities
+        is done, while League-Admin-only workflows remain) gets
+        ``next: None`` alongside this non-``true`` ``complete`` — the
+        caller distinguishes "genuinely done" (League Admin only, real
+        ``true``) from "nothing more for you" by checking ``complete``.
 
         ``next`` is the FIRST todo workflow, in the fixed #204 order, that
         this caller's role can manage — filtered to what's actually safe to
-        execute right now, not merely permitted (#331 review round 3/4
-        finding 1): both "facilities" and "participation" need a resolved,
-        ACTIVE Season (their real writes both route through
+        execute right now, not merely permitted (#331 review rounds 3-5):
+        both "facilities" and "participation" need a resolved, ACTIVE
+        Season (their real writes both route through
         ``season_guard.require_active_season`` and fail ``season_missing``
         with none resolved, ``season_archived`` if the resolved one is
-        archived — see ``_workflow_prerequisite_gap``). The FIRST
-        permitted-todo workflow is the one this applies to; a prerequisite
-        gap there blocks it IN PLACE rather than falling through to a
-        later, incidentally-safe workflow — #330 names "the actual next
-        incomplete step" as a strictly ordered contract, and skipping ahead
-        would silently reorder it and could read as the blocked step being
-        forgotten rather than blocked. When that first workflow is safe, it
-        is ``next``; when it is blocked, ``next`` is None and
-        ``next_blocked`` names it with a reason code and human-readable
-        guidance, so the operator is told what to resolve first instead of
-        being left to infer it (or, for a role that cannot resolve it
-        themselves — an Arena Manager blocked on a Season only a League
-        Admin can create — at least told clearly rather than handed a CTA
-        that silently fails).
+        archived), AND each has one more hard floor beyond the Season alone
+        that would otherwise leave its CTA a guaranteed dead end —
+        "facilities" needs at least one Rink with active Season venue
+        access (``venue_access_missing`` — a preview with none provably
+        yields zero slots, and an Arena Manager cannot grant that access
+        themselves) and "participation" needs at least one Program Team
+        eligible for the resolved Season's league(s)
+        (``team_league_mismatch`` — a Team with a permanent League can only
+        register into a LeagueSeason of that same League, so with no
+        eligible Team every registration attempt is a guaranteed rejection)
+        — see ``_workflow_prerequisite_gap`` for the full detail on both.
+        The FIRST permitted-todo workflow is the one this applies to; a
+        prerequisite gap there blocks it IN PLACE rather than falling
+        through to a later, incidentally-safe workflow — #330 names "the
+        actual next incomplete step" as a strictly ordered contract, and
+        skipping ahead would silently reorder it and could read as the
+        blocked step being forgotten rather than blocked. When that first
+        workflow is safe, it is ``next``; when it is blocked, ``next`` is
+        None and ``next_blocked`` names it with a reason code and
+        human-readable guidance, so the operator is told what to resolve
+        first instead of being left to infer it (or, for a role that
+        cannot resolve it themselves — an Arena Manager blocked on a
+        Season only a League Admin can create, or on venue access only a
+        League Admin can grant — at least told clearly rather than handed
+        a CTA that silently fails).
 
         "Imports and onboarding" reports a third ``status``, ``"optional"``,
         instead of ``"done"``/``"todo"`` (#330 review round 1 finding 5): it
@@ -366,6 +393,17 @@ class ApiService:
         # resolved (a Program-only context) means neither can be done yet.
         season_ls_ids = ({ls.id for ls in program_league_seasons
                           if ls.season_id == season.id} if season else set())
+        # The resolved Season's own League ids (via its LeagueSeasons) --
+        # used below by _workflow_prerequisite_gap to check whether ANY
+        # Program Team is even eligible to register here (#331 review round
+        # 5 finding 2): a Team with a permanent League can only ever
+        # register into a LeagueSeason of that same League
+        # (register_team_for_season rule 7, team_league_mismatch), so if no
+        # Team's permanent League appears here (and none is league-less),
+        # every possible registration attempt in this Season is a
+        # guaranteed rejection.
+        season_league_ids = ({ls.league_id for ls in program_league_seasons
+                              if ls.season_id == season.id} if season else set())
 
         workflows = []
 
@@ -471,12 +509,23 @@ class ApiService:
         # here's why"). Permission still filters candidacy exactly as
         # before (round 1) -- only the FIRST permitted one is ever
         # considered, whether that turns out safe or blocked.
+        # Prerequisite context for _workflow_prerequisite_gap (#331 review
+        # round 5 findings 1/2), computed once here rather than re-derived
+        # inside a static method: `schedulable_rink_ids` is exactly the set
+        # already computed for facilities' own done/todo check above (a Rink
+        # is a candidate ice-generation target only via that same active
+        # SeasonVenueAccess), and `team_league_eligible` mirrors
+        # register_team_for_season's own rule 7.
+        team_league_eligible = any(
+            t.league_id is None or t.league_id in season_league_ids
+            for t in teams)
         next_incomplete = None
         next_blocked = None
         for w in workflows:
             if w["status"] != "todo" or not can(role, self._WORKFLOW_PERMISSION[w["key"]]):
                 continue
-            gap = self._workflow_prerequisite_gap(w["key"], season)
+            gap = self._workflow_prerequisite_gap(
+                w["key"], season, schedulable_rink_ids, team_league_eligible)
             if gap is None:
                 next_incomplete = w
             else:
@@ -488,41 +537,89 @@ class ApiService:
         # Redact workflows this caller's role cannot manage from the
         # response (#331 review round 3 finding 1) -- computed from the full
         # list above only AFTER complete/next_incomplete are already
-        # resolved, so an Arena Manager's narrower view can never change
-        # either of those.
+        # resolved internally, so an Arena Manager's narrower view can never
+        # change either of those INTERNAL values.
         visible_workflows = [w for w in workflows
                               if can(role, self._WORKFLOW_PERMISSION[w["key"]])]
+
+        # #331 review round 5 finding 3: `complete` (computed above from the
+        # FULL, unfiltered list) must not be EXPOSED to a role whose visible
+        # slice is narrower than that full list -- round 3 already held its
+        # raw value to the full list so it could never overclaim true just
+        # because the caller's own narrower slice happened to be done, but
+        # exposing that value unconditionally still let a change to a
+        # workflow this caller cannot even see flip a bit in THEIR own
+        # response -- an information leak through the very redaction
+        # boundary `workflows` itself exists to hold. A role that cannot
+        # see the full list can also never truthfully VERIFY a claim about
+        # the whole Program, so it gets `None` instead: neither `true`
+        # (would overclaim, the round 3 bug) nor a real, independently
+        # meaningful `false` (would still leak the invisible signal) --
+        # `None` is constant regardless of invisible state, so by
+        # construction it can carry none of it. A role that CAN see
+        # everything (today, only League Admin -- MANAGE_SETUP AND
+        # MANAGE_ARENA) is completely unaffected: its `visible_workflows`
+        # already equals the full list, so it keeps receiving the real,
+        # verifiable value exactly as before.
+        role_sees_every_workflow = len(visible_workflows) == len(workflows)
 
         return {
             "program_id": program.id, "program": _serialize(program),
             "workflows": visible_workflows,
             "next": next_incomplete,
             "next_blocked": next_blocked,
-            "complete": complete,
+            "complete": complete if role_sees_every_workflow else None,
         }
 
     @staticmethod
-    def _workflow_prerequisite_gap(key, season):
+    def _workflow_prerequisite_gap(key, season, schedulable_rink_ids,
+                                   team_league_eligible):
         """None if `key`'s primary action is safe to execute given the
         resolved Season context; otherwise (reason, detail) describing what
-        must change first (#331 review round 3/4 finding 1). Mirrors the
-        exact conditions the real writes enforce, read-only -- never
-        mutates or row-locks, unlike the guards it mirrors. Both
-        "facilities" (``SetupService.commit_ice_availability``, behind the
-        Ice Availability Builder) and "participation"
+        must change first (#331 review rounds 3-5). Mirrors the exact
+        conditions the real writes enforce, read-only -- never mutates or
+        row-locks, unlike the guards it mirrors.
+
+        Both "facilities" (``SetupService.commit_ice_availability``, behind
+        the Ice Availability Builder) and "participation"
         (``register_team_for_season``) route through
-        ``season_guard.require_active_season``, so both fail identically:
-        ``season_missing`` with no Season resolved (nothing to generate ice
-        into / no season to register a team for -- also true for
-        "participation" specifically because its own real destination,
-        ``focusParticipationRegisterControl()``, needs an exact selected
-        Season to deep-link/focus a specific Register control; with none
-        resolved it can only fall back to a generic, unbound landing on the
-        Setup tree, not the precise binding #330's round-2 review already
-        required), and ``season_archived`` if the resolved one is archived
-        (read-only until an authorized reopen). Every other workflow's
-        primary action (Add Season, Add Team, Add Player, Import data) has
-        no Season prerequisite of its own."""
+        ``season_guard.require_active_season``, so both fail identically at
+        the Season level: ``season_missing`` with no Season resolved
+        (nothing to generate ice into / no season to register a team for --
+        also true for "participation" specifically because its own real
+        destination, ``focusParticipationRegisterControl()``, needs an exact
+        selected Season to deep-link/focus a specific Register control; with
+        none resolved it can only fall back to a generic, unbound landing on
+        the Setup tree, not the precise binding #330's round-2 review
+        already required), and ``season_archived`` if the resolved one is
+        archived (read-only until an authorized reopen).
+
+        Beyond the Season itself, each has one more hard floor that makes
+        its CTA a guaranteed dead end even with an active Season resolved
+        (#331 review round 5 findings 1/2) -- both are existence checks the
+        real write also has no way around, not heuristics:
+
+        - "facilities": ``schedulable_rink_ids`` (the Rinks reachable via
+          active ``SeasonVenueAccess`` for the resolved Season -- the exact
+          set ``get_setup_progress`` already computes for facilities' own
+          done/todo check) must be non-empty. With none, every rink the
+          builder could offer lands in ``venue_access_missing``, so a
+          preview provably generates zero slots no matter what the operator
+          picks -- and an Arena Manager, who holds MANAGE_ARENA but not
+          MANAGE_SETUP, cannot grant that access themselves, making this a
+          true dead end rather than a gap the same role could close.
+        - "participation": ``team_league_eligible`` (whether any of this
+          Program's Teams has no permanent League yet, or a permanent
+          League that matches one of the resolved Season's own
+          LeagueSeasons) must be true. A Team WITH a permanent League can
+          only ever register into a LeagueSeason of that same League (rule
+          7); if none of the Program's Teams qualify, every possible
+          registration in this Season is a guaranteed
+          ``team_league_mismatch`` rejection, regardless of which team the
+          operator picks in the control.
+
+        Every other workflow's primary action (Add Season, Add Team, Add
+        Player, Import data) has no Season prerequisite of its own."""
         if key not in ("facilities", "participation"):
             return None
         action = "adding ice" if key == "facilities" else "registering teams"
@@ -532,6 +629,17 @@ class ApiService:
             return ("season_archived",
                     f"Season '{season.name}' is archived and read-only — "
                     f"reopen it or select an active Season before {action}.")
+        if key == "facilities" and not schedulable_rink_ids:
+            return ("venue_access_missing",
+                    f"No rink has venue access granted for Season "
+                    f"'{season.name}' yet — a League Admin must grant "
+                    f"access to at least one rink before ice can be added.")
+        if key == "participation" and not team_league_eligible:
+            return ("team_league_mismatch",
+                    f"No permanent team is eligible to register in Season "
+                    f"'{season.name}' yet — add a team under a matching "
+                    f"league, or add a league to this season that matches "
+                    f"an existing team, before registering teams.")
         return None
 
     # -- competition-hierarchy resolution (#283) ---------------------------

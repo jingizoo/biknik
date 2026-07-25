@@ -520,9 +520,20 @@ function renderSetupProgressCard(progress, hadError, loading) {
   // paints this skeleton immediately, before the real fetch even starts, so
   // a slow setup-progress request only delays this one card, never the rest
   // of the Dashboard (see loadSetupProgressCard()).
+  //
+  // #331 review round 5 finding 5: the loading state used to be a bare,
+  // heading-less <div class="skeleton"> -- invisible to a screen-reader
+  // user (no busy cue, no label) and unscannable by axe helpers that
+  // locate this card by its own heading (KNOWN_CARD_HEADINGS in the e2e
+  // suite). It now carries a real <h3> (so it's a first-class state, not
+  // structurally excluded) plus a visually-hidden label; #sp-card-slot
+  // itself (render()'s own wrapper, persisting across every re-render of
+  // this function's output) carries the actual aria-busy/aria-live
+  // semantics, so this is just the content that live region announces.
   if (loading) {
     return `<div class="dash-card sp-card" style="margin-bottom:16px">
-      <div class="skeleton"></div>
+      <div class="dash-card-head"><h3>Setup progress</h3></div>
+      <div class="skeleton"><span class="sr-only">Loading setup progress…</span></div>
     </div>`;
   }
   if (hadError) {
@@ -530,9 +541,13 @@ function renderSetupProgressCard(progress, hadError, loading) {
     // finding 4): .banner.alert's own white-on-red is a sitewide convention
     // used well below WCAG AA (~3.3:1) -- fixed here without touching the
     // shared class every other screen using .banner.alert still relies on.
+    // role="alert" (#331 review round 5 finding 5): an assertive
+    // announcement distinct from the outer #sp-card-slot's own polite live
+    // region -- a failed fetch is more urgent/actionable than routine
+    // content settling and should interrupt rather than wait its turn.
     return `<div class="dash-card sp-card" style="margin-bottom:16px">
       <div class="dash-card-head"><h3>Setup progress unavailable</h3></div>
-      <div class="banner alert"><p>Could not load your setup progress.</p></div>
+      <div class="banner alert" role="alert"><p>Could not load your setup progress.</p></div>
       <div class="actions">
         <button class="act primary" data-setup-progress-retry>Retry</button>
       </div>
@@ -622,6 +637,12 @@ function renderSetupProgressCard(progress, hadError, loading) {
 // this one thing instead of the whole Dashboard (overview/standings too).
 async function loadSetupProgressCard() {
   const mySeq = ++setupProgressFetchSeq;
+  // aria-busy (#331 review round 5 finding 5): re-asserted here, not just
+  // left over from render()'s initial paint, so a RETRY (the slot's own
+  // aria-busy already flipped back to "false" after the failed fetch that
+  // preceded it) is exposed as busy again too, not just the very first load.
+  const busySlot = document.getElementById("sp-card-slot");
+  if (busySlot) busySlot.setAttribute("aria-busy", "true");
   const sp = await getJSON("/api/v2/setup/progress");
   if (mySeq !== setupProgressFetchSeq) return;  // a newer load already won
   if (sp && !sp.error) { setupProgress = sp; setupProgressError = false; }
@@ -629,6 +650,7 @@ async function loadSetupProgressCard() {
   const slot = document.getElementById("sp-card-slot");
   if (!slot) return;  // navigated away from Dashboard before this resolved
   slot.innerHTML = renderSetupProgressCard(setupProgress, setupProgressError, false);
+  slot.setAttribute("aria-busy", "false");
   const spAction = slot.querySelector("[data-setup-progress-action]");
   if (spAction) spAction.onclick = () =>
     goToSetupWorkflow(spAction.dataset.setupProgressAction);
@@ -655,7 +677,7 @@ async function loadSetupProgressCard() {
 // render() behavior); the plain view switches below additionally focus the
 // destination's own heading so keyboard/screen-reader users land somewhere
 // meaningful, not silently at the top of the page.
-function goToSetupWorkflow(key) {
+async function goToSetupWorkflow(key) {
   if (key === "facilities") {
     iceBuilder = { form: null, preview: null };
     switchTab("calendar");
@@ -665,7 +687,21 @@ function goToSetupWorkflow(key) {
   if (key === "league_season" || key === "teams" || key === "roster") {
     const kind = key === "league_season" ? "season"
       : key === "teams" ? "team" : "player";
-    drawer = { kind }; drawerError = ""; drawerValues = {};
+    // Seed the parent field from the ACTIVE Program (#331 review round 5
+    // finding 4): left empty, drawerField()'s own fallback picks
+    // rows[0] -- whichever Program/League/Team happens to sort first
+    // GLOBALLY (these fields' option lists span every Program, unfiltered
+    // -- #159's contextOptions is a display-only selection today, existing
+    // screens are not filtered by it), not the one this hub is scoped to.
+    // A valid submit against that silent wrong default would create data
+    // under a DIFFERENT Program than the one the operator is acting from.
+    // Awaited BEFORE opening the drawer (a single, cheap fetch) rather
+    // than reading the module-level permLeaguesByProgram/leagueTeams
+    // caches, which are only populated as a side effect of the Setup
+    // view's OWN last render and can be stale or entirely unpopulated at
+    // the moment this hub CTA is clicked straight from the Dashboard.
+    const values = await contextSeededDrawerValues(kind);
+    drawer = { kind }; drawerError = ""; drawerValues = values;
     switchTab("setup");
     return;
   }
@@ -682,6 +718,45 @@ function goToSetupWorkflow(key) {
   }
   switchTab("setup");
   focusContentHeading();
+}
+// The correct parent-field seed for a hub-driven create drawer (#331 review
+// round 5 finding 4), scoped to the ACTIVE Program (#159's
+// contextOptions.selected) via a FRESH, targeted fetch of the canonical
+// Program->League->Team hierarchy -- NOT the module-level
+// permLeaguesByProgram/leagueTeams caches (only populated as a side effect
+// of the Setup view's OWN last render, so stale or entirely empty when this
+// hub CTA is clicked straight from the Dashboard), and NOT a change to the
+// shared drawer field definitions' own option lists, which stay
+// global/unfiltered (the general Setup screen's own "+ Add" entry points
+// are not Program-scoped by design; contextOptions is documented as
+// "existing screens are not filtered by it yet"). Seeding only the DEFAULT
+// selected value is enough to close the actual bug -- a silent wrong-
+// Program default on first open -- while an operator who deliberately wants
+// a different Program can still change the select same as always. Empty
+// when no active Program is selected, or the active Program has no
+// candidate of its own yet (a fresh Program with zero permanent
+// Leagues/Teams so far); drawerField() falls back to its ordinary
+// first-option behavior in that case, same as any other entry point into
+// the same drawer.
+async function contextSeededDrawerValues(kind) {
+  const programId = contextOptions && contextOptions.selected
+    && contextOptions.selected.program_id;
+  if (!programId) return {};
+  if (kind === "season") return { "f-season-league": programId };
+  const hvr = await getJSON("/api/v2/setup/hierarchy");
+  const program = hvr && !hvr.error
+    && (hvr.programs || []).find((p) => p.id === programId);
+  if (!program) return {};
+  if (kind === "team") {
+    const lgs = program.leagues || [];
+    return lgs.length ? { "f-team-perm-league": lgs[0].id } : {};
+  }
+  if (kind === "player") {
+    const teams = (program.leagues || []).flatMap((lg) => lg.teams || [])
+      .concat(program.teams_without_league || []);
+    return teams.length ? { "f-player-team": teams[0].id } : {};
+  }
+  return {};
 }
 // Best-effort focus landing for a plain view switch (no drawer of its own to
 // auto-focus) — the first heading-ish element in the freshly rendered view,
@@ -2999,7 +3074,21 @@ const IB_WEEKDAYS = [[0, "Mon"], [1, "Tue"], [2, "Wed"], [3, "Thu"],
 
 function defaultIceForm(ov) {
   const seasons = ov.seasons || [];
-  const active = seasons.find((s) => s.status === "active") || seasons[0] || null;
+  // Prefer the #159 ACTIVE Season selection over "the first active/global
+  // Season" (#331 review round 5 finding 4): `seasons` here spans every
+  // Program (GET /api/demo/overview is unfiltered), so picking the first
+  // status==="active" row could default the builder onto a DIFFERENT
+  // Program's Season than the one the Home/Tasks hub CTA was scoped to. A
+  // committed submit against that silent wrong default would generate ice
+  // for the wrong Program. Falls back to the old global-first behavior only
+  // when no Season is actively selected (a Program-only context, or no
+  // context at all) or the selected id no longer resolves (a stale/deleted
+  // Season) -- never left unset when a real active/global one exists.
+  const selectedId = contextOptions && contextOptions.selected
+    && contextOptions.selected.season_id;
+  const selected = selectedId ? seasons.find((s) => s.id === selectedId) : null;
+  const active = selected
+    || seasons.find((s) => s.status === "active") || seasons[0] || null;
   const rinks = ov.rinks || [];
   return {
     season_id: active ? active.id : "",
@@ -6054,9 +6143,17 @@ async function render() {
   // fetch fill the slot in on its own schedule.
   const showSetupCard = view === "dashboard"
     && (hasPerm("manage_setup") || hasPerm("manage_arena"));
+  // role="status"/aria-live="polite" (#331 review round 5 finding 5): this
+  // wrapper persists across every re-render of renderSetupProgressCard()'s
+  // OWN output (loadSetupProgressCard() only ever replaces its innerHTML),
+  // so it is the one stable point a screen reader can watch to have
+  // loading -> success/blocked/error, and a later retry's own settle,
+  // announced automatically. aria-busy starts true (a fetch is about to
+  // start, per the loading skeleton painted on the same line) and
+  // loadSetupProgressCard() clears it once real content lands.
   c.innerHTML =
     view === "dashboard" ? (showSetupCard
-        ? `<div id="sp-card-slot">${renderSetupProgressCard(null, false, true)}</div>` : "")
+        ? `<div id="sp-card-slot" role="status" aria-live="polite" aria-busy="true">${renderSetupProgressCard(null, false, true)}</div>` : "")
       + renderDashboard(ov, standings)
     : view === "setup" ? renderSetup(sv, hv, ov)
     : view === "import" ? renderImport(ov)

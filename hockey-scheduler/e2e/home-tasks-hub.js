@@ -59,6 +59,10 @@ const KNOWN_CARD_HEADINGS = [
   "Continue setup",
   "✓ All setup steps complete",
   "Setup progress unavailable",
+  // The loading state's own heading (#331 review round 5 finding 5) --
+  // previously heading-less and so structurally unscannable by both
+  // cardState() and the axe helper below; now a first-class state.
+  "Setup progress",
 ];
 const AXE_PATH = require.resolve("axe-core/axe.min.js");
 
@@ -283,6 +287,13 @@ async function checkViewport(browser, viewport) {
     await page.goto(base, { waitUntil: "domcontentloaded" });
     await page.waitForSelector("#content > *", { timeout: 10000 });
     await reachDashboard(page);
+    // The loading state is now a real, heading-bearing state of its own
+    // (#331 review round 5 finding 5), so it can transiently match
+    // cardState()'s heading search too -- wait past it before asserting
+    // the SETTLED "no card" state below (previously masked: a heading-less
+    // loading skeleton never matched cardState() either, so this check
+    // "worked" even without waiting for settlement, for the wrong reason).
+    await waitForCardSettled(page);
 
     // (1) No Program exists at all yet -> no card (bootstrapping the very
     // first Program is the onboarding wizard's job, not this card's).
@@ -472,18 +483,42 @@ async function checkViewport(browser, viewport) {
     await page.click('.tab[data-tab="dashboard"]');
     await reachDashboard(page);
 
-    // (7) Add a player -> facilities becomes next; its primary action opens
-    // the Ice Availability Builder specifically, which renders from the
-    // Calendar view, not Setup (#331 review round 1 finding 3 — this is the
-    // exact destination an Arena Manager needs to be able to execute).
+    // (7) Add a player -> facilities becomes next but BLOCKED (#331 review
+    // round 5 finding 1): an active Season alone is not enough -- with no
+    // Rink holding granted venue access yet, the Ice Availability
+    // Builder's own preview would provably yield zero slots (every
+    // requested rink lands in venue_access_missing), so `next` must stay
+    // blocked rather than offer a dead-end "Add Ice" CTA.
     await apiPost(page, "/api/v2/setup/player",
       { team_id: ids.teamId, name: "Vince Skater", position: "forward" });
     await page.goto(base, { waitUntil: "domcontentloaded" });
     await reachDashboard(page);
     await waitForCardSettled(page);
     s = await cardState(page);
+    if (!s || s.nextTitle !== "Venues, rinks and ice" || s.primaryLabel !== null) {
+      fail(`after player, no venue access yet: expected facilities `
+        + `blocked (no enabled CTA), got ${JSON.stringify(s)}`);
+    }
+
+    // Granting venue access (with no ice slot yet) makes facilities
+    // genuinely SAFE -- `next` finally names it with an enabled "Add Ice"
+    // CTA whose primary action opens the REAL Ice Availability Builder
+    // specifically, which renders from the Calendar view, not Setup
+    // (#331 review round 1 finding 3 — this is the exact destination an
+    // Arena Manager needs to be able to execute).
+    const venue = await apiPost(page, "/api/v2/setup/venue",
+      { name: "Arena", organization_id: null });
+    const rink = await apiPost(page, "/api/v2/setup/rink",
+      { venue_id: venue.id, name: "Rink 1" });
+    await apiPost(page, `/api/v2/setup/seasons/${ids.seasonId}/venue-access`,
+      { venue_id: venue.id });
+    await page.goto(base, { waitUntil: "domcontentloaded" });
+    await reachDashboard(page);
+    await waitForCardSettled(page);
+    s = await cardState(page);
     if (!s || s.nextTitle !== "Venues, rinks and ice") {
-      fail(`after player: expected next = "Venues, rinks and ice", got ${JSON.stringify(s)}`);
+      fail(`after venue access granted: expected next = "Venues, rinks `
+        + `and ice", got ${JSON.stringify(s)}`);
     }
     if (s.primaryLabel !== "Add Ice") {
       fail(`expected primary action "Add Ice", got ${JSON.stringify(s)}`);
@@ -506,26 +541,11 @@ async function checkViewport(browser, viewport) {
     await page.click('.tab[data-tab="dashboard"]');
     await reachDashboard(page);
 
-    // (8) Finish facilities via the API, reaching full completion -> the
+    // (8) Add the actual ice slot, reaching full completion -> the
     // required success state with a keyboard-operable Schedule link.
-    await page.evaluate(async () => {
-      const post = async (p, b) => (await fetch(p, {
-        method: "POST", credentials: "same-origin",
-        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
-      })).json();
-      const venue = await post("/api/v2/setup/venue",
-        { name: "Arena", organization_id: null });
-      const rink = await post("/api/v2/setup/rink",
-        { venue_id: venue.id, name: "Rink 1" });
-      await post("/api/v2/setup/ice-slot", {
-        rink_id: rink.id, start_time: "2026-09-01T18:30:00+00:00",
-        end_time: "2026-09-01T20:00:00+00:00", slot_type: "game" });
-      return venue;
-    });
-    await apiPost(page, `/api/v2/setup/seasons/${ids.seasonId}/venue-access`, {
-      venue_id: (await page.evaluate(() =>
-        fetch("/api/v2/setup/overview", { credentials: "same-origin" })
-          .then((r) => r.json()).then((ov) => ov.venues[0].id))),
+    await apiPost(page, "/api/v2/setup/ice-slot", {
+      rink_id: rink.id, start_time: "2026-09-01T18:30:00+00:00",
+      end_time: "2026-09-01T20:00:00+00:00", slot_type: "game",
     });
     await page.goto(base, { waitUntil: "domcontentloaded" });
     await reachDashboard(page);
@@ -629,15 +649,44 @@ async function checkViewport(browser, viewport) {
     const midFlight = await page.evaluate(() => {
       const slot = document.getElementById("sp-card-slot");
       return { slotShowsSkeleton: !!(slot && slot.querySelector(".skeleton")),
-        dashboardReady: !!document.querySelector(".dash-stats") };
+        dashboardReady: !!document.querySelector(".dash-stats"),
+        // #331 review round 5 finding 5: the loading state must be a real,
+        // announced, scannable status region, not silent/structurally
+        // excluded -- role/aria-live persist on #sp-card-slot itself
+        // (render()'s wrapper), aria-busy flips true the moment a fetch
+        // starts.
+        slotRole: slot && slot.getAttribute("role"),
+        slotAriaLive: slot && slot.getAttribute("aria-live"),
+        slotAriaBusy: slot && slot.getAttribute("aria-busy"),
+      };
     });
     if (!midFlight.slotShowsSkeleton || !midFlight.dashboardReady) {
       fail(`expected the card's own loading skeleton while the rest of the `
         + `Dashboard is already ready, got ${JSON.stringify(midFlight)}`);
     }
+    if (midFlight.slotRole !== "status" || midFlight.slotAriaLive !== "polite"
+        || midFlight.slotAriaBusy !== "true") {
+      fail(`expected #sp-card-slot to carry role="status" `
+        + `aria-live="polite" aria-busy="true" while loading, got `
+        + `${JSON.stringify(midFlight)}`);
+    }
+    // Loading is now a first-class, heading-bearing state (#331 review
+    // round 5 finding 5) -- scannable by the SAME axe helper every other
+    // state already uses, not structurally excluded from the gate.
+    await assertCardHasNoA11yViolations(page, viewport.label, "loading state");
     releaseDelay();
     await page.unroute("**/api/v2/setup/progress");
     await waitForCompleteHeading(page);
+    // loading -> success (#331 review round 5 finding 5): aria-busy must
+    // clear once real content has landed, so a screen reader is told the
+    // region has settled, not left permanently "busy".
+    const settledBusy = await page.evaluate(() =>
+      (document.getElementById("sp-card-slot") || {}).getAttribute
+        && document.getElementById("sp-card-slot").getAttribute("aria-busy"));
+    if (settledBusy !== "false") {
+      fail(`expected aria-busy="false" once the complete state settled, `
+        + `got ${JSON.stringify(settledBusy)}`);
+    }
 
     // (9) Error + retry: a failed fetch shows the error state with a
     // working Retry, not a silently-vanished card (#331 review round 1
@@ -656,8 +705,38 @@ async function checkViewport(browser, viewport) {
     await reachDashboard(page);
     await page.waitForSelector("[data-setup-progress-retry]", { timeout: 10000 });
     await assertCardHasNoA11yViolations(page, viewport.label, "error state");
+    // loading -> error (#331 review round 5 finding 5): role="alert" gives
+    // the failure an ASSERTIVE announcement distinct from the outer
+    // #sp-card-slot's own polite live region, and aria-busy must have
+    // cleared once the (failed) fetch settled -- an error is not "still
+    // busy".
+    const errorSemantics = await page.evaluate(() => ({
+      bannerRole: (document.querySelector(".dash-card .banner.alert") || {})
+        .getAttribute && document.querySelector(".dash-card .banner.alert").getAttribute("role"),
+      slotAriaBusy: (document.getElementById("sp-card-slot") || {}).getAttribute
+        && document.getElementById("sp-card-slot").getAttribute("aria-busy"),
+    }));
+    if (errorSemantics.bannerRole !== "alert" || errorSemantics.slotAriaBusy !== "false") {
+      fail(`expected the error banner to carry role="alert" and `
+        + `aria-busy="false" once settled, got ${JSON.stringify(errorSemantics)}`);
+    }
     await page.unroute("**/api/v2/setup/progress");
+    // Re-route to a deliberately delayed (but successful) response so the
+    // retry's OWN in-flight fetch can be observed carrying aria-busy="true"
+    // again -- not just the very first load (#331 review round 5 finding 5).
+    let releaseRetryDelay;
+    const retryDelayPromise = new Promise((resolve) => { releaseRetryDelay = resolve; });
+    await page.route("**/api/v2/setup/progress", async (route) => {
+      await retryDelayPromise;
+      await route.continue();
+    });
     await page.click("[data-setup-progress-retry]");
+    await page.waitForFunction(
+      () => (document.getElementById("sp-card-slot") || {}).getAttribute
+        && document.getElementById("sp-card-slot").getAttribute("aria-busy") === "true",
+      null, { timeout: 5000 });
+    releaseRetryDelay();
+    await page.unroute("**/api/v2/setup/progress");
     // waitForCardSettled's "no .skeleton" check is already true on the
     // error state BEFORE this click (the error state has no skeleton of its
     // own -- retry re-fetches without showing one), so it would resolve
@@ -667,6 +746,15 @@ async function checkViewport(browser, viewport) {
     s = await cardState(page);
     if (!s || s.heading !== "✓ All setup steps complete") {
       fail(`expected Retry to recover the real (complete) state, got ${JSON.stringify(s)}`);
+    }
+    // error -> retry-success (#331 review round 5 finding 5): aria-busy
+    // must have cleared again once the retry's own fetch settled.
+    const retrySettledBusy = await page.evaluate(() =>
+      (document.getElementById("sp-card-slot") || {}).getAttribute
+        && document.getElementById("sp-card-slot").getAttribute("aria-busy"));
+    if (retrySettledBusy !== "false") {
+      fail(`expected aria-busy="false" once the retry's success settled, `
+        + `got ${JSON.stringify(retrySettledBusy)}`);
     }
     // The deliberately-injected 500 above is expected to log a browser
     // resource-load console error (Chromium logs any non-2xx fetch this way
@@ -894,11 +982,20 @@ async function checkRoleScenarios(browser, viewport) {
     // ---- (A2) Same Program A / season s2, viewed as Arena Manager: proves
     // BOTH halves of finding 1 together in a genuinely executable (not
     // blocked) context -- `next` still correctly recommends facilities
-    // (season s2 is active, not archived), and the response's `workflows`
-    // is redacted to just that one entry, never the League-Admin-only
-    // league_season/teams/participation/roster detail this Program now
-    // carries (participation just went done above -- an exact count Arena
-    // Manager must never receive).
+    // (season s2 is active, not archived, AND has a Rink with granted
+    // venue access -- #331 review round 5 finding 1's own gate, satisfied
+    // here as admin since Arena Manager cannot grant it themselves), and
+    // the response's `workflows` is redacted to just that one entry, never
+    // the League-Admin-only league_season/teams/participation/roster
+    // detail this Program now carries (participation just went done above
+    // -- an exact count Arena Manager must never receive).
+    const a2Venue = await apiPost(page, "/api/v2/setup/venue",
+      { name: "A2 Arena", organization_id: null });
+    await apiPost(page, "/api/v2/setup/rink",
+      { venue_id: a2Venue.id, name: "A2 Rink" });
+    await apiPost(page, `/api/v2/setup/seasons/${a.s2}/venue-access`,
+      { venue_id: a2Venue.id });
+
     await logout(page);
     await loginAs(page, "arena", "demo");
     await apiPost(page, "/api/context", { program_id: a.program, season_id: a.s2 });
@@ -1037,31 +1134,192 @@ async function checkRoleScenarios(browser, viewport) {
     await logout(page);
     await loginAs(page, "arena", "demo");
     await apiPost(page, "/api/context", { program_id: cIds.program, season_id: cIds.season });
+    // #331 review round 5 finding 3: Arena Manager can never truthfully
+    // verify a whole-Program "complete" claim from their own narrower
+    // view -- `complete` reads `null` for them even though the Program
+    // (and their own visible facilities workflow) is genuinely, fully
+    // done, and the card renders NOTHING rather than the success banner
+    // it hands League Admin above (a claim Arena Manager cannot verify)
+    // or a stale/misleading "nothing more for you" card. The Arena
+    // Calendar stays reachable the ordinary way, via the main nav tab --
+    // this card's own "Go to Schedule" shortcut simply has nothing left
+    // to say once there is nothing to recommend and nothing to verify.
+    const cArenaProgress = await apiGet(page, "/api/v2/setup/progress");
+    if (cArenaProgress.complete !== null) {
+      fail(`Program C, Arena Manager: expected complete: null (never a `
+        + `real True/False from a partial view), got `
+        + `${JSON.stringify(cArenaProgress)}`);
+    }
+    if (cArenaProgress.next !== null || cArenaProgress.next_blocked !== null) {
+      fail(`Program C, Arena Manager: expected both next and next_blocked `
+        + `null once their own visible facilities workflow is done, got `
+        + `${JSON.stringify(cArenaProgress)}`);
+    }
     await freshLoad();
     s = await cardState(page);
-    if (!s || s.heading !== "✓ All setup steps complete") {
-      fail(`Program C, Arena Manager: expected the complete state, got ${JSON.stringify(s)}`);
+    if (s !== null) {
+      fail(`Program C, Arena Manager: expected NO setup-progress card `
+        + `(nothing left to recommend, nothing left to verify), got `
+        + `${JSON.stringify(s)}`);
     }
-    if (s.primaryLabel !== "Go to Schedule") {
-      fail(`Arena Manager must keep the "Go to Schedule" primary action, `
+    if (await page.$("#sp-card-slot .dash-card")) {
+      fail("expected #sp-card-slot to render no card at all in this state");
+    }
+
+    // ---- (D) Two Programs, A created first / B active (#331 review round
+    // 5 finding 4): every hub-driven create-drawer/Ice-Builder destination
+    // must seed its parent field from the ACTIVE Program/Season -- these
+    // fields' own option lists span every Program, unfiltered, so left
+    // unseeded they fall back to whichever entity happens to sort first
+    // GLOBALLY, which is Program A's here by construction (created, hence
+    // id-ordered, first). A silent wrong default would let a real submit
+    // create data under A while the operator is acting from B.
+    await logout(page);
+    await loginAs(page, "admin", "demo");
+    const d = await page.evaluate(async () => {
+      const post = async (p, b) => (await fetch(p, {
+        method: "POST", credentials: "same-origin",
+        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
+      })).json();
+      // Program A: built out fully so its League/Team/Season are all
+      // plausible (and, pre-fix, actual) wrong defaults.
+      const progA = await post("/api/v2/setup/program",
+        { name: "Round5F4 Program A", country: "US" });
+      const seasonA = await post("/api/v2/setup/season",
+        { program_id: progA.id, name: "Season A" });
+      const leagueA = await post("/api/v2/setup/league",
+        { season_id: seasonA.id, name: "League A" });
+      const clubA = await post("/api/v2/setup/club", { name: "Club A" });
+      const teamA = await post("/api/v2/setup/team",
+        { league_id: leagueA.id, club_id: clubA.id, name: "Team A" });
+      // Program B: created SECOND, starts with nothing -- built up one
+      // workflow at a time via the REAL hub CTA below, never an API
+      // shortcut, so each drawer's actual pre-fill is exercised.
+      const progB = await post("/api/v2/setup/program",
+        { name: "Round5F4 Program B", country: "US" });
+      return { progA: progA.id, seasonA: seasonA.id, leagueA: leagueA.id,
+        teamA: teamA.id, progB: progB.id };
+    });
+    await apiPost(page, "/api/context", { program_id: d.progB, season_id: null });
+    await freshLoad();
+
+    // -- Add Season: the Program select must default to the ACTIVE Program
+    // B, never fall through to Program A.
+    s = await cardState(page);
+    if (!s || s.nextTitle !== "League profile and seasons") {
+      fail(`Program B fresh: expected next = "League profile and seasons", `
         + `got ${JSON.stringify(s)}`);
     }
-    importBtn = await page.$('[data-setup-progress-action="import"]');
-    if (importBtn) {
-      fail("Arena Manager must never receive an enabled Import action "
-        + "(MANAGE_SETUP-only) in the complete state");
+    await page.click("[data-setup-progress-action]");
+    await page.waitForSelector("#f-season-league", { timeout: 10000 });
+    let selected = await page.$eval("#f-season-league", (el) => el.value);
+    if (selected !== d.progB) {
+      fail(`Add Season: expected the Program select to default to the `
+        + `ACTIVE Program B (${d.progB}), got ${selected} (Program A is `
+        + `${d.progA})`);
     }
-    await assertCardHasNoA11yViolations(page, viewport.label,
-      "complete state (Arena Manager, no Import)");
-    // Keyboard-operable Schedule stays reachable for Arena Manager too.
-    await page.evaluate(() => {
-      const b = Array.from(document.querySelectorAll(".dash-card .act.primary"))
-        .find((x) => x.textContent.trim() === "Go to Schedule");
-      b.focus();
-    });
-    await page.keyboard.press("Enter");
+    await page.fill("#f-season", "Season B");
+    const seasonResp = page.waitForResponse((r) =>
+      r.url() === `${base}/api/v2/setup/season` && r.request().method() === "POST");
+    await page.click('[data-drawer-submit="season"]');
+    const seasonB = await (await seasonResp).json();
+    if (seasonB.program_id !== d.progB) {
+      fail(`Add Season submit created "Season B" under the wrong Program `
+        + `-- got ${JSON.stringify(seasonB)}`);
+    }
+    await page.waitForFunction(() => !document.querySelector(".drawer"),
+      null, { timeout: 10000 });
+    // Select the just-created Season B as the active context -- without
+    // this, participation stays blocked on season_missing (round 4's own
+    // gate) ahead of "teams"/"roster" in the fixed order, masking the
+    // rest of this scenario.
+    await apiPost(page, "/api/context", { program_id: d.progB, season_id: seasonB.id });
+
+    // -- Add League for Season B (a plain API call -- not part of this
+    // bug) so "league_season" flips done and "teams" becomes next.
+    const leagueB = await apiPost(page, "/api/v2/setup/league",
+      { season_id: seasonB.id, name: "League B" });
+    await freshLoad();
+
+    // -- Add Team: the Permanent league select must default to Program
+    // B's own League B, never League A.
+    s = await cardState(page);
+    if (!s || s.nextTitle !== "Permanent teams") {
+      fail(`Program B / Season B: expected next = "Permanent teams", got `
+        + `${JSON.stringify(s)}`);
+    }
+    await page.click("[data-setup-progress-action]");
+    await page.waitForSelector("#f-team-perm-league", { timeout: 10000 });
+    selected = await page.$eval("#f-team-perm-league", (el) => el.value);
+    if (selected !== leagueB.id) {
+      fail(`Add Team: expected the Permanent league select to default to `
+        + `Program B's own League B (${leagueB.id}), got ${selected} `
+        + `(Program A's League A is ${d.leagueA})`);
+    }
+    await page.fill("#f-team", "Team B");
+    const teamResp = page.waitForResponse((r) =>
+      r.url() === `${base}/api/v2/setup/team` && r.request().method() === "POST");
+    await page.click('[data-drawer-submit="team"]');
+    await teamResp;
+    await page.waitForFunction(() => !document.querySelector(".drawer"),
+      null, { timeout: 10000 });
+    const overviewAfterTeam = await apiGet(page, "/api/v2/setup/overview");
+    const teamB = (overviewAfterTeam.teams || []).find(
+      (t) => t.name === "Team B" && t.program_id === d.progB);
+    if (!teamB) {
+      fail(`Add Team submit did not create "Team B" under the active `
+        + `Program B -- got teams: ${JSON.stringify(overviewAfterTeam.teams)}`);
+    }
+    // Register Team B into Season B (a plain API call -- not part of this
+    // bug) so "participation" flips done and "roster" becomes next.
+    await apiPost(page,
+      `/api/v2/setup/seasons/${seasonB.id}/team-registrations`,
+      { team_id: teamB.id, league_id: leagueB.id });
+
+    // -- Add Player: the Team select must default to Program B's own Team
+    // B, never Program A's Team A.
+    await freshLoad();
+    s = await cardState(page);
+    if (!s || s.nextTitle !== "Clubs, players and staff") {
+      fail(`Program B / Team B: expected next = "Clubs, players and `
+        + `staff", got ${JSON.stringify(s)}`);
+    }
+    await page.click("[data-setup-progress-action]");
+    await page.waitForSelector("#f-player-team", { timeout: 10000 });
+    selected = await page.$eval("#f-player-team", (el) => el.value);
+    if (selected !== teamB.id) {
+      fail(`Add Player: expected the Team select to default to Program `
+        + `B's own Team B (${teamB.id}), got ${selected} (Program A's `
+        + `Team A is ${d.teamA})`);
+    }
+    await page.fill("#f-player-name", "Player B");
+    const playerResp = page.waitForResponse((r) =>
+      r.url() === `${base}/api/v2/setup/player` && r.request().method() === "POST");
+    await page.click('[data-drawer-submit="player"]');
+    const playerB = await (await playerResp).json();
+    if (playerB.team_id !== teamB.id) {
+      fail(`Add Player submit created "Player B" under the wrong Team -- `
+        + `got ${JSON.stringify(playerB)}`);
+    }
+    await page.waitForFunction(() => !document.querySelector(".drawer"),
+      null, { timeout: 10000 });
+
+    // -- Add Ice (facilities): the Ice Builder's own Season select must
+    // default to the ACTIVE Season B, never Season A, even though A's
+    // Season also has status "active" and sorts first in the global
+    // seasons list defaultIceForm() reads from.
+    await apiPost(page, "/api/context", { program_id: d.progB, season_id: seasonB.id });
+    await page.click('.tab[data-tab="calendar"]');
     await page.waitForFunction(
       () => document.body.dataset.view === "calendar", null, { timeout: 10000 });
+    await page.click("[data-ice-builder-open]");
+    await page.waitForSelector("#ib-season", { timeout: 10000 });
+    selected = await page.$eval("#ib-season", (el) => el.value);
+    if (selected !== seasonB.id) {
+      fail(`Add Ice: expected the Ice Builder's Season select to default `
+        + `to the ACTIVE Season B (${seasonB.id}), got ${selected} `
+        + `(Season A is ${d.seasonA})`);
+    }
 
     if (errors.length) {
       fail(`console/page errors:\n${errors.join("\n")}`);

@@ -111,14 +111,35 @@ class SetupProgressComputationTest(unittest.TestCase):
 
         api.create_player(team["id"], "Vince Skater", "forward",
                           actor_id="admin")
-        self.assertEqual(next_key(), "facilities")
+        # Facilities needs more than an active Season now (#331 review round
+        # 5 finding 1): with no Rink holding active Season venue access yet,
+        # the Ice Availability Builder's own preview provably yields zero
+        # slots -- `next` must stay blocked rather than offer a dead-end
+        # "Add Ice" CTA, even though facilities is otherwise correctly next
+        # in order.
+        blocked = api.get_setup_progress("admin", *ADMIN)
+        self.assertIsNone(blocked["next"], blocked)
+        self.assertEqual(blocked["next_blocked"]["key"], "facilities")
+        self.assertEqual(blocked["next_blocked"]["reason"], "venue_access_missing")
 
         venue = api.create_venue("V", league_id=pid, actor_id="admin")
         rink = api.create_rink(venue["id"], "R", actor_id="admin")
-        api.create_ice_slot(rink["id"], "2026-09-01T18:30:00+00:00",
-                            "2026-09-01T20:00:00+00:00", actor_id="admin")
+        # A Rink now exists, but access has not been GRANTED yet -- proves
+        # the gate checks the grant itself, not mere Rink existence.
+        still_blocked = api.get_setup_progress("admin", *ADMIN)
+        self.assertIsNone(still_blocked["next"], still_blocked)
+        self.assertEqual(still_blocked["next_blocked"]["reason"],
+                         "venue_access_missing")
+
+        # Granting access (with no ice slot yet) makes facilities genuinely
+        # SAFE -- `next` finally names it -- while it is still "todo" (no
+        # slot exists yet to flip the "done" status).
         api.grant_season_venue_access(season["id"], venue["id"],
                                       actor_id="admin")
+        self.assertEqual(next_key(), "facilities")
+
+        api.create_ice_slot(rink["id"], "2026-09-01T18:30:00+00:00",
+                            "2026-09-01T20:00:00+00:00", actor_id="admin")
 
         final = api.get_setup_progress("admin", *ADMIN)
         self.assertIsNone(final["next"], final)
@@ -231,12 +252,15 @@ class SetupProgressComputationTest(unittest.TestCase):
     def test_next_action_is_role_aware(self):
         """#330 review round 1 finding 1: an Arena Manager (MANAGE_ARENA
         only, no MANAGE_SETUP) must never be handed a MANAGE_SETUP-only
-        action like "Add Season" — with a Season already selected (so
-        facilities is genuinely executable, not blocked on season_missing —
-        see test_facilities_next_is_blocked_without_a_season for the no-
-        Season case) they're routed straight to facilities, the one
-        workflow their role can actually execute; League Admin's own
-        ordering is unaffected.
+        action like "Add Season" — with a Season already selected AND
+        venue access already granted (so facilities is genuinely
+        executable, not blocked on season_missing or, since #331 review
+        round 5 finding 1, venue_access_missing — see
+        test_facilities_next_is_blocked_without_a_season and
+        test_facilities_next_is_blocked_without_venue_access for those two
+        cases) they're routed straight to facilities, the one workflow
+        their role can actually execute; League Admin's own ordering is
+        unaffected.
 
         #331 review round 3 finding 1's redaction half: unlike the prior
         contract ("the GLOBAL workflow list stays identical across roles"),
@@ -249,7 +273,10 @@ class SetupProgressComputationTest(unittest.TestCase):
         api = self._api()
         api.create_user_account("admin", "pw", "league_admin")
         program = api.create_program("Prog", actor_id="admin")
-        api.create_season(program["id"], "Fall", actor_id="admin")
+        season = api.create_season(program["id"], "Fall", actor_id="admin")
+        venue = api.create_venue("V", league_id=program["id"], actor_id="admin")
+        api.create_rink(venue["id"], "R", actor_id="admin")
+        api.grant_season_venue_access(season["id"], venue["id"], actor_id="admin")
 
         admin_progress = api.get_setup_progress("admin", *ADMIN)
         self.assertEqual(admin_progress["next"]["key"], "league_season")
@@ -290,6 +317,61 @@ class SetupProgressComputationTest(unittest.TestCase):
 
         admin_progress = api.get_setup_progress("admin", *ADMIN)
         self.assertEqual(admin_progress["next"]["key"], "league_season")
+
+    def test_arena_manager_complete_is_none_and_unaffected_by_league_admin_only_changes(self):
+        """#331 review round 5 finding 3: `complete` must not vary based on
+        workflows an Arena Manager cannot even see -- exposing the FULL
+        list's real boolean unconditionally let a change to a
+        League-Admin-only workflow (invisible to Arena Manager) flip a bit
+        in Arena Manager's OWN response, an information leak through the
+        very redaction boundary `workflows` itself holds. Arena Manager's
+        `complete` must read `None` (never a real True/False -- they can
+        never verify a whole-Program claim from a partial view), and a
+        NONINTERFERENCE property must hold: mutating ONLY League-Admin-only
+        workflow state -- even a mutation that flips the REAL,
+        League-Admin-visible `complete` all the way from False to True --
+        must leave Arena Manager's entire payload provably unchanged."""
+        api = self._api()
+        api.create_user_account("admin", "pw", "league_admin")
+        program = api.create_program("Prog", actor_id="admin")
+        season = api.create_season(program["id"], "Fall", actor_id="admin")
+        venue = api.create_venue("V", league_id=program["id"], actor_id="admin")
+        rink = api.create_rink(venue["id"], "R", actor_id="admin")
+        api.create_ice_slot(rink["id"], "2026-09-01T18:30:00+00:00",
+                            "2026-09-01T20:00:00+00:00", actor_id="admin")
+        api.grant_season_venue_access(season["id"], venue["id"], actor_id="admin")
+
+        before = api.get_setup_progress("admin", *ARENA)
+        self.assertEqual(_statuses(before)["facilities"], "done")
+        self.assertIsNone(
+            before["complete"],
+            "Arena Manager can never verify a whole-Program claim from a "
+            "partial view -- must be None, not a real True/False")
+        self.assertIsNone(before["next"])
+        self.assertIsNone(before["next_blocked"])
+
+        # Mutate ONLY League-Admin-only workflows (league_season, teams,
+        # participation, roster) -- all invisible to Arena Manager. This is
+        # enough to flip the WHOLE Program to genuinely complete.
+        league = api.create_league(season["id"], "Adult League", actor_id="admin")
+        club = api.create_club("C", actor_id="admin")
+        team = api.create_team(club["id"], None, "T", actor_id="admin",
+                               league_id=league["id"])
+        reg = api.register_team_for_season(season["id"], team["id"],
+                                           actor_id="admin",
+                                           league_id=league["id"])
+        self.assertNotIn("error", reg, reg)
+        api.create_player(team["id"], "Vince Skater", "forward", actor_id="admin")
+
+        admin_now = api.get_setup_progress("admin", *ADMIN)
+        self.assertTrue(admin_now["complete"], admin_now)
+
+        after = api.get_setup_progress("admin", *ARENA)
+        self.assertEqual(
+            after, before,
+            f"Arena Manager's entire payload must be unchanged by "
+            f"League-Admin-only workflow mutations -- before={before}, "
+            f"after={after}")
 
     def test_participation_and_facilities_scope_to_selected_season_only(self):
         """#330 review round 1 finding 2: an OLDER Season's registrations/
@@ -395,6 +477,43 @@ class SetupProgressComputationTest(unittest.TestCase):
         self.assertEqual(arena_progress["next_blocked"]["key"], "facilities")
         self.assertEqual(arena_progress["next_blocked"]["reason"], "season_missing")
 
+    def test_facilities_next_is_blocked_without_venue_access(self):
+        """#331 review round 5 finding 1: an active, resolved Season alone
+        is not enough for facilities to be safe -- with a Venue and Rink
+        but NO active SeasonVenueAccess granted, the Ice Availability
+        Builder's real preview provably yields zero slots (every requested
+        rink lands in venue_access_missing), and Arena Manager -- who
+        holds MANAGE_ARENA but not MANAGE_SETUP -- cannot grant that
+        access themselves, making this a true dead end rather than a
+        same-role-solvable gap. `next` must stay None with `next_blocked`
+        naming facilities and venue_access_missing, not the dead-end "Add
+        Ice" CTA. Once a League Admin grants access, the workflow must
+        genuinely advance for Arena Manager -- not just flip a status
+        bit."""
+        api = self._api()
+        api.create_user_account("admin", "pw", "league_admin")
+        program = api.create_program("Prog", actor_id="admin")
+        season = api.create_season(program["id"], "Fall", actor_id="admin")
+        venue = api.create_venue("V", league_id=program["id"], actor_id="admin")
+        api.create_rink(venue["id"], "R", actor_id="admin")
+        api.set_active_context("admin", Role.LEAGUE_ADMIN, {},
+                               program["id"], season["id"])
+
+        arena_progress = api.get_setup_progress("admin", *ARENA)
+        self.assertIsNone(arena_progress["next"], arena_progress)
+        self.assertEqual(
+            arena_progress["next_blocked"],
+            {"key": "facilities", "label": "Venues, rinks and ice",
+             "reason": "venue_access_missing",
+             "detail": "No rink has venue access granted for Season 'Fall' "
+                       "yet — a League Admin must grant access to at least "
+                       "one rink before ice can be added."})
+
+        api.grant_season_venue_access(season["id"], venue["id"], actor_id="admin")
+        advanced = api.get_setup_progress("admin", *ARENA)
+        self.assertEqual(advanced["next"]["key"], "facilities", advanced)
+        self.assertIsNone(advanced["next_blocked"])
+
     def test_participation_next_is_blocked_when_program_selected_but_no_season_chosen(self):
         """#331 review round 4: "participation" is blocked by season_missing
         exactly like "facilities" is when no Season is resolved -- not just
@@ -471,6 +590,80 @@ class SetupProgressComputationTest(unittest.TestCase):
         self.assertFalse(progress["complete"],
                          "participation is still todo -- archiving must not "
                          "fake completion")
+
+    def test_participation_next_is_blocked_when_no_team_matches_the_seasons_league(self):
+        """#331 review round 5 finding 2: an active, resolved Season alone
+        is not enough for participation to be safe -- a Team permanently
+        bound to League A (from an earlier registration, the realistic way
+        a Team acquires a permanent League) cannot register into a
+        DIFFERENT Season whose only League is B; register_team_for_season's
+        own rule 7 rejects with team_league_mismatch regardless of which
+        team the operator picks, since this Program has no OTHER, eligible
+        team. `next` must stay None with `next_blocked` naming
+        participation and team_league_mismatch, not a dead-end "Register
+        Team" CTA. Establishing an eligible Team must genuinely unblock it,
+        and the focused control must then write into exactly this Season."""
+        api = self._api()
+        api.create_user_account("admin", "pw", "league_admin")
+        program = api.create_program("Prog", actor_id="admin")
+
+        # Team becomes permanently bound to League A via an earlier
+        # Season's registration.
+        season_a = api.create_season(program["id"], "Season A", actor_id="admin")
+        league_a = api.create_league(season_a["id"], "League A", actor_id="admin")
+        club = api.create_club("C", actor_id="admin")
+        team = api.create_team(club["id"], None, "Team", actor_id="admin",
+                               program_id=program["id"])
+        reg_a = api.register_team_for_season(season_a["id"], team["id"],
+                                             actor_id="admin",
+                                             league_id=league_a["id"])
+        self.assertNotIn("error", reg_a, reg_a)
+
+        # Season B has only League B -- Team is now permanently ineligible.
+        season_b = api.create_season(program["id"], "Season B", actor_id="admin")
+        league_b = api.create_league(season_b["id"], "League B", actor_id="admin")
+        api.set_active_context("admin", Role.LEAGUE_ADMIN, {},
+                               program["id"], season_b["id"])
+
+        progress = api.get_setup_progress("admin", *ADMIN)
+        statuses = _statuses(progress)
+        self.assertEqual(statuses["league_season"], "done")
+        self.assertEqual(statuses["teams"], "done")
+        self.assertEqual(statuses["participation"], "todo")
+        self.assertIsNone(progress["next"], progress)
+        self.assertEqual(
+            progress["next_blocked"],
+            {"key": "participation", "label": "Season participation and divisions",
+             "reason": "team_league_mismatch",
+             "detail": "No permanent team is eligible to register in Season "
+                       "'Season B' yet — add a team under a matching "
+                       "league, or add a league to this season that "
+                       "matches an existing team, before registering "
+                       "teams."})
+
+        # A SECOND Team, created explicitly under League B (the realistic
+        # remediation the guidance message itself suggests: "add a team
+        # under a matching league"), must genuinely unblock it -- not just
+        # flip a status bit.
+        team2 = api.create_team(club["id"], None, "Team2", actor_id="admin",
+                                league_id=league_b["id"])
+        self.assertNotIn("error", team2, team2)
+        advanced = api.get_setup_progress("admin", *ADMIN)
+        self.assertEqual(advanced["next"]["key"], "participation", advanced)
+        self.assertIsNone(advanced["next_blocked"])
+
+        # And the focused control writes into exactly Season B -- Season A's
+        # own registration for the mismatched Team is untouched.
+        reg_b = api.register_team_for_season(season_b["id"], team2["id"],
+                                             actor_id="admin",
+                                             league_id=league_b["id"])
+        self.assertNotIn("error", reg_b, reg_b)
+        final = api.get_setup_progress("admin", *ADMIN)
+        self.assertEqual(_statuses(final)["participation"], "done")
+        regs_a = api.list_season_team_registrations(season_a["id"])
+        self.assertEqual([r["team_id"] for r in regs_a["registrations"]
+                          if r["active"]], [team["id"]],
+                         "Season A's own registration must be untouched")
 
     def test_facilities_next_is_also_blocked_when_selected_season_is_archived(self):
         """Not just "participation" -- ``commit_ice_availability`` (the Ice
@@ -608,14 +801,17 @@ class SetupProgressHttpTest(unittest.TestCase):
     def test_next_action_is_role_aware_over_real_http(self):
         """#330 review round 1 finding 1, over the real route: League Admin
         and Arena Manager viewing the SAME Program (with a Season already
-        selected, so facilities is genuinely executable — see
-        test_no_season_blocks_facilities_over_real_http for the no-Season
-        case) must get DIFFERENT primary actions — League Admin the normal
-        ordering, Arena Manager an executable one (facilities/Add Ice),
-        never a MANAGE_SETUP-only action they cannot perform. Coach stays
-        denied entirely (unchanged). #331 review round 3 finding 1's
-        redaction half: Arena Manager's `workflows` must carry only
-        "facilities", never League-Admin-only completion detail."""
+        selected AND venue access already granted, so facilities is
+        genuinely executable — see
+        test_no_season_blocks_facilities_over_real_http and
+        test_no_venue_access_blocks_facilities_over_real_http for those two
+        blocked cases) must get DIFFERENT primary actions — League Admin
+        the normal ordering, Arena Manager an executable one
+        (facilities/Add Ice), never a MANAGE_SETUP-only action they cannot
+        perform. Coach stays denied entirely (unchanged). #331 review round
+        3 finding 1's redaction half: Arena Manager's `workflows` must
+        carry only "facilities", never League-Admin-only completion
+        detail."""
         admin = self._login("admin")
         status, program = self._req(admin, "POST", "/api/v2/setup/program",
                                     {"name": "Round1F1 HTTP Prog", "country": "US"})
@@ -623,6 +819,16 @@ class SetupProgressHttpTest(unittest.TestCase):
         status, season = self._req(admin, "POST", "/api/v2/setup/season",
                                    {"program_id": program["id"], "name": "Fall"})
         self.assertEqual(status, 200, season)
+        status, venue = self._req(admin, "POST", "/api/v2/setup/venue",
+                                  {"name": "V"})
+        self.assertEqual(status, 200, venue)
+        status, _ = self._req(admin, "POST", "/api/v2/setup/rink",
+                              {"venue_id": venue["id"], "name": "R"})
+        self.assertEqual(status, 200)
+        status, _ = self._req(
+            admin, "POST", f"/api/v2/setup/seasons/{season['id']}/venue-access",
+            {"venue_id": venue["id"]})
+        self.assertEqual(status, 200)
         status, _ = self._req(admin, "POST", "/api/context",
                               {"program_id": program["id"], "season_id": season["id"]})
         self.assertEqual(status, 200)
@@ -710,6 +916,107 @@ class SetupProgressHttpTest(unittest.TestCase):
         self.assertIsNone(progress["next"], progress)
         self.assertEqual(progress["next_blocked"]["key"], "participation")
         self.assertEqual(progress["next_blocked"]["reason"], "season_missing")
+
+    def test_no_venue_access_blocks_facilities_over_real_http(self):
+        """#331 review round 5 finding 1, over the real route: with an
+        active Season and a Rink but NO granted venue access, Arena
+        Manager's only permitted workflow (facilities) is still not safe --
+        the real Ice Builder preview would yield zero slots
+        (venue_access_missing), and Arena Manager cannot grant access
+        themselves. `next` must stay None with `next_blocked` naming
+        facilities/venue_access_missing, never the dead-end "Add Ice" CTA;
+        granting access as League Admin must genuinely unblock Arena
+        Manager's view."""
+        admin = self._login("admin")
+        status, program = self._req(admin, "POST", "/api/v2/setup/program",
+                                    {"name": "Round5F1 HTTP Prog", "country": "US"})
+        self.assertEqual(status, 200, program)
+        status, season = self._req(admin, "POST", "/api/v2/setup/season",
+                                   {"program_id": program["id"], "name": "Fall"})
+        self.assertEqual(status, 200, season)
+        status, venue = self._req(admin, "POST", "/api/v2/setup/venue", {"name": "V"})
+        self.assertEqual(status, 200, venue)
+        status, _ = self._req(admin, "POST", "/api/v2/setup/rink",
+                              {"venue_id": venue["id"], "name": "R"})
+        self.assertEqual(status, 200)
+        status, _ = self._req(admin, "POST", "/api/context",
+                              {"program_id": program["id"], "season_id": season["id"]})
+        self.assertEqual(status, 200)
+
+        arena = self._login("arena")
+        status, _ = self._req(arena, "POST", "/api/context",
+                              {"program_id": program["id"], "season_id": season["id"]})
+        self.assertEqual(status, 200)
+        status, arena_progress = self._req(arena, "GET", "/api/v2/setup/progress")
+        self.assertEqual(status, 200, arena_progress)
+        self.assertIsNone(arena_progress["next"], arena_progress)
+        self.assertEqual(arena_progress["next_blocked"]["key"], "facilities")
+        self.assertEqual(arena_progress["next_blocked"]["reason"],
+                         "venue_access_missing")
+
+        status, _ = self._req(
+            admin, "POST", f"/api/v2/setup/seasons/{season['id']}/venue-access",
+            {"venue_id": venue["id"]})
+        self.assertEqual(status, 200)
+        status, advanced = self._req(arena, "GET", "/api/v2/setup/progress")
+        self.assertEqual(status, 200, advanced)
+        self.assertEqual(advanced["next"]["key"], "facilities", advanced)
+        self.assertIsNone(advanced["next_blocked"])
+
+    def test_team_league_mismatch_blocks_participation_over_real_http(self):
+        """#331 review round 5 finding 2, over the real route: a Team
+        permanently bound to League A cannot register into a Season whose
+        only League is B -- register_team_for_season's own rule 7 rejects
+        with team_league_mismatch regardless of which team the operator
+        picks. `next` must stay None with `next_blocked` naming
+        participation/team_league_mismatch, never a dead-end "Register
+        Team" CTA; adding an eligible team must genuinely unblock it."""
+        admin = self._login("admin")
+        status, program = self._req(admin, "POST", "/api/v2/setup/program",
+                                    {"name": "Round5F2 HTTP Prog", "country": "US"})
+        self.assertEqual(status, 200, program)
+        status, season_a = self._req(admin, "POST", "/api/v2/setup/season",
+                                     {"program_id": program["id"], "name": "Season A"})
+        self.assertEqual(status, 200, season_a)
+        status, league_a = self._req(admin, "POST", "/api/v2/setup/league",
+                                     {"season_id": season_a["id"], "name": "League A"})
+        self.assertEqual(status, 200, league_a)
+        status, club = self._req(admin, "POST", "/api/v2/setup/club", {"name": "Club"})
+        self.assertEqual(status, 200, club)
+        status, team = self._req(admin, "POST", "/api/v2/setup/team",
+                                 {"club_id": club["id"], "league_id": league_a["id"],
+                                  "name": "Team"})
+        self.assertEqual(status, 200, team)
+        status, _ = self._req(
+            admin, "POST",
+            f"/api/v2/setup/seasons/{season_a['id']}/team-registrations",
+            {"team_id": team["id"], "league_id": league_a["id"]})
+        self.assertEqual(status, 200)
+
+        status, season_b = self._req(admin, "POST", "/api/v2/setup/season",
+                                     {"program_id": program["id"], "name": "Season B"})
+        self.assertEqual(status, 200, season_b)
+        status, league_b = self._req(admin, "POST", "/api/v2/setup/league",
+                                     {"season_id": season_b["id"], "name": "League B"})
+        self.assertEqual(status, 200, league_b)
+        status, _ = self._req(admin, "POST", "/api/context",
+                              {"program_id": program["id"], "season_id": season_b["id"]})
+        self.assertEqual(status, 200)
+
+        status, progress = self._req(admin, "GET", "/api/v2/setup/progress")
+        self.assertEqual(status, 200, progress)
+        self.assertIsNone(progress["next"], progress)
+        self.assertEqual(progress["next_blocked"]["key"], "participation")
+        self.assertEqual(progress["next_blocked"]["reason"], "team_league_mismatch")
+
+        status, team2 = self._req(admin, "POST", "/api/v2/setup/team",
+                                  {"club_id": club["id"], "league_id": league_b["id"],
+                                   "name": "Team2"})
+        self.assertEqual(status, 200, team2)
+        status, advanced = self._req(admin, "GET", "/api/v2/setup/progress")
+        self.assertEqual(status, 200, advanced)
+        self.assertEqual(advanced["next"]["key"], "participation", advanced)
+        self.assertIsNone(advanced["next_blocked"])
 
 
 if __name__ == "__main__":

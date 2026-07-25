@@ -147,7 +147,7 @@ venues/rinks/ice), that the caller's role can actually execute (an Arena
 Manager, who holds `MANAGE_ARENA` but not `MANAGE_SETUP`, is routed to
 facilities, never to a League-Admin-only action like "Add Season") AND that
 is actually safe to run given the resolved Season's own state (#331 review
-rounds 3–4): both "facilities" and "participation" need a resolved, ACTIVE
+rounds 3–5): both "facilities" and "participation" need a resolved, ACTIVE
 Season (their real writes both route through the same #159 active-Season
 guard and fail identically — `season_missing` with none resolved,
 `season_archived` if the resolved one is archived). "participation" needs
@@ -157,6 +157,29 @@ plus one more: its real destination on the Home/Tasks card,
 deep-link/focus the one specific Register control the card promises (#330's
 round-2 review requirement) — with none resolved it can only fall back to
 a generic, unbound landing on the Setup tree.
+
+Beyond the Season itself, each has one more hard floor that would otherwise
+leave its CTA a guaranteed dead end even with an active Season resolved
+(#331 review round 5 findings 1/2) — both are existence checks the real
+write also has no way around, not heuristics:
+
+- **"facilities"** needs at least one Rink reachable via active
+  `SeasonVenueAccess` for the resolved Season. With none, every Rink the
+  Ice Availability Builder could offer lands in `venue_access_missing`, so
+  a preview provably generates zero slots no matter what the operator
+  picks — and an Arena Manager cannot grant that access themselves
+  (`MANAGE_SETUP`-only), so this is a true dead end, not a gap the same
+  role could close. Reported as `next_blocked.reason: "venue_access_missing"`.
+- **"participation"** needs at least one of the Program's Teams to be
+  eligible for the resolved Season's League(s) — no permanent League yet
+  (an ordinary, if rare, state for a legacy-imported Team), or a permanent
+  League that matches one of the Season's own `LeagueSeason`s. A Team WITH
+  a permanent League can only ever register into a `LeagueSeason` of that
+  same League (`register_team_for_season` rule 7); with none of the
+  Program's Teams eligible, every possible registration is a guaranteed
+  `team_league_mismatch` rejection regardless of which Team the operator
+  picks in the control. Reported as `next_blocked.reason:
+  "team_league_mismatch"`.
 
 Critically, `next` never skips AHEAD to a later, incidentally-safe workflow
 just because the first todo one is blocked — #330's "actual next incomplete
@@ -175,12 +198,23 @@ manage, not global (a reversal of the original design — an Arena Manager
 must never receive League-Admin-only completion signals or exact team/
 registration/player counts, the same role/privacy boundary `next`'s own
 filter exists to hold). `complete` is still computed from the full,
-unfiltered internal list first, so it keeps meaning "the WHOLE Program's
-setup is done," never flipping true just because the one workflow a caller
-can see happens to be done. The complete-state secondary "Import data"
-action inherits this: it renders only when "import" survives that same
-per-role filter, so an Arena Manager (MANAGE_SETUP-only workflow) never
-receives an enabled action for a surface they cannot use.
+unfiltered internal list first, so its raw value keeps meaning "the WHOLE
+Program's setup is done," never flipping true just because the one workflow
+a caller can see happens to be done — but that value is only ever *exposed*
+to a role whose `workflows` already equals the full list (today, League
+Admin); anyone with a narrower view (Arena Manager) receives `null` instead
+(#331 review round 5 finding 3). Exposing the real boolean unconditionally
+still let a change to a workflow that role can't even see flip a bit in
+their own response — an information leak through the same redaction
+boundary `workflows` itself holds. `null` is neither an overclaimed `true`
+nor an independently meaningful `false`; it is constant regardless of
+invisible state, so by construction it carries none of it. The
+complete-state secondary "Import data" action inherits the `workflows`
+filter: it renders only when "import" survives that same per-role filter,
+so an Arena Manager (MANAGE_SETUP-only workflow) never receives an enabled
+action for a surface they cannot use — and since the success state itself
+only ever renders on a real `true`, an Arena Manager can never reach it
+either, even when the whole Program happens to be genuinely done.
 
 Once every required workflow reads done the card shows the required success
 state ("All setup steps complete" plus a Schedule link) instead of
@@ -189,6 +223,44 @@ rather than silently rendering nothing, and a monotonic fetch-sequence guard
 discards a stale response that resolves after a newer one (e.g. a slow
 fetch completing after a context switch already rendered the fresher
 result).
+
+Every destination `next`'s CTA opens is seeded from the ACTIVE Program/
+Season, not left to fall through to whatever happens to sort first in that
+destination's own (Program-unfiltered) option list (#331 review round 5
+finding 4). `goToSetupWorkflow()` resolves the correct parent field — the
+active Program itself for "Add Season", the active Program's own permanent
+League for "Add Team", one of its own Teams for "Add Player" (each via a
+fresh fetch of the canonical Program→League→Team hierarchy, not the
+Setup screen's own cached state, which can be stale or entirely
+unpopulated when this CTA is clicked straight from the Dashboard) — and
+pre-fills it into the create drawer before opening it. `defaultIceForm()`
+does the same for the Ice Availability Builder's own Season selector,
+preferring the #159 active Season over "the first `status === "active"`
+Season it finds," since that list also spans every Program. None of this
+changes what these destinations' own dropdowns OFFER (they stay
+Program-unfiltered, matching every other entry point into the same
+drawers/builder — #159's active-context selection is still a display-only
+convenience, not a sitewide data filter); it only fixes what they default
+to, so a silent submit against the wrong Program can no longer happen from
+this hub's own navigation.
+
+The card's async states carry real accessibility semantics, not just visual
+ones (#331 review round 5 finding 5): `#sp-card-slot` (the wrapper
+`loadSetupProgressCard()` swaps content into, itself painted once by
+`render()` and never replaced) carries `role="status"`/`aria-live="polite"`
+for the whole of its lifetime, so a screen reader is told whenever this
+region's content settles — loading finishing, a retry resolving, a context
+switch's fresher response landing — without needing separate handling per
+transition. `aria-busy` tracks the fetch itself, not just the very first
+one: true from the moment any fetch (including a retry) starts, false once
+its result has actually painted. The loading state is a real, heading-
+bearing state of its own now (`<h3>Setup progress</h3>` plus a visually-
+hidden label), not a bare, unlabeled skeleton excluded from both screen
+readers and the same accessibility scan every other state already passes —
+excluding a state from the gate is not the same as it having no
+accessibility surface to gate. The error banner additionally carries
+`role="alert"`, an assertive announcement distinct from the outer region's
+own polite one, since a failed fetch is more urgent than routine settling.
 
 This is additive to, not a replacement for, the wizard in this slice:
 first-Program bootstrapping still belongs to Initial Setup above — an

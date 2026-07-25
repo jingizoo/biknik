@@ -30,6 +30,15 @@
 .sp-card .badge.gray { background: #ececf1; color: #57575c; }
 .sp-card .banner.alert { background: #c0271b; }
 
+/* Visually hidden but still announced by screen readers (#331 review round
+   5 finding 5) -- the standard clip-based pattern, not display:none/
+   visibility:hidden, both of which remove the element from the
+   accessibility tree entirely. */
+.sr-only {
+  position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+  overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;
+}
+
 * { box-sizing: border-box; }
 
 body {
