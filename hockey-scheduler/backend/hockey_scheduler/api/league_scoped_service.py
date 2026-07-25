@@ -10,6 +10,7 @@ from datetime import datetime
 from ..domain import Game, IceSlotStatus
 from ..domain.errors import ConcurrencyConflictError, DomainError, ValidationError
 from ..services.scheduler import _existing_pairing_games
+from ..services.league_scoped_scheduler import season_candidate_rink_ids
 from ..services.league_scope import (
     require_game_league_id,
     require_slot_belongs_to_season,
@@ -129,11 +130,22 @@ class ApiService(_BaseApiService):
             # locator re-verified under the locks. See
             # SetupService._policy_scope_lock_plan / _lock_teams /
             # _lock_rinks for the ordering contract.
-            _pre_rinks = set()
-            for row in proposal["draft_games"]:
-                _s = self.store.get_ice_slot(row["ice_slot_id"])
-                if _s is not None:
-                    _pre_rinks.add(_s.rink_id)
+            # #328 review round 13 -- the candidate Rink set is not just the
+            # rinks of THIS proposal's placed rows: when the caller omits
+            # slot_ids (the real Scheduler UI's own call), draft_season_schedule
+            # considers every Rink with active SeasonVenueAccess for this
+            # Season (`season_candidate_rink_ids`, computed the same way,
+            # Rink-first so a Rink with ZERO existing slots is still
+            # included) -- so an eligible-but-currently-unplaced Rink
+            # gaining its first or another usable slot, having a candidate
+            # slot allocated, or having its effective policy change is
+            # invisible to a lock plan built only from placed rows.
+            # Recomputing the SAME candidate pool the generator itself
+            # scans, not just its output, keeps the locked set and the
+            # generator's read set identical by construction -- current and
+            # future, not one more hand-picked dimension.
+            _pre_rinks = season_candidate_rink_ids(
+                self.store, resolved_season_id, slot_ids)
             _plan = self.setup._policy_scope_lock_plan(
                 _pre_rinks, (resolved_season_id,))
             self.setup._lock_programs(_plan["programs"])
@@ -148,11 +160,13 @@ class ApiService(_BaseApiService):
             self.setup._lock_teams(
                 t for row in proposal["draft_games"] + proposal["already_scheduled"]
                 for t in (row["home_team_id"], row["away_team_id"]))
-            _batch_rinks = set()
-            for row in proposal["draft_games"]:
-                _s = self.store.get_ice_slot(row["ice_slot_id"])
-                if _s is not None:
-                    _batch_rinks.add(_s.rink_id)
+            # #328 review round 13 -- recomputed fresh (not reused from
+            # `_pre_rinks` above) under the Team locks just acquired, exactly
+            # mirroring the pre-existing draft_games-only pattern this
+            # replaces: the candidate pool itself, not just which rows placed
+            # against it, can have changed in the gap since the locator read.
+            _batch_rinks = season_candidate_rink_ids(
+                self.store, resolved_season_id, slot_ids)
             self.setup._lock_rinks(_batch_rinks)
             self.setup._lock_seasons(_plan["seasons"])
             self._guard_active_seasons([resolved_season_id])
@@ -183,45 +197,23 @@ class ApiService(_BaseApiService):
             require_slots_belong_to_locked_season(
                 self.store, [row["ice_slot_id"] for row in proposal["draft_games"]],
                 resolved_season_id)
-            # #314 review — also re-validate every proposed row's competition
-            # participation HERE, under the same locks: a concurrent
-            # unregister_team_from_season or a team-to-league transfer can
-            # commit in the SAME gap a stale pre-lock proposal would miss, after
-            # which the write would persist a Game for a team no longer a valid
-            # participant. Reuses the identical check create_game enforces.
-            self.setup._require_batch_team_participation(
-                resolved_season_id, draft_ls_id, proposal["draft_games"])
-            # #328 review round 11 finding 2 -- the checks immediately
-            # above and below only revalidate draft_games/already_scheduled
-            # row identity and participation; a team's ELIGIBILITY changing
-            # in the narrow gap between this method's own pre-lock
-            # regeneration/fingerprint compare and the locks just acquired
-            # is invisible to all of them, since a newly-registered (or
-            # newly-unregistered) team need not touch any row actually in
-            # this batch to change what a fresh preview would show.
-            # Regenerating the complete current proposal HERE -- now that
-            # every lock a proposal's inputs depend on (Program/Team/Rink/
-            # Season) is held -- and comparing its own fingerprint against
-            # the one the operator's Generate call actually returned is one
-            # general check covering every fingerprint-bound dimension at
-            # once (current and future), rather than hand-listing each one.
-            # A concurrent register_team_for_season/
-            # unregister_team_from_season also locks the Season row
-            # (require_active_season), so by the time this transaction
-            # holds it, any such write has either already committed (and
-            # this regeneration observes it) or is blocked behind this
-            # transaction (and cannot land before the writes below).
-            _locked_proposal = self.draft_season_schedule(
-                division_id=division_id, season_id=season_id,
-                league_id=league_id, slot_ids=slot_ids,
-                constraints=constraints)
-            if _locked_proposal.get("draft_fingerprint") != draft_fingerprint:
-                raise ConcurrencyConflictError(
-                    "This preview is out of date — a game may have been "
-                    "added, cancelled, or otherwise changed since you "
-                    "generated it. Generate a fresh preview and review it "
-                    "before committing.",
-                    {"reason": "preview_stale"})
+            # #328 review round 12 finding 1 -- #314's participation check
+            # and round 11's general fingerprint recheck (both below) must
+            # run AFTER `_existing_now`, not before: with
+            # `_require_batch_team_participation` first (the original
+            # order), a team unregistering in the exact race window round 11
+            # closed surfaced as `team_not_registered` -- a
+            # DivisionMismatchError reason app.js's stale-preview recovery
+            # does not recognise, leaving the operator a generic toast with
+            # no clear-preview/refocus UX, instead of the terminal,
+            # recoverable `preview_stale` every OTHER cause of staleness in
+            # this same window produces. Symmetrically, a winning
+            # exact-pairing race landing in that window surfaced as the
+            # general recheck's generic `preview_stale` instead of the
+            # specific, product-confirmed `pairing_already_scheduled` naming
+            # the pairing and winning Game -- a regression against round
+            # 2/3/4's own accepted contract for that exact scenario, which
+            # this reordering also restores.
             # #206 slice 1 — freshly computed HERE, under the Team locks just
             # acquired, so the read is race-free against any other writer
             # touching these exact teams. Checked per row BELOW, BEFORE that
@@ -253,13 +245,93 @@ class ApiService(_BaseApiService):
             # `pairing_already_scheduled` is deliberately NOT
             # `placement_raced` (the base facade's inherited retry shell
             # only retries that one reason), so this reaches the caller
-            # unretried.
+            # unretried. #328 review round 12 -- also reused below by the
+            # general fingerprint recheck's winning-pairing carve-out, under
+            # this identical snapshot.
             _existing_now = _existing_pairing_games(
                 self.store,
                 {(draft_ls_id, row.get("division_id"))
                  for row in proposal["draft_games"]}
                 | {(draft_ls_id, a.get("division_id"))
                    for a in proposal["already_scheduled"]})
+            # #328 review round 11 finding 2 -- the checks immediately below
+            # only revalidate draft_games/already_scheduled row identity and
+            # participation; a team's ELIGIBILITY changing in the narrow gap
+            # between this method's own pre-lock regeneration/fingerprint
+            # compare and the locks just acquired is invisible to all of
+            # them, since a newly-registered (or newly-unregistered) team
+            # need not touch any row actually in this batch to change what a
+            # fresh preview would show. Regenerating the complete current
+            # proposal HERE -- now that every lock a proposal's inputs depend
+            # on (Program/Team/Rink/Season) is held -- and comparing its own
+            # fingerprint against the one the operator's Generate call
+            # actually returned is one general check covering every
+            # fingerprint-bound dimension at once (current and future),
+            # rather than hand-listing each one. A concurrent
+            # register_team_for_season/unregister_team_from_season also
+            # locks the Season row (require_active_season), so by the time
+            # this transaction holds it, any such write has either already
+            # committed (and this regeneration observes it) or is blocked
+            # behind this transaction (and cannot land before the writes
+            # below).
+            _locked_proposal = self.draft_season_schedule(
+                division_id=division_id, season_id=season_id,
+                league_id=league_id, slot_ids=slot_ids,
+                constraints=constraints)
+            if _locked_proposal.get("draft_fingerprint") != draft_fingerprint:
+                # #328 review round 12 finding 1 -- a mismatch here can be
+                # fully explained by a winning exact-pairing race: one of
+                # THIS proposal's own draft_games rows now has a real Game
+                # for its exact pairing in `_existing_now` above, the same
+                # terminal fact the per-row loop below independently
+                # detects. When that's the case, raise the specific,
+                # product-confirmed `pairing_already_scheduled` (naming the
+                # pairing and winning Game) instead of the generic
+                # `preview_stale`, matching round 2/3/4's accepted contract
+                # for this scenario exactly rather than silently downgrading
+                # it just because this general recheck now runs first.
+                _raced_row = next(
+                    (row for row in proposal["draft_games"]
+                     if (draft_ls_id, row.get("division_id"),
+                         frozenset((row["home_team_id"], row["away_team_id"])))
+                     in _existing_now), None)
+                if _raced_row is not None:
+                    _raced_key = (draft_ls_id, _raced_row.get("division_id"),
+                                  frozenset((_raced_row["home_team_id"],
+                                             _raced_row["away_team_id"])))
+                    _raced_gid = _existing_now[_raced_key]
+                    raise ConcurrencyConflictError(
+                        f"{_raced_row['home_team_name']} vs "
+                        f"{_raced_row['away_team_name']} is already "
+                        f"scheduled as Game {_raced_gid} — generate a "
+                        "fresh preview before committing again.",
+                        {"reason": "pairing_already_scheduled",
+                         "home_team_id": _raced_row["home_team_id"],
+                         "away_team_id": _raced_row["away_team_id"],
+                         "existing_game_id": _raced_gid})
+                raise ConcurrencyConflictError(
+                    "This preview is out of date — a game may have been "
+                    "added, cancelled, or otherwise changed since you "
+                    "generated it. Generate a fresh preview and review it "
+                    "before committing.",
+                    {"reason": "preview_stale"})
+            # #314 review — also re-validate every proposed row's competition
+            # participation HERE, under the same locks: a concurrent
+            # unregister_team_from_season or a team-to-league transfer can
+            # commit in the SAME gap a stale pre-lock proposal would miss, after
+            # which the write would persist a Game for a team no longer a valid
+            # participant. Reuses the identical check create_game enforces.
+            # #328 review round 12 finding 1 -- now redundant-but-harmless
+            # defense-in-depth: the general fingerprint recheck above already
+            # classifies any such change as `preview_stale` (or the more
+            # specific `pairing_already_scheduled`) first, since a changed
+            # participant is itself part of what the regenerated proposal's
+            # fingerprint binds (team_ids / unschedulable_teams, round 10).
+            # Left in place on the same established precedent as the other
+            # narrower checks below: more specific where it can still add
+            # anything, harmless where it can't.
+            self.setup._require_batch_team_participation(
+                resolved_season_id, draft_ls_id, proposal["draft_games"])
             # #328 review round 8 finding 1 -- an already_scheduled row's
             # Game is not part of this batch's writes, so nothing else ever
             # re-examines it under the lock: the wide draft_fingerprint gate

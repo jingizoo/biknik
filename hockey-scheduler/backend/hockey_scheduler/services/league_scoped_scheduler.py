@@ -32,6 +32,35 @@ def _season_scoped_slot_ids(store, season_id, slot_ids):
             if slot_belongs_to_season(store, slot.id, season_id)]
 
 
+def season_candidate_rink_ids(store, season_id, slot_ids):
+    """#328 review round 13 -- every Rink ``draft_season_schedule`` can
+    possibly draw ice from for this (season, slot_ids) call, computed the
+    SAME way regardless of whether any of those Rinks currently have an
+    existing IceSlot: an explicit selection resolves to exactly those
+    slots' Rinks; an omitted selection resolves to every Rink whose Venue
+    holds active SeasonVenueAccess for the Season.
+
+    Deliberately NOT derived from :func:`_season_scoped_slot_ids` (which
+    would miss a Rink with zero EXISTING slots): a lock-scope computation
+    for a not-yet-populated but already season-eligible Rink is exactly
+    the case a commit must still cover, since a concurrent ice-availability
+    BUILDER commit (or CSV import) can give that Rink its FIRST slot at
+    any moment, not only add to a Rink that already has one."""
+    if slot_ids:
+        rinks = set()
+        for slot_id in slot_ids:
+            slot = store.get_ice_slot(slot_id)
+            if slot is not None:
+                rinks.add(slot.rink_id)
+        return rinks
+    rinks = set()
+    for rink in store.all_rinks():
+        access = store.season_venue_access_for_pair(season_id, rink.venue_id)
+        if access is not None and access.active:
+            rinks.add(rink.id)
+    return rinks
+
+
 def draft_schedule(store, division_id, slot_ids=None, constraints=None):
     division = store.get_division(division_id) if division_id else None
     # Preserve the scheduler/API's established not-found behavior via the shared

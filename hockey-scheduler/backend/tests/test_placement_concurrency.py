@@ -733,6 +733,169 @@ class PostgresPlacementConcurrencyTest(_ForcedRaceHarnessMixin, unittest.TestCas
         self._assert_schedule_consistent(store)
 
 
+class _RinkInventoryRaceMixin(_ForcedRaceHarnessMixin):
+    """#328 review round 13: draft-commit's Rink lock must cover every
+    Season-eligible Rink ``draft_season_schedule`` can consider when
+    ``slot_ids`` is omitted (the real Scheduler UI's own call) -- not just
+    Rinks a placement in THIS proposal happened to land on. Before this
+    fix, ``_pre_rinks``/``_batch_rinks`` were built only from
+    ``proposal["draft_games"]``'s own slots, so an eligible-but-currently-
+    EMPTY Rink was never locked at all: a concurrent ice-availability
+    BUILDER commit giving it its first usable slot could land anywhere
+    inside the draft commit's own transaction, invisibly to the Rink lock
+    plan. ``season_candidate_rink_ids`` now derives the lock set from
+    Rink->Venue->SeasonVenueAccess directly (not from existing IceSlots),
+    so even a Rink with ZERO slots so far is covered."""
+
+    def test_new_rink_gains_first_slot_vs_draft_commit(self):
+        store = self._store()
+        store.add_rink(Rink(id="r_new13", venue_id="v", name="New13"))
+        # r1 has exactly 6 seeded slots (s0-s5) for d1's 6 round-robin
+        # pairings; delete s5 so only 5 remain placeable on r1, leaving
+        # exactly one pairing genuinely missing -- sensitive to whether a
+        # brand-new slot appears elsewhere before the draft's OWN
+        # regeneration completes, the axis this race exercises.
+        store.delete_ice_slot("s5")
+        new_date = (BASE + timedelta(days=5)).date()
+        tmpl = dict(season_id="se1", rink_ids=["r_new13"],
+                   weekdays=[new_date.weekday()], start_local="18:00",
+                   end_local="19:00", start_date=new_date.isoformat(),
+                   end_date=new_date.isoformat(), playable_minutes=60,
+                   turnover_minutes=0)
+        fp = self._api_cls()(self._store()).preview_ice_availability(
+            actor_id="b", **tmpl)["template_fingerprint"]
+
+        out = self._run([
+            lambda a: commit_fresh_draft(a, "d1"),
+            lambda a: a.commit_ice_availability(
+                actor_id="b", template_fingerprint=fp, **tmpl),
+        ])
+        self._assert_no_crash(out)
+        draft_res, builder_res = out
+        # The builder's own new-Rink commit never depends on the draft's
+        # outcome (a fresh, empty Rink can't conflict with anything) -- it
+        # always succeeds.
+        self.assertNotIn("error", builder_res,
+                         f"the builder should always succeed: {out!r}")
+        self.assertEqual(builder_res["totals"]["created"], 1, repr(out))
+        store = self._store()
+        games = [g for g in store.all_games() if not g.cancelled]
+        if isinstance(draft_res, dict) and "error" not in draft_res:
+            # A consistent read of either the pre-race 5-slot candidate
+            # pool (5 games, one pairing legitimately still unscheduled)
+            # or the post-race 6-slot pool (all 6 placed) -- never a
+            # torn mix, and never more than one Game per pairing/slot.
+            self.assertIn(len(games), (5, 6), repr(out))
+            self.assertTrue(any(a.action == "draft_schedule_committed"
+                               for a in store.all_setup_audit()))
+        else:
+            self.assertEqual(_reason(draft_res), "preview_stale", repr(out))
+            self.assertEqual(len(games), 0, repr(out))
+            self.assertFalse(any(a.action == "draft_schedule_committed"
+                                for a in store.all_setup_audit()))
+        self._assert_schedule_consistent(store)
+
+    def test_new_rink_row_lock_is_held_while_draft_commit_is_open(self):
+        """Directly proves genuine mutual exclusion, not merely a
+        consistent outcome: while draft-commit's transaction is open, a
+        concurrent, completely independent connection's non-blocking
+        ``SELECT ... FOR UPDATE NOWAIT`` probe on a brand-new, still-empty
+        Rink's own row must fail with a lock-contention error.
+
+        Deliberately NOT timing-based (an earlier version of this test
+        measured how long a concurrent ``commit_ice_availability`` call
+        took): even a SAME-SEASON version of that test stayed green with
+        round 13's fix fully reverted, because ``commit_ice_availability``
+        ALSO locks the Program and Season rows draft-commit already holds
+        (Program->Rink->Season, acquired regardless of this fix) -- those
+        shared locks alone were enough to force serialization and mask
+        whether the Rink lock specifically was ever taken. A direct
+        ``FOR UPDATE NOWAIT`` probe on the Rink's own row, from a THIRD
+        connection that touches nothing else, has no such confound: it
+        can only fail if that exact row is locked."""
+        store = self._store()
+        store.add_rink(Rink(id="r_new13c", venue_id="v", name="New13c"))
+
+        api_cls = self._api_cls()
+        draft_api = api_cls(SqlStore(self.url))
+        locks_held = threading.Event()
+        release_locks = threading.Event()
+        real_guard = draft_api._guard_active_seasons
+
+        def _hold_then_guard(*args, **kwargs):
+            # Real guard first (matches production order: every
+            # Program->Team->Rink->Season lock, including r_new13c's, is
+            # already held by the time this fires), THEN hold the
+            # transaction open until the probe below is done -- bounded by
+            # a timeout, so a probe bug can never hang this transaction
+            # forever, and never itself waiting on the probe thread (no
+            # possibility of the two circularly waiting on each other).
+            result = real_guard(*args, **kwargs)
+            locks_held.set()
+            release_locks.wait(timeout=10)
+            return result
+
+        draft_api._guard_active_seasons = _hold_then_guard
+
+        draft_thread = threading.Thread(
+            target=lambda: commit_fresh_draft(draft_api, "d1"))
+        draft_thread.start()
+        try:
+            self.assertTrue(
+                locks_held.wait(timeout=10),
+                "draft-commit never reached its locked section")
+
+            probe = SqlStore(self.url)
+            contended = False
+            try:
+                probe.conn.cursor().execute(
+                    "SELECT id FROM rinks WHERE id = %s FOR UPDATE NOWAIT",
+                    ("r_new13c",))
+            except Exception as exc:
+                contended = "lock" in str(exc).lower()
+                if not contended:
+                    raise
+            finally:
+                try:
+                    probe.conn.rollback()
+                except Exception:
+                    pass
+                probe.conn.close()
+        finally:
+            release_locks.set()
+            draft_thread.join(timeout=15)
+
+        self.assertFalse(draft_thread.is_alive(), "draft commit thread hung")
+        self.assertTrue(
+            contended,
+            "a concurrent FOR UPDATE NOWAIT on r_new13c's own row "
+            "succeeded while draft-commit's transaction was still open -- "
+            "the Rink was never actually locked")
+        self._assert_schedule_consistent(self._store())
+
+
+@unittest.skipUnless(os.environ.get("TEST_DATABASE_URL"),
+                     "PostgreSQL required (set TEST_DATABASE_URL)")
+class PostgresLeagueScopedRinkInventoryRaceTest(
+        _RinkInventoryRaceMixin, unittest.TestCase):
+    """Exercises the LEAGUE-SCOPED commit_draft_schedule (api/
+    league_scoped_service.py) — the implementation production actually runs."""
+    # _api_cls() inherited default (the league-scoped ApiService).
+
+
+@unittest.skipUnless(os.environ.get("TEST_DATABASE_URL"),
+                     "PostgreSQL required (set TEST_DATABASE_URL)")
+class PostgresBaseApiRinkInventoryRaceTest(
+        _RinkInventoryRaceMixin, unittest.TestCase):
+    """Exercises the BASE facade's OWN commit_draft_schedule (api/service.py)
+    — not reached in production, but the review asked for BOTH
+    implementations to be race-safe, not just the one production resolves
+    to."""
+
+    def _api_cls(self):
+        return BaseApiService
+
+
 # -- draft-commit must also revalidate TEAM PARTICIPATION under the lock
 # (#314 review, follow-up) ---------------------------------------------------
 #
@@ -1130,6 +1293,147 @@ class PostgresBaseApiDraftParticipationRaceTest(
     method resolution), but directly instantiable/testable, and the review
     asked for BOTH implementations to be race-safe, not just the one
     production resolves to."""
+
+    def _api_cls(self):
+        return BaseApiService
+
+
+class _DeterministicEligibilityRaceMixin(_ForcedRaceHarnessMixin):
+    """#328 review round 12 finding 3: the round-11 eligibility-race
+    regression (test_scheduler.py's
+    ``_team_eligibility_change_after_internal_regen_refused``) forces the
+    "team registers/unregisters between commit's own pre-lock wide-gate
+    regeneration and its locked regeneration" window deterministically,
+    but entirely on ONE connection/thread -- a call-counted monkeypatch
+    applies the mutation itself between the two ``draft_season_schedule``
+    calls. That proves the CODE PATH behaves correctly once the mutation
+    lands there, but not that a genuinely separate, concurrent PostgreSQL
+    transaction committing that same mutation is actually forced into
+    that exact window rather than landing somewhere the code doesn't
+    check.
+
+    This mixin proves both at once: a call-counted hook on
+    ``draft_season_schedule`` still forces the window deterministically
+    (so the test isn't left to chance timing the way a bare
+    ``_run``-style barrier release would be — confirmed non-isolating for
+    a materially identical case while designing round 13's own
+    regression), but the FIRST hooked call spawns a genuinely SEPARATE
+    connection/thread that performs a REAL
+    ``register_team_for_season``/``unregister_team_from_season`` call and
+    is waited on to fully COMMIT before the hook returns control — so the
+    mutation reaching the locked regeneration is a real, independently
+    committed transaction, not a same-connection simulation."""
+
+    def _run_real_eligibility_race(self, change):
+        api_cls = self._api_cls()
+        draft_api = api_cls(SqlStore(self.url))
+        frozen_preview = draft_api.draft_season_schedule(
+            "d1", slot_ids=["s0"])
+        self.assertEqual(len(frozen_preview["draft_games"]), 1,
+                         repr(frozen_preview))
+        row = frozen_preview["draft_games"][0]
+        stale_fingerprint = frozen_preview["draft_fingerprint"]
+
+        if change == "register":
+            self._store().add_team(Team(
+                id="t_new13", name="TNew13", division="D1",
+                division_id="d1", program_id="pg", league_id="lg"))
+        else:
+            assert change == "unregister"
+            reg_id = f"reg1_{row['home_team_id']}"
+
+        real_draft_season_schedule = draft_api.draft_season_schedule
+        calls = [0]
+        writer_done = threading.Event()
+        writer_result = [None]
+
+        def _hooked(*args, **kwargs):
+            result = real_draft_season_schedule(*args, **kwargs)
+            calls[0] += 1
+            if calls[0] == 1:
+                # This IS the wide gate -- the very first
+                # draft_season_schedule call inside commit_draft_schedule
+                # (the initial Generate call above already ran, unhooked,
+                # before this hook was installed). Spawn a GENUINELY
+                # separate connection/thread that performs and fully
+                # COMMITS a real eligibility change, and block here until
+                # it finishes -- so by the time control returns to
+                # commit_draft_schedule and it opens its OWN transaction,
+                # the writer's change already independently committed,
+                # landing exactly in the gap between the wide gate and
+                # the locks this finding targets.
+                def _run_writer():
+                    writer_api = api_cls(SqlStore(self.url))
+                    try:
+                        if change == "register":
+                            writer_result[0] = (
+                                writer_api.register_team_for_season(
+                                    "se1", "t_new13", division_id="d1",
+                                    actor_id="admin"))
+                        else:
+                            writer_result[0] = (
+                                writer_api.unregister_team_from_season(
+                                    reg_id, actor_id="admin"))
+                    except Exception as exc:      # unexpected; asserted below
+                        writer_result[0] = exc
+                    finally:
+                        writer_done.set()
+                threading.Thread(target=_run_writer).start()
+                if not writer_done.wait(timeout=10):
+                    raise AssertionError(
+                        "writer did not complete in time")
+            return result
+
+        draft_api.draft_season_schedule = _hooked
+        res = draft_api.commit_draft_schedule(
+            "d1", slot_ids=["s0"], draft_fingerprint=stale_fingerprint)
+
+        self.assertGreaterEqual(calls[0], 2, repr(calls))
+        self.assertNotIsInstance(
+            writer_result[0], Exception,
+            f"unexpected crash: {writer_result[0]!r}")
+        self.assertNotIn(
+            "error", writer_result[0],
+            f"the writer should always succeed (no committed Game exists "
+            f"yet to strand): {writer_result[0]!r}")
+        self.assertIn("error", res, repr(res))
+        self.assertEqual(
+            res["error"]["details"]["reason"], "preview_stale", repr(res))
+        store = self._store()
+        self.assertEqual(
+            len([g for g in store.all_games() if not g.cancelled]), 0,
+            repr(res))
+        self.assertEqual(store.get_ice_slot("s0").status.value, "available")
+        self.assertFalse(any(a.action == "draft_schedule_committed"
+                            for a in store.all_setup_audit()))
+        self._assert_schedule_consistent(store)
+
+    def test_team_registers_via_real_concurrent_transaction_after_wide_gate(
+            self):
+        self._run_real_eligibility_race("register")
+
+    def test_team_unregisters_via_real_concurrent_transaction_after_wide_gate(
+            self):
+        self._run_real_eligibility_race("unregister")
+
+
+@unittest.skipUnless(os.environ.get("TEST_DATABASE_URL"),
+                     "PostgreSQL required (set TEST_DATABASE_URL)")
+class PostgresLeagueScopedDeterministicEligibilityRaceTest(
+        _DeterministicEligibilityRaceMixin, unittest.TestCase):
+    """Exercises the LEAGUE-SCOPED commit_draft_schedule (api/
+    league_scoped_service.py) — the implementation production actually runs."""
+    # _api_cls() inherited default (the league-scoped ApiService).
+
+
+@unittest.skipUnless(os.environ.get("TEST_DATABASE_URL"),
+                     "PostgreSQL required (set TEST_DATABASE_URL)")
+class PostgresBaseApiDeterministicEligibilityRaceTest(
+        _DeterministicEligibilityRaceMixin, unittest.TestCase):
+    """Exercises the BASE facade's OWN commit_draft_schedule (api/service.py)
+    — not reached in production, but the review asked for BOTH
+    implementations to be race-safe, not just the one production resolves
+    to."""
 
     def _api_cls(self):
         return BaseApiService

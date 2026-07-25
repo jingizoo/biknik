@@ -454,7 +454,7 @@ def _split_already_scheduled(store, pairings, existing, league_season_id):
 def _draft_fingerprint(league_season_id, team_ids, draft_games, unscheduled,
                         unschedulable_teams, already_scheduled):
     """Deterministic identity of exactly what this proposal reviewed — #328
-    review round 5, widened round 7 and round 10. Bound into the response
+    review round 5, widened rounds 7, 10, 11, and 12. Bound into the response
     so the commit path can prove, right before writing, that this fact
     hasn't changed since: a Regular Game silently created or cancelled in
     the gap between the operator's preview and clicking Commit changes
@@ -506,10 +506,28 @@ def _draft_fingerprint(league_season_id, team_ids, draft_games, unscheduled,
     current policy value. Binding `reason` too closes that gap: the
     operator reviewed the specific explanation on screen, not just its
     category.
+
+    #328 review round 12 finding 2 correction: `ice_slot_id` alone does
+    not bind everything a `draft_games` row displays AND persists onto
+    its created Game. Each row also carries `rink_name` (resolved once,
+    at generation time, from the slot's Rink) and `end_time` — both
+    written verbatim onto `Game.rink`/`Game.end_time` by commit, neither
+    a live reference re-resolved at write time. A Rink rename (e.g. a
+    repeat CSV import that re-labels an existing Rink) between Generate
+    and Commit leaves `ice_slot_id`/`start_time` byte-for-byte identical
+    — same slot, same instant — while the name the operator reviewed and
+    the name about to be persisted onto the Game have already diverged;
+    an in-place edit of a slot's own `end_time` (its `id`/`start_time`
+    unchanged) is the identical risk for the playing-time span shown and
+    persisted. Binding `rink_id` (defense in depth: the id itself is
+    stable even across a rename, so this only ever adds coverage, never
+    narrows what `rink_name` alone already catches), `rink_name`, and
+    `end_time` closes both gaps.
     """
     missing = sorted(
         f"{d.get('division_id')}|{d['home_team_id']}|{d['away_team_id']}|"
-        f"{d.get('ice_slot_id')}|{d.get('start_time')}"
+        f"{d.get('ice_slot_id')}|{d.get('start_time')}|{d.get('end_time')}|"
+        f"{d.get('rink_id')}|{d.get('rink_name')}"
         for d in draft_games)
     scheduled = sorted(
         f"{a.get('division_id')}|{a['home_team_id']}|{a['away_team_id']}|"

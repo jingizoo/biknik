@@ -139,6 +139,39 @@ class DraftFingerprintTest(unittest.TestCase):
                    "50.")]
         self.assertNotEqual(_draft_fingerprint(**a), _draft_fingerprint(**b))
 
+    def test_changed_rink_name_changes_fingerprint(self):
+        """#328 review round 12 finding 2: a repeat rinks CSV import that
+        renames an existing Rink (matched by rink_code, #95) leaves
+        ice_slot_id/start_time identical -- the fingerprint must still
+        catch the divergence, since rink_name is both displayed and
+        persisted verbatim onto Game.rink."""
+        a = self._base_args()
+        b = self._base_args()
+        a["draft_games"] = [dict(a["draft_games"][0], rink_id="r1",
+                                 rink_name="Main")]
+        b["draft_games"] = [dict(b["draft_games"][0], rink_id="r1",
+                                 rink_name="Main Renamed")]
+        self.assertNotEqual(_draft_fingerprint(**a), _draft_fingerprint(**b))
+
+    def test_changed_rink_id_changes_fingerprint(self):
+        a = self._base_args()
+        b = self._base_args()
+        a["draft_games"] = [dict(a["draft_games"][0], rink_id="r1")]
+        b["draft_games"] = [dict(b["draft_games"][0], rink_id="r2")]
+        self.assertNotEqual(_draft_fingerprint(**a), _draft_fingerprint(**b))
+
+    def test_changed_end_time_changes_fingerprint(self):
+        """#328 review round 12 finding 2: an in-place edit of a slot's own
+        end_time (its id/start_time unchanged) must also invalidate the
+        preview -- end_time is persisted verbatim onto Game.end_time."""
+        a = self._base_args()
+        b = self._base_args()
+        a["draft_games"] = [dict(a["draft_games"][0],
+                                 end_time="2026-09-12T09:00:00+00:00")]
+        b["draft_games"] = [dict(b["draft_games"][0],
+                                 end_time="2026-09-12T09:30:00+00:00")]
+        self.assertNotEqual(_draft_fingerprint(**a), _draft_fingerprint(**b))
+
     def test_changed_unschedulable_teams_changes_fingerprint(self):
         a = self._base_args()
         b = self._base_args()
@@ -1287,6 +1320,65 @@ class SchedulerContract:
         self._stale_preview_refused_on_unscheduled_reason_change(
             BaseApiService)
 
+    # -- fingerprint must bind rink identity/name, not just ice_slot_id
+    # (#328 review round 12 finding 2) --------------------------------------
+    def _stale_preview_refused_on_rink_rename(self, api_cls):
+        """A repeat rinks/ice_slots CSV import (#95) that renames an
+        EXISTING Rink -- matched by rink_code (``external_ref``), not
+        name or id -- between Generate and Commit leaves ice_slot_id and
+        start_time byte-for-byte identical: same slot, same instant. But
+        the rink_name the operator reviewed on screen, and the name about
+        to be written verbatim onto the created Game's own `rink` field
+        (never re-resolved from a live Rink reference at commit time),
+        have already diverged. Commit must still refuse as stale."""
+        self._division_fixture(4, 1)  # t0..t3, 1 slot on r1: places (t0, t3)
+        rink = self.store.get_rink("r1")
+        rink.external_ref = "R1"
+        self.store.save_rink(rink)
+        api = api_cls(self.store)
+        preview = api.draft_season_schedule("div1")
+        self.assertEqual(len(preview["draft_games"]), 1, repr(preview))
+        self.assertEqual(
+            preview["draft_games"][0]["rink_name"], "Main", repr(preview))
+        placed_slot_id = preview["draft_games"][0]["ice_slot_id"]
+        stale_fingerprint = preview["draft_fingerprint"]
+
+        renamed_csv = "venue_name,rink_code,rink_name\nArena,R1,Main Renamed\n"
+        import_res = api.commit_rinks_ice_slots_import(
+            {"rinks_csv": renamed_csv}, actor_id="admin")
+        self.assertTrue(import_res.get("committed"), repr(import_res))
+        self.assertEqual(self.store.get_rink("r1").name, "Main Renamed")
+        # Confirm the fresh regeneration really does keep the placed row's
+        # identity (same pairing, same slot) unchanged -- otherwise this
+        # fixture wouldn't isolate the rink-NAME axis from the (already
+        # separately covered) placement axis.
+        fresh = api.draft_season_schedule("div1")
+        self.assertEqual(len(fresh["draft_games"]), 1, repr(fresh))
+        self.assertEqual(
+            fresh["draft_games"][0]["ice_slot_id"], placed_slot_id,
+            repr(fresh))
+        self.assertEqual(
+            fresh["draft_games"][0]["rink_name"], "Main Renamed", repr(fresh))
+
+        games_before = len(self.store.all_games())
+        audits_before = len(self.store.all_setup_audit())
+        res = api.commit_draft_schedule(
+            "div1", draft_fingerprint=stale_fingerprint)
+        self.assertIn("error", res, repr(res))
+        self.assertEqual(
+            res["error"]["details"]["reason"], "preview_stale", repr(res))
+        self.assertEqual(len(self.store.all_games()), games_before, repr(res))
+        self.assertEqual(
+            len(self.store.all_setup_audit()), audits_before, repr(res))
+
+    def test_league_scoped_commit_refuses_stale_preview_after_rink_renamed(
+            self):
+        self._stale_preview_refused_on_rink_rename(ApiService)
+
+    def test_base_facade_commit_refuses_stale_preview_after_rink_renamed(
+            self):
+        self._stale_preview_refused_on_rink_rename(BaseApiService)
+
     # -- ALL fingerprint-bound state must be revalidated under the lock, not
     # just draft_games/already_scheduled row identity (#328 review round 11
     # finding 2) -------------------------------------------------------------
@@ -1384,6 +1476,210 @@ class SchedulerContract:
             self):
         self._team_eligibility_change_after_internal_regen_refused(
             BaseApiService, "unregister")
+
+    # -- terminal reason/status/UX contract must survive the round-11 locked
+    # recheck (#328 review round 12 finding 1) ------------------------------
+    def _pairing_race_lands_between_wide_gate_and_locked_regen(self, api_cls):
+        """#328 review round 12 finding 1(a): a winning exact-pairing race
+        landing AFTER commit's own unlocked wide-gate regeneration but
+        BEFORE its locked regeneration (round 11's general recheck) must
+        still surface the specific, product-confirmed `pairing_already_
+        scheduled` (naming the pairing and winning Game) -- not the general
+        recheck's generic `preview_stale` -- exactly like every other timing
+        of the same race (round 2/3/4). Round 11's own fix ordered the
+        general recheck BEFORE the pre-existing `_existing_now`-based
+        per-row check, which happened to regress this exact scenario: the
+        general recheck detects the drift (a real regeneration legitimately
+        moves this pairing from draft_games to already_scheduled) but,
+        without a carve-out, could only raise its own generic reason.
+
+        Forces the timing deterministically, without threads: a call-counted
+        monkeypatched ``draft_season_schedule`` returns the SAME frozen
+        proposal on its first call (the wide gate), creates a real winning
+        Game for the proposal's own pairing on a DIFFERENT slot on the
+        second call (the locked regeneration), then delegates to the REAL
+        function -- so the locked regeneration is the first call to observe
+        the new state.
+
+        The winning Game must exist BEFORE ``commit_draft_schedule`` is even
+        called, exactly like ``_pairing_race_wins_over_physical_conflict``'s
+        established technique -- not injected mid-flight from within the
+        losing attempt's OWN transaction (an earlier version of this test
+        did that via a ``_guard_active_seasons`` hook, and the store's
+        transactional rollback on the eventual raise silently erased the
+        "winning" Game along with the loser's own tentative writes, since
+        both were mutations of the SAME transaction). A call-counted
+        monkeypatched ``draft_season_schedule`` then freezes ONLY the FIRST
+        (wide-gate) call to the pre-race snapshot -- simulating a wide gate
+        that legitimately ran a moment before the race landed, even though
+        the winner already durably exists in the store by the time anyone
+        looks again -- and lets every later call (the locked regeneration)
+        run for REAL, so it genuinely observes the winner and legitimately
+        moves this pairing from ``draft_games`` to ``already_scheduled``,
+        differing from ``draft_fingerprint``.
+
+        Uses a FULLY saturated round-robin (``_division_fixture(4, 6)``,
+        6 slots for 4 teams' 6 pairings -- mirrors
+        ``_pairing_race_wins_over_physical_conflict``'s established
+        technique) so the extra far-away winning-Game slot added below
+        cannot itself change the wide gate's own fresh regeneration: with
+        every pairing already placed, one more never-consumed slot changes
+        nothing about ``draft_games``/``unscheduled``/the fingerprint. The
+        raced pairing is the LAST of the 6 rows, proving the whole batch
+        (not merely the bad row) rolls back."""
+        self._division_fixture(4, 6)  # t0..t3, 6 slots: all 6 pairings placed
+        api = api_cls(self.store)
+        frozen_preview = api.draft_season_schedule("div1")
+        self.assertEqual(len(frozen_preview["draft_games"]), 6,
+                         repr(frozen_preview))
+        row = frozen_preview["draft_games"][-1]
+        stale_fingerprint = frozen_preview["draft_fingerprint"]
+
+        # Strictly LATER than every fixture slot (which run BASE_TIME ..
+        # BASE_TIME+5d): _available_game_slots sorts earliest-first, so a
+        # slot any earlier could itself get assigned to a pairing instead
+        # of one of the fixture's own 6 slots, silently changing WHICH
+        # ice_slot_id each pairing lands on (round 7 binds that too) and
+        # tripping the wide gate before the transaction even opens -- not
+        # the scenario this test targets.
+        far_start = BASE_TIME + timedelta(days=100)
+        self.store.add_rink(Rink(id="r_r12a", venue_id="v1", name="Race12a"))
+        self.store.add_ice_slot(IceSlot(
+            id="r12a_slot", rink_id="r_r12a", start_time=far_start,
+            end_time=far_start + timedelta(hours=1)))
+        winning_game_id = "r12a_winner"
+        self.store.add_game(Game(
+            id=winning_game_id, home_team_id=row["home_team_id"],
+            away_team_id=row["away_team_id"], start_time=far_start,
+            end_time=far_start + timedelta(hours=1),
+            ice_slot_id="r12a_slot", division_id="div1", season_id="se1",
+            league_id="lg1", league_season_id="ls_lg1_se1"))
+        winner_slot = self.store.get_ice_slot("r12a_slot")
+        winner_slot.status = IceSlotStatus.ALLOCATED
+        self.store.save_ice_slot(winner_slot)
+
+        real_draft_season_schedule = api.draft_season_schedule
+        calls = [0]
+
+        def _freeze_wide_gate_only(*args, **kwargs):
+            calls[0] += 1
+            if calls[0] == 1:
+                return frozen_preview
+            return real_draft_season_schedule(*args, **kwargs)
+
+        api.draft_season_schedule = _freeze_wide_gate_only
+        games_before = len(self.store.all_games())
+        audits_before = len(self.store.all_setup_audit())
+        res = api.commit_draft_schedule(
+            "div1", draft_fingerprint=stale_fingerprint)
+        self.assertGreaterEqual(calls[0], 2, repr(calls))
+        self.assertIn("error", res, repr(res))
+        self.assertEqual(
+            res["error"]["details"]["reason"], "pairing_already_scheduled",
+            repr(res))
+        self.assertEqual(
+            res["error"]["details"]["existing_game_id"], winning_game_id,
+            repr(res))
+        self.assertIn(row["home_team_name"], res["error"]["message"])
+        self.assertIn(row["away_team_name"], res["error"]["message"])
+        # Atomic rollback: only the pre-existing winning Game remains -- the
+        # five EARLIER rows this loser's own transaction tentatively
+        # created/allocated before reaching the raced (last) row are back
+        # to AVAILABLE, and no batch audit landed.
+        self.assertEqual(len(self.store.all_games()), games_before, repr(res))
+        for r in frozen_preview["draft_games"][:-1]:
+            self.assertEqual(
+                self.store.get_ice_slot(r["ice_slot_id"]).status,
+                IceSlotStatus.AVAILABLE, r["ice_slot_id"])
+        self.assertEqual(
+            len(self.store.all_setup_audit()), audits_before, repr(res))
+
+    def test_league_scoped_commit_pairing_race_before_locked_regen_yields_pairing_already_scheduled(
+            self):
+        self._pairing_race_lands_between_wide_gate_and_locked_regen(
+            ApiService)
+
+    def test_base_facade_commit_pairing_race_before_locked_regen_yields_pairing_already_scheduled(
+            self):
+        self._pairing_race_lands_between_wide_gate_and_locked_regen(
+            BaseApiService)
+
+    def _placed_team_eligibility_visible_before_either_locked_check(
+            self, api_cls):
+        """#328 review round 12 finding 1(b): once this transaction holds
+        the Season lock, a team's registration state is settled for the
+        rest of the transaction -- a concurrent unregister needs that SAME
+        lock, so it has either already committed (visible to every
+        subsequent read) or is blocked behind us. Which of the two locked
+        checks happens to run FIRST therefore decides the operator-facing
+        reason: `_require_batch_team_participation`'s DivisionMismatchError
+        reasons (e.g. `team_not_registered`) are not recognised by app.js's
+        stale-preview recovery, while the general fingerprint recheck's
+        `preview_stale` is.
+
+        Deliberately unregisters t3 -- one of the ALREADY-PLACED pairing's
+        own teams -- not a bystander: `_require_batch_team_participation`
+        only re-validates teams actually named in `draft_games`'s rows, so
+        a bystander team's registration changing (round 10/11's own
+        fixtures, which register a BYE-taking team the round-robin never
+        places) can never reach it at all in EITHER ordering -- only the
+        general recheck's team_ids/unschedulable_teams fingerprint binding
+        (round 10) ever catches that. Only a change to a team already IN
+        the batch can make `_require_batch_team_participation` itself have
+        something to say, which is what makes this fixture load-bearing
+        for isolating the ordering axis specifically.
+
+        Applying the change right after the Season lock is acquired
+        (`_guard_active_seasons`, which both checks run strictly after) --
+        rather than tying it to either check's own execution, the way
+        round 11's own regression test does -- makes both checks observe
+        the identical already-changed state and isolates pure
+        ordering/precedence, exactly the axis this finding is about."""
+        self._division_fixture(4, 1)  # places (t0, t3)
+        api = api_cls(self.store)
+        frozen_preview = api.draft_season_schedule("div1")
+        self.assertEqual(len(frozen_preview["draft_games"]), 1,
+                         repr(frozen_preview))
+        self.assertEqual(
+            (frozen_preview["draft_games"][0]["home_team_id"],
+             frozen_preview["draft_games"][0]["away_team_id"]), ("t0", "t3"),
+            repr(frozen_preview))
+        stale_fingerprint = frozen_preview["draft_fingerprint"]
+
+        real_guard = api._guard_active_seasons
+        applied = [False]
+
+        def _unregister_t3_then_guard(*args, **kwargs):
+            result = real_guard(*args, **kwargs)
+            if not applied[0]:
+                applied[0] = True
+                reg = self.store.get_season_team_registration("streg_t3")
+                reg.active = False
+                self.store.save_season_team_registration(reg)
+            return result
+
+        api._guard_active_seasons = _unregister_t3_then_guard
+        games_before = len(self.store.all_games())
+        audits_before = len(self.store.all_setup_audit())
+        res = api.commit_draft_schedule(
+            "div1", draft_fingerprint=stale_fingerprint)
+        self.assertTrue(applied[0])
+        self.assertIn("error", res, repr(res))
+        self.assertEqual(
+            res["error"]["details"]["reason"], "preview_stale", repr(res))
+        self.assertEqual(len(self.store.all_games()), games_before, repr(res))
+        self.assertEqual(
+            len(self.store.all_setup_audit()), audits_before, repr(res))
+
+    def test_league_scoped_commit_placed_team_unregisters_before_participation_check_yields_preview_stale(
+            self):
+        self._placed_team_eligibility_visible_before_either_locked_check(
+            ApiService)
+
+    def test_base_facade_commit_placed_team_unregisters_before_participation_check_yields_preview_stale(
+            self):
+        self._placed_team_eligibility_visible_before_either_locked_check(
+            BaseApiService)
 
     # -- already_scheduled revalidation under the lock (#328 review round 8
     # finding 1) -----------------------------------------------------------

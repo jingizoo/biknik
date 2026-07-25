@@ -635,6 +635,181 @@ the mock to a single call (the registration/unregistration mutation is
 never even applied), directly demonstrating the narrow window is
 unguarded.
 
+### Ordering the locked checks so the terminal reason/status/UX contract survives (#328 review round 12 finding 1)
+
+Round 11's general recheck (`_locked_proposal = self.draft_season_schedule(...)`,
+compared against the operator's `draft_fingerprint` once every lock is held)
+was inserted BEFORE the pre-existing `_existing_now`/per-row
+`pairing_already_scheduled` check but AFTER `_require_batch_team_participation`
+(#314). That ordering regressed two already-accepted contracts for exactly
+the narrow window round 11 closed:
+
+1. A team unregistering (or otherwise losing eligibility) in that window
+   was caught by `_require_batch_team_participation` FIRST, surfacing its
+   `DivisionMismatchError` reason (`team_not_registered`,
+   `team_not_in_league_season`, `registration_cross_league`, …) — none of
+   which `app.js`'s stale-preview recovery recognizes. Only
+   `preview_stale`/`pairing_already_scheduled` clear the stale preview and
+   refocus Generate; every other reason falls back to a generic toast that
+   leaves the operator stuck looking at a proposal they can no longer
+   commit.
+2. A winning exact-pairing race (round 2/3/4's own scenario) landing in
+   that same window was caught by the general recheck FIRST, since a real
+   regeneration legitimately moves the raced pairing from `draft_games` to
+   `already_scheduled`, changing the fingerprint. Without a carve-out, that
+   surfaced the general recheck's generic `preview_stale` instead of the
+   specific, product-confirmed `pairing_already_scheduled` (naming the
+   pairing and winning Game) round 2/3/4 established as the correct,
+   terminal answer for this exact scenario.
+
+Both facades now compute `_existing_now` (the live already-scheduled-Game
+snapshot) BEFORE the general recheck, and BEFORE
+`_require_batch_team_participation`. The general recheck's mismatch branch
+first checks whether any `draft_games` row's exact pairing now appears in
+`_existing_now` — if so, it raises the specific `pairing_already_scheduled`
+itself (matching the per-row loop's message format exactly); otherwise it
+falls through to the generic `preview_stale`, which every OTHER cause of
+staleness — including a team's own eligibility changing — now reaches
+before `_require_batch_team_participation` gets a chance to run.
+`_require_batch_team_participation` and the pre-existing per-row loop are
+left in place unchanged: once the general recheck has already passed, a
+changed participant is itself part of what the regenerated proposal's own
+fingerprint binds (`team_ids`/`unschedulable_teams`, round 10), so neither
+check can still find anything the general recheck missed — they are
+redundant-but-harmless defense-in-depth, the same precedent round 11
+established for the pre-existing checks it left behind.
+
+Pinned two ways, both-facade Memory/SQLite/PostgreSQL, using the SAME
+`_guard_active_seasons` hook technique (see below): (a) a winning
+exact-pairing race is forced to land after the wide gate but before the
+locked regeneration by creating the winning Game durably in the store
+BEFORE `commit_draft_schedule` is even called, then freezing ONLY the wide
+gate's own `draft_season_schedule` call to the pre-race snapshot — so the
+locked regeneration, run for real, genuinely observes the winner and the
+carve-out fires; (b) a placed team's own eligibility change is applied via
+a hook on `_guard_active_seasons` — which both the general recheck and
+`_require_batch_team_participation` run strictly after — so both checks
+observe the identical already-changed state and the test isolates pure
+ordering/precedence rather than a timing gap between them (since, once
+this transaction holds the Season lock, a genuine concurrent write is
+either already committed and visible to everything from that point on, or
+blocked behind this transaction — there is no real sub-window between the
+two checks to force). Verified falsifiable: disabling the carve-out
+regresses the winning-pairing case back to generic `preview_stale`;
+restoring the pre-round-12 ordering (participation checked first)
+regresses the eligibility case back to `team_not_registered`.
+
+### The Rink lock must cover the generator's full candidate pool, not just placed rows (#328 review round 13)
+
+Both facades' `_pre_rinks`/`_batch_rinks` — the Rink set locked before
+revalidating the reviewed proposal — were built only from
+`proposal["draft_games"]`'s own slots: the Rinks a placement in THIS
+proposal happened to land on. When the caller omits `slot_ids` (the real
+Scheduler UI's own call), `draft_season_schedule` considers every Rink
+with active `SeasonVenueAccess` for the Season, not just the ones that
+received a placement — so an eligible-but-currently-unused Rink was never
+locked at all. A concurrent ice-availability BUILDER commit (or CSV
+import) giving that Rink a usable slot, allocating one of its candidate
+slots, or changing its effective policy could land anywhere inside the
+draft commit's own transaction, invisible to the Rink lock plan and to
+everything downstream of it.
+
+`season_candidate_rink_ids` (`services/league_scoped_scheduler.py`) now
+computes the full candidate Rink set the SAME way `draft_season_schedule`
+itself resolves candidate ice: an explicit `slot_ids` selection resolves
+to exactly those slots' Rinks; an omitted selection resolves to every Rink
+whose Venue holds active `SeasonVenueAccess` for the Season — via
+Rink→Venue→`SeasonVenueAccess` directly, NOT by enumerating existing
+IceSlots and reading their `rink_id` (the prior in-file design, which
+would still have missed a Rink with zero existing slots — exactly the
+"gains its first usable slot" case a concurrent BUILDER commit or import
+can produce at any moment). Both facades compute this set twice, matching
+the pre-existing pattern: once as the pre-lock locator (before the
+Program lock), once again after the Team lock, feeding the actual
+`_lock_rinks` call and the `_verify_policy_scope_plan` re-check.
+
+Pinned two ways on forced two-session PostgreSQL races (Memory/SQLite
+cannot exercise genuine lock contention, so there is no meaningful
+same-process equivalent here — confirmed empirically: a same-season,
+timing-only version of this test stayed green with the fix fully
+reverted, because a live regeneration reflects a new slot regardless of
+whether its Rink was ever locked; a cross-season, blocking-duration
+version ALSO stayed green reverted, because `commit_ice_availability` and
+draft-commit still share the SAME Program lock regardless of round 13,
+which alone was enough to force serialization and mask the Rink lock
+specifically):
+
+1. A barrier-released race between a draft commit (one pairing missing
+   after freeing capacity on its own Rink) and a builder commit adding a
+   brand-new Rink's first slot, asserting the outcome is always one of the
+   two internally-consistent states (the pre-race candidate pool, or the
+   post-race one) and never a crash, a double-booking, or a torn read.
+2. A direct row-lock proof: while a draft commit's transaction is held
+   open (via the SAME `_guard_active_seasons` hook technique used above),
+   a genuinely separate connection's non-blocking
+   `SELECT ... FOR UPDATE NOWAIT` probe on the brand-new Rink's own row
+   must fail with a lock-contention error — the only verification with no
+   confound from any OTHER lock the two operations happen to share.
+
+### Exercising the round-11 eligibility race with a genuinely separate transaction, not a same-connection simulation (#328 review round 12 finding 3)
+
+Round 11's own regression (`test_scheduler.py`'s
+`_team_eligibility_change_after_internal_regen_refused`) forces the
+"team registers/unregisters between the wide gate and the locked
+regeneration" window deterministically, but the mutation itself is
+applied by the SAME call-counted monkeypatch that stands in for
+`draft_season_schedule` — a same-connection simulation that proves the
+code behaves correctly once the mutation lands in that window, but not
+that a genuinely concurrent PostgreSQL transaction committing that
+mutation is actually forced into it.
+
+A new `_DeterministicEligibilityRaceMixin`
+(`test_placement_concurrency.py`) proves both properties at once: a
+call-counted hook on `draft_season_schedule` still forces the window
+deterministically (a bare `_run`-style barrier release, with no further
+synchronization, cannot reliably pin this specific window — the
+pre-existing `_DraftParticipationRaceMixin` races already cover the
+general "some interleaving of a participation change and a draft commit"
+property that way, but not this exact one), but the FIRST hooked call
+spawns a genuinely separate connection/thread that performs and fully
+COMMITS a real `register_team_for_season`/`unregister_team_from_season`
+call, and blocks until it finishes before returning control — so the
+change reaching the locked regeneration is an independently committed
+transaction, not a same-connection mutation. Verified falsifiable against
+round 11's own mechanism: disabling the general recheck lets the register
+case commit outright (nothing else can catch a team not yet in
+`draft_games`) and downgrades the unregister case to
+`_require_batch_team_participation`'s `team_not_registered` (round 12
+finding 1's own axis) instead of `preview_stale`.
+
+### Binding rink identity/name and end_time, not just ice_slot_id/start_time (#328 review round 12 finding 2)
+
+Each `draft_games` row carries `rink_id`/`rink_name` (resolved once, at
+generation time, from the chosen slot's Rink) and `end_time` — none of
+them re-resolved from a live reference at commit time. Commit writes
+`rink_name` and `end_time` verbatim onto the created `Game.rink` /
+`Game.end_time`, and the Scheduler UI displays `rink_name` on the
+reviewed row. `_draft_fingerprint` bound `ice_slot_id`/`start_time` (round
+7) but not these — so a repeat rinks/ice_slots CSV import (#95) that
+renames an existing Rink (matched by `rink_code`/`external_ref`, never by
+name or id) between Generate and Commit leaves `ice_slot_id`/`start_time`
+byte-for-byte identical — same slot, same instant — while the name the
+operator reviewed, and the name about to be persisted, have already
+diverged; an in-place edit of a slot's own `end_time` (its id/start_time
+unchanged) is the identical risk for the persisted playing-time span.
+
+`_draft_fingerprint`'s `missing` entries now also bind `end_time`,
+`rink_id`, and `rink_name` (`rink_id` is defense in depth alongside the
+name: stable across a rename, so it only ever adds coverage). Pinned by
+direct `DraftFingerprintTest` unit tests (one field varied at a time)
+plus a both-facade Memory/SQLite/PostgreSQL regression that commits a
+real repeat `rinks_csv` import renaming the placed row's own Rink between
+Generate and Commit — via `commit_rinks_ice_slots_import`, the real
+import path, not a raw store mutation — confirming the placed
+pairing/slot stay unchanged while the fresh regeneration's `rink_name`
+reflects the rename, then asserting terminal `preview_stale` and zero
+writes.
+
 ## Reason codes referenced here
 
 Unscheduled-pairing codes are generation-time (`services/scheduler.py`,
