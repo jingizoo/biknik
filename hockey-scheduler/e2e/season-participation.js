@@ -195,10 +195,12 @@ async function checkViewport(browser, viewport) {
     // Open Setup → Season participation reflects the fresh, empty seasons.
     // (Navigating to the tab re-renders and re-fetches the registration data;
     // no full reload, which would drop the signed-in session.) The register
-    // control lives per League, keyed by the League's id.
+    // control lives per Season+League (#331 review round 3 finding 2 — a
+    // League-only id collided across Seasons sharing that same permanent
+    // League, which this file's own lg1/lg2 fixture below exercises).
     await page.click('.tab[data-tab="setup"]');
     await page.waitForFunction(
-      (sel) => !!document.querySelector(sel), `#reg-team-${ids.lg1}`, { timeout: 15000 });
+      (sel) => !!document.querySelector(sel), `#reg-team-${ids.s1}-${ids.lg1}`, { timeout: 15000 });
 
     // #233 B2b review r3: the fixture Program above was created with no
     // operator_organization_id (optional on the canonical Program, B2a/ADR
@@ -214,10 +216,9 @@ async function checkViewport(browser, viewport) {
     }
 
     // Register the permanent team for season 1 under its permanent League /
-    // Division Gold. lg1 is only in season 1 so far, so this register control
-    // is unambiguous. The League select already defaults to lg1 (its section).
-    await page.selectOption(`#reg-team-${ids.lg1}`, ids.team);
-    await page.selectOption(`#reg-div-add-${ids.lg1}`, ids.dA);
+    // Division Gold. The League select already defaults to lg1 (its section).
+    await page.selectOption(`#reg-team-${ids.s1}-${ids.lg1}`, ids.team);
+    await page.selectOption(`#reg-div-add-${ids.s1}-${ids.lg1}`, ids.dA);
     let resp = page.waitForResponse((r) =>
       r.url() === `${base}/api/v2/setup/seasons/${ids.s1}/team-registrations`
       && r.request().method() === "POST");
@@ -242,7 +243,7 @@ async function checkViewport(browser, viewport) {
         { team_id: i.team, league_id: i.lg1, division_id: null });
       await post(`/api/v2/setup/season-team-registration/${boot.id}/remove`, {});
     }, ids);
-    await refreshSetup({ selector: `#reg-team-${ids.lg2}` });
+    await refreshSetup({ selector: `#reg-team-${ids.s2}-${ids.lg2}` });
 
     // Register the SAME permanent team for season 2 under the SAME permanent
     // League (rule 7 — it can register nowhere else). Division is left at "No
@@ -250,7 +251,7 @@ async function checkViewport(browser, viewport) {
     // API once lg1 spans both seasons (ambiguous), so this registration is
     // league-only. The team is still available for s2 (its bootstrapped row is
     // inactive), so its s2 register control is present.
-    await page.selectOption(`#reg-team-${ids.lg2}`, ids.team);
+    await page.selectOption(`#reg-team-${ids.s2}-${ids.lg2}`, ids.team);
     resp = page.waitForResponse((r) =>
       r.url() === `${base}/api/v2/setup/seasons/${ids.s2}/team-registrations`
       && r.request().method() === "POST");
@@ -299,7 +300,7 @@ async function checkViewport(browser, viewport) {
     // Removed from s2 → the team is available for s2 again, so its register
     // control reappears; wait for the panel to settle on that.
     await page.waitForFunction(
-      (sel) => !!document.querySelector(sel), `#reg-team-${ids.lg2}`, { timeout: 15000 });
+      (sel) => !!document.querySelector(sel), `#reg-team-${ids.s2}-${ids.lg2}`, { timeout: 15000 });
 
     const after = await page.evaluate(async (i) => {
       const get = async (p) => (await fetch(p, { credentials: "same-origin" })).json();
@@ -399,8 +400,8 @@ async function checkViewport(browser, viewport) {
     // its permanent League (Sapphire) but leaving Division at "No division" —
     // the create POST body must carry division_id: null (not omitted, not "").
     await page.waitForFunction(
-      (sel) => !!document.querySelector(sel), `#reg-team-${edit.lg1b}`, { timeout: 15000 });
-    await page.selectOption(`#reg-team-${edit.lg1b}`, edit.bears);
+      (sel) => !!document.querySelector(sel), `#reg-team-${ids.s1}-${edit.lg1b}`, { timeout: 15000 });
+    await page.selectOption(`#reg-team-${ids.s1}-${edit.lg1b}`, edit.bears);
     const addResp = page.waitForResponse((r) =>
       r.url() === `${base}/api/v2/setup/seasons/${ids.s1}/team-registrations`
       && r.request().method() === "POST");

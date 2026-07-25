@@ -60,6 +60,7 @@ class SetupProgressComputationTest(unittest.TestCase):
         self.assertIsNone(progress["program_id"])
         self.assertEqual(progress["workflows"], [])
         self.assertIsNone(progress["next"])
+        self.assertIsNone(progress["next_blocked"])
         self.assertFalse(progress["complete"])
 
     def test_fresh_program_lists_all_six_workflows_todo_league_first(self):
@@ -230,25 +231,41 @@ class SetupProgressComputationTest(unittest.TestCase):
     def test_next_action_is_role_aware(self):
         """#330 review round 1 finding 1: an Arena Manager (MANAGE_ARENA
         only, no MANAGE_SETUP) must never be handed a MANAGE_SETUP-only
-        action like "Add Season" — on a fresh Program they're routed
-        straight to facilities, the one workflow their role can actually
-        execute; League Admin's own ordering is unaffected. The GLOBAL
-        workflow list (informational) stays identical across roles — only
-        the primary-action recommendation differs."""
+        action like "Add Season" — with a Season already selected (so
+        facilities is genuinely executable, not blocked on season_missing —
+        see test_facilities_next_is_blocked_without_a_season for the no-
+        Season case) they're routed straight to facilities, the one
+        workflow their role can actually execute; League Admin's own
+        ordering is unaffected.
+
+        #331 review round 3 finding 1's redaction half: unlike the prior
+        contract ("the GLOBAL workflow list stays identical across roles"),
+        the response's `workflows` is now filtered to what each role can
+        actually manage — Arena Manager's list holds only "facilities" (the
+        one workflow keyed to MANAGE_ARENA), never the League-Admin-only
+        completion signals/counts for league_season/teams/participation/
+        roster/import. League Admin (who holds both MANAGE_SETUP and
+        MANAGE_ARENA) still sees all six."""
         api = self._api()
         api.create_user_account("admin", "pw", "league_admin")
-        api.create_program("Prog", actor_id="admin")
+        program = api.create_program("Prog", actor_id="admin")
+        api.create_season(program["id"], "Fall", actor_id="admin")
 
         admin_progress = api.get_setup_progress("admin", *ADMIN)
         self.assertEqual(admin_progress["next"]["key"], "league_season")
         self.assertEqual(admin_progress["next"]["primary_action"], "Add Season")
+        self.assertEqual([w["key"] for w in admin_progress["workflows"]],
+                         _WORKFLOW_KEYS)
 
         arena_progress = api.get_setup_progress("admin", *ARENA)
         self.assertEqual(arena_progress["next"]["key"], "facilities",
                          f"Arena Manager must get an executable action, "
                          f"got {arena_progress['next']}")
         self.assertEqual(arena_progress["next"]["primary_action"], "Add Ice")
-        self.assertEqual(_statuses(arena_progress), _statuses(admin_progress))
+        self.assertEqual([w["key"] for w in arena_progress["workflows"]],
+                         ["facilities"],
+                         "Arena Manager must never receive League-Admin-only "
+                         f"workflow detail, got {arena_progress['workflows']}")
 
     def test_next_action_is_none_but_not_complete_when_nothing_actionable_for_role(self):
         """Once facilities (the only Arena-Manager-actionable workflow) is
@@ -330,6 +347,150 @@ class SetupProgressComputationTest(unittest.TestCase):
         self.assertEqual(statuses_old["participation"], "done")
         self.assertEqual(statuses_old["facilities"], "done")
 
+    def test_facilities_next_is_blocked_without_a_season(self):
+        """#331 review round 3 finding 1: on a fresh Program with no Season
+        at all, Arena Manager's only permitted workflow (facilities) is not
+        safe to execute yet — the real Ice Availability Builder write fails
+        `season_missing` (league_scope.assign_game_ice) with nothing to
+        attach ice to. `next` must be None, not the dead-end "Add Ice" CTA
+        the pre-round-3 endpoint handed out here, and `next_blocked` must
+        name facilities with actionable guidance so the operator (who, as
+        Arena Manager, cannot create a Season themselves either) is told
+        what's missing rather than routed into a silent failure."""
+        api = self._api()
+        api.create_user_account("admin", "pw", "league_admin")
+        api.create_program("Prog", actor_id="admin")
+
+        arena_progress = api.get_setup_progress("admin", *ARENA)
+        self.assertIsNone(arena_progress["next"], arena_progress)
+        self.assertEqual(arena_progress["next_blocked"],
+                         {"key": "facilities", "label": "Venues, rinks and ice",
+                          "reason": "season_missing",
+                          "detail": "Create or select a Season before adding ice."})
+        self.assertFalse(arena_progress["complete"])
+
+        # League Admin is UNAFFECTED: "Add Season" (league_season) has no
+        # Season prerequisite of its own -- it's the thing that creates one.
+        admin_progress = api.get_setup_progress("admin", *ADMIN)
+        self.assertEqual(admin_progress["next"]["key"], "league_season")
+        self.assertIsNone(admin_progress["next_blocked"])
+
+    def test_facilities_next_is_blocked_when_program_selected_but_no_season_chosen(self):
+        """The same season_missing gap applies even when the Program DOES
+        have Seasons, as long as none is the currently-selected active
+        context (#159) -- `next`/`next_blocked` are computed from the
+        session's resolved Season, not "does any Season exist somewhere".
+        Distinct from the fresh-Program case above (named separately in
+        #331 review round 3's required regression contexts: "no-Season" vs
+        "Program-only")."""
+        api = self._api()
+        api.create_user_account("admin", "pw", "league_admin")
+        program = api.create_program("Prog", actor_id="admin")
+        api.create_season(program["id"], "Fall", actor_id="admin")
+        api.set_active_context("admin", Role.LEAGUE_ADMIN, {},
+                               program["id"], None)  # Program-only, no Season chosen
+
+        arena_progress = api.get_setup_progress("admin", *ARENA)
+        self.assertIsNone(arena_progress["next"], arena_progress)
+        self.assertEqual(arena_progress["next_blocked"]["key"], "facilities")
+        self.assertEqual(arena_progress["next_blocked"]["reason"], "season_missing")
+
+    def test_participation_next_is_blocked_when_selected_season_is_archived(self):
+        """#331 review round 3 finding 1: with an ARCHIVED Season selected,
+        League Admin's "participation" is permitted (MANAGE_SETUP) but not
+        safe -- the real write fails `season_archived`
+        (season_guard.require_active_season, read-only until an authorized
+        reopen). Every other workflow is already done, so participation is
+        the only remaining todo+permitted candidate: `next` must be None
+        with `next_blocked` naming participation and the archived Season by
+        name, not the dead-end "Register Team" CTA the pre-round-3 endpoint
+        handed out here."""
+        api = self._api()
+        api.create_user_account("admin", "pw", "league_admin")
+        program = api.create_program("Prog", actor_id="admin")
+        season = api.create_season(program["id"], "Fall", actor_id="admin")
+        api.create_league(season["id"], "Adult League", actor_id="admin")
+        club = api.create_club("C", actor_id="admin")
+        team = api.create_team(club["id"], None, "T", actor_id="admin",
+                               program_id=program["id"])
+        api.create_player(team["id"], "Vince Skater", "forward", actor_id="admin")
+        venue = api.create_venue("V", league_id=program["id"], actor_id="admin")
+        rink = api.create_rink(venue["id"], "R", actor_id="admin")
+        api.create_ice_slot(rink["id"], "2026-09-01T18:30:00+00:00",
+                            "2026-09-01T20:00:00+00:00", actor_id="admin")
+        api.grant_season_venue_access(season["id"], venue["id"], actor_id="admin")
+        # league_season/teams/roster/facilities are all done now; only
+        # participation is left -- archive the Season before registering
+        # anyone, so participation stays "todo" AND becomes unsafe.
+        archived = api.archive_season(season["id"], reason="year-end close",
+                                      actor_id="admin")
+        self.assertNotIn("error", archived, archived)
+        api.set_active_context("admin", Role.LEAGUE_ADMIN, {},
+                               program["id"], season["id"])
+
+        progress = api.get_setup_progress("admin", *ADMIN)
+        statuses = _statuses(progress)
+        self.assertEqual(statuses["participation"], "todo")
+        self.assertTrue(all(statuses[k] == "done"
+                            for k in ("league_season", "teams", "roster", "facilities")))
+        self.assertIsNone(progress["next"], progress)
+        self.assertEqual(progress["next_blocked"]["key"], "participation")
+        self.assertEqual(progress["next_blocked"]["reason"], "season_archived")
+        self.assertIn("Fall", progress["next_blocked"]["detail"])
+        self.assertFalse(progress["complete"],
+                         "participation is still todo -- archiving must not "
+                         "fake completion")
+
+    def test_facilities_next_is_also_blocked_when_selected_season_is_archived(self):
+        """Not just "participation" -- ``commit_ice_availability`` (the Ice
+        Availability Builder's real write behind "facilities") itself
+        "requires an active Season (#159)" and fails `season_archived` the
+        same way `register_team_for_season` does. Arena Manager's only
+        permitted workflow must be recognized as blocked here too, not just
+        on the no-Season case."""
+        api = self._api()
+        api.create_user_account("admin", "pw", "league_admin")
+        program = api.create_program("Prog", actor_id="admin")
+        season = api.create_season(program["id"], "Fall", actor_id="admin")
+        api.archive_season(season["id"], reason="test", actor_id="admin")
+        api.set_active_context("admin", Role.LEAGUE_ADMIN, {},
+                               program["id"], season["id"])
+
+        arena_progress = api.get_setup_progress("admin", *ARENA)
+        self.assertEqual(_statuses(arena_progress)["facilities"], "todo")
+        self.assertIsNone(arena_progress["next"], arena_progress)
+        self.assertEqual(arena_progress["next_blocked"]["key"], "facilities")
+        self.assertEqual(arena_progress["next_blocked"]["reason"], "season_archived")
+        self.assertIn("Fall", arena_progress["next_blocked"]["detail"])
+
+    def test_next_skips_a_blocked_workflow_for_one_that_is_safe(self):
+        """A workflow that is permitted but prerequisite-blocked must never
+        suppress a LATER workflow that is both permitted and safe -- `next`
+        keeps scanning past it rather than going straight to None/
+        next_blocked. With the selected Season archived (blocking
+        participation) but roster still genuinely open, League Admin must
+        be routed to roster, not left with a dead-end/no CTA."""
+        api = self._api()
+        api.create_user_account("admin", "pw", "league_admin")
+        program = api.create_program("Prog", actor_id="admin")
+        season = api.create_season(program["id"], "Fall", actor_id="admin")
+        api.create_league(season["id"], "Adult League", actor_id="admin")
+        club = api.create_club("C", actor_id="admin")
+        api.create_team(club["id"], None, "T", actor_id="admin",
+                        program_id=program["id"])
+        # No player added -- roster stays todo and has no Season prerequisite.
+        api.archive_season(season["id"], reason="test", actor_id="admin")
+        api.set_active_context("admin", Role.LEAGUE_ADMIN, {},
+                               program["id"], season["id"])
+
+        progress = api.get_setup_progress("admin", *ADMIN)
+        self.assertEqual(_statuses(progress)["participation"], "todo")
+        self.assertEqual(progress["next"]["key"], "roster",
+                         f"expected next to skip blocked participation for "
+                         f"safe roster, got {progress['next']}")
+        self.assertIsNone(progress["next_blocked"],
+                          "next_blocked must stay unset once a safe next is found")
+
 
 class SetupProgressHttpTest(unittest.TestCase):
     """Route/authz contract over real HTTP — mirrors test_v2_setup_contract.
@@ -406,25 +567,35 @@ class SetupProgressHttpTest(unittest.TestCase):
 
     def test_next_action_is_role_aware_over_real_http(self):
         """#330 review round 1 finding 1, over the real route: League Admin
-        and Arena Manager viewing the SAME fresh Program must get DIFFERENT
-        primary actions — League Admin the normal ordering, Arena Manager an
-        executable one (facilities/Add Ice), never a MANAGE_SETUP-only
-        action they cannot perform. Coach stays denied entirely (unchanged)."""
+        and Arena Manager viewing the SAME Program (with a Season already
+        selected, so facilities is genuinely executable — see
+        test_no_season_blocks_facilities_over_real_http for the no-Season
+        case) must get DIFFERENT primary actions — League Admin the normal
+        ordering, Arena Manager an executable one (facilities/Add Ice),
+        never a MANAGE_SETUP-only action they cannot perform. Coach stays
+        denied entirely (unchanged). #331 review round 3 finding 1's
+        redaction half: Arena Manager's `workflows` must carry only
+        "facilities", never League-Admin-only completion detail."""
         admin = self._login("admin")
         status, program = self._req(admin, "POST", "/api/v2/setup/program",
                                     {"name": "Round1F1 HTTP Prog", "country": "US"})
         self.assertEqual(status, 200, program)
+        status, season = self._req(admin, "POST", "/api/v2/setup/season",
+                                   {"program_id": program["id"], "name": "Fall"})
+        self.assertEqual(status, 200, season)
         status, _ = self._req(admin, "POST", "/api/context",
-                              {"program_id": program["id"], "season_id": None})
+                              {"program_id": program["id"], "season_id": season["id"]})
         self.assertEqual(status, 200)
 
         status, admin_progress = self._req(admin, "GET", "/api/v2/setup/progress")
         self.assertEqual(status, 200, admin_progress)
         self.assertEqual(admin_progress["next"]["key"], "league_season")
+        self.assertEqual([w["key"] for w in admin_progress["workflows"]],
+                         _WORKFLOW_KEYS)
 
         arena = self._login("arena")
         status, _ = self._req(arena, "POST", "/api/context",
-                              {"program_id": program["id"], "season_id": None})
+                              {"program_id": program["id"], "season_id": season["id"]})
         self.assertEqual(status, 200,
                          "Arena Manager must be able to select the same Program")
         status, arena_progress = self._req(arena, "GET", "/api/v2/setup/progress")
@@ -434,10 +605,39 @@ class SetupProgressHttpTest(unittest.TestCase):
             f"Arena Manager must get an executable action, not the League "
             f"Admin-only one: {arena_progress}")
         self.assertEqual(arena_progress["next"]["primary_action"], "Add Ice")
+        self.assertEqual([w["key"] for w in arena_progress["workflows"]],
+                         ["facilities"],
+                         "Arena Manager must never receive League-Admin-only "
+                         f"workflow detail over HTTP either: {arena_progress}")
 
         coach = self._login("coach")
         status, _ = self._req(coach, "GET", "/api/v2/setup/progress")
         self.assertEqual(status, 403)
+
+    def test_no_season_blocks_facilities_over_real_http(self):
+        """#331 review round 3 finding 1, over the real route: on a fresh
+        Program with no Season yet, Arena Manager's only permitted workflow
+        (facilities) is not safe to execute — the real Ice Builder write
+        would fail season_missing (league_scope.assign_game_ice) — so `next`
+        must be None with `next_blocked` explaining why, never the dead-end
+        "Add Ice" CTA the pre-round-3 endpoint handed out here."""
+        admin = self._login("admin")
+        status, program = self._req(admin, "POST", "/api/v2/setup/program",
+                                    {"name": "Round3F1 HTTP Prog", "country": "US"})
+        self.assertEqual(status, 200, program)
+        status, _ = self._req(admin, "POST", "/api/context",
+                              {"program_id": program["id"], "season_id": None})
+        self.assertEqual(status, 200)
+
+        arena = self._login("arena")
+        status, _ = self._req(arena, "POST", "/api/context",
+                              {"program_id": program["id"], "season_id": None})
+        self.assertEqual(status, 200)
+        status, arena_progress = self._req(arena, "GET", "/api/v2/setup/progress")
+        self.assertEqual(status, 200, arena_progress)
+        self.assertIsNone(arena_progress["next"], arena_progress)
+        self.assertEqual(arena_progress["next_blocked"]["key"], "facilities")
+        self.assertEqual(arena_progress["next_blocked"]["reason"], "season_missing")
 
 
 if __name__ == "__main__":

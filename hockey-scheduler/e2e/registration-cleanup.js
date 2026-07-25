@@ -143,13 +143,13 @@ async function checkViewport(browser, viewport) {
 
     await page.click('.tab[data-tab="setup"]');
     await page.waitForFunction(
-      (sel) => !!document.querySelector(sel), `#reg-team-${fx.leagueClean}`, { timeout: 15000 });
+      (sel) => !!document.querySelector(sel), `#reg-team-${fx.season}-${fx.leagueClean}`, { timeout: 15000 });
 
     // (1) Register both teams through the real Season participation panel —
     // teamA with a Division, teamB without (Division stays optional).
     const registerVia = async (teamId, divId) => {
-      await page.selectOption(`#reg-team-${fx.leagueClean}`, teamId);
-      await page.selectOption(`#reg-div-add-${fx.leagueClean}`, divId || "");
+      await page.selectOption(`#reg-team-${fx.season}-${fx.leagueClean}`, teamId);
+      await page.selectOption(`#reg-div-add-${fx.season}-${fx.leagueClean}`, divId || "");
       const resp = page.waitForResponse((r) =>
         r.url() === `${base}/api/v2/setup/seasons/${fx.season}/team-registrations`
         && r.request().method() === "POST");
@@ -160,7 +160,7 @@ async function checkViewport(browser, viewport) {
     };
     const regA = await registerVia(fx.teamA, fx.division);
     await page.waitForFunction(
-      (sel) => !!document.querySelector(sel), `#reg-team-${fx.leagueClean}`, { timeout: 15000 });
+      (sel) => !!document.querySelector(sel), `#reg-team-${fx.season}-${fx.leagueClean}`, { timeout: 15000 });
     const regB = await registerVia(fx.teamB, "");
 
     // Remove both from the season — they become inactive, not gone.

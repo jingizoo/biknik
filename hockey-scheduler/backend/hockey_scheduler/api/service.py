@@ -289,16 +289,39 @@ class ApiService:
         their computation for why "league profile and seasons" stays
         deliberately Program-wide instead.
 
-        ``workflows`` always reports the six workflows' GLOBAL (Program-wide)
-        state, regardless of caller role — it is informational, not itself
-        gated on what this caller can do. Only ``next`` (the primary-action
-        recommendation) is filtered to workflows this caller's role can
-        actually act on; ``complete`` means the WHOLE Program's setup is
-        done, independent of role. A caller with nothing left THEY can act on
-        (e.g. an Arena Manager once facilities is done, while League-Admin-
-        only workflows remain) gets ``next: None`` without ``complete`` being
-        true — the caller distinguishes "genuinely done" from "nothing more
-        for you" by checking ``complete``.
+        The response's ``workflows`` is filtered to entries this caller's
+        role can actually manage (#331 review round 3 finding 1): an Arena
+        Manager reading this alongside "facilities" must never also receive
+        League-Admin-only completion signals or exact team/registration/
+        player counts — that crosses the same role/privacy boundary
+        ``next``'s own permission filter exists to hold. ``complete`` and
+        ``next`` are still derived from the FULL, unfiltered internal list
+        computed below, BEFORE that filtering step: ``complete`` means the
+        WHOLE Program's setup is done, independent of role, and must not
+        flip true just because the one workflow a caller can see happens to
+        be done. A caller with nothing left THEY can act on (e.g. an Arena
+        Manager once facilities is done, while League-Admin-only workflows
+        remain) gets ``next: None`` without ``complete`` being true — the
+        caller distinguishes "genuinely done" from "nothing more for you" by
+        checking ``complete``.
+
+        ``next`` is also filtered to workflows that are actually safe to
+        execute right now, not merely permitted (#331 review round 3
+        finding 1): "facilities" needs a resolved, ACTIVE Season to
+        generate ice into (its real write fails ``season_missing`` with no
+        Season resolved, and — being itself required to run under an
+        active Season, #159 — ``season_archived`` if the resolved one is
+        archived), and "participation" needs that same Season to be active
+        (its real write likewise fails ``season_archived`` when it is
+        not). A workflow that is permitted but prerequisite-blocked is never
+        handed out as ``next`` (a dead-end CTA the operator cannot actually
+        complete); if no workflow is both permitted and safe, ``next`` is
+        None and ``next_blocked`` names the first permitted-but-blocked one
+        with a reason code and human-readable guidance, so the operator is
+        told what to resolve first instead of being left to infer it (or,
+        for a role that cannot resolve it themselves — an Arena Manager
+        blocked on a Season only a League Admin can create — at least told
+        clearly rather than handed a CTA that silently fails).
 
         "Imports and onboarding" reports a third ``status``, ``"optional"``,
         instead of ``"done"``/``"todo"`` (#330 review round 1 finding 5): it
@@ -321,8 +344,8 @@ class ApiService:
         """
         program, season = self.context.resolve(user_id, role, scope)
         if program is None:
-            return {"program_id": None, "program": None,
-                    "workflows": [], "next": None, "complete": False}
+            return {"program_id": None, "program": None, "workflows": [],
+                    "next": None, "next_blocked": None, "complete": False}
 
         seasons = self.store.seasons_for_program(program.id)
         season_ids = {s.id for s in seasons}
@@ -430,17 +453,76 @@ class ApiService:
             "detail": "Bulk-import league, team, or ice data.",
             "primary_action": "Import data"})
 
-        next_incomplete = next(
-            (w for w in workflows if w["status"] == "todo"
-             and can(role, self._WORKFLOW_PERMISSION[w["key"]])), None)
         complete = all(w["status"] == "done" for w in workflows
                        if w["status"] != "optional")
+
+        # #331 review round 3 finding 1: a workflow permitted by role but
+        # blocked by an unmet Season prerequisite is never handed out as
+        # `next` -- keep scanning for one that is both permitted AND safe,
+        # remembering the first permitted-but-blocked candidate in case none
+        # ever is.
+        next_incomplete = None
+        next_blocked = None
+        for w in workflows:
+            if w["status"] != "todo" or not can(role, self._WORKFLOW_PERMISSION[w["key"]]):
+                continue
+            gap = self._workflow_prerequisite_gap(w["key"], season)
+            if gap is None:
+                next_incomplete = w
+                break
+            if next_blocked is None:
+                reason, detail = gap
+                next_blocked = {"key": w["key"], "label": w["label"],
+                                 "reason": reason, "detail": detail}
+        if next_incomplete is not None:
+            next_blocked = None
+
+        # Redact workflows this caller's role cannot manage from the
+        # response (#331 review round 3 finding 1) -- computed from the full
+        # list above only AFTER complete/next_incomplete are already
+        # resolved, so an Arena Manager's narrower view can never change
+        # either of those.
+        visible_workflows = [w for w in workflows
+                              if can(role, self._WORKFLOW_PERMISSION[w["key"]])]
+
         return {
             "program_id": program.id, "program": _serialize(program),
-            "workflows": workflows,
+            "workflows": visible_workflows,
             "next": next_incomplete,
+            "next_blocked": next_blocked,
             "complete": complete,
         }
+
+    @staticmethod
+    def _workflow_prerequisite_gap(key, season):
+        """None if `key`'s primary action is safe to execute given the
+        resolved Season context; otherwise (reason, detail) describing what
+        must change first (#331 review round 3 finding 1). Mirrors the exact
+        conditions the real writes enforce, read-only -- never mutates or
+        row-locks, unlike the guards it mirrors: "facilities"'s real write
+        (``SetupService.commit_ice_availability``, behind the Ice
+        Availability Builder) has nothing to generate ice into without a
+        resolved Season (``season_missing`` — see
+        ``league_scope.assign_game_ice``'s identical check on the same
+        underlying condition) and itself "requires an active Season (#159)"
+        -- an ARCHIVED one is rejected exactly like "participation"'s real
+        write (``register_team_for_season``) is, both via
+        ``season_guard.require_active_season``'s ``season_archived``. Every
+        other workflow's primary action (Add Season, Add Team, Add Player,
+        Import data) has no Season prerequisite of its own."""
+        if key not in ("facilities", "participation"):
+            return None
+        if season is None:
+            if key == "facilities":
+                return ("season_missing",
+                        "Create or select a Season before adding ice.")
+            return None
+        if season.status == SeasonStatus.ARCHIVED:
+            action = "adding ice" if key == "facilities" else "registering teams"
+            return ("season_archived",
+                    f"Season '{season.name}' is archived and read-only — "
+                    f"reopen it or select an active Season before {action}.")
+        return None
 
     # -- competition-hierarchy resolution (#283) ---------------------------
     # After the #283 model change a League is a permanent child of a Program

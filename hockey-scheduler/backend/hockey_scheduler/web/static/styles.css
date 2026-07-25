@@ -11,6 +11,25 @@
   --purple: #5856d6;
 }
 
+/* Setup-progress card (#331 review round 3 finding 4): the sitewide --muted
+   (3.26:1 on white), button.primary's white-on-blue (~3.65:1), the "Done"/
+   "To do" badge text colors (3.91:1 / 4.50:1), and .banner.alert's white-
+   on-red (~3.3:1) all fail WCAG 2.2 AA for normal text -- being pre-
+   existing conventions this card reuses doesn't waive #330's explicit
+   requirement for the card's OWN surface. Scoped to .sp-card (every
+   renderSetupProgressCard() state carries this class) so every other
+   screen reusing these same shared classes/tokens is unaffected. Colors
+   reuse an existing passing token in the same hue where one already exists
+   in the needed role (.badge.blue/.badge.gray's own text colors); no
+   sitewide token passes as a SOLID FILL + white text (only as a light tint
+   + dark text, the badge convention), so button.primary/.banner.alert get
+   a same-hue value computed to clear 4.5:1 instead. */
+.sp-card { --muted: #6b6b70; }
+.sp-card button.primary { background: #0a64c4; }
+.sp-card .badge.green { background: #e3f9e8; color: #167029; }
+.sp-card .badge.gray { background: #ececf1; color: #57575c; }
+.sp-card .banner.alert { background: #c0271b; }
+
 * { box-sizing: border-box; }
 
 body {

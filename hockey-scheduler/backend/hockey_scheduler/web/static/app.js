@@ -501,25 +501,36 @@ function nextUpcomingGame(games) {
 /* ---------- Home/Tasks hub setup-progress card (#204/#330) ---------- */
 // The hub's single primary action (§4 of the operator-UX requirements): a
 // dynamic "Continue setup" naming the actual next incomplete Setup workflow
-// this caller's role can actually execute (the backend already filters
-// `next` to a role-actionable workflow — #330 review round 1 finding 1),
-// with the other five/six always listed below as a non-competing secondary
-// list. Renders the required success state once the WHOLE Program's setup
-// is done (`complete`); renders nothing if there's simply nothing left for
-// THIS role to act on while other, not-this-role's workflows remain (those
-// two are different claims — see get_setup_progress's docstring).
+// this caller's role can actually execute AND that is actually safe to run
+// given the resolved Season (the backend already filters `next` to a
+// role-actionable, prerequisite-clear workflow — #330 review round 1
+// finding 1, #331 review round 3 finding 1), with the other workflows this
+// caller's role can manage listed below as a non-competing secondary list
+// (also role-filtered as of round 3 -- an Arena Manager never receives
+// League-Admin-only completion detail here either). A workflow that's
+// permitted but blocked on the Season (no Season resolved, or the resolved
+// one archived) surfaces as actionable guidance instead — `next_blocked` —
+// never a CTA that would just fail. Renders the required success state
+// once the WHOLE Program's setup is done (`complete`); renders nothing if
+// there's simply nothing left for THIS role to act on AND nothing blocked
+// to explain either, while other, not-this-role's workflows remain (three
+// different claims — see get_setup_progress's docstring).
 function renderSetupProgressCard(progress, hadError, loading) {
   // Per-card loading boundary (#331 review round 2 finding 3): the caller
   // paints this skeleton immediately, before the real fetch even starts, so
   // a slow setup-progress request only delays this one card, never the rest
   // of the Dashboard (see loadSetupProgressCard()).
   if (loading) {
-    return `<div class="dash-card" style="margin-bottom:16px">
+    return `<div class="dash-card sp-card" style="margin-bottom:16px">
       <div class="skeleton"></div>
     </div>`;
   }
   if (hadError) {
-    return `<div class="dash-card" style="margin-bottom:16px">
+    // sp-card scopes the color overrides below (#331 review round 3
+    // finding 4): .banner.alert's own white-on-red is a sitewide convention
+    // used well below WCAG AA (~3.3:1) -- fixed here without touching the
+    // shared class every other screen using .banner.alert still relies on.
+    return `<div class="dash-card sp-card" style="margin-bottom:16px">
       <div class="dash-card-head"><h3>Setup progress unavailable</h3></div>
       <div class="banner alert"><p>Could not load your setup progress.</p></div>
       <div class="actions">
@@ -535,19 +546,22 @@ function renderSetupProgressCard(progress, hadError, loading) {
     // that should vanish once its own "optional" status is the only one
     // left. "Go to Schedule" stays the single primary action per #204's
     // one-primary-action-per-screen principle; Import data is secondary.
+    // The backend now omits "import" from `workflows` entirely for a role
+    // that cannot manage it (#331 review round 3 finding 5 -- MANAGE_SETUP,
+    // League Admin only), so rendering the button only when found redacts
+    // it for Arena Manager instead of routing them to a surface they cannot
+    // use, rather than falling back to a generic always-shown label.
     const importWf = progress.workflows.find((w) => w.key === "import");
-    return `<div class="dash-card" style="margin-bottom:16px">
+    return `<div class="dash-card sp-card" style="margin-bottom:16px">
       <div class="dash-card-head"><h3>✓ All setup steps complete</h3></div>
       <p class="muted">Every Setup workflow is done for ${esc(progress.program.name)}.</p>
       <div class="actions">
         <button class="act primary" data-goto="calendar">Go to Schedule</button>
-        <button class="act ghost" data-setup-progress-action="import"
-          >${esc(importWf ? importWf.primary_action : "Import data")}</button>
+        ${importWf ? `<button class="act ghost" data-setup-progress-action="import"
+          >${esc(importWf.primary_action)}</button>` : ""}
       </div>
     </div>`;
   }
-  const next = progress.next;
-  if (!next) return "";  // nothing actionable for this role right now
   const rows = progress.workflows.map((w) => {
     // "optional" (Imports and onboarding, #331 review round 1 finding 5) is
     // a standing alternative entry point, not a required step -- its badge
@@ -562,16 +576,38 @@ function renderSetupProgressCard(progress, hadError, loading) {
         <div class="li-sub">${esc(w.detail)}</div></div>
     </div>`;
   }).join("");
-  return `<div class="dash-card" style="margin-bottom:16px">
+  const next = progress.next;
+  if (next) {
+    return `<div class="dash-card sp-card" style="margin-bottom:16px">
+      <div class="dash-card-head"><span class="dch-dot"></span><h3>Continue setup</h3></div>
+      <div class="na-row">
+        <div class="na-ico blue">📋</div>
+        <div class="na-body"><div class="na-title">${esc(next.label)}</div>
+          <div class="na-sub">${esc(next.detail)}</div></div>
+      </div>
+      <div class="actions">
+        <button class="act primary" data-setup-progress-action="${esc(next.key)}"
+          >${esc(next.primary_action)}</button>
+      </div>
+      <div class="section-title">Setup workflows</div>
+      ${rows}
+    </div>`;
+  }
+  // Nothing is both permitted AND safe to execute right now (#331 review
+  // round 3 finding 1). Two different reasons look the same to a naive
+  // "next is null" check but must not be conflated: `next_blocked` names a
+  // workflow this caller COULD act on except for an unmet Season
+  // prerequisite (guidance to surface, not a CTA that would just fail), vs.
+  // truly nothing left for this role while other, not-this-role's workflows
+  // remain (renders nothing -- see get_setup_progress's docstring).
+  const blocked = progress.next_blocked;
+  if (!blocked) return "";
+  return `<div class="dash-card sp-card" style="margin-bottom:16px">
     <div class="dash-card-head"><span class="dch-dot"></span><h3>Continue setup</h3></div>
     <div class="na-row">
-      <div class="na-ico blue">📋</div>
-      <div class="na-body"><div class="na-title">${esc(next.label)}</div>
-        <div class="na-sub">${esc(next.detail)}</div></div>
-    </div>
-    <div class="actions">
-      <button class="act primary" data-setup-progress-action="${esc(next.key)}"
-        >${esc(next.primary_action)}</button>
+      <div class="na-ico amber">⚠️</div>
+      <div class="na-body"><div class="na-title">${esc(blocked.label)}</div>
+        <div class="na-sub">${esc(blocked.detail)}</div></div>
     </div>
     <div class="section-title">Setup workflows</div>
     ${rows}
@@ -2288,10 +2324,10 @@ function renderSeasonParticipation(hv, ov, sv) {
         const available = permanentTeams.filter((t) => !registeredTeamIds.has(t.id));
         const addCtl = available.length
           ? `<div class="tn-leaf reg-add">
-              <select id="reg-team-${esc(lv.id)}"><option value="">Add a program team…</option>${
+              <select id="reg-team-${esc(s.id)}-${esc(lv.id)}"><option value="">Add a program team…</option>${
                 available.map((t) => opt(t.id, t.name)).join("")}</select>
-              <select id="reg-league-add-${esc(lv.id)}" data-reg-league-add="${esc(lv.id)}">${leagueOptsFor(lv.id)}</select>
-              <select id="reg-div-add-${esc(lv.id)}"><option value="">No division</option>${divOptsFor("")}</select>
+              <select id="reg-league-add-${esc(s.id)}-${esc(lv.id)}" data-reg-league-add="${esc(s.id)}-${esc(lv.id)}">${leagueOptsFor(lv.id)}</select>
+              <select id="reg-div-add-${esc(s.id)}-${esc(lv.id)}"><option value="">No division</option>${divOptsFor("")}</select>
               <button class="act primary" data-reg-add="${esc(lv.id)}" data-reg-add-season="${esc(s.id)}">Register</button></div>`
           : (permanentTeams.length
               ? `<div class="tn-empty">Every program team is registered for this season.</div>`
@@ -6141,12 +6177,19 @@ async function render() {
   // remove it. Each posts to the v2 registration routes then re-renders; the
   // toast reflects the server's structured error (e.g. a team with scheduled
   // games can't be removed/reassigned).
+  // IDs below are keyed by Season+League together, not League alone (#331
+  // review round 3 finding 2): two Seasons sharing one League used to render
+  // IDENTICAL element ids for their own "Register" add-rows, so querying by
+  // League id alone returned whichever Season's row happened to come first
+  // in DOM order -- silently reading (and submitting) the WRONG Season's
+  // chosen team/league/division.
   c.querySelectorAll("[data-reg-add]").forEach((b) => b.onclick = async () => {
     const lvId = b.dataset.regAdd;
     const sid = b.dataset.regAddSeason;
-    const team = c.querySelector(`#reg-team-${lvId}`);
-    const league = c.querySelector(`#reg-league-add-${lvId}`);
-    const div = c.querySelector(`#reg-div-add-${lvId}`);
+    const key = `${sid}-${lvId}`;
+    const team = c.querySelector(`#reg-team-${key}`);
+    const league = c.querySelector(`#reg-league-add-${key}`);
+    const div = c.querySelector(`#reg-div-add-${key}`);
     if (!team || !team.value) { toast = "Choose a program team to register."; toastIsError = true; return render(); }
     if (!league || !league.value) { toast = "Choose a league to register the team under."; toastIsError = true; return render(); }
     toast = "";
@@ -6157,9 +6200,12 @@ async function render() {
   });
   // A "Register" control's League select rescopes its own Division select to
   // the newly-chosen League's divisions (never guessing a same-named one).
+  // data-reg-league-add already carries the same Season+League composite key
+  // as the ids above (#331 review round 3 finding 2), so this stays scoped
+  // to the exact same row even when another Season shares this League.
   c.querySelectorAll("[data-reg-league-add]").forEach((sel) => sel.onchange = () => {
-    const lvId = sel.dataset.regLeagueAdd;
-    const divSel = c.querySelector(`#reg-div-add-${lvId}`);
+    const key = sel.dataset.regLeagueAdd;
+    const divSel = c.querySelector(`#reg-div-add-${key}`);
     if (!divSel) return;
     const divs = leagueDivisions[sel.value] || [];
     divSel.innerHTML = `<option value="">No division</option>${divs.map((d) => opt(d.id, d.name)).join("")}`;
@@ -7274,7 +7320,7 @@ async function render() {
 }
 
 function switchTab(next) {
-  view = next; toast = ""; if (next !== "calendar") { wizard = null; conflict = null; movingGameId = null; pendingMove = null; }
+  view = next; toast = ""; if (next !== "calendar") { wizard = null; conflict = null; movingGameId = null; pendingMove = null; iceBuilder = null; }
   if (next !== "setup") { drawer = null; drawerError = ""; drawerValues = {}; pendingReassign = null; }
   // A pending checkout confirmation doesn't survive leaving Home (#107) —
   // same reset discipline as drawer/wizard above, so a stale "are you
