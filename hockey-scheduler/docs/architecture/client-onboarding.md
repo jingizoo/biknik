@@ -117,6 +117,36 @@ the source — exiting non-zero on any divergence. Run it after configuring a
 client and after any risky operation. See runbook *Backup/restore acceptance
 check*.
 
+## 7. Home/Tasks hub setup-progress (#204/#330)
+
+A second, narrower progress view sits alongside the wizard above:
+`GET /api/v2/setup/progress` (`MANAGE_ARENA` — League Admin **and** Arena
+Manager, unlike this wizard's League-Admin-only `onboarding/status`) resolves
+the caller's ACTIVE Program from the #159 session context and reports
+completion for the six Setup workflows #204 names — league profile and
+seasons, permanent teams, season participation/divisions, clubs/players/
+staff, venues/rinks/ice, and imports/onboarding — scoped to that one Program,
+never the whole installation. The Dashboard's Home/Tasks hub card leads with
+a single "Continue setup" primary action naming the actual next incomplete
+workflow and deep-linking into Setup; the other five list below as a
+non-competing secondary list (today's `.act.primary` convention — see #204's
+"one primary action per screen" principle); the whole card renders nothing
+once every workflow reads done, so it never lingers as permanent chrome.
+
+This is additive to, not a replacement for, the wizard in this slice:
+first-Program bootstrapping still belongs to Initial Setup above — an
+operator with zero Programs sees nothing from this card (`get_setup_progress`
+returns an empty `workflows: []` rather than inventing progress for a Program
+that does not exist yet), and a fresh, genuinely-incomplete League Admin
+session still lands there first. Per #204's IA crosswalk the wizard is slated
+to eventually fold into this same hub's "Imports and onboarding" workflow
+rather than stay a standalone screen — not done as of this slice.
+
+"Imports and onboarding" (the sixth workflow) is a shortcut into the other
+five, not an independent gate: it reads done once they all are, so it can
+never itself be the sole next-incomplete step, but it still stays listed as
+its own reachable entry regardless of sequence.
+
 ## Authorization and privacy invariants
 
 - The bootstrap claim is the only unauthenticated mutation, and only on a fresh,
@@ -124,7 +154,9 @@ check*.
 - After claim, all setup and onboarding-status detail requires an authenticated
   League Admin. An Arena Manager manages facility inventory but cannot claim an
   installation, create League Admin accounts, or read client-wide onboarding
-  detail.
+  detail — the one exception is the Home/Tasks hub's Program-scoped
+  `/api/v2/setup/progress` (§7), which both roles read since both land on that
+  hub.
 - Passwords and the setup code never appear in responses, logs, audit detail,
   browser state, or toasts. Post-claim actor attribution comes from the session.
 - Onboarding status, the setup hierarchy, and the acceptance report expose

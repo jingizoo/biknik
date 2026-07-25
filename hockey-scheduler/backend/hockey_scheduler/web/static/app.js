@@ -111,6 +111,7 @@ let gCheckout = null;        // {jid, game_id} while a junior's "Can't Play" con
 let gOpp = null;             // {jid, game_id} of the junior's opportunity detail open
 let gOppDetail = null;       // fetched detail payload for gOpp
 let activityExpandedBatches = new Set();  // import_batch_ids expanded in Activity (#102)
+let setupProgress = null;  // fetched /api/v2/setup/progress payload, Home/Tasks hub (#330)
 let setupView = "hierarchy";  // "hierarchy" | "records" — Setup sub-view (#165)
 let readinessCheck = null;  // /api/readiness snapshot for the Pilot Readiness card (#104)
 let importState = {         // Pilot onboarding import wizard (#96)
@@ -485,6 +486,40 @@ function coachTeamGames(ov, teamId) {
 function nextUpcomingGame(games) {
   return games.filter((g) => g.result_status !== "final")
     .slice().sort((a, b) => new Date(a.start_time) - new Date(b.start_time))[0] || null;
+}
+
+/* ---------- Home/Tasks hub setup-progress card (#204/#330) ---------- */
+// The hub's single primary action (§4 of the operator-UX requirements): a
+// dynamic "Continue setup" naming the actual next incomplete Setup workflow,
+// with the other five/six always listed below as a non-competing secondary
+// list. Renders nothing once every workflow is done, so it never lingers as
+// permanent chrome after setup is finished. The deep-link target is the
+// existing Setup page for now — once the six workflows get their own entry
+// screens (#330 follow-on slice) this points at the specific one instead.
+function renderSetupProgressCard(progress) {
+  if (!progress || !progress.program_id || progress.complete) return "";
+  const next = progress.next;
+  const rows = progress.workflows.map((w) => {
+    const done = w.status === "done";
+    return `<div class="li">
+      <span class="badge ${done ? "green" : "gray"}" aria-hidden="true">${done ? "✓" : "○"}</span>
+      <div class="li-main"><div class="li-title">${esc(w.label)}</div>
+        <div class="li-sub">${esc(w.detail)}</div></div>
+    </div>`;
+  }).join("");
+  return `<div class="dash-card" style="margin-bottom:16px">
+    <div class="dash-card-head"><span class="dch-dot"></span><h3>Continue setup</h3></div>
+    <div class="na-row">
+      <div class="na-ico blue">📋</div>
+      <div class="na-body"><div class="na-title">${esc(next.label)}</div>
+        <div class="na-sub">${esc(next.detail)}</div></div>
+    </div>
+    <div class="actions">
+      <button class="act primary" data-goto="setup">${esc(next.primary_action)}</button>
+    </div>
+    <div class="section-title">Setup workflows</div>
+    ${rows}
+  </div>`;
 }
 
 function renderDashboard(ov, standings) {
@@ -5760,6 +5795,14 @@ async function render() {
     if (view === "dashboard" && ov.divisions[0]) {
       standings = await getJSON(`/api/standings/${ov.divisions[0].id}`);
     }
+    // Home/Tasks hub setup-progress card (#330) — only for a role that can
+    // act on Setup (League Admin/Arena Manager); a Coach also lands on
+    // "dashboard" (canSeeOpsConsole) but has nothing to do with this.
+    setupProgress = null;
+    if (view === "dashboard" && (hasPerm("manage_setup") || hasPerm("manage_arena"))) {
+      const sp = await getJSON("/api/v2/setup/progress");
+      if (sp && !sp.error) setupProgress = sp;
+    }
   } catch (e) {
     setChrome(ov);
     c.innerHTML = `<div class="banner alert"><h2>Could not load data</h2>
@@ -5792,7 +5835,7 @@ async function render() {
     return;
   }
   c.innerHTML =
-    view === "dashboard" ? renderDashboard(ov, standings)
+    view === "dashboard" ? renderSetupProgressCard(setupProgress) + renderDashboard(ov, standings)
     : view === "setup" ? renderSetup(sv, hv, ov)
     : view === "import" ? renderImport(ov)
     : view === "calendar" ? renderCalendar(ov)

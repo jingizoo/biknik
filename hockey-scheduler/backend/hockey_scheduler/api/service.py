@@ -246,6 +246,134 @@ class ApiService:
             },
         }
 
+    @catch
+    def get_setup_progress(self, user_id, role, scope) -> dict:
+        """Program-scoped completion state for the six Setup workflows #204/
+        #330 name, for the Home/Tasks hub's "Continue setup" primary action:
+        which of the six is next incomplete, so the operator is told rather
+        than left to infer it from the data model.
+
+        Resolves the acting Program from the SAME active-context selection as
+        ``get_active_context`` (#159) — this is a per-user, session-scoped
+        view, unlike the installation-wide ``get_setup_overview_v2``/
+        ``get_onboarding_status_v2``. No Program yet (or none authorized) is a
+        legitimate empty state, not an error: an empty ``workflows`` list with
+        ``next: None``.
+
+        Each workflow's own "done" boundary mirrors the matching
+        ``get_onboarding_status_v2`` step, scoped to this Program instead of
+        the whole installation. "Imports and onboarding" is a shortcut into
+        the other five rather than an independent gate, so it is defined as
+        done once they all are — it can never itself be the sole next-
+        incomplete step, but per #330 it must stay reachable as its own entry
+        point the whole time, which this shape already allows (the caller
+        lists all six regardless of ``next``).
+        """
+        program, _season = self.context.resolve(user_id, role, scope)
+        if program is None:
+            return {"program_id": None, "program": None,
+                    "workflows": [], "next": None, "complete": False}
+
+        seasons = self.store.seasons_for_program(program.id)
+        season_ids = {s.id for s in seasons}
+        leagues = self.store.leagues_for_program(program.id)
+        program_league_seasons = [ls for ls in self.store.all_league_seasons()
+                                  if ls.season_id in season_ids]
+        ls_by_id = {ls.id: ls for ls in program_league_seasons}
+        teams = self.store.teams_for_program(program.id)
+        team_ids = {t.id for t in teams}
+
+        workflows = []
+
+        def add(key, label, done, detail, primary_action):
+            workflows.append({
+                "key": key, "label": label,
+                "status": "done" if done else "todo",
+                "detail": detail, "primary_action": primary_action})
+
+        # 1. League profile and seasons: every Season this Program has must
+        # carry at least one grouping League.
+        seasons_without_league = [
+            s for s in seasons
+            if s.id not in {ls.season_id for ls in program_league_seasons}]
+        league_done = bool(seasons) and not seasons_without_league
+        add("league_season", "League profile and seasons", league_done,
+            (f"{len(seasons)} season(s), {len(leagues)} league(s)"
+             if seasons else "No season created yet."),
+            "Add Season")
+
+        # 2. Permanent teams.
+        add("teams", "Permanent teams", bool(teams),
+            f"{len(teams)} team(s)" if teams else "No team added yet.",
+            "Add Team")
+
+        # 3. Season participation/divisions: at least one active
+        # registration whose League resolves and whose Team is this
+        # Program's, with any Division agreeing with the registration's
+        # League+Season — same validity rule as get_onboarding_status_v2's
+        # "participation" step, scoped here.
+        divisions_by_id = {d.id: d for d in self.store.all_divisions()}
+        schedulable = 0
+        for reg in self.store.all_season_team_registrations():
+            if not reg.active or reg.team_id not in team_ids:
+                continue
+            if reg.league_season_id not in ls_by_id:
+                continue
+            if reg.division_id:
+                division = divisions_by_id.get(reg.division_id)
+                if division is None or division.league_season_id != reg.league_season_id:
+                    continue
+            schedulable += 1
+        add("participation", "Season participation and divisions",
+            schedulable > 0,
+            (f"{schedulable} schedulable registration(s)" if schedulable
+             else "No team registered to play yet."),
+            "Register Team")
+
+        # 4. Clubs, players and staff: at least one player on one of this
+        # Program's teams.
+        program_players = [p for p in self.store.all_players()
+                           if p.team_id in team_ids]
+        add("roster", "Clubs, players and staff", bool(program_players),
+            (f"{len(program_players)} player(s)" if program_players
+             else "No player added yet."),
+            "Add Player")
+
+        # 5. Venues, rinks and ice: at least one available GAME slot at a
+        # rink whose Venue holds active SeasonVenueAccess to one of this
+        # Program's Seasons.
+        venue_access_venue_ids = {
+            a.venue_id for a in self.store.all_season_venue_access()
+            if a.active and a.season_id in season_ids}
+        schedulable_rink_ids = {
+            r.id for r in self.store.all_rinks()
+            if r.venue_id in venue_access_venue_ids}
+        available_game_slots = [
+            s for s in self.store.all_ice_slots()
+            if s.rink_id in schedulable_rink_ids
+            and s.slot_type == IceSlotType.GAME
+            and s.status == IceSlotStatus.AVAILABLE]
+        add("facilities", "Venues, rinks and ice", bool(available_game_slots),
+            (f"{len(available_game_slots)} available game slot(s)"
+             if available_game_slots else "No available game ice slot yet."),
+            "Add Ice")
+
+        # 6. Imports and onboarding — see docstring: done once 1-5 all are.
+        others_done = all(w["status"] == "done" for w in workflows)
+        add("import", "Imports and onboarding", others_done,
+            ("All other setup workflows are complete."
+             if others_done else "Bulk-import league, team, or ice data."),
+            "Import data")
+
+        next_incomplete = next(
+            (w for w in workflows if w["status"] != "done"), None)
+        return {
+            "program_id": program.id, "program": _serialize(program),
+            "workflows": workflows,
+            "next": next_incomplete,
+            "complete": next_incomplete is None,
+        }
+
     # -- competition-hierarchy resolution (#283) ---------------------------
     # After the #283 model change a League is a permanent child of a Program
     # and its per-Season participation lives in a LeagueSeason; Divisions and
