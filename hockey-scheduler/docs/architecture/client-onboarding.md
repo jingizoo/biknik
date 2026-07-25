@@ -122,16 +122,34 @@ check*.
 A second, narrower progress view sits alongside the wizard above:
 `GET /api/v2/setup/progress` (`MANAGE_ARENA` — League Admin **and** Arena
 Manager, unlike this wizard's League-Admin-only `onboarding/status`) resolves
-the caller's ACTIVE Program from the #159 session context and reports
-completion for the six Setup workflows #204 names — league profile and
-seasons, permanent teams, season participation/divisions, clubs/players/
+the caller's ACTIVE Program **and Season** from the #159 session context and
+reports completion for the six Setup workflows #204 names — league profile
+and seasons, permanent teams, season participation/divisions, clubs/players/
 staff, venues/rinks/ice, and imports/onboarding — scoped to that one Program,
-never the whole installation. The Dashboard's Home/Tasks hub card leads with
-a single "Continue setup" primary action naming the actual next incomplete
-workflow and deep-linking into Setup; the other five list below as a
-non-competing secondary list (today's `.act.primary` convention — see #204's
-"one primary action per screen" principle); the whole card renders nothing
-once every workflow reads done, so it never lingers as permanent chrome.
+never the whole installation. League profile/seasons and permanent teams are
+deliberately Program-wide (an integrity check with no Season dimension of
+its own, for teams); season participation and facilities are scoped further,
+to the ACTUAL resolved Season, so an older Season's registrations or granted
+ice can never mask required work in a newly-selected Season.
+
+The Dashboard's Home/Tasks hub card leads with a single "Continue setup"
+primary action naming the actual next incomplete workflow and deep-linking
+straight into that workflow's real entry point — a create drawer, the Ice
+Availability Builder, or the Setup hierarchy tree, never a generic Setup
+landing; the other five list below as a non-competing secondary list
+(today's `.act.primary` convention — see #204's "one primary action per
+screen" principle), each with an accessible, visible-text status ("Done" /
+"To do" / "Optional" — never an icon-only badge). `next` is filtered to
+workflows the caller's role can actually execute (an Arena Manager, who
+holds `MANAGE_ARENA` but not `MANAGE_SETUP`, is routed to facilities, never
+to a League-Admin-only action like "Add Season"); the informational
+`workflows` list itself stays role-independent. Once every required
+workflow reads done the card shows the required success state ("All setup
+steps complete" plus a Schedule link) instead of disappearing; a failed
+fetch shows a per-card error with a working Retry rather than silently
+rendering nothing, and a monotonic fetch-sequence guard discards a stale
+response that resolves after a newer one (e.g. a slow fetch completing
+after a context switch already rendered the fresher result).
 
 This is additive to, not a replacement for, the wizard in this slice:
 first-Program bootstrapping still belongs to Initial Setup above — an
@@ -142,10 +160,22 @@ session still lands there first. Per #204's IA crosswalk the wizard is slated
 to eventually fold into this same hub's "Imports and onboarding" workflow
 rather than stay a standalone screen — not done as of this slice.
 
-"Imports and onboarding" (the sixth workflow) is a shortcut into the other
-five, not an independent gate: it reads done once they all are, so it can
-never itself be the sole next-incomplete step, but it still stays listed as
-its own reachable entry regardless of sequence.
+"Imports and onboarding" (the sixth workflow) reports a third status,
+`"optional"`, instead of `"done"`/`"todo"`: it is a standing, always-
+available alternative entry point into the other five (bulk-import teams/
+players, officials/availability, or rinks/ice-slots), not an independently
+gated step. Unlike the other five, there is no reliable Program-scoped "has
+an import ever run here" signal to compute a real done/todo state from —
+two of the three import-commit paths write only aggregate counts into their
+own audit summary row, no season- or program-derivable field. An earlier
+shape derived "done" from whether the other five happened to all be done,
+which was an invented rule with no such grounding and, as a side effect,
+made this workflow impossible to ever surface as `next`. `"optional"` is
+never a candidate for `next` and never blocks `complete`, but the workflow
+stays fully visible on the card and independently reachable at all times via
+the persistent Import nav tab both League Admin and Arena Manager hold.
+Recorded as decision 9 in `docs/product/operator-ux-requirements.md`'s
+"Product decisions requiring sign-off" section.
 
 ## Authorization and privacy invariants
 

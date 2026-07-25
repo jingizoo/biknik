@@ -26,6 +26,7 @@ from ..domain import (
     NotificationKind,
     NotificationPreference,
     NotificationRecipient,
+    Permission,
     Role,
     OfficialRole,
     ResultStatus,
@@ -33,6 +34,7 @@ from ..domain import (
     SeasonStatus,
     SlotType,
     SubstituteStatus,
+    can,
     intervals_overlap,
 )
 from ..domain.errors import (
@@ -246,30 +248,78 @@ class ApiService:
             },
         }
 
+    # The permission each Setup workflow's own primary action needs (#330
+    # review round 1 finding 1). Facilities is MANAGE_ARENA — the one
+    # permission both League Admin and Arena Manager hold — like its own
+    # underlying routes (ice-slot create, the Ice Availability Builder); every
+    # other workflow's primary action (season/team/player create, season
+    # team-registration, the full import surface) requires MANAGE_SETUP,
+    # which only League Admin holds.
+    _WORKFLOW_PERMISSION = {
+        "league_season": Permission.MANAGE_SETUP,
+        "teams": Permission.MANAGE_SETUP,
+        "participation": Permission.MANAGE_SETUP,
+        "roster": Permission.MANAGE_SETUP,
+        "facilities": Permission.MANAGE_ARENA,
+        "import": Permission.MANAGE_SETUP,
+    }
+
     @catch
     def get_setup_progress(self, user_id, role, scope) -> dict:
         """Program-scoped completion state for the six Setup workflows #204/
         #330 name, for the Home/Tasks hub's "Continue setup" primary action:
-        which of the six is next incomplete, so the operator is told rather
-        than left to infer it from the data model.
+        which of the six is next incomplete AND actually actionable by the
+        caller's role, so the operator is told rather than left to infer it
+        from the data model or steered into a CTA they cannot execute (#330
+        review round 1 finding 1 — an Arena Manager, who holds MANAGE_ARENA
+        but not MANAGE_SETUP, must never be handed "Add Season").
 
-        Resolves the acting Program from the SAME active-context selection as
-        ``get_active_context`` (#159) — this is a per-user, session-scoped
-        view, unlike the installation-wide ``get_setup_overview_v2``/
-        ``get_onboarding_status_v2``. No Program yet (or none authorized) is a
-        legitimate empty state, not an error: an empty ``workflows`` list with
-        ``next: None``.
+        Resolves the acting Program AND Season from the SAME active-context
+        selection as ``get_active_context`` (#159) — this is a per-user,
+        session-scoped view, unlike the installation-wide
+        ``get_setup_overview_v2``/``get_onboarding_status_v2``. No Program yet
+        (or none authorized) is a legitimate empty state, not an error: an
+        empty ``workflows`` list with ``next: None``.
 
         Each workflow's own "done" boundary mirrors the matching
         ``get_onboarding_status_v2`` step, scoped to this Program instead of
-        the whole installation. "Imports and onboarding" is a shortcut into
-        the other five rather than an independent gate, so it is defined as
-        done once they all are — it can never itself be the sole next-
-        incomplete step, but per #330 it must stay reachable as its own entry
-        point the whole time, which this shape already allows (the caller
-        lists all six regardless of ``next``).
+        the whole installation. Season participation and facilities are
+        further scoped to the ACTUAL resolved Season, not every Season the
+        Program has (#330 review round 1 finding 2) — see the comment at
+        their computation for why "league profile and seasons" stays
+        deliberately Program-wide instead.
+
+        ``workflows`` always reports the six workflows' GLOBAL (Program-wide)
+        state, regardless of caller role — it is informational, not itself
+        gated on what this caller can do. Only ``next`` (the primary-action
+        recommendation) is filtered to workflows this caller's role can
+        actually act on; ``complete`` means the WHOLE Program's setup is
+        done, independent of role. A caller with nothing left THEY can act on
+        (e.g. an Arena Manager once facilities is done, while League-Admin-
+        only workflows remain) gets ``next: None`` without ``complete`` being
+        true — the caller distinguishes "genuinely done" from "nothing more
+        for you" by checking ``complete``.
+
+        "Imports and onboarding" reports a third ``status``, ``"optional"``,
+        instead of ``"done"``/``"todo"`` (#330 review round 1 finding 5): it
+        is a standing, always-available alternative entry point into 1-5
+        (bulk-import teams/players, officials/availability, or rinks/ice-
+        slots), not an independently gated step — unlike 1-5, there is no
+        reliable Program-scoped "has an import ever run here" signal to
+        compute a real done/todo state from (two of the three import-commit
+        paths write only aggregate counts into their own audit summary row,
+        no season- or program-derivable field — see
+        ``SetupService.commit_officials_availability_import``/
+        ``commit_rinks_ice_slots_import``). Deriving "done" from whether 1-5
+        happen to all be done (the prior shape) was an invented rule with no
+        such grounding, and made it impossible for this step to ever be
+        surfaced as ``next`` on its own. ``"optional"`` is never a candidate
+        for ``next`` and never blocks ``complete``, but the workflow stays
+        fully visible and reachable the whole time, per #330. Recorded as
+        decision 9 in ``docs/product/operator-ux-requirements.md``'s
+        "Product decisions requiring sign-off" section.
         """
-        program, _season = self.context.resolve(user_id, role, scope)
+        program, season = self.context.resolve(user_id, role, scope)
         if program is None:
             return {"program_id": None, "program": None,
                     "workflows": [], "next": None, "complete": False}
@@ -279,9 +329,16 @@ class ApiService:
         leagues = self.store.leagues_for_program(program.id)
         program_league_seasons = [ls for ls in self.store.all_league_seasons()
                                   if ls.season_id in season_ids]
-        ls_by_id = {ls.id: ls for ls in program_league_seasons}
         teams = self.store.teams_for_program(program.id)
         team_ids = {t.id for t in teams}
+        # Participation and facilities are inherently per-Season concepts —
+        # narrowed to the RESOLVED active Season's own LeagueSeasons/venue
+        # access below, never every Season the Program has, so an older
+        # Season's registrations or granted ice can't mask required work in
+        # a newly-selected Season (#330 review round 1 finding 2). No Season
+        # resolved (a Program-only context) means neither can be done yet.
+        season_ls_ids = ({ls.id for ls in program_league_seasons
+                          if ls.season_id == season.id} if season else set())
 
         workflows = []
 
@@ -292,7 +349,11 @@ class ApiService:
                 "detail": detail, "primary_action": primary_action})
 
         # 1. League profile and seasons: every Season this Program has must
-        # carry at least one grouping League.
+        # carry at least one grouping League. Deliberately Program-wide, NOT
+        # scoped to the selected Season like participation/facilities below:
+        # this is an integrity check ("does EVERY Season have a League"),
+        # mirroring get_onboarding_status_v2's own "league" step exactly, not
+        # a per-selected-Season fact.
         seasons_without_league = [
             s for s in seasons
             if s.id not in {ls.season_id for ls in program_league_seasons}]
@@ -302,22 +363,23 @@ class ApiService:
              if seasons else "No season created yet."),
             "Add Season")
 
-        # 2. Permanent teams.
+        # 2. Permanent teams — Program-level, no Season dimension at all.
         add("teams", "Permanent teams", bool(teams),
             f"{len(teams)} team(s)" if teams else "No team added yet.",
             "Add Team")
 
         # 3. Season participation/divisions: at least one active
-        # registration whose League resolves and whose Team is this
-        # Program's, with any Division agreeing with the registration's
-        # League+Season — same validity rule as get_onboarding_status_v2's
-        # "participation" step, scoped here.
+        # registration, IN THE SELECTED SEASON, whose League resolves and
+        # whose Team is this Program's, with any Division agreeing with the
+        # registration's League+Season — same validity rule as
+        # get_onboarding_status_v2's "participation" step, scoped further to
+        # one Season here.
         divisions_by_id = {d.id: d for d in self.store.all_divisions()}
         schedulable = 0
         for reg in self.store.all_season_team_registrations():
             if not reg.active or reg.team_id not in team_ids:
                 continue
-            if reg.league_season_id not in ls_by_id:
+            if reg.league_season_id not in season_ls_ids:
                 continue
             if reg.division_id:
                 division = divisions_by_id.get(reg.division_id)
@@ -331,7 +393,8 @@ class ApiService:
             "Register Team")
 
         # 4. Clubs, players and staff: at least one player on one of this
-        # Program's teams.
+        # Program's teams. Program-level like Teams — a Player belongs to a
+        # Team, never a Season directly.
         program_players = [p for p in self.store.all_players()
                            if p.team_id in team_ids]
         add("roster", "Clubs, players and staff", bool(program_players),
@@ -340,11 +403,11 @@ class ApiService:
             "Add Player")
 
         # 5. Venues, rinks and ice: at least one available GAME slot at a
-        # rink whose Venue holds active SeasonVenueAccess to one of this
-        # Program's Seasons.
-        venue_access_venue_ids = {
+        # rink whose Venue holds active SeasonVenueAccess to the SELECTED
+        # Season specifically (not any of the Program's Seasons).
+        venue_access_venue_ids = ({
             a.venue_id for a in self.store.all_season_venue_access()
-            if a.active and a.season_id in season_ids}
+            if a.active and a.season_id == season.id} if season else set())
         schedulable_rink_ids = {
             r.id for r in self.store.all_rinks()
             if r.venue_id in venue_access_venue_ids}
@@ -358,20 +421,25 @@ class ApiService:
              if available_game_slots else "No available game ice slot yet."),
             "Add Ice")
 
-        # 6. Imports and onboarding — see docstring: done once 1-5 all are.
-        others_done = all(w["status"] == "done" for w in workflows)
-        add("import", "Imports and onboarding", others_done,
-            ("All other setup workflows are complete."
-             if others_done else "Bulk-import league, team, or ice data."),
-            "Import data")
+        # 6. Imports and onboarding — see docstring: "optional", not
+        # done/todo, since there is no real Program-scoped completion signal
+        # to compute either from.
+        workflows.append({
+            "key": "import", "label": "Imports and onboarding",
+            "status": "optional",
+            "detail": "Bulk-import league, team, or ice data.",
+            "primary_action": "Import data"})
 
         next_incomplete = next(
-            (w for w in workflows if w["status"] != "done"), None)
+            (w for w in workflows if w["status"] == "todo"
+             and can(role, self._WORKFLOW_PERMISSION[w["key"]])), None)
+        complete = all(w["status"] == "done" for w in workflows
+                       if w["status"] != "optional")
         return {
             "program_id": program.id, "program": _serialize(program),
             "workflows": workflows,
             "next": next_incomplete,
-            "complete": next_incomplete is None,
+            "complete": complete,
         }
 
     # -- competition-hierarchy resolution (#283) ---------------------------

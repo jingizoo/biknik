@@ -112,6 +112,16 @@ let gOpp = null;             // {jid, game_id} of the junior's opportunity detai
 let gOppDetail = null;       // fetched detail payload for gOpp
 let activityExpandedBatches = new Set();  // import_batch_ids expanded in Activity (#102)
 let setupProgress = null;  // fetched /api/v2/setup/progress payload, Home/Tasks hub (#330)
+let setupProgressError = false;  // the fetch above failed (distinct from "no data")
+// Discards a stale /api/v2/setup/progress response (#330 review round 1
+// finding 4): a NEWER render() call — e.g. after a context switch — may
+// already have committed its own result while an OLDER call's fetch is
+// still in flight. No existing generation-counter/AbortController
+// convention exists elsewhere in this file to reuse (the closest precedent,
+// the CSV import flow's snapshot-before/compare-after style, depends on
+// re-derivable DOM form state that doesn't fit a server-resolved context
+// fetch), so a minimal monotonic sequence number is used directly instead.
+let setupProgressFetchSeq = 0;
 let setupView = "hierarchy";  // "hierarchy" | "records" — Setup sub-view (#165)
 let readinessCheck = null;  // /api/readiness snapshot for the Pilot Readiness card (#104)
 let importState = {         // Pilot onboarding import wizard (#96)
@@ -490,19 +500,46 @@ function nextUpcomingGame(games) {
 
 /* ---------- Home/Tasks hub setup-progress card (#204/#330) ---------- */
 // The hub's single primary action (§4 of the operator-UX requirements): a
-// dynamic "Continue setup" naming the actual next incomplete Setup workflow,
+// dynamic "Continue setup" naming the actual next incomplete Setup workflow
+// this caller's role can actually execute (the backend already filters
+// `next` to a role-actionable workflow — #330 review round 1 finding 1),
 // with the other five/six always listed below as a non-competing secondary
-// list. Renders nothing once every workflow is done, so it never lingers as
-// permanent chrome after setup is finished. The deep-link target is the
-// existing Setup page for now — once the six workflows get their own entry
-// screens (#330 follow-on slice) this points at the specific one instead.
-function renderSetupProgressCard(progress) {
-  if (!progress || !progress.program_id || progress.complete) return "";
+// list. Renders the required success state once the WHOLE Program's setup
+// is done (`complete`); renders nothing if there's simply nothing left for
+// THIS role to act on while other, not-this-role's workflows remain (those
+// two are different claims — see get_setup_progress's docstring).
+function renderSetupProgressCard(progress, hadError) {
+  if (hadError) {
+    return `<div class="dash-card" style="margin-bottom:16px">
+      <div class="dash-card-head"><h3>Setup progress unavailable</h3></div>
+      <div class="banner alert"><p>Could not load your setup progress.</p></div>
+      <div class="actions">
+        <button class="act primary" data-setup-progress-retry>Retry</button>
+      </div>
+    </div>`;
+  }
+  if (!progress || !progress.program_id) return "";
+  if (progress.complete) {
+    return `<div class="dash-card" style="margin-bottom:16px">
+      <div class="dash-card-head"><h3>✓ All setup steps complete</h3></div>
+      <p class="muted">Every Setup workflow is done for ${esc(progress.program.name)}.</p>
+      <div class="actions">
+        <button class="act primary" data-goto="calendar">Go to Schedule</button>
+      </div>
+    </div>`;
+  }
   const next = progress.next;
+  if (!next) return "";  // nothing actionable for this role right now
   const rows = progress.workflows.map((w) => {
-    const done = w.status === "done";
+    // "optional" (Imports and onboarding, #331 review round 1 finding 5) is
+    // a standing alternative entry point, not a required step -- its badge
+    // must read as neither "Done" nor a to-do nag.
+    const cls = w.status === "done" ? "green"
+      : w.status === "optional" ? "blue" : "gray";
+    const text = w.status === "done" ? "Done"
+      : w.status === "optional" ? "Optional" : "To do";
     return `<div class="li">
-      <span class="badge ${done ? "green" : "gray"}" aria-hidden="true">${done ? "✓" : "○"}</span>
+      <span class="badge ${cls}">${text}</span>
       <div class="li-main"><div class="li-title">${esc(w.label)}</div>
         <div class="li-sub">${esc(w.detail)}</div></div>
     </div>`;
@@ -515,11 +552,77 @@ function renderSetupProgressCard(progress) {
         <div class="na-sub">${esc(next.detail)}</div></div>
     </div>
     <div class="actions">
-      <button class="act primary" data-goto="setup">${esc(next.primary_action)}</button>
+      <button class="act primary" data-setup-progress-action="${esc(next.key)}"
+        >${esc(next.primary_action)}</button>
     </div>
     <div class="section-title">Setup workflows</div>
     ${rows}
   </div>`;
+}
+// Each workflow's real entry point (#330 review round 1 finding 3), not the
+// generic Setup tab: season/team/player open the matching create drawer
+// directly (mirrors the existing topbar "jump to Setup and open a drawer"
+// shortcut at the bottom of this file — drawer state must be set BEFORE
+// switchTab("setup"), since switchTab only clears `drawer` when leaving
+// Setup, not when entering it); facilities opens the Ice Availability
+// Builder, which renders from the Calendar view, not Setup; participation
+// has no dedicated drawer (it's an inline action inside the Setup hierarchy
+// tree) so it lands on that tree; import lands on the standalone Import tab.
+// Drawer opens already move focus to the drawer's first field (existing
+// render() behavior); the plain view switches below additionally focus the
+// destination's own heading so keyboard/screen-reader users land somewhere
+// meaningful, not silently at the top of the page.
+function goToSetupWorkflow(key) {
+  if (key === "facilities") {
+    iceBuilder = { form: null, preview: null };
+    switchTab("calendar");
+    focusContentHeading();
+    return;
+  }
+  if (key === "league_season" || key === "teams" || key === "roster") {
+    const kind = key === "league_season" ? "season"
+      : key === "teams" ? "team" : "player";
+    drawer = { kind }; drawerError = ""; drawerValues = {};
+    switchTab("setup");
+    return;
+  }
+  if (key === "participation") {
+    setupView = "hierarchy";
+    switchTab("setup");
+    focusContentHeading();
+    return;
+  }
+  if (key === "import") {
+    switchTab("import");
+    focusContentHeading();
+    return;
+  }
+  switchTab("setup");
+  focusContentHeading();
+}
+// Best-effort focus landing for a plain view switch (no drawer of its own to
+// auto-focus) — the first heading-ish element in the freshly rendered view,
+// falling back to the #content region itself for a destination with no
+// heading of its own (e.g. the Setup hierarchy tree), so focus always lands
+// somewhere real rather than silently staying nowhere. switchTab() kicks off
+// render() without awaiting it, and render() itself is async (it awaits its
+// own overview fetch) — so neither target necessarily exists yet on the very
+// next tick. Poll briefly instead of a single setTimeout(0), which raced
+// that fetch and could fire before the real content painted (#331 review
+// round 1 finding 4).
+function focusContentHeading(attempt) {
+  const content = document.getElementById("content");
+  const heading = content && content.querySelector(
+    "h1, h2, h3, .section-title");
+  if (heading) { heading.setAttribute("tabindex", "-1"); heading.focus(); return; }
+  const stillLoading = content && content.querySelector(".skeleton");
+  if (content && !stillLoading && content.firstElementChild) {
+    content.setAttribute("tabindex", "-1");
+    content.setAttribute("aria-label", "Page content");
+    content.focus();
+    return;
+  }
+  if ((attempt || 0) < 40) setTimeout(() => focusContentHeading((attempt || 0) + 1), 50);
 }
 
 function renderDashboard(ov, standings) {
@@ -5799,9 +5902,14 @@ async function render() {
     // act on Setup (League Admin/Arena Manager); a Coach also lands on
     // "dashboard" (canSeeOpsConsole) but has nothing to do with this.
     setupProgress = null;
+    setupProgressError = false;
     if (view === "dashboard" && (hasPerm("manage_setup") || hasPerm("manage_arena"))) {
+      const mySeq = ++setupProgressFetchSeq;
       const sp = await getJSON("/api/v2/setup/progress");
-      if (sp && !sp.error) setupProgress = sp;
+      if (mySeq === setupProgressFetchSeq) {  // else a newer fetch already won
+        if (sp && !sp.error) setupProgress = sp;
+        else setupProgressError = true;
+      }
     }
   } catch (e) {
     setChrome(ov);
@@ -5835,7 +5943,7 @@ async function render() {
     return;
   }
   c.innerHTML =
-    view === "dashboard" ? renderSetupProgressCard(setupProgress) + renderDashboard(ov, standings)
+    view === "dashboard" ? renderSetupProgressCard(setupProgress, setupProgressError) + renderDashboard(ov, standings)
     : view === "setup" ? renderSetup(sv, hv, ov)
     : view === "import" ? renderImport(ov)
     : view === "calendar" ? renderCalendar(ov)
@@ -5860,6 +5968,13 @@ async function render() {
 
   wireModal(c);
   c.querySelectorAll("[data-goto]").forEach((b) => b.onclick = () => switchTab(b.dataset.goto));
+  // Home/Tasks hub setup-progress card (#330): each workflow's own precise
+  // entry point, and a retry for a failed progress fetch.
+  const spAction = c.querySelector("[data-setup-progress-action]");
+  if (spAction) spAction.onclick = () =>
+    goToSetupWorkflow(spAction.dataset.setupProgressAction);
+  const spRetry = c.querySelector("[data-setup-progress-retry]");
+  if (spRetry) spRetry.onclick = () => render();
   // Administration → Danger zone (#256): opens the guarded factory-reset modal.
   const frBtn = c.querySelector("[data-factory-reset]");
   if (frBtn) frBtn.onclick = () => { if (canFactoryReset()) startFactoryReset(); };

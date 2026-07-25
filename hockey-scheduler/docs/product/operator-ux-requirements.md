@@ -640,11 +640,13 @@ conflicts reported, not silently created; a month view renders; zero
 console errors desktop+phone with backend tests) are each satisfied by
 #313's delivered scope, with no unmet item identified — #158 is closed as
 functionally complete, citing #313 (closing #315) and #277's policy
-integration (#318/#319).
+integration (#318/#319). Decision 9 (workflow 6's completion contract) was
+raised and resolved during #331's review, after implementation against
+decisions 1–8 was already under way — see below.
 
-Eight decisions this package resolves or proposes an answer for, gathered
+Nine decisions this package resolves or proposes an answer for, gathered
 here so they can be reviewed and checked off in one place rather than
-hunting through each section. All eight now have a concrete, stated answer
+hunting through each section. All nine now have a concrete, stated answer
 — none is left as a bare open question:
 
 1. **Users placement** (§2): Administration, not Teams & People — account/
@@ -685,6 +687,24 @@ hunting through each section. All eight now have a concrete, stated answer
    honored and conflicts reported; a month view renders; zero console
    errors desktop+phone with backend tests) — no unmet item identified.
    Closed per @jingizoo's sign-off above, citing #313, #315, #318, #319.
+9. **Workflow 6 ("Imports and onboarding") completion contract** (§2/§4):
+   **resolved — always-reachable alternative, not a gated step.** The first
+   Home/Tasks hub implementation (#330 PR #331) derived this workflow's
+   done/todo state from whether workflows 1–5 were all done — an invented
+   rule with no grounding, flagged in #331's review as inventing an
+   undocumented completion signal and, as a side effect, making this
+   workflow impossible to ever surface as the hub's `next` action. There is
+   no reliable Program-scoped "has an import ever run here" signal to
+   compute a real done/todo state from instead: two of the three import-
+   commit paths (officials/availability, rinks/ice-slots) write only
+   aggregate counts into their own audit summary row, no season- or
+   program-derivable field. Resolved as a third status, distinct from both
+   "done" and "todo" — this workflow is never a candidate for the hub's
+   `next` recommendation and never blocks the hub's complete/success state,
+   but stays fully visible and reachable as its own entry point the whole
+   time (already true independent of the hub card, via the persistent
+   Import nav tab both League Admin and Arena Manager hold). Signed off via
+   @jingizoo's #331 review comment, 2026-07-25.
 
 ## Out of scope for this package
 

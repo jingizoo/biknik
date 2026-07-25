@@ -40,6 +40,7 @@
     "season-fmt-unit": "node season-fmt-unit.js"
   },
   "devDependencies": {
+    "axe-core": "^4.12.1",
     "playwright": "^1.48.0"
   }
 }
