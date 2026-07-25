@@ -263,6 +263,35 @@ trigger — a second, faster click on the same CTA superseding an in-flight
 first one — by discarding the older call's result outright rather than
 letting it race the newer one to paint.
 
+Two more hub-adjacent surfaces had the identical class of gap, closed the
+same round (#331 review round 7): the Import wizard's chosen Season, and an
+already-open Ice Availability Builder's whole form and preview. Neither
+`goToSetupWorkflow("import")` (which only switches tabs) nor
+`setActiveContext()` (the switcher's own handler) ever touched either one,
+so a Season/Program switch made mid-review — while the operator is still
+looking at an Import form or a live Builder preview from the PRIOR
+selection — left both cached against the old context. Both send their
+Season verbatim to a real commit endpoint (`commit_import`,
+`commit_ice_availability`), and #159's context is display-only, not a
+backend filter, so nothing else would have caught it either — a real,
+committable cross-Program write, not a cosmetic staleness. A single
+monotonic `contextRevision` counter, bumped by every successful
+`setActiveContext()` call, gives every context-scoped view a cheap way to
+tell "still the same selection" apart from "changed and changed back": each
+stamps the revision it was last bound under, and a mismatch is unambiguous
+proof something needs rebinding. Import rebinds its Season (and discards
+any already-validated report/committed result — a stale review is worth no
+more than a stale seed) on every render while `view === "import"`, whether
+reached fresh via the hub CTA or already open when the switch happens; with
+no Season actively selected it fails CLOSED to an explicit, disabled
+placeholder option, never a fresh global-first default disguised as "no
+selection made yet." The Ice Builder discards its ENTIRE cached form (not
+just the Season field) and any live preview on a revision mismatch, since
+rink selections are just as Program/Venue-scoped as the Season is; clearing
+the preview alone is what makes a stale one uncommittable, since Create is
+already bound to a previewed template's own fingerprint and renders only
+when a preview exists.
+
 The card's async states carry real accessibility semantics, not just visual
 ones (#331 review round 5 finding 5): `#sp-card-slot` (the wrapper
 `loadSetupProgressCard()` swaps content into, itself painted once by

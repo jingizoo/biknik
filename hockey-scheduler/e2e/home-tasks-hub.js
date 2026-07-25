@@ -1553,6 +1553,290 @@ async function checkRoleScenarios(browser, viewport) {
     await page.waitForFunction(() => !document.querySelector(".drawer"),
       null, { timeout: 10000 });
 
+    // ---- (F) Hub Import destination must bind to, and rebind on, the
+    // active Program/Season (#331 review round 7 finding 1):
+    // importState.seasonId used to default from the GLOBAL first Season
+    // and persist across a Program switch untouched -- Commit sends it
+    // verbatim, so a League Admin acting from Program F2 could silently
+    // import into Program F1.
+    //
+    // logout()'s own networkidle wait (see its comment) is a single
+    // sample -- it can read "quiet" a moment before a just-scheduled
+    // fetch (e.g. the Setup view's own render() after this drawer's
+    // close) actually reaches the network layer. Step E's drawer-close
+    // sequence directly above is the first place in this file that lands
+    // on the Setup view via a drawer-close rather than a plain click, so
+    // give it an explicit second look: settle once, a short buffer for
+    // anything about to fire to actually start, then settle again.
+    await page.waitForLoadState("networkidle").catch(() => {});
+    await new Promise((r) => setTimeout(r, 500));
+    await page.waitForLoadState("networkidle").catch(() => {});
+    await logout(page);
+    await loginAs(page, "admin", "demo");
+    const f = await page.evaluate(async () => {
+      const post = async (p, b) => (await fetch(p, {
+        method: "POST", credentials: "same-origin",
+        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
+      })).json();
+      // Program F1: driven fully complete (same recipe as step C above) so
+      // its Home/Tasks card genuinely offers the real complete-card
+      // "Import data" action this scenario must click through, not a
+      // shortcut via the separate always-on Import nav tab.
+      const progF1 = await post("/api/v2/setup/program",
+        { name: "Round7F1 Program", country: "US" });
+      const seasonF1 = await post("/api/v2/setup/season",
+        { program_id: progF1.id, name: "Season F1" });
+      const leagueF1 = await post("/api/v2/setup/league",
+        { season_id: seasonF1.id, name: "League F1" });
+      const clubF1 = await post("/api/v2/setup/club", { name: "Club F1" });
+      const teamF1 = await post("/api/v2/setup/team",
+        { league_id: leagueF1.id, club_id: clubF1.id, name: "Team F1" });
+      await post(`/api/v2/setup/seasons/${seasonF1.id}/team-registrations`,
+        { team_id: teamF1.id, league_id: leagueF1.id, division_id: null });
+      await post("/api/v2/setup/player",
+        { team_id: teamF1.id, name: "P", position: "forward" });
+      const venueF1 = await post("/api/v2/setup/venue",
+        { name: "VF1", organization_id: null });
+      const rinkF1 = await post("/api/v2/setup/rink",
+        { venue_id: venueF1.id, name: "RF1" });
+      await post("/api/v2/setup/ice-slot", { rink_id: rinkF1.id,
+        start_time: "2026-09-01T18:30:00+00:00", end_time: "2026-09-01T20:00:00+00:00",
+        slot_type: "game" });
+      await post(`/api/v2/setup/seasons/${seasonF1.id}/venue-access`,
+        { venue_id: venueF1.id });
+      // Program F2: just needs its own Season to import into.
+      const progF2 = await post("/api/v2/setup/program",
+        { name: "Round7F2 Program", country: "US" });
+      const seasonF2 = await post("/api/v2/setup/season",
+        { program_id: progF2.id, name: "Season F2" });
+      return { progF1: progF1.id, seasonF1: seasonF1.id,
+        progF2: progF2.id, seasonF2: seasonF2.id };
+    });
+    await apiPost(page, "/api/context", { program_id: f.progF1, season_id: f.seasonF1 });
+    await freshLoad();
+    s = await cardState(page);
+    if (!s || s.heading !== "✓ All setup steps complete") {
+      fail(`Program F1: expected the complete state, got ${JSON.stringify(s)}`);
+    }
+    // hierarchy-import.js monkey-patches render() and, the FIRST time
+    // view === "import" is ever reached this session, fires its own
+    // unawaited follow-up render() (after fetching
+    // /api/import/hierarchy-codes) right after the first paint -- which
+    // briefly wipes #content back to a loading skeleton before
+    // repainting. This is the first visit to Import in this whole
+    // checkRoleScenarios run, so it WILL fire; wait for that specific
+    // fetch explicitly (registered before the triggering click, so a
+    // fast response can't be missed) rather than racing a value-poll
+    // against an unbounded second render.
+    const hierarchyCodesResp = page.waitForResponse((r) =>
+      r.url() === `${base}/api/import/hierarchy-codes` && r.request().method() === "GET")
+      .catch(() => null);
+    await page.click('[data-setup-progress-action="import"]');
+    await hierarchyCodesResp;
+    await page.waitForFunction(
+      (v) => (document.getElementById("import-season") || {}).value === v,
+      f.seasonF1, { timeout: 10000 });
+    const importSeasonSelected = await page.$eval("#import-season", (el) => el.value);
+    if (importSeasonSelected !== f.seasonF1) {
+      fail(`Import: expected the Season select to default to the ACTIVE `
+        + `Season F1 (${f.seasonF1}), got ${importSeasonSelected}`);
+    }
+    // -- Validate then Commit against F1, entirely through the real UI,
+    // and assert the ACTUAL POSTED season_id belongs to F1.
+    await page.click("[data-import-sample]");
+    const validateResp = page.waitForResponse((r) =>
+      r.url() === `${base}/api/import/dry-run` && r.request().method() === "POST");
+    await page.click("[data-import-validate]");
+    await validateResp;
+    await page.waitForFunction(() => {
+      const btn = document.querySelector("[data-import-commit]");
+      return !!(btn && !btn.disabled);
+    }, null, { timeout: 10000 });
+    const commitResp = page.waitForResponse((r) =>
+      r.url() === `${base}/api/import/commit/teams-players` && r.request().method() === "POST");
+    await page.click("[data-import-commit]");
+    const commitReq = await commitResp;
+    const committedBody = JSON.parse(commitReq.request().postData());
+    if (committedBody.season_id !== f.seasonF1) {
+      fail(`Import commit: expected season_id to be the active Season F1 `
+        + `(${f.seasonF1}), got ${committedBody.season_id}`);
+    }
+    const commitResult = await commitReq.json();
+    if (!commitResult || !commitResult.committed) {
+      fail(`Import commit against F1 unexpectedly failed: `
+        + `${JSON.stringify(commitResult)}`);
+    }
+
+    // -- Re-validate (fresh sample, fresh report) so a real, currently-
+    // committable state exists, THEN switch F1->F2 via the REAL context
+    // switcher while Import is still open -- contextRevision only bumps
+    // from setActiveContext(), so a bare apiPost here would leave the
+    // client's own importState none the wiser, the same gap round 6's
+    // own drawer-seeding regression already had to guard against.
+    await page.click("[data-import-sample]");
+    const revalidateResp = page.waitForResponse((r) =>
+      r.url() === `${base}/api/import/dry-run` && r.request().method() === "POST");
+    await page.click("[data-import-validate]");
+    await revalidateResp;
+    await page.waitForFunction(() => {
+      const btn = document.querySelector("[data-import-commit]");
+      return !!(btn && !btn.disabled);
+    }, null, { timeout: 10000 });
+    const switchToF2 = `${f.progF2}|${f.seasonF2}`;
+    await page.selectOption("#ctx-select", switchToF2);
+    // Wait for the Import view's OWN re-render, not #ctx-select's value --
+    // the switcher and #content are painted by the same render() call but
+    // not necessarily at the same instant within it, so #ctx-select
+    // settling first doesn't prove renderImport() has repainted yet too
+    // (this exact gap is what broke the first pass at this scenario).
+    await page.waitForFunction(
+      (v) => (document.getElementById("import-season") || {}).value === v,
+      f.seasonF2, { timeout: 10000 });
+    const commitStillEnabled = await page.evaluate(() => {
+      const btn = document.querySelector("[data-import-commit]");
+      return btn ? !btn.disabled : null;
+    });
+    if (commitStillEnabled) {
+      fail("expected F1's prior validated report to be invalidated after "
+        + "switching to Program F2, not still committable");
+    }
+
+    // -- Switch to a Program-ONLY context (no Season selected at all) --
+    // the explicit "fail closed when no valid in-context Season resolves"
+    // requirement, distinct from rebinding Season-to-Season above: the
+    // field must show no real selection (never a silent global-first
+    // fallback disguised as one), and Commit must stay disabled.
+    const switchToF2ProgramOnly = `${f.progF2}|`;
+    await page.selectOption("#ctx-select", switchToF2ProgramOnly);
+    await page.waitForFunction(
+      (v) => document.getElementById("ctx-select").value === v,
+      switchToF2ProgramOnly, { timeout: 10000 });
+    await page.waitForFunction(
+      () => (document.getElementById("import-season") || {}).value === "",
+      null, { timeout: 10000 });
+    const noSeasonCommitEnabled = await page.evaluate(() => {
+      const btn = document.querySelector("[data-import-commit]");
+      return btn ? !btn.disabled : null;
+    });
+    if (noSeasonCommitEnabled) {
+      fail("expected Commit to stay disabled with no Season actively "
+        + "selected, not fall back to a global default");
+    }
+
+    // ---- (G) An open Ice Builder must rebind to, and not silently
+    // retain state across, a context switch (#331 review round 7 finding
+    // 2): iceBuilder.form/preview were cached once and setActiveContext()
+    // never touched them, so a live A preview/commit could target A's
+    // Season under a B context header.
+    const g = await page.evaluate(async () => {
+      const post = async (p, b) => (await fetch(p, {
+        method: "POST", credentials: "same-origin",
+        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
+      })).json();
+      // Explicit Season dates (#158's own generation range requirement) --
+      // the builder's form leaves start_date/end_date blank, meaning to
+      // fall back to the Season's own range; a Season created with no
+      // dates of its own has none to fall back to, and the real preview
+      // endpoint correctly REJECTS that (missing_start_date), which would
+      // read here as "no [data-ib-commit]" for an unrelated reason.
+      const progG1 = await post("/api/v2/setup/program",
+        { name: "Round7G1 Program", country: "US" });
+      const seasonG1 = await post("/api/v2/setup/season", { program_id: progG1.id,
+        name: "Season G1", start_date: "2026-09-01", end_date: "2027-03-31" });
+      const venueG1 = await post("/api/v2/setup/venue",
+        { name: "VG1", organization_id: null });
+      const rinkG1 = await post("/api/v2/setup/rink",
+        { venue_id: venueG1.id, name: "RG1" });
+      await post(`/api/v2/setup/seasons/${seasonG1.id}/venue-access`,
+        { venue_id: venueG1.id });
+      const progG2 = await post("/api/v2/setup/program",
+        { name: "Round7G2 Program", country: "US" });
+      const seasonG2 = await post("/api/v2/setup/season", { program_id: progG2.id,
+        name: "Season G2", start_date: "2026-09-01", end_date: "2027-03-31" });
+      const venueG2 = await post("/api/v2/setup/venue",
+        { name: "VG2", organization_id: null });
+      const rinkG2 = await post("/api/v2/setup/rink",
+        { venue_id: venueG2.id, name: "RG2" });
+      await post(`/api/v2/setup/seasons/${seasonG2.id}/venue-access`,
+        { venue_id: venueG2.id });
+      return { progG1: progG1.id, seasonG1: seasonG1.id, rinkG1: rinkG1.id,
+        progG2: progG2.id, seasonG2: seasonG2.id, rinkG2: rinkG2.id };
+    });
+    await apiPost(page, "/api/context", { program_id: g.progG1, season_id: g.seasonG1 });
+    await freshLoad();
+    await page.click('.tab[data-tab="calendar"]');
+    await page.waitForFunction(() => document.body.dataset.view === "calendar",
+      null, { timeout: 10000 });
+    await page.waitForSelector("[data-ice-builder-open]", { timeout: 10000 });
+    await page.click("[data-ice-builder-open]");
+    // Polls the field's value directly (see the identical Import-view
+    // comment above) rather than a one-shot waitForSelector+$eval pair.
+    await page.waitForFunction(
+      (v) => (document.getElementById("ib-season") || {}).value === v,
+      g.seasonG1, { timeout: 10000 }).catch(() => {});
+    const ibSeasonSelected = await page.$eval("#ib-season", (el) => el.value)
+      .catch(() => null);
+    if (ibSeasonSelected !== g.seasonG1) {
+      fail(`Ice Builder: expected the Season select to default to the `
+        + `ACTIVE Season G1 (${g.seasonG1}), got ${ibSeasonSelected}`);
+    }
+    // -- Select G1's own rink and preview under A.
+    await page.click(`.ib-rink[value="${g.rinkG1}"]`);
+    const previewResp = page.waitForResponse((r) =>
+      r.url() === `${base}/api/setup/ice-availability/preview` && r.request().method() === "POST");
+    await page.click("[data-ib-preview]");
+    await previewResp;
+    await page.waitForSelector("[data-ib-commit]", { timeout: 10000 });
+    // -- Switch to Program G2 mid-flight, while the builder is still open
+    // with a live A preview -- via the REAL context switcher.
+    const switchToG2 = `${g.progG2}|${g.seasonG2}`;
+    await page.selectOption("#ctx-select", switchToG2);
+    // Wait for the Ice Builder's OWN re-render, not #ctx-select's value --
+    // same gap as Import above: the switcher and #content are painted by
+    // the same render() call but not necessarily at the same instant.
+    await page.waitForFunction(
+      (v) => (document.getElementById("ib-season") || {}).value === v,
+      g.seasonG2, { timeout: 10000 });
+    if (await page.$("[data-ib-commit]")) {
+      fail("expected A's stale preview/Create action to be gone after "
+        + "switching to Program G2 mid-flight, not still committable");
+    }
+    // -- G1's own rink checkbox must not survive -- the WHOLE form
+    // reinitialized, not just season_id.
+    const g1RinkStillChecked = await page.evaluate((rinkId) => {
+      const el = document.querySelector(`.ib-rink[value="${rinkId}"]`);
+      return el ? el.checked : null;
+    }, g.rinkG1);
+    if (g1RinkStillChecked) {
+      fail("expected Program G1's own rink selection to be cleared, not "
+        + "carried over, after switching to Program G2");
+    }
+    // -- A fresh preview+create now targets G2 only, all the way through.
+    await page.click(`.ib-rink[value="${g.rinkG2}"]`);
+    const previewResp2 = page.waitForResponse((r) =>
+      r.url() === `${base}/api/setup/ice-availability/preview` && r.request().method() === "POST");
+    await page.click("[data-ib-preview]");
+    const previewBody2 = JSON.parse((await previewResp2).request().postData());
+    if (previewBody2.season_id !== g.seasonG2) {
+      fail(`Ice Builder: expected the fresh preview to target Season G2 `
+        + `(${g.seasonG2}), got ${previewBody2.season_id}`);
+    }
+    await page.waitForSelector("[data-ib-commit]", { timeout: 10000 });
+    const commitResp2 = page.waitForResponse((r) =>
+      r.url() === `${base}/api/setup/ice-availability/commit` && r.request().method() === "POST");
+    await page.click("[data-ib-commit]");
+    const commitReq2 = await commitResp2;
+    const commitBody2 = JSON.parse(commitReq2.request().postData());
+    if (commitBody2.season_id !== g.seasonG2) {
+      fail(`Ice Builder: expected the eventual commit to target Season `
+        + `G2 (${g.seasonG2}), got ${commitBody2.season_id}`);
+    }
+    const commitResult2 = await commitReq2.json();
+    if (!commitResult2 || !commitResult2.totals || !commitResult2.totals.created) {
+      fail(`Ice Builder commit against G2 unexpectedly failed: `
+        + `${JSON.stringify(commitResult2)}`);
+    }
+
     if (errors.length) {
       fail(`console/page errors:\n${errors.join("\n")}`);
     }

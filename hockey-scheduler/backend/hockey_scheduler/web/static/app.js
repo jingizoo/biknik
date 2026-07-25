@@ -45,6 +45,16 @@ let newFeedUrl = null;             // freshly-minted feed URL, shown once (#82)
 // scoped user can neither select nor enumerate an unrelated context). A saved
 // DISPLAY context only — existing screens are not filtered by it yet.
 let contextOptions = null;         // {programs:[{id,name,seasons:[...]}], selected:{program_id,season_id,read_only}}
+// Monotonic "context generation" (#331 review round 7), bumped by every
+// successful setActiveContext() call. #159's context switcher can move the
+// active Program/Season out from under a view that cached something scoped
+// to the PREVIOUS selection (the Import wizard's chosen Season, an open Ice
+// Builder's whole form+preview) -- a plain boolean/timestamp can't tell
+// "still the same selection" apart from "changed and changed back", but an
+// always-incrementing counter can: a view stamps the revision it was last
+// bound under, and a mismatch against the current one is unambiguous proof
+// something needs rebinding, however many switches happened in between.
+let contextRevision = 0;
 let publicState = { schedule: null, standings: null, division: null, game: null,
   feedUrl: null, feedLabel: null };  // feedUrl/feedLabel: freshly-minted public calendar subscription (#33)
 let publicTab = "schedule";        // "schedule" | "standings" (#83)
@@ -132,6 +142,9 @@ let importState = {         // Pilot onboarding import wizard (#96)
   validatedKey: null,        // snapshot of sheetsText at the last successful validate;
                              // Commit refuses to run if the current text has drifted
   committed: null,           // last commit result (or {error})
+  contextRevision: null,     // #331 review round 7 -- the contextRevision this
+                             // seasonId/report/validatedKey/committed were last
+                             // bound under; a mismatch means they're stale.
 };
 
 const DAY_MS = 86400000;
@@ -3164,7 +3177,25 @@ function ibLocalOffset(iso) {
 function ibDateOnly(v) { return v ? String(v).slice(0, 10) : "—"; }
 
 function renderIceBuilder(ov) {
-  const f = iceBuilder.form || (iceBuilder.form = defaultIceForm(ov));
+  // Rebind to the active Program/Season on any context revision (#331
+  // review round 7): a form/preview cached from BEFORE the operator
+  // switched Program via the #159 switcher is exactly the same
+  // committable wrong-Program risk as Import's own stale Season (both
+  // send season_id verbatim to their commit endpoint, and the switcher is
+  // display-only -- nothing else validates "matches the active
+  // context"). Rinks are ALSO Program/Venue-scoped, so a context change
+  // discards the WHOLE form, not just season_id -- defaultIceForm(ov)
+  // already prefers the active Season the same way Import's own re-seed
+  // does. Clearing preview too makes it uncommittable the same way an
+  // edited form already does (Create is bound to the previewed
+  // template's own fingerprint, see its onclick below): with no preview,
+  // Create has nothing to send.
+  if (iceBuilder.contextRevision !== contextRevision) {
+    iceBuilder.form = defaultIceForm(ov);
+    iceBuilder.preview = null;
+    iceBuilder.contextRevision = contextRevision;
+  }
+  const f = iceBuilder.form;
   const seasons = ov.seasons || [];
   const season = seasons.find((s) => s.id === f.season_id) || null;
   const seasonOpts = seasons.map((s) =>
@@ -5110,11 +5141,18 @@ function renderImport(ov) {
     data-import-type="${t.key}">${esc(t.label)}</button>`).join("");
 
   const seasons = ov.seasons || [];
+  // No selected `<option>` (#331 review round 7) when importState.seasonId
+  // is unset -- fails CLOSED to an explicit, disabled placeholder rather
+  // than the native <select>'s own "no option marked selected -> pick the
+  // first one" default, which would silently reintroduce a global-first
+  // Season exactly like the fallback this state now deliberately omits.
   const seasonField = !type.needsSeason ? "" : !seasons.length
     ? `<label>Season <span class="req">*</span></label>
        <div class="drawer-note">Create a season first.</div>`
     : `<label>Season <span class="req">*</span></label>
-       <select id="import-season">${seasons.map((s) => `<option value="${esc(s.id)}"`
+       <select id="import-season">${!importState.seasonId
+          ? `<option value="" selected disabled>— select a season —</option>` : ""}
+         ${seasons.map((s) => `<option value="${esc(s.id)}"`
           + `${s.id === importState.seasonId ? " selected" : ""}>${esc(s.name)}</option>`).join("")}</select>`;
 
   const sheetFields = type.sheets.map((s) => `<div class="import-field-head">
@@ -6076,12 +6114,34 @@ async function render() {
       schedulerState.summary = (dr && dr.summary) || null;
       reconcileDraftSelection(drafts, previousDrafts);
     }
-    // Import wizard (#96): default the season picker once seasons exist,
-    // same pattern as schedulerState.division/standingsDivision above —
-    // the state default belongs here in the impure orchestrator, not
-    // inside renderImport() itself, which stays a pure string-builder.
-    if (view === "import" && !importState.seasonId && ov.seasons[0]) {
-      importState.seasonId = ov.seasons[0].id;
+    // Import wizard (#96): bind the season picker to the ACTIVE #159
+    // Season, not "the first Season that happens to exist" (#331 review
+    // round 7) — `ov.seasons` is unfiltered (every Program), and
+    // goToSetupWorkflow("import") does no seeding of its own (it only
+    // switches tabs), so the old fallback was a silent, COMMITTABLE
+    // cross-Program default: needsSeason import types send seasonId
+    // verbatim to commit_import, and #159's context is display-only, not
+    // a backend filter, so nothing else would have caught it. Re-binds on
+    // ANY context revision, not just the first visit, since the operator
+    // can reach Import once and then switch Program via the switcher
+    // while still on this view. Fails CLOSED, not to a fresh global
+    // default, when no Season is actively selected (a Program-only
+    // context) — importCommitState() already refuses to enable Commit
+    // without a real importState.seasonId, and renderImport()'s own
+    // season <select> below renders no `selected` option in that case,
+    // so a native browser default can't silently stand in for one either.
+    // A stale Season also makes any ALREADY-validated report/committed
+    // result suspect (it was reviewed by a person looking at a different
+    // Program), so those are invalidated here too, not just re-seeded —
+    // the operator must re-validate against whatever Season they land on
+    // under the new context before Commit can enable again.
+    if (view === "import" && importState.contextRevision !== contextRevision) {
+      importState.seasonId = (contextOptions && contextOptions.selected
+        && contextOptions.selected.season_id) || null;
+      importState.report = null;
+      importState.validatedKey = null;
+      importState.committed = null;
+      importState.contextRevision = contextRevision;
     }
     // Account/session admin, League-Admin only (#78).
     if (view === "users" && hasPerm("manage_users")) {
@@ -7638,6 +7698,11 @@ async function setActiveContext(programId, seasonId) {
     contextOptions.selected = { program_id: r.program_id,
       season_id: r.season_id, read_only: !!r.read_only };
   }
+  // Bump BEFORE render() below (#331 review round 7) so any view painted by
+  // this same cycle -- the Import wizard, an open Ice Builder -- already
+  // sees the new generation and rebinds instead of reusing what it cached
+  // under the selection this call just moved away from.
+  contextRevision += 1;
   syncContextHash();
   // Then reconcile the whole option set from a fresh GET so the label/status/
   // read-only badge reflect canonical state at POST time — a Season may have
