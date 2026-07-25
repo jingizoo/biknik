@@ -454,7 +454,7 @@ def _split_already_scheduled(store, pairings, existing, league_season_id):
 def _draft_fingerprint(league_season_id, team_ids, draft_games, unscheduled,
                         unschedulable_teams, already_scheduled):
     """Deterministic identity of exactly what this proposal reviewed — #328
-    review round 5, widened rounds 7, 10, 11, and 12. Bound into the response
+    review round 5, widened rounds 7, 10, 11, 12, and 15. Bound into the response
     so the commit path can prove, right before writing, that this fact
     hasn't changed since: a Regular Game silently created or cancelled in
     the gap between the operator's preview and clicking Commit changes
@@ -523,23 +523,42 @@ def _draft_fingerprint(league_season_id, team_ids, draft_games, unscheduled,
     stable even across a rename, so this only ever adds coverage, never
     narrows what `rink_name` alone already catches), `rink_name`, and
     `end_time` closes both gaps.
+
+    #328 review round 15 finding 1 correction: every row above binds each
+    team by id only, never by the display name the operator actually
+    reviewed on screen -- and the name a commit is about to persist onto
+    the created Game (``Game.home_team``/``away_team``, resolved once at
+    generation time via ``_team_name`` and never re-resolved from a live
+    Team reference at commit time, exactly like round 12 finding 2's
+    `rink_name`). A repeat teams/players CSV import that renames an
+    existing Team (matched by `team_code`/`external_ref`, #92) between
+    Generate and Commit leaves every id-keyed field above byte-for-byte
+    identical -- same team, same pairing, same placement -- while the
+    matchup label already differs. Binding `home_team_name`/
+    `away_team_name` (`draft_games`/`already_scheduled`/`unscheduled`) and
+    `team_name` (`unschedulable_teams`) closes that gap the same way
+    `rink_name` closed it for ice.
     """
     missing = sorted(
         f"{d.get('division_id')}|{d['home_team_id']}|{d['away_team_id']}|"
+        f"{d.get('home_team_name')}|{d.get('away_team_name')}|"
         f"{d.get('ice_slot_id')}|{d.get('start_time')}|{d.get('end_time')}|"
         f"{d.get('rink_id')}|{d.get('rink_name')}"
         for d in draft_games)
     scheduled = sorted(
         f"{a.get('division_id')}|{a['home_team_id']}|{a['away_team_id']}|"
+        f"{a.get('home_team_name')}|{a.get('away_team_name')}|"
         f"{a['existing_game_id']}"
         for a in already_scheduled)
     unresolved = sorted(
         f"{u.get('division_id')}|{u['home_team_id']}|{u['away_team_id']}|"
+        f"{u.get('home_team_name')}|{u.get('away_team_name')}|"
         + ",".join(sorted(u.get("reason_codes") or ())) + "|"
         + (u.get("reason") or "")
         for u in unscheduled)
     blocked_teams = sorted(
-        f"{t['team_id']}|" + ",".join(sorted(t.get("reason_codes") or ()))
+        f"{t['team_id']}|{t.get('team_name')}|"
+        + ",".join(sorted(t.get("reason_codes") or ()))
         for t in unschedulable_teams)
     payload = {
         "league_season_id": league_season_id,

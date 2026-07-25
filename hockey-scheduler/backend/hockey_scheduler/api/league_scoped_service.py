@@ -172,6 +172,30 @@ class ApiService(_BaseApiService):
             self._guard_active_seasons([resolved_season_id])
             self.setup._verify_policy_scope_plan(
                 _plan, _batch_rinks, season_ids=(resolved_season_id,))
+            # #328 review round 14 -- _batch_rinks above is still computed
+            # and locked BEFORE the Season lock (Program->Team->Rink->Season
+            # order), so a concurrent grant_season_venue_access (which takes
+            # only the Season lock -- see SetupService.grant_season_venue_access)
+            # can make a new Rink season-eligible in the exact gap between
+            # that computation and the Season lock just acquired above.
+            # That Rink's row was never in _batch_rinks and so was never
+            # locked by _lock_rinks -- a concurrent create_ice_slot (which
+            # takes only a Rink lock) can then give it its first candidate
+            # slot at any point up to and including after the locked-regen
+            # fingerprint recheck below (which sees no change while that
+            # Rink still has zero slots) but before this commit's writes
+            # complete. Re-verify the candidate set now that the Season
+            # lock closes that gap for good: from here on our own Season
+            # lock blocks any further grant, so any drift here proves the
+            # inventory changed strictly before we started holding it, and
+            # the whole attempt must restart against a fresh lock plan
+            # rather than proceed against a scope we never actually locked.
+            if season_candidate_rink_ids(
+                    self.store, resolved_season_id, slot_ids) != _batch_rinks:
+                raise ConcurrencyConflictError(
+                    "A scheduling-policy scope changed while processing "
+                    "the request; please retry.",
+                    {"reason": "placement_raced"})
             # Resolve the exact LeagueSeason after the Season lock. A regular
             # draft must carry this identity so publish/move can enforce the
             # same competition scope, including league-wide rows with no
@@ -186,17 +210,6 @@ class ApiService(_BaseApiService):
                      "league_id": canonical_league_id,
                      "season_id": resolved_season_id})
             draft_ls_id = draft_ls.id
-            # #314 review — re-validate every proposed slot's Season eligibility
-            # HERE, under the Rink+Season locks just acquired, not before this
-            # transaction opened (as a stale prevalidation could leave a window
-            # for a concurrent SeasonVenueAccess revoke or Rink→Venue
-            # reassignment to commit and then be missed). Before ANY Game,
-            # slot-status, or audit write for the whole batch — a bad row rolls
-            # back everything, matching this commit's existing all-or-nothing
-            # contract; shared with move_game via the same locked helper.
-            require_slots_belong_to_locked_season(
-                self.store, [row["ice_slot_id"] for row in proposal["draft_games"]],
-                resolved_season_id)
             # #328 review round 12 finding 1 -- #314's participation check
             # and round 11's general fingerprint recheck (both below) must
             # run AFTER `_existing_now`, not before: with
@@ -332,6 +345,35 @@ class ApiService(_BaseApiService):
             # anything, harmless where it can't.
             self.setup._require_batch_team_participation(
                 resolved_season_id, draft_ls_id, proposal["draft_games"])
+            # #314 review — re-validate every proposed slot's Season
+            # eligibility HERE, under the Rink+Season locks just acquired,
+            # not before this transaction opened (a stale prevalidation
+            # could leave a window for a concurrent SeasonVenueAccess
+            # revoke or Rink→Venue reassignment to commit and then be
+            # missed) — shared with move_game via the same locked helper.
+            # #328 review round 15 finding 2 -- also moved to run AFTER the
+            # general fingerprint recheck above (previously ran right after
+            # draft_ls_id resolution, before it): this narrower check's own
+            # terminal reason (`venue_access_missing`) is not one of the
+            # Scheduler UI's recognised stale-preview recovery reasons, so
+            # the exact race this call guards against must not reach the
+            # operator as this narrower, unrecognised reason before the
+            # general recheck gets a chance to classify it as
+            # `preview_stale` first — the identical reordering rationale
+            # round 12 finding 1 already applied to
+            # `_require_batch_team_participation` above. Any slot-scope
+            # drift this call could still catch necessarily also changes
+            # the Season-scoped candidate pool `_locked_proposal`'s own
+            # regeneration draws from (`_season_scoped_slot_ids` runs the
+            # identical `require_slot_belongs_to_season` check, directly
+            # for an explicit `slot_ids` selection or via
+            # `slot_belongs_to_season` for an omitted one) — already caught
+            # above, leaving this now redundant-but-harmless
+            # defense-in-depth, on the same established precedent as the
+            # check above it.
+            require_slots_belong_to_locked_season(
+                self.store, [row["ice_slot_id"] for row in proposal["draft_games"]],
+                resolved_season_id)
             # #328 review round 8 finding 1 -- an already_scheduled row's
             # Game is not part of this batch's writes, so nothing else ever
             # re-examines it under the lock: the wide draft_fingerprint gate

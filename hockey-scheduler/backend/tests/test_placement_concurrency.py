@@ -896,6 +896,97 @@ class PostgresBaseApiRinkInventoryRaceTest(
         return BaseApiService
 
 
+class _RinkGrantRaceMixin(_ForcedRaceHarnessMixin):
+    """#328 review round 14: round 13's `_batch_rinks` is still computed and
+    LOCKED before the Season lock (the established Program->Team->Rink->
+    Season order), so a concurrent `grant_season_venue_access` (which takes
+    only the Season lock -- see `SetupService.grant_season_venue_access`)
+    followed by `create_ice_slot` on a brand-new Rink (which takes only a
+    Rink lock -- see `SetupService.create_ice_slot`) can land in the exact
+    gap between `_batch_rinks`'s computation and this transaction's OWN
+    Season lock a few statements later: the new Rink's row was never in
+    `_batch_rinks` and so was never locked by `_lock_rinks`, and the Season
+    lock (the only lock that could have serialized against the grant) is
+    not held yet either. A post-Season-lock re-verification closes this: it
+    recomputes `season_candidate_rink_ids` once more and requires it to
+    still equal the actually-locked `_batch_rinks`, refusing with the
+    retryable `placement_raced` on any drift so the retry shell restarts
+    the whole attempt against a fresh (and now complete) lock plan."""
+
+    def test_new_rink_access_and_first_slot_after_rink_lock_forces_retry(self):
+        store = self._store()
+        store.add_venue(Venue(id="v_new14", name="New14", organization_id="org"))
+        store.add_rink(Rink(id="r_new14", venue_id="v_new14", name="R14"))
+
+        api_cls = self._api_cls()
+        draft_api = api_cls(SqlStore(self.url))
+        real_lock_seasons = draft_api.setup._lock_seasons
+        calls = [0]
+
+        def _race_before_season_lock(*args, **kwargs):
+            calls[0] += 1
+            if calls[0] == 1:
+                # Fires once every full commit ATTEMPT holds the Program/
+                # Team/Rink locks (including the OLD, r_new14-less
+                # `_batch_rinks`) but BEFORE it attempts the Season lock --
+                # exactly the gap this finding describes. The writer below
+                # needs only the Season lock (grant) then only a Rink lock
+                # on r_new14 (create_ice_slot), neither held by this
+                # transaction at this point, so it completes and fully
+                # commits with no blocking or deadlock risk.
+                writer_done = threading.Event()
+
+                def _writer():
+                    writer_api = api_cls(SqlStore(self.url))
+                    granted = writer_api.grant_season_venue_access(
+                        "se1", "v_new14", actor_id="racer")
+                    assert "error" not in granted, granted
+                    slotted = writer_api.create_ice_slot(
+                        "r_new14",
+                        (BASE + timedelta(days=200)).isoformat(),
+                        (BASE + timedelta(days=200, hours=1)).isoformat(),
+                        actor_id="racer")
+                    assert "error" not in slotted, slotted
+                    writer_done.set()
+
+                threading.Thread(target=_writer, daemon=True).start()
+                self.assertTrue(
+                    writer_done.wait(timeout=10),
+                    "concurrent grant_season_venue_access + create_ice_slot "
+                    "never completed")
+            return real_lock_seasons(*args, **kwargs)
+
+        draft_api.setup._lock_seasons = _race_before_season_lock
+        result = commit_fresh_draft(draft_api, "d1")
+        self.assertNotIn("error", result, repr(result))
+        self.assertGreaterEqual(
+            calls[0], 2, f"the post-Season-lock candidate-Rink "
+            f"re-verification never forced a retry -- calls={calls}")
+        self._assert_schedule_consistent(self._store())
+
+
+@unittest.skipUnless(os.environ.get("TEST_DATABASE_URL"),
+                     "PostgreSQL required (set TEST_DATABASE_URL)")
+class PostgresLeagueScopedRinkGrantRaceTest(
+        _RinkGrantRaceMixin, unittest.TestCase):
+    """Exercises the LEAGUE-SCOPED commit_draft_schedule (api/
+    league_scoped_service.py) — the implementation production actually runs."""
+    # _api_cls() inherited default (the league-scoped ApiService).
+
+
+@unittest.skipUnless(os.environ.get("TEST_DATABASE_URL"),
+                     "PostgreSQL required (set TEST_DATABASE_URL)")
+class PostgresBaseApiRinkGrantRaceTest(
+        _RinkGrantRaceMixin, unittest.TestCase):
+    """Exercises the BASE facade's OWN commit_draft_schedule (api/service.py)
+    — not reached in production, but the review asked for BOTH
+    implementations to be race-safe, not just the one production resolves
+    to."""
+
+    def _api_cls(self):
+        return BaseApiService
+
+
 # -- draft-commit must also revalidate TEAM PARTICIPATION under the lock
 # (#314 review, follow-up) ---------------------------------------------------
 #

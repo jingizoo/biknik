@@ -810,6 +810,150 @@ pairing/slot stay unchanged while the fresh regeneration's `rink_name`
 reflects the rename, then asserting terminal `preview_stale` and zero
 writes.
 
+### Re-verifying the candidate-Rink set after the Season lock, closing the gap round 13 left open (#328 review round 14)
+
+Round 13's `_batch_rinks` is computed and locked at the Rink-lock step —
+still BEFORE the Season lock, per the established
+Program→Team→Rink→Season order. `grant_season_venue_access` takes only the
+Season lock (`_require_active_season`); `create_ice_slot` takes only a
+Rink lock (`get_rink_for_update`) — neither shares a lock with the OTHER,
+and specifically `grant_season_venue_access` shares no lock with
+`_lock_rinks(_batch_rinks)`. A concurrent `grant_season_venue_access` can
+therefore commit — making a new Rink season-eligible — in the exact gap
+between `_batch_rinks`'s computation and this transaction's own Season
+lock a few statements later. That Rink's row was never in `_batch_rinks`
+and so was never locked at all. A concurrent `create_ice_slot` on it (Rink
+lock only, never taken for this Rink by this transaction) can then give it
+its first candidate slot at any point afterward — including after the
+locked-regen fingerprint recheck (round 11), which sees no change while
+that Rink still has zero slots at the moment it runs — but before this
+commit's writes complete, letting a successful commit land against an
+inventory the operator's reviewed proposal never covered.
+
+Both facades now re-verify the candidate set a THIRD time, immediately
+after `_verify_policy_scope_plan` (i.e. once the Season lock — the one
+lock that closes this specific gap — is held): recomputing
+`season_candidate_rink_ids` once more and requiring it to still equal the
+actually-locked `_batch_rinks`. Any drift — growth or shrinkage — refuses
+with the retryable `placement_raced`, forcing the retry shell to restart
+the whole attempt from scratch; the fresh attempt recomputes
+`_pre_rinks`/`_batch_rinks` from current state (now correctly including
+the newly-eligible Rink) and locks it properly. This is sufficient, not
+just necessary: once past this check, the Season lock — held for the rest
+of the transaction — blocks any FURTHER grant from landing, and the
+now-verified-complete Rink lock set protects every candidate Rink for the
+remainder of the transaction, exactly the reasoning
+`_verify_policy_scope_plan`'s own drift checks already rely on for the
+scopes it covers.
+
+Pinned two ways, both facades. A forced two-session PostgreSQL race
+(`_RinkGrantRaceMixin`, `test_placement_concurrency.py`): a hook on
+`self.setup._lock_seasons` fires once every commit ATTEMPT reaches this
+exact gap (Rink locks held, Season lock not yet attempted), spawns a
+genuinely separate connection that calls the real
+`grant_season_venue_access` then `create_ice_slot` on a brand-new Rink and
+fully commits both — needing only locks this transaction does not hold at
+that point, so there is no blocking or deadlock risk — before letting the
+real `_lock_seasons` proceed; asserts the hook fires again on a retried
+attempt (`calls[0] >= 2`), proving the re-verification actually forced
+one. A deterministic Memory/SQLite counterpart
+(`test_scheduler.py`'s `_new_rink_access_and_slot_after_rink_lock_forces_raced`)
+applies the identical two writes directly against the store (not via the
+API methods themselves, which would each try to open their own nested
+transaction on the SAME connection) as a side effect of the same
+`_lock_seasons` hook's first call, proving the re-verification's own
+read-compare logic is what forces the retry — not lock contention, which
+Memory/SQLite cannot exercise — with the SAME `calls[0] >= 2` assertion.
+Both use a division fixture sized so every pairing already fits the
+EXISTING slots (the new Rink's own slot, deliberately dated far in the
+future, is never actually needed by the round-robin), isolating whether
+the re-verification fires from whether the outcome happens to change.
+Verified falsifiable: disabling the re-verification leaves `calls[0]` at
+1 (no retry) in every one of the four regressions.
+
+### Binding team display names, not just team ids (#328 review round 15 finding 1)
+
+Every `_draft_fingerprint` bucket binds each team by id only —
+`home_team_id`/`away_team_id` (`draft_games`/`already_scheduled`/
+`unscheduled`) and `team_id` (`unschedulable_teams`) — never by the
+display name the operator actually reviewed on screen, and the name a
+commit is about to persist onto the created Game (`Game.home_team`/
+`away_team`, resolved once at generation time via `_team_name` and never
+re-resolved from a live Team reference at commit time — the identical risk
+round 12 finding 2 closed for `rink_name`). A repeat teams/players CSV
+import (#92) that renames an existing Team — matched by
+`team_code`/`external_ref`, never by name or id — between Generate and
+Commit leaves every id-keyed field byte-for-byte identical: same team,
+same pairing, same placement. Before this fix, Commit accepted the old
+token and created the Game under the stale name.
+
+`_draft_fingerprint` now also binds `home_team_name`/`away_team_name`
+(`draft_games`/`already_scheduled`/`unscheduled`) and `team_name`
+(`unschedulable_teams`). Pinned by direct `DraftFingerprintTest` unit
+tests (one bucket varied at a time) plus a both-facade
+Memory/SQLite/PostgreSQL regression (`SchedulerContract`'s
+`_stale_preview_refused_on_team_rename`) that commits a real repeat
+`teams_csv` import renaming the placed row's own Team between Generate and
+Commit — via `commit_teams_players_import`, the real import path, not a
+raw store mutation, with `division_name` included in the repeat row so
+the import's idempotent registration upsert leaves the team's
+division/league-season untouched — confirming the placed pairing/slot
+stay unchanged while the fresh regeneration's `home_team_name` reflects
+the rename, then asserting terminal `preview_stale` and zero writes.
+Verified falsifiable: reverting the binding across all four buckets lets
+Commit succeed and persist the Game under the stale name (confirmed
+directly in the reverted run, not just inferred).
+
+### The general locked recheck must also win over the narrower per-slot Season-eligibility refusal (#328 review round 15 finding 2)
+
+`require_slots_belong_to_locked_season` (#314) — a narrower, per-slot
+Season-eligibility recheck — ran BEFORE the general locked-regen
+fingerprint recheck (round 11), the same structural defect round 12
+finding 1 already fixed for `_require_batch_team_participation`, just
+against a different narrower check that review missed at the time. A
+SeasonVenueAccess revoke or Rink→Venue reassignment landing after the
+wide gate but before this transaction's own Rink+Season locks surfaced
+this check's own terminal `venue_access_missing` (a plain
+`ValidationError`, not retried) instead of the general recheck's
+`preview_stale` — a reason the Scheduler UI's stale-preview recovery does
+not recognize, leaving the operator a stale Commit affordance and generic
+remediation for a preview that must be regenerated.
+
+Both facades now run `require_slots_belong_to_locked_season` AFTER the
+general recheck (immediately after `_require_batch_team_participation`,
+the other now-reordered narrower check), for the identical reason: any
+slot-scope drift this call could still catch necessarily also changes the
+Season-scoped candidate pool `_locked_proposal`'s own regeneration draws
+from (`_season_scoped_slot_ids` runs the identical
+`require_slot_belongs_to_season` check the narrower call uses, directly
+for an explicit `slot_ids` selection — where it raises INSIDE the
+`@catch`-decorated `draft_season_schedule`, becoming an error dict whose
+missing `draft_fingerprint` unconditionally fails the comparison — or via
+`slot_belongs_to_season` for an omitted one, changing which slots are
+even candidates) — already caught above, leaving this call now
+redundant-but-harmless defense-in-depth, on the same established
+precedent as the check above it.
+
+Pinned both facades, deterministic Memory/SQLite (real concurrent access
+to this check needs only the Season/Rink locks this transaction already
+holds by the time either check runs, so both a genuine race AND this
+same-process simulation observe the identical already-landed mutation —
+unlike round 13's Rink-lock-HELD proof, this is a pure read-compare, not
+reliant on demonstrating lock contention itself): a monkeypatched
+`draft_season_schedule` applies a SeasonVenueAccess revoke, or a Rink
+reassigned to a different Venue with no access, as a side effect of its
+FIRST call (the wide gate) — returning the pre-mutation snapshot so the
+wide gate's own comparison still passes — so the store already reflects
+the new state by the time the transaction opens and every subsequent
+check, in whichever order, observes it uniformly; asserts the LOCKED
+regeneration (the mock's second call) is what actually ran
+(`calls[0] == 2`) and that the result is `preview_stale`. Verified
+falsifiable: reintroducing the narrower check at its old position
+(immediately after `draft_ls_id` resolution) makes it win the race against
+the mock's own call counter — `calls[0]` stays at 1, the locked
+regeneration never runs, and the surfaced reason regresses to
+`venue_access_missing`.
+
 ## Reason codes referenced here
 
 Unscheduled-pairing codes are generation-time (`services/scheduler.py`,
