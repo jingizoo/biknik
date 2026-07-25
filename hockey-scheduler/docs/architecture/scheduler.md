@@ -954,6 +954,57 @@ the mock's own call counter — `calls[0]` stays at 1, the locked
 regeneration never runs, and the surfaced reason regresses to
 `venue_access_missing`.
 
+### The fingerprint's row encoding must be collision-free, not just complete (#328 review round 16)
+
+Every round from 5 through 15 widened `_draft_fingerprint` by adding more
+fields, but the encoding itself was unchanged since round 5: each row
+flattened to a single `"|"`-delimited string (e.g.
+`f"{home_team_name}|{away_team_name}|..."`), and the SET of those strings
+was what actually got hashed. Team names (and other operator-controlled
+text reaching the fingerprint — reason text, rink names) are free-form and
+may themselves contain `"|"`, so two DIFFERENT reviewed proposals could
+concatenate to the IDENTICAL pre-hash string: renaming a pairing's two
+teams from (`"A|B"`, `"C"`) to (`"A"`, `"B|C"`) leaves
+`f"{home_team_name}|{away_team_name}"` as `"A|B|C"` either way — a stale
+preview could then commit undetected despite the fingerprint supposedly
+binding exactly this field. Confirmed directly: a 2-team fixture (isolated
+so the renamed pair's one pairing is the ONLY row anywhere in the
+proposal — with more teams, the same two teams also appear in other rows
+whose strings legitimately differ, masking the specific collision) shows
+Commit accepting a stale token and creating the Game after this exact
+rename, with the fix reverted.
+
+Every bucket (`draft_games`/`already_scheduled`/`unscheduled`/
+`unschedulable_teams`) now builds a STRUCTURED dict of typed fields per
+row, embedded directly in the hashed JSON payload, rather than
+pre-flattening to a string: JSON's own quoting/escaping makes field
+boundaries unambiguous (`{"a":"X|Y","b":"Z"}` and `{"a":"X","b":"Y|Z"}`
+serialize to textually different JSON, regardless of what characters `X`,
+`Y`, or `Z` contain). Row order within each bucket — needed so the same
+SET of rows hashes identically regardless of generation order — is now
+established by sorting on each row's own canonical JSON serialization
+(`_canonical_sort_key`), never by concatenating fields together the way
+the old sort key did; this sort key carries none of the same
+field-boundary ambiguity since a JSON object's serialization is itself
+unambiguous.
+
+Pinned by direct `DraftFingerprintTest` unit tests reproducing the exact
+collision construction for each bucket with an adjacent pair of free-text
+fields (`draft_games`/`already_scheduled`/`unscheduled`, each carrying
+`home_team_name`/`away_team_name` back-to-back — `unschedulable_teams` has
+only one free-text field per row, so no adjacent-pair collision is
+constructible there) plus a both-facade Memory/SQLite/PostgreSQL
+regression using the real `commit_teams_players_import` repeat-import
+path to rename both of a placed pairing's teams in one import, exactly
+reproducing the collision end-to-end and asserting terminal
+`preview_stale` with zero writes. `reason_codes`/`team_ids` stay
+order-independent sets, now represented as genuine JSON arrays rather
+than comma-joined strings — confirmed via a permuted-order test
+alongside the pre-existing `team_ids` one. All verified falsifiable
+against the pre-round-16 delimiter-joined encoding, including the
+end-to-end regression actually creating a Game under a stale token when
+reverted.
+
 ## Reason codes referenced here
 
 Unscheduled-pairing codes are generation-time (`services/scheduler.py`,

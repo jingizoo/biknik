@@ -228,6 +228,58 @@ class DraftFingerprintTest(unittest.TestCase):
              "reason_codes": ["no_ice_available"]}]
         self.assertNotEqual(_draft_fingerprint(**a), _draft_fingerprint(**b))
 
+    # -- the pre-round-16 delimiter-joined encoding let differently-shaped
+    # operator text collide into the same pre-hash string (#328 review
+    # round 16) -------------------------------------------------------------
+    def test_draft_games_team_name_split_does_not_collide(self):
+        """A team name containing the OLD encoding's own "|" delimiter
+        could make two genuinely different (home_team_name,
+        away_team_name) pairs concatenate to the identical string: "A|B"
+        home + "C" away, versus "A" home + "B|C" away, both joined
+        f"{home}|{away}" as "A|B|C". A real-world equivalent: an operator
+        splits a combined club/team name differently across two teams in a
+        repeat CSV import. The fingerprint must still distinguish them."""
+        a = self._base_args()
+        b = self._base_args()
+        a["draft_games"] = [dict(a["draft_games"][0], home_team_name="A|B",
+                                 away_team_name="C")]
+        b["draft_games"] = [dict(b["draft_games"][0], home_team_name="A",
+                                 away_team_name="B|C")]
+        self.assertNotEqual(_draft_fingerprint(**a), _draft_fingerprint(**b))
+
+    def test_already_scheduled_team_name_split_does_not_collide(self):
+        a = self._base_args()
+        b = self._base_args()
+        row = {"division_id": "d1", "home_team_id": "t0", "away_team_id": "t3",
+               "existing_game_id": "g1"}
+        a["already_scheduled"] = [dict(row, home_team_name="A|B",
+                                       away_team_name="C")]
+        b["already_scheduled"] = [dict(row, home_team_name="A",
+                                       away_team_name="B|C")]
+        self.assertNotEqual(_draft_fingerprint(**a), _draft_fingerprint(**b))
+
+    def test_unscheduled_team_name_split_does_not_collide(self):
+        a = self._base_args()
+        b = self._base_args()
+        a["unscheduled"] = [dict(a["unscheduled"][0], home_team_name="A|B",
+                                 away_team_name="C")]
+        b["unscheduled"] = [dict(b["unscheduled"][0], home_team_name="A",
+                                 away_team_name="B|C")]
+        self.assertNotEqual(_draft_fingerprint(**a), _draft_fingerprint(**b))
+
+    def test_reason_codes_order_does_not_matter(self):
+        """The round-16 refactor still embeds reason_codes as an explicit
+        sorted JSON array, not a delimiter-joined string -- confirm this
+        semantically-unordered set stays order-independent, the same
+        property test_team_ids_order_does_not_matter proves for team_ids."""
+        a = self._base_args()
+        b = self._base_args()
+        a["unscheduled"] = [dict(a["unscheduled"][0],
+                                 reason_codes=["no_ice_available", "team_rest_violation"])]
+        b["unscheduled"] = [dict(b["unscheduled"][0],
+                                 reason_codes=["team_rest_violation", "no_ice_available"])]
+        self.assertEqual(_draft_fingerprint(**a), _draft_fingerprint(**b))
+
     def test_identical_inputs_are_deterministic(self):
         a = self._base_args()
         b = self._base_args()
@@ -1644,6 +1696,91 @@ class SchedulerContract:
             self):
         self._venue_scope_change_after_internal_regen_refused(
             BaseApiService, "reparent")
+
+    # -- the fingerprint's delimiter-joined encoding let a differently-split
+    # team-name pair produce the SAME pre-hash string (#328 review round 16)
+    # -------------------------------------------------------------------
+    def _stale_preview_refused_on_delimiter_colliding_team_rename(self, api_cls):
+        """The exact real-world reproduction of round 16's finding: a
+        repeat teams/players CSV import (#92) renames BOTH of a placed
+        pairing's teams in the SAME import, from ("A|B", "C") to
+        ("A", "B|C") -- splitting where the "|" delimiter falls
+        differently across the two names. Under the pre-round-16 encoding
+        (f"{home_team_name}|{away_team_name}") both states concatenate to
+        the identical "A|B|C", so the fingerprint would have stayed
+        unchanged despite two genuinely different reviewed matchup labels.
+        Commit must still refuse as stale.
+
+        Uses a 2-TEAM fixture (`_division_fixture(2, 1)`), not the usual
+        4-team one: with more teams, the renamed pair would ALSO each
+        appear in OTHER pairings (vs a third/fourth team whose own name is
+        unchanged), and those OTHER rows' strings would legitimately
+        differ before/after regardless of this fix -- masking the specific
+        collision under test entirely (confirmed empirically while
+        designing this test: a 4-team version of this same test stayed
+        green even with the round-16 fix fully reverted). With only two
+        teams, their one pairing is the ONLY row in the whole proposal, so
+        nothing else can change the fingerprint out from under the
+        isolated axis this test exercises."""
+        self._division_fixture(2, 1)  # t0, t1, 1 slot on r1: places (t0, t1)
+        home = self.store.get_team("t0")
+        away = self.store.get_team("t1")
+        home.name, home.external_ref = "A|B", "T0"
+        away.name, away.external_ref = "C", "T1"
+        self.store.save_team(home)
+        self.store.save_team(away)
+        api = api_cls(self.store)
+        preview = api.draft_season_schedule("div1")
+        self.assertEqual(len(preview["draft_games"]), 1, repr(preview))
+        self.assertEqual(
+            (preview["draft_games"][0]["home_team_name"],
+             preview["draft_games"][0]["away_team_name"]),
+            ("A|B", "C"), repr(preview))
+        placed_slot_id = preview["draft_games"][0]["ice_slot_id"]
+        stale_fingerprint = preview["draft_fingerprint"]
+
+        renamed_csv = ("team_code,team_name,division_name\n"
+                       "T0,A,D1\nT1,B|C,D1\n")
+        import_res = api.commit_teams_players_import(
+            "se1", {"teams_csv": renamed_csv}, actor_id="admin")
+        self.assertTrue(import_res.get("committed"), repr(import_res))
+        self.assertEqual(self.store.get_team("t0").name, "A")
+        self.assertEqual(self.store.get_team("t1").name, "B|C")
+        # Confirm the fresh regeneration keeps the placed row's identity
+        # (same pairing, same slot) unchanged -- isolating the team-NAME
+        # axis -- and that its fingerprint genuinely differs despite the
+        # OLD encoding's own home|away concatenation being identical
+        # either way ("A|B|C").
+        fresh = api.draft_season_schedule("div1")
+        self.assertEqual(len(fresh["draft_games"]), 1, repr(fresh))
+        self.assertEqual(
+            fresh["draft_games"][0]["ice_slot_id"], placed_slot_id, repr(fresh))
+        self.assertEqual(
+            (fresh["draft_games"][0]["home_team_name"],
+             fresh["draft_games"][0]["away_team_name"]),
+            ("A", "B|C"), repr(fresh))
+        self.assertNotEqual(
+            fresh["draft_fingerprint"], stale_fingerprint, repr(fresh))
+
+        games_before = len(self.store.all_games())
+        audits_before = len(self.store.all_setup_audit())
+        res = api.commit_draft_schedule(
+            "div1", draft_fingerprint=stale_fingerprint)
+        self.assertIn("error", res, repr(res))
+        self.assertEqual(
+            res["error"]["details"]["reason"], "preview_stale", repr(res))
+        self.assertEqual(len(self.store.all_games()), games_before, repr(res))
+        self.assertEqual(
+            len(self.store.all_setup_audit()), audits_before, repr(res))
+
+    def test_league_scoped_commit_refuses_stale_preview_after_delimiter_colliding_team_rename(
+            self):
+        self._stale_preview_refused_on_delimiter_colliding_team_rename(ApiService)
+
+    def test_base_facade_commit_refuses_stale_preview_after_delimiter_colliding_team_rename(
+            self):
+        self._stale_preview_refused_on_delimiter_colliding_team_rename(
+            BaseApiService)
 
     # -- ALL fingerprint-bound state must be revalidated under the lock, not
     # just draft_games/already_scheduled row identity (#328 review round 11

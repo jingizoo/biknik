@@ -451,10 +451,22 @@ def _split_already_scheduled(store, pairings, existing, league_season_id):
     return remaining, already
 
 
+def _canonical_sort_key(row):
+    """A row's own canonical JSON serialization (#328 review round 16),
+    used purely to give ``_draft_fingerprint``'s bucket lists a
+    deterministic order independent of generation order -- e.g. so the
+    same SET of unscheduled rows hashes identically regardless of which
+    order the constraint-evaluation loop happened to produce them in.
+    Never delimiter-joined: unlike the pre-round-16 string encoding this
+    replaces, a dict's own JSON serialization has no field-boundary
+    ambiguity for a sort key to inherit."""
+    return json.dumps(row, sort_keys=True, separators=(",", ":"), default=str)
+
+
 def _draft_fingerprint(league_season_id, team_ids, draft_games, unscheduled,
                         unschedulable_teams, already_scheduled):
     """Deterministic identity of exactly what this proposal reviewed — #328
-    review round 5, widened rounds 7, 10, 11, 12, and 15. Bound into the response
+    review round 5, widened rounds 7, 10, 11, 12, 15, and 16. Bound into the response
     so the commit path can prove, right before writing, that this fact
     hasn't changed since: a Regular Game silently created or cancelled in
     the gap between the operator's preview and clicking Commit changes
@@ -538,28 +550,66 @@ def _draft_fingerprint(league_season_id, team_ids, draft_games, unscheduled,
     `away_team_name` (`draft_games`/`already_scheduled`/`unscheduled`) and
     `team_name` (`unschedulable_teams`) closes that gap the same way
     `rink_name` closed it for ice.
+
+    #328 review round 16 correction: every row above was previously a
+    single ``"|"``-delimited string, e.g.
+    ``f"{home_team_name}|{away_team_name}|..."``. Team names (and other
+    operator-controlled text) are free-form and may themselves contain
+    ``"|"``, so two DIFFERENT reviewed proposals could concatenate to the
+    IDENTICAL pre-hash string: renaming a pairing's teams from
+    (``"A|B"``, ``"C"``) to (``"A"``, ``"B|C"``) leaves
+    ``f"{home}|{away}"`` as ``"A|B|C"`` either way -- a stale preview could
+    then commit undetected. Each row is now a STRUCTURED dict of typed
+    fields, embedded directly in the hashed JSON payload (whose own
+    quoting/escaping makes field boundaries unambiguous -- ``{"a":"X|Y",
+    "b":"Z"}`` and ``{"a":"X","b":"Y|Z"}`` serialize to textually
+    different JSON) rather than pre-flattened to a string; row ORDER
+    within each bucket is still made deterministic by sorting on each
+    row's own canonical JSON serialization (`_canonical_sort_key`), never
+    by concatenating fields together the way the old sort key did.
     """
-    missing = sorted(
-        f"{d.get('division_id')}|{d['home_team_id']}|{d['away_team_id']}|"
-        f"{d.get('home_team_name')}|{d.get('away_team_name')}|"
-        f"{d.get('ice_slot_id')}|{d.get('start_time')}|{d.get('end_time')}|"
-        f"{d.get('rink_id')}|{d.get('rink_name')}"
-        for d in draft_games)
-    scheduled = sorted(
-        f"{a.get('division_id')}|{a['home_team_id']}|{a['away_team_id']}|"
-        f"{a.get('home_team_name')}|{a.get('away_team_name')}|"
-        f"{a['existing_game_id']}"
-        for a in already_scheduled)
-    unresolved = sorted(
-        f"{u.get('division_id')}|{u['home_team_id']}|{u['away_team_id']}|"
-        f"{u.get('home_team_name')}|{u.get('away_team_name')}|"
-        + ",".join(sorted(u.get("reason_codes") or ())) + "|"
-        + (u.get("reason") or "")
-        for u in unscheduled)
-    blocked_teams = sorted(
-        f"{t['team_id']}|{t.get('team_name')}|"
-        + ",".join(sorted(t.get("reason_codes") or ()))
-        for t in unschedulable_teams)
+    missing = sorted((
+        {
+            "division_id": d.get("division_id"),
+            "home_team_id": d["home_team_id"],
+            "away_team_id": d["away_team_id"],
+            "home_team_name": d.get("home_team_name"),
+            "away_team_name": d.get("away_team_name"),
+            "ice_slot_id": d.get("ice_slot_id"),
+            "start_time": d.get("start_time"),
+            "end_time": d.get("end_time"),
+            "rink_id": d.get("rink_id"),
+            "rink_name": d.get("rink_name"),
+        }
+        for d in draft_games), key=_canonical_sort_key)
+    scheduled = sorted((
+        {
+            "division_id": a.get("division_id"),
+            "home_team_id": a["home_team_id"],
+            "away_team_id": a["away_team_id"],
+            "home_team_name": a.get("home_team_name"),
+            "away_team_name": a.get("away_team_name"),
+            "existing_game_id": a["existing_game_id"],
+        }
+        for a in already_scheduled), key=_canonical_sort_key)
+    unresolved = sorted((
+        {
+            "division_id": u.get("division_id"),
+            "home_team_id": u["home_team_id"],
+            "away_team_id": u["away_team_id"],
+            "home_team_name": u.get("home_team_name"),
+            "away_team_name": u.get("away_team_name"),
+            "reason_codes": sorted(u.get("reason_codes") or ()),
+            "reason": u.get("reason") or "",
+        }
+        for u in unscheduled), key=_canonical_sort_key)
+    blocked_teams = sorted((
+        {
+            "team_id": t["team_id"],
+            "team_name": t.get("team_name"),
+            "reason_codes": sorted(t.get("reason_codes") or ()),
+        }
+        for t in unschedulable_teams), key=_canonical_sort_key)
     payload = {
         "league_season_id": league_season_id,
         "team_ids": sorted(team_ids),
