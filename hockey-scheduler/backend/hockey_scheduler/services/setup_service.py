@@ -5903,123 +5903,141 @@ class SetupService:
                 "warnings": officials_result["warnings"] + avail_result["warnings"],
             }
 
-        counts = {"officials_created": 0, "officials_updated": 0,
-                  "availability_created": 0, "availability_updated": 0,
-                  "clubs_created": 0}
         # See commit_teams_players_import's identical note: generated up
         # front so every row-level audit entry can be tagged with it (#102).
         batch_id = self.store.next_id("importbatch")
 
-        with self.store.transaction():
-            official_code_to_id = {}
-            for row in officials_rows:
-                official_code = _clean(row.get("official_code"))
-                name = _clean(row.get("name"))
-                email_raw = row.get("email")
-                email = _clean(email_raw) if not _blank(email_raw) else None
+        # Retry the whole batch if the unique-index backstop rejects an
+        # INSERT (#331 review round 11 finding 2): unlike
+        # commit_teams_players_import, there is no Season row to lock, so a
+        # brand-new official_code or availability (official, start, end)
+        # tuple has nothing to serialize check-then-create against two
+        # concurrent commits landing the same key. Migration 047's unique
+        # indexes are the authoritative backstop; a race-losing INSERT rolls
+        # the whole attempt back (self.store.transaction() translates it to
+        # IntegrityConflictError) and the retry's fresh absence checks see
+        # the winner's row and correctly take the update path instead of
+        # creating a second one -- mirrors commit_ice_availability's
+        # identical retry loop.
+        for attempt in range(3):
+            counts = {"officials_created": 0, "officials_updated": 0,
+                      "availability_created": 0, "availability_updated": 0,
+                      "clubs_created": 0}
+            try:
+                with self.store.transaction():
+                    official_code_to_id = {}
+                    for row in officials_rows:
+                        official_code = _clean(row.get("official_code"))
+                        name = _clean(row.get("name"))
+                        email_raw = row.get("email")
+                        email = _clean(email_raw) if not _blank(email_raw) else None
 
-                club_id = None
-                club_name_raw = row.get("home_club_name")
-                if not _no_club(club_name_raw):
-                    club_name = _clean(club_name_raw)
-                    club = next((c for c in self.store.all_clubs()
-                                if c.name == club_name), None)
-                    if club is None:
-                        club = Club(id=self.store.next_id("club"), name=club_name)
-                        self.store.add_club(club)
-                        self._audit("club_created", "club", club.id, actor_id,
-                                    {"import_batch_id": batch_id})
-                        counts["clubs_created"] += 1
-                    club_id = club.id
+                        club_id = None
+                        club_name_raw = row.get("home_club_name")
+                        if not _no_club(club_name_raw):
+                            club_name = _clean(club_name_raw)
+                            club = next((c for c in self.store.all_clubs()
+                                        if c.name == club_name), None)
+                            if club is None:
+                                club = Club(id=self.store.next_id("club"), name=club_name)
+                                self.store.add_club(club)
+                                self._audit("club_created", "club", club.id, actor_id,
+                                            {"import_batch_id": batch_id})
+                                counts["clubs_created"] += 1
+                            club_id = club.id
 
-                official = next((o for o in self.store.all_officials()
+                        official = next((o for o in self.store.all_officials()
+                                         if o.external_ref == official_code), None)
+                        if official is not None:
+                            official.name = name
+                            official.home_club_id = club_id
+                            self.store.save_official(official)
+                            self._audit("official_updated", "official", official.id,
+                                        actor_id, {"home_club_id": club_id,
+                                                  "import_batch_id": batch_id})
+                            counts["officials_updated"] += 1
+                        else:
+                            official = Official(id=self.store.next_id("official"),
+                                                name=name, home_club_id=club_id,
+                                                external_ref=official_code)
+                            self.store.add_official(official)
+                            self._audit("official_created", "official", official.id,
+                                        actor_id, {"import_batch_id": batch_id})
+                            counts["officials_created"] += 1
+                        official_code_to_id[official_code] = official.id
+
+                        if email is not None:
+                            recipient_ref = f"official:{official.id}"
+                            existing = self.store.get_contact_destination(
+                                recipient_ref, NotificationChannel.EMAIL)
+                            if existing is not None:
+                                existing.destination = email
+                                self.store.save_contact_destination(existing)
+                            else:
+                                self.store.add_contact_destination(ContactDestination(
+                                    id=self.store.next_id("contact"),
+                                    recipient_ref=recipient_ref,
+                                    channel=NotificationChannel.EMAIL,
+                                    destination=email))
+
+                    for row in availability_rows:
+                        official_code = _clean(row.get("official_code"))
+                        official_id = official_code_to_id.get(official_code)
+                        if official_id is None:
+                            # Not in this upload's officials sheet — validation only
+                            # let this through because official_code matched an
+                            # existing_external_ref, i.e. an official created by a
+                            # PRIOR commit (#94's key new capability over #93).
+                            existing = next(
+                                (o for o in self.store.all_officials()
                                  if o.external_ref == official_code), None)
-                if official is not None:
-                    official.name = name
-                    official.home_club_id = club_id
-                    self.store.save_official(official)
-                    self._audit("official_updated", "official", official.id,
-                                actor_id, {"home_club_id": club_id,
-                                          "import_batch_id": batch_id})
-                    counts["officials_updated"] += 1
-                else:
-                    official = Official(id=self.store.next_id("official"),
-                                        name=name, home_club_id=club_id,
-                                        external_ref=official_code)
-                    self.store.add_official(official)
-                    self._audit("official_created", "official", official.id,
-                                actor_id, {"import_batch_id": batch_id})
-                    counts["officials_created"] += 1
-                official_code_to_id[official_code] = official.id
+                            official_id = existing.id if existing else None
+                        if official_id is None:
+                            raise ValidationError(
+                                f"Unknown official_code {official_code} for "
+                                f"official_availability row.")
 
-                if email is not None:
-                    recipient_ref = f"official:{official.id}"
-                    existing = self.store.get_contact_destination(
-                        recipient_ref, NotificationChannel.EMAIL)
-                    if existing is not None:
-                        existing.destination = email
-                        self.store.save_contact_destination(existing)
-                    else:
-                        self.store.add_contact_destination(ContactDestination(
-                            id=self.store.next_id("contact"),
-                            recipient_ref=recipient_ref,
-                            channel=NotificationChannel.EMAIL,
-                            destination=email))
+                        start = _parse_iso_utc(row.get("start_time"))
+                        end = _parse_iso_utc(row.get("end_time"))
+                        status_raw = _clean(row.get("status"))
+                        note_raw = row.get("note")
+                        note = _clean(note_raw) if not _blank(note_raw) else None
 
-            for row in availability_rows:
-                official_code = _clean(row.get("official_code"))
-                official_id = official_code_to_id.get(official_code)
-                if official_id is None:
-                    # Not in this upload's officials sheet — validation only
-                    # let this through because official_code matched an
-                    # existing_external_ref, i.e. an official created by a
-                    # PRIOR commit (#94's key new capability over #93).
-                    existing = next(
-                        (o for o in self.store.all_officials()
-                         if o.external_ref == official_code), None)
-                    official_id = existing.id if existing else None
-                if official_id is None:
-                    raise ValidationError(
-                        f"Unknown official_code {official_code} for "
-                        f"official_availability row.")
+                        existing_window = next(
+                            (a for a in self.store.availability_for_official(official_id)
+                             if a.start_time == start and a.end_time == end), None)
+                        if existing_window is not None:
+                            existing_window.status = OfficialAvailabilityStatus(status_raw)
+                            existing_window.note = note
+                            self.store.save_official_availability(existing_window)
+                            self._audit("official_availability_updated",
+                                        "official_availability", existing_window.id,
+                                        actor_id, {"official_id": official_id,
+                                                  "status": status_raw,
+                                                  "import_batch_id": batch_id})
+                            counts["availability_updated"] += 1
+                        else:
+                            self.set_official_availability(
+                                official_id, start, end, status_raw, note=note,
+                                actor_id=actor_id,
+                                extra_detail={"import_batch_id": batch_id})
+                            counts["availability_created"] += 1
 
-                start = _parse_iso_utc(row.get("start_time"))
-                end = _parse_iso_utc(row.get("end_time"))
-                status_raw = _clean(row.get("status"))
-                note_raw = row.get("note")
-                note = _clean(note_raw) if not _blank(note_raw) else None
-
-                existing_window = next(
-                    (a for a in self.store.availability_for_official(official_id)
-                     if a.start_time == start and a.end_time == end), None)
-                if existing_window is not None:
-                    existing_window.status = OfficialAvailabilityStatus(status_raw)
-                    existing_window.note = note
-                    self.store.save_official_availability(existing_window)
-                    self._audit("official_availability_updated",
-                                "official_availability", existing_window.id,
-                                actor_id, {"official_id": official_id,
-                                          "status": status_raw,
-                                          "import_batch_id": batch_id})
-                    counts["availability_updated"] += 1
-                else:
-                    self.set_official_availability(
-                        official_id, start, end, status_raw, note=note,
-                        actor_id=actor_id,
-                        extra_detail={"import_batch_id": batch_id})
-                    counts["availability_created"] += 1
-
-            # skipped/errors are always 0 here by construction — see the
-            # identical note on commit_teams_players_import's import_committed
-            # audit row above.
-            self._audit("import_committed", "import_batch", batch_id, actor_id,
-                        {"import_type": "officials_availability",
-                         "officials_created": counts["officials_created"],
-                         "officials_updated": counts["officials_updated"],
-                         "availability_created": counts["availability_created"],
-                         "availability_updated": counts["availability_updated"],
-                         "clubs_created": counts["clubs_created"],
-                         "skipped": 0, "errors": 0})
+                    # skipped/errors are always 0 here by construction — see the
+                    # identical note on commit_teams_players_import's import_committed
+                    # audit row above.
+                    self._audit("import_committed", "import_batch", batch_id, actor_id,
+                                {"import_type": "officials_availability",
+                                 "officials_created": counts["officials_created"],
+                                 "officials_updated": counts["officials_updated"],
+                                 "availability_created": counts["availability_created"],
+                                 "availability_updated": counts["availability_updated"],
+                                 "clubs_created": counts["clubs_created"],
+                                 "skipped": 0, "errors": 0})
+                break  # committed cleanly
+            except IntegrityConflictError:
+                if attempt == 2:
+                    raise
 
         return {
             "committed": True,
@@ -6164,165 +6182,186 @@ class SetupService:
                     f"from {existing_slot.slot_type.value} to "
                     f"{new_slot_type.value}.")
 
-        counts = {"rinks_created": 0, "rinks_updated": 0,
-                  "ice_slots_created": 0, "ice_slots_updated": 0,
-                  "venues_created": 0}
         # See commit_teams_players_import's identical note: generated up
         # front so every row-level audit entry can be tagged with it (#102).
         batch_id = self.store.next_id("importbatch")
 
-        with self.store.transaction():
-            # Row-lock every rink this import already has (matched by
-            # external_ref), in ascending id order, before any slot read or
-            # write. commit_ice_availability locks its accessible rinks in the
-            # same order, so a concurrent builder commit (or a second import) on
-            # a shared rink serializes here instead of racing or deadlocking, and
-            # the overlap snapshot below then reads state no locked-out writer can
-            # still grow underneath it (#158 review).
-            _existing_rink_by_code = {r.external_ref: r
-                                      for r in self.store.all_rinks()
-                                      if r.external_ref}
-            _codes = {_clean(row.get("rink_code")) for row in rink_rows}
-            for _rid in sorted(_existing_rink_by_code[c].id for c in _codes
-                               if c in _existing_rink_by_code):
-                self.store.get_rink_for_update(_rid)
+        # Retry the whole batch if the unique-index backstop rejects an
+        # INSERT (#331 review round 11 finding 2): the row-lock loop just
+        # below only covers rinks this import ALREADY has -- a brand-new
+        # rink_code has nothing to lock, so two concurrent commits can each
+        # see it absent and both attempt to create their own Rink. Migration
+        # 048's unique index is the authoritative backstop; a race-losing
+        # Rink INSERT rolls the whole attempt back and the retry's fresh
+        # by-external_ref lookup sees the winner's row and correctly takes
+        # the update path instead of creating a second one -- mirrors
+        # commit_ice_availability's and
+        # commit_officials_availability_import's identical retry loops. The
+        # separate Venue-by-name match is a structurally identical unlocked
+        # check-then-create to commit_officials_availability_import's Club-
+        # by-name match (also out of this scope) and is not independently
+        # closed by this index -- see migration 048's own comment.
+        for attempt in range(3):
+            counts = {"rinks_created": 0, "rinks_updated": 0,
+                      "ice_slots_created": 0, "ice_slots_updated": 0,
+                      "venues_created": 0}
+            try:
+                with self.store.transaction():
+                    # Row-lock every rink this import already has (matched by
+                    # external_ref), in ascending id order, before any slot read or
+                    # write. commit_ice_availability locks its accessible rinks in the
+                    # same order, so a concurrent builder commit (or a second import) on
+                    # a shared rink serializes here instead of racing or deadlocking, and
+                    # the overlap snapshot below then reads state no locked-out writer can
+                    # still grow underneath it (#158 review).
+                    _existing_rink_by_code = {r.external_ref: r
+                                              for r in self.store.all_rinks()
+                                              if r.external_ref}
+                    _codes = {_clean(row.get("rink_code")) for row in rink_rows}
+                    for _rid in sorted(_existing_rink_by_code[c].id for c in _codes
+                                       if c in _existing_rink_by_code):
+                        self.store.get_rink_for_update(_rid)
 
-            # Overlap gate, under the locks and BEFORE any write (mirrors the
-            # slot_type gate's all-or-nothing placement so it rolls back cleanly
-            # on every backend, including InMemoryStore's no-op transaction). A
-            # new slot on an EXISTING rink must not physically overlap ice already
-            # persisted there by another writer — a concurrent
-            # commit_ice_availability batch or an earlier import. Migration 045's
-            # (rink, start, end) unique index catches only an exact-tuple
-            # duplicate (which takes the update path below), so a NON-exact
-            # overlap (an imported 22:30-23:30 against a committed 22:00-23:00)
-            # would otherwise leave both rows alive. Slots on rinks this import
-            # is creating have no persisted ice to clash with; overlaps *within
-            # this upload* aren't persisted yet, so they stay validate_import's
-            # warning-only concern (#158 review).
-            _persisted_by_rink = {}
-            for _s in self.store.all_ice_slots():
-                _persisted_by_rink.setdefault(_s.rink_id, []).append(_s)
-            for row in slot_rows:
-                _rink = _existing_rink_by_code.get(_clean(row.get("rink_code")))
-                if _rink is None:
-                    continue  # a brand-new rink can't yet have persisted ice
-                _start = _parse_iso_utc(row.get("start_time"))
-                _end = _parse_iso_utc(row.get("end_time"))
-                _persisted = _persisted_by_rink.get(_rink.id, [])
-                if any(s.start_time == _start and s.end_time == _end
-                       for s in _persisted):
-                    continue  # exact tuple -> update path, not a new overlap
-                _clash = next((s for s in _persisted if intervals_overlap(
-                    _start, _end, s.start_time, s.end_time)), None)
-                if _clash is not None:
-                    raise ScheduleConflictError(
-                        f"Imported ice slot {_start.isoformat()} to "
-                        f"{_end.isoformat()} on rink_code "
-                        f"{_clean(row.get('rink_code'))} overlaps persisted slot "
-                        f"{_clash.id} on the same rink.",
-                        {"reason": "ice_slot_overlap", "rink_id": _rink.id,
-                         "rink_code": _clean(row.get("rink_code")),
-                         "conflict_slot_id": _clash.id})
+                    # Overlap gate, under the locks and BEFORE any write (mirrors the
+                    # slot_type gate's all-or-nothing placement so it rolls back cleanly
+                    # on every backend, including InMemoryStore's no-op transaction). A
+                    # new slot on an EXISTING rink must not physically overlap ice already
+                    # persisted there by another writer — a concurrent
+                    # commit_ice_availability batch or an earlier import. Migration 045's
+                    # (rink, start, end) unique index catches only an exact-tuple
+                    # duplicate (which takes the update path below), so a NON-exact
+                    # overlap (an imported 22:30-23:30 against a committed 22:00-23:00)
+                    # would otherwise leave both rows alive. Slots on rinks this import
+                    # is creating have no persisted ice to clash with; overlaps *within
+                    # this upload* aren't persisted yet, so they stay validate_import's
+                    # warning-only concern (#158 review).
+                    _persisted_by_rink = {}
+                    for _s in self.store.all_ice_slots():
+                        _persisted_by_rink.setdefault(_s.rink_id, []).append(_s)
+                    for row in slot_rows:
+                        _rink = _existing_rink_by_code.get(_clean(row.get("rink_code")))
+                        if _rink is None:
+                            continue  # a brand-new rink can't yet have persisted ice
+                        _start = _parse_iso_utc(row.get("start_time"))
+                        _end = _parse_iso_utc(row.get("end_time"))
+                        _persisted = _persisted_by_rink.get(_rink.id, [])
+                        if any(s.start_time == _start and s.end_time == _end
+                               for s in _persisted):
+                            continue  # exact tuple -> update path, not a new overlap
+                        _clash = next((s for s in _persisted if intervals_overlap(
+                            _start, _end, s.start_time, s.end_time)), None)
+                        if _clash is not None:
+                            raise ScheduleConflictError(
+                                f"Imported ice slot {_start.isoformat()} to "
+                                f"{_end.isoformat()} on rink_code "
+                                f"{_clean(row.get('rink_code'))} overlaps persisted slot "
+                                f"{_clash.id} on the same rink.",
+                                {"reason": "ice_slot_overlap", "rink_id": _rink.id,
+                                 "rink_code": _clean(row.get("rink_code")),
+                                 "conflict_slot_id": _clash.id})
 
-            rink_code_to_id = {}
-            for row in rink_rows:
-                rink_code = _clean(row.get("rink_code"))
-                venue_name = _clean(row.get("venue_name"))
-                rink_name_raw = row.get("rink_name")
-                # rink_name isn't in validate_import's required fields for
-                # "rinks" (only venue_name/rink_code are). A brand-new rink
-                # defaults its name to the code so it's never blank (an
-                # explicit judgment call mirroring #93's position-default,
-                # may want revisiting); an EXISTING rink's name is a
-                # partial-field-overwrite — a repeat row that omits
-                # rink_name must leave the current name alone rather than
-                # clobbering it back to the code (review fix).
-                rink_name_supplied = not _blank(rink_name_raw)
-                rink_name = _clean(rink_name_raw) if rink_name_supplied else None
-                address_raw = row.get("address")
-                address = _clean(address_raw) if not _blank(address_raw) else ""
+                    rink_code_to_id = {}
+                    for row in rink_rows:
+                        rink_code = _clean(row.get("rink_code"))
+                        venue_name = _clean(row.get("venue_name"))
+                        rink_name_raw = row.get("rink_name")
+                        # rink_name isn't in validate_import's required fields for
+                        # "rinks" (only venue_name/rink_code are). A brand-new rink
+                        # defaults its name to the code so it's never blank (an
+                        # explicit judgment call mirroring #93's position-default,
+                        # may want revisiting); an EXISTING rink's name is a
+                        # partial-field-overwrite — a repeat row that omits
+                        # rink_name must leave the current name alone rather than
+                        # clobbering it back to the code (review fix).
+                        rink_name_supplied = not _blank(rink_name_raw)
+                        rink_name = _clean(rink_name_raw) if rink_name_supplied else None
+                        address_raw = row.get("address")
+                        address = _clean(address_raw) if not _blank(address_raw) else ""
 
-                venue = next((v for v in self.store.all_venues()
-                             if v.name == venue_name), None)
-                if venue is None:
-                    venue = Venue(id=self.store.next_id("venue"), name=venue_name,
-                                  address=address)
-                    self.store.add_venue(venue)
-                    self._audit("venue_created", "venue", venue.id, actor_id,
-                                {"import_batch_id": batch_id})
-                    counts["venues_created"] += 1
+                        venue = next((v for v in self.store.all_venues()
+                                     if v.name == venue_name), None)
+                        if venue is None:
+                            venue = Venue(id=self.store.next_id("venue"), name=venue_name,
+                                          address=address)
+                            self.store.add_venue(venue)
+                            self._audit("venue_created", "venue", venue.id, actor_id,
+                                        {"import_batch_id": batch_id})
+                            counts["venues_created"] += 1
 
-                rink = next((r for r in self.store.all_rinks()
-                            if r.external_ref == rink_code), None)
-                if rink is not None:
-                    if rink_name_supplied:
-                        rink.name = rink_name
-                    rink.venue_id = venue.id
-                    self.store.save_rink(rink)
-                    self._audit("rink_updated", "rink", rink.id, actor_id,
-                                {"venue_id": venue.id, "import_batch_id": batch_id})
-                    counts["rinks_updated"] += 1
-                else:
-                    rink = Rink(id=self.store.next_id("rink"), venue_id=venue.id,
-                               name=rink_name if rink_name_supplied else rink_code,
-                               external_ref=rink_code)
-                    self.store.add_rink(rink)
-                    self._audit("rink_created", "rink", rink.id, actor_id,
-                                {"venue_id": venue.id, "import_batch_id": batch_id})
-                    counts["rinks_created"] += 1
-                rink_code_to_id[rink_code] = rink.id
+                        rink = next((r for r in self.store.all_rinks()
+                                    if r.external_ref == rink_code), None)
+                        if rink is not None:
+                            if rink_name_supplied:
+                                rink.name = rink_name
+                            rink.venue_id = venue.id
+                            self.store.save_rink(rink)
+                            self._audit("rink_updated", "rink", rink.id, actor_id,
+                                        {"venue_id": venue.id, "import_batch_id": batch_id})
+                            counts["rinks_updated"] += 1
+                        else:
+                            rink = Rink(id=self.store.next_id("rink"), venue_id=venue.id,
+                                       name=rink_name if rink_name_supplied else rink_code,
+                                       external_ref=rink_code)
+                            self.store.add_rink(rink)
+                            self._audit("rink_created", "rink", rink.id, actor_id,
+                                        {"venue_id": venue.id, "import_batch_id": batch_id})
+                            counts["rinks_created"] += 1
+                        rink_code_to_id[rink_code] = rink.id
 
-            for row in slot_rows:
-                rink_code = _clean(row.get("rink_code"))
-                # validate_import already guarantees this rink_code matches a
-                # row in THIS SAME upload's rinks sheet; .get() is just a
-                # defensive belt-and-suspenders check against a bug elsewhere.
-                rink_id = rink_code_to_id.get(rink_code)
-                if rink_id is None:
-                    raise ValidationError(
-                        f"Unknown rink_code {rink_code} for ice_slots row.")
+                    for row in slot_rows:
+                        rink_code = _clean(row.get("rink_code"))
+                        # validate_import already guarantees this rink_code matches a
+                        # row in THIS SAME upload's rinks sheet; .get() is just a
+                        # defensive belt-and-suspenders check against a bug elsewhere.
+                        rink_id = rink_code_to_id.get(rink_code)
+                        if rink_id is None:
+                            raise ValidationError(
+                                f"Unknown rink_code {rink_code} for ice_slots row.")
 
-                start = _parse_iso_utc(row.get("start_time"))
-                end = _parse_iso_utc(row.get("end_time"))
-                slot_type = IceSlotType(_clean(row.get("slot_type")))
+                        start = _parse_iso_utc(row.get("start_time"))
+                        end = _parse_iso_utc(row.get("end_time"))
+                        slot_type = IceSlotType(_clean(row.get("slot_type")))
 
-                existing_slot = next(
-                    (s for s in self.store.all_ice_slots()
-                     if s.rink_id == rink_id and s.start_time == start
-                     and s.end_time == end), None)
-                if existing_slot is not None:
-                    existing_slot.slot_type = slot_type
-                    if self.store.game_using_ice_slot(existing_slot.id) is None:
-                        existing_slot.status = (
-                            IceSlotStatus.AVAILABLE
-                            if slot_type == IceSlotType.GAME
-                            else IceSlotStatus.BLOCKED)
-                    self.store.save_ice_slot(existing_slot)
-                    self._audit("ice_slot_updated", "ice_slot", existing_slot.id,
-                                actor_id, {"rink_id": rink_id,
-                                          "slot_type": slot_type.value,
-                                          "import_batch_id": batch_id})
-                    counts["ice_slots_updated"] += 1
-                else:
-                    status = (IceSlotStatus.AVAILABLE
-                             if slot_type == IceSlotType.GAME
-                             else IceSlotStatus.BLOCKED)
-                    slot = IceSlot(id=self.store.next_id("slot"), rink_id=rink_id,
-                                  start_time=start, end_time=end,
-                                  slot_type=slot_type, status=status)
-                    self.store.add_ice_slot(slot)
-                    self._audit("ice_slot_created", "ice_slot", slot.id, actor_id,
-                                {"rink_id": rink_id, "slot_type": slot_type.value,
-                                 "import_batch_id": batch_id})
-                    counts["ice_slots_created"] += 1
+                        existing_slot = next(
+                            (s for s in self.store.all_ice_slots()
+                             if s.rink_id == rink_id and s.start_time == start
+                             and s.end_time == end), None)
+                        if existing_slot is not None:
+                            existing_slot.slot_type = slot_type
+                            if self.store.game_using_ice_slot(existing_slot.id) is None:
+                                existing_slot.status = (
+                                    IceSlotStatus.AVAILABLE
+                                    if slot_type == IceSlotType.GAME
+                                    else IceSlotStatus.BLOCKED)
+                            self.store.save_ice_slot(existing_slot)
+                            self._audit("ice_slot_updated", "ice_slot", existing_slot.id,
+                                        actor_id, {"rink_id": rink_id,
+                                                  "slot_type": slot_type.value,
+                                                  "import_batch_id": batch_id})
+                            counts["ice_slots_updated"] += 1
+                        else:
+                            status = (IceSlotStatus.AVAILABLE
+                                     if slot_type == IceSlotType.GAME
+                                     else IceSlotStatus.BLOCKED)
+                            slot = IceSlot(id=self.store.next_id("slot"), rink_id=rink_id,
+                                          start_time=start, end_time=end,
+                                          slot_type=slot_type, status=status)
+                            self.store.add_ice_slot(slot)
+                            self._audit("ice_slot_created", "ice_slot", slot.id, actor_id,
+                                        {"rink_id": rink_id, "slot_type": slot_type.value,
+                                         "import_batch_id": batch_id})
+                            counts["ice_slots_created"] += 1
 
-            # skipped/errors are always 0 here by construction — see the
-            # identical note on commit_teams_players_import's import_committed
-            # audit row above.
-            self._audit("import_committed", "import_batch", batch_id, actor_id,
-                        {"import_type": "rinks_ice_slots", "skipped": 0,
-                         "errors": 0, **counts})
+                    # skipped/errors are always 0 here by construction — see the
+                    # identical note on commit_teams_players_import's import_committed
+                    # audit row above.
+                    self._audit("import_committed", "import_batch", batch_id, actor_id,
+                                {"import_type": "rinks_ice_slots", "skipped": 0,
+                                 "errors": 0, **counts})
+                break  # committed cleanly
+            except IntegrityConflictError:
+                if attempt == 2:
+                    raise
 
         return {
             "committed": True,

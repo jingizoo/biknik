@@ -521,6 +521,135 @@ text can coincidentally cycle back to a value an in-flight request's own
 snapshot already matches, unlike `contextRevision`, which — being
 append-only — never can.
 
+Round 10's own sweep still left two gaps in the operation-token coverage
+(#331 review round 11). The first: `.ib-form`'s `change` listener only
+ever bumps `iceOperationSeq` on blur — a `change` event, by definition,
+never fires while a text/date/number field is still focused and being
+typed into. A Preview held in flight while the operator is mid-keystroke
+into, say, `#ib-playable` therefore saw no bump at all until they
+eventually tabbed or clicked away, well after the stale response could
+already have landed. The fix adds a second listener on the same
+`.ib-form`, this time for `input` (which *does* fire continuously while
+focused), bumping `iceOperationSeq` on every keystroke and, if a preview
+panel is already showing, removing its DOM node directly rather than
+calling the full `render()` this listener's own edit is trying to avoid
+mid-keystroke — a full render would rebuild the very field the operator
+is typing into and steal focus/cursor out from under them, the same
+concern round 8's drawer-removal already had to design around.
+
+Regression-testing this exposed a subtler trap than the fix itself: the
+first two test designs both passed even with the fix fully reverted — a
+false negative discovered only by deliberately reverting the fix and
+finding the "regression" didn't fail. Checking the field's *final*
+settled value doesn't work, because `render()` replaces `#content` via
+`innerHTML`, which tears down the still-focused, value-changed
+`#ib-playable` node — and removing a focused, dirty `<input>` is a
+documented native browser behavior that synthesizes a `change` event on
+it as part of the removal. That synthetic `change` lands on the
+pre-existing, entirely unrelated `.ib-form` listener, which reads the
+live (correct) value via `readIceBuilderForm()` and re-renders without
+the stale preview — so an incorrectly-accepted stale response and a
+correctly-rejected one converge on the identical final DOM, self-healing
+the very bug being tested for. A tight poll for the preview panel's
+transient appearance *also* failed to catch it: the corrective
+re-render, triggered synchronously by the same DOM removal that painted
+the stale one, consistently finished after it, regardless of poll
+frequency — the two `render()` calls are a race, and the self-correcting
+one reliably won in this environment's timing. The regression that
+finally works checks neither value nor preview state: it tags the
+*original* `#ib-playable` DOM node with a marker property right after
+typing, then asserts `document.activeElement` is still that exact
+tagged node once everything settles. That signal survives the self-heal
+because *any* `render()` call tears the original node down and nothing
+in this app ever re-focuses a freshly-rendered field — so the guard
+being reverted is detectable by "was the focused element ever destroyed
+at all," independent of which of the two racing renders happened to
+paint last.
+
+The second gap: `#import-season`'s own `onchange` assigned
+`importState.seasonId` but never touched `importOperationSeq` or
+participated in Commit's response-ownership check. Switching to a
+different Season in the same Program (no context change, so
+`contextRevision` doesn't move) while an earlier Commit for the
+previously-selected Season was still in flight let that stale response
+land and be presented as the newly-selected Season's own result —
+including wiping `report`/`validatedKey` state the operator never
+actually invalidated. The fix is the same one-line idiom as every other
+same-context operation-boundary event: bump `importOperationSeq` in the
+handler. Validate's own dry-run body deliberately stays season-agnostic
+(its correctness never depended on which Season was selected), so this
+only closes the *response-ownership* gap, not a validation contract
+change — a distinction worth preserving since the two are easy to
+conflate. This one's regression test worked correctly on the first
+attempt: no DOM-removal side effect confounds a Commit's own success/
+failure banner the way it did the Ice Builder's live form value.
+
+A third, unrelated finding landed in the same round: `commit_officials_
+availability_import` and `commit_rinks_ice_slots_import` have no row to
+lock for a brand-new natural key. `commit_teams_players_import`'s own
+Season row lock (acquired via `get_season_for_update` as the first
+statement inside its transaction) already serializes concurrent commits
+against each other, but officials and rinks are both deliberately *not*
+season-scoped — there is no equivalent parent row two concurrent
+commits could contend on before checking whether an `official_code` or
+`rink_code` already exists. Two commits landing the identical new key
+could each see it absent and each create their own row: a duplicate
+Official, a duplicate availability window even for an *already-existing*
+Official, or a duplicate Rink (and, since Venue creation for a new Rink
+happens in the same transaction, a duplicate Venue riding along with it).
+
+The fix mirrors `commit_ice_availability`'s own established idiom rather
+than inventing a new one: migrations 047 and 048 add unique indexes —
+`officials.external_ref`, `official_availability(official_id,
+start_time, end_time)`, and `rinks.external_ref`, each a partial index
+(`WHERE ... IS NOT NULL`) since the columns are legitimately absent for
+non-imported rows, matching migration 023's identical reasoning for
+`game_roster_entries`. Both commit functions now wrap their transaction
+in the same three-attempt retry loop `commit_ice_availability` already
+uses: a race-losing INSERT is translated to the stable
+`IntegrityConflictError` shape `db_errors.translate_db_exception`'s
+generic `unique_violation` fallback already produces (no new translator
+function needed — migration 045 already established that this generic
+path exists), the whole attempt rolls back, and the retry's fresh
+absence-check sees the winning transaction's committed row and correctly
+takes the update path instead of inserting a second one. Because a new
+Rink's Venue is created in the *same* transaction as the Rink itself, the
+Venue-by-name race resolves for free: rolling back the losing side's
+whole attempt also undoes its own uncommitted Venue insert, so its retry
+finds the winner's already-committed Venue rather than creating a
+second one. This deliberately does not close every interleaving of the
+*separate* Venue-by-name match on its own (e.g. two different new
+`rink_code`s that happen to share one brand-new venue name) — that is
+structurally the same unlocked check-then-create as
+`commit_officials_availability_import`'s own Club-by-name match, already
+accepted as out of scope for the identical reason, and whether Venue
+names should be globally unique is a product decision this migration
+does not assume.
+
+Forced PostgreSQL regressions for both paths use the codebase's
+established two-independent-connections pattern (`SeasonArchiveRaceTest`'s
+own template): each side drives its own `ApiService(SqlStore(url))`, a
+`threading.Barrier` pauses each side's `next_id()` call for the specific
+prefix under test (`"official"`, `"oavail"`, or `"rink"`) rather than the
+write call itself — pausing any later would risk a self-inflicted
+circular wait, since `next_id()` itself upserts a shared per-prefix
+counter row and could leave one side holding that row's lock while
+blocked on the same barrier the other side's own `next_id()` call needs
+to clear. A companion test isolates the availability-window race
+specifically, since the primary officials-race test only ever contends
+on `next_id("official")` — the window insert never actually races
+between the two threads in that test (the losing side's retry already
+finds the Official and takes the update path before it ever reaches its
+own window insert), so it cannot by itself prove the *second* unique
+index is load-bearing. Fixing the underlying race also broke an
+unrelated, pre-existing legacy-adoption test
+(`test_migrations.test_adoption_over_legacy_marker_is_safe`, which
+simulates a pre-#94/#95 database by manually dropping the columns these
+migrations' indexes now depend on): the same `DROP INDEX IF EXISTS`
+before the indexed column drop the test already applies for the #173/
+#174 columns now also covers `officials.external_ref` and
+`rinks.external_ref`.
+
 The card's async states carry real accessibility semantics, not just visual
 ones (#331 review round 5 finding 5): `#sp-card-slot` (the wrapper
 `loadSetupProgressCard()` swaps content into, itself painted once by

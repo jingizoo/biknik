@@ -1215,3 +1215,104 @@ def assert_player_jersey_constraints_ready(conn):
         "Cannot enforce Player jersey constraints: " + "; ".join(problems)
         + ". Reassign a valid jersey or deactivate/reassign duplicate active "
           "players before upgrading.")
+
+
+def find_duplicate_official_external_refs(conn):
+    """Concrete ``external_ref`` values shared by more than one Official.
+
+    Only non-null refs are considered — matching migration 047's partial
+    unique index, which excludes NULL-bearing rows because both SQLite and
+    PostgreSQL treat NULLs as distinct."""
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT external_ref FROM officials "
+        "WHERE external_ref IS NOT NULL "
+        "GROUP BY external_ref HAVING COUNT(*) > 1")
+    return sorted(row["external_ref"] for row in cur.fetchall())
+
+
+def find_duplicate_official_availability_windows(conn):
+    """``(official_id, start_time, end_time, [window_id, ...])`` for every
+    fully specified tuple that backs more than one availability window —
+    the exact duplicates migration 047's unique index rejects. A row with a
+    NULL anywhere in the tuple is skipped, matching the index's own partial
+    predicate."""
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT official_id, start_time, end_time FROM official_availability "
+        "WHERE official_id IS NOT NULL AND start_time IS NOT NULL "
+        "AND end_time IS NOT NULL "
+        "GROUP BY official_id, start_time, end_time HAVING COUNT(*) > 1")
+    dup_keys = {(r["official_id"], r["start_time"], r["end_time"])
+                for r in cur.fetchall()}
+    if not dup_keys:
+        return []
+    cur.execute(
+        "SELECT id, official_id, start_time, end_time "
+        "FROM official_availability "
+        "WHERE official_id IS NOT NULL AND start_time IS NOT NULL "
+        "AND end_time IS NOT NULL")
+    grouped = {}
+    for r in cur.fetchall():
+        key = (r["official_id"], r["start_time"], r["end_time"])
+        if key in dup_keys:
+            grouped.setdefault(key, []).append(r["id"])
+    return sorted((k[0], k[1], k[2], sorted(ids)) for k, ids in grouped.items())
+
+
+def assert_officials_availability_import_constraints_ready(conn):
+    """Abort migration 047 unless existing data satisfies both new indexes
+    (#331 review round 11 finding 2)."""
+    dup_refs = find_duplicate_official_external_refs(conn)
+    dup_windows = find_duplicate_official_availability_windows(conn)
+    if not dup_refs and not dup_windows:
+        return
+
+    problems = []
+    if dup_refs:
+        shown = ", ".join(dup_refs[:20])
+        more = "" if len(dup_refs) <= 20 else f" (+{len(dup_refs) - 20} more)"
+        problems.append(
+            f"{len(dup_refs)} external_ref value(s) already back more than "
+            f"one Official: {shown}{more}")
+    if dup_windows:
+        shown = "; ".join(
+            f"official {official} [{start} - {end}]: windows {', '.join(ids)}"
+            for official, start, end, ids in dup_windows[:20])
+        more = ("" if len(dup_windows) <= 20
+                else f" (+{len(dup_windows) - 20} more)")
+        problems.append(
+            f"{len(dup_windows)} (official, start, end) tuple(s) already back "
+            f"more than one availability window: {shown}{more}")
+    raise MigrationDataError(
+        "Cannot enforce Official import uniqueness: " + "; ".join(problems)
+        + ". Merge or retag the duplicate Official(s) and delete or retime "
+          "the extra availability window(s) before upgrading.")
+
+
+def find_duplicate_rink_external_refs(conn):
+    """Concrete ``external_ref`` values shared by more than one Rink.
+
+    Only non-null refs are considered — matching migration 048's partial
+    unique index, which excludes NULL-bearing rows because both SQLite and
+    PostgreSQL treat NULLs as distinct."""
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT external_ref FROM rinks "
+        "WHERE external_ref IS NOT NULL "
+        "GROUP BY external_ref HAVING COUNT(*) > 1")
+    return sorted(row["external_ref"] for row in cur.fetchall())
+
+
+def assert_no_duplicate_rink_external_refs(conn):
+    """Abort migration 048 if any external_ref already backs more than one
+    Rink (#331 review round 11 finding 2)."""
+    duplicates = find_duplicate_rink_external_refs(conn)
+    if duplicates:
+        shown = ", ".join(duplicates[:20])
+        more = "" if len(duplicates) <= 20 else f" (+{len(duplicates) - 20} more)"
+        raise MigrationDataError(
+            "Cannot enforce one Rink per external_ref: "
+            f"{len(duplicates)} rink_code value(s) already back more than "
+            f"one Rink: {shown}{more}. Merge or retag the duplicate Rink(s) "
+            "before upgrading.")

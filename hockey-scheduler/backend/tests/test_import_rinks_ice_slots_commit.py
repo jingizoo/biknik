@@ -10,6 +10,7 @@ officials/availability (#94) are out of scope here.
 """
 
 import json
+import os
 import threading
 import unittest
 import urllib.error
@@ -20,7 +21,7 @@ from http.server import ThreadingHTTPServer
 from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
 
 from hockey_scheduler.api import ApiService
-from hockey_scheduler.domain import IceSlotStatus
+from hockey_scheduler.domain import IceSlotStatus, Venue
 from hockey_scheduler.services import SetupService
 from hockey_scheduler.store import InMemoryStore, SqlStore
 
@@ -56,6 +57,17 @@ OVERLAP_SLOT_CSV = (
 
 def _valid_sheets_csv():
     return {"rinks_csv": RINKS_CSV, "ice_slots_csv": ICE_SLOTS_CSV}
+
+
+RACE_RINK_CSV = (
+    "venue_name,rink_code\n"
+    "Race Arena,RACE1\n"
+)
+
+RACE_SLOT_CSV = (
+    "rink_code,start_time,end_time,slot_type\n"
+    "RACE1,2026-09-01T18:00:00+00:00,2026-09-01T19:30:00+00:00,game\n"
+)
 
 
 class ImportRinksIceSlotsCommitServiceContract:
@@ -472,6 +484,114 @@ class ImportRinksIceSlotsCommitHttpTest(unittest.TestCase):
         rink_row = [a for a in audit if a.action == "rink_created"][-1]
         self.assertEqual(rink_row.actor_id, admin_uid)
         self.assertNotEqual(rink_row.actor_id, "attacker")
+
+
+@unittest.skipUnless(os.environ.get("TEST_DATABASE_URL"),
+                     "PostgreSQL required (set TEST_DATABASE_URL)")
+class PostgresRinksIceSlotsImportRaceTest(unittest.TestCase):
+    """#331 review round 11 finding 2: commit_rinks_ice_slots_import row-
+    locks every rink it ALREADY has, but a brand-new rink_code has no row
+    to lock -- two concurrent commits landing the identical new rink_code
+    must not both succeed in creating their own duplicate Rink. Each
+    thread drives its OWN ApiService(SqlStore(...)) -- a separate
+    connection and process-local RLock -- so passing here depends on the
+    real PostgreSQL unique-index backstop (migration 048), not the
+    in-process lock a shared store instance would provide for free.
+
+    The Venue is pre-seeded (existing, not raced) so both threads' Venue
+    lookups resolve identically without contending on next_id("venue")'s
+    own shared counter row -- that contention is a SEPARATE, out-of-scope
+    concern (see migration 048's own comment on the Venue-by-name match),
+    not something this test's synchronization needs to fight through to
+    exercise the Rink race cleanly.
+
+    Memory/SQLite parity for the same "identical input committed twice
+    does not duplicate" property is already covered by
+    test_idempotent_repeat_commit_updates_not_duplicates above, which runs
+    on both backends via ImportRinksIceSlotsCommitServiceContract -- no
+    separate parity test is added here to avoid duplicating it."""
+
+    def setUp(self):
+        self.url = os.environ["TEST_DATABASE_URL"]
+        SqlStore(self.url).clear_all_data()
+
+    def test_identical_new_rink_and_slot_commits_do_not_duplicate(self):
+        seed_store = SqlStore(self.url)
+        seed_venue = Venue(id=seed_store.next_id("venue"), name="Race Arena", address="")
+        seed_store.add_venue(seed_venue)
+
+        store_a, store_b = SqlStore(self.url), SqlStore(self.url)
+        api_a, api_b = ApiService(store_a), ApiService(store_b)
+
+        barrier = threading.Barrier(2)
+        # Pause each side's OWN connection right before it generates a new
+        # Rink's id -- reached only after its own Rink absence-check
+        # already ran and found nothing (the Venue lookup above it finds
+        # the pre-seeded row and never calls next_id("venue") at all),
+        # exactly the review's required "after their initial absence
+        # observation before either writes" ordering. Deliberately NOT
+        # hooked any later than this (e.g. at add_rink itself): next_id()
+        # upserts a shared per-prefix row in `counters`, so pausing AFTER
+        # it already ran would leave one side holding that row's lock
+        # while blocked on this very barrier waiting for the other side --
+        # which can't arrive because ITS OWN next_id() call is blocked on
+        # that same lock. A real circular wait, self-inflicted by the
+        # test, not the production code (the same class of bug already
+        # fixed once in this PR's history for the forced cancel-vs-commit
+        # race).
+        def _pausing(store):
+            real = store.next_id
+            def _wrapped(prefix):
+                if prefix == "rink":
+                    barrier.wait(timeout=10)
+                return real(prefix)
+            return _wrapped
+        store_a.next_id = _pausing(store_a)
+        store_b.next_id = _pausing(store_b)
+
+        results = {}
+
+        def run(api, key):
+            try:
+                results[key] = api.commit_rinks_ice_slots_import(
+                    {"rinks_csv": RACE_RINK_CSV, "ice_slots_csv": RACE_SLOT_CSV},
+                    actor_id=key)
+            except Exception as exc:
+                results[key] = exc
+
+        ta = threading.Thread(target=run, args=(api_a, "a"))
+        tb = threading.Thread(target=run, args=(api_b, "b"))
+        ta.start(); tb.start()
+        ta.join(20); tb.join(20)
+
+        self.assertFalse(ta.is_alive(), "thread a hung")
+        self.assertFalse(tb.is_alive(), "thread b hung")
+        for key, res in results.items():
+            self.assertNotIsInstance(
+                res, Exception,
+                f"commit {key} raised instead of committing or retrying "
+                f"cleanly: {res!r}")
+            self.assertTrue(res.get("committed"), f"commit {key}: {res}")
+
+        fresh = SqlStore(self.url)
+        rinks = [r for r in fresh.all_rinks() if r.external_ref == "RACE1"]
+        self.assertEqual(
+            len(rinks), 1,
+            f"expected exactly one Rink for RACE1, got {[r.id for r in rinks]}")
+        venues = [v for v in fresh.all_venues() if v.name == "Race Arena"]
+        self.assertEqual(
+            len(venues), 1,
+            "expected exactly one Venue for 'Race Arena' (the pre-seeded "
+            f"one, untouched), got {[v.id for v in venues]}")
+        slots = [s for s in fresh.all_ice_slots() if s.rink_id == rinks[0].id]
+        self.assertEqual(
+            len(slots), 1, f"expected exactly one ice slot, got {[s.id for s in slots]}")
+        audit_batches = [a for a in fresh.all_setup_audit()
+                        if a.action == "import_committed"]
+        self.assertEqual(
+            len(audit_batches), 2,
+            f"expected one import_committed audit row per commit call, got "
+            f"{len(audit_batches)}")
 
 
 if __name__ == "__main__":

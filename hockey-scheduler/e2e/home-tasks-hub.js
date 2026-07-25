@@ -2414,6 +2414,99 @@ async function checkRoleScenarios(browser, viewport) {
         + "content trivially matches the first load");
     }
 
+    // ---- (J, season-switch reorder) #import-season's own onchange only
+    // ever assigned importState.seasonId -- it never bumped
+    // importOperationSeq or otherwise participated in Commit's response
+    // ownership check (#331 review round 11 finding 1b). Switching to a
+    // DIFFERENT Season in the SAME context doesn't touch contextRevision (no
+    // context change) and, by design, must NOT touch report/validatedKey
+    // either (Validate's own dry-run is deliberately season-agnostic -- its
+    // result stays valid regardless of which Season is selected). Without
+    // its own operation bump, a Commit response captured for the
+    // PREVIOUSLY selected Season would still pass every remaining check and
+    // land as if it were the NEWLY selected Season's own result.
+    const jSeasonSwitch = await page.evaluate(async () => {
+      const post = async (p, b) => (await fetch(p, {
+        method: "POST", credentials: "same-origin",
+        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
+      })).json();
+      const progJSS = await post("/api/v2/setup/program",
+        { name: "Round11JSS Program", country: "US" });
+      const seasonJSSA = await post("/api/v2/setup/season",
+        { program_id: progJSS.id, name: "Season JSS-A" });
+      const seasonJSSB = await post("/api/v2/setup/season",
+        { program_id: progJSS.id, name: "Season JSS-B" });
+      return { progJSS: progJSS.id, seasonJSSA: seasonJSSA.id, seasonJSSB: seasonJSSB.id };
+    });
+    await apiPost(page, "/api/context",
+      { program_id: jSeasonSwitch.progJSS, season_id: jSeasonSwitch.seasonJSSA });
+    await freshLoad();
+    // Same one-time-PER-PAGE-LOAD hierarchy-codes race as the top-level (J)
+    // setup above -- this Import visit is the first since this freshLoad().
+    const jSeasonSwitchHierarchyResp = page.waitForResponse((r) =>
+      r.url() === `${base}/api/import/hierarchy-codes` && r.request().method() === "GET")
+      .catch(() => null);
+    await page.click('.tab[data-tab="import"]');
+    await jSeasonSwitchHierarchyResp;
+    await page.waitForFunction(
+      (v) => (document.getElementById("import-season") || {}).value === v,
+      jSeasonSwitch.seasonJSSA, { timeout: 10000 });
+    await page.click("[data-import-sample]");
+    const jSeasonSwitchValidateResp = page.waitForResponse((r) =>
+      r.url() === `${base}/api/import/dry-run` && r.request().method() === "POST");
+    await page.click("[data-import-validate]");
+    await jSeasonSwitchValidateResp;
+    await page.waitForFunction(() => {
+      const btn = document.querySelector("[data-import-commit]");
+      return !!(btn && !btn.disabled);
+    }, null, { timeout: 10000 });
+
+    let releaseSeasonSwitchCommit;
+    const holdSeasonSwitchCommit = new Promise((resolve) => { releaseSeasonSwitchCommit = resolve; });
+    let seasonSwitchCommitBody = null;
+    await page.route("**/api/import/commit/**", async (route) => {
+      seasonSwitchCommitBody = route.request().postDataJSON();
+      await holdSeasonSwitchCommit;
+      await route.fulfill({
+        status: 200, contentType: "application/json",
+        body: JSON.stringify({ committed: true, summary: {} }),
+      });
+    });
+    await page.click("[data-import-commit]");  // captures & sends season_id = JSS-A
+    await new Promise((r) => setTimeout(r, 200));  // let the request actually leave
+    await page.selectOption("#import-season", jSeasonSwitch.seasonJSSB);
+    await new Promise((r) => setTimeout(r, 100));
+    releaseSeasonSwitchCommit();
+    await page.unroute("**/api/import/commit/**");
+    await new Promise((r) => setTimeout(r, 300));  // let the stale A response's own (discarded) handler run
+
+    if (!seasonSwitchCommitBody || seasonSwitchCommitBody.season_id !== jSeasonSwitch.seasonJSSA) {
+      fail("(J, season-switch reorder) expected the Commit request itself "
+        + `to have targeted Season A, got: ${JSON.stringify(seasonSwitchCommitBody)}`);
+    }
+    const jSeasonSwitchPickerValue = await page.$eval("#import-season", (el) => el.value);
+    if (jSeasonSwitchPickerValue !== jSeasonSwitch.seasonJSSB) {
+      fail("(J, season-switch reorder) expected the season picker to "
+        + `remain on B, got "${jSeasonSwitchPickerValue}"`);
+    }
+    const jSeasonSwitchHeadings = await page.evaluate(() =>
+      Array.from(document.querySelectorAll(".banner h2")).map((h) => h.textContent));
+    if (jSeasonSwitchHeadings.includes("Committed")) {
+      fail("(J, season-switch reorder) expected Season A's stale Commit "
+        + "success to NOT be presented as Season B's own result after "
+        + "switching");
+    }
+    const jSeasonSwitchCommitStillEnabled = await page.evaluate(() => {
+      const btn = document.querySelector("[data-import-commit]");
+      return btn ? !btn.disabled : null;
+    });
+    if (!jSeasonSwitchCommitStillEnabled) {
+      fail("(J, season-switch reorder) expected Season B's own Commit "
+        + "availability -- never legitimately touched by A's stale response, "
+        + "since Validate's dry-run is deliberately season-agnostic -- to "
+        + "remain exactly as it was before A's response landed");
+    }
+
     // ---- (K) Ice Builder Create must be uncommittable the INSTANT a
     // context switch is attempted too (#331 review round 8) -- the
     // identical gap as Import's own Commit above, closed the same way
@@ -2945,6 +3038,79 @@ async function checkRoleScenarios(browser, viewport) {
         + "issued BEFORE the exclusion add -- with no existing preview yet "
         + "to clear -- to still be recognized as stale and NOT painted onto "
         + "the form with the new exclusion applied");
+    }
+
+    // ---- (K, unblurred-input-during-preview) A `change` event only fires
+    // on BLUR -- an operator still typing into a focused text/date/number
+    // field never blurs mid-edit, so every (K, ...-during-preview) case
+    // above (which all edit via a synthetic weekday `change`, or a discrete
+    // click) never actually exercised this (#331 review round 11 finding
+    // 1a): iceOperationSeq must also be bumped by the continuous `input`
+    // events a focused field fires WHILE being typed into, or a Preview
+    // issued before the edit still lands once released, and render()
+    // replaces the value still being typed with whatever
+    // readIceBuilderForm() captured back at the original Preview click.
+    // Real keyboard interaction, not a synthetic dispatch, per the review's
+    // own "include keyboard-only input" requirement.
+    await page.click("[data-ib-cancel]");
+    await page.waitForFunction(() => !document.querySelector(".ib-form"),
+      null, { timeout: 10000 });
+    await page.click("[data-ice-builder-open]");
+    await page.waitForFunction(
+      (v) => (document.getElementById("ib-season") || {}).value === v,
+      k.seasonK5, { timeout: 10000 });
+    await page.click(`.ib-rink[value="${k.rinkK5}"]`);
+    let releaseInputPreview;
+    const holdInputPreview = new Promise((resolve) => { releaseInputPreview = resolve; });
+    await page.route("**/api/setup/ice-availability/preview", async (route) => {
+      await holdInputPreview; await route.continue();
+    });
+    await page.click("[data-ib-preview]");  // no existing preview to clear -- hadPreview is false
+    await new Promise((r) => setTimeout(r, 200));  // let the request actually leave
+    await page.click("#ib-playable", { clickCount: 3 });  // focus + select-all -- no blur
+    await page.keyboard.type("45");  // real keystrokes fire `input` per character; still focused, no `change` yet
+    // Tag this EXACT node (not just "whatever #ib-playable currently
+    // resolves to") so the check below can tell "still this element,
+    // untouched" apart from "torn down and silently recreated, then
+    // self-corrected" -- checking only the FINAL value/preview state
+    // cannot: render() replaces #content via innerHTML, which removes the
+    // still-focused, value-changed #ib-playable node, and removing a
+    // focused, DIRTY <input> synthesizes a native browser "change" event on
+    // it as part of that removal. If the guard incorrectly lets the stale
+    // response through, iceBuilder.preview gets set and render() DOES run
+    // -- but that SAME removal then fires the pre-existing, unrelated
+    // .ib-form "change" listener, which reads the live (correct) "45" via
+    // readIceBuilderForm(), clears the stale preview, and re-renders --
+    // converging the fix-applied and fix-reverted cases on the identical
+    // final value AND (per repeated observation) the identical absence of
+    // a lingering .ib-preview, since the corrective re-render consistently
+    // finishes after the stale one. Neither the final value nor a tight
+    // poll for .ib-preview can tell the two cases apart. Focus identity
+    // can: the ORIGINAL node either survives untouched (fix applied, the
+    // guard rejects the response before render() is ever called) or gets
+    // torn down at least once (fix reverted, render() runs at least once)
+    // -- and nothing in this app ever re-focuses a freshly-rendered
+    // #ib-playable, so a torn-down original can never come back.
+    await page.evaluate(() => { document.getElementById("ib-playable").__k331OriginalNode = true; });
+    await new Promise((r) => setTimeout(r, 100));
+    releaseInputPreview();
+    await page.unroute("**/api/setup/ice-availability/preview");
+    await new Promise((r) => setTimeout(r, 400));  // let any render() -- stale or corrective -- fully settle
+    const survivedUntouched = await page.evaluate(() =>
+      document.activeElement && document.activeElement.__k331OriginalNode === true);
+    if (!survivedUntouched) {
+      fail("(K, unblurred-input-during-preview) expected the ORIGINAL "
+        + "#ib-playable node -- still focused, mid-keystroke, with no "
+        + "existing preview to clear -- to never be torn down by the "
+        + "Preview response issued BEFORE this edit; the fact that it was "
+        + "replaced (even if a later self-correction happened to restore "
+        + "the right VALUE afterward) means the stale response was still "
+        + "incorrectly accepted and painted");
+    }
+    const kUnblurredValue = await page.$eval("#ib-playable", (el) => el.value);
+    if (kUnblurredValue !== "45") {
+      fail("(K, unblurred-input-during-preview) expected the typed value to "
+        + `survive the stale Preview response landing, got "${kUnblurredValue}"`);
     }
 
     // ---- (L) Rapid A->B->C must reach the SERVER as "last INTENT wins",

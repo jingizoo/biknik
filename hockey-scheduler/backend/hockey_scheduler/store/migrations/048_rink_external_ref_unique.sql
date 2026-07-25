@@ -1,0 +1,41 @@
+-- One Rink per external_ref -- the atomic DB backstop for the rinks +
+-- ice-slots CSV import commit (#331 review round 11 finding 2).
+--
+-- commit_rinks_ice_slots_import already row-locks every EXISTING rink
+-- matched by external_ref before writing (in ascending id order, shared
+-- with commit_ice_availability's own rink-locking order), but that lock
+-- set is built from a snapshot taken before the lock loop runs -- a
+-- brand-new rink_code isn't in it, so it has no row to lock. Two
+-- concurrent commits can each see the same new rink_code absent and both
+-- create their own Rink (each under its own newly-created Venue, since
+-- venue creation happens in the same transaction -- see below).
+--
+-- external_ref is nullable (a manually-created rink has none), and both
+-- SQLite and PostgreSQL treat NULLs as distinct in a unique index, so the
+-- partial predicate makes explicit exactly what this index enforces --
+-- same reasoning as migration 047's officials.external_ref index.
+--
+-- Forward-only, so existing data may already violate this: registers
+-- assert_no_duplicate_rink_external_refs (see _PRE_MIGRATION_CHECKS),
+-- which names the conflicting external_ref + rink ids before this DDL
+-- runs, rather than an opaque index error. Once applied, a race-losing
+-- Rink INSERT is translated to the same stable IntegrityConflictError
+-- migration 045 already established (db_errors.translate_db_exception's
+-- generic unique_violation fallback); commit_rinks_ice_slots_import
+-- retries the whole batch on it, mirroring commit_ice_availability's
+-- identical retry loop. In the interleaving where BOTH sides' Rink
+-- absence-checks complete before either INSERTs, rolling the losing
+-- side's whole attempt back also undoes its own new Venue row from the
+-- SAME transaction, so its retry's fresh venue-by-name lookup finds the
+-- winner's already-committed Venue instead of creating a second one.
+--
+-- This index deliberately does NOT close every interleaving of the
+-- SEPARATE venue-by-name match -- structurally the same unlocked
+-- check-then-create as commit_officials_availability_import's Club-by-
+-- name match (also out of this scope) -- since Venue has no natural-key
+-- column of its own to make unique. Whether Venue names should be
+-- globally unique is a product decision, not something this migration
+-- assumes.
+CREATE UNIQUE INDEX IF NOT EXISTS ux_rinks_external_ref
+    ON rinks (external_ref)
+    WHERE external_ref IS NOT NULL;

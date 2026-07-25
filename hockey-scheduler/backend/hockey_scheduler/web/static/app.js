@@ -7183,7 +7183,19 @@ async function render() {
     render();
   };
   const importSeason = c.querySelector("#import-season");
-  if (importSeason) importSeason.onchange = () => { importState.seasonId = importSeason.value; };
+  // #331 review round 11: a Commit captured for the PREVIOUSLY selected
+  // Season can still be in flight when the operator switches to a different
+  // Season in the same context -- contextRevision alone doesn't catch this
+  // (no context change), so without an operation bump here the late response
+  // would apply its result (or clear report/validatedKey) onto the NEWLY
+  // selected Season's own UI even though the write it actually reports on
+  // targeted the OLD Season. Validate's own dry-run body deliberately stays
+  // season-agnostic (unchanged) -- this only invalidates RESPONSE ownership,
+  // same as every other same-context operation-boundary event above.
+  if (importSeason) importSeason.onchange = () => {
+    importState.seasonId = importSeason.value;
+    importOperationSeq += 1;
+  };
   // Builds the POST body straight from the LIVE textarea DOM — always, for
   // both Validate and Commit. importState.sheetsText is a display cache
   // only (kept in sync below by each textarea's own `input` handler so a
@@ -7506,6 +7518,30 @@ async function render() {
     iceBuilder.form = readIceBuilderForm(c);
     if (hadPreview) { iceBuilder.preview = null; toast = ""; }
     if (hadPreview || isWeekday) render();
+  });
+  // #331 review round 11: text/date/time controls fire `input` continuously
+  // WHILE FOCUSED but don't fire `change` until blur -- a Preview/Commit held
+  // in flight across an edit the operator hasn't blurred yet would still see
+  // iceOperationSeq unchanged (only `change` bumped it), so the stale
+  // response passes the guard above and render() replaces what's live in the
+  // focused field with the old value readIceBuilderForm() captured at click
+  // time. Bump the op token on every keystroke too, so that response is
+  // discarded before it ever reaches render() -- and if a preview panel is
+  // already showing, drop its DOM node DIRECTLY rather than calling the full
+  // render() this listener's own edit is trying to avoid mid-keystroke
+  // (matches the drawer-removal idiom from round 8: a full render() here
+  // would also rebuild the very field the operator is still typing in and
+  // steal focus/cursor out from under them).
+  if (ibFormEl) ibFormEl.addEventListener("input", (e) => {
+    if (!iceBuilder) return;
+    if (e.target && e.target.id === "ib-excl") return;  // staging input, not the template
+    iceOperationSeq += 1;
+    iceBuilder.form = readIceBuilderForm(c);
+    if (iceBuilder.preview) {
+      iceBuilder.preview = null;
+      const pv = c.querySelector(".ib-preview");
+      if (pv) pv.remove();
+    }
   });
   c.querySelectorAll("[data-ib-preview]").forEach((b) => b.onclick = async () => {
     // A context/identity switch invalidated (round 8) or fully closed
