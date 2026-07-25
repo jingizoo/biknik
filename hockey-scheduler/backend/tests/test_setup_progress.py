@@ -395,6 +395,37 @@ class SetupProgressComputationTest(unittest.TestCase):
         self.assertEqual(arena_progress["next_blocked"]["key"], "facilities")
         self.assertEqual(arena_progress["next_blocked"]["reason"], "season_missing")
 
+    def test_participation_next_is_blocked_when_program_selected_but_no_season_chosen(self):
+        """#331 review round 4: "participation" is blocked by season_missing
+        exactly like "facilities" is when no Season is resolved -- not just
+        because ``register_team_for_season`` itself needs one, but because
+        its real destination (``focusParticipationRegisterControl()``) needs
+        an exact selected Season to deep-link/focus the specific Register
+        control; with none resolved it can only fall back to a generic,
+        unbound landing, which is not the precise binding #330's round-2
+        review already required. League Admin whose League/Teams are
+        already done (a realistic "just needs to register a team" state)
+        must not receive an enabled Register Team CTA here."""
+        api = self._api()
+        api.create_user_account("admin", "pw", "league_admin")
+        program = api.create_program("Prog", actor_id="admin")
+        season = api.create_season(program["id"], "Fall", actor_id="admin")
+        api.create_league(season["id"], "Adult League", actor_id="admin")
+        club = api.create_club("C", actor_id="admin")
+        api.create_team(club["id"], None, "T", actor_id="admin",
+                        program_id=program["id"])
+        api.set_active_context("admin", Role.LEAGUE_ADMIN, {},
+                               program["id"], None)  # Program-only, no Season chosen
+
+        progress = api.get_setup_progress("admin", *ADMIN)
+        statuses = _statuses(progress)
+        self.assertEqual(statuses["league_season"], "done")
+        self.assertEqual(statuses["teams"], "done")
+        self.assertEqual(statuses["participation"], "todo")
+        self.assertIsNone(progress["next"], progress)
+        self.assertEqual(progress["next_blocked"]["key"], "participation")
+        self.assertEqual(progress["next_blocked"]["reason"], "season_missing")
+
     def test_participation_next_is_blocked_when_selected_season_is_archived(self):
         """#331 review round 3 finding 1: with an ARCHIVED Season selected,
         League Admin's "participation" is permitted (MANAGE_SETUP) but not
@@ -463,13 +494,18 @@ class SetupProgressComputationTest(unittest.TestCase):
         self.assertEqual(arena_progress["next_blocked"]["reason"], "season_archived")
         self.assertIn("Fall", arena_progress["next_blocked"]["detail"])
 
-    def test_next_skips_a_blocked_workflow_for_one_that_is_safe(self):
-        """A workflow that is permitted but prerequisite-blocked must never
-        suppress a LATER workflow that is both permitted and safe -- `next`
-        keeps scanning past it rather than going straight to None/
-        next_blocked. With the selected Season archived (blocking
-        participation) but roster still genuinely open, League Admin must
-        be routed to roster, not left with a dead-end/no CTA."""
+    def test_next_stays_blocked_even_when_a_later_workflow_is_safe(self):
+        """#331 review round 4: `next` must never skip AHEAD of a blocked
+        workflow to a later, incidentally-safe one -- #330's "actual next
+        incomplete step" is a strictly ordered contract (round 3's original
+        fix got this wrong: it scanned past a blocked candidate for a safe
+        later one, which silently reordered the sequence and could read as
+        the blocked step being skipped/forgotten rather than blocked). With
+        the selected Season archived (blocking participation, which comes
+        before roster in the fixed #204 order) but roster itself still
+        genuinely open and prerequisite-free, League Admin must still see
+        `next: None` / `next_blocked: participation` -- NOT get routed
+        ahead to roster."""
         api = self._api()
         api.create_user_account("admin", "pw", "league_admin")
         program = api.create_program("Prog", actor_id="admin")
@@ -478,18 +514,22 @@ class SetupProgressComputationTest(unittest.TestCase):
         club = api.create_club("C", actor_id="admin")
         api.create_team(club["id"], None, "T", actor_id="admin",
                         program_id=program["id"])
-        # No player added -- roster stays todo and has no Season prerequisite.
+        # No player added -- roster stays todo and has no Season prerequisite
+        # of its own, but must NOT be surfaced ahead of blocked participation.
         api.archive_season(season["id"], reason="test", actor_id="admin")
         api.set_active_context("admin", Role.LEAGUE_ADMIN, {},
                                program["id"], season["id"])
 
         progress = api.get_setup_progress("admin", *ADMIN)
-        self.assertEqual(_statuses(progress)["participation"], "todo")
-        self.assertEqual(progress["next"]["key"], "roster",
-                         f"expected next to skip blocked participation for "
-                         f"safe roster, got {progress['next']}")
-        self.assertIsNone(progress["next_blocked"],
-                          "next_blocked must stay unset once a safe next is found")
+        statuses = _statuses(progress)
+        self.assertEqual(statuses["participation"], "todo")
+        self.assertEqual(statuses["roster"], "todo")
+        self.assertIsNone(progress["next"], progress)
+        self.assertEqual(progress["next_blocked"]["key"], "participation",
+                         f"expected next_blocked to name participation (the "
+                         f"FIRST blocked todo workflow in order), not skip "
+                         f"ahead to roster: {progress}")
+        self.assertEqual(progress["next_blocked"]["reason"], "season_archived")
 
 
 class SetupProgressHttpTest(unittest.TestCase):
@@ -638,6 +678,38 @@ class SetupProgressHttpTest(unittest.TestCase):
         self.assertIsNone(arena_progress["next"], arena_progress)
         self.assertEqual(arena_progress["next_blocked"]["key"], "facilities")
         self.assertEqual(arena_progress["next_blocked"]["reason"], "season_missing")
+
+    def test_no_season_blocks_participation_over_real_http(self):
+        """#331 review round 4, over the real route: League Admin with
+        league_season/teams already done but no Season selected must not
+        receive an enabled Register Team CTA -- the real destination
+        (focusParticipationRegisterControl) cannot bind/focus an exact
+        control without a resolved Season, the same class of dead end as
+        facilities' season_missing."""
+        admin = self._login("admin")
+        status, program = self._req(admin, "POST", "/api/v2/setup/program",
+                                    {"name": "Round4F1 HTTP Prog", "country": "US"})
+        self.assertEqual(status, 200, program)
+        status, season = self._req(admin, "POST", "/api/v2/setup/season",
+                                   {"program_id": program["id"], "name": "Fall"})
+        self.assertEqual(status, 200, season)
+        status, league = self._req(admin, "POST", "/api/v2/setup/league",
+                                   {"season_id": season["id"], "name": "Adult League"})
+        self.assertEqual(status, 200, league)
+        status, club = self._req(admin, "POST", "/api/v2/setup/club", {"name": "Club"})
+        self.assertEqual(status, 200, club)
+        status, _ = self._req(admin, "POST", "/api/v2/setup/team",
+                              {"club_id": club["id"], "league_id": league["id"], "name": "Team"})
+        self.assertEqual(status, 200)
+        status, _ = self._req(admin, "POST", "/api/context",
+                              {"program_id": program["id"], "season_id": None})
+        self.assertEqual(status, 200)
+
+        status, progress = self._req(admin, "GET", "/api/v2/setup/progress")
+        self.assertEqual(status, 200, progress)
+        self.assertIsNone(progress["next"], progress)
+        self.assertEqual(progress["next_blocked"]["key"], "participation")
+        self.assertEqual(progress["next_blocked"]["reason"], "season_missing")
 
 
 if __name__ == "__main__":

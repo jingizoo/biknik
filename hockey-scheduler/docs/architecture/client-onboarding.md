@@ -141,20 +141,34 @@ landing; the other five list below as a non-competing secondary list
 screen" principle), each with an accessible, visible-text status ("Done" /
 "To do" / "Optional" — never an icon-only badge).
 
-`next` is filtered to workflows the caller's role can actually execute (an
-Arena Manager, who holds `MANAGE_ARENA` but not `MANAGE_SETUP`, is routed to
+`next` is the FIRST todo workflow, in the fixed #204 order (league profile/
+seasons → permanent teams → season participation → clubs/players/staff →
+venues/rinks/ice), that the caller's role can actually execute (an Arena
+Manager, who holds `MANAGE_ARENA` but not `MANAGE_SETUP`, is routed to
 facilities, never to a League-Admin-only action like "Add Season") AND that
-are actually safe to run given the resolved Season's own state (#331 review
-round 3): "facilities" needs a resolved, ACTIVE Season to generate ice into
-(its real write, `commit_ice_availability`, itself requires an active
-Season — #159), and "participation" needs that same Season to be active,
-not archived, for the identical reason. A workflow that is permitted but
-blocked on the Season is never handed out as `next` — a CTA the operator
-cannot actually complete — the response's `next_blocked` names it instead,
-with a reason code and a plain-language explanation of what to resolve
-first, so a role that cannot resolve it themselves (an Arena Manager
-blocked on a Season only a League Admin can create) is still told clearly
-rather than routed into a silent failure.
+is actually safe to run given the resolved Season's own state (#331 review
+rounds 3–4): both "facilities" and "participation" need a resolved, ACTIVE
+Season (their real writes both route through the same #159 active-Season
+guard and fail identically — `season_missing` with none resolved,
+`season_archived` if the resolved one is archived). "participation" needs
+this for the same reason `commit_ice_availability` needs it for facilities,
+plus one more: its real destination on the Home/Tasks card,
+`focusParticipationRegisterControl()`, needs an exact selected Season to
+deep-link/focus the one specific Register control the card promises (#330's
+round-2 review requirement) — with none resolved it can only fall back to
+a generic, unbound landing on the Setup tree.
+
+Critically, `next` never skips AHEAD to a later, incidentally-safe workflow
+just because the first todo one is blocked — #330's "actual next incomplete
+step" is a strictly ordered contract, and reordering it around a blocker
+would read as that step being skipped or forgotten rather than blocked. The
+FIRST todo workflow this role can manage is the one this whole prerequisite
+check applies to: if it's safe, it's `next`; if it's blocked, `next` is
+`None` and `next_blocked` names that same workflow with a reason code and a
+plain-language explanation of what to resolve first, so a role that cannot
+resolve it themselves (an Arena Manager blocked on a Season only a League
+Admin can create) is still told clearly rather than routed into a silent
+failure or a workflow further down the list.
 
 The `workflows` list itself is also filtered to what the caller's role can
 manage, not global (a reversal of the original design — an Arena Manager

@@ -957,6 +957,42 @@ async function checkRoleScenarios(browser, viewport) {
     await logout(page);
     await loginAs(page, "admin", "demo");
 
+    // ---- (B2) Program B, League Admin, still no Season selected (#331
+    // review round 4): league_season/teams are already done, so
+    // "participation" is the first todo workflow -- it must be blocked by
+    // season_missing exactly like facilities was for Arena Manager above,
+    // not handed out as an enabled "Register Team" CTA that
+    // focusParticipationRegisterControl() cannot bind/focus without an
+    // exact selected Season.
+    const b2Season = await apiPost(page, "/api/v2/setup/season",
+      { program_id: b.id, name: "Fall" });
+    const b2League = await apiPost(page, "/api/v2/setup/league",
+      { season_id: b2Season.id, name: "League" });
+    const b2Club = await apiPost(page, "/api/v2/setup/club", { name: "Club" });
+    await apiPost(page, "/api/v2/setup/team",
+      { league_id: b2League.id, club_id: b2Club.id, name: "Team" });
+    await apiPost(page, "/api/context", { program_id: b.id, season_id: null });
+    await freshLoad();
+    s = await cardState(page);
+    if (!s || s.heading !== "Continue setup") {
+      fail(`League Admin, Program-only (participation): expected the `
+        + `guidance card, got ${JSON.stringify(s)}`);
+    }
+    if (s.nextTitle !== "Season participation and divisions"
+        || !/[Ss]eason/.test(s.nextDetail)) {
+      fail(`expected participation-blocked guidance naming the missing `
+        + `Season, got ${JSON.stringify(s)}`);
+    }
+    if (s.primaryLabel !== null) {
+      fail(`Program-only participation must never render a clickable `
+        + `Register Team action that would land unbound/unfocused, got `
+        + `primary "${s.primaryLabel}"`);
+    }
+    await assertCardHasNoA11yViolations(page, viewport.label,
+      "blocked-guidance state (participation, Program-only)");
+    await logout(page);
+    await loginAs(page, "admin", "demo");
+
     // ---- (C) Program C, driven fully complete by League Admin: the
     // complete-state secondary Import action must be visible/reachable for
     // League Admin (MANAGE_SETUP) but withheld from Arena Manager (#331

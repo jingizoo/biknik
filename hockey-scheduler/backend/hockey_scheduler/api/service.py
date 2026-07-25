@@ -305,23 +305,27 @@ class ApiService:
         caller distinguishes "genuinely done" from "nothing more for you" by
         checking ``complete``.
 
-        ``next`` is also filtered to workflows that are actually safe to
-        execute right now, not merely permitted (#331 review round 3
-        finding 1): "facilities" needs a resolved, ACTIVE Season to
-        generate ice into (its real write fails ``season_missing`` with no
-        Season resolved, and — being itself required to run under an
-        active Season, #159 — ``season_archived`` if the resolved one is
-        archived), and "participation" needs that same Season to be active
-        (its real write likewise fails ``season_archived`` when it is
-        not). A workflow that is permitted but prerequisite-blocked is never
-        handed out as ``next`` (a dead-end CTA the operator cannot actually
-        complete); if no workflow is both permitted and safe, ``next`` is
-        None and ``next_blocked`` names the first permitted-but-blocked one
-        with a reason code and human-readable guidance, so the operator is
-        told what to resolve first instead of being left to infer it (or,
-        for a role that cannot resolve it themselves — an Arena Manager
-        blocked on a Season only a League Admin can create — at least told
-        clearly rather than handed a CTA that silently fails).
+        ``next`` is the FIRST todo workflow, in the fixed #204 order, that
+        this caller's role can manage — filtered to what's actually safe to
+        execute right now, not merely permitted (#331 review round 3/4
+        finding 1): both "facilities" and "participation" need a resolved,
+        ACTIVE Season (their real writes both route through
+        ``season_guard.require_active_season`` and fail ``season_missing``
+        with none resolved, ``season_archived`` if the resolved one is
+        archived — see ``_workflow_prerequisite_gap``). The FIRST
+        permitted-todo workflow is the one this applies to; a prerequisite
+        gap there blocks it IN PLACE rather than falling through to a
+        later, incidentally-safe workflow — #330 names "the actual next
+        incomplete step" as a strictly ordered contract, and skipping ahead
+        would silently reorder it and could read as the blocked step being
+        forgotten rather than blocked. When that first workflow is safe, it
+        is ``next``; when it is blocked, ``next`` is None and
+        ``next_blocked`` names it with a reason code and human-readable
+        guidance, so the operator is told what to resolve first instead of
+        being left to infer it (or, for a role that cannot resolve it
+        themselves — an Arena Manager blocked on a Season only a League
+        Admin can create — at least told clearly rather than handed a CTA
+        that silently fails).
 
         "Imports and onboarding" reports a third ``status``, ``"optional"``,
         instead of ``"done"``/``"todo"`` (#330 review round 1 finding 5): it
@@ -456,11 +460,17 @@ class ApiService:
         complete = all(w["status"] == "done" for w in workflows
                        if w["status"] != "optional")
 
-        # #331 review round 3 finding 1: a workflow permitted by role but
-        # blocked by an unmet Season prerequisite is never handed out as
-        # `next` -- keep scanning for one that is both permitted AND safe,
-        # remembering the first permitted-but-blocked candidate in case none
-        # ever is.
+        # #331 review round 3/4 finding 1: `next` is the FIRST todo workflow
+        # this role can manage, in the fixed #204 order -- #330's "actual
+        # next incomplete step" is a strictly ordered contract, not "the
+        # first one that happens to be safe". A prerequisite gap on that
+        # one workflow blocks it in place; it is never skipped in favor of
+        # a LATER todo workflow that happens to be unblocked (round 4
+        # review: doing so silently reordered the sequence and could read
+        # as "participation was skipped/forgotten" instead of "blocked,
+        # here's why"). Permission still filters candidacy exactly as
+        # before (round 1) -- only the FIRST permitted one is ever
+        # considered, whether that turns out safe or blocked.
         next_incomplete = None
         next_blocked = None
         for w in workflows:
@@ -469,13 +479,11 @@ class ApiService:
             gap = self._workflow_prerequisite_gap(w["key"], season)
             if gap is None:
                 next_incomplete = w
-                break
-            if next_blocked is None:
+            else:
                 reason, detail = gap
                 next_blocked = {"key": w["key"], "label": w["label"],
                                  "reason": reason, "detail": detail}
-        if next_incomplete is not None:
-            next_blocked = None
+            break
 
         # Redact workflows this caller's role cannot manage from the
         # response (#331 review round 3 finding 1) -- computed from the full
@@ -497,28 +505,30 @@ class ApiService:
     def _workflow_prerequisite_gap(key, season):
         """None if `key`'s primary action is safe to execute given the
         resolved Season context; otherwise (reason, detail) describing what
-        must change first (#331 review round 3 finding 1). Mirrors the exact
-        conditions the real writes enforce, read-only -- never mutates or
-        row-locks, unlike the guards it mirrors: "facilities"'s real write
-        (``SetupService.commit_ice_availability``, behind the Ice
-        Availability Builder) has nothing to generate ice into without a
-        resolved Season (``season_missing`` — see
-        ``league_scope.assign_game_ice``'s identical check on the same
-        underlying condition) and itself "requires an active Season (#159)"
-        -- an ARCHIVED one is rejected exactly like "participation"'s real
-        write (``register_team_for_season``) is, both via
-        ``season_guard.require_active_season``'s ``season_archived``. Every
-        other workflow's primary action (Add Season, Add Team, Add Player,
-        Import data) has no Season prerequisite of its own."""
+        must change first (#331 review round 3/4 finding 1). Mirrors the
+        exact conditions the real writes enforce, read-only -- never
+        mutates or row-locks, unlike the guards it mirrors. Both
+        "facilities" (``SetupService.commit_ice_availability``, behind the
+        Ice Availability Builder) and "participation"
+        (``register_team_for_season``) route through
+        ``season_guard.require_active_season``, so both fail identically:
+        ``season_missing`` with no Season resolved (nothing to generate ice
+        into / no season to register a team for -- also true for
+        "participation" specifically because its own real destination,
+        ``focusParticipationRegisterControl()``, needs an exact selected
+        Season to deep-link/focus a specific Register control; with none
+        resolved it can only fall back to a generic, unbound landing on the
+        Setup tree, not the precise binding #330's round-2 review already
+        required), and ``season_archived`` if the resolved one is archived
+        (read-only until an authorized reopen). Every other workflow's
+        primary action (Add Season, Add Team, Add Player, Import data) has
+        no Season prerequisite of its own."""
         if key not in ("facilities", "participation"):
             return None
+        action = "adding ice" if key == "facilities" else "registering teams"
         if season is None:
-            if key == "facilities":
-                return ("season_missing",
-                        "Create or select a Season before adding ice.")
-            return None
+            return ("season_missing", f"Create or select a Season before {action}.")
         if season.status == SeasonStatus.ARCHIVED:
-            action = "adding ice" if key == "facilities" else "registering teams"
             return ("season_archived",
                     f"Season '{season.name}' is archived and read-only — "
                     f"reopen it or select an active Season before {action}.")
