@@ -3727,6 +3727,11 @@ const IMPORT_CONFLICT_VIEWPORTS = [
   { label: "phone", width: 390, height: 844, port: 8316 },
 ];
 
+const IMPORT_AMBIGUOUS_DIVISION_VIEWPORTS = [
+  { label: "desktop", width: 1440, height: 900, port: 8317 },
+  { label: "phone", width: 390, height: 844, port: 8318 },
+];
+
 // #331 review round 15 finding 1's required desktop/390px import smoke
 // coverage: the Teams & Players import wizard must show the STRUCTURED
 // incompatibility this round's own new gate produces, never a `Committed`
@@ -3846,6 +3851,119 @@ async function checkImportLeagueConflict(browser, viewport) {
   }
 }
 
+// #331 review round 16 reproduction 3's required desktop/390px import smoke
+// coverage: a Division name that exists under TWO different permanent
+// Leagues (Division names are not unique within a Season) must be rejected
+// with a structured import_division_name_ambiguous error, never silently
+// resolved by whichever duplicate the UI's own network layer happens to
+// see first, when the row's own Team has no permanent League to
+// disambiguate with.
+async function checkImportAmbiguousDivisionRejection(browser, viewport) {
+  const base = `http://${HOST}:${viewport.port}`;
+  const server = spawn(
+    process.env.PYTHON || "python3",
+    ["-u", "-m", "hockey_scheduler.web.server", "--host", HOST, "--port", String(viewport.port)],
+    { cwd: BACKEND_DIR, stdio: ["ignore", "pipe", "pipe"] });
+  let serverOutput = "";
+  server.stdout.on("data", (d) => { serverOutput += d.toString(); });
+  server.stderr.on("data", (d) => { serverOutput += d.toString(); });
+
+  const context = await browser.newContext({
+    viewport: { width: viewport.width, height: viewport.height },
+  });
+  const page = await context.newPage();
+  const errors = [];
+  page.on("pageerror", (e) => errors.push(`[pageerror] ${e.message}`));
+  page.on("console", (m) => { if (m.type() === "error") errors.push(`[console] ${m.text()}`); });
+
+  const fail = (msg) => { throw new Error(`[${viewport.label}] ${msg}`); };
+
+  try {
+    await waitForServer(`${base}/api/health`, READY_TIMEOUT_MS);
+    await page.goto(base, { waitUntil: "domcontentloaded" });
+    await loginAs(page, "admin", "demo");
+
+    // One Season, two permanent Leagues, and a Division named identically
+    // under each -- a real, supported topology (Division creation enforces
+    // no name-uniqueness constraint).
+    const seed = await page.evaluate(async () => {
+      const post = async (p, b) => (await fetch(p, {
+        method: "POST", credentials: "same-origin",
+        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
+      })).json();
+      const program = await post("/api/v2/setup/program",
+        { name: "Ambiguous Division Program", country: "US" });
+      const season = await post("/api/v2/setup/season", { program_id: program.id,
+        name: "Ambiguous Season", start_date: "2026-09-01", end_date: "2027-03-31" });
+      const leagueA = await post("/api/v2/setup/league",
+        { season_id: season.id, name: "Ambiguous League A" });
+      const leagueB = await post("/api/v2/setup/league",
+        { season_id: season.id, name: "Ambiguous League B" });
+      await post("/api/v2/setup/division", { league_id: leagueA.id, name: "SharedName" });
+      await post("/api/v2/setup/division", { league_id: leagueB.id, name: "SharedName" });
+      return { season: season.id };
+    });
+
+    await page.goto(base, { waitUntil: "domcontentloaded" });
+    await reachDashboard(page);
+    await page.click('.tab[data-tab="import"]');
+    await page.waitForSelector("[data-import-type]", { timeout: 10000 });
+    await page.click('[data-import-type="teams_players"]');
+    await page.waitForFunction(
+      (v) => (document.getElementById("import-season") || {}).value === v,
+      seed.season, { timeout: 10000 });
+
+    const ambiguousCsv = "team_code,team_name,division_name\n"
+      + "AMBIGNEW,Ambiguous New Team,SharedName\n";
+    await page.fill("#import-teams_csv", ambiguousCsv);
+    const validateResp = page.waitForResponse((r) =>
+      r.url() === `${base}/api/import/dry-run` && r.request().method() === "POST");
+    await page.click("[data-import-validate]");
+    await validateResp;
+    await page.waitForFunction(() => {
+      const btn = document.querySelector("[data-import-commit]");
+      return !!(btn && !btn.disabled);
+    }, null, { timeout: 10000 });
+
+    const commitResp = page.waitForResponse((r) =>
+      r.url() === `${base}/api/import/commit/teams-players` && r.request().method() === "POST");
+    await page.click("[data-import-commit]");
+    const commitJson = await (await commitResp).json();
+    if (commitJson.committed) {
+      fail(`expected the ambiguous Division name to be rejected, not `
+        + `committed: ${JSON.stringify(commitJson)}`);
+    }
+    if (!(commitJson.errors || []).some(
+        (e) => e.reason === "import_division_name_ambiguous")) {
+      fail(`expected an import_division_name_ambiguous structured error, `
+        + `got: ${JSON.stringify(commitJson)}`);
+    }
+    // The UI itself must SURFACE the structured incompatibility, not just
+    // the raw network response -- no silent "Committed" success state.
+    await page.waitForFunction(() => {
+      const body = document.body.textContent || "";
+      return !/\bCommitted\b/.test(body) || /ambiguous|more than one|different/i.test(body);
+    }, null, { timeout: 10000 });
+    const bodyText = await page.evaluate(() => document.body.textContent || "");
+    if (/^\s*Committed\s*$/im.test(bodyText.split("\n").find((l) => l.trim()) || "")) {
+      fail("expected the Import screen to show the structured incompatibility, "
+        + "not a bare Committed success state");
+    }
+
+    if (errors.length) {
+      fail(`unexpected browser errors: ${JSON.stringify(errors)}`);
+    }
+    console.log(`[${viewport.label}] OK — a Division name that exists under `
+      + `two different leagues is rejected with a structured error for a `
+      + `league-less team's row, never a false Committed success state.`);
+  } catch (error) {
+    throw new Error(`${error.message}\n--- demo server output ---\n${serverOutput}`);
+  } finally {
+    await context.close();
+    await stopServer(server);
+  }
+}
+
 async function main() {
   let browser;
   try {
@@ -3855,6 +3973,9 @@ async function main() {
     for (const viewport of ROLE_VIEWPORTS) await checkRoleScenarios(browser, viewport);
     for (const viewport of IMPORT_CONFLICT_VIEWPORTS) {
       await checkImportLeagueConflict(browser, viewport);
+    }
+    for (const viewport of IMPORT_AMBIGUOUS_DIVISION_VIEWPORTS) {
+      await checkImportAmbiguousDivisionRejection(browser, viewport);
     }
     console.log("Home/Tasks hub browser journey passed.");
   } catch (error) {

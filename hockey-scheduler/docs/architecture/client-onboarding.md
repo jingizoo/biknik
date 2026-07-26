@@ -1119,6 +1119,116 @@ deactivating aliased the very mutation under test, keeping the test green
 even with both fix layers reverted; fixed by snapshotting an independent
 copy before mutating.
 
+Round 15's own convergence review (#331 review round 16) confirmed both of
+its findings fixed, then found three further reproductions still violating
+the identical invariant round 15 was meant to close
+(`Team.league_id == registration.LeagueSeason.league_id`, and a non-null
+Division must belong to that same LeagueSeason) through code paths round 15
+never touched — all three traced back to the same root cause the review
+named directly: gate validation and apply each derived a row's Division and
+target League independently, so the two could silently diverge.
+
+The first: a brand-new Team's row was invisible to the per-existing-Team
+gate loop entirely (`if existing is None: continue`), so it never
+contributed to — or was constrained by — round 15's own same-upload
+new-Division-League conflict tracking. Worse, apply's own per-row Division
+resolution was a *live* `divisions_for_season()` re-query, so a Division an
+**earlier** row in the same apply pass had just created (for a brand-new
+Team, correctly falling back to the Season's ambient default League, since
+a new Team has nothing else to prefer) became visible to a **later**
+row for an *existing* Team naming the identical Division name — which then
+silently reused it, leaving `Team.league_id` at the existing Team's real
+permanent League while the registration landed under the ambient default.
+Reversing the two rows' upload order avoided the defect, confirming it was
+order-dependence, not a genuine conflict. Closed by moving the entire
+cross-row Division-League resolution to a whole-batch pre-pass that runs
+*before* any row is decided: every row in the upload — new Team or existing
+alike — that names a not-yet-existing Division contributes its Team's own
+permanent League (when it has one) to a `{name: {league_ids}}` map; more
+than one distinct League named for the same Division is the existing
+same-upload conflict, rejected before any write; exactly one is the
+resolved target for every row naming that name, regardless of which row a
+loop visits first or whether that row's own Team has a preference at all.
+
+The second: the registration created inside `commit_teams_players_import`
+apply is a `SeasonTeamRegistration` — its `active` and `division_id` fields
+were the *only* signal the apply loop's own update-vs-no-op branch checked;
+`league_season_id` itself was never compared. A registration already
+active, with a division that already matches, silently skipped the update
+branch entirely even when `league_season_id` had drifted to point at the
+wrong League — reporting success while leaving the wrong League in place.
+Distinct from the first finding: this is a row whose Team's own
+`league_id` may already be perfectly correct, but whose separately-stored
+registration disagrees with it regardless — a state no current write path
+can produce going forward (this fix, and `register_team_for_season`'s own
+Rule 7, both prevent it), but which a write path predating this invariant
+(the pre-round-15 importer, or any other direct write) could leave behind.
+Closed with the same lifecycle semantics `assign_season_team_league`
+already established for exactly this class of change — never merely adding
+`league_season_id` to the raw-save condition, which alone would silently
+move a registration out of a League committed games still reference: a new
+gate check compares each existing registration's *actual* current League
+against the row's resolved target, and where they disagree, scans for a
+non-cancelled Game still referencing the current (soon-to-be-wrong) League
+for that Team in that Season. Any such Game rejects the whole batch with
+zero mutation and the same `registration_league_change_strands_games`
+reason `assign_season_team_league` itself raises; otherwise the repair
+proceeds — the update branch's own condition now includes the
+`league_season_id` comparison, safe specifically *because* the gate above
+already proved it game-free.
+
+The third: a Season can validly contain two Divisions sharing an identical
+name under two different permanent Leagues — Division creation enforces no
+name-uniqueness constraint at all. Gate's own snapshot was a
+`{name: division}` dict comprehension — last-wins by store iteration order
+— while apply's own lookup was a `next(...)` generator expression over a
+live query — first-wins. Whichever one the store's iteration order happened
+to put last vs. first could therefore diverge, letting apply commit a
+registration under a League gate never actually validated. Closed with one
+shared `_pick_division_candidate` helper both gate and apply call
+identically: Divisions are now grouped by name (never collapsed), a lone
+candidate is always unambiguous regardless of League, and two or more
+requires the row's own Team's permanent League to resolve to *exactly* one
+of them — no preference to disambiguate with, or none/more than one
+candidate actually matching it, is genuinely ambiguous and rejected with a
+new `import_division_name_ambiguous` reason before any write, never
+silently guessed.
+
+All three fixes converge on one general resolver, `_resolve_row_division_
+and_league`, replacing round 15's narrower `_resolve_import_team_target_
+league`: called identically by gate validation (to predict what apply would
+do, without apply's own auto-create side effects) and by apply itself (to
+actually do it) against the SAME frozen `_divisions_by_name` grouping and
+whole-batch `_new_division_target_league` consensus map — the one property
+the review's own required correction named explicitly: "gate and apply must
+operate on the same frozen identities, independent of upload/insertion
+order." A Division apply creates mid-pass is registered back into that same
+frozen grouping immediately, so a later row in the identical apply pass
+correctly reuses it (gate's own whole-batch pre-pass already proved every
+row naming that name agrees on its League, so this reuse is provably safe,
+not a reintroduction of the live-requery bug the first finding closes).
+
+Regression coverage runs all eight new scenarios (the three reproductions,
+plus their positive/negative counterparts — both upload orders for the
+first, both Division-creation orders for the third, and the game-free-
+repair/stranded-rejection/already-correct-no-op triple for the second)
+through the SAME shared `ImportCommitServiceContract` every other
+Memory/SQLite import-commit test in this file already uses — extended with
+a third mix-in, `PostgresImportCommitTest`, running the identical contract
+against a real PostgreSQL-backed store (none of the three reproductions is
+a genuine concurrency race; all are deterministic within one commit call,
+one connection, so a real third backend, not a forced two-connection race,
+is what the review's own required matrix calls for here). Two of the eight
+scenarios are additionally driven through the real HTTP commit route. All
+three fixes are falsifiability-verified independently — each of the three
+mechanisms (the whole-batch consensus map, the shared disambiguation
+helper, and the registration-repair gate check) reverted in turn, with the
+rest of the fix left in place, confirming each scenario's own regressions
+fail for the exact documented reason and no other, before every revert is
+restored. Desktop and 390px import smoke coverage gains a second scenario
+(alongside round 15's) proving the ambiguous-Division-name rejection
+surfaces in the real UI, never a false `Committed` state.
+
 ## Authorization and privacy invariants
 
 - The bootstrap claim is the only unauthenticated mutation, and only on a fresh,
