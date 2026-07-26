@@ -39,6 +39,7 @@ from ..domain.jersey import (
 from .setup_service import (
     _HierarchyTeamOrPlayerDrifted,
     parse_season_boundary,
+    resolve_team_registration_for_import,
     resolve_timezone,
 )
 
@@ -1040,19 +1041,44 @@ def _preflight_reassignment_safety(store, rows, now=None) -> List[dict]:
     # (b) A registration's LEAGUE or DIVISION move must not strand committed
     #     games (#260 review: league_code is now an explicit, changeable
     #     registration field, not just division_code).
+    league_id_by_code = {code: lid for lid, code in league_code_by_id.items()}
     for index, row in enumerate(rows["registrations"], start=1):
         season = seasons.get(_clean(row.get("season_code")))
         team = teams.get(_clean(row.get("team_code")))
         if season is None or team is None:
             continue  # a new season/team has no existing registration to move
-        # #283: registration_for_team_in_season is gone; a Team registers per
-        # LeagueSeason, so find its row among the Season's registrations.
-        reg = next((r for r in store.registrations_for_season(season.id)
-                    if r.team_id == team.id), None)
-        if reg is None:
-            continue  # a genuinely new registration moves nothing
         new_league_code = _clean(row.get("league_code"))
         new_division_code = _clean(row.get("division_code"))
+        # #331 review round 18: resolved by exact (team, target LeagueSeason)
+        # identity -- and, only when the Team has no row there yet, its SOLE
+        # other active registration in this Season -- never the first
+        # registration registrations_for_season happens to return, which
+        # could cannibalize an inactive HISTORICAL row (destroying what
+        # transfer_team_to_league deliberately preserved) or collide with an
+        # already-correct different active one. Shared with upsert_imported_
+        # registration's own apply-time resolution (the same module-level
+        # resolve_team_registration_for_import) so this gate and that apply
+        # can never derive different answers for the identical row. A
+        # league_code naming a League not yet created in this SAME batch
+        # resolves to target_league_id=None, which the shared resolver
+        # already treats safely: no LeagueSeason can match it, so the
+        # Team's other active registration (if exactly one) is still
+        # correctly identified as the row being compared against.
+        target_league_id = league_id_by_code.get(new_league_code)
+        reg, _is_move, conflict_ids = resolve_team_registration_for_import(
+            store, season.id, team.id, target_league_id)
+        if conflict_ids:
+            errors.append({
+                "sheet": "registrations", "row": index, "field": "team_code",
+                "code": "team_registration_conflict",
+                "message": (f"Team {_clean(row.get('team_code'))} already "
+                            "has more than one active registration in "
+                            f"season {_clean(row.get('season_code'))}; "
+                            "resolve the conflict before importing."),
+                "affected_registration_ids": conflict_ids})
+            continue
+        if reg is None:
+            continue  # a genuinely new registration moves nothing
         # #283: registration.league_id dropped; resolve current League via LeagueSeason.
         reg_ls = store.get_league_season(reg.league_season_id)
         reg_league_id = reg_ls.league_id if reg_ls else None

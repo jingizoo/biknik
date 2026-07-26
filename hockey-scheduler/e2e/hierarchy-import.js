@@ -401,11 +401,41 @@ async function checkViewport(browser, viewport) {
         throw new Error(`[${viewport.label}] hierarchy data appeared in browser storage`);
       }
     }
+    // #331 review round 18: team_registration_conflict (and any other
+    // reason carrying affected_registration_ids/affected_game_ids) must
+    // name the EXACT conflicting row ids in the rendered error, not just a
+    // generic message — an operator resolving a two-active-registration
+    // conflict needs to know precisely which rows Season participation's
+    // own per-League controls (season-participation.js's own round-18
+    // coverage) should Save/Remove. Checked directly against the real
+    // renderImportRows the commit path calls, rather than wiring a full
+    // conflicting-registration CSV fixture through validate/commit.
+    const conflictHtml = await page.evaluate(() => renderImportRows([
+      { sheet: "teams", row: 3, field: "team_code",
+        message: "Team HOME already has more than one active registration "
+          + "in this season; resolve the conflict before importing.",
+        affected_registration_ids: ["streg_1", "streg_2"] },
+      { sheet: "registrations", row: 1, message: "would strand a game",
+        affected_game_ids: ["game_9"] },
+      { sheet: "competition", row: 2, message: "no affected ids on this one" },
+    ], "error"));
+    if (!conflictHtml.includes("<code>streg_1</code>")
+        || !conflictHtml.includes("<code>streg_2</code>")) {
+      throw new Error(`[${viewport.label}] affected_registration_ids not rendered: ${conflictHtml}`);
+    }
+    if (!conflictHtml.includes("<code>game_9</code>")) {
+      throw new Error(`[${viewport.label}] affected_game_ids not rendered: ${conflictHtml}`);
+    }
+    const noIdsRowHtml = conflictHtml.split('row 2')[1] || "";
+    if (noIdsRowHtml.includes("Affected:")) {
+      throw new Error(`[${viewport.label}] an id-less row rendered a spurious Affected: line`);
+    }
+
     if (errors.length) {
       throw new Error(`[${viewport.label}] console/page errors:\n${errors.join("\n")}`);
     }
     console.log(`[${viewport.label}] OK — wizard order/visibility, fresh commit, `
-      + "idempotent repeat, and invalid-row rollback all verified.");
+      + "idempotent repeat, invalid-row rollback, and affected-id rendering all verified.");
   } catch (error) {
     throw new Error(`${error.message}\n--- demo server output ---\n${serverOutput}`);
   } finally {

@@ -173,23 +173,31 @@ def team_registration_valid(store, season, team_id, division_id=None,
     # no operational consumer may trust such a row.
     if get_scope_program(store, season_scope) is None:
         return None
-    # #283: registration_for_team_in_season is gone; a Team registers per
-    # LeagueSeason, so find its row among the Season's registrations.
-    reg = next((r for r in store.registrations_for_season(season.id)
-                if r.team_id == team_id), None)
-    if reg is None or not reg.active:
-        return None
     team = store.get_team(team_id)
     if team is None or not team_scope_id(team) or team_scope_id(team) != season_scope:
         return None
-    # #283 rules 7-9: sharing a Program is not enough — the registration must sit
-    # in the Team's OWN permanent League. Resolve the registration's LeagueSeason
-    # and fail closed unless its League equals the Team's permanent league_id, so
-    # a same-Program cross-League drift (a Bronze Team injected into Platinum's
-    # LeagueSeason) is never trusted by game creation, drafts, or standings.
-    ls = (store.get_league_season(reg.league_season_id)
-          if reg.league_season_id else None)
-    if ls is None or not team.league_id or ls.league_id != team.league_id:
+    # #331 review round 18: resolved by the Team's exact (team, permanent-
+    # League LeagueSeason) identity -- never the first Season-wide row for
+    # this team regardless of active status/LeagueSeason. A Team can hold
+    # more than one registration row in the same Season (migration 035:
+    # unique only on (team_id, league_season_id)) -- an inactive prior-
+    # League row transfer_team_to_league deliberately preserved as history,
+    # or a stale cross-League row a write path predating Rule 7 left behind
+    # (#331 review round 17/18's own commit_teams_players_import fix names
+    # both exact failure shapes). Picking the first one regardless of League
+    # could silently hide a genuinely valid active row behind an inactive or
+    # cross-League sibling that happens to sort first -- rejecting real
+    # participation instead of validating it. #283 rules 7-9: a registration
+    # must sit in the Team's OWN permanent League; at most one row can ever
+    # match (team_id, league_season_id) for that exact LeagueSeason, so this
+    # lookup is unambiguous by construction, never a guess.
+    if not team.league_id:
+        return None
+    ls = store.league_season_for(team.league_id, season.id)
+    if ls is None:
+        return None
+    reg = store.registration_for_team_in_league_season(ls.id, team_id)
+    if reg is None or not reg.active:
         return None
     if require_division and division_id is not None and reg.division_id != division_id:
         return None

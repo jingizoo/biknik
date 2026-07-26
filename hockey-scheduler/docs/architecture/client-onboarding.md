@@ -1342,7 +1342,239 @@ suite — which this review's report did not name and this round did not
 attempt, to keep the shipped fix scoped to exactly what was reported and
 independently verifiable.
 
-## Authorization and privacy invariants
+Round 17's own convergence review (#331 review round 18) generalized the
+identical defect class it closed for `commit_teams_players_import` to six
+more places sharing the same underlying assumption: that a Team has at most
+one registration row per Season, so a Season-wide scan (`next(r for r in
+registrations_for_season(...) if r.team_id == team_id)`, or an equivalent
+first-match pattern) safely identifies "the" row. Migration 035 never
+enforced that — its uniqueness is `(team_id, league_season_id)` — and this
+whole review cycle's own round 16/17 fixes exist precisely because
+`transfer_team_to_league` deliberately leaves a Season's prior-League row
+untouched as history. Every write or read path that re-derives "the"
+registration from a bare team id, rather than resolving the Team's *current*
+target `LeagueSeason` first, inherits the same two failure shapes: picking an
+inactive historical row and cannibalizing it (destroying preserved history),
+or picking an unrelated active row and colliding with it (a silent duplicate
+on Memory, a raw `unique_violation` on SQLite/PostgreSQL).
+
+The six sites and their fixes:
+
+1. **Hierarchy import** (`hierarchy_import.py`'s `_preflight_reassignment_
+   safety` check (b), and `commit_hierarchy_import`'s own
+   `upsert_imported_registration` apply path) had the textually identical
+   `next(...)` pattern round 17's own "out of scope" note named but
+   deliberately deferred. Round 17's resolver, `_resolve_import_row_
+   registration`, was a `SetupService` method — unusable from
+   `hierarchy_import.py`'s module-level functions, which have no service
+   instance. Lifted to a module-level, `store`-only function,
+   `resolve_team_registration_for_import(store, season_id, team_id,
+   target_league_id)`, with the identical exact-identity/conflict contract;
+   `SetupService._resolve_import_row_registration` is now a one-line
+   delegate to it, so `commit_teams_players_import`, `upsert_imported_
+   registration`, both rollover entry points, and the hierarchy preflight
+   gate all resolve a row through the exact same callable — never two
+   independently-written lookups that could quietly diverge on the identical
+   input, the same discipline round 16 established for Division/League
+   resolution and round 17 extended to row selection. The preflight's
+   existing per-row stranded-Game guard (unconditional on `league_changed`/
+   `division_changed`, already correct) composes with the resolver's
+   corrected identity unchanged.
+
+2. **Season rollover v1** (`roll_forward_registrations`) reused the same
+   resolver for its per-team apply loop, but its skip/reactivate branching —
+   `if existing is not None and existing.active: skipped += 1; continue` —
+   was written before the resolver's three-way contract was fully reasoned
+   through. The resolver's own "move" candidate (`other_active[0]` when
+   `target_reg` is `None` and exactly one other active row exists) is active
+   *by construction*, since `other_active` is filtered on `r.active`. Without
+   also excluding the move case, every move candidate satisfied `existing is
+   not None and existing.active` and was silently counted as "already
+   correctly registered" — the move branch that would rewrite its
+   `league_season_id` was unreachable dead code, and a Team stuck under the
+   wrong League from a stale write path stayed there forever, silently
+   reported as a successful skip. Fixed by adding `and not _is_move` to the
+   skip condition, and — since nothing had ever gated the move itself against
+   a committed Game — adding the identical guard `assign_season_team_league`
+   and `commit_teams_players_import` already apply before an equivalent
+   move: a non-cancelled Game still referencing the row's *current* League
+   blocks the move with a new `registration_league_change_strands_games`
+   rejection instead of silently stranding it.
+
+3. **Season rollover v2** (`roll_forward_registrations_v2`) does not reuse
+   the shared resolver at all — reusing its "move" semantics would have
+   regressed v2's own deliberate, pre-existing "reject on any active-row
+   mismatch, never silently move" contract (the code's own comment: a
+   mismatch "would silently ignore the selection's required League/Division
+   ... a contract violation"). Instead, the identity bug is fixed narrowly:
+   the gate's existing-row lookup and its scan for any *other* active
+   registration elsewhere in the target Season now both resolve by exact
+   `(team_id, target_league_season_id)` identity via `registration_for_team_
+   in_league_season`, never a Season-wide `next(...)`/unfiltered scan. v2's
+   own conservative behavior is unchanged and unconditional either way: an
+   inactive sibling under a different League never blocks (a distinct new
+   active row is created, matching v1/hierarchy import), and any *other
+   active* row under a different League is always rejected as `rollover_
+   conflicts_active_registration` — regardless of whether a committed Game
+   is even present to strand, since v2 never attempts the move that would
+   strand one in the first place.
+
+4. **`_transfer_team_to_league_inner`** and **`assign_season_team_league`**
+   both blindly rebound a Team's active registration's `league_season_id`
+   onto the target LeagueSeason with no existence check at the destination —
+   silently duplicating an active row on Memory, or raising a raw `unique_
+   violation` on SQLite/PostgreSQL, when the Team already retained a row
+   there (inactive history from a prior assignment/transfer cycle, or —
+   rarer — an independently active row left by legacy data). Both gained a
+   direct `registration_for_team_in_league_season(target_ls.id, team_id)`
+   check before any write: a retained *inactive* row is reactivated in place
+   and the source row retired (mirroring `register_team_for_season`'s own
+   reactivate-in-place semantics for the identical situation), while an
+   independently *active* row at the target is an unresolvable conflict,
+   rejected with a new `team_registration_conflict` before any write.
+   `_transfer_team_to_league_inner` additionally pre-scans its full
+   candidate batch (one candidate per Season the Team holds a mismatched
+   active row in) for two candidates that would collide on the *same*
+   target LeagueSeason — reachable only when the Team already held two
+   concurrently active rows in two other Leagues for one Season, itself a
+   pre-existing Rule 7 violation — before any candidate in the batch writes,
+   preserving the function's documented zero-mutation-on-rejection contract.
+
+   `assign_season_team_league`'s first attempt at this fix reused the shared
+   import resolver (passing its own already-known `reg` as the team id's
+   implicit "row to write"), on the reasoning that `reg` would always
+   surface as the resolver's `is_move=True` reflection of itself. That holds
+   only when nothing yet exists at the target — once a retained row *is*
+   found there, `reg` (being active and elsewhere) unavoidably appears in
+   the resolver's own `other_active` scan too, self-reported as a second
+   conflicting registration, since the resolver has no way to know `reg` was
+   the caller's own row rather than a genuine second candidate. Caught by
+   the new regression suite below (a false `team_registration_conflict` on
+   exactly the retained-inactive-row case this fix is supposed to handle)
+   and corrected: unlike every other caller of the shared resolver — which
+   must first *discover* which row a team id resolves to — `assign_season_
+   team_league` already has the specific row pinned by its caller, so it
+   never needed the resolver's discovery machinery at all. Replaced with the
+   same direct, resolver-independent `registration_for_team_in_league_
+   season` check `_transfer_team_to_league_inner` uses.
+
+5. **`team_registration_valid`** (`league_scope.py`), the single shared
+   resolver every live-scheduling consumer (`create_game`, standings, draft
+   generation) reads through, had the same `next(r for r in registrations_
+   for_season(...) if r.team_id == team_id)` pattern at its core — a Team's
+   genuinely valid active registration under its current permanent League
+   could be hidden behind an inactive or cross-League sibling that happened
+   to sort first. Rewritten to resolve the Team's permanent-League
+   `LeagueSeason` first (`league_season_for(team.league_id, season.id)`),
+   then look up the registration by that exact identity
+   (`registration_for_team_in_league_season`) — unambiguous by construction,
+   since at most one row can ever match one exact LeagueSeason.
+
+6. **`get_setup_progress`/`get_onboarding_status_v2`** (Home/Tasks hub
+   readiness and the installation-wide onboarding readiness) counted *any*
+   active registration whose `LeagueSeason` fell within the resolved
+   Season as schedulable participation, without checking that Team against
+   the same Rule 7 invariant `team_registration_valid` and `register_team_
+   for_season` both enforce. `transfer_team_to_league` deliberately leaves a
+   Season's active registration frozen at a Team's OLD League while `Team.
+   league_id` moves on (history preservation for an ended Season, or the
+   identical same-Program cross-League drift a stale pre-Rule-7 write path
+   could leave in a current one) — exactly the row `create_game`/`move_game`
+   /`publish` would all reject outright, yet both readiness endpoints
+   reported it as "done"/`ready_to_schedule`, a false-positive completion
+   signal an operator would only discover by hitting the real rejection
+   later. Both now require `team.league_id == ls.league_id` alongside the
+   existing Program-membership check before counting a registration.
+
+Regression coverage: nine new tests across `test_import_teams_
+registrations.py` (hierarchy import — inactive-sibling-creates-distinct-row,
+true no-op, and the two-active-registrations conflict, mirroring round 17's
+own `commit_teams_players_import` matrix on the identical shared resolver);
+eight in a new `RolloverExactIdentityTest` in `test_season_rollover.py` (v1 —
+inactive-sibling, true no-op in both physical insertion orders, the stale-
+active-row move succeeding game-free and with only a cancelled Game present,
+rejecting with zero mutation when a non-cancelled Game is present, and the
+two-active-row conflict in both insertion orders); four new tests extending
+`RollForwardConflictSqlTest` in `test_v2_reassignment_integrity_sql.py` (v2 —
+inactive-sibling, and the active-elsewhere conflict proven identical whether
+or not a committed Game is present, on both SQLite and PostgreSQL); four new
+tests in two new SQL-integrity classes in the same file,
+`TransferRetainedTargetSqlTest` and `AssignLeagueRetainedTargetSqlTest`
+(retained-inactive-row reactivation and independently-active-row conflict,
+zero mutation on rejection, for both `_transfer_team_to_league_inner` and
+`assign_season_team_league`, on both SQLite and PostgreSQL); a new test in
+`test_team_division_id_removed.py`'s Memory/SQLite/PostgreSQL contract
+proving `team_registration_valid` resolves correctly (and `create_game`
+schedules successfully) with an inactive cross-League sibling present, in
+both insertion orders; and one new Memory test each in `test_setup_
+progress.py` and `test_v2_onboarding_status.py` proving a stale wrong-League
+active registration is excluded from "done"/`ready_to_schedule`, surfaces as
+an actionable (not blocked) `next` step when a genuinely eligible Team
+exists, and — deliberately — is left untouched and still reported even after
+an operator adds the correct registration alongside it, since this endpoint
+never silently drops a known-bad row just because unrelated data now makes
+the installation schedulable.
+
+Falsifiability-verified for the four backend behavior changes with the
+sharpest failure shapes: reverting the `not _is_move` exclusion in v1
+rollover's skip condition fails exactly the two stale-active-row move tests
+(`rolled_forward: 0, skipped: 1` instead of the expected move); reverting
+`get_setup_progress`'s and `get_onboarding_status_v2`'s added League-match
+condition each fail their new test with the exact false-positive the finding
+described (`participation: done` / `ready_to_schedule: true`) restored; and
+the frontend fix (below) fails its new e2e assertions with the Team's home-
+League row missing from the DOM entirely once its `regByTeamLeague` map is
+collapsed back to a team-id-only key, confirming the map population and its
+read site must both stay keyed by `(team_id, league_id)` together.
+
+**Frontend**: `renderSeasonParticipation`'s `regByTeam` map was keyed by
+`team_id` alone, `regRow(t, divId)` looked it up the same way regardless of
+which League section it was rendering — so a Team holding two simultaneously
+active registrations in one Season across two Leagues (the exact Rule 7
+violation `team_registration_conflict` exists to catch before an import can
+create one, but which pre-existing legacy data or a stale write path can
+still leave behind) collapsed onto whichever row the map's last write
+happened to keep: only one League section rendered a row for that Team at
+all, and any Save/Remove control shown addressed that one winning
+registration regardless of which section's controls were actually clicked.
+Fixed by keying (and looking up) by `${team_id}::${league_id}` instead, so
+each League section's row is bound to its own section's own registration.
+Proven with new desktop and 390×844 e2e coverage in `season-participation.js`:
+a second active registration is planted directly into the running journey's
+own durable SQLite file (the same direct-injection technique the file's
+existing repair-surface coverage already uses for `registration_league_not_
+in_season`), both League sections' rows are confirmed present as genuinely
+distinct DOM elements naming the same Team, the non-home League's row is
+removed via a Tab-focus-then-Enter keyboard activation (not just a click),
+and the home League's row — same Team, different registration id — is
+confirmed both still present in the DOM and still active in the store,
+proving Remove on one row never reaches the other.
+
+The same finding separately named the import error renderer itself:
+`renderImportRows` showed only `sheet`/`row`/`field`/`message` for every
+`errors[]`/`warnings[]` entry, never the `affected_registration_ids` (or
+`affected_game_ids`) several structured reasons carry — including `team_
+registration_conflict` — so an operator seeing "Team HOME already has more
+than one active registration" had no way to identify exactly which two rows
+were conflicting before navigating to Season participation to resolve one
+via its now-fixed per-League controls above. Fixed by rendering a reason-
+agnostic "Affected: registration(s) …/game(s) …" line whenever either id
+list is present and non-empty, with no reason-specific branch to leave
+uncovered later, matching this renderer's existing reason-agnostic
+philosophy. Verified directly in a real browser (calling the live
+`renderImportRows` with representative fixture rows, one of each id-bearing
+shape plus a plain row with neither, confirming the plain row renders no
+spurious "Affected:" line) and captured as new permanent desktop/390×844
+coverage in `hierarchy-import.js`.
+
+Not independently confirmed and left for a future round if the reviewer
+still considers it in scope: `renderRollover`'s own team-id-derived
+`data-rollover-pick` selection ids, flagged during this round's frontend
+investigation as *structurally similar* to the fixed `regByTeam` pattern, but
+rollover's UI only ever offers *source*-Season teams for selection (never
+renders a control bound to a specific *target*-Season registration id the
+way Season participation's Save/Remove do), so whether the identical
+two-active-registrations shape can actually reach it was not established.
 
 - The bootstrap claim is the only unauthenticated mutation, and only on a fresh,
   durable, unclaimed installation.

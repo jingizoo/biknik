@@ -105,6 +105,50 @@ finally:
   return result.stdout.trim();
 }
 
+// #331 review round 18: renderSeasonParticipation's Save/Remove controls must
+// render unique, distinct rows when a Team holds TWO simultaneously active
+// registrations in the SAME Season across DIFFERENT Leagues -- a Rule 7
+// violation (register_team_for_season/assign_season_team_league both refuse
+// to create this) that only legacy data or a write path predating Rule 7 can
+// leave behind, exactly like injectCorruptRegistration above reproduces
+// registration_league_not_in_season. Plants a second SeasonTeamRegistration
+// for an EXISTING team directly into the SAME durable SQLite file, under a
+// DIFFERENT League's LeagueSeason, from a separate process (no write
+// contention with the running server -- see injectCorruptRegistration).
+function injectSecondActiveRegistration(databasePath, { seasonId, leagueId, teamId }) {
+  const script = `
+import os
+from hockey_scheduler.store import create_store
+from hockey_scheduler.domain import SeasonTeamRegistration
+
+store = create_store(os.environ["FIXTURE_DB_PATH"])
+try:
+    ls = store.league_season_for(os.environ["FIXTURE_LEAGUE_ID"], os.environ["FIXTURE_SEASON_ID"])
+    reg_id = store.next_id("streg")
+    store.add_season_team_registration(SeasonTeamRegistration(
+        id=reg_id, league_season_id=ls.id,
+        team_id=os.environ["FIXTURE_TEAM_ID"], division_id=None, active=True))
+    print(reg_id)
+finally:
+    store.close()
+`;
+  const result = spawnSync(process.env.PYTHON || "python3", ["-c", script], {
+    cwd: BACKEND_DIR,
+    env: {
+      ...process.env,
+      FIXTURE_DB_PATH: databasePath,
+      FIXTURE_SEASON_ID: seasonId,
+      FIXTURE_LEAGUE_ID: leagueId,
+      FIXTURE_TEAM_ID: teamId,
+    },
+    encoding: "utf8",
+  });
+  if (result.status !== 0) {
+    throw new Error(`Second-registration fixture injection failed (exit ${result.status}): ${result.stderr}`);
+  }
+  return result.stdout.trim();
+}
+
 async function checkViewport(browser, viewport) {
   const base = `http://${HOST}:${viewport.port}`;
   // A durable SQLite file (not the in-memory demo default) so the repair-UI
@@ -612,6 +656,90 @@ async function checkViewport(browser, viewport) {
       (await fetch("/api/v2/onboarding/status", { credentials: "same-origin" })).json());
     if (onboarding.blocking.some((b) => b.code === "invalid_registrations")) {
       throw new Error(`[${viewport.label}] readiness still blocks on invalid_registrations after repair`);
+    }
+
+    // (8) #331 review round 18: a Team with TWO simultaneously active
+    // registrations in the SAME Season, across DIFFERENT Leagues (a Rule 7
+    // violation only legacy data/a stale write path can leave behind — the
+    // exact shape commit_teams_players_import's team_registration_conflict
+    // rejection exists to catch before an import can create it) must render
+    // as two DISTINCT, independently addressable rows — never one row's
+    // Save/Remove silently acting on the OTHER row's registration.
+    const dupFixture = await page.evaluate(async (i) => {
+      const post = async (p, b) => (await fetch(p, {
+        method: "POST", credentials: "same-origin",
+        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
+      })).json();
+      const home = await post("/api/v2/setup/league", { season_id: i.s1, name: "Timber League" });
+      const stray = await post("/api/v2/setup/league", { season_id: i.s1, name: "Ridge League" });
+      const club = await post("/api/v2/setup/club", { name: "Duplicate Coverage Club" });
+      const team = await post("/api/v2/setup/team",
+        { league_id: home.id, club_id: club.id, name: "Perma Wolves" });
+      const homeReg = await post(`/api/v2/setup/seasons/${i.s1}/team-registrations`,
+        { team_id: team.id, league_id: home.id, division_id: null });
+      return { home: home.id, stray: stray.id, team: team.id, homeReg: homeReg.id };
+    }, { s1: ids.s1 });
+    const strayRegId = injectSecondActiveRegistration(databasePath, {
+      seasonId: ids.s1, leagueId: dupFixture.stray, teamId: dupFixture.team,
+    });
+    await refreshSetup({ selector: `[data-reg-remove="${strayRegId}"]` });
+
+    // Both rows exist, are DISTINCT elements, and each names Perma Wolves —
+    // the pre-fix `regByTeam` collapse would leave one of these selectors
+    // missing (the last-write-wins map only ever exposed ONE reg id to
+    // BOTH League sections).
+    const dupRows = await page.evaluate((i) => {
+      const homeBtn = document.querySelector(`[data-reg-remove="${i.homeReg}"]`);
+      const strayBtn = document.querySelector(`[data-reg-remove="${i.strayReg}"]`);
+      return {
+        homeText: homeBtn && homeBtn.closest(".reg-row").textContent,
+        strayText: strayBtn && strayBtn.closest(".reg-row").textContent,
+        sameElement: homeBtn === strayBtn,
+      };
+    }, { homeReg: dupFixture.homeReg, strayReg: strayRegId });
+    if (!dupRows.homeText || !/Perma Wolves/.test(dupRows.homeText)) {
+      throw new Error(`[${viewport.label}] Timber League row for Perma Wolves missing/wrong: ${JSON.stringify(dupRows)}`);
+    }
+    if (!dupRows.strayText || !/Perma Wolves/.test(dupRows.strayText)) {
+      throw new Error(`[${viewport.label}] Ridge League row for Perma Wolves missing/wrong: ${JSON.stringify(dupRows)}`);
+    }
+    if (dupRows.sameElement) {
+      throw new Error(`[${viewport.label}] both League rows resolved to the SAME element/registration id`);
+    }
+
+    // Keyboard-operate the Ridge League row's Remove control (Tab-reachable
+    // focus + Enter, not just a click) — only ITS registration deactivates.
+    await page.evaluate((regId) => {
+      document.querySelector(`[data-reg-remove="${regId}"]`).focus();
+    }, strayRegId);
+    const removeResp = page.waitForResponse((r) =>
+      r.url().includes(`/season-team-registration/${strayRegId}/remove`) && r.request().method() === "POST");
+    await page.keyboard.press("Enter");
+    if ((await removeResp).status() !== 200) {
+      throw new Error(`[${viewport.label}] keyboard-activated Remove on the Ridge League row failed`);
+    }
+    // Wait for the SETTLED post-render state in one shot (both the stray
+    // row's removal AND the home row's survival) rather than checking them
+    // as two separate steps -- render() tears down and rebuilds the whole
+    // tree on completion, so polling right after the stray node detaches
+    // could race a rebuild that hasn't reached the home row yet.
+    await page.waitForFunction((i) =>
+      !document.querySelector(`[data-reg-remove="${i.strayReg}"]`)
+      && !!document.querySelector(`[data-reg-remove="${i.homeReg}"]`),
+      { strayReg: strayRegId, homeReg: dupFixture.homeReg }, { timeout: 15000 });
+    const finalRegs = await page.evaluate(async (i) => {
+      const get = async (p) => (await fetch(p, { credentials: "same-origin" })).json();
+      const regs = (await get(`/api/v2/setup/seasons/${i.s1}/team-registrations`)).registrations;
+      return {
+        home: regs.find((r) => r.id === i.homeReg),
+        stray: regs.find((r) => r.id === i.strayReg),
+      };
+    }, { s1: ids.s1, homeReg: dupFixture.homeReg, strayReg: strayRegId });
+    if (!finalRegs.home || !finalRegs.home.active) {
+      throw new Error(`[${viewport.label}] Timber League's registration was deactivated by mistake: ${JSON.stringify(finalRegs.home)}`);
+    }
+    if (!finalRegs.stray || finalRegs.stray.active) {
+      throw new Error(`[${viewport.label}] Ridge League's registration wasn't deactivated: ${JSON.stringify(finalRegs.stray)}`);
     }
 
     if (errors.length) {

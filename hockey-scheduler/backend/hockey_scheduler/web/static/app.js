@@ -2371,8 +2371,17 @@ function renderSeasonParticipation(hv, ov, sv) {
 
     const seasonBlocks = seasons.map((s) => {
       const regs = (seasonRegs[s.id] || []).filter((r) => r.active);
-      const regByTeam = {};
-      regs.forEach((r) => { regByTeam[r.team_id] = r; });
+      // #331 review round 18: keyed by (team_id, league_id), never team_id
+      // alone — a Team can hold more than one active registration in this
+      // Season across different Leagues (the exact structured conflict
+      // round 17's commit_teams_players_import gate now rejects, pending
+      // operator remediation here). A team_id-only map silently collapses
+      // the second row, so both League sections render the SAME baked-in
+      // registration id on their Save/Remove controls — clicking either
+      // row's Save/Remove can only ever address whichever row won the
+      // last-write overwrite, never the one actually shown.
+      const regByTeamLeague = {};
+      regs.forEach((r) => { regByTeamLeague[`${r.team_id}::${r.league_id}`] = r; });
       const registeredTeamIds = new Set(regs.map((r) => r.team_id));
       const leagues = s.leagues || [];
       // Cache each League's Division options for the cascade handlers wired
@@ -2471,11 +2480,13 @@ function renderSeasonParticipation(hv, ov, sv) {
         const divs = lv.divisions || [];
         const divOptsFor = (selId) => divs.map((d) => opt(d.id, d.name, d.id === selId)).join("");
         // A registered team's row: its own League+Division cascade (both
-        // scoped to this season) plus Save/Remove. `reg` is looked up by team
-        // id — structurally guaranteed present since t only appears here
-        // because a valid registration resolved it into this League/Division.
+        // scoped to this season) plus Save/Remove. `reg` is looked up by
+        // (team id, THIS section's own League id) — #331 review round 18:
+        // never team id alone, which would resolve to whichever OTHER
+        // League's registration happened to win the map's last-write
+        // overwrite when a Team has more than one active row this Season.
         const regRow = (t, divId) => {
-          const reg = regByTeam[t.id];
+          const reg = regByTeamLeague[`${t.id}::${lv.id}`];
           if (!reg) return "";
           return `<div class="tn-leaf reg-row">
             <span class="tn-label">👥 ${esc(t.name)}</span>
@@ -5126,9 +5137,28 @@ function importCommitState(type) {
 }
 
 function renderImportRows(items, cls) {
+  // #331 review round 18: several structured errors/warnings name the
+  // EXACT conflicting row ids (`affected_registration_ids`,
+  // `affected_game_ids`) so an operator can resolve them precisely instead
+  // of guessing which of several rows for the same team/season is at
+  // fault -- team_registration_conflict is the round-18 motivating case
+  // (two active registrations for one team, only distinguishable by their
+  // League, which Season participation's own rows now render — see
+  // renderSeasonParticipation), but this stays reason-agnostic like the
+  // rest of this renderer: any entry carrying either id list gets it shown,
+  // with no reason-specific branch to leave uncovered later.
+  const idList = (it) => {
+    const regIds = it.affected_registration_ids || [];
+    const gameIds = it.affected_game_ids || [];
+    if (!regIds.length && !gameIds.length) return "";
+    const parts = [];
+    if (regIds.length) parts.push(`registration(s) ${regIds.map((id) => `<code>${esc(id)}</code>`).join(", ")}`);
+    if (gameIds.length) parts.push(`game(s) ${gameIds.map((id) => `<code>${esc(id)}</code>`).join(", ")}`);
+    return `<div class="li-sub muted">Affected: ${parts.join(" · ")}</div>`;
+  };
   return items.map((it) => `<div class="li"><div class="li-main">
     <div class="li-title">${esc(it.sheet || "")}${it.row != null ? ` — row ${it.row}` : ""}${it.field ? ` (${esc(it.field)})` : ""}</div>
-    <div class="li-sub ${cls}">${cls === "error" ? "⚠" : "ℹ"} ${esc(it.message)}</div></div></div>`).join("");
+    <div class="li-sub ${cls}">${cls === "error" ? "⚠" : "ℹ"} ${esc(it.message)}</div>${idList(it)}</div></div>`).join("");
 }
 
 function renderImportReport(report, type) {

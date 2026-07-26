@@ -440,11 +440,28 @@ class ApiService:
         # get_onboarding_status_v2's "participation" step, scoped further to
         # one Season here.
         divisions_by_id = {d.id: d for d in self.store.all_divisions()}
+        teams_by_id = {t.id: t for t in teams}
+        ls_league_id_by_id = {ls.id: ls.league_id for ls in program_league_seasons}
         schedulable = 0
         for reg in self.store.all_season_team_registrations():
             if not reg.active or reg.team_id not in team_ids:
                 continue
             if reg.league_season_id not in season_ls_ids:
+                continue
+            # #331 review round 18: a registration only counts once its
+            # LeagueSeason's League matches the Team's OWN permanent League
+            # (Rule 7) -- the same invariant register_team_for_season and
+            # team_registration_valid (the shared live-scheduling resolver)
+            # both enforce. transfer_team_to_league deliberately leaves an
+            # archived/ended Season's active registration frozen at its OLD
+            # League while Team.league_id moves on (history preservation) —
+            # exactly the state that must never be reported as "done" here,
+            # since create_game/move/publish would reject it outright, and
+            # counting it would report a false "schedulable" completion
+            # signal for this Season's guided-setup workflow.
+            team = teams_by_id.get(reg.team_id)
+            if (team is None or not team.league_id
+                    or team.league_id != ls_league_id_by_id.get(reg.league_season_id)):
                 continue
             if reg.division_id:
                 division = divisions_by_id.get(reg.division_id)
@@ -1841,7 +1858,18 @@ class ApiService:
             # is structurally impossible now — the League need only resolve.
             league_ok = league is not None
             team = teams_by_id.get(reg.team_id)
-            team_ok = team is not None and team.program_id == season.program_id
+            # #331 review round 18: Program membership alone is not enough --
+            # the registration must sit in the Team's OWN permanent League
+            # (Rule 7), the same invariant register_team_for_season and
+            # team_registration_valid (the shared live-scheduling resolver)
+            # both enforce. transfer_team_to_league deliberately leaves an
+            # archived/ended Season's active registration frozen at its OLD
+            # League while Team.league_id moves on (history preservation) --
+            # exactly the same-Program cross-League drift that must never be
+            # counted as schedulable here, since create_game/move/publish
+            # would reject it outright.
+            team_ok = (team is not None and team.program_id == season.program_id
+                      and team.league_id and team.league_id == ls.league_id)
             div_ok = True
             if reg.division_id:
                 division = divisions_by_id.get(reg.division_id)

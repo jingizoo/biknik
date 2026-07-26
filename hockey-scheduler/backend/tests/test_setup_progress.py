@@ -30,7 +30,7 @@ from http.server import ThreadingHTTPServer
 from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
 
 from hockey_scheduler.api import ApiService
-from hockey_scheduler.domain import Role
+from hockey_scheduler.domain import Role, SeasonTeamRegistration
 from hockey_scheduler.store import InMemoryStore
 
 ADMIN = (Role.LEAGUE_ADMIN, {})
@@ -664,6 +664,64 @@ class SetupProgressComputationTest(unittest.TestCase):
         self.assertEqual([r["team_id"] for r in regs_a["registrations"]
                           if r["active"]], [team["id"]],
                          "Season A's own registration must be untouched")
+
+    def test_stale_wrong_league_active_registration_never_counts_as_done(self):
+        """#331 review round 18: a Team can hold more than one registration
+        row in one Season across different LeagueSeasons (migration 035:
+        unique only on (team_id, league_season_id)). transfer_team_to_league
+        deliberately leaves a Season's active registration frozen at the
+        Team's OLD League while Team.league_id moves on -- typically ended-
+        Season history, but the same shape can occur through any write path
+        predating Rule 7. Whatever its cause, an active registration whose
+        LeagueSeason no longer matches the Team's current permanent League
+        is not operationally schedulable (create_game/team_registration_valid
+        both reject it), so it must never report "participation: done" --
+        unlike test_participation_next_is_blocked_when_no_team_matches_the_
+        seasons_league above, a genuinely eligible Team DOES exist here, so
+        this must surface as an actionable `next`, not a `next_blocked`."""
+        api = self._api()
+        api.create_user_account("admin", "pw", "league_admin")
+        program = api.create_program("Prog", actor_id="admin")
+        season = api.create_season(program["id"], "Season", actor_id="admin")
+        league_a = api.create_league(season["id"], "League A", actor_id="admin")
+        league_b = api.create_league(season["id"], "League B", actor_id="admin")
+        club = api.create_club("C", actor_id="admin")
+        team = api.create_team(club["id"], None, "Team", actor_id="admin",
+                               league_id=league_a["id"])
+        # A stale ACTIVE row under League B -- NOT the Team's current
+        # permanent League A -- injected directly (no current write path
+        # can leave this behind in a fresh season; it reproduces the
+        # historical-transfer/legacy-drift shape this fix defends against).
+        ls_b = api.store.league_season_for(league_b["id"], season["id"])
+        stale = SeasonTeamRegistration(
+            id=api.store.next_id("streg"), league_season_id=ls_b.id,
+            team_id=team["id"], division_id=None, active=True)
+        api.store.add_season_team_registration(stale)
+
+        api.set_active_context("admin", Role.LEAGUE_ADMIN, {},
+                               program["id"], season["id"])
+        progress = api.get_setup_progress("admin", *ADMIN)
+        statuses = _statuses(progress)
+        self.assertEqual(statuses["league_season"], "done")
+        self.assertEqual(statuses["teams"], "done")
+        self.assertEqual(statuses["participation"], "todo", progress)
+        # Team A IS genuinely eligible (its own permanent league), so this
+        # is actionable, not blocked.
+        self.assertIsNotNone(progress["next"], progress)
+        self.assertEqual(progress["next"]["key"], "participation", progress)
+        self.assertIsNone(progress["next_blocked"], progress)
+
+        # Registering the Team correctly into its OWN permanent League A
+        # genuinely unblocks it -- the stale League B row is left untouched.
+        reg_a = api.register_team_for_season(season["id"], team["id"],
+                                             actor_id="admin",
+                                             league_id=league_a["id"])
+        self.assertNotIn("error", reg_a, reg_a)
+        after = api.get_setup_progress("admin", *ADMIN)
+        self.assertEqual(_statuses(after)["participation"], "done")
+        still_stale = api.store.get_season_team_registration(stale.id)
+        self.assertTrue(still_stale.active)
+        self.assertEqual(still_stale.league_season_id, ls_b.id)
 
     def test_facilities_next_is_also_blocked_when_selected_season_is_archived(self):
         """Not just "participation" -- ``commit_ice_availability`` (the Ice

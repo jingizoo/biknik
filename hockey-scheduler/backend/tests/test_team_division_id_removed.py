@@ -194,6 +194,77 @@ class LegacyFieldIsInertContract:
         self.assertIsNone(team_registration_valid(
             self.store, self.store.get_season(s1), team, d2))
 
+    def _inject_reg(self, league_id, season_id, team_id, active,
+                    division_id=None):
+        """Plant a SeasonTeamRegistration directly (bypassing the service's
+        Rule 7 guard) to reproduce legacy/historical drift no current write
+        path can produce."""
+        ls = self.store.league_season_for(league_id, season_id)
+        reg = SeasonTeamRegistration(
+            id=self.store.next_id("streg"), league_season_id=ls.id,
+            team_id=team_id, division_id=division_id, active=active)
+        self.store.add_season_team_registration(reg)
+        return reg
+
+    def _two_league_season(self, name):
+        season = self._season(name)
+        league_a = self.api.create_league(season, "League A",
+                                          actor_id=self.ACTOR)["id"]
+        league_b = self.api.create_league(season, "League B",
+                                          actor_id=self.ACTOR)["id"]
+        d_a = self.api.create_division(
+            season, "A", league_id=league_a, actor_id=self.ACTOR)["id"]
+        self.api.create_division(
+            season, "B", league_id=league_b, actor_id=self.ACTOR)["id"]
+        return season, league_a, league_b, d_a
+
+    def test_inactive_sibling_in_another_league_never_hides_the_active_row(self):
+        # #331 review round 18: a Team can hold more than one registration
+        # row in the SAME Season across different LeagueSeasons (migration
+        # 035: unique only on (team_id, league_season_id)). An inactive
+        # sibling from a former League -- history transfer_team_to_league
+        # deliberately preserves -- must never hide, corrupt, or be
+        # confused with the Team's real ACTIVE registration under its
+        # current permanent League, regardless of which row was planted
+        # first (insertion order must never matter to an identity lookup).
+
+        # Order 1: the inactive sibling is planted BEFORE the active row.
+        season, league_a, league_b, d_a = self._two_league_season("S1")
+        team = self._team("Nomads", league_id=league_a)
+        stale = self._inject_reg(league_b, season, team, active=False)
+        active_reg_id = self._register(season, team, d_a)
+        active = self.store.get_season_team_registration(active_reg_id)
+        self.assertLess(stale.id, active.id)
+        resolved = team_registration_valid(
+            self.store, self.store.get_season(season), team, d_a)
+        self.assertIsNotNone(resolved)
+        self.assertEqual(resolved.id, active.id)
+        # A scheduling entry point (create_game) resolves the SAME way.
+        away = self._team("Rivals", league_id=league_a)
+        self._register(season, away, d_a)
+        slot = self._slot(season)
+        game = self.api.create_game(season, d_a, team, away, slot,
+                                    actor_id=self.ACTOR)
+        self.assertNotIn("error", game, game)
+        untouched = self.store.get_season_team_registration(stale.id)
+        self.assertFalse(untouched.active)
+
+        # Order 2: the active row is registered FIRST (lower id); the
+        # inactive sibling is planted AFTERWARD (higher id) -- a fresh
+        # scenario so no committed game blocks re-registration mid-test.
+        season2, league_a2, league_b2, d_a2 = self._two_league_season("S2")
+        team2 = self._team("Wanderers", league_id=league_a2)
+        active_reg_id2 = self._register(season2, team2, d_a2)
+        active2 = self.store.get_season_team_registration(active_reg_id2)
+        stale2 = self._inject_reg(league_b2, season2, team2, active=False)
+        self.assertLess(active2.id, stale2.id)
+        resolved2 = team_registration_valid(
+            self.store, self.store.get_season(season2), team2, d_a2)
+        self.assertIsNotNone(resolved2)
+        self.assertEqual(resolved2.id, active2.id)
+        untouched2 = self.store.get_season_team_registration(stale2.id)
+        self.assertFalse(untouched2.active)
+
     def test_changing_registration_leaves_legacy_field_and_history_untouched(self):
         s1 = self._season("2026")
         s2 = self._season("2027")

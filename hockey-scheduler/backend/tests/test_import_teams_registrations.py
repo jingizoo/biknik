@@ -156,6 +156,141 @@ class ImportConvergenceContract:
             self._team("PUMAS").program_id,
             by_ref(self.store.all_programs(), "OVER55").id)
 
+    # -- #331 review round 18: upsert_imported_registration and
+    # _preflight_reassignment_safety must never pick the first Season-wide
+    # registrations_for_season() row regardless of LeagueSeason -- the exact
+    # same defect class round 17 closed for commit_teams_players_import. ---
+    def _hierarchy_seed_transferred_from_inactive(self):
+        """The #331 review round 18 reproduction's exact hierarchy-import
+        shape: LIONS registered in FALL26/L1, unregistered (inactive), then
+        permanently transferred to L2 -- transfer_team_to_league finds no
+        ACTIVE registration to move (L1 is already inactive), so it writes
+        only the permanent Team and leaves L1's row untouched as history.
+        Returns (lions, season, l1, l2, reg_l1)."""
+        self._commit_base(
+            permanent_teams_csv=fx.permanent_teams_csv(rows=(
+                "OVER55,L1,LIONS,Lions,",)),
+            registrations_csv=fx.registrations_csv(rows=("FALL26,LIONS,L1,DIVA",)))
+        season = by_ref(self.store.all_seasons(), "FALL26")
+        lions = self._team("LIONS")
+        reg_l1 = self.store.registration_for_team_in_season(season.id, lions.id)
+        self.api.unregister_team_from_season(reg_l1.id, actor_id="admin")
+        result = self.api.commit_hierarchy_import({
+            "import_type": "hierarchy",
+            "competition_csv": fx.competition_csv(rows=(
+                "OVER55,FALL26,Fall 2026,L1,Adult League,1,DIVA,Division A,Adult",
+                "OVER55,FALL26,Fall 2026,L1,Adult League,1,DIVB,Division B,Adult",
+                "OVER55,FALL26,Fall 2026,L2,B League,2,,,")),
+            "permanent_teams_csv": fx.permanent_teams_csv(rows=(
+                "OVER55,L2,LIONS,Lions,",))}, actor_id="admin")
+        self.assertTrue(result["committed"], result.get("errors"))
+        l1 = by_ref(self.store.all_leagues(), "L1")
+        l2 = by_ref(self.store.all_leagues(), "L2")
+        return lions, season, l1, l2, reg_l1
+
+    def test_hierarchy_reimport_after_transfer_from_inactive_creates_distinct_active_row(self):
+        # Required regression matrix bullet 1: re-importing the registrations
+        # sheet after a transfer-from-inactive-only leaves L1's row untouched
+        # as history and creates a DISTINCT active row for L2 -- never
+        # cannibalizes L1's row by rewriting its league_season_id (which
+        # would silently erase the fact the team was ever in League L1).
+        lions, season, l1, l2, reg_l1 = self._hierarchy_seed_transferred_from_inactive()
+        result = self.api.commit_hierarchy_import({
+            "import_type": "hierarchy",
+            "registrations_csv": fx.registrations_csv(rows=(
+                "FALL26,LIONS,L2,",))}, actor_id="admin")
+        self.assertTrue(result["committed"], result.get("errors"))
+        untouched = self.store.get_season_team_registration(reg_l1.id)
+        self.assertFalse(untouched.active)
+        self.assertEqual(
+            self.store.get_league_season(untouched.league_season_id).league_id,
+            l1.id)
+        regs = [r for r in self.store.all_season_team_registrations()
+                if r.team_id == lions.id]
+        self.assertEqual(len(regs), 2)
+        active = [r for r in regs if r.active]
+        self.assertEqual(len(active), 1)
+        self.assertNotEqual(active[0].id, reg_l1.id)
+        self.assertEqual(
+            self.store.get_league_season(active[0].league_season_id).league_id,
+            l2.id)
+
+    def test_hierarchy_reimport_after_transfer_is_a_true_noop_once_active_exists(self):
+        # Required regression matrix bullet 2: once L2's row already exists
+        # and is correct, re-importing the identical registrations row must
+        # be a true no-op -- never rewrite L1's untouched history, never
+        # re-audit the registration.
+        lions, season, l1, l2, reg_l1 = self._hierarchy_seed_transferred_from_inactive()
+        self.api.commit_hierarchy_import({
+            "import_type": "hierarchy",
+            "registrations_csv": fx.registrations_csv(rows=(
+                "FALL26,LIONS,L2,",))}, actor_id="admin")
+        reg_audits_before = len([
+            a for a in self.store.all_setup_audit()
+            if a.action in ("season_team_registered",
+                            "season_team_registration_updated")])
+        regs_before = {r.id: (r.active, r.league_season_id, r.division_id)
+                       for r in self.store.all_season_team_registrations()
+                       if r.team_id == lions.id}
+        result = self.api.commit_hierarchy_import({
+            "import_type": "hierarchy",
+            "registrations_csv": fx.registrations_csv(rows=(
+                "FALL26,LIONS,L2,",))}, actor_id="admin")
+        self.assertTrue(result["committed"], result.get("errors"))
+        reg_audits_after = len([
+            a for a in self.store.all_setup_audit()
+            if a.action in ("season_team_registered",
+                            "season_team_registration_updated")])
+        self.assertEqual(reg_audits_after, reg_audits_before)
+        regs_after = {r.id: (r.active, r.league_season_id, r.division_id)
+                      for r in self.store.all_season_team_registrations()
+                      if r.team_id == lions.id}
+        self.assertEqual(regs_after, regs_before)
+
+    def test_hierarchy_rejects_two_active_registrations_conflict(self):
+        # Required regression matrix bullet 4: a Team with two simultaneously
+        # ACTIVE registrations in the same Season (a Rule 7 violation legacy
+        # data, or a write path predating Rule 7, could have left behind)
+        # must be rejected with a structured, zero-mutation error over the
+        # real hierarchy commit boundary -- never silently duplicated (as
+        # the OLD first-registrations_for_season() lookup would on Memory)
+        # or a raw unique-constraint crash (as it would on SQLite/PostgreSQL).
+        self._commit_base(
+            competition_csv=fx.competition_csv(rows=(
+                "OVER55,FALL26,Fall 2026,L1,Adult League,1,DIVA,Division A,Adult",
+                "OVER55,FALL26,Fall 2026,L2,B League,2,,,")),
+            permanent_teams_csv=fx.permanent_teams_csv(rows=(
+                "OVER55,L1,LIONS,Lions,",)),
+            registrations_csv=fx.registrations_csv(rows=("FALL26,LIONS,L1,DIVA",)))
+        lions = self._team("LIONS")
+        season = by_ref(self.store.all_seasons(), "FALL26")
+        reg_l1 = self.store.registration_for_team_in_season(season.id, lions.id)
+        l2 = by_ref(self.store.all_leagues(), "L2")
+        ls_l2 = self.store.league_season_for(l2.id, season.id)
+        from hockey_scheduler.domain import SeasonTeamRegistration
+        reg_l2 = SeasonTeamRegistration(
+            id=self.store.next_id("streg"), league_season_id=ls_l2.id,
+            team_id=lions.id, division_id=None, active=True)
+        self.store.add_season_team_registration(reg_l2)
+        # LIONS's permanent League must actually be one of the two active
+        # rows' Leagues for this to be a genuine same-Team conflict rather
+        # than an unrelated team_league_mismatch; L1 (the team's own
+        # permanent League) is already correct, so re-importing L1's own
+        # registration row is what surfaces the stray L2 conflict.
+        audits_before = len(self.store.all_setup_audit())
+        result = self.api.commit_hierarchy_import({
+            "import_type": "hierarchy",
+            "registrations_csv": fx.registrations_csv(rows=(
+                "FALL26,LIONS,L1,DIVA",))}, actor_id="admin")
+        self.assertFalse(result["committed"], result)
+        err = next(e for e in result["errors"]
+                  if e["code"] == "team_registration_conflict")
+        self.assertEqual(set(err["affected_registration_ids"]),
+                         {reg_l1.id, reg_l2.id})
+        self.assertEqual(len(self.store.all_setup_audit()), audits_before)
+        self.assertTrue(self.store.get_season_team_registration(reg_l1.id).active)
+        self.assertTrue(self.store.get_season_team_registration(reg_l2.id).active)
+
     def test_imported_registered_team_is_schedulable(self):
         # End-to-end: an imported permanent team, once registered, passes the
         # scheduling guard and can be given a game.
