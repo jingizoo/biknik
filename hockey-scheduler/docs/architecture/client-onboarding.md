@@ -808,6 +808,138 @@ own internal locking/retry/validation-ordering behavior, so the code
 revert is not purely "additive-only" the way the new route and Dashboard
 card are, even though no public API contract changes.
 
+Round 13's own convergence review (#331 review round 14) found three
+further gaps in the same import-commit family.
+
+The first: round 13's `_RinkLockPlanDrifted` recheck re-resolved every
+requested `rink_code` after the lock loop, but only compared *code
+presence* against the original snapshot — it never verified that the
+freshly-resolved row was the *same row*, by id, that the lock loop had
+actually locked. Two distinct gaps followed from that: a Rink deleted and
+recreated under the identical code between the snapshot and the recheck
+passes the code-presence check with a different id than the one held
+under lock, so the lock protects nothing; and even when the recheck
+itself is sound, the apply phase re-resolved `rink_code` a second time via
+its own fresh `all_rinks()` scan rather than reusing the verified
+mapping, reopening the same window one step later for a Rink that arrives
+after the recheck but before the write. Round 12's regressions couldn't
+reach either path, since both pre-seeded their target Rink and so never
+exercised "a Rink appears where the snapshot found none." Closed by
+building one id-verified `_rink_plan`: for each requested code, the
+freshly-resolved row is trusted only if its id appears in `_locked_by_id`
+(the map of rows the lock loop actually acquired); any other outcome
+raises `_RinkLockPlanDrifted` for the existing retry loop to catch. Both
+the overlap gate and the apply phase's rink resolution now read `_rink_plan`
+exclusively — the apply phase's separate fresh scan is deleted rather than
+kept as a second source of truth. One fix closes both sub-cases, since both
+trace back to the same un-pinned re-read. Four new regressions (delete-
+recreate id substitution and post-recheck arrival, each proven against
+both the `slot_type` retype and the overlap gate) pause the import's own
+`get_rink_for_update` on a second, already-locked, unrelated Rink to give
+an independent connection room to land the drifting write before the
+paused side resumes.
+
+The second: `commit_teams_players_import`'s Program-level gate check
+(round 12) had no League-level counterpart — a team's target League could
+drift under a concurrent import exactly the way its Program already could
+before round 12's fix, uncaught. A new read-only helper,
+`_resolve_import_target_league_id_readonly`, predicts the target permanent
+League the same way the real resolution path would, without performing
+any of that path's auto-create side effects, and gate-checks it alongside
+the existing Program check (documented residual: it returns `None`, and
+so skips the check, for the rare case where the real resolution would
+itself need to auto-create a League — a narrower gap than the one being
+closed, not a new one). Separately, the per-row update/create branch for
+an existing Team never confirmed the Team it found under lock was the same
+one the gate-check pass had already validated against; a Team created
+concurrently, between the gate check and the lock, could be silently
+adopted via the update branch, bypassing every gate the create branch
+would have run. Closed with the same drift-then-retry shape as the Rink
+fix: if a locked Team's code was absent from the gate-check-time snapshot,
+raise the new `_TeamLockPlanDrifted` rather than proceed, caught by
+wrapping the whole import transaction in the existing bounded retry loop
+(three attempts, `ConcurrencyConflictError` with reason
+`team_import_raced` on the last). Round 13's own positive-case regression,
+`test_identical_global_team_and_player_codes_across_seasons_does_not_duplicate`,
+assumed the pre-round-14 behavior — a racing duplicate silently
+deduplicating — as correct; the widened gate now rejects the loser
+instead, so the test is rewritten to assert exactly that
+(`..._the_loser_is_rejected`), plus a cross-Program variant and a
+positive control proving two Seasons legitimately sharing one League via
+`create_league_season` still both succeed.
+
+The third: `hierarchy_import.py`'s `commit_hierarchy_import` (the #260
+Slice F nine-sheet importer) is a separate code path from the three
+pilot importers above, with its own `upsert_imported_team`/
+`upsert_imported_player` helpers — and those helpers had no protection at
+all against a *pilot* import creating the identical global `team_code` or
+`player_code` concurrently; only pilot-vs-pilot and hierarchy-vs-hierarchy
+races were ever covered. Closed with the same reserve-then-recheck shape
+`commit_teams_players_import` already uses for its own create branch: the
+new id is reserved via `next_id` first, then `all_teams()`/`all_players()`
+is re-read; a matching `external_ref` appearing there raises the new
+`_HierarchyTeamOrPlayerDrifted` instead of creating a duplicate, caught by
+wrapping `commit_hierarchy_import`'s transaction in the identical
+three-attempt retry loop. Forcing genuine two-connection concurrency for
+this cross-importer race hit four self-inflicted circular waits in turn —
+the Season lock, the League lock `commit_hierarchy_import` cannot avoid
+taking (required for its own sheet validation), the unconditional
+Team-row lock both importers take, and, underneath all of them, the one
+global `next_id("importbatch")` counter every import commit path reserves
+essentially as its first statement and holds for the whole transaction —
+each root-caused with a timestamped diagnostic script rather than assumed
+by analogy. Team's race is constructible as a genuine two-connection pause
+in one direction — hierarchy commits first while pilot is paused inside
+its own `next_id("team")` reservation, using a two-season seed so the
+Season lock doesn't serialize the two sides — because that pause point
+precedes pilot's own involvement with any shared counter. The reverse
+direction (pilot commits first, hierarchy discovers) is not: the global
+`next_id("importbatch")` counter every import commit path reserves
+essentially as its first statement, and holds for the whole transaction,
+means pausing hierarchy at any point still leaves it holding that counter,
+and pilot's own commit cannot even begin without it — a self-inflicted
+circular wait, not a race. Player's version of the same asymmetry is
+worse: pilot's `players_csv` row always requires a `teams_csv` row for
+the same team in the same upload, and processing that row unconditionally
+writes an audit entry that reserves the one global `next_id("setupaudit")`
+counter *before* pilot's player loop ever runs — so pausing pilot at any
+point at or after its own player processing already holds that counter
+too, and hierarchy's player-row audit write blocks behind it exactly like
+the importbatch case. Confirmed by direct reproduction (giving each side
+its own separate, non-colliding team still forced an 8+ second block) for
+both Player directions, not just the one Team's own asymmetry already
+predicted.
+
+Both non-constructible directions are instead covered by the same
+stale-snapshot technique: `all_teams()`/`all_players()` on the *would-be-
+paused* side's own store is patched so its first call (or first two, for
+`commit_teams_players_import`'s player loop specifically — an earlier,
+identity-unrelated jersey-release snapshot occupies the position a naive
+single-call patch would target) after a tracked `next_id("importbatch")`
+marker returns a result that omits a row a separate, already-fully-
+committed connection just created, while the final call — the code's own
+internal reserve-then-recheck — always sees real, current data. This
+exercises the exact drift a genuine race would produce, against a real
+PostgreSQL-backed store, through the complete retry-and-recovery path,
+without literal thread interleaving; each such test's docstring states
+plainly that it proves the recovery path rather than the underlying
+race's constructibility. Four tests in total cover both entities in both
+winner directions — Team's genuine-pause direction plus its stale-snapshot
+reverse, and Player's two stale-snapshot directions, the second of which
+(hierarchy commits first, pilot's own reserve-then-recheck discovers it)
+closes a gap the first round-14 pass left: the combined Team+Player
+regression alone cannot independently prove Player's late-winner branch,
+since Team/audit serialization already settles that test before Player's
+own logic is exercised, a point #331 review round 14 raised directly.
+
+A correction to round 13's own PR reply: it described a third home-tasks-hub
+e2e retry as having been run "three more times," passing once. The actual
+transcript shows only one additional run after the two already reported,
+and it passed — the true tally across this PR's investigation is two
+failures and three passes with round 13's changes present, one pass with
+them reverted, consistent throughout with the pre-existing, already-tracked
+#337 frontend `#import-season` race rather than anything round 13 changed.
+
 The card's async states carry real accessibility semantics, not just visual
 ones (#331 review round 5 finding 5): `#sp-card-slot` (the wrapper
 `loadSetupProgressCard()` swaps content into, itself painted once by

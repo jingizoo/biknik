@@ -245,6 +245,53 @@ class _RinkLockPlanDrifted(Exception):
     Rink — rather than proceeding against an untrustworthy lock set."""
 
 
+class _TeamLockPlanDrifted(Exception):
+    """Internal retry signal (#331 review round 14 finding 2):
+    commit_teams_players_import's gate_errors pass (Program/permanent-League/
+    registration-division move guards) runs from a snapshot of
+    store.all_teams() taken BEFORE any of that row's writes — a team_code
+    absent from that snapshot is a team the gate never evaluated at all, even
+    though a concurrent import for a DIFFERENT Season can create that exact
+    team_code (with its OWN Program/League already set) in the gap between
+    the gate snapshot and this attempt's later double-checked-locking
+    recheck. Without this signal, that later recheck would silently adopt
+    the concurrently-created Team via the plain "team is not None" update
+    branch and write a registration into THIS attempt's League/Program
+    without ever re-running the guards that branch exists to enforce.
+    Raised when the recheck finds a team_code that was not present at the
+    gate_errors snapshot. Caught by the commit's bounded retry loop, which
+    rolls back and retries with a fresh snapshot — one whose gate_errors
+    pass will correctly evaluate the now-visible Team — rather than
+    proceeding against an ungated write."""
+
+
+class _HierarchyTeamOrPlayerDrifted(Exception):
+    """Internal retry signal (#331 review round 14 finding 3):
+    commit_hierarchy_import resolves every Team/Player external_ref ONCE,
+    into a {code: obj} snapshot taken before its own _preflight_reassignment_
+    safety pass and before any write, then passes each row's resolved
+    ``existing`` (or None) into upsert_imported_team/upsert_imported_player.
+    Neither helper previously rechecked a None ``existing`` under its
+    next_id() reservation lock before inserting, so a Team/Player created by
+    a DIFFERENT concurrent writer — the pilot commit_teams_players_import,
+    or another hierarchy import — in the gap between that snapshot and this
+    row's upsert could either (a) be silently duplicated (no lock at all
+    protected the insert), or, once (a) is closed by the SAME reserve-then-
+    recheck pattern commit_teams_players_import already uses, (b) be
+    silently ADOPTED via a plain "existing is not None" update branch that
+    _preflight_reassignment_safety's own snapshot never evaluated for
+    program/league-move stranding — exactly the "late materialization
+    bypasses the earlier gate" class _TeamLockPlanDrifted closes for the
+    pilot import, here for the hierarchy path's own preflight instead.
+    Raised when either helper's reserve-then-recheck finds a row for a code
+    the caller believed absent. Caught by commit_hierarchy_import's bounded
+    retry loop, which rolls back and retries the WHOLE nine-sheet batch with
+    a fresh snapshot — one whose _preflight_reassignment_safety pass (and
+    every other check downstream of it) will correctly evaluate the
+    now-visible Team/Player — rather than proceeding against an unguarded
+    or ungated write."""
+
+
 class SetupService:
     def __init__(self, store: InMemoryStore, clock: Callable[[], datetime] = _utcnow):
         self.store = store
@@ -1264,6 +1311,34 @@ class SetupService:
         """The League a registration belongs to (via its LeagueSeason), or None."""
         ls = self.store.get_league_season(reg.league_season_id)
         return ls.league_id if ls else None
+
+    def _resolve_import_target_league_id_readonly(self, season_id, division_name_raw):
+        """Read-only prediction of the permanent League
+        commit_teams_players_import's per-row division resolution would bind
+        a team/registration to for THIS row (#331 review round 14 finding
+        2), without that resolution's own auto-create side effects: a
+        not-yet-existing Division or LeagueSeason can't be safely created
+        here, since gate_errors must run before any write to preserve the
+        all-or-nothing guarantee on a gate failure. Returns None when the
+        real resolution would need to auto-create -- the gate this feeds
+        then simply has nothing to compare against for that row, and defers
+        to the narrower ``not team.league_id`` guard already in the main
+        loop below, which cannot corrupt an EXISTING non-None league_id even
+        without this prediction (a documented, narrower residual gap: an
+        import that is itself the FIRST to establish a Season's LeagueSeason
+        can still silently bind a team whose league_id was already set by a
+        different, already-established League -- not exercised by the
+        review's own race fixtures, which pre-provision both Seasons'
+        permanent Leagues)."""
+        if not _blank(division_name_raw):
+            division = next((d for d in self.store.divisions_for_season(season_id)
+                             if d.name == _clean(division_name_raw)), None)
+            if division is None:
+                return None
+            ls = self.store.get_league_season(division.league_season_id)
+            return ls.league_id if ls else None
+        candidates = self.store.league_seasons_for_season(season_id)
+        return candidates[0].league_id if candidates else None
 
     def _revalidate_game_participation(self, game):
         """Both teams must still be valid participants of ``game``'s competition
@@ -4704,7 +4779,20 @@ class SetupService:
         # relegation in the sheet updates it in place, mirroring
         # transfer_team_to_league's field change).
         if existing is None:
-            obj = Team(id=self.store.next_id("team"), external_ref=code,
+            # #331 review round 14 finding 3: reserve the id via next_id
+            # ("team") FIRST (blocks a concurrent creator until it commits/
+            # rolls back), then re-check under that lock before inserting —
+            # commit_hierarchy_import's own {code: obj} snapshot (and its
+            # _preflight_reassignment_safety pass) both ran before this call,
+            # so a row this recheck now finds is one a DIFFERENT concurrent
+            # writer created in that gap: the whole batch's snapshot is
+            # stale, not just this one row. Raise rather than silently
+            # adopting it in place (see _HierarchyTeamOrPlayerDrifted's own
+            # docstring for why that would bypass the preflight check).
+            _reserved_team_id = self.store.next_id("team")
+            if any(t.external_ref == code for t in self.store.all_teams()):
+                raise _HierarchyTeamOrPlayerDrifted()
+            obj = Team(id=_reserved_team_id, external_ref=code,
                        name=name, program_id=program_id, club_id=club_id,
                        league_id=league_id)
             self.store.add_team(obj)
@@ -4786,7 +4874,14 @@ class SetupService:
         values = {"name": canonical_name, "team_id": team_id,
                   "position": position, "jersey_number": jersey_number}
         if existing is None:
-            obj = Player(id=self.store.next_id("player"), external_ref=code,
+            # #331 review round 14 finding 3: same mechanism as
+            # upsert_imported_team above -- reserve first, recheck under
+            # that lock, raise (don't silently adopt) if a DIFFERENT
+            # concurrent writer already created this player_code.
+            _reserved_player_id = self.store.next_id("player")
+            if any(p.external_ref == code for p in self.store.all_players()):
+                raise _HierarchyTeamOrPlayerDrifted()
+            obj = Player(id=_reserved_player_id, external_ref=code,
                         **values)
             self.store.add_player(obj)
             self._audit("player_created", "player", obj.id, actor_id,
@@ -5556,359 +5651,429 @@ class SetupService:
                     f"Unknown position '{value}' for player_code "
                     f"{row.get('player_code')}.")
 
-        counts = {"teams_created": 0, "teams_updated": 0,
-                  "players_created": 0, "players_updated": 0,
-                  "clubs_created": 0, "divisions_created": 0}
         # Generated up front (not after the row loops) so every row-level
         # audit entry below can be tagged with it, letting the Activity feed
         # group a batch's individual creates/updates under its summary (#102).
         batch_id = self.store.next_id("importbatch")
 
-        with self.store.transaction():
-            # #159 — acquire the archived-Season row lock as the FIRST statement
-            # inside the single transaction that holds every import write, and
-            # derive Season-owned values from that same locked read. On
-            # PostgreSQL the FOR UPDATE lock is then held through all the
-            # Team/Division/registration/Player/contact/audit writes, so a
-            # concurrent archive either commits before this import (which then
-            # fails season_archived with zero mutation) or blocks until this
-            # import commits — never a write into an already-archived Season.
-            _season = self._require_active_season(season_id)
-            # The permanent program every imported team belongs to (#180): the
-            # program of the season being imported into.
-            season_league_id = _season.program_id
-            # Pre-write integrity gate (#180 review): before ANY write, prove the
-            # import won't silently re-home a permanent Team across leagues or
-            # strand committed games by moving a registration's division. A
-            # violation returns a structured error with zero writes.
-            if (not season_league_id
-                    or self.store.get_program(season_league_id) is None):
-                return {"committed": False, "summary": result["summary"],
-                        "errors": [{"sheet": "teams",
-                            "reason": "season_league_missing",
-                            "message": ("The import target season is not linked "
-                                        "to a valid league."),
-                            "season_id": season_id}],
-                        "warnings": result["warnings"]}
-            gate_errors = []
-            for row in team_rows:
-                code = _clean(row.get("team_code"))
-                existing = next((t for t in self.store.all_teams()
-                                 if t.external_ref == code), None)
-                if existing is None:
-                    continue
-                team_regs = [r for r in self.store.all_season_team_registrations()
-                             if r.team_id == existing.id]
-                # (1) The import must never move a permanent Team's program.
-                if (existing.program_id or None) != season_league_id:
-                    if existing.program_id is None:
-                        # A league-less team is repaired to the target league
-                        # only if EVERY retained registration already resolves
-                        # there; otherwise its history would go cross-league.
-                        stray = [r.id for r in team_regs
-                                 if self._registration_program(r) != season_league_id]
-                        if stray:
-                            gate_errors.append({
-                                "sheet": "teams", "team_code": code,
-                                "reason": "team_league_ambiguous",
-                                "message": (f"Team {code} has registrations in "
-                                            "another league; assign its permanent "
-                                            "league before importing."),
-                                "affected_registration_ids": stray})
-                    else:
-                        gate_errors.append({
-                            "sheet": "teams", "team_code": code,
-                            "reason": "team_league_move_blocked",
-                            "message": (f"Team {code} already belongs to a "
-                                        "different league; the import can't "
-                                        "re-home it."),
-                            "affected_registration_ids": [r.id for r in team_regs],
-                            "affected_game_ids": [
-                                g.id for g in self.store.all_games()
-                                if existing.id in (g.home_team_id, g.away_team_id)]})
-                # (2) ANY change to a registration's division must not strand
-                # committed games — the same guard assign_season_team_division
-                # enforces. The target is resolved for every row, including
-                # None for a blank division (which would CLEAR the division), so
-                # a blank re-import can't quietly unassign a team that still has
-                # scheduled games. Applies to inactive/historical registrations
-                # too (a re-import reactivates and may re-place them).
-                div_name = row.get("division_name")
-                reg = next(  # #283: find the team's registration in this Season
-                    (r for r in self.store.registrations_for_season(season_id)
-                     if r.team_id == existing.id), None)
-                if reg is not None:
-                    if _blank(div_name):
-                        target_div_id = None
-                    else:
-                        match = next(
-                            (d for d in self.store.divisions_for_season(season_id)
-                             if d.name == _clean(div_name)), None)
-                        # A not-yet-created named division is necessarily a
-                        # different placement than the current one.
-                        target_div_id = match.id if match else object()
-                    if target_div_id != reg.division_id:
-                        stranded = self._games_scheduled_for_team_in_season(
-                            season_id, existing.id)
-                        if stranded:
-                            gate_errors.append({
-                                "sheet": "teams", "team_code": code,
-                                "reason": "registration_division_move_strands_games",
-                                "message": (f"Re-importing team {code} would move "
-                                            "or clear its division while it has "
-                                            "scheduled games; resolve them first."),
-                                "affected_game_ids": stranded})
-            if gate_errors:
-                return {"committed": False, "summary": result["summary"],
-                        "errors": gate_errors, "warnings": result["warnings"]}
+        # #331 review round 14 finding 2: counts must reset PER ATTEMPT, not
+        # once before the retry loop -- a _TeamLockPlanDrifted retry rolls
+        # back every write from the failed attempt, but a Python-level
+        # counter increment survives that rollback unless reset here too,
+        # which would double-count rows the fresh attempt reprocesses.
+        for attempt in range(3):
+            counts = {"teams_created": 0, "teams_updated": 0,
+                      "players_created": 0, "players_updated": 0,
+                      "clubs_created": 0, "divisions_created": 0}
+            try:
+                with self.store.transaction():
+                    # #159 — acquire the archived-Season row lock as the FIRST statement
+                    # inside the single transaction that holds every import write, and
+                    # derive Season-owned values from that same locked read. On
+                    # PostgreSQL the FOR UPDATE lock is then held through all the
+                    # Team/Division/registration/Player/contact/audit writes, so a
+                    # concurrent archive either commits before this import (which then
+                    # fails season_archived with zero mutation) or blocks until this
+                    # import commits — never a write into an already-archived Season.
+                    _season = self._require_active_season(season_id)
+                    # The permanent program every imported team belongs to (#180): the
+                    # program of the season being imported into.
+                    season_league_id = _season.program_id
+                    # Pre-write integrity gate (#180 review): before ANY write, prove the
+                    # import won't silently re-home a permanent Team across leagues or
+                    # strand committed games by moving a registration's division. A
+                    # violation returns a structured error with zero writes.
+                    if (not season_league_id
+                            or self.store.get_program(season_league_id) is None):
+                        return {"committed": False, "summary": result["summary"],
+                                "errors": [{"sheet": "teams",
+                                    "reason": "season_league_missing",
+                                    "message": ("The import target season is not linked "
+                                                "to a valid league."),
+                                    "season_id": season_id}],
+                                "warnings": result["warnings"]}
+                    # Snapshot of every Team known to exist BEFORE the gate_errors
+                    # pass below runs (#331 review round 14 finding 2), reused for
+                    # both that pass's own existing-lookup AND, later, to detect a
+                    # team_code that only became visible AFTER this snapshot was
+                    # taken -- a concurrent import for a DIFFERENT Season creating
+                    # it in the gap between this snapshot and this attempt's later
+                    # double-checked-locking recheck. See _TeamLockPlanDrifted's
+                    # docstring for the full mechanism this closes.
+                    _teams_at_gate_check = {t.external_ref: t for t in self.store.all_teams()
+                                            if t.external_ref}
+                    gate_errors = []
+                    for row in team_rows:
+                        code = _clean(row.get("team_code"))
+                        existing = _teams_at_gate_check.get(code)
+                        if existing is None:
+                            continue
+                        team_regs = [r for r in self.store.all_season_team_registrations()
+                                     if r.team_id == existing.id]
+                        # (1) The import must never move a permanent Team's program.
+                        if (existing.program_id or None) != season_league_id:
+                            if existing.program_id is None:
+                                # A league-less team is repaired to the target league
+                                # only if EVERY retained registration already resolves
+                                # there; otherwise its history would go cross-league.
+                                stray = [r.id for r in team_regs
+                                         if self._registration_program(r) != season_league_id]
+                                if stray:
+                                    gate_errors.append({
+                                        "sheet": "teams", "team_code": code,
+                                        "reason": "team_league_ambiguous",
+                                        "message": (f"Team {code} has registrations in "
+                                                    "another league; assign its permanent "
+                                                    "league before importing."),
+                                        "affected_registration_ids": stray})
+                            else:
+                                gate_errors.append({
+                                    "sheet": "teams", "team_code": code,
+                                    "reason": "team_league_move_blocked",
+                                    "message": (f"Team {code} already belongs to a "
+                                                "different league; the import can't "
+                                                "re-home it."),
+                                    "affected_registration_ids": [r.id for r in team_regs],
+                                    "affected_game_ids": [
+                                        g.id for g in self.store.all_games()
+                                        if existing.id in (g.home_team_id, g.away_team_id)]})
+                        # (1b) #331 review round 14 finding 2: the SAME invariant as
+                        # (1), but at the narrower permanent-League grain -- two
+                        # Seasons can share one Program yet carry distinct permanent
+                        # Leagues, a case (1) alone cannot see since it only compares
+                        # Program ids. Read-only prediction (never auto-creates a
+                        # Division/LeagueSeason -- see the resolver's own docstring
+                        # for why, and for the narrow residual gap that leaves).
+                        target_league_id = self._resolve_import_target_league_id_readonly(
+                            season_id, row.get("division_name"))
+                        if (target_league_id is not None
+                                and (existing.league_id or None) != target_league_id):
+                            if existing.league_id is None:
+                                stray = [r.id for r in team_regs
+                                         if self._registration_league_id(r) != target_league_id]
+                                if stray:
+                                    gate_errors.append({
+                                        "sheet": "teams", "team_code": code,
+                                        "reason": "team_permanent_league_ambiguous",
+                                        "message": (f"Team {code} has registrations in "
+                                                    "another permanent league; assign its "
+                                                    "permanent league before importing."),
+                                        "affected_registration_ids": stray})
+                            else:
+                                gate_errors.append({
+                                    "sheet": "teams", "team_code": code,
+                                    "reason": "team_permanent_league_move_blocked",
+                                    "message": (f"Team {code} already belongs to a "
+                                                "different permanent league; the import "
+                                                "can't re-home it."),
+                                    "affected_registration_ids": [r.id for r in team_regs],
+                                    "affected_game_ids": [
+                                        g.id for g in self.store.all_games()
+                                        if existing.id in (g.home_team_id, g.away_team_id)]})
+                        # (2) ANY change to a registration's division must not strand
+                        # committed games — the same guard assign_season_team_division
+                        # enforces. The target is resolved for every row, including
+                        # None for a blank division (which would CLEAR the division), so
+                        # a blank re-import can't quietly unassign a team that still has
+                        # scheduled games. Applies to inactive/historical registrations
+                        # too (a re-import reactivates and may re-place them).
+                        div_name = row.get("division_name")
+                        reg = next(  # #283: find the team's registration in this Season
+                            (r for r in self.store.registrations_for_season(season_id)
+                             if r.team_id == existing.id), None)
+                        if reg is not None:
+                            if _blank(div_name):
+                                target_div_id = None
+                            else:
+                                match = next(
+                                    (d for d in self.store.divisions_for_season(season_id)
+                                     if d.name == _clean(div_name)), None)
+                                # A not-yet-created named division is necessarily a
+                                # different placement than the current one.
+                                target_div_id = match.id if match else object()
+                            if target_div_id != reg.division_id:
+                                stranded = self._games_scheduled_for_team_in_season(
+                                    season_id, existing.id)
+                                if stranded:
+                                    gate_errors.append({
+                                        "sheet": "teams", "team_code": code,
+                                        "reason": "registration_division_move_strands_games",
+                                        "message": (f"Re-importing team {code} would move "
+                                                    "or clear its division while it has "
+                                                    "scheduled games; resolve them first."),
+                                        "affected_game_ids": stranded})
+                    if gate_errors:
+                        return {"committed": False, "summary": result["summary"],
+                                "errors": gate_errors, "warnings": result["warnings"]}
 
-            team_code_to_id = {}
-            for row in team_rows:
-                team_code = _clean(row.get("team_code"))
-                team_name = _clean(row.get("team_name"))
+                    team_code_to_id = {}
+                    for row in team_rows:
+                        team_code = _clean(row.get("team_code"))
+                        team_name = _clean(row.get("team_name"))
 
-                club_id = None
-                club_name_raw = row.get("club_name")
-                if not _no_club(club_name_raw):
-                    club_name = _clean(club_name_raw)
-                    # #331 review round 13 finding 2: shared with
-                    # commit_officials_availability_import -- see
-                    # _find_or_create_import_club's own docstring for why a
-                    # bare check-then-create here (this method's own copy,
-                    # unprotected until now) could still duplicate a Club
-                    # racing a DIFFERENT Season's import, or an officials
-                    # import, on the identical new name.
-                    club, created = self._find_or_create_import_club(
-                        club_name, actor_id, batch_id)
-                    if created:
-                        counts["clubs_created"] += 1
-                    club_id = club.id
+                        club_id = None
+                        club_name_raw = row.get("club_name")
+                        if not _no_club(club_name_raw):
+                            club_name = _clean(club_name_raw)
+                            # #331 review round 13 finding 2: shared with
+                            # commit_officials_availability_import -- see
+                            # _find_or_create_import_club's own docstring for why a
+                            # bare check-then-create here (this method's own copy,
+                            # unprotected until now) could still duplicate a Club
+                            # racing a DIFFERENT Season's import, or an officials
+                            # import, on the identical new name.
+                            club, created = self._find_or_create_import_club(
+                                club_name, actor_id, batch_id)
+                            if created:
+                                counts["clubs_created"] += 1
+                            club_id = club.id
 
-                division = None
-                division_name_raw = row.get("division_name")
-                if not _blank(division_name_raw):
-                    division_name = _clean(division_name_raw)
-                    division = next(
-                        (d for d in self.store.divisions_for_season(season_id)
-                         if d.name == division_name),
-                        None)
-                    if division is None:
-                        # #283: a Division belongs to a LeagueSeason. This simple
-                        # onboarding import carries no per-division League, so use
-                        # the Season's LeagueSeason, auto-provisioning a default
-                        # League when the Season has none yet (mirrors
-                        # create_division so imported rows are never orphaned with
-                        # a null league_season_id).
-                        _ls = self._import_default_league_season(season_id)
-                        division = Division(id=self.store.next_id("division"),
-                                            league_season_id=_ls.id,
-                                            name=division_name)
-                        self.store.add_division(division)
-                        self._audit("division_created", "division", division.id,
-                                    actor_id, {"season_id": season_id,
-                                              "import_batch_id": batch_id})
-                        counts["divisions_created"] += 1
+                        division = None
+                        division_name_raw = row.get("division_name")
+                        if not _blank(division_name_raw):
+                            division_name = _clean(division_name_raw)
+                            division = next(
+                                (d for d in self.store.divisions_for_season(season_id)
+                                 if d.name == division_name),
+                                None)
+                            if division is None:
+                                # #283: a Division belongs to a LeagueSeason. This simple
+                                # onboarding import carries no per-division League, so use
+                                # the Season's LeagueSeason, auto-provisioning a default
+                                # League when the Season has none yet (mirrors
+                                # create_division so imported rows are never orphaned with
+                                # a null league_season_id).
+                                _ls = self._import_default_league_season(season_id)
+                                division = Division(id=self.store.next_id("division"),
+                                                    league_season_id=_ls.id,
+                                                    name=division_name)
+                                self.store.add_division(division)
+                                self._audit("division_created", "division", division.id,
+                                            actor_id, {"season_id": season_id,
+                                                      "import_batch_id": batch_id})
+                                counts["divisions_created"] += 1
 
-                division_id = division.id if division else None
+                        division_id = division.id if division else None
 
-                # #180/#283: a team's participation is converged onto its
-                # permanent League + a SeasonTeamRegistration, never the legacy
-                # Team.division_id. The team is a permanent member of THIS
-                # import season's League (auto-provisioned if the Season had
-                # none); the imported division lives on the registration.
-                _import_ls = (self.store.get_league_season(division.league_season_id)
-                              if division is not None
-                              else self._import_default_league_season(season_id))
-                _import_league_id = _import_ls.league_id if _import_ls else None
-                team = next((t for t in self.store.all_teams()
-                            if t.external_ref == team_code), None)
-                if team is None:
-                    # #331 review round 13 finding 2: this method's own copy
-                    # of the same unlocked check-then-create shape Club had
-                    # (see _find_or_create_import_club's docstring) --
-                    # team_code is documented above as a globally stable
-                    # external ref, but this method only locks its OWN
-                    # target Season, so two imports for DIFFERENT Seasons
-                    # never serialize against each other here and could
-                    # each create their own duplicate Team for an identical
-                    # new team_code. Same fix, same mechanism: reserve the
-                    # id via next_id("team") first (blocks a concurrent
-                    # creator until it commits/rolls back), then re-check
-                    # under that lock before deciding create-vs-update.
-                    _reserved_team_id = self.store.next_id("team")
-                    team = next((t for t in self.store.all_teams()
-                                if t.external_ref == team_code), None)
-                if team is not None:
-                    team.name = team_name
-                    team.club_id = club_id
-                    if season_league_id:
-                        team.program_id = season_league_id
-                    if _import_league_id and not team.league_id:
-                        team.league_id = _import_league_id
-                    self.store.save_team(team)
-                    self._audit("team_updated", "team", team.id, actor_id,
-                                {"club_id": club_id, "league_id": team.program_id,
-                                 "import_batch_id": batch_id})
-                    counts["teams_updated"] += 1
-                else:
-                    team = Team(id=_reserved_team_id, name=team_name,
-                               club_id=club_id, program_id=season_league_id,
-                               league_id=_import_league_id,
-                               external_ref=team_code)
-                    self.store.add_team(team)
-                    self._audit("team_created", "team", team.id, actor_id,
-                                {"club_id": club_id, "league_id": season_league_id,
-                                 "import_batch_id": batch_id})
-                    counts["teams_created"] += 1
-                team_code_to_id[team_code] = team.id
+                        # #180/#283: a team's participation is converged onto its
+                        # permanent League + a SeasonTeamRegistration, never the legacy
+                        # Team.division_id. The team is a permanent member of THIS
+                        # import season's League (auto-provisioned if the Season had
+                        # none); the imported division lives on the registration.
+                        _import_ls = (self.store.get_league_season(division.league_season_id)
+                                      if division is not None
+                                      else self._import_default_league_season(season_id))
+                        _import_league_id = _import_ls.league_id if _import_ls else None
+                        team = next((t for t in self.store.all_teams()
+                                    if t.external_ref == team_code), None)
+                        if team is None:
+                            # #331 review round 13 finding 2: this method's own copy
+                            # of the same unlocked check-then-create shape Club had
+                            # (see _find_or_create_import_club's docstring) --
+                            # team_code is documented above as a globally stable
+                            # external ref, but this method only locks its OWN
+                            # target Season, so two imports for DIFFERENT Seasons
+                            # never serialize against each other here and could
+                            # each create their own duplicate Team for an identical
+                            # new team_code. Same fix, same mechanism: reserve the
+                            # id via next_id("team") first (blocks a concurrent
+                            # creator until it commits/rolls back), then re-check
+                            # under that lock before deciding create-vs-update.
+                            _reserved_team_id = self.store.next_id("team")
+                            team = next((t for t in self.store.all_teams()
+                                        if t.external_ref == team_code), None)
+                        if team is not None and team_code not in _teams_at_gate_check:
+                            # #331 review round 14 finding 2: this Team did not exist
+                            # when gate_errors ran above -- a concurrent import for a
+                            # DIFFERENT Season created it (with its own Program/League
+                            # already set) in the gap between that snapshot and this
+                            # row's resolution. None of the (1)/(1b) guards above ever
+                            # evaluated it. Retry the whole attempt with a fresh
+                            # snapshot, which will correctly gate this team's real
+                            # current state before any write.
+                            raise _TeamLockPlanDrifted()
+                        if team is not None:
+                            team.name = team_name
+                            team.club_id = club_id
+                            if season_league_id:
+                                team.program_id = season_league_id
+                            if _import_league_id and not team.league_id:
+                                team.league_id = _import_league_id
+                            self.store.save_team(team)
+                            self._audit("team_updated", "team", team.id, actor_id,
+                                        {"club_id": club_id, "league_id": team.program_id,
+                                         "import_batch_id": batch_id})
+                            counts["teams_updated"] += 1
+                        else:
+                            team = Team(id=_reserved_team_id, name=team_name,
+                                       club_id=club_id, program_id=season_league_id,
+                                       league_id=_import_league_id,
+                                       external_ref=team_code)
+                            self.store.add_team(team)
+                            self._audit("team_created", "team", team.id, actor_id,
+                                        {"club_id": club_id, "league_id": season_league_id,
+                                         "import_batch_id": batch_id})
+                            counts["teams_created"] += 1
+                        team_code_to_id[team_code] = team.id
 
-                # Idempotently upsert THIS season's registration with the
-                # imported division; never touch another season's row.
-                # #283: a registration is stored against a LeagueSeason — the
-                # chosen Division's LeagueSeason, else the Season's sole one.
-                if division is not None:
-                    reg_ls_id = division.league_season_id
-                else:
-                    reg_ls_id = _import_ls.id if _import_ls else None
-                reg = next(
-                    (r for r in self.store.registrations_for_season(season_id)
-                     if r.team_id == team.id), None)
-                if reg is not None:
-                    if not reg.active or reg.division_id != division_id:
-                        reg.active = True
-                        reg.division_id = division_id
-                        reg.league_season_id = reg_ls_id
-                        self.store.save_season_team_registration(reg)
-                        self._audit("season_team_registration_updated",
-                                    "season_team_registration", reg.id, actor_id,
-                                    {"season_id": season_id, "team_id": team.id,
-                                     "division_id": division_id,
-                                     "import_batch_id": batch_id})
-                else:
-                    reg = SeasonTeamRegistration(
-                        id=self.store.next_id("streg"),
-                        league_season_id=reg_ls_id,
-                        team_id=team.id, division_id=division_id,
-                        active=True)
-                    self.store.add_season_team_registration(reg)
-                    self._audit("season_team_registered",
-                                "season_team_registration", reg.id, actor_id,
-                                {"season_id": season_id, "team_id": team.id,
-                                 "division_id": division_id,
-                                 "import_batch_id": batch_id})
+                        # Idempotently upsert THIS season's registration with the
+                        # imported division; never touch another season's row.
+                        # #283: a registration is stored against a LeagueSeason — the
+                        # chosen Division's LeagueSeason, else the Season's sole one.
+                        if division is not None:
+                            reg_ls_id = division.league_season_id
+                        else:
+                            reg_ls_id = _import_ls.id if _import_ls else None
+                        reg = next(
+                            (r for r in self.store.registrations_for_season(season_id)
+                             if r.team_id == team.id), None)
+                        if reg is not None:
+                            if not reg.active or reg.division_id != division_id:
+                                reg.active = True
+                                reg.division_id = division_id
+                                reg.league_season_id = reg_ls_id
+                                self.store.save_season_team_registration(reg)
+                                self._audit("season_team_registration_updated",
+                                            "season_team_registration", reg.id, actor_id,
+                                            {"season_id": season_id, "team_id": team.id,
+                                             "division_id": division_id,
+                                             "import_batch_id": batch_id})
+                        else:
+                            reg = SeasonTeamRegistration(
+                                id=self.store.next_id("streg"),
+                                league_season_id=reg_ls_id,
+                                team_id=team.id, division_id=division_id,
+                                active=True)
+                            self.store.add_season_team_registration(reg)
+                            self._audit("season_team_registered",
+                                        "season_team_registration", reg.id, actor_id,
+                                        {"season_id": season_id, "team_id": team.id,
+                                         "division_id": division_id,
+                                         "import_batch_id": batch_id})
 
-            # Swap-safe apply (#292): release every existing player's jersey
-            # whose final slot moves BEFORE any per-row write, so a valid
-            # same-team swap (A 7→8, B 8→7) commits without a transient
-            # uniqueness failure. A blank jersey cell keeps the current number
-            # (final == current → not released).
-            by_code = {p.external_ref: p for p in self.store.all_players()
-                       if p.external_ref is not None}
+                    # Swap-safe apply (#292): release every existing player's jersey
+                    # whose final slot moves BEFORE any per-row write, so a valid
+                    # same-team swap (A 7→8, B 8→7) commits without a transient
+                    # uniqueness failure. A blank jersey cell keeps the current number
+                    # (final == current → not released).
+                    by_code = {p.external_ref: p for p in self.store.all_players()
+                               if p.external_ref is not None}
 
-            def _final_slot(row):
-                existing = by_code.get(_clean(row.get("player_code")))
-                team_id = team_code_to_id.get(_clean(row.get("team_code")))
-                raw = row.get("jersey_number")
-                jersey = (int(_clean(raw)) if not _blank(raw)
-                          else (existing.jersey_number if existing else None))
-                return existing, team_id, jersey
-            released = self.release_batch_player_jerseys(
-                _final_slot(row) for row in player_rows)
+                    def _final_slot(row):
+                        existing = by_code.get(_clean(row.get("player_code")))
+                        team_id = team_code_to_id.get(_clean(row.get("team_code")))
+                        raw = row.get("jersey_number")
+                        jersey = (int(_clean(raw)) if not _blank(raw)
+                                  else (existing.jersey_number if existing else None))
+                        return existing, team_id, jersey
+                    released = self.release_batch_player_jerseys(
+                        _final_slot(row) for row in player_rows)
 
-            for row in player_rows:
-                player_code = _clean(row.get("player_code"))
-                full_name = self._validate_player_name(
-                    (f"{_clean(row.get('first_name'))} "
-                     f"{_clean(row.get('last_name'))}").strip())
-                # validate_import already guarantees this team_code matches a
-                # row in THIS SAME upload's teams sheet; .get() is just a
-                # defensive belt-and-suspenders check against a bug elsewhere.
-                team_id = team_code_to_id.get(_clean(row.get("team_code")))
-                if team_id is None:
-                    raise ValidationError(
-                        f"Unknown team_code for player_code {player_code}.")
+                    for row in player_rows:
+                        player_code = _clean(row.get("player_code"))
+                        full_name = self._validate_player_name(
+                            (f"{_clean(row.get('first_name'))} "
+                             f"{_clean(row.get('last_name'))}").strip())
+                        # validate_import already guarantees this team_code matches a
+                        # row in THIS SAME upload's teams sheet; .get() is just a
+                        # defensive belt-and-suspenders check against a bug elsewhere.
+                        team_id = team_code_to_id.get(_clean(row.get("team_code")))
+                        if team_id is None:
+                            raise ValidationError(
+                                f"Unknown team_code for player_code {player_code}.")
 
-                jersey_raw = row.get("jersey_number")
-                jersey_number = (int(_clean(jersey_raw)) if not _blank(jersey_raw)
-                                else None)
-                self._validate_jersey_number(jersey_number)
-                position_raw = row.get("position")
-                position = (Position(_clean(position_raw))
-                           if not _blank(position_raw) else None)
-                email_raw = row.get("email")
-                email = _clean(email_raw) if not _blank(email_raw) else None
+                        jersey_raw = row.get("jersey_number")
+                        jersey_number = (int(_clean(jersey_raw)) if not _blank(jersey_raw)
+                                        else None)
+                        self._validate_jersey_number(jersey_number)
+                        position_raw = row.get("position")
+                        position = (Position(_clean(position_raw))
+                                   if not _blank(position_raw) else None)
+                        email_raw = row.get("email")
+                        email = _clean(email_raw) if not _blank(email_raw) else None
 
-                player = next((p for p in self.store.all_players()
-                              if p.external_ref == player_code), None)
-                if player is None:
-                    # #331 review round 13 finding 2: same gap, same fix as
-                    # Team above -- player_code is documented as a globally
-                    # stable external ref but only THIS Season's row is
-                    # locked, so two different-Season imports could each
-                    # create their own duplicate Player for an identical
-                    # new player_code.
-                    _reserved_player_id = self.store.next_id("player")
-                    player = next((p for p in self.store.all_players()
-                                  if p.external_ref == player_code), None)
-                if player is not None:
-                    # Partial-field-overwrite: only fields the sheet actually
-                    # supplies this time are updated. A blank jersey cell keeps
-                    # the existing number — resolved from the ORIGINAL captured
-                    # before the swap-safe release (#292), never the transient
-                    # NULL the release wrote, so a Team move with a blank cell
-                    # never erases the number. The uniqueness check uses the
-                    # resulting number on the resulting team (#269), before any
-                    # write — a collision aborts the whole batch, zero rows.
-                    original_jersey = released.get(player.id, player.jersey_number)
-                    target_jersey = (jersey_number if jersey_number is not None
-                                     else original_jersey)
-                    if player.is_active:
-                        self._assert_jersey_available(
-                            team_id, target_jersey, exclude_player_id=player.id)
-                    player.name = full_name
-                    player.team_id = team_id
-                    player.jersey_number = target_jersey
-                    if position is not None:
-                        player.position = position
-                    self.store.save_player(player)
-                    self._audit("player_updated", "player", player.id, actor_id,
-                                {"team_id": team_id, "import_batch_id": batch_id})
-                    counts["players_updated"] += 1
-                else:
-                    # A brand-new imported player is active, so its number must
-                    # be free among the team's active players (#269).
-                    self._assert_jersey_available(team_id, jersey_number)
-                    # The domain model requires a Position with no default,
-                    # but #92 doesn't require the CSV to supply one — default
-                    # a brand-new player to FORWARD as an explicit judgment
-                    # call; may want revisiting.
-                    player = Player(id=_reserved_player_id, team_id=team_id,
-                                    name=full_name,
-                                    position=position or Position.FORWARD,
-                                    jersey_number=jersey_number,
-                                    external_ref=player_code)
-                    self.store.add_player(player)
-                    self._audit("player_added", "player", player.id, actor_id,
-                                {"team_id": team_id, "import_batch_id": batch_id})
-                    counts["players_created"] += 1
+                        player = next((p for p in self.store.all_players()
+                                      if p.external_ref == player_code), None)
+                        if player is None:
+                            # #331 review round 13 finding 2: same gap, same fix as
+                            # Team above -- player_code is documented as a globally
+                            # stable external ref but only THIS Season's row is
+                            # locked, so two different-Season imports could each
+                            # create their own duplicate Player for an identical
+                            # new player_code.
+                            _reserved_player_id = self.store.next_id("player")
+                            player = next((p for p in self.store.all_players()
+                                          if p.external_ref == player_code), None)
+                        if player is not None:
+                            # Partial-field-overwrite: only fields the sheet actually
+                            # supplies this time are updated. A blank jersey cell keeps
+                            # the existing number — resolved from the ORIGINAL captured
+                            # before the swap-safe release (#292), never the transient
+                            # NULL the release wrote, so a Team move with a blank cell
+                            # never erases the number. The uniqueness check uses the
+                            # resulting number on the resulting team (#269), before any
+                            # write — a collision aborts the whole batch, zero rows.
+                            original_jersey = released.get(player.id, player.jersey_number)
+                            target_jersey = (jersey_number if jersey_number is not None
+                                             else original_jersey)
+                            if player.is_active:
+                                self._assert_jersey_available(
+                                    team_id, target_jersey, exclude_player_id=player.id)
+                            player.name = full_name
+                            player.team_id = team_id
+                            player.jersey_number = target_jersey
+                            if position is not None:
+                                player.position = position
+                            self.store.save_player(player)
+                            self._audit("player_updated", "player", player.id, actor_id,
+                                        {"team_id": team_id, "import_batch_id": batch_id})
+                            counts["players_updated"] += 1
+                        else:
+                            # A brand-new imported player is active, so its number must
+                            # be free among the team's active players (#269).
+                            self._assert_jersey_available(team_id, jersey_number)
+                            # The domain model requires a Position with no default,
+                            # but #92 doesn't require the CSV to supply one — default
+                            # a brand-new player to FORWARD as an explicit judgment
+                            # call; may want revisiting.
+                            player = Player(id=_reserved_player_id, team_id=team_id,
+                                            name=full_name,
+                                            position=position or Position.FORWARD,
+                                            jersey_number=jersey_number,
+                                            external_ref=player_code)
+                            self.store.add_player(player)
+                            self._audit("player_added", "player", player.id, actor_id,
+                                        {"team_id": team_id, "import_batch_id": batch_id})
+                            counts["players_created"] += 1
 
-                # A blank cell parsed to None above → no-op (leave any existing
-                # contact untouched). A supplied address validates, updates AND
-                # reactivates the single player:<id> EMAIL contact through the
-                # shared set/retire path, so a re-import revives a contact a
-                # prior edit had retired instead of leaving it active=False
-                # (#268 review).
-                if email is not None:
-                    self._set_email_contact(f"player:{player.id}", email)
+                        # A blank cell parsed to None above → no-op (leave any existing
+                        # contact untouched). A supplied address validates, updates AND
+                        # reactivates the single player:<id> EMAIL contact through the
+                        # shared set/retire path, so a re-import revives a contact a
+                        # prior edit had retired instead of leaving it active=False
+                        # (#268 review).
+                        if email is not None:
+                            self._set_email_contact(f"player:{player.id}", email)
 
-            # skipped/errors are always 0 here by construction: the
-            # all-or-nothing gate above means the only way to reach this line
-            # is a fully clean validate_import result — any error blocks the
-            # transaction before an audit row is ever written. Present anyway
-            # for a stable import_committed detail shape across #93-#95.
-            self._audit("import_committed", "import_batch", batch_id, actor_id,
-                        {"import_type": "teams_players", "season_id": season_id,
-                         "skipped": 0, "errors": 0, **counts})
+                    # skipped/errors are always 0 here by construction: the
+                    # all-or-nothing gate above means the only way to reach this line
+                    # is a fully clean validate_import result — any error blocks the
+                    # transaction before an audit row is ever written. Present anyway
+                    # for a stable import_committed detail shape across #93-#95.
+                    self._audit("import_committed", "import_batch", batch_id, actor_id,
+                                {"import_type": "teams_players", "season_id": season_id,
+                                 "skipped": 0, "errors": 0, **counts})
+                break  # committed cleanly
+            except _TeamLockPlanDrifted:
+                # A team_code resolved to a real Team outside this
+                # attempt's gate-checked snapshot (#331 review round 14
+                # finding 2) -- retry with a fresh snapshot, which will
+                # correctly gate it.
+                if attempt == 2:
+                    raise ConcurrencyConflictError(
+                        "A team referenced by this import was created "
+                        "concurrently; please retry.",
+                        {"reason": "team_import_raced"})
 
         return {
             "committed": True,
@@ -6275,31 +6440,51 @@ class SetupService:
                                               for r in self.store.all_rinks()
                                               if r.external_ref}
                     _codes = {_clean(row.get("rink_code")) for row in rink_rows}
-                    for _rid in sorted(_existing_rink_by_code[c].id for c in _codes
-                                       if c in _existing_rink_by_code):
-                        self.store.get_rink_for_update(_rid)
+                    _planned_ids = sorted(_existing_rink_by_code[c].id for c in _codes
+                                         if c in _existing_rink_by_code)
+                    _locked_by_id = {_rid: self.store.get_rink_for_update(_rid)
+                                     for _rid in _planned_ids}
 
-                    # Re-resolve every requested rink_code AFTER the lock plan
-                    # above is fully acquired (#331 review round 13 finding
-                    # 1): _existing_rink_by_code is a snapshot taken BEFORE any
-                    # lock, so a rink_code absent from it was skipped by the
-                    # lock loop just above -- but a concurrent transaction can
-                    # create that exact rink_code (plus a GAME slot on it, plus
-                    # even a Game booked on that slot) in the gap between our
-                    # snapshot and our lock acquisition. Neither gate below can
-                    # trust a Rink this attempt never locked: both would wrongly
-                    # treat a code missing from the snapshot as "brand-new, no
-                    # persisted ice to protect" even though it may now be real,
-                    # booked ice. If any requested code has newly resolved to a
-                    # Rink outside the locked plan, this attempt's lock plan is
-                    # stale -- abort and retry with a fresh snapshot (which will
-                    # correctly lock and gate it) rather than proceed
-                    # unprotected.
-                    _rechecked_codes = {r.external_ref for r in self.store.all_rinks()
-                                       if r.external_ref}
-                    if any(c not in _existing_rink_by_code and c in _rechecked_codes
-                           for c in _codes):
-                        raise _RinkLockPlanDrifted()
+                    # Freeze the rink_code -> Rink mapping this attempt will use
+                    # for BOTH the gates below AND the apply/write phase,
+                    # verified against the IDs this attempt actually locked --
+                    # not just code presence (#331 review round 14 finding 1).
+                    # Round 13's own recheck asked only "did a code that was
+                    # absent become present", which misses two narrower windows:
+                    # (a) a code can stay PRESENT throughout but silently REMAP
+                    # to a different, never-locked Rink id -- e.g. the planned
+                    # Rink is deleted (delete_rink permits this once it has no
+                    # dependent slots/games) and a new Rink is created under the
+                    # same external_ref, racing this attempt's lock acquisition;
+                    # get_rink_for_update on the now-deleted id simply returns
+                    # None, which round 13's loop silently discarded instead of
+                    # treating as drift. (b) a genuinely-new code can materialize,
+                    # unlocked, in the gap between this recheck and a LATER fresh
+                    # lookup -- which is exactly what the apply phase used to do
+                    # below (its own independent all_rinks() scan by code, re-run
+                    # per row instead of reusing this snapshot). Comparing every
+                    # code's fresh id against what this attempt actually locked,
+                    # ONCE here, and then having every downstream read go through
+                    # this frozen mapping rather than re-querying, closes both
+                    # windows at once: nothing that changes Rink state after this
+                    # point can be silently adopted by either the gates or the
+                    # write. A code with no fresh Rink at all (never existed, or
+                    # deleted with nothing recreated in its place) is frozen to
+                    # None -- the apply phase below then reserves+inserts it,
+                    # under migration 048's unique external_ref index, exactly
+                    # as it already does for a code new from the start.
+                    _fresh_rink_by_code = {r.external_ref: r
+                                           for r in self.store.all_rinks()
+                                           if r.external_ref}
+                    _rink_plan = {}
+                    for c in _codes:
+                        _fresh = _fresh_rink_by_code.get(c)
+                        if _fresh is None:
+                            _rink_plan[c] = None
+                        elif _locked_by_id.get(_fresh.id) is not None:
+                            _rink_plan[c] = _fresh
+                        else:
+                            raise _RinkLockPlanDrifted()
 
                     # Overlap gate, under the locks and BEFORE any write (mirrors the
                     # slot_type gate's all-or-nothing placement so it rolls back cleanly
@@ -6318,7 +6503,7 @@ class SetupService:
                     for _s in self.store.all_ice_slots():
                         _persisted_by_rink.setdefault(_s.rink_id, []).append(_s)
                     for row in slot_rows:
-                        _rink = _existing_rink_by_code.get(_clean(row.get("rink_code")))
+                        _rink = _rink_plan.get(_clean(row.get("rink_code")))
                         if _rink is None:
                             continue  # a brand-new rink can't yet have persisted ice
                         _start = _parse_iso_utc(row.get("start_time"))
@@ -6403,8 +6588,13 @@ class SetupService:
                                             {"import_batch_id": batch_id})
                                 counts["venues_created"] += 1
 
-                        rink = next((r for r in self.store.all_rinks()
-                                    if r.external_ref == rink_code), None)
+                        # Resolve against the frozen, lock-verified _rink_plan
+                        # (#331 review round 14 finding 1), NOT a fresh
+                        # all_rinks() scan here: a fresh scan at this later
+                        # point could silently adopt a Rink that never went
+                        # through either gate above -- the same unlocked-
+                        # adoption bug the plan freeze exists to close.
+                        rink = _rink_plan.get(rink_code)
                         if rink is not None:
                             if rink_name_supplied:
                                 rink.name = rink_name

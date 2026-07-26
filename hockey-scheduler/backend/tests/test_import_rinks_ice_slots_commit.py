@@ -814,7 +814,35 @@ class PostgresRinksLockPlanDriftRaceTest(unittest.TestCase):
     all_rinks() too, before the transaction even opens, which would make
     raw call-counting pause at the wrong site. Pausing get_rink_for_update
     for a specific, already-known rink id is the same reliable,
-    content-addressed hook the slot_type-game race above already uses."""
+    content-addressed hook the slot_type-game race above already uses.
+
+    #331 review round 14 finding 1 named two further windows the fix above
+    left open, both closed by freezing a single, lock-verified _rink_plan
+    that both the gates and the apply phase consult (see
+    commit_rinks_ice_slots_import's own comment for the mechanism):
+
+    (a) ID SUBSTITUTION: a code can stay PRESENT throughout -- never
+    absent from any snapshot -- while silently REMAPPING to a different,
+    never-locked Rink id (the originally-planned Rink is deleted, empty,
+    and a new one is created under the same external_ref). Round 13's own
+    recheck compared code presence only, so this slipped through; the
+    two `test_id_substitution_via_delete_recreate_*` tests below reproduce
+    it with the SAME STABLE1 lock-loop pause as the round-13 tests above
+    (the substitution must land BEFORE thread B ever attempts to lock the
+    original id, since that lock -- if acquired -- would block the
+    deleting transaction).
+
+    (b) POST-RECHECK ARRIVAL: a genuinely-new code, correctly absent at
+    the recheck, can still be created by a concurrent writer before an
+    UNPROTECTED later re-lookup resolves it -- which is exactly what the
+    apply phase used to do (its own independent all_rinks() scan by code).
+    The two `test_post_recheck_arrival_*` tests below pause immediately
+    after the specific store.all_rinks() call that _rink_plan's own
+    "_fresh_rink_by_code" snapshot makes (tracked via a phase flag set once
+    STABLE1 is locked, not a raw call count, for the same reason given
+    above), proving the concurrent write lands strictly after that
+    snapshot -- and is still safely handled by the plan freeze rather than
+    silently adopted."""
 
     def setUp(self):
         self.url = os.environ["TEST_DATABASE_URL"]
@@ -1045,6 +1073,433 @@ class PostgresRinksLockPlanDriftRaceTest(unittest.TestCase):
             len(slots), 1,
             f"expected only A's persisted slot to survive, got {[s.id for s in slots]}")
         self.assertEqual(slots[0].start_time.isoformat(), "2026-09-01T18:00:00+00:00")
+
+    def _seed_league(self, seed_store, name_suffix):
+        setup_seed = SetupService(seed_store)
+        program = setup_seed.create_program(
+            f"Drift League {name_suffix}", actor_id="admin")
+        season = setup_seed.create_season(program.id, "2026 Season", actor_id="admin")
+        division = setup_seed.create_division(season.id, "U16", actor_id="admin")
+        club = setup_seed.create_club(f"Drift Club {name_suffix}", actor_id="admin")
+        home = setup_seed.create_team(club.id, division.id, "Home", actor_id="admin")
+        away = setup_seed.create_team(club.id, division.id, "Away", actor_id="admin")
+        setup_seed.register_team_for_season(season.id, home.id, division.id,
+                                            actor_id="admin")
+        setup_seed.register_team_for_season(season.id, away.id, division.id,
+                                            actor_id="admin")
+        return season, division, home, away
+
+    def test_id_substitution_via_delete_recreate_cannot_retype_a_booked_slot(self):
+        seed_store = SqlStore(self.url)
+        stable_rink = self._seed_stable_rink(seed_store)
+        season, division, home, away = self._seed_league(seed_store, "A")
+        # DRIFT-R1 must be EMPTY (delete_rink refuses a rink with dependent
+        # slots/games) and must land a HIGHER id than STABLE1 so the lock
+        # loop's ascending-id order reaches STABLE1 first and pauses there
+        # -- before ever attempting to lock DRIFT-R1's original id, which
+        # (if held) would block thread A's delete_rink outright.
+        drift_venue = Venue(id=seed_store.next_id("venue"), name="Drift Arena",
+                            address="")
+        seed_store.add_venue(drift_venue)
+        old_rink = Rink(id=seed_store.next_id("rink"), venue_id=drift_venue.id,
+                        name="Drift Rink", external_ref="DRIFT-R1")
+        seed_store.add_rink(old_rink)
+
+        store_a, store_b = SqlStore(self.url), SqlStore(self.url)
+        api_a, api_b = ApiService(store_a), ApiService(store_b)
+        setup_a = SetupService(store_a)
+
+        b_stable = next(r for r in store_b.all_rinks() if r.external_ref == "STABLE1")
+
+        b_reached_lock = threading.Event()
+        resume_import = threading.Event()
+        real_get_rink_for_update = store_b.get_rink_for_update
+        def _pausing_get_rink_for_update(rink_id):
+            if rink_id == b_stable.id:
+                b_reached_lock.set()
+                if not resume_import.wait(timeout=10):
+                    raise AssertionError(
+                        "thread a never signalled completion")
+            return real_get_rink_for_update(rink_id)
+        store_b.get_rink_for_update = _pausing_get_rink_for_update
+
+        b_rinks_csv = "venue_name,rink_code\nStable Arena,STABLE1\nDrift Arena,DRIFT-R1\n"
+        b_slots_csv = (
+            "rink_code,start_time,end_time,slot_type\n"
+            "DRIFT-R1,2026-09-01T18:00:00+00:00,2026-09-01T19:30:00+00:00,practice\n"
+        )
+
+        results = {}
+
+        def run_import():
+            try:
+                results["import"] = api_b.commit_rinks_ice_slots_import(
+                    {"rinks_csv": b_rinks_csv, "ice_slots_csv": b_slots_csv},
+                    actor_id="b")
+            except Exception as exc:
+                results["import"] = exc
+
+        def run_delete_recreate_and_game():
+            self.assertTrue(b_reached_lock.wait(timeout=10),
+                            "import never reached its lock-loop pause")
+            try:
+                setup_a.delete_rink(old_rink.id, actor_id="admin")
+                a_rinks_csv = "venue_name,rink_code\nDrift Arena,DRIFT-R1\n"
+                a_slots_csv = (
+                    "rink_code,start_time,end_time,slot_type\n"
+                    "DRIFT-R1,2026-09-01T18:00:00+00:00,2026-09-01T19:30:00+00:00,game\n"
+                )
+                a_import = api_a.commit_rinks_ice_slots_import(
+                    {"rinks_csv": a_rinks_csv, "ice_slots_csv": a_slots_csv},
+                    actor_id="a")
+                assert a_import.get("committed"), a_import
+                new_rink = next(r for r in store_a.all_rinks()
+                                if r.external_ref == "DRIFT-R1")
+                assert new_rink.id != old_rink.id, "must be a genuinely new id"
+                slot = next(s for s in store_a.all_ice_slots()
+                           if s.rink_id == new_rink.id)
+                setup_a.grant_season_venue_access(
+                    season.id, new_rink.venue_id, actor_id="admin")
+                results["game"] = setup_a.create_game(
+                    season.id, division.id, home.id, away.id, slot.id,
+                    actor_id="scheduler")
+            except Exception as exc:
+                results["game"] = exc
+            finally:
+                resume_import.set()
+
+        ta = threading.Thread(target=run_import)
+        tb = threading.Thread(target=run_delete_recreate_and_game)
+        ta.start()
+        tb.start()
+        ta.join(20); tb.join(20)
+
+        self.assertFalse(ta.is_alive(), "import thread hung")
+        self.assertFalse(tb.is_alive(), "delete/recreate thread hung")
+
+        self.assertNotIsInstance(
+            results.get("game"), Exception,
+            f"create_game raised unexpectedly: {results.get('game')!r}")
+
+        imported = results.get("import")
+        self.assertIsInstance(
+            imported, dict,
+            f"import raised instead of returning a structured rejection: {imported!r}")
+        self.assertIn(
+            "error", imported,
+            "the import must be rejected, not silently retype a slot a "
+            f"concurrent game just claimed on the REPLACEMENT rink: {imported}")
+        self.assertEqual(imported["error"]["code"], "validation_error")
+
+        fresh = SqlStore(self.url)
+        rink = next(r for r in fresh.all_rinks() if r.external_ref == "DRIFT-R1")
+        self.assertNotEqual(rink.id, old_rink.id)
+        slot = next(s for s in fresh.all_ice_slots() if s.rink_id == rink.id)
+        self.assertEqual(slot.slot_type.value, "game")
+        self.assertEqual(slot.status.value, "allocated")
+        self.assertIsNotNone(
+            fresh.game_using_ice_slot(slot.id),
+            "the Game must still claim its slot on the replacement rink")
+
+    def test_id_substitution_via_delete_recreate_cannot_bypass_the_overlap_gate(self):
+        seed_store = SqlStore(self.url)
+        stable_rink = self._seed_stable_rink(seed_store)
+        drift_venue = Venue(id=seed_store.next_id("venue"), name="Drift Arena 2",
+                            address="")
+        seed_store.add_venue(drift_venue)
+        old_rink = Rink(id=seed_store.next_id("rink"), venue_id=drift_venue.id,
+                        name="Drift Rink 2", external_ref="DRIFT-R2")
+        seed_store.add_rink(old_rink)
+
+        store_a, store_b = SqlStore(self.url), SqlStore(self.url)
+        api_a, api_b = ApiService(store_a), ApiService(store_b)
+        setup_a = SetupService(store_a)
+
+        b_stable = next(r for r in store_b.all_rinks() if r.external_ref == "STABLE1")
+
+        b_reached_lock = threading.Event()
+        resume_import = threading.Event()
+        real_get_rink_for_update = store_b.get_rink_for_update
+        def _pausing_get_rink_for_update(rink_id):
+            if rink_id == b_stable.id:
+                b_reached_lock.set()
+                if not resume_import.wait(timeout=10):
+                    raise AssertionError(
+                        "thread a never signalled completion")
+            return real_get_rink_for_update(rink_id)
+        store_b.get_rink_for_update = _pausing_get_rink_for_update
+
+        b_rinks_csv = "venue_name,rink_code\nStable Arena,STABLE1\nDrift Arena 2,DRIFT-R2\n"
+        # A NON-exact overlap of the replacement rink's persisted
+        # 18:00-19:30: migration 045's exact-tuple unique index cannot
+        # catch this shape, so only the (now id-substitution-safe) overlap
+        # gate can.
+        b_slots_csv = (
+            "rink_code,start_time,end_time,slot_type\n"
+            "DRIFT-R2,2026-09-01T19:00:00+00:00,2026-09-01T20:00:00+00:00,game\n"
+        )
+
+        results = {}
+
+        def run_import():
+            try:
+                results["import"] = api_b.commit_rinks_ice_slots_import(
+                    {"rinks_csv": b_rinks_csv, "ice_slots_csv": b_slots_csv},
+                    actor_id="b")
+            except Exception as exc:
+                results["import"] = exc
+
+        def run_delete_recreate():
+            self.assertTrue(b_reached_lock.wait(timeout=10),
+                            "import never reached its lock-loop pause")
+            try:
+                setup_a.delete_rink(old_rink.id, actor_id="admin")
+                a_rinks_csv = "venue_name,rink_code\nDrift Arena 2,DRIFT-R2\n"
+                a_slots_csv = (
+                    "rink_code,start_time,end_time,slot_type\n"
+                    "DRIFT-R2,2026-09-01T18:00:00+00:00,2026-09-01T19:30:00+00:00,game\n"
+                )
+                results["a"] = api_a.commit_rinks_ice_slots_import(
+                    {"rinks_csv": a_rinks_csv, "ice_slots_csv": a_slots_csv},
+                    actor_id="a")
+            except Exception as exc:
+                results["a"] = exc
+            finally:
+                resume_import.set()
+
+        ta = threading.Thread(target=run_import)
+        tb = threading.Thread(target=run_delete_recreate)
+        ta.start()
+        tb.start()
+        ta.join(20); tb.join(20)
+
+        self.assertFalse(ta.is_alive(), "import thread hung")
+        self.assertFalse(tb.is_alive(), "delete/recreate thread hung")
+
+        self.assertIsInstance(
+            results.get("a"), dict,
+            f"thread a raised unexpectedly: {results.get('a')!r}")
+        self.assertTrue(results["a"].get("committed"), results["a"])
+
+        imported = results.get("import")
+        self.assertIsInstance(
+            imported, dict,
+            f"import raised instead of returning a structured rejection: {imported!r}")
+        self.assertIn(
+            "error", imported,
+            "the import must be rejected as an overlap on the REPLACEMENT "
+            f"rink, not silently create a second overlapping slot: {imported}")
+        self.assertEqual(imported["error"]["code"], "schedule_conflict")
+
+        fresh = SqlStore(self.url)
+        rink = next(r for r in fresh.all_rinks() if r.external_ref == "DRIFT-R2")
+        self.assertNotEqual(rink.id, old_rink.id)
+        slots = [s for s in fresh.all_ice_slots() if s.rink_id == rink.id]
+        self.assertEqual(
+            len(slots), 1,
+            f"expected only A's persisted slot to survive, got {[s.id for s in slots]}")
+        self.assertEqual(slots[0].start_time.isoformat(), "2026-09-01T18:00:00+00:00")
+
+    def _pausing_all_rinks_after_stable_lock(self, store_b, b_stable_id):
+        """Shared helper for the two post-recheck-arrival tests below:
+        wraps store_b.get_rink_for_update/all_rinks so the FIRST
+        store.all_rinks() call after STABLE1 is locked -- which is exactly
+        _rink_plan's own "_fresh_rink_by_code" snapshot inside
+        commit_rinks_ice_slots_import, not a guess at a raw call count --
+        pauses AFTER it returns. That proves the snapshot underlying the
+        frozen plan already ran (and correctly saw the drifting code
+        absent) strictly before the concurrent write lands. Returns the
+        two Events the caller waits/signals on."""
+        b_reached_apply = threading.Event()
+        resume_import = threading.Event()
+        phase = {"locked": False, "paused": False}
+        real_get_rink_for_update = store_b.get_rink_for_update
+        def _tracking_get_rink_for_update(rink_id):
+            result = real_get_rink_for_update(rink_id)
+            if rink_id == b_stable_id:
+                phase["locked"] = True
+            return result
+        store_b.get_rink_for_update = _tracking_get_rink_for_update
+
+        real_all_rinks = store_b.all_rinks
+        def _pausing_all_rinks():
+            result = real_all_rinks()
+            if phase["locked"] and not phase["paused"]:
+                phase["paused"] = True
+                b_reached_apply.set()
+                if not resume_import.wait(timeout=10):
+                    raise AssertionError("thread a never signalled completion")
+            return result
+        store_b.all_rinks = _pausing_all_rinks
+        return b_reached_apply, resume_import
+
+    def test_post_recheck_arrival_cannot_retype_a_booked_slot(self):
+        seed_store = SqlStore(self.url)
+        stable_rink = self._seed_stable_rink(seed_store)
+        season, division, home, away = self._seed_league(seed_store, "B")
+
+        store_a, store_b = SqlStore(self.url), SqlStore(self.url)
+        api_a, api_b = ApiService(store_a), ApiService(store_b)
+        setup_a = SetupService(store_a)
+
+        b_stable = next(r for r in store_b.all_rinks() if r.external_ref == "STABLE1")
+        b_reached_apply, resume_import = self._pausing_all_rinks_after_stable_lock(
+            store_b, b_stable.id)
+
+        b_rinks_csv = "venue_name,rink_code\nStable Arena,STABLE1\nDrift Arena B,DRIFT2\n"
+        b_slots_csv = (
+            "rink_code,start_time,end_time,slot_type\n"
+            "DRIFT2,2026-09-01T18:00:00+00:00,2026-09-01T19:30:00+00:00,practice\n"
+        )
+        a_rinks_csv = "venue_name,rink_code\nDrift Arena B,DRIFT2\n"
+        a_slots_csv = (
+            "rink_code,start_time,end_time,slot_type\n"
+            "DRIFT2,2026-09-01T18:00:00+00:00,2026-09-01T19:30:00+00:00,game\n"
+        )
+
+        results = {}
+
+        def run_import():
+            try:
+                results["import"] = api_b.commit_rinks_ice_slots_import(
+                    {"rinks_csv": b_rinks_csv, "ice_slots_csv": b_slots_csv},
+                    actor_id="b")
+            except Exception as exc:
+                results["import"] = exc
+
+        def run_create_and_game():
+            self.assertTrue(b_reached_apply.wait(timeout=10),
+                            "import never reached its post-freeze pause")
+            try:
+                a_import = api_a.commit_rinks_ice_slots_import(
+                    {"rinks_csv": a_rinks_csv, "ice_slots_csv": a_slots_csv},
+                    actor_id="a")
+                assert a_import.get("committed"), a_import
+                drift_rink = next(r for r in store_a.all_rinks()
+                                  if r.external_ref == "DRIFT2")
+                slot = next(s for s in store_a.all_ice_slots()
+                           if s.rink_id == drift_rink.id)
+                setup_a.grant_season_venue_access(
+                    season.id, drift_rink.venue_id, actor_id="admin")
+                results["game"] = setup_a.create_game(
+                    season.id, division.id, home.id, away.id, slot.id,
+                    actor_id="scheduler")
+            except Exception as exc:
+                results["game"] = exc
+            finally:
+                resume_import.set()
+
+        ta = threading.Thread(target=run_import)
+        tb = threading.Thread(target=run_create_and_game)
+        ta.start()
+        tb.start()
+        ta.join(20); tb.join(20)
+
+        self.assertFalse(ta.is_alive(), "import thread hung")
+        self.assertFalse(tb.is_alive(), "create thread hung")
+
+        self.assertNotIsInstance(
+            results.get("game"), Exception,
+            f"create_game raised unexpectedly: {results.get('game')!r}")
+
+        imported = results.get("import")
+        self.assertIsInstance(
+            imported, dict,
+            f"import raised instead of returning a structured rejection: {imported!r}")
+        self.assertIn(
+            "error", imported,
+            "the import must be rejected, not silently retype a slot a "
+            f"concurrent game just claimed: {imported}")
+        self.assertEqual(imported["error"]["code"], "validation_error")
+
+        fresh = SqlStore(self.url)
+        rink = next(r for r in fresh.all_rinks() if r.external_ref == "DRIFT2")
+        slot = next(s for s in fresh.all_ice_slots() if s.rink_id == rink.id)
+        self.assertEqual(slot.slot_type.value, "game")
+        self.assertEqual(slot.status.value, "allocated")
+        self.assertIsNotNone(
+            fresh.game_using_ice_slot(slot.id),
+            "the Game must still claim its slot")
+        all_drift2 = [r for r in fresh.all_rinks() if r.external_ref == "DRIFT2"]
+        self.assertEqual(len(all_drift2), 1, all_drift2)
+
+    def test_post_recheck_arrival_cannot_bypass_the_overlap_gate(self):
+        seed_store = SqlStore(self.url)
+        stable_rink = self._seed_stable_rink(seed_store)
+
+        store_a, store_b = SqlStore(self.url), SqlStore(self.url)
+        api_a, api_b = ApiService(store_a), ApiService(store_b)
+
+        b_stable = next(r for r in store_b.all_rinks() if r.external_ref == "STABLE1")
+        b_reached_apply, resume_import = self._pausing_all_rinks_after_stable_lock(
+            store_b, b_stable.id)
+
+        b_rinks_csv = "venue_name,rink_code\nStable Arena,STABLE1\nDrift Arena C,DRIFT3\n"
+        b_slots_csv = (
+            "rink_code,start_time,end_time,slot_type\n"
+            "DRIFT3,2026-09-01T19:00:00+00:00,2026-09-01T20:00:00+00:00,game\n"
+        )
+        a_rinks_csv = "venue_name,rink_code\nDrift Arena C,DRIFT3\n"
+        a_slots_csv = (
+            "rink_code,start_time,end_time,slot_type\n"
+            "DRIFT3,2026-09-01T18:00:00+00:00,2026-09-01T19:30:00+00:00,game\n"
+        )
+
+        results = {}
+
+        def run_import():
+            try:
+                results["import"] = api_b.commit_rinks_ice_slots_import(
+                    {"rinks_csv": b_rinks_csv, "ice_slots_csv": b_slots_csv},
+                    actor_id="b")
+            except Exception as exc:
+                results["import"] = exc
+
+        def run_create():
+            self.assertTrue(b_reached_apply.wait(timeout=10),
+                            "import never reached its post-freeze pause")
+            try:
+                results["a"] = api_a.commit_rinks_ice_slots_import(
+                    {"rinks_csv": a_rinks_csv, "ice_slots_csv": a_slots_csv},
+                    actor_id="a")
+            except Exception as exc:
+                results["a"] = exc
+            finally:
+                resume_import.set()
+
+        ta = threading.Thread(target=run_import)
+        tb = threading.Thread(target=run_create)
+        ta.start()
+        tb.start()
+        ta.join(20); tb.join(20)
+
+        self.assertFalse(ta.is_alive(), "import thread hung")
+        self.assertFalse(tb.is_alive(), "create thread hung")
+
+        self.assertIsInstance(
+            results.get("a"), dict,
+            f"thread a raised unexpectedly: {results.get('a')!r}")
+        self.assertTrue(results["a"].get("committed"), results["a"])
+
+        imported = results.get("import")
+        self.assertIsInstance(
+            imported, dict,
+            f"import raised instead of returning a structured rejection: {imported!r}")
+        self.assertIn(
+            "error", imported,
+            "the import must be rejected as an overlap, not silently "
+            f"create a second overlapping slot: {imported}")
+        self.assertEqual(imported["error"]["code"], "schedule_conflict")
+
+        fresh = SqlStore(self.url)
+        rink = next(r for r in fresh.all_rinks() if r.external_ref == "DRIFT3")
+        slots = [s for s in fresh.all_ice_slots() if s.rink_id == rink.id]
+        self.assertEqual(
+            len(slots), 1,
+            f"expected only A's persisted slot to survive, got {[s.id for s in slots]}")
+        self.assertEqual(slots[0].start_time.isoformat(), "2026-09-01T18:00:00+00:00")
+        all_drift3 = [r for r in fresh.all_rinks() if r.external_ref == "DRIFT3"]
+        self.assertEqual(len(all_drift3), 1, all_drift3)
 
 
 if __name__ == "__main__":
