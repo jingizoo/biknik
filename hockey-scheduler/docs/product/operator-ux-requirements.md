@@ -648,9 +648,10 @@ comment that surfaced the gap identified the problem and offered two
 possible directions, which is not itself approval of either one. Treat
 decision 9 as open until that confirmation lands.
 
-Eight decisions this package resolves, plus one (workflow 6) still awaiting
-explicit confirmation — gathered here so they can be reviewed and checked
-off in one place rather than hunting through each section:
+Eight decisions this package resolves, plus two (workflow 6; import-fix
+migration scope) still awaiting explicit confirmation — gathered here so
+they can be reviewed and checked off in one place rather than hunting
+through each section:
 
 1. **Users placement** (§2): Administration, not Teams & People — account/
    login lifecycle is a one-time administrative concern, distinct from
@@ -711,6 +712,27 @@ off in one place rather than hunting through each section:
    field. This is implemented in PR #331 as the working assumption, but
    remains reversible pending explicit sign-off, same as any other
    not-yet-confirmed product decision in this section.
+10. **Migration/schema scope for import data-integrity fixes** (#331 review
+    round 12 finding 3): **open — proposed, not yet confirmed.** Issue #330
+    explicitly lists "Any new schema, migration, API contract…" as a
+    non-goal for this PR. Round 11 nonetheless added two forward-only
+    migrations (047, 048) — partial unique indexes backstopping the
+    officials/rinks CSV-import commit against a duplicate-row PostgreSQL
+    race — because the alternative (documented in each migration's own
+    comment) was leaving a confirmed release-blocking data-integrity bug
+    unfixed in this PR's already-in-scope import-commit logic. Round 12
+    closed an adjacent gap in the same race (the Club/Venue find-or-create
+    half) without a further migration — structurally, via an existing
+    locking primitive (see the code comments at each call site) rather than
+    a new index — but 047/048 themselves remain a schema change #330 didn't
+    anticipate. **Proposed** (pending @jingizoo's confirmation): accept
+    047/048 as an approved, narrowly-scoped prerequisite to this PR's own
+    import-commit correctness — not a #330 scope expansion the epic needs
+    to account for elsewhere — since they backstop a bug in code this PR
+    already introduced, not new product surface. Until confirmed, the PR
+    body's data/rollback notes describe these migrations as existing
+    (a factual correction, made regardless of how this decision resolves)
+    without claiming the scope expansion itself is accepted.
 
 ## Out of scope for this package
 

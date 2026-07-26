@@ -593,6 +593,207 @@ class PostgresRinksIceSlotsImportRaceTest(unittest.TestCase):
             f"expected one import_committed audit row per commit call, got "
             f"{len(audit_batches)}")
 
+    def test_identical_new_venue_name_commits_do_not_duplicate_venue(self):
+        """#331 review round 12 finding 1: migration 048 protects the Rink
+        row itself, but the Venue it's found-or-created FROM has no
+        unique-by-name backstop (this migration's own comment names the
+        gap explicitly). Two concurrent commits that each resolve a
+        brand-new venue_name can each see it absent and each create their
+        own duplicate Venue -- and since that doesn't violate any DB
+        constraint, the existing retry loop never fires: the LOSER's later
+        Rink lookup (a DIFFERENT rink_code here, so IT never contends)
+        just proceeds normally and points its own new Rink at its own
+        orphaned Venue, never discovering the winner's. Distinct rink_codes
+        specifically so the Rink index can't be what saves it -- only the
+        fix under test (double-checked locking over next_id("venue")'s own
+        cross-connection counter-row lock) can."""
+        store_a, store_b = SqlStore(self.url), SqlStore(self.url)
+        api_a, api_b = ApiService(store_a), ApiService(store_b)
+
+        barrier = threading.Barrier(2)
+        # Same reasoning as the Rink race above, keyed to "venue" instead --
+        # reached only after each side's own Venue absence-check already ran
+        # and found nothing.
+        def _pausing(store):
+            real = store.next_id
+            def _wrapped(prefix):
+                if prefix == "venue":
+                    barrier.wait(timeout=10)
+                return real(prefix)
+            return _wrapped
+        store_a.next_id = _pausing(store_a)
+        store_b.next_id = _pausing(store_b)
+
+        race_rink_a_csv = "venue_name,rink_code\nRace Venue,RACE_VENUE_A\n"
+        race_rink_b_csv = "venue_name,rink_code\nRace Venue,RACE_VENUE_B\n"
+
+        results = {}
+
+        def run(api, key, csv):
+            try:
+                results[key] = api.commit_rinks_ice_slots_import(
+                    {"rinks_csv": csv}, actor_id=key)
+            except Exception as exc:
+                results[key] = exc
+
+        ta = threading.Thread(target=run, args=(api_a, "a", race_rink_a_csv))
+        tb = threading.Thread(target=run, args=(api_b, "b", race_rink_b_csv))
+        ta.start(); tb.start()
+        ta.join(20); tb.join(20)
+
+        self.assertFalse(ta.is_alive(), "thread a hung")
+        self.assertFalse(tb.is_alive(), "thread b hung")
+        for key, res in results.items():
+            self.assertNotIsInstance(
+                res, Exception,
+                f"commit {key} raised instead of committing or retrying "
+                f"cleanly: {res!r}")
+            self.assertTrue(res.get("committed"), f"commit {key}: {res}")
+
+        fresh = SqlStore(self.url)
+        venues = [v for v in fresh.all_venues() if v.name == "Race Venue"]
+        self.assertEqual(
+            len(venues), 1,
+            f"expected exactly one Venue named 'Race Venue', got {[v.id for v in venues]}")
+        rink_a = next(r for r in fresh.all_rinks() if r.external_ref == "RACE_VENUE_A")
+        rink_b = next(r for r in fresh.all_rinks() if r.external_ref == "RACE_VENUE_B")
+        self.assertEqual(
+            rink_a.venue_id, venues[0].id,
+            "rink A must point at the surviving Venue, not an orphan")
+        self.assertEqual(
+            rink_b.venue_id, venues[0].id,
+            "rink B must point at the surviving Venue, not an orphan")
+
+
+@unittest.skipUnless(os.environ.get("TEST_DATABASE_URL"),
+                     "PostgreSQL required (set TEST_DATABASE_URL)")
+class PostgresRinksIceSlotsSlotTypeGameRaceTest(unittest.TestCase):
+    """#331 review round 12 finding 2: the booked-slot slot_type gate used
+    to run in a lock-free preflight, before commit_rinks_ice_slots_import's
+    own transaction/rink lock. create_game takes that SAME rink lock before
+    allocating a slot, so a Game could commit in the window between the
+    import's stale preflight read and the import's own lock acquisition,
+    leaving the import to overwrite slot_type on a slot a brand-new Game
+    now depends on staying GAME-bookable. A single connection can never
+    observe this ordering -- the fix moved the check to run fresh, under
+    the lock -- so this needs two independent connections racing for real,
+    like this file's other Postgres-only tests."""
+
+    def setUp(self):
+        self.url = os.environ["TEST_DATABASE_URL"]
+        SqlStore(self.url).clear_all_data()
+
+    def test_import_cannot_retype_a_slot_a_concurrent_game_just_claimed(self):
+        seed_store = SqlStore(self.url)
+        seed_api = ApiService(seed_store)
+        seed_setup = SetupService(seed_store)
+        first = seed_api.commit_rinks_ice_slots_import(
+            _valid_sheets_csv(), actor_id="admin")
+        self.assertTrue(first["committed"])
+        rink = next(r for r in seed_store.all_rinks() if r.external_ref == "R1")
+        slot = next(s for s in seed_store.all_ice_slots() if s.rink_id == rink.id)
+
+        program = seed_setup.create_program("Race League", actor_id="admin")
+        venue = seed_store.get_venue(rink.venue_id)
+        season = seed_setup.create_season(program.id, "2026 Season", actor_id="admin")
+        seed_setup.grant_season_venue_access(season.id, venue.id, actor_id="admin")
+        division = seed_setup.create_division(season.id, "U16", actor_id="admin")
+        club = seed_setup.create_club("Race Club", actor_id="admin")
+        home = seed_setup.create_team(club.id, division.id, "Home", actor_id="admin")
+        away = seed_setup.create_team(club.id, division.id, "Away", actor_id="admin")
+        seed_setup.register_team_for_season(season.id, home.id, division.id,
+                                            actor_id="admin")
+        seed_setup.register_team_for_season(season.id, away.id, division.id,
+                                            actor_id="admin")
+
+        audit_ids_before = {a.id for a in seed_store.all_setup_audit()}
+
+        store_a, store_b = SqlStore(self.url), SqlStore(self.url)
+        api_a = ApiService(store_a)
+        setup_b = SetupService(store_b)
+
+        rink_locked = threading.Event()
+        game_committed = threading.Event()
+
+        # Pause the import right before it locks the target rink -- the
+        # exact point its now-fixed slot_type gate runs after. Let
+        # create_game run to completion on an INDEPENDENT connection first,
+        # then release the import: its fresh, under-lock read must see the
+        # Game that just claimed the slot.
+        real_get_rink_for_update = store_a.get_rink_for_update
+        def _pausing_get_rink_for_update(rink_id):
+            if rink_id == rink.id:
+                rink_locked.set()
+                if not game_committed.wait(timeout=10):
+                    raise AssertionError(
+                        "create_game thread never signalled completion")
+            return real_get_rink_for_update(rink_id)
+        store_a.get_rink_for_update = _pausing_get_rink_for_update
+
+        changed_type_csv = (
+            "rink_code,start_time,end_time,slot_type\n"
+            f"R1,{slot.start_time.isoformat()},{slot.end_time.isoformat()},practice\n"
+        )
+
+        results = {}
+
+        def run_import():
+            try:
+                results["import"] = api_a.commit_rinks_ice_slots_import(
+                    {"rinks_csv": RINKS_CSV, "ice_slots_csv": changed_type_csv},
+                    actor_id="importer")
+            except Exception as exc:
+                results["import"] = exc
+
+        def run_create_game():
+            self.assertTrue(rink_locked.wait(timeout=10),
+                            "import never reached its rink-lock pause")
+            try:
+                results["game"] = setup_b.create_game(
+                    season.id, division.id, home.id, away.id, slot.id,
+                    actor_id="scheduler")
+            except Exception as exc:
+                results["game"] = exc
+            finally:
+                game_committed.set()
+
+        ta = threading.Thread(target=run_import)
+        tb = threading.Thread(target=run_create_game)
+        ta.start(); tb.start()
+        ta.join(20); tb.join(20)
+
+        self.assertFalse(ta.is_alive(), "import thread hung")
+        self.assertFalse(tb.is_alive(), "create_game thread hung")
+
+        self.assertNotIsInstance(
+            results.get("game"), Exception,
+            f"create_game raised unexpectedly: {results.get('game')!r}")
+
+        imported = results.get("import")
+        self.assertIsInstance(
+            imported, dict,
+            f"import raised instead of returning a structured rejection: {imported!r}")
+        self.assertIn(
+            "error", imported,
+            "the import must be rejected, not silently retype a slot a "
+            f"concurrent game just claimed: {imported}")
+        self.assertEqual(imported["error"]["code"], "validation_error")
+
+        fresh = SqlStore(self.url)
+        allocated_slot = fresh.get_ice_slot(slot.id)
+        self.assertEqual(allocated_slot.slot_type.value, "game")
+        self.assertEqual(allocated_slot.status.value, "allocated")
+        self.assertIsNotNone(
+            fresh.game_using_ice_slot(slot.id),
+            "the Game must still claim its slot")
+
+        new_audits = [a for a in fresh.all_setup_audit()
+                     if a.id not in audit_ids_before]
+        self.assertEqual(
+            [a.action for a in new_audits], ["game_created"],
+            "the rejected import must not write any audit row -- only "
+            f"create_game's own success, got {[a.action for a in new_audits]}")
+
 
 if __name__ == "__main__":
     unittest.main()

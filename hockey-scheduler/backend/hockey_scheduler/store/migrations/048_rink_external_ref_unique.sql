@@ -36,6 +36,15 @@
 -- column of its own to make unique. Whether Venue names should be
 -- globally unique is a product decision, not something this migration
 -- assumes.
+--
+-- That gap (and the identical one for Club) was closed a different way in
+-- #331 review round 12 finding 1, without a new index/product decision:
+-- commit_rinks_ice_slots_import and commit_officials_availability_import
+-- now call next_id("venue")/next_id("club") BEFORE re-checking absence,
+-- reusing that call's existing cross-connection counter-row lock as a
+-- mutex over the find-or-create itself, rather than asserting a new
+-- global-uniqueness constraint this migration deliberately declined to
+-- make. See the comments at both call sites.
 CREATE UNIQUE INDEX IF NOT EXISTS ux_rinks_external_ref
     ON rinks (external_ref)
     WHERE external_ref IS NOT NULL;

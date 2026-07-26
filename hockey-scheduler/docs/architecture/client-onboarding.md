@@ -650,6 +650,94 @@ before the indexed column drop the test already applies for the #173/
 #174 columns now also covers `officials.external_ref` and
 `rinks.external_ref`.
 
+Migrations 047/048 backstop the Official/Rink row itself, but round 11's
+own comment on migration 048 already flagged what they deliberately left
+open: the Club/Venue each is found-or-created *from* has no unique-by-name
+index of its own, so the identical race can still land one step earlier in
+the same chain (#331 review round 12 finding 1). Concretely: two
+concurrent commits can both observe a brand-new `home_club_name` (or
+`venue_name`) absent, both create their own Club/Venue row, and — because
+neither insert violates any constraint — the retry loop never fires at
+all. The *loser* then resolves its Official/Rink lookup fresh, now sees
+the *winner's* already-committed Official/Rink (protected by 047/048), and
+silently updates it to point at the loser's own orphaned Club/Venue rather
+than the winner's. Migration 047/048's coverage of the child key actively
+hides this: nothing about the sequence raises `IntegrityConflictError`, so
+from the caller's side both commits simply "succeed."
+
+A further unique index on `Club.name`/`Venue.name` would close it the same
+way 047/048 closed the child race, but would also assert a new,
+unreviewed product invariant — global name uniqueness — neither migration
+was willing to assume (048's own comment names this explicitly). Round 12
+closes the gap a different way instead: double-checked locking over
+`next_id()`'s own cross-connection counter-row lock, the same mechanism
+the retry loops already depend on for their synchronization, repurposed
+here as a mutex rather than a pure id generator. Each find-or-create now
+calls `next_id("club")`/`next_id("venue")` *before* creating — which
+blocks a concurrent creator until this transaction commits or rolls back
+— then re-checks absence, now guaranteed fresh, before actually
+inserting. A reservation that goes unused (the re-check finds the row
+after all) is simply a harmless gap in that id's sequence, consistent
+with this codebase's own "ids are opaque strings" convention. No schema
+change, no new product decision required — the fix lives entirely in
+`setup_service.py`, at the two call sites, with migration 048's stale
+"deliberately does not close" comment updated to point at it.
+
+The second finding was a genuinely different race in
+`commit_rinks_ice_slots_import`: the booked-slot `slot_type` gate — which
+exists so a repeat import can never retype a slot a Game already depends
+on staying `GAME`-bookable — ran as a lock-free preflight, entirely before
+the transaction and its per-rink row lock (#331 review round 12 finding
+2). `create_game` takes that identical rink lock before allocating a slot.
+So a Game could commit in the exact window between the import's stale
+preflight read (which correctly saw no Game yet) and the import's own
+lock acquisition moments later — at which point the import would proceed
+to overwrite `slot_type` unconditionally, using an answer that was true
+when read but false by the time it was acted on. The existing
+`game_using_ice_slot` check the import's update path *already* runs
+(guarding `status`, not `slot_type`) sits on the correct side of the lock;
+the `slot_type` gate simply wasn't colocated with it. The fix folds the
+`slot_type` check into that same post-lock pass — literally the same loop
+already computing the overlap gate's exact-tuple match, since both need
+the identical "is this update-path row already the Game's slot" answer —
+so the only version of this check that ever runs again is the one made
+fresh, under the lock, at the last possible moment before any write. The
+lock-free preflight is deleted outright rather than kept as an early exit:
+a stale-but-cheap early check that must be re-verified anyway adds nothing
+but the appearance of safety.
+
+Forced regressions for both findings extend the same two-independent-
+connections pattern round 11 established. Finding 1's races use two
+distinct new officials/rinks (different `official_code`/`rink_code`, so
+migration 047/048's own indexes can't be what saves the test) that share
+one brand-new `home_club_name`/`venue_name`, with the barrier at
+`next_id("club")`/`next_id("venue")` specifically — isolating the Club/
+Venue race from the already-covered child-key race. Finding 2's test
+can't use a `next_id()` barrier at all, since nothing about the race turns
+on id generation; it instead patches `get_rink_for_update` on the
+import's own store to pause — via a `threading.Event`, not a `Barrier`,
+since the two sides need strict *ordering* (create_game fully commits
+before the import's lock attempt resumes) rather than simultaneous
+release — right before the import would acquire the target rink's lock,
+letting an independent-connection `create_game` claim the slot first. All
+three tests assert the same shape of outcome: exactly one surviving
+parent row with every child correctly pointing at it (findings 1), or a
+stable rejection with zero partial writes and the Game still owning its
+slot (finding 2) — falsifiability-verified by disabling each guard in
+isolation and confirming the specific new test fails for exactly that
+reason before restoring it.
+
+A third, non-code finding closed this round: issue #330 lists new schema/
+migrations as an explicit non-goal, and migrations 047/048 (added in round
+11 to fix a release-blocking data-integrity bug in this PR's own already-
+in-scope import logic) are exactly that. Recorded as decision 10 in
+`docs/product/operator-ux-requirements.md`, proposed but **not** claimed
+as confirmed — the same pattern decision 9 already established for this
+PR, after an earlier round mistakenly treated a bug report as sign-off.
+The PR body's "Data/privacy impact" and rollback notes are corrected to
+describe the migrations as existing (a factual fix, independent of how the
+scope question resolves) rather than continuing to claim none exist.
+
 The card's async states carry real accessibility semantics, not just visual
 ones (#331 review round 5 finding 5): `#sp-card-slot` (the wrapper
 `loadSetupProgressCard()` swaps content into, itself painted once by

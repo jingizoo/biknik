@@ -5939,11 +5939,44 @@ class SetupService:
                             club = next((c for c in self.store.all_clubs()
                                         if c.name == club_name), None)
                             if club is None:
-                                club = Club(id=self.store.next_id("club"), name=club_name)
-                                self.store.add_club(club)
-                                self._audit("club_created", "club", club.id, actor_id,
-                                            {"import_batch_id": batch_id})
-                                counts["clubs_created"] += 1
+                                # #331 review round 12 finding 1: this find-or-
+                                # create has no row to lock for a brand-new
+                                # club_name -- Club has no unique-by-name index
+                                # (adding one would assert global club-name
+                                # uniqueness as a product rule this import
+                                # doesn't get to decide, same reasoning as
+                                # migration 048's note on Venue below). Two
+                                # concurrent commits can each see the name
+                                # absent, each create their own duplicate Club,
+                                # and the LOSER's later Official lookup then
+                                # finds the WINNER's already-committed Official
+                                # and silently repoints it at the loser's own
+                                # orphaned Club -- nothing about that sequence
+                                # violates a DB constraint (migration 047 only
+                                # protects the Official row itself), so the
+                                # retry loop below never even fires. Closed with
+                                # double-checked locking over next_id("club")'s
+                                # own cross-connection counter-row lock --
+                                # already the load-bearing mechanism the retry
+                                # loop itself depends on -- instead of a new
+                                # constraint: reserve the id FIRST (blocks a
+                                # concurrent creator until this transaction
+                                # commits or rolls back), THEN re-check absence,
+                                # now guaranteed fresh, before actually
+                                # creating. A reservation that goes unused (the
+                                # re-check finds the row after all) is just a
+                                # harmless gap in the "club" id sequence --
+                                # ids are opaque strings.
+                                _reserved_club_id = self.store.next_id("club")
+                                club = next((c for c in self.store.all_clubs()
+                                            if c.name == club_name), None)
+                                if club is None:
+                                    club = Club(id=_reserved_club_id, name=club_name)
+                                    self.store.add_club(club)
+                                    self._audit("club_created", "club", club.id,
+                                                actor_id,
+                                                {"import_batch_id": batch_id})
+                                    counts["clubs_created"] += 1
                             club_id = club.id
 
                         official = next((o for o in self.store.all_officials()
@@ -6120,10 +6153,16 @@ class SetupService:
         game on ``practice``/``maintenance``/etc ice), so silently changing
         ``slot_type`` out from under an allocated slot would leave the game
         record pointing at ice that's no longer game-bookable, even with
-        ``status`` correctly preserved. A pre-write gate below therefore
-        rejects the ENTIRE commit — before any writes, same all-or-nothing
-        guarantee as everything else here — if an incoming row would change
-        the ``slot_type`` of a slot a game already uses.
+        ``status`` correctly preserved. This is checked FRESH under the rink
+        lock, folded into the overlap gate below rather than run as a
+        separate pre-transaction preflight (#331 review round 12 finding 2):
+        ``create_game`` takes this SAME rink lock before allocating a slot,
+        so a lock-free preflight read can already be stale — observing no
+        game yet — by the time this transaction acquires the lock and a
+        concurrent ``create_game`` has since committed. The same TOCTOU class
+        the overlap gate below was already written to avoid (#158 review).
+        Rejects the ENTIRE commit, before any write, if an incoming row would
+        change the ``slot_type`` of a slot a game already uses.
 
         Overlap handling is split by SOURCE. Overlaps WITHIN this upload
         (two rows in the same ``ice_slots`` sheet) stay ``validate_import``'s
@@ -6150,37 +6189,6 @@ class SetupService:
 
         rink_rows = list(sheets.get("rinks") or [])
         slot_rows = list(sheets.get("ice_slots") or [])
-
-        # Pre-write gate (mirrors #93's Position check): create_game requires
-        # a booked slot's slot_type to stay GAME (it refuses to schedule onto
-        # practice/maintenance/etc ice). Silently changing slot_type on a
-        # slot a game already uses would leave that game pointing at ice
-        # that's no longer game-bookable, even though the status-preserving
-        # guard below correctly leaves `status` alone (review fix). Block the
-        # WHOLE commit before any writes if any row would do this — the same
-        # all-or-nothing guarantee as everything else here.
-        for row in slot_rows:
-            rink_code = _clean(row.get("rink_code"))
-            existing_rink = next((r for r in self.store.all_rinks()
-                                 if r.external_ref == rink_code), None)
-            if existing_rink is None:
-                continue  # a brand-new rink can't yet have a booked slot
-            start = _parse_iso_utc(row.get("start_time"))
-            end = _parse_iso_utc(row.get("end_time"))
-            new_slot_type = IceSlotType(_clean(row.get("slot_type")))
-            existing_slot = next(
-                (s for s in self.store.all_ice_slots()
-                 if s.rink_id == existing_rink.id and s.start_time == start
-                 and s.end_time == end), None)
-            if existing_slot is None:
-                continue
-            if (existing_slot.slot_type != new_slot_type
-                    and self.store.game_using_ice_slot(existing_slot.id) is not None):
-                raise ValidationError(
-                    f"Ice slot {existing_slot.id} on rink_code {rink_code} "
-                    f"has a game scheduled on it; slot_type cannot change "
-                    f"from {existing_slot.slot_type.value} to "
-                    f"{new_slot_type.value}.")
 
         # See commit_teams_players_import's identical note: generated up
         # front so every row-level audit entry can be tagged with it (#102).
@@ -6245,9 +6253,30 @@ class SetupService:
                         _start = _parse_iso_utc(row.get("start_time"))
                         _end = _parse_iso_utc(row.get("end_time"))
                         _persisted = _persisted_by_rink.get(_rink.id, [])
-                        if any(s.start_time == _start and s.end_time == _end
-                               for s in _persisted):
-                            continue  # exact tuple -> update path, not a new overlap
+                        _exact = next((s for s in _persisted
+                                      if s.start_time == _start and s.end_time == _end),
+                                     None)
+                        if _exact is not None:
+                            # Exact tuple -> update path, not a new overlap. The
+                            # booked-slot slot_type gate lives HERE, under the
+                            # rink lock (see this function's docstring, "#331
+                            # review round 12 finding 2") rather than at an
+                            # earlier, lock-free preflight -- create_game takes
+                            # this identical rink lock before allocating a
+                            # slot, so only a check made fresh at this exact
+                            # point can't be stale relative to a concurrent
+                            # commit.
+                            _new_slot_type = IceSlotType(_clean(row.get("slot_type")))
+                            if (_exact.slot_type != _new_slot_type
+                                    and self.store.game_using_ice_slot(_exact.id)
+                                        is not None):
+                                raise ValidationError(
+                                    f"Ice slot {_exact.id} on rink_code "
+                                    f"{_clean(row.get('rink_code'))} has a game "
+                                    f"scheduled on it; slot_type cannot change "
+                                    f"from {_exact.slot_type.value} to "
+                                    f"{_new_slot_type.value}.")
+                            continue
                         _clash = next((s for s in _persisted if intervals_overlap(
                             _start, _end, s.start_time, s.end_time)), None)
                         if _clash is not None:
@@ -6281,12 +6310,27 @@ class SetupService:
                         venue = next((v for v in self.store.all_venues()
                                      if v.name == venue_name), None)
                         if venue is None:
-                            venue = Venue(id=self.store.next_id("venue"), name=venue_name,
-                                          address=address)
-                            self.store.add_venue(venue)
-                            self._audit("venue_created", "venue", venue.id, actor_id,
-                                        {"import_batch_id": batch_id})
-                            counts["venues_created"] += 1
+                            # #331 review round 12 finding 1: same gap, same
+                            # fix as the Club match in
+                            # commit_officials_availability_import above (see
+                            # that comment for the full mechanism). Venue has
+                            # no unique-by-name index -- migration 048's own
+                            # comment named this exact interleaving as
+                            # deliberately open, product-decision-gated scope;
+                            # closed here structurally instead, via
+                            # next_id("venue")'s existing cross-connection
+                            # lock rather than a new constraint.
+                            _reserved_venue_id = self.store.next_id("venue")
+                            venue = next((v for v in self.store.all_venues()
+                                         if v.name == venue_name), None)
+                            if venue is None:
+                                venue = Venue(id=_reserved_venue_id, name=venue_name,
+                                              address=address)
+                                self.store.add_venue(venue)
+                                self._audit("venue_created", "venue", venue.id,
+                                            actor_id,
+                                            {"import_batch_id": batch_id})
+                                counts["venues_created"] += 1
 
                         rink = next((r for r in self.store.all_rinks()
                                     if r.external_ref == rink_code), None)

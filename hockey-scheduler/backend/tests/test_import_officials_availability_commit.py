@@ -77,6 +77,18 @@ RACE_AVAILABILITY_CSV = (
     "RACE1,2026-08-01T18:00:00+00:00,2026-08-01T20:00:00+00:00,available\n"
 )
 
+# #331 review round 12 finding 1: DISTINCT official_codes so the Official
+# unique index (migration 047) never contends -- the only shared identity
+# under race is the brand-new home_club_name both rows resolve to.
+RACE_CLUB_OFFICIAL_A_CSV = (
+    "official_code,name,home_club_name\n"
+    "RACE_CLUB_A,Race Official A,Race Club\n"
+)
+RACE_CLUB_OFFICIAL_B_CSV = (
+    "official_code,name,home_club_name\n"
+    "RACE_CLUB_B,Race Official B,Race Club\n"
+)
+
 
 class ImportOfficialsAvailabilityCommitServiceContract:
     """Run against both store backends (mirrors test_import_commit.py)."""
@@ -608,6 +620,79 @@ class PostgresOfficialsAvailabilityImportRaceTest(unittest.TestCase):
         self.assertEqual(
             len(windows), 1,
             f"expected exactly one availability window, got {[w.id for w in windows]}")
+
+    def test_identical_new_home_club_name_commits_do_not_duplicate_club(self):
+        """#331 review round 12 finding 1: migration 047's indexes protect
+        the Official row itself, but the Club it's found-or-created FROM has
+        no unique-by-name backstop of its own. Two concurrent commits that
+        each resolve a brand-new home_club_name can each see it absent and
+        each create their own duplicate Club -- and since that doesn't
+        violate any DB constraint, the existing retry loop never fires: the
+        LOSER's later Official lookup (a DIFFERENT official_code here, so
+        IT never contends) just proceeds normally and points its own new
+        Official at its own orphaned Club, never discovering the winner's.
+        This test uses two distinct official_codes specifically so the
+        Official index can't be what saves it -- only the fix under test
+        (double-checked locking over next_id("club")'s own cross-connection
+        counter-row lock, see the comment at that call site) can."""
+        store_a, store_b = SqlStore(self.url), SqlStore(self.url)
+        api_a, api_b = ApiService(store_a), ApiService(store_b)
+
+        barrier = threading.Barrier(2)
+        # Pause each side's OWN connection right before it generates a new
+        # Club's id -- reached only after its own Club absence-check already
+        # ran and found nothing. Not hooked any later (e.g. add_club
+        # itself): next_id() upserts the shared per-prefix "club" counter
+        # row, so pausing after it already ran risks the same self-inflicted
+        # circular wait this file's other race tests document at length.
+        def _pausing(store):
+            real = store.next_id
+            def _wrapped(prefix):
+                if prefix == "club":
+                    barrier.wait(timeout=10)
+                return real(prefix)
+            return _wrapped
+        store_a.next_id = _pausing(store_a)
+        store_b.next_id = _pausing(store_b)
+
+        results = {}
+
+        def run(api, key, csv):
+            try:
+                results[key] = api.commit_officials_availability_import(
+                    {"officials_csv": csv}, actor_id=key)
+            except Exception as exc:
+                results[key] = exc
+
+        ta = threading.Thread(target=run, args=(api_a, "a", RACE_CLUB_OFFICIAL_A_CSV))
+        tb = threading.Thread(target=run, args=(api_b, "b", RACE_CLUB_OFFICIAL_B_CSV))
+        ta.start(); tb.start()
+        ta.join(20); tb.join(20)
+
+        self.assertFalse(ta.is_alive(), "thread a hung")
+        self.assertFalse(tb.is_alive(), "thread b hung")
+        for key, res in results.items():
+            self.assertNotIsInstance(
+                res, Exception,
+                f"commit {key} raised instead of committing or retrying "
+                f"cleanly: {res!r}")
+            self.assertTrue(res.get("committed"), f"commit {key}: {res}")
+
+        fresh = SqlStore(self.url)
+        clubs = [c for c in fresh.all_clubs() if c.name == "Race Club"]
+        self.assertEqual(
+            len(clubs), 1,
+            f"expected exactly one Club named 'Race Club', got {[c.id for c in clubs]}")
+        official_a = next(o for o in fresh.all_officials()
+                          if o.external_ref == "RACE_CLUB_A")
+        official_b = next(o for o in fresh.all_officials()
+                          if o.external_ref == "RACE_CLUB_B")
+        self.assertEqual(
+            official_a.home_club_id, clubs[0].id,
+            "official A must point at the surviving Club, not an orphan")
+        self.assertEqual(
+            official_b.home_club_id, clubs[0].id,
+            "official B must point at the surviving Club, not an orphan")
 
 
 if __name__ == "__main__":
