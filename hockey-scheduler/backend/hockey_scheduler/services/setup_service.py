@@ -1629,10 +1629,15 @@ class SetupService:
         identity) -- unconditionally on any exact-key or season-wide conflict
         (#331 review round 21 finding 1), exactly as ``create_game`` itself
         enforces; when the game also carries a Division, the stricter
-        season+division match is kept too. A legacy regular game with no
-        ``league_season_id`` falls back to the season(+division) check. An
-        EXHIBITION only requires both teams to remain active participants of
-        the game's Season (it may cross Leagues)."""
+        season+division match is kept too. The game's own ``league_season_id``
+        is itself resolved and validated first -- it must exist and belong to
+        the game's Season (#331 review round 22) -- before either teams'
+        registrations are checked against it; a Team's registration must sit
+        at this EXACT LeagueSeason, not merely one under the same permanent
+        League. A legacy regular game with no ``league_season_id`` falls back
+        to the season(+division) check. An EXHIBITION only requires both
+        teams to remain active participants of the game's Season (it may
+        cross Leagues)."""
         if game.game_type == GameType.EXHIBITION.value:
             if not game.season_id:
                 return
@@ -1659,6 +1664,29 @@ class SetupService:
                 "or moved until it is repaired.",
                 {"reason": "regular_game_missing_league_season",
                  "game_id": game.id})
+        # #331 review round 22: `ls_id` being non-None doesn't mean it
+        # resolves to a real, correctly-scoped row -- round 21's fix only
+        # ever compared League ids, so a dangling reference (the row was
+        # since deleted, or never existed) or one silently reassigned to a
+        # DIFFERENT Season's LeagueSeason for the SAME League both slipped
+        # through undetected. Resolved and validated the same way
+        # _require_batch_team_participation resolves its own target
+        # LeagueSeason -- existence, then Season match -- before either
+        # Team is checked against it.
+        ls = self.store.get_league_season(ls_id)
+        if ls is None:
+            raise ValidationError(
+                "This game's league-season no longer exists; it cannot be "
+                "published or moved until it is repaired.",
+                {"reason": "regular_game_missing_league_season",
+                 "game_id": game.id, "league_season_id": ls_id})
+        if game.season_id and ls.season_id != game.season_id:
+            raise ValidationError(
+                "This game's league-season belongs to a different season; "
+                "it cannot be published or moved until it is repaired.",
+                {"reason": "game_league_season_mismatch", "game_id": game.id,
+                 "season_id": game.season_id, "league_season_id": ls.id,
+                 "league_season_season_id": ls.season_id})
         # The season+division check runs first: it raises the precise
         # DivisionMismatchError and is the stricter guard for a divisioned game.
         if game.season_id and game.division_id:
@@ -1666,37 +1694,20 @@ class SetupService:
                 game.season_id, game.home_team_id, game.division_id)
             self._require_team_registered(
                 game.season_id, game.away_team_id, game.division_id)
-        # Both teams must be active in the game's exact LeagueSeason (covers the
-        # division-less regular game the check above skips). #331 review
-        # round 21 finding 1: routed through the same shared resolver
-        # create_game itself uses -- _require_team_registered (season-wide +
-        # exact-key conflict-aware since round 20) -- instead of a raw
-        # {active team_ids in ls_id} set, which only asked "is this team
-        # active SOMEWHERE in ls_id" and stayed true with an active stray
-        # registration active elsewhere this Season, or with an exact
-        # active+inactive duplicate at ls_id itself (both invisible to a
-        # plain set membership test). _require_team_registered resolves via
-        # the Team's own permanent League, not necessarily THIS game's
-        # ls_id, so an explicit registration_wrong_league re-check follows,
-        # mirroring create_game's own Rules 8/9 check for the identical gap.
-        ls = self.store.get_league_season(ls_id)
-        expected_league_id = ls.league_id if ls else None
+        # Both teams must be active in the game's exact LeagueSeason (covers
+        # the division-less regular game the check above skips). #331 review
+        # round 22: routed through the same shared per-team resolver
+        # _require_batch_team_participation uses -- resolved directly
+        # against `ls` (this game's own, now fully-validated LeagueSeason) --
+        # rather than round 21's fix, which resolved each Team's registration
+        # via its own permanent League (_require_team_registered) and only
+        # compared League ids afterward: that comparison could never detect
+        # `ls` being a different Season's row for the identical League, since
+        # the registration it found (via the Team's CURRENT permanent
+        # League + `game.season_id`) would share that same League id too.
         for tid in (game.home_team_id, game.away_team_id):
-            if tid is None:
-                continue
-            team = self.store.get_team(tid)
-            reg = self._require_team_registered(
-                game.season_id, tid, None, team, require_division=False)
-            reg_league_id = self._registration_league_id(reg)
-            if expected_league_id is not None and reg_league_id != expected_league_id:
-                label = team.name if team is not None else tid
-                raise ValidationError(
-                    f"{label}'s registration belongs to a different league "
-                    "than this game.",
-                    {"reason": "registration_wrong_league", "team_id": tid,
-                     "season_id": game.season_id,
-                     "expected_league_id": expected_league_id,
-                     "registered_league_id": reg_league_id})
+            if tid is not None:
+                self._require_team_in_league_season(game.season_id, ls, tid)
 
     @_transactional
     def assign_season_team_division(self, registration_id: str,
@@ -4246,6 +4257,75 @@ class SetupService:
              "season_id": season_id, "division_id": division_id,
              "registered_division_id": raw.division_id})
 
+    def _require_team_in_league_season(self, season_id, league_season, team_id):
+        """Require ``team_id`` to have exactly one active, unambiguous
+        registration in the EXACT ``league_season`` given -- never the
+        Team's own permanent-League LeagueSeason ``team_registration_valid``/
+        ``_require_team_registered`` resolve instead (#331 review round 22).
+        A Team's permanent League can diverge from a Game's or draft's own
+        recorded LeagueSeason -- a stale reference a transfer left behind,
+        or (this round's reproduction) a corrupted/reassigned
+        ``league_season_id`` on the Game itself -- and comparing only
+        League ids afterward cannot detect that the registration found
+        isn't actually AT this exact LeagueSeason, merely that it happens
+        to share the same League.
+
+        Shares ``_require_batch_team_participation``'s own two-layer
+        resolution: ``exact_registration_or_conflict`` (unconditional on
+        active state) and ``team_season_participation`` (season-wide,
+        active-only) must both hold. The caller resolves/validates
+        ``league_season`` itself first (existence, and that it belongs to
+        ``season_id``) -- this method trusts it as given.
+
+        Raises ``DivisionMismatchError`` with a structured reason; returns
+        the registration on success."""
+        team = self.store.get_team(team_id)
+        label = team.name if team is not None else team_id
+        exact_reg, exact_conflicts = exact_registration_or_conflict(
+            self.store, league_season.id, team_id)
+        if exact_conflicts:
+            raise DivisionMismatchError(
+                f"{label} has more than one registration at this exact "
+                "league/season; resolve the conflict before scheduling.",
+                {"reason": "team_registration_conflict", "team_id": team_id,
+                 "league_season_id": league_season.id,
+                 "affected_registration_ids": exact_conflicts})
+        season_reg, season_conflicts = team_season_participation(
+            self.store, season_id, team_id)
+        if season_conflicts:
+            raise DivisionMismatchError(
+                f"{label} has more than one active registration this "
+                "season; resolve the conflict before scheduling.",
+                {"reason": "team_registration_conflict", "team_id": team_id,
+                 "season_id": season_id,
+                 "affected_registration_ids": season_conflicts})
+        registration = (
+            exact_reg if exact_reg is not None and exact_reg.active
+            and season_reg is not None and season_reg.id == exact_reg.id
+            else None)
+        if registration is None:
+            if season_reg is None:
+                raise DivisionMismatchError(
+                    f"{label} is not registered in this season.",
+                    {"reason": "team_not_registered", "team_id": team_id,
+                     "season_id": season_id})
+            raise DivisionMismatchError(
+                f"{label} is not registered in this league-season.",
+                {"reason": "team_not_in_league_season", "team_id": team_id,
+                 "season_id": season_id, "league_season_id": league_season.id,
+                 "registered_league_season_id": season_reg.league_season_id})
+        if (team is None or not team.league_id
+                or team.league_id != league_season.league_id):
+            raise DivisionMismatchError(
+                f"{label}'s registration does not match its permanent "
+                "League.",
+                {"reason": "registration_cross_league", "team_id": team_id,
+                 "league_season_id": league_season.id,
+                 "league_id": league_season.league_id,
+                 "team_league_id": (
+                     team.league_id if team is not None else None)})
+        return registration
+
     def _require_batch_team_participation(self, season_id, league_season_id,
                                           rows):
         """Require every proposed row to belong to one exact LeagueSeason.
@@ -4305,72 +4385,17 @@ class SetupService:
                              if division is not None else None)})
 
             for team_id in (row["home_team_id"], row["away_team_id"]):
-                team = self.store.get_team(team_id)
-                label = team.name if team is not None else team_id
-                # #331 review round 20: two layered checks, matching
-                # team_registration_valid's own contract. exact_registration_
-                # or_conflict is unconditional on active state (co-existence
-                # at this identical key is itself corrupted, regardless of
-                # which row is live) -- the raw {team_id: r} dict this
-                # replaced would silently pick whichever of two colliding
-                # rows won the dict-key collision and accept the batch on
-                # it. team_season_participation additionally catches a
-                # genuinely-valid exact-key row that ISN'T the Team's only
-                # active registration this Season (a stray row active under
-                # a different League) -- neither check alone covers both
-                # shapes.
-                exact_reg, exact_conflicts = exact_registration_or_conflict(
-                    self.store, league_season.id, team_id)
-                if exact_conflicts:
-                    raise DivisionMismatchError(
-                        f"{label} has more than one registration at this "
-                        "exact league/season; resolve the conflict before "
-                        "drafting.",
-                        {"reason": "team_registration_conflict",
-                         "team_id": team_id,
-                         "league_season_id": league_season.id,
-                         "affected_registration_ids": exact_conflicts})
-                season_reg, season_conflicts = team_season_participation(
-                    self.store, season_id, team_id)
-                if season_conflicts:
-                    raise DivisionMismatchError(
-                        f"{label} has more than one active registration "
-                        "this season; resolve the conflict before drafting.",
-                        {"reason": "team_registration_conflict",
-                         "team_id": team_id, "season_id": season_id,
-                         "affected_registration_ids": season_conflicts})
-                registration = (
-                    exact_reg if exact_reg is not None and exact_reg.active
-                    and season_reg is not None and season_reg.id == exact_reg.id
-                    else None)
-                if registration is None:
-                    if season_reg is None:
-                        raise DivisionMismatchError(
-                            f"{label} is not registered in this season.",
-                            {"reason": "team_not_registered",
-                             "team_id": team_id, "season_id": season_id})
-                    raise DivisionMismatchError(
-                        f"{label} is not registered in this draft's "
-                        "league-season.",
-                        {"reason": "team_not_in_league_season",
-                         "team_id": team_id,
-                         "season_id": season_id,
-                         "league_season_id": league_season.id,
-                         "registered_league_season_id":
-                             season_reg.league_season_id})
-                if (team is None or not team.league_id
-                        or team.league_id != league_season.league_id):
-                    raise DivisionMismatchError(
-                        f"{label}'s registration does not match its permanent "
-                        "League.",
-                        {"reason": "registration_cross_league",
-                         "team_id": team_id,
-                         "league_season_id": league_season.id,
-                         "league_id": league_season.league_id,
-                         "team_league_id": (
-                             team.league_id if team is not None else None)})
+                # #331 review round 22: shared with _revalidate_game_
+                # participation's own divisionless branch via
+                # _require_team_in_league_season -- see that method's
+                # docstring for the two-layer (exact-key + season-wide)
+                # contract this delegates to.
+                registration = self._require_team_in_league_season(
+                    season_id, league_season, team_id)
                 if (division_id is not None
                         and registration.division_id != division_id):
+                    team = self.store.get_team(team_id)
+                    label = team.name if team is not None else team_id
                     raise DivisionMismatchError(
                         f"{label} is not registered in this division.",
                         {"reason": "team_wrong_division",

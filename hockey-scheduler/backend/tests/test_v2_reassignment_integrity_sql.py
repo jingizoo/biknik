@@ -359,6 +359,112 @@ class ParticipationSeasonWideConflictSqlTest(_SqlIntegrityBase):
         self._run(case)
 
 
+class GameLeagueSeasonIdentitySqlTest(_SqlIntegrityBase):
+    """#331 review round 22: ``_revalidate_game_participation``'s
+    division-less branch (round 21) compared only the resolved
+    registration's permanent League id against ``game.league_season_id``'s
+    OWN League id -- never confirming ``league_season_id`` resolves to a
+    real row, nor that it belongs to the game's Season. Both gaps are
+    reachable on a real SQL backend: a dangling id (the row was deleted, or
+    the id never existed) needs no unique-index bypass at all, and a SAME-
+    League-different-Season LeagueSeason is genuinely constructible (no
+    unique index spans two different Seasons). Proven here on SQLite always
+    and PostgreSQL when ``TEST_DATABASE_URL`` is set, for both ``move_game``
+    and ``publish_game``, zero mutation on rejection."""
+
+    def _fixture(self, api, store):
+        org, program = self._org_program(api)
+        season = api.create_season(program["id"], "Fall", actor_id=ADMIN)
+        league = api.create_league(season["id"], "L", actor_id=ADMIN)
+        club = api.create_club("C", actor_id=ADMIN)
+        home = api.create_team(club["id"], None, "Home", actor_id=ADMIN,
+                               program_id=program["id"], league_id=league["id"])
+        away = api.create_team(club["id"], None, "Away", actor_id=ADMIN,
+                               program_id=program["id"], league_id=league["id"])
+        api.register_team_for_season(season["id"], home["id"], actor_id=ADMIN,
+                                     league_id=league["id"])
+        api.register_team_for_season(season["id"], away["id"], actor_id=ADMIN,
+                                     league_id=league["id"])
+        org2, venue_program = org, program
+        venue = api.create_venue("V", organization_id=org2["id"],
+                                 league_id=venue_program["id"], actor_id=ADMIN)
+        api.grant_season_venue_access(season["id"], venue["id"], actor_id=ADMIN)
+        rink = api.create_rink(venue["id"], "R", actor_id=ADMIN)
+        slot1 = api.create_ice_slot(
+            rink["id"], "2026-09-01T18:30:00+00:00",
+            "2026-09-01T20:00:00+00:00", "game", actor_id=ADMIN)
+        slot2 = api.create_ice_slot(
+            rink["id"], "2026-09-02T18:30:00+00:00",
+            "2026-09-02T20:00:00+00:00", "game", actor_id=ADMIN)
+        game = api.create_game(season["id"], None, home["id"], away["id"],
+                               slot1["id"], actor_id=ADMIN, league_id=league["id"])
+        self.assertNotIn("error", game, game)
+        return program, season, league, slot1, slot2, game
+
+    def _corrupt(self, store, game_id, new_league_season_id):
+        game = store.get_game(game_id)
+        game.league_season_id = new_league_season_id
+        store.save_game(game)
+
+    def test_move_rejects_a_dangling_league_season_id_zero_mutation(self):
+        def case(api, store):
+            program, season, league, slot1, slot2, game = self._fixture(api, store)
+            self._corrupt(store, game["id"], "leagueseason_does_not_exist")
+            audits_before = len(store.all_setup_audit())
+            res = api.move_game(game["id"], slot2["id"], actor_id=ADMIN)
+            self.assertEqual(res["error"]["details"]["reason"],
+                             "regular_game_missing_league_season", res)
+            self.assertEqual(store.get_game(game["id"]).ice_slot_id, slot1["id"])
+            self.assertEqual(len(store.all_setup_audit()), audits_before)
+
+        self._run(case)
+
+    def test_publish_rejects_a_dangling_league_season_id_zero_mutation(self):
+        def case(api, store):
+            program, season, league, slot1, slot2, game = self._fixture(api, store)
+            self._corrupt(store, game["id"], "leagueseason_does_not_exist")
+            audits_before = len(store.all_setup_audit())
+            res = api.publish_game(game["id"], actor_id=ADMIN)
+            self.assertEqual(res["error"]["details"]["reason"],
+                             "regular_game_missing_league_season", res)
+            self.assertFalse(store.get_game(game["id"]).published)
+            self.assertEqual(len(store.all_setup_audit()), audits_before)
+
+        self._run(case)
+
+    def test_move_rejects_a_league_season_from_a_different_season_zero_mutation(self):
+        def case(api, store):
+            program, season, league, slot1, slot2, game = self._fixture(api, store)
+            other_season = api.create_season(program["id"], "Other", actor_id=ADMIN)
+            other_ls = api.setup.create_league_season(
+                league["id"], other_season["id"], actor_id=ADMIN)
+            self._corrupt(store, game["id"], other_ls.id)
+            audits_before = len(store.all_setup_audit())
+            res = api.move_game(game["id"], slot2["id"], actor_id=ADMIN)
+            self.assertEqual(res["error"]["details"]["reason"],
+                             "game_league_season_mismatch", res)
+            self.assertEqual(store.get_game(game["id"]).ice_slot_id, slot1["id"])
+            self.assertEqual(len(store.all_setup_audit()), audits_before)
+
+        self._run(case)
+
+    def test_publish_rejects_a_league_season_from_a_different_season_zero_mutation(self):
+        def case(api, store):
+            program, season, league, slot1, slot2, game = self._fixture(api, store)
+            other_season = api.create_season(program["id"], "Other", actor_id=ADMIN)
+            other_ls = api.setup.create_league_season(
+                league["id"], other_season["id"], actor_id=ADMIN)
+            self._corrupt(store, game["id"], other_ls.id)
+            audits_before = len(store.all_setup_audit())
+            res = api.publish_game(game["id"], actor_id=ADMIN)
+            self.assertEqual(res["error"]["details"]["reason"],
+                             "game_league_season_mismatch", res)
+            self.assertFalse(store.get_game(game["id"]).published)
+            self.assertEqual(len(store.all_setup_audit()), audits_before)
+
+        self._run(case)
+
+
 class AssignClubOptionalSqlTest(_SqlIntegrityBase):
     """Club is optional on a Team in both v1 and v2 (#233 Slice D)."""
 

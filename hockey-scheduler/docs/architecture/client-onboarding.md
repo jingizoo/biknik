@@ -2134,6 +2134,72 @@ division-participation.js`, `registration-cleanup.js`, and `home-tasks-hub.js`
 after the shared-code changes, plus the new `setup-progress-conflict-
 attention.js` journey itself, zero console errors throughout.
 
+### Round 22: LeagueSeason identity gap in round 21's own divisionless fix
+
+Round 21's convergence review (#331 review round 22) confirmed both prior
+reproductions fixed, but found a NEW release blocker introduced by round 21's
+own fix.
+
+**The bug.** `_revalidate_game_participation`'s division-less branch
+resolved each Team's registration via `_require_team_registered` (correctly
+season-wide/exact-key-conflict-aware since round 20), but then compared only
+that registration's permanent League id against
+`get_league_season(game.league_season_id).league_id` — never confirming
+`game.league_season_id` itself resolves to a real row, nor that the row it
+DOES resolve to actually belongs to the Game's own Season. Two adjacent
+shapes slipped through as a result, reproduced live on Memory and real
+SQLite: a dangling (non-`None` but nonexistent) `league_season_id`, and one
+silently reassigned to a genuinely different Season's LeagueSeason for the
+identical permanent League. Both `move_game` and `publish_game` accepted
+either shape and mutated the Game (slot occupancy / `published`) plus wrote
+an audit row — for BOTH the divisionless and (confirmed while reproducing
+over real HTTP against the demo's own seeded divisioned Game) the divisioned
+branch, since neither branch had ever independently validated the Game's own
+`league_season_id` before this round.
+
+**Fix.** Resolves and validates the Game's own `league_season_id` first —
+existence, then Season match — using the identical two-step
+`_require_batch_team_participation` already uses for its own target
+LeagueSeason (missing → `regular_game_missing_league_season`; wrong Season →
+the new `game_league_season_mismatch`), placed BEFORE the divisioned/
+divisionless branch split so it protects both unconditionally. Each Team is
+then required to hold an unambiguous, active registration EXACTLY at that
+now-validated LeagueSeason — not merely one sharing its League — via a new
+shared `_require_team_in_league_season(season_id, league_season, team_id)`,
+extracted from `_require_batch_team_participation`'s own per-team block
+(which now calls it too, replacing its prior duplicated inline logic with
+zero behavior change) so the identical exact-key + season-wide two-layer
+resolution and cross-League check live in exactly one place, callable from
+both the draft-commit gate and this game-revalidation gate.
+
+**Regression coverage:** four new tests in `GameParticipationRevalidationTest`
+(`test_exact_registration_identity.py`) covering both shapes for both
+`move_game` and `publish_game`, each asserting zero mutation (Game fields,
+slot occupancy, `published` state, and audit-log count all unchanged on
+rejection). A new `GameLeagueSeasonIdentitySqlTest` class in `test_v2_
+reassignment_integrity_sql.py` proves the identical four cases on real
+SQLite always and PostgreSQL when `TEST_DATABASE_URL` is set, using the same
+zero-mutation assertions. A new `test_game_league_season_identity_http.py`
+proves the dangling-id rejection over the actual authenticated `/api/games/
+{id}/move` and `/api/games/{id}/publish` HTTP routes the UI itself posts to
+— both actions write an audited mutation, so (unlike simpler role-only
+checks) they require a genuine logged-in session, not just the `X-Demo-Role`
+header other lighter-weight HTTP tests use.
+
+**Falsifiability:** reverting the `setup_service.py` fix alone reproduces all
+four claimed shapes live (both `move_game` and `publish_game` accept a
+dangling `league_season_id` and one reassigned to a different Season) —
+restored, reconfirmed green on Memory, both SQL backends, and over real
+HTTP.
+
+**Verification:** full Memory/SQLite (3514 tests, 314.6s) and PostgreSQL
+(3514 tests, 917.9s) suites both green, +10 from round 21.
+`scheduler-empty-state.js`/`scheduler-already-scheduled.js` (both exercise
+`_require_batch_team_participation` via the draft scheduler, the other
+caller of the now-shared per-team resolver) and `setup-progress-conflict-
+attention.js` all reconfirmed green at desktop and 390×844, zero console
+errors — no frontend files changed this round.
+
 - The bootstrap claim is the only unauthenticated mutation, and only on a fresh,
   durable, unclaimed installation.
 - After claim, all setup and onboarding-status detail requires an authenticated

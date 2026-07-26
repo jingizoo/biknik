@@ -707,7 +707,20 @@ class GameParticipationRevalidationTest(_Base):
     duplicate at the game's own LeagueSeason. The divisioned branch
     (`_require_team_registered` with a real ``division_id``) already routed
     through the fixed shared resolver; this closes the one branch that
-    didn't."""
+    didn't.
+
+    #331 review round 22: that round-21 fix itself only ever compared the
+    resolved registration's permanent League id against
+    ``get_league_season(game.league_season_id).league_id`` -- never
+    confirming ``game.league_season_id`` resolves to a real row at all, nor
+    that it belongs to the game's own Season. A dangling (non-``None`` but
+    nonexistent) ``league_season_id``, or one reassigned to a DIFFERENT
+    Season's LeagueSeason for the SAME permanent League, both slipped
+    through: the League-id comparison alone cannot see either shape. Fixed
+    by resolving and validating the game's LeagueSeason (existence, then
+    Season match) the same way ``_require_batch_team_participation``
+    resolves its own target LeagueSeason, before checking either Team
+    against it via the newly-shared ``_require_team_in_league_season``."""
 
     def setUp(self):
         super().setUp()
@@ -814,6 +827,66 @@ class GameParticipationRevalidationTest(_Base):
                          "team_registration_conflict", res)
         game = self.store.get_game(self.game["id"])
         self.assertEqual(game.ice_slot_id, self.slot1["id"])
+
+    def _corrupt_league_season_id(self, new_league_season_id):
+        game = self.store.get_game(self.game["id"])
+        game.league_season_id = new_league_season_id
+        self.store.save_game(game)
+
+    def test_move_rejects_a_dangling_league_season_id(self):
+        # #331 review round 22: non-None but references no real row.
+        self._corrupt_league_season_id("leagueseason_does_not_exist")
+        before_audit = self._audit_count()
+        res = self.api.move_game(self.game["id"], self.slot2["id"], actor_id=ADMIN)
+        self.assertEqual(res["error"]["details"]["reason"],
+                         "regular_game_missing_league_season", res)
+        game = self.store.get_game(self.game["id"])
+        self.assertEqual(game.ice_slot_id, self.slot1["id"])
+        self.assertEqual(self._audit_count(), before_audit)
+
+    def test_publish_rejects_a_dangling_league_season_id(self):
+        self._corrupt_league_season_id("leagueseason_does_not_exist")
+        before_audit = self._audit_count()
+        res = self.api.publish_game(self.game["id"], actor_id=ADMIN)
+        self.assertEqual(res["error"]["details"]["reason"],
+                         "regular_game_missing_league_season", res)
+        game = self.store.get_game(self.game["id"])
+        self.assertFalse(game.published)
+        self.assertEqual(self._audit_count(), before_audit)
+
+    def test_move_rejects_a_league_season_from_a_different_season(self):
+        # #331 review round 22: the SAME permanent League (league_a), a
+        # DIFFERENT Season's LeagueSeason row -- round 21's League-id-only
+        # comparison could never distinguish this from the correct one.
+        other_season = self.api.create_season(
+            self.program["id"], "Other Season", actor_id=ADMIN)
+        other_ls = self.api.setup.create_league_season(
+            self.league_a["id"], other_season["id"], actor_id=ADMIN)
+        self._corrupt_league_season_id(other_ls.id)
+        before_audit = self._audit_count()
+        res = self.api.move_game(self.game["id"], self.slot2["id"], actor_id=ADMIN)
+        self.assertEqual(res["error"]["details"]["reason"],
+                         "game_league_season_mismatch", res)
+        self.assertEqual(res["error"]["details"]["league_season_id"], other_ls.id)
+        self.assertEqual(res["error"]["details"]["league_season_season_id"],
+                         other_season["id"])
+        game = self.store.get_game(self.game["id"])
+        self.assertEqual(game.ice_slot_id, self.slot1["id"])
+        self.assertEqual(self._audit_count(), before_audit)
+
+    def test_publish_rejects_a_league_season_from_a_different_season(self):
+        other_season = self.api.create_season(
+            self.program["id"], "Other Season", actor_id=ADMIN)
+        other_ls = self.api.setup.create_league_season(
+            self.league_a["id"], other_season["id"], actor_id=ADMIN)
+        self._corrupt_league_season_id(other_ls.id)
+        before_audit = self._audit_count()
+        res = self.api.publish_game(self.game["id"], actor_id=ADMIN)
+        self.assertEqual(res["error"]["details"]["reason"],
+                         "game_league_season_mismatch", res)
+        game = self.store.get_game(self.game["id"])
+        self.assertFalse(game.published)
+        self.assertEqual(self._audit_count(), before_audit)
 
 
 if __name__ == "__main__":
